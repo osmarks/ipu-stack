@@ -447,6 +447,14 @@ fn main() -> Result<()> {
                 .checked_mul(4)
                 .filter(|bytes| *bytes != 0)
                 .ok_or_else(|| anyhow::anyhow!("exchange byte count overflow"))?;
+            let guard_words = 16u32;
+            // Keep worker sync storage, receive staging, executable plans, and
+            // outgoing data in separate SRAM regions. Exchange instructions
+            // can raise TEXCPT_CONFLICT when plan and payload share an element.
+            let destination_segment_address = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x1000;
+            let destination_address = destination_segment_address + guard_words * 4;
+            let plan_address = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x8000;
+            let source_address = plan_address + 0x8000;
             let mut transfers = Vec::new();
             let mut allocations = Vec::new();
             let mut sources = BTreeMap::new();
@@ -464,7 +472,7 @@ fn main() -> Result<()> {
                 allocations.push(Allocation {
                     tensor,
                     tile: source,
-                    address: 0x52000,
+                    address: source_address,
                     size: bytes,
                     live_from: 0,
                     live_until: 1,
@@ -488,7 +496,7 @@ fn main() -> Result<()> {
                     allocations.push(Allocation {
                         tensor,
                         tile: requested,
-                        address: 0x51040,
+                        address: destination_address,
                         size: bytes,
                         live_from: 0,
                         live_until: 1,
@@ -535,6 +543,7 @@ fn main() -> Result<()> {
                     as usize)
             };
             let execute_offset = symbol_offset("ipu_stack_execute")?;
+            let plan_address_offset = symbol_offset("ipu_stack_plan_address")?;
             let nonparticipant_redirect_offset =
                 symbol_offset("ipu_stack_nonparticipant_redirect")?;
             let coordinator_nonparticipant_redirect_offset =
@@ -553,6 +562,8 @@ fn main() -> Result<()> {
                     sources.contains_key(&logical) || destinations.contains_key(&logical);
                 code[sync_base_offset..sync_base_offset + 4]
                     .copy_from_slice(&(0x1900_0000 | (u32::from(logical) * 8)).to_le_bytes());
+                code[plan_address_offset..plan_address_offset + 4]
+                    .copy_from_slice(&(0x1900_0000 | plan_address).to_le_bytes());
                 if !participant {
                     let redirect_offset = if physical == 0 {
                         coordinator_nonparticipant_redirect_offset
@@ -598,7 +609,6 @@ fn main() -> Result<()> {
                 }
                 code_blobs.insert(logical, app.add_blob(code));
             }
-            let guard_words = 16u32;
             let destination_words = count + guard_words * 2;
             let destination_initial = words_to_bytes(
                 &(0..destination_words)
@@ -620,7 +630,7 @@ fn main() -> Result<()> {
                     let row = lowered[0].epochs[0].row_for(logical);
                     let plan_blob = app.add_blob(words_to_bytes(&row));
                     segments.push(Segment {
-                        address: 0x54000,
+                        address: plan_address,
                         memory_size: (ipu_exchange::PLAN_WORDS * 4) as u32,
                         blob: plan_blob,
                         blob_offset: 0,
@@ -661,7 +671,7 @@ fn main() -> Result<()> {
                         .collect::<Vec<_>>();
                     let blob = app.add_blob(words_to_bytes(&source));
                     segments.push(Segment {
-                        address: 0x52000,
+                        address: source_address,
                         memory_size: bytes,
                         blob,
                         blob_offset: 0,
@@ -670,7 +680,7 @@ fn main() -> Result<()> {
                     });
                 } else if destinations.contains_key(&logical) {
                     segments.push(Segment {
-                        address: 0x51000,
+                        address: destination_segment_address,
                         memory_size: destination_words * 4,
                         blob: destination_blob,
                         blob_offset: 0,
@@ -681,9 +691,9 @@ fn main() -> Result<()> {
                 app.tiles.push(TileImage {
                     physical_tile: physical,
                     entry_point: image.base,
-                    command_address: 0x54000,
+                    command_address: plan_address,
                     diagnostic_address: if destinations.contains_key(&logical) {
-                        0x51040
+                        destination_address
                     } else {
                         0
                     },

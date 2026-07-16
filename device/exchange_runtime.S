@@ -101,6 +101,8 @@ ipu_stack_execute:
 #endif
 	setzi $m8, 1
 	put 0xa6, $m8
+	.globl ipu_stack_plan_address
+ipu_stack_plan_address:
 	setzi $m0, 0x54000
 	setzi $m10, .Lexchange_complete
 	br $m0

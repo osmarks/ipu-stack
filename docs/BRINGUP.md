@@ -37,7 +37,7 @@ inside Poplar's runtime. The direct runtime now reaches the same plan with:
 - the SDK supervisor's global master sequence and per-tile worker sync bases;
 - `A6=1` on senders and receivers;
 - `sans 0; sync 1` on every tile without a plan in an exchange launch;
-- plan code in normal executable SRAM at `0x54000`.
+- plan code in a separately allocated executable SRAM region.
 
 The launch roles must not be conflated. Before a launch, non-master tiles
 execute `sans 1; sync 1` as part of the device-wide synchronization. During the
@@ -55,6 +55,21 @@ its global-sync descriptor route is `0x21a` rather than `0x211`. The fixture
 therefore accepts the descriptor route explicitly instead of embedding one
 capture's value. Generating those four allocation records and the corresponding
 route identifier is still required for a topology-independent runtime.
+
+Hardware acceptance with the checked-in configuration and coordinator route
+now covers:
+
+- complete source, destination, and guard checks at counts 1, 52, 64, 65,
+  512, 1,024, and the maximum 4,148 words;
+- routes in both directions across physical rows and columns;
+- four disjoint sender/receiver pairs in one exchange launch;
+- one 1,024-word source stream received simultaneously by physical tiles 32
+  and 53.
+
+The fixture places worker sync storage, receive staging, executable plans, and
+outgoing data in separate SRAM regions. Placing plan and source in the same
+SRAM element was reproduced as `TEXCPT_CONFLICT` at the sender's `send`
+instruction.
 
 TDI reports both inactive and WAEX as context state zero. Architectural
 exceptions are only classified when exception metadata is nonzero; attempting
