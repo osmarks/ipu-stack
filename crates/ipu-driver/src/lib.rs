@@ -32,6 +32,14 @@ const TILE_DEBUG_TILE_STRIDE: u32 = 0x40;
 const TILE_DEBUG_EXCEPTION_STATE: u32 = 5;
 const TILE_DEBUG_REGISTER_STRIDE: u32 = 4;
 const TILE_DEBUG_BREAK_ON_SYNC: u32 = 1 << 5;
+const TDI_CONTEXT_STATUS: u32 = 0;
+const TDI_RUN_BREAK: u32 = 1;
+const TDI_INSTRUCTION: u32 = 3;
+const TDI_INSTRUCTION_OWNER: u32 = 4;
+const TDI_EXCEPTION_CLEAR: u32 = 6;
+const TDI_DATA: u32 = 7;
+const TDI_STATUS: u32 = 8;
+const TDI_STATUS_CLEAR: u32 = 9;
 
 /// IPU21 `$SSR.ETYPE` / `$WSR.ETYPE` values from the Tile Vertex ISA.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -380,6 +388,101 @@ impl Device {
         self.write_config(offset, state)
     }
 
+    pub fn read_tile_word(&self, physical_tile: u16, address: u32) -> Result<u32, DriverError> {
+        if address & 3 != 0
+            || !(TILE_MEMORY_BASE..=TILE_MEMORY_BASE + TILE_MEMORY_SIZE as u32 - 4)
+                .contains(&address)
+        {
+            return Err(DriverError::Invalid(format!(
+                "invalid tile memory address 0x{address:x}"
+            )));
+        }
+        let context = 0;
+        let context_bit = 1 << context;
+        let old_run_break = self.read_tile_debug(physical_tile, TDI_RUN_BREAK)?;
+        let initial_state = self.tile_context_state(physical_tile, context)?;
+        let already_stopped = matches!(initial_state, 2 | 3);
+        if !already_stopped {
+            self.write_tile_debug(physical_tile, TDI_RUN_BREAK, old_run_break | context_bit)?;
+        }
+        let result = (|| {
+            if !already_stopped {
+                let deadline = Instant::now() + Duration::from_millis(100);
+                while !matches!(self.tile_context_state(physical_tile, context)?, 2 | 3) {
+                    if Instant::now() >= deadline {
+                        return Err(DriverError::Timeout("stopping tile supervisor".into()));
+                    }
+                }
+            }
+            self.write_tile_debug(physical_tile, TDI_DATA, address)?;
+            for instruction in [0x4101_0070, 0x01f0_1000, 0x4300_8070] {
+                self.execute_tile_instruction(physical_tile, context, instruction)?;
+            }
+            self.read_tile_debug(physical_tile, TDI_DATA)
+        })();
+        if !already_stopped {
+            self.write_tile_debug(physical_tile, TDI_RUN_BREAK, old_run_break)?;
+            if old_run_break & context_bit == 0 {
+                self.write_tile_debug(physical_tile, TDI_EXCEPTION_CLEAR, context_bit)?;
+            }
+        }
+        result
+    }
+
+    fn tile_context_state(&self, physical_tile: u16, context: u32) -> Result<u32, DriverError> {
+        Ok((self.read_tile_debug(physical_tile, TDI_CONTEXT_STATUS)? >> (context * 2)) & 3)
+    }
+
+    fn read_tile_debug(&self, physical_tile: u16, register: u32) -> Result<u32, DriverError> {
+        self.read_config(
+            TILE_DEBUG_BASE
+                + u32::from(physical_tile) * TILE_DEBUG_TILE_STRIDE
+                + register * TILE_DEBUG_REGISTER_STRIDE,
+        )
+    }
+
+    fn write_tile_debug(
+        &self,
+        physical_tile: u16,
+        register: u32,
+        value: u32,
+    ) -> Result<(), DriverError> {
+        self.write_config(
+            TILE_DEBUG_BASE
+                + u32::from(physical_tile) * TILE_DEBUG_TILE_STRIDE
+                + register * TILE_DEBUG_REGISTER_STRIDE,
+            value,
+        )
+    }
+
+    fn execute_tile_instruction(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        instruction: u32,
+    ) -> Result<(), DriverError> {
+        const INVALID_OR_DOUBLE: u32 = 0x6;
+        const BUSY: u32 = 0x8;
+        self.write_tile_debug(physical_tile, TDI_STATUS_CLEAR, INVALID_OR_DOUBLE)?;
+        self.write_tile_debug(physical_tile, TDI_INSTRUCTION_OWNER, context)?;
+        self.write_tile_debug(physical_tile, TDI_INSTRUCTION, instruction)?;
+        let deadline = Instant::now() + Duration::from_millis(100);
+        loop {
+            let status = self.read_tile_debug(physical_tile, TDI_STATUS)?;
+            if status & BUSY == 0 {
+                if status & (INVALID_OR_DOUBLE | 1) != 0 {
+                    return Err(DriverError::Invalid(format!(
+                        "TDI instruction failed with status 0x{status:x}"
+                    )));
+                }
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(DriverError::Timeout("TDI instruction".into()));
+            }
+        }
+    }
+
     fn wait_autoloader(&self, timeout: Duration) -> Result<(), DriverError> {
         let deadline = Instant::now() + timeout;
         while self.read_config(pci::AUTOLD_CSR)? & pci::AUTOLD_GO != 0 {
@@ -478,13 +581,13 @@ impl Drop for Device {
     }
 }
 
-struct MappedBuffer {
+pub struct HostBuffer {
     data: *mut u8,
     size: usize,
 }
 
-impl MappedBuffer {
-    fn new(size: usize) -> Result<Self, DriverError> {
+impl HostBuffer {
+    pub fn new(size: usize) -> Result<Self, DriverError> {
         let data = unsafe {
             libc::mmap(
                 ptr::null_mut(),
@@ -506,12 +609,20 @@ impl MappedBuffer {
         }
     }
 
-    fn bytes_mut(&mut self) -> &mut [u8] {
+    pub fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.data, self.size) }
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.data, self.size) }
+    }
+
+    pub fn attach(&self, device: &Device, index: u32) -> Result<(), DriverError> {
+        device.attach_buffer(index, self.data, self.size)
     }
 }
 
-impl Drop for MappedBuffer {
+impl Drop for HostBuffer {
     fn drop(&mut self) {
         unsafe { libc::munmap(self.data.cast(), self.size) };
     }
@@ -636,7 +747,7 @@ impl<'a> Loader<'a> {
         self.install_bootloader(tile_count)?;
         self.device
             .write_config(pci::EXCHANGE_WINDOW_BASE, pci::EXCHANGE_WINDOW_HEXOPT)?;
-        let mut transport = MappedBuffer::new(TRANSPORT_SIZE)?;
+        let mut transport = HostBuffer::new(TRANSPORT_SIZE)?;
         let _attachment = BufferAttachment::new(self.device, 0, transport.data, transport.size)?;
         let guard = ExchangeBufferGuard::new(self.device)?;
         guard.restore_primary()?;
@@ -751,7 +862,7 @@ impl<'a> Loader<'a> {
 pub struct HostSession<'a> {
     device: &'a Device,
     protocol: HostExchange,
-    pages: HashMap<u32, MappedBuffer>,
+    pages: HashMap<u32, HostBuffer>,
     attached: bool,
 }
 
@@ -759,7 +870,7 @@ impl<'a> HostSession<'a> {
     pub fn new(device: &'a Device, protocol: HostExchange) -> Result<Self, DriverError> {
         let mut pages = HashMap::new();
         for page in &protocol.pages {
-            pages.insert(page.index, MappedBuffer::new(page.size as usize)?);
+            pages.insert(page.index, HostBuffer::new(page.size as usize)?);
         }
         Ok(Self {
             device,
@@ -855,7 +966,7 @@ impl Drop for HostSession<'_> {
 }
 
 fn copy_input(
-    pages: &mut HashMap<u32, MappedBuffer>,
+    pages: &mut HashMap<u32, HostBuffer>,
     call: &HostCall,
     input: &[u8],
 ) -> Result<(), DriverError> {
@@ -884,7 +995,7 @@ fn copy_input(
 }
 
 fn copy_output(
-    pages: &mut HashMap<u32, MappedBuffer>,
+    pages: &mut HashMap<u32, HostBuffer>,
     call: &HostCall,
 ) -> Result<Vec<u8>, DriverError> {
     let size = call
