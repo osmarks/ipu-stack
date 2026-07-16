@@ -24,6 +24,61 @@ pub struct HostTransferChunk {
     pub header: HostPacketHeader,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileToHostProgram {
+    pub instructions: Vec<u32>,
+    pub packet_words: [u32; 4],
+}
+
+pub fn assemble_tile_to_host_xreq_program(
+    packet_address: u32,
+) -> Result<TileToHostProgram, ExchangeError> {
+    if packet_address & 7 != 0 {
+        return Err(ExchangeError::HostPacket);
+    }
+    Ok(TileToHostProgram {
+        instructions: vec![
+            0x1980_0600, // setzi $m8, 0x600
+            0x4380_80a0, // put $INCOMING_MUX, $m8
+            0x4180_000f, // sync 15
+            encode_send(1, 3, packet_address >> 2)?,
+            0x4180_0007, // sync 7
+            0x1980_0640, // setzi $m8, 0x640
+            0x4380_80a0, // put $INCOMING_MUX, $m8
+            0x43a0_0000, // br $m10
+        ],
+        packet_words: [2, 0, 0, 0],
+    })
+}
+
+pub fn assemble_host_command_read_program(
+    packet_address: u32,
+    destination_address: u32,
+    host_offset: u32,
+) -> Result<TileToHostProgram, ExchangeError> {
+    if packet_address & 7 != 0 {
+        return Err(ExchangeError::HostPacket);
+    }
+    let request = host_to_tile_packet(0, destination_address, host_offset, 4)?;
+    Ok(TileToHostProgram {
+        instructions: vec![
+            0x1980_0600,
+            0x4380_80a0,
+            0x4180_000f,
+            0x1980_0001,
+            0x4380_80a6,
+            encode_send(1, 3, packet_address >> 2)?,
+            encode_send(1, 3, (packet_address + 8) >> 2)?,
+            0x4180_0000,
+            0x4180_0007,
+            0x1980_0640,
+            0x4380_80a0,
+            0x43a0_0000,
+        ],
+        packet_words: [1, 0, request.word0, request.word1],
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HostPacketSize {
     Short,
@@ -150,6 +205,56 @@ pub fn plan_tile_to_host(
     }
     plan_host_transfer(tile_address, host_offset, bytes, |_tile, host, count| {
         tile_to_host_packet(physical_tile, host, count)
+    })
+}
+
+pub fn assemble_tile_to_host_program(
+    physical_tile: u16,
+    tile_address: u32,
+    host_offset: u32,
+    bytes: u32,
+    packet_address: u32,
+    dummy_tile_address: u32,
+) -> Result<TileToHostProgram, ExchangeError> {
+    let chunks = plan_tile_to_host(physical_tile, tile_address, host_offset, bytes)?;
+    if chunks.len() != 1 || packet_address & 7 != 0 {
+        return Err(ExchangeError::HostPacket);
+    }
+    let chunk = chunks[0];
+    let close = zero_byte_read_packet(physical_tile, dummy_tile_address)?;
+    let mut instructions = vec![
+        0x1980_0600, // setzi $m8, 0x600
+        0x4380_80a0, // put $INCOMING_MUX, $m8
+        0x4180_0007, // sync 7
+        0x1980_0001, // setzi $m8, 1
+        0x4380_80a6, // put $INCOMING_DCOUNT, $m8
+        encode_send(1, 3, packet_address >> 2)?,
+    ];
+    let words = chunk.bytes / 4;
+    for offset in (0..words).step_by(64) {
+        instructions.push(encode_send(
+            (words - offset).min(64) - 1,
+            3,
+            (chunk.tile_address >> 2) + offset,
+        )?);
+    }
+    instructions.extend([
+        delay(1),
+        encode_send(1, 3, (packet_address + 8) >> 2)?,
+        0x4180_0000, // sync 0
+        0x4180_0007, // sync 7
+        0x1980_0640, // setzi $m8, 0x640
+        0x4380_80a0, // put $INCOMING_MUX, $m8
+        0x43a0_0000, // br $m10
+    ]);
+    Ok(TileToHostProgram {
+        instructions,
+        packet_words: [
+            chunk.header.word0,
+            chunk.header.word1,
+            close.word0,
+            close.word1,
+        ],
     })
 }
 
@@ -779,6 +884,52 @@ mod tests {
         );
         assert_eq!(h2d.last().unwrap().tile_address + 36, 0x50064);
         assert!(plan_host_to_tile(0, 0x50004, 0, 4).is_err());
+    }
+
+    #[test]
+    fn assembles_tile_to_host_program() {
+        let plan = assemble_tile_to_host_program(2, 0x50120, 0x40, 64, 0x50160, 0x50180).unwrap();
+        assert_eq!(plan.packet_words, [0xa001_0000, 0x11, 0xcc01_020c, 0]);
+        assert_eq!(
+            plan.instructions[0..3],
+            [0x1980_0600, 0x4380_80a0, 0x4180_0007]
+        );
+        assert_eq!(
+            plan.instructions[3..6],
+            [0x1980_0001, 0x4380_80a6, 0x782a_02c3]
+        );
+        assert_eq!(plan.instructions[6], 0x79ea_0243);
+        assert_eq!(
+            plan.instructions[7..],
+            [
+                0x40a0_0001,
+                0x782a_02d3,
+                0x4180_0000,
+                0x4180_0007,
+                0x1980_0640,
+                0x4380_80a0,
+                0x43a0_0000
+            ]
+        );
+    }
+
+    #[test]
+    fn assembles_tile_to_host_xreq_program() {
+        let plan = assemble_tile_to_host_xreq_program(0x50170).unwrap();
+        assert_eq!(plan.packet_words, [2, 0, 0, 0]);
+        assert_eq!(plan.instructions[2], 0x4180_000f);
+        assert_eq!(plan.instructions[3], 0x782a_02e3);
+        assert_eq!(plan.instructions.last(), Some(&0x43a0_0000));
+    }
+
+    #[test]
+    fn assembles_host_command_read_program() {
+        let plan = assemble_host_command_read_program(0x50160, 0x50180, 0x1000).unwrap();
+        assert_eq!(plan.packet_words, [1, 0, 0xcc00_020c, 0x4001]);
+        assert_eq!(
+            plan.instructions[5..8],
+            [0x782a_02c3, 0x782a_02d3, 0x4180_0000]
+        );
     }
 
     #[test]
