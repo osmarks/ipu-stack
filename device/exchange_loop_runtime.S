@@ -48,9 +48,22 @@ ipu_stack_command_table_address:
 	brnz $m4, .Llaunch_complete
 	cmpeq $m4, $m5, 2
 	brnz $m4, .Linactive_launch
+	cmpeq $m4, $m5, 6
+	brnz $m4, .Lexternal_completion
 	cmpeq $m4, $m5, 3
-	brz $m4, .Lset_receive_base
+	brnz $m4, .Lset_send_base
+	cmpeq $m4, $m5, 5
+	brnz $m4, .Lset_absolute_send_base
+	cmpeq $m4, $m5, 7
+	brnz $m4, .Lset_absolute_send_base
+	cmpeq $m4, $m5, 8
+	brnz $m4, .Lset_absolute_send_base
+	bri .Lset_receive_base
+.Lset_send_base:
 	put 0xa7, $m2
+	bri .Larm_plan
+.Lset_absolute_send_base:
+	put 0xa7, $m15
 	bri .Larm_plan
 .Lset_receive_base:
 	put 0xa4, $m3
@@ -75,6 +88,11 @@ ipu_stack_command_table_address:
 
 .Linactive_launch:
 	.long 0x40c00000
+	.long 0x41800001
+	bri .Llaunch_complete
+
+.Lexternal_completion:
+	.long 0x40c00001
 	.long 0x41800001
 
 .Llaunch_complete:

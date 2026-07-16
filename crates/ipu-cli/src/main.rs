@@ -4,12 +4,12 @@ use ipu_compiler::{
     Allocation, AllocationKind, CompilerOptions, EncoderConfig, EncoderWeights, Phase, Schedule,
     TensorId, Transfer, compile, encoder_graph, encoder_reference,
 };
-use ipu_driver::{Device, HostSession, Loader, block_device_interrupt_signals};
+use ipu_driver::{Device, HostBuffer, HostSession, Loader, block_device_interrupt_signals};
 use ipu_elf::{LinkOptions, Toolchain, inspect_object, link};
 use ipu_exchange::Topology;
 use ipu_package::{
-    Application, EntryPoint, HostCall, HostExchange, HostPage, HostSlice, SEGMENT_EXECUTE,
-    SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
+    Application, Binding, EntryPoint, HostCall, HostExchange, HostPage, HostSlice, RegionSlice,
+    SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
 };
 use object::{Object, ObjectSegment};
 use std::collections::{BTreeMap, HashMap};
@@ -126,6 +126,12 @@ enum Command {
         global_sync_packet_address: u32,
         #[arg(long, value_parser = parse_u32)]
         global_sync_release_address: u32,
+        #[arg(long, default_value = "0x50160", value_parser = parse_u32)]
+        host_packet_address: u32,
+        #[arg(long, default_value = "0x50180", value_parser = parse_u32)]
+        host_dummy_address: u32,
+        #[arg(long, default_value = "0x40", value_parser = parse_u32)]
+        host_output_offset: u32,
     },
     DeviceProbe {
         #[arg(long, default_value = "/dev/ipu0")]
@@ -141,6 +147,23 @@ enum Command {
         entry: Option<String>,
         #[arg(long, hide = true)]
         break_on_sync_tile: Vec<u16>,
+        #[arg(long, default_value = "/dev/ipu0")]
+        device: String,
+    },
+    RunOutput {
+        package: PathBuf,
+        bootloader: PathBuf,
+        configuration: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 4096)]
+        page_size: usize,
+        #[arg(long, default_value = "0x40", value_parser = parse_u32)]
+        page_offset: u32,
+        #[arg(long, default_value_t = 4)]
+        size: usize,
+        #[arg(long)]
+        entry: Option<String>,
         #[arg(long, default_value = "/dev/ipu0")]
         device: String,
     },
@@ -749,6 +772,9 @@ fn main() -> Result<()> {
             global_sync_route,
             global_sync_packet_address,
             global_sync_release_address,
+            host_packet_address,
+            host_dummy_address,
+            host_output_offset,
         } => {
             let topology = Topology::c600();
             if global_sync_route > 0x00ff_ffff {
@@ -813,6 +839,29 @@ fn main() -> Result<()> {
             };
             let lowered = schedule.lower_exchanges(&topology)?;
             let launches: Vec<_> = lowered.iter().flat_map(|phase| &phase.epochs).collect();
+            let host_plan_address = plan_base + launches.len() as u32 * plan_stride;
+            let host_program = ipu_exchange::assemble_tile_to_host_program(
+                topology.physical(root)?,
+                accumulator_address,
+                host_output_offset,
+                64,
+                host_packet_address,
+                host_dummy_address,
+            )?;
+            let host_xreq_packet_address = host_packet_address
+                .checked_add(16)
+                .ok_or_else(|| anyhow::anyhow!("host packet address overflow"))?;
+            let host_xreq_program =
+                ipu_exchange::assemble_tile_to_host_xreq_program(host_xreq_packet_address)?;
+            let host_command_program = ipu_exchange::assemble_host_command_read_program(
+                host_packet_address,
+                host_dummy_address,
+                0x1000,
+            )?;
+            let host_command_plan_address =
+                host_plan_address + ((host_program.instructions.len() as u32 * 4 + 7) & !7);
+            let host_xreq_plan_address = host_command_plan_address
+                + ((host_command_program.instructions.len() as u32 * 4 + 7) & !7);
             let image = link(
                 &[fs::read(object)?],
                 &LinkOptions {
@@ -902,7 +951,7 @@ fn main() -> Result<()> {
                     file_size: image.bytes.len() as u32,
                     flags: SEGMENT_READ | SEGMENT_EXECUTE,
                 }];
-                let mut commands = Vec::with_capacity((launches.len() + 1) * 16);
+                let mut commands = Vec::with_capacity((launches.len() + 4) * 16);
                 for (launch_index, epoch) in launches.iter().enumerate() {
                     let plan_address = plan_base + launch_index as u32 * plan_stride;
                     let mut role = if physical == 0 { 1 } else { 2 };
@@ -937,6 +986,30 @@ fn main() -> Result<()> {
                         staging,
                     ]));
                 }
+                commands.extend_from_slice(&words_to_bytes(&[
+                    if physical == 0 { 8 } else { 2 },
+                    host_command_plan_address,
+                    0,
+                    0,
+                ]));
+                let host_role = if physical == 0 {
+                    7
+                } else if logical == root {
+                    5
+                } else {
+                    2
+                };
+                commands.extend_from_slice(&words_to_bytes(&[
+                    host_role,
+                    if physical == 0 {
+                        host_xreq_plan_address
+                    } else {
+                        host_plan_address
+                    },
+                    accumulator_address,
+                    0,
+                ]));
+                commands.extend_from_slice(&words_to_bytes(&[1, 0, 0, 0]));
                 commands.extend_from_slice(&words_to_bytes(&[0, 0, 0, 0]));
                 let command_blob = app.add_blob(commands.clone());
                 segments.push(Segment {
@@ -956,11 +1029,71 @@ fn main() -> Result<()> {
                     let blob = app.add_blob(words_to_bytes(&[initial]));
                     segments.push(Segment {
                         address: accumulator_address,
-                        memory_size: 4,
+                        memory_size: 64,
                         blob,
                         blob_offset: 0,
                         file_size: 4,
                         flags: SEGMENT_READ | SEGMENT_WRITE,
+                    });
+                }
+                if logical == root {
+                    let plan = app.add_blob(words_to_bytes(&host_program.instructions));
+                    segments.push(Segment {
+                        address: host_plan_address,
+                        memory_size: (host_program.instructions.len() * 4) as u32,
+                        blob: plan,
+                        blob_offset: 0,
+                        file_size: (host_program.instructions.len() * 4) as u32,
+                        flags: SEGMENT_READ | SEGMENT_EXECUTE,
+                    });
+                    let packets = app.add_blob(words_to_bytes(&host_program.packet_words));
+                    segments.push(Segment {
+                        address: host_packet_address,
+                        memory_size: 16,
+                        blob: packets,
+                        blob_offset: 0,
+                        file_size: 16,
+                        flags: SEGMENT_READ,
+                    });
+                }
+                if physical == 0 {
+                    let command_plan =
+                        app.add_blob(words_to_bytes(&host_command_program.instructions));
+                    segments.push(Segment {
+                        address: host_command_plan_address,
+                        memory_size: (host_command_program.instructions.len() * 4) as u32,
+                        blob: command_plan,
+                        blob_offset: 0,
+                        file_size: (host_command_program.instructions.len() * 4) as u32,
+                        flags: SEGMENT_READ | SEGMENT_EXECUTE,
+                    });
+                    let command_packets =
+                        app.add_blob(words_to_bytes(&host_command_program.packet_words));
+                    segments.push(Segment {
+                        address: host_packet_address,
+                        memory_size: 16,
+                        blob: command_packets,
+                        blob_offset: 0,
+                        file_size: 16,
+                        flags: SEGMENT_READ,
+                    });
+                    let plan = app.add_blob(words_to_bytes(&host_xreq_program.instructions));
+                    segments.push(Segment {
+                        address: host_xreq_plan_address,
+                        memory_size: (host_xreq_program.instructions.len() * 4) as u32,
+                        blob: plan,
+                        blob_offset: 0,
+                        file_size: (host_xreq_program.instructions.len() * 4) as u32,
+                        flags: SEGMENT_READ | SEGMENT_EXECUTE,
+                    });
+                    let packet = app.add_blob(words_to_bytes(&host_xreq_program.packet_words[..2]));
+                    segments.push(Segment {
+                        address: host_xreq_packet_address,
+                        memory_size: 8,
+                        blob: packet,
+                        blob_offset: 0,
+                        file_size: 8,
+                        flags: SEGMENT_READ,
                     });
                 }
                 if receiver_tiles.contains(&logical) {
@@ -1012,13 +1145,25 @@ fn main() -> Result<()> {
                 });
             }
             app.tiles.sort_by_key(|tile| tile.physical_tile);
-            // Startup consumes one credit. Each launch then consumes one
-            // global-release and one plan-entry credit.
-            let external_syncs = 1 + launches.len() as u32 * 2;
+            // D2H uses global entry and coordinator XREQ phases. A following
+            // all-tile launch contributes global entry and external completion
+            // only after the source's sync 0 has retired.
+            let external_syncs = launches.len() as u32 * 2 + 6;
             app.entry_points.push(EntryPoint {
                 name: "parallel-sum".into(),
                 command: 0,
                 external_syncs,
+            });
+            app.outputs.push(Binding {
+                name: "sum".into(),
+                dtype: "u32".into(),
+                shape: vec![1],
+                slices: vec![RegionSlice {
+                    tile: u32::from(topology.physical(root)?),
+                    tile_address: accumulator_address,
+                    file_offset: 0,
+                    size: 4,
+                }],
             });
             app.write(fs::File::create(&output)?)?;
             let expected = (topology.tile_count() as u32)
@@ -1158,6 +1303,112 @@ fn main() -> Result<()> {
                 entry.external_syncs + 1
             );
         }
+        Command::RunOutput {
+            package,
+            bootloader,
+            configuration,
+            output,
+            page_size,
+            page_offset,
+            size,
+            entry,
+            device,
+        } => {
+            let app = Application::read(fs::File::open(package)?)?;
+            let entry = match entry {
+                Some(name) => app
+                    .entry_points
+                    .iter()
+                    .find(|candidate| candidate.name == name)
+                    .ok_or_else(|| anyhow::anyhow!("unknown entry point {name}"))?,
+                None => app
+                    .entry_points
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("package has no entry point"))?,
+            };
+            let page_offset = page_offset as usize;
+            if size == 0 || page_offset > page_size || size > page_size - page_offset {
+                bail!("output slice is outside the attached host page");
+            }
+            let bootloader = fs::read(bootloader)?;
+            let configuration = fs::read(configuration)?;
+            block_device_interrupt_signals()?;
+            let device = Device::open(&device)?;
+            device.initialize()?;
+            device.replay_configuration(&configuration)?;
+            Loader::new(&device, &bootloader)?.load(&app, 0)?;
+            let page = HostBuffer::new(page_size)?;
+            let command_page = HostBuffer::new(4096)?;
+            device.set_mark(1)?;
+            device.wait_mark(
+                ipu_driver::pci::HSP_GS2_CONTROL,
+                0,
+                std::time::Duration::from_secs(10),
+            )?;
+            device.write_config(
+                ipu_driver::pci::EXCHANGE_WINDOW_BASE,
+                ipu_driver::pci::EXCHANGE_WINDOW_HEXOPT,
+            )?;
+            command_page.attach(&device, 1)?;
+            device.write_config(
+                ipu_driver::pci::EXCHANGE_WINDOW_BASE,
+                ipu_driver::pci::EXCHANGE_WINDOW_HEXOPT,
+            )?;
+            page.attach(&device, 0)?;
+            device.write_config(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+            device.wait_mark(
+                ipu_driver::pci::HSP_GS2_CONTROL,
+                0,
+                std::time::Duration::from_secs(10),
+            )?;
+            const HOST_OUTPUT_PHASES: u32 = 6;
+            let bulk_syncs = entry
+                .external_syncs
+                .checked_sub(1 + HOST_OUTPUT_PHASES)
+                .ok_or_else(|| anyhow::anyhow!("entry point has too few output phases"))?;
+            device.write_config(ipu_driver::pci::HSP_GS2_CONTROL, bulk_syncs)?;
+            device.wait_mark(
+                ipu_driver::pci::HSP_GS2_CONTROL,
+                0,
+                std::time::Duration::from_secs(10),
+            )?;
+            for phase in 0..HOST_OUTPUT_PHASES {
+                device.write_config(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+                device
+                    .wait_mark(
+                        ipu_driver::pci::HSP_GS2_CONTROL,
+                        0,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .with_context(|| format!("host output phase {phase}"))?;
+            }
+            if let Some(slice) = app
+                .outputs
+                .first()
+                .and_then(|binding| binding.slices.first())
+            {
+                match device.read_tile_word(slice.tile as u16, slice.tile_address) {
+                    Ok(value) => info!(
+                        output = %app.outputs[0].name,
+                        physical_tile = slice.tile,
+                        tile_address = format_args!("0x{:x}", slice.tile_address),
+                        value,
+                        "read device output diagnostic"
+                    ),
+                    Err(error) => tracing::debug!(%error, "device output diagnostic unavailable"),
+                }
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            fs::write(&output, &page.bytes()[page_offset..page_offset + size])?;
+            device.detach_buffer(0);
+            device.detach_buffer(1);
+            println!(
+                "entry={} outputBytes={} output={} directOutput=PASS",
+                entry.name,
+                size,
+                output.display()
+            );
+        }
         Command::HostRun {
             package,
             bootloader,
@@ -1221,6 +1472,7 @@ impl Command {
             Self::PackageParallelSumFixture { .. } => "package-parallel-sum-fixture",
             Self::DeviceProbe { .. } => "device-probe",
             Self::Load { .. } => "load",
+            Self::RunOutput { .. } => "run-output",
             Self::HostRun { .. } => "host-run",
         }
     }
