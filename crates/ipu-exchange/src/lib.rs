@@ -5,8 +5,22 @@ use tracing::debug;
 pub const PLAN_WORDS: usize = 9;
 pub const MAX_TRANSFER_WORDS: u32 = 4148;
 pub const EXCHANGE_WINDOW_BASE: u32 = 0x50000;
+pub const HOST_SHORT_MAX_BYTES: u32 = 60;
+pub const HOST_LONG_MAX_BYTES: u32 = 1024;
 
 pub type PlanRow = [u32; PLAN_WORDS];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostPacketHeader {
+    pub word0: u32,
+    pub word1: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostPacketSize {
+    Short,
+    Long,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
@@ -39,6 +53,106 @@ pub enum ExchangeError {
     Schedule(&'static str),
     #[error("tile address 0x{0:x} is not encodable")]
     Address(u32),
+    #[error("host exchange address or length is not encodable")]
+    HostPacket,
+}
+
+pub fn host_to_tile_packet(
+    physical_tile: u16,
+    tile_address: u32,
+    host_offset: u32,
+    bytes: u32,
+) -> Result<HostPacketHeader, ExchangeError> {
+    if tile_address < EXCHANGE_WINDOW_BASE || tile_address & 31 != 0 {
+        return Err(ExchangeError::HostPacket);
+    }
+    let exchange_address = (tile_address - EXCHANGE_WINDOW_BASE) >> 5;
+    if exchange_address > 0x1ff {
+        return Err(ExchangeError::HostPacket);
+    }
+    let size = host_packet_size(host_offset, bytes)?;
+    let opcode = match size {
+        HostPacketSize::Short => 0xcc00_0200,
+        HostPacketSize::Long => 0xec00_0200,
+    };
+    Ok(HostPacketHeader {
+        word0: opcode | host_route_word0(physical_tile) | exchange_address,
+        word1: host_route_word1(physical_tile) | host_address_length(host_offset, bytes, size)?,
+    })
+}
+
+pub fn tile_to_host_packet(
+    physical_tile: u16,
+    host_offset: u32,
+    bytes: u32,
+) -> Result<HostPacketHeader, ExchangeError> {
+    let size = host_packet_size(host_offset, bytes)?;
+    let opcode = match size {
+        HostPacketSize::Short => 0x8000_0000,
+        HostPacketSize::Long => 0xa000_0000,
+    };
+    Ok(HostPacketHeader {
+        word0: opcode | host_route_word0(physical_tile),
+        word1: host_route_word1(physical_tile) | host_address_length(host_offset, bytes, size)?,
+    })
+}
+
+pub fn zero_byte_read_packet(
+    physical_tile: u16,
+    dummy_tile_address: u32,
+) -> Result<HostPacketHeader, ExchangeError> {
+    if dummy_tile_address < EXCHANGE_WINDOW_BASE || dummy_tile_address & 31 != 0 {
+        return Err(ExchangeError::HostPacket);
+    }
+    let exchange_address = (dummy_tile_address - EXCHANGE_WINDOW_BASE) >> 5;
+    if exchange_address > 0x1ff {
+        return Err(ExchangeError::HostPacket);
+    }
+    Ok(HostPacketHeader {
+        word0: 0xcc00_0200 | host_route_word0(physical_tile) | exchange_address,
+        word1: host_route_word1(physical_tile),
+    })
+}
+
+fn host_packet_size(host_offset: u32, bytes: u32) -> Result<HostPacketSize, ExchangeError> {
+    if (4..=HOST_SHORT_MAX_BYTES).contains(&bytes) && host_offset & 3 == 0 && bytes & 3 == 0 {
+        return Ok(HostPacketSize::Short);
+    }
+    if (64..=HOST_LONG_MAX_BYTES).contains(&bytes) && host_offset & 63 == 0 && bytes & 63 == 0 {
+        return Ok(HostPacketSize::Long);
+    }
+    Err(ExchangeError::HostPacket)
+}
+
+fn host_address_length(
+    host_offset: u32,
+    bytes: u32,
+    size: HostPacketSize,
+) -> Result<u32, ExchangeError> {
+    let shift = match size {
+        HostPacketSize::Short => 2,
+        HostPacketSize::Long => 6,
+    };
+    let units = bytes >> shift;
+    let length = if size == HostPacketSize::Long && bytes == HOST_LONG_MAX_BYTES {
+        0
+    } else {
+        units
+    };
+    (u64::from(host_offset >> shift) << 4 | u64::from(length))
+        .try_into()
+        .ok()
+        .filter(|encoded: &u32| *encoded <= 0x7fff_ffff)
+        .ok_or(ExchangeError::HostPacket)
+}
+
+fn host_route_word0(physical_tile: u16) -> u32 {
+    let tile = u32::from(physical_tile);
+    ((tile >> 1) << 16) | ((tile & 1) << 15)
+}
+
+fn host_route_word1(physical_tile: u16) -> u32 {
+    u32::from(physical_tile & 1) << 31
 }
 
 impl Topology {
@@ -520,6 +634,49 @@ mod tests {
         assert!(encode_send(64, 3, 0).is_err());
         assert!(encode_send(1, 8, 0).is_err());
         assert!(encode_send(1, 3, 0x4_0000).is_err());
+    }
+
+    #[test]
+    fn host_packets_match_recovered_sdk_vectors() {
+        assert_eq!(
+            tile_to_host_packet(0, 0x40, 64).unwrap(),
+            HostPacketHeader {
+                word0: 0xa000_0000,
+                word1: 0x0000_0011,
+            }
+        );
+        assert_eq!(
+            host_to_tile_packet(0, 0x50120, 0x40, 64).unwrap(),
+            HostPacketHeader {
+                word0: 0xec00_0209,
+                word1: 0x0000_0011,
+            }
+        );
+        assert_eq!(
+            zero_byte_read_packet(2, 0x50180).unwrap(),
+            HostPacketHeader {
+                word0: 0xcc01_020c,
+                word1: 0,
+            }
+        );
+        assert_eq!(
+            tile_to_host_packet(1409, 0x40, 64).unwrap(),
+            HostPacketHeader {
+                word0: 0xa2c0_8000,
+                word1: 0x8000_0011,
+            }
+        );
+    }
+
+    #[test]
+    fn host_packets_validate_both_size_classes() {
+        assert!(tile_to_host_packet(0, 4, 4).is_ok());
+        assert!(tile_to_host_packet(0, 0x400, 1024).is_ok());
+        assert!(tile_to_host_packet(0, 2, 4).is_err());
+        assert!(tile_to_host_packet(0, 0, 0).is_err());
+        assert!(tile_to_host_packet(0, 0, 1028).is_err());
+        assert!(host_to_tile_packet(0, 0x50124, 0x40, 64).is_err());
+        assert!(host_to_tile_packet(0, 0x54000, 0x40, 64).is_err());
     }
 
     #[test]
