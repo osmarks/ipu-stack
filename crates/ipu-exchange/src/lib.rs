@@ -17,6 +17,14 @@ pub struct HostPacketHeader {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostTransferChunk {
+    pub tile_address: u32,
+    pub host_offset: u32,
+    pub bytes: u32,
+    pub header: HostPacketHeader,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HostPacketSize {
     Short,
     Long,
@@ -63,6 +71,7 @@ pub fn host_to_tile_packet(
     host_offset: u32,
     bytes: u32,
 ) -> Result<HostPacketHeader, ExchangeError> {
+    validate_host_tile(physical_tile)?;
     if tile_address < EXCHANGE_WINDOW_BASE || tile_address & 31 != 0 {
         return Err(ExchangeError::HostPacket);
     }
@@ -86,6 +95,7 @@ pub fn tile_to_host_packet(
     host_offset: u32,
     bytes: u32,
 ) -> Result<HostPacketHeader, ExchangeError> {
+    validate_host_tile(physical_tile)?;
     let size = host_packet_size(host_offset, bytes)?;
     let opcode = match size {
         HostPacketSize::Short => 0x8000_0000,
@@ -101,6 +111,7 @@ pub fn zero_byte_read_packet(
     physical_tile: u16,
     dummy_tile_address: u32,
 ) -> Result<HostPacketHeader, ExchangeError> {
+    validate_host_tile(physical_tile)?;
     if dummy_tile_address < EXCHANGE_WINDOW_BASE || dummy_tile_address & 31 != 0 {
         return Err(ExchangeError::HostPacket);
     }
@@ -112,6 +123,76 @@ pub fn zero_byte_read_packet(
         word0: 0xcc00_0200 | host_route_word0(physical_tile) | exchange_address,
         word1: host_route_word1(physical_tile),
     })
+}
+
+pub fn plan_host_to_tile(
+    physical_tile: u16,
+    tile_address: u32,
+    host_offset: u32,
+    bytes: u32,
+) -> Result<Vec<HostTransferChunk>, ExchangeError> {
+    if bytes == 0 || bytes & 3 != 0 || tile_address & 31 != 0 || host_offset & 3 != 0 {
+        return Err(ExchangeError::HostPacket);
+    }
+    plan_host_transfer(tile_address, host_offset, bytes, |tile, host, count| {
+        host_to_tile_packet(physical_tile, tile, host, count)
+    })
+}
+
+pub fn plan_tile_to_host(
+    physical_tile: u16,
+    tile_address: u32,
+    host_offset: u32,
+    bytes: u32,
+) -> Result<Vec<HostTransferChunk>, ExchangeError> {
+    if bytes == 0 || bytes & 3 != 0 || tile_address & 3 != 0 || host_offset & 3 != 0 {
+        return Err(ExchangeError::HostPacket);
+    }
+    plan_host_transfer(tile_address, host_offset, bytes, |_tile, host, count| {
+        tile_to_host_packet(physical_tile, host, count)
+    })
+}
+
+fn plan_host_transfer(
+    mut tile_address: u32,
+    mut host_offset: u32,
+    mut bytes: u32,
+    packet: impl Fn(u32, u32, u32) -> Result<HostPacketHeader, ExchangeError>,
+) -> Result<Vec<HostTransferChunk>, ExchangeError> {
+    let mut chunks = Vec::new();
+    while bytes != 0 {
+        let count = if host_offset & 63 == 0 && bytes >= 64 {
+            bytes.min(HOST_LONG_MAX_BYTES) & !63
+        } else if bytes <= HOST_SHORT_MAX_BYTES {
+            bytes
+        } else {
+            // Keeping intermediate short packets at 32 bytes also preserves
+            // the destination alignment required by host-to-tile requests.
+            32
+        };
+        let header = packet(tile_address, host_offset, count)?;
+        chunks.push(HostTransferChunk {
+            tile_address,
+            host_offset,
+            bytes: count,
+            header,
+        });
+        tile_address = tile_address
+            .checked_add(count)
+            .ok_or(ExchangeError::HostPacket)?;
+        host_offset = host_offset
+            .checked_add(count)
+            .ok_or(ExchangeError::HostPacket)?;
+        bytes -= count;
+    }
+    Ok(chunks)
+}
+
+fn validate_host_tile(physical_tile: u16) -> Result<(), ExchangeError> {
+    if physical_tile > 0xfff {
+        return Err(ExchangeError::HostPacket);
+    }
+    Ok(())
 }
 
 fn host_packet_size(host_offset: u32, bytes: u32) -> Result<HostPacketSize, ExchangeError> {
@@ -677,6 +758,27 @@ mod tests {
         assert!(tile_to_host_packet(0, 0, 1028).is_err());
         assert!(host_to_tile_packet(0, 0x50124, 0x40, 64).is_err());
         assert!(host_to_tile_packet(0, 0x54000, 0x40, 64).is_err());
+        assert!(tile_to_host_packet(0x1000, 0, 4).is_err());
+    }
+
+    #[test]
+    fn host_transfer_planner_covers_unaligned_and_large_ranges() {
+        let d2h = plan_tile_to_host(2, 0x60004, 4, 2200).unwrap();
+        assert_eq!(d2h.first().unwrap().host_offset, 4);
+        assert_eq!(d2h.iter().map(|chunk| chunk.bytes).sum::<u32>(), 2200);
+        assert!(d2h.iter().all(|chunk| chunk.bytes <= 1024));
+        assert!(
+            d2h.windows(2)
+                .all(|pair| pair[0].tile_address + pair[0].bytes == pair[1].tile_address)
+        );
+
+        let h2d = plan_host_to_tile(1409, 0x50000, 4, 100).unwrap();
+        assert_eq!(
+            h2d.iter().map(|chunk| chunk.bytes).collect::<Vec<_>>(),
+            [32, 32, 36]
+        );
+        assert_eq!(h2d.last().unwrap().tile_address + 36, 0x50064);
+        assert!(plan_host_to_tile(0, 0x50004, 0, 4).is_err());
     }
 
     #[test]
