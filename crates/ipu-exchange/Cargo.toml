@@ -1,12 +1,10 @@
 [package]
-name = "ipu-compiler"
+name = "ipu-exchange"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ipu-exchange = { path = "../ipu-exchange" }
-ipu-package = { path = "../ipu-package" }
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -4,6 +4,7 @@
 	.section .text.ipu_stack_start,"ax",@progbits
 	.globl ipu_stack_start
 	.p2align 2
+	nop
 	.type ipu_stack_start,@function
 ipu_stack_start:
 	.supervisor

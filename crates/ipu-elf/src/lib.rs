@@ -254,7 +254,7 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
             }
             let alignment = usize::try_from(section.align().max(1))
                 .map_err(|_| ElfError::Link("section alignment overflow".into()))?;
-            cursor = align(cursor, alignment)?;
+            cursor = align_image_offset(options.image_base, cursor, alignment)?;
             let size = usize::try_from(section.size())
                 .map_err(|_| ElfError::Link("section size overflow".into()))?;
             let address = options
@@ -463,6 +463,16 @@ fn align(value: usize, alignment: usize) -> Result<usize, ElfError> {
         .ok_or_else(|| ElfError::Link("alignment overflow".into()))
 }
 
+fn align_image_offset(base: u32, offset: usize, alignment: usize) -> Result<usize, ElfError> {
+    let address = usize::try_from(base)
+        .map_err(|_| ElfError::Link("image base overflow".into()))?
+        .checked_add(offset)
+        .ok_or_else(|| ElfError::Link("image address overflow".into()))?;
+    align(address, alignment)?
+        .checked_sub(base as usize)
+        .ok_or_else(|| ElfError::Link("aligned image address precedes base".into()))
+}
+
 pub fn apply_relocation(
     image: &mut [u8],
     offset: usize,
@@ -620,5 +630,12 @@ mod tests {
         apply_relocation(&mut bytes, 0, R_COLOSSUS_RUN, 0x50000, 0x4c000).unwrap();
         let word = u32::from_le_bytes(bytes.try_into().unwrap());
         assert_eq!(word & 0x000f_0fff, 0x1_0000);
+    }
+
+    #[test]
+    fn section_alignment_uses_absolute_image_address() {
+        assert_eq!(align_image_offset(0x4c014, 0xc8, 16).unwrap(), 0xcc);
+        assert_eq!(0x4c014 + 0xcc, 0x4c0e0);
+        assert_eq!(align_image_offset(0x4c014, 0xcc, 16).unwrap(), 0xcc);
     }
 }

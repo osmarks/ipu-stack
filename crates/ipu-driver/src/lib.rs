@@ -13,9 +13,9 @@ use tracing::{debug, info, trace};
 
 pub const CONFIG_BAR_SIZE: usize = 0x80000;
 pub const TILE_MEMORY_SIZE: usize = 624 * 1024;
-// The secondary loader synthesizes a launch instruction at 0x4c010 and places
-// framed application payload immediately after it.
-pub const APPLICATION_LOAD_BASE: u32 = TILE_MEMORY_BASE + 0x14;
+// The secondary loader installs framed application payload at the SDK image's
+// launch slot. Applications reserve that word and enter at the following word.
+pub const APPLICATION_LOAD_BASE: u32 = TILE_MEMORY_BASE + 0x10;
 pub const HSP_MARK_MASK: u32 = 0xffff;
 pub const TILES_PER_BATCH: usize = 64;
 pub const FRAME_SIZE: usize = 1024;
@@ -27,6 +27,106 @@ pub const TRANSPORT_SIZE: usize = 0x2842000;
 // The Graphcore secondary loader does not acknowledge a one-frame application.
 // Pad transport payloads to the smallest established working envelope.
 pub const SECONDARY_LOADER_MIN_PAYLOAD_SIZE: usize = 0x4134;
+const TILE_DEBUG_BASE: u32 = 0x30000;
+const TILE_DEBUG_TILE_STRIDE: u32 = 0x40;
+const TILE_DEBUG_EXCEPTION_STATE: u32 = 5;
+const TILE_DEBUG_REGISTER_STRIDE: u32 = 4;
+const TILE_DEBUG_BREAK_ON_SYNC: u32 = 1 << 5;
+
+/// IPU21 `$SSR.ETYPE` / `$WSR.ETYPE` values from the Tile Vertex ISA.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TileException {
+    None = 0,
+    RetirementBreak = 1,
+    PatchedBreak0 = 2,
+    PatchedBreak1 = 3,
+    BreakOnSync = 4,
+    FloatingPoint = 5,
+    MemoryConflict = 6,
+    InvalidExchangeConfiguration = 7,
+    InvalidMemoryAddress = 8,
+    InvalidOperand = 9,
+    InvalidProgramCounter = 10,
+    DataBreak = 11,
+    InvalidInstruction = 12,
+    ExchangeError = 13,
+    MemoryError = 14,
+    InstructionBreak = 15,
+}
+
+impl TileException {
+    pub const ALL: [Self; 16] = [
+        Self::None,
+        Self::RetirementBreak,
+        Self::PatchedBreak0,
+        Self::PatchedBreak1,
+        Self::BreakOnSync,
+        Self::FloatingPoint,
+        Self::MemoryConflict,
+        Self::InvalidExchangeConfiguration,
+        Self::InvalidMemoryAddress,
+        Self::InvalidOperand,
+        Self::InvalidProgramCounter,
+        Self::DataBreak,
+        Self::InvalidInstruction,
+        Self::ExchangeError,
+        Self::MemoryError,
+        Self::InstructionBreak,
+    ];
+
+    pub const fn architecture_name(self) -> &'static str {
+        match self {
+            Self::None => "TEXCPT_NONE",
+            Self::RetirementBreak => "TEXCPT_RBRK",
+            Self::PatchedBreak0 => "TEXCPT_PBRK0",
+            Self::PatchedBreak1 => "TEXCPT_PBRK1",
+            Self::BreakOnSync => "TEXCPT_BOS",
+            Self::FloatingPoint => "TEXCPT_FP",
+            Self::MemoryConflict => "TEXCPT_CONFLICT",
+            Self::InvalidExchangeConfiguration => "TEXCPT_EXCONF",
+            Self::InvalidMemoryAddress => "TEXCPT_INVALID_ADDR",
+            Self::InvalidOperand => "TEXCPT_INVALID_OP",
+            Self::InvalidProgramCounter => "TEXCPT_INVALID_PC",
+            Self::DataBreak => "TEXCPT_DBRK",
+            Self::InvalidInstruction => "TEXCPT_INVALID_INSTR",
+            Self::ExchangeError => "TEXCPT_EXERR",
+            Self::MemoryError => "TEXCPT_MEMERR",
+            Self::InstructionBreak => "TEXCPT_IBRK",
+        }
+    }
+
+    pub const fn is_debug(self) -> bool {
+        matches!(
+            self,
+            Self::RetirementBreak
+                | Self::PatchedBreak0
+                | Self::PatchedBreak1
+                | Self::BreakOnSync
+                | Self::DataBreak
+                | Self::InstructionBreak
+        )
+    }
+
+    pub const fn from_status(status: u32) -> Self {
+        // ETYPE occupies bits 4..=7 in both supervisor SSR and worker WSR.
+        Self::ALL[((status >> 4) & 0xf) as usize]
+    }
+}
+
+impl TryFrom<u8> for TileException {
+    type Error = u8;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::ALL.get(value as usize).copied().ok_or(value)
+    }
+}
+
+impl std::fmt::Display for TileException {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.architecture_name())
+    }
+}
 
 pub mod pci {
     pub const CCSR: u32 = 0x2000;
@@ -88,6 +188,7 @@ const MAILBOX_WRITE_READ: libc::c_ulong = ioctl_code(IOC_READ | IOC_WRITE, 31, 8
 const STOP_MONITORING: libc::c_ulong = ioctl_code(0, 34, 0);
 const START_MONITORING: libc::c_ulong = ioctl_code(0, 35, 0);
 const ACCUMULATE_ERRORS: libc::c_ulong = ioctl_code(0, 36, 0);
+const SET_HEXOPT_IDENTITY_TABLE: libc::c_ulong = ioctl_code(0, 44, 0);
 const RESET_DEVICE: libc::c_ulong = ioctl_code(IOC_WRITE, 45, 4);
 const SET_SECONDARY_IPU_ID: libc::c_ulong = ioctl_code(IOC_WRITE, 47, 8);
 
@@ -260,6 +361,23 @@ impl Device {
             return Err(DriverError::Invalid("HSP mark out of range".into()));
         }
         self.write_config(pci::HSP_GS1_CONTROL, mark)
+    }
+
+    pub fn set_hexopt_identity_table(&self) -> Result<(), DriverError> {
+        self.ioctl_value(SET_HEXOPT_IDENTITY_TABLE, 0, "set HEXOPT identity table")
+    }
+
+    pub fn set_break_on_sync(&self, physical_tile: u16, enabled: bool) -> Result<(), DriverError> {
+        let offset = TILE_DEBUG_BASE
+            + u32::from(physical_tile) * TILE_DEBUG_TILE_STRIDE
+            + TILE_DEBUG_EXCEPTION_STATE * TILE_DEBUG_REGISTER_STRIDE;
+        let mut state = self.read_config(offset)?;
+        if enabled {
+            state |= TILE_DEBUG_BREAK_ON_SYNC;
+        } else {
+            state &= !TILE_DEBUG_BREAK_ON_SYNC;
+        }
+        self.write_config(offset, state)
     }
 
     fn wait_autoloader(&self, timeout: Duration) -> Result<(), DriverError> {
@@ -669,6 +787,22 @@ impl<'a> HostSession<'a> {
         Ok(())
     }
 
+    pub fn start(&mut self) -> Result<(), DriverError> {
+        info!(
+            startup_mark = self.protocol.startup_mark,
+            "starting host exchange session"
+        );
+        self.device.set_mark(1)?;
+        self.device
+            .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
+        self.attach()?;
+        self.device.write_config(pci::HSP_GS2_CONTROL, 1)?;
+        self.device
+            .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
+        info!("host exchange session started");
+        Ok(())
+    }
+
     pub fn invoke(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, DriverError> {
         if !self.attached {
             return Err(DriverError::Invalid("host session not attached".into()));
@@ -696,8 +830,6 @@ impl<'a> HostSession<'a> {
         command.bytes_mut()[offset..offset + 4].copy_from_slice(&call.command.to_le_bytes());
         fence(Ordering::SeqCst);
         for _ in 0..call.phases {
-            self.device
-                .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
             self.device.write_config(pci::HSP_GS2_CONTROL, 1)?;
             self.device
                 .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
@@ -841,5 +973,17 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0xff)
         );
+    }
+
+    #[test]
+    fn decodes_every_ipu21_exception_type() {
+        for (value, exception) in TileException::ALL.into_iter().enumerate() {
+            assert_eq!(TileException::try_from(value as u8), Ok(exception));
+            assert_eq!(TileException::from_status((value as u32) << 4), exception);
+            assert!(exception.architecture_name().starts_with("TEXCPT_"));
+        }
+        assert_eq!(TileException::try_from(16), Err(16));
+        assert!(TileException::BreakOnSync.is_debug());
+        assert!(!TileException::InvalidExchangeConfiguration.is_debug());
     }
 }

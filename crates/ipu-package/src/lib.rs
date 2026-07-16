@@ -108,6 +108,8 @@ pub struct HostExchange {
 pub struct EntryPoint {
     pub name: String,
     pub command: u32,
+    /// Host-visible syncs after the initial application-startup rendezvous.
+    pub external_syncs: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,6 +140,105 @@ impl Default for Application {
 }
 
 impl Application {
+    pub fn import_ipuimg(bytes: &[u8]) -> Result<Self, PackageError> {
+        if bytes.len() < 40 || &bytes[..8] != b"IPUIMG1\0" || legacy_u32(bytes, 8)? != 1 {
+            return Err(PackageError::Invalid("invalid legacy IPUIMG header".into()));
+        }
+        let tile_count = legacy_u32(bytes, 12)? as usize;
+        let linked_base_address = legacy_u32(bytes, 16)?;
+        // IPUIMG includes the reserved launch word at the first linked address,
+        // and the secondary loader installs that complete image byte-for-byte.
+        let base_address = linked_base_address;
+        let image_size = legacy_u32(bytes, 20)? as usize;
+        let entry_point = legacy_u32(bytes, 24)?;
+        let template_crc = legacy_u32(bytes, 28)?;
+        let template_tile = legacy_u32(bytes, 32)? as usize;
+        if tile_count == 0
+            || image_size == 0
+            || template_tile >= tile_count
+            || legacy_u32(bytes, 36)? != 0
+        {
+            return Err(PackageError::Invalid(
+                "invalid legacy IPUIMG dimensions".into(),
+            ));
+        }
+        let records_end = 40usize
+            .checked_add(
+                tile_count
+                    .checked_mul(16)
+                    .ok_or_else(|| PackageError::Invalid("legacy IPUIMG record overflow".into()))?,
+            )
+            .ok_or_else(|| PackageError::Invalid("legacy IPUIMG record overflow".into()))?;
+        let template_end = records_end
+            .checked_add(image_size)
+            .ok_or_else(|| PackageError::Invalid("legacy IPUIMG template overflow".into()))?;
+        let template = bytes
+            .get(records_end..template_end)
+            .ok_or_else(|| PackageError::Invalid("truncated legacy IPUIMG template".into()))?;
+        if crc32(template) != template_crc {
+            return Err(PackageError::Invalid(
+                "legacy IPUIMG template checksum".into(),
+            ));
+        }
+
+        let mut app = Application::default();
+        for tile in 0..tile_count {
+            let record = 40 + tile * 16;
+            let patch_offset = legacy_u64(bytes, record)? as usize;
+            let patch_size = legacy_u32(bytes, record + 8)? as usize;
+            let image_crc = legacy_u32(bytes, record + 12)?;
+            let patch_end = patch_offset
+                .checked_add(patch_size)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| PackageError::Invalid("legacy IPUIMG patch extent".into()))?;
+            let mut image = template.to_vec();
+            let mut cursor = patch_offset;
+            while cursor < patch_end {
+                let offset = legacy_u32(bytes, cursor)? as usize;
+                let size = legacy_u32(bytes, cursor + 4)? as usize;
+                cursor += 8;
+                let source_end = cursor
+                    .checked_add(size)
+                    .filter(|end| *end <= patch_end)
+                    .ok_or_else(|| PackageError::Invalid("legacy IPUIMG patch data".into()))?;
+                let destination_end = offset
+                    .checked_add(size)
+                    .filter(|end| *end <= image.len())
+                    .ok_or_else(|| PackageError::Invalid("legacy IPUIMG patch range".into()))?;
+                image[offset..destination_end].copy_from_slice(&bytes[cursor..source_end]);
+                cursor = source_end;
+            }
+            if crc32(&image) != image_crc {
+                return Err(PackageError::Invalid(format!(
+                    "legacy IPUIMG tile {tile} checksum"
+                )));
+            }
+            let image_len = image.len() as u32;
+            let blob = app.add_blob(image);
+            app.tiles.push(TileImage {
+                physical_tile: tile as u32,
+                entry_point,
+                command_address: 0,
+                diagnostic_address: 0,
+                segments: vec![Segment {
+                    address: base_address,
+                    memory_size: image_len,
+                    blob,
+                    blob_offset: 0,
+                    file_size: image_len,
+                    flags: SEGMENT_READ | SEGMENT_WRITE | SEGMENT_EXECUTE,
+                }],
+            });
+        }
+        app.validate()?;
+        info!(
+            tile_count,
+            blobs = app.blobs.len(),
+            "imported legacy IPUIMG"
+        );
+        Ok(app)
+    }
+
     pub fn add_blob(&mut self, bytes: Vec<u8>) -> usize {
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         if let Some(index) = self.blobs.iter().position(|blob| blob.digest == digest) {
@@ -238,11 +339,16 @@ impl Application {
             return Err(PackageError::Invalid("invalid host page table".into()));
         }
         if !self.host_exchange.calls.is_empty()
-            && pages
-                .get(&self.host_exchange.command_page)
-                .is_none_or(|size| self.host_exchange.command_offset.checked_add(4) > Some(*size))
+            && (self.host_exchange.startup_mark == 0
+                || pages
+                    .get(&self.host_exchange.command_page)
+                    .is_none_or(|size| {
+                        self.host_exchange.command_offset.checked_add(4) > Some(*size)
+                    }))
         {
-            return Err(PackageError::Invalid("invalid host command word".into()));
+            return Err(PackageError::Invalid(
+                "invalid host startup protocol".into(),
+            ));
         }
         for call in &self.host_exchange.calls {
             for slice in call.inputs.iter().chain(&call.outputs) {
@@ -322,6 +428,7 @@ impl Application {
             let mut item = entries.reborrow().get(index as u32);
             item.set_name(&entry.name);
             item.set_command(entry.command);
+            item.set_external_syncs(entry.external_syncs);
         }
         let digest = self.build_digest();
         root.set_build_digest(&digest);
@@ -371,6 +478,7 @@ impl Application {
                 Ok(EntryPoint {
                     name: item.get_name()?.to_str()?.into(),
                     command: item.get_command(),
+                    external_syncs: item.get_external_syncs(),
                 })
             })
             .collect::<Result<_, PackageError>>()?;
@@ -499,6 +607,10 @@ impl Application {
         for entry in &self.entry_points {
             hash_string(&mut hash, &entry.name);
             hash.update(entry.command.to_le_bytes());
+            if entry.external_syncs != 0 {
+                hash.update(b"external-syncs");
+                hash.update(entry.external_syncs.to_le_bytes());
+            }
         }
         hash.finalize().into()
     }
@@ -511,6 +623,28 @@ fn hash_string(hash: &mut Sha256, value: &str) {
 
 fn hash_len(hash: &mut Sha256, length: usize) {
     hash.update((length as u64).to_le_bytes());
+}
+
+fn legacy_u32(bytes: &[u8], offset: usize) -> Result<u32, PackageError> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| PackageError::Invalid("truncated legacy IPUIMG".into()))?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn legacy_u64(bytes: &[u8], offset: usize) -> Result<u64, PackageError> {
+    Ok(u64::from(legacy_u32(bytes, offset)?) | (u64::from(legacy_u32(bytes, offset + 4)?) << 32))
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
 }
 
 fn hex_digest(digest: &[u8; 32]) -> String {

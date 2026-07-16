@@ -75,6 +75,7 @@ struct HostExchange {
 struct EntryPoint {
   name @0 :Text;
   command @1 :UInt32;
+  externalSyncs @2 :UInt32;
 }
 
 struct Application {

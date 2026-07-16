@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{debug, info};
 
+use ipu_exchange::{
+    MulticastPlan, PlanRow, Topology, patch_multicast_receiver_address, patch_sender_address,
+};
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_TILE_COUNT: u16 = 64;
 
@@ -82,6 +86,8 @@ pub enum CompileError {
     Graph(String),
     #[error("SRAM allocation failed: {0}")]
     Memory(String),
+    #[error("exchange lowering failed: {0}")]
+    Exchange(#[from] ipu_exchange::ExchangeError),
 }
 
 impl Graph {
@@ -350,6 +356,13 @@ pub struct Allocation {
     pub size: u32,
     pub live_from: usize,
     pub live_until: usize,
+    pub kind: AllocationKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AllocationKind {
+    Home,
+    ExchangeStaging { phase: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,6 +386,75 @@ pub enum TileOpcode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EncodedTileCommand(pub [u32; TILE_COMMAND_WORDS]);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoweredExchangeGroup {
+    pub source_tile: u16,
+    pub destination_tiles: Vec<u16>,
+    pub tensor: TensorId,
+    pub bytes: u32,
+    pub sender: PlanRow,
+    pub receivers: Vec<PlanRow>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeCost {
+    pub launches: u32,
+    pub estimated_cycles: u64,
+    pub payload_words: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoweredExchangeEpoch {
+    pub groups: Vec<LoweredExchangeGroup>,
+    pub tile_rows: BTreeMap<u16, PlanRow>,
+    pub cost: ExchangeCost,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoweredExchangePhase {
+    pub phase: usize,
+    pub epochs: Vec<LoweredExchangeEpoch>,
+    pub cost: ExchangeCost,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoweredComputeCommand {
+    pub op: OpId,
+    pub output_address: u32,
+    pub input_addresses: Vec<u32>,
+    pub specialization: SpecializationKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoweredTileStep {
+    Exchange {
+        phase: usize,
+        epoch: usize,
+        row: PlanRow,
+    },
+    Compute(LoweredComputeCommand),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoweredTileProgram {
+    pub tile: u16,
+    pub steps: Vec<LoweredTileStep>,
+}
+
+impl LoweredExchangeEpoch {
+    pub fn row_for(&self, tile: u16) -> PlanRow {
+        self.tile_rows.get(&tile).copied().unwrap_or_else(|| {
+            let mut row = [0; ipu_exchange::PLAN_WORDS];
+            // The runtime performs the all-tile epoch barrier. Inactive tiles
+            // then use the SDK's local non-participation sequence.
+            row[0] = 0x40c0_0000;
+            row[1] = 0x4180_0001;
+            row[2] = 0x43a0_0000;
+            row
+        })
+    }
+}
 
 impl EncodedTileCommand {
     pub fn to_le_bytes(self) -> [u8; TILE_COMMAND_WORDS * 4] {
@@ -438,11 +520,337 @@ impl Schedule {
         ]));
         Ok(encoded)
     }
+
+    pub fn lower_exchanges(
+        &self,
+        topology: &Topology,
+    ) -> Result<Vec<LoweredExchangePhase>, CompileError> {
+        if topology.tile_count() < usize::from(self.tile_count) {
+            return Err(CompileError::Graph(
+                "exchange topology has too few tiles".into(),
+            ));
+        }
+        #[derive(Clone)]
+        struct PendingGroup {
+            source: u16,
+            tensor: TensorId,
+            bytes: u32,
+            destinations: Vec<u16>,
+        }
+
+        let mut lowered_phases = Vec::new();
+        for (phase_index, phase) in self.phases.iter().enumerate() {
+            let Phase::Exchange { transfers } = phase else {
+                continue;
+            };
+            validate_transfers(transfers)?;
+            let mut groups: Vec<PendingGroup> = Vec::new();
+            for transfer in transfers {
+                if let Some(group) = groups.iter_mut().find(|group| {
+                    group.source == transfer.source_tile
+                        && group.tensor == transfer.tensor
+                        && group.bytes == transfer.bytes
+                }) {
+                    group.destinations.push(transfer.destination_tile);
+                } else {
+                    groups.push(PendingGroup {
+                        source: transfer.source_tile,
+                        tensor: transfer.tensor,
+                        bytes: transfer.bytes,
+                        destinations: vec![transfer.destination_tile],
+                    });
+                }
+            }
+            for group in &mut groups {
+                group.destinations.sort_unstable();
+                group.destinations.dedup();
+            }
+
+            // A tile has one supervisor exchange role in an epoch. Color the
+            // multicast-hyperedge conflict graph with deterministic DSATUR.
+            let adjacency: Vec<HashSet<usize>> = groups
+                .iter()
+                .enumerate()
+                .map(|(left_index, left)| {
+                    groups
+                        .iter()
+                        .enumerate()
+                        .filter(|(right_index, right)| {
+                            left_index != *right_index
+                                && exchange_groups_conflict(
+                                    left.source,
+                                    &left.destinations,
+                                    right.source,
+                                    &right.destinations,
+                                )
+                        })
+                        .map(|(index, _)| index)
+                        .collect()
+                })
+                .collect();
+            let mut colors = vec![None; groups.len()];
+            for _ in 0..groups.len() {
+                let index = (0..groups.len())
+                    .filter(|index| colors[*index].is_none())
+                    .max_by_key(|index| {
+                        let saturation: HashSet<_> = adjacency[*index]
+                            .iter()
+                            .filter_map(|neighbor| colors[*neighbor])
+                            .collect();
+                        (
+                            saturation.len(),
+                            adjacency[*index].len(),
+                            std::cmp::Reverse(groups[*index].source),
+                            std::cmp::Reverse(groups[*index].tensor.0),
+                        )
+                    })
+                    .ok_or_else(|| CompileError::Graph("exchange coloring failed".into()))?;
+                let unavailable: HashSet<_> = adjacency[index]
+                    .iter()
+                    .filter_map(|neighbor| colors[*neighbor])
+                    .collect();
+                colors[index] = Some(
+                    (0..)
+                        .find(|color| !unavailable.contains(color))
+                        .ok_or_else(|| CompileError::Graph("exchange color overflow".into()))?,
+                );
+            }
+            let color_count = colors
+                .iter()
+                .filter_map(|color| *color)
+                .max()
+                .map_or(0, |color| color + 1);
+            let mut epoch_groups = vec![Vec::new(); color_count];
+            for (group, color) in groups.into_iter().zip(colors) {
+                let color =
+                    color.ok_or_else(|| CompileError::Graph("uncolored exchange group".into()))?;
+                epoch_groups[color].push(group);
+            }
+
+            let mut epochs = Vec::new();
+            for pending in epoch_groups {
+                let mut lowered_groups = Vec::new();
+                let mut tile_rows = BTreeMap::new();
+                let mut cost = ExchangeCost {
+                    launches: 1,
+                    ..ExchangeCost::default()
+                };
+                for PendingGroup {
+                    source,
+                    tensor,
+                    bytes,
+                    destinations,
+                } in pending
+                {
+                    if bytes == 0 || bytes & 3 != 0 {
+                        return Err(CompileError::Graph(format!(
+                            "tensor {} exchange size is not whole words",
+                            tensor.0
+                        )));
+                    }
+                    let words = bytes / 4;
+                    let source_address = self
+                        .allocations
+                        .iter()
+                        .find(|allocation| {
+                            allocation.tensor == tensor
+                                && allocation.tile == source
+                                && allocation.kind == AllocationKind::Home
+                        })
+                        .ok_or_else(|| {
+                            CompileError::Memory(format!(
+                                "missing source allocation for tensor {} on tile {source}",
+                                tensor.0
+                            ))
+                        })?
+                        .address;
+                    let mut plan: MulticastPlan =
+                        topology.multicast(source, &destinations, words, 0)?;
+                    patch_sender_address(&mut plan.sender, source_address)?;
+                    for (receiver, destination) in
+                        plan.receivers.iter_mut().zip(destinations.iter())
+                    {
+                        let address = self
+                            .allocations
+                            .iter()
+                            .find(|allocation| {
+                                allocation.tensor == tensor
+                                    && allocation.tile == *destination
+                                    && allocation.kind
+                                        == AllocationKind::ExchangeStaging {
+                                            phase: phase_index,
+                                        }
+                            })
+                            .ok_or_else(|| {
+                                CompileError::Memory(format!(
+                                    "missing staging allocation for tensor {} on tile {destination}",
+                                    tensor.0
+                                ))
+                            })?
+                            .address;
+                        patch_multicast_receiver_address(receiver, address)?;
+                    }
+                    if tile_rows.insert(source, plan.sender).is_some() {
+                        return Err(CompileError::Graph(
+                            "sender scheduled twice in one epoch".into(),
+                        ));
+                    }
+                    for (destination, receiver) in destinations
+                        .iter()
+                        .copied()
+                        .zip(plan.receivers.iter().copied())
+                    {
+                        if tile_rows.insert(destination, receiver).is_some() {
+                            return Err(CompileError::Graph(
+                                "receiver scheduled twice in one epoch".into(),
+                            ));
+                        }
+                    }
+                    cost.estimated_cycles = cost.estimated_cycles.max(u64::from(156 + words));
+                    cost.payload_words += u64::from(words);
+                    lowered_groups.push(LoweredExchangeGroup {
+                        source_tile: source,
+                        destination_tiles: destinations,
+                        tensor,
+                        bytes,
+                        sender: plan.sender,
+                        receivers: plan.receivers,
+                    });
+                }
+                epochs.push(LoweredExchangeEpoch {
+                    groups: lowered_groups,
+                    tile_rows,
+                    cost,
+                });
+            }
+            let phase_cost = epochs
+                .iter()
+                .fold(ExchangeCost::default(), |mut total, epoch| {
+                    total.launches += epoch.cost.launches;
+                    total.estimated_cycles += epoch.cost.estimated_cycles;
+                    total.payload_words += epoch.cost.payload_words;
+                    total
+                });
+            lowered_phases.push(LoweredExchangePhase {
+                phase: phase_index,
+                epochs,
+                cost: phase_cost,
+            });
+        }
+        let launches: u32 = lowered_phases.iter().map(|phase| phase.cost.launches).sum();
+        info!(
+            phases = lowered_phases.len(),
+            launches, "lowered exchange schedule"
+        );
+        Ok(lowered_phases)
+    }
+
+    pub fn lower_tile_programs(
+        &self,
+        topology: &Topology,
+    ) -> Result<Vec<LoweredTileProgram>, CompileError> {
+        let exchanges = self.lower_exchanges(topology)?;
+        let exchange_by_phase: HashMap<_, _> = exchanges
+            .iter()
+            .map(|exchange| (exchange.phase, exchange))
+            .collect();
+        let mut programs = Vec::with_capacity(usize::from(self.tile_count));
+        for tile in 0..self.tile_count {
+            let mut steps = Vec::new();
+            for (phase_index, phase) in self.phases.iter().enumerate() {
+                match phase {
+                    Phase::Exchange { .. } => {
+                        let exchange = exchange_by_phase.get(&phase_index).ok_or_else(|| {
+                            CompileError::Graph(format!(
+                                "missing lowered exchange phase {phase_index}"
+                            ))
+                        })?;
+                        for (epoch, lowered) in exchange.epochs.iter().enumerate() {
+                            steps.push(LoweredTileStep::Exchange {
+                                phase: phase_index,
+                                epoch,
+                                row: lowered.row_for(tile),
+                            });
+                        }
+                    }
+                    Phase::Compute { op, commands } => {
+                        for command in commands.iter().filter(|command| command.tile == tile) {
+                            let output_address = self.home_address(command.output, tile)?;
+                            let input_addresses = command
+                                .inputs
+                                .iter()
+                                .map(|input| self.compute_input_address(*input, tile, phase_index))
+                                .collect::<Result<_, _>>()?;
+                            steps.push(LoweredTileStep::Compute(LoweredComputeCommand {
+                                op: *op,
+                                output_address,
+                                input_addresses,
+                                specialization: command.specialization.clone(),
+                            }));
+                        }
+                    }
+                }
+            }
+            programs.push(LoweredTileProgram { tile, steps });
+        }
+        info!(tiles = programs.len(), "lowered per-tile programs");
+        Ok(programs)
+    }
+
+    fn home_address(&self, tensor: TensorId, tile: u16) -> Result<u32, CompileError> {
+        self.allocations
+            .iter()
+            .find(|allocation| {
+                allocation.tensor == tensor
+                    && allocation.tile == tile
+                    && allocation.kind == AllocationKind::Home
+            })
+            .map(|allocation| allocation.address)
+            .ok_or_else(|| {
+                CompileError::Memory(format!(
+                    "missing home allocation for tensor {} on tile {tile}",
+                    tensor.0
+                ))
+            })
+    }
+
+    fn compute_input_address(
+        &self,
+        tensor: TensorId,
+        tile: u16,
+        compute_phase: usize,
+    ) -> Result<u32, CompileError> {
+        if let Some(staging) = self.allocations.iter().find(|allocation| {
+            allocation.tensor == tensor
+                && allocation.tile == tile
+                && allocation.live_until == compute_phase
+                && matches!(allocation.kind, AllocationKind::ExchangeStaging { .. })
+        }) {
+            return Ok(staging.address);
+        }
+        self.home_address(tensor, tile)
+    }
+}
+
+fn exchange_groups_conflict(
+    left_source: u16,
+    left_destinations: &[u16],
+    right_source: u16,
+    right_destinations: &[u16],
+) -> bool {
+    left_source == right_source
+        || left_destinations.contains(&right_source)
+        || right_destinations.contains(&left_source)
+        || left_destinations
+            .iter()
+            .any(|tile| right_destinations.contains(tile))
 }
 
 #[derive(Clone, Debug)]
 pub struct CompilerOptions {
     pub tile_count: u16,
+    pub exchange_base: u32,
+    pub exchange_limit: u32,
     pub data_base: u32,
     pub data_limit: u32,
 }
@@ -451,7 +859,9 @@ impl Default for CompilerOptions {
     fn default() -> Self {
         Self {
             tile_count: DEFAULT_TILE_COUNT,
-            data_base: 0x52000,
+            exchange_base: 0x50000,
+            exchange_limit: 0x58000,
+            data_base: 0x58000,
             data_limit: 0xe0000,
         }
     }
@@ -465,7 +875,13 @@ pub fn compile(graph: &Graph, options: &CompilerOptions) -> Result<Schedule, Com
         "compiling graph"
     );
     graph.validate()?;
-    if options.tile_count == 0 || options.data_base >= options.data_limit {
+    if options.tile_count == 0
+        || options.exchange_base < ipu_exchange::EXCHANGE_WINDOW_BASE
+        || options.exchange_limit > ipu_exchange::EXCHANGE_WINDOW_BASE + 0x8000
+        || options.exchange_base >= options.exchange_limit
+        || options.exchange_limit > options.data_base
+        || options.data_base >= options.data_limit
+    {
         return Err(CompileError::Graph("invalid compiler options".into()));
     }
     let layouts: Vec<_> = graph
@@ -528,12 +944,13 @@ pub fn compile(graph: &Graph, options: &CompilerOptions) -> Result<Schedule, Com
     let allocations = plan_memory(graph, &layouts, &phases, options)?;
     let mut peak_sram: BTreeMap<u16, u32> = BTreeMap::new();
     for allocation in &allocations {
+        let memory_base = options.exchange_base.min(options.data_base);
         peak_sram
             .entry(allocation.tile)
             .and_modify(|peak| {
-                *peak = (*peak).max(allocation.address + allocation.size - options.data_base)
+                *peak = (*peak).max(allocation.address + allocation.size - memory_base)
             })
-            .or_insert(allocation.address + allocation.size - options.data_base);
+            .or_insert(allocation.address + allocation.size - memory_base);
     }
     let schedule = Schedule {
         layouts,
@@ -641,50 +1058,109 @@ fn plan_memory(
         let layout = &layouts[tensor.id.0];
         let size = align_u32(local_bytes(tensor, layout) as u32, layout.alignment);
         for tile in &layout.tiles {
-            let existing = by_tile.entry(*tile).or_default();
-            let mut address = options.data_base;
-            loop {
-                let end = address
-                    .checked_add(size)
-                    .ok_or_else(|| CompileError::Memory("address overflow".into()))?;
-                let conflict = existing
-                    .iter()
-                    .filter(|allocation| {
-                        lifetimes_overlap(
-                            produced[tensor.id.0],
-                            consumed[tensor.id.0],
-                            allocation.live_from,
-                            allocation.live_until,
-                        )
-                    })
-                    .find(|allocation| {
-                        address < allocation.address + allocation.size && allocation.address < end
-                    });
-                if let Some(conflict) = conflict {
-                    address = align_u32(conflict.address + conflict.size, layout.alignment);
-                    continue;
-                }
-                if end > options.data_limit {
-                    return Err(CompileError::Memory(format!(
-                        "tile {tile} exceeds data limit allocating {}",
-                        tensor.name
-                    )));
-                }
-                let allocation = Allocation {
-                    tensor: tensor.id,
-                    tile: *tile,
-                    address,
-                    size,
-                    live_from: produced[tensor.id.0],
-                    live_until: consumed[tensor.id.0],
-                };
-                existing.push(allocation.clone());
-                allocations.push(allocation);
-                break;
+            allocate_region(
+                &mut allocations,
+                &mut by_tile,
+                tensor.id,
+                *tile,
+                size,
+                produced[tensor.id.0],
+                consumed[tensor.id.0],
+                layout.alignment,
+                AllocationKind::Home,
+                options.data_base,
+                options.data_limit,
+                &tensor.name,
+            )?;
+        }
+    }
+    for (phase_index, phase) in phases.iter().enumerate() {
+        let Phase::Exchange { transfers } = phase else {
+            continue;
+        };
+        for transfer in transfers {
+            if allocations.iter().any(|allocation| {
+                allocation.tensor == transfer.tensor
+                    && allocation.tile == transfer.destination_tile
+                    && allocation.kind == AllocationKind::ExchangeStaging { phase: phase_index }
+            }) {
+                continue;
             }
+            allocate_region(
+                &mut allocations,
+                &mut by_tile,
+                transfer.tensor,
+                transfer.destination_tile,
+                align_u32(transfer.bytes, 16),
+                phase_index,
+                phase_index + 1,
+                16,
+                AllocationKind::ExchangeStaging { phase: phase_index },
+                options.exchange_base,
+                options.exchange_limit,
+                &format!("tensor {} exchange staging", transfer.tensor.0),
+            )?;
         }
     }
     Ok(allocations)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn allocate_region(
+    allocations: &mut Vec<Allocation>,
+    by_tile: &mut HashMap<u16, Vec<Allocation>>,
+    tensor: TensorId,
+    tile: u16,
+    size: u32,
+    live_from: usize,
+    live_until: usize,
+    alignment: u32,
+    kind: AllocationKind,
+    allocation_base: u32,
+    allocation_limit: u32,
+    label: &str,
+) -> Result<(), CompileError> {
+    let existing = by_tile.entry(tile).or_default();
+    let mut address = allocation_base;
+    loop {
+        let end = address
+            .checked_add(size)
+            .ok_or_else(|| CompileError::Memory("address overflow".into()))?;
+        let conflict = existing
+            .iter()
+            .filter(|allocation| {
+                lifetimes_overlap(
+                    live_from,
+                    live_until,
+                    allocation.live_from,
+                    allocation.live_until,
+                )
+            })
+            .find(|allocation| {
+                address < allocation.address + allocation.size && allocation.address < end
+            });
+        if let Some(conflict) = conflict {
+            address = align_u32(conflict.address + conflict.size, alignment);
+            continue;
+        }
+        if end > allocation_limit {
+            return Err(CompileError::Memory(format!(
+                "tile {tile} exceeds data limit allocating {label}"
+            )));
+        }
+        let allocation = Allocation {
+            tensor,
+            tile,
+            address,
+            size,
+            live_from,
+            live_until,
+            kind,
+        };
+        existing.push(allocation.clone());
+        allocations.push(allocation);
+        return Ok(());
+    }
 }
 
 fn lifetimes_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
@@ -927,6 +1403,49 @@ fn gelu(value: f32) -> f32 {
 mod tests {
     use super::*;
 
+    fn exchange_schedule(transfers: Vec<Transfer>) -> Schedule {
+        let mut allocations = Vec::new();
+        for transfer in &transfers {
+            if !allocations.iter().any(|allocation: &Allocation| {
+                allocation.tensor == transfer.tensor
+                    && allocation.tile == transfer.source_tile
+                    && allocation.kind == AllocationKind::Home
+            }) {
+                allocations.push(Allocation {
+                    tensor: transfer.tensor,
+                    tile: transfer.source_tile,
+                    address: 0x62000,
+                    size: transfer.bytes,
+                    live_from: 0,
+                    live_until: 1,
+                    kind: AllocationKind::Home,
+                });
+            }
+            if !allocations.iter().any(|allocation| {
+                allocation.tensor == transfer.tensor
+                    && allocation.tile == transfer.destination_tile
+                    && allocation.kind == AllocationKind::ExchangeStaging { phase: 0 }
+            }) {
+                allocations.push(Allocation {
+                    tensor: transfer.tensor,
+                    tile: transfer.destination_tile,
+                    address: 0x52000,
+                    size: transfer.bytes,
+                    live_from: 0,
+                    live_until: 1,
+                    kind: AllocationKind::ExchangeStaging { phase: 0 },
+                });
+            }
+        }
+        Schedule {
+            layouts: Vec::new(),
+            phases: vec![Phase::Exchange { transfers }],
+            allocations,
+            tile_count: 16,
+            peak_sram: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn encoder_graph_compiles_deterministically() {
         let graph = encoder_graph(EncoderConfig::default()).unwrap();
@@ -936,6 +1455,18 @@ mod tests {
         assert_eq!(graph.ops.len(), 15);
         assert!(first.phases.len() >= graph.ops.len());
         assert!(first.peak_sram.values().all(|peak| *peak < 0x8e000));
+        assert!(
+            first.allocations.iter().any(|allocation| matches!(
+                allocation.kind,
+                AllocationKind::ExchangeStaging { .. }
+            ))
+        );
+        let lowered = first.lower_exchanges(&Topology::c600()).unwrap();
+        assert!(!lowered.is_empty());
+        assert!(lowered.iter().all(|phase| phase.cost.launches > 0));
+        let programs = first.lower_tile_programs(&Topology::c600()).unwrap();
+        assert_eq!(programs.len(), usize::from(first.tile_count));
+        assert!(programs.iter().all(|program| !program.steps.is_empty()));
         let commands = first.tile_commands(0).unwrap();
         assert_eq!(commands.last().unwrap().0[0], TileOpcode::End as u32);
         assert_eq!(commands.last().unwrap().to_le_bytes().len(), 32);
@@ -963,6 +1494,173 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn scheduler_coalesces_fanout_and_packs_disjoint_groups() {
+        let schedule = exchange_schedule(vec![
+            Transfer {
+                source_tile: 0,
+                destination_tile: 1,
+                tensor: TensorId(0),
+                bytes: 64,
+            },
+            Transfer {
+                source_tile: 0,
+                destination_tile: 2,
+                tensor: TensorId(0),
+                bytes: 64,
+            },
+            Transfer {
+                source_tile: 3,
+                destination_tile: 4,
+                tensor: TensorId(1),
+                bytes: 128,
+            },
+        ]);
+        let lowered = schedule.lower_exchanges(&Topology::c600()).unwrap();
+        assert_eq!(lowered.len(), 1);
+        assert_eq!(lowered[0].epochs.len(), 1);
+        assert_eq!(lowered[0].epochs[0].groups.len(), 2);
+        assert_eq!(lowered[0].cost.launches, 1);
+        assert_eq!(lowered[0].cost.payload_words, 16 + 32);
+        assert_eq!(lowered[0].epochs[0].tile_rows.len(), 5);
+        let inactive = lowered[0].epochs[0].row_for(15);
+        assert_eq!(inactive[0], 0x40c0_0000);
+        assert_eq!(inactive[1], 0x4180_0001);
+    }
+
+    #[test]
+    fn scheduler_splits_tile_role_conflicts() {
+        let schedule = exchange_schedule(vec![
+            Transfer {
+                source_tile: 0,
+                destination_tile: 1,
+                tensor: TensorId(0),
+                bytes: 64,
+            },
+            Transfer {
+                source_tile: 2,
+                destination_tile: 3,
+                tensor: TensorId(1),
+                bytes: 64,
+            },
+            Transfer {
+                source_tile: 1,
+                destination_tile: 2,
+                tensor: TensorId(2),
+                bytes: 64,
+            },
+        ]);
+        let lowered = schedule.lower_exchanges(&Topology::c600()).unwrap();
+        assert_eq!(lowered[0].epochs.len(), 2);
+        assert_eq!(lowered[0].cost.launches, 2);
+        for epoch in &lowered[0].epochs {
+            let mut active = HashSet::new();
+            for group in &epoch.groups {
+                assert!(active.insert(group.source_tile));
+                for destination in &group.destination_tiles {
+                    assert!(active.insert(*destination));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scheduler_is_deterministic_for_varied_transfer_graphs() {
+        let mut state = 0x1234_5678u32;
+        for _ in 0..64 {
+            let mut transfers = Vec::new();
+            let mut destinations = HashSet::new();
+            for tensor in 0..12 {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let source = (state % 16) as u16;
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let mut destination = (state % 16) as u16;
+                if destination == source {
+                    destination = (destination + 1) % 16;
+                }
+                if !destinations.insert((destination, TensorId(tensor))) {
+                    continue;
+                }
+                transfers.push(Transfer {
+                    source_tile: source,
+                    destination_tile: destination,
+                    tensor: TensorId(tensor),
+                    bytes: 4 * (1 + (state % 64)),
+                });
+            }
+            let schedule = exchange_schedule(transfers.clone());
+            let first = schedule.lower_exchanges(&Topology::c600()).unwrap();
+            let second = schedule.lower_exchanges(&Topology::c600()).unwrap();
+            assert_eq!(first, second);
+            let represented: usize = first[0]
+                .epochs
+                .iter()
+                .flat_map(|epoch| &epoch.groups)
+                .map(|group| group.destination_tiles.len())
+                .sum();
+            assert_eq!(represented, transfers.len());
+        }
+    }
+
+    #[test]
+    fn scheduler_packs_an_all_tile_matching_into_one_launch() {
+        let transfers = (0..736)
+            .map(|pair| Transfer {
+                source_tile: pair * 2,
+                destination_tile: pair * 2 + 1,
+                tensor: TensorId(usize::from(pair)),
+                bytes: 4,
+            })
+            .collect();
+        let mut schedule = exchange_schedule(transfers);
+        schedule.tile_count = 1472;
+        let lowered = schedule.lower_exchanges(&Topology::c600()).unwrap();
+        assert_eq!(lowered[0].epochs.len(), 1);
+        assert_eq!(lowered[0].epochs[0].groups.len(), 736);
+        assert_eq!(lowered[0].epochs[0].tile_rows.len(), 1472);
+        assert_eq!(lowered[0].cost.payload_words, 736);
+    }
+
+    #[test]
+    fn scheduler_colors_ring_and_all_to_all_fanout() {
+        let ring = (0..16)
+            .map(|source| Transfer {
+                source_tile: source,
+                destination_tile: (source + 1) % 16,
+                tensor: TensorId(usize::from(source)),
+                bytes: 4,
+            })
+            .collect();
+        let lowered = exchange_schedule(ring)
+            .lower_exchanges(&Topology::c600())
+            .unwrap();
+        assert_eq!(lowered[0].epochs.len(), 2);
+
+        let all_to_all = (0..8)
+            .flat_map(|source| {
+                (0..8)
+                    .filter(move |destination| *destination != source)
+                    .map(move |destination| Transfer {
+                        source_tile: source,
+                        destination_tile: destination,
+                        tensor: TensorId(usize::from(source)),
+                        bytes: 4,
+                    })
+            })
+            .collect();
+        let lowered = exchange_schedule(all_to_all)
+            .lower_exchanges(&Topology::c600())
+            .unwrap();
+        assert_eq!(lowered[0].epochs.len(), 8);
+        assert!(
+            lowered[0]
+                .epochs
+                .iter()
+                .all(|epoch| epoch.groups.len() == 1)
+        );
+        assert_eq!(lowered[0].cost.payload_words, 8);
     }
 
     #[test]

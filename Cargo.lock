@@ -272,7 +272,9 @@ dependencies = [
  "ipu-compiler",
  "ipu-driver",
  "ipu-elf",
+ "ipu-exchange",
  "ipu-package",
+ "object",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -282,6 +284,7 @@ dependencies = [
 name = "ipu-compiler"
 version = "0.1.0"
 dependencies = [
+ "ipu-exchange",
  "ipu-package",
  "serde",
  "thiserror",
@@ -307,6 +310,15 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "ipu-exchange"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "thiserror",
  "tracing",
 ]
