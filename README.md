@@ -54,10 +54,12 @@ Logging uses `tracing`. Set `RUST_LOG`, for example
 The Rust path has attached to a C600, reset and configured it, loaded a linked
 application onto all 1472 discovered package tiles in 64-tile bootloader
 batches, completed startup synchronization, and run a supervisor plus six
-barrel workers without an IPU exception. Arbitrary application host exchange is
-represented and implemented by `HostSession`, but the standalone fixture has
-not yet completed non-debugger result readback. TDI cannot retirement-break its
-terminal supervisor loop, so that is not used as a production data path.
+barrel workers without an IPU exception. SDK-generated application host
+exchange is represented and driven by `HostSession`. Native packet headers,
+XREQs, command reads, and D2H instruction plans are independently assembled,
+but the native output prototype does not yet return payload bytes: its host
+page remains zero and its final phase can remain in WAEX. It is diagnostic
+code, not a passing production data path.
 
 The exchange planner now lowers one-to-one transfers to direction-specific
 point-to-point rows and fanout to single-send multicast rows. The direct loop
@@ -69,6 +71,6 @@ without Poplar exchange code generation or host-side phase delays.
 The current scheduler conservatively caps an epoch at 16 independent exchange
 groups. Wider favorable matchings have passed at 368 groups, but a route-aware
 resource model is still needed before raising the general cap. The remaining
-executable-lowering work is to dispatch specialized compute kernels from the
-same per-tile program stream and expose terminal results through normal host
-exchange rather than the TDI acceptance breakpoint.
+executable-lowering work is to resolve native host-phase retirement, dispatch
+specialized compute kernels from the same per-tile program stream, and replace
+fixture-specific package construction with the general compiler pipeline.

@@ -79,6 +79,22 @@ single-send multicast for fanout, and a conservative maximum of 16 groups per
 epoch. The resulting 97 launches produce `1084128` on physical tile 2, and all
 sampled tiles reach the terminal acceptance trap.
 
+Native host-output lowering is partially recovered. Rust independently emits
+the short and long host packet headers, arbitrary-range chunk plans, the tile-0
+`[1, 0]` command-read XREQ, the `[2, 0]` D2H XREQ, and the source command,
+payload, and zero-byte-close sequence. Disassembly of the SDK fixture shows
+that D2H is a two-tile operation: physical tile 0 executes `sync 15` and sends
+the XREQ while the source tile switches its incoming mux, sends the payload,
+and waits in `sync 0`. A command-page H2D read precedes that operation.
+
+The current `run-output` prototype reproduces page attachment order and staged
+GS2 handoffs, but is not accepted as working: the attached page remains zero,
+and some tail schedules leave the source in WAEX. Experiments with short versus
+long packets, absolute versus relative source addressing, source addresses
+`0x50120` and `0x60000`, exact SDK packet-table locations, and explicit command
+ID 1 did not change that result. These variants were removed or kept behind
+the structured assembler rather than accumulated as constants.
+
 TDI reports both inactive and WAEX as context state zero. Architectural
 exceptions are only classified when exception metadata is nonzero; attempting
 retirement break or instruction injection against WAEX is not a reliable way
