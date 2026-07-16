@@ -1382,28 +1382,12 @@ fn main() -> Result<()> {
                     )
                     .with_context(|| format!("host output phase {phase}"))?;
             }
-            if let Some(slice) = app
-                .outputs
-                .first()
-                .and_then(|binding| binding.slices.first())
-            {
-                match device.read_tile_word(slice.tile as u16, slice.tile_address) {
-                    Ok(value) => info!(
-                        output = %app.outputs[0].name,
-                        physical_tile = slice.tile,
-                        tile_address = format_args!("0x{:x}", slice.tile_address),
-                        value,
-                        "read device output diagnostic"
-                    ),
-                    Err(error) => tracing::debug!(%error, "device output diagnostic unavailable"),
-                }
-            }
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             fs::write(&output, &page.bytes()[page_offset..page_offset + size])?;
             device.detach_buffer(0);
             device.detach_buffer(1);
             println!(
-                "entry={} outputBytes={} output={} directOutput=PASS",
+                "entry={} outputBytes={} output={} directOutput=EXPERIMENTAL",
                 entry.name,
                 size,
                 output.display()
