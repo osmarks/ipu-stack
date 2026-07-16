@@ -71,6 +71,14 @@ outgoing data in separate SRAM regions. Placing plan and source in the same
 SRAM element was reproduced as `TEXCPT_CONFLICT` at the sender's `send`
 instruction.
 
+The multi-pass command-table runtime also completes an all-device reduction.
+Physical tile 0 is the coordinator; its scalar is folded into logical tile 1,
+and the other 1,471 tiles exchange and add through 11 binary-tree rounds. The
+compiler emits direction-specific point-to-point rows for one-to-one edges,
+single-send multicast for fanout, and a conservative maximum of 16 groups per
+epoch. The resulting 97 launches produce `1084128` on physical tile 2, and all
+sampled tiles reach the terminal acceptance trap.
+
 TDI reports both inactive and WAEX as context state zero. Architectural
 exceptions are only classified when exception metadata is nonzero; attempting
 retirement break or instruction injection against WAEX is not a reliable way

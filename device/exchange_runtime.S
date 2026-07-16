@@ -101,6 +101,11 @@ ipu_stack_execute:
 #endif
 	setzi $m8, 1
 	put 0xa6, $m8
+	.globl ipu_stack_active_base
+ipu_stack_active_base:
+	setzi $m9, 0
+	put 0xa7, $m9
+	put 0xa4, $m9
 	.globl ipu_stack_plan_address
 ipu_stack_plan_address:
 	setzi $m0, 0x54000

@@ -282,6 +282,20 @@ pub fn patch_multicast_receiver_address(
     Ok(())
 }
 
+pub fn finalize_point_receiver(
+    row: &PlanRow,
+    source_physical: u16,
+) -> Result<PlanRow, ExchangeError> {
+    let patch_index = row[0] as usize;
+    if patch_index >= PLAN_WORDS - 1 || u32::from(source_physical) > 0x1fff {
+        return Err(ExchangeError::Schedule("point receiver patch index"));
+    }
+    let mut executable = [0; PLAN_WORDS];
+    executable[..PLAN_WORDS - 1].copy_from_slice(&row[1..]);
+    executable[patch_index] = (executable[patch_index] & !0x1fff) | u32::from(source_physical);
+    Ok(executable)
+}
+
 fn validate_count(count: u32) -> Result<(), ExchangeError> {
     if (1..=MAX_TRANSFER_WORDS).contains(&count) {
         Ok(())
@@ -506,5 +520,15 @@ mod tests {
         assert!(encode_send(64, 3, 0).is_err());
         assert!(encode_send(1, 8, 0).is_err());
         assert!(encode_send(1, 3, 0x4_0000).is_err());
+    }
+
+    #[test]
+    fn finalizes_point_receiver_for_direct_execution() {
+        let topology = Topology::c600();
+        let plan = topology.point_to_point(274, 1286, 64).unwrap();
+        let row = finalize_point_receiver(&plan.receiver, topology.physical(274).unwrap()).unwrap();
+        assert_eq!(row[0], 0x4180_0003);
+        assert_eq!(row[1] & 0x1fff, 9);
+        assert_eq!(row[5], 0x43a0_0000);
     }
 }

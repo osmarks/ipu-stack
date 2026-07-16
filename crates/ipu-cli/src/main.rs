@@ -116,6 +116,17 @@ enum Command {
         #[arg(long, value_parser = parse_u32)]
         global_sync_release_address: u32,
     },
+    PackageParallelSumFixture {
+        object: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, value_parser = parse_u32)]
+        global_sync_route: u32,
+        #[arg(long, value_parser = parse_u32)]
+        global_sync_packet_address: u32,
+        #[arg(long, value_parser = parse_u32)]
+        global_sync_release_address: u32,
+    },
     DeviceProbe {
         #[arg(long, default_value = "/dev/ipu0")]
         device: String,
@@ -411,18 +422,19 @@ fn main() -> Result<()> {
             global_sync_release_address,
         } => {
             let topology = Topology::c600();
-            let endpoint_span = pairs
+            let endpoint_extent = pairs
                 .checked_mul(2)
+                .and_then(|extent| extent.checked_sub(1))
                 .ok_or_else(|| anyhow::anyhow!("exchange pair count overflow"))?;
             if pairs == 0
-                || usize::from(endpoint_span) > topology.tile_count()
-                || usize::from(sender_base) + usize::from(endpoint_span) > topology.tile_count()
-                || usize::from(receiver_base) + usize::from(endpoint_span) > topology.tile_count()
-                || sender_base.abs_diff(receiver_base) < endpoint_span
+                || usize::from(endpoint_extent) > topology.tile_count()
+                || usize::from(sender_base) + usize::from(endpoint_extent) > topology.tile_count()
+                || usize::from(receiver_base) + usize::from(endpoint_extent) > topology.tile_count()
+                || sender_base.abs_diff(receiver_base) < endpoint_extent
                 || second_receiver_base.is_some_and(|base| {
-                    usize::from(base) + usize::from(endpoint_span) > topology.tile_count()
-                        || base.abs_diff(sender_base) < endpoint_span
-                        || base.abs_diff(receiver_base) < endpoint_span
+                    usize::from(base) + usize::from(endpoint_extent) > topology.tile_count()
+                        || base.abs_diff(sender_base) < endpoint_extent
+                        || base.abs_diff(receiver_base) < endpoint_extent
                 })
             {
                 bail!("exchange pair count is out of range");
@@ -543,6 +555,7 @@ fn main() -> Result<()> {
                     as usize)
             };
             let execute_offset = symbol_offset("ipu_stack_execute")?;
+            let active_base_offset = symbol_offset("ipu_stack_active_base")?;
             let plan_address_offset = symbol_offset("ipu_stack_plan_address")?;
             let nonparticipant_redirect_offset =
                 symbol_offset("ipu_stack_nonparticipant_redirect")?;
@@ -564,6 +577,15 @@ fn main() -> Result<()> {
                     .copy_from_slice(&(0x1900_0000 | (u32::from(logical) * 8)).to_le_bytes());
                 code[plan_address_offset..plan_address_offset + 4]
                     .copy_from_slice(&(0x1900_0000 | plan_address).to_le_bytes());
+                if participant {
+                    let address = if sources.contains_key(&logical) {
+                        source_address
+                    } else {
+                        destination_address
+                    };
+                    code[active_base_offset..active_base_offset + 4]
+                        .copy_from_slice(&(0x1990_0000 | address).to_le_bytes());
+                }
                 if !participant {
                     let redirect_offset = if physical == 0 {
                         coordinator_nonparticipant_redirect_offset
@@ -718,6 +740,300 @@ fn main() -> Result<()> {
                 topology.physical(receiver_base)?,
                 exchange_fixture_value(0, 0),
                 exchange_fixture_value(0, count - 1),
+                output.display()
+            );
+        }
+        Command::PackageParallelSumFixture {
+            object,
+            output,
+            global_sync_route,
+            global_sync_packet_address,
+            global_sync_release_address,
+        } => {
+            let topology = Topology::c600();
+            if global_sync_route > 0x00ff_ffff {
+                bail!("global sync route is out of range");
+            }
+            let plan_base = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x8000;
+            let plan_stride = 40u32;
+            let command_address = plan_base + 0x2000;
+            let staging_address = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x1040;
+            let accumulator_address = plan_base + 0x8000;
+
+            let mut allocations = Vec::new();
+            for tile in 1..topology.tile_count() as u16 {
+                allocations.push(Allocation {
+                    tensor: TensorId(usize::from(tile)),
+                    tile,
+                    address: accumulator_address,
+                    size: 4,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                });
+            }
+            let mut phases = Vec::new();
+            let mut active: Vec<u16> = (1..topology.tile_count() as u16).collect();
+            while active.len() > 1 {
+                let phase_index = phases.len();
+                let mut transfers = Vec::new();
+                let mut next = Vec::with_capacity(active.len().div_ceil(2));
+                for pair in active.chunks(2) {
+                    let receiver = pair[0];
+                    next.push(receiver);
+                    if let Some(&sender) = pair.get(1) {
+                        let tensor = TensorId(usize::from(sender));
+                        transfers.push(Transfer {
+                            source_tile: sender,
+                            destination_tile: receiver,
+                            tensor,
+                            bytes: 4,
+                        });
+                        allocations.push(Allocation {
+                            tensor,
+                            tile: receiver,
+                            address: staging_address,
+                            size: 4,
+                            live_from: phase_index,
+                            live_until: phase_index + 1,
+                            kind: AllocationKind::ExchangeStaging { phase: phase_index },
+                        });
+                    }
+                }
+                phases.push(Phase::Exchange { transfers });
+                active = next;
+            }
+            let root = active[0];
+            let schedule = Schedule {
+                layouts: Vec::new(),
+                phases,
+                allocations,
+                tile_count: topology.tile_count() as u16,
+                peak_sram: BTreeMap::new(),
+            };
+            let lowered = schedule.lower_exchanges(&topology)?;
+            let launches: Vec<_> = lowered.iter().flat_map(|phase| &phase.epochs).collect();
+            let image = link(
+                &[fs::read(object)?],
+                &LinkOptions {
+                    image_base: ipu_driver::APPLICATION_LOAD_BASE,
+                    entry_symbol: "ipu_stack_exchange_loop_start".into(),
+                    externals: HashMap::new(),
+                },
+            )?;
+            let symbol_offset = |name: &str| -> Result<usize> {
+                Ok(image
+                    .symbols
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("exchange loop runtime has no {name} symbol"))?
+                    .checked_sub(image.base)
+                    .ok_or_else(|| anyhow::anyhow!("{name} symbol precedes image"))?
+                    as usize)
+            };
+            let worker_sync_offset = symbol_offset("ipu_stack_loop_worker_sync_base")?;
+            let command_offset = symbol_offset("ipu_stack_command_table_address")?;
+            let pre_sync_offset = symbol_offset("ipu_stack_pre_sync_dispatch")?;
+            let nonmaster_redirect_offset = symbol_offset("ipu_stack_nonmaster_pre_sync_redirect")?;
+            let endpoint_offset = symbol_offset("ipu_stack_loop_global_sync_endpoint")?;
+            let send0_offset = symbol_offset("ipu_stack_loop_global_sync_send0")?;
+            let send1_offset = symbol_offset("ipu_stack_loop_global_sync_send1")?;
+            let release_offset = symbol_offset("ipu_stack_loop_global_sync_release")?;
+
+            let mut app = Application::default();
+            let mut code_blobs = BTreeMap::new();
+            for logical in 0..topology.tile_count() as u16 {
+                let physical = u32::from(topology.physical(logical)?);
+                let mut code = image.bytes.clone();
+                code[worker_sync_offset..worker_sync_offset + 4]
+                    .copy_from_slice(&(0x1900_0000 | (u32::from(logical) * 8)).to_le_bytes());
+                let mut command_instruction = u32::from_le_bytes(
+                    code[command_offset..command_offset + 4]
+                        .try_into()
+                        .expect("instruction word"),
+                );
+                command_instruction = (command_instruction & !0x1f_ffff) | command_address;
+                code[command_offset..command_offset + 4]
+                    .copy_from_slice(&command_instruction.to_le_bytes());
+                if physical == 0 {
+                    for (offset, address) in [
+                        (send0_offset, global_sync_packet_address),
+                        (send1_offset, global_sync_packet_address + 8),
+                    ] {
+                        code[offset..offset + 4].copy_from_slice(
+                            &ipu_exchange::encode_send(1, 3, address >> 2)?.to_le_bytes(),
+                        );
+                    }
+                    code[release_offset..release_offset + 4].copy_from_slice(
+                        &ipu_exchange::encode_send(0, 3, global_sync_release_address >> 2)?
+                            .to_le_bytes(),
+                    );
+                    let mut endpoint = u32::from_le_bytes(
+                        code[endpoint_offset..endpoint_offset + 4]
+                            .try_into()
+                            .expect("instruction word"),
+                    );
+                    endpoint = (endpoint & !0x1f_ffff) | (0x600 + physical);
+                    code[endpoint_offset..endpoint_offset + 4]
+                        .copy_from_slice(&endpoint.to_le_bytes());
+                } else {
+                    let redirect =
+                        code[nonmaster_redirect_offset..nonmaster_redirect_offset + 4].to_vec();
+                    code[pre_sync_offset..pre_sync_offset + 4].copy_from_slice(&redirect);
+                }
+                code_blobs.insert(logical, app.add_blob(code));
+            }
+
+            let mut receiver_tiles = std::collections::BTreeSet::new();
+            for phase in &lowered {
+                for epoch in &phase.epochs {
+                    for group in &epoch.groups {
+                        receiver_tiles.extend(group.destination_tiles.iter().copied());
+                    }
+                }
+            }
+            for logical in 0..topology.tile_count() as u16 {
+                let physical = u32::from(topology.physical(logical)?);
+                let mut segments = vec![Segment {
+                    address: image.base,
+                    memory_size: image.bytes.len() as u32,
+                    blob: code_blobs[&logical],
+                    blob_offset: 0,
+                    file_size: image.bytes.len() as u32,
+                    flags: SEGMENT_READ | SEGMENT_EXECUTE,
+                }];
+                let mut commands = Vec::with_capacity((launches.len() + 1) * 16);
+                for (launch_index, epoch) in launches.iter().enumerate() {
+                    let plan_address = plan_base + launch_index as u32 * plan_stride;
+                    let mut role = if physical == 0 { 1 } else { 2 };
+                    let mut accumulator = 0;
+                    let mut staging = 0;
+                    if let Some(row) = epoch.tile_rows.get(&logical) {
+                        role = 3;
+                        accumulator = accumulator_address;
+                        if epoch
+                            .groups
+                            .iter()
+                            .any(|group| group.destination_tiles.contains(&logical))
+                        {
+                            role = 4;
+                            accumulator = accumulator_address;
+                            staging = staging_address;
+                        }
+                        let blob = app.add_blob(words_to_bytes(row));
+                        segments.push(Segment {
+                            address: plan_address,
+                            memory_size: (ipu_exchange::PLAN_WORDS * 4) as u32,
+                            blob,
+                            blob_offset: 0,
+                            file_size: (ipu_exchange::PLAN_WORDS * 4) as u32,
+                            flags: SEGMENT_READ | SEGMENT_WRITE | SEGMENT_EXECUTE,
+                        });
+                    }
+                    commands.extend_from_slice(&words_to_bytes(&[
+                        role,
+                        plan_address,
+                        accumulator,
+                        staging,
+                    ]));
+                }
+                commands.extend_from_slice(&words_to_bytes(&[0, 0, 0, 0]));
+                let command_blob = app.add_blob(commands.clone());
+                segments.push(Segment {
+                    address: command_address,
+                    memory_size: commands.len() as u32,
+                    blob: command_blob,
+                    blob_offset: 0,
+                    file_size: commands.len() as u32,
+                    flags: SEGMENT_READ,
+                });
+                if logical != 0 {
+                    let initial = if logical == root {
+                        u32::from(logical) + 2
+                    } else {
+                        u32::from(logical) + 1
+                    };
+                    let blob = app.add_blob(words_to_bytes(&[initial]));
+                    segments.push(Segment {
+                        address: accumulator_address,
+                        memory_size: 4,
+                        blob,
+                        blob_offset: 0,
+                        file_size: 4,
+                        flags: SEGMENT_READ | SEGMENT_WRITE,
+                    });
+                }
+                if receiver_tiles.contains(&logical) {
+                    let blob = app.add_blob(words_to_bytes(&[0]));
+                    segments.push(Segment {
+                        address: staging_address,
+                        memory_size: 4,
+                        blob,
+                        blob_offset: 0,
+                        file_size: 4,
+                        flags: SEGMENT_READ | SEGMENT_WRITE,
+                    });
+                }
+                if physical == 0 {
+                    let packet_blob = app.add_blob(words_to_bytes(&[
+                        1,
+                        0,
+                        0xcc00_0000 | global_sync_route,
+                        0x0000_4001,
+                    ]));
+                    segments.push(Segment {
+                        address: global_sync_packet_address,
+                        memory_size: 16,
+                        blob: packet_blob,
+                        blob_offset: 0,
+                        file_size: 16,
+                        flags: SEGMENT_READ,
+                    });
+                    let release_blob = app.add_blob(words_to_bytes(&[0]));
+                    segments.push(Segment {
+                        address: global_sync_release_address,
+                        memory_size: 4,
+                        blob: release_blob,
+                        blob_offset: 0,
+                        file_size: 4,
+                        flags: SEGMENT_READ,
+                    });
+                }
+                app.tiles.push(TileImage {
+                    physical_tile: physical,
+                    entry_point: image.base,
+                    command_address,
+                    diagnostic_address: if logical == root {
+                        accumulator_address
+                    } else {
+                        0
+                    },
+                    segments,
+                });
+            }
+            app.tiles.sort_by_key(|tile| tile.physical_tile);
+            // Startup consumes one credit. Each launch then consumes one
+            // global-release and one plan-entry credit.
+            let external_syncs = 1 + launches.len() as u32 * 2;
+            app.entry_points.push(EntryPoint {
+                name: "parallel-sum".into(),
+                command: 0,
+                external_syncs,
+            });
+            app.write(fs::File::create(&output)?)?;
+            let expected = (topology.tile_count() as u32)
+                .checked_mul(topology.tile_count() as u32 + 1)
+                .expect("C600 sum fits u32")
+                / 2;
+            println!(
+                "tiles={} rootLogical={} rootPhysical={} rounds={} launches={} expected={} resultAddress=0x{:x} output={}",
+                topology.tile_count(),
+                root,
+                topology.physical(root)?,
+                lowered.len(),
+                launches.len(),
+                expected,
+                accumulator_address,
                 output.display()
             );
         }
@@ -902,6 +1218,7 @@ impl Command {
             Self::PackageRuntimeFixture { .. } => "package-runtime-fixture",
             Self::PackageElfDirectory { .. } => "package-elf-directory",
             Self::PackageExchangeFixture { .. } => "package-exchange-fixture",
+            Self::PackageParallelSumFixture { .. } => "package-parallel-sum-fixture",
             Self::DeviceProbe { .. } => "device-probe",
             Self::Load { .. } => "load",
             Self::HostRun { .. } => "host-run",

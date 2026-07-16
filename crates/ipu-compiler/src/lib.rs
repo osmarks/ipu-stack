@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{debug, info};
 
 use ipu_exchange::{
-    MulticastPlan, PlanRow, Topology, patch_multicast_receiver_address, patch_sender_address,
+    MulticastPlan, PlanRow, Topology, finalize_point_receiver, patch_multicast_receiver_address,
+    patch_sender_address,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -393,8 +394,15 @@ pub struct LoweredExchangeGroup {
     pub destination_tiles: Vec<u16>,
     pub tensor: TensorId,
     pub bytes: u32,
+    pub addressing: ExchangeAddressing,
     pub sender: PlanRow,
     pub receivers: Vec<PlanRow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExchangeAddressing {
+    Relative,
+    Absolute,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -417,6 +425,8 @@ pub struct LoweredExchangePhase {
     pub epochs: Vec<LoweredExchangeEpoch>,
     pub cost: ExchangeCost,
 }
+
+pub const MAX_EXCHANGE_GROUPS_PER_EPOCH: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoweredComputeCommand {
@@ -626,6 +636,15 @@ impl Schedule {
                     color.ok_or_else(|| CompileError::Graph("uncolored exchange group".into()))?;
                 epoch_groups[color].push(group);
             }
+            let epoch_groups: Vec<_> = epoch_groups
+                .into_iter()
+                .flat_map(|groups| {
+                    groups
+                        .chunks(MAX_EXCHANGE_GROUPS_PER_EPOCH)
+                        .map(<[PendingGroup]>::to_vec)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
 
             let mut epochs = Vec::new();
             for pending in epoch_groups {
@@ -664,41 +683,53 @@ impl Schedule {
                             ))
                         })?
                         .address;
-                    let mut plan: MulticastPlan =
-                        topology.multicast(source, &destinations, words, 0)?;
-                    patch_sender_address(&mut plan.sender, source_address)?;
-                    for (receiver, destination) in
-                        plan.receivers.iter_mut().zip(destinations.iter())
-                    {
-                        let address = self
-                            .allocations
-                            .iter()
-                            .find(|allocation| {
-                                allocation.tensor == tensor
-                                    && allocation.tile == *destination
-                                    && allocation.kind
-                                        == AllocationKind::ExchangeStaging {
-                                            phase: phase_index,
-                                        }
-                            })
-                            .ok_or_else(|| {
-                                CompileError::Memory(format!(
-                                    "missing staging allocation for tensor {} on tile {destination}",
-                                    tensor.0
-                                ))
-                            })?
-                            .address;
-                        patch_multicast_receiver_address(receiver, address)?;
-                    }
-                    if tile_rows.insert(source, plan.sender).is_some() {
+                    let destination_addresses = destinations
+                        .iter()
+                        .map(|destination| {
+                            self.allocations
+                                .iter()
+                                .find(|allocation| {
+                                    allocation.tensor == tensor
+                                        && allocation.tile == *destination
+                                        && allocation.kind
+                                            == AllocationKind::ExchangeStaging {
+                                                phase: phase_index,
+                                            }
+                                })
+                                .map(|allocation| allocation.address)
+                                .ok_or_else(|| {
+                                    CompileError::Memory(format!(
+                                        "missing staging allocation for tensor {} on tile {destination}",
+                                        tensor.0
+                                    ))
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let (sender, receivers, addressing) = if destinations.len() == 1 {
+                        let plan = topology.point_to_point(source, destinations[0], words)?;
+                        let receiver =
+                            finalize_point_receiver(&plan.receiver, topology.physical(source)?)?;
+                        (plan.sender, vec![receiver], ExchangeAddressing::Relative)
+                    } else {
+                        let mut plan: MulticastPlan =
+                            topology.multicast(source, &destinations, words, 0)?;
+                        patch_sender_address(&mut plan.sender, source_address)?;
+                        for (receiver, address) in plan
+                            .receivers
+                            .iter_mut()
+                            .zip(destination_addresses.iter().copied())
+                        {
+                            patch_multicast_receiver_address(receiver, address)?;
+                        }
+                        (plan.sender, plan.receivers, ExchangeAddressing::Absolute)
+                    };
+                    if tile_rows.insert(source, sender).is_some() {
                         return Err(CompileError::Graph(
                             "sender scheduled twice in one epoch".into(),
                         ));
                     }
-                    for (destination, receiver) in destinations
-                        .iter()
-                        .copied()
-                        .zip(plan.receivers.iter().copied())
+                    for (destination, receiver) in
+                        destinations.iter().copied().zip(receivers.iter().copied())
                     {
                         if tile_rows.insert(destination, receiver).is_some() {
                             return Err(CompileError::Graph(
@@ -713,8 +744,9 @@ impl Schedule {
                         destination_tiles: destinations,
                         tensor,
                         bytes,
-                        sender: plan.sender,
-                        receivers: plan.receivers,
+                        addressing,
+                        sender,
+                        receivers,
                     });
                 }
                 epochs.push(LoweredExchangeEpoch {
@@ -1605,7 +1637,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_packs_an_all_tile_matching_into_one_launch() {
+    fn scheduler_caps_an_all_tile_matching_to_safe_launch_width() {
         let transfers = (0..736)
             .map(|pair| Transfer {
                 source_tile: pair * 2,
@@ -1617,9 +1649,13 @@ mod tests {
         let mut schedule = exchange_schedule(transfers);
         schedule.tile_count = 1472;
         let lowered = schedule.lower_exchanges(&Topology::c600()).unwrap();
-        assert_eq!(lowered[0].epochs.len(), 1);
-        assert_eq!(lowered[0].epochs[0].groups.len(), 736);
-        assert_eq!(lowered[0].epochs[0].tile_rows.len(), 1472);
+        assert_eq!(lowered[0].epochs.len(), 46);
+        assert!(
+            lowered[0]
+                .epochs
+                .iter()
+                .all(|epoch| epoch.groups.len() <= MAX_EXCHANGE_GROUPS_PER_EPOCH)
+        );
         assert_eq!(lowered[0].cost.payload_words, 736);
     }
 
