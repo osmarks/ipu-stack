@@ -111,6 +111,10 @@ enum Command {
         second_receiver_base: Option<u16>,
         #[arg(long, value_parser = parse_u32)]
         global_sync_route: u32,
+        #[arg(long, value_parser = parse_u32)]
+        global_sync_packet_address: u32,
+        #[arg(long, value_parser = parse_u32)]
+        global_sync_release_address: u32,
     },
     DeviceProbe {
         #[arg(long, default_value = "/dev/ipu0")]
@@ -403,6 +407,8 @@ fn main() -> Result<()> {
             receiver_base,
             second_receiver_base,
             global_sync_route,
+            global_sync_packet_address,
+            global_sync_release_address,
         } => {
             let topology = Topology::c600();
             let endpoint_span = pairs
@@ -424,6 +430,19 @@ fn main() -> Result<()> {
             if global_sync_route > 0x00ff_ffff {
                 bail!("global sync route is out of range");
             }
+            let tile_memory = ipu_package::TILE_MEMORY_BASE
+                ..ipu_package::TILE_MEMORY_BASE + ipu_driver::TILE_MEMORY_SIZE as u32;
+            if global_sync_packet_address & 7 != 4
+                || global_sync_release_address & 3 != 0
+                || !tile_memory.contains(&global_sync_packet_address)
+                || !tile_memory.contains(&global_sync_release_address)
+                || global_sync_packet_address + 16 > tile_memory.end
+                || global_sync_release_address + 4 > tile_memory.end
+                || (global_sync_packet_address..global_sync_packet_address + 16)
+                    .contains(&global_sync_release_address)
+            {
+                bail!("global sync buffer allocation is invalid");
+            }
             let bytes = count
                 .checked_mul(4)
                 .filter(|bytes| *bytes != 0)
@@ -436,6 +455,9 @@ fn main() -> Result<()> {
                 let tensor = TensorId(usize::from(pair));
                 let source = sender_base + pair * 2;
                 let destination = receiver_base + pair * 2;
+                if topology.physical(source)? == 0 || topology.physical(destination)? == 0 {
+                    bail!("physical tile 0 is reserved for the global sync coordinator");
+                }
                 let mut requested_destinations = vec![destination];
                 sources.insert(source, pair);
                 destinations.insert(destination, pair);
@@ -450,6 +472,9 @@ fn main() -> Result<()> {
                 });
                 if let Some(base) = second_receiver_base {
                     let second_destination = base + pair * 2;
+                    if topology.physical(second_destination)? == 0 {
+                        bail!("physical tile 0 is reserved for the global sync coordinator");
+                    }
                     requested_destinations.push(second_destination);
                     destinations.insert(second_destination, pair);
                 }
@@ -512,14 +537,14 @@ fn main() -> Result<()> {
             let execute_offset = symbol_offset("ipu_stack_execute")?;
             let nonparticipant_redirect_offset =
                 symbol_offset("ipu_stack_nonparticipant_redirect")?;
+            let coordinator_nonparticipant_redirect_offset =
+                symbol_offset("ipu_stack_coordinator_nonparticipant_redirect")?;
             let pre_sync_offset = symbol_offset("ipu_stack_pre_exchange_sync")?;
             let nonmaster_redirect_offset = symbol_offset("ipu_stack_nonmaster_redirect")?;
             let global_sync_endpoint_offset = symbol_offset("ipu_stack_global_sync_endpoint")?;
             let global_sync_send0_offset = symbol_offset("ipu_stack_global_sync_send0")?;
             let global_sync_send1_offset = symbol_offset("ipu_stack_global_sync_send1")?;
             let global_sync_release_offset = symbol_offset("ipu_stack_global_sync_release")?;
-            const GLOBAL_SYNC_PACKET_ADDRESS: u32 = 0x501e4;
-            const GLOBAL_SYNC_RELEASE_ADDRESS: u32 = 0x50220;
             let mut code_blobs = BTreeMap::new();
             for logical in 0..topology.tile_count() as u16 {
                 let mut code = image.bytes.clone();
@@ -529,8 +554,13 @@ fn main() -> Result<()> {
                 code[sync_base_offset..sync_base_offset + 4]
                     .copy_from_slice(&(0x1900_0000 | (u32::from(logical) * 8)).to_le_bytes());
                 if !participant {
+                    let redirect_offset = if physical == 0 {
+                        coordinator_nonparticipant_redirect_offset
+                    } else {
+                        nonparticipant_redirect_offset
+                    };
                     let redirect = u32::from_le_bytes(
-                        code[nonparticipant_redirect_offset..nonparticipant_redirect_offset + 4]
+                        code[redirect_offset..redirect_offset + 4]
                             .try_into()
                             .expect("instruction word"),
                     );
@@ -539,14 +569,14 @@ fn main() -> Result<()> {
                 }
                 if logical == 0 {
                     for (offset, address) in [
-                        (global_sync_send0_offset, GLOBAL_SYNC_PACKET_ADDRESS),
-                        (global_sync_send1_offset, GLOBAL_SYNC_PACKET_ADDRESS + 8),
+                        (global_sync_send0_offset, global_sync_packet_address),
+                        (global_sync_send1_offset, global_sync_packet_address + 8),
                     ] {
                         let instruction = ipu_exchange::encode_send(1, 3, address >> 2)?;
                         code[offset..offset + 4].copy_from_slice(&instruction.to_le_bytes());
                     }
                     let release =
-                        ipu_exchange::encode_send(0, 3, GLOBAL_SYNC_RELEASE_ADDRESS >> 2)?;
+                        ipu_exchange::encode_send(0, 3, global_sync_release_address >> 2)?;
                     code[global_sync_release_offset..global_sync_release_offset + 4]
                         .copy_from_slice(&release.to_le_bytes());
                     let mut instruction = u32::from_le_bytes(
@@ -608,7 +638,7 @@ fn main() -> Result<()> {
                         0x0000_4001,
                     ]));
                     segments.push(Segment {
-                        address: GLOBAL_SYNC_PACKET_ADDRESS,
+                        address: global_sync_packet_address,
                         memory_size: 16,
                         blob: packet_blob,
                         blob_offset: 0,
@@ -617,7 +647,7 @@ fn main() -> Result<()> {
                     });
                     let release_blob = app.add_blob(words_to_bytes(&[0]));
                     segments.push(Segment {
-                        address: GLOBAL_SYNC_RELEASE_ADDRESS,
+                        address: global_sync_release_address,
                         memory_size: 4,
                         blob: release_blob,
                         blob_offset: 0,

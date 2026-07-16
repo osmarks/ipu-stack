@@ -39,13 +39,15 @@ inside Poplar's runtime. The direct runtime now reaches the same plan with:
 - `sans 0; sync 1` on every tile without a plan in an exchange launch;
 - plan code in normal executable SRAM at `0x54000`.
 
-The two launch roles must not be conflated. Before a launch, non-master tiles
+The launch roles must not be conflated. Before a launch, non-master tiles
 execute `sans 1; sync 1` as part of the device-wide synchronization. During the
-launch, inactive tiles execute `sans 0; sync 1`. Omitting the latter deadlocks
-both active endpoints. Restoring it lets the receiver and inactive tiles retire
-while the sender remains in WAEX. The receiver's payload range is overwritten
-with zeros and both guards survive, proving that its address and count fields
-are active but not yet that the intended source stream completed.
+launch, ordinary inactive tiles execute `sans 0; sync 1`. Omitting the latter
+deadlocks both active endpoints. Physical tile 0 has already participated as
+the global coordinator and returns directly instead. Applying that distinction
+lets every tile retire and transfers the expected nonuniform payload from
+logical tile 274 (physical 9) to logical tile 1286 (physical 53). The current
+runtime reserves physical tile 0 from payload placement until its combined
+coordinator/sender role is implemented.
 
 Exchange configuration is executable-specific. A fresh SDK capture for logical
 tile `0 -> 274` differs from the checked-in capture in four MMIO records, and

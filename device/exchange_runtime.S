@@ -46,6 +46,10 @@ ipu_stack_pre_exchange_sync:
 .Lexchange_complete:
 	.globl ipu_stack_post_exchange_sync
 ipu_stack_post_exchange_sync:
+#ifdef IPU_STACK_TRAP_BEFORE_DCOUNT_CLEAR
+	zero $m0
+	br $m0
+#endif
 	zero $m0
 	put 0xa6, $m0
 	setzi $m0, 0x640
@@ -104,6 +108,9 @@ ipu_stack_execute:
 	.globl ipu_stack_nonparticipant_redirect
 ipu_stack_nonparticipant_redirect:
 	bri ipu_stack_nonparticipant_execute
+	.globl ipu_stack_coordinator_nonparticipant_redirect
+ipu_stack_coordinator_nonparticipant_redirect:
+	br $m10
 	.globl ipu_stack_nonparticipant_execute
 ipu_stack_nonparticipant_execute:
 	# Exchange-launch participation for tiles with no sender/receiver plan.
