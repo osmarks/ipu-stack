@@ -1,0 +1,21 @@
+[package]
+name = "ipu-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ipu-stack"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+hex.workspace = true
+ipu-compiler = { path = "../ipu-compiler" }
+ipu-driver = { path = "../ipu-driver" }
+ipu-elf = { path = "../ipu-elf" }
+ipu-package = { path = "../ipu-package" }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

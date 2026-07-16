@@ -1,0 +1,12 @@
+[package]
+name = "ipu-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ipu-package = { path = "../ipu-package" }
+libc.workspace = true
+object.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
