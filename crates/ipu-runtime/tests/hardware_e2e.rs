@@ -37,6 +37,20 @@ fn generated_multi_epoch_host_exchange_runs_end_to_end() {
 
 #[test]
 #[ignore = "requires exclusive access to a physical C600"]
+fn generated_remote_tile_h2d_and_d2h_run_end_to_end() {
+    let status = Command::new(env!("CARGO_BIN_EXE_ipu-host-e2e"))
+        .env("IPU_HOST_TEST_TILE", "1471")
+        .env("IPU_HOST_TEST_BYTES", "8192")
+        .status()
+        .expect("launch remote-tile C600 H2D/D2H test runner");
+    assert!(
+        status.success(),
+        "C600 remote H2D/D2H test runner failed with {status}"
+    );
+}
+
+#[test]
+#[ignore = "requires exclusive access to a physical C600"]
 fn generated_remote_tile_d2h_runs_end_to_end() {
     let status = Command::new(env!("CARGO_BIN_EXE_ipu-host-e2e"))
         .env("IPU_HOST_TEST_REMOTE_D2H", "1")
