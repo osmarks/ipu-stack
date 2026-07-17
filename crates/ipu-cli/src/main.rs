@@ -132,6 +132,8 @@ enum Command {
         host_dummy_address: u32,
         #[arg(long, default_value = "0x40", value_parser = parse_u32)]
         host_output_offset: u32,
+        #[arg(long)]
+        experimental_host_output: bool,
     },
     DeviceProbe {
         #[arg(long, default_value = "/dev/ipu0")]
@@ -487,8 +489,13 @@ fn main() -> Result<()> {
                 let tensor = TensorId(usize::from(pair));
                 let source = sender_base + pair * 2;
                 let destination = receiver_base + pair * 2;
-                if topology.physical(source)? == 0 || topology.physical(destination)? == 0 {
-                    bail!("physical tile 0 is reserved for the global sync coordinator");
+                if u32::from(topology.physical(source)?) == GLOBAL_SYNC_MASTER_PHYSICAL_TILE
+                    || u32::from(topology.physical(destination)?)
+                        == GLOBAL_SYNC_MASTER_PHYSICAL_TILE
+                {
+                    bail!(
+                        "physical tile {GLOBAL_SYNC_MASTER_PHYSICAL_TILE} is reserved for the global sync master"
+                    );
                 }
                 let mut requested_destinations = vec![destination];
                 sources.insert(source, pair);
@@ -504,8 +511,12 @@ fn main() -> Result<()> {
                 });
                 if let Some(base) = second_receiver_base {
                     let second_destination = base + pair * 2;
-                    if topology.physical(second_destination)? == 0 {
-                        bail!("physical tile 0 is reserved for the global sync coordinator");
+                    if u32::from(topology.physical(second_destination)?)
+                        == GLOBAL_SYNC_MASTER_PHYSICAL_TILE
+                    {
+                        bail!(
+                            "physical tile {GLOBAL_SYNC_MASTER_PHYSICAL_TILE} is reserved for the global sync master"
+                        );
                     }
                     requested_destinations.push(second_destination);
                     destinations.insert(second_destination, pair);
@@ -585,21 +596,18 @@ fn main() -> Result<()> {
                 let physical = u32::from(topology.physical(logical)?);
                 let participant =
                     sources.contains_key(&logical) || destinations.contains_key(&logical);
-                code[sync_base_offset..sync_base_offset + 4]
-                    .copy_from_slice(&(0x1900_0000 | (u32::from(logical) * 8)).to_le_bytes());
-                code[plan_address_offset..plan_address_offset + 4]
-                    .copy_from_slice(&(0x1900_0000 | plan_address).to_le_bytes());
+                patch_setzi_immediate(&mut code, sync_base_offset, u32::from(logical) * 8)?;
+                patch_setzi_immediate(&mut code, plan_address_offset, plan_address)?;
                 if participant {
                     let address = if sources.contains_key(&logical) {
                         source_address
                     } else {
                         destination_address
                     };
-                    code[active_base_offset..active_base_offset + 4]
-                        .copy_from_slice(&(0x1990_0000 | address).to_le_bytes());
+                    patch_setzi_immediate(&mut code, active_base_offset, address)?;
                 }
                 if !participant {
-                    let redirect_offset = if physical == 0 {
+                    let redirect_offset = if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
                         coordinator_nonparticipant_redirect_offset
                     } else {
                         nonparticipant_redirect_offset
@@ -612,7 +620,7 @@ fn main() -> Result<()> {
                     code[execute_offset..execute_offset + 4]
                         .copy_from_slice(&redirect.to_le_bytes());
                 }
-                if logical == 0 {
+                if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
                     for (offset, address) in [
                         (global_sync_send0_offset, global_sync.packet_address),
                         (global_sync_send1_offset, global_sync.packet_address + 8),
@@ -624,14 +632,11 @@ fn main() -> Result<()> {
                         ipu_exchange::encode_send(0, 3, global_sync.release_address >> 2)?;
                     code[global_sync_release_offset..global_sync_release_offset + 4]
                         .copy_from_slice(&release.to_le_bytes());
-                    let mut instruction = u32::from_le_bytes(
-                        code[global_sync_endpoint_offset..global_sync_endpoint_offset + 4]
-                            .try_into()
-                            .expect("instruction word"),
-                    );
-                    instruction = (instruction & !0x1f_ffff) | (0x600 + physical);
-                    code[global_sync_endpoint_offset..global_sync_endpoint_offset + 4]
-                        .copy_from_slice(&instruction.to_le_bytes());
+                    patch_setzi_immediate(
+                        &mut code,
+                        global_sync_endpoint_offset,
+                        TILE_MUX_HOST_BASE + physical,
+                    )?;
                 } else {
                     let redirect = u32::from_le_bytes(
                         code[nonmaster_redirect_offset..nonmaster_redirect_offset + 4]
@@ -672,7 +677,7 @@ fn main() -> Result<()> {
                         flags: SEGMENT_READ | SEGMENT_WRITE | SEGMENT_EXECUTE,
                     });
                 }
-                if logical == 0 {
+                if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
                     let packet_blob = app.add_blob(words_to_bytes(&[
                         1,
                         0,
@@ -764,6 +769,7 @@ fn main() -> Result<()> {
             host_packet_address,
             host_dummy_address,
             host_output_offset,
+            experimental_host_output,
         } => {
             let topology = Topology::c600();
             let global_sync = GlobalSyncAllocation::new(
@@ -826,33 +832,24 @@ fn main() -> Result<()> {
             };
             let lowered = schedule.lower_exchanges(&topology)?;
             let launches: Vec<_> = lowered.iter().flat_map(|phase| &phase.epochs).collect();
-            let host_plan_address = layout.plan_base + launches.len() as u32 * layout.plan_stride;
-            let host_program = ipu_exchange::assemble_tile_to_host_program(
-                topology.physical(root)?,
-                layout.accumulator_address,
-                host_output_offset,
-                64,
-                host_packet_address,
-                host_dummy_address,
-            )?;
-            let host_xreq_packet_address = host_packet_address
-                .checked_add(16)
-                .ok_or_else(|| anyhow::anyhow!("host packet address overflow"))?;
-            let host_xreq_program =
-                ipu_exchange::assemble_tile_to_host_xreq_program(host_xreq_packet_address)?;
-            let host_command_program = ipu_exchange::assemble_host_command_read_program(
-                host_packet_address,
-                host_dummy_address,
-                0x1000,
-            )?;
-            let host_command_plan_address =
-                host_plan_address + ((host_program.instructions.len() as u32 * 4 + 7) & !7);
-            let host_xreq_plan_address = host_command_plan_address
-                + ((host_command_program.instructions.len() as u32 * 4 + 7) & !7);
-            let plan_region_end = host_xreq_plan_address
-                .checked_add(host_xreq_program.instructions.len() as u32 * 4)
-                .ok_or_else(|| anyhow::anyhow!("host plan address overflow"))?;
-            layout.validate(plan_region_end, launches.len() + 4)?;
+            let host_output = if experimental_host_output {
+                Some(HostOutputPlans::new(
+                    layout,
+                    launches.len(),
+                    topology.physical(root)?,
+                    host_packet_address,
+                    host_dummy_address,
+                    host_output_offset,
+                )?)
+            } else {
+                None
+            };
+            let plan_region_end = match &host_output {
+                Some(host) => host.plan_region_end()?,
+                None => layout.plan_address(launches.len())?,
+            };
+            let command_count = launches.len() + 1 + usize::from(host_output.is_some()) * 3;
+            layout.validate(plan_region_end, command_count)?;
             let image = link(
                 &[fs::read(object)?],
                 &LinkOptions {
@@ -885,17 +882,9 @@ fn main() -> Result<()> {
             for logical in 0..topology.tile_count() as u16 {
                 let physical = u32::from(topology.physical(logical)?);
                 let mut code = image.bytes.clone();
-                code[worker_sync_offset..worker_sync_offset + 4]
-                    .copy_from_slice(&(0x1900_0000 | (u32::from(logical) * 8)).to_le_bytes());
-                let mut command_instruction = u32::from_le_bytes(
-                    code[command_offset..command_offset + 4]
-                        .try_into()
-                        .expect("instruction word"),
-                );
-                command_instruction = (command_instruction & !0x1f_ffff) | layout.command_address;
-                code[command_offset..command_offset + 4]
-                    .copy_from_slice(&command_instruction.to_le_bytes());
-                if physical == 0 {
+                patch_setzi_immediate(&mut code, worker_sync_offset, u32::from(logical) * 8)?;
+                patch_setzi_immediate(&mut code, command_offset, layout.command_address)?;
+                if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
                     for (offset, address) in [
                         (send0_offset, global_sync.packet_address),
                         (send1_offset, global_sync.packet_address + 8),
@@ -908,14 +897,11 @@ fn main() -> Result<()> {
                         &ipu_exchange::encode_send(0, 3, global_sync.release_address >> 2)?
                             .to_le_bytes(),
                     );
-                    let mut endpoint = u32::from_le_bytes(
-                        code[endpoint_offset..endpoint_offset + 4]
-                            .try_into()
-                            .expect("instruction word"),
-                    );
-                    endpoint = (endpoint & !0x1f_ffff) | (0x600 + physical);
-                    code[endpoint_offset..endpoint_offset + 4]
-                        .copy_from_slice(&endpoint.to_le_bytes());
+                    patch_setzi_immediate(
+                        &mut code,
+                        endpoint_offset,
+                        TILE_MUX_HOST_BASE + physical,
+                    )?;
                 } else {
                     let redirect =
                         code[nonmaster_redirect_offset..nonmaster_redirect_offset + 4].to_vec();
@@ -942,11 +928,14 @@ fn main() -> Result<()> {
                     file_size: image.bytes.len() as u32,
                     flags: SEGMENT_READ | SEGMENT_EXECUTE,
                 }];
-                let mut commands = Vec::with_capacity((launches.len() + 4) * 16);
+                let trailing_commands = if host_output.is_some() { 4 } else { 1 };
+                let mut commands = Vec::with_capacity(
+                    (launches.len() + trailing_commands) * RUNTIME_COMMAND_BYTES,
+                );
                 for (launch_index, epoch) in launches.iter().enumerate() {
-                    let plan_address = layout.plan_base + launch_index as u32 * layout.plan_stride;
-                    let mut role = if physical == 0 {
-                        RuntimeRole::Coordinator
+                    let plan_address = layout.plan_address(launch_index)?;
+                    let mut role = if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
+                        RuntimeRole::GlobalSyncMaster
                     } else {
                         RuntimeRole::Inactive
                     };
@@ -981,40 +970,42 @@ fn main() -> Result<()> {
                         staging,
                     ]));
                 }
-                commands.extend_from_slice(&words_to_bytes(&[
-                    if physical == 0 {
-                        RuntimeRole::HostCommandRead
+                if let Some(host) = &host_output {
+                    commands.extend_from_slice(&words_to_bytes(&[
+                        if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
+                            RuntimeRole::HostCommandRead
+                        } else {
+                            RuntimeRole::Inactive
+                        }
+                        .word(),
+                        host.command_plan_address,
+                        0,
+                        0,
+                    ]));
+                    let host_role = if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
+                        RuntimeRole::HostXreq
+                    } else if logical == root {
+                        RuntimeRole::SendAbsolute
                     } else {
                         RuntimeRole::Inactive
-                    }
-                    .word(),
-                    host_command_plan_address,
-                    0,
-                    0,
-                ]));
-                let host_role = if physical == 0 {
-                    RuntimeRole::HostXreq
-                } else if logical == root {
-                    RuntimeRole::SendAbsolute
-                } else {
-                    RuntimeRole::Inactive
-                };
-                commands.extend_from_slice(&words_to_bytes(&[
-                    host_role.word(),
-                    if physical == 0 {
-                        host_xreq_plan_address
-                    } else {
-                        host_plan_address
-                    },
-                    layout.accumulator_address,
-                    0,
-                ]));
-                commands.extend_from_slice(&words_to_bytes(&[
-                    RuntimeRole::Coordinator.word(),
-                    0,
-                    0,
-                    0,
-                ]));
+                    };
+                    commands.extend_from_slice(&words_to_bytes(&[
+                        host_role.word(),
+                        if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
+                            host.xreq_plan_address
+                        } else {
+                            host.output_plan_address
+                        },
+                        layout.accumulator_address,
+                        0,
+                    ]));
+                    commands.extend_from_slice(&words_to_bytes(&[
+                        RuntimeRole::GlobalSyncMaster.word(),
+                        0,
+                        0,
+                        0,
+                    ]));
+                }
                 commands.extend_from_slice(&words_to_bytes(&[0, 0, 0, 0]));
                 let command_blob = app.add_blob(commands.clone());
                 segments.push(Segment {
@@ -1041,17 +1032,19 @@ fn main() -> Result<()> {
                         flags: SEGMENT_READ | SEGMENT_WRITE,
                     });
                 }
-                if logical == root {
-                    let plan = app.add_blob(words_to_bytes(&host_program.instructions));
+                if let Some(host) = &host_output
+                    && logical == root
+                {
+                    let plan = app.add_blob(words_to_bytes(&host.output.instructions));
                     segments.push(Segment {
-                        address: host_plan_address,
-                        memory_size: (host_program.instructions.len() * 4) as u32,
+                        address: host.output_plan_address,
+                        memory_size: (host.output.instructions.len() * 4) as u32,
                         blob: plan,
                         blob_offset: 0,
-                        file_size: (host_program.instructions.len() * 4) as u32,
+                        file_size: (host.output.instructions.len() * 4) as u32,
                         flags: SEGMENT_READ | SEGMENT_EXECUTE,
                     });
-                    let packets = app.add_blob(words_to_bytes(&host_program.packet_words));
+                    let packets = app.add_blob(words_to_bytes(&host.output.packet_words));
                     segments.push(Segment {
                         address: host_packet_address,
                         memory_size: 16,
@@ -1061,19 +1054,19 @@ fn main() -> Result<()> {
                         flags: SEGMENT_READ,
                     });
                 }
-                if physical == 0 {
-                    let command_plan =
-                        app.add_blob(words_to_bytes(&host_command_program.instructions));
+                if let Some(host) = &host_output
+                    && physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE
+                {
+                    let command_plan = app.add_blob(words_to_bytes(&host.command.instructions));
                     segments.push(Segment {
-                        address: host_command_plan_address,
-                        memory_size: (host_command_program.instructions.len() * 4) as u32,
+                        address: host.command_plan_address,
+                        memory_size: (host.command.instructions.len() * 4) as u32,
                         blob: command_plan,
                         blob_offset: 0,
-                        file_size: (host_command_program.instructions.len() * 4) as u32,
+                        file_size: (host.command.instructions.len() * 4) as u32,
                         flags: SEGMENT_READ | SEGMENT_EXECUTE,
                     });
-                    let command_packets =
-                        app.add_blob(words_to_bytes(&host_command_program.packet_words));
+                    let command_packets = app.add_blob(words_to_bytes(&host.command.packet_words));
                     segments.push(Segment {
                         address: host_packet_address,
                         memory_size: 16,
@@ -1082,18 +1075,18 @@ fn main() -> Result<()> {
                         file_size: 16,
                         flags: SEGMENT_READ,
                     });
-                    let plan = app.add_blob(words_to_bytes(&host_xreq_program.instructions));
+                    let plan = app.add_blob(words_to_bytes(&host.xreq.instructions));
                     segments.push(Segment {
-                        address: host_xreq_plan_address,
-                        memory_size: (host_xreq_program.instructions.len() * 4) as u32,
+                        address: host.xreq_plan_address,
+                        memory_size: (host.xreq.instructions.len() * 4) as u32,
                         blob: plan,
                         blob_offset: 0,
-                        file_size: (host_xreq_program.instructions.len() * 4) as u32,
+                        file_size: (host.xreq.instructions.len() * 4) as u32,
                         flags: SEGMENT_READ | SEGMENT_EXECUTE,
                     });
-                    let packet = app.add_blob(words_to_bytes(&host_xreq_program.packet_words[..2]));
+                    let packet = app.add_blob(words_to_bytes(&host.xreq.packet_words[..2]));
                     segments.push(Segment {
-                        address: host_xreq_packet_address,
+                        address: host.xreq_packet_address,
                         memory_size: 8,
                         blob: packet,
                         blob_offset: 0,
@@ -1112,7 +1105,7 @@ fn main() -> Result<()> {
                         flags: SEGMENT_READ | SEGMENT_WRITE,
                     });
                 }
-                if physical == 0 {
+                if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
                     let packet_blob = app.add_blob(words_to_bytes(&global_sync.packet_words()));
                     segments.push(Segment {
                         address: global_sync.packet_address,
@@ -1145,26 +1138,31 @@ fn main() -> Result<()> {
                 });
             }
             app.tiles.sort_by_key(|tile| tile.physical_tile);
-            // D2H uses global entry and coordinator XREQ phases. A following
-            // all-tile launch contributes global entry and external completion
-            // only after the source's sync 0 has retired.
-            let external_syncs = launches.len() as u32 * 2 + 6;
+            let external_syncs = if host_output.is_some() {
+                // D2H uses global entry and master XREQ phases. A following
+                // all-tile launch contributes global entry and external completion.
+                launches.len() as u32 * 2 + 6
+            } else {
+                1 + launches.len() as u32 * 2
+            };
             app.entry_points.push(EntryPoint {
                 name: "parallel-sum".into(),
                 command: 0,
                 external_syncs,
             });
-            app.outputs.push(Binding {
-                name: "sum".into(),
-                dtype: "u32".into(),
-                shape: vec![1],
-                slices: vec![RegionSlice {
-                    tile: u32::from(topology.physical(root)?),
-                    tile_address: layout.accumulator_address,
-                    file_offset: 0,
-                    size: 4,
-                }],
-            });
+            if host_output.is_some() {
+                app.outputs.push(Binding {
+                    name: "sum".into(),
+                    dtype: "u32".into(),
+                    shape: vec![1],
+                    slices: vec![RegionSlice {
+                        tile: u32::from(topology.physical(root)?),
+                        tile_address: layout.accumulator_address,
+                        file_offset: 0,
+                        size: 4,
+                    }],
+                });
+            }
             app.write(fs::File::create(&output)?)?;
             let expected = (topology.tile_count() as u32)
                 .checked_mul(topology.tile_count() as u32 + 1)
@@ -1470,10 +1468,27 @@ fn words_to_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
+const GLOBAL_SYNC_MASTER_PHYSICAL_TILE: u32 = 0;
+const TILE_MUX_HOST_BASE: u32 = 0x600;
+const SETZI_IMMEDIATE_MASK: u32 = 0x001f_ffff;
+const RUNTIME_COMMAND_BYTES: usize = 16;
+
+fn patch_setzi_immediate(code: &mut [u8], offset: usize, immediate: u32) -> Result<()> {
+    if immediate > SETZI_IMMEDIATE_MASK {
+        bail!("setzi immediate 0x{immediate:x} is out of range");
+    }
+    let instruction = code
+        .get_mut(offset..offset + 4)
+        .ok_or_else(|| anyhow::anyhow!("setzi patch at byte {offset} exceeds linked image"))?;
+    let word = u32::from_le_bytes(instruction.try_into().expect("four-byte instruction"));
+    instruction.copy_from_slice(&((word & !SETZI_IMMEDIATE_MASK) | immediate).to_le_bytes());
+    Ok(())
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy)]
 enum RuntimeRole {
-    Coordinator = 1,
+    GlobalSyncMaster = 1,
     Inactive = 2,
     SendRelative = 3,
     ReceiveAdd = 4,
@@ -1540,6 +1555,65 @@ struct ReductionLayout {
     accumulator_address: u32,
 }
 
+struct HostOutputPlans {
+    output_plan_address: u32,
+    output: ipu_exchange::TileToHostProgram,
+    xreq_packet_address: u32,
+    xreq_plan_address: u32,
+    xreq: ipu_exchange::TileToHostProgram,
+    command_plan_address: u32,
+    command: ipu_exchange::TileToHostProgram,
+}
+
+impl HostOutputPlans {
+    fn new(
+        layout: ReductionLayout,
+        launch_count: usize,
+        source_physical: u16,
+        host_packet_address: u32,
+        host_dummy_address: u32,
+        host_output_offset: u32,
+    ) -> Result<Self> {
+        let output_plan_address = layout.plan_address(launch_count)?;
+        let output = ipu_exchange::assemble_tile_to_host_program(
+            source_physical,
+            layout.accumulator_address,
+            host_output_offset,
+            64,
+            host_packet_address,
+            host_dummy_address,
+        )?;
+        let xreq_packet_address = host_packet_address
+            .checked_add(16)
+            .ok_or_else(|| anyhow::anyhow!("host packet address overflow"))?;
+        let xreq = ipu_exchange::assemble_tile_to_host_xreq_program(xreq_packet_address)?;
+        let command = ipu_exchange::assemble_host_command_read_program(
+            host_packet_address,
+            host_dummy_address,
+            0x1000,
+        )?;
+        let command_plan_address =
+            output_plan_address + align_up(output.instructions.len() as u32 * 4, 8);
+        let xreq_plan_address =
+            command_plan_address + align_up(command.instructions.len() as u32 * 4, 8);
+        Ok(Self {
+            output_plan_address,
+            output,
+            xreq_packet_address,
+            xreq_plan_address,
+            xreq,
+            command_plan_address,
+            command,
+        })
+    }
+
+    fn plan_region_end(&self) -> Result<u32> {
+        self.xreq_plan_address
+            .checked_add(self.xreq.instructions.len() as u32 * 4)
+            .ok_or_else(|| anyhow::anyhow!("host plan address overflow"))
+    }
+}
+
 impl ReductionLayout {
     const PLAN_REGION_BYTES: u32 = 0x2000;
     const SRAM_BANK_BYTES: u32 = 0x8000;
@@ -1556,10 +1630,18 @@ impl ReductionLayout {
         }
     }
 
+    fn plan_address(self, index: usize) -> Result<u32> {
+        u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(self.plan_stride))
+            .and_then(|offset| self.plan_base.checked_add(offset))
+            .ok_or_else(|| anyhow::anyhow!("reduction plan address overflow"))
+    }
+
     fn validate(self, plan_region_end: u32, command_count: usize) -> Result<()> {
         let command_bytes = u32::try_from(command_count)
             .ok()
-            .and_then(|count| count.checked_mul(16))
+            .and_then(|count| count.checked_mul(RUNTIME_COMMAND_BYTES as u32))
             .ok_or_else(|| anyhow::anyhow!("command table size overflow"))?;
         if plan_region_end > self.command_address
             || self
@@ -1680,4 +1762,56 @@ fn parse_host_manifest(text: &str) -> Result<HostExchange> {
         bail!("empty host manifest");
     }
     Ok(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setzi_patch_preserves_non_immediate_fields_and_checks_bounds() {
+        let original = 0x1990_0000u32;
+        let immediate = SETZI_IMMEDIATE_MASK / 3;
+        let mut code = original.to_le_bytes().to_vec();
+        patch_setzi_immediate(&mut code, 0, immediate).unwrap();
+        let patched = u32::from_le_bytes(code.try_into().unwrap());
+        assert_eq!(
+            patched & !SETZI_IMMEDIATE_MASK,
+            original & !SETZI_IMMEDIATE_MASK
+        );
+        assert_eq!(patched & SETZI_IMMEDIATE_MASK, immediate);
+
+        assert!(patch_setzi_immediate(&mut [0; 4], 0, SETZI_IMMEDIATE_MASK + 1).is_err());
+        assert!(patch_setzi_immediate(&mut [0; 3], 0, 0).is_err());
+    }
+
+    #[test]
+    fn global_sync_allocation_checks_alignment_range_and_overlap() {
+        let packet = ipu_package::TILE_MEMORY_BASE + 4;
+        let release = packet + 32;
+        assert!(GlobalSyncAllocation::new(1, packet, release).is_ok());
+        assert!(GlobalSyncAllocation::new(1, packet + 4, release).is_err());
+        assert!(GlobalSyncAllocation::new(1, packet, packet + 4).is_err());
+        assert!(GlobalSyncAllocation::new(0x0100_0000, packet, release).is_err());
+    }
+
+    #[test]
+    fn reduction_layout_rejects_exhausted_plan_and_command_regions() {
+        let layout = ReductionLayout::new();
+        assert!(layout.validate(layout.command_address, 1).is_ok());
+        assert!(layout.validate(layout.command_address + 4, 1).is_err());
+
+        let command_capacity =
+            (layout.accumulator_address - layout.command_address) as usize / RUNTIME_COMMAND_BYTES;
+        assert!(
+            layout
+                .validate(layout.command_address, command_capacity)
+                .is_ok()
+        );
+        assert!(
+            layout
+                .validate(layout.command_address, command_capacity + 1)
+                .is_err()
+        );
+    }
 }

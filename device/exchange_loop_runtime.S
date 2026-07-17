@@ -1,7 +1,7 @@
 	.text
 	.allow_optimizations
 
-	.set ROLE_COORDINATOR, 1
+	.set ROLE_GLOBAL_SYNC_MASTER, 1
 	.set ROLE_INACTIVE, 2
 	.set ROLE_SEND_RELATIVE, 3
 	.set ROLE_RECEIVE_ADD, 4
@@ -14,12 +14,19 @@
 	.set WORKER_BASE_START, 0x50000
 	.set WORKER_BASE_STRIDE, 0x30
 	.set SYNC_ALL, 7
+	.set SYNC_SUPERVISOR, 3
+	.set SYNC_HOST, 15
 	.set SYNC_EXTERNAL, 1
 	.set SYNC_RECEIVE, 0
 	.set SANS_INACTIVE, 0
 	.set SANS_EXTERNAL, 1
 	.set OPCODE_SYNC, 0x41800000
 	.set OPCODE_SANS, 0x40c00000
+	.set OPCODE_DELAY, 0x40a00000
+	.set SEND_ONE_WORD_PLACEHOLDER, 0x78200003
+	.set SEND_RELEASE_PLACEHOLDER, 0x78000003
+	.set GLOBAL_SYNC_RELEASE_DELAY, 72
+	.set COMMAND_TABLE_PLACEHOLDER, 0x59000
 
 	.section .text.ipu_stack_exchange_loop_start,"ax",@progbits
 	.globl ipu_stack_exchange_loop_start
@@ -28,7 +35,7 @@
 	.type ipu_stack_exchange_loop_start,@function
 ipu_stack_exchange_loop_start:
 	.supervisor
-	.long 0x41800003
+	.long OPCODE_SYNC | SYNC_SUPERVISOR
 	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
 	put 0xa7, $m15
@@ -54,7 +61,7 @@ ipu_stack_exchange_loop_start:
 	put 0xa0, $m0
 	.globl ipu_stack_command_table_address
 ipu_stack_command_table_address:
-	setzi $m6, 0x59000
+	setzi $m6, COMMAND_TABLE_PLACEHOLDER
 
 .Lcommand_loop:
 	ld32 $m5, $m6, $m15, 0
@@ -64,7 +71,7 @@ ipu_stack_command_table_address:
 	ld32 $m2, $m6, $m15, 2
 	ld32 $m3, $m6, $m15, 3
 	add $m6, $m6, 16
-	cmpeq $m4, $m5, ROLE_COORDINATOR
+	cmpeq $m4, $m5, ROLE_GLOBAL_SYNC_MASTER
 	brnz $m4, .Llaunch_complete
 	cmpeq $m4, $m5, ROLE_INACTIVE
 	brnz $m4, .Linactive_launch
@@ -174,10 +181,10 @@ ipu_stack_global_pre_sync:
 	put 0xa6, $m8
 	.globl ipu_stack_loop_global_sync_send0
 ipu_stack_loop_global_sync_send0:
-	.long 0x78200003
+	.long SEND_ONE_WORD_PLACEHOLDER
 	.globl ipu_stack_loop_global_sync_send1
 ipu_stack_loop_global_sync_send1:
-	.long 0x78200003
+	.long SEND_ONE_WORD_PLACEHOLDER
 	.long OPCODE_SYNC | SYNC_RECEIVE
 	br $m10
 .Lglobal_sync_wait:
@@ -185,12 +192,12 @@ ipu_stack_loop_global_sync_send1:
 ipu_stack_loop_global_sync_endpoint:
 	setzi $m8, TILE_MUX_HOST
 	put 0xa0, $m8
-	.long 0x4180000f
+	.long OPCODE_SYNC | SYNC_HOST
 	br $m10
 .Lglobal_sync_release:
-	.long 0x41800003
-	.long 0x40a00048
+	.long OPCODE_SYNC | SYNC_SUPERVISOR
+	.long OPCODE_DELAY | GLOBAL_SYNC_RELEASE_DELAY
 	.globl ipu_stack_loop_global_sync_release
 ipu_stack_loop_global_sync_release:
-	.long 0x78000003
+	.long SEND_RELEASE_PLACEHOLDER
 	br $m10

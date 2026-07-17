@@ -40,14 +40,16 @@ inside Poplar's runtime. The direct runtime now reaches the same plan with:
 - plan code in a separately allocated executable SRAM region.
 
 The launch roles must not be conflated. Before a launch, non-master tiles
-execute `sans 1; sync 1` as part of the device-wide synchronization. During the
-launch, ordinary inactive tiles execute `sans 0; sync 1`. Omitting the latter
-deadlocks both active endpoints. Physical tile 0 has already participated as
-the global coordinator and returns directly instead. Applying that distinction
+execute `sans 1; sync 1` as part of the device-wide synchronization. Physical
+tile 0 is the protocol master that emits the global packets and release; every
+tile still participates in the barrier. During the launch, ordinary inactive
+tiles execute `sans 0; sync 1`. Omitting the latter deadlocks both active
+endpoints. Physical tile 0 has already participated as the global-sync master
+and returns directly instead. Applying that distinction
 lets every tile retire and transfers the expected nonuniform payload from
 logical tile 274 (physical 9) to logical tile 1286 (physical 53). The current
 runtime reserves physical tile 0 from payload placement until its combined
-coordinator/sender role is implemented.
+master/sender role is implemented.
 
 Exchange configuration is executable-specific. A fresh SDK capture for logical
 tile `0 -> 274` differs from the checked-in capture in four MMIO records, and
@@ -56,7 +58,7 @@ therefore accepts the descriptor route explicitly instead of embedding one
 capture's value. Generating those four allocation records and the corresponding
 route identifier is still required for a topology-independent runtime.
 
-Hardware acceptance with the checked-in configuration and coordinator route
+Hardware acceptance with the checked-in configuration and master route
 now covers:
 
 - complete source, destination, and guard checks at counts 1, 52, 64, 65,
@@ -72,8 +74,9 @@ SRAM element was reproduced as `TEXCPT_CONFLICT` at the sender's `send`
 instruction.
 
 The multi-pass command-table runtime also completes an all-device reduction.
-Physical tile 0 is the coordinator; its scalar is folded into logical tile 1,
-and the other 1,471 tiles exchange and add through 11 binary-tree rounds. The
+Physical tile 0 is the global-sync master; its scalar is folded into logical
+tile 1, and the other 1,471 tiles exchange and add through 11 binary-tree
+rounds. The
 compiler emits direction-specific point-to-point rows for one-to-one edges,
 single-send multicast for fanout, and a conservative maximum of 16 groups per
 epoch. The resulting 97 launches produce `1084128` on physical tile 2, and all
