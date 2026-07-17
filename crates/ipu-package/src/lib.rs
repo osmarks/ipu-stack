@@ -8,7 +8,7 @@ pub mod application_capnp {
     include!(concat!(env!("OUT_DIR"), "/application_capnp.rs"));
 }
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const TARGET_IPU21: &str = "ipu21";
 pub const TILE_MEMORY_BASE: u32 = 0x4c000;
 pub const TILE_MEMORY_SIZE: u32 = 624 * 1024;
@@ -112,6 +112,12 @@ pub struct EntryPoint {
     pub external_syncs: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceConfigWrite {
+    pub offset: u32,
+    pub value: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Application {
     pub compiler_version: String,
@@ -122,6 +128,7 @@ pub struct Application {
     pub weights: Vec<Binding>,
     pub host_exchange: HostExchange,
     pub entry_points: Vec<EntryPoint>,
+    pub device_config_writes: Vec<DeviceConfigWrite>,
 }
 
 impl Default for Application {
@@ -135,6 +142,7 @@ impl Default for Application {
             weights: Vec::new(),
             host_exchange: HostExchange::default(),
             entry_points: Vec::new(),
+            device_config_writes: Vec::new(),
         }
     }
 }
@@ -251,6 +259,16 @@ impl Application {
     pub fn validate(&self) -> Result<(), PackageError> {
         if self.tiles.is_empty() {
             return Err(PackageError::Invalid("application has no tiles".into()));
+        }
+        let mut config_offsets = std::collections::HashSet::new();
+        if self
+            .device_config_writes
+            .iter()
+            .any(|write| write.offset & 3 != 0 || !config_offsets.insert(write.offset))
+        {
+            return Err(PackageError::Invalid(
+                "unaligned or duplicate device configuration write".into(),
+            ));
         }
         let mut seen = HashMap::new();
         for tile in &self.tiles {
@@ -430,6 +448,14 @@ impl Application {
             item.set_command(entry.command);
             item.set_external_syncs(entry.external_syncs);
         }
+        let mut config_writes = root
+            .reborrow()
+            .init_device_config_writes(self.device_config_writes.len() as u32);
+        for (index, write) in self.device_config_writes.iter().enumerate() {
+            let mut item = config_writes.reborrow().get(index as u32);
+            item.set_offset(write.offset);
+            item.set_value(write.value);
+        }
         let digest = self.build_digest();
         root.set_build_digest(&digest);
         serialize::write_message(&mut output, &message)?;
@@ -482,6 +508,14 @@ impl Application {
                 })
             })
             .collect::<Result<_, PackageError>>()?;
+        app.device_config_writes = root
+            .get_device_config_writes()?
+            .iter()
+            .map(|item| DeviceConfigWrite {
+                offset: item.get_offset(),
+                value: item.get_value(),
+            })
+            .collect();
         app.validate()?;
         if root.get_build_digest()? != app.build_digest() {
             return Err(PackageError::Invalid("build digest mismatch".into()));
@@ -611,6 +645,11 @@ impl Application {
                 hash.update(b"external-syncs");
                 hash.update(entry.external_syncs.to_le_bytes());
             }
+        }
+        hash_len(&mut hash, self.device_config_writes.len());
+        for write in &self.device_config_writes {
+            hash.update(write.offset.to_le_bytes());
+            hash.update(write.value.to_le_bytes());
         }
         hash.finalize().into()
     }
@@ -878,7 +917,11 @@ mod tests {
 
     #[test]
     fn round_trip_and_reconstruct() {
-        let app = sample();
+        let mut app = sample();
+        app.device_config_writes.push(DeviceConfigWrite {
+            offset: 0x4018,
+            value: 0xc000_000d,
+        });
         let mut encoded = Vec::new();
         app.write(&mut encoded).unwrap();
         let decoded = Application::read(encoded.as_slice()).unwrap();
@@ -894,6 +937,22 @@ mod tests {
         let mut app = sample();
         let duplicate = app.tiles[0].segments[0].clone();
         app.tiles[0].segments.push(duplicate);
+        assert!(app.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ambiguous_device_configuration() {
+        let mut app = sample();
+        app.device_config_writes = vec![
+            DeviceConfigWrite {
+                offset: 4,
+                value: 1,
+            },
+            DeviceConfigWrite {
+                offset: 4,
+                value: 2,
+            },
+        ];
         assert!(app.validate().is_err());
     }
 }

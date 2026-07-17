@@ -48,13 +48,23 @@ tile in every payload epoch. Omitting the inactive payload role lets the packet
 origin run ahead and deadlocks active endpoints. The older one-shot diagnostic
 runtime still excludes its packet origin; the command-loop runtime does not.
 
-Exchange configuration is executable-specific. A fresh SDK capture for logical
-tile `0 -> 274` differs from the checked-in capture in four MMIO records, and
-its global-sync descriptor route is `0x21a` rather than `0x211`. The fixture
-therefore accepts the complete descriptor words, release word, packet origin,
-and SRAM addresses instead of embedding one capture's values. Generating those
-four allocation records and the corresponding descriptor is still required for
-a topology-independent runtime.
+The Rust compiler now emits global-sync configuration rather than accepting
+captured words on the command line. For C600 the repeated command-loop protocol
+derives the canonical physical tile chain `[0, 1, 5, 13]` from the GSP hierarchy
+extents `[1, 4, 8]` and builds the five-level descriptor route one two-bit step
+at a time. The resulting four configuration-register writes travel in the
+`.ipuexe` and override the generic
+initialization capture before application loading. Packet and release SRAM
+addresses are allocated after the fixture's live data, not supplied as target
+constants. Hardware acceptance uses `artifacts/c600-init.ipucfg`, not a capture
+from the tested exchange schedule.
+
+SDK captures also show translated GSP chains, and translating all four selectors
+plus the descriptor route has passed on hardware. Translation of the packet
+emitter itself has not been established, so the compiler does not conflate
+those two decisions. The command-loop runtime permits canonical physical tile 0
+to perform payload work. The older one-shot diagnostic has schedule-allocated
+GSP selectors and is not part of this topology-independent acceptance path.
 
 Hardware acceptance with the checked-in configuration and master route
 now covers:

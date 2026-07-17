@@ -9,6 +9,75 @@ pub const EXCHANGE_WINDOW_BYTES: u32 = 0x8000;
 pub const HOST_SHORT_MAX_BYTES: u32 = 60;
 pub const HOST_LONG_MAX_BYTES: u32 = 1024;
 
+// C600 GSP configuration registers. Their payload selects the physical tiles
+// forming the hardware global-sync distribution hierarchy.
+pub const GSP_ROOT_CONFIG: u32 = 0x1b400;
+pub const GSP_LEVEL_1_CONFIG: u32 = 0x401c;
+pub const GSP_LEVEL_2_CONFIG: u32 = 0x4020;
+pub const GSP_LEVEL_3_CONFIG: u32 = 0x4018;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfigWrite {
+    pub offset: u32,
+    pub value: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlobalSyncProgram {
+    pub packet_origin_physical_tile: u16,
+    pub packet_words: [u32; 4],
+    pub release_word: u32,
+    pub config_writes: [ConfigWrite; 4],
+}
+
+/// Builds the canonical C600 global-sync distribution rooted at physical tile 0.
+///
+/// The GSP hierarchy crosses a tile, four-tile group, eight-tile group, and
+/// finally the complete device. Each level's selected tile is the cumulative
+/// extent of the preceding levels. The descriptor takes the positive branch at
+/// each of the five routing levels needed to cover the C600 hierarchy.
+pub fn c600_global_sync() -> GlobalSyncProgram {
+    const LEVEL_EXTENTS: [u16; 3] = [1, 4, 8];
+    const ROUTE_BRANCHES: [u32; 5] = [1; 5];
+    const SELECT: u32 = 0x4000_0000;
+    const DISTRIBUTION_ROOT: u32 = 0x8000_0000;
+    const GLOBAL_SYNC_PACKET: u32 = 0xcc00_0000;
+    const ALL_TILES_WITH_RELEASE: u32 = 0x0024_0001;
+    const RELEASE_TOKEN: u32 = 1;
+
+    let mut selected_tiles = [0u16; 4];
+    for (level, extent) in LEVEL_EXTENTS.into_iter().enumerate() {
+        selected_tiles[level + 1] = selected_tiles[level] + extent;
+    }
+    let route = ROUTE_BRANCHES
+        .into_iter()
+        .fold(0u32, |route, branch| (route << 2) | branch);
+
+    GlobalSyncProgram {
+        packet_origin_physical_tile: selected_tiles[0],
+        packet_words: [1, 0, GLOBAL_SYNC_PACKET | route, ALL_TILES_WITH_RELEASE],
+        release_word: RELEASE_TOKEN,
+        config_writes: [
+            ConfigWrite {
+                offset: GSP_ROOT_CONFIG,
+                value: SELECT | u32::from(selected_tiles[0]),
+            },
+            ConfigWrite {
+                offset: GSP_LEVEL_1_CONFIG,
+                value: SELECT | u32::from(selected_tiles[1]),
+            },
+            ConfigWrite {
+                offset: GSP_LEVEL_2_CONFIG,
+                value: SELECT | u32::from(selected_tiles[2]),
+            },
+            ConfigWrite {
+                offset: GSP_LEVEL_3_CONFIG,
+                value: SELECT | DISTRIBUTION_ROOT | u32::from(selected_tiles[3]),
+            },
+        ],
+    }
+}
+
 pub type PlanRow = [u32; PLAN_WORDS];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -941,5 +1010,35 @@ mod tests {
         assert_eq!(row[0], 0x4180_0003);
         assert_eq!(row[1] & 0x1fff, 9);
         assert_eq!(row[5], 0x43a0_0000);
+    }
+
+    #[test]
+    fn c600_global_sync_is_derived_from_the_hardware_hierarchy() {
+        let sync = c600_global_sync();
+        let selected: Vec<_> = sync
+            .config_writes
+            .iter()
+            .map(|write| (write.value & 0xffff) as u16)
+            .collect();
+        assert_eq!(selected[0], sync.packet_origin_physical_tile);
+        assert_eq!(
+            selected
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .collect::<Vec<_>>(),
+            [1, 4, 8]
+        );
+        assert!(
+            selected
+                .iter()
+                .all(|tile| usize::from(*tile) < Topology::c600().tile_count())
+        );
+
+        let mut route = sync.packet_words[2] & 0x00ff_ffff;
+        for _ in 0..5 {
+            assert_eq!(route & 3, 1);
+            route >>= 2;
+        }
+        assert_eq!(route, 0);
     }
 }

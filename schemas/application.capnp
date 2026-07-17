@@ -78,6 +78,11 @@ struct EntryPoint {
   externalSyncs @2 :UInt32;
 }
 
+struct DeviceConfigWrite {
+  offset @0 :UInt32;
+  value @1 :UInt32;
+}
+
 struct Application {
   schemaVersion @0 :UInt32;
   compilerVersion @1 :Text;
@@ -92,4 +97,5 @@ struct Application {
   hostExchange @10 :HostExchange;
   entryPoints @11 :List(EntryPoint);
   buildDigest @12 :Data;
+  deviceConfigWrites @13 :List(DeviceConfigWrite);
 }

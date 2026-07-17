@@ -14,7 +14,8 @@ There are three deliberately separate artifact levels:
    stream. Tiles may select different kernel specializations and code sections.
 3. An `.ipuexe` is a Cap'n Proto whole-device application. It contains
    content-addressed blobs, final segments for every physical tile, tensor
-   bindings, host-exchange pages, and named entry commands.
+   bindings, host-exchange pages, device-configuration writes, and named entry
+   commands.
 
 The independent linker performs reachability-based section collection and all
 Colossus relocation types emitted by the current toolchain. No independent
