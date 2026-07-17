@@ -60,6 +60,7 @@ ipu_stack_exchange_loop_start:
 	.long OPCODE_SYNC | SYNC_ALL
 	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
+	call $m7, ipu_stack_pre_sync_dispatch
 	.globl ipu_stack_command_table_address
 ipu_stack_command_table_address:
 	setzi $m6, COMMAND_TABLE_PLACEHOLDER
@@ -68,14 +69,13 @@ ipu_stack_command_table_address:
 .Lcommand_loop:
 	ld32 $m5, $m6, $m15, 0
 	brz $m5, .Ldone
-	brz $m14, .Lcommand_ready
-	call $m7, ipu_stack_pre_sync_dispatch
-	zero $m14
-.Lcommand_ready:
 	cmpeq $m8, $m5, ROLE_HOST_PROGRAM
 	brnz $m8, .Lload_host_command
 	cmpeq $m8, $m5, ROLE_HOST_IDLE
 	brnz $m8, .Lload_host_command
+	brz $m14, .Llaunch_workers
+	call $m7, ipu_stack_pre_sync_dispatch
+	zero $m14
 .Llaunch_workers:
 	setzi $m0, ipu_stack_exchange_loop_worker_cycle_start
 	runall $m0, $m15, 0

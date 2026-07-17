@@ -60,18 +60,24 @@ application onto all 1472 discovered package tiles in 64-tile bootloader
 batches, completed startup synchronization, and run a supervisor plus six
 barrel workers without an IPU exception. `HostSession` directly attaches host
 pages and drives HSP handoffs. Rust-generated packet headers, XREQs, command
-reads, H2D plans, and D2H plans have transferred a randomized 64-byte payload
-to tile SRAM and returned it byte-for-byte without Poplar or TDI readback. The
-automated host hardware test specifies only graph bindings and checks that
-round trip.
+reads, H2D plans, and D2H plans have transferred randomized payloads to tile
+SRAM and returned them byte-for-byte without Poplar or TDI readback. Direct
+host-only transfers have been verified repeatedly through 8 KiB, including a
+transfer crossing a 4 KiB attached-page boundary.
 
 Host transfers are split at the recovered short/long packet limits and 4 KiB
 attachment boundaries. The runtime allocates one attached buffer per page,
 places the command page after the data pages, and derives one self-contained
 call's HSP phase count from its generated operations. Multi-page layouts and
-packet boundaries are covered by unit tests; a multi-page transfer still needs
-hardware validation after the current test board receives a PCI function
-reset.
+packet boundaries are covered by unit tests and hardware runs.
+
+Exchange Tx/Rx staging addresses are selected from explicit memory constraints:
+tile, byte range, alignment, placement direction, and half-open phase lifetime.
+The allocator rejects exhaustion and permits the same address on different
+tiles or across disjoint lifetimes. The host H2D source is constrained to the
+encodable 8 KiB host-to-tile window; ordinary exchange receivers use the full
+32 KiB exchange window. No concrete staging address is specified by the host
+exchange acceptance graph.
 
 The exchange planner lowers one-to-one and fanout transfers to absolute,
 single-send exchange rows. Direct hardware
@@ -88,6 +94,9 @@ launch, with one synchronization and a shared event horizon. Hardware testing
 includes a multicast whose relay receiver sends the payload onward in a later
 slot without an intermediate BSP barrier. Compute is a following graph phase:
 the dispatcher branches to a separately compiled kernel symbol and exchange
-commands perform no arithmetic. The remaining runtime work includes repairing
-the transition from a generated tile-exchange phase into a following host-read
-phase, then broadening kernel dispatch and host-transfer hardware coverage.
+commands perform no arithmetic. A randomized 64-byte hardware acceptance path
+now performs H2D to the controller tile, two generated tile-exchange phases via
+a relay tile, and D2H from the automatically allocated return range. Larger
+host-only transfers work; larger combined tile-exchange transfers still need
+their exchange timing failure isolated. Arbitrary direct host I/O on a
+non-controller tile also still requires distributed host-role generation.

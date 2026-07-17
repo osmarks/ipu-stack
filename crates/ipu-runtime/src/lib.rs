@@ -334,10 +334,8 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                 &mut commands,
                 *transfer,
                 physical as u16,
-                layout.plan_address(command_index)?,
-                layout.host_packet_address(command_index)?,
-                layout.host_command_address,
-                layout.host_zero_read_address,
+                &layout,
+                command_index,
             )?;
             command_index += 1;
         }
@@ -439,10 +437,8 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                 &mut commands,
                 *transfer,
                 physical as u16,
-                layout.plan_address(command_index)?,
-                layout.host_packet_address(command_index)?,
-                layout.host_command_address,
-                layout.host_zero_read_address,
+                &layout,
+                command_index,
             )?;
             command_index += 1;
         }
@@ -654,16 +650,6 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
     let host_phases = 1usize
         .checked_add(inputs.len())
         .and_then(|phases| phases.checked_add(outputs.len()))
-        .and_then(|phases| {
-            phases.checked_add(
-                graph
-                    .schedule
-                    .phases
-                    .iter()
-                    .filter(|phase| matches!(phase, Phase::Exchange { .. }))
-                    .count(),
-            )
-        })
         .ok_or("host phase count overflow")?;
     Ok(HostLayout {
         inputs,
@@ -810,14 +796,22 @@ fn append_host_command(
     commands: &mut Vec<u8>,
     transfer: HostTransfer,
     physical_tile: u16,
-    plan_address: u32,
-    packet_address: u32,
-    command_address: u32,
-    zero_read_address: u32,
+    layout: &RuntimeLayout,
+    command_index: usize,
 ) -> Result<()> {
-    let (role, address) = if transfer.physical_tile == physical_tile {
-        let program =
-            assemble_host_program(transfer, packet_address, command_address, zero_read_address)?;
+    let execution_tile = match transfer.direction {
+        HostDirection::CommandRead | HostDirection::ToTile => 0,
+        HostDirection::ToHost => transfer.physical_tile,
+    };
+    let (role, address) = if execution_tile == physical_tile {
+        let plan_address = layout.plan_address(command_index)?;
+        let packet_address = layout.host_packet_address(command_index)?;
+        let program = assemble_host_program(
+            transfer,
+            packet_address,
+            layout.host_command_address,
+            layout.host_zero_read_address,
+        )?;
         let instructions = words_to_bytes(&program.instructions);
         let size = u32::try_from(instructions.len())?;
         let blob = app.add_blob(instructions);
