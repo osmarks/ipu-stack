@@ -246,17 +246,9 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             "lowered host output command"
         );
     }
-    let output_transfers = host
-        .outputs
-        .iter()
-        .copied()
-        .filter(|transfer| matches!(transfer.direction, HostDirection::ToHost))
-        .collect::<Vec<_>>();
-    let output_command_count =
-        usize::from(!host.outputs.is_empty()) + usize::from(!output_transfers.is_empty());
     let command_count = host.inputs.len()
         + graph.schedule.phases.len()
-        + output_command_count
+        + host.outputs.len()
         + usize::from(!host.inputs.is_empty() || !host.outputs.is_empty());
     let mut plan_bytes = Vec::new();
     let mut packet_bytes = Vec::new();
@@ -284,15 +276,18 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         });
         packet_bytes.push(0);
     }
-    if let Some(command_read) = host.outputs.first() {
-        plan_bytes.push(host_plan_size(command_read)?);
-        packet_bytes.push(host_packet_size(command_read)?);
-    }
-    if !output_transfers.is_empty() {
-        let (plan_size, packet_size) = output_batch_sizes(&output_transfers)?;
-        plan_bytes.push(plan_size);
-        packet_bytes.push(packet_size);
-    }
+    plan_bytes.extend(
+        host.outputs
+            .iter()
+            .map(host_plan_size)
+            .collect::<Result<Vec<_>>>()?,
+    );
+    packet_bytes.extend(
+        host.outputs
+            .iter()
+            .map(host_packet_size)
+            .collect::<Result<Vec<_>>>()?,
+    );
     plan_bytes.resize(command_count, 0);
     packet_bytes.resize(command_count, 0);
     let layout = RuntimeLayout::new(
@@ -499,24 +494,12 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             }
             command_index += 1;
         }
-        if let Some(command_read) = host.outputs.first() {
+        for transfer in &host.outputs {
             append_host_command(
                 &mut app,
                 &mut segments,
                 &mut commands,
-                *command_read,
-                physical as u16,
-                &layout,
-                command_index,
-            )?;
-            command_index += 1;
-        }
-        if !output_transfers.is_empty() {
-            append_host_output_batch(
-                &mut app,
-                &mut segments,
-                &mut commands,
-                &output_transfers,
+                *transfer,
                 physical as u16,
                 &layout,
                 command_index,
@@ -732,7 +715,7 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
 
     let host_phases = inputs
         .len()
-        .checked_add(usize::from(!outputs.is_empty()) * 2)
+        .checked_add(outputs.len())
         .ok_or("host phase count overflow")?;
     Ok(HostLayout {
         inputs,
@@ -846,133 +829,6 @@ fn host_packet_size(transfer: &HostTransfer) -> Result<usize> {
     .packet_words
     .len()
         * 4)
-}
-
-fn output_batch_program(
-    transfers: &[HostTransfer],
-    physical_tile: u16,
-    packet_address: u32,
-    zero_read_address: u32,
-) -> Result<Option<TileToHostProgram>> {
-    let transfers = transfers
-        .iter()
-        .map(|transfer| ipu_exchange::TileToHostTransfer {
-            physical_tile: transfer.physical_tile,
-            tile_address: transfer.tile_address,
-            host_offset: transfer.host_offset,
-            bytes: transfer.bytes,
-        })
-        .collect::<Vec<_>>();
-    let mut source_tiles = Vec::new();
-    for transfer in &transfers {
-        if !source_tiles.contains(&transfer.physical_tile) {
-            source_tiles.push(transfer.physical_tile);
-        }
-    }
-    if source_tiles.is_empty() {
-        return Err("tile-to-host batch cannot be empty".into());
-    }
-    let mut close_cycle = 0u32;
-    for source in source_tiles.iter().copied() {
-        let source_transfers = transfers
-            .iter()
-            .copied()
-            .filter(|transfer| transfer.physical_tile == source)
-            .collect::<Vec<_>>();
-        close_cycle = close_cycle
-            .checked_add(ipu_exchange::tile_to_host_stream_cycles(&source_transfers)?)
-            .ok_or("tile-to-host batch cycle overflow")?;
-    }
-    let mut start_cycle = 0u32;
-    for source in source_tiles.iter().copied() {
-        if source == physical_tile {
-            break;
-        }
-        let source_transfers = transfers
-            .iter()
-            .copied()
-            .filter(|transfer| transfer.physical_tile == source)
-            .collect::<Vec<_>>();
-        start_cycle = start_cycle
-            .checked_add(ipu_exchange::tile_to_host_stream_cycles(&source_transfers)?)
-            .ok_or("tile-to-host batch cycle overflow")?;
-    }
-    let local = transfers
-        .iter()
-        .copied()
-        .filter(|transfer| transfer.physical_tile == physical_tile)
-        .collect::<Vec<_>>();
-    if physical_tile == 0 {
-        if local.is_empty() {
-            Ok(Some(
-                ipu_exchange::assemble_tile_to_host_batch_coordinator_program(
-                    packet_address,
-                    zero_read_address,
-                    close_cycle,
-                )?,
-            ))
-        } else {
-            Ok(Some(
-                ipu_exchange::assemble_tile_to_host_batch_complete_program(
-                    &local,
-                    packet_address,
-                    zero_read_address,
-                    start_cycle,
-                    close_cycle,
-                )?,
-            ))
-        }
-    } else if local.is_empty() {
-        Ok(None)
-    } else {
-        let program = ipu_exchange::assemble_tile_to_host_batch_source_program(
-            physical_tile,
-            &local,
-            packet_address,
-            start_cycle,
-        )?;
-        debug!(
-            physical_tile,
-            transfers = local.len(),
-            instructions = program.instructions.len(),
-            packet_words = ?program.packet_words,
-            "assembled tile-to-host batch source"
-        );
-        Ok(Some(program))
-    }
-}
-
-fn output_batch_sizes(transfers: &[HostTransfer]) -> Result<(usize, usize)> {
-    let mut physical_tiles = vec![0];
-    for transfer in transfers {
-        if !physical_tiles.contains(&transfer.physical_tile) {
-            physical_tiles.push(transfer.physical_tile);
-        }
-    }
-    let programs = physical_tiles
-        .into_iter()
-        .map(|physical_tile| {
-            output_batch_program(
-                transfers,
-                physical_tile,
-                HOST_PACKET_BASE,
-                ipu_exchange::EXCHANGE_WINDOW_BASE + HOST_PACKET_ALIGNMENT,
-            )?
-            .ok_or_else(|| "missing tile-to-host batch program".into())
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok((
-        programs
-            .iter()
-            .map(|program| program.instructions.len() * 4)
-            .max()
-            .unwrap_or(0),
-        programs
-            .iter()
-            .map(|program| program.packet_words.len() * 4)
-            .max()
-            .unwrap_or(0),
-    ))
 }
 
 fn assemble_host_program(
@@ -1127,52 +983,6 @@ fn append_host_command(
             blob: packet_blob,
             blob_offset: 0,
             file_size: packet_size,
-            flags: SEGMENT_READ,
-        });
-        (RuntimeRole::HostProgram, plan_address)
-    } else {
-        (RuntimeRole::HostIdle, 0)
-    };
-    commands.extend_from_slice(&words_to_bytes(&[role.word(), address, 0, 0, 0]));
-    Ok(())
-}
-
-fn append_host_output_batch(
-    app: &mut Application,
-    segments: &mut Vec<Segment>,
-    commands: &mut Vec<u8>,
-    transfers: &[HostTransfer],
-    physical_tile: u16,
-    layout: &RuntimeLayout,
-    command_index: usize,
-) -> Result<()> {
-    let program = output_batch_program(
-        transfers,
-        physical_tile,
-        layout.host_packet_address(command_index)?,
-        layout.host_zero_read_address,
-    )?;
-    let (role, address) = if let Some(program) = program {
-        let plan_address = layout.plan_address(command_index)?;
-        let instructions = words_to_bytes(&program.instructions);
-        let blob = app.add_blob(instructions.clone());
-        segments.push(Segment {
-            address: plan_address,
-            memory_size: u32::try_from(instructions.len())?,
-            blob,
-            blob_offset: 0,
-            file_size: u32::try_from(instructions.len())?,
-            flags: SEGMENT_READ | SEGMENT_EXECUTE,
-        });
-        let packet_address = layout.host_packet_address(command_index)?;
-        let packets = words_to_bytes(&program.packet_words);
-        let packet_blob = app.add_blob(packets.clone());
-        segments.push(Segment {
-            address: packet_address,
-            memory_size: u32::try_from(packets.len())?,
-            blob: packet_blob,
-            blob_offset: 0,
-            file_size: u32::try_from(packets.len())?,
             flags: SEGMENT_READ,
         });
         (RuntimeRole::HostProgram, plan_address)

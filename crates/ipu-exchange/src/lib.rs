@@ -11,7 +11,6 @@ pub const HOST_LONG_MAX_BYTES: u32 = 1024;
 pub const TILE_TO_HOST_MAX_BYTES: u32 = 256;
 pub const HOST_PAGE_BYTES: u32 = 4096;
 pub const HOST_TO_TILE_WINDOW_BYTES: u32 = 0x4000;
-pub const C600_ROUTE_ENVELOPE_CYCLES: u32 = 256;
 pub const TILE_MUX_HOST: u32 = 0x600;
 pub const TILE_MUX_EXCHANGE: u32 = 0x640;
 
@@ -260,14 +259,6 @@ pub struct HostTransferChunk {
     pub host_offset: u32,
     pub bytes: u32,
     pub header: HostPacketHeader,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TileToHostTransfer {
-    pub physical_tile: u16,
-    pub tile_address: u32,
-    pub host_offset: u32,
-    pub bytes: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -564,7 +555,7 @@ pub fn assemble_tile_to_host_program(
     let chunks = plan_tile_to_host(physical_tile, tile_address, host_offset, bytes)?;
     let xreq_address = packet_address + (chunks.len() as u32 + 1) * 8;
     let coordinator = tile_to_host_coordinator_instructions(xreq_address)?;
-    let source = tile_to_host_source_instructions(&chunks, packet_address)?;
+    let source = tile_to_host_source_instructions(physical_tile, &chunks, packet_address)?;
     let mut instructions = coordinator;
     instructions.extend(source);
     Ok(TileToHostProgram {
@@ -603,7 +594,7 @@ pub fn assemble_tile_to_host_source_program(
 ) -> Result<TileToHostProgram, ExchangeError> {
     let chunks = plan_tile_to_host(physical_tile, tile_address, host_offset, bytes)?;
     Ok(TileToHostProgram {
-        instructions: tile_to_host_source_instructions(&chunks, packet_address)?,
+        instructions: tile_to_host_source_instructions(physical_tile, &chunks, packet_address)?,
         packet_words: tile_to_host_packet_words(
             physical_tile,
             tile_address,
@@ -613,203 +604,6 @@ pub fn assemble_tile_to_host_source_program(
             false,
         )?,
     })
-}
-
-pub fn assemble_tile_to_host_batch_coordinator_program(
-    packet_address: u32,
-    dummy_tile_address: u32,
-    close_cycle: u32,
-) -> Result<TileToHostProgram, ExchangeError> {
-    if packet_address & 7 != 0 {
-        return Err(ExchangeError::HostPacket);
-    }
-    let close = zero_byte_read_packet(0, dummy_tile_address)?;
-    Ok(TileToHostProgram {
-        instructions: tile_to_host_batch_coordinator_instructions(packet_address, close_cycle)?,
-        packet_words: vec![2, 0, close.word0, close.word1],
-    })
-}
-
-pub fn assemble_tile_to_host_batch_source_program(
-    physical_tile: u16,
-    transfers: &[TileToHostTransfer],
-    packet_address: u32,
-    start_cycle: u32,
-) -> Result<TileToHostProgram, ExchangeError> {
-    if transfers.is_empty()
-        || transfers
-            .iter()
-            .any(|transfer| transfer.physical_tile != physical_tile)
-    {
-        return Err(ExchangeError::HostPacket);
-    }
-    tile_to_host_batch_source_program(transfers, packet_address, true, start_cycle)
-}
-
-pub fn assemble_tile_to_host_batch_complete_program(
-    transfers: &[TileToHostTransfer],
-    packet_address: u32,
-    dummy_tile_address: u32,
-    start_cycle: u32,
-    close_cycle: u32,
-) -> Result<TileToHostProgram, ExchangeError> {
-    if transfers.is_empty() || transfers.iter().any(|transfer| transfer.physical_tile != 0) {
-        return Err(ExchangeError::HostPacket);
-    }
-    let source =
-        tile_to_host_batch_source_program(transfers, packet_address + 8, false, start_cycle)?;
-    let source_cycles = tile_to_host_stream_cycles(transfers)? - C600_ROUTE_ENVELOPE_CYCLES;
-    let source_end = start_cycle
-        .checked_add(source_cycles)
-        .ok_or(ExchangeError::Schedule(
-            "tile-to-host stream cycle overflow",
-        ))?;
-    let remaining = close_cycle
-        .checked_sub(source_end)
-        .ok_or(ExchangeError::Schedule(
-            "tile-to-host close precedes payload",
-        ))?;
-    let close_address = packet_address
-        + 8
-        + u32::try_from(source.packet_words.len() * 4).map_err(|_| ExchangeError::HostPacket)?;
-    let close = zero_byte_read_packet(0, dummy_tile_address)?;
-    let mut instructions = vec![
-        setzi_m(8, TILE_MUX_HOST),
-        put_special_from_m8(INCOMING_MUX_REGISTER),
-        SYNC_HOST_INSTRUCTION,
-        encode_send(1, 3, packet_address >> 2)?,
-    ];
-    instructions.extend_from_slice(&source.instructions[..source.instructions.len() - 4]);
-    append_delay_cycles(&mut instructions, remaining);
-    instructions.extend([
-        encode_send(1, 3, close_address >> 2)?,
-        SYNC_RECEIVE_INSTRUCTION,
-        setzi_m(8, TILE_MUX_EXCHANGE),
-        put_special_from_m8(INCOMING_MUX_REGISTER),
-        RETURN_M10_INSTRUCTION,
-    ]);
-    let mut packet_words = vec![2, 0];
-    packet_words.extend(source.packet_words);
-    packet_words.extend([close.word0, close.word1]);
-    Ok(TileToHostProgram {
-        instructions,
-        packet_words,
-    })
-}
-
-fn tile_to_host_batch_coordinator_instructions(
-    xreq_address: u32,
-    close_cycle: u32,
-) -> Result<Vec<u32>, ExchangeError> {
-    let mut instructions = vec![
-        setzi_m(8, TILE_MUX_HOST),
-        put_special_from_m8(INCOMING_MUX_REGISTER),
-        SYNC_HOST_INSTRUCTION,
-        encode_send(1, 3, xreq_address >> 2)?,
-    ];
-    append_delay_cycles(&mut instructions, close_cycle);
-    instructions.extend([
-        setzi_m(8, 1),
-        put_special_from_m8(INCOMING_DCOUNT_REGISTER),
-        encode_send(1, 3, (xreq_address + 8) >> 2)?,
-        SYNC_RECEIVE_INSTRUCTION,
-        setzi_m(8, TILE_MUX_EXCHANGE),
-        put_special_from_m8(INCOMING_MUX_REGISTER),
-        RETURN_M10_INSTRUCTION,
-    ]);
-    Ok(instructions)
-}
-
-fn tile_to_host_batch_source_program(
-    transfers: &[TileToHostTransfer],
-    packet_address: u32,
-    waits_for_request: bool,
-    start_cycle: u32,
-) -> Result<TileToHostProgram, ExchangeError> {
-    if transfers.is_empty() || packet_address & 7 != 0 {
-        return Err(ExchangeError::HostPacket);
-    }
-    let mut chunks = Vec::new();
-    for transfer in transfers {
-        chunks.extend(plan_tile_to_host(
-            transfer.physical_tile,
-            transfer.tile_address,
-            transfer.host_offset,
-            transfer.bytes,
-        )?);
-    }
-    let packet_words = chunks
-        .iter()
-        .flat_map(|chunk| [chunk.header.word0, chunk.header.word1])
-        .collect::<Vec<_>>();
-    let mut instructions = Vec::new();
-    if waits_for_request {
-        instructions.extend([sans(1), SYNC_EXTERNAL_INSTRUCTION]);
-    }
-    instructions.extend([
-        setzi_m(8, TILE_MUX_HOST),
-        put_special_from_m8(INCOMING_MUX_REGISTER),
-        setzi_m(8, 1),
-        put_special_from_m8(INCOMING_DCOUNT_REGISTER),
-    ]);
-    append_delay_cycles(&mut instructions, start_cycle);
-    for (index, chunk) in chunks.iter().enumerate() {
-        instructions.push(encode_send(
-            1,
-            3,
-            host_packet_entry_address(packet_address, index)? >> 2,
-        )?);
-        let words = chunk.bytes / 4;
-        for offset in (0..words).step_by(64) {
-            instructions.push(encode_send(
-                (words - offset).min(64) - 1,
-                3,
-                (chunk.tile_address >> 2) + offset,
-            )?);
-        }
-    }
-    instructions.extend([
-        SYNC_ALL_INSTRUCTION,
-        setzi_m(8, TILE_MUX_EXCHANGE),
-        put_special_from_m8(INCOMING_MUX_REGISTER),
-        RETURN_M10_INSTRUCTION,
-    ]);
-    Ok(TileToHostProgram {
-        instructions,
-        packet_words,
-    })
-}
-
-pub fn tile_to_host_stream_cycles(transfers: &[TileToHostTransfer]) -> Result<u32, ExchangeError> {
-    let mut cycles = 0u32;
-    for transfer in transfers {
-        for chunk in plan_tile_to_host(
-            transfer.physical_tile,
-            transfer.tile_address,
-            transfer.host_offset,
-            transfer.bytes,
-        )? {
-            cycles = cycles
-                .checked_add(2 + chunk.bytes / 4)
-                .ok_or(ExchangeError::Schedule(
-                    "tile-to-host stream cycle overflow",
-                ))?;
-        }
-    }
-    cycles
-        .checked_add(C600_ROUTE_ENVELOPE_CYCLES)
-        .ok_or(ExchangeError::Schedule(
-            "tile-to-host stream cycle overflow",
-        ))
-}
-
-fn append_delay_cycles(instructions: &mut Vec<u32>, mut cycles: u32) {
-    const MAX_DELAY_CYCLES: u32 = 0x80000;
-    while cycles != 0 {
-        let chunk = cycles.min(MAX_DELAY_CYCLES);
-        instructions.push(delay(chunk - 1));
-        cycles -= chunk;
-    }
 }
 
 fn tile_to_host_coordinator_instructions(xreq_address: u32) -> Result<Vec<u32>, ExchangeError> {
@@ -827,6 +621,7 @@ fn tile_to_host_coordinator_instructions(xreq_address: u32) -> Result<Vec<u32>, 
 }
 
 fn tile_to_host_source_instructions(
+    physical_tile: u16,
     chunks: &[HostTransferChunk],
     packet_address: u32,
 ) -> Result<Vec<u32>, ExchangeError> {
@@ -836,7 +631,7 @@ fn tile_to_host_source_instructions(
     let mut instructions = vec![
         sans(1),
         SYNC_EXTERNAL_INSTRUCTION,
-        setzi_m(8, TILE_MUX_HOST),
+        setzi_m(8, host_tile_mux(physical_tile)?),
         put_special_from_m8(INCOMING_MUX_REGISTER),
         setzi_m(8, 1),
         put_special_from_m8(INCOMING_DCOUNT_REGISTER),
@@ -941,8 +736,7 @@ fn host_packet_entry_address(base: u32, index: usize) -> Result<u32, ExchangeErr
 
 fn host_tile_mux(physical_tile: u16) -> Result<u32, ExchangeError> {
     validate_host_tile(physical_tile)?;
-    // Physical bit 1 selects the paired tile sharing this host endpoint.
-    Ok(TILE_MUX_HOST + u32::from(physical_tile & !2))
+    Ok(TILE_MUX_HOST + u32::from((physical_tile & 0x3f) & !2))
 }
 
 fn host_packet_size(host_offset: u32, bytes: u32) -> Result<HostPacketSize, ExchangeError> {
@@ -1694,44 +1488,6 @@ mod tests {
     }
 
     #[test]
-    fn schedules_multi_source_host_payloads_before_coordinator_close() {
-        let first = [TileToHostTransfer {
-            physical_tile: 116,
-            tile_address: 0x54000,
-            host_offset: 0x40,
-            bytes: 64,
-        }];
-        let second = [TileToHostTransfer {
-            physical_tile: 582,
-            tile_address: 0x54000,
-            host_offset: 0x80,
-            bytes: 64,
-        }];
-        let first_cycles = tile_to_host_stream_cycles(&first).unwrap();
-        let second_cycles = tile_to_host_stream_cycles(&second).unwrap();
-        let coordinator = assemble_tile_to_host_batch_coordinator_program(
-            0x50160,
-            0x50140,
-            first_cycles + second_cycles,
-        )
-        .unwrap();
-        let first_source =
-            assemble_tile_to_host_batch_source_program(116, &first, 0x50160, 0).unwrap();
-        let second_source =
-            assemble_tile_to_host_batch_source_program(582, &second, 0x50160, first_cycles)
-                .unwrap();
-
-        assert_eq!(first_source.packet_words.len(), 2);
-        assert_eq!(second_source.packet_words.len(), 2);
-        assert_eq!(coordinator.packet_words.len(), 4);
-        assert!(second_source.instructions.iter().any(|instruction| {
-            *instruction & DELAY_OPCODE_MASK == DELAY_OPCODE
-                && instruction_advance(*instruction) == first_cycles
-        }));
-        assert!(coordinator.instructions.contains(&SYNC_RECEIVE_INSTRUCTION));
-    }
-
-    #[test]
     fn assembles_host_to_tile_as_one_self_contained_request() {
         let plan = assemble_host_to_tile_program(2, 0x50120, 0x40, 64, 0x50160).unwrap();
         assert_eq!(&plan.packet_words[..2], &[1, 0]);
@@ -1784,6 +1540,13 @@ mod tests {
 
     fn host_packet_words(header: HostPacketHeader) -> [u32; 2] {
         [header.word0, header.word1]
+    }
+
+    #[test]
+    fn host_mux_uses_the_physical_tile_row_endpoint() {
+        for (physical_tile, mux) in [(116, 0x634), (582, 0x604), (1173, 0x615)] {
+            assert_eq!(host_tile_mux(physical_tile).unwrap(), mux);
+        }
     }
 
     fn send_address(instruction: u32) -> u32 {
