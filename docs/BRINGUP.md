@@ -22,7 +22,7 @@ pads payloads to the smallest established working envelope, `0x4134` bytes. The
 padding is not recorded as an application segment or treated as an architectural
 SRAM requirement; its precise protocol cause remains an investigation item.
 
-The worker fixture uses `runall` once. All six workers execute barrel-threaded,
+The worker bring-up program uses `runall` once. All six workers execute barrel-threaded,
 write through their distinct vertex-base values, synchronize locally, and let
 the supervisor aggregate the words. There are no per-worker mailbox loops.
 
@@ -54,7 +54,7 @@ extents `[1, 4, 8]` and builds the five-level descriptor route one two-bit step
 at a time. The resulting four configuration-register writes travel in the
 `.ipuexe` and override the generic
 initialization capture before application loading. Packet and release SRAM
-addresses are allocated after the fixture's live data, not supplied as target
+addresses are allocated after the graph's live data, not supplied as target
 constants. Hardware acceptance uses `artifacts/c600-init.ipucfg`, not a capture
 from the tested exchange schedule.
 
@@ -81,7 +81,7 @@ now covers:
   Both the independent multicast receiver and final relay destination were
   exact.
 
-The fixture places worker sync storage, receive staging, executable plans, and
+The graph packager places worker sync storage, receive staging, executable plans, and
 outgoing data in separate SRAM regions. Placing plan and source in the same
 SRAM element was reproduced as `TEXCPT_CONFLICT` at the sender's `send`
 instruction.
@@ -92,7 +92,7 @@ and `A4` for multicast receivers; point-to-point plans continue to use those
 registers as relative bases. Treating an absolute receiver like a relative one
 completes without an exchange exception but leaves its destination unchanged.
 
-The multi-pass command-table runtime also completes an all-device reduction.
+The graph-driven command-table runtime also completes an all-device reduction.
 All 1,472 tile scalars, including physical tile 0's scalar, exchange and add
 through 11 binary-tree rounds. The
 compiler emits absolute single-receiver rows for one-to-one edges and
@@ -130,8 +130,17 @@ are padded to the launch horizon, and only one `sync 3` and one return remain.
 Groups whose source is exchange staging are topologically ordered after the
 group that fills that staging allocation. The runtime's combined absolute role
 clears both `A4` and `A7`; sender and receiver addresses are carried by the
-generated instructions. The fixture derives plan stride from the longest tile
+generated instructions. The packager derives plan stride from the longest tile
 program rather than assuming the original nine-word row size.
+
+`scripts/hardware-e2e.sh` compiles the generic graph runtime and a separate
+`add_u32` kernel, packages one `Schedule`, runs it through the direct loader,
+and validates diagnostic bindings. That schedule contains eleven alternating
+exchange and compute phases for a 1,472-input reduction, an all-tile affine
+permutation, and a multicast with a dependent relay in one exchange phase.
+The test checks the reduction scalar, all 1,472 permutation values, all 64 tap
+words, all 64 relay words, and runtime completion. Exchange commands only move
+data; the following compute phase dynamically dispatches the linked kernel.
 
 `run-diagnostic` uses a deliberate coordinator completion trap after every
 tile has stored its completion word. This makes TDI result collection

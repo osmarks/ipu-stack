@@ -336,6 +336,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipu-runtime"
+version = "0.1.0"
+dependencies = [
+ "ipu-compiler",
+ "ipu-driver",
+ "ipu-elf",
+ "ipu-exchange",
+ "ipu-package",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

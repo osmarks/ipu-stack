@@ -2,14 +2,9 @@
 	.allow_optimizations
 
 	.set ROLE_INACTIVE, 2
-	.set ROLE_SEND_RELATIVE, 3
-	.set ROLE_RECEIVE_ADD, 4
-	.set ROLE_SEND_ABSOLUTE, 5
-	.set ROLE_EXTERNAL_COMPLETION, 6
-	.set ROLE_HOST_XREQ, 7
-	.set ROLE_HOST_COMMAND_READ, 8
-	.set ROLE_RECEIVE_ABSOLUTE_ADD, 9
 	.set ROLE_EXCHANGE_ABSOLUTE, 10
+	.set ROLE_COMPUTE, 11
+	.set ROLE_COMPUTE_NOOP, 12
 	.set TILE_MUX_HOST, 0x600
 	.set TILE_MUX_EXCHANGE, 0x640
 	.set WORKER_BASE_START, 0x50000
@@ -81,36 +76,17 @@ ipu_stack_command_table_address:
 	ld32 $m1, $m6, $m15, 1
 	ld32 $m2, $m6, $m15, 2
 	ld32 $m3, $m6, $m15, 3
-	add $m6, $m6, 16
-	cmpeq $m4, $m5, ROLE_INACTIVE
-	brnz $m4, .Linactive_launch
-	cmpeq $m4, $m5, ROLE_EXTERNAL_COMPLETION
-	brnz $m4, .Lexternal_completion
-	cmpeq $m4, $m5, ROLE_SEND_RELATIVE
-	brnz $m4, .Lset_send_base
-	cmpeq $m4, $m5, ROLE_SEND_ABSOLUTE
-	brnz $m4, .Lset_absolute_send_base
-	cmpeq $m4, $m5, ROLE_HOST_XREQ
-	brnz $m4, .Lset_absolute_send_base
-	cmpeq $m4, $m5, ROLE_HOST_COMMAND_READ
-	brnz $m4, .Lset_absolute_send_base
-	cmpeq $m4, $m5, ROLE_RECEIVE_ABSOLUTE_ADD
-	brnz $m4, .Lset_absolute_receive_base
-	cmpeq $m4, $m5, ROLE_EXCHANGE_ABSOLUTE
-	brnz $m4, .Lset_absolute_exchange_bases
-	bri .Lset_receive_base
-.Lset_send_base:
-	put 0xa7, $m2
-	bri .Larm_plan
-.Lset_absolute_send_base:
-	put 0xa7, $m15
-	bri .Larm_plan
-.Lset_receive_base:
-	put 0xa4, $m3
-	bri .Larm_plan
-.Lset_absolute_receive_base:
-	put 0xa4, $m15
-	bri .Larm_plan
+	ld32 $m4, $m6, $m15, 4
+	add $m6, $m6, 20
+	cmpeq $m8, $m5, ROLE_INACTIVE
+	brnz $m8, .Linactive_launch
+	cmpeq $m8, $m5, ROLE_EXCHANGE_ABSOLUTE
+	brnz $m8, .Lset_absolute_exchange_bases
+	cmpeq $m8, $m5, ROLE_COMPUTE
+	brnz $m8, .Lrun_compute
+	cmpeq $m8, $m5, ROLE_COMPUTE_NOOP
+	brnz $m8, .Llaunch_complete
+	bri .Lhalt
 .Lset_absolute_exchange_bases:
 	put 0xa7, $m15
 	put 0xa4, $m15
@@ -120,19 +96,14 @@ ipu_stack_command_table_address:
 	setzi $m10, .Lplan_complete
 	br $m1
 
+.Lrun_compute:
+	setzi $m10, .Llaunch_complete
+	br $m1
+
 .Lplan_complete:
 	setzi $m0, ipu_stack_exchange_loop_worker_cycle_end
 	runall $m0, $m15, 0
 	.long OPCODE_SYNC | SYNC_COMPUTE_SET
-	cmpeq $m4, $m5, ROLE_RECEIVE_ADD
-	brnz $m4, .Lreceive_add
-	cmpeq $m4, $m5, ROLE_RECEIVE_ABSOLUTE_ADD
-	brz $m4, .Llaunch_complete
-.Lreceive_add:
-	ld32 $m8, $m2, $m15, 0
-	ld32 $m9, $m3, $m15, 0
-	add $m8, $m8, $m9
-	st32 $m8, $m2, $m15, 0
 #ifdef IPU_STACK_TRAP_AFTER_RECEIVE
 	zero $m0
 	br $m0
@@ -143,10 +114,6 @@ ipu_stack_command_table_address:
 	.long OPCODE_SANS | SANS_INACTIVE
 	.long OPCODE_SYNC | SYNC_EXTERNAL
 	bri .Llaunch_complete
-
-.Lexternal_completion:
-	.long OPCODE_SANS | SANS_EXTERNAL
-	.long OPCODE_SYNC | SYNC_EXTERNAL
 
 .Llaunch_complete:
 	setzi $m0, TILE_MUX_EXCHANGE

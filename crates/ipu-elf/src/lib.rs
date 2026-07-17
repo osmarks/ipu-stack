@@ -201,6 +201,8 @@ pub fn inspect_object(bytes: &[u8]) -> Result<ObjectSummary, ElfError> {
 pub struct LinkOptions {
     pub image_base: u32,
     pub entry_symbol: String,
+    /// Symbols reached through runtime dispatch tables rather than ELF relocations.
+    pub retained_symbols: Vec<String>,
     pub externals: HashMap<String, u32>,
 }
 
@@ -232,7 +234,10 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
         .iter()
         .map(|bytes| object::File::parse(bytes.as_slice()))
         .collect::<Result<Vec<_>, _>>()?;
-    let kept = reachable_sections(&parsed, &options.entry_symbol)?;
+    let roots = std::iter::once(options.entry_symbol.as_str())
+        .chain(options.retained_symbols.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    let kept = reachable_sections(&parsed, &roots)?;
     debug!(sections = kept.len(), "retained reachable sections");
     let mut placements = Vec::new();
     let mut cursor = 0usize;
@@ -391,7 +396,7 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
 
 fn reachable_sections(
     objects: &[object::File<'_>],
-    entry_symbol: &str,
+    root_symbols: &[&str],
 ) -> Result<HashSet<(usize, object::SectionIndex)>, ElfError> {
     let mut definitions = HashMap::new();
     for (object_index, file) in objects.iter().enumerate() {
@@ -408,12 +413,16 @@ fn reachable_sections(
             }
         }
     }
-    let root = definitions
-        .get(entry_symbol)
-        .copied()
-        .ok_or_else(|| ElfError::Link(format!("missing entry symbol {entry_symbol}")))?;
     let mut kept = HashSet::new();
-    let mut pending = vec![root];
+    let mut pending = root_symbols
+        .iter()
+        .map(|symbol| {
+            definitions
+                .get(*symbol)
+                .copied()
+                .ok_or_else(|| ElfError::Link(format!("missing retained symbol {symbol}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     while let Some((object_index, section_index)) = pending.pop() {
         if !kept.insert((object_index, section_index)) {
             continue;

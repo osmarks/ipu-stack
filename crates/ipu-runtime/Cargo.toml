@@ -1,0 +1,17 @@
+[package]
+name = "ipu-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ipu-compiler = { path = "../ipu-compiler" }
+ipu-driver = { path = "../ipu-driver" }
+ipu-elf = { path = "../ipu-elf" }
+ipu-exchange = { path = "../ipu-exchange" }
+ipu-package = { path = "../ipu-package" }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+ipu-elf = { path = "../ipu-elf" }

@@ -31,7 +31,7 @@ ipu_stack_start:
 	add $m2, $m2, $m3
 	setzi $m1, 0x52020
 	st32 $m2, $m1, $m15, 0
-	# Let the host release the completed fixture into its diagnostic loop.
+	# Let the host release the completed bring-up program into its diagnostic loop.
 	.long 0x41800007
 .Lidle:
 	add $m0, $m0, 0

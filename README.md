@@ -30,6 +30,8 @@ instruction assembler is required.
   and semantic digests.
 - `ipu-driver`: direct Linux device setup, bootloader framing, application load,
   HSP synchronization, and attached host exchange pages.
+- `ipu-runtime`: graph-schedule packaging, dynamic kernel retention, per-tile
+  command generation, and automated diagnostic execution.
 - `ipu-cli`: build, inspect, plan, probe, and load commands.
 
 ## Build and inspect
@@ -43,8 +45,9 @@ cargo run -p ipu-cli -- kernel-compile device/runtime.S /tmp/runtime \
 cargo run -p ipu-cli -- encoder-plan -o /tmp/encoder.json --tiles 1472
 ```
 
-The hardware fixture is `scripts/hardware-runtime.sh`; it requires explicit
-`POPLAR_SDK_ENABLED`, `IPU_CONFIG`, and `IPU_TILE_COUNT` environment values.
+The ignored end-to-end hardware test is `scripts/hardware-e2e.sh`. It requires
+`POPLAR_SDK_ENABLED` and `IPU_CONFIG`, and accepts optional `IPU_BOOTLOADER` and
+`IPU_DEVICE` overrides.
 
 Logging uses `tracing`. Set `RUST_LOG`, for example
 `RUST_LOG=ipu_driver=debug,ipu_elf=info`, to expose batch and linker details. Set
@@ -65,17 +68,17 @@ code, not a passing production data path.
 The exchange planner lowers one-to-one and fanout transfers to absolute,
 single-send exchange rows. Direct hardware
 acceptance includes a 1,024-word single-packet broadcast to all 1,471 other
-tiles. The direct loop
-runtime executes generated per-tile plan tables across repeated globally
-synchronized launches. Hardware acceptance includes a 1,472-value parallel
-sum: 11 reduction rounds and the exact result `1084128`
+tiles. The graph runtime executes generated per-tile plan tables and separately
+linked compute kernels. The automated hardware graph checks a 1,472-value
+reduction, an all-tile affine permutation, a 64-word multicast, and a dependent
+64-word relay. It validates every exposed word through diagnostic SRAM reads,
 without Poplar exchange code generation or host-side phase delays.
 
 The scheduler treats the on-chip fabric as non-blocking. Tile-disjoint groups
 run concurrently; role conflicts become statically timed slots in the same
 launch, with one synchronization and a shared event horizon. Hardware testing
 includes a multicast whose relay receiver sends the payload onward in a later
-slot without an intermediate BSP barrier. The remaining executable-lowering
-work is to resolve native host completion and host-phase retirement, dispatch
-specialized compute kernels from the same per-tile program stream, and replace
-fixture-specific package construction with the general compiler pipeline.
+slot without an intermediate BSP barrier. Compute is a following graph phase:
+the dispatcher branches to a separately compiled kernel symbol and exchange
+commands perform no arithmetic. The remaining runtime work is native host
+completion and host-phase retirement plus broader kernel dispatch.
