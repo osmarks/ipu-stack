@@ -96,14 +96,12 @@ launch, with one synchronization and a shared event horizon. Hardware testing
 includes a multicast whose relay receiver sends the payload onward in a later
 slot without an intermediate BSP barrier. Compute is a following graph phase:
 the dispatcher branches to a separately compiled kernel symbol and exchange
-commands perform no arithmetic. A randomized 64-byte hardware acceptance path
-now performs H2D to the controller tile, two generated tile-exchange phases via
-a relay tile, and D2H from the automatically allocated return range. Larger
-host-only transfers work; larger combined tile-exchange transfers still need
-their exchange timing failure isolated. D2H lowering now emits separate tile-0
-coordinator and source-tile endpoint programs in one host phase. Randomized
-H2D to tile 0, D2D staging, and direct D2H from five remote tiles across the
-topology pass through 1 KiB, including the last logical tile. Multi-packet D2H
-uses one XREQ and close around 256-byte packet/payload pairs, matching the SDK
-schedule. Larger remote-output tests are currently blocked by the preceding
-large D2D phase rather than by a demonstrated D2H limit.
+commands perform no arithmetic. A randomized hardware acceptance path performs
+H2D to the controller tile, two generated tile-exchange epochs via a relay tile,
+and D2H from the automatically allocated return range. Every exchange epoch
+starts with a device-wide barrier, resetting the exchange synchronization state
+before any tile enters its plan. D2H lowering emits separate tile-0 coordinator
+and source-tile endpoint programs in one host phase. Randomized H2D to tile 0,
+one 8 KiB D2D transfer, and direct D2H from the last logical tile pass
+byte-for-byte. Multi-packet D2H uses one XREQ and close around 256-byte
+packet/payload pairs, matching the SDK schedule.

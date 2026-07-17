@@ -64,7 +64,6 @@ ipu_stack_exchange_loop_start:
 	.globl ipu_stack_command_table_address
 ipu_stack_command_table_address:
 	setzi $m6, COMMAND_TABLE_PLACEHOLDER
-	setzi $m14, 1
 
 .Lcommand_loop:
 	ld32 $m5, $m6, $m15, 0
@@ -73,9 +72,12 @@ ipu_stack_command_table_address:
 	brnz $m8, .Lload_host_command
 	cmpeq $m8, $m5, ROLE_HOST_IDLE
 	brnz $m8, .Lload_host_command
-	brz $m14, .Llaunch_workers
+	cmpeq $m8, $m5, ROLE_INACTIVE
+	brnz $m8, .Lpre_sync_exchange
+	cmpeq $m8, $m5, ROLE_EXCHANGE_ABSOLUTE
+	brz $m8, .Llaunch_workers
+.Lpre_sync_exchange:
 	call $m7, ipu_stack_pre_sync_dispatch
-	zero $m14
 .Llaunch_workers:
 	setzi $m0, ipu_stack_exchange_loop_worker_cycle_start
 	runall $m0, $m15, 0
