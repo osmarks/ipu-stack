@@ -28,6 +28,8 @@
 	.set SEND_RELEASE_PLACEHOLDER, 0x78000003
 	.set GLOBAL_SYNC_RELEASE_DELAY, 72
 	.set COMMAND_TABLE_PLACEHOLDER, 0x59000
+	.set CYCLE_SAMPLE_ADDRESS_PLACEHOLDER, 0
+	.set COMPLETION_ADDRESS_PLACEHOLDER, 0
 
 	.section .text.ipu_stack_exchange_loop_start,"ax",@progbits
 	.globl ipu_stack_exchange_loop_start
@@ -72,7 +74,7 @@ ipu_stack_command_table_address:
 	call $m7, ipu_stack_pre_sync_dispatch
 	zero $m14
 .Llaunch_workers:
-	setzi $m0, ipu_stack_exchange_loop_worker_barrier
+	setzi $m0, ipu_stack_exchange_loop_worker_cycle_start
 	runall $m0, $m15, 0
 	.long OPCODE_SYNC | SYNC_COMPUTE_SET
 	ld32 $m1, $m6, $m15, 1
@@ -112,6 +114,9 @@ ipu_stack_command_table_address:
 	br $m1
 
 .Lplan_complete:
+	setzi $m0, ipu_stack_exchange_loop_worker_cycle_end
+	runall $m0, $m15, 0
+	.long OPCODE_SYNC | SYNC_COMPUTE_SET
 	cmpeq $m4, $m5, ROLE_RECEIVE_ADD
 	brnz $m4, .Lreceive_add
 	cmpeq $m4, $m5, ROLE_RECEIVE_ABSOLUTE_ADD
@@ -142,8 +147,23 @@ ipu_stack_command_table_address:
 	bri .Lcommand_loop
 
 .Ldone:
+	setzi $m0, 1
+	.globl ipu_stack_completion_address
+ipu_stack_completion_address:
+	setzi $m1, COMPLETION_ADDRESS_PLACEHOLDER
+	st32 $m0, $m1, $m15, 0
+	.globl ipu_stack_completion_dispatch
+ipu_stack_completion_dispatch:
+	bri ipu_stack_master_completion
+	.globl ipu_stack_nonmaster_completion_redirect
+ipu_stack_nonmaster_completion_redirect:
+	bri .Lhalt
+	.globl ipu_stack_master_completion
+ipu_stack_master_completion:
 	zero $m0
 	br $m0
+.Lhalt:
+	bri .Lhalt
 	.size ipu_stack_exchange_loop_start, .-ipu_stack_exchange_loop_start
 
 	.section .text.ipu_stack_exchange_loop_worker_init,"ax",@progbits
@@ -164,14 +184,43 @@ ipu_stack_loop_worker_sync_base:
 	exitnz $m15
 	.size ipu_stack_exchange_loop_worker_init, .-ipu_stack_exchange_loop_worker_init
 
-	.section .text.ipu_stack_exchange_loop_worker_barrier,"ax",@progbits
-	.globl ipu_stack_exchange_loop_worker_barrier
+	.section .text.ipu_stack_exchange_loop_worker_cycle_start,"ax",@progbits
+	.globl ipu_stack_exchange_loop_worker_cycle_start
 	.p2align 2
-	.type ipu_stack_exchange_loop_worker_barrier,@function
-ipu_stack_exchange_loop_worker_barrier:
+	.type ipu_stack_exchange_loop_worker_cycle_start,@function
+ipu_stack_exchange_loop_worker_cycle_start:
 	.worker
+	get $m1, $WSR
+	and $m1, $m1, 7
+	brnz $m1, .Lcycle_start_exit
+	get $m0, $COUNT_L
+	.globl ipu_stack_cycle_start_address
+ipu_stack_cycle_start_address:
+	setzi $m1, CYCLE_SAMPLE_ADDRESS_PLACEHOLDER
+	st32 $m0, $m1, $m15, 0
+.Lcycle_start_exit:
 	exitz $m15
-	.size ipu_stack_exchange_loop_worker_barrier, .-ipu_stack_exchange_loop_worker_barrier
+	.size ipu_stack_exchange_loop_worker_cycle_start, .-ipu_stack_exchange_loop_worker_cycle_start
+
+	.section .text.ipu_stack_exchange_loop_worker_cycle_end,"ax",@progbits
+	.globl ipu_stack_exchange_loop_worker_cycle_end
+	.p2align 2
+	.type ipu_stack_exchange_loop_worker_cycle_end,@function
+ipu_stack_exchange_loop_worker_cycle_end:
+	.worker
+	get $m1, $WSR
+	and $m1, $m1, 7
+	brnz $m1, .Lcycle_end_exit
+	get $m0, $COUNT_L
+	.globl ipu_stack_cycle_end_address
+ipu_stack_cycle_end_address:
+	setzi $m1, CYCLE_SAMPLE_ADDRESS_PLACEHOLDER
+	ld32 $m2, $m1, $m15, 0
+	sub $m0, $m0, $m2
+	st32 $m0, $m1, $m15, 0
+.Lcycle_end_exit:
+	exitz $m15
+	.size ipu_stack_exchange_loop_worker_cycle_end, .-ipu_stack_exchange_loop_worker_cycle_end
 
 	.section .text.ipu_stack_exchange_loop_sync,"ax",@progbits
 	.p2align 3

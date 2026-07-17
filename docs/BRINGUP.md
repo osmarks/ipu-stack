@@ -98,6 +98,27 @@ physical mapping the reduction root is physical tile 0, which is also the
 configured packet origin; this is an exercised combined role, not a reserved
 tile.
 
+The diagnostic runtime samples the tile cycle counter through worker 0 because
+`$COUNT_L` is not accessible from supervisor mode. The worker samples before
+and after each active plan; the reported interval therefore includes a fixed
+worker/supervisor handoff around the plan. A direct two-receiver multicast gave
+the following repeatable intervals:
+
+| Words | Sender | Receiver physical 32 | Receiver physical 53 |
+|------:|-------:|---------------------:|---------------------:|
+| 1     | 204    | 552                  | 534                  |
+| 52    | 258    | 606                  | 582                  |
+| 64    | 270    | 618                  | 594                  |
+| 65    | 270    | 618                  | 594                  |
+| 1,024 | 1,230  | 1,578                | 1,554                |
+| 4,148 | 4,350  | 4,698                | 4,680                |
+
+Both the one-word and maximum-size cases preserved the expected first word on
+both receivers. The compiler no longer estimates an epoch as `156 + words`;
+it decodes each generated row's delay and send fields and takes the maximum
+event horizon. This route-sensitive horizon is the basis for placing multiple
+roles on one tile without inserting another BSP synchronization.
+
 Native host-output lowering is partially recovered. Rust independently emits
 the short and long host packet headers, arbitrary-range chunk plans, the tile-0
 `[1, 0]` command-read XREQ, the `[2, 0]` D2H XREQ, and the source command,

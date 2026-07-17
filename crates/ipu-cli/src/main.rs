@@ -109,6 +109,8 @@ enum Command {
         experimental_host_output: bool,
         #[arg(long)]
         broadcast_destination: Vec<u16>,
+        #[arg(long, default_value_t = 1024)]
+        broadcast_words: u32,
     },
     DeviceProbe {
         #[arg(long, default_value = "/dev/ipu0")]
@@ -122,6 +124,18 @@ enum Command {
         final_mark: u32,
         #[arg(long)]
         entry: Option<String>,
+        #[arg(long, hide = true)]
+        break_on_sync_tile: Vec<u16>,
+        #[arg(long, default_value = "/dev/ipu0")]
+        device: String,
+    },
+    RunDiagnostic {
+        package: PathBuf,
+        bootloader: PathBuf,
+        configuration: PathBuf,
+        binding: String,
+        #[arg(long)]
+        slice: Vec<usize>,
         #[arg(long, hide = true)]
         break_on_sync_tile: Vec<u16>,
         #[arg(long, default_value = "/dev/ipu0")]
@@ -418,9 +432,21 @@ fn main() -> Result<()> {
             host_output_offset,
             experimental_host_output,
             broadcast_destination,
+            broadcast_words,
         } => {
             let topology = Topology::c600();
             let broadcast_result = !broadcast_destination.is_empty();
+            if broadcast_result
+                && !(1..=ipu_exchange::MAX_TRANSFER_WORDS).contains(&broadcast_words)
+            {
+                bail!(
+                    "broadcast word count must be between 1 and {}",
+                    ipu_exchange::MAX_TRANSFER_WORDS
+                );
+            }
+            let broadcast_bytes = broadcast_words
+                .checked_mul(4)
+                .ok_or_else(|| anyhow::anyhow!("broadcast byte count overflow"))?;
             let layout = ReductionLayout::new();
             let global_sync = GlobalSyncPlacement::new(
                 ipu_exchange::c600_global_sync(),
@@ -473,14 +499,13 @@ fn main() -> Result<()> {
             }
             let root = active[0];
             if broadcast_result {
-                const BROADCAST_BYTES: u32 = 4096;
                 let phase_index = phases.len();
                 let tensor = TensorId(topology.tile_count());
                 allocations.push(Allocation {
                     tensor,
                     tile: root,
                     address: layout.broadcast_source_address,
-                    size: BROADCAST_BYTES,
+                    size: broadcast_bytes,
                     live_from: phase_index,
                     live_until: phase_index + 1,
                     kind: AllocationKind::Home,
@@ -494,13 +519,13 @@ fn main() -> Result<()> {
                         source_tile: root,
                         destination_tile: destination,
                         tensor,
-                        bytes: BROADCAST_BYTES,
+                        bytes: broadcast_bytes,
                     });
                     allocations.push(Allocation {
                         tensor,
                         tile: destination,
                         address: layout.broadcast_staging_address,
-                        size: BROADCAST_BYTES,
+                        size: broadcast_bytes,
                         live_from: phase_index,
                         live_until: phase_index + 1,
                         kind: AllocationKind::ExchangeStaging { phase: phase_index },
@@ -555,6 +580,12 @@ fn main() -> Result<()> {
             };
             let worker_sync_offset = symbol_offset("ipu_stack_loop_worker_sync_base")?;
             let command_offset = symbol_offset("ipu_stack_command_table_address")?;
+            let cycle_start_offset = symbol_offset("ipu_stack_cycle_start_address")?;
+            let cycle_end_offset = symbol_offset("ipu_stack_cycle_end_address")?;
+            let completion_offset = symbol_offset("ipu_stack_completion_address")?;
+            let completion_dispatch_offset = symbol_offset("ipu_stack_completion_dispatch")?;
+            let nonmaster_completion_offset =
+                symbol_offset("ipu_stack_nonmaster_completion_redirect")?;
             let pre_sync_offset = symbol_offset("ipu_stack_pre_sync_dispatch")?;
             let nonmaster_redirect_offset = symbol_offset("ipu_stack_nonmaster_pre_sync_redirect")?;
             let endpoint_offset = symbol_offset("ipu_stack_loop_global_sync_endpoint")?;
@@ -569,6 +600,10 @@ fn main() -> Result<()> {
                 let mut code = image.bytes.clone();
                 patch_setzi_immediate(&mut code, worker_sync_offset, u32::from(logical) * 8)?;
                 patch_setzi_immediate(&mut code, command_offset, layout.command_address)?;
+                for offset in [cycle_start_offset, cycle_end_offset] {
+                    patch_setzi_immediate(&mut code, offset, layout.cycle_sample_address)?;
+                }
+                patch_setzi_immediate(&mut code, completion_offset, layout.completion_address)?;
                 if physical == u32::from(global_sync.packet_origin_physical_tile) {
                     for (offset, address) in [
                         (send0_offset, global_sync.packet_address),
@@ -591,6 +626,10 @@ fn main() -> Result<()> {
                     let redirect =
                         code[nonmaster_redirect_offset..nonmaster_redirect_offset + 4].to_vec();
                     code[pre_sync_offset..pre_sync_offset + 4].copy_from_slice(&redirect);
+                    let redirect =
+                        code[nonmaster_completion_offset..nonmaster_completion_offset + 4].to_vec();
+                    code[completion_dispatch_offset..completion_dispatch_offset + 4]
+                        .copy_from_slice(&redirect);
                 }
                 code_blobs.insert(logical, app.add_blob(code));
             }
@@ -757,7 +796,7 @@ fn main() -> Result<()> {
                     flags: SEGMENT_READ | SEGMENT_WRITE,
                 });
                 if broadcast_result && logical == root {
-                    let mut source = vec![0u32; 1024];
+                    let mut source = vec![0u32; broadcast_words as usize];
                     source[0] = expected_parallel_sum(topology.tile_count());
                     for (index, word) in source.iter_mut().enumerate().skip(1) {
                         *word = 0x5a17_0000 ^ index as u32;
@@ -765,10 +804,10 @@ fn main() -> Result<()> {
                     let blob = app.add_blob(words_to_bytes(&source));
                     segments.push(Segment {
                         address: layout.broadcast_source_address,
-                        memory_size: 4096,
+                        memory_size: broadcast_bytes,
                         blob,
                         blob_offset: 0,
-                        file_size: 4096,
+                        file_size: broadcast_bytes,
                         flags: SEGMENT_READ,
                     });
                 }
@@ -891,13 +930,7 @@ fn main() -> Result<()> {
                     physical_tile: physical,
                     entry_point: image.base,
                     command_address: layout.command_address,
-                    diagnostic_address: if logical == root {
-                        layout.accumulator_address
-                    } else if broadcast_destination.contains(&logical) {
-                        layout.broadcast_address
-                    } else {
-                        0
-                    },
+                    diagnostic_address: layout.accumulator_address,
                     segments,
                 });
             }
@@ -915,23 +948,70 @@ fn main() -> Result<()> {
                 command: 0,
                 external_syncs,
             });
-            if host_output.is_some() {
+            app.outputs.push(Binding {
+                name: "sum".into(),
+                dtype: "u32".into(),
+                shape: vec![1],
+                slices: vec![RegionSlice {
+                    tile: u32::from(topology.physical(root)?),
+                    tile_address: layout.accumulator_address,
+                    file_offset: 0,
+                    size: 4,
+                }],
+            });
+            app.outputs.push(Binding {
+                name: "exchange-cycles".into(),
+                dtype: "u32".into(),
+                shape: vec![topology.tile_count() as u32],
+                slices: (0..topology.tile_count() as u16)
+                    .map(|logical| {
+                        Ok(RegionSlice {
+                            tile: u32::from(topology.physical(logical)?),
+                            tile_address: layout.cycle_sample_address,
+                            file_offset: u64::from(logical) * 4,
+                            size: 4,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            });
+            app.outputs.push(Binding {
+                name: "completion".into(),
+                dtype: "u32".into(),
+                shape: vec![topology.tile_count() as u32],
+                slices: (0..topology.tile_count() as u16)
+                    .map(|logical| {
+                        Ok(RegionSlice {
+                            tile: u32::from(topology.physical(logical)?),
+                            tile_address: layout.completion_address,
+                            file_offset: u64::from(logical) * 4,
+                            size: 4,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            });
+            if broadcast_result {
                 app.outputs.push(Binding {
-                    name: "sum".into(),
+                    name: "broadcast-first".into(),
                     dtype: "u32".into(),
-                    shape: vec![1],
-                    slices: vec![RegionSlice {
-                        tile: u32::from(topology.physical(root)?),
-                        tile_address: layout.accumulator_address,
-                        file_offset: 0,
-                        size: 4,
-                    }],
+                    shape: vec![broadcast_destination.len() as u32],
+                    slices: broadcast_destination
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &logical)| {
+                            Ok(RegionSlice {
+                                tile: u32::from(topology.physical(logical)?),
+                                tile_address: layout.broadcast_address,
+                                file_offset: index as u64 * 4,
+                                size: 4,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
                 });
             }
             app.write(fs::File::create(&output)?)?;
             let expected = expected_parallel_sum(topology.tile_count());
             println!(
-                "tiles={} rootLogical={} rootPhysical={} rounds={} launches={} expected={} resultAddress=0x{:x} broadcastAddress={} output={}",
+                "tiles={} rootLogical={} rootPhysical={} rounds={} launches={} expected={} resultAddress=0x{:x} cycleSampleAddress=0x{:x} broadcastAddress={} broadcastWords={} output={}",
                 topology.tile_count(),
                 root,
                 topology.physical(root)?,
@@ -939,11 +1019,13 @@ fn main() -> Result<()> {
                 launches.len(),
                 expected,
                 layout.accumulator_address,
+                layout.cycle_sample_address,
                 if broadcast_result {
                     format!("0x{:x}", layout.broadcast_address)
                 } else {
                     "none".into()
                 },
+                broadcast_words,
                 output.display()
             );
         }
@@ -1068,6 +1150,119 @@ fn main() -> Result<()> {
                 entry.name,
                 entry.external_syncs + 1
             );
+        }
+        Command::RunDiagnostic {
+            package,
+            bootloader,
+            configuration,
+            binding,
+            slice,
+            break_on_sync_tile,
+            device,
+        } => {
+            let app = Application::read(fs::File::open(package)?)?;
+            let entry = app
+                .entry_points
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("package has no entry point"))?;
+            let binding = app
+                .outputs
+                .iter()
+                .find(|candidate| candidate.name == binding)
+                .ok_or_else(|| anyhow::anyhow!("unknown output binding {binding}"))?;
+            let selected = if slice.is_empty() {
+                (0..binding.slices.len()).collect::<Vec<_>>()
+            } else {
+                slice
+            };
+            let bootloader = fs::read(bootloader)?;
+            let configuration = fs::read(configuration)?;
+            block_device_interrupt_signals()?;
+            let device = Device::open(&device)?;
+            device.initialize()?;
+            device.replay_configuration(&configuration)?;
+            apply_device_config_writes(&device, &app)?;
+            Loader::new(&device, &bootloader)?.load(&app, 0)?;
+            for physical_tile in break_on_sync_tile {
+                device.set_break_on_sync(physical_tile, true)?;
+            }
+            device.write_config(
+                ipu_driver::pci::EXCHANGE_WINDOW_BASE,
+                ipu_driver::pci::EXCHANGE_WINDOW_HEXOPT,
+            )?;
+            device.write_config(ipu_driver::pci::HSP_GS2_CONTROL, entry.external_syncs)?;
+            device.set_mark(1)?;
+            let completion_tile = app
+                .outputs
+                .iter()
+                .find(|candidate| candidate.name == "completion")
+                .and_then(|binding| binding.slices.first())
+                .ok_or_else(|| anyhow::anyhow!("package has no completion binding"))?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while device.tile_context_state(completion_tile.tile as u16, 0)? != 3 {
+                if std::time::Instant::now() >= deadline {
+                    let error = anyhow::anyhow!("diagnostic completion timed out");
+                    let mut states = [[0usize; 4]; 7];
+                    for tile in &app.tiles {
+                        for (context, context_states) in states.iter_mut().enumerate() {
+                            let state = device
+                                .tile_context_state(tile.physical_tile as u16, context as u32)?;
+                            context_states[state as usize] += 1;
+                        }
+                    }
+                    let mut context_diagnostics = Vec::new();
+                    for physical_tile in [0, 2, 32, 53, 63] {
+                        if matches!(device.tile_context_state(physical_tile, 0)?, 2 | 3) {
+                            context_diagnostics.push((
+                                physical_tile,
+                                0,
+                                0,
+                                device.read_tile_program_counter(physical_tile, 0)?,
+                                0,
+                                0,
+                            ));
+                        }
+                        if matches!(device.tile_context_state(physical_tile, 1)?, 2 | 3) {
+                            let status = device.read_tile_worker_status(physical_tile, 1)?;
+                            context_diagnostics.push((
+                                physical_tile,
+                                1,
+                                u32::from(ipu_driver::TileException::from_status(status) as u8),
+                                device.read_tile_program_counter(physical_tile, 1)?,
+                                device.read_tile_m_register(physical_tile, 1, 1)?,
+                                device.read_tile_m_register(physical_tile, 1, 15)?,
+                            ));
+                        }
+                    }
+                    tracing::error!(
+                        ?states,
+                        ?context_diagnostics,
+                        %error,
+                        "diagnostic application did not complete"
+                    );
+                    return Err(error);
+                }
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            if device.read_tile_word(completion_tile.tile as u16, completion_tile.tile_address)?
+                != 1
+            {
+                bail!("coordinator trapped before storing completion");
+            }
+            for index in selected {
+                let region = binding
+                    .slices
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("binding slice {index} is out of range"))?;
+                if region.size != 4 {
+                    bail!("diagnostic binding slices must contain one u32");
+                }
+                let value = device.read_tile_word(region.tile as u16, region.tile_address)?;
+                println!(
+                    "binding={} slice={} physicalTile={} value={}",
+                    binding.name, index, region.tile, value
+                );
+            }
         }
         Command::RunOutput {
             package,
@@ -1223,6 +1418,7 @@ impl Command {
             Self::PackageParallelSumFixture { .. } => "package-parallel-sum-fixture",
             Self::DeviceProbe { .. } => "device-probe",
             Self::Load { .. } => "load",
+            Self::RunDiagnostic { .. } => "run-diagnostic",
             Self::RunOutput { .. } => "run-output",
             Self::HostRun { .. } => "host-run",
         }
@@ -1238,7 +1434,7 @@ fn words_to_bytes(words: &[u32]) -> Vec<u8> {
 }
 
 const TILE_MUX_HOST_BASE: u32 = 0x600;
-const SETZI_IMMEDIATE_MASK: u32 = 0x001f_ffff;
+const SETZI_IMMEDIATE_MASK: u32 = (1 << 20) - 1;
 const RUNTIME_COMMAND_BYTES: usize = 16;
 
 fn patch_setzi_immediate(code: &mut [u8], offset: usize, immediate: u32) -> Result<()> {
@@ -1343,6 +1539,8 @@ struct ReductionLayout {
     plan_stride: u32,
     command_address: u32,
     accumulator_address: u32,
+    cycle_sample_address: u32,
+    completion_address: u32,
     sync_packet_address: u32,
     sync_release_address: u32,
     broadcast_address: u32,
@@ -1413,21 +1611,35 @@ impl ReductionLayout {
     const PLAN_REGION_BYTES: u32 = 0x2000;
     const SRAM_BANK_BYTES: u32 = 0x8000;
     const STAGING_OFFSET: u32 = 0x1040;
+    const ACCUMULATOR_BYTES: u32 = 64;
+    const GLOBAL_SYNC_PACKET_BYTES: u32 = 16;
+    const GLOBAL_SYNC_RELEASE_BYTES: u32 = 4;
+    const SCALAR_BYTES: u32 = 4;
+    const SRAM_PAGE_BYTES: u32 = 4096;
 
     fn new() -> Self {
         let plan_base = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
         let accumulator_address = plan_base + Self::SRAM_BANK_BYTES;
+        let sync_packet_address = accumulator_address + Self::ACCUMULATOR_BYTES;
+        let sync_release_address = sync_packet_address + Self::GLOBAL_SYNC_PACKET_BYTES;
+        let broadcast_address = sync_release_address + Self::GLOBAL_SYNC_RELEASE_BYTES;
+        let cycle_sample_address = broadcast_address + Self::SCALAR_BYTES;
+        let completion_address = cycle_sample_address + Self::SCALAR_BYTES;
         Self {
             staging_address: ipu_exchange::EXCHANGE_WINDOW_BASE + Self::STAGING_OFFSET,
             plan_base,
             plan_stride: align_up((ipu_exchange::PLAN_WORDS * 4) as u32, 8),
             command_address: plan_base + Self::PLAN_REGION_BYTES,
             accumulator_address,
-            sync_packet_address: accumulator_address + 64,
-            sync_release_address: accumulator_address + 80,
-            broadcast_address: accumulator_address + 88,
-            broadcast_source_address: accumulator_address + 0x1000,
-            broadcast_staging_address: ipu_exchange::EXCHANGE_WINDOW_BASE + 0x4000,
+            cycle_sample_address,
+            completion_address,
+            sync_packet_address,
+            sync_release_address,
+            broadcast_address,
+            broadcast_source_address: accumulator_address + Self::SRAM_PAGE_BYTES,
+            broadcast_staging_address: ipu_exchange::EXCHANGE_WINDOW_BASE
+                + ipu_exchange::EXCHANGE_WINDOW_BYTES
+                - ipu_exchange::MAX_TRANSFER_WORDS * 4,
         }
     }
 
@@ -1572,7 +1784,8 @@ mod tests {
 
     #[test]
     fn setzi_patch_preserves_non_immediate_fields_and_checks_bounds() {
-        let original = 0x1990_0000u32;
+        // `setzi $m1, 0`: bits 20..=23 select the destination register.
+        let original = 0x1910_0000u32;
         let immediate = SETZI_IMMEDIATE_MASK / 3;
         let mut code = original.to_le_bytes().to_vec();
         patch_setzi_immediate(&mut code, 0, immediate).unwrap();
@@ -1582,6 +1795,7 @@ mod tests {
             original & !SETZI_IMMEDIATE_MASK
         );
         assert_eq!(patched & SETZI_IMMEDIATE_MASK, immediate);
+        assert_eq!((patched >> 20) & 0xf, 1);
 
         assert!(patch_setzi_immediate(&mut [0; 4], 0, SETZI_IMMEDIATE_MASK + 1).is_err());
         assert!(patch_setzi_immediate(&mut [0; 3], 0, 0).is_err());

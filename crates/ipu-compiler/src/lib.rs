@@ -725,7 +725,14 @@ impl Schedule {
                             ));
                         }
                     }
-                    cost.estimated_cycles = cost.estimated_cycles.max(u64::from(156 + words));
+                    let group_cycles = std::iter::once(&sender)
+                        .chain(receivers.iter())
+                        .map(|row| ipu_exchange::plan_event_cycles(row))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .max()
+                        .unwrap_or(0);
+                    cost.estimated_cycles = cost.estimated_cycles.max(u64::from(group_cycles));
                     cost.payload_words += u64::from(words);
                     lowered_groups.push(LoweredExchangeGroup {
                         source_tile: source,

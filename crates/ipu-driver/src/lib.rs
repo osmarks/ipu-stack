@@ -41,6 +41,19 @@ const TDI_DATA: u32 = 7;
 const TDI_STATUS: u32 = 8;
 const TDI_STATUS_CLEAR: u32 = 9;
 
+mod tdi_instruction {
+    // IPU21 diagnostic instructions, named by their Tile Vertex ISA assembly.
+    pub const GET_M0_PC: u32 = 0x4100_0000;
+    pub const GET_M0_WSR: u32 = 0x4100_0001;
+    pub const GET_M1_DEBUG_DATA: u32 = 0x4101_0070;
+    pub const LOAD_M0_FROM_M1: u32 = 0x01f0_1000;
+    pub const PUT_DEBUG_DATA_M0: u32 = 0x4300_8070;
+
+    pub fn put_debug_data_m(register: u32) -> Option<u32> {
+        (register < 16).then_some(PUT_DEBUG_DATA_M0 | (register << 20))
+    }
+}
+
 /// IPU21 `$SSR.ETYPE` / `$WSR.ETYPE` values from the Tile Vertex ISA.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -397,29 +410,90 @@ impl Device {
                 "invalid tile memory address 0x{address:x}"
             )));
         }
-        let context = 0;
+        self.with_stopped_tile_context(physical_tile, 0, || {
+            self.write_tile_debug(physical_tile, TDI_DATA, address)?;
+            for instruction in [
+                tdi_instruction::GET_M1_DEBUG_DATA,
+                tdi_instruction::LOAD_M0_FROM_M1,
+                tdi_instruction::PUT_DEBUG_DATA_M0,
+            ] {
+                self.execute_tile_instruction(physical_tile, 0, instruction)?;
+            }
+            self.read_tile_debug(physical_tile, TDI_DATA)
+        })
+    }
+
+    pub fn read_tile_program_counter(
+        &self,
+        physical_tile: u16,
+        context: u32,
+    ) -> Result<u32, DriverError> {
+        self.with_stopped_tile_context(physical_tile, context, || {
+            self.execute_tile_instruction(physical_tile, context, tdi_instruction::GET_M0_PC)?;
+            self.execute_tile_instruction(
+                physical_tile,
+                context,
+                tdi_instruction::PUT_DEBUG_DATA_M0,
+            )?;
+            self.read_tile_debug(physical_tile, TDI_DATA)
+        })
+    }
+
+    pub fn read_tile_worker_status(
+        &self,
+        physical_tile: u16,
+        context: u32,
+    ) -> Result<u32, DriverError> {
+        if context == 0 {
+            return Err(DriverError::Invalid(
+                "worker status requires a worker context".into(),
+            ));
+        }
+        self.with_stopped_tile_context(physical_tile, context, || {
+            self.execute_tile_instruction(physical_tile, context, tdi_instruction::GET_M0_WSR)?;
+            self.execute_tile_instruction(
+                physical_tile,
+                context,
+                tdi_instruction::PUT_DEBUG_DATA_M0,
+            )?;
+            self.read_tile_debug(physical_tile, TDI_DATA)
+        })
+    }
+
+    pub fn read_tile_m_register(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        register: u32,
+    ) -> Result<u32, DriverError> {
+        let instruction = tdi_instruction::put_debug_data_m(register)
+            .ok_or_else(|| DriverError::Invalid("M register index out of range".into()))?;
+        self.with_stopped_tile_context(physical_tile, context, || {
+            self.execute_tile_instruction(physical_tile, context, instruction)?;
+            self.read_tile_debug(physical_tile, TDI_DATA)
+        })
+    }
+
+    fn with_stopped_tile_context<T>(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        operation: impl FnOnce() -> Result<T, DriverError>,
+    ) -> Result<T, DriverError> {
         let context_bit = 1 << context;
         let old_run_break = self.read_tile_debug(physical_tile, TDI_RUN_BREAK)?;
         let initial_state = self.tile_context_state(physical_tile, context)?;
         let already_stopped = matches!(initial_state, 2 | 3);
         if !already_stopped {
             self.write_tile_debug(physical_tile, TDI_RUN_BREAK, old_run_break | context_bit)?;
-        }
-        let result = (|| {
-            if !already_stopped {
-                let deadline = Instant::now() + Duration::from_millis(100);
-                while !matches!(self.tile_context_state(physical_tile, context)?, 2 | 3) {
-                    if Instant::now() >= deadline {
-                        return Err(DriverError::Timeout("stopping tile supervisor".into()));
-                    }
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while !matches!(self.tile_context_state(physical_tile, context)?, 2 | 3) {
+                if Instant::now() >= deadline {
+                    return Err(DriverError::Timeout("stopping tile context".into()));
                 }
             }
-            self.write_tile_debug(physical_tile, TDI_DATA, address)?;
-            for instruction in [0x4101_0070, 0x01f0_1000, 0x4300_8070] {
-                self.execute_tile_instruction(physical_tile, context, instruction)?;
-            }
-            self.read_tile_debug(physical_tile, TDI_DATA)
-        })();
+        }
+        let result = operation();
         if !already_stopped {
             self.write_tile_debug(physical_tile, TDI_RUN_BREAK, old_run_break)?;
             if old_run_break & context_bit == 0 {
@@ -429,7 +503,7 @@ impl Device {
         result
     }
 
-    fn tile_context_state(&self, physical_tile: u16, context: u32) -> Result<u32, DriverError> {
+    pub fn tile_context_state(&self, physical_tile: u16, context: u32) -> Result<u32, DriverError> {
         Ok((self.read_tile_debug(physical_tile, TDI_CONTEXT_STATUS)? >> (context * 2)) & 3)
     }
 

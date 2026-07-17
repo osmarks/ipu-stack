@@ -9,6 +9,15 @@ pub const EXCHANGE_WINDOW_BYTES: u32 = 0x8000;
 pub const HOST_SHORT_MAX_BYTES: u32 = 60;
 pub const HOST_LONG_MAX_BYTES: u32 = 1024;
 
+const OPCODE_MASK: u32 = 0xfc00_0000;
+const LONG_OPCODE_MASK: u32 = 0xf800_0000;
+const DELAY_OPCODE_MASK: u32 = 0xfff8_0000;
+const DELAY_OPCODE: u32 = 0x40a0_0000;
+const DELAY_PIC_OPCODE: u32 = 0x6000_0000;
+const DELAY_XPIC_OPCODE: u32 = 0x6400_0000;
+const SEND_OPCODE: u32 = 0x7800_0000;
+const SEND_OFF_OPCODE: u32 = 0x7000_0000;
+
 // C600 GSP configuration registers. Their payload selects the physical tiles
 // forming the hardware global-sync distribution hierarchy.
 pub const GSP_ROOT_CONFIG: u32 = 0x1b400;
@@ -79,6 +88,37 @@ pub fn c600_global_sync() -> GlobalSyncProgram {
 }
 
 pub type PlanRow = [u32; PLAN_WORDS];
+
+/// Returns the plan event horizon measured from the entry synchronization.
+///
+/// Delay immediates advance to the event `N + 1` cycles later. Send
+/// instructions occupy one event per transferred word.
+pub fn plan_event_cycles(row: &[u32]) -> Result<u32, ExchangeError> {
+    let mut cycles = 0u32;
+    for &instruction in row {
+        let advance = if instruction & DELAY_OPCODE_MASK == DELAY_OPCODE {
+            (instruction & 0x7_ffff) + 1
+        } else {
+            match instruction & OPCODE_MASK {
+                DELAY_PIC_OPCODE => ((instruction >> 19) & 0x7f) + 1,
+                DELAY_XPIC_OPCODE => ((instruction >> 14) & 0xfff) + 1,
+                _ => match instruction & LONG_OPCODE_MASK {
+                    SEND_OPCODE => ((instruction >> 21) & 0x3f) + 1,
+                    SEND_OFF_OPCODE => {
+                        let count_minus_one =
+                            ((instruction >> 21) & 0x3f) | (((instruction >> 14) & 0x3f) << 6);
+                        count_minus_one + 1
+                    }
+                    _ => 0,
+                },
+            }
+        };
+        cycles = cycles
+            .checked_add(advance)
+            .ok_or(ExchangeError::Schedule("plan event horizon overflow"))?;
+    }
+    Ok(cycles)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostPacketHeader {
@@ -860,6 +900,27 @@ mod tests {
         let boundary = topology.multicast(736, &[100, 900], 52, 0).unwrap();
         assert_eq!(boundary.receivers[0][2], 0x61d14000);
         assert_eq!(boundary.receivers[0][3], 0x64000640);
+    }
+
+    #[test]
+    fn event_horizon_tracks_transfer_size_and_route() {
+        let topology = Topology::c600();
+        let short = topology.multicast(0, &[736, 1286], 1, 0).unwrap();
+        let long = topology.multicast(0, &[736, 1286], 1024, 0).unwrap();
+        let horizon = |plan: &MulticastPlan| {
+            std::iter::once(&plan.sender)
+                .chain(plan.receivers.iter())
+                .map(|row| plan_event_cycles(row).unwrap())
+                .max()
+                .unwrap()
+        };
+
+        assert!(horizon(&short) > 0);
+        assert!(horizon(&long) > horizon(&short));
+        assert_ne!(
+            plan_event_cycles(&short.receivers[0]).unwrap(),
+            plan_event_cycles(&short.receivers[1]).unwrap()
+        );
     }
 
     #[test]

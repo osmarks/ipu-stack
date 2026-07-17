@@ -310,6 +310,7 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
     for (name, value) in &options.externals {
         symbols.insert(name.clone(), *value);
     }
+    debug!(?symbols, "resolved linked symbols");
 
     for (object_index, file) in parsed.iter().enumerate() {
         for section in file.sections() {
