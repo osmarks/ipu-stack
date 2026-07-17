@@ -110,7 +110,13 @@ enum Command {
         #[arg(long)]
         second_receiver_base: Option<u16>,
         #[arg(long, value_parser = parse_u32)]
-        global_sync_route: u32,
+        global_sync_descriptor_word2: u32,
+        #[arg(long, value_parser = parse_u32)]
+        global_sync_descriptor_word3: u32,
+        #[arg(long, value_parser = parse_u32)]
+        global_sync_release_word: u32,
+        #[arg(long, default_value_t = 0)]
+        global_sync_packet_origin: u16,
         #[arg(long, value_parser = parse_u32)]
         global_sync_packet_address: u32,
         #[arg(long, value_parser = parse_u32)]
@@ -121,7 +127,13 @@ enum Command {
         #[arg(short, long)]
         output: PathBuf,
         #[arg(long, value_parser = parse_u32)]
-        global_sync_route: u32,
+        global_sync_descriptor_word2: u32,
+        #[arg(long, value_parser = parse_u32)]
+        global_sync_descriptor_word3: u32,
+        #[arg(long, value_parser = parse_u32)]
+        global_sync_release_word: u32,
+        #[arg(long, default_value_t = 0)]
+        global_sync_packet_origin: u16,
         #[arg(long, value_parser = parse_u32)]
         global_sync_packet_address: u32,
         #[arg(long, value_parser = parse_u32)]
@@ -442,15 +454,22 @@ fn main() -> Result<()> {
             sender_base,
             receiver_base,
             second_receiver_base,
-            global_sync_route,
+            global_sync_descriptor_word2,
+            global_sync_descriptor_word3,
+            global_sync_release_word,
+            global_sync_packet_origin,
             global_sync_packet_address,
             global_sync_release_address,
         } => {
             let topology = Topology::c600();
             let global_sync = GlobalSyncAllocation::new(
-                global_sync_route,
+                global_sync_descriptor_word2,
+                global_sync_descriptor_word3,
+                global_sync_release_word,
+                global_sync_packet_origin,
                 global_sync_packet_address,
                 global_sync_release_address,
+                topology.tile_count(),
             )?;
             let endpoint_extent = pairs
                 .checked_mul(2)
@@ -489,13 +508,11 @@ fn main() -> Result<()> {
                 let tensor = TensorId(usize::from(pair));
                 let source = sender_base + pair * 2;
                 let destination = receiver_base + pair * 2;
-                if u32::from(topology.physical(source)?) == GLOBAL_SYNC_MASTER_PHYSICAL_TILE
-                    || u32::from(topology.physical(destination)?)
-                        == GLOBAL_SYNC_MASTER_PHYSICAL_TILE
+                let packet_origin = global_sync.packet_origin_physical_tile;
+                if topology.physical(source)? == packet_origin
+                    || topology.physical(destination)? == packet_origin
                 {
-                    bail!(
-                        "physical tile {GLOBAL_SYNC_MASTER_PHYSICAL_TILE} is reserved for the global sync master"
-                    );
+                    bail!("the one-shot fixture cannot place payload on the sync packet origin");
                 }
                 let mut requested_destinations = vec![destination];
                 sources.insert(source, pair);
@@ -511,11 +528,9 @@ fn main() -> Result<()> {
                 });
                 if let Some(base) = second_receiver_base {
                     let second_destination = base + pair * 2;
-                    if u32::from(topology.physical(second_destination)?)
-                        == GLOBAL_SYNC_MASTER_PHYSICAL_TILE
-                    {
+                    if topology.physical(second_destination)? == packet_origin {
                         bail!(
-                            "physical tile {GLOBAL_SYNC_MASTER_PHYSICAL_TILE} is reserved for the global sync master"
+                            "the one-shot fixture cannot place payload on the sync packet origin"
                         );
                     }
                     requested_destinations.push(second_destination);
@@ -607,11 +622,12 @@ fn main() -> Result<()> {
                     patch_setzi_immediate(&mut code, active_base_offset, address)?;
                 }
                 if !participant {
-                    let redirect_offset = if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
-                        coordinator_nonparticipant_redirect_offset
-                    } else {
-                        nonparticipant_redirect_offset
-                    };
+                    let redirect_offset =
+                        if physical == u32::from(global_sync.packet_origin_physical_tile) {
+                            coordinator_nonparticipant_redirect_offset
+                        } else {
+                            nonparticipant_redirect_offset
+                        };
                     let redirect = u32::from_le_bytes(
                         code[redirect_offset..redirect_offset + 4]
                             .try_into()
@@ -620,7 +636,7 @@ fn main() -> Result<()> {
                     code[execute_offset..execute_offset + 4]
                         .copy_from_slice(&redirect.to_le_bytes());
                 }
-                if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
+                if physical == u32::from(global_sync.packet_origin_physical_tile) {
                     for (offset, address) in [
                         (global_sync_send0_offset, global_sync.packet_address),
                         (global_sync_send1_offset, global_sync.packet_address + 8),
@@ -677,15 +693,8 @@ fn main() -> Result<()> {
                         flags: SEGMENT_READ | SEGMENT_WRITE | SEGMENT_EXECUTE,
                     });
                 }
-                if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
-                    let packet_blob = app.add_blob(words_to_bytes(&[
-                        1,
-                        0,
-                        // The low route identifier belongs to the exchange
-                        // allocation represented by the device configuration.
-                        0xcc00_0000 | global_sync_route,
-                        0x0000_4001,
-                    ]));
+                if physical == u32::from(global_sync.packet_origin_physical_tile) {
+                    let packet_blob = app.add_blob(words_to_bytes(&global_sync.packet_words()));
                     segments.push(Segment {
                         address: global_sync_packet_address,
                         memory_size: 16,
@@ -694,7 +703,7 @@ fn main() -> Result<()> {
                         file_size: 16,
                         flags: SEGMENT_READ,
                     });
-                    let release_blob = app.add_blob(words_to_bytes(&[0]));
+                    let release_blob = app.add_blob(words_to_bytes(&[global_sync.release_word]));
                     segments.push(Segment {
                         address: global_sync_release_address,
                         memory_size: 4,
@@ -763,7 +772,10 @@ fn main() -> Result<()> {
         Command::PackageParallelSumFixture {
             object,
             output,
-            global_sync_route,
+            global_sync_descriptor_word2,
+            global_sync_descriptor_word3,
+            global_sync_release_word,
+            global_sync_packet_origin,
             global_sync_packet_address,
             global_sync_release_address,
             host_packet_address,
@@ -773,14 +785,18 @@ fn main() -> Result<()> {
         } => {
             let topology = Topology::c600();
             let global_sync = GlobalSyncAllocation::new(
-                global_sync_route,
+                global_sync_descriptor_word2,
+                global_sync_descriptor_word3,
+                global_sync_release_word,
+                global_sync_packet_origin,
                 global_sync_packet_address,
                 global_sync_release_address,
+                topology.tile_count(),
             )?;
             let layout = ReductionLayout::new();
 
             let mut allocations = Vec::new();
-            for tile in 1..topology.tile_count() as u16 {
+            for tile in 0..topology.tile_count() as u16 {
                 allocations.push(Allocation {
                     tensor: TensorId(usize::from(tile)),
                     tile,
@@ -792,7 +808,7 @@ fn main() -> Result<()> {
                 });
             }
             let mut phases = Vec::new();
-            let mut active: Vec<u16> = (1..topology.tile_count() as u16).collect();
+            let mut active: Vec<u16> = (0..topology.tile_count() as u16).collect();
             while active.len() > 1 {
                 let phase_index = phases.len();
                 let mut transfers = Vec::new();
@@ -884,7 +900,7 @@ fn main() -> Result<()> {
                 let mut code = image.bytes.clone();
                 patch_setzi_immediate(&mut code, worker_sync_offset, u32::from(logical) * 8)?;
                 patch_setzi_immediate(&mut code, command_offset, layout.command_address)?;
-                if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
+                if physical == u32::from(global_sync.packet_origin_physical_tile) {
                     for (offset, address) in [
                         (send0_offset, global_sync.packet_address),
                         (send1_offset, global_sync.packet_address + 8),
@@ -934,11 +950,7 @@ fn main() -> Result<()> {
                 );
                 for (launch_index, epoch) in launches.iter().enumerate() {
                     let plan_address = layout.plan_address(launch_index)?;
-                    let mut role = if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
-                        RuntimeRole::GlobalSyncMaster
-                    } else {
-                        RuntimeRole::Inactive
-                    };
+                    let mut role = RuntimeRole::Inactive;
                     let mut accumulator = 0;
                     let mut staging = 0;
                     if let Some(row) = epoch.tile_rows.get(&logical) {
@@ -972,7 +984,7 @@ fn main() -> Result<()> {
                 }
                 if let Some(host) = &host_output {
                     commands.extend_from_slice(&words_to_bytes(&[
-                        if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
+                        if physical == u32::from(global_sync.packet_origin_physical_tile) {
                             RuntimeRole::HostCommandRead
                         } else {
                             RuntimeRole::Inactive
@@ -982,16 +994,17 @@ fn main() -> Result<()> {
                         0,
                         0,
                     ]));
-                    let host_role = if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
-                        RuntimeRole::HostXreq
-                    } else if logical == root {
-                        RuntimeRole::SendAbsolute
-                    } else {
-                        RuntimeRole::Inactive
-                    };
+                    let host_role =
+                        if physical == u32::from(global_sync.packet_origin_physical_tile) {
+                            RuntimeRole::HostXreq
+                        } else if logical == root {
+                            RuntimeRole::SendAbsolute
+                        } else {
+                            RuntimeRole::Inactive
+                        };
                     commands.extend_from_slice(&words_to_bytes(&[
                         host_role.word(),
-                        if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
+                        if physical == u32::from(global_sync.packet_origin_physical_tile) {
                             host.xreq_plan_address
                         } else {
                             host.output_plan_address
@@ -1000,7 +1013,7 @@ fn main() -> Result<()> {
                         0,
                     ]));
                     commands.extend_from_slice(&words_to_bytes(&[
-                        RuntimeRole::GlobalSyncMaster.word(),
+                        RuntimeRole::Inactive.word(),
                         0,
                         0,
                         0,
@@ -1016,22 +1029,16 @@ fn main() -> Result<()> {
                     file_size: commands.len() as u32,
                     flags: SEGMENT_READ,
                 });
-                if logical != 0 {
-                    let initial = if logical == root {
-                        u32::from(logical) + 2
-                    } else {
-                        u32::from(logical) + 1
-                    };
-                    let blob = app.add_blob(words_to_bytes(&[initial]));
-                    segments.push(Segment {
-                        address: layout.accumulator_address,
-                        memory_size: 64,
-                        blob,
-                        blob_offset: 0,
-                        file_size: 4,
-                        flags: SEGMENT_READ | SEGMENT_WRITE,
-                    });
-                }
+                let initial = u32::from(logical) + 1;
+                let blob = app.add_blob(words_to_bytes(&[initial]));
+                segments.push(Segment {
+                    address: layout.accumulator_address,
+                    memory_size: 64,
+                    blob,
+                    blob_offset: 0,
+                    file_size: 4,
+                    flags: SEGMENT_READ | SEGMENT_WRITE,
+                });
                 if let Some(host) = &host_output
                     && logical == root
                 {
@@ -1055,7 +1062,7 @@ fn main() -> Result<()> {
                     });
                 }
                 if let Some(host) = &host_output
-                    && physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE
+                    && physical == u32::from(global_sync.packet_origin_physical_tile)
                 {
                     let command_plan = app.add_blob(words_to_bytes(&host.command.instructions));
                     segments.push(Segment {
@@ -1105,7 +1112,7 @@ fn main() -> Result<()> {
                         flags: SEGMENT_READ | SEGMENT_WRITE,
                     });
                 }
-                if physical == GLOBAL_SYNC_MASTER_PHYSICAL_TILE {
+                if physical == u32::from(global_sync.packet_origin_physical_tile) {
                     let packet_blob = app.add_blob(words_to_bytes(&global_sync.packet_words()));
                     segments.push(Segment {
                         address: global_sync.packet_address,
@@ -1115,7 +1122,7 @@ fn main() -> Result<()> {
                         file_size: 16,
                         flags: SEGMENT_READ,
                     });
-                    let release_blob = app.add_blob(words_to_bytes(&[0]));
+                    let release_blob = app.add_blob(words_to_bytes(&[global_sync.release_word]));
                     segments.push(Segment {
                         address: global_sync.release_address,
                         memory_size: 4,
@@ -1468,7 +1475,6 @@ fn words_to_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
-const GLOBAL_SYNC_MASTER_PHYSICAL_TILE: u32 = 0;
 const TILE_MUX_HOST_BASE: u32 = 0x600;
 const SETZI_IMMEDIATE_MASK: u32 = 0x001f_ffff;
 const RUNTIME_COMMAND_BYTES: usize = 16;
@@ -1488,7 +1494,6 @@ fn patch_setzi_immediate(code: &mut [u8], offset: usize, immediate: u32) -> Resu
 #[repr(u32)]
 #[derive(Clone, Copy)]
 enum RuntimeRole {
-    GlobalSyncMaster = 1,
     Inactive = 2,
     SendRelative = 3,
     ReceiveAdd = 4,
@@ -1505,14 +1510,24 @@ impl RuntimeRole {
 
 #[derive(Clone, Copy)]
 struct GlobalSyncAllocation {
-    route: u32,
+    descriptor_word2: u32,
+    descriptor_word3: u32,
+    release_word: u32,
+    packet_origin_physical_tile: u16,
     packet_address: u32,
     release_address: u32,
 }
 
 impl GlobalSyncAllocation {
-    fn new(route: u32, packet_address: u32, release_address: u32) -> Result<Self> {
-        const ROUTE_MASK: u32 = 0x00ff_ffff;
+    fn new(
+        descriptor_word2: u32,
+        descriptor_word3: u32,
+        release_word: u32,
+        packet_origin_physical_tile: u16,
+        packet_address: u32,
+        release_address: u32,
+        physical_tile_count: usize,
+    ) -> Result<Self> {
         const PACKET_BYTES: u32 = 16;
         const RELEASE_BYTES: u32 = 4;
         let memory_start = ipu_package::TILE_MEMORY_BASE;
@@ -1523,8 +1538,8 @@ impl GlobalSyncAllocation {
         let release_end = release_address
             .checked_add(RELEASE_BYTES)
             .ok_or_else(|| anyhow::anyhow!("global sync release address overflow"))?;
-        if route > ROUTE_MASK
-            || packet_address & 7 != 4
+        if usize::from(packet_origin_physical_tile) >= physical_tile_count
+            || packet_address & 3 != 0
             || release_address & 3 != 0
             || packet_address < memory_start
             || packet_end > memory_end
@@ -1535,14 +1550,17 @@ impl GlobalSyncAllocation {
             bail!("global sync allocation is invalid");
         }
         Ok(Self {
-            route,
+            descriptor_word2,
+            descriptor_word3,
+            release_word,
+            packet_origin_physical_tile,
             packet_address,
             release_address,
         })
     }
 
     fn packet_words(self) -> [u32; 4] {
-        [1, 0, 0xcc00_0000 | self.route, 0x0000_4001]
+        [1, 0, self.descriptor_word2, self.descriptor_word3]
     }
 }
 
@@ -1789,10 +1807,14 @@ mod tests {
     fn global_sync_allocation_checks_alignment_range_and_overlap() {
         let packet = ipu_package::TILE_MEMORY_BASE + 4;
         let release = packet + 32;
-        assert!(GlobalSyncAllocation::new(1, packet, release).is_ok());
-        assert!(GlobalSyncAllocation::new(1, packet + 4, release).is_err());
-        assert!(GlobalSyncAllocation::new(1, packet, packet + 4).is_err());
-        assert!(GlobalSyncAllocation::new(0x0100_0000, packet, release).is_err());
+        assert!(GlobalSyncAllocation::new(2, 3, 4, 0, packet, release, 10).is_ok());
+        assert!(GlobalSyncAllocation::new(2, 3, 4, 10, packet, release, 10).is_err());
+        assert!(GlobalSyncAllocation::new(2, 3, 4, 0, packet + 2, release, 10).is_err());
+        assert!(GlobalSyncAllocation::new(2, 3, 4, 0, packet, packet + 4, 10).is_err());
+        assert!(
+            GlobalSyncAllocation::new(2, 3, 4, 0, ipu_package::TILE_MEMORY_BASE - 4, release, 10)
+                .is_err()
+        );
     }
 
     #[test]

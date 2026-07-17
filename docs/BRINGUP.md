@@ -39,24 +39,22 @@ inside Poplar's runtime. The direct runtime now reaches the same plan with:
 - `sans 0; sync 1` on every tile without a plan in an exchange launch;
 - plan code in a separately allocated executable SRAM region.
 
-The launch roles must not be conflated. Before a launch, non-master tiles
-execute `sans 1; sync 1` as part of the device-wide synchronization. Physical
-tile 0 is the protocol master that emits the global packets and release; every
-tile still participates in the barrier. During the launch, ordinary inactive
-tiles execute `sans 0; sync 1`. Omitting the latter deadlocks both active
-endpoints. Physical tile 0 has already participated as the global-sync master
-and returns directly instead. Applying that distinction
-lets every tile retire and transfers the expected nonuniform payload from
-logical tile 274 (physical 9) to logical tile 1286 (physical 53). The current
-runtime reserves physical tile 0 from payload placement until its combined
-master/sender role is implemented.
+The launch roles must not be conflated. Before the command loop, non-origin
+tiles execute `sans 1; sync 1` as part of the device-wide synchronization. One
+configurable physical tile emits the global packets and release, while every
+tile participates in the barrier. The packet origin is not reserved afterward:
+it executes the same sender, receiver, or `sans 0; sync 1` role as any other
+tile in every payload epoch. Omitting the inactive payload role lets the packet
+origin run ahead and deadlocks active endpoints. The older one-shot diagnostic
+runtime still excludes its packet origin; the command-loop runtime does not.
 
 Exchange configuration is executable-specific. A fresh SDK capture for logical
 tile `0 -> 274` differs from the checked-in capture in four MMIO records, and
 its global-sync descriptor route is `0x21a` rather than `0x211`. The fixture
-therefore accepts the descriptor route explicitly instead of embedding one
-capture's value. Generating those four allocation records and the corresponding
-route identifier is still required for a topology-independent runtime.
+therefore accepts the complete descriptor words, release word, packet origin,
+and SRAM addresses instead of embedding one capture's values. Generating those
+four allocation records and the corresponding descriptor is still required for
+a topology-independent runtime.
 
 Hardware acceptance with the checked-in configuration and master route
 now covers:
@@ -74,13 +72,15 @@ SRAM element was reproduced as `TEXCPT_CONFLICT` at the sender's `send`
 instruction.
 
 The multi-pass command-table runtime also completes an all-device reduction.
-Physical tile 0 is the global-sync master; its scalar is folded into logical
-tile 1, and the other 1,471 tiles exchange and add through 11 binary-tree
-rounds. The
+All 1,472 tile scalars, including physical tile 0's scalar, exchange and add
+through 11 binary-tree rounds. The
 compiler emits direction-specific point-to-point rows for one-to-one edges,
 single-send multicast for fanout, and a conservative maximum of 16 groups per
-epoch. The resulting 97 launches produce `1084128` on physical tile 2, and all
-sampled tiles reach the terminal acceptance trap.
+epoch. The resulting 97 launches produce `1084128` on physical tile 0, and all
+sampled tiles reach the terminal acceptance trap. In the current logical to
+physical mapping the reduction root is physical tile 0, which is also the
+configured packet origin; this is an exercised combined role, not a reserved
+tile.
 
 Native host-output lowering is partially recovered. Rust independently emits
 the short and long host packet headers, arbitrary-range chunk plans, the tile-0

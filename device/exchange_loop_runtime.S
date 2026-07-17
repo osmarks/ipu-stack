@@ -1,7 +1,6 @@
 	.text
 	.allow_optimizations
 
-	.set ROLE_GLOBAL_SYNC_MASTER, 1
 	.set ROLE_INACTIVE, 2
 	.set ROLE_SEND_RELATIVE, 3
 	.set ROLE_RECEIVE_ADD, 4
@@ -14,6 +13,7 @@
 	.set WORKER_BASE_START, 0x50000
 	.set WORKER_BASE_STRIDE, 0x30
 	.set SYNC_ALL, 7
+	.set SYNC_COMPUTE_SET, 2
 	.set SYNC_SUPERVISOR, 3
 	.set SYNC_HOST, 15
 	.set SYNC_EXTERNAL, 1
@@ -62,17 +62,22 @@ ipu_stack_exchange_loop_start:
 	.globl ipu_stack_command_table_address
 ipu_stack_command_table_address:
 	setzi $m6, COMMAND_TABLE_PLACEHOLDER
+	setzi $m14, 1
 
 .Lcommand_loop:
 	ld32 $m5, $m6, $m15, 0
 	brz $m5, .Ldone
+	brz $m14, .Llaunch_workers
 	call $m7, ipu_stack_pre_sync_dispatch
+	zero $m14
+.Llaunch_workers:
+	setzi $m0, ipu_stack_exchange_loop_worker_barrier
+	runall $m0, $m15, 0
+	.long OPCODE_SYNC | SYNC_COMPUTE_SET
 	ld32 $m1, $m6, $m15, 1
 	ld32 $m2, $m6, $m15, 2
 	ld32 $m3, $m6, $m15, 3
 	add $m6, $m6, 16
-	cmpeq $m4, $m5, ROLE_GLOBAL_SYNC_MASTER
-	brnz $m4, .Llaunch_complete
 	cmpeq $m4, $m5, ROLE_INACTIVE
 	brnz $m4, .Linactive_launch
 	cmpeq $m4, $m5, ROLE_EXTERNAL_COMPLETION
@@ -149,6 +154,15 @@ ipu_stack_loop_worker_sync_base:
 	put 0x7, $a0
 	exitnz $m15
 	.size ipu_stack_exchange_loop_worker_init, .-ipu_stack_exchange_loop_worker_init
+
+	.section .text.ipu_stack_exchange_loop_worker_barrier,"ax",@progbits
+	.globl ipu_stack_exchange_loop_worker_barrier
+	.p2align 2
+	.type ipu_stack_exchange_loop_worker_barrier,@function
+ipu_stack_exchange_loop_worker_barrier:
+	.worker
+	exitz $m15
+	.size ipu_stack_exchange_loop_worker_barrier, .-ipu_stack_exchange_loop_worker_barrier
 
 	.section .text.ipu_stack_exchange_loop_sync,"ax",@progbits
 	.p2align 3
