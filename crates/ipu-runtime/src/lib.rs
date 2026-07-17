@@ -616,6 +616,9 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
         let size = binding_size(binding)?;
         let page_base = u64::from(align_up(page_cursor, 64));
         for slice in &binding.slices {
+            if slice.tile != 0 {
+                return Err("direct H2D currently requires physical tile 0; stage remote inputs through a D2D exchange".into());
+            }
             let host_offset = u32::try_from(page_base + slice.file_offset)?;
             append_host_slices(
                 &mut input_slices,
@@ -649,6 +652,14 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
     }
     if !graph.host_outputs.is_empty() {
         outputs.push(command_read_transfer(command_host_offset)?);
+    }
+    let output_slice_count: usize = graph
+        .host_outputs
+        .iter()
+        .map(|binding| binding.slices.len())
+        .sum();
+    if output_slice_count > 1 {
+        return Err("multiple D2H slices in one host call are not yet supported".into());
     }
     page_cursor = DATA_START;
     for binding in &graph.host_outputs {
@@ -1167,6 +1178,71 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_graph() -> ExecutableGraph {
+        ExecutableGraph {
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: Vec::new(),
+                tile_count: 1472,
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        }
+    }
+
+    fn test_binding(name: &str, slices: Vec<RegionSlice>) -> Binding {
+        Binding {
+            name: name.into(),
+            dtype: "u32".into(),
+            shape: vec![slices.iter().map(|slice| slice.size).sum::<u64>() as u32 / 4],
+            slices,
+        }
+    }
+
+    #[test]
+    fn host_layout_rejects_unimplemented_direct_remote_h2d() {
+        let mut graph = empty_graph();
+        graph.host_inputs.push(test_binding(
+            "input",
+            vec![RegionSlice {
+                tile: 63,
+                tile_address: 0x53000,
+                file_offset: 0,
+                size: 64,
+            }],
+        ));
+        let error = build_host_layout(&graph).err().unwrap().to_string();
+        assert!(error.contains("physical tile 0"), "{error}");
+    }
+
+    #[test]
+    fn host_layout_rejects_unimplemented_repeated_d2h() {
+        let mut graph = empty_graph();
+        graph.host_outputs.push(test_binding(
+            "output",
+            vec![
+                RegionSlice {
+                    tile: 2,
+                    tile_address: 0x54000,
+                    file_offset: 0,
+                    size: 64,
+                },
+                RegionSlice {
+                    tile: 63,
+                    tile_address: 0x54000,
+                    file_offset: 64,
+                    size: 64,
+                },
+            ],
+        ));
+        let error = build_host_layout(&graph).err().unwrap().to_string();
+        assert!(error.contains("multiple D2H slices"), "{error}");
+    }
 
     #[test]
     fn host_layout_pages_large_bindings_without_crossing_packets() {

@@ -49,3 +49,22 @@ fn generated_remote_tile_d2h_runs_end_to_end() {
         "C600 remote D2H test runner failed with {status}"
     );
 }
+
+#[test]
+#[ignore = "requires exclusive access to a physical C600"]
+fn randomized_exchange_graphs_run_end_to_end() {
+    for seed in [
+        0x4950_552d_5354_4143u64,
+        0x6a09_e667_f3bc_c909,
+        0xbb67_ae85_84ca_a73b,
+    ] {
+        let status = Command::new(env!("CARGO_BIN_EXE_ipu-randomized-e2e"))
+            .env("IPU_RANDOM_SEED", format!("0x{seed:x}"))
+            .status()
+            .expect("launch randomized C600 exchange test runner");
+        assert!(
+            status.success(),
+            "C600 randomized exchange test failed for seed {seed:#x} with {status}"
+        );
+    }
+}

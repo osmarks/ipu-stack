@@ -47,7 +47,9 @@ cargo run -p ipu-cli -- encoder-plan -o /tmp/encoder.json --tiles 1472
 
 The ignored end-to-end hardware test is `scripts/hardware-e2e.sh`. It requires
 `POPLAR_SDK_ENABLED` and `IPU_CONFIG`, and accepts optional `IPU_BOOTLOADER` and
-`IPU_DEVICE` overrides.
+`IPU_DEVICE` overrides. The suite includes seeded randomized exchange graphs;
+run one reproducible case directly with `IPU_RANDOM_SEED=0x1234 cargo run -p
+ipu-runtime --bin ipu-randomized-e2e`.
 
 Logging uses `tracing`. Set `RUST_LOG`, for example
 `RUST_LOG=ipu_driver=debug,ipu_elf=info`, to expose batch and linker details. Set
@@ -61,9 +63,11 @@ batches, completed startup synchronization, and run a supervisor plus six
 barrel workers without an IPU exception. `HostSession` directly attaches host
 pages and drives HSP handoffs. Rust-generated packet headers, XREQs, command
 reads, H2D plans, and D2H plans have transferred randomized payloads to tile
-SRAM and returned them byte-for-byte without Poplar or TDI readback. Direct
-host-only transfers have been verified repeatedly through 8 KiB, including a
-transfer crossing a 4 KiB attached-page boundary.
+SRAM and returned them byte-for-byte without Poplar or TDI readback. Direct H2D
+currently targets physical tile 0; remote inputs are staged through generated
+D2D epochs. Direct D2H from arbitrary tiles is verified through 8 KiB. Multiple
+D2H slices in one host call are rejected because repeated D2H currently returns
+zeros after the first slice.
 
 Host transfers are split at the recovered short/long packet limits and 4 KiB
 attachment boundaries. The runtime allocates one attached buffer per page,
@@ -81,27 +85,31 @@ available to an application. Ordinary exchange receivers use the full 32 KiB
 exchange window. No concrete staging address is specified by the host exchange
 acceptance graph.
 
-The exchange planner lowers one-to-one and fanout transfers to absolute,
-single-send exchange rows. Direct hardware
-acceptance includes a 1,024-word single-packet broadcast to all 1,471 other
-tiles. The graph runtime executes generated per-tile plan tables and separately
-linked compute kernels. The automated hardware graph checks a 1,472-value
-reduction, an all-tile affine permutation, a 64-word multicast, and a dependent
-64-word relay. It validates every exposed word through diagnostic SRAM reads,
-without Poplar exchange code generation or host-side phase delays.
+The exchange planner lowers one-to-one transfers to absolute exchange rows.
+Arbitrary fanout is currently lowered to statically scheduled per-destination
+sends in one launch: randomized hardware testing found that one mode-3 packet
+does not reach every receiver set. The graph runtime executes generated per-tile
+plan tables and separately linked compute kernels. The older diagnostic graph
+contains a 1,472-value reduction, an all-tile affine permutation, and a relay,
+but its launcher still needs conversion to the per-epoch HSP protocol.
 
 The scheduler treats the on-chip fabric as non-blocking. Tile-disjoint groups
 run concurrently; role conflicts become statically timed slots in the same
-launch, with one synchronization and a shared event horizon. Hardware testing
-includes a multicast whose relay receiver sends the payload onward in a later
-slot without an intermediate BSP barrier. Compute is a following graph phase:
-the dispatcher branches to a separately compiled kernel symbol and exchange
-commands perform no arithmetic. A randomized hardware acceptance path performs
-H2D to the controller tile, two generated tile-exchange epochs via a relay tile,
-and D2H from the automatically allocated return range. Every exchange epoch
+launch, with one synchronization and a shared event horizon. Compute is a
+following graph phase: the dispatcher branches to a separately compiled kernel
+symbol and exchange commands perform no arithmetic. A randomized hardware
+acceptance path performs H2D to the controller tile, two generated tile-exchange
+epochs via a relay tile, and D2H from the automatically allocated return range.
+Every exchange epoch
 starts with a device-wide barrier, resetting the exchange synchronization state
 before any tile enters its plan. D2H lowering emits separate tile-0 coordinator
 and source-tile endpoint programs in one host phase. Randomized H2D to tile 0,
 one 8 KiB D2D transfer, and direct D2H from the last logical tile pass
 byte-for-byte. Multi-packet D2H uses one XREQ and close around 256-byte
 packet/payload pairs, matching the SDK schedule.
+
+The seeded randomized hardware runner uses allocated addresses and generated
+payloads. Each case performs H2D to tile 0, D2D to a random relay, serialized
+fanout from that arbitrary sender to one through four random destinations, and
+direct D2H verification from every destination. Default cases cover 1, 2, 15,
+16, 17, 31, 63, and 64 words; `IPU_RANDOM_CASES` extends into larger boundaries.

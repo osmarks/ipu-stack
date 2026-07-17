@@ -229,19 +229,8 @@ fn binding(name: &str, physical_tile: u16, address: u32, transfer_bytes: u32) ->
 }
 
 fn test_payload(transfer_bytes: u32) -> Vec<u8> {
-    let mut state = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
-        ^ u64::from(std::process::id());
-    (0..transfer_bytes)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state as u8
-        })
-        .collect()
+    let mut rng = fastrand::Rng::new();
+    (0..transfer_bytes).map(|_| rng.u8(..)).collect()
 }
 
 fn required_env(name: &str) -> String {

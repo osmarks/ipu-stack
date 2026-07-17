@@ -637,27 +637,18 @@ impl Schedule {
                 continue;
             };
             validate_transfers(transfers)?;
-            let mut groups: Vec<PendingGroup> = Vec::new();
-            for transfer in transfers {
-                if let Some(group) = groups.iter_mut().find(|group| {
-                    group.source == transfer.source_tile
-                        && group.tensor == transfer.tensor
-                        && group.bytes == transfer.bytes
-                }) {
-                    group.destinations.push(transfer.destination_tile);
-                } else {
-                    groups.push(PendingGroup {
-                        source: transfer.source_tile,
-                        tensor: transfer.tensor,
-                        bytes: transfer.bytes,
-                        destinations: vec![transfer.destination_tile],
-                    });
-                }
-            }
-            for group in &mut groups {
-                group.destinations.sort_unstable();
-                group.destinations.dedup();
-            }
+            // A single mode-3 send does not reach every arbitrary receiver set.
+            // Until branch compatibility is modeled, retain fanout semantics by
+            // scheduling one send per destination in the same exchange launch.
+            let groups: Vec<PendingGroup> = transfers
+                .iter()
+                .map(|transfer| PendingGroup {
+                    source: transfer.source_tile,
+                    tensor: transfer.tensor,
+                    bytes: transfer.bytes,
+                    destinations: vec![transfer.destination_tile],
+                })
+                .collect();
 
             // A tile can execute one exchange role at a time. Color the
             // multicast-hyperedge conflict graph into timed slots with deterministic DSATUR.
@@ -1663,7 +1654,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_coalesces_fanout_and_packs_disjoint_groups() {
+    fn scheduler_serializes_fanout_and_packs_disjoint_groups() {
         let schedule = exchange_schedule(vec![
             Transfer {
                 source_tile: 0,
@@ -1687,12 +1678,16 @@ mod tests {
         let lowered = schedule.lower_exchanges(&Topology::c600()).unwrap();
         assert_eq!(lowered.len(), 1);
         assert_eq!(lowered[0].epochs.len(), 1);
-        assert_eq!(lowered[0].epochs[0].groups.len(), 2);
-        assert!(lowered[0].epochs[0].groups.iter().any(|group| {
-            group.destination_tiles.len() == 2 && group.addressing == ExchangeAddressing::Absolute
-        }));
+        assert_eq!(lowered[0].epochs[0].groups.len(), 3);
+        assert!(
+            lowered[0].epochs[0]
+                .groups
+                .iter()
+                .all(|group| group.destination_tiles.len() == 1
+                    && group.addressing == ExchangeAddressing::Absolute)
+        );
         assert_eq!(lowered[0].cost.launches, 1);
-        assert_eq!(lowered[0].cost.payload_words, 16 + 32);
+        assert_eq!(lowered[0].cost.payload_words, 16 + 16 + 32);
         assert_eq!(lowered[0].epochs[0].tile_rows.len(), 5);
         let inactive = lowered[0].epochs[0].row_for(15);
         assert_eq!(inactive[0], SANS_INACTIVE_INSTRUCTION);
@@ -1925,15 +1920,13 @@ mod tests {
 
     #[test]
     fn scheduler_is_deterministic_for_varied_transfer_graphs() {
-        let mut state = 0x1234_5678u32;
+        let mut rng = fastrand::Rng::with_seed(0x1234_5678);
         for _ in 0..64 {
             let mut transfers = Vec::new();
             let mut destinations = HashSet::new();
             for tensor in 0..12 {
-                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                let source = (state % 16) as u16;
-                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                let mut destination = (state % 16) as u16;
+                let source = rng.u16(0..16);
+                let mut destination = rng.u16(0..16);
                 if destination == source {
                     destination = (destination + 1) % 16;
                 }
@@ -1944,7 +1937,7 @@ mod tests {
                     source_tile: source,
                     destination_tile: destination,
                     tensor: TensorId(tensor),
-                    bytes: 4 * (1 + (state % 64)),
+                    bytes: 4 * rng.u32(1..=64),
                 });
             }
             let schedule = exchange_schedule(transfers.clone());
@@ -1958,6 +1951,72 @@ mod tests {
                 .map(|group| group.destination_tiles.len())
                 .sum();
             assert_eq!(represented, transfers.len());
+        }
+    }
+
+    #[test]
+    fn randomized_exchange_rows_preserve_schedule_invariants() {
+        const WORD_COUNTS: [u32; 10] = [1, 2, 15, 16, 17, 63, 64, 65, 127, 256];
+        let topology = Topology::c600();
+        let mut rng = fastrand::Rng::with_seed(0xd1b5_4a32_d192_ed03);
+        for case in 0..64 {
+            let mut transfers = Vec::new();
+            for tensor in 0..24 {
+                let source = rng.u16(0..96);
+                let words = WORD_COUNTS[rng.usize(0..WORD_COUNTS.len())];
+                let fanout = rng.usize(1..=4);
+                let mut destinations = Vec::new();
+                while destinations.len() < fanout {
+                    let destination = rng.u16(0..96);
+                    if destination != source && !destinations.contains(&destination) {
+                        destinations.push(destination);
+                    }
+                }
+                transfers.extend(destinations.into_iter().map(|destination| Transfer {
+                    source_tile: source,
+                    destination_tile: destination,
+                    tensor: TensorId(tensor),
+                    bytes: words * 4,
+                }));
+            }
+            let schedule = exchange_schedule(transfers.clone());
+            let first = schedule.lower_exchanges(&topology).unwrap();
+            let second = schedule.lower_exchanges(&topology).unwrap();
+            assert_eq!(first, second, "case={case}");
+
+            let epoch = &first[0].epochs[0];
+            assert_eq!(first[0].epochs.len(), 1, "case={case}");
+            assert_eq!(first[0].cost.launches, 1, "case={case}");
+            assert_eq!(
+                epoch
+                    .groups
+                    .iter()
+                    .map(|group| group.destination_tiles.len())
+                    .sum::<usize>(),
+                transfers.len(),
+                "case={case}"
+            );
+            for (tile, row) in &epoch.tile_rows {
+                assert_eq!(
+                    row.iter()
+                        .filter(|word| { **word == ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION })
+                        .count(),
+                    1,
+                    "case={case} tile={tile}"
+                );
+                assert_eq!(
+                    row.iter()
+                        .filter(|word| **word == RETURN_M10_INSTRUCTION)
+                        .count(),
+                    1,
+                    "case={case} tile={tile}"
+                );
+                assert_eq!(
+                    u64::from(ipu_exchange::plan_event_cycles(row).unwrap()),
+                    first[0].cost.estimated_cycles,
+                    "case={case} tile={tile}"
+                );
+            }
         }
     }
 
@@ -2012,7 +2071,7 @@ mod tests {
             .unwrap();
         assert_eq!(lowered[0].epochs.len(), 1);
         assert_eq!(lowered[0].cost.launches, 1);
-        assert_eq!(lowered[0].cost.payload_words, 8);
+        assert_eq!(lowered[0].cost.payload_words, 56);
     }
 
     #[test]
