@@ -40,15 +40,10 @@ fn main() {
         let case_seed = rng.u64(..);
         let words = WORD_COUNTS[case % WORD_COUNTS.len()];
         let fanout = 1 + case % 4;
-        for output in 0..fanout {
-            let (graph, input, expected) = randomized_case(case_seed, words, fanout, output);
-            let app = package_graph(&graph, std::slice::from_ref(&runtime_object)).unwrap();
-            let result = run_host(&app, &bootloader, &configuration, &device, &input).unwrap();
-            assert_eq!(
-                result, expected,
-                "seed={seed:#x} case={case} output={output}"
-            );
-        }
+        let (graph, input, expected) = randomized_case(case_seed, words, fanout);
+        let app = package_graph(&graph, std::slice::from_ref(&runtime_object)).unwrap();
+        let result = run_host(&app, &bootloader, &configuration, &device, &input).unwrap();
+        assert_eq!(result, expected, "seed={seed:#x} case={case}");
         tracing::info!(
             seed,
             case,
@@ -64,18 +59,13 @@ fn main() {
     let _ = fs::remove_dir_all(output);
 }
 
-fn randomized_case(
-    seed: u64,
-    words: u32,
-    fanout: usize,
-    output: usize,
-) -> (ExecutableGraph, Vec<u8>, Vec<u8>) {
+fn randomized_case(seed: u64, words: u32, fanout: usize) -> (ExecutableGraph, Vec<u8>, Vec<u8>) {
     let topology = ipu_exchange::Topology::c600();
     let mut rng = fastrand::Rng::with_seed(seed);
-    let relay = random_tile_except(&mut rng, &[0]);
+    let source_tile = random_tile_except(&mut rng, &[0]);
     let mut destinations = Vec::with_capacity(fanout);
     while destinations.len() < fanout {
-        let destination = random_tile_except(&mut rng, &[0, relay]);
+        let destination = random_tile_except(&mut rng, &[source_tile]);
         if !destinations.contains(&destination) {
             destinations.push(destination);
         }
@@ -86,7 +76,7 @@ fn randomized_case(
         .map(|word| payload_word(seed, word))
         .collect::<Vec<_>>();
     let input = words_to_bytes(&payload);
-    let expected = input.clone();
+    let expected = input.repeat(fanout);
 
     let host_constraint = MemoryConstraint {
         base: ipu_exchange::EXCHANGE_WINDOW_BASE,
@@ -100,32 +90,16 @@ fn randomized_case(
         alignment: 32,
         placement: MemoryPlacement::High,
     };
-    let source_address = find_free_region(&[], 0, bytes, 0, usize::MAX, host_constraint).unwrap();
+    let source_address =
+        find_free_region(&[], source_tile, bytes, 0, usize::MAX, host_constraint).unwrap();
     let mut allocations = vec![allocation(
         tensor,
-        0,
+        source_tile,
         source_address,
         bytes,
         AllocationKind::Home,
         0,
     )];
-    let relay_address = find_free_region(
-        &allocations,
-        relay,
-        bytes,
-        0,
-        usize::MAX,
-        exchange_constraint,
-    )
-    .unwrap();
-    allocations.push(allocation(
-        tensor,
-        relay,
-        relay_address,
-        bytes,
-        AllocationKind::ExchangeStaging { phase: 0 },
-        0,
-    ));
     let destination_addresses = destinations
         .iter()
         .copied()
@@ -134,7 +108,7 @@ fn randomized_case(
                 &allocations,
                 destination,
                 bytes,
-                1,
+                0,
                 usize::MAX,
                 exchange_constraint,
             )
@@ -144,47 +118,41 @@ fn randomized_case(
                 destination,
                 address,
                 bytes,
-                AllocationKind::ExchangeStaging { phase: 1 },
-                1,
+                AllocationKind::ExchangeStaging { phase: 0 },
+                0,
             ));
             address
         })
         .collect::<Vec<_>>();
-    let phases = vec![
-        Phase::Exchange {
-            transfers: vec![Transfer {
-                source_tile: 0,
-                destination_tile: relay,
+    let phases = vec![Phase::Exchange {
+        transfers: destinations
+            .iter()
+            .copied()
+            .map(|destination| Transfer {
+                source_tile,
+                destination_tile: destination,
                 tensor,
                 bytes,
-            }],
-        },
-        Phase::Exchange {
-            transfers: destinations
-                .iter()
-                .copied()
-                .map(|destination| Transfer {
-                    source_tile: relay,
-                    destination_tile: destination,
-                    tensor,
-                    bytes,
-                })
-                .collect(),
-        },
-    ];
+            })
+            .collect(),
+    }];
     let host_inputs = vec![binding(
         "input",
-        vec![(topology.physical(0).unwrap(), source_address, bytes)],
+        vec![(
+            topology.physical(source_tile).unwrap(),
+            source_address,
+            bytes,
+        )],
         words,
     )];
     let host_outputs = vec![binding(
         "output",
-        vec![(
-            topology.physical(destinations[output]).unwrap(),
-            destination_addresses[output],
-            bytes,
-        )],
-        words,
+        destinations
+            .iter()
+            .zip(destination_addresses.iter())
+            .map(|(tile, address)| (topology.physical(*tile).unwrap(), *address, bytes))
+            .collect(),
+        words * u32::try_from(fanout).unwrap(),
     )];
     (
         ExecutableGraph {

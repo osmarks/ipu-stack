@@ -616,9 +616,6 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
         let size = binding_size(binding)?;
         let page_base = u64::from(align_up(page_cursor, 64));
         for slice in &binding.slices {
-            if slice.tile != 0 {
-                return Err("direct H2D currently requires physical tile 0; stage remote inputs through a D2D exchange".into());
-            }
             let host_offset = u32::try_from(page_base + slice.file_offset)?;
             append_host_slices(
                 &mut input_slices,
@@ -652,14 +649,6 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
     }
     if !graph.host_outputs.is_empty() {
         outputs.push(command_read_transfer(command_host_offset)?);
-    }
-    let output_slice_count: usize = graph
-        .host_outputs
-        .iter()
-        .map(|binding| binding.slices.len())
-        .sum();
-    if output_slice_count > 1 {
-        return Err("multiple D2H slices in one host call are not yet supported".into());
     }
     page_cursor = DATA_START;
     for binding in &graph.host_outputs {
@@ -1205,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn host_layout_rejects_unimplemented_direct_remote_h2d() {
+    fn host_layout_accepts_remote_h2d_and_multiple_d2h_slices() {
         let mut graph = empty_graph();
         graph.host_inputs.push(test_binding(
             "input",
@@ -1216,13 +1205,6 @@ mod tests {
                 size: 64,
             }],
         ));
-        let error = build_host_layout(&graph).err().unwrap().to_string();
-        assert!(error.contains("physical tile 0"), "{error}");
-    }
-
-    #[test]
-    fn host_layout_rejects_unimplemented_repeated_d2h() {
-        let mut graph = empty_graph();
         graph.host_outputs.push(test_binding(
             "output",
             vec![
@@ -1240,8 +1222,18 @@ mod tests {
                 },
             ],
         ));
-        let error = build_host_layout(&graph).err().unwrap().to_string();
-        assert!(error.contains("multiple D2H slices"), "{error}");
+        let layout = build_host_layout(&graph).unwrap();
+        assert!(layout.inputs.iter().any(|transfer| {
+            matches!(transfer.direction, HostDirection::ToTile) && transfer.physical_tile == 63
+        }));
+        assert_eq!(
+            layout
+                .outputs
+                .iter()
+                .filter(|transfer| matches!(transfer.direction, HostDirection::ToHost))
+                .count(),
+            2
+        );
     }
 
     #[test]

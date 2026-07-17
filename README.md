@@ -85,11 +85,12 @@ available to an application. Ordinary exchange receivers use the full 32 KiB
 exchange window. No concrete staging address is specified by the host exchange
 acceptance graph.
 
-The exchange planner lowers one-to-one transfers to absolute exchange rows.
-Arbitrary fanout is currently lowered to statically scheduled per-destination
-sends in one launch: randomized hardware testing found that one mode-3 packet
-does not reach every receiver set. The graph runtime executes generated per-tile
-plan tables and separately linked compute kernels. The older diagnostic graph
+The exchange planner lowers one-to-one transfers to absolute exchange rows and
+coalesces transfers sharing a source tensor into multicast groups. A randomized
+hardware test currently exposes a receiver-set bug in the generated multicast
+rows; it is retained as a protocol regression rather than replaced by serialized
+unicast. The graph runtime executes generated per-tile plan tables and separately
+linked compute kernels. The older diagnostic graph
 contains a 1,472-value reduction, an all-tile affine permutation, and a relay,
 but its launcher still needs conversion to the per-epoch HSP protocol.
 
@@ -109,7 +110,6 @@ byte-for-byte. Multi-packet D2H uses one XREQ and close around 256-byte
 packet/payload pairs, matching the SDK schedule.
 
 The seeded randomized hardware runner uses allocated addresses and generated
-payloads. Each case performs H2D to tile 0, D2D to a random relay, serialized
-fanout from that arbitrary sender to one through four random destinations, and
-direct D2H verification from every destination. Default cases cover 1, 2, 15,
+payloads. Each case performs H2D, generated D2D fanout to one through four
+random destinations, and direct D2H verification. Default cases cover 1, 2, 15,
 16, 17, 31, 63, and 64 words; `IPU_RANDOM_CASES` extends into larger boundaries.
