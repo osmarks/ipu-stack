@@ -1,6 +1,26 @@
 	.text
 	.allow_optimizations
 
+	.set ROLE_COORDINATOR, 1
+	.set ROLE_INACTIVE, 2
+	.set ROLE_SEND_RELATIVE, 3
+	.set ROLE_RECEIVE_ADD, 4
+	.set ROLE_SEND_ABSOLUTE, 5
+	.set ROLE_EXTERNAL_COMPLETION, 6
+	.set ROLE_HOST_XREQ, 7
+	.set ROLE_HOST_COMMAND_READ, 8
+	.set TILE_MUX_HOST, 0x600
+	.set TILE_MUX_EXCHANGE, 0x640
+	.set WORKER_BASE_START, 0x50000
+	.set WORKER_BASE_STRIDE, 0x30
+	.set SYNC_ALL, 7
+	.set SYNC_EXTERNAL, 1
+	.set SYNC_RECEIVE, 0
+	.set SANS_INACTIVE, 0
+	.set SANS_EXTERNAL, 1
+	.set OPCODE_SYNC, 0x41800000
+	.set OPCODE_SANS, 0x40c00000
+
 	.section .text.ipu_stack_exchange_loop_start,"ax",@progbits
 	.globl ipu_stack_exchange_loop_start
 	.p2align 2
@@ -9,28 +29,28 @@
 ipu_stack_exchange_loop_start:
 	.supervisor
 	.long 0x41800003
-	setzi $m0, 0x640
+	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
 	put 0xa7, $m15
-	setzi $m11, 0x50000
+	setzi $m11, WORKER_BASE_START
 	put 0x21, $m11
-	setzi $m11, 0x50030
+	setzi $m11, WORKER_BASE_START + WORKER_BASE_STRIDE
 	put 0x22, $m11
-	setzi $m11, 0x50060
+	setzi $m11, WORKER_BASE_START + 2 * WORKER_BASE_STRIDE
 	put 0x23, $m11
-	setzi $m11, 0x50090
+	setzi $m11, WORKER_BASE_START + 3 * WORKER_BASE_STRIDE
 	put 0x24, $m11
-	setzi $m11, 0x500c0
+	setzi $m11, WORKER_BASE_START + 4 * WORKER_BASE_STRIDE
 	put 0x25, $m11
-	setzi $m11, 0x500f0
+	setzi $m11, WORKER_BASE_START + 5 * WORKER_BASE_STRIDE
 	put 0x26, $m11
-	setzi $m11, 0x50120
+	setzi $m11, WORKER_BASE_START + 6 * WORKER_BASE_STRIDE
 	setzi $m0, ipu_stack_exchange_loop_worker_init
 	runall $m0, $m15, 0
-	setzi $m0, 0x600
+	setzi $m0, TILE_MUX_HOST
 	put 0xa0, $m0
-	.long 0x41800007
-	setzi $m0, 0x640
+	.long OPCODE_SYNC | SYNC_ALL
+	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
 	.globl ipu_stack_command_table_address
 ipu_stack_command_table_address:
@@ -44,19 +64,19 @@ ipu_stack_command_table_address:
 	ld32 $m2, $m6, $m15, 2
 	ld32 $m3, $m6, $m15, 3
 	add $m6, $m6, 16
-	cmpeq $m4, $m5, 1
+	cmpeq $m4, $m5, ROLE_COORDINATOR
 	brnz $m4, .Llaunch_complete
-	cmpeq $m4, $m5, 2
+	cmpeq $m4, $m5, ROLE_INACTIVE
 	brnz $m4, .Linactive_launch
-	cmpeq $m4, $m5, 6
+	cmpeq $m4, $m5, ROLE_EXTERNAL_COMPLETION
 	brnz $m4, .Lexternal_completion
-	cmpeq $m4, $m5, 3
+	cmpeq $m4, $m5, ROLE_SEND_RELATIVE
 	brnz $m4, .Lset_send_base
-	cmpeq $m4, $m5, 5
+	cmpeq $m4, $m5, ROLE_SEND_ABSOLUTE
 	brnz $m4, .Lset_absolute_send_base
-	cmpeq $m4, $m5, 7
+	cmpeq $m4, $m5, ROLE_HOST_XREQ
 	brnz $m4, .Lset_absolute_send_base
-	cmpeq $m4, $m5, 8
+	cmpeq $m4, $m5, ROLE_HOST_COMMAND_READ
 	brnz $m4, .Lset_absolute_send_base
 	bri .Lset_receive_base
 .Lset_send_base:
@@ -74,7 +94,7 @@ ipu_stack_command_table_address:
 	br $m1
 
 .Lplan_complete:
-	cmpeq $m4, $m5, 4
+	cmpeq $m4, $m5, ROLE_RECEIVE_ADD
 	brz $m4, .Llaunch_complete
 	ld32 $m8, $m2, $m15, 0
 	ld32 $m9, $m3, $m15, 0
@@ -87,16 +107,16 @@ ipu_stack_command_table_address:
 	bri .Llaunch_complete
 
 .Linactive_launch:
-	.long 0x40c00000
-	.long 0x41800001
+	.long OPCODE_SANS | SANS_INACTIVE
+	.long OPCODE_SYNC | SYNC_EXTERNAL
 	bri .Llaunch_complete
 
 .Lexternal_completion:
-	.long 0x40c00001
-	.long 0x41800001
+	.long OPCODE_SANS | SANS_EXTERNAL
+	.long OPCODE_SYNC | SYNC_EXTERNAL
 
 .Llaunch_complete:
-	setzi $m0, 0x640
+	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
 	bri .Lcommand_loop
 
@@ -133,8 +153,8 @@ ipu_stack_nonmaster_pre_sync_redirect:
 	bri ipu_stack_nonmaster_pre_sync
 	.globl ipu_stack_nonmaster_pre_sync
 ipu_stack_nonmaster_pre_sync:
-	.long 0x40c00001
-	.long 0x41800001
+	.long OPCODE_SANS | SANS_EXTERNAL
+	.long OPCODE_SYNC | SYNC_EXTERNAL
 	br $m7
 
 	.globl ipu_stack_global_pre_sync
@@ -145,8 +165,8 @@ ipu_stack_global_pre_sync:
 	call $m10, .Lglobal_sync_release
 	br $m7
 .Lglobal_sync_local:
-	.long 0x41800007
-	setzi $m8, 0x640
+	.long OPCODE_SYNC | SYNC_ALL
+	setzi $m8, TILE_MUX_EXCHANGE
 	put 0xa0, $m8
 	br $m10
 .Lglobal_sync_send:
@@ -158,12 +178,12 @@ ipu_stack_loop_global_sync_send0:
 	.globl ipu_stack_loop_global_sync_send1
 ipu_stack_loop_global_sync_send1:
 	.long 0x78200003
-	.long 0x41800000
+	.long OPCODE_SYNC | SYNC_RECEIVE
 	br $m10
 .Lglobal_sync_wait:
 	.globl ipu_stack_loop_global_sync_endpoint
 ipu_stack_loop_global_sync_endpoint:
-	setzi $m8, 0x600
+	setzi $m8, TILE_MUX_HOST
 	put 0xa0, $m8
 	.long 0x4180000f
 	br $m10
