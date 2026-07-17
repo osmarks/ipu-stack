@@ -9,6 +9,7 @@
 	.set ROLE_HOST_XREQ, 7
 	.set ROLE_HOST_COMMAND_READ, 8
 	.set ROLE_RECEIVE_ABSOLUTE_ADD, 9
+	.set ROLE_EXCHANGE_ABSOLUTE, 10
 	.set TILE_MUX_HOST, 0x600
 	.set TILE_MUX_EXCHANGE, 0x640
 	.set WORKER_BASE_START, 0x50000
@@ -95,6 +96,8 @@ ipu_stack_command_table_address:
 	brnz $m4, .Lset_absolute_send_base
 	cmpeq $m4, $m5, ROLE_RECEIVE_ABSOLUTE_ADD
 	brnz $m4, .Lset_absolute_receive_base
+	cmpeq $m4, $m5, ROLE_EXCHANGE_ABSOLUTE
+	brnz $m4, .Lset_absolute_exchange_bases
 	bri .Lset_receive_base
 .Lset_send_base:
 	put 0xa7, $m2
@@ -106,6 +109,10 @@ ipu_stack_command_table_address:
 	put 0xa4, $m3
 	bri .Larm_plan
 .Lset_absolute_receive_base:
+	put 0xa4, $m15
+	bri .Larm_plan
+.Lset_absolute_exchange_bases:
+	put 0xa7, $m15
 	put 0xa4, $m15
 .Larm_plan:
 	setzi $m8, 1

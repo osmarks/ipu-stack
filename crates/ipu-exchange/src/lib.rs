@@ -8,6 +8,8 @@ pub const EXCHANGE_WINDOW_BASE: u32 = 0x50000;
 pub const EXCHANGE_WINDOW_BYTES: u32 = 0x8000;
 pub const HOST_SHORT_MAX_BYTES: u32 = 60;
 pub const HOST_LONG_MAX_BYTES: u32 = 1024;
+pub const TILE_MUX_HOST: u32 = 0x600;
+pub const TILE_MUX_EXCHANGE: u32 = 0x640;
 
 const OPCODE_MASK: u32 = 0xfc00_0000;
 const LONG_OPCODE_MASK: u32 = 0xf800_0000;
@@ -17,6 +19,41 @@ const DELAY_PIC_OPCODE: u32 = 0x6000_0000;
 const DELAY_XPIC_OPCODE: u32 = 0x6400_0000;
 const SEND_OPCODE: u32 = 0x7800_0000;
 const SEND_OFF_OPCODE: u32 = 0x7000_0000;
+const SYNC_OPCODE: u32 = 0x4180_0000;
+const SANS_OPCODE: u32 = 0x40c0_0000;
+const BR_M_OPCODE: u32 = 0x4300_0000;
+const SETZI_M_OPCODE: u32 = 0x1900_0000;
+const PUT_SPECIAL_FROM_M8_OPCODE: u32 = 0x4380_8000;
+const INCOMING_MUX_REGISTER: u8 = 0xa0;
+const INCOMING_DCOUNT_REGISTER: u8 = 0xa6;
+
+pub const SANS_INACTIVE_INSTRUCTION: u32 = sans(0);
+pub const SYNC_RECEIVE_INSTRUCTION: u32 = sync(0);
+pub const SYNC_EXTERNAL_INSTRUCTION: u32 = sync(1);
+pub const SYNC_SUPERVISOR_INSTRUCTION: u32 = sync(3);
+pub const SYNC_ALL_INSTRUCTION: u32 = sync(7);
+pub const SYNC_HOST_INSTRUCTION: u32 = sync(15);
+pub const RETURN_M10_INSTRUCTION: u32 = br_m(10);
+
+pub const fn sans(selector: u8) -> u32 {
+    SANS_OPCODE | selector as u32
+}
+
+pub const fn sync(selector: u8) -> u32 {
+    SYNC_OPCODE | selector as u32
+}
+
+pub const fn br_m(register: u8) -> u32 {
+    BR_M_OPCODE | ((register as u32) << 20)
+}
+
+const fn setzi_m(register: u8, immediate: u32) -> u32 {
+    SETZI_M_OPCODE | ((register as u32) << 20) | immediate
+}
+
+const fn put_special_from_m8(register: u8) -> u32 {
+    PUT_SPECIAL_FROM_M8_OPCODE | register as u32
+}
 
 // C600 GSP configuration registers. Their payload selects the physical tiles
 // forming the hardware global-sync distribution hierarchy.
@@ -96,28 +133,119 @@ pub type PlanRow = [u32; PLAN_WORDS];
 pub fn plan_event_cycles(row: &[u32]) -> Result<u32, ExchangeError> {
     let mut cycles = 0u32;
     for &instruction in row {
-        let advance = if instruction & DELAY_OPCODE_MASK == DELAY_OPCODE {
-            (instruction & 0x7_ffff) + 1
-        } else {
-            match instruction & OPCODE_MASK {
-                DELAY_PIC_OPCODE => ((instruction >> 19) & 0x7f) + 1,
-                DELAY_XPIC_OPCODE => ((instruction >> 14) & 0xfff) + 1,
-                _ => match instruction & LONG_OPCODE_MASK {
-                    SEND_OPCODE => ((instruction >> 21) & 0x3f) + 1,
-                    SEND_OFF_OPCODE => {
-                        let count_minus_one =
-                            ((instruction >> 21) & 0x3f) | (((instruction >> 14) & 0x3f) << 6);
-                        count_minus_one + 1
-                    }
-                    _ => 0,
-                },
-            }
-        };
+        let advance = instruction_advance(instruction);
         cycles = cycles
             .checked_add(advance)
             .ok_or(ExchangeError::Schedule("plan event horizon overflow"))?;
     }
     Ok(cycles)
+}
+
+#[derive(Clone, Debug)]
+pub struct PlanProgramBuilder {
+    words: Vec<u32>,
+    event_cycles: u32,
+}
+
+impl Default for PlanProgramBuilder {
+    fn default() -> Self {
+        Self {
+            words: vec![SYNC_SUPERVISOR_INSTRUCTION],
+            event_cycles: 0,
+        }
+    }
+}
+
+impl PlanProgramBuilder {
+    pub fn event_cycles(&self) -> u32 {
+        self.event_cycles
+    }
+
+    pub fn append_scheduled_row(&mut self, row: &PlanRow) -> Result<(), ExchangeError> {
+        if row[0] != SYNC_SUPERVISOR_INSTRUCTION {
+            return Err(ExchangeError::Schedule("exchange row entry"));
+        }
+        let end = row
+            .iter()
+            .position(|instruction| *instruction == RETURN_M10_INSTRUCTION)
+            .ok_or(ExchangeError::Schedule("exchange row return"))?;
+        let mut body = row[1..end].to_vec();
+        if self.event_cycles == 0 {
+            self.words.extend(body);
+            self.event_cycles = plan_event_cycles(&self.words)?;
+            return Ok(());
+        }
+        let first_timed = body
+            .iter()
+            .position(|instruction| instruction_advance(*instruction) != 0)
+            .ok_or(ExchangeError::Schedule("exchange row has no timed event"))?;
+        let first_advance = instruction_advance(body[first_timed]);
+        if first_advance <= self.event_cycles {
+            return Err(ExchangeError::Schedule("overlapping tile exchange roles"));
+        }
+        set_instruction_advance(&mut body[first_timed], first_advance - self.event_cycles)?;
+        self.words.extend(body);
+        self.event_cycles = plan_event_cycles(&self.words)?;
+        Ok(())
+    }
+
+    pub fn finish(mut self, horizon: u32) -> Result<Vec<u32>, ExchangeError> {
+        if horizon < self.event_cycles {
+            return Err(ExchangeError::Schedule("plan horizon precedes tile events"));
+        }
+        let padding = horizon - self.event_cycles;
+        if padding != 0 {
+            self.words.push(delay(padding - 1));
+        }
+        self.words.push(RETURN_M10_INSTRUCTION);
+        Ok(self.words)
+    }
+}
+
+fn instruction_advance(instruction: u32) -> u32 {
+    if instruction & DELAY_OPCODE_MASK == DELAY_OPCODE {
+        (instruction & 0x7_ffff) + 1
+    } else {
+        match instruction & OPCODE_MASK {
+            DELAY_PIC_OPCODE => ((instruction >> 19) & 0x7f) + 1,
+            DELAY_XPIC_OPCODE => ((instruction >> 14) & 0xfff) + 1,
+            _ => match instruction & LONG_OPCODE_MASK {
+                SEND_OPCODE => ((instruction >> 21) & 0x3f) + 1,
+                SEND_OFF_OPCODE => {
+                    (((instruction >> 21) & 0x3f) | (((instruction >> 14) & 0x3f) << 6)) + 1
+                }
+                _ => 0,
+            },
+        }
+    }
+}
+
+fn set_instruction_advance(instruction: &mut u32, advance: u32) -> Result<(), ExchangeError> {
+    if advance == 0 {
+        return Err(ExchangeError::Schedule("zero event advance"));
+    }
+    let immediate = advance - 1;
+    if *instruction & DELAY_OPCODE_MASK == DELAY_OPCODE {
+        if immediate > 0x7_ffff {
+            return Err(ExchangeError::Schedule("delay advance overflow"));
+        }
+        *instruction = (*instruction & !0x7_ffff) | immediate;
+    } else if *instruction & OPCODE_MASK == DELAY_PIC_OPCODE {
+        if immediate > 0x7f {
+            return Err(ExchangeError::Schedule("PIC delay advance overflow"));
+        }
+        *instruction = (*instruction & !0x03f8_0000) | (immediate << 19);
+    } else if *instruction & OPCODE_MASK == DELAY_XPIC_OPCODE {
+        if immediate > 0xfff {
+            return Err(ExchangeError::Schedule("XPIC delay advance overflow"));
+        }
+        *instruction = (*instruction & !0x03ff_c000) | (immediate << 14);
+    } else {
+        return Err(ExchangeError::Schedule(
+            "first scheduled event is not a delay",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,14 +276,14 @@ pub fn assemble_tile_to_host_xreq_program(
     }
     Ok(TileToHostProgram {
         instructions: vec![
-            0x1980_0600, // setzi $m8, 0x600
-            0x4380_80a0, // put $INCOMING_MUX, $m8
-            0x4180_000f, // sync 15
+            setzi_m(8, TILE_MUX_HOST),
+            put_special_from_m8(INCOMING_MUX_REGISTER),
+            SYNC_HOST_INSTRUCTION,
             encode_send(1, 3, packet_address >> 2)?,
-            0x4180_0007, // sync 7
-            0x1980_0640, // setzi $m8, 0x640
-            0x4380_80a0, // put $INCOMING_MUX, $m8
-            0x43a0_0000, // br $m10
+            SYNC_ALL_INSTRUCTION,
+            setzi_m(8, TILE_MUX_EXCHANGE),
+            put_special_from_m8(INCOMING_MUX_REGISTER),
+            RETURN_M10_INSTRUCTION,
         ],
         packet_words: [2, 0, 0, 0],
     })
@@ -172,18 +300,18 @@ pub fn assemble_host_command_read_program(
     let request = host_to_tile_packet(0, destination_address, host_offset, 4)?;
     Ok(TileToHostProgram {
         instructions: vec![
-            0x1980_0600,
-            0x4380_80a0,
-            0x4180_000f,
-            0x1980_0001,
-            0x4380_80a6,
+            setzi_m(8, TILE_MUX_HOST),
+            put_special_from_m8(INCOMING_MUX_REGISTER),
+            SYNC_HOST_INSTRUCTION,
+            setzi_m(8, 1),
+            put_special_from_m8(INCOMING_DCOUNT_REGISTER),
             encode_send(1, 3, packet_address >> 2)?,
             encode_send(1, 3, (packet_address + 8) >> 2)?,
-            0x4180_0000,
-            0x4180_0007,
-            0x1980_0640,
-            0x4380_80a0,
-            0x43a0_0000,
+            SYNC_RECEIVE_INSTRUCTION,
+            SYNC_ALL_INSTRUCTION,
+            setzi_m(8, TILE_MUX_EXCHANGE),
+            put_special_from_m8(INCOMING_MUX_REGISTER),
+            RETURN_M10_INSTRUCTION,
         ],
         packet_words: [1, 0, request.word0, request.word1],
     })
@@ -333,11 +461,11 @@ pub fn assemble_tile_to_host_program(
     let chunk = chunks[0];
     let close = zero_byte_read_packet(physical_tile, dummy_tile_address)?;
     let mut instructions = vec![
-        0x1980_0600, // setzi $m8, 0x600
-        0x4380_80a0, // put $INCOMING_MUX, $m8
-        0x4180_0007, // sync 7
-        0x1980_0001, // setzi $m8, 1
-        0x4380_80a6, // put $INCOMING_DCOUNT, $m8
+        setzi_m(8, TILE_MUX_HOST),
+        put_special_from_m8(INCOMING_MUX_REGISTER),
+        SYNC_ALL_INSTRUCTION,
+        setzi_m(8, 1),
+        put_special_from_m8(INCOMING_DCOUNT_REGISTER),
         encode_send(1, 3, packet_address >> 2)?,
     ];
     let words = chunk.bytes / 4;
@@ -351,11 +479,11 @@ pub fn assemble_tile_to_host_program(
     instructions.extend([
         delay(1),
         encode_send(1, 3, (packet_address + 8) >> 2)?,
-        0x4180_0000, // sync 0
-        0x4180_0007, // sync 7
-        0x1980_0640, // setzi $m8, 0x640
-        0x4380_80a0, // put $INCOMING_MUX, $m8
-        0x43a0_0000, // br $m10
+        SYNC_RECEIVE_INSTRUCTION,
+        SYNC_ALL_INSTRUCTION,
+        setzi_m(8, TILE_MUX_EXCHANGE),
+        put_special_from_m8(INCOMING_MUX_REGISTER),
+        RETURN_M10_INSTRUCTION,
     ]);
     Ok(TileToHostProgram {
         instructions,
@@ -504,7 +632,7 @@ impl Topology {
         }
 
         let mut sender_row = [0; PLAN_WORDS];
-        sender_row[0] = 0x4180_0003;
+        sender_row[0] = SYNC_SUPERVISOR_INSTRUCTION;
         let mut cursor = 1;
         if sender_delay >= 0 {
             sender_row[cursor] = delay(sender_delay as u32);
@@ -522,27 +650,27 @@ impl Topology {
             sender_row[cursor] = delay(trailing_delay as u32);
             cursor += 1;
         }
-        sender_row[cursor] = 0x43a0_0000;
+        sender_row[cursor] = RETURN_M10_INSTRUCTION;
 
         let mut receiver_row = [0; PLAN_WORDS];
         receiver_row[0] = 1;
-        receiver_row[1] = 0x4180_0003;
+        receiver_row[1] = SYNC_SUPERVISOR_INSTRUCTION;
         receiver_row[2] = delay_xpic(112, 0, 0);
         if count <= 51 {
-            receiver_row[3] = delay_xpic(count - 1, 0, 0x640);
+            receiver_row[3] = delay_xpic(count - 1, 0, TILE_MUX_EXCHANGE);
             receiver_row[4] = delay_pic(51 - count + receiver_phase, 0, 0);
             receiver_row[5] = delay(count + 4);
-            receiver_row[6] = 0x43a0_0000;
+            receiver_row[6] = RETURN_M10_INSTRUCTION;
         } else if count == 52 {
             receiver_row[3] = delay_pic(50 + receiver_phase, 0, 0);
-            receiver_row[4] = delay_xpic(0, 0, 0x640);
+            receiver_row[4] = delay_xpic(0, 0, TILE_MUX_EXCHANGE);
             receiver_row[5] = delay(56);
-            receiver_row[6] = 0x43a0_0000;
+            receiver_row[6] = RETURN_M10_INSTRUCTION;
         } else {
             receiver_row[3] = delay_pic(51 + receiver_phase, 0, 0);
-            receiver_row[4] = delay_xpic(count - 53, 0, 0x640);
+            receiver_row[4] = delay_xpic(count - 53, 0, TILE_MUX_EXCHANGE);
             receiver_row[5] = delay(56);
-            receiver_row[6] = 0x43a0_0000;
+            receiver_row[6] = RETURN_M10_INSTRUCTION;
         }
         debug!(
             sender_logical,
@@ -588,7 +716,7 @@ impl Topology {
 
         let mut sender = [0; PLAN_WORDS];
         let mut cursor = 0;
-        sender[cursor] = 0x4180_0003;
+        sender[cursor] = SYNC_SUPERVISOR_INSTRUCTION;
         cursor += 1;
         if sender_delay >= 0 {
             sender[cursor] = delay(sender_delay as u32);
@@ -605,7 +733,7 @@ impl Topology {
             sender[cursor] = delay(trailing_delay as u32);
             cursor += 1;
         }
-        sender[cursor] = 0x43a0_0000;
+        sender[cursor] = RETURN_M10_INSTRUCTION;
 
         let mut receivers = Vec::with_capacity(receiver_logical.len());
         for (logical, mux_time) in receiver_logical.iter().zip(mux_times) {
@@ -616,23 +744,23 @@ impl Topology {
             }
             let receiver_phase = 2 * (physical >> 6);
             let mut row = [0; PLAN_WORDS];
-            row[0] = 0x4180_0003;
+            row[0] = SYNC_SUPERVISOR_INSTRUCTION;
             row[1] = delay_xpic(receive_cycle as u32, 0, source_physical);
             if count <= 51 {
-                row[2] = delay_xpic(count - 1, 0, 0x640);
+                row[2] = delay_xpic(count - 1, 0, TILE_MUX_EXCHANGE);
                 row[3] = delay_pic(51 - count + receiver_phase, 0, 0) | 0x0001_4000;
                 row[4] = delay(count + 4);
-                row[5] = 0x43a0_0000;
+                row[5] = RETURN_M10_INSTRUCTION;
             } else if count == 52 {
                 row[2] = delay_pic(50 + receiver_phase, 0, 0) | 0x0001_4000;
-                row[3] = delay_xpic(0, 0, 0x640);
+                row[3] = delay_xpic(0, 0, TILE_MUX_EXCHANGE);
                 row[4] = delay(56);
-                row[5] = 0x43a0_0000;
+                row[5] = RETURN_M10_INSTRUCTION;
             } else {
                 row[2] = delay_pic(51 + receiver_phase, 0, 0) | 0x0001_4000;
-                row[3] = delay_xpic(count - 53, 0, 0x640);
+                row[3] = delay_xpic(count - 53, 0, TILE_MUX_EXCHANGE);
                 row[4] = delay(56);
-                row[5] = 0x43a0_0000;
+                row[5] = RETURN_M10_INSTRUCTION;
             }
             receivers.push(row);
         }
@@ -924,6 +1052,41 @@ mod tests {
     }
 
     #[test]
+    fn composes_receive_then_send_on_one_event_timeline() {
+        let topology = Topology::c600();
+        let first = topology.multicast(0, &[736], 64, 0).unwrap();
+        let first_horizon = std::iter::once(&first.sender)
+            .chain(first.receivers.iter())
+            .map(|row| plan_event_cycles(row).unwrap())
+            .max()
+            .unwrap();
+        let second = topology
+            .multicast(736, &[1286], 64, first_horizon + 1)
+            .unwrap();
+        let horizon = std::iter::once(&second.sender)
+            .chain(second.receivers.iter())
+            .map(|row| plan_event_cycles(row).unwrap())
+            .max()
+            .unwrap();
+
+        let mut relay = PlanProgramBuilder::default();
+        relay.append_scheduled_row(&first.receivers[0]).unwrap();
+        relay.append_scheduled_row(&second.sender).unwrap();
+        let relay = relay.finish(horizon).unwrap();
+
+        assert_eq!(relay.first(), Some(&SYNC_SUPERVISOR_INSTRUCTION));
+        assert_eq!(relay.last(), Some(&RETURN_M10_INSTRUCTION));
+        assert_eq!(
+            relay
+                .iter()
+                .filter(|instruction| **instruction == SYNC_SUPERVISOR_INSTRUCTION)
+                .count(),
+            1
+        );
+        assert_eq!(plan_event_cycles(&relay).unwrap(), horizon);
+    }
+
+    #[test]
     fn validates_limits_and_patches_addresses() {
         let topology = Topology::c600();
         assert_eq!(
@@ -1023,7 +1186,7 @@ mod tests {
         assert_eq!(plan.packet_words, [0xa001_0000, 0x11, 0xcc01_020c, 0]);
         assert_eq!(
             plan.instructions[0..3],
-            [0x1980_0600, 0x4380_80a0, 0x4180_0007]
+            [0x1980_0600, 0x4380_80a0, SYNC_ALL_INSTRUCTION]
         );
         assert_eq!(
             plan.instructions[3..6],
@@ -1035,11 +1198,11 @@ mod tests {
             [
                 0x40a0_0001,
                 0x782a_02d3,
-                0x4180_0000,
-                0x4180_0007,
+                SYNC_RECEIVE_INSTRUCTION,
+                SYNC_ALL_INSTRUCTION,
                 0x1980_0640,
                 0x4380_80a0,
-                0x43a0_0000
+                RETURN_M10_INSTRUCTION
             ]
         );
     }
@@ -1048,9 +1211,9 @@ mod tests {
     fn assembles_tile_to_host_xreq_program() {
         let plan = assemble_tile_to_host_xreq_program(0x50170).unwrap();
         assert_eq!(plan.packet_words, [2, 0, 0, 0]);
-        assert_eq!(plan.instructions[2], 0x4180_000f);
+        assert_eq!(plan.instructions[2], SYNC_HOST_INSTRUCTION);
         assert_eq!(plan.instructions[3], 0x782a_02e3);
-        assert_eq!(plan.instructions.last(), Some(&0x43a0_0000));
+        assert_eq!(plan.instructions.last(), Some(&RETURN_M10_INSTRUCTION));
     }
 
     #[test]
@@ -1059,7 +1222,7 @@ mod tests {
         assert_eq!(plan.packet_words, [1, 0, 0xcc00_020c, 0x4001]);
         assert_eq!(
             plan.instructions[5..8],
-            [0x782a_02c3, 0x782a_02d3, 0x4180_0000]
+            [0x782a_02c3, 0x782a_02d3, SYNC_RECEIVE_INSTRUCTION]
         );
     }
 
@@ -1068,9 +1231,9 @@ mod tests {
         let topology = Topology::c600();
         let plan = topology.point_to_point(274, 1286, 64).unwrap();
         let row = finalize_point_receiver(&plan.receiver, topology.physical(274).unwrap()).unwrap();
-        assert_eq!(row[0], 0x4180_0003);
+        assert_eq!(row[0], SYNC_SUPERVISOR_INSTRUCTION);
         assert_eq!(row[1] & 0x1fff, 9);
-        assert_eq!(row[5], 0x43a0_0000);
+        assert_eq!(row[5], RETURN_M10_INSTRUCTION);
     }
 
     #[test]

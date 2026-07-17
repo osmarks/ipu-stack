@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{debug, info};
 
 use ipu_exchange::{
-    MulticastPlan, PlanRow, Topology, finalize_point_receiver, patch_multicast_receiver_address,
-    patch_sender_address,
+    MulticastPlan, PlanProgramBuilder, PlanRow, RETURN_M10_INSTRUCTION, SANS_INACTIVE_INSTRUCTION,
+    SYNC_EXTERNAL_INSTRUCTION, Topology, patch_multicast_receiver_address, patch_sender_address,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -415,7 +415,7 @@ pub struct ExchangeCost {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoweredExchangeEpoch {
     pub groups: Vec<LoweredExchangeGroup>,
-    pub tile_rows: BTreeMap<u16, PlanRow>,
+    pub tile_rows: BTreeMap<u16, Vec<u32>>,
     pub cost: ExchangeCost,
 }
 
@@ -439,7 +439,7 @@ pub enum LoweredTileStep {
     Exchange {
         phase: usize,
         epoch: usize,
-        row: PlanRow,
+        row: Vec<u32>,
     },
     Compute(LoweredComputeCommand),
 }
@@ -451,14 +451,14 @@ pub struct LoweredTileProgram {
 }
 
 impl LoweredExchangeEpoch {
-    pub fn row_for(&self, tile: u16) -> PlanRow {
-        self.tile_rows.get(&tile).copied().unwrap_or_else(|| {
-            let mut row = [0; ipu_exchange::PLAN_WORDS];
+    pub fn row_for(&self, tile: u16) -> Vec<u32> {
+        self.tile_rows.get(&tile).cloned().unwrap_or_else(|| {
+            let mut row = vec![0; ipu_exchange::PLAN_WORDS];
             // The runtime performs the all-tile epoch barrier. Inactive tiles
             // then use the SDK's local non-participation sequence.
-            row[0] = 0x40c0_0000;
-            row[1] = 0x4180_0001;
-            row[2] = 0x43a0_0000;
+            row[0] = SANS_INACTIVE_INSTRUCTION;
+            row[1] = SYNC_EXTERNAL_INSTRUCTION;
+            row[2] = RETURN_M10_INSTRUCTION;
             row
         })
     }
@@ -574,8 +574,8 @@ impl Schedule {
                 group.destinations.dedup();
             }
 
-            // A tile has one supervisor exchange role in an epoch. Color the
-            // multicast-hyperedge conflict graph with deterministic DSATUR.
+            // A tile can execute one exchange role at a time. Color the
+            // multicast-hyperedge conflict graph into timed slots with deterministic DSATUR.
             let adjacency: Vec<HashSet<usize>> = groups
                 .iter()
                 .enumerate()
@@ -628,20 +628,50 @@ impl Schedule {
                 .filter_map(|color| *color)
                 .max()
                 .map_or(0, |color| color + 1);
-            let mut epoch_groups = vec![Vec::new(); color_count];
+            let mut colored_groups = vec![Vec::new(); color_count];
             for (group, color) in groups.into_iter().zip(colors) {
                 let color =
                     color.ok_or_else(|| CompileError::Graph("uncolored exchange group".into()))?;
-                epoch_groups[color].push(group);
+                colored_groups[color].push(group);
             }
-            let mut epochs = Vec::new();
+            let mut available: HashSet<_> = self
+                .allocations
+                .iter()
+                .filter(|allocation| allocation.kind == AllocationKind::Home)
+                .map(|allocation| (allocation.tensor, allocation.tile))
+                .collect();
+            let mut epoch_groups = Vec::with_capacity(colored_groups.len());
+            while !colored_groups.is_empty() {
+                let ready = colored_groups
+                    .iter()
+                    .position(|slot| {
+                        slot.iter()
+                            .all(|group| available.contains(&(group.tensor, group.source)))
+                    })
+                    .ok_or_else(|| {
+                        CompileError::Graph("exchange staging dependencies contain a cycle".into())
+                    })?;
+                let slot = colored_groups.remove(ready);
+                for group in &slot {
+                    available.extend(
+                        group
+                            .destinations
+                            .iter()
+                            .map(|destination| (group.tensor, *destination)),
+                    );
+                }
+                epoch_groups.push(slot);
+            }
+            let mut lowered_groups = Vec::new();
+            let mut builders = BTreeMap::<u16, PlanProgramBuilder>::new();
+            let mut cost = ExchangeCost {
+                launches: u32::from(!epoch_groups.is_empty()),
+                ..ExchangeCost::default()
+            };
+            let mut horizon = 0u32;
             for pending in epoch_groups {
-                let mut lowered_groups = Vec::new();
-                let mut tile_rows = BTreeMap::new();
-                let mut cost = ExchangeCost {
-                    launches: 1,
-                    ..ExchangeCost::default()
-                };
+                let schedule_offset = if horizon == 0 { 0 } else { horizon + 1 };
+                let mut slot_horizon = horizon;
                 for PendingGroup {
                     source,
                     tensor,
@@ -662,7 +692,15 @@ impl Schedule {
                         .find(|allocation| {
                             allocation.tensor == tensor
                                 && allocation.tile == source
-                                && allocation.kind == AllocationKind::Home
+                                && allocation.kind
+                                    == AllocationKind::ExchangeStaging { phase: phase_index }
+                        })
+                        .or_else(|| {
+                            self.allocations.iter().find(|allocation| {
+                                allocation.tensor == tensor
+                                    && allocation.tile == source
+                                    && allocation.kind == AllocationKind::Home
+                            })
                         })
                         .ok_or_else(|| {
                             CompileError::Memory(format!(
@@ -693,37 +731,29 @@ impl Schedule {
                                 })
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    let (sender, receivers, addressing) = if destinations.len() == 1 {
-                        let plan = topology.point_to_point(source, destinations[0], words)?;
-                        let receiver =
-                            finalize_point_receiver(&plan.receiver, topology.physical(source)?)?;
-                        (plan.sender, vec![receiver], ExchangeAddressing::Relative)
-                    } else {
-                        let mut plan: MulticastPlan =
-                            topology.multicast(source, &destinations, words, 0)?;
-                        patch_sender_address(&mut plan.sender, source_address)?;
-                        for (receiver, address) in plan
-                            .receivers
-                            .iter_mut()
-                            .zip(destination_addresses.iter().copied())
-                        {
-                            patch_multicast_receiver_address(receiver, address)?;
-                        }
-                        (plan.sender, plan.receivers, ExchangeAddressing::Absolute)
-                    };
-                    if tile_rows.insert(source, sender).is_some() {
-                        return Err(CompileError::Graph(
-                            "sender scheduled twice in one epoch".into(),
-                        ));
+                    let mut plan: MulticastPlan =
+                        topology.multicast(source, &destinations, words, schedule_offset)?;
+                    patch_sender_address(&mut plan.sender, source_address)?;
+                    for (receiver, address) in plan
+                        .receivers
+                        .iter_mut()
+                        .zip(destination_addresses.iter().copied())
+                    {
+                        patch_multicast_receiver_address(receiver, address)?;
                     }
+                    let sender = plan.sender;
+                    let receivers = plan.receivers;
+                    builders
+                        .entry(source)
+                        .or_default()
+                        .append_scheduled_row(&sender)?;
                     for (destination, receiver) in
                         destinations.iter().copied().zip(receivers.iter().copied())
                     {
-                        if tile_rows.insert(destination, receiver).is_some() {
-                            return Err(CompileError::Graph(
-                                "receiver scheduled twice in one epoch".into(),
-                            ));
-                        }
+                        builders
+                            .entry(destination)
+                            .or_default()
+                            .append_scheduled_row(&receiver)?;
                     }
                     let group_cycles = std::iter::once(&sender)
                         .chain(receivers.iter())
@@ -732,32 +762,35 @@ impl Schedule {
                         .into_iter()
                         .max()
                         .unwrap_or(0);
-                    cost.estimated_cycles = cost.estimated_cycles.max(u64::from(group_cycles));
+                    slot_horizon = slot_horizon.max(group_cycles);
                     cost.payload_words += u64::from(words);
                     lowered_groups.push(LoweredExchangeGroup {
                         source_tile: source,
                         destination_tiles: destinations,
                         tensor,
                         bytes,
-                        addressing,
+                        addressing: ExchangeAddressing::Absolute,
                         sender,
                         receivers,
                     });
                 }
-                epochs.push(LoweredExchangeEpoch {
+                horizon = slot_horizon;
+            }
+            cost.estimated_cycles = u64::from(horizon);
+            let tile_rows = builders
+                .into_iter()
+                .map(|(tile, builder)| Ok((tile, builder.finish(horizon)?)))
+                .collect::<Result<BTreeMap<_, _>, CompileError>>()?;
+            let epochs = if lowered_groups.is_empty() {
+                Vec::new()
+            } else {
+                vec![LoweredExchangeEpoch {
                     groups: lowered_groups,
                     tile_rows,
                     cost,
-                });
-            }
-            let phase_cost = epochs
-                .iter()
-                .fold(ExchangeCost::default(), |mut total, epoch| {
-                    total.launches += epoch.cost.launches;
-                    total.estimated_cycles += epoch.cost.estimated_cycles;
-                    total.payload_words += epoch.cost.payload_words;
-                    total
-                });
+                }]
+            };
+            let phase_cost = cost;
             lowered_phases.push(LoweredExchangePhase {
                 phase: phase_index,
                 epochs,
@@ -1556,12 +1589,12 @@ mod tests {
         assert_eq!(lowered[0].cost.payload_words, 16 + 32);
         assert_eq!(lowered[0].epochs[0].tile_rows.len(), 5);
         let inactive = lowered[0].epochs[0].row_for(15);
-        assert_eq!(inactive[0], 0x40c0_0000);
-        assert_eq!(inactive[1], 0x4180_0001);
+        assert_eq!(inactive[0], SANS_INACTIVE_INSTRUCTION);
+        assert_eq!(inactive[1], SYNC_EXTERNAL_INSTRUCTION);
     }
 
     #[test]
-    fn scheduler_splits_tile_role_conflicts() {
+    fn scheduler_times_tile_role_conflicts_within_one_launch() {
         let schedule = exchange_schedule(vec![
             Transfer {
                 source_tile: 0,
@@ -1583,17 +1616,88 @@ mod tests {
             },
         ]);
         let lowered = schedule.lower_exchanges(&Topology::c600()).unwrap();
-        assert_eq!(lowered[0].epochs.len(), 2);
-        assert_eq!(lowered[0].cost.launches, 2);
-        for epoch in &lowered[0].epochs {
-            let mut active = HashSet::new();
-            for group in &epoch.groups {
-                assert!(active.insert(group.source_tile));
-                for destination in &group.destination_tiles {
-                    assert!(active.insert(*destination));
-                }
-            }
-        }
+        assert_eq!(lowered[0].epochs.len(), 1);
+        assert_eq!(lowered[0].cost.launches, 1);
+        let row = lowered[0].epochs[0].row_for(1);
+        assert_eq!(
+            row.iter()
+                .filter(|word| **word == ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION)
+                .count(),
+            1
+        );
+        assert_eq!(
+            row.iter()
+                .filter(|word| **word == RETURN_M10_INSTRUCTION)
+                .count(),
+            1
+        );
+        assert_eq!(
+            u64::from(ipu_exchange::plan_event_cycles(&row).unwrap()),
+            lowered[0].cost.estimated_cycles
+        );
+    }
+
+    #[test]
+    fn scheduler_relays_a_tensor_without_an_intermediate_launch() {
+        let tensor = TensorId(0);
+        let mut schedule = exchange_schedule(vec![
+            Transfer {
+                source_tile: 3,
+                destination_tile: 1,
+                tensor,
+                bytes: 256,
+            },
+            Transfer {
+                source_tile: 1,
+                destination_tile: 2,
+                tensor,
+                bytes: 256,
+            },
+        ]);
+        schedule
+            .allocations
+            .retain(|allocation| !(allocation.tensor == tensor && allocation.tile == 1));
+        schedule.allocations.push(Allocation {
+            tensor,
+            tile: 1,
+            address: ipu_exchange::EXCHANGE_WINDOW_BASE + 1024,
+            size: 256,
+            live_from: 0,
+            live_until: 1,
+            kind: AllocationKind::ExchangeStaging { phase: 0 },
+        });
+        let lowered = schedule.lower_exchanges(&Topology::c600()).unwrap();
+        let epoch = &lowered[0].epochs[0];
+
+        assert_eq!(lowered[0].cost.launches, 1);
+        assert_eq!(epoch.groups.len(), 2);
+        assert_eq!(
+            epoch
+                .groups
+                .iter()
+                .map(|group| group.source_tile)
+                .collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+        let relay = epoch.row_for(1);
+        assert_eq!(
+            relay
+                .iter()
+                .filter(|word| **word == ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION)
+                .count(),
+            1
+        );
+        assert_eq!(
+            relay
+                .iter()
+                .filter(|word| **word == RETURN_M10_INSTRUCTION)
+                .count(),
+            1
+        );
+        assert_eq!(
+            u64::from(ipu_exchange::plan_event_cycles(&relay).unwrap()),
+            lowered[0].cost.estimated_cycles
+        );
     }
 
     #[test]
@@ -1665,7 +1769,8 @@ mod tests {
         let lowered = exchange_schedule(ring)
             .lower_exchanges(&Topology::c600())
             .unwrap();
-        assert_eq!(lowered[0].epochs.len(), 2);
+        assert_eq!(lowered[0].epochs.len(), 1);
+        assert_eq!(lowered[0].cost.launches, 1);
 
         let all_to_all = (0..8)
             .flat_map(|source| {
@@ -1682,13 +1787,8 @@ mod tests {
         let lowered = exchange_schedule(all_to_all)
             .lower_exchanges(&Topology::c600())
             .unwrap();
-        assert_eq!(lowered[0].epochs.len(), 8);
-        assert!(
-            lowered[0]
-                .epochs
-                .iter()
-                .all(|epoch| epoch.groups.len() == 1)
-        );
+        assert_eq!(lowered[0].epochs.len(), 1);
+        assert_eq!(lowered[0].cost.launches, 1);
         assert_eq!(lowered[0].cost.payload_words, 8);
     }
 

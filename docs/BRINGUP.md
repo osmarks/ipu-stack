@@ -72,10 +72,14 @@ now covers:
 - routes in both directions across physical rows and columns;
 - four disjoint sender/receiver pairs in one exchange launch;
 - one 1,024-word source stream received simultaneously by physical tiles 32
-  and 53.
+  and 53;
 - one 1,024-word source stream received simultaneously by all other 1,471
   tiles through the direct command-loop runtime, with sampled first and last
-  words exact.
+  words exact;
+- one launch in which physical tile 0 multicasts 64 words to physical tiles 9
+  and 32, then physical tile 32 sends the received buffer to physical tile 53.
+  Both the independent multicast receiver and final relay destination were
+  exact.
 
 The fixture places worker sync storage, receive staging, executable plans, and
 outgoing data in separate SRAM regions. Placing plan and source in the same
@@ -91,7 +95,7 @@ completes without an exchange exception but leaves its destination unchanged.
 The multi-pass command-table runtime also completes an all-device reduction.
 All 1,472 tile scalars, including physical tile 0's scalar, exchange and add
 through 11 binary-tree rounds. The
-compiler emits direction-specific point-to-point rows for one-to-one edges and
+compiler emits absolute single-receiver rows for one-to-one edges and
 single-send multicast for fanout. The resulting launches produce `1084128` on physical tile 0, and all
 sampled tiles reach the terminal acceptance trap. In the current logical to
 physical mapping the reduction root is physical tile 0, which is also the
@@ -118,6 +122,22 @@ both receivers. The compiler no longer estimates an epoch as `156 + words`;
 it decodes each generated row's delay and send fields and takes the maximum
 event horizon. This route-sensitive horizon is the basis for placing multiple
 roles on one tile without inserting another BSP synchronization.
+
+The scheduler colors only tile-role conflicts. Colors are emitted as timed
+slots in one variable-length plan program, not separate epochs. Each row's
+first event is rebased against that tile's preceding event horizon, active rows
+are padded to the launch horizon, and only one `sync 3` and one return remain.
+Groups whose source is exchange staging are topologically ordered after the
+group that fills that staging allocation. The runtime's combined absolute role
+clears both `A4` and `A7`; sender and receiver addresses are carried by the
+generated instructions. The fixture derives plan stride from the longest tile
+program rather than assuming the original nine-word row size.
+
+`run-diagnostic` uses a deliberate coordinator completion trap after every
+tile has stored its completion word. This makes TDI result collection
+deterministic without a host delay. It is diagnostic termination, not the
+production host-completion protocol; that still depends on completing native
+host exchange.
 
 Native host-output lowering is partially recovered. Rust independently emits
 the short and long host packet headers, arbitrary-range chunk plans, the tile-0

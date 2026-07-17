@@ -111,6 +111,10 @@ enum Command {
         broadcast_destination: Vec<u16>,
         #[arg(long, default_value_t = 1024)]
         broadcast_words: u32,
+        #[arg(long)]
+        relay_via: Option<u16>,
+        #[arg(long)]
+        relay_destination: Option<u16>,
     },
     DeviceProbe {
         #[arg(long, default_value = "/dev/ipu0")]
@@ -433,11 +437,18 @@ fn main() -> Result<()> {
             experimental_host_output,
             broadcast_destination,
             broadcast_words,
+            relay_via,
+            relay_destination,
         } => {
             let topology = Topology::c600();
             let broadcast_result = !broadcast_destination.is_empty();
-            if broadcast_result
-                && !(1..=ipu_exchange::MAX_TRANSFER_WORDS).contains(&broadcast_words)
+            let relay = match (relay_via, relay_destination) {
+                (Some(via), Some(destination)) => Some((via, destination)),
+                (None, None) => None,
+                _ => bail!("relay requires both --relay-via and --relay-destination"),
+            };
+            let payload_result = broadcast_result || relay.is_some();
+            if payload_result && !(1..=ipu_exchange::MAX_TRANSFER_WORDS).contains(&broadcast_words)
             {
                 bail!(
                     "broadcast word count must be between 1 and {}",
@@ -447,7 +458,7 @@ fn main() -> Result<()> {
             let broadcast_bytes = broadcast_words
                 .checked_mul(4)
                 .ok_or_else(|| anyhow::anyhow!("broadcast byte count overflow"))?;
-            let layout = ReductionLayout::new();
+            let mut layout = ReductionLayout::new();
             let global_sync = GlobalSyncPlacement::new(
                 ipu_exchange::c600_global_sync(),
                 layout.sync_packet_address,
@@ -498,7 +509,7 @@ fn main() -> Result<()> {
                 active = next;
             }
             let root = active[0];
-            if broadcast_result {
+            if broadcast_result && relay.is_none() {
                 let phase_index = phases.len();
                 let tensor = TensorId(topology.tile_count());
                 allocations.push(Allocation {
@@ -533,6 +544,70 @@ fn main() -> Result<()> {
                 }
                 phases.push(Phase::Exchange { transfers });
             }
+            if let Some((via, destination)) = relay {
+                if via == root
+                    || destination == root
+                    || destination == via
+                    || usize::from(via) >= topology.tile_count()
+                    || usize::from(destination) >= topology.tile_count()
+                {
+                    bail!("invalid relay route {root}->{via}->{destination}");
+                }
+                let mut relay_receivers = vec![via];
+                for &tap in &broadcast_destination {
+                    if tap == root
+                        || tap == via
+                        || tap == destination
+                        || usize::from(tap) >= topology.tile_count()
+                        || relay_receivers.contains(&tap)
+                    {
+                        bail!("invalid relay multicast tap {tap}");
+                    }
+                    relay_receivers.push(tap);
+                }
+                let phase_index = phases.len();
+                let tensor = TensorId(topology.tile_count());
+                allocations.push(Allocation {
+                    tensor,
+                    tile: root,
+                    address: layout.broadcast_source_address,
+                    size: broadcast_bytes,
+                    live_from: phase_index,
+                    live_until: phase_index + 1,
+                    kind: AllocationKind::Home,
+                });
+                for tile in relay_receivers
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(destination))
+                {
+                    allocations.push(Allocation {
+                        tensor,
+                        tile,
+                        address: layout.broadcast_staging_address,
+                        size: broadcast_bytes,
+                        live_from: phase_index,
+                        live_until: phase_index + 1,
+                        kind: AllocationKind::ExchangeStaging { phase: phase_index },
+                    });
+                }
+                let mut transfers = relay_receivers
+                    .into_iter()
+                    .map(|receiver| Transfer {
+                        source_tile: root,
+                        destination_tile: receiver,
+                        tensor,
+                        bytes: broadcast_bytes,
+                    })
+                    .collect::<Vec<_>>();
+                transfers.push(Transfer {
+                    source_tile: via,
+                    destination_tile: destination,
+                    tensor,
+                    bytes: broadcast_bytes,
+                });
+                phases.push(Phase::Exchange { transfers });
+            }
             let schedule = Schedule {
                 layouts: Vec::new(),
                 phases,
@@ -542,6 +617,15 @@ fn main() -> Result<()> {
             };
             let lowered = schedule.lower_exchanges(&topology)?;
             let launches: Vec<_> = lowered.iter().flat_map(|phase| &phase.epochs).collect();
+            layout.plan_stride = align_up(
+                launches
+                    .iter()
+                    .flat_map(|epoch| epoch.tile_rows.values())
+                    .map(|row| row.len() as u32 * 4)
+                    .max()
+                    .unwrap_or((ipu_exchange::PLAN_WORDS * 4) as u32),
+                8,
+            );
             let host_output = if experimental_host_output {
                 Some(HostOutputPlans::new(
                     layout,
@@ -662,10 +746,17 @@ fn main() -> Result<()> {
                     let mut accumulator = 0;
                     let mut staging = 0;
                     if let Some(row) = epoch.tile_rows.get(&logical) {
-                        role = if epoch.groups.iter().any(|group| {
+                        let sends = epoch.groups.iter().any(|group| {
                             group.source_tile == logical
                                 && group.addressing == ipu_compiler::ExchangeAddressing::Absolute
-                        }) {
+                        });
+                        let receives = epoch.groups.iter().any(|group| {
+                            group.destination_tiles.contains(&logical)
+                                && group.addressing == ipu_compiler::ExchangeAddressing::Absolute
+                        });
+                        role = if sends && receives {
+                            RuntimeRole::ExchangeAbsolute
+                        } else if sends {
                             RuntimeRole::SendAbsolute
                         } else {
                             RuntimeRole::SendRelative
@@ -687,7 +778,9 @@ fn main() -> Result<()> {
                             .iter()
                             .any(|group| group.destination_tiles.contains(&logical))
                         {
-                            role = if epoch.groups.iter().any(|group| {
+                            role = if sends && receives {
+                                RuntimeRole::ExchangeAbsolute
+                            } else if epoch.groups.iter().any(|group| {
                                 group.destination_tiles.contains(&logical)
                                     && group.addressing
                                         == ipu_compiler::ExchangeAddressing::Absolute
@@ -722,12 +815,13 @@ fn main() -> Result<()> {
                                 .map_or(layout.staging_address, |allocation| allocation.address);
                         }
                         let blob = app.add_blob(words_to_bytes(row));
+                        let plan_bytes = row.len() as u32 * 4;
                         segments.push(Segment {
                             address: plan_address,
-                            memory_size: (ipu_exchange::PLAN_WORDS * 4) as u32,
+                            memory_size: plan_bytes,
                             blob,
                             blob_offset: 0,
-                            file_size: (ipu_exchange::PLAN_WORDS * 4) as u32,
+                            file_size: plan_bytes,
                             flags: SEGMENT_READ | SEGMENT_WRITE | SEGMENT_EXECUTE,
                         });
                     }
@@ -795,7 +889,7 @@ fn main() -> Result<()> {
                     file_size: 4,
                     flags: SEGMENT_READ | SEGMENT_WRITE,
                 });
-                if broadcast_result && logical == root {
+                if payload_result && logical == root {
                     let mut source = vec![0u32; broadcast_words as usize];
                     source[0] = expected_parallel_sum(topology.tile_count());
                     for (index, word) in source.iter_mut().enumerate().skip(1) {
@@ -811,7 +905,9 @@ fn main() -> Result<()> {
                         flags: SEGMENT_READ,
                     });
                 }
-                if broadcast_destination.contains(&logical) {
+                if broadcast_destination.contains(&logical)
+                    || relay.is_some_and(|(_, destination)| destination == logical)
+                {
                     let blob = app.add_blob(words_to_bytes(&[0]));
                     segments.push(Segment {
                         address: layout.broadcast_address,
@@ -1006,6 +1102,19 @@ fn main() -> Result<()> {
                             })
                         })
                         .collect::<Result<Vec<_>>>()?,
+                });
+            }
+            if let Some((_, destination)) = relay {
+                app.outputs.push(Binding {
+                    name: "relay-first".into(),
+                    dtype: "u32".into(),
+                    shape: vec![1],
+                    slices: vec![RegionSlice {
+                        tile: u32::from(topology.physical(destination)?),
+                        tile_address: layout.broadcast_staging_address,
+                        file_offset: 0,
+                        size: 4,
+                    }],
                 });
             }
             app.write(fs::File::create(&output)?)?;
@@ -1459,6 +1568,7 @@ enum RuntimeRole {
     HostXreq = 7,
     HostCommandRead = 8,
     ReceiveAbsoluteAdd = 9,
+    ExchangeAbsolute = 10,
 }
 
 impl RuntimeRole {

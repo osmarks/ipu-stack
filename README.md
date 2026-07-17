@@ -62,8 +62,8 @@ but the native output prototype does not yet return payload bytes: its host
 page remains zero and its final phase can remain in WAEX. It is diagnostic
 code, not a passing production data path.
 
-The exchange planner now lowers one-to-one transfers to direction-specific
-point-to-point rows and fanout to single-send multicast rows. Direct hardware
+The exchange planner lowers one-to-one and fanout transfers to absolute,
+single-send exchange rows. Direct hardware
 acceptance includes a 1,024-word single-packet broadcast to all 1,471 other
 tiles. The direct loop
 runtime executes generated per-tile plan tables across repeated globally
@@ -71,8 +71,11 @@ synchronized launches. Hardware acceptance includes a 1,472-value parallel
 sum: 11 reduction rounds and the exact result `1084128`
 without Poplar exchange code generation or host-side phase delays.
 
-The scheduler packs every tile-disjoint exchange group into the same epoch; the
-on-chip fabric is treated as non-blocking. The remaining executable-lowering
-work is to resolve native host-phase retirement, dispatch
+The scheduler treats the on-chip fabric as non-blocking. Tile-disjoint groups
+run concurrently; role conflicts become statically timed slots in the same
+launch, with one synchronization and a shared event horizon. Hardware testing
+includes a multicast whose relay receiver sends the payload onward in a later
+slot without an intermediate BSP barrier. The remaining executable-lowering
+work is to resolve native host completion and host-phase retirement, dispatch
 specialized compute kernels from the same per-tile program stream, and replace
 fixture-specific package construction with the general compiler pipeline.
