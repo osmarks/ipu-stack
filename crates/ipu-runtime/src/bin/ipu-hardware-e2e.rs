@@ -259,6 +259,8 @@ fn acceptance_graph() -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
             },
             initial_buffers,
             outputs,
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
         },
         expected_sum,
         permutation_expected,

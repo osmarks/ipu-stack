@@ -1,10 +1,10 @@
 use ipu_compiler::{AllocationKind, Phase, Schedule};
-use ipu_driver::{Device, Loader, block_device_interrupt_signals};
+use ipu_driver::{Device, HostSession, Loader, block_device_interrupt_signals};
 use ipu_elf::{LinkOptions, link};
-use ipu_exchange::{GlobalSyncProgram, Topology};
+use ipu_exchange::{GlobalSyncProgram, HostTransferChunk, TileToHostProgram, Topology};
 use ipu_package::{
-    Application, Binding, DeviceConfigWrite, EntryPoint, RegionSlice, SEGMENT_EXECUTE,
-    SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
+    Application, Binding, DeviceConfigWrite, EntryPoint, HostCall, HostExchange, HostPage,
+    HostSlice, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -14,6 +14,13 @@ const COMMAND_WORDS: usize = 5;
 const COMMAND_BYTES: u32 = (COMMAND_WORDS * 4) as u32;
 const PLAN_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
 const TILE_MUX_HOST_BASE: u32 = 0x600;
+const WORKER_CONTEXTS: u32 = 7;
+const WORKER_CONTEXT_BYTES: u32 = 0x30;
+const HOST_PACKET_STRIDE: u32 = 32;
+const HOST_PACKET_BASE: u32 = align_up(
+    ipu_exchange::EXCHANGE_WINDOW_BASE + WORKER_CONTEXTS * WORKER_CONTEXT_BYTES,
+    HOST_PACKET_STRIDE,
+);
 
 #[derive(Clone, Debug)]
 pub struct InitialBuffer {
@@ -27,6 +34,8 @@ pub struct ExecutableGraph {
     pub schedule: Schedule,
     pub initial_buffers: Vec<InitialBuffer>,
     pub outputs: Vec<Binding>,
+    pub host_inputs: Vec<Binding>,
+    pub host_outputs: Vec<Binding>,
 }
 
 #[derive(Clone, Debug)]
@@ -41,6 +50,8 @@ enum RuntimeRole {
     ExchangeAbsolute = 10,
     Compute = 11,
     ComputeNoop = 12,
+    HostProgram = 13,
+    HostIdle = 14,
 }
 
 impl RuntimeRole {
@@ -57,17 +68,19 @@ struct RuntimeLayout {
     completion_address: u32,
     sync_packet_address: u32,
     sync_release_address: u32,
+    host_command_address: u32,
+    host_zero_read_address: u32,
 }
 
 impl RuntimeLayout {
-    fn new(schedule: &Schedule, launch_rows: &[usize], command_count: usize) -> Result<Self> {
+    fn new(schedule: &Schedule, plan_bytes: &[usize], command_count: usize) -> Result<Self> {
         let plan_stride = align_up(
-            u32::try_from(launch_rows.iter().copied().max().unwrap_or(1))? * 4,
+            u32::try_from(plan_bytes.iter().copied().max().unwrap_or(1))?,
             8,
         );
         let plan_end = PLAN_BASE
             .checked_add(
-                u32::try_from(launch_rows.len())?
+                u32::try_from(command_count)?
                     .checked_mul(plan_stride)
                     .ok_or("plan size overflow")?,
             )
@@ -85,13 +98,41 @@ impl RuntimeLayout {
         let sync_packet_address = align_up(completion_address + 4, 8);
         let sync_release_address = sync_packet_address + 16;
         let runtime_end = sync_release_address + 4;
+        let host_packet_end = HOST_PACKET_BASE
+            .checked_add(
+                u32::try_from(command_count)?
+                    .checked_mul(HOST_PACKET_STRIDE)
+                    .ok_or("host packet size overflow")?,
+            )
+            .ok_or("host packet address overflow")?;
+        let host_control_end = host_packet_end
+            .checked_add(2 * HOST_PACKET_STRIDE)
+            .ok_or("host control address overflow")?;
+        if host_control_end
+            > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES
+        {
+            return Err("host packet table exceeds the exchange window".into());
+        }
 
         for allocation in &schedule.allocations {
             let allocation_end = allocation
                 .address
                 .checked_add(allocation.size)
                 .ok_or("allocation address overflow")?;
-            if ranges_overlap(PLAN_BASE, runtime_end, allocation.address, allocation_end) {
+            if ranges_overlap(PLAN_BASE, runtime_end, allocation.address, allocation_end)
+                || ranges_overlap(
+                    HOST_PACKET_BASE,
+                    host_packet_end,
+                    allocation.address,
+                    allocation_end,
+                )
+                || ranges_overlap(
+                    host_packet_end,
+                    host_control_end,
+                    allocation.address,
+                    allocation_end,
+                )
+            {
                 return Err(format!(
                     "runtime region overlaps tensor {} on tile {}",
                     allocation.tensor.0, allocation.tile
@@ -106,15 +147,44 @@ impl RuntimeLayout {
             completion_address,
             sync_packet_address,
             sync_release_address,
+            host_command_address: host_packet_end,
+            host_zero_read_address: host_packet_end + HOST_PACKET_STRIDE,
         })
     }
 
-    fn plan_address(self, launch: usize) -> Result<u32> {
+    fn plan_address(self, command: usize) -> Result<u32> {
         Ok(PLAN_BASE
-            + u32::try_from(launch)?
+            + u32::try_from(command)?
                 .checked_mul(self.plan_stride)
                 .ok_or("plan address overflow")?)
     }
+
+    fn host_packet_address(self, command: usize) -> Result<u32> {
+        Ok(HOST_PACKET_BASE
+            + u32::try_from(command)?
+                .checked_mul(HOST_PACKET_STRIDE)
+                .ok_or("host packet address overflow")?)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HostDirection {
+    CommandRead,
+    ToTile,
+    ToHost,
+}
+
+#[derive(Clone, Copy)]
+struct HostTransfer {
+    direction: HostDirection,
+    physical_tile: u16,
+    chunk: HostTransferChunk,
+}
+
+struct HostLayout {
+    inputs: Vec<HostTransfer>,
+    outputs: Vec<HostTransfer>,
+    protocol: HostExchange,
 }
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -127,13 +197,46 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     let lowered = graph.schedule.lower_exchanges(&topology)?;
     let exchange_by_phase: HashMap<_, _> =
         lowered.iter().map(|phase| (phase.phase, phase)).collect();
-    let launch_rows = lowered
+    if lowered.iter().any(|phase| phase.epochs.len() != 1) {
+        return Err("runtime expects one statically scheduled launch per exchange phase".into());
+    }
+    let host = build_host_layout(graph)?;
+    let command_count = host.inputs.len()
+        + graph.schedule.phases.len()
+        + host.outputs.len()
+        + usize::from(!host.inputs.is_empty() || !host.outputs.is_empty());
+    let mut plan_bytes = Vec::new();
+    plan_bytes.extend(
+        host.inputs
+            .iter()
+            .map(host_plan_size)
+            .collect::<Result<Vec<_>>>()?,
+    );
+    for (phase_index, phase) in graph.schedule.phases.iter().enumerate() {
+        plan_bytes.push(match phase {
+            Phase::Exchange { .. } => exchange_by_phase[&phase_index].epochs[0]
+                .tile_rows
+                .values()
+                .map(|row| row.len() * 4)
+                .max()
+                .unwrap_or(4),
+            Phase::Compute { .. } => 0,
+        });
+    }
+    plan_bytes.extend(
+        host.outputs
+            .iter()
+            .map(host_plan_size)
+            .collect::<Result<Vec<_>>>()?,
+    );
+    plan_bytes.resize(command_count, 0);
+    let layout = RuntimeLayout::new(&graph.schedule, &plan_bytes, command_count + 1)?;
+    let exchange_commands = graph
+        .schedule
+        .phases
         .iter()
-        .flat_map(|phase| phase.epochs.iter())
-        .map(|epoch| epoch.tile_rows.values().map(Vec::len).max().unwrap_or(1))
-        .collect::<Vec<_>>();
-    let command_count = graph.schedule.phases.len() + 1;
-    let layout = RuntimeLayout::new(&graph.schedule, &launch_rows, command_count)?;
+        .filter(|phase| matches!(phase, Phase::Exchange { .. }))
+        .count();
     let global_sync = ipu_exchange::c600_global_sync();
     let image = link(
         objects,
@@ -223,22 +326,30 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         });
 
         let mut commands = Vec::new();
-        let mut launch = 0usize;
+        let mut command_index = 0usize;
+        for transfer in &host.inputs {
+            append_host_command(
+                &mut app,
+                &mut segments,
+                &mut commands,
+                *transfer,
+                physical as u16,
+                layout.plan_address(command_index)?,
+                layout.host_packet_address(command_index)?,
+                layout.host_command_address,
+                layout.host_zero_read_address,
+            )?;
+            command_index += 1;
+        }
         for (phase_index, phase) in graph.schedule.phases.iter().enumerate() {
             match phase {
                 Phase::Exchange { .. } => {
                     let lowered = exchange_by_phase
                         .get(&phase_index)
                         .ok_or("missing lowered exchange phase")?;
-                    if lowered.epochs.len() != 1 {
-                        return Err(
-                            "runtime expects one statically scheduled launch per exchange phase"
-                                .into(),
-                        );
-                    }
                     let epoch = &lowered.epochs[0];
                     let (role, plan_address) = if let Some(row) = epoch.tile_rows.get(&logical) {
-                        let address = layout.plan_address(launch)?;
+                        let address = layout.plan_address(command_index)?;
                         let bytes = words_to_bytes(row);
                         let blob = app.add_blob(bytes.clone());
                         segments.push(Segment {
@@ -260,7 +371,6 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                         0,
                         0,
                     ]));
-                    launch += 1;
                 }
                 Phase::Compute {
                     commands: phase_commands,
@@ -320,7 +430,33 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                     }
                 }
             }
+            command_index += 1;
         }
+        for transfer in &host.outputs {
+            append_host_command(
+                &mut app,
+                &mut segments,
+                &mut commands,
+                *transfer,
+                physical as u16,
+                layout.plan_address(command_index)?,
+                layout.host_packet_address(command_index)?,
+                layout.host_command_address,
+                layout.host_zero_read_address,
+            )?;
+            command_index += 1;
+        }
+        if !host.inputs.is_empty() || !host.outputs.is_empty() {
+            commands.extend_from_slice(&words_to_bytes(&[
+                RuntimeRole::ComputeNoop.word(),
+                0,
+                0,
+                0,
+                0,
+            ]));
+            command_index += 1;
+        }
+        debug_assert_eq!(command_index, command_count);
         commands.extend_from_slice(&words_to_bytes(&[0, 0, 0, 0, 0]));
         let command_blob = app.add_blob(commands.clone());
         segments.push(Segment {
@@ -378,7 +514,9 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         });
     }
     app.tiles.sort_by_key(|tile| tile.physical_tile);
+    app.inputs = graph.host_inputs.clone();
     app.outputs = graph.outputs.clone();
+    app.outputs.extend(graph.host_outputs.clone());
     app.outputs.push(Binding {
         name: "runtime-completion".into(),
         dtype: "u32".into(),
@@ -395,21 +533,400 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             offset: write.offset,
             value: write.value,
         }));
-    let launches = lowered
-        .iter()
-        .map(|phase| phase.epochs.len() as u32)
-        .sum::<u32>();
+    app.host_exchange = host.protocol;
     app.entry_points.push(EntryPoint {
         name: "graph".into(),
         command: 0,
-        external_syncs: 1 + launches * 2,
+        external_syncs: 1 + u32::try_from(command_count + exchange_commands)?,
     });
     app.validate()?;
     info!(
         tiles = app.tiles.len(),
-        launches, "packaged executable graph"
+        commands = command_count,
+        host_inputs = graph.host_inputs.len(),
+        host_outputs = graph.host_outputs.len(),
+        "packaged executable graph"
     );
     Ok(app)
+}
+
+fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
+    if graph.host_inputs.is_empty() && graph.host_outputs.is_empty() {
+        return Ok(HostLayout {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            protocol: HostExchange::default(),
+        });
+    }
+
+    const HOST_PAGE_BYTES: u32 = ipu_exchange::HOST_PAGE_BYTES;
+    const DATA_START: u32 = 64;
+    let input_page_end = host_bindings_end(&graph.host_inputs, DATA_START)?;
+    let output_page_end = host_bindings_end(&graph.host_outputs, DATA_START)?;
+    let data_page_count = align_up(
+        input_page_end.max(output_page_end).max(HOST_PAGE_BYTES),
+        HOST_PAGE_BYTES,
+    ) / HOST_PAGE_BYTES;
+    let command_page = data_page_count;
+    let command_host_offset = command_page
+        .checked_mul(HOST_PAGE_BYTES)
+        .ok_or("command page offset overflow")?;
+    let mut page_cursor = DATA_START;
+    let mut input_cursor = 0u64;
+    let mut output_cursor = 0u64;
+    let mut input_slices = Vec::new();
+    let mut output_slices = Vec::new();
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+
+    if !graph.host_inputs.is_empty() {
+        inputs.push(command_read_transfer(command_host_offset)?);
+    }
+
+    for binding in &graph.host_inputs {
+        let size = binding_size(binding)?;
+        let page_base = u64::from(align_up(page_cursor, 64));
+        for slice in &binding.slices {
+            let host_offset = u32::try_from(page_base + slice.file_offset)?;
+            append_host_slices(
+                &mut input_slices,
+                host_offset,
+                input_cursor + slice.file_offset,
+                slice.size,
+                HOST_PAGE_BYTES,
+            )?;
+            for chunk in ipu_exchange::plan_host_to_tile(
+                u16::try_from(slice.tile)?,
+                slice.tile_address,
+                host_offset,
+                u32::try_from(slice.size)?,
+            )? {
+                inputs.push(HostTransfer {
+                    direction: HostDirection::ToTile,
+                    physical_tile: u16::try_from(slice.tile)?,
+                    chunk,
+                });
+            }
+        }
+        page_cursor = u32::try_from(page_base + size)?;
+        input_cursor = input_cursor
+            .checked_add(size)
+            .ok_or("host input size overflow")?;
+    }
+    if !graph.schedule.phases.is_empty() {
+        inputs.push(command_read_transfer(command_host_offset)?);
+    }
+    if !graph.host_outputs.is_empty() {
+        outputs.push(command_read_transfer(command_host_offset)?);
+    }
+    page_cursor = DATA_START;
+    for binding in &graph.host_outputs {
+        let size = binding_size(binding)?;
+        let page_base = u64::from(align_up(page_cursor, 64));
+        for slice in &binding.slices {
+            let host_offset = u32::try_from(page_base + slice.file_offset)?;
+            append_host_slices(
+                &mut output_slices,
+                host_offset,
+                output_cursor + slice.file_offset,
+                slice.size,
+                HOST_PAGE_BYTES,
+            )?;
+            for chunk in ipu_exchange::plan_tile_to_host(
+                u16::try_from(slice.tile)?,
+                slice.tile_address,
+                host_offset,
+                u32::try_from(slice.size)?,
+            )? {
+                outputs.push(HostTransfer {
+                    direction: HostDirection::ToHost,
+                    physical_tile: u16::try_from(slice.tile)?,
+                    chunk,
+                });
+            }
+        }
+        page_cursor = u32::try_from(page_base + size)?;
+        output_cursor = output_cursor
+            .checked_add(size)
+            .ok_or("host output size overflow")?;
+    }
+
+    let host_phases = 1usize
+        .checked_add(inputs.len())
+        .and_then(|phases| phases.checked_add(outputs.len()))
+        .and_then(|phases| {
+            phases.checked_add(
+                graph
+                    .schedule
+                    .phases
+                    .iter()
+                    .filter(|phase| matches!(phase, Phase::Exchange { .. }))
+                    .count(),
+            )
+        })
+        .ok_or("host phase count overflow")?;
+    Ok(HostLayout {
+        inputs,
+        outputs,
+        protocol: HostExchange {
+            startup_mark: ipu_driver::HOST_EXCHANGE_HANDOFF_MARK,
+            command_page,
+            command_offset: 0,
+            pages: (0..=command_page)
+                .map(|index| HostPage {
+                    index,
+                    size: u64::from(HOST_PAGE_BYTES),
+                })
+                .collect(),
+            attach_order: std::iter::once(command_page)
+                .chain(0..data_page_count)
+                .collect(),
+            calls: vec![HostCall {
+                name: "graph".into(),
+                command: 0,
+                phases: u32::try_from(host_phases)?,
+                inputs: input_slices,
+                outputs: output_slices,
+            }],
+        },
+    })
+}
+
+fn host_bindings_end(bindings: &[Binding], start: u32) -> Result<u32> {
+    let mut cursor = start;
+    for binding in bindings {
+        let base = align_up(cursor, 64);
+        cursor = u32::try_from(u64::from(base) + binding_size(binding)?)?;
+    }
+    Ok(cursor)
+}
+
+fn append_host_slices(
+    slices: &mut Vec<HostSlice>,
+    mut host_offset: u32,
+    mut file_offset: u64,
+    mut size: u64,
+    page_bytes: u32,
+) -> Result<()> {
+    while size != 0 {
+        let page = host_offset / page_bytes;
+        let page_offset = host_offset % page_bytes;
+        let count = size.min(u64::from(page_bytes - page_offset));
+        slices.push(HostSlice {
+            page,
+            page_offset: u64::from(page_offset),
+            file_offset,
+            size: count,
+        });
+        host_offset = host_offset
+            .checked_add(u32::try_from(count)?)
+            .ok_or("host slice offset overflow")?;
+        file_offset = file_offset
+            .checked_add(count)
+            .ok_or("host file offset overflow")?;
+        size -= count;
+    }
+    Ok(())
+}
+
+fn command_read_transfer(host_offset: u32) -> Result<HostTransfer> {
+    Ok(HostTransfer {
+        direction: HostDirection::CommandRead,
+        physical_tile: 0,
+        chunk: HostTransferChunk {
+            tile_address: ipu_exchange::EXCHANGE_WINDOW_BASE,
+            host_offset,
+            bytes: 4,
+            header: ipu_exchange::host_to_tile_packet(
+                0,
+                ipu_exchange::EXCHANGE_WINDOW_BASE,
+                host_offset,
+                4,
+            )?,
+        },
+    })
+}
+
+fn binding_size(binding: &Binding) -> Result<u64> {
+    binding
+        .slices
+        .iter()
+        .try_fold(0u64, |size, slice| {
+            slice
+                .file_offset
+                .checked_add(slice.size)
+                .map(|end| size.max(end))
+                .ok_or("binding size overflow")
+        })
+        .map_err(Into::into)
+}
+
+fn host_plan_size(transfer: &HostTransfer) -> Result<usize> {
+    Ok(assemble_host_program(
+        *transfer,
+        HOST_PACKET_BASE,
+        ipu_exchange::EXCHANGE_WINDOW_BASE,
+        ipu_exchange::EXCHANGE_WINDOW_BASE + HOST_PACKET_STRIDE,
+    )?
+    .instructions
+    .len()
+        * 4)
+}
+
+fn assemble_host_program(
+    transfer: HostTransfer,
+    packet_address: u32,
+    command_address: u32,
+    zero_read_address: u32,
+) -> Result<TileToHostProgram> {
+    let chunk = transfer.chunk;
+    match transfer.direction {
+        HostDirection::CommandRead => Ok(ipu_exchange::assemble_host_command_read_program(
+            packet_address,
+            command_address,
+            chunk.host_offset,
+        )?),
+        HostDirection::ToTile => Ok(ipu_exchange::assemble_host_to_tile_program(
+            transfer.physical_tile,
+            chunk.tile_address,
+            chunk.host_offset,
+            chunk.bytes,
+            packet_address,
+        )?),
+        HostDirection::ToHost => Ok(ipu_exchange::assemble_tile_to_host_program(
+            transfer.physical_tile,
+            chunk.tile_address,
+            chunk.host_offset,
+            chunk.bytes,
+            packet_address,
+            zero_read_address,
+        )?),
+    }
+}
+
+fn append_host_command(
+    app: &mut Application,
+    segments: &mut Vec<Segment>,
+    commands: &mut Vec<u8>,
+    transfer: HostTransfer,
+    physical_tile: u16,
+    plan_address: u32,
+    packet_address: u32,
+    command_address: u32,
+    zero_read_address: u32,
+) -> Result<()> {
+    let (role, address) = if transfer.physical_tile == physical_tile {
+        let program =
+            assemble_host_program(transfer, packet_address, command_address, zero_read_address)?;
+        let instructions = words_to_bytes(&program.instructions);
+        let size = u32::try_from(instructions.len())?;
+        let blob = app.add_blob(instructions);
+        segments.push(Segment {
+            address: plan_address,
+            memory_size: size,
+            blob,
+            blob_offset: 0,
+            file_size: size,
+            flags: SEGMENT_READ | SEGMENT_EXECUTE,
+        });
+        let packets = words_to_bytes(&program.packet_words);
+        let packet_size = u32::try_from(packets.len())?;
+        let packet_blob = app.add_blob(packets);
+        segments.push(Segment {
+            address: packet_address,
+            memory_size: packet_size,
+            blob: packet_blob,
+            blob_offset: 0,
+            file_size: packet_size,
+            flags: SEGMENT_READ,
+        });
+        (RuntimeRole::HostProgram, plan_address)
+    } else {
+        (RuntimeRole::HostIdle, 0)
+    };
+    commands.extend_from_slice(&words_to_bytes(&[role.word(), address, 0, 0, 0]));
+    Ok(())
+}
+
+pub fn run_host(
+    app: &Application,
+    bootloader: &[u8],
+    configuration: &[u8],
+    device_path: &str,
+    input: &[u8],
+) -> Result<Vec<u8>> {
+    if app.host_exchange.calls.is_empty() {
+        return Err("application has no generated host graph call".into());
+    }
+    block_device_interrupt_signals()?;
+    let device = Device::open(device_path)?;
+    device.initialize()?;
+    device.replay_configuration(configuration)?;
+    for write in &app.device_config_writes {
+        device.write_config(write.offset, write.value)?;
+    }
+    Loader::new(&device, bootloader)?.load(app, app.host_exchange.startup_mark)?;
+    let mut session = HostSession::new(&device, app.host_exchange.clone())?;
+    let calls = app.host_exchange.calls.clone();
+    let first = &calls[0];
+    session.prepare(
+        &first.name,
+        if first.inputs.is_empty() { &[] } else { input },
+    )?;
+    session
+        .start()
+        .map_err(|error| format!("generated host startup rendezvous: {error}"))?;
+    let mut output = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
+        if index != 0 {
+            session.prepare(&call.name, if call.inputs.is_empty() { &[] } else { input })?;
+        }
+        output = match session.invoke_prepared(&call.name) {
+            Ok(output) => output,
+            Err(error) => {
+                let states = supervisor_state_summary(&device, app);
+                return Err(format!(
+                    "generated host call {}: {error}; supervisor states: {states}",
+                    call.name
+                )
+                .into());
+            }
+        };
+    }
+    Ok(output)
+}
+
+fn supervisor_state_summary(device: &Device, app: &Application) -> String {
+    let mut counts = [0usize; 4];
+    let mut samples = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut read_errors = 0usize;
+    for tile in &app.tiles {
+        match device.tile_context_state(tile.physical_tile as u16, 0) {
+            Ok(state @ 0..=3) => {
+                counts[state as usize] += 1;
+                if samples[state as usize].len() < 8 {
+                    samples[state as usize].push(tile.physical_tile);
+                }
+            }
+            Ok(_) | Err(_) => read_errors += 1,
+        }
+    }
+    let program_counters = app
+        .tiles
+        .iter()
+        .take(8)
+        .map(|tile| {
+            let pc = device
+                .read_tile_program_counter(tile.physical_tile as u16, 0)
+                .map(|pc| format!("0x{pc:x}"))
+                .unwrap_or_else(|error| format!("error({error})"));
+            format!("{}:{pc}", tile.physical_tile)
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "0={} {:?}, 1={} {:?}, 2={} {:?}, 3={} {:?}, errors={read_errors}, pc={program_counters:?}",
+        counts[0], samples[0], counts[1], samples[1], counts[2], samples[2], counts[3], samples[3]
+    )
 }
 
 pub fn run_diagnostic(
@@ -443,14 +960,11 @@ pub fn run_diagnostic(
     device.write_config(ipu_driver::pci::HSP_GS2_CONTROL, entry.external_syncs)?;
     device.set_mark(1)?;
     let deadline = Instant::now() + Duration::from_secs(10);
-    while device.tile_context_state(completion.tile as u16, 0)? != 3 {
+    while device.read_tile_word(completion.tile as u16, completion.tile_address)? != 1 {
         if Instant::now() >= deadline {
             return Err("diagnostic graph execution timed out".into());
         }
         std::thread::sleep(Duration::from_micros(100));
-    }
-    if device.read_tile_word(completion.tile as u16, completion.tile_address)? != 1 {
-        return Err("coordinator trapped before recording completion".into());
     }
 
     let mut bindings = BTreeMap::new();
@@ -564,4 +1078,68 @@ const fn align_up(value: u32, alignment: u32) -> u32 {
 
 const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_end: u32) -> bool {
     left_start < right_end && right_start < left_end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_layout_pages_large_bindings_without_crossing_packets() {
+        let binding = Binding {
+            name: "payload".into(),
+            dtype: "u8".into(),
+            shape: vec![4096],
+            slices: vec![RegionSlice {
+                tile: 0,
+                tile_address: 0x53000,
+                file_offset: 0,
+                size: 4096,
+            }],
+        };
+        let graph = ExecutableGraph {
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: Vec::new(),
+                tile_count: 1472,
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_inputs: vec![binding.clone()],
+            host_outputs: vec![binding],
+        };
+
+        let layout = build_host_layout(&graph).unwrap();
+        let call = &layout.protocol.calls[0];
+        assert!(
+            layout
+                .protocol
+                .pages
+                .iter()
+                .all(|page| page.size == u64::from(ipu_exchange::HOST_PAGE_BYTES))
+        );
+        assert_eq!(
+            call.inputs.iter().map(|slice| slice.size).sum::<u64>(),
+            4096
+        );
+        assert_eq!(
+            call.outputs.iter().map(|slice| slice.size).sum::<u64>(),
+            4096
+        );
+        assert!(call.inputs.iter().chain(&call.outputs).all(|slice| {
+            slice.page != layout.protocol.command_page
+                && slice.page_offset + slice.size <= u64::from(ipu_exchange::HOST_PAGE_BYTES)
+        }));
+        assert!(layout.inputs.iter().chain(&layout.outputs).all(|transfer| {
+            let chunk = transfer.chunk;
+            chunk.host_offset / ipu_exchange::HOST_PAGE_BYTES
+                == (chunk.host_offset + chunk.bytes - 1) / ipu_exchange::HOST_PAGE_BYTES
+        }));
+        assert_eq!(
+            call.phases,
+            u32::try_from(1 + layout.inputs.len() + layout.outputs.len()).unwrap()
+        );
+    }
 }

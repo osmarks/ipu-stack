@@ -8,3 +8,15 @@ fn generated_compute_exchange_graph_runs_end_to_end() {
         .expect("launch single-threaded C600 test runner");
     assert!(status.success(), "C600 test runner failed with {status}");
 }
+
+#[test]
+#[ignore = "requires exclusive access to a physical C600"]
+fn generated_host_exchange_graph_runs_end_to_end() {
+    let status = Command::new(env!("CARGO_BIN_EXE_ipu-host-e2e"))
+        .status()
+        .expect("launch C600 host exchange test runner");
+    assert!(
+        status.success(),
+        "C600 host test runner failed with {status}"
+    );
+}

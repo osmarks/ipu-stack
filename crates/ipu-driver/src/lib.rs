@@ -17,6 +17,9 @@ pub const TILE_MEMORY_SIZE: usize = 624 * 1024;
 // launch slot. Applications reserve that word and enter at the following word.
 pub const APPLICATION_LOAD_BASE: u32 = TILE_MEMORY_BASE + 0x10;
 pub const HSP_MARK_MASK: u32 = 0xffff;
+// The secondary loader consumes 23 tile batches before handing HSP ownership
+// to the resident host-exchange program.
+pub const HOST_EXCHANGE_HANDOFF_MARK: u32 = 23;
 pub const TILES_PER_BATCH: usize = 64;
 pub const FRAME_SIZE: usize = 1024;
 pub const FRAME_HEADER_SIZE: usize = 16;
@@ -204,6 +207,7 @@ const fn ioctl_code(direction: u32, number: u32, size: u32) -> libc::c_ulong {
 const USER_ATTACH: libc::c_ulong = ioctl_code(IOC_READ | IOC_WRITE, 10, 8);
 const BUFFER_ATTACH: libc::c_ulong = ioctl_code(IOC_READ | IOC_WRITE, 11, 8);
 const BUFFER_DETACH: libc::c_ulong = ioctl_code(IOC_READ | IOC_WRITE, 12, 8);
+const BUFFER_DETACH_ALL: libc::c_ulong = ioctl_code(0, 18, 0);
 const SET_IPU_ID: libc::c_ulong = ioctl_code(IOC_READ | IOC_WRITE, 14, 8);
 const MAILBOX_WRITE_READ: libc::c_ulong = ioctl_code(IOC_READ | IOC_WRITE, 31, 8);
 const STOP_MONITORING: libc::c_ulong = ioctl_code(0, 34, 0);
@@ -595,6 +599,10 @@ impl Device {
         unsafe { libc::ioctl(self.fd, BUFFER_DETACH, index as libc::c_ulong) };
     }
 
+    pub fn detach_all_buffers(&self) -> Result<(), DriverError> {
+        self.ioctl_value(BUFFER_DETACH_ALL, 0, "detach all host buffers")
+    }
+
     fn mailbox(&self, request: MailboxMessage) -> Result<MailboxMessage, DriverError> {
         let mut response = MailboxMessage::default();
         let mut argument = MailboxArgument {
@@ -937,7 +945,7 @@ pub struct HostSession<'a> {
     device: &'a Device,
     protocol: HostExchange,
     pages: HashMap<u32, HostBuffer>,
-    attached: bool,
+    attached_pages: Vec<u32>,
 }
 
 impl<'a> HostSession<'a> {
@@ -950,7 +958,7 @@ impl<'a> HostSession<'a> {
             device,
             protocol,
             pages,
-            attached: false,
+            attached_pages: Vec::new(),
         })
     }
 
@@ -959,6 +967,7 @@ impl<'a> HostSession<'a> {
             pages = self.protocol.attach_order.len(),
             "attaching host exchange pages"
         );
+        self.device.detach_all_buffers()?;
         for index in &self.protocol.attach_order {
             let page = self
                 .pages
@@ -966,9 +975,14 @@ impl<'a> HostSession<'a> {
                 .ok_or_else(|| DriverError::Invalid(format!("missing host page {index}")))?;
             self.device
                 .write_config(pci::EXCHANGE_WINDOW_BASE, pci::EXCHANGE_WINDOW_HEXOPT)?;
-            self.device.attach_buffer(*index, page.data, page.size)?;
+            if let Err(error) = self.device.attach_buffer(*index, page.data, page.size) {
+                for attached in self.attached_pages.drain(..).rev() {
+                    self.device.detach_buffer(attached);
+                }
+                return Err(error);
+            }
+            self.attached_pages.push(*index);
         }
-        self.attached = true;
         Ok(())
     }
 
@@ -989,7 +1003,34 @@ impl<'a> HostSession<'a> {
     }
 
     pub fn invoke(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, DriverError> {
-        if !self.attached {
+        if self.attached_pages.len() != self.protocol.attach_order.len() {
+            return Err(DriverError::Invalid("host session not attached".into()));
+        }
+        let call = self.prepare(name, input)?;
+        self.drive(call)
+    }
+
+    pub fn prepare(&mut self, name: &str, input: &[u8]) -> Result<HostCall, DriverError> {
+        let call = self
+            .protocol
+            .calls
+            .iter()
+            .find(|call| call.name == name)
+            .cloned()
+            .ok_or_else(|| DriverError::Invalid(format!("unknown host call {name}")))?;
+        copy_input(&mut self.pages, &call, input)?;
+        let command = self
+            .pages
+            .get_mut(&self.protocol.command_page)
+            .ok_or_else(|| DriverError::Invalid("missing command page".into()))?;
+        let offset = self.protocol.command_offset as usize;
+        command.bytes_mut()[offset..offset + 4].copy_from_slice(&call.command.to_le_bytes());
+        fence(Ordering::SeqCst);
+        Ok(call)
+    }
+
+    pub fn invoke_prepared(&mut self, name: &str) -> Result<Vec<u8>, DriverError> {
+        if self.attached_pages.len() != self.protocol.attach_order.len() {
             return Err(DriverError::Invalid("host session not attached".into()));
         }
         let call = self
@@ -999,29 +1040,32 @@ impl<'a> HostSession<'a> {
             .find(|call| call.name == name)
             .cloned()
             .ok_or_else(|| DriverError::Invalid(format!("unknown host call {name}")))?;
+        self.drive(call)
+    }
+
+    fn drive(&mut self, call: HostCall) -> Result<Vec<u8>, DriverError> {
         info!(
-            call = name,
+            call = call.name,
             command = call.command,
             phases = call.phases,
-            input_bytes = input.len(),
             "invoking host exchange call"
         );
-        copy_input(&mut self.pages, &call, input)?;
-        let command = self
-            .pages
-            .get_mut(&self.protocol.command_page)
-            .ok_or_else(|| DriverError::Invalid("missing command page".into()))?;
-        let offset = self.protocol.command_offset as usize;
-        command.bytes_mut()[offset..offset + 4].copy_from_slice(&call.command.to_le_bytes());
-        fence(Ordering::SeqCst);
-        for _ in 0..call.phases {
-            self.device.write_config(pci::HSP_GS2_CONTROL, 1)?;
+        for phase in 0..call.phases {
             self.device
                 .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
+            self.device.write_config(pci::HSP_GS2_CONTROL, 1)?;
+            self.device
+                .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))
+                .map_err(|error| {
+                    DriverError::Timeout(format!(
+                        "host call {} phase {phase}/{}: {error}",
+                        call.name, call.phases
+                    ))
+                })?;
         }
         let output = copy_output(&mut self.pages, &call)?;
         info!(
-            call = name,
+            call = call.name,
             output_bytes = output.len(),
             "host exchange call completed"
         );
@@ -1031,10 +1075,8 @@ impl<'a> HostSession<'a> {
 
 impl Drop for HostSession<'_> {
     fn drop(&mut self) {
-        if self.attached {
-            for index in self.protocol.attach_order.iter().rev() {
-                self.device.detach_buffer(*index);
-            }
+        for index in self.attached_pages.drain(..).rev() {
+            self.device.detach_buffer(index);
         }
     }
 }

@@ -357,12 +357,9 @@ impl Application {
             return Err(PackageError::Invalid("invalid host page table".into()));
         }
         if !self.host_exchange.calls.is_empty()
-            && (self.host_exchange.startup_mark == 0
-                || pages
-                    .get(&self.host_exchange.command_page)
-                    .is_none_or(|size| {
-                        self.host_exchange.command_offset.checked_add(4) > Some(*size)
-                    }))
+            && pages
+                .get(&self.host_exchange.command_page)
+                .is_none_or(|size| self.host_exchange.command_offset.checked_add(4) > Some(*size))
         {
             return Err(PackageError::Invalid(
                 "invalid host startup protocol".into(),
