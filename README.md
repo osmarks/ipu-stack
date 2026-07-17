@@ -74,10 +74,12 @@ packet boundaries are covered by unit tests and hardware runs.
 Exchange Tx/Rx staging addresses are selected from explicit memory constraints:
 tile, byte range, alignment, placement direction, and half-open phase lifetime.
 The allocator rejects exhaustion and permits the same address on different
-tiles or across disjoint lifetimes. The host H2D source is constrained to the
-encodable 8 KiB host-to-tile window; ordinary exchange receivers use the full
-32 KiB exchange window. No concrete staging address is specified by the host
-exchange acceptance graph.
+tiles or across disjoint lifetimes. The host H2D destination is constrained to
+the protocol's directly encodable 16 KiB host-to-tile window; runtime control
+storage within that window reduces the largest contiguous allocation currently
+available to an application. Ordinary exchange receivers use the full 32 KiB
+exchange window. No concrete staging address is specified by the host exchange
+acceptance graph.
 
 The exchange planner lowers one-to-one and fanout transfers to absolute,
 single-send exchange rows. Direct hardware
