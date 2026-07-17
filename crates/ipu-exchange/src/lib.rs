@@ -5,6 +5,7 @@ use tracing::debug;
 pub const PLAN_WORDS: usize = 9;
 pub const MAX_TRANSFER_WORDS: u32 = 4148;
 pub const EXCHANGE_WINDOW_BASE: u32 = 0x50000;
+pub const EXCHANGE_WINDOW_BYTES: u32 = 0x8000;
 pub const HOST_SHORT_MAX_BYTES: u32 = 60;
 pub const HOST_LONG_MAX_BYTES: u32 = 1024;
 
