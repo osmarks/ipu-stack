@@ -7,6 +7,7 @@
 	.set ROLE_COMPUTE_NOOP, 12
 	.set ROLE_HOST_PROGRAM, 13
 	.set ROLE_HOST_IDLE, 14
+	.set ROLE_HOST_COMPLETION, 15
 	.set TILE_MUX_HOST, 0x600
 	.set TILE_MUX_EXCHANGE, 0x640
 	.set WORKER_BASE_START, 0x50000
@@ -72,6 +73,8 @@ ipu_stack_command_table_address:
 	brnz $m8, .Lload_host_command
 	cmpeq $m8, $m5, ROLE_HOST_IDLE
 	brnz $m8, .Lload_host_command
+	cmpeq $m8, $m5, ROLE_HOST_COMPLETION
+	brnz $m8, .Ldispatch_command
 	cmpeq $m8, $m5, ROLE_INACTIVE
 	brnz $m8, .Lpre_sync_exchange
 	cmpeq $m8, $m5, ROLE_EXCHANGE_ABSOLUTE
@@ -83,13 +86,13 @@ ipu_stack_command_table_address:
 	runall $m0, $m15, 0
 	.long OPCODE_SYNC | SYNC_COMPUTE_SET
 	ld32 $m1, $m6, $m15, 1
+	ld32 $m2, $m6, $m15, 2
 	ld32 $m3, $m6, $m15, 3
 	ld32 $m4, $m6, $m15, 4
 	add $m6, $m6, 20
 	bri .Ldispatch_command
 .Lload_host_command:
 	ld32 $m1, $m6, $m15, 1
-	ld32 $m2, $m6, $m15, 2
 	add $m6, $m6, 20
 .Ldispatch_command:
 	cmpeq $m8, $m5, ROLE_INACTIVE
@@ -104,6 +107,8 @@ ipu_stack_command_table_address:
 	brnz $m8, .Lrun_host_program
 	cmpeq $m8, $m5, ROLE_HOST_IDLE
 	brnz $m8, .Lhost_idle
+	cmpeq $m8, $m5, ROLE_HOST_COMPLETION
+	brnz $m8, .Lhost_completion
 	bri .Lhalt
 .Lset_absolute_exchange_bases:
 	put 0xa7, $m15
@@ -119,13 +124,17 @@ ipu_stack_command_table_address:
 	br $m1
 
 .Lrun_host_program:
-	setzi $m10, .Lhost_launch_complete
+	setzi $m10, .Llaunch_complete
 	br $m1
 
 .Lhost_idle:
 	.long OPCODE_SANS | SANS_EXTERNAL
 	.long OPCODE_SYNC | SYNC_EXTERNAL
-	bri .Lhost_launch_complete
+	bri .Llaunch_complete
+
+.Lhost_completion:
+	call $m7, ipu_stack_pre_sync_dispatch
+	bri .Ldone
 
 .Lplan_complete:
 	setzi $m0, ipu_stack_exchange_loop_worker_cycle_end
@@ -145,12 +154,6 @@ ipu_stack_command_table_address:
 .Llaunch_complete:
 	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
-	bri .Lcommand_loop
-
-.Lhost_launch_complete:
-	setzi $m0, TILE_MUX_EXCHANGE
-	put 0xa0, $m0
-	call $m7, ipu_stack_pre_sync_dispatch
 	bri .Lcommand_loop
 
 .Ldone:
