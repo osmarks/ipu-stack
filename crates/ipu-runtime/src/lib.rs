@@ -52,7 +52,6 @@ enum RuntimeRole {
     ComputeNoop = 12,
     HostProgram = 13,
     HostIdle = 14,
-    HostCompletion = 15,
 }
 
 impl RuntimeRole {
@@ -215,10 +214,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         return Err("runtime expects one statically scheduled launch per exchange phase".into());
     }
     let host = build_host_layout(graph)?;
-    let command_count = host.inputs.len()
-        + graph.schedule.phases.len()
-        + host.outputs.len()
-        + usize::from(!host.inputs.is_empty() || !host.outputs.is_empty());
+    let command_count = host.inputs.len() + graph.schedule.phases.len() + host.outputs.len();
     let mut plan_bytes = Vec::new();
     let mut packet_bytes = Vec::new();
     plan_bytes.extend(
@@ -476,16 +472,6 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             )?;
             command_index += 1;
         }
-        if !host.inputs.is_empty() || !host.outputs.is_empty() {
-            commands.extend_from_slice(&words_to_bytes(&[
-                RuntimeRole::HostCompletion.word(),
-                0,
-                0,
-                0,
-                0,
-            ]));
-            command_index += 1;
-        }
         debug_assert_eq!(command_index, command_count);
         commands.extend_from_slice(&words_to_bytes(&[0, 0, 0, 0, 0]));
         let command_blob = app.add_blob(commands.clone());
@@ -645,6 +631,12 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
             .checked_add(size)
             .ok_or("host input size overflow")?;
     }
+    if !graph.schedule.phases.is_empty() {
+        inputs.push(command_read_transfer(command_host_offset)?);
+    }
+    if !graph.host_outputs.is_empty() {
+        outputs.push(command_read_transfer(command_host_offset)?);
+    }
     page_cursor = DATA_START;
     for binding in &graph.host_outputs {
         let size = binding_size(binding)?;
@@ -678,9 +670,10 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
             .ok_or("host output size overflow")?;
     }
 
-    let host_phases = 1usize
-        .checked_add(inputs.len())
-        .and_then(|phases| phases.checked_add(outputs.len()))
+    let host_phases = inputs
+        .len()
+        .checked_add(outputs.len())
+        .and_then(|transfers| transfers.checked_mul(2))
         .ok_or("host phase count overflow")?;
     Ok(HostLayout {
         inputs,
@@ -1258,7 +1251,7 @@ mod tests {
         }));
         assert_eq!(
             call.phases,
-            u32::try_from(1 + layout.inputs.len() + layout.outputs.len()).unwrap()
+            u32::try_from(2 * (layout.inputs.len() + layout.outputs.len())).unwrap()
         );
         let output = layout
             .outputs
