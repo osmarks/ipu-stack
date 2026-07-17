@@ -100,5 +100,10 @@ commands perform no arithmetic. A randomized 64-byte hardware acceptance path
 now performs H2D to the controller tile, two generated tile-exchange phases via
 a relay tile, and D2H from the automatically allocated return range. Larger
 host-only transfers work; larger combined tile-exchange transfers still need
-their exchange timing failure isolated. Arbitrary direct host I/O on a
-non-controller tile also still requires distributed host-role generation.
+their exchange timing failure isolated. D2H lowering now emits separate tile-0
+coordinator and source-tile endpoint programs in one host phase. Randomized
+H2D to tile 0, D2D staging, and direct D2H from five remote tiles across the
+topology pass through 1 KiB, including the last logical tile. Multi-packet D2H
+uses one XREQ and close around 256-byte packet/payload pairs, matching the SDK
+schedule. Larger remote-output tests are currently blocked by the preceding
+large D2D phase rather than by a demonstrated D2H limit.

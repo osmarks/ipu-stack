@@ -38,22 +38,37 @@ fn main() {
         })
         .unwrap_or(DEFAULT_TRANSFER_BYTES);
     let exchange = std::env::var_os("IPU_HOST_TEST_EXCHANGE").is_some();
+    let remote_d2h = std::env::var_os("IPU_HOST_TEST_REMOTE_D2H").is_some();
     let host_tile = std::env::var("IPU_HOST_TEST_TILE")
         .map(|value| {
             value
                 .parse()
                 .expect("IPU_HOST_TEST_TILE must be an integer")
         })
-        .unwrap_or(HOST_CONTROLLER_TILE);
+        .unwrap_or(if remote_d2h {
+            EXCHANGE_RELAY_TILE
+        } else {
+            HOST_CONTROLLER_TILE
+        });
     let input = test_payload(transfer_bytes);
-    let graph = host_exchange_graph(transfer_bytes, exchange, host_tile).unwrap();
+    let graph = host_exchange_graph(
+        transfer_bytes,
+        exchange || remote_d2h,
+        host_tile,
+        remote_d2h,
+    )
+    .unwrap();
     let app = package_graph(&graph, &[runtime_object]).unwrap();
     let result = run_host(&app, &bootloader, &configuration, &device, &input).unwrap();
     assert_eq!(result, input);
     println!(
         "hostBytes={} h2d=PASS exchange={} d2h=PASS",
         result.len(),
-        if exchange { "PASS" } else { "SKIP" }
+        if exchange || remote_d2h {
+            "PASS"
+        } else {
+            "SKIP"
+        }
     );
     let _ = fs::remove_dir_all(output);
 }
@@ -62,9 +77,15 @@ fn host_exchange_graph(
     transfer_bytes: u32,
     exchange: bool,
     host_tile: u16,
+    remote_d2h: bool,
 ) -> Result<ExecutableGraph, ipu_compiler::CompileError> {
     let topology = ipu_exchange::Topology::c600();
     let tensor = TensorId(0);
+    let relay_tile = if remote_d2h {
+        host_tile
+    } else {
+        EXCHANGE_RELAY_TILE
+    };
     let source_tile = if exchange {
         HOST_CONTROLLER_TILE
     } else {
@@ -102,62 +123,68 @@ fn host_exchange_graph(
     }];
     let mut output_address = source_address;
     let phases = if exchange {
+        let relay_live_until = if remote_d2h { 1 } else { 2 };
         let relay_address = find_free_region(
             &allocations,
-            EXCHANGE_RELAY_TILE,
+            relay_tile,
             transfer_bytes,
             0,
-            2,
+            relay_live_until,
             exchange_constraint,
         )?;
         allocations.push(Allocation {
             tensor,
-            tile: EXCHANGE_RELAY_TILE,
+            tile: relay_tile,
             address: relay_address,
             size: transfer_bytes,
             live_from: 0,
-            live_until: 2,
+            live_until: relay_live_until,
             kind: AllocationKind::ExchangeStaging { phase: 0 },
         });
-        output_address = find_free_region(
-            &allocations,
-            HOST_CONTROLLER_TILE,
-            transfer_bytes,
-            1,
-            2,
-            exchange_constraint,
-        )?;
-        allocations.push(Allocation {
-            tensor,
-            tile: HOST_CONTROLLER_TILE,
-            address: output_address,
-            size: transfer_bytes,
-            live_from: 1,
-            live_until: 2,
-            kind: AllocationKind::ExchangeStaging { phase: 1 },
-        });
-        vec![
-            Phase::Exchange {
+        let mut phases = vec![Phase::Exchange {
+            transfers: vec![Transfer {
+                source_tile: HOST_CONTROLLER_TILE,
+                destination_tile: relay_tile,
+                tensor,
+                bytes: transfer_bytes,
+            }],
+        }];
+        if remote_d2h {
+            output_address = relay_address;
+        } else {
+            output_address = find_free_region(
+                &allocations,
+                HOST_CONTROLLER_TILE,
+                transfer_bytes,
+                1,
+                2,
+                exchange_constraint,
+            )?;
+            allocations.push(Allocation {
+                tensor,
+                tile: HOST_CONTROLLER_TILE,
+                address: output_address,
+                size: transfer_bytes,
+                live_from: 1,
+                live_until: 2,
+                kind: AllocationKind::ExchangeStaging { phase: 1 },
+            });
+            phases.push(Phase::Exchange {
                 transfers: vec![Transfer {
-                    source_tile: HOST_CONTROLLER_TILE,
-                    destination_tile: EXCHANGE_RELAY_TILE,
-                    tensor,
-                    bytes: transfer_bytes,
-                }],
-            },
-            Phase::Exchange {
-                transfers: vec![Transfer {
-                    source_tile: EXCHANGE_RELAY_TILE,
+                    source_tile: relay_tile,
                     destination_tile: HOST_CONTROLLER_TILE,
                     tensor,
                     bytes: transfer_bytes,
                 }],
-            },
-        ]
+            });
+        }
+        phases
     } else {
         Vec::new()
     };
-    let output_tile = if exchange {
+    let output_tile = if remote_d2h {
+        relay_tile
+    } else if exchange {
         HOST_CONTROLLER_TILE
     } else {
         source_tile

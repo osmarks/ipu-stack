@@ -1,7 +1,7 @@
 use ipu_compiler::{AllocationKind, Phase, Schedule};
 use ipu_driver::{Device, HostSession, Loader, block_device_interrupt_signals};
 use ipu_elf::{LinkOptions, link};
-use ipu_exchange::{GlobalSyncProgram, HostTransferChunk, TileToHostProgram, Topology};
+use ipu_exchange::{GlobalSyncProgram, TileToHostProgram, Topology};
 use ipu_package::{
     Application, Binding, DeviceConfigWrite, EntryPoint, HostCall, HostExchange, HostPage,
     HostSlice, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
@@ -16,10 +16,10 @@ const PLAN_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHAN
 const TILE_MUX_HOST_BASE: u32 = 0x600;
 const WORKER_CONTEXTS: u32 = 7;
 const WORKER_CONTEXT_BYTES: u32 = 0x30;
-const HOST_PACKET_STRIDE: u32 = 32;
+const HOST_PACKET_ALIGNMENT: u32 = 32;
 const HOST_PACKET_BASE: u32 = align_up(
     ipu_exchange::EXCHANGE_WINDOW_BASE + WORKER_CONTEXTS * WORKER_CONTEXT_BYTES,
-    HOST_PACKET_STRIDE,
+    HOST_PACKET_ALIGNMENT,
 );
 
 #[derive(Clone, Debug)]
@@ -63,6 +63,7 @@ impl RuntimeRole {
 #[derive(Clone, Copy)]
 struct RuntimeLayout {
     plan_stride: u32,
+    host_packet_stride: u32,
     command_address: u32,
     cycle_address: u32,
     completion_address: u32,
@@ -73,7 +74,12 @@ struct RuntimeLayout {
 }
 
 impl RuntimeLayout {
-    fn new(schedule: &Schedule, plan_bytes: &[usize], command_count: usize) -> Result<Self> {
+    fn new(
+        schedule: &Schedule,
+        plan_bytes: &[usize],
+        packet_bytes: &[usize],
+        command_count: usize,
+    ) -> Result<Self> {
         let plan_stride = align_up(
             u32::try_from(plan_bytes.iter().copied().max().unwrap_or(1))?,
             8,
@@ -98,15 +104,19 @@ impl RuntimeLayout {
         let sync_packet_address = align_up(completion_address + 4, 8);
         let sync_release_address = sync_packet_address + 16;
         let runtime_end = sync_release_address + 4;
+        let host_packet_stride = align_up(
+            u32::try_from(packet_bytes.iter().copied().max().unwrap_or(1))?,
+            HOST_PACKET_ALIGNMENT,
+        );
         let host_packet_end = HOST_PACKET_BASE
             .checked_add(
                 u32::try_from(command_count)?
-                    .checked_mul(HOST_PACKET_STRIDE)
+                    .checked_mul(host_packet_stride)
                     .ok_or("host packet size overflow")?,
             )
             .ok_or("host packet address overflow")?;
         let host_control_end = host_packet_end
-            .checked_add(2 * HOST_PACKET_STRIDE)
+            .checked_add(2 * HOST_PACKET_ALIGNMENT)
             .ok_or("host control address overflow")?;
         if host_control_end
             > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES
@@ -142,13 +152,14 @@ impl RuntimeLayout {
         }
         Ok(Self {
             plan_stride,
+            host_packet_stride,
             command_address,
             cycle_address,
             completion_address,
             sync_packet_address,
             sync_release_address,
             host_command_address: host_packet_end,
-            host_zero_read_address: host_packet_end + HOST_PACKET_STRIDE,
+            host_zero_read_address: host_packet_end + HOST_PACKET_ALIGNMENT,
         })
     }
 
@@ -162,7 +173,7 @@ impl RuntimeLayout {
     fn host_packet_address(self, command: usize) -> Result<u32> {
         Ok(HOST_PACKET_BASE
             + u32::try_from(command)?
-                .checked_mul(HOST_PACKET_STRIDE)
+                .checked_mul(self.host_packet_stride)
                 .ok_or("host packet address overflow")?)
     }
 }
@@ -178,7 +189,9 @@ enum HostDirection {
 struct HostTransfer {
     direction: HostDirection,
     physical_tile: u16,
-    chunk: HostTransferChunk,
+    tile_address: u32,
+    host_offset: u32,
+    bytes: u32,
 }
 
 struct HostLayout {
@@ -206,10 +219,17 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         + host.outputs.len()
         + usize::from(!host.inputs.is_empty() || !host.outputs.is_empty());
     let mut plan_bytes = Vec::new();
+    let mut packet_bytes = Vec::new();
     plan_bytes.extend(
         host.inputs
             .iter()
             .map(host_plan_size)
+            .collect::<Result<Vec<_>>>()?,
+    );
+    packet_bytes.extend(
+        host.inputs
+            .iter()
+            .map(host_packet_size)
             .collect::<Result<Vec<_>>>()?,
     );
     for (phase_index, phase) in graph.schedule.phases.iter().enumerate() {
@@ -222,6 +242,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                 .unwrap_or(4),
             Phase::Compute { .. } => 0,
         });
+        packet_bytes.push(0);
     }
     plan_bytes.extend(
         host.outputs
@@ -229,8 +250,20 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             .map(host_plan_size)
             .collect::<Result<Vec<_>>>()?,
     );
+    packet_bytes.extend(
+        host.outputs
+            .iter()
+            .map(host_packet_size)
+            .collect::<Result<Vec<_>>>()?,
+    );
     plan_bytes.resize(command_count, 0);
-    let layout = RuntimeLayout::new(&graph.schedule, &plan_bytes, command_count + 1)?;
+    packet_bytes.resize(command_count, 0);
+    let layout = RuntimeLayout::new(
+        &graph.schedule,
+        &plan_bytes,
+        &packet_bytes,
+        command_count + 1,
+    )?;
     let exchange_commands = graph
         .schedule
         .phases
@@ -600,7 +633,9 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
                 inputs.push(HostTransfer {
                     direction: HostDirection::ToTile,
                     physical_tile: u16::try_from(slice.tile)?,
-                    chunk,
+                    tile_address: chunk.tile_address,
+                    host_offset: chunk.host_offset,
+                    bytes: chunk.bytes,
                 });
             }
         }
@@ -628,18 +663,19 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
                 slice.size,
                 HOST_PAGE_BYTES,
             )?;
-            for chunk in ipu_exchange::plan_tile_to_host(
+            ipu_exchange::plan_tile_to_host(
                 u16::try_from(slice.tile)?,
                 slice.tile_address,
                 host_offset,
                 u32::try_from(slice.size)?,
-            )? {
-                outputs.push(HostTransfer {
-                    direction: HostDirection::ToHost,
-                    physical_tile: u16::try_from(slice.tile)?,
-                    chunk,
-                });
-            }
+            )?;
+            outputs.push(HostTransfer {
+                direction: HostDirection::ToHost,
+                physical_tile: u16::try_from(slice.tile)?,
+                tile_address: slice.tile_address,
+                host_offset,
+                bytes: u32::try_from(slice.size)?,
+            });
         }
         page_cursor = u32::try_from(page_base + size)?;
         output_cursor = output_cursor
@@ -719,17 +755,9 @@ fn command_read_transfer(host_offset: u32) -> Result<HostTransfer> {
     Ok(HostTransfer {
         direction: HostDirection::CommandRead,
         physical_tile: 0,
-        chunk: HostTransferChunk {
-            tile_address: ipu_exchange::EXCHANGE_WINDOW_BASE,
-            host_offset,
-            bytes: 4,
-            header: ipu_exchange::host_to_tile_packet(
-                0,
-                ipu_exchange::EXCHANGE_WINDOW_BASE,
-                host_offset,
-                4,
-            )?,
-        },
+        tile_address: ipu_exchange::EXCHANGE_WINDOW_BASE,
+        host_offset,
+        bytes: 4,
     })
 }
 
@@ -750,44 +778,93 @@ fn binding_size(binding: &Binding) -> Result<u64> {
 fn host_plan_size(transfer: &HostTransfer) -> Result<usize> {
     Ok(assemble_host_program(
         *transfer,
+        HostProgramRole::Complete,
         HOST_PACKET_BASE,
         ipu_exchange::EXCHANGE_WINDOW_BASE,
-        ipu_exchange::EXCHANGE_WINDOW_BASE + HOST_PACKET_STRIDE,
+        ipu_exchange::EXCHANGE_WINDOW_BASE + HOST_PACKET_ALIGNMENT,
     )?
     .instructions
     .len()
         * 4)
 }
 
+fn host_packet_size(transfer: &HostTransfer) -> Result<usize> {
+    Ok(assemble_host_program(
+        *transfer,
+        HostProgramRole::Complete,
+        HOST_PACKET_BASE,
+        ipu_exchange::EXCHANGE_WINDOW_BASE,
+        ipu_exchange::EXCHANGE_WINDOW_BASE + HOST_PACKET_ALIGNMENT,
+    )?
+    .packet_words
+    .len()
+        * 4)
+}
+
 fn assemble_host_program(
     transfer: HostTransfer,
+    role: HostProgramRole,
     packet_address: u32,
     command_address: u32,
     zero_read_address: u32,
 ) -> Result<TileToHostProgram> {
-    let chunk = transfer.chunk;
     match transfer.direction {
-        HostDirection::CommandRead => Ok(ipu_exchange::assemble_host_command_read_program(
-            packet_address,
-            command_address,
-            chunk.host_offset,
-        )?),
-        HostDirection::ToTile => Ok(ipu_exchange::assemble_host_to_tile_program(
-            transfer.physical_tile,
-            chunk.tile_address,
-            chunk.host_offset,
-            chunk.bytes,
-            packet_address,
-        )?),
-        HostDirection::ToHost => Ok(ipu_exchange::assemble_tile_to_host_program(
-            transfer.physical_tile,
-            chunk.tile_address,
-            chunk.host_offset,
-            chunk.bytes,
-            packet_address,
-            zero_read_address,
-        )?),
+        HostDirection::CommandRead if role == HostProgramRole::Complete => {
+            Ok(ipu_exchange::assemble_host_command_read_program(
+                packet_address,
+                command_address,
+                transfer.host_offset,
+            )?)
+        }
+        HostDirection::ToTile if role == HostProgramRole::Complete => {
+            Ok(ipu_exchange::assemble_host_to_tile_program(
+                transfer.physical_tile,
+                transfer.tile_address,
+                transfer.host_offset,
+                transfer.bytes,
+                packet_address,
+            )?)
+        }
+        HostDirection::ToHost => match role {
+            HostProgramRole::Complete => Ok(ipu_exchange::assemble_tile_to_host_program(
+                transfer.physical_tile,
+                transfer.tile_address,
+                transfer.host_offset,
+                transfer.bytes,
+                packet_address,
+                zero_read_address,
+            )?),
+            HostProgramRole::Coordinator => {
+                let header_count = ipu_exchange::plan_tile_to_host(
+                    transfer.physical_tile,
+                    transfer.tile_address,
+                    transfer.host_offset,
+                    transfer.bytes,
+                )?
+                .len();
+                Ok(ipu_exchange::assemble_tile_to_host_coordinator_program(
+                    packet_address,
+                    header_count,
+                )?)
+            }
+            HostProgramRole::Source => Ok(ipu_exchange::assemble_tile_to_host_source_program(
+                transfer.physical_tile,
+                transfer.tile_address,
+                transfer.host_offset,
+                transfer.bytes,
+                packet_address,
+                zero_read_address,
+            )?),
+        },
+        _ => Err("host program role does not match transfer direction".into()),
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostProgramRole {
+    Complete,
+    Coordinator,
+    Source,
 }
 
 fn append_host_command(
@@ -799,15 +876,28 @@ fn append_host_command(
     layout: &RuntimeLayout,
     command_index: usize,
 ) -> Result<()> {
-    let execution_tile = match transfer.direction {
-        HostDirection::CommandRead | HostDirection::ToTile => 0,
-        HostDirection::ToHost => transfer.physical_tile,
+    const HOST_COORDINATOR_TILE: u16 = 0;
+    let program_role = match transfer.direction {
+        HostDirection::CommandRead | HostDirection::ToTile => {
+            (physical_tile == HOST_COORDINATOR_TILE).then_some(HostProgramRole::Complete)
+        }
+        HostDirection::ToHost if transfer.physical_tile == HOST_COORDINATOR_TILE => {
+            (physical_tile == HOST_COORDINATOR_TILE).then_some(HostProgramRole::Complete)
+        }
+        HostDirection::ToHost if physical_tile == HOST_COORDINATOR_TILE => {
+            Some(HostProgramRole::Coordinator)
+        }
+        HostDirection::ToHost if physical_tile == transfer.physical_tile => {
+            Some(HostProgramRole::Source)
+        }
+        HostDirection::ToHost => None,
     };
-    let (role, address) = if execution_tile == physical_tile {
+    let (role, address) = if let Some(program_role) = program_role {
         let plan_address = layout.plan_address(command_index)?;
         let packet_address = layout.host_packet_address(command_index)?;
         let program = assemble_host_program(
             transfer,
+            program_role,
             packet_address,
             layout.host_command_address,
             layout.host_zero_read_address,
@@ -1127,13 +1217,37 @@ mod tests {
                 && slice.page_offset + slice.size <= u64::from(ipu_exchange::HOST_PAGE_BYTES)
         }));
         assert!(layout.inputs.iter().chain(&layout.outputs).all(|transfer| {
-            let chunk = transfer.chunk;
-            chunk.host_offset / ipu_exchange::HOST_PAGE_BYTES
-                == (chunk.host_offset + chunk.bytes - 1) / ipu_exchange::HOST_PAGE_BYTES
+            let chunks = match transfer.direction {
+                HostDirection::CommandRead | HostDirection::ToTile => {
+                    ipu_exchange::plan_host_to_tile(
+                        transfer.physical_tile,
+                        transfer.tile_address,
+                        transfer.host_offset,
+                        transfer.bytes,
+                    )
+                }
+                HostDirection::ToHost => ipu_exchange::plan_tile_to_host(
+                    transfer.physical_tile,
+                    transfer.tile_address,
+                    transfer.host_offset,
+                    transfer.bytes,
+                ),
+            }
+            .unwrap();
+            chunks.iter().all(|chunk| {
+                chunk.host_offset / ipu_exchange::HOST_PAGE_BYTES
+                    == (chunk.host_offset + chunk.bytes - 1) / ipu_exchange::HOST_PAGE_BYTES
+            })
         }));
         assert_eq!(
             call.phases,
             u32::try_from(1 + layout.inputs.len() + layout.outputs.len()).unwrap()
         );
+        let output = layout
+            .outputs
+            .iter()
+            .find(|transfer| matches!(transfer.direction, HostDirection::ToHost))
+            .unwrap();
+        assert!(host_packet_size(output).unwrap() > HOST_PACKET_ALIGNMENT as usize);
     }
 }
