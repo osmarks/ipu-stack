@@ -71,6 +71,12 @@ ipu_stack_command_table_address:
 	brnz $m8, .Lload_host_command
 	cmpeq $m8, $m5, ROLE_HOST_IDLE
 	brnz $m8, .Lload_host_command
+	cmpeq $m8, $m5, ROLE_INACTIVE
+	brnz $m8, .Lpre_sync_exchange
+	cmpeq $m8, $m5, ROLE_EXCHANGE_ABSOLUTE
+	brz $m8, .Llaunch_workers
+.Lpre_sync_exchange:
+	call $m7, ipu_stack_pre_sync_dispatch
 .Llaunch_workers:
 	setzi $m0, ipu_stack_exchange_loop_worker_barrier
 	runall $m0, $m15, 0

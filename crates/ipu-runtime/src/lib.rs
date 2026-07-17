@@ -622,11 +622,10 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
     const HOST_PAGE_BYTES: u32 = ipu_exchange::HOST_PAGE_BYTES;
     const DATA_START: u32 = 64;
     let input_page_end = host_bindings_end(&graph.host_inputs, DATA_START)?;
-    let output_page_end = host_bindings_end(&graph.host_outputs, DATA_START)?;
-    let data_page_count = align_up(
-        input_page_end.max(output_page_end).max(HOST_PAGE_BYTES),
-        HOST_PAGE_BYTES,
-    ) / HOST_PAGE_BYTES;
+    let output_start = align_up(input_page_end, 64);
+    let output_page_end = host_bindings_end(&graph.host_outputs, output_start)?;
+    let data_page_count =
+        align_up(output_page_end.max(HOST_PAGE_BYTES), HOST_PAGE_BYTES) / HOST_PAGE_BYTES;
     let command_page = data_page_count;
     let command_host_offset = command_page
         .checked_mul(HOST_PAGE_BYTES)
@@ -680,7 +679,7 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
     if !graph.host_outputs.is_empty() {
         outputs.push(command_read_transfer(command_host_offset)?);
     }
-    page_cursor = DATA_START;
+    page_cursor = output_start;
     for binding in &graph.host_outputs {
         let size = binding_size(binding)?;
         let page_base = u64::from(align_up(page_cursor, 64));
@@ -1255,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn host_layout_preserves_remote_endpoint_descriptors() {
+    fn host_layout_separates_input_and_output_storage() {
         let mut graph = empty_graph();
         graph.host_inputs.push(test_binding(
             "input",
@@ -1295,6 +1294,20 @@ mod tests {
                 .count(),
             2
         );
+        let input = layout
+            .inputs
+            .iter()
+            .find(|transfer| matches!(transfer.direction, HostDirection::ToTile))
+            .unwrap();
+        assert!(layout.outputs.iter().all(|output| {
+            !matches!(output.direction, HostDirection::ToHost)
+                || !ranges_overlap(
+                    input.host_offset,
+                    input.host_offset + input.bytes,
+                    output.host_offset,
+                    output.host_offset + output.bytes,
+                )
+        }));
     }
 
     #[test]

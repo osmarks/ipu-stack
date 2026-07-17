@@ -62,10 +62,13 @@ Logging uses `tracing`. Set `RUST_LOG`, for example
 ## Current hardware boundary
 
 The Rust path resets and configures a C600, loads linked code onto all 1472
-tiles, attaches host pages, and drives HSP without Poplar. Hardware acceptance
-passes 8 KiB remote H2D/D2H, multi-packet D2D, and distinct two-source D2H.
-The latter uploads different randomized blocks to two remote tiles, so source
-loss, duplication, and ordering errors cannot pass unnoticed.
+tiles, attaches host pages, and drives HSP without Poplar. Native D2H is not
+currently accepted as working: with input and output assigned disjoint host
+regions, the output remains zero. Earlier round-trip tests reused the input
+host offsets for output and could therefore pass on unchanged H2D input bytes;
+that overlap is now forbidden by the layout and covered by a unit invariant.
+The required hardware tests fail until the device-to-host protocol writes the
+disjoint output region correctly.
 
 Host transfers are split at the recovered short/long packet limits and 4 KiB
 attachment boundaries. The runtime allocates one attached buffer per page,
@@ -84,22 +87,20 @@ exchange window. No concrete staging address is specified by the host exchange
 acceptance graph.
 
 The exchange planner lowers one-to-one transfers to absolute exchange rows and
-coalesces transfers sharing a source tensor into multicast groups. A randomized
-hardware test currently exposes a multicast execution bug: one receiver in a
-two-receiver generated fanout remains zero. The test gathers each receiver to a
-distinct tile-0 range before D2H, so this failure is independent of multi-source
-host readback. It is retained as a required hardware regression rather than
-replaced by serialized unicast. The graph runtime executes generated per-tile
-plan tables and separately linked compute kernels. The older diagnostic graph
-contains a 1,472-value reduction, an all-tile affine permutation, and a relay,
-but its launcher still needs conversion to the per-epoch HSP protocol.
+coalesces transfers sharing a source tensor into multicast groups. The same
+single-packet multicast plan passes under Poplar orchestration, but the Rust
+end-to-end randomized test cannot establish its result until native D2H works.
+The graph runtime executes generated per-tile plan tables and separately linked
+compute kernels. The older diagnostic graph contains a 1,472-value reduction,
+an all-tile affine permutation, and a relay, but its launcher still needs
+conversion to the per-epoch HSP protocol.
 
 The scheduler treats the on-chip fabric as non-blocking. Tile-disjoint groups
 run concurrently; role conflicts become statically timed slots in the same
 launch, with one synchronization and a shared event horizon. Compute is a
 following graph phase: the dispatcher branches to a separately compiled kernel
 symbol and exchange commands perform no arithmetic. A randomized hardware
-acceptance path performs H2D to the controller tile, two generated tile-exchange
+acceptance path attempts H2D to the controller tile, two generated tile-exchange
 epochs via a relay tile, and D2H from the automatically allocated return range.
 Command boundaries use the generated C600 GSP program before the next exchange
 can begin. D2H lowering emits separate tile-0 transaction ownership and
