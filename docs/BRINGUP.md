@@ -45,8 +45,7 @@ configurable physical tile emits the global packets and release, while every
 tile participates in the barrier. The packet origin is not reserved afterward:
 it executes the same sender, receiver, or `sans 0; sync 1` role as any other
 tile in every payload epoch. Omitting the inactive payload role lets the packet
-origin run ahead and deadlocks active endpoints. The older one-shot diagnostic
-runtime still excludes its packet origin; the command-loop runtime does not.
+origin run ahead and deadlocks active endpoints.
 
 The Rust compiler now emits global-sync configuration rather than accepting
 captured words on the command line. For C600 the repeated command-loop protocol
@@ -63,8 +62,7 @@ SDK captures also show translated GSP chains, and translating all four selectors
 plus the descriptor route has passed on hardware. Translation of the packet
 emitter itself has not been established, so the compiler does not conflate
 those two decisions. The command-loop runtime permits canonical physical tile 0
-to perform payload work. The older one-shot diagnostic has schedule-allocated
-GSP selectors and is not part of this topology-independent acceptance path.
+to perform payload work.
 
 Hardware acceptance with the checked-in configuration and master route
 now covers:
