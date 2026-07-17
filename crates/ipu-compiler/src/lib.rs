@@ -366,6 +366,91 @@ pub enum AllocationKind {
     ExchangeStaging { phase: usize },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryPlacement {
+    Low,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryConstraint {
+    /// Inclusive first byte available for allocation.
+    pub base: u32,
+    /// Exclusive end of the allocation window.
+    pub limit: u32,
+    pub alignment: u32,
+    pub placement: MemoryPlacement,
+}
+
+/// Finds an address satisfying an address window and a half-open phase lifetime.
+/// Allocations on different tiles or with disjoint lifetimes may share an address.
+pub fn find_free_region(
+    allocations: &[Allocation],
+    tile: u16,
+    size: u32,
+    live_from: usize,
+    live_until: usize,
+    constraint: MemoryConstraint,
+) -> Result<u32, CompileError> {
+    if size == 0
+        || live_from >= live_until
+        || !constraint.alignment.is_power_of_two()
+        || constraint.base >= constraint.limit
+        || size > constraint.limit - constraint.base
+    {
+        return Err(CompileError::Memory("invalid allocation constraint".into()));
+    }
+    let alignment = constraint.alignment;
+    let start = match constraint.placement {
+        MemoryPlacement::Low => align_u32(constraint.base, alignment),
+        MemoryPlacement::High => (constraint.limit - size) & !(alignment - 1),
+    };
+    let fits = |address: u32| {
+        let end = address + size;
+        end <= constraint.limit
+            && allocations.iter().all(|allocation| {
+                allocation.tile != tile
+                    || live_from >= allocation.live_until
+                    || allocation.live_from >= live_until
+                    || end <= allocation.address
+                    || address >= allocation.address.saturating_add(allocation.size)
+            })
+    };
+
+    match constraint.placement {
+        MemoryPlacement::Low => {
+            let mut address = start;
+            while address <= constraint.limit - size {
+                if fits(address) {
+                    return Ok(address);
+                }
+                address = address
+                    .checked_add(alignment)
+                    .ok_or_else(|| CompileError::Memory("allocation address overflow".into()))?;
+            }
+        }
+        MemoryPlacement::High => {
+            let mut address = start;
+            loop {
+                if address >= constraint.base && fits(address) {
+                    return Ok(address);
+                }
+                let Some(previous) = address.checked_sub(alignment) else {
+                    break;
+                };
+                address = previous;
+                if address < constraint.base {
+                    break;
+                }
+            }
+        }
+    }
+    Err(CompileError::Memory(format!(
+        "no {size}-byte region for tile {tile} in 0x{:x}..0x{:x}",
+        constraint.base, constraint.limit
+    )))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schedule {
     pub layouts: Vec<Layout>,
@@ -637,7 +722,15 @@ impl Schedule {
             let mut available: HashSet<_> = self
                 .allocations
                 .iter()
-                .filter(|allocation| allocation.kind == AllocationKind::Home)
+                .filter(|allocation| {
+                    allocation.kind == AllocationKind::Home
+                        || matches!(
+                            allocation.kind,
+                            AllocationKind::ExchangeStaging { phase }
+                                if phase < phase_index
+                        ) && allocation.live_from <= phase_index
+                            && allocation.live_until > phase_index
+                })
                 .map(|allocation| (allocation.tensor, allocation.tile))
                 .collect();
             let mut epoch_groups = Vec::with_capacity(colored_groups.len());
@@ -694,6 +787,19 @@ impl Schedule {
                                 && allocation.tile == source
                                 && allocation.kind
                                     == AllocationKind::ExchangeStaging { phase: phase_index }
+                        })
+                        .or_else(|| {
+                            self.allocations.iter().find(|allocation| {
+                                allocation.tensor == tensor
+                                    && allocation.tile == source
+                                    && matches!(
+                                        allocation.kind,
+                                        AllocationKind::ExchangeStaging { phase }
+                                            if phase < phase_index
+                                    )
+                                    && allocation.live_from <= phase_index
+                                    && allocation.live_until > phase_index
+                            })
                         })
                         .or_else(|| {
                             self.allocations.iter().find(|allocation| {
@@ -1698,6 +1804,123 @@ mod tests {
             u64::from(ipu_exchange::plan_event_cycles(&relay).unwrap()),
             lowered[0].cost.estimated_cycles
         );
+    }
+
+    #[test]
+    fn scheduler_uses_live_staging_as_a_later_phase_source() {
+        let tensor = TensorId(0);
+        let schedule = Schedule {
+            layouts: Vec::new(),
+            phases: vec![
+                Phase::Exchange {
+                    transfers: vec![Transfer {
+                        source_tile: 0,
+                        destination_tile: 1,
+                        tensor,
+                        bytes: 64,
+                    }],
+                },
+                Phase::Exchange {
+                    transfers: vec![Transfer {
+                        source_tile: 1,
+                        destination_tile: 2,
+                        tensor,
+                        bytes: 64,
+                    }],
+                },
+            ],
+            allocations: vec![
+                Allocation {
+                    tensor,
+                    tile: 0,
+                    address: 0x62000,
+                    size: 64,
+                    live_from: 0,
+                    live_until: 2,
+                    kind: AllocationKind::Home,
+                },
+                Allocation {
+                    tensor,
+                    tile: 1,
+                    address: 0x52000,
+                    size: 64,
+                    live_from: 0,
+                    live_until: 2,
+                    kind: AllocationKind::ExchangeStaging { phase: 0 },
+                },
+                Allocation {
+                    tensor,
+                    tile: 2,
+                    address: 0x53000,
+                    size: 64,
+                    live_from: 1,
+                    live_until: 2,
+                    kind: AllocationKind::ExchangeStaging { phase: 1 },
+                },
+            ],
+            tile_count: 16,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let lowered = schedule.lower_exchanges(&Topology::c600()).unwrap();
+        assert_eq!(lowered.len(), schedule.phases.len());
+        assert!(lowered.iter().all(|phase| phase.epochs.len() == 1));
+        assert!(lowered[1].epochs[0].tile_rows.contains_key(&1));
+    }
+
+    #[test]
+    fn constrained_allocator_obeys_bounds_and_reuses_dead_storage() {
+        let constraint = MemoryConstraint {
+            base: ipu_exchange::EXCHANGE_WINDOW_BASE,
+            limit: ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES,
+            alignment: 32,
+            placement: MemoryPlacement::High,
+        };
+        let first = find_free_region(&[], 0, 256, 0, 1, constraint).unwrap();
+        let allocation = Allocation {
+            tensor: TensorId(0),
+            tile: 0,
+            address: first,
+            size: 256,
+            live_from: 0,
+            live_until: 1,
+            kind: AllocationKind::Home,
+        };
+        let concurrent =
+            find_free_region(std::slice::from_ref(&allocation), 0, 256, 0, 1, constraint).unwrap();
+        let reused =
+            find_free_region(std::slice::from_ref(&allocation), 0, 256, 1, 2, constraint).unwrap();
+        let other_tile = find_free_region(&[allocation], 1, 256, 0, 1, constraint).unwrap();
+
+        for address in [first, concurrent, reused, other_tile] {
+            assert_eq!(address % constraint.alignment, 0);
+            assert!(address >= constraint.base);
+            assert!(address + 256 <= constraint.limit);
+        }
+        assert!(concurrent + 256 <= first || first + 256 <= concurrent);
+        assert_eq!(reused, first);
+        assert_eq!(other_tile, first);
+    }
+
+    #[test]
+    fn constrained_allocator_reports_exhaustion() {
+        let constraint = MemoryConstraint {
+            base: 0x50000,
+            limit: 0x50040,
+            alignment: 32,
+            placement: MemoryPlacement::Low,
+        };
+        let allocations = [Allocation {
+            tensor: TensorId(0),
+            tile: 7,
+            address: constraint.base,
+            size: constraint.limit - constraint.base,
+            live_from: 3,
+            live_until: 5,
+            kind: AllocationKind::ExchangeStaging { phase: 3 },
+        }];
+
+        assert!(find_free_region(&allocations, 7, 32, 4, 6, constraint).is_err());
     }
 
     #[test]
