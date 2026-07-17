@@ -31,7 +31,7 @@ instruction assembler is required.
 - `ipu-driver`: direct Linux device setup, bootloader framing, application load,
   HSP synchronization, and attached host exchange pages.
 - `ipu-runtime`: graph-schedule packaging, dynamic kernel retention, per-tile
-  command generation, and automated diagnostic execution.
+  command generation, direct host execution, and automated diagnostics.
 - `ipu-cli`: build, inspect, plan, probe, and load commands.
 
 ## Build and inspect
@@ -58,12 +58,20 @@ Logging uses `tracing`. Set `RUST_LOG`, for example
 The Rust path has attached to a C600, reset and configured it, loaded a linked
 application onto all 1472 discovered package tiles in 64-tile bootloader
 batches, completed startup synchronization, and run a supervisor plus six
-barrel workers without an IPU exception. SDK-generated application host
-exchange is represented and driven by `HostSession`. Native packet headers,
-XREQs, command reads, and D2H instruction plans are independently assembled,
-but the native output prototype does not yet return payload bytes: its host
-page remains zero and its final phase can remain in WAEX. It is diagnostic
-code, not a passing production data path.
+barrel workers without an IPU exception. `HostSession` directly attaches host
+pages and drives HSP handoffs. Rust-generated packet headers, XREQs, command
+reads, H2D plans, and D2H plans have transferred a randomized 64-byte payload
+to tile SRAM and returned it byte-for-byte without Poplar or TDI readback. The
+automated host hardware test specifies only graph bindings and checks that
+round trip.
+
+Host transfers are split at the recovered short/long packet limits and 4 KiB
+attachment boundaries. The runtime allocates one attached buffer per page,
+places the command page after the data pages, and derives one self-contained
+call's HSP phase count from its generated operations. Multi-page layouts and
+packet boundaries are covered by unit tests; a multi-page transfer still needs
+hardware validation after the current test board receives a PCI function
+reset.
 
 The exchange planner lowers one-to-one and fanout transfers to absolute,
 single-send exchange rows. Direct hardware
@@ -80,5 +88,6 @@ launch, with one synchronization and a shared event horizon. Hardware testing
 includes a multicast whose relay receiver sends the payload onward in a later
 slot without an intermediate BSP barrier. Compute is a following graph phase:
 the dispatcher branches to a separately compiled kernel symbol and exchange
-commands perform no arithmetic. The remaining runtime work is native host
-completion and host-phase retirement plus broader kernel dispatch.
+commands perform no arithmetic. The remaining runtime work includes repairing
+the transition from a generated tile-exchange phase into a following host-read
+phase, then broadening kernel dispatch and host-transfer hardware coverage.
