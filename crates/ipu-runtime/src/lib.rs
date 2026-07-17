@@ -52,7 +52,6 @@ enum RuntimeRole {
     ComputeNoop = 12,
     HostProgram = 13,
     HostIdle = 14,
-    HostCompletion = 15,
 }
 
 impl RuntimeRole {
@@ -478,7 +477,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         }
         if !host.inputs.is_empty() || !host.outputs.is_empty() {
             commands.extend_from_slice(&words_to_bytes(&[
-                RuntimeRole::HostCompletion.word(),
+                RuntimeRole::ComputeNoop.word(),
                 0,
                 0,
                 0,
@@ -644,6 +643,12 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
         input_cursor = input_cursor
             .checked_add(size)
             .ok_or("host input size overflow")?;
+    }
+    if !graph.schedule.phases.is_empty() {
+        inputs.push(command_read_transfer(command_host_offset)?);
+    }
+    if !graph.host_outputs.is_empty() {
+        outputs.push(command_read_transfer(command_host_offset)?);
     }
     page_cursor = DATA_START;
     for binding in &graph.host_outputs {
@@ -820,18 +825,6 @@ fn assemble_host_program(
                 packet_address,
             )?)
         }
-        HostDirection::ToTile if role == HostProgramRole::Coordinator => Ok(
-            ipu_exchange::assemble_host_to_tile_coordinator_program(packet_address)?,
-        ),
-        HostDirection::ToTile if role == HostProgramRole::Source => {
-            Ok(ipu_exchange::assemble_host_to_tile_receiver_program(
-                transfer.physical_tile,
-                transfer.tile_address,
-                transfer.host_offset,
-                transfer.bytes,
-                packet_address,
-            )?)
-        }
         HostDirection::ToHost => match role {
             HostProgramRole::Complete => Ok(ipu_exchange::assemble_tile_to_host_program(
                 transfer.physical_tile,
@@ -885,19 +878,9 @@ fn append_host_command(
 ) -> Result<()> {
     const HOST_COORDINATOR_TILE: u16 = 0;
     let program_role = match transfer.direction {
-        HostDirection::CommandRead => {
+        HostDirection::CommandRead | HostDirection::ToTile => {
             (physical_tile == HOST_COORDINATOR_TILE).then_some(HostProgramRole::Complete)
         }
-        HostDirection::ToTile if transfer.physical_tile == HOST_COORDINATOR_TILE => {
-            (physical_tile == HOST_COORDINATOR_TILE).then_some(HostProgramRole::Complete)
-        }
-        HostDirection::ToTile if physical_tile == HOST_COORDINATOR_TILE => {
-            Some(HostProgramRole::Coordinator)
-        }
-        HostDirection::ToTile if physical_tile == transfer.physical_tile => {
-            Some(HostProgramRole::Source)
-        }
-        HostDirection::ToTile => None,
         HostDirection::ToHost if transfer.physical_tile == HOST_COORDINATOR_TILE => {
             (physical_tile == HOST_COORDINATOR_TILE).then_some(HostProgramRole::Complete)
         }
@@ -1184,6 +1167,74 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_graph() -> ExecutableGraph {
+        ExecutableGraph {
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: Vec::new(),
+                tile_count: 1472,
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        }
+    }
+
+    fn test_binding(name: &str, slices: Vec<RegionSlice>) -> Binding {
+        Binding {
+            name: name.into(),
+            dtype: "u32".into(),
+            shape: vec![slices.iter().map(|slice| slice.size).sum::<u64>() as u32 / 4],
+            slices,
+        }
+    }
+
+    #[test]
+    fn host_layout_accepts_remote_h2d_and_multiple_d2h_slices() {
+        let mut graph = empty_graph();
+        graph.host_inputs.push(test_binding(
+            "input",
+            vec![RegionSlice {
+                tile: 63,
+                tile_address: 0x53000,
+                file_offset: 0,
+                size: 64,
+            }],
+        ));
+        graph.host_outputs.push(test_binding(
+            "output",
+            vec![
+                RegionSlice {
+                    tile: 2,
+                    tile_address: 0x54000,
+                    file_offset: 0,
+                    size: 64,
+                },
+                RegionSlice {
+                    tile: 63,
+                    tile_address: 0x54000,
+                    file_offset: 64,
+                    size: 64,
+                },
+            ],
+        ));
+        let layout = build_host_layout(&graph).unwrap();
+        assert!(layout.inputs.iter().any(|transfer| {
+            matches!(transfer.direction, HostDirection::ToTile) && transfer.physical_tile == 63
+        }));
+        assert_eq!(
+            layout
+                .outputs
+                .iter()
+                .filter(|transfer| matches!(transfer.direction, HostDirection::ToHost))
+                .count(),
+            2
+        );
+    }
 
     #[test]
     fn host_layout_pages_large_bindings_without_crossing_packets() {
