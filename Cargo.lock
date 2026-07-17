@@ -354,6 +354,7 @@ dependencies = [
  "ipu-package",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

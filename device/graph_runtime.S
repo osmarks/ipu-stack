@@ -26,7 +26,6 @@
 	.set SEND_RELEASE_PLACEHOLDER, 0x78000003
 	.set GLOBAL_SYNC_RELEASE_DELAY, 72
 	.set COMMAND_TABLE_PLACEHOLDER, 0x59000
-	.set CYCLE_SAMPLE_ADDRESS_PLACEHOLDER, 0
 	.set COMPLETION_ADDRESS_PLACEHOLDER, 0
 
 	.section .text.ipu_stack_exchange_loop_start,"ax",@progbits
@@ -72,14 +71,8 @@ ipu_stack_command_table_address:
 	brnz $m8, .Lload_host_command
 	cmpeq $m8, $m5, ROLE_HOST_IDLE
 	brnz $m8, .Lload_host_command
-	cmpeq $m8, $m5, ROLE_INACTIVE
-	brnz $m8, .Lpre_sync_exchange
-	cmpeq $m8, $m5, ROLE_EXCHANGE_ABSOLUTE
-	brz $m8, .Llaunch_workers
-.Lpre_sync_exchange:
-	call $m7, ipu_stack_pre_sync_dispatch
 .Llaunch_workers:
-	setzi $m0, ipu_stack_exchange_loop_worker_cycle_start
+	setzi $m0, ipu_stack_exchange_loop_worker_barrier
 	runall $m0, $m15, 0
 	.long OPCODE_SYNC | SYNC_COMPUTE_SET
 	ld32 $m1, $m6, $m15, 1
@@ -119,18 +112,15 @@ ipu_stack_command_table_address:
 	br $m1
 
 .Lrun_host_program:
-	setzi $m10, .Llaunch_complete
+	setzi $m10, .Lhost_launch_complete
 	br $m1
 
 .Lhost_idle:
 	.long OPCODE_SANS | SANS_EXTERNAL
 	.long OPCODE_SYNC | SYNC_EXTERNAL
-	bri .Llaunch_complete
+	bri .Lhost_launch_complete
 
 .Lplan_complete:
-	setzi $m0, ipu_stack_exchange_loop_worker_cycle_end
-	runall $m0, $m15, 0
-	.long OPCODE_SYNC | SYNC_COMPUTE_SET
 #ifdef IPU_STACK_TRAP_AFTER_RECEIVE
 	zero $m0
 	br $m0
@@ -145,6 +135,13 @@ ipu_stack_command_table_address:
 .Llaunch_complete:
 	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
+	call $m7, ipu_stack_device_sync_dispatch
+	bri .Lcommand_loop
+
+.Lhost_launch_complete:
+	setzi $m0, TILE_MUX_EXCHANGE
+	put 0xa0, $m0
+	call $m7, ipu_stack_device_sync_dispatch
 	bri .Lcommand_loop
 
 .Ldone:
@@ -184,43 +181,14 @@ ipu_stack_loop_worker_sync_base:
 	exitnz $m15
 	.size ipu_stack_exchange_loop_worker_init, .-ipu_stack_exchange_loop_worker_init
 
-	.section .text.ipu_stack_exchange_loop_worker_cycle_start,"ax",@progbits
-	.globl ipu_stack_exchange_loop_worker_cycle_start
+	.section .text.ipu_stack_exchange_loop_worker_barrier,"ax",@progbits
+	.globl ipu_stack_exchange_loop_worker_barrier
 	.p2align 2
-	.type ipu_stack_exchange_loop_worker_cycle_start,@function
-ipu_stack_exchange_loop_worker_cycle_start:
+	.type ipu_stack_exchange_loop_worker_barrier,@function
+ipu_stack_exchange_loop_worker_barrier:
 	.worker
-	get $m1, $WSR
-	and $m1, $m1, 7
-	brnz $m1, .Lcycle_start_exit
-	get $m0, $COUNT_L
-	.globl ipu_stack_cycle_start_address
-ipu_stack_cycle_start_address:
-	setzi $m1, CYCLE_SAMPLE_ADDRESS_PLACEHOLDER
-	st32 $m0, $m1, $m15, 0
-.Lcycle_start_exit:
 	exitz $m15
-	.size ipu_stack_exchange_loop_worker_cycle_start, .-ipu_stack_exchange_loop_worker_cycle_start
-
-	.section .text.ipu_stack_exchange_loop_worker_cycle_end,"ax",@progbits
-	.globl ipu_stack_exchange_loop_worker_cycle_end
-	.p2align 2
-	.type ipu_stack_exchange_loop_worker_cycle_end,@function
-ipu_stack_exchange_loop_worker_cycle_end:
-	.worker
-	get $m1, $WSR
-	and $m1, $m1, 7
-	brnz $m1, .Lcycle_end_exit
-	get $m0, $COUNT_L
-	.globl ipu_stack_cycle_end_address
-ipu_stack_cycle_end_address:
-	setzi $m1, CYCLE_SAMPLE_ADDRESS_PLACEHOLDER
-	ld32 $m2, $m1, $m15, 0
-	sub $m0, $m0, $m2
-	st32 $m0, $m1, $m15, 0
-.Lcycle_end_exit:
-	exitz $m15
-	.size ipu_stack_exchange_loop_worker_cycle_end, .-ipu_stack_exchange_loop_worker_cycle_end
+	.size ipu_stack_exchange_loop_worker_barrier, .-ipu_stack_exchange_loop_worker_barrier
 
 	.section .text.ipu_stack_exchange_loop_sync,"ax",@progbits
 	.p2align 3
@@ -234,6 +202,20 @@ ipu_stack_nonmaster_pre_sync_redirect:
 ipu_stack_nonmaster_pre_sync:
 	.long OPCODE_SANS | SANS_EXTERNAL
 	.long OPCODE_SYNC | SYNC_EXTERNAL
+	br $m7
+
+	.globl ipu_stack_device_sync_dispatch
+ipu_stack_device_sync_dispatch:
+	bri ipu_stack_global_device_sync
+	.globl ipu_stack_nonmaster_device_sync_redirect
+ipu_stack_nonmaster_device_sync_redirect:
+	bri ipu_stack_nonmaster_pre_sync
+	.globl ipu_stack_global_device_sync
+ipu_stack_global_device_sync:
+	call $m10, .Lglobal_sync_select_endpoint
+	call $m10, .Lglobal_sync_send
+	call $m10, .Lglobal_sync_local
+	call $m10, .Lglobal_sync_release
 	br $m7
 
 	.globl ipu_stack_global_pre_sync
@@ -260,11 +242,14 @@ ipu_stack_loop_global_sync_send1:
 	.long OPCODE_SYNC | SYNC_RECEIVE
 	br $m10
 .Lglobal_sync_wait:
+	call $m10, .Lglobal_sync_select_endpoint
+	.long OPCODE_SYNC | SYNC_HOST
+	br $m10
+.Lglobal_sync_select_endpoint:
 	.globl ipu_stack_loop_global_sync_endpoint
 ipu_stack_loop_global_sync_endpoint:
 	setzi $m8, TILE_MUX_HOST
 	put 0xa0, $m8
-	.long OPCODE_SYNC | SYNC_HOST
 	br $m10
 .Lglobal_sync_release:
 	.long OPCODE_SYNC | SYNC_SUPERVISOR

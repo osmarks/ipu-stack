@@ -15,6 +15,7 @@ const EXCHANGE_RELAY_TILE: u16 = 1;
 const DEFAULT_TRANSFER_BYTES: u32 = 64;
 
 fn main() {
+    ipu_runtime::init_tracing();
     let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
     let configuration = fs::read(required_env("IPU_CONFIG")).unwrap();
     let bootloader = fs::read(
@@ -39,6 +40,21 @@ fn main() {
         .unwrap_or(DEFAULT_TRANSFER_BYTES);
     let exchange = std::env::var_os("IPU_HOST_TEST_EXCHANGE").is_some();
     let remote_d2h = std::env::var_os("IPU_HOST_TEST_REMOTE_D2H").is_some();
+    let output_count = std::env::var("IPU_HOST_TEST_OUTPUTS")
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .expect("IPU_HOST_TEST_OUTPUTS must be an integer")
+        })
+        .unwrap_or(1);
+    let second_tile = std::env::var("IPU_HOST_TEST_SECOND_TILE")
+        .map(|value| {
+            value
+                .parse::<u16>()
+                .expect("IPU_HOST_TEST_SECOND_TILE must be an integer")
+        })
+        .ok();
+    assert!(output_count != 0, "IPU_HOST_TEST_OUTPUTS must be nonzero");
     let host_tile = std::env::var("IPU_HOST_TEST_TILE")
         .map(|value| {
             value
@@ -50,14 +66,24 @@ fn main() {
         } else {
             HOST_CONTROLLER_TILE
         });
-    let input = test_payload(transfer_bytes);
-    let graph = host_exchange_graph(
-        transfer_bytes,
-        exchange || remote_d2h,
-        host_tile,
-        remote_d2h,
-    )
-    .unwrap();
+    assert!(
+        output_count == 1 || (!exchange && !remote_d2h),
+        "multiple output slices are only supported by the direct host test"
+    );
+    let payload_count = second_tile.map_or(output_count, |_| 2);
+    let input = test_payload(transfer_bytes * payload_count);
+    let graph = if let Some(second_tile) = second_tile {
+        two_tile_host_graph(transfer_bytes, host_tile, second_tile).unwrap()
+    } else {
+        host_exchange_graph(
+            transfer_bytes,
+            exchange || remote_d2h,
+            host_tile,
+            remote_d2h,
+            output_count,
+        )
+        .unwrap()
+    };
     let app = package_graph(&graph, &[runtime_object]).unwrap();
     let result = run_host(&app, &bootloader, &configuration, &device, &input).unwrap();
     assert_eq!(result, input);
@@ -73,11 +99,76 @@ fn main() {
     let _ = fs::remove_dir_all(output);
 }
 
+fn two_tile_host_graph(
+    transfer_bytes: u32,
+    first_tile: u16,
+    second_tile: u16,
+) -> Result<ExecutableGraph, ipu_compiler::CompileError> {
+    assert_ne!(first_tile, second_tile);
+    let topology = ipu_exchange::Topology::c600();
+    let constraint = MemoryConstraint {
+        base: ipu_exchange::EXCHANGE_WINDOW_BASE,
+        limit: ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES,
+        alignment: 32,
+        placement: MemoryPlacement::High,
+    };
+    let mut allocations = Vec::new();
+    let mut slices = Vec::new();
+    for (index, tile) in [first_tile, second_tile].into_iter().enumerate() {
+        let address = find_free_region(
+            &allocations,
+            tile,
+            transfer_bytes,
+            0,
+            usize::MAX,
+            constraint,
+        )?;
+        allocations.push(Allocation {
+            tensor: TensorId(index),
+            tile,
+            address,
+            size: transfer_bytes,
+            live_from: 0,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        });
+        slices.push(RegionSlice {
+            tile: u32::from(topology.physical(tile).unwrap()),
+            tile_address: address,
+            file_offset: index as u64 * u64::from(transfer_bytes),
+            size: u64::from(transfer_bytes),
+        });
+    }
+    let input_binding = Binding {
+        name: "input".into(),
+        dtype: "u8".into(),
+        shape: vec![transfer_bytes * 2],
+        slices,
+    };
+    Ok(ExecutableGraph {
+        schedule: Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations,
+            tile_count: TILE_COUNT,
+            peak_sram: BTreeMap::new(),
+        },
+        initial_buffers: Vec::new(),
+        outputs: Vec::new(),
+        host_inputs: vec![input_binding.clone()],
+        host_outputs: vec![Binding {
+            name: "output".into(),
+            ..input_binding
+        }],
+    })
+}
+
 fn host_exchange_graph(
     transfer_bytes: u32,
     exchange: bool,
     host_tile: u16,
     remote_d2h: bool,
+    output_count: u32,
 ) -> Result<ExecutableGraph, ipu_compiler::CompileError> {
     let topology = ipu_exchange::Topology::c600();
     let tensor = TensorId(0);
@@ -104,10 +195,11 @@ fn host_exchange_graph(
         placement: MemoryPlacement::High,
     };
     let source_live_until = if exchange { 1 } else { usize::MAX };
+    let input_bytes = transfer_bytes * output_count;
     let source_address = find_free_region(
         &[],
         source_tile,
-        transfer_bytes,
+        input_bytes,
         0,
         source_live_until,
         host_constraint,
@@ -116,7 +208,7 @@ fn host_exchange_graph(
         tensor,
         tile: source_tile,
         address: source_address,
-        size: transfer_bytes,
+        size: input_bytes,
         live_from: 0,
         live_until: source_live_until,
         kind: AllocationKind::Home,
@@ -203,15 +295,38 @@ fn host_exchange_graph(
             "input",
             topology.physical(source_tile).unwrap(),
             source_address,
-            transfer_bytes,
+            input_bytes,
         )],
-        host_outputs: vec![binding(
+        host_outputs: vec![repeated_binding(
             "output",
             topology.physical(output_tile).unwrap(),
             output_address,
             transfer_bytes,
+            output_count,
         )],
     })
+}
+
+fn repeated_binding(
+    name: &str,
+    physical_tile: u16,
+    address: u32,
+    transfer_bytes: u32,
+    count: u32,
+) -> Binding {
+    Binding {
+        name: name.into(),
+        dtype: "u8".into(),
+        shape: vec![transfer_bytes * count],
+        slices: (0..count)
+            .map(|index| RegionSlice {
+                tile: u32::from(physical_tile),
+                tile_address: address + index * transfer_bytes,
+                file_offset: u64::from(index * transfer_bytes),
+                size: u64::from(transfer_bytes),
+            })
+            .collect(),
+    }
 }
 
 fn binding(name: &str, physical_tile: u16, address: u32, transfer_bytes: u32) -> Binding {

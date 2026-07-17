@@ -15,6 +15,7 @@ const DEFAULT_CASES: usize = 8;
 const WORD_COUNTS: [u32; 12] = [1, 2, 15, 16, 17, 31, 63, 64, 65, 127, 256, 1024];
 
 fn main() {
+    ipu_runtime::init_tracing();
     let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
     let configuration = fs::read(required_env("IPU_CONFIG")).unwrap();
     let bootloader = fs::read(
@@ -65,7 +66,7 @@ fn randomized_case(seed: u64, words: u32, fanout: usize) -> (ExecutableGraph, Ve
     let source_tile = random_tile_except(&mut rng, &[0]);
     let mut destinations = Vec::with_capacity(fanout);
     while destinations.len() < fanout {
-        let destination = random_tile_except(&mut rng, &[source_tile]);
+        let destination = random_tile_except(&mut rng, &[0, source_tile]);
         if !destinations.contains(&destination) {
             destinations.push(destination);
         }
@@ -124,7 +125,7 @@ fn randomized_case(seed: u64, words: u32, fanout: usize) -> (ExecutableGraph, Ve
             address
         })
         .collect::<Vec<_>>();
-    let phases = vec![Phase::Exchange {
+    let multicast = Phase::Exchange {
         transfers: destinations
             .iter()
             .copied()
@@ -135,7 +136,47 @@ fn randomized_case(seed: u64, words: u32, fanout: usize) -> (ExecutableGraph, Ve
                 bytes,
             })
             .collect(),
-    }];
+    };
+    let mut gather_transfers = Vec::with_capacity(fanout);
+    let mut gather_addresses = Vec::with_capacity(fanout);
+    for (index, (&source, &source_address)) in destinations
+        .iter()
+        .zip(destination_addresses.iter())
+        .enumerate()
+    {
+        let gather_tensor = TensorId(index + 1);
+        allocations.push(allocation(
+            gather_tensor,
+            source,
+            source_address,
+            bytes,
+            AllocationKind::Home,
+            1,
+        ));
+        let gather_address =
+            find_free_region(&allocations, 0, bytes, 1, usize::MAX, exchange_constraint).unwrap();
+        allocations.push(allocation(
+            gather_tensor,
+            0,
+            gather_address,
+            bytes,
+            AllocationKind::ExchangeStaging { phase: 1 },
+            1,
+        ));
+        gather_transfers.push(Transfer {
+            source_tile: source,
+            destination_tile: 0,
+            tensor: gather_tensor,
+            bytes,
+        });
+        gather_addresses.push(gather_address);
+    }
+    let phases = vec![
+        multicast,
+        Phase::Exchange {
+            transfers: gather_transfers,
+        },
+    ];
     let host_inputs = vec![binding(
         "input",
         vec![(
@@ -147,10 +188,9 @@ fn randomized_case(seed: u64, words: u32, fanout: usize) -> (ExecutableGraph, Ve
     )];
     let host_outputs = vec![binding(
         "output",
-        destinations
+        gather_addresses
             .iter()
-            .zip(destination_addresses.iter())
-            .map(|(tile, address)| (topology.physical(*tile).unwrap(), *address, bytes))
+            .map(|address| (topology.physical(0).unwrap(), *address, bytes))
             .collect(),
         words * u32::try_from(fanout).unwrap(),
     )];

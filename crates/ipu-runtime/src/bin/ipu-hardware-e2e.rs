@@ -24,6 +24,7 @@ const MULTICAST_TAP_TILE: u16 = 274;
 const RELAY_DESTINATION_TILE: u16 = 1286;
 
 fn main() {
+    ipu_runtime::init_tracing();
     let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
     let configuration = fs::read(required_env("IPU_CONFIG")).unwrap();
     let bootloader = fs::read(

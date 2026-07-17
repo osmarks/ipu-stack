@@ -61,16 +61,11 @@ Logging uses `tracing`. Set `RUST_LOG`, for example
 
 ## Current hardware boundary
 
-The Rust path has attached to a C600, reset and configured it, loaded a linked
-application onto all 1472 discovered package tiles in 64-tile bootloader
-batches, completed startup synchronization, and run a supervisor plus six
-barrel workers without an IPU exception. `HostSession` directly attaches host
-pages and drives HSP handoffs. Isolated Rust-generated command reads and host
-packet programs have transferred payloads in earlier bring-up tests, but the
-composed host protocol is not yet accepted. The randomized hardware gate
-currently fails at the HSP transition following its first host transfer. Remote
-H2D, repeated arbitrary-tile D2H, and their composition with multicast therefore
-remain unverified capabilities, regardless of whether their plans serialize.
+The Rust path resets and configures a C600, loads linked code onto all 1472
+tiles, attaches host pages, and drives HSP without Poplar. Hardware acceptance
+passes 8 KiB remote H2D/D2H, multi-packet D2D, and distinct two-source D2H.
+The latter uploads different randomized blocks to two remote tiles, so source
+loss, duplication, and ordering errors cannot pass unnoticed.
 
 Host transfers are split at the recovered short/long packet limits and 4 KiB
 attachment boundaries. The runtime allocates one attached buffer per page,
@@ -90,10 +85,12 @@ acceptance graph.
 
 The exchange planner lowers one-to-one transfers to absolute exchange rows and
 coalesces transfers sharing a source tensor into multicast groups. A randomized
-hardware test currently exposes a receiver-set bug in the generated multicast
-rows; it is retained as a protocol regression rather than replaced by serialized
-unicast. The graph runtime executes generated per-tile plan tables and separately
-linked compute kernels. The older diagnostic graph
+hardware test currently exposes a multicast execution bug: one receiver in a
+two-receiver generated fanout remains zero. The test gathers each receiver to a
+distinct tile-0 range before D2H, so this failure is independent of multi-source
+host readback. It is retained as a required hardware regression rather than
+replaced by serialized unicast. The graph runtime executes generated per-tile
+plan tables and separately linked compute kernels. The older diagnostic graph
 contains a 1,472-value reduction, an all-tile affine permutation, and a relay,
 but its launcher still needs conversion to the per-epoch HSP protocol.
 
@@ -104,15 +101,14 @@ following graph phase: the dispatcher branches to a separately compiled kernel
 symbol and exchange commands perform no arithmetic. A randomized hardware
 acceptance path performs H2D to the controller tile, two generated tile-exchange
 epochs via a relay tile, and D2H from the automatically allocated return range.
-Every exchange epoch
-starts with a device-wide barrier, resetting the exchange synchronization state
-before any tile enters its plan. D2H lowering emits separate tile-0 coordinator
-and source-tile endpoint programs in one host phase. Randomized H2D to tile 0,
-one 8 KiB D2D transfer, and direct D2H from the last logical tile pass
-byte-for-byte. Multi-packet D2H uses one XREQ and close around 256-byte
-packet/payload pairs, matching the SDK schedule.
+Command boundaries use the generated C600 GSP program before the next exchange
+can begin. D2H lowering emits separate tile-0 transaction ownership and
+source-tile payload programs in one host phase. Multi-packet D2H uses one XREQ
+and close around 256-byte packet/payload pairs, matching the recovered SDK
+schedule.
 
 The seeded randomized hardware runner uses allocated addresses and generated
 payloads. Each case performs H2D, generated D2D fanout to one through four
-random destinations, and direct D2H verification. Default cases cover 1, 2, 15,
-16, 17, 31, 63, and 64 words; `IPU_RANDOM_CASES` extends into larger boundaries.
+random destinations, a generated gather into distinct tile-0 ranges, and D2H
+verification. Default cases cover 1, 2, 15, 16, 17, 31, 63, and 64 words;
+`IPU_RANDOM_CASES` extends into larger boundaries.

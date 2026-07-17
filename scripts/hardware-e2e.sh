@@ -11,6 +11,7 @@ tests=(
   generated_multi_epoch_host_exchange_runs_end_to_end
   generated_remote_tile_h2d_and_d2h_run_end_to_end
   generated_remote_tile_d2h_runs_end_to_end
+  generated_distinct_multi_source_d2h_runs_end_to_end
   randomized_exchange_graphs_run_end_to_end
 )
 failed=()

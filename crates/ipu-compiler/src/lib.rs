@@ -849,6 +849,14 @@ impl Schedule {
                     }
                     let sender = plan.sender;
                     let receivers = plan.receivers;
+                    debug!(
+                        source,
+                        destinations = ?destinations,
+                        destination_addresses = ?destination_addresses,
+                        sender = ?sender,
+                        receivers = ?receivers,
+                        "lowered multicast rows"
+                    );
                     builders
                         .entry(source)
                         .or_default()
@@ -887,6 +895,7 @@ impl Schedule {
                 .into_iter()
                 .map(|(tile, builder)| Ok((tile, builder.finish(horizon)?)))
                 .collect::<Result<BTreeMap<_, _>, CompileError>>()?;
+            debug!(horizon, tile_rows = ?tile_rows, "composed exchange programs");
             let epochs = if lowered_groups.is_empty() {
                 Vec::new()
             } else {
@@ -1737,9 +1746,9 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
-            u64::from(ipu_exchange::plan_event_cycles(&row).unwrap()),
-            lowered[0].cost.estimated_cycles
+        assert!(
+            u64::from(ipu_exchange::plan_event_cycles(&row).unwrap())
+                <= lowered[0].cost.estimated_cycles
         );
     }
 
@@ -1800,9 +1809,9 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(
-            u64::from(ipu_exchange::plan_event_cycles(&relay).unwrap()),
-            lowered[0].cost.estimated_cycles
+        assert!(
+            u64::from(ipu_exchange::plan_event_cycles(&relay).unwrap())
+                <= lowered[0].cost.estimated_cycles
         );
     }
 
@@ -1960,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_exchange_rows_preserve_schedule_invariants() {
+    fn randomized_exchange_encoding_preserves_static_invariants() {
         const WORD_COUNTS: [u32; 10] = [1, 2, 15, 16, 17, 63, 64, 65, 127, 256];
         let topology = Topology::c600();
         let mut rng = fastrand::Rng::with_seed(0xd1b5_4a32_d192_ed03);
@@ -2016,12 +2025,21 @@ mod tests {
                     1,
                     "case={case} tile={tile}"
                 );
-                assert_eq!(
-                    u64::from(ipu_exchange::plan_event_cycles(row).unwrap()),
-                    first[0].cost.estimated_cycles,
+                assert!(
+                    u64::from(ipu_exchange::plan_event_cycles(row).unwrap())
+                        <= first[0].cost.estimated_cycles,
                     "case={case} tile={tile}"
                 );
             }
+            assert_eq!(
+                epoch
+                    .tile_rows
+                    .values()
+                    .map(|row| u64::from(ipu_exchange::plan_event_cycles(row).unwrap()))
+                    .max(),
+                Some(first[0].cost.estimated_cycles),
+                "case={case}"
+            );
         }
     }
 

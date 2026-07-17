@@ -9,6 +9,7 @@ use ipu_package::{
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
+use tracing_subscriber::EnvFilter;
 
 const COMMAND_WORDS: usize = 5;
 const COMMAND_BYTES: u32 = (COMMAND_WORDS * 4) as u32;
@@ -21,6 +22,18 @@ const HOST_PACKET_BASE: u32 = align_up(
     ipu_exchange::EXCHANGE_WINDOW_BASE + WORKER_CONTEXTS * WORKER_CONTEXT_BYTES,
     HOST_PACKET_ALIGNMENT,
 );
+
+pub fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false);
+    if std::env::var("IPU_LOG_FORMAT").as_deref() == Ok("json") {
+        builder.json().try_init().ok();
+    } else {
+        builder.try_init().ok();
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct InitialBuffer {
@@ -65,7 +78,6 @@ struct RuntimeLayout {
     plan_stride: u32,
     host_packet_stride: u32,
     command_address: u32,
-    cycle_address: u32,
     completion_address: u32,
     sync_packet_address: u32,
     sync_release_address: u32,
@@ -99,8 +111,7 @@ impl RuntimeLayout {
                     .ok_or("command size overflow")?,
             )
             .ok_or("command address overflow")?;
-        let cycle_address = align_up(command_end, 64);
-        let completion_address = cycle_address + 4;
+        let completion_address = align_up(command_end, 64);
         let sync_packet_address = align_up(completion_address + 4, 8);
         let sync_release_address = sync_packet_address + 16;
         let runtime_end = sync_release_address + 4;
@@ -154,7 +165,6 @@ impl RuntimeLayout {
             plan_stride,
             host_packet_stride,
             command_address,
-            cycle_address,
             completion_address,
             sync_packet_address,
             sync_release_address,
@@ -178,7 +188,7 @@ impl RuntimeLayout {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum HostDirection {
     CommandRead,
     ToTile,
@@ -214,9 +224,39 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         return Err("runtime expects one statically scheduled launch per exchange phase".into());
     }
     let host = build_host_layout(graph)?;
+    for (index, transfer) in host.inputs.iter().enumerate() {
+        debug!(
+            command = index,
+            direction = ?transfer.direction,
+            physical_tile = transfer.physical_tile,
+            tile_address = format_args!("{:#x}", transfer.tile_address),
+            host_offset = format_args!("{:#x}", transfer.host_offset),
+            bytes = transfer.bytes,
+            "lowered host input command"
+        );
+    }
+    for (index, transfer) in host.outputs.iter().enumerate() {
+        debug!(
+            command = host.inputs.len() + graph.schedule.phases.len() + index,
+            direction = ?transfer.direction,
+            physical_tile = transfer.physical_tile,
+            tile_address = format_args!("{:#x}", transfer.tile_address),
+            host_offset = format_args!("{:#x}", transfer.host_offset),
+            bytes = transfer.bytes,
+            "lowered host output command"
+        );
+    }
+    let output_transfers = host
+        .outputs
+        .iter()
+        .copied()
+        .filter(|transfer| matches!(transfer.direction, HostDirection::ToHost))
+        .collect::<Vec<_>>();
+    let output_command_count =
+        usize::from(!host.outputs.is_empty()) + usize::from(!output_transfers.is_empty());
     let command_count = host.inputs.len()
         + graph.schedule.phases.len()
-        + host.outputs.len()
+        + output_command_count
         + usize::from(!host.inputs.is_empty() || !host.outputs.is_empty());
     let mut plan_bytes = Vec::new();
     let mut packet_bytes = Vec::new();
@@ -244,18 +284,15 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         });
         packet_bytes.push(0);
     }
-    plan_bytes.extend(
-        host.outputs
-            .iter()
-            .map(host_plan_size)
-            .collect::<Result<Vec<_>>>()?,
-    );
-    packet_bytes.extend(
-        host.outputs
-            .iter()
-            .map(host_packet_size)
-            .collect::<Result<Vec<_>>>()?,
-    );
+    if let Some(command_read) = host.outputs.first() {
+        plan_bytes.push(host_plan_size(command_read)?);
+        packet_bytes.push(host_packet_size(command_read)?);
+    }
+    if !output_transfers.is_empty() {
+        let (plan_size, packet_size) = output_batch_sizes(&output_transfers)?;
+        plan_bytes.push(plan_size);
+        packet_bytes.push(packet_size);
+    }
     plan_bytes.resize(command_count, 0);
     packet_bytes.resize(command_count, 0);
     let layout = RuntimeLayout::new(
@@ -300,13 +337,13 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     };
     let worker_sync_offset = symbol_offset("ipu_stack_loop_worker_sync_base")?;
     let command_offset = symbol_offset("ipu_stack_command_table_address")?;
-    let cycle_start_offset = symbol_offset("ipu_stack_cycle_start_address")?;
-    let cycle_end_offset = symbol_offset("ipu_stack_cycle_end_address")?;
     let completion_offset = symbol_offset("ipu_stack_completion_address")?;
     let completion_dispatch_offset = symbol_offset("ipu_stack_completion_dispatch")?;
     let nonmaster_completion_offset = symbol_offset("ipu_stack_nonmaster_completion_redirect")?;
     let pre_sync_offset = symbol_offset("ipu_stack_pre_sync_dispatch")?;
     let nonmaster_redirect_offset = symbol_offset("ipu_stack_nonmaster_pre_sync_redirect")?;
+    let device_sync_offset = symbol_offset("ipu_stack_device_sync_dispatch")?;
+    let nonmaster_device_sync_offset = symbol_offset("ipu_stack_nonmaster_device_sync_redirect")?;
     let endpoint_offset = symbol_offset("ipu_stack_loop_global_sync_endpoint")?;
     let send0_offset = symbol_offset("ipu_stack_loop_global_sync_send0")?;
     let send1_offset = symbol_offset("ipu_stack_loop_global_sync_send1")?;
@@ -323,8 +360,6 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         let mut code = image.bytes.clone();
         patch_setzi_immediate(&mut code, worker_sync_offset, u32::from(logical) * 8)?;
         patch_setzi_immediate(&mut code, command_offset, layout.command_address)?;
-        patch_setzi_immediate(&mut code, cycle_start_offset, layout.cycle_address)?;
-        patch_setzi_immediate(&mut code, cycle_end_offset, layout.cycle_address)?;
         patch_setzi_immediate(&mut code, completion_offset, layout.completion_address)?;
         if physical == u32::from(global_sync.packet_origin_physical_tile) {
             for (offset, address) in [
@@ -340,6 +375,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             patch_setzi_immediate(&mut code, endpoint_offset, TILE_MUX_HOST_BASE + physical)?;
         } else {
             copy_instruction(&mut code, nonmaster_redirect_offset, pre_sync_offset);
+            copy_instruction(&mut code, nonmaster_device_sync_offset, device_sync_offset);
             copy_instruction(
                 &mut code,
                 nonmaster_completion_offset,
@@ -463,12 +499,24 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             }
             command_index += 1;
         }
-        for transfer in &host.outputs {
+        if let Some(command_read) = host.outputs.first() {
             append_host_command(
                 &mut app,
                 &mut segments,
                 &mut commands,
-                *transfer,
+                *command_read,
+                physical as u16,
+                &layout,
+                command_index,
+            )?;
+            command_index += 1;
+        }
+        if !output_transfers.is_empty() {
+            append_host_output_batch(
+                &mut app,
+                &mut segments,
+                &mut commands,
+                &output_transfers,
                 physical as u16,
                 &layout,
                 command_index,
@@ -624,20 +672,19 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
                 slice.size,
                 HOST_PAGE_BYTES,
             )?;
-            for chunk in ipu_exchange::plan_host_to_tile(
+            ipu_exchange::plan_host_to_tile(
                 u16::try_from(slice.tile)?,
                 slice.tile_address,
                 host_offset,
                 u32::try_from(slice.size)?,
-            )? {
-                inputs.push(HostTransfer {
-                    direction: HostDirection::ToTile,
-                    physical_tile: u16::try_from(slice.tile)?,
-                    tile_address: chunk.tile_address,
-                    host_offset: chunk.host_offset,
-                    bytes: chunk.bytes,
-                });
-            }
+            )?;
+            inputs.push(HostTransfer {
+                direction: HostDirection::ToTile,
+                physical_tile: u16::try_from(slice.tile)?,
+                tile_address: slice.tile_address,
+                host_offset,
+                bytes: u32::try_from(slice.size)?,
+            });
         }
         page_cursor = u32::try_from(page_base + size)?;
         input_cursor = input_cursor
@@ -683,9 +730,9 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
             .ok_or("host output size overflow")?;
     }
 
-    let host_phases = 1usize
-        .checked_add(inputs.len())
-        .and_then(|phases| phases.checked_add(outputs.len()))
+    let host_phases = inputs
+        .len()
+        .checked_add(usize::from(!outputs.is_empty()) * 2)
         .ok_or("host phase count overflow")?;
     Ok(HostLayout {
         inputs,
@@ -801,6 +848,133 @@ fn host_packet_size(transfer: &HostTransfer) -> Result<usize> {
         * 4)
 }
 
+fn output_batch_program(
+    transfers: &[HostTransfer],
+    physical_tile: u16,
+    packet_address: u32,
+    zero_read_address: u32,
+) -> Result<Option<TileToHostProgram>> {
+    let transfers = transfers
+        .iter()
+        .map(|transfer| ipu_exchange::TileToHostTransfer {
+            physical_tile: transfer.physical_tile,
+            tile_address: transfer.tile_address,
+            host_offset: transfer.host_offset,
+            bytes: transfer.bytes,
+        })
+        .collect::<Vec<_>>();
+    let mut source_tiles = Vec::new();
+    for transfer in &transfers {
+        if !source_tiles.contains(&transfer.physical_tile) {
+            source_tiles.push(transfer.physical_tile);
+        }
+    }
+    if source_tiles.is_empty() {
+        return Err("tile-to-host batch cannot be empty".into());
+    }
+    let mut close_cycle = 0u32;
+    for source in source_tiles.iter().copied() {
+        let source_transfers = transfers
+            .iter()
+            .copied()
+            .filter(|transfer| transfer.physical_tile == source)
+            .collect::<Vec<_>>();
+        close_cycle = close_cycle
+            .checked_add(ipu_exchange::tile_to_host_stream_cycles(&source_transfers)?)
+            .ok_or("tile-to-host batch cycle overflow")?;
+    }
+    let mut start_cycle = 0u32;
+    for source in source_tiles.iter().copied() {
+        if source == physical_tile {
+            break;
+        }
+        let source_transfers = transfers
+            .iter()
+            .copied()
+            .filter(|transfer| transfer.physical_tile == source)
+            .collect::<Vec<_>>();
+        start_cycle = start_cycle
+            .checked_add(ipu_exchange::tile_to_host_stream_cycles(&source_transfers)?)
+            .ok_or("tile-to-host batch cycle overflow")?;
+    }
+    let local = transfers
+        .iter()
+        .copied()
+        .filter(|transfer| transfer.physical_tile == physical_tile)
+        .collect::<Vec<_>>();
+    if physical_tile == 0 {
+        if local.is_empty() {
+            Ok(Some(
+                ipu_exchange::assemble_tile_to_host_batch_coordinator_program(
+                    packet_address,
+                    zero_read_address,
+                    close_cycle,
+                )?,
+            ))
+        } else {
+            Ok(Some(
+                ipu_exchange::assemble_tile_to_host_batch_complete_program(
+                    &local,
+                    packet_address,
+                    zero_read_address,
+                    start_cycle,
+                    close_cycle,
+                )?,
+            ))
+        }
+    } else if local.is_empty() {
+        Ok(None)
+    } else {
+        let program = ipu_exchange::assemble_tile_to_host_batch_source_program(
+            physical_tile,
+            &local,
+            packet_address,
+            start_cycle,
+        )?;
+        debug!(
+            physical_tile,
+            transfers = local.len(),
+            instructions = program.instructions.len(),
+            packet_words = ?program.packet_words,
+            "assembled tile-to-host batch source"
+        );
+        Ok(Some(program))
+    }
+}
+
+fn output_batch_sizes(transfers: &[HostTransfer]) -> Result<(usize, usize)> {
+    let mut physical_tiles = vec![0];
+    for transfer in transfers {
+        if !physical_tiles.contains(&transfer.physical_tile) {
+            physical_tiles.push(transfer.physical_tile);
+        }
+    }
+    let programs = physical_tiles
+        .into_iter()
+        .map(|physical_tile| {
+            output_batch_program(
+                transfers,
+                physical_tile,
+                HOST_PACKET_BASE,
+                ipu_exchange::EXCHANGE_WINDOW_BASE + HOST_PACKET_ALIGNMENT,
+            )?
+            .ok_or_else(|| "missing tile-to-host batch program".into())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((
+        programs
+            .iter()
+            .map(|program| program.instructions.len() * 4)
+            .max()
+            .unwrap_or(0),
+        programs
+            .iter()
+            .map(|program| program.packet_words.len() * 4)
+            .max()
+            .unwrap_or(0),
+    ))
+}
+
 fn assemble_host_program(
     transfer: HostTransfer,
     role: HostProgramRole,
@@ -818,6 +992,27 @@ fn assemble_host_program(
         }
         HostDirection::ToTile if role == HostProgramRole::Complete => {
             Ok(ipu_exchange::assemble_host_to_tile_program(
+                transfer.physical_tile,
+                transfer.tile_address,
+                transfer.host_offset,
+                transfer.bytes,
+                packet_address,
+            )?)
+        }
+        HostDirection::ToTile if role == HostProgramRole::Coordinator => {
+            Ok(ipu_exchange::assemble_host_to_tile_coordinator_program(
+                packet_address,
+                ipu_exchange::plan_host_to_tile(
+                    transfer.physical_tile,
+                    transfer.tile_address,
+                    transfer.host_offset,
+                    transfer.bytes,
+                )?
+                .len(),
+            )?)
+        }
+        HostDirection::ToTile if role == HostProgramRole::Source => {
+            Ok(ipu_exchange::assemble_host_to_tile_receiver_program(
                 transfer.physical_tile,
                 transfer.tile_address,
                 transfer.host_offset,
@@ -878,9 +1073,19 @@ fn append_host_command(
 ) -> Result<()> {
     const HOST_COORDINATOR_TILE: u16 = 0;
     let program_role = match transfer.direction {
-        HostDirection::CommandRead | HostDirection::ToTile => {
+        HostDirection::CommandRead => {
             (physical_tile == HOST_COORDINATOR_TILE).then_some(HostProgramRole::Complete)
         }
+        HostDirection::ToTile if transfer.physical_tile == HOST_COORDINATOR_TILE => {
+            (physical_tile == HOST_COORDINATOR_TILE).then_some(HostProgramRole::Complete)
+        }
+        HostDirection::ToTile if physical_tile == HOST_COORDINATOR_TILE => {
+            Some(HostProgramRole::Coordinator)
+        }
+        HostDirection::ToTile if physical_tile == transfer.physical_tile => {
+            Some(HostProgramRole::Source)
+        }
+        HostDirection::ToTile => None,
         HostDirection::ToHost if transfer.physical_tile == HOST_COORDINATOR_TILE => {
             (physical_tile == HOST_COORDINATOR_TILE).then_some(HostProgramRole::Complete)
         }
@@ -922,6 +1127,52 @@ fn append_host_command(
             blob: packet_blob,
             blob_offset: 0,
             file_size: packet_size,
+            flags: SEGMENT_READ,
+        });
+        (RuntimeRole::HostProgram, plan_address)
+    } else {
+        (RuntimeRole::HostIdle, 0)
+    };
+    commands.extend_from_slice(&words_to_bytes(&[role.word(), address, 0, 0, 0]));
+    Ok(())
+}
+
+fn append_host_output_batch(
+    app: &mut Application,
+    segments: &mut Vec<Segment>,
+    commands: &mut Vec<u8>,
+    transfers: &[HostTransfer],
+    physical_tile: u16,
+    layout: &RuntimeLayout,
+    command_index: usize,
+) -> Result<()> {
+    let program = output_batch_program(
+        transfers,
+        physical_tile,
+        layout.host_packet_address(command_index)?,
+        layout.host_zero_read_address,
+    )?;
+    let (role, address) = if let Some(program) = program {
+        let plan_address = layout.plan_address(command_index)?;
+        let instructions = words_to_bytes(&program.instructions);
+        let blob = app.add_blob(instructions.clone());
+        segments.push(Segment {
+            address: plan_address,
+            memory_size: u32::try_from(instructions.len())?,
+            blob,
+            blob_offset: 0,
+            file_size: u32::try_from(instructions.len())?,
+            flags: SEGMENT_READ | SEGMENT_EXECUTE,
+        });
+        let packet_address = layout.host_packet_address(command_index)?;
+        let packets = words_to_bytes(&program.packet_words);
+        let packet_blob = app.add_blob(packets.clone());
+        segments.push(Segment {
+            address: packet_address,
+            memory_size: u32::try_from(packets.len())?,
+            blob: packet_blob,
+            blob_offset: 0,
+            file_size: u32::try_from(packets.len())?,
             flags: SEGMENT_READ,
         });
         (RuntimeRole::HostProgram, plan_address)
@@ -1309,7 +1560,8 @@ mod tests {
         }));
         assert_eq!(
             call.phases,
-            u32::try_from(1 + layout.inputs.len() + layout.outputs.len()).unwrap()
+            u32::try_from(layout.inputs.len() + usize::from(!layout.outputs.is_empty()) * 2)
+                .unwrap()
         );
         let output = layout
             .outputs

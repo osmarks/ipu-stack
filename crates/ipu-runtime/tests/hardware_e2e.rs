@@ -66,6 +66,21 @@ fn generated_remote_tile_d2h_runs_end_to_end() {
 
 #[test]
 #[ignore = "requires exclusive access to a physical C600"]
+fn generated_distinct_multi_source_d2h_runs_end_to_end() {
+    let status = Command::new(env!("CARGO_BIN_EXE_ipu-host-e2e"))
+        .env("IPU_HOST_TEST_TILE", "1471")
+        .env("IPU_HOST_TEST_SECOND_TILE", "274")
+        .env("IPU_HOST_TEST_BYTES", "64")
+        .status()
+        .expect("launch distinct multi-source C600 D2H test runner");
+    assert!(
+        status.success(),
+        "C600 distinct multi-source D2H test runner failed with {status}"
+    );
+}
+
+#[test]
+#[ignore = "requires exclusive access to a physical C600"]
 fn randomized_exchange_graphs_run_end_to_end() {
     for seed in [
         0x4950_552d_5354_4143u64,
