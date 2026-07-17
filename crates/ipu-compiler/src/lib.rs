@@ -426,8 +426,6 @@ pub struct LoweredExchangePhase {
     pub cost: ExchangeCost,
 }
 
-pub const MAX_EXCHANGE_GROUPS_PER_EPOCH: usize = 16;
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoweredComputeCommand {
     pub op: OpId,
@@ -636,16 +634,6 @@ impl Schedule {
                     color.ok_or_else(|| CompileError::Graph("uncolored exchange group".into()))?;
                 epoch_groups[color].push(group);
             }
-            let epoch_groups: Vec<_> = epoch_groups
-                .into_iter()
-                .flat_map(|groups| {
-                    groups
-                        .chunks(MAX_EXCHANGE_GROUPS_PER_EPOCH)
-                        .map(<[PendingGroup]>::to_vec)
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-
             let mut epochs = Vec::new();
             for pending in epoch_groups {
                 let mut lowered_groups = Vec::new();
@@ -1637,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_caps_an_all_tile_matching_to_safe_launch_width() {
+    fn scheduler_packs_an_all_tile_matching_into_one_epoch() {
         let transfers = (0..736)
             .map(|pair| Transfer {
                 source_tile: pair * 2,
@@ -1649,13 +1637,8 @@ mod tests {
         let mut schedule = exchange_schedule(transfers);
         schedule.tile_count = 1472;
         let lowered = schedule.lower_exchanges(&Topology::c600()).unwrap();
-        assert_eq!(lowered[0].epochs.len(), 46);
-        assert!(
-            lowered[0]
-                .epochs
-                .iter()
-                .all(|epoch| epoch.groups.len() <= MAX_EXCHANGE_GROUPS_PER_EPOCH)
-        );
+        assert_eq!(lowered[0].epochs.len(), 1);
+        assert_eq!(lowered[0].epochs[0].groups.len(), 736);
         assert_eq!(lowered[0].cost.payload_words, 736);
     }
 

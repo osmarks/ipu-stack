@@ -82,9 +82,8 @@ instruction.
 The multi-pass command-table runtime also completes an all-device reduction.
 All 1,472 tile scalars, including physical tile 0's scalar, exchange and add
 through 11 binary-tree rounds. The
-compiler emits direction-specific point-to-point rows for one-to-one edges,
-single-send multicast for fanout, and a conservative maximum of 16 groups per
-epoch. The resulting 97 launches produce `1084128` on physical tile 0, and all
+compiler emits direction-specific point-to-point rows for one-to-one edges and
+single-send multicast for fanout. The resulting launches produce `1084128` on physical tile 0, and all
 sampled tiles reach the terminal acceptance trap. In the current logical to
 physical mapping the reduction root is physical tile 0, which is also the
 configured packet origin; this is an exercised combined role, not a reserved

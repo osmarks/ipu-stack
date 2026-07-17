@@ -66,12 +66,11 @@ The exchange planner now lowers one-to-one transfers to direction-specific
 point-to-point rows and fanout to single-send multicast rows. The direct loop
 runtime executes generated per-tile plan tables across repeated globally
 synchronized launches. Hardware acceptance includes a 1,472-value parallel
-sum: 11 reduction rounds, 97 exchange epochs, and the exact result `1084128`
+sum: 11 reduction rounds and the exact result `1084128`
 without Poplar exchange code generation or host-side phase delays.
 
-The current scheduler conservatively caps an epoch at 16 independent exchange
-groups. Wider favorable matchings have passed at 368 groups, but a route-aware
-resource model is still needed before raising the general cap. The remaining
-executable-lowering work is to resolve native host-phase retirement, dispatch
+The scheduler packs every tile-disjoint exchange group into the same epoch; the
+on-chip fabric is treated as non-blocking. The remaining executable-lowering
+work is to resolve native host-phase retirement, dispatch
 specialized compute kernels from the same per-tile program stream, and replace
 fixture-specific package construction with the general compiler pipeline.
