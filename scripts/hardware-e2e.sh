@@ -6,6 +6,7 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 tests=(
+  generated_compute_exchange_graph_runs_end_to_end
   generated_host_exchange_graph_runs_end_to_end
   generated_multi_epoch_host_exchange_runs_end_to_end
   generated_remote_tile_d2h_runs_end_to_end

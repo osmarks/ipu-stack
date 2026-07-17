@@ -1194,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn host_layout_accepts_remote_h2d_and_multiple_d2h_slices() {
+    fn host_layout_preserves_remote_endpoint_descriptors() {
         let mut graph = empty_graph();
         graph.host_inputs.push(test_binding(
             "input",

@@ -37,6 +37,7 @@ instruction assembler is required.
 ## Build and inspect
 
 ```sh
+# Offline encoder, planner, package, and driver tests only.
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 
@@ -45,7 +46,10 @@ cargo run -p ipu-cli -- kernel-compile device/runtime.S /tmp/runtime \
 cargo run -p ipu-cli -- encoder-plan -o /tmp/encoder.json --tiles 1472
 ```
 
-The ignored end-to-end hardware test is `scripts/hardware-e2e.sh`. It requires
+`cargo test --workspace` does not claim device-transfer coverage. The exclusive
+hardware acceptance gate is `scripts/hardware-e2e.sh`; its tests are ignored by
+the ordinary test command so that package builds cannot reset an attached IPU.
+It requires
 `POPLAR_SDK_ENABLED` and `IPU_CONFIG`, and accepts optional `IPU_BOOTLOADER` and
 `IPU_DEVICE` overrides. The suite includes seeded randomized exchange graphs;
 run one reproducible case directly with `IPU_RANDOM_SEED=0x1234 cargo run -p
@@ -61,13 +65,12 @@ The Rust path has attached to a C600, reset and configured it, loaded a linked
 application onto all 1472 discovered package tiles in 64-tile bootloader
 batches, completed startup synchronization, and run a supervisor plus six
 barrel workers without an IPU exception. `HostSession` directly attaches host
-pages and drives HSP handoffs. Rust-generated packet headers, XREQs, command
-reads, H2D plans, and D2H plans have transferred randomized payloads to tile
-SRAM and returned them byte-for-byte without Poplar or TDI readback. Direct H2D
-currently targets physical tile 0; remote inputs are staged through generated
-D2D epochs. Direct D2H from arbitrary tiles is verified through 8 KiB. Multiple
-D2H slices in one host call are rejected because repeated D2H currently returns
-zeros after the first slice.
+pages and drives HSP handoffs. Isolated Rust-generated command reads and host
+packet programs have transferred payloads in earlier bring-up tests, but the
+composed host protocol is not yet accepted. The randomized hardware gate
+currently fails at the HSP transition following its first host transfer. Remote
+H2D, repeated arbitrary-tile D2H, and their composition with multicast therefore
+remain unverified capabilities, regardless of whether their plans serialize.
 
 Host transfers are split at the recovered short/long packet limits and 4 KiB
 attachment boundaries. The runtime allocates one attached buffer per page,
