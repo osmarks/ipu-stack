@@ -39,7 +39,6 @@ fn main() {
         .unwrap_or(DEFAULT_TRANSFER_BYTES);
     let exchange = std::env::var_os("IPU_HOST_TEST_EXCHANGE").is_some();
     let remote_d2h = std::env::var_os("IPU_HOST_TEST_REMOTE_D2H").is_some();
-    let h2d_only = std::env::var_os("IPU_HOST_TEST_H2D_ONLY").is_some();
     let host_tile = std::env::var("IPU_HOST_TEST_TILE")
         .map(|value| {
             value
@@ -57,16 +56,11 @@ fn main() {
         exchange || remote_d2h,
         host_tile,
         remote_d2h,
-        h2d_only,
     )
     .unwrap();
     let app = package_graph(&graph, &[runtime_object]).unwrap();
     let result = run_host(&app, &bootloader, &configuration, &device, &input).unwrap();
-    if h2d_only {
-        assert!(result.is_empty());
-    } else {
-        assert_eq!(result, input);
-    }
+    assert_eq!(result, input);
     println!(
         "hostBytes={} h2d=PASS exchange={} d2h=PASS",
         result.len(),
@@ -84,7 +78,6 @@ fn host_exchange_graph(
     exchange: bool,
     host_tile: u16,
     remote_d2h: bool,
-    h2d_only: bool,
 ) -> Result<ExecutableGraph, ipu_compiler::CompileError> {
     let topology = ipu_exchange::Topology::c600();
     let tensor = TensorId(0);
@@ -212,16 +205,12 @@ fn host_exchange_graph(
             source_address,
             transfer_bytes,
         )],
-        host_outputs: if h2d_only {
-            Vec::new()
-        } else {
-            vec![binding(
-                "output",
-                topology.physical(output_tile).unwrap(),
-                output_address,
-                transfer_bytes,
-            )]
-        },
+        host_outputs: vec![binding(
+            "output",
+            topology.physical(output_tile).unwrap(),
+            output_address,
+            transfer_bytes,
+        )],
     })
 }
 
