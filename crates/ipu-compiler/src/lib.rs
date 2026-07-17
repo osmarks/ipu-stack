@@ -1542,6 +1542,9 @@ mod tests {
         assert_eq!(lowered.len(), 1);
         assert_eq!(lowered[0].epochs.len(), 1);
         assert_eq!(lowered[0].epochs[0].groups.len(), 2);
+        assert!(lowered[0].epochs[0].groups.iter().any(|group| {
+            group.destination_tiles.len() == 2 && group.addressing == ExchangeAddressing::Absolute
+        }));
         assert_eq!(lowered[0].cost.launches, 1);
         assert_eq!(lowered[0].cost.payload_words, 16 + 32);
         assert_eq!(lowered[0].epochs[0].tile_rows.len(), 5);

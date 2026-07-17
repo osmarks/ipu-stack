@@ -73,11 +73,20 @@ now covers:
 - four disjoint sender/receiver pairs in one exchange launch;
 - one 1,024-word source stream received simultaneously by physical tiles 32
   and 53.
+- one 1,024-word source stream received simultaneously by all other 1,471
+  tiles through the direct command-loop runtime, with sampled first and last
+  words exact.
 
 The fixture places worker sync storage, receive staging, executable plans, and
 outgoing data in separate SRAM regions. Placing plan and source in the same
 SRAM element was reproduced as `TEXCPT_CONFLICT` at the sender's `send`
 instruction.
+
+Multicast source and destination addresses are embedded in the plan
+instructions. The direct runtime therefore clears `A7` for multicast senders
+and `A4` for multicast receivers; point-to-point plans continue to use those
+registers as relative bases. Treating an absolute receiver like a relative one
+completes without an exchange exception but leaves its destination unchanged.
 
 The multi-pass command-table runtime also completes an all-device reduction.
 All 1,472 tile scalars, including physical tile 0's scalar, exchange and add

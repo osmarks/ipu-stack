@@ -107,6 +107,8 @@ enum Command {
         host_output_offset: u32,
         #[arg(long)]
         experimental_host_output: bool,
+        #[arg(long)]
+        broadcast_destination: Vec<u16>,
     },
     DeviceProbe {
         #[arg(long, default_value = "/dev/ipu0")]
@@ -415,8 +417,10 @@ fn main() -> Result<()> {
             host_dummy_address,
             host_output_offset,
             experimental_host_output,
+            broadcast_destination,
         } => {
             let topology = Topology::c600();
+            let broadcast_result = !broadcast_destination.is_empty();
             let layout = ReductionLayout::new();
             let global_sync = GlobalSyncPlacement::new(
                 ipu_exchange::c600_global_sync(),
@@ -468,6 +472,42 @@ fn main() -> Result<()> {
                 active = next;
             }
             let root = active[0];
+            if broadcast_result {
+                const BROADCAST_BYTES: u32 = 4096;
+                let phase_index = phases.len();
+                let tensor = TensorId(topology.tile_count());
+                allocations.push(Allocation {
+                    tensor,
+                    tile: root,
+                    address: layout.broadcast_source_address,
+                    size: BROADCAST_BYTES,
+                    live_from: phase_index,
+                    live_until: phase_index + 1,
+                    kind: AllocationKind::Home,
+                });
+                let mut transfers = Vec::with_capacity(broadcast_destination.len());
+                for &destination in &broadcast_destination {
+                    if destination == root || usize::from(destination) >= topology.tile_count() {
+                        bail!("invalid broadcast destination {destination}");
+                    }
+                    transfers.push(Transfer {
+                        source_tile: root,
+                        destination_tile: destination,
+                        tensor,
+                        bytes: BROADCAST_BYTES,
+                    });
+                    allocations.push(Allocation {
+                        tensor,
+                        tile: destination,
+                        address: layout.broadcast_staging_address,
+                        size: BROADCAST_BYTES,
+                        live_from: phase_index,
+                        live_until: phase_index + 1,
+                        kind: AllocationKind::ExchangeStaging { phase: phase_index },
+                    });
+                }
+                phases.push(Phase::Exchange { transfers });
+            }
             let schedule = Schedule {
                 layouts: Vec::new(),
                 phases,
@@ -583,16 +623,64 @@ fn main() -> Result<()> {
                     let mut accumulator = 0;
                     let mut staging = 0;
                     if let Some(row) = epoch.tile_rows.get(&logical) {
-                        role = RuntimeRole::SendRelative;
-                        accumulator = layout.accumulator_address;
+                        role = if epoch.groups.iter().any(|group| {
+                            group.source_tile == logical
+                                && group.addressing == ipu_compiler::ExchangeAddressing::Absolute
+                        }) {
+                            RuntimeRole::SendAbsolute
+                        } else {
+                            RuntimeRole::SendRelative
+                        };
+                        accumulator = epoch
+                            .groups
+                            .iter()
+                            .find(|group| group.source_tile == logical)
+                            .and_then(|group| {
+                                schedule.allocations.iter().find(|allocation| {
+                                    allocation.tensor == group.tensor
+                                        && allocation.tile == logical
+                                        && allocation.kind == AllocationKind::Home
+                                })
+                            })
+                            .map_or(layout.accumulator_address, |allocation| allocation.address);
                         if epoch
                             .groups
                             .iter()
                             .any(|group| group.destination_tiles.contains(&logical))
                         {
-                            role = RuntimeRole::ReceiveAdd;
-                            accumulator = layout.accumulator_address;
-                            staging = layout.staging_address;
+                            role = if epoch.groups.iter().any(|group| {
+                                group.destination_tiles.contains(&logical)
+                                    && group.addressing
+                                        == ipu_compiler::ExchangeAddressing::Absolute
+                            }) {
+                                RuntimeRole::ReceiveAbsoluteAdd
+                            } else {
+                                RuntimeRole::ReceiveAdd
+                            };
+                            accumulator = if epoch
+                                .groups
+                                .iter()
+                                .any(|group| group.destination_tiles.len() > 1)
+                            {
+                                layout.broadcast_address
+                            } else {
+                                layout.accumulator_address
+                            };
+                            staging = epoch
+                                .groups
+                                .iter()
+                                .find(|group| group.destination_tiles.contains(&logical))
+                                .and_then(|group| {
+                                    schedule.allocations.iter().find(|allocation| {
+                                        allocation.tensor == group.tensor
+                                            && allocation.tile == logical
+                                            && matches!(
+                                                allocation.kind,
+                                                AllocationKind::ExchangeStaging { .. }
+                                            )
+                                    })
+                                })
+                                .map_or(layout.staging_address, |allocation| allocation.address);
                         }
                         let blob = app.add_blob(words_to_bytes(row));
                         segments.push(Segment {
@@ -668,6 +756,33 @@ fn main() -> Result<()> {
                     file_size: 4,
                     flags: SEGMENT_READ | SEGMENT_WRITE,
                 });
+                if broadcast_result && logical == root {
+                    let mut source = vec![0u32; 1024];
+                    source[0] = expected_parallel_sum(topology.tile_count());
+                    for (index, word) in source.iter_mut().enumerate().skip(1) {
+                        *word = 0x5a17_0000 ^ index as u32;
+                    }
+                    let blob = app.add_blob(words_to_bytes(&source));
+                    segments.push(Segment {
+                        address: layout.broadcast_source_address,
+                        memory_size: 4096,
+                        blob,
+                        blob_offset: 0,
+                        file_size: 4096,
+                        flags: SEGMENT_READ,
+                    });
+                }
+                if broadcast_destination.contains(&logical) {
+                    let blob = app.add_blob(words_to_bytes(&[0]));
+                    segments.push(Segment {
+                        address: layout.broadcast_address,
+                        memory_size: 4,
+                        blob,
+                        blob_offset: 0,
+                        file_size: 4,
+                        flags: SEGMENT_READ | SEGMENT_WRITE,
+                    });
+                }
                 if let Some(host) = &host_output
                     && logical == root
                 {
@@ -741,6 +856,17 @@ fn main() -> Result<()> {
                         flags: SEGMENT_READ | SEGMENT_WRITE,
                     });
                 }
+                if broadcast_destination.contains(&logical) {
+                    let blob = app.add_blob(vec![0; 4096]);
+                    segments.push(Segment {
+                        address: layout.broadcast_staging_address,
+                        memory_size: 4096,
+                        blob,
+                        blob_offset: 0,
+                        file_size: 4096,
+                        flags: SEGMENT_READ | SEGMENT_WRITE,
+                    });
+                }
                 if physical == u32::from(global_sync.packet_origin_physical_tile) {
                     let packet_blob = app.add_blob(words_to_bytes(&global_sync.packet_words()));
                     segments.push(Segment {
@@ -767,6 +893,8 @@ fn main() -> Result<()> {
                     command_address: layout.command_address,
                     diagnostic_address: if logical == root {
                         layout.accumulator_address
+                    } else if broadcast_destination.contains(&logical) {
+                        layout.broadcast_address
                     } else {
                         0
                     },
@@ -801,12 +929,9 @@ fn main() -> Result<()> {
                 });
             }
             app.write(fs::File::create(&output)?)?;
-            let expected = (topology.tile_count() as u32)
-                .checked_mul(topology.tile_count() as u32 + 1)
-                .expect("C600 sum fits u32")
-                / 2;
+            let expected = expected_parallel_sum(topology.tile_count());
             println!(
-                "tiles={} rootLogical={} rootPhysical={} rounds={} launches={} expected={} resultAddress=0x{:x} output={}",
+                "tiles={} rootLogical={} rootPhysical={} rounds={} launches={} expected={} resultAddress=0x{:x} broadcastAddress={} output={}",
                 topology.tile_count(),
                 root,
                 topology.physical(root)?,
@@ -814,6 +939,11 @@ fn main() -> Result<()> {
                 launches.len(),
                 expected,
                 layout.accumulator_address,
+                if broadcast_result {
+                    format!("0x{:x}", layout.broadcast_address)
+                } else {
+                    "none".into()
+                },
                 output.display()
             );
         }
@@ -1132,6 +1262,7 @@ enum RuntimeRole {
     SendAbsolute = 5,
     HostXreq = 7,
     HostCommandRead = 8,
+    ReceiveAbsoluteAdd = 9,
 }
 
 impl RuntimeRole {
@@ -1214,6 +1345,9 @@ struct ReductionLayout {
     accumulator_address: u32,
     sync_packet_address: u32,
     sync_release_address: u32,
+    broadcast_address: u32,
+    broadcast_source_address: u32,
+    broadcast_staging_address: u32,
 }
 
 struct HostOutputPlans {
@@ -1291,6 +1425,9 @@ impl ReductionLayout {
             accumulator_address,
             sync_packet_address: accumulator_address + 64,
             sync_release_address: accumulator_address + 80,
+            broadcast_address: accumulator_address + 88,
+            broadcast_source_address: accumulator_address + 0x1000,
+            broadcast_staging_address: ipu_exchange::EXCHANGE_WINDOW_BASE + 0x4000,
         }
     }
 
@@ -1325,6 +1462,11 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 
 const fn align_up(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
+}
+
+fn expected_parallel_sum(tile_count: usize) -> u32 {
+    let count = u32::try_from(tile_count).expect("tile count fits u32");
+    count.checked_mul(count + 1).expect("tile sum fits u32") / 2
 }
 
 fn parse_u32(value: &str) -> Result<u32, String> {

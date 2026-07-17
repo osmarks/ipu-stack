@@ -63,7 +63,9 @@ page remains zero and its final phase can remain in WAEX. It is diagnostic
 code, not a passing production data path.
 
 The exchange planner now lowers one-to-one transfers to direction-specific
-point-to-point rows and fanout to single-send multicast rows. The direct loop
+point-to-point rows and fanout to single-send multicast rows. Direct hardware
+acceptance includes a 1,024-word single-packet broadcast to all 1,471 other
+tiles. The direct loop
 runtime executes generated per-tile plan tables across repeated globally
 synchronized launches. Hardware acceptance includes a 1,472-value parallel
 sum: 11 reduction rounds and the exact result `1084128`

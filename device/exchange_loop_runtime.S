@@ -8,6 +8,7 @@
 	.set ROLE_EXTERNAL_COMPLETION, 6
 	.set ROLE_HOST_XREQ, 7
 	.set ROLE_HOST_COMMAND_READ, 8
+	.set ROLE_RECEIVE_ABSOLUTE_ADD, 9
 	.set TILE_MUX_HOST, 0x600
 	.set TILE_MUX_EXCHANGE, 0x640
 	.set WORKER_BASE_START, 0x50000
@@ -90,6 +91,8 @@ ipu_stack_command_table_address:
 	brnz $m4, .Lset_absolute_send_base
 	cmpeq $m4, $m5, ROLE_HOST_COMMAND_READ
 	brnz $m4, .Lset_absolute_send_base
+	cmpeq $m4, $m5, ROLE_RECEIVE_ABSOLUTE_ADD
+	brnz $m4, .Lset_absolute_receive_base
 	bri .Lset_receive_base
 .Lset_send_base:
 	put 0xa7, $m2
@@ -99,6 +102,9 @@ ipu_stack_command_table_address:
 	bri .Larm_plan
 .Lset_receive_base:
 	put 0xa4, $m3
+	bri .Larm_plan
+.Lset_absolute_receive_base:
+	put 0xa4, $m15
 .Larm_plan:
 	setzi $m8, 1
 	put 0xa6, $m8
@@ -107,7 +113,10 @@ ipu_stack_command_table_address:
 
 .Lplan_complete:
 	cmpeq $m4, $m5, ROLE_RECEIVE_ADD
+	brnz $m4, .Lreceive_add
+	cmpeq $m4, $m5, ROLE_RECEIVE_ABSOLUTE_ADD
 	brz $m4, .Llaunch_complete
+.Lreceive_add:
 	ld32 $m8, $m2, $m15, 0
 	ld32 $m9, $m3, $m15, 0
 	add $m8, $m8, $m9
