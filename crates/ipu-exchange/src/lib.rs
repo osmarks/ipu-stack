@@ -314,7 +314,7 @@ pub fn assemble_host_to_tile_program(
     }
     let chunk = chunks[0];
     let instructions = vec![
-        setzi_m(8, TILE_MUX_HOST),
+        setzi_m(8, host_tile_mux(physical_tile)?),
         put_special_from_m8(INCOMING_MUX_REGISTER),
         SYNC_HOST_INSTRUCTION,
         setzi_m(8, chunk.bytes / 4),
@@ -329,6 +329,54 @@ pub fn assemble_host_to_tile_program(
     Ok(TileToHostProgram {
         instructions,
         packet_words: vec![1, 0, 0, 0, chunk.header.word0, chunk.header.word1],
+    })
+}
+
+pub fn assemble_host_to_tile_coordinator_program(
+    packet_address: u32,
+) -> Result<TileToHostProgram, ExchangeError> {
+    if packet_address & 7 != 0 {
+        return Err(ExchangeError::HostPacket);
+    }
+    Ok(TileToHostProgram {
+        instructions: vec![
+            setzi_m(8, TILE_MUX_HOST),
+            put_special_from_m8(INCOMING_MUX_REGISTER),
+            SYNC_HOST_INSTRUCTION,
+            encode_send(1, 3, packet_address >> 2)?,
+            RETURN_M10_INSTRUCTION,
+        ],
+        packet_words: vec![1, 0],
+    })
+}
+
+pub fn assemble_host_to_tile_receiver_program(
+    physical_tile: u16,
+    tile_address: u32,
+    host_offset: u32,
+    bytes: u32,
+    packet_address: u32,
+) -> Result<TileToHostProgram, ExchangeError> {
+    let chunks = plan_host_to_tile(physical_tile, tile_address, host_offset, bytes)?;
+    if chunks.len() != 1 || packet_address & 7 != 0 {
+        return Err(ExchangeError::HostPacket);
+    }
+    let chunk = chunks[0];
+    Ok(TileToHostProgram {
+        instructions: vec![
+            sans(1),
+            SYNC_EXTERNAL_INSTRUCTION,
+            setzi_m(8, host_tile_mux(physical_tile)?),
+            put_special_from_m8(INCOMING_MUX_REGISTER),
+            setzi_m(8, chunk.bytes / 4),
+            put_special_from_m8(INCOMING_DCOUNT_REGISTER),
+            encode_send(1, 3, packet_address >> 2)?,
+            SYNC_RECEIVE_INSTRUCTION,
+            setzi_m(8, TILE_MUX_EXCHANGE),
+            put_special_from_m8(INCOMING_MUX_REGISTER),
+            RETURN_M10_INSTRUCTION,
+        ],
+        packet_words: vec![chunk.header.word0, chunk.header.word1],
     })
 }
 
@@ -480,7 +528,7 @@ pub fn assemble_tile_to_host_program(
     let chunks = plan_tile_to_host(physical_tile, tile_address, host_offset, bytes)?;
     let xreq_address = packet_address + (chunks.len() as u32 + 1) * 8;
     let coordinator = tile_to_host_coordinator_instructions(xreq_address)?;
-    let source = tile_to_host_source_instructions(&chunks, packet_address)?;
+    let source = tile_to_host_source_instructions(physical_tile, &chunks, packet_address)?;
     let mut instructions = coordinator;
     instructions.extend(source);
     Ok(TileToHostProgram {
@@ -519,7 +567,7 @@ pub fn assemble_tile_to_host_source_program(
 ) -> Result<TileToHostProgram, ExchangeError> {
     let chunks = plan_tile_to_host(physical_tile, tile_address, host_offset, bytes)?;
     Ok(TileToHostProgram {
-        instructions: tile_to_host_source_instructions(&chunks, packet_address)?,
+        instructions: tile_to_host_source_instructions(physical_tile, &chunks, packet_address)?,
         packet_words: tile_to_host_packet_words(
             physical_tile,
             tile_address,
@@ -540,12 +588,12 @@ fn tile_to_host_coordinator_instructions(xreq_address: u32) -> Result<Vec<u32>, 
         put_special_from_m8(INCOMING_MUX_REGISTER),
         SYNC_HOST_INSTRUCTION,
         encode_send(1, 3, xreq_address >> 2)?,
-        SYNC_ALL_INSTRUCTION,
         RETURN_M10_INSTRUCTION,
     ])
 }
 
 fn tile_to_host_source_instructions(
+    physical_tile: u16,
     chunks: &[HostTransferChunk],
     packet_address: u32,
 ) -> Result<Vec<u32>, ExchangeError> {
@@ -555,7 +603,7 @@ fn tile_to_host_source_instructions(
     let mut instructions = vec![
         sans(1),
         SYNC_EXTERNAL_INSTRUCTION,
-        setzi_m(8, TILE_MUX_HOST),
+        setzi_m(8, host_tile_mux(physical_tile)?),
         put_special_from_m8(INCOMING_MUX_REGISTER),
         setzi_m(8, 1),
         put_special_from_m8(INCOMING_DCOUNT_REGISTER),
@@ -575,7 +623,6 @@ fn tile_to_host_source_instructions(
         delay(1),
         encode_send(1, 3, (packet_address + chunks.len() as u32 * 8) >> 2)?,
         SYNC_RECEIVE_INSTRUCTION,
-        SYNC_ALL_INSTRUCTION,
         setzi_m(8, TILE_MUX_EXCHANGE),
         put_special_from_m8(INCOMING_MUX_REGISTER),
         RETURN_M10_INSTRUCTION,
@@ -647,6 +694,12 @@ fn validate_host_tile(physical_tile: u16) -> Result<(), ExchangeError> {
         return Err(ExchangeError::HostPacket);
     }
     Ok(())
+}
+
+fn host_tile_mux(physical_tile: u16) -> Result<u32, ExchangeError> {
+    validate_host_tile(physical_tile)?;
+    // Bit 1 selects the other tile attached to the same host exchange endpoint.
+    Ok(TILE_MUX_HOST + u32::from(physical_tile & !2))
 }
 
 fn host_packet_size(host_offset: u32, bytes: u32) -> Result<HostPacketSize, ExchangeError> {
@@ -1395,11 +1448,11 @@ mod tests {
 
     #[test]
     fn assembles_host_to_tile_as_one_self_contained_request() {
-        let plan = assemble_host_to_tile_program(2, 0x50120, 0x40, 64, 0x50160).unwrap();
+        let plan = assemble_host_to_tile_program(63, 0x50120, 0x40, 64, 0x50160).unwrap();
         assert_eq!(&plan.packet_words[..4], &[1, 0, 0, 0]);
         assert_eq!(
             &plan.packet_words[4..],
-            &host_packet_words(host_to_tile_packet(2, 0x50120, 0x40, 64).unwrap())
+            &host_packet_words(host_to_tile_packet(63, 0x50120, 0x40, 64).unwrap())
         );
         let sends = plan
             .instructions
@@ -1410,6 +1463,8 @@ mod tests {
         assert_eq!(sends.len(), 2);
         assert_eq!(send_address(sends[0]), 0x50160);
         assert_eq!(send_address(sends[1]), 0x50170);
+        assert_eq!(plan.instructions[0], setzi_m(8, 0x63d));
+        assert!(plan.instructions.contains(&SYNC_HOST_INSTRUCTION));
         assert!(plan.instructions.contains(&SYNC_RECEIVE_INSTRUCTION));
     }
 
