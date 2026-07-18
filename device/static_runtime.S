@@ -103,6 +103,21 @@ ipu_stack_static_copy_u32:
 	br $m10
 	.size ipu_stack_static_copy_u32, .-ipu_stack_static_copy_u32
 
+	.section .text.ipu_stack_static_repeat_call,"ax",@progbits
+	.globl ipu_stack_static_repeat_call
+	.p2align 2
+	.type ipu_stack_static_repeat_call,@function
+ipu_stack_static_repeat_call:
+	.supervisor
+.Lrepeat_call:
+	setzi $m10, .Lrepeat_return
+	br $m3
+.Lrepeat_return:
+	sub $m2, $m2, 1
+	brnz $m2, .Lrepeat_call
+	br $m9
+	.size ipu_stack_static_repeat_call, .-ipu_stack_static_repeat_call
+
 	.section .text.ipu_stack_static_complete,"ax",@progbits
 	.globl ipu_stack_static_complete
 	.p2align 2

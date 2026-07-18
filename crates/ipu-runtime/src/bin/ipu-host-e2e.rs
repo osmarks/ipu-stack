@@ -243,10 +243,9 @@ fn host_compute_relay_graph() -> Result<ExecutableGraph, ipu_compiler::CompileEr
         alignment: 32,
         placement: MemoryPlacement::High,
     };
-    let compiler_memory = ipu_compiler::CompilerOptions::default();
     let data_constraint = MemoryConstraint {
-        base: compiler_memory.data_base,
-        limit: compiler_memory.data_limit,
+        base: ipu_exchange::EXCHANGE_WINDOW_BASE + 2 * ipu_exchange::EXCHANGE_WINDOW_BYTES,
+        limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
         alignment: 32,
         placement: MemoryPlacement::Low,
     };

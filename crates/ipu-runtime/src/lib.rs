@@ -39,6 +39,11 @@ struct StaticHostLayout {
     outputs: Vec<StaticHostTransfer>,
     protocol: HostExchange,
 }
+
+struct TileHostPlans {
+    addresses: Vec<u32>,
+    end: u32,
+}
 pub fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt()
@@ -274,26 +279,40 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         .chain(&host.outputs)
         .copied()
         .collect::<Vec<_>>();
-    let host_plan_sizes = host_transfers
-        .iter()
-        .map(|transfer| host_phase_size(*transfer))
-        .collect::<Result<Vec<_>>>()?;
-    let (host_plan_addresses, host_plan_end) = packed_addresses(plan_end, &host_plan_sizes, 8)?;
     let host_packet_sizes = host_transfers
         .iter()
         .map(|transfer| host_packet_size(*transfer))
         .collect::<Result<Vec<_>>>()?;
     let host_packet_addresses =
         allocate_host_packet_addresses(&graph.schedule, &host_transfers, &host_packet_sizes)?;
-    let completion_address = align_up(host_plan_end, 64);
-    let runtime_end = completion_address
-        .checked_add(4)
-        .ok_or("static runtime address overflow")?;
+    let tile_host_plans = programs
+        .iter()
+        .map(|program| -> Result<TileHostPlans> {
+            let physical = topology.physical(program.tile)?;
+            let sizes = host_transfers
+                .iter()
+                .zip(&host_packet_addresses)
+                .map(|(&transfer, &packet_address)| {
+                    Ok(host_phase_instructions(physical, transfer, packet_address)?
+                        .0
+                        .len()
+                        * 4)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let (addresses, end) = packed_addresses(plan_end, &sizes, 8)?;
+            Ok(TileHostPlans { addresses, end })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let completion_addresses = tile_host_plans
+        .iter()
+        .map(|plans| align_up(plans.end, 64))
+        .collect::<Vec<_>>();
 
     let mut retained_symbols = vec![
         static_codegen::WORKER_BARRIER.into(),
         static_codegen::COMPLETE.into(),
         static_codegen::COPY_U32.into(),
+        static_codegen::REPEAT_CALL.into(),
     ];
     retained_symbols.extend(programs.iter().flat_map(|program| {
         program.steps.iter().filter_map(|step| match step {
@@ -323,9 +342,10 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     );
     let generated = programs
         .iter()
-        .map(|program| -> Result<Vec<u8>> {
+        .zip(&tile_host_plans)
+        .map(|(program, host_plans)| -> Result<Vec<u8>> {
             let physical = topology.physical(program.tile)?;
-            let host_inputs = host_plan_addresses[..host.inputs.len()]
+            let host_inputs = host_plans.addresses[..host.inputs.len()]
                 .iter()
                 .copied()
                 .zip(&host.inputs)
@@ -338,13 +358,22 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                             destination,
                             words: transfer.bytes / 4,
                         });
-                    (address, copy)
+                    static_codegen::HostPhaseCall {
+                        address,
+                        copy,
+                        active: host_phase_is_active(physical, transfer),
+                    }
                 })
                 .collect::<Vec<_>>();
-            let host_outputs = host_plan_addresses[host.inputs.len()..]
+            let host_outputs = host_plans.addresses[host.inputs.len()..]
                 .iter()
                 .copied()
-                .map(|address| (address, None))
+                .zip(&host.outputs)
+                .map(|(address, transfer)| static_codegen::HostPhaseCall {
+                    address,
+                    copy: None,
+                    active: host_phase_is_active(physical, transfer),
+                })
                 .collect::<Vec<_>>();
             static_codegen::emit(
                 program,
@@ -370,12 +399,15 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             .address
             .checked_add(allocation.size)
             .ok_or("allocation address overflow")?;
+        let runtime_end = completion_addresses[usize::from(allocation.tile)]
+            .checked_add(4)
+            .ok_or("static runtime address overflow")?;
         if ranges_overlap(image.base, program_end, allocation.address, end)
             || ranges_overlap(PLAN_BASE, runtime_end, allocation.address, end)
         {
             return Err(format!(
-                "static runtime region overlaps tensor {} on tile {}",
-                allocation.tensor.0, allocation.tile
+                "static runtime 0x{PLAN_BASE:x}..0x{runtime_end:x} overlaps tensor {} on tile {} at 0x{:x}..0x{end:x}",
+                allocation.tensor.0, allocation.tile, allocation.address
             )
             .into());
         }
@@ -412,8 +444,20 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                 .map(u32::from)
         })
         .ok_or("static graph has no tile for diagnostic completion")?;
+    let completion_logical_tile = programs
+        .iter()
+        .find(|program| {
+            topology.physical(program.tile).map(u32::from).ok() == Some(completion_physical_tile)
+        })
+        .map(|program| program.tile)
+        .ok_or("diagnostic completion tile is outside the schedule")?;
     let mut app = Application::default();
-    for (program, generated_code) in programs.iter().zip(generated) {
+    for (((program, generated_code), host_plans), &completion_address) in programs
+        .iter()
+        .zip(generated)
+        .zip(&tile_host_plans)
+        .zip(&completion_addresses)
+    {
         let logical = program.tile;
         let physical = u32::from(topology.physical(logical)?);
         let mut support_code = image.bytes.clone();
@@ -445,7 +489,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             flags: SEGMENT_READ | SEGMENT_EXECUTE,
         });
 
-        let plan_region_size = usize::try_from(host_plan_end - PLAN_BASE)?;
+        let plan_region_size = usize::try_from(host_plans.end - PLAN_BASE)?;
         let mut plan_region = vec![0; plan_region_size];
         let mut exchange_index = 0usize;
         for step in &program.steps {
@@ -460,7 +504,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             &mut segments,
             physical as u16,
             &host_transfers,
-            &host_plan_addresses,
+            &host_plans.addresses,
             &host_packet_addresses,
             &mut plan_region,
         )?;
@@ -495,7 +539,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         shape: vec![1],
         slices: vec![RegionSlice {
             tile: completion_physical_tile,
-            tile_address: completion_address,
+            tile_address: completion_addresses[usize::from(completion_logical_tile)],
             file_offset: 0,
             size: 4,
         }],
@@ -780,22 +824,54 @@ fn host_target_program(
     })
 }
 
-fn host_phase_size(transfer: StaticHostTransfer) -> Result<usize> {
-    let target = host_target_program(transfer, PLAN_BASE + 8)?;
+fn host_phase_is_active(physical_tile: u16, transfer: &StaticHostTransfer) -> bool {
+    ipu_exchange::host_hierarchy(transfer.physical_tile).is_ok_and(|hierarchy| {
+        physical_tile == transfer.physical_tile || physical_tile == hierarchy.xreq_physical_tile
+    })
+}
+
+fn host_phase_instructions(
+    physical_tile: u16,
+    transfer: StaticHostTransfer,
+    packet_address: u32,
+) -> Result<(Vec<u32>, Option<Vec<u32>>)> {
+    let target = host_target_program(transfer, packet_address + 8)?;
     let hierarchy = ipu_exchange::host_hierarchy(transfer.physical_tile)?;
-    let target_words = if hierarchy.xreq_physical_tile == transfer.physical_tile {
-        ipu_exchange::wrap_combined_host_operation(
-            transfer.physical_tile,
-            &target.instructions,
-            PLAN_BASE,
-        )?
+    if hierarchy.xreq_physical_tile == transfer.physical_tile
+        && physical_tile == transfer.physical_tile
+    {
+        let mut packets = vec![1, 0];
+        packets.extend_from_slice(&target.packet_words);
+        Ok((
+            ipu_exchange::wrap_combined_host_operation(
+                transfer.physical_tile,
+                &target.instructions,
+                packet_address,
+            )?,
+            Some(packets),
+        ))
+    } else if physical_tile == hierarchy.xreq_physical_tile {
+        let xreq =
+            ipu_exchange::assemble_host_xreq_program(transfer.physical_tile, packet_address)?;
+        Ok((
+            ipu_exchange::wrap_host_xreq_operation(physical_tile, &xreq.instructions)?,
+            Some(xreq.packet_words),
+        ))
+    } else if physical_tile == transfer.physical_tile {
+        Ok((
+            ipu_exchange::wrap_host_target_operation(physical_tile, &target.instructions)?,
+            Some(target.packet_words),
+        ))
     } else {
-        ipu_exchange::wrap_host_target_operation(transfer.physical_tile, &target.instructions)?
-    };
-    let xreq = ipu_exchange::assemble_host_xreq_program(transfer.physical_tile, PLAN_BASE)?;
-    let xreq_words =
-        ipu_exchange::wrap_host_xreq_operation(hierarchy.xreq_physical_tile, &xreq.instructions)?;
-    Ok(target_words.len().max(xreq_words.len()).max(3) * 4)
+        Ok((
+            vec![
+                ipu_exchange::sans(1),
+                ipu_exchange::SYNC_ANS_INSTRUCTION,
+                ipu_exchange::RETURN_M10_INSTRUCTION,
+            ],
+            None,
+        ))
+    }
 }
 
 fn host_packet_size(transfer: StaticHostTransfer) -> Result<usize> {
@@ -816,42 +892,8 @@ fn append_static_host_packets(
         transfers.iter().zip(plan_addresses).zip(packet_addresses)
     {
         let hierarchy = ipu_exchange::host_hierarchy(transfer.physical_tile)?;
-        let target = host_target_program(*transfer, packet_address + 8)?;
-        let (instructions, packet_words) = if hierarchy.xreq_physical_tile == transfer.physical_tile
-            && physical_tile == transfer.physical_tile
-        {
-            let mut packets = vec![1, 0];
-            packets.extend_from_slice(&target.packet_words);
-            (
-                ipu_exchange::wrap_combined_host_operation(
-                    transfer.physical_tile,
-                    &target.instructions,
-                    packet_address,
-                )?,
-                Some(packets),
-            )
-        } else if physical_tile == hierarchy.xreq_physical_tile {
-            let xreq =
-                ipu_exchange::assemble_host_xreq_program(transfer.physical_tile, packet_address)?;
-            (
-                ipu_exchange::wrap_host_xreq_operation(physical_tile, &xreq.instructions)?,
-                Some(xreq.packet_words),
-            )
-        } else if physical_tile == transfer.physical_tile {
-            (
-                ipu_exchange::wrap_host_target_operation(physical_tile, &target.instructions)?,
-                Some(target.packet_words),
-            )
-        } else {
-            (
-                vec![
-                    ipu_exchange::sans(1),
-                    ipu_exchange::SYNC_ANS_INSTRUCTION,
-                    ipu_exchange::RETURN_M10_INSTRUCTION,
-                ],
-                None,
-            )
-        };
+        let (instructions, packet_words) =
+            host_phase_instructions(physical_tile, *transfer, packet_address)?;
         let instruction_bytes = words_to_bytes(&instructions);
         write_plan_bytes(plan_region, plan_address, &instruction_bytes)?;
         if let Some(packet_words) = packet_words {

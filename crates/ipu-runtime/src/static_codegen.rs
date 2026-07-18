@@ -9,6 +9,7 @@ const INCOMING_SBASE: u8 = 0xa7;
 pub(crate) const WORKER_BARRIER: &str = "ipu_stack_static_worker_barrier";
 pub(crate) const COMPLETE: &str = "ipu_stack_static_complete";
 pub(crate) const COPY_U32: &str = "ipu_stack_static_copy_u32";
+pub(crate) const REPEAT_CALL: &str = "ipu_stack_static_repeat_call";
 
 #[derive(Clone, Copy)]
 pub(crate) struct HostCopy {
@@ -17,22 +18,24 @@ pub(crate) struct HostCopy {
     pub words: u32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct HostPhaseCall {
+    pub address: u32,
+    pub copy: Option<HostCopy>,
+    pub active: bool,
+}
+
 pub(crate) fn emit(
     program: &LoweredTileProgram,
     base: u32,
     symbols: &BTreeMap<String, u32>,
     plan_addresses: &[u32],
-    host_inputs: &[(u32, Option<HostCopy>)],
-    host_outputs: &[(u32, Option<HostCopy>)],
+    host_inputs: &[HostPhaseCall],
+    host_outputs: &[HostPhaseCall],
 ) -> Result<Vec<u8>> {
     let mut code = TileCode::new(base);
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
-    for &(address, copy) in host_inputs {
-        code.call(address, 10)?;
-        if let Some(copy) = copy {
-            emit_copy(&mut code, symbols, copy)?;
-        }
-    }
+    emit_host_phases(&mut code, symbols, host_inputs)?;
     let mut plan_index = 0usize;
     for step in &program.steps {
         match step {
@@ -77,14 +80,36 @@ pub(crate) fn emit(
     if plan_index != plan_addresses.len() {
         return Err("unused exchange plan address".into());
     }
-    for &(address, copy) in host_outputs {
-        if let Some(copy) = copy {
-            emit_copy(&mut code, symbols, copy)?;
-        }
-        code.call(address, 10)?;
-    }
+    emit_host_phases(&mut code, symbols, host_outputs)?;
     code.jump(symbol(symbols, COMPLETE)?)?;
     Ok(code.words.into_iter().flat_map(u32::to_le_bytes).collect())
+}
+
+fn emit_host_phases(
+    code: &mut TileCode,
+    symbols: &BTreeMap<String, u32>,
+    phases: &[HostPhaseCall],
+) -> Result<()> {
+    let repeat_call = symbol(symbols, REPEAT_CALL)?;
+    let mut index = 0;
+    while index < phases.len() {
+        if phases[index].active {
+            code.call(phases[index].address, 10)?;
+            if let Some(copy) = phases[index].copy {
+                emit_copy(code, symbols, copy)?;
+            }
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < phases.len() && !phases[index].active {
+            index += 1;
+        }
+        code.setzi(2, u32::try_from(index - start)?)?;
+        code.setzi(3, phases[start].address)?;
+        code.call(repeat_call, 9)?;
+    }
+    Ok(())
 }
 
 fn emit_copy(code: &mut TileCode, symbols: &BTreeMap<String, u32>, copy: HostCopy) -> Result<()> {
