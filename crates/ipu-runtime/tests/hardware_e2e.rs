@@ -1,4 +1,5 @@
 use std::process::{Command, ExitStatus};
+use std::sync::{Mutex, MutexGuard};
 
 const RANDOM_SEEDS: [u64; 3] = [
     0x4950_552d_5354_4143,
@@ -6,13 +7,26 @@ const RANDOM_SEEDS: [u64; 3] = [
     0xbb67_ae85_84ca_a73b,
 ];
 
+static DEVICE: Mutex<()> = Mutex::new(());
+
 #[test]
-fn hardware_capabilities_run_end_to_end() {
+fn initialized_local_tile_d2h_works() {
+    let _device = device();
     require_success(
         "initialized tile D2H",
         host_test(&[("IPU_HOST_TEST_D2H_ONLY", "1")]),
     );
+}
+
+#[test]
+fn local_h2d_and_d2h_round_trip_works() {
+    let _device = device();
     require_success("local H2D and D2H", host_test(&[]));
+}
+
+#[test]
+fn large_multi_epoch_host_and_device_transfers_work() {
+    let _device = device();
     require_success(
         "multi-epoch H2D, D2D, and D2H",
         host_test(&[
@@ -20,6 +34,11 @@ fn hardware_capabilities_run_end_to_end() {
             ("IPU_HOST_TEST_BYTES", "2048"),
         ]),
     );
+}
+
+#[test]
+fn remote_tile_h2d_and_d2h_work() {
+    let _device = device();
     require_success(
         "remote-tile H2D and D2H",
         host_test(&[
@@ -27,6 +46,11 @@ fn hardware_capabilities_run_end_to_end() {
             ("IPU_HOST_TEST_BYTES", "8192"),
         ]),
     );
+}
+
+#[test]
+fn initialized_remote_tile_d2h_works() {
+    let _device = device();
     require_success(
         "remote-tile initialized D2H",
         host_test(&[
@@ -35,6 +59,11 @@ fn hardware_capabilities_run_end_to_end() {
             ("IPU_HOST_TEST_BYTES", "8192"),
         ]),
     );
+}
+
+#[test]
+fn distinct_sources_can_write_disjoint_host_ranges() {
+    let _device = device();
     require_success(
         "distinct multi-source D2H",
         host_test(&[
@@ -43,12 +72,47 @@ fn hardware_capabilities_run_end_to_end() {
             ("IPU_HOST_TEST_BYTES", "64"),
         ]),
     );
+}
+
+#[test]
+fn all_tile_reduction_works() {
+    let _device = device();
     require_success(
-        "reduction, permutation, and multicast graph",
+        "all-tile reduction graph",
         Command::new(env!("CARGO_BIN_EXE_ipu-hardware-e2e"))
+            .env("IPU_GRAPH_TEST", "reduction")
             .status()
-            .expect("launch deterministic hardware test runner"),
+            .expect("launch reduction hardware test runner"),
     );
+}
+
+#[test]
+fn all_tile_permutation_works() {
+    let _device = device();
+    require_success(
+        "all-tile permutation graph",
+        Command::new(env!("CARGO_BIN_EXE_ipu-hardware-e2e"))
+            .env("IPU_GRAPH_TEST", "permutation")
+            .status()
+            .expect("launch permutation hardware test runner"),
+    );
+}
+
+#[test]
+fn multicast_with_relay_role_works() {
+    let _device = device();
+    require_success(
+        "multicast graph with a receiver that sends in the same phase",
+        Command::new(env!("CARGO_BIN_EXE_ipu-hardware-e2e"))
+            .env("IPU_GRAPH_TEST", "multicast")
+            .status()
+            .expect("launch multicast hardware test runner"),
+    );
+}
+
+#[test]
+fn randomized_host_and_exchange_graphs_work() {
+    let _device = device();
     for seed in RANDOM_SEEDS {
         require_success(
             &format!("randomized exchange graph seed {seed:#x}"),
@@ -58,6 +122,12 @@ fn hardware_capabilities_run_end_to_end() {
                 .expect("launch randomized hardware test runner"),
         );
     }
+}
+
+fn device() -> MutexGuard<'static, ()> {
+    DEVICE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn host_test(environment: &[(&str, &str)]) -> ExitStatus {

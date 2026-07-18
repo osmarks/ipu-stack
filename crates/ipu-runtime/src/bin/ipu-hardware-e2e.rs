@@ -22,6 +22,7 @@ const PERMUTATION_OFFSET: u32 = 17;
 const RELAY_TILE: u16 = 736;
 const MULTICAST_TAP_TILE: u16 = 274;
 const RELAY_DESTINATION_TILE: u16 = 1286;
+const REDUCTION_PHASES: usize = 22;
 
 fn main() {
     ipu_runtime::init_tracing();
@@ -47,16 +48,84 @@ fn main() {
         .unwrap();
     let kernel_object = fs::read(kernel.object).unwrap();
 
-    let (graph, expected_sum, expected_permutation, expected_multicast) = acceptance_graph();
+    let mode = std::env::var("IPU_GRAPH_TEST").unwrap_or_else(|_| "all".into());
+    let (graph, expected_sum, expected_permutation, expected_multicast) = acceptance_case(&mode);
     let app = package_graph(&graph, &[runtime_object, kernel_object]).unwrap();
     let results = run_diagnostic(&app, &bootloader, &configuration, &device).unwrap();
 
-    assert_eq!(results.bindings["sum"], [expected_sum]);
-    assert_eq!(results.bindings["permutation"], expected_permutation);
-    assert_eq!(results.bindings["multicast-tap"], expected_multicast);
-    assert_eq!(results.bindings["relay-destination"], expected_multicast);
+    if let Some(result) = results.bindings.get("sum") {
+        assert_eq!(result, &[expected_sum]);
+    }
+    if let Some(result) = results.bindings.get("permutation") {
+        assert_eq!(result, &expected_permutation);
+    }
+    if let Some(result) = results.bindings.get("multicast-tap") {
+        assert_eq!(result, &expected_multicast);
+        assert_eq!(results.bindings["relay-destination"], expected_multicast);
+    }
     assert_eq!(results.bindings["runtime-completion"], [1]);
     let _ = fs::remove_dir_all(output);
+}
+
+fn acceptance_case(mode: &str) -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
+    let (mut graph, sum, permutation, multicast) = acceptance_graph();
+    match mode {
+        "all" => {}
+        "reduction" => {
+            graph.schedule.phases.truncate(REDUCTION_PHASES);
+            graph
+                .schedule
+                .allocations
+                .retain(|allocation| allocation.tensor.0 < usize::from(TILE_COUNT));
+            graph
+                .initial_buffers
+                .retain(|buffer| buffer.address == ACCUMULATOR_ADDRESS);
+            graph.outputs.retain(|binding| binding.name == "sum");
+        }
+        "permutation" => {
+            graph.schedule.phases = vec![graph.schedule.phases[REDUCTION_PHASES].clone()];
+            graph.schedule.allocations.retain_mut(|allocation| {
+                let keep = (usize::from(TILE_COUNT)..usize::from(TILE_COUNT) * 2)
+                    .contains(&allocation.tensor.0);
+                if keep {
+                    allocation.live_from = 0;
+                    allocation.live_until = 1;
+                    if matches!(allocation.kind, AllocationKind::ExchangeStaging { .. }) {
+                        allocation.kind = AllocationKind::ExchangeStaging { phase: 0 };
+                    }
+                }
+                keep
+            });
+            graph
+                .initial_buffers
+                .retain(|buffer| buffer.address == PERMUTATION_SOURCE_ADDRESS);
+            graph
+                .outputs
+                .retain(|binding| binding.name == "permutation");
+        }
+        "multicast" => {
+            graph.schedule.phases = vec![graph.schedule.phases[REDUCTION_PHASES + 1].clone()];
+            graph.schedule.allocations.retain_mut(|allocation| {
+                let keep = allocation.tensor.0 == usize::from(TILE_COUNT) * 2;
+                if keep {
+                    allocation.live_from = 0;
+                    allocation.live_until = 1;
+                    if matches!(allocation.kind, AllocationKind::ExchangeStaging { .. }) {
+                        allocation.kind = AllocationKind::ExchangeStaging { phase: 0 };
+                    }
+                }
+                keep
+            });
+            graph
+                .initial_buffers
+                .retain(|buffer| buffer.address == MULTICAST_SOURCE_ADDRESS);
+            graph.outputs.retain(|binding| {
+                matches!(binding.name.as_str(), "multicast-tap" | "relay-destination")
+            });
+        }
+        _ => panic!("IPU_GRAPH_TEST must be reduction, permutation, multicast, or all"),
+    }
+    (graph, sum, permutation, multicast)
 }
 
 fn acceptance_graph() -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {

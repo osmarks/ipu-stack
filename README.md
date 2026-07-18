@@ -37,7 +37,7 @@ instruction assembler is required.
 ## Build and inspect
 
 ```sh
-# Offline encoder, planner, package, and driver tests only.
+# Offline encoder, planner, package, and driver tests plus hardware acceptance.
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 
@@ -46,10 +46,10 @@ cargo run -p ipu-cli -- kernel-compile device/runtime.S /tmp/runtime \
 cargo run -p ipu-cli -- encoder-plan -o /tmp/encoder.json --tiles 1472
 ```
 
-`cargo test --workspace` includes the exclusive hardware capability gate and
-therefore requires an attached C600. The gate runs serially in dependency order
-and fails at the first broken capability. `scripts/hardware-e2e.sh` runs that
-test directly. It requires
+`cargo test --workspace` includes exclusive hardware capability tests and
+therefore requires an attached C600. Each transport capability is a separate
+test, and an in-process lock serializes access to the device.
+`scripts/hardware-e2e.sh` runs those tests directly. It requires
 `POPLAR_SDK_ENABLED` and `IPU_CONFIG`, and accepts optional `IPU_BOOTLOADER` and
 `IPU_DEVICE` overrides. The suite includes seeded randomized exchange graphs;
 run one reproducible case directly with `IPU_RANDOM_SEED=0x1234 cargo run -p
@@ -105,11 +105,11 @@ acceptance path attempts H2D to the controller tile, two generated tile-exchange
 epochs via a relay tile, and D2H from the automatically allocated return range.
 Command boundaries use the generated C600 GSP program before the next exchange
 can begin. D2H lowering currently emits the SDK-derived source-tile host packet
-routine. Oracle disassembly shows that `A6` carries the total 32-bit payload
-word count while every host payload send uses a send count of one; the Rust
-encoder now follows that rule. The attached destination remains untouched in
-direct hardware acceptance, so transaction ownership or host stream setup is
-still incomplete.
+routine. Oracle disassembly shows that `A6` is one for each transaction and the
+payload send count is the chunk's 32-bit word count minus one. The attached
+destination remains untouched in direct hardware acceptance. The generated
+wrapper and close sequencing are still under investigation; encoder-level
+agreement does not establish D2H capability.
 
 Offline unit tests verify encodings, allocation, lowering, and package structure;
 they do not count as evidence that a transport capability works. The seeded
