@@ -37,7 +37,7 @@ instruction assembler is required.
 ## Build and inspect
 
 ```sh
-# Offline encoder, planner, package, and driver tests plus hardware acceptance.
+# Offline tests plus required hardware acceptance.
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 
@@ -49,6 +49,8 @@ cargo run -p ipu-cli -- encoder-plan -o /tmp/encoder.json --tiles 1472
 `cargo test --workspace` includes exclusive hardware capability tests and
 therefore requires an attached C600. Each transport capability is a separate
 test, and an in-process lock serializes access to the device.
+Crate-local `--lib` tests cover only encodings and structural invariants; they
+are not a transport acceptance result.
 `scripts/hardware-e2e.sh` runs those tests directly. It requires
 `POPLAR_SDK_ENABLED` and `IPU_CONFIG`, and accepts optional `IPU_BOOTLOADER` and
 `IPU_DEVICE` overrides. The suite includes seeded randomized exchange graphs;
@@ -62,13 +64,18 @@ Logging uses `tracing`. Set `RUST_LOG`, for example
 ## Current hardware boundary
 
 The Rust path resets and configures a C600, loads linked code onto all 1472
-tiles, attaches host pages, and drives HSP without Poplar. Native D2H is not
-currently accepted as working: with input and output assigned disjoint host
-regions, the output remains zero. Earlier round-trip tests reused the input
-host offsets for output and could therefore pass on unchanged H2D input bytes;
-that overlap is now forbidden by the layout and covered by a unit invariant.
-The required hardware tests fail until the device-to-host protocol writes the
-disjoint output region correctly.
+tiles, attaches host pages, and drives HSP without Poplar. Local physical-tile-0
+H2D followed by D2H passes with random 64-byte and 2-KiB payloads in disjoint
+host regions, and the runtime completion store is checked. Device-only point,
+multicast, relay, permutation, and all-tile reduction graphs pass from
+initialized SRAM.
+
+Host/device composition is not accepted as working. A valid random H2D payload
+is visible at its tile-0 source address, but routing it through generated D2D
+passes currently leaves the destination zero. Remote H2D and arbitrary-tile
+D2H also remain red, including the 8-KiB hardware gates. These failures are
+required integration-test failures; passing crate-local unit tests does not
+change the capability status.
 
 Host transfers are split at the recovered short/long packet limits and 4 KiB
 attachment boundaries. The runtime allocates one attached buffer per page,

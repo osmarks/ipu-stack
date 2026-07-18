@@ -1092,8 +1092,9 @@ fn call_input<'a>(call: &HostCall, input: &'a [u8]) -> Result<&'a [u8]> {
 }
 
 fn host_source_summary(device: &Device, app: &Application) -> String {
-    app.outputs
+    app.inputs
         .iter()
+        .chain(&app.outputs)
         .filter(|binding| binding.name != "runtime-completion")
         .flat_map(|binding| {
             binding.slices.iter().map(|slice| {
