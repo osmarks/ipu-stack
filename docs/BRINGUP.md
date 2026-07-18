@@ -152,9 +152,14 @@ Native host-output lowering is partially recovered. Rust independently emits
 the short and long host packet headers, arbitrary-range chunk plans, the tile-0
 `[1, 0]` command-read XREQ, the `[2, 0]` D2H XREQ, and the source command,
 payload, and zero-byte-close sequence. Disassembly of the SDK fixture shows
-that D2H is a two-tile operation: physical tile 0 executes `sync 15` and sends
-the XREQ while the source tile switches its incoming mux, sends the payload,
-and waits in `sync 0`. A command-page H2D read precedes that operation.
+that D2H is a two-role operation. Tile 0 preissues `[2, 0]` after `sync 3` and
+the 73-cycle route envelope. During the host command it executes `sync 15`,
+sends a two-word zero command packet, then restores exchange muxing after
+`sync 7`. A remote source waits on `sans 1; sync 1`, selects
+`0x600 + (physicalTile & ~2)`, and executes `DCOUNT=1`, header send, payload
+send, encoded one-cycle delay, zero-byte close, `sync 0`, and `sync 7`.
+Nonparticipants remain in `sans 255; sync 1`. A command-page H2D read precedes
+that operation.
 
 The current `run-output` prototype reproduces page attachment order and staged
 GS2 handoffs, but is not accepted as working: the attached page remains zero,
@@ -163,6 +168,13 @@ long packets, absolute versus relative source addressing, source addresses
 `0x50120` and `0x60000`, exact SDK packet-table locations, and explicit command
 ID 1 did not change that result. These variants were removed or kept behind
 the structured assembler rather than accumulated as constants.
+
+Reproducing all visible roles above for the SDK fixture's exact physical tile
+2 and host offset 64 still produced no write anywhere in either attached 4 KiB
+page. A post-payload host rendezvous also left the page untouched. This rules
+out a mere readback race and leaves an unmodeled host-exchange state transition
+or command-packet field. Hardware acceptance deliberately remains red for
+every D2H-dependent capability.
 
 TDI reports both inactive and WAEX as context state zero. Architectural
 exceptions are only classified when exception metadata is nonzero; attempting
