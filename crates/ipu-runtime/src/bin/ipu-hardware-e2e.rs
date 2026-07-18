@@ -53,16 +53,15 @@ fn main() {
     let app = package_graph(&graph, &[runtime_object, kernel_object]).unwrap();
     let results = run_diagnostic(&app, &bootloader, &configuration, &device).unwrap();
 
-    if let Some(result) = results.bindings.get("sum") {
-        assert_eq!(result, &[expected_sum]);
-    }
-    if let Some(result) = results.bindings.get("permutation") {
-        assert_eq!(result, &expected_permutation);
-    }
-    if let Some(result) = results.bindings.get("multicast-tap") {
-        assert_eq!(result, &expected_multicast);
-        if let Some(relay) = results.bindings.get("relay-destination") {
-            assert_eq!(relay, &expected_multicast);
+    for binding in &graph.outputs {
+        let actual = &results.bindings[&binding.name];
+        match binding.name.as_str() {
+            "sum" => assert_eq!(actual, &[expected_sum]),
+            "permutation" => assert_eq!(actual, &expected_permutation),
+            "multicast-tap" | "relay-destination" => {
+                assert_eq!(actual, &expected_multicast)
+            }
+            name => panic!("acceptance graph contains unchecked output {name:?}"),
         }
     }
     assert_eq!(results.bindings["runtime-completion"], [1]);

@@ -1247,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn composes_receive_then_send_on_one_event_timeline() {
+    fn encoder_places_receive_then_send_on_one_event_timeline() {
         let topology = Topology::c600();
         let first = topology.multicast(0, &[736], 64, 0).unwrap();
         let first_horizon = std::iter::once(&first.sender)

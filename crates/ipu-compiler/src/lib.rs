@@ -733,6 +733,7 @@ impl Schedule {
                 })
                 .map(|allocation| (allocation.tensor, allocation.tile))
                 .collect();
+            let available_before_phase = available.clone();
             let mut epoch_groups = Vec::with_capacity(colored_groups.len());
             while !colored_groups.is_empty() {
                 let ready = colored_groups
@@ -779,42 +780,46 @@ impl Schedule {
                         )));
                     }
                     let words = bytes / 4;
-                    let source_address = self
-                        .allocations
-                        .iter()
-                        .find(|allocation| {
+                    let same_phase_staging = || {
+                        self.allocations.iter().find(|allocation| {
                             allocation.tensor == tensor
                                 && allocation.tile == source
                                 && allocation.kind
                                     == AllocationKind::ExchangeStaging { phase: phase_index }
                         })
-                        .or_else(|| {
-                            self.allocations.iter().find(|allocation| {
-                                allocation.tensor == tensor
-                                    && allocation.tile == source
-                                    && matches!(
-                                        allocation.kind,
-                                        AllocationKind::ExchangeStaging { phase }
-                                            if phase < phase_index
-                                    )
-                                    && allocation.live_from <= phase_index
-                                    && allocation.live_until > phase_index
-                            })
+                    };
+                    let earlier_staging = || {
+                        self.allocations.iter().find(|allocation| {
+                            allocation.tensor == tensor
+                                && allocation.tile == source
+                                && matches!(
+                                    allocation.kind,
+                                    AllocationKind::ExchangeStaging { phase }
+                                        if phase < phase_index
+                                )
+                                && allocation.live_from <= phase_index
+                                && allocation.live_until > phase_index
                         })
-                        .or_else(|| {
-                            self.allocations.iter().find(|allocation| {
-                                allocation.tensor == tensor
-                                    && allocation.tile == source
-                                    && allocation.kind == AllocationKind::Home
-                            })
+                    };
+                    let home = || {
+                        self.allocations.iter().find(|allocation| {
+                            allocation.tensor == tensor
+                                && allocation.tile == source
+                                && allocation.kind == AllocationKind::Home
                         })
-                        .ok_or_else(|| {
-                            CompileError::Memory(format!(
-                                "missing source allocation for tensor {} on tile {source}",
-                                tensor.0
-                            ))
-                        })?
-                        .address;
+                    };
+                    let source_address = if available_before_phase.contains(&(tensor, source)) {
+                        earlier_staging().or_else(home).or_else(same_phase_staging)
+                    } else {
+                        same_phase_staging().or_else(earlier_staging).or_else(home)
+                    }
+                    .ok_or_else(|| {
+                        CompileError::Memory(format!(
+                            "missing source allocation for tensor {} on tile {source}",
+                            tensor.0
+                        ))
+                    })?
+                    .address;
                     let destination_addresses = destinations
                         .iter()
                         .map(|destination| {
@@ -1672,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_coalesces_fanout_and_packs_disjoint_groups() {
+    fn lowering_coalesces_fanout_and_packs_disjoint_groups() {
         let schedule = exchange_schedule(vec![
             Transfer {
                 source_tile: 0,
@@ -1709,7 +1714,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_times_tile_role_conflicts_within_one_launch() {
+    fn lowering_assigns_distinct_times_to_tile_role_conflicts() {
         let schedule = exchange_schedule(vec![
             Transfer {
                 source_tile: 0,
@@ -1753,7 +1758,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_relays_a_tensor_without_an_intermediate_launch() {
+    fn lowering_places_dependent_relay_rows_on_one_timeline() {
         let tensor = TensorId(0);
         let mut schedule = exchange_schedule(vec![
             Transfer {
@@ -1764,7 +1769,7 @@ mod tests {
             },
             Transfer {
                 source_tile: 1,
-                destination_tile: 2,
+                destination_tile: 3,
                 tensor,
                 bytes: 256,
             },
@@ -1794,6 +1799,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 1]
         );
+        assert_eq!(
+            epoch.groups[0].sender[2] & 0x001f_fff8,
+            ((0x62000 >> 2) << 3) & 0x001f_fff8
+        );
+        assert_eq!(
+            epoch.groups[1].sender[2] & 0x001f_fff8,
+            (((ipu_exchange::EXCHANGE_WINDOW_BASE + 1024) >> 2) << 3) & 0x001f_fff8
+        );
         let relay = epoch.row_for(1);
         assert_eq!(
             relay
@@ -1816,7 +1829,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_uses_live_staging_as_a_later_phase_source() {
+    fn lowering_selects_live_staging_as_a_later_phase_source() {
         let tensor = TensorId(0);
         let schedule = Schedule {
             layouts: Vec::new(),
@@ -2044,7 +2057,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_packs_an_all_tile_matching_into_one_epoch() {
+    fn lowering_encodes_an_all_tile_matching_in_one_epoch() {
         let transfers = (0..736)
             .map(|pair| Transfer {
                 source_tile: pair * 2,
@@ -2062,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_colors_ring_and_all_to_all_fanout() {
+    fn lowering_encodes_ring_and_all_to_all_fanout_in_one_epoch() {
         let ring = (0..16)
             .map(|source| Transfer {
                 source_tile: source,
