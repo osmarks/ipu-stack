@@ -9,6 +9,10 @@
 	.set ROLE_HOST_IDLE, 14
 	.set ROLE_HOST_PROGRAM_UNBARRIERED, 15
 	.set ROLE_HOST_IDLE_UNBARRIERED, 16
+	.set ROLE_COMMAND_GUARD, 17
+	.set ROLE_COMMAND_FOLLOWER, 18
+	.set ROLE_COMMAND_COORDINATOR, 19
+	.set ROLE_COMMAND_HANDLER_FOLLOWER, 20
 	.set TILE_MUX_HOST, 0x600
 	.set TILE_MUX_EXCHANGE, 0x640
 	.set WORKER_BASE_START, 0x50000
@@ -79,6 +83,12 @@ ipu_stack_command_table_address:
 	brnz $m8, .Lload_host_command
 	cmpeq $m8, $m5, ROLE_HOST_IDLE_UNBARRIERED
 	brnz $m8, .Lload_host_command
+	cmpeq $m8, $m5, ROLE_COMMAND_FOLLOWER
+	brnz $m8, .Lload_host_command
+	cmpeq $m8, $m5, ROLE_COMMAND_COORDINATOR
+	brnz $m8, .Lload_host_command
+	cmpeq $m8, $m5, ROLE_COMMAND_HANDLER_FOLLOWER
+	brnz $m8, .Lload_host_command
 	cmpeq $m8, $m5, ROLE_INACTIVE
 	brnz $m8, .Lpre_sync_exchange
 	cmpeq $m8, $m5, ROLE_EXCHANGE_ABSOLUTE
@@ -117,6 +127,8 @@ ipu_stack_command_table_address:
 	brnz $m8, .Lrun_compute
 	cmpeq $m8, $m5, ROLE_COMPUTE_NOOP
 	brnz $m8, .Llaunch_complete
+	cmpeq $m8, $m5, ROLE_COMMAND_GUARD
+	brnz $m8, .Lcommand_guard
 	cmpeq $m8, $m5, ROLE_HOST_PROGRAM
 	brnz $m8, .Lrun_host_program
 	cmpeq $m8, $m5, ROLE_HOST_IDLE
@@ -125,6 +137,12 @@ ipu_stack_command_table_address:
 	brnz $m8, .Lrun_host_program_unbarriered
 	cmpeq $m8, $m5, ROLE_HOST_IDLE_UNBARRIERED
 	brnz $m8, .Lhost_idle_unbarriered
+	cmpeq $m8, $m5, ROLE_COMMAND_FOLLOWER
+	brnz $m8, .Lcommand_follower
+	cmpeq $m8, $m5, ROLE_COMMAND_COORDINATOR
+	brnz $m8, .Lcommand_coordinator
+	cmpeq $m8, $m5, ROLE_COMMAND_HANDLER_FOLLOWER
+	brnz $m8, .Lcommand_handler_follower
 	bri .Lhalt
 .Lset_absolute_exchange_bases:
 	put 0xa7, $m15
@@ -143,6 +161,13 @@ ipu_stack_command_table_address:
 	setzi $m10, .Llaunch_complete
 	br $m1
 
+.Lcommand_guard:
+	ld32 $m8, $m3, $m15, 0
+	cmpeq $m8, $m8, $m1
+	brnz $m8, .Llaunch_complete
+	mov $m6, $m2
+	bri .Lcommand_loop
+
 .Lrun_host_program:
 	setzi $m10, .Lhost_launch_complete
 	br $m1
@@ -152,14 +177,45 @@ ipu_stack_command_table_address:
 	br $m1
 
 .Lhost_idle:
+#ifdef IPU_STACK_TRACE_MILESTONES
+	setzi $m8, 0x30
+	call $m11, .Lrecord_milestone
+#endif
 	.long OPCODE_SANS | SANS_HOST_FOLLOWER
 	.long OPCODE_SYNC | SYNC_EXTERNAL
+#ifdef IPU_STACK_TRACE_MILESTONES
+	setzi $m8, 0x31
+	call $m11, .Lrecord_milestone
+#endif
 	bri .Lhost_launch_complete
 
 .Lhost_idle_unbarriered:
 	.long OPCODE_SANS | SANS_HOST_FOLLOWER
 	.long OPCODE_SYNC | SYNC_EXTERNAL
 	bri .Lhost_launch_complete_unbarriered
+
+.Lcommand_follower:
+#ifdef IPU_STACK_TRACE_MILESTONES
+	setzi $m8, 0x32
+	call $m11, .Lrecord_milestone
+#endif
+	.long OPCODE_SANS | SANS_EXTERNAL
+	.long OPCODE_SYNC | SYNC_EXTERNAL
+	setzi $m10, .Lcommand_dispatch_complete
+	br $m1
+
+.Lcommand_coordinator:
+	setzi $m10, .Lcommand_dispatch_complete
+	br $m1
+
+.Lcommand_dispatch_complete:
+	zero $m14
+	bri .Lhost_launch_complete
+
+.Lcommand_handler_follower:
+	.long OPCODE_SANS | SANS_EXTERNAL
+	.long OPCODE_SYNC | SYNC_EXTERNAL
+	bri .Lhost_launch_complete
 
 .Lplan_complete:
 #ifdef IPU_STACK_TRACE_MILESTONES

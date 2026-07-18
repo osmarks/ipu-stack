@@ -917,7 +917,15 @@ impl Topology {
             sender[cursor] = delay(sender_delay as u32);
             cursor += 1;
         }
-        sender[cursor] = encode_send(count.min(64) - 1, 3, 0)?;
+        let send_direction = if receiver_logical.len() == 1 {
+            direction(
+                source_physical,
+                u32::from(self.physical(receiver_logical[0])?),
+            )
+        } else {
+            3
+        };
+        sender[cursor] = encode_send(count.min(64) - 1, send_direction, 0)?;
         cursor += 1;
         if count > 64 {
             sender[cursor] = send_off(count - 65, 3, 0);
@@ -1223,6 +1231,16 @@ mod tests {
         let boundary = topology.multicast(736, &[100, 900], 52, 0).unwrap();
         assert_eq!(boundary.receivers[0][2], 0x61d14000);
         assert_eq!(boundary.receivers[0][3], 0x64000640);
+    }
+
+    #[test]
+    fn single_receiver_uses_the_directional_send_route() {
+        let topology = Topology::c600();
+        let unicast = topology.multicast(0, &[1], 16, 0).unwrap();
+        let fanout = topology.multicast(0, &[1, 2], 16, 0).unwrap();
+
+        assert_eq!(unicast.sender[2] & 7, 1);
+        assert_eq!(fanout.sender[2] & 7, 3);
     }
 
     #[test]

@@ -166,8 +166,25 @@ initial two-word header, `sendoff` for each continuation header, and one
 `sync0`. Only the final header carries the `0x0c00_0000` stream-end field. A
 direct random 2048-byte H2D-to-D2H round trip passes exactly and reaches
 runtime completion. The same payload routed through two 2048-byte D2D passes
-currently returns zeros, so the combined large-transfer gate remains red for
-D2D rather than host transport. Remote 64-byte H2D also stalls.
+also passes after command-scoped dispatch. Remote host transfer remains
+unresolved.
+
+Command-scoped dispatch now matches the SDK's all-tile control shape. The
+coordinator reads the host command and emits the delayed one-word direction-3
+send in the same program. Other tiles execute `sans 1; sync 1` followed by a
+tile-specific multicast receiver row, then every tile validates its local
+command word before entering the handler. Command SRAM starts with an invalid
+sentinel so command 0 cannot pass on zero-filled memory. Commands 2, 0, and 1
+are all lowered through this path.
+
+On hardware, a random 2048-byte command-2 H2D followed by command-0 two-hop
+D2D and command-1 D2H now returns exact data and reaches runtime completion.
+Single-receiver graph transfers use the route-specific send direction while
+true fanout retains direction 3; this matches the live SDK two-pass image.
+Local round trips, initialized D2D, direct multicast, and a receiver that also
+sends later in the same exchange phase remain passing. Remote 8192-byte H2D
+still stalls in the final command-2 payload phase and remains a mandatory red
+hardware gate.
 
 Remote D2H is a distinct two-role operation and remains unresolved. Tile 0
 preissues `[2, 0]` after `sync 3` and the 73-cycle route envelope. During the

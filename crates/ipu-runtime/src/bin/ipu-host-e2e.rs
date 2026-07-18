@@ -123,7 +123,26 @@ fn main() {
         .unwrap();
         (graph, payload.clone(), payload)
     };
-    if exchange && std::env::var_os("IPU_STACK_TRAP_AFTER_RECEIVE").is_some() {
+    if exchange
+        && (std::env::var_os("IPU_STACK_TRAP_AFTER_RECEIVE").is_some()
+            || std::env::var_os("IPU_STACK_TRACE_MILESTONES").is_some())
+    {
+        let source = graph
+            .schedule
+            .allocations
+            .iter()
+            .find(|allocation| {
+                allocation.tile == HOST_CONTROLLER_TILE && allocation.kind == AllocationKind::Home
+            })
+            .unwrap();
+        graph.outputs.push(binding(
+            "diagnostic-source",
+            ipu_exchange::Topology::c600()
+                .physical(HOST_CONTROLLER_TILE)
+                .unwrap(),
+            source.address,
+            transfer_bytes,
+        ));
         let relay = graph
             .schedule
             .allocations

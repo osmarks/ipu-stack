@@ -1,7 +1,9 @@
 use ipu_compiler::{AllocationKind, Phase, Schedule};
 use ipu_driver::{Device, HostSession, Loader, block_device_interrupt_signals};
 use ipu_elf::{LinkOptions, link};
-use ipu_exchange::{GlobalSyncProgram, TileToHostProgram, Topology};
+use ipu_exchange::{
+    GlobalSyncProgram, TileToHostProgram, Topology, patch_multicast_receiver_address,
+};
 use ipu_package::{
     Application, Binding, DeviceConfigWrite, EntryPoint, HostCall, HostExchange, HostPage,
     HostSlice, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
@@ -18,6 +20,8 @@ const TILE_MUX_HOST_BASE: u32 = 0x600;
 const WORKER_CONTEXTS: u32 = 7;
 const WORKER_CONTEXT_BYTES: u32 = 0x30;
 const HOST_PACKET_ALIGNMENT: u32 = 32;
+const INVALID_HOST_COMMAND: u32 = u32::MAX;
+const HOST_COMMAND_RUN: u32 = 0;
 const HOST_COMMAND_TILE_TO_HOST: u32 = 1;
 const HOST_COMMAND_HOST_TO_TILE: u32 = 2;
 const HOST_PACKET_BASE: u32 = align_up(
@@ -69,6 +73,10 @@ enum RuntimeRole {
     HostIdle = 14,
     HostProgramUnbarriered = 15,
     HostIdleUnbarriered = 16,
+    CommandGuard = 17,
+    CommandFollower = 18,
+    CommandCoordinator = 19,
+    CommandHandlerFollower = 20,
 }
 
 impl RuntimeRole {
@@ -193,7 +201,7 @@ impl RuntimeLayout {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HostDirection {
     ControlRead,
     ToTile,
@@ -211,6 +219,7 @@ struct HostTransfer {
 
 struct HostLayout {
     inputs: Vec<HostTransfer>,
+    run: Option<HostTransfer>,
     outputs: Vec<HostTransfer>,
     protocol: HostExchange,
 }
@@ -251,21 +260,31 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             "lowered host output command"
         );
     }
-    let command_count = host.inputs.len() + graph.schedule.phases.len() + host.outputs.len();
+    let run_commands = usize::from(host.run.is_some()) * 2;
+    let command_count = host.inputs.len()
+        + host.inputs.len() / 2
+        + run_commands
+        + graph.schedule.phases.len()
+        + host.outputs.len()
+        + host.outputs.len() / 2;
     let mut plan_bytes = Vec::new();
     let mut packet_bytes = Vec::new();
-    plan_bytes.extend(
-        host.inputs
-            .iter()
-            .map(host_plan_size)
-            .collect::<Result<Vec<_>>>()?,
-    );
-    packet_bytes.extend(
-        host.inputs
-            .iter()
-            .map(host_packet_size)
-            .collect::<Result<Vec<_>>>()?,
-    );
+    for commands in host.inputs.chunks_exact(2) {
+        plan_bytes.extend([
+            host_plan_size(&commands[0])?.max(ipu_exchange::PLAN_WORDS * 4),
+            0,
+            host_plan_size(&commands[1])?,
+        ]);
+        packet_bytes.extend([
+            host_packet_size(&commands[0])?,
+            0,
+            host_packet_size(&commands[1])?,
+        ]);
+    }
+    if let Some(run) = &host.run {
+        plan_bytes.extend([host_plan_size(run)?.max(ipu_exchange::PLAN_WORDS * 4), 0]);
+        packet_bytes.extend([host_packet_size(run)?, 0]);
+    }
     for (phase_index, phase) in graph.schedule.phases.iter().enumerate() {
         plan_bytes.push(match phase {
             Phase::Exchange { .. } => exchange_by_phase[&phase_index].epochs[0]
@@ -278,18 +297,18 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         });
         packet_bytes.push(0);
     }
-    plan_bytes.extend(
-        host.outputs
-            .iter()
-            .map(host_plan_size)
-            .collect::<Result<Vec<_>>>()?,
-    );
-    packet_bytes.extend(
-        host.outputs
-            .iter()
-            .map(host_packet_size)
-            .collect::<Result<Vec<_>>>()?,
-    );
+    for commands in host.outputs.chunks_exact(2) {
+        plan_bytes.extend([
+            host_plan_size(&commands[0])?.max(ipu_exchange::PLAN_WORDS * 4),
+            0,
+            host_plan_size(&commands[1])?,
+        ]);
+        packet_bytes.extend([
+            host_packet_size(&commands[0])?,
+            0,
+            host_packet_size(&commands[1])?,
+        ]);
+    }
     plan_bytes.resize(command_count, 0);
     packet_bytes.resize(command_count, 0);
     let layout = RuntimeLayout::new(
@@ -298,6 +317,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         &packet_bytes,
         command_count + 1,
     )?;
+    let command_broadcast = command_broadcast_rows(&topology, layout.host_command_address)?;
     let exchange_commands = graph
         .schedule
         .phases
@@ -404,19 +424,72 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
 
         let mut commands = Vec::new();
         let mut command_index = 0usize;
-        for transfer in &host.inputs {
+        for pair in host.inputs.chunks_exact(2) {
+            let retry_index = command_index;
             append_host_command(
                 &mut app,
                 &mut segments,
                 &mut commands,
-                *transfer,
+                pair[0],
                 physical as u16,
                 HostCommandContext {
                     layout: &layout,
                     command_index,
                     barrier_after: true,
+                    command_dispatch: true,
+                    command_receiver: command_broadcast.get(&logical).map(Vec::as_slice),
+                    handler_follower: false,
                 },
             )?;
+            command_index += 1;
+            append_command_guard(
+                &mut commands,
+                HOST_COMMAND_HOST_TO_TILE,
+                layout.command_address + u32::try_from(retry_index)? * COMMAND_BYTES,
+                layout.host_command_address,
+            );
+            command_index += 1;
+            append_host_command(
+                &mut app,
+                &mut segments,
+                &mut commands,
+                pair[1],
+                physical as u16,
+                HostCommandContext {
+                    layout: &layout,
+                    command_index,
+                    barrier_after: true,
+                    command_dispatch: false,
+                    command_receiver: None,
+                    handler_follower: true,
+                },
+            )?;
+            command_index += 1;
+        }
+        if let Some(run) = host.run {
+            let retry_index = command_index;
+            append_host_command(
+                &mut app,
+                &mut segments,
+                &mut commands,
+                run,
+                physical as u16,
+                HostCommandContext {
+                    layout: &layout,
+                    command_index,
+                    barrier_after: true,
+                    command_dispatch: true,
+                    command_receiver: command_broadcast.get(&logical).map(Vec::as_slice),
+                    handler_follower: false,
+                },
+            )?;
+            command_index += 1;
+            append_command_guard(
+                &mut commands,
+                HOST_COMMAND_RUN,
+                layout.command_address + u32::try_from(retry_index)? * COMMAND_BYTES,
+                layout.host_command_address,
+            );
             command_index += 1;
         }
         for (phase_index, phase) in graph.schedule.phases.iter().enumerate() {
@@ -510,17 +583,44 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             }
             command_index += 1;
         }
-        for transfer in &host.outputs {
+        for pair in host.outputs.chunks_exact(2) {
+            let retry_index = command_index;
             append_host_command(
                 &mut app,
                 &mut segments,
                 &mut commands,
-                *transfer,
+                pair[0],
+                physical as u16,
+                HostCommandContext {
+                    layout: &layout,
+                    command_index,
+                    barrier_after: true,
+                    command_dispatch: true,
+                    command_receiver: command_broadcast.get(&logical).map(Vec::as_slice),
+                    handler_follower: false,
+                },
+            )?;
+            command_index += 1;
+            append_command_guard(
+                &mut commands,
+                HOST_COMMAND_TILE_TO_HOST,
+                layout.command_address + u32::try_from(retry_index)? * COMMAND_BYTES,
+                layout.host_command_address,
+            );
+            command_index += 1;
+            append_host_command(
+                &mut app,
+                &mut segments,
+                &mut commands,
+                pair[1],
                 physical as u16,
                 HostCommandContext {
                     layout: &layout,
                     command_index,
                     barrier_after: false,
+                    command_dispatch: false,
+                    command_receiver: None,
+                    handler_follower: true,
                 },
             )?;
             command_index += 1;
@@ -541,6 +641,15 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             address: layout.milestone_address,
             memory_size: 4,
             blob: milestone_blob,
+            blob_offset: 0,
+            file_size: 4,
+            flags: SEGMENT_READ | SEGMENT_WRITE,
+        });
+        let host_command_blob = app.add_blob(INVALID_HOST_COMMAND.to_le_bytes().to_vec());
+        segments.push(Segment {
+            address: layout.host_command_address,
+            memory_size: 4,
+            blob: host_command_blob,
             blob_offset: 0,
             file_size: 4,
             flags: SEGMENT_READ | SEGMENT_WRITE,
@@ -632,6 +741,7 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
     if graph.host_inputs.is_empty() && graph.host_outputs.is_empty() {
         return Ok(HostLayout {
             inputs: Vec::new(),
+            run: None,
             outputs: Vec::new(),
             protocol: HostExchange::default(),
         });
@@ -663,6 +773,7 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
         host_offset: command_host_offset,
         bytes: 4,
     };
+    let run = (!graph.schedule.phases.is_empty()).then_some(control_read);
     for binding in &graph.host_inputs {
         let size = binding_size(binding)?;
         let page_base = u64::from(align_up(page_cursor, 64));
@@ -728,7 +839,7 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
             .checked_add(size)
             .ok_or("host output size overflow")?;
     }
-    let operations = inputs.len() / 2 + outputs.len() / 2;
+    let operations = inputs.len() / 2 + usize::from(run.is_some()) + outputs.len() / 2;
     let mut calls = Vec::with_capacity(operations);
     for (index, commands) in inputs.chunks_exact(2).enumerate() {
         let transfer = commands[1];
@@ -740,7 +851,16 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
             outputs: Vec::new(),
         });
     }
-    let input_operations = inputs.len() / 2;
+    if run.is_some() {
+        calls.push(HostCall {
+            name: "device-run".into(),
+            command: HOST_COMMAND_RUN,
+            phases: 2,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        });
+    }
+    let input_operations = inputs.len() / 2 + usize::from(run.is_some());
     for (output_index, commands) in outputs.chunks_exact(2).enumerate() {
         let operation = input_operations + output_index;
         let transfer = commands[1];
@@ -754,6 +874,7 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
     }
     Ok(HostLayout {
         inputs,
+        run,
         outputs,
         protocol: HostExchange {
             startup_mark: ipu_driver::HOST_EXCHANGE_HANDOFF_MARK,
@@ -876,6 +997,38 @@ fn sizing_host_role(direction: HostDirection) -> HostProgramRole {
     }
 }
 
+fn command_broadcast_rows(
+    topology: &Topology,
+    command_address: u32,
+) -> Result<HashMap<u16, Vec<u32>>> {
+    let receivers = (1..u16::try_from(topology.tile_count())?).collect::<Vec<_>>();
+    let multicast = topology.multicast(0, &receivers, 1, 0)?;
+    let mut rows = HashMap::with_capacity(receivers.len());
+    for (logical, mut row) in receivers.into_iter().zip(multicast.receivers) {
+        patch_multicast_receiver_address(&mut row, command_address)?;
+        rows.insert(logical, row);
+    }
+    Ok(rows
+        .into_iter()
+        .map(|(tile, row)| (tile, row.into_iter().collect()))
+        .collect())
+}
+
+fn append_command_guard(
+    commands: &mut Vec<u8>,
+    expected: u32,
+    retry_address: u32,
+    command_address: u32,
+) {
+    commands.extend_from_slice(&words_to_bytes(&[
+        RuntimeRole::CommandGuard.word(),
+        expected,
+        retry_address,
+        command_address,
+        0,
+    ]));
+}
+
 fn assemble_host_program(
     transfer: HostTransfer,
     role: HostProgramRole,
@@ -945,6 +1098,9 @@ struct HostCommandContext<'a> {
     layout: &'a RuntimeLayout,
     command_index: usize,
     barrier_after: bool,
+    command_dispatch: bool,
+    command_receiver: Option<&'a [u32]>,
+    handler_follower: bool,
 }
 
 fn append_host_command(
@@ -959,7 +1115,13 @@ fn append_host_command(
         layout,
         command_index,
         barrier_after,
+        command_dispatch,
+        command_receiver,
+        handler_follower,
     } = context;
+    if command_dispatch && transfer.direction != HostDirection::ControlRead {
+        return Err("command dispatch requires a control-read transfer".into());
+    }
     const HOST_COORDINATOR_TILE: u16 = 0;
     let program_role = match transfer.direction {
         HostDirection::ControlRead => {
@@ -1012,16 +1174,36 @@ fn append_host_command(
             flags: SEGMENT_READ,
         });
         (
-            if barrier_after {
+            if command_dispatch {
+                RuntimeRole::CommandCoordinator
+            } else if barrier_after {
                 RuntimeRole::HostProgram
             } else {
                 RuntimeRole::HostProgramUnbarriered
             },
             plan_address,
         )
+    } else if let Some(receiver) = command_receiver {
+        let plan_address = layout.plan_address(command_index)?;
+        let instructions = words_to_bytes(receiver);
+        let size = u32::try_from(instructions.len())?;
+        let blob = app.add_blob(instructions);
+        segments.push(Segment {
+            address: plan_address,
+            memory_size: size,
+            blob,
+            blob_offset: 0,
+            file_size: size,
+            flags: SEGMENT_READ | SEGMENT_EXECUTE,
+        });
+        (RuntimeRole::CommandFollower, plan_address)
     } else {
         (
-            if barrier_after {
+            if command_dispatch {
+                return Err("noncoordinator command dispatch has no receiver row".into());
+            } else if handler_follower {
+                RuntimeRole::CommandHandlerFollower
+            } else if barrier_after {
                 RuntimeRole::HostIdle
             } else {
                 RuntimeRole::HostIdleUnbarriered
@@ -1094,6 +1276,7 @@ pub fn run_host(
     }
     device.write_config(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
     verify_runtime_completion(&device, app)?;
+    debug!(states = %supervisor_state_summary(&device, app), "host exchange supervisor states");
     debug!(sources = %host_source_summary(&device, app), "host exchange device sources");
     Ok(output)
 }
