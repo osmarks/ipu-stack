@@ -108,8 +108,8 @@ run concurrently; role conflicts become statically timed slots in the same
 launch, with one synchronization and a shared event horizon. Compute is a
 following graph phase: the dispatcher branches to a separately compiled kernel
 symbol and exchange commands perform no arithmetic. A randomized hardware
-acceptance path attempts H2D to the controller tile, two generated tile-exchange
-epochs via a relay tile, and D2H from the automatically allocated return range.
+acceptance path attempts H2D to the controller tile, two generated D2D transfers
+on one timed relay timeline, and D2H from the automatically allocated return range.
 Command boundaries use the generated C600 GSP program before the next exchange
 can begin. D2H lowering currently emits the SDK-derived source-tile host packet
 routine. Oracle disassembly shows that `A6` is one for each transaction and the

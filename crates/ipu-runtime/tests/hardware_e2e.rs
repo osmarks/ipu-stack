@@ -37,10 +37,10 @@ fn initialized_d2d_relay_and_d2h_work() {
 }
 
 #[test]
-fn large_multi_epoch_host_and_device_transfers_work() {
+fn large_h2d_timed_relay_and_d2h_composition_works() {
     let _device = device();
     require_success(
-        "multi-epoch H2D, D2D, and D2H",
+        "large H2D, timed D2D relay, and D2H composition",
         host_test(&[
             ("IPU_HOST_TEST_EXCHANGE", "1"),
             ("IPU_HOST_TEST_BYTES", "2048"),
