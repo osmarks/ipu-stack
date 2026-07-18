@@ -109,8 +109,8 @@ following graph phase: each tile program calls a separately compiled kernel
 symbol and exchange commands perform no arithmetic. A randomized hardware
 acceptance path attempts H2D to the controller tile, two generated D2D transfers
 on one timed relay timeline, and D2H from the automatically allocated return range.
-Command boundaries use the generated C600 GSP program before the next exchange
-can begin. D2H lowering currently emits the SDK-derived source-tile host packet
+The static path does not yet implement the IPU-local barrier required at a
+compute-to-exchange boundary. D2H lowering currently emits the SDK-derived source-tile host packet
 routine. Oracle disassembly shows that `A6` is one for each transaction and the
 payload send count is the chunk's 32-bit word count minus one. The attached
 destination remains untouched in direct hardware acceptance. The generated

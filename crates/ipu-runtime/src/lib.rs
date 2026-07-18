@@ -198,7 +198,19 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         .map(|buffer| ((buffer.tile, buffer.address), words_to_bytes(&buffer.words)))
         .collect();
 
-    let completion_physical_tile = 0;
+    let completion_physical_tile = graph
+        .outputs
+        .iter()
+        .flat_map(|binding| &binding.slices)
+        .map(|slice| slice.tile)
+        .next()
+        .or_else(|| {
+            programs
+                .first()
+                .and_then(|program| topology.physical(program.tile).ok())
+                .map(u32::from)
+        })
+        .ok_or("static graph has no tile for diagnostic completion")?;
     let mut app = Application::default();
     for (program, generated_code) in programs.iter().zip(generated) {
         let logical = program.tile;

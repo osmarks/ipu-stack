@@ -8,8 +8,8 @@ a blob range, final SRAM address, memory size, and access flags. Identical code
 and constants are stored once even when referenced by every tile. The build
 digest covers all semantic package fields, including bindings, host calls, and
 ordered device-configuration writes. Configuration writes let the compiler
-carry application-specific hardware setup such as GSP tile selection without
-requiring a matching SDK schedule capture at load time.
+carry hardware setup that cannot be expressed as tile images without requiring
+a matching SDK schedule capture at load time.
 
 Bindings map a logical tensor byte range to one or more `(tile, address)` SRAM
 ranges. Host calls map input and output ranges onto driver-attached pages and

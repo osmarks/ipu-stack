@@ -39,8 +39,9 @@ oracle. The static runtime executes those plans directly with:
 
 The loader's startup rendezvous releases all tile supervisors together. Every
 tile then enters its generated row for each exchange launch. There is no
-command loop, GSP packet program, reserved synchronization tile, or per-phase
-host synchronization. Physical tile 0 participates in payload work normally.
+command loop, device-barrier packet program, reserved synchronization tile, or
+per-phase host synchronization. Physical tile 0 participates in payload work
+normally.
 
 Hardware acceptance with the checked-in configuration and master route
 now covers:
@@ -120,12 +121,14 @@ move data; the following compute phase calls the linked kernel directly.
 Combining the sparse reduction tail and the unrelated dense permutation in one
 program is a mandatory red gate. The reduction remains exact, but the following
 permutation starts with tile skew and returns partial data. Replaying the
-recovered GSP sequence before compute-to-exchange transitions leaves the packet
-origin running while all followers wait, so that experiment was removed. A
-reusable device barrier or equivalent absolute static timing is still required.
+recovered SDK internal-sync master sequence before compute-to-exchange
+transitions leaves the packet origin running while all followers wait, so that
+experiment was removed. A reusable device barrier or equivalent absolute static
+timing is still required.
 
-`run-diagnostic` uses a deliberate physical-tile-0 completion trap after every
-tile has stored its completion word. This makes TDI result collection
+`run-diagnostic` places its completion trap on the first output tile, falling
+back to the first scheduled tile when the graph has no output binding. Every
+tile stores its completion word first. This makes TDI result collection
 deterministic without a host delay. It is diagnostic termination, not the
 production host-completion protocol; that still depends on completing native
 host exchange.

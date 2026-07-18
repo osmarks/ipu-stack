@@ -54,11 +54,13 @@ output in those graphs.
 
 A sparse compute tail followed by an unrelated dense exchange remains a red
 hardware gate because the static programs do not yet emit a reusable all-tile
-device barrier at that boundary. Replaying the recovered GSP sequence there
+device barrier at that boundary. Replaying the recovered SDK internal-sync
+master sequence there
 leaves the packet origin running while all follower tiles wait, so that failed
 path is not retained.
 
 The next static implementation therefore needs an explicit, hardware-verified
-GSP-to-exchange phase transition and a reusable device barrier. It must not hide
-the issue by reserving physical tile 0, choosing a completion tile that ignores a
-waiting origin, serializing through the host, or restoring runtime roles.
+internal-sync-to-exchange phase transition and a reusable device barrier. It
+must not hide the issue by reserving physical tile 0, choosing a completion tile
+that ignores a waiting origin, serializing through the host, or restoring
+runtime roles.
