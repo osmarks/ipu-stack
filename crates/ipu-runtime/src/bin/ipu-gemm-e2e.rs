@@ -91,39 +91,63 @@ fn main() {
         return;
     }
 
-    let run_start = Instant::now();
+    let runs = std::env::var("IPU_GEMM_RUNS")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("IPU_GEMM_RUNS must be an integer")
+        })
+        .unwrap_or(1);
+    assert!(runs != 0, "IPU_GEMM_RUNS must be nonzero");
+    assert!(
+        profile_output.is_none() || runs == 1,
+        "cycle profiling currently requires exactly one GEMM run"
+    );
     let diagnostic_block = diagnostic_block(dimension);
-    let actual = run_host_with_inspector(
-        &app,
-        &bootloader,
-        &configuration,
-        &device,
-        &input,
-        HostRunOptions::from_environment().unwrap(),
-        |device, output| {
-            inspect_output(
-                device,
-                dimension,
-                output,
-                &output_placements,
-                diagnostic_block,
-            )
-        },
-    )
-    .unwrap();
-    if let (Some(path), Some(layout)) = (profile_output, profile_layout) {
-        let clock_hz = std::env::var("IPU_CLOCK_HZ")
-            .map(|value| value.parse().expect("IPU_CLOCK_HZ must be an integer"))
-            .unwrap_or(1_500_000_000);
-        let report = layout.decode(&actual, clock_hz).unwrap();
-        report.write(fs::File::create(&path).unwrap()).unwrap();
-        info!(path = %path.display(), tiles = report.tiles.len(), "wrote cycle profile");
+    let options = HostRunOptions::from_environment().unwrap();
+    let all_runs_start = Instant::now();
+    for run_index in 0..runs {
+        let run_start = Instant::now();
+        let actual = run_host_with_inspector(
+            &app,
+            &bootloader,
+            &configuration,
+            &device,
+            &input,
+            options,
+            |device, output| {
+                inspect_output(
+                    device,
+                    dimension,
+                    output,
+                    &output_placements,
+                    diagnostic_block,
+                )
+            },
+        )
+        .unwrap_or_else(|error| panic!("GEMM run {}/{} failed: {error}", run_index + 1, runs));
+        if let (Some(path), Some(layout)) = (&profile_output, &profile_layout) {
+            let clock_hz = std::env::var("IPU_CLOCK_HZ")
+                .map(|value| value.parse().expect("IPU_CLOCK_HZ must be an integer"))
+                .unwrap_or(1_500_000_000);
+            let report = layout.decode(&actual, clock_hz).unwrap();
+            report.write(fs::File::create(path).unwrap()).unwrap();
+            info!(path = %path.display(), tiles = report.tiles.len(), "wrote cycle profile");
+        }
+        info!(
+            dimension,
+            completed = run_index + 1,
+            runs,
+            run_ms = run_start.elapsed().as_millis(),
+            output_bytes = actual.len(),
+            "blocked FP32 GEMM iteration passed"
+        );
     }
     info!(
         dimension,
-        run_ms = run_start.elapsed().as_millis(),
-        output_bytes = actual.len(),
-        "blocked FP32 GEMM passed"
+        runs,
+        elapsed_ms = all_runs_start.elapsed().as_millis(),
+        "all blocked FP32 GEMM iterations passed"
     );
     let _ = fs::remove_dir_all(output);
 }
