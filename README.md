@@ -106,11 +106,11 @@ The scheduler treats the on-chip fabric as non-blocking. Tile-disjoint groups
 run concurrently; local endpoint conflicts become statically timed slots in the same
 launch, with one synchronization and a shared event horizon. Compute is a
 following graph phase: each tile program calls a separately compiled kernel
-symbol and exchange commands perform no arithmetic. A randomized hardware
-acceptance path attempts H2D to the controller tile, two generated D2D transfers
-on one timed relay timeline, and D2H from the automatically allocated return range.
-The static path does not yet implement the IPU-local barrier required at a
-compute-to-exchange boundary. D2H lowering currently emits the SDK-derived source-tile host packet
+symbol and exchange commands perform no arithmetic. The randomized hardware
+acceptance path executes initialized multicast, sparse compute, and a second
+random matching as one static program. Compute-to-exchange transitions use the
+SDK-derived command barrier, including a topology-generated one-word release
+multicast. D2H lowering currently emits the SDK-derived source-tile host packet
 routine. Oracle disassembly shows that `A6` is one for each transaction and the
 payload send count is the chunk's 32-bit word count minus one. The attached
 destination remains untouched in direct hardware acceptance. The generated
@@ -119,8 +119,7 @@ agreement does not establish D2H capability.
 
 Offline unit tests verify encodings, allocation, lowering, and package structure;
 they do not count as evidence that a transport capability works. The seeded
-randomized hardware runner uses allocated addresses and generated
-payloads. Each case performs H2D, generated D2D fanout to one through four
-random destinations, a generated gather into distinct tile-0 ranges, and D2H
-verification. Default cases cover 1, 2, 15, 16, 17, 31, 63, and 64 words;
-`IPU_RANDOM_CASES` extends into larger boundaries.
+randomized hardware runner uses generated payloads and destinations. Each case
+performs D2D fanout to one through six destinations, sparse compute, and a
+second disjoint matching. Default cases sample 1, 15, 16, 17, 52, 64, 65, 127,
+512, and 1,024 words. Diagnostic readback verifies every result.

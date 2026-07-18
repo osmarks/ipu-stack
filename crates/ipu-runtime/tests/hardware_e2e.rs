@@ -147,13 +147,13 @@ fn multicast_receiver_can_send_in_same_phase() {
 }
 
 #[test]
-fn randomized_host_and_exchange_graphs_work() {
+fn randomized_static_d2d_graphs_work() {
     let _device = device();
     for seed in RANDOM_SEEDS {
         require_success(
             &format!("randomized exchange graph seed {seed:#x}"),
             Command::new(env!("CARGO_BIN_EXE_ipu-randomized-e2e"))
-                .env("IPU_RANDOM_SEED", format!("0x{seed:x}"))
+                .env("IPU_RANDOM_SEED", seed.to_string())
                 .status()
                 .expect("launch randomized hardware test runner"),
         );

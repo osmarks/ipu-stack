@@ -37,11 +37,10 @@ oracle. The static runtime executes those plans directly with:
 - `sans 0; sync 1` on every tile without a plan in an exchange launch;
 - plan code in a separately allocated executable SRAM region.
 
-The loader's startup rendezvous releases all tile supervisors together. Every
-tile then enters its generated row for each exchange launch. There is no
-command loop, device-barrier packet program, reserved synchronization tile, or
-per-phase host synchronization. Physical tile 0 participates in payload work
-normally.
+The loader's startup rendezvous releases all tile supervisors together. Later
+exchange launches use the SDK-derived command barrier and a generated one-word
+release multicast. There is no command loop or reserved synchronization tile;
+physical tile 0 participates in payload work normally.
 
 Hardware acceptance with the checked-in configuration and master route
 now covers:
@@ -113,18 +112,17 @@ program rather than assuming the original nine-word row size.
 
 `scripts/hardware-e2e.sh` compiles the static startup runtime and a separate
 `add_u32` kernel, packages schedules, runs them through the direct loader, and
-validates diagnostic bindings. Passing modes cover eleven alternating exchange
-and compute phases for a 1,472-input reduction, an all-tile affine permutation,
-and multicast with a dependent relay in one exchange phase. Exchange rows only
-move data; the following compute phase calls the linked kernel directly.
+validates diagnostic bindings. The passing hardware paths cover an all-tile
+affine permutation, multicast with a dependent relay in one exchange phase, and
+18 seeded two-launch randomized graphs. Exchange rows only move data; following
+compute phases call the linked kernel directly. The full script remains red
+while the deeper reduction tests below fail.
 
-Combining the sparse reduction tail and the unrelated dense permutation in one
-program is a mandatory red gate. The reduction remains exact, but the following
-permutation starts with tile skew and returns partial data. Replaying the
-recovered SDK internal-sync master sequence before compute-to-exchange
-transitions leaves the packet origin running while all followers wait, so that
-experiment was removed. A reusable device barrier or equivalent absolute static
-timing is still required.
+The 11-stage reduction followed by the unrelated dense permutation is still a
+mandatory red gate. With the generated command barrier, an intermediate sparse
+reduction launch leaves its participating tiles in exchange while the remaining
+tiles await the next phase. This deeper-launch failure is not hidden by reducing
+the completion set or excluding physical tile 0.
 
 `run-diagnostic` places its completion trap on the first output tile, falling
 back to the first scheduled tile when the graph has no output binding. Every

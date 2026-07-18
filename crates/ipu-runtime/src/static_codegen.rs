@@ -7,6 +7,8 @@ const INCOMING_DCOUNT: u8 = 0xa6;
 const INCOMING_SBASE: u8 = 0xa7;
 
 pub(crate) const WORKER_BARRIER: &str = "ipu_stack_static_worker_barrier";
+pub(crate) const GLOBAL_BARRIER_MASTER: &str = "ipu_stack_static_global_barrier_master";
+pub(crate) const GLOBAL_BARRIER_FOLLOWER: &str = "ipu_stack_static_global_barrier_follower";
 pub(crate) const COMPLETE: &str = "ipu_stack_static_complete";
 
 pub(crate) fn emit(
@@ -14,6 +16,8 @@ pub(crate) fn emit(
     base: u32,
     symbols: &BTreeMap<String, u32>,
     plan_addresses: &[u32],
+    global_barrier: u32,
+    startup_exchange: bool,
 ) -> Result<Vec<u8>> {
     let mut code = TileCode::new(base);
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
@@ -21,6 +25,9 @@ pub(crate) fn emit(
     for step in &program.steps {
         match step {
             LoweredTileStep::Exchange { row, .. } => {
+                if !startup_exchange || plan_index != 0 {
+                    code.call(global_barrier, 7)?;
+                }
                 code.call(worker_barrier, 7)?;
                 if row.first() != Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION) {
                     code.put_special(INCOMING_SBASE, 15)?;
