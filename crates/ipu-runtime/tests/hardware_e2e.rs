@@ -49,6 +49,18 @@ fn large_h2d_timed_relay_and_d2h_composition_works() {
 }
 
 #[test]
+fn h2d_compute_d2d_compute_d2h_works() {
+    let _device = device();
+    require_success(
+        "H2D, compute, D2D, compute, and D2H composition",
+        host_test(&[
+            ("IPU_HOST_TEST_COMPUTE_RELAY", "1"),
+            ("IPU_HOST_TEST_BYTES", "4"),
+        ]),
+    );
+}
+
+#[test]
 fn remote_tile_h2d_and_d2h_work() {
     let _device = device();
     require_success(

@@ -70,10 +70,12 @@ initialized SRAM.
 
 Host/device composition passes with randomized payloads. Required hardware
 tests cover local and remote H2D/D2H, distinct host slices on different tiles,
-an 8-KiB remote round trip, and H2D -> D2D relay -> D2H. A 64-KiB round trip at
-tile address `0x60000` also passes: H2D is automatically staged through the
-packet-addressable exchange window and copied to ordinary SRAM, while D2H sends
-directly from the high address.
+an 8-KiB remote round trip, H2D -> D2D relay -> D2H, and H2D -> compute -> D2D
+-> compute -> D2H. The latter doubles a random `u32` on each endpoint and checks
+the final wrapping result on the host. A 64-KiB round trip at tile address
+`0x60000` also passes: H2D is automatically staged through the packet-addressable
+exchange window and copied to ordinary SRAM, while D2H sends directly from the
+high address.
 
 Host transfers are split at the recovered short/long packet limits and 4 KiB
 attachment boundaries. The runtime allocates one attached buffer per page,

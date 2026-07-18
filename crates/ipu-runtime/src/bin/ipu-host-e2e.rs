@@ -1,6 +1,6 @@
 use ipu_compiler::{
-    Allocation, AllocationKind, MemoryConstraint, MemoryPlacement, Phase, Schedule, TensorId,
-    Transfer, find_free_region,
+    Allocation, AllocationKind, KernelCommand, MemoryConstraint, MemoryPlacement, OpId, Phase,
+    Schedule, SpecializationKey, TensorId, Transfer, find_free_region,
 };
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
@@ -39,7 +39,8 @@ fn main() {
             compile_flags.push(format!("-D{define}"));
         }
     }
-    let artifact = Toolchain::from_sdk(sdk)
+    let toolchain = Toolchain::from_sdk(sdk);
+    let artifact = toolchain
         .compile(&source, &output, "host-e2e", &compile_flags)
         .unwrap();
     let runtime_object = fs::read(artifact.object).unwrap();
@@ -72,6 +73,7 @@ fn main() {
         .ok();
     let d2h_only = std::env::var_os("IPU_HOST_TEST_D2H_ONLY").is_some();
     let initialized_exchange = std::env::var_os("IPU_HOST_TEST_INITIALIZED_EXCHANGE").is_some();
+    let compute_relay = std::env::var_os("IPU_HOST_TEST_COMPUTE_RELAY").is_some();
     assert!(output_count != 0, "IPU_HOST_TEST_OUTPUTS must be nonzero");
     let host_tile = std::env::var("IPU_HOST_TEST_TILE")
         .map(|value| {
@@ -92,7 +94,17 @@ fn main() {
         .as_ref()
         .map_or(output_count, |tiles| tiles.len() as u32);
     let payload = test_payload(transfer_bytes * payload_count);
-    let (mut graph, input, expected) = if d2h_only {
+    let (mut graph, input, expected) = if compute_relay {
+        assert_eq!(transfer_bytes, 4, "compute relay operates on one u32");
+        assert!(host_tiles.is_none());
+        let input = payload.clone();
+        let value = u32::from_le_bytes(input[..4].try_into().unwrap());
+        (
+            host_compute_relay_graph().unwrap(),
+            input,
+            value.wrapping_mul(4).to_le_bytes().to_vec(),
+        )
+    } else if d2h_only {
         assert!(host_tiles.is_none());
         (
             d2h_only_graph(transfer_bytes, host_tile, &payload).unwrap(),
@@ -170,7 +182,16 @@ fn main() {
             transfer_bytes,
         ));
     }
-    let app = package_graph(&graph, &[runtime_object]).unwrap();
+    let mut objects = vec![runtime_object];
+    if compute_relay {
+        let kernel_source =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/add_u32.S");
+        let kernel = toolchain
+            .compile(&kernel_source, &output, "host-compute-relay", &[])
+            .unwrap();
+        objects.push(fs::read(kernel.object).unwrap());
+    }
+    let app = package_graph(&graph, &objects).unwrap();
     if let Some(path) = std::env::var_os("IPU_HOST_TEST_PACKAGE") {
         app.write(fs::File::create(path).unwrap()).unwrap();
     }
@@ -195,13 +216,166 @@ fn main() {
     println!(
         "hostBytes={} h2d=PASS exchange={} d2h=PASS",
         result.len(),
-        if exchange || remote_d2h {
+        if exchange || remote_d2h || compute_relay {
             "PASS"
         } else {
             "SKIP"
         }
     );
     let _ = fs::remove_dir_all(output);
+}
+
+fn host_compute_relay_graph() -> Result<ExecutableGraph, ipu_compiler::CompileError> {
+    const SOURCE_TILE: u16 = 1471;
+    const DESTINATION_TILE: u16 = 274;
+    const BYTES: u32 = 4;
+
+    let topology = ipu_exchange::Topology::c600();
+    let host_constraint = MemoryConstraint {
+        base: ipu_exchange::EXCHANGE_WINDOW_BASE,
+        limit: ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES,
+        alignment: 32,
+        placement: MemoryPlacement::High,
+    };
+    let exchange_constraint = MemoryConstraint {
+        base: ipu_exchange::EXCHANGE_WINDOW_BASE,
+        limit: ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+        alignment: 32,
+        placement: MemoryPlacement::High,
+    };
+    let compiler_memory = ipu_compiler::CompilerOptions::default();
+    let data_constraint = MemoryConstraint {
+        base: compiler_memory.data_base,
+        limit: compiler_memory.data_limit,
+        alignment: 32,
+        placement: MemoryPlacement::Low,
+    };
+    let input = TensorId(0);
+    let first_result = TensorId(1);
+    let final_result = TensorId(2);
+    let mut allocations = Vec::new();
+    let input_address = find_free_region(
+        &allocations,
+        SOURCE_TILE,
+        BYTES,
+        0,
+        usize::MAX,
+        host_constraint,
+    )?;
+    allocations.push(home(input, SOURCE_TILE, input_address, BYTES));
+    let first_result_address = find_free_region(
+        &allocations,
+        SOURCE_TILE,
+        BYTES,
+        0,
+        usize::MAX,
+        data_constraint,
+    )?;
+    allocations.push(home(first_result, SOURCE_TILE, first_result_address, BYTES));
+    let staging_address = find_free_region(
+        &allocations,
+        DESTINATION_TILE,
+        BYTES,
+        1,
+        2,
+        exchange_constraint,
+    )?;
+    allocations.push(Allocation {
+        tensor: first_result,
+        tile: DESTINATION_TILE,
+        address: staging_address,
+        size: BYTES,
+        live_from: 1,
+        live_until: 2,
+        kind: AllocationKind::ExchangeStaging { phase: 1 },
+    });
+    let final_result_address = find_free_region(
+        &allocations,
+        DESTINATION_TILE,
+        BYTES,
+        0,
+        usize::MAX,
+        data_constraint,
+    )?;
+    allocations.push(home(
+        final_result,
+        DESTINATION_TILE,
+        final_result_address,
+        BYTES,
+    ));
+
+    Ok(ExecutableGraph {
+        schedule: Schedule {
+            layouts: Vec::new(),
+            phases: vec![
+                Phase::Compute {
+                    op: OpId(0),
+                    commands: vec![add_u32(SOURCE_TILE, first_result, input, "before-exchange")],
+                },
+                Phase::Exchange {
+                    transfers: vec![Transfer {
+                        source_tile: SOURCE_TILE,
+                        destination_tile: DESTINATION_TILE,
+                        tensor: first_result,
+                        bytes: BYTES,
+                    }],
+                },
+                Phase::Compute {
+                    op: OpId(1),
+                    commands: vec![add_u32(
+                        DESTINATION_TILE,
+                        final_result,
+                        first_result,
+                        "after-exchange",
+                    )],
+                },
+            ],
+            allocations,
+            tile_count: TILE_COUNT,
+            peak_sram: BTreeMap::new(),
+        },
+        initial_buffers: Vec::new(),
+        outputs: Vec::new(),
+        host_inputs: vec![binding(
+            "input",
+            topology.physical(SOURCE_TILE)?,
+            input_address,
+            BYTES,
+        )],
+        host_outputs: vec![binding(
+            "output",
+            topology.physical(DESTINATION_TILE)?,
+            final_result_address,
+            BYTES,
+        )],
+    })
+}
+
+fn home(tensor: TensorId, tile: u16, address: u32, size: u32) -> Allocation {
+    Allocation {
+        tensor,
+        tile,
+        address,
+        size,
+        live_from: 0,
+        live_until: usize::MAX,
+        kind: AllocationKind::Home,
+    }
+}
+
+fn add_u32(tile: u16, output: TensorId, input: TensorId, role: &str) -> KernelCommand {
+    KernelCommand {
+        tile,
+        output,
+        inputs: vec![input, input],
+        specialization: SpecializationKey {
+            operation: "add_u32".into(),
+            shape: vec![1],
+            worker_count: 1,
+            role: role.into(),
+            alignment: 4,
+        },
+    }
 }
 
 fn relocate_direct_host_graph(graph: &mut ExecutableGraph, address: u32) {
