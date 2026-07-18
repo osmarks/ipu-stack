@@ -302,6 +302,7 @@ dependencies = [
 name = "ipu-driver"
 version = "0.1.0"
 dependencies = [
+ "fastrand",
  "ipu-package",
  "libc",
  "object",

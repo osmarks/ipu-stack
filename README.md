@@ -61,6 +61,16 @@ Logging uses `tracing`. Set `RUST_LOG`, for example
 `RUST_LOG=ipu_driver=debug,ipu_elf=info`, to expose batch and linker details. Set
 `IPU_LOG_FORMAT=json` for newline-delimited JSON events.
 
+Host-exchange hardware tests can delay every host acknowledgement by an
+independent seeded interval. This verifies that device execution remains at the
+host rendezvous until the write actually occurs:
+
+```sh
+IPU_TEST_HOST_WRITE_JITTER_MAX_US=2000 \
+IPU_TEST_HOST_WRITE_JITTER_SEED=0x1234 \
+  scripts/hardware-e2e.sh
+```
+
 ## Current hardware boundary
 
 The Rust path resets and configures a C600, loads linked code onto all 1472

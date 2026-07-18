@@ -276,6 +276,48 @@ fn range_is_free(
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostRunOptions {
+    pub write_jitter: Option<HostWriteJitter>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HostWriteJitter {
+    pub seed: u64,
+    pub max_delay: Duration,
+}
+
+impl HostRunOptions {
+    pub fn from_environment() -> Result<Self> {
+        let Some(max_delay) = optional_environment_number("IPU_HOST_WRITE_JITTER_MAX_US")? else {
+            return Ok(Self::default());
+        };
+        let seed = optional_environment_number("IPU_HOST_WRITE_JITTER_SEED")?
+            .unwrap_or_else(|| fastrand::u64(..));
+        Ok(Self {
+            write_jitter: Some(HostWriteJitter {
+                seed,
+                max_delay: Duration::from_micros(max_delay),
+            }),
+        })
+    }
+}
+
+fn optional_environment_number(name: &str) -> Result<Option<u64>> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("{name} is not valid UTF-8"))?;
+    let (digits, radix) = value
+        .strip_prefix("0x")
+        .map_or((value, 10), |digits| (digits, 16));
+    Ok(Some(u64::from_str_radix(digits, radix).map_err(
+        |error| format!("invalid {name} value {value:?}: {error}"),
+    )?))
+}
+
 pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<Application> {
     package_graph_impl(graph, objects, &[], None)
 }
@@ -1217,6 +1259,24 @@ pub fn run_host(
     device_path: &str,
     input: &[u8],
 ) -> Result<Vec<u8>> {
+    run_host_with_options(
+        app,
+        bootloader,
+        configuration,
+        device_path,
+        input,
+        HostRunOptions::default(),
+    )
+}
+
+pub fn run_host_with_options(
+    app: &Application,
+    bootloader: &[u8],
+    configuration: &[u8],
+    device_path: &str,
+    input: &[u8],
+    options: HostRunOptions,
+) -> Result<Vec<u8>> {
     if app.host_exchange.calls.is_empty() {
         return Err("application has no generated host graph call".into());
     }
@@ -1229,6 +1289,14 @@ pub fn run_host(
         device.write_config(write.offset, write.value)?;
     }
     let mut session = HostSession::new(&device, app.host_exchange.clone())?;
+    if let Some(jitter) = options.write_jitter {
+        info!(
+            seed = jitter.seed,
+            max_delay_us = jitter.max_delay.as_micros(),
+            "enabling host acknowledgement jitter"
+        );
+        session.set_write_jitter(jitter.seed, jitter.max_delay);
+    }
     let calls = app.host_exchange.calls.clone();
     if let Err(error) = session.start() {
         return Err(format!(

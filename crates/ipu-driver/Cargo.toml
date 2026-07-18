@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fastrand.workspace = true
 ipu-package = { path = "../ipu-package" }
 libc.workspace = true
 object.workspace = true

@@ -993,6 +993,12 @@ pub struct HostSession<'a> {
     storage: HostBuffer,
     pages: HashMap<u32, HostPageRange>,
     attached_pages: Vec<u32>,
+    write_jitter: Option<HostWriteJitter>,
+}
+
+struct HostWriteJitter {
+    rng: fastrand::Rng,
+    max_delay: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -1032,7 +1038,29 @@ impl<'a> HostSession<'a> {
             storage: HostBuffer::new(storage_size)?,
             pages,
             attached_pages: Vec::new(),
+            write_jitter: None,
         })
+    }
+
+    pub fn set_write_jitter(&mut self, seed: u64, max_delay: Duration) {
+        self.write_jitter = (!max_delay.is_zero()).then(|| HostWriteJitter {
+            rng: fastrand::Rng::with_seed(seed),
+            max_delay,
+        });
+    }
+
+    fn delay_host_write(&mut self) {
+        if let Some(jitter) = &mut self.write_jitter {
+            let max_micros = u64::try_from(jitter.max_delay.as_micros()).unwrap_or(u64::MAX);
+            let delay_micros = jitter.rng.u64(0..=max_micros);
+            trace!(delay_micros, "delaying host synchronization write");
+            std::thread::sleep(Duration::from_micros(delay_micros));
+        }
+    }
+
+    fn acknowledge_device(&mut self) -> Result<(), DriverError> {
+        self.delay_host_write();
+        self.device.write_config(pci::HSP_GS2_CONTROL, 1)
     }
 
     pub fn attach(&mut self) -> Result<(), DriverError> {
@@ -1067,11 +1095,12 @@ impl<'a> HostSession<'a> {
         );
         self.device
             .write_config(pci::EXCHANGE_WINDOW_BASE, pci::EXCHANGE_WINDOW_HEXOPT)?;
+        self.delay_host_write();
         self.device.set_mark(1)?;
         self.device
             .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
         self.attach()?;
-        self.device.write_config(pci::HSP_GS2_CONTROL, 1)?;
+        self.acknowledge_device()?;
         self.device
             .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
         info!("host exchange session started");
@@ -1131,7 +1160,7 @@ impl<'a> HostSession<'a> {
         for phase in 0..call.phases {
             self.device
                 .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
-            self.device.write_config(pci::HSP_GS2_CONTROL, 1)?;
+            self.acknowledge_device()?;
             self.device
                 .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))
                 .map_err(|error| {

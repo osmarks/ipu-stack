@@ -1,7 +1,9 @@
 use ipu_compiler::{BlockedGemmConfig, BlockedGemmPlan, plan_blocked_gemm};
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
-use ipu_runtime::{ExecutableGraph, package_graph, package_graph_profiled, run_host};
+use ipu_runtime::{
+    ExecutableGraph, HostRunOptions, package_graph, package_graph_profiled, run_host_with_options,
+};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -89,7 +91,15 @@ fn main() {
     }
 
     let run_start = Instant::now();
-    let actual = run_host(&app, &bootloader, &configuration, &device, &input).unwrap();
+    let actual = run_host_with_options(
+        &app,
+        &bootloader,
+        &configuration,
+        &device,
+        &input,
+        HostRunOptions::from_environment().unwrap(),
+    )
+    .unwrap();
     let matrix_bytes = usize::from(dimension) * usize::from(dimension) * 4;
     verify_output(dimension, &actual[..matrix_bytes]);
     if let (Some(path), Some(layout)) = (profile_output, profile_layout) {

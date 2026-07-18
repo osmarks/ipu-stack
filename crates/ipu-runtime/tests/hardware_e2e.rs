@@ -246,9 +246,12 @@ fn blocked_gemm_with_cycle_profile_works() {
         "ipu-stack-gemm-profile-{}.capnp",
         std::process::id()
     ));
-    let status = Command::new(env!("CARGO_BIN_EXE_ipu-gemm-e2e"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ipu-gemm-e2e"));
+    command
         .env("IPU_GEMM_DIMENSION", "128")
-        .env("IPU_PROFILE_OUTPUT", &path)
+        .env("IPU_PROFILE_OUTPUT", &path);
+    configure_host_write_jitter(&mut command);
+    let status = command
         .status()
         .expect("launch profiled blocked GEMM hardware test runner");
     require_success("blocked GEMM with per-tile cycle profile", status);
@@ -279,7 +282,17 @@ fn device() -> MutexGuard<'static, ()> {
 fn host_test(environment: &[(&str, &str)]) -> ExitStatus {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ipu-host-e2e"));
     command.envs(environment.iter().copied());
+    configure_host_write_jitter(&mut command);
     command.status().expect("launch host exchange test runner")
+}
+
+fn configure_host_write_jitter(command: &mut Command) {
+    if let Some(max_delay) = std::env::var_os("IPU_TEST_HOST_WRITE_JITTER_MAX_US") {
+        command.env("IPU_HOST_WRITE_JITTER_MAX_US", max_delay);
+    }
+    if let Some(seed) = std::env::var_os("IPU_TEST_HOST_WRITE_JITTER_SEED") {
+        command.env("IPU_HOST_WRITE_JITTER_SEED", seed);
+    }
 }
 
 fn require_success(capability: &str, status: ExitStatus) {

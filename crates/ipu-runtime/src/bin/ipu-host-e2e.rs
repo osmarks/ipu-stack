@@ -4,7 +4,9 @@ use ipu_compiler::{
 };
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
-use ipu_runtime::{ExecutableGraph, InitialBuffer, package_graph, run_host};
+use ipu_runtime::{
+    ExecutableGraph, HostRunOptions, InitialBuffer, package_graph, run_host_with_options,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -211,7 +213,15 @@ fn main() {
         let start = segment.blob_offset as usize;
         assert_eq!(&blob[start..start + expected.len()], expected);
     }
-    let result = run_host(&app, &bootloader, &configuration, &device, &input).unwrap();
+    let result = run_host_with_options(
+        &app,
+        &bootloader,
+        &configuration,
+        &device,
+        &input,
+        HostRunOptions::from_environment().unwrap(),
+    )
+    .unwrap();
     assert_transfer_eq(&result, &expected);
     println!(
         "hostBytes={} h2d=PASS exchange={} d2h=PASS",
