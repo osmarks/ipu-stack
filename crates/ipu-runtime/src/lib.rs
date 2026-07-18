@@ -3,8 +3,8 @@ use ipu_driver::{Device, DriverError, HostSession, Loader, block_device_interrup
 use ipu_elf::{LinkOptions, link};
 use ipu_exchange::Topology;
 use ipu_package::{
-    Application, Binding, EntryPoint, HostCall, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ,
-    SEGMENT_WRITE, Segment, TileImage,
+    Application, Binding, EntryPoint, HostCall, HostExchange, HostPage, HostSlice, RegionSlice,
+    SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -14,6 +14,30 @@ use tracing_subscriber::EnvFilter;
 mod static_codegen;
 
 const PLAN_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
+const HOST_DATA_START: u32 = 64;
+const HOST_CLOSE_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x160;
+const HOST_PACKET_SEARCH_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x180;
+
+#[derive(Clone, Copy, Debug)]
+enum HostDirection {
+    ToTile,
+    ToHost,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StaticHostTransfer {
+    direction: HostDirection,
+    physical_tile: u16,
+    tile_address: u32,
+    host_offset: u32,
+    bytes: u32,
+}
+
+struct StaticHostLayout {
+    inputs: Vec<StaticHostTransfer>,
+    outputs: Vec<StaticHostTransfer>,
+    protocol: HostExchange,
+}
 pub fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt()
@@ -60,13 +84,33 @@ fn packed_addresses(base: u32, sizes: &[usize], alignment: u32) -> Result<(Vec<u
     Ok((addresses, cursor))
 }
 
+fn allocate_host_packet_addresses(schedule: &Schedule, sizes: &[usize]) -> Result<Vec<u32>> {
+    let limit = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES;
+    let mut candidate = HOST_PACKET_SEARCH_BASE;
+    while candidate < limit {
+        let (addresses, end) = packed_addresses(candidate, sizes, 8)?;
+        if end <= limit
+            && schedule.allocations.iter().all(|allocation| {
+                !ranges_overlap(
+                    candidate,
+                    end,
+                    allocation.address,
+                    allocation.address.saturating_add(allocation.size),
+                )
+            })
+        {
+            return Ok(addresses);
+        }
+        candidate = candidate
+            .checked_add(32)
+            .ok_or("host packet allocation overflow")?;
+    }
+    Err("no exchange-window range is available for host packet tables".into())
+}
+
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<Application> {
-    if !graph.host_inputs.is_empty() || !graph.host_outputs.is_empty() {
-        return Err("static host exchange is not implemented".into());
-    }
-
     let topology = Topology::c600();
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
         return Err("the direct C600 runtime requires a schedule for every discovered tile".into());
@@ -113,7 +157,25 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let (plan_addresses, plan_end) = packed_addresses(PLAN_BASE, &plan_sizes, 8)?;
-    let completion_address = align_up(plan_end, 64);
+    let host = build_static_host_layout(graph)?;
+    let host_transfers = host
+        .inputs
+        .iter()
+        .chain(&host.outputs)
+        .copied()
+        .collect::<Vec<_>>();
+    let host_plan_sizes = host_transfers
+        .iter()
+        .map(|transfer| host_phase_size(*transfer))
+        .collect::<Result<Vec<_>>>()?;
+    let (host_plan_addresses, host_plan_end) = packed_addresses(plan_end, &host_plan_sizes, 8)?;
+    let host_packet_sizes = host_transfers
+        .iter()
+        .map(|transfer| host_packet_size(*transfer))
+        .collect::<Result<Vec<_>>>()?;
+    let host_packet_addresses =
+        allocate_host_packet_addresses(&graph.schedule, &host_packet_sizes)?;
+    let completion_address = align_up(host_plan_end, 64);
     let runtime_end = completion_address
         .checked_add(4)
         .ok_or("static runtime address overflow")?;
@@ -150,7 +212,16 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     );
     let generated = programs
         .iter()
-        .map(|program| static_codegen::emit(program, program_base, &image.symbols, &plan_addresses))
+        .map(|program| {
+            static_codegen::emit(
+                program,
+                program_base,
+                &image.symbols,
+                &plan_addresses,
+                &host_plan_addresses[..host.inputs.len()],
+                &host_plan_addresses[host.inputs.len()..],
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     let program_end = generated.iter().try_fold(program_base, |end, code| {
         let code_end = program_base
@@ -258,6 +329,14 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                 exchange_index += 1;
             }
         }
+        append_static_host_segments(
+            &mut app,
+            &mut segments,
+            physical as u16,
+            &host_transfers,
+            &host_plan_addresses,
+            &host_packet_addresses,
+        )?;
         append_initial_segments(&mut app, &mut segments, graph, &initial, logical)?;
         app.tiles.push(TileImage {
             physical_tile: physical,
@@ -268,7 +347,9 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         });
     }
     app.tiles.sort_by_key(|tile| tile.physical_tile);
+    app.inputs = graph.host_inputs.clone();
     app.outputs = graph.outputs.clone();
+    app.outputs.extend(graph.host_outputs.clone());
     app.outputs.push(Binding {
         name: "runtime-completion".into(),
         dtype: "u32".into(),
@@ -285,14 +366,322 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         command: 0,
         external_syncs: 1,
     });
+    app.host_exchange = host.protocol;
     app.validate()?;
     info!(
         tiles = app.tiles.len(),
         exchange_launches = exchange_count,
+        host_inputs = graph.host_inputs.len(),
+        host_outputs = graph.host_outputs.len(),
         max_program_bytes = program_end - program_base,
         "packaged static executable graph"
     );
     Ok(app)
+}
+
+fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout> {
+    if graph.host_inputs.is_empty() && graph.host_outputs.is_empty() {
+        return Ok(StaticHostLayout {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            protocol: HostExchange::default(),
+        });
+    }
+
+    let mut host_cursor = HOST_DATA_START;
+    let mut input_file_cursor = 0u64;
+    let mut output_file_cursor = 0u64;
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let mut calls = Vec::new();
+    append_host_bindings(
+        &graph.host_inputs,
+        HostDirection::ToTile,
+        &mut host_cursor,
+        &mut input_file_cursor,
+        &mut inputs,
+        &mut calls,
+    )?;
+    append_host_bindings(
+        &graph.host_outputs,
+        HostDirection::ToHost,
+        &mut host_cursor,
+        &mut output_file_cursor,
+        &mut outputs,
+        &mut calls,
+    )?;
+    let call_inputs = calls
+        .iter()
+        .flat_map(|call| call.inputs.iter().cloned())
+        .collect();
+    let call_outputs = calls
+        .iter()
+        .flat_map(|call| call.outputs.iter().cloned())
+        .collect();
+    let transfer_count = inputs.len() + outputs.len();
+    calls = vec![HostCall {
+        name: "graph".into(),
+        command: 0,
+        phases: u32::try_from(transfer_count + 1)?,
+        inputs: call_inputs,
+        outputs: call_outputs,
+    }];
+
+    let data_page_count = align_up(
+        host_cursor.max(ipu_exchange::HOST_PAGE_BYTES),
+        ipu_exchange::HOST_PAGE_BYTES,
+    ) / ipu_exchange::HOST_PAGE_BYTES;
+    let command_page = data_page_count;
+    Ok(StaticHostLayout {
+        inputs,
+        outputs,
+        protocol: HostExchange {
+            startup_mark: ipu_driver::HOST_EXCHANGE_HANDOFF_MARK,
+            command_page,
+            command_offset: 0,
+            pages: (0..=command_page)
+                .map(|index| HostPage {
+                    index,
+                    size: u64::from(ipu_exchange::HOST_PAGE_BYTES),
+                })
+                .collect(),
+            attach_order: std::iter::once(command_page)
+                .chain(0..data_page_count)
+                .collect(),
+            calls,
+        },
+    })
+}
+
+fn append_host_bindings(
+    bindings: &[Binding],
+    direction: HostDirection,
+    host_cursor: &mut u32,
+    file_cursor: &mut u64,
+    transfers: &mut Vec<StaticHostTransfer>,
+    calls: &mut Vec<HostCall>,
+) -> Result<()> {
+    for binding in bindings {
+        let binding_base = align_up(*host_cursor, 64);
+        let binding_file_base = *file_cursor;
+        for slice in &binding.slices {
+            let host_offset = binding_base
+                .checked_add(u32::try_from(slice.file_offset)?)
+                .ok_or("host binding offset overflow")?;
+            let transfer = StaticHostTransfer {
+                direction,
+                physical_tile: u16::try_from(slice.tile)?,
+                tile_address: slice.tile_address,
+                host_offset,
+                bytes: u32::try_from(slice.size)?,
+            };
+            match direction {
+                HostDirection::ToTile => {
+                    ipu_exchange::plan_host_to_tile(
+                        transfer.physical_tile,
+                        transfer.tile_address,
+                        transfer.host_offset,
+                        transfer.bytes,
+                    )?;
+                }
+                HostDirection::ToHost => {
+                    ipu_exchange::plan_tile_to_host(
+                        transfer.physical_tile,
+                        transfer.tile_address,
+                        transfer.host_offset,
+                        transfer.bytes,
+                    )?;
+                }
+            }
+            let mut host_slices = Vec::new();
+            append_host_slices(
+                &mut host_slices,
+                host_offset,
+                binding_file_base + slice.file_offset,
+                slice.size,
+            )?;
+            let index = transfers.len();
+            transfers.push(transfer);
+            calls.push(HostCall {
+                name: match direction {
+                    HostDirection::ToTile => format!("host-input-{index}"),
+                    HostDirection::ToHost => format!("host-output-{index}"),
+                },
+                command: 0,
+                phases: 0,
+                inputs: matches!(direction, HostDirection::ToTile)
+                    .then_some(host_slices.clone())
+                    .unwrap_or_default(),
+                outputs: matches!(direction, HostDirection::ToHost)
+                    .then_some(host_slices)
+                    .unwrap_or_default(),
+            });
+        }
+        let size = binding_size(binding)?;
+        *host_cursor = u32::try_from(u64::from(binding_base) + size)?;
+        *file_cursor = file_cursor
+            .checked_add(size)
+            .ok_or("host binding file range overflow")?;
+    }
+    Ok(())
+}
+
+fn append_host_slices(
+    slices: &mut Vec<HostSlice>,
+    mut host_offset: u32,
+    mut file_offset: u64,
+    mut size: u64,
+) -> Result<()> {
+    while size != 0 {
+        let page = host_offset / ipu_exchange::HOST_PAGE_BYTES;
+        let page_offset = host_offset % ipu_exchange::HOST_PAGE_BYTES;
+        let count = size.min(u64::from(ipu_exchange::HOST_PAGE_BYTES - page_offset));
+        slices.push(HostSlice {
+            page,
+            page_offset: u64::from(page_offset),
+            file_offset,
+            size: count,
+        });
+        host_offset = host_offset
+            .checked_add(u32::try_from(count)?)
+            .ok_or("host page offset overflow")?;
+        file_offset = file_offset
+            .checked_add(count)
+            .ok_or("host file offset overflow")?;
+        size -= count;
+    }
+    Ok(())
+}
+
+fn binding_size(binding: &Binding) -> Result<u64> {
+    binding.slices.iter().try_fold(0u64, |size, slice| {
+        slice
+            .file_offset
+            .checked_add(slice.size)
+            .map(|end| size.max(end))
+            .ok_or_else(|| "host binding size overflow".into())
+    })
+}
+
+fn host_target_program(
+    transfer: StaticHostTransfer,
+    packet_address: u32,
+) -> Result<ipu_exchange::TileToHostProgram> {
+    Ok(match transfer.direction {
+        HostDirection::ToTile => ipu_exchange::assemble_host_to_tile_target_program(
+            transfer.physical_tile,
+            transfer.tile_address,
+            transfer.host_offset,
+            transfer.bytes,
+            packet_address,
+        )?,
+        HostDirection::ToHost => ipu_exchange::assemble_tile_to_host_target_program(
+            transfer.physical_tile,
+            transfer.tile_address,
+            transfer.host_offset,
+            transfer.bytes,
+            packet_address,
+            HOST_CLOSE_ADDRESS,
+        )?,
+    })
+}
+
+fn host_phase_size(transfer: StaticHostTransfer) -> Result<usize> {
+    let target = host_target_program(transfer, PLAN_BASE + 8)?;
+    let hierarchy = ipu_exchange::host_hierarchy(transfer.physical_tile)?;
+    let target_words = if hierarchy.xreq_physical_tile == transfer.physical_tile {
+        ipu_exchange::wrap_local_host_operation(&target.instructions, PLAN_BASE)?
+    } else {
+        ipu_exchange::wrap_host_target_operation(transfer.physical_tile, &target.instructions)?
+    };
+    let xreq = ipu_exchange::assemble_host_xreq_program(transfer.physical_tile, PLAN_BASE)?;
+    let xreq_words =
+        ipu_exchange::wrap_host_xreq_operation(hierarchy.xreq_physical_tile, &xreq.instructions)?;
+    Ok(target_words.len().max(xreq_words.len()).max(3) * 4)
+}
+
+fn host_packet_size(transfer: StaticHostTransfer) -> Result<usize> {
+    let target = host_target_program(transfer, PLAN_BASE + 8)?;
+    Ok(8 + target.packet_words.len() * 4)
+}
+
+fn append_static_host_segments(
+    app: &mut Application,
+    segments: &mut Vec<Segment>,
+    physical_tile: u16,
+    transfers: &[StaticHostTransfer],
+    plan_addresses: &[u32],
+    packet_addresses: &[u32],
+) -> Result<()> {
+    for ((transfer, &plan_address), &packet_address) in
+        transfers.iter().zip(plan_addresses).zip(packet_addresses)
+    {
+        let hierarchy = ipu_exchange::host_hierarchy(transfer.physical_tile)?;
+        let target = host_target_program(*transfer, packet_address + 8)?;
+        let (instructions, packet_words) = if hierarchy.xreq_physical_tile == transfer.physical_tile
+            && physical_tile == transfer.physical_tile
+        {
+            let mut packets = vec![1, 0];
+            packets.extend_from_slice(&target.packet_words);
+            (
+                ipu_exchange::wrap_local_host_operation(&target.instructions, packet_address)?,
+                Some(packets),
+            )
+        } else if physical_tile == hierarchy.xreq_physical_tile {
+            let xreq =
+                ipu_exchange::assemble_host_xreq_program(transfer.physical_tile, packet_address)?;
+            (
+                ipu_exchange::wrap_host_xreq_operation(physical_tile, &xreq.instructions)?,
+                Some(xreq.packet_words),
+            )
+        } else if physical_tile == transfer.physical_tile {
+            (
+                ipu_exchange::wrap_host_target_operation(physical_tile, &target.instructions)?,
+                Some(target.packet_words),
+            )
+        } else {
+            (
+                vec![
+                    ipu_exchange::sans(255),
+                    ipu_exchange::SYNC_ANS_INSTRUCTION,
+                    ipu_exchange::RETURN_M10_INSTRUCTION,
+                ],
+                None,
+            )
+        };
+        let instruction_bytes = words_to_bytes(&instructions);
+        let size = u32::try_from(instruction_bytes.len())?;
+        let blob = app.add_blob(instruction_bytes);
+        segments.push(Segment {
+            address: plan_address,
+            memory_size: size,
+            blob,
+            blob_offset: 0,
+            file_size: size,
+            flags: SEGMENT_READ | SEGMENT_EXECUTE,
+        });
+        if let Some(packet_words) = packet_words {
+            let address = if physical_tile == transfer.physical_tile
+                && hierarchy.xreq_physical_tile != transfer.physical_tile
+            {
+                packet_address + 8
+            } else {
+                packet_address
+            };
+            let packet_bytes = words_to_bytes(&packet_words);
+            let size = u32::try_from(packet_bytes.len())?;
+            let blob = app.add_blob(packet_bytes);
+            segments.push(Segment {
+                address,
+                memory_size: size,
+                blob,
+                blob_offset: 0,
+                file_size: size,
+                flags: SEGMENT_READ,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn append_initial_segments(

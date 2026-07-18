@@ -14,9 +14,14 @@ pub(crate) fn emit(
     base: u32,
     symbols: &BTreeMap<String, u32>,
     plan_addresses: &[u32],
+    host_input_addresses: &[u32],
+    host_output_addresses: &[u32],
 ) -> Result<Vec<u8>> {
     let mut code = TileCode::new(base);
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
+    for &address in host_input_addresses {
+        code.call(address, 10)?;
+    }
     let mut plan_index = 0usize;
     for step in &program.steps {
         match step {
@@ -60,6 +65,9 @@ pub(crate) fn emit(
     }
     if plan_index != plan_addresses.len() {
         return Err("unused exchange plan address".into());
+    }
+    for &address in host_output_addresses {
+        code.call(address, 10)?;
     }
     code.jump(symbol(symbols, COMPLETE)?)?;
     Ok(code.words.into_iter().flat_map(u32::to_le_bytes).collect())

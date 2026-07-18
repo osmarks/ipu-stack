@@ -529,9 +529,10 @@ fn append_local_host_completion(instructions: &mut Vec<u32>) {
     ]);
 }
 
-pub fn wrap_host_target_operation(
+fn wrap_host_operation(
     physical_tile: u16,
     operation: &[u32],
+    entry_sync: u32,
 ) -> Result<Vec<u32>, ExchangeError> {
     let Some((&RETURN_M10_INSTRUCTION, body)) = operation.split_last() else {
         return Err(ExchangeError::Schedule("host target operation return"));
@@ -539,9 +540,50 @@ pub fn wrap_host_target_operation(
     let mut instructions = vec![
         setzi_m(8, host_mux_for_tile(physical_tile)?),
         put_special_from_m8(INCOMING_MUX_REGISTER),
-        SYNC_HOST_INSTRUCTION,
+        entry_sync,
     ];
     instructions.extend_from_slice(body);
+    instructions.extend([
+        SYNC_ALL_INSTRUCTION,
+        setzi_m(8, TILE_MUX_EXCHANGE),
+        put_special_from_m8(INCOMING_MUX_REGISTER),
+        RETURN_M10_INSTRUCTION,
+    ]);
+    Ok(instructions)
+}
+
+pub fn wrap_host_xreq_operation(
+    physical_tile: u16,
+    operation: &[u32],
+) -> Result<Vec<u32>, ExchangeError> {
+    wrap_host_operation(physical_tile, operation, SYNC_HOST_INSTRUCTION)
+}
+
+pub fn wrap_host_target_operation(
+    physical_tile: u16,
+    operation: &[u32],
+) -> Result<Vec<u32>, ExchangeError> {
+    wrap_host_operation(physical_tile, operation, SYNC_ALL_INSTRUCTION)
+}
+
+pub fn wrap_local_host_operation(
+    operation: &[u32],
+    xreq_packet_address: u32,
+) -> Result<Vec<u32>, ExchangeError> {
+    let Some((&RETURN_M10_INSTRUCTION, body)) = operation.split_last() else {
+        return Err(ExchangeError::Schedule("local host operation return"));
+    };
+    if body.len() < 2 || xreq_packet_address & 7 != 0 {
+        return Err(ExchangeError::Schedule("local host operation prefix"));
+    }
+    let mut instructions = vec![
+        setzi_m(8, TILE_MUX_HOST),
+        put_special_from_m8(INCOMING_MUX_REGISTER),
+        SYNC_HOST_INSTRUCTION,
+    ];
+    instructions.extend_from_slice(&body[..2]);
+    instructions.push(encode_send(1, 3, xreq_packet_address >> 2)?);
+    instructions.extend_from_slice(&body[2..]);
     instructions.extend([
         SYNC_ALL_INSTRUCTION,
         setzi_m(8, TILE_MUX_EXCHANGE),
@@ -1480,7 +1522,7 @@ mod tests {
         assert_eq!(xreq.instructions, [0x782a_0243, 0x43a0_0000]);
         assert_eq!(xreq.packet_words, [0x100, 0]);
         let wrapped_xreq =
-            wrap_host_target_operation(hierarchy.xreq_physical_tile, &xreq.instructions).unwrap();
+            wrap_host_xreq_operation(hierarchy.xreq_physical_tile, &xreq.instructions).unwrap();
         assert_eq!(&wrapped_xreq[..3], &[0x1980_0604, 0x4380_80a0, 0x4180_000f]);
 
         let d2h =
@@ -1514,11 +1556,19 @@ mod tests {
         assert_eq!(h2d.packet_words, [0xec82_0209, 0x0000_0011]);
 
         let wrapped = wrap_host_target_operation(260, &d2h.instructions).unwrap();
-        assert_eq!(&wrapped[..3], &[0x1980_0604, 0x4380_80a0, 0x4180_000f]);
+        assert_eq!(&wrapped[..3], &[0x1980_0604, 0x4380_80a0, 0x4180_0007]);
         assert_eq!(
             &wrapped[wrapped.len() - 4..],
             &[0x4180_0007, 0x1980_0640, 0x4380_80a0, 0x43a0_0000]
         );
+
+        let local = assemble_host_to_tile_target_program(0, 0x50120, 0x40, 64, 0x50168).unwrap();
+        let wrapped_local = wrap_local_host_operation(&local.instructions, 0x50160).unwrap();
+        assert_eq!(
+            &wrapped_local[..3],
+            &[0x1980_0600, 0x4380_80a0, 0x4180_000f]
+        );
+        assert_eq!(send_address(wrapped_local[5]), 0x50160);
     }
 
     fn send_address(instruction: u32) -> u32 {
