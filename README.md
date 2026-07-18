@@ -98,15 +98,14 @@ The exchange planner lowers one-to-one transfers to absolute exchange rows and
 coalesces transfers sharing a source tensor into multicast groups. The same
 single-packet multicast plan passes under Poplar orchestration, but the Rust
 end-to-end randomized test cannot establish its result until native D2H works.
-The graph runtime executes generated per-tile plan tables and separately linked
-compute kernels. The older diagnostic graph contains a 1,472-value reduction,
-an all-tile affine permutation, and a relay, but its launcher still needs
-conversion to the per-epoch HSP protocol.
+The static runtime executes a distinct straight-line program per tile and calls
+separately linked compute kernels. Hardware acceptance covers a 1,472-value
+reduction, an all-tile affine permutation, multicast, and a dependent relay.
 
 The scheduler treats the on-chip fabric as non-blocking. Tile-disjoint groups
-run concurrently; role conflicts become statically timed slots in the same
+run concurrently; local endpoint conflicts become statically timed slots in the same
 launch, with one synchronization and a shared event horizon. Compute is a
-following graph phase: the dispatcher branches to a separately compiled kernel
+following graph phase: each tile program calls a separately compiled kernel
 symbol and exchange commands perform no arithmetic. A randomized hardware
 acceptance path attempts H2D to the controller tile, two generated D2D transfers
 on one timed relay timeline, and D2H from the automatically allocated return range.

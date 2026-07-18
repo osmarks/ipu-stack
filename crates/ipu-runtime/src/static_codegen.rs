@@ -2,9 +2,6 @@ use crate::Result;
 use ipu_compiler::{LoweredTileProgram, LoweredTileStep};
 use std::collections::BTreeMap;
 
-const SETZI_M: u32 = 0x1900_0000;
-const PUT_SPECIAL_M: u32 = 0x4300_8000;
-const BR_M: u32 = 0x4300_0000;
 const INCOMING_DBASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;
 const INCOMING_SBASE: u8 = 0xa7;
@@ -103,20 +100,14 @@ impl TileCode {
     }
 
     fn setzi(&mut self, register: u8, immediate: u32) -> Result<()> {
-        if register >= 16 || immediate >= 1 << 20 {
-            return Err("setzi operand is outside the IPU21 encoding range".into());
-        }
         self.words
-            .push(SETZI_M | (u32::from(register) << 20) | immediate);
+            .push(ipu_exchange::encode_setzi_m(register, immediate)?);
         Ok(())
     }
 
     fn put_special(&mut self, special: u8, register: u8) -> Result<()> {
-        if register >= 16 {
-            return Err("put source register is outside the IPU21 encoding range".into());
-        }
         self.words
-            .push(PUT_SPECIAL_M | (u32::from(register) << 20) | u32::from(special));
+            .push(ipu_exchange::encode_put_special_m(special, register)?);
         Ok(())
     }
 
@@ -124,13 +115,13 @@ impl TileCode {
         let return_address = self.address_after(3)?;
         self.setzi(return_register, return_address)?;
         self.setzi(0, target)?;
-        self.words.push(BR_M);
+        self.words.push(ipu_exchange::encode_br_m(0)?);
         Ok(())
     }
 
     fn jump(&mut self, target: u32) -> Result<()> {
         self.setzi(0, target)?;
-        self.words.push(BR_M);
+        self.words.push(ipu_exchange::encode_br_m(0)?);
         Ok(())
     }
 }

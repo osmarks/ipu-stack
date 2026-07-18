@@ -99,6 +99,18 @@ fn all_tile_reduction_works() {
 }
 
 #[test]
+fn sparse_compute_to_dense_exchange_works() {
+    let _device = device();
+    require_success(
+        "sparse compute followed by an all-tile exchange",
+        Command::new(env!("CARGO_BIN_EXE_ipu-hardware-e2e"))
+            .env("IPU_GRAPH_TEST", "reduction-permutation")
+            .status()
+            .expect("launch compute-to-exchange hardware test runner"),
+    );
+}
+
+#[test]
 fn all_tile_permutation_works() {
     let _device = device();
     require_success(
@@ -123,7 +135,7 @@ fn direct_multicast_works() {
 }
 
 #[test]
-fn multicast_with_relay_role_works() {
+fn multicast_receiver_can_send_in_same_phase() {
     let _device = device();
     require_success(
         "multicast graph with a receiver that sends in the same phase",

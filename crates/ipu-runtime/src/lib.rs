@@ -154,11 +154,12 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         .iter()
         .map(|program| static_codegen::emit(program, program_base, &image.symbols, &plan_addresses))
         .collect::<Result<Vec<_>>>()?;
-    let program_end = generated
-        .iter()
-        .map(|code| program_base + u32::try_from(code.len()).unwrap_or(u32::MAX))
-        .max()
-        .unwrap_or(program_base);
+    let program_end = generated.iter().try_fold(program_base, |end, code| {
+        let code_end = program_base
+            .checked_add(u32::try_from(code.len())?)
+            .ok_or("generated tile program address overflow")?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(end.max(code_end))
+    })?;
     if program_end > ipu_exchange::EXCHANGE_WINDOW_BASE {
         return Err("static tile program exceeds the application code region".into());
     }

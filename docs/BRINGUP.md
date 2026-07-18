@@ -29,40 +29,18 @@ the supervisor aggregate the words. There are no per-worker mailbox loops.
 ## Exchange runtime status
 
 The Rust planner's point-to-point and multicast rows match the independent C++
-oracle, and the single-packet multicast plan passes on hardware when executed
-inside Poplar's runtime. The direct runtime now reaches the same plan with:
+oracle. The static runtime executes those plans directly with:
 
-- preloaded launch/global-sync credits rather than host delays between device
-  phases;
-- the SDK supervisor's global master sequence and per-tile worker sync bases;
+- one straight-line instruction stream generated for each tile;
+- per-tile worker sync bases and local supervisor/worker rendezvous;
 - `A6=1` on senders and receivers;
 - `sans 0; sync 1` on every tile without a plan in an exchange launch;
 - plan code in a separately allocated executable SRAM region.
 
-The launch roles must not be conflated. Before the command loop, non-origin
-tiles execute `sans 1; sync 1` as part of the device-wide synchronization. One
-configurable physical tile emits the global packets and release, while every
-tile participates in the barrier. The packet origin is not reserved afterward:
-it executes the same sender, receiver, or `sans 0; sync 1` role as any other
-tile in every payload epoch. Omitting the inactive payload role lets the packet
-origin run ahead and deadlocks active endpoints.
-
-The Rust compiler now emits global-sync configuration rather than accepting
-captured words on the command line. For C600 the repeated command-loop protocol
-derives the canonical physical tile chain `[0, 1, 5, 13]` from the GSP hierarchy
-extents `[1, 4, 8]` and builds the five-level descriptor route one two-bit step
-at a time. The resulting four configuration-register writes travel in the
-`.ipuexe` and override the generic
-initialization capture before application loading. Packet and release SRAM
-addresses are allocated after the graph's live data, not supplied as target
-constants. Hardware acceptance uses `artifacts/c600-init.ipucfg`, not a capture
-from the tested exchange schedule.
-
-SDK captures also show translated GSP chains, and translating all four selectors
-plus the descriptor route has passed on hardware. Translation of the packet
-emitter itself has not been established, so the compiler does not conflate
-those two decisions. The command-loop runtime permits canonical physical tile 0
-to perform payload work.
+The loader's startup rendezvous releases all tile supervisors together. Every
+tile then enters its generated row for each exchange launch. There is no
+command loop, GSP packet program, reserved synchronization tile, or per-phase
+host synchronization. Physical tile 0 participates in payload work normally.
 
 Hardware acceptance with the checked-in configuration and master route
 now covers:
@@ -74,7 +52,7 @@ now covers:
 - one 1,024-word source stream received simultaneously by physical tiles 32
   and 53;
 - one 1,024-word source stream received simultaneously by all other 1,471
-  tiles through the direct command-loop runtime, with sampled first and last
+  tiles, with sampled first and last
   words exact;
 - one launch in which physical tile 0 multicasts 64 words to physical tiles 9
   and 32, then physical tile 32 sends the received buffer to physical tile 53.
@@ -92,15 +70,14 @@ and `A4` for multicast receivers; point-to-point plans continue to use those
 registers as relative bases. Treating an absolute receiver like a relative one
 completes without an exchange exception but leaves its destination unchanged.
 
-The graph-driven command-table runtime also completes an all-device reduction.
+The generated straight-line programs also complete an all-device reduction.
 All 1,472 tile scalars, including physical tile 0's scalar, exchange and add
 through 11 binary-tree rounds. The
 compiler emits absolute single-receiver rows for one-to-one edges and
 single-send multicast for fanout. The resulting launches produce `1084128` on physical tile 0, and all
 sampled tiles reach the terminal acceptance trap. In the current logical to
-physical mapping the reduction root is physical tile 0, which is also the
-configured packet origin; this is an exercised combined role, not a reserved
-tile.
+physical mapping the reduction root is physical tile 0, confirming that tile 0
+is not reserved by synchronization.
 
 The diagnostic runtime samples the tile cycle counter through worker 0 because
 `$COUNT_L` is not accessible from supervisor mode. The worker samples before
@@ -121,96 +98,45 @@ Both the one-word and maximum-size cases preserved the expected first word on
 both receivers. The compiler no longer estimates an epoch as `156 + words`;
 it decodes each generated row's delay and send fields and takes the maximum
 event horizon. This route-sensitive horizon is the basis for placing multiple
-roles on one tile without inserting another BSP synchronization.
+endpoint actions on one tile without inserting another BSP synchronization.
 
-The scheduler colors only tile-role conflicts. Colors are emitted as timed
+The scheduler colors only local endpoint conflicts. Colors are emitted as timed
 slots in one variable-length plan program, not separate epochs. Each row's
 first event is rebased against that tile's preceding event horizon, active rows
 are padded to the launch horizon, and only one `sync 3` and one return remain.
 Groups whose source is exchange staging are topologically ordered after the
-group that fills that staging allocation. The runtime's combined absolute role
-clears both `A4` and `A7`; sender and receiver addresses are carried by the
+group that fills that staging allocation. Generated active absolute calls clear
+both `A4` and `A7`; sender and receiver addresses are carried by the
 generated instructions. The packager derives plan stride from the longest tile
 program rather than assuming the original nine-word row size.
 
-`scripts/hardware-e2e.sh` compiles the generic graph runtime and a separate
-`add_u32` kernel, packages one `Schedule`, runs it through the direct loader,
-and validates diagnostic bindings. That schedule contains eleven alternating
-exchange and compute phases for a 1,472-input reduction, an all-tile affine
-permutation, and a multicast with a dependent relay in one exchange phase.
-The test checks the reduction scalar, all 1,472 permutation values, all 64 tap
-words, all 64 relay words, and runtime completion. Exchange commands only move
-data; the following compute phase dynamically dispatches the linked kernel.
+`scripts/hardware-e2e.sh` compiles the static startup runtime and a separate
+`add_u32` kernel, packages schedules, runs them through the direct loader, and
+validates diagnostic bindings. Passing modes cover eleven alternating exchange
+and compute phases for a 1,472-input reduction, an all-tile affine permutation,
+and multicast with a dependent relay in one exchange phase. Exchange rows only
+move data; the following compute phase calls the linked kernel directly.
 
-`run-diagnostic` uses a deliberate coordinator completion trap after every
+Combining the sparse reduction tail and the unrelated dense permutation in one
+program is a mandatory red gate. The reduction remains exact, but the following
+permutation starts with tile skew and returns partial data. Replaying the
+recovered GSP sequence before compute-to-exchange transitions leaves the packet
+origin running while all followers wait, so that experiment was removed. A
+reusable device barrier or equivalent absolute static timing is still required.
+
+`run-diagnostic` uses a deliberate physical-tile-0 completion trap after every
 tile has stored its completion word. This makes TDI result collection
 deterministic without a host delay. It is diagnostic termination, not the
 production host-completion protocol; that still depends on completing native
 host exchange.
 
-Native host-output lowering is partially recovered. Rust independently emits
-the short and long host packet headers, arbitrary-range chunk plans, and the
-source command, payload, and zero-byte-close sequence. Local physical-tile-0
-D2H uses an inline `[1, 0]` XREQ. An automated hardware test initializes 64
-bytes in tile-0 SRAM, poisons the attached host page, executes the generated
-control-read and D2H programs, verifies exact output equality, releases the
-terminal receive, and checks the runtime completion store. A second hardware
-test uploads a random 64-byte payload and reads it back exactly. Host transfers
-are separate calls with recovered write selector 2 and read selector 1; each
-has its own control read. Nonterminal calls wait for the following command
-rendezvous. The terminal call instead issues its last GS2 release without
-waiting for a rendezvous from an application that has already completed.
+## Native host exchange
 
-Multi-packet local H2D uses one stream: total-word `DCOUNT`, one XREQ, an
-initial two-word header, `sendoff` for each continuation header, and one
-`sync0`. Only the final header carries the `0x0c00_0000` stream-end field. A
-direct random 2048-byte H2D-to-D2H round trip passes exactly and reaches
-runtime completion. The same payload routed through two 2048-byte D2D passes
-also passes after command-scoped dispatch. Remote host transfer remains
-unresolved.
-
-Command-scoped dispatch now matches the SDK's all-tile control shape. The
-coordinator reads the host command and emits the delayed one-word direction-3
-send in the same program. Other tiles execute `sans 1; sync 1` followed by a
-tile-specific multicast receiver row, then every tile validates its local
-command word before entering the handler. Command SRAM starts with an invalid
-sentinel so command 0 cannot pass on zero-filled memory. Commands 2, 0, and 1
-are all lowered through this path.
-
-On hardware, a random 2048-byte command-2 H2D followed by command-0 two-hop
-D2D and command-1 D2H now returns exact data and reaches runtime completion.
-Single-receiver graph transfers use the route-specific send direction while
-true fanout retains direction 3; this matches the live SDK two-pass image.
-Local round trips, initialized D2D, direct multicast, and a receiver that also
-sends later in the same exchange phase remain passing. Remote 8192-byte H2D
-still stalls in the final command-2 payload phase and remains a mandatory red
-hardware gate.
-
-Remote D2H is a distinct two-role operation and remains unresolved. Tile 0
-preissues `[2, 0]` after `sync 3` and the 73-cycle route envelope. During the
-host command it executes `sync 15`, sends a two-word zero command packet, then
-restores exchange muxing after `sync 7`. A remote source waits on
-`sans 1; sync 1`, selects
-`0x600 + (physicalTile & ~2)`, and executes `DCOUNT=1`, header send, payload
-send, encoded one-cycle delay, zero-byte close, `sync 0`, and `sync 7`.
-Nonparticipants remain in `sans 255; sync 1`. A command-page H2D read precedes
-that operation.
-
-The current `run-output` prototype reproduces page attachment order and staged
-GS2 handoffs, but is not accepted as working: the attached page remains zero,
-and some tail schedules leave the source in WAEX. Experiments with short versus
-long packets, absolute versus relative source addressing, source addresses
-`0x50120` and `0x60000`, exact SDK packet-table locations, and explicit command
-ID 1 did not change that result. These variants were removed or kept behind
-the structured assembler rather than accumulated as constants.
-
-Reproducing all visible roles above for the SDK fixture's exact physical tile
-2 and host offset 64 still produced no write anywhere in either attached 4 KiB
-page. A post-payload host rendezvous also left the page untouched. This rules
-out a mere readback race and leaves an unmodeled host-exchange state transition
-or command-packet field. Hardware acceptance deliberately remains red for
-remote D2H. Local single-packet H2D followed by D2H now passes as two generated
-host calls and reaches the runtime completion marker.
+The prior command-dispatch implementation and its partially recovered H2D/D2H
+paths were removed with the device interpreter. `package_graph` currently
+rejects host bindings explicitly. The packet encoders and driver-side HSP
+primitives remain available as reference material, but encoder agreement alone
+is not treated as a working host-transfer capability.
 
 TDI reports both inactive and WAEX as context state zero. Architectural
 exceptions are only classified when exception metadata is nonzero; attempting

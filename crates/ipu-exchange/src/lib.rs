@@ -26,7 +26,7 @@ const SYNC_OPCODE: u32 = 0x4180_0000;
 const SANS_OPCODE: u32 = 0x40c0_0000;
 const BR_M_OPCODE: u32 = 0x4300_0000;
 const SETZI_M_OPCODE: u32 = 0x1900_0000;
-const PUT_SPECIAL_FROM_M8_OPCODE: u32 = 0x4380_8000;
+const PUT_SPECIAL_M_OPCODE: u32 = 0x4300_8000;
 const INCOMING_MUX_REGISTER: u8 = 0xa0;
 const INCOMING_DCOUNT_REGISTER: u8 = 0xa6;
 const TILE_TO_HOST_CLOSE_DELAY_CYCLES: u32 = 1;
@@ -55,12 +55,33 @@ pub const fn br_m(register: u8) -> u32 {
     BR_M_OPCODE | ((register as u32) << 20)
 }
 
+pub fn encode_br_m(register: u8) -> Result<u32, ExchangeError> {
+    if register >= 16 {
+        return Err(ExchangeError::Schedule("branch register"));
+    }
+    Ok(br_m(register))
+}
+
+pub fn encode_setzi_m(register: u8, immediate: u32) -> Result<u32, ExchangeError> {
+    if register >= 16 || immediate >= 1 << 20 {
+        return Err(ExchangeError::Schedule("setzi operand"));
+    }
+    Ok(setzi_m(register, immediate))
+}
+
+pub fn encode_put_special_m(special: u8, register: u8) -> Result<u32, ExchangeError> {
+    if register >= 16 {
+        return Err(ExchangeError::Schedule("put source register"));
+    }
+    Ok(PUT_SPECIAL_M_OPCODE | (u32::from(register) << 20) | u32::from(special))
+}
+
 const fn setzi_m(register: u8, immediate: u32) -> u32 {
     SETZI_M_OPCODE | ((register as u32) << 20) | immediate
 }
 
 const fn put_special_from_m8(register: u8) -> u32 {
-    PUT_SPECIAL_FROM_M8_OPCODE | register as u32
+    PUT_SPECIAL_M_OPCODE | (8 << 20) | register as u32
 }
 
 // C600 GSP configuration registers. Their payload selects the physical tiles
@@ -1125,6 +1146,23 @@ fn send_off(count_minus_one: u32, direction: u32, base_word: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_instruction_encoders_preserve_operands_and_reject_overflow() {
+        let setzi = encode_setzi_m(15, (1 << 20) - 1).unwrap();
+        assert_eq!((setzi >> 20) & 0xf, 15);
+        assert_eq!(setzi & ((1 << 20) - 1), (1 << 20) - 1);
+
+        let put = encode_put_special_m(0xa6, 8).unwrap();
+        assert_eq!((put >> 20) & 0xf, 8);
+        assert_eq!(put & 0xff, 0xa6);
+        assert_eq!((encode_br_m(10).unwrap() >> 20) & 0xf, 10);
+
+        assert!(encode_setzi_m(16, 0).is_err());
+        assert!(encode_setzi_m(0, 1 << 20).is_err());
+        assert!(encode_put_special_m(0, 16).is_err());
+        assert!(encode_br_m(16).is_err());
+    }
 
     #[test]
     fn c600_mapping_is_a_permutation() {

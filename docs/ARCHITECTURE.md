@@ -48,17 +48,15 @@ removed.
 The static emitter consumes `LoweredTileProgram` directly, emits distinct
 straight-line programs, and branches to per-tile executable exchange rows
 without a command table. Hardware tests verify a 64-word point transfer,
-fanout, multicast, an all-tile permutation, and an 11-stage reduction with
-compute between exchanges. Diagnostic readback verified every expected output.
+fanout, multicast, an all-tile permutation, and an 11-stage dependent reduction
+with compute between exchanges. Diagnostic readback verified every expected
+output in those graphs.
 
-The same program exposed an unresolved global-synchronization transition. When
-physical tile 0 generated the GSP packet and then entered a payload or inactive
-exchange row, it remained in exchange wait. Removing the row's duplicate leading
-`sync 3` allowed completion, but an active receiver consumed the one-word GSP
-release token (`[1, 0, ...]`) instead of the payload. Delays, an unarmed `sync 0`,
-`DCOUNT=2`, moving plan code, and naively shifting the GSP hierarchy root did not
-fix this and were removed. A second direct GSP barrier also stalled; the legacy
-runtime only performs its GSP pre-sync once.
+A sparse compute tail followed by an unrelated dense exchange remains a red
+hardware gate because the static programs do not yet emit a reusable all-tile
+device barrier at that boundary. Replaying the recovered GSP sequence there
+leaves the packet origin running while all follower tiles wait, so that failed
+path is not retained.
 
 The next static implementation therefore needs an explicit, hardware-verified
 GSP-to-exchange phase transition and a reusable device barrier. It must not hide

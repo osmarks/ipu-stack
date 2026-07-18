@@ -72,6 +72,22 @@ fn acceptance_case(mode: &str) -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
     let (mut graph, sum, permutation, multicast) = acceptance_graph();
     match mode {
         "all" => {}
+        "reduction-permutation" => {
+            graph.schedule.phases.truncate(REDUCTION_PHASES + 1);
+            graph
+                .schedule
+                .allocations
+                .retain(|allocation| allocation.tensor.0 < usize::from(TILE_COUNT) * 2);
+            graph.initial_buffers.retain(|buffer| {
+                matches!(
+                    buffer.address,
+                    ACCUMULATOR_ADDRESS | PERMUTATION_SOURCE_ADDRESS
+                )
+            });
+            graph
+                .outputs
+                .retain(|binding| matches!(binding.name.as_str(), "sum" | "permutation"));
+        }
         "reduction" => {
             graph.schedule.phases.truncate(REDUCTION_PHASES);
             graph
@@ -134,7 +150,7 @@ fn acceptance_case(mode: &str) -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
             });
         }
         _ => panic!(
-            "IPU_GRAPH_TEST must be reduction, permutation, point, fanout, multicast, or all"
+            "IPU_GRAPH_TEST must be reduction, reduction-permutation, permutation, point, fanout, multicast, or all"
         ),
     }
     (graph, sum, permutation, multicast)
