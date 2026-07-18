@@ -81,7 +81,7 @@ fn acceptance_case(mode: &str) -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
             graph.initial_buffers.retain(|buffer| {
                 matches!(
                     buffer.address,
-                    ACCUMULATOR_ADDRESS | PERMUTATION_SOURCE_ADDRESS
+                    ACCUMULATOR_ADDRESS | PERMUTATION_SOURCE_ADDRESS | PERMUTATION_STAGING_ADDRESS
                 )
             });
             graph
@@ -113,9 +113,12 @@ fn acceptance_case(mode: &str) -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
                 }
                 keep
             });
-            graph
-                .initial_buffers
-                .retain(|buffer| buffer.address == PERMUTATION_SOURCE_ADDRESS);
+            graph.initial_buffers.retain(|buffer| {
+                matches!(
+                    buffer.address,
+                    PERMUTATION_SOURCE_ADDRESS | PERMUTATION_STAGING_ADDRESS
+                )
+            });
             graph
                 .outputs
                 .retain(|binding| binding.name == "permutation");
@@ -241,6 +244,11 @@ fn acceptance_graph() -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
             tile: source,
             address: PERMUTATION_SOURCE_ADDRESS,
             words: vec![value],
+        });
+        initial_buffers.push(InitialBuffer {
+            tile: destination,
+            address: PERMUTATION_STAGING_ADDRESS,
+            words: vec![0xdead_0000 | u32::from(destination)],
         });
         permutation_transfers.push(Transfer {
             source_tile: source,

@@ -94,10 +94,12 @@ available to an application. Ordinary exchange receivers use the full 32 KiB
 exchange window. No concrete staging address is specified by the host exchange
 acceptance graph.
 
-The exchange planner lowers one-to-one transfers to absolute exchange rows and
-coalesces transfers sharing a source tensor into multicast groups. The same
-single-packet multicast plan passes under Poplar orchestration, but the Rust
-end-to-end randomized test cannot establish its result until native D2H works.
+The exchange planner lowers an independent one-to-one transfer with the
+point-to-point scheduler and converts its receiver to the compiler-allocated
+absolute exchange-window address. Transfers sharing a source tensor are
+coalesced into multicast groups; dependent groups with a nonzero timing offset
+also use the multicast scheduler. Both paths pass direct device-only hardware
+acceptance without relying on native D2H.
 The static runtime executes a distinct straight-line program per tile and calls
 separately linked compute kernels. Hardware acceptance separately covers a
 1,472-value reduction, an all-tile affine permutation, multicast, and a

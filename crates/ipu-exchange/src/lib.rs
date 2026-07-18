@@ -20,6 +20,8 @@ const DELAY_OPCODE_MASK: u32 = 0xfff8_0000;
 const DELAY_OPCODE: u32 = 0x40a0_0000;
 const DELAY_PIC_OPCODE: u32 = 0x6000_0000;
 const DELAY_XPIC_OPCODE: u32 = 0x6400_0000;
+const PIC_ABSOLUTE_RECEIVE_BITS: u32 = (1 << 16) | (1 << 14);
+const PIC_RECEIVE_ADDRESS_MASK: u32 = 0x1fff;
 const SEND_OPCODE: u32 = 0x7800_0000;
 const SEND_OFF_OPCODE: u32 = 0x7000_0000;
 const SYNC_OPCODE: u32 = 0x4180_0000;
@@ -932,10 +934,7 @@ pub fn patch_sender_address(row: &mut PlanRow, byte_address: u32) -> Result<(), 
     Err(ExchangeError::Address(byte_address))
 }
 
-pub fn patch_multicast_receiver_address(
-    row: &mut PlanRow,
-    byte_address: u32,
-) -> Result<(), ExchangeError> {
+pub fn patch_receiver_address(row: &mut PlanRow, byte_address: u32) -> Result<(), ExchangeError> {
     if byte_address < EXCHANGE_WINDOW_BASE || byte_address & 3 != 0 {
         return Err(ExchangeError::Address(byte_address));
     }
@@ -945,9 +944,11 @@ pub fn patch_multicast_receiver_address(
     }
     let instruction = row
         .iter_mut()
-        .find(|word| **word & 0xfc01_4000 == 0x6001_4000)
+        .find(|word| **word & OPCODE_MASK == DELAY_PIC_OPCODE)
         .ok_or(ExchangeError::Address(byte_address))?;
-    *instruction = (*instruction & !0x1fff) | window_word;
+    *instruction = (*instruction & !(PIC_ABSOLUTE_RECEIVE_BITS | PIC_RECEIVE_ADDRESS_MASK))
+        | PIC_ABSOLUTE_RECEIVE_BITS
+        | window_word;
     Ok(())
 }
 
@@ -1192,7 +1193,7 @@ mod tests {
                 1
             );
             let cycles = plan_event_cycles(&receiver).unwrap();
-            patch_multicast_receiver_address(&mut receiver, EXCHANGE_WINDOW_BASE).unwrap();
+            patch_receiver_address(&mut receiver, EXCHANGE_WINDOW_BASE).unwrap();
             assert_eq!(plan_event_cycles(&receiver).unwrap(), cycles);
             assert_eq!(
                 receiver.iter().rfind(|instruction| **instruction != 0),
@@ -1280,7 +1281,7 @@ mod tests {
         );
         let mut plan = topology.multicast(0, &[274], 65, 0).unwrap();
         patch_sender_address(&mut plan.sender, 0x52040).unwrap();
-        patch_multicast_receiver_address(&mut plan.receivers[0], 0x53080).unwrap();
+        patch_receiver_address(&mut plan.receivers[0], 0x53080).unwrap();
         assert_eq!(
             plan.sender[2] & 0x001f_fff8,
             ((0x52040 >> 2) << 3) & 0x001f_fff8

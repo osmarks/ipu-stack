@@ -4,7 +4,8 @@ use tracing::{debug, info};
 
 use ipu_exchange::{
     MulticastPlan, PlanProgramBuilder, PlanRow, RETURN_M10_INSTRUCTION, SANS_INACTIVE_INSTRUCTION,
-    SYNC_ANS_INSTRUCTION, Topology, patch_multicast_receiver_address, patch_sender_address,
+    SYNC_ANS_INSTRUCTION, Topology, finalize_point_receiver, patch_receiver_address,
+    patch_sender_address,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -765,15 +766,26 @@ impl Schedule {
                                 })
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    let mut plan: MulticastPlan =
-                        topology.multicast(source, &destinations, words, schedule_offset)?;
+                    let mut plan: MulticastPlan = if destinations.len() == 1 && schedule_offset == 0
+                    {
+                        let point = topology.point_to_point(source, destinations[0], words)?;
+                        MulticastPlan {
+                            sender: point.sender,
+                            receivers: vec![finalize_point_receiver(
+                                &point.receiver,
+                                topology.physical(source)?,
+                            )?],
+                        }
+                    } else {
+                        topology.multicast(source, &destinations, words, schedule_offset)?
+                    };
                     patch_sender_address(&mut plan.sender, source_address)?;
                     for (receiver, address) in plan
                         .receivers
                         .iter_mut()
                         .zip(destination_addresses.iter().copied())
                     {
-                        patch_multicast_receiver_address(receiver, address)?;
+                        patch_receiver_address(receiver, address)?;
                     }
                     let sender = plan.sender;
                     let receivers = plan.receivers;
@@ -1631,6 +1643,29 @@ mod tests {
         let inactive = lowered[0].epochs[0].row_for(15);
         assert_eq!(inactive[0], SANS_INACTIVE_INSTRUCTION);
         assert_eq!(inactive[1], SYNC_ANS_INSTRUCTION);
+    }
+
+    #[test]
+    fn lowering_uses_point_schedule_for_an_independent_single_destination() {
+        let topology = Topology::c600();
+        let schedule = exchange_schedule(vec![Transfer {
+            source_tile: 0,
+            destination_tile: 1,
+            tensor: TensorId(0),
+            bytes: 64,
+        }]);
+        let lowered = schedule.lower_exchanges(&topology).unwrap();
+        let group = &lowered[0].epochs[0].groups[0];
+
+        let point = topology.point_to_point(0, 1, 16).unwrap();
+        let mut expected_sender = point.sender;
+        let mut expected_receiver =
+            finalize_point_receiver(&point.receiver, topology.physical(0).unwrap()).unwrap();
+        patch_sender_address(&mut expected_sender, 0x62000).unwrap();
+        patch_receiver_address(&mut expected_receiver, 0x52000).unwrap();
+
+        assert_eq!(group.sender, expected_sender);
+        assert_eq!(group.receivers, vec![expected_receiver]);
     }
 
     #[test]

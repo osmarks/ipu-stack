@@ -58,9 +58,10 @@ and execute their complete exchange row, while inactive tiles execute
 `sans 0; sync ANS`. D2D phase transitions do not use a host packet, GSP, or a
 release multicast, and no tile is reserved for synchronization.
 
-An alternating 11-stage reduction followed by a dense permutation remains a
-red hardware gate. All reduction stages complete and produce the correct sum,
-but the following all-tile multi-role permutation deterministically loses a
-subset of packets. Standalone dense permutation and two-launch randomized
-fanout/compute/matching programs pass; arbitrary launch depth followed by a
-dense multi-role exchange is not yet accepted.
+An alternating 11-stage reduction followed by a dense all-tile permutation
+passes hardware acceptance. The earlier packet loss came from routing
+independent single-destination groups through the multicast scheduler. The SDK
+uses its point-to-point schedule for those groups; the compiler now does the
+same, finalizes the receiver's source selector, and converts its receive address
+to the compiler-allocated absolute exchange-window address. Fanout and groups
+with a nonzero dependency offset continue to use the multicast scheduler.
