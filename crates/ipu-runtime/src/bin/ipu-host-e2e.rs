@@ -115,7 +115,7 @@ fn main() {
         assert_eq!(&blob[start..start + expected.len()], expected);
     }
     let result = run_host(&app, &bootloader, &configuration, &device, &input).unwrap();
-    assert_eq!(result, expected);
+    assert_transfer_eq(&result, &expected);
     println!(
         "hostBytes={} h2d=PASS exchange={} d2h=PASS",
         result.len(),
@@ -126,6 +126,24 @@ fn main() {
         }
     );
     let _ = fs::remove_dir_all(output);
+}
+
+fn assert_transfer_eq(actual: &[u8], expected: &[u8]) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "host transfer length mismatch"
+    );
+    if let Some((offset, (&actual, &expected))) = actual
+        .iter()
+        .zip(expected)
+        .enumerate()
+        .find(|(_, (actual, expected))| actual != expected)
+    {
+        panic!(
+            "host transfer mismatch at byte {offset}: actual={actual:#04x}, expected={expected:#04x}"
+        );
+    }
 }
 
 fn d2h_only_graph(

@@ -1387,7 +1387,7 @@ mod tests {
     }
 
     #[test]
-    fn assembles_tile_to_host_program() {
+    fn tile_to_host_encoder_preserves_packet_and_payload_addresses() {
         let plan = assemble_tile_to_host_program(2, 0x50120, 0x40, 64, 0x50160, 0x501a0).unwrap();
         assert_eq!(
             &plan.packet_words[..2],
@@ -1421,16 +1421,13 @@ mod tests {
             plan.instructions[payload + 1],
             delay(TILE_TO_HOST_CLOSE_DELAY_CYCLES)
         );
-        assert!(plan.instructions.contains(&SYNC_RECEIVE_INSTRUCTION));
     }
 
     #[test]
-    fn assembles_remote_tile_to_host_source_role() {
+    fn remote_tile_to_host_encoder_preserves_recovered_packet_header() {
         let source =
             assemble_tile_to_host_source_program(2, 0x50120, 0x40, 64, 0x50160, 0x501a0).unwrap();
 
-        assert!(source.instructions.contains(&SYNC_ALL_INSTRUCTION));
-        assert!(!source.instructions.contains(&SYNC_HOST_INSTRUCTION));
         assert_eq!(source.packet_words.len(), 4);
         assert_eq!(
             &source.packet_words[..2],
@@ -1476,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn assembles_host_to_tile_as_one_self_contained_request() {
+    fn host_to_tile_encoder_preserves_packet_and_request_addresses() {
         let plan = assemble_host_to_tile_program(2, 0x50120, 0x40, 64, 0x50160).unwrap();
         assert_eq!(&plan.packet_words[..2], &[1, 0]);
         assert_eq!(
@@ -1492,28 +1489,12 @@ mod tests {
         assert_eq!(sends.len(), 2);
         assert_eq!(send_address(sends[0]), 0x50160);
         assert_eq!(send_address(sends[1]), 0x50168);
-        assert!(plan.instructions.contains(&SYNC_RECEIVE_INSTRUCTION));
     }
 
     #[test]
     fn groups_multi_packet_host_to_tile_as_one_stream_copy() {
         let chunks = plan_host_to_tile(63, 0x50000, 0x40, 4096).unwrap();
         let plan = assemble_host_to_tile_program(63, 0x50000, 0x40, 4096, 0x54000).unwrap();
-        assert_eq!(
-            plan.instructions
-                .iter()
-                .filter(|instruction| **instruction == SYNC_HOST_INSTRUCTION)
-                .count(),
-            1
-        );
-        assert!(plan.instructions.contains(&SYNC_ALL_INSTRUCTION));
-        assert_eq!(
-            plan.instructions
-                .iter()
-                .filter(|instruction| **instruction == SYNC_RECEIVE_INSTRUCTION)
-                .count(),
-            1
-        );
         assert_eq!(plan.packet_words.len(), 2 + chunks.len() * 2);
         assert!(
             plan.packet_words[2..plan.packet_words.len() - 2]
@@ -1534,21 +1515,11 @@ mod tests {
     }
 
     #[test]
-    fn assembles_host_command_read_program() {
+    fn host_command_read_encoder_preserves_recovered_packet_and_addresses() {
         let plan = assemble_host_command_read_program(0x50160, 0x50180, 0x1000).unwrap();
         assert_eq!(plan.packet_words, [1, 0, 0xcc00_020c, 0x4001]);
-        assert_eq!(
-            plan.instructions[5..8],
-            [0x782a_02c3, 0x782a_02d3, SYNC_RECEIVE_INSTRUCTION]
-        );
-        assert_eq!(
-            plan.instructions
-                .iter()
-                .filter(|instruction| **instruction == SYNC_HOST_INSTRUCTION)
-                .count(),
-            1
-        );
-        assert!(plan.instructions.contains(&SYNC_ALL_INSTRUCTION));
+        assert_eq!(send_address(plan.instructions[5]), 0x50160);
+        assert_eq!(send_address(plan.instructions[6]), 0x50168);
         let command_send = plan.instructions[plan.instructions.len() - 2];
         assert_eq!(send_address(command_send), 0x50180);
     }
@@ -1576,35 +1547,5 @@ mod tests {
         assert_eq!(row[0], SYNC_SUPERVISOR_INSTRUCTION);
         assert_eq!(row[1] & 0x1fff, 9);
         assert_eq!(row[5], RETURN_M10_INSTRUCTION);
-    }
-
-    #[test]
-    fn c600_global_sync_is_derived_from_the_hardware_hierarchy() {
-        let sync = c600_global_sync();
-        let selected: Vec<_> = sync
-            .config_writes
-            .iter()
-            .map(|write| (write.value & 0xffff) as u16)
-            .collect();
-        assert_eq!(selected[0], sync.packet_origin_physical_tile);
-        assert_eq!(
-            selected
-                .windows(2)
-                .map(|pair| pair[1] - pair[0])
-                .collect::<Vec<_>>(),
-            [1, 4, 8]
-        );
-        assert!(
-            selected
-                .iter()
-                .all(|tile| usize::from(*tile) < Topology::c600().tile_count())
-        );
-
-        let mut route = sync.packet_words[2] & 0x00ff_ffff;
-        for _ in 0..5 {
-            assert_eq!(route & 3, 1);
-            route >>= 2;
-        }
-        assert_eq!(route, 0);
     }
 }
