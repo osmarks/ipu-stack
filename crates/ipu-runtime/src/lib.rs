@@ -289,17 +289,31 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         .iter()
         .map(|program| -> Result<TileHostPlans> {
             let physical = topology.physical(program.tile)?;
-            let sizes = host_transfers
-                .iter()
-                .zip(&host_packet_addresses)
-                .map(|(&transfer, &packet_address)| {
-                    Ok(host_phase_instructions(physical, transfer, packet_address)?
-                        .0
-                        .len()
-                        * 4)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let (addresses, end) = packed_addresses(plan_end, &sizes, 8)?;
+            let follower_address = align_up(plan_end, 8);
+            let mut cursor = if host_transfers.is_empty() {
+                plan_end
+            } else {
+                follower_address + 3 * 4
+            };
+            let mut addresses = Vec::with_capacity(host_transfers.len());
+            for (&transfer, &packet_address) in host_transfers.iter().zip(&host_packet_addresses) {
+                if host_phase_is_active(physical, &transfer) {
+                    cursor = align_up(cursor, 8);
+                    addresses.push(cursor);
+                    let bytes = u32::try_from(
+                        host_phase_instructions(physical, transfer, packet_address)?
+                            .0
+                            .len()
+                            * 4,
+                    )?;
+                    cursor = cursor
+                        .checked_add(bytes)
+                        .ok_or("static host plan address overflow")?;
+                } else {
+                    addresses.push(follower_address);
+                }
+            }
+            let end = cursor;
             Ok(TileHostPlans { addresses, end })
         })
         .collect::<Result<Vec<_>>>()?;

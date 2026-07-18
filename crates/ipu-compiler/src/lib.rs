@@ -461,6 +461,290 @@ pub struct Schedule {
     pub peak_sram: BTreeMap<u16, u32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockPlacement {
+    pub tensor: TensorId,
+    pub tile: u16,
+    pub address: u32,
+    pub block_row: u16,
+    pub block_column: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockedGemmConfig {
+    pub dimension: u16,
+    pub block_dimension: u16,
+    pub tile_count: u16,
+    pub data_base: u32,
+    pub data_limit: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockedGemmPlan {
+    pub schedule: Schedule,
+    pub left: Vec<BlockPlacement>,
+    pub right: Vec<BlockPlacement>,
+    pub output: Vec<BlockPlacement>,
+}
+
+pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, CompileError> {
+    if config.dimension == 0
+        || config.block_dimension != 64
+        || !config.dimension.is_multiple_of(config.block_dimension)
+        || config.data_base >= config.data_limit
+    {
+        return Err(CompileError::Graph(
+            "blocked GEMM currently requires 64x64 blocks and divisible dimensions".into(),
+        ));
+    }
+    let grid = config.dimension / config.block_dimension;
+    let block_count = usize::from(grid) * usize::from(grid);
+    if block_count > usize::from(config.tile_count) {
+        return Err(CompileError::Graph(format!(
+            "blocked GEMM requires {block_count} output tiles but only {} are available",
+            config.tile_count
+        )));
+    }
+    let block_bytes = u32::from(config.block_dimension)
+        .checked_mul(u32::from(config.block_dimension))
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or_else(|| CompileError::Memory("GEMM block size overflow".into()))?;
+    if block_bytes > ipu_exchange::MAX_TRANSFER_WORDS * 4 {
+        return Err(CompileError::Graph(format!(
+            "{block_bytes}-byte GEMM blocks exceed one exchange transfer"
+        )));
+    }
+    let data_constraint = MemoryConstraint {
+        base: config.data_base,
+        limit: config.data_limit,
+        alignment: 32,
+        placement: MemoryPlacement::Low,
+    };
+    let exchange_address =
+        ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES - block_bytes;
+    let mut allocations = Vec::with_capacity(block_count * (usize::from(grid) * 3 + 5));
+    let mut left = Vec::with_capacity(block_count);
+    let mut right = Vec::with_capacity(block_count);
+    let mut output = Vec::with_capacity(block_count);
+    let mut local_left_addresses = vec![0; block_count];
+
+    for block_row in 0..grid {
+        for block_column in 0..grid {
+            let index = usize::from(block_row) * usize::from(grid) + usize::from(block_column);
+            let tile = u16::try_from(index)
+                .map_err(|_| CompileError::Graph("GEMM tile index overflow".into()))?;
+            for (tensor_offset, placements) in [
+                (0, &mut left),
+                (block_count, &mut right),
+                (2 * block_count, &mut output),
+            ] {
+                let tensor = TensorId(tensor_offset + index);
+                let address = find_free_region(
+                    &allocations,
+                    tile,
+                    block_bytes,
+                    0,
+                    usize::MAX,
+                    data_constraint,
+                )?;
+                allocations.push(Allocation {
+                    tensor,
+                    tile,
+                    address,
+                    size: block_bytes,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                });
+                placements.push(BlockPlacement {
+                    tensor,
+                    tile,
+                    address,
+                    block_row,
+                    block_column,
+                });
+            }
+            local_left_addresses[index] = find_free_region(
+                &allocations,
+                tile,
+                block_bytes,
+                0,
+                usize::MAX,
+                data_constraint,
+            )?;
+        }
+    }
+
+    let mut phases = Vec::with_capacity(usize::from(grid) * 4);
+    let temporary_base = 3 * block_count;
+    for inner_block in 0..grid {
+        let left_exchange_phase = phases.len();
+        let mut left_transfers = Vec::with_capacity(block_count - usize::from(grid));
+        for block_row in 0..grid {
+            let source_index =
+                usize::from(block_row) * usize::from(grid) + usize::from(inner_block);
+            let source = left[source_index];
+            for block_column in 0..grid {
+                if block_column == inner_block {
+                    continue;
+                }
+                let destination_index =
+                    usize::from(block_row) * usize::from(grid) + usize::from(block_column);
+                let destination_tile = output[destination_index].tile;
+                left_transfers.push(Transfer {
+                    source_tile: source.tile,
+                    destination_tile,
+                    tensor: source.tensor,
+                    bytes: block_bytes,
+                });
+                allocations.push(Allocation {
+                    tensor: source.tensor,
+                    tile: destination_tile,
+                    address: exchange_address,
+                    size: block_bytes,
+                    live_from: left_exchange_phase,
+                    live_until: left_exchange_phase + 1,
+                    kind: AllocationKind::ExchangeStaging {
+                        phase: left_exchange_phase,
+                    },
+                });
+            }
+        }
+        phases.push(Phase::Exchange {
+            transfers: left_transfers,
+        });
+
+        let copy_phase = phases.len();
+        let mut copy_commands = Vec::with_capacity(block_count - usize::from(grid));
+        for block_row in 0..grid {
+            let left_tensor =
+                left[usize::from(block_row) * usize::from(grid) + usize::from(inner_block)].tensor;
+            for block_column in 0..grid {
+                if block_column == inner_block {
+                    continue;
+                }
+                let destination_index =
+                    usize::from(block_row) * usize::from(grid) + usize::from(block_column);
+                let temporary = TensorId(
+                    temporary_base + usize::from(inner_block) * block_count + destination_index,
+                );
+                allocations.push(Allocation {
+                    tensor: temporary,
+                    tile: output[destination_index].tile,
+                    address: local_left_addresses[destination_index],
+                    size: block_bytes,
+                    live_from: copy_phase,
+                    live_until: copy_phase + 2,
+                    kind: AllocationKind::Home,
+                });
+                copy_commands.push(KernelCommand {
+                    tile: output[destination_index].tile,
+                    output: temporary,
+                    inputs: vec![left_tensor, left_tensor],
+                    specialization: SpecializationKey {
+                        operation: "copy_4096_u32".into(),
+                        shape: vec![usize::from(config.block_dimension); 2],
+                        worker_count: 1,
+                        role: "left-block-staging".into(),
+                        alignment: 32,
+                    },
+                });
+            }
+        }
+        phases.push(Phase::Compute {
+            op: OpId(copy_phase),
+            commands: copy_commands,
+        });
+
+        let right_exchange_phase = phases.len();
+        let mut right_transfers = Vec::with_capacity(block_count - usize::from(grid));
+        for block_column in 0..grid {
+            let source_index =
+                usize::from(inner_block) * usize::from(grid) + usize::from(block_column);
+            let source = right[source_index];
+            for block_row in 0..grid {
+                if block_row == inner_block {
+                    continue;
+                }
+                let destination_index =
+                    usize::from(block_row) * usize::from(grid) + usize::from(block_column);
+                let destination_tile = output[destination_index].tile;
+                right_transfers.push(Transfer {
+                    source_tile: source.tile,
+                    destination_tile,
+                    tensor: source.tensor,
+                    bytes: block_bytes,
+                });
+                allocations.push(Allocation {
+                    tensor: source.tensor,
+                    tile: destination_tile,
+                    address: exchange_address,
+                    size: block_bytes,
+                    live_from: right_exchange_phase,
+                    live_until: right_exchange_phase + 1,
+                    kind: AllocationKind::ExchangeStaging {
+                        phase: right_exchange_phase,
+                    },
+                });
+            }
+        }
+        phases.push(Phase::Exchange {
+            transfers: right_transfers,
+        });
+
+        let gemm_phase = phases.len();
+        let mut gemm_commands = Vec::with_capacity(block_count);
+        for block_row in 0..grid {
+            for block_column in 0..grid {
+                let index = usize::from(block_row) * usize::from(grid) + usize::from(block_column);
+                let left_tensor = if block_column == inner_block {
+                    left[usize::from(block_row) * usize::from(grid) + usize::from(inner_block)]
+                        .tensor
+                } else {
+                    TensorId(temporary_base + usize::from(inner_block) * block_count + index)
+                };
+                let right_tensor = right
+                    [usize::from(inner_block) * usize::from(grid) + usize::from(block_column)]
+                .tensor;
+                gemm_commands.push(KernelCommand {
+                    tile: output[index].tile,
+                    output: output[index].tensor,
+                    inputs: vec![left_tensor, right_tensor],
+                    specialization: SpecializationKey {
+                        operation: if inner_block == 0 {
+                            "gemm_f32_64_init"
+                        } else {
+                            "gemm_f32_64_accumulate"
+                        }
+                        .into(),
+                        shape: vec![usize::from(config.block_dimension); 3],
+                        worker_count: 6,
+                        role: format!("inner-block-{inner_block}"),
+                        alignment: 32,
+                    },
+                });
+            }
+        }
+        phases.push(Phase::Compute {
+            op: OpId(gemm_phase),
+            commands: gemm_commands,
+        });
+    }
+
+    Ok(BlockedGemmPlan {
+        schedule: Schedule {
+            layouts: Vec::new(),
+            phases,
+            allocations,
+            tile_count: config.tile_count,
+            peak_sram: BTreeMap::new(),
+        },
+        left,
+        right,
+        output,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoweredExchangeGroup {
     pub source_tile: u16,
@@ -1517,6 +1801,47 @@ fn gelu(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn blocked_gemm_plan_preserves_block_ownership_and_phase_dependencies() {
+        let plan = plan_blocked_gemm(BlockedGemmConfig {
+            dimension: 128,
+            block_dimension: 64,
+            tile_count: 1472,
+            data_base: 0xa0000,
+            data_limit: 0xe8000,
+        })
+        .unwrap();
+
+        assert_eq!(plan.left.len(), plan.right.len());
+        assert_eq!(plan.right.len(), plan.output.len());
+        assert_eq!(
+            plan.output
+                .iter()
+                .map(|block| block.tile)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            plan.output.len()
+        );
+        assert!(plan.schedule.phases.chunks_exact(4).all(|round| {
+            matches!(round[0], Phase::Exchange { .. })
+                && matches!(round[1], Phase::Compute { .. })
+                && matches!(round[2], Phase::Exchange { .. })
+                && matches!(round[3], Phase::Compute { .. })
+        }));
+        assert!(plan.schedule.phases.iter().all(|phase| {
+            match phase {
+                Phase::Exchange { transfers } => transfers
+                    .iter()
+                    .all(|transfer| transfer.bytes <= ipu_exchange::MAX_TRANSFER_WORDS * 4),
+                Phase::Compute { commands, .. } => commands.iter().all(|command| {
+                    command.inputs.len() == 2
+                        && plan.output.iter().any(|block| block.tile == command.tile)
+                }),
+            }
+        }));
+    }
 
     fn exchange_schedule(transfers: Vec<Transfer>) -> Schedule {
         let mut allocations = Vec::new();
