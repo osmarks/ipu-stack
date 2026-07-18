@@ -514,12 +514,19 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
             "{block_bytes}-byte GEMM blocks exceed one exchange transfer"
         )));
     }
-    let data_constraint = MemoryConstraint {
-        base: config.data_base,
-        limit: config.data_limit,
-        alignment: 32,
-        placement: MemoryPlacement::Low,
-    };
+    let tile_data_end = config
+        .data_base
+        .checked_add(
+            block_bytes
+                .checked_mul(4)
+                .ok_or_else(|| CompileError::Memory("GEMM per-tile data size overflow".into()))?,
+        )
+        .ok_or_else(|| CompileError::Memory("GEMM per-tile data address overflow".into()))?;
+    if config.data_base & 31 != 0 || tile_data_end > config.data_limit {
+        return Err(CompileError::Memory(
+            "four GEMM blocks do not fit the aligned per-tile data range".into(),
+        ));
+    }
     let exchange_address =
         ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES - block_bytes;
     let mut allocations = Vec::with_capacity(block_count * (usize::from(grid) * 3 + 5));
@@ -533,20 +540,13 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
             let index = usize::from(block_row) * usize::from(grid) + usize::from(block_column);
             let tile = u16::try_from(index)
                 .map_err(|_| CompileError::Graph("GEMM tile index overflow".into()))?;
-            for (tensor_offset, placements) in [
-                (0, &mut left),
-                (block_count, &mut right),
-                (2 * block_count, &mut output),
+            for (slot, tensor_offset, placements) in [
+                (0, 0, &mut left),
+                (1, block_count, &mut right),
+                (2, 2 * block_count, &mut output),
             ] {
                 let tensor = TensorId(tensor_offset + index);
-                let address = find_free_region(
-                    &allocations,
-                    tile,
-                    block_bytes,
-                    0,
-                    usize::MAX,
-                    data_constraint,
-                )?;
+                let address = config.data_base + slot * block_bytes;
                 allocations.push(Allocation {
                     tensor,
                     tile,
@@ -564,14 +564,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     block_column,
                 });
             }
-            local_left_addresses[index] = find_free_region(
-                &allocations,
-                tile,
-                block_bytes,
-                0,
-                usize::MAX,
-                data_constraint,
-            )?;
+            local_left_addresses[index] = config.data_base + 3 * block_bytes;
         }
     }
 
@@ -836,6 +829,7 @@ impl Schedule {
                 "exchange topology has too few tiles".into(),
             ));
         }
+        let allocation_index = AllocationIndex::new(&self.allocations);
         #[derive(Clone)]
         struct PendingGroup {
             source: u16,
@@ -993,33 +987,28 @@ impl Schedule {
                         )));
                     }
                     let words = bytes / 4;
+                    let candidates = allocation_index.at(tensor, source);
                     let same_phase_staging = || {
-                        self.allocations.iter().find(|allocation| {
-                            allocation.tensor == tensor
-                                && allocation.tile == source
-                                && allocation.kind
-                                    == AllocationKind::ExchangeStaging { phase: phase_index }
+                        candidates.iter().copied().find(|allocation| {
+                            allocation.kind
+                                == AllocationKind::ExchangeStaging { phase: phase_index }
                         })
                     };
                     let earlier_staging = || {
-                        self.allocations.iter().find(|allocation| {
-                            allocation.tensor == tensor
-                                && allocation.tile == source
-                                && matches!(
-                                    allocation.kind,
-                                    AllocationKind::ExchangeStaging { phase }
-                                        if phase < phase_index
-                                )
-                                && allocation.live_from <= phase_index
+                        candidates.iter().copied().find(|allocation| {
+                            matches!(
+                                allocation.kind,
+                                AllocationKind::ExchangeStaging { phase }
+                                    if phase < phase_index
+                            ) && allocation.live_from <= phase_index
                                 && allocation.live_until > phase_index
                         })
                     };
                     let home = || {
-                        self.allocations.iter().find(|allocation| {
-                            allocation.tensor == tensor
-                                && allocation.tile == source
-                                && allocation.kind == AllocationKind::Home
-                        })
+                        candidates
+                            .iter()
+                            .copied()
+                            .find(|allocation| allocation.kind == AllocationKind::Home)
                     };
                     let source_address = if available_before_phase.contains(&(tensor, source)) {
                         earlier_staging().or_else(home).or_else(same_phase_staging)
@@ -1036,15 +1025,13 @@ impl Schedule {
                     let destination_addresses = destinations
                         .iter()
                         .map(|destination| {
-                            self.allocations
+                            allocation_index
+                                .at(tensor, *destination)
                                 .iter()
+                                .copied()
                                 .find(|allocation| {
-                                    allocation.tensor == tensor
-                                        && allocation.tile == *destination
-                                        && allocation.kind
-                                            == AllocationKind::ExchangeStaging {
-                                                phase: phase_index,
-                                            }
+                                    allocation.kind
+                                        == AllocationKind::ExchangeStaging { phase: phase_index }
                                 })
                                 .map(|allocation| allocation.address)
                                 .ok_or_else(|| {
@@ -1158,6 +1145,7 @@ impl Schedule {
             .iter()
             .map(|exchange| (exchange.phase, exchange))
             .collect();
+        let allocation_index = AllocationIndex::new(&self.allocations);
         let mut programs = Vec::with_capacity(usize::from(self.tile_count));
         for tile in 0..self.tile_count {
             let mut steps = Vec::new();
@@ -1181,11 +1169,18 @@ impl Schedule {
                         let mut active = false;
                         for command in commands.iter().filter(|command| command.tile == tile) {
                             active = true;
-                            let output_address = self.home_address(command.output, tile)?;
+                            let output_address =
+                                allocation_index.home_address(command.output, tile)?;
                             let input_addresses = command
                                 .inputs
                                 .iter()
-                                .map(|input| self.compute_input_address(*input, tile, phase_index))
+                                .map(|input| {
+                                    allocation_index.compute_input_address(
+                                        *input,
+                                        tile,
+                                        phase_index,
+                                    )
+                                })
                                 .collect::<Result<_, _>>()?;
                             steps.push(LoweredTileStep::Compute(LoweredComputeCommand {
                                 op: *op,
@@ -1209,15 +1204,36 @@ impl Schedule {
         info!(tiles = programs.len(), "lowered per-tile programs");
         Ok(programs)
     }
+}
+
+struct AllocationIndex<'a> {
+    by_location: HashMap<(TensorId, u16), Vec<&'a Allocation>>,
+}
+
+impl<'a> AllocationIndex<'a> {
+    fn new(allocations: &'a [Allocation]) -> Self {
+        let mut by_location = HashMap::<_, Vec<_>>::new();
+        for allocation in allocations {
+            by_location
+                .entry((allocation.tensor, allocation.tile))
+                .or_default()
+                .push(allocation);
+        }
+        Self { by_location }
+    }
+
+    fn at(&self, tensor: TensorId, tile: u16) -> &[&'a Allocation] {
+        self.by_location
+            .get(&(tensor, tile))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
 
     fn home_address(&self, tensor: TensorId, tile: u16) -> Result<u32, CompileError> {
-        self.allocations
+        self.at(tensor, tile)
             .iter()
-            .find(|allocation| {
-                allocation.tensor == tensor
-                    && allocation.tile == tile
-                    && allocation.kind == AllocationKind::Home
-            })
+            .copied()
+            .find(|allocation| allocation.kind == AllocationKind::Home)
             .map(|allocation| allocation.address)
             .ok_or_else(|| {
                 CompileError::Memory(format!(
@@ -1233,10 +1249,8 @@ impl Schedule {
         tile: u16,
         compute_phase: usize,
     ) -> Result<u32, CompileError> {
-        if let Some(staging) = self.allocations.iter().find(|allocation| {
-            allocation.tensor == tensor
-                && allocation.tile == tile
-                && allocation.live_until == compute_phase
+        if let Some(staging) = self.at(tensor, tile).iter().copied().find(|allocation| {
+            allocation.live_until == compute_phase
                 && matches!(allocation.kind, AllocationKind::ExchangeStaging { .. })
         }) {
             return Ok(staging.address);
