@@ -247,7 +247,7 @@ fn inspect_output(
     let mismatch = find_mismatch(dimension, actual);
     let mismatch_block =
         mismatch.map(|item| (item.row / BLOCK_DIMENSION, item.column / BLOCK_DIMENSION));
-    let comparison = if let Some((block_row, block_column)) = requested_block.or(mismatch_block) {
+    let comparison = if let Some((block_row, block_column)) = mismatch_block.or(requested_block) {
         Some(compare_sram_block(
             device,
             dimension,
