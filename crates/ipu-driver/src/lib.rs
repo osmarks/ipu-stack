@@ -434,6 +434,41 @@ impl Device {
         self.read_tile_word_from_context(physical_tile, context, address, true)
     }
 
+    pub fn read_tile_words_from_inactive_context(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        address: u32,
+        words: u32,
+    ) -> Result<Vec<u32>, DriverError> {
+        if context == 0 {
+            return Err(DriverError::Invalid(
+                "inactive SRAM diagnostic requires a worker context".into(),
+            ));
+        }
+        let bytes = words
+            .checked_mul(4)
+            .ok_or_else(|| DriverError::Invalid("tile diagnostic size overflow".into()))?;
+        let end = address
+            .checked_add(bytes)
+            .ok_or_else(|| DriverError::Invalid("tile diagnostic range overflow".into()))?;
+        if address & 3 != 0
+            || address < TILE_MEMORY_BASE
+            || end > TILE_MEMORY_BASE + TILE_MEMORY_SIZE as u32
+        {
+            return Err(DriverError::Invalid(format!(
+                "invalid tile memory range 0x{address:x}..0x{end:x}"
+            )));
+        }
+        self.with_tile_context(physical_tile, context, true, || {
+            (0..words)
+                .map(|index| {
+                    self.read_tile_word_in_context(physical_tile, context, address + index * 4)
+                })
+                .collect()
+        })
+    }
+
     fn read_tile_word_from_context(
         &self,
         physical_tile: u16,
@@ -450,16 +485,25 @@ impl Device {
             )));
         }
         self.with_tile_context(physical_tile, context, inactive_is_quiescent, || {
-            self.write_tile_debug(physical_tile, TDI_DATA, address)?;
-            for instruction in [
-                tdi_instruction::GET_M1_DEBUG_DATA,
-                tdi_instruction::LOAD_M0_FROM_M1,
-                tdi_instruction::PUT_DEBUG_DATA_M0,
-            ] {
-                self.execute_tile_instruction(physical_tile, context, instruction)?;
-            }
-            self.read_tile_debug(physical_tile, TDI_DATA)
+            self.read_tile_word_in_context(physical_tile, context, address)
         })
+    }
+
+    fn read_tile_word_in_context(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        address: u32,
+    ) -> Result<u32, DriverError> {
+        self.write_tile_debug(physical_tile, TDI_DATA, address)?;
+        for instruction in [
+            tdi_instruction::GET_M1_DEBUG_DATA,
+            tdi_instruction::LOAD_M0_FROM_M1,
+            tdi_instruction::PUT_DEBUG_DATA_M0,
+        ] {
+            self.execute_tile_instruction(physical_tile, context, instruction)?;
+        }
+        self.read_tile_debug(physical_tile, TDI_DATA)
     }
 
     pub fn read_tile_program_counter(

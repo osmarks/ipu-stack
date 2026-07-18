@@ -249,7 +249,8 @@ fn blocked_gemm_with_cycle_profile_works() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ipu-gemm-e2e"));
     command
         .env("IPU_GEMM_DIMENSION", "128")
-        .env("IPU_PROFILE_OUTPUT", &path);
+        .env("IPU_PROFILE_OUTPUT", &path)
+        .env("IPU_GEMM_SRAM_CHECK_BLOCK", "1,1");
     configure_host_write_jitter(&mut command);
     let status = command
         .status()

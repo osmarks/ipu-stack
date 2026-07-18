@@ -2,7 +2,7 @@ use ipu_compiler::{BlockedGemmConfig, BlockedGemmPlan, plan_blocked_gemm};
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    ExecutableGraph, HostRunOptions, package_graph, package_graph_profiled, run_host_with_options,
+    ExecutableGraph, HostRunOptions, package_graph, package_graph_profiled, run_host_with_inspector,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -54,6 +54,7 @@ fn main() {
         data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
     })
     .unwrap();
+    let output_placements = plan.output.clone();
     let (graph, input) = gemm_graph_and_input(dimension, plan);
     let objects = [
         fs::read(runtime.object).unwrap(),
@@ -91,17 +92,25 @@ fn main() {
     }
 
     let run_start = Instant::now();
-    let actual = run_host_with_options(
+    let diagnostic_block = diagnostic_block(dimension);
+    let actual = run_host_with_inspector(
         &app,
         &bootloader,
         &configuration,
         &device,
         &input,
         HostRunOptions::from_environment().unwrap(),
+        |device, output| {
+            inspect_output(
+                device,
+                dimension,
+                output,
+                &output_placements,
+                diagnostic_block,
+            )
+        },
     )
     .unwrap();
-    let matrix_bytes = usize::from(dimension) * usize::from(dimension) * 4;
-    verify_output(dimension, &actual[..matrix_bytes]);
     if let (Some(path), Some(layout)) = (profile_output, profile_layout) {
         let clock_hz = std::env::var("IPU_CLOCK_HZ")
             .map(|value| value.parse().expect("IPU_CLOCK_HZ must be an integer"))
@@ -187,9 +196,63 @@ fn blocked_matrix(dimension: u16, value: impl Fn(u16, u16) -> f32) -> Vec<u8> {
     bytes
 }
 
-fn verify_output(dimension: u16, actual: &[u8]) {
+#[derive(Clone, Copy)]
+struct GemmMismatch {
+    row: u16,
+    column: u16,
+    actual: u32,
+    expected: u32,
+}
+
+struct BlockComparison {
+    transport_differences: usize,
+    sram_expected_differences: usize,
+}
+
+fn inspect_output(
+    device: &ipu_driver::Device,
+    dimension: u16,
+    actual: &[u8],
+    placements: &[ipu_compiler::BlockPlacement],
+    requested_block: Option<(u16, u16)>,
+) -> ipu_runtime::Result<()> {
     let expected_bytes = usize::from(dimension) * usize::from(dimension) * 4;
-    assert_eq!(actual.len(), expected_bytes, "GEMM output byte count");
+    let actual = actual
+        .get(..expected_bytes)
+        .ok_or("GEMM output is shorter than the matrix")?;
+    let mismatch = find_mismatch(dimension, actual);
+    let mismatch_block =
+        mismatch.map(|item| (item.row / BLOCK_DIMENSION, item.column / BLOCK_DIMENSION));
+    let comparison = if let Some((block_row, block_column)) = requested_block.or(mismatch_block) {
+        Some(compare_sram_block(
+            device,
+            dimension,
+            actual,
+            placements,
+            block_row,
+            block_column,
+            mismatch,
+        )?)
+    } else {
+        None
+    };
+    if let Some(mismatch) = mismatch {
+        let comparison = comparison.expect("a mismatched output always selects its SRAM block");
+        return Err(format!(
+            "GEMM mismatch at [{}, {}]: D2H={:#010x} expected={:#010x}; block SRAM-vs-D2H differences={}, SRAM-vs-expected differences={}",
+            mismatch.row,
+            mismatch.column,
+            mismatch.actual,
+            mismatch.expected,
+            comparison.transport_differences,
+            comparison.sram_expected_differences
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn find_mismatch(dimension: u16, actual: &[u8]) -> Option<GemmMismatch> {
     let grid = dimension / BLOCK_DIMENSION;
     let expected = (0..7)
         .map(|row| {
@@ -209,16 +272,103 @@ fn verify_output(dimension: u16, actual: &[u8]) {
                         f32::from_le_bytes(actual[offset..offset + 4].try_into().unwrap());
                     let expected =
                         expected[usize::from(global_row % 7)][usize::from(global_column % 5)];
-                    assert_eq!(
-                        actual_value.to_bits(),
-                        expected.to_bits(),
-                        "GEMM mismatch at [{global_row}, {global_column}]"
-                    );
+                    if actual_value.to_bits() != expected.to_bits() {
+                        return Some(GemmMismatch {
+                            row: global_row,
+                            column: global_column,
+                            actual: actual_value.to_bits(),
+                            expected: expected.to_bits(),
+                        });
+                    }
                     offset += 4;
                 }
             }
         }
     }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_sram_block(
+    device: &ipu_driver::Device,
+    dimension: u16,
+    d2h: &[u8],
+    placements: &[ipu_compiler::BlockPlacement],
+    block_row: u16,
+    block_column: u16,
+    mismatch: Option<GemmMismatch>,
+) -> ipu_runtime::Result<BlockComparison> {
+    let grid = dimension / BLOCK_DIMENSION;
+    let block_index = usize::from(block_row) * usize::from(grid) + usize::from(block_column);
+    let placement = placements
+        .get(block_index)
+        .ok_or("diagnostic GEMM block is outside the placement table")?;
+    let physical_tile = ipu_exchange::Topology::c600().physical(placement.tile)?;
+    let block_words = u32::from(BLOCK_DIMENSION) * u32::from(BLOCK_DIMENSION);
+    let sram = device.read_tile_words_from_inactive_context(
+        physical_tile,
+        1,
+        placement.address,
+        block_words,
+    )?;
+    let block_bytes = usize::try_from(block_words)? * 4;
+    let d2h = &d2h[block_index * block_bytes..(block_index + 1) * block_bytes];
+    let mut transport_differences = 0usize;
+    let mut sram_expected_differences = 0usize;
+    let mut first_transport_difference = None;
+    for (index, &sram_word) in sram.iter().enumerate() {
+        let d2h_word = u32::from_le_bytes(d2h[index * 4..index * 4 + 4].try_into().unwrap());
+        if d2h_word != sram_word {
+            transport_differences += 1;
+            first_transport_difference.get_or_insert((index, d2h_word, sram_word));
+        }
+        let block_dimension = usize::from(BLOCK_DIMENSION);
+        let row = block_row * BLOCK_DIMENSION + u16::try_from(index / block_dimension)?;
+        let column = block_column * BLOCK_DIMENSION + u16::try_from(index % block_dimension)?;
+        if sram_word != expected_value(dimension, row, column).to_bits() {
+            sram_expected_differences += 1;
+        }
+    }
+    info!(
+        block_row,
+        block_column,
+        logical_tile = placement.tile,
+        physical_tile,
+        address = format_args!("0x{:x}", placement.address),
+        transport_differences,
+        sram_expected_differences,
+        "compared GEMM output block in SRAM with D2H"
+    );
+    if mismatch.is_none() && transport_differences != 0 {
+        return Err(format!(
+            "D2H differs from SRAM in {transport_differences} words of block ({block_row}, {block_column}); first difference {first_transport_difference:?}"
+        )
+        .into());
+    }
+    Ok(BlockComparison {
+        transport_differences,
+        sram_expected_differences,
+    })
+}
+
+fn diagnostic_block(dimension: u16) -> Option<(u16, u16)> {
+    let value = std::env::var("IPU_GEMM_SRAM_CHECK_BLOCK").ok()?;
+    let (row, column) = value
+        .split_once(',')
+        .expect("IPU_GEMM_SRAM_CHECK_BLOCK must be ROW,COLUMN");
+    let block = (
+        row.parse::<u16>()
+            .expect("diagnostic block row must be a u16"),
+        column
+            .parse::<u16>()
+            .expect("diagnostic block column must be a u16"),
+    );
+    let grid = dimension / BLOCK_DIMENSION;
+    assert!(
+        block.0 < grid && block.1 < grid,
+        "diagnostic block is outside the GEMM grid"
+    );
+    Some(block)
 }
 
 fn left_value(row: u16, inner: u16) -> f32 {

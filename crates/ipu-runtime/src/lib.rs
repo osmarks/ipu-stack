@@ -287,6 +287,8 @@ pub struct HostWriteJitter {
     pub max_delay: Duration,
 }
 
+type HostInspector<'a> = dyn FnMut(&Device, &[u8]) -> Result<()> + 'a;
+
 impl HostRunOptions {
     pub fn from_environment() -> Result<Self> {
         let Some(max_delay) = optional_environment_number("IPU_HOST_WRITE_JITTER_MAX_US")? else {
@@ -1277,6 +1279,46 @@ pub fn run_host_with_options(
     input: &[u8],
     options: HostRunOptions,
 ) -> Result<Vec<u8>> {
+    run_host_impl(
+        app,
+        bootloader,
+        configuration,
+        device_path,
+        input,
+        options,
+        None,
+    )
+}
+
+pub fn run_host_with_inspector(
+    app: &Application,
+    bootloader: &[u8],
+    configuration: &[u8],
+    device_path: &str,
+    input: &[u8],
+    options: HostRunOptions,
+    mut inspector: impl FnMut(&Device, &[u8]) -> Result<()>,
+) -> Result<Vec<u8>> {
+    run_host_impl(
+        app,
+        bootloader,
+        configuration,
+        device_path,
+        input,
+        options,
+        Some(&mut inspector),
+    )
+}
+
+fn run_host_impl(
+    app: &Application,
+    bootloader: &[u8],
+    configuration: &[u8],
+    device_path: &str,
+    input: &[u8],
+    options: HostRunOptions,
+    inspector: Option<&mut HostInspector<'_>>,
+) -> Result<Vec<u8>> {
     if app.host_exchange.calls.is_empty() {
         return Err("application has no generated host graph call".into());
     }
@@ -1336,6 +1378,10 @@ pub fn run_host_with_options(
     verify_runtime_completion(&device, app)?;
     debug!(states = %supervisor_state_summary(&device, app), "host exchange supervisor states");
     debug!(sources = %host_source_summary(&device, app), "host exchange device sources");
+    drop(session);
+    if let Some(inspector) = inspector {
+        inspector(&device, &output)?;
+    }
     Ok(output)
 }
 

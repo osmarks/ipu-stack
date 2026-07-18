@@ -165,6 +165,11 @@ IPU_GEMM_DIMENSION=128 \
 IPU_PROFILE_OUTPUT=/tmp/gemm-profile.capnp \
   cargo run -p ipu-runtime --bin ipu-gemm-e2e
 capnp decode schemas/profile.capnp Profile </tmp/gemm-profile.capnp
+
+# Compare one completed output block directly in tile SRAM against D2H.
+IPU_GEMM_LOAD_PACKAGE=/tmp/gemm.ipuexe \
+IPU_GEMM_SRAM_CHECK_BLOCK=15,24 \
+  cargo run -p ipu-runtime --bin ipu-gemm-e2e
 ```
 
 Profiling is optional and absent from an ordinary package. A profiled package
@@ -176,3 +181,9 @@ perturbs short steps; the records are intended for graph-level attribution,
 not instruction-level benchmarking. The hardware acceptance suite runs a
 profiled 128 GEMM, parses records for all 1,472 tiles, and requires exchange and
 compute samples.
+
+The GEMM verifier runs while the application remains loaded. On any mismatch it
+bulk-reads the owning tile's complete 64x64 C block through an inactive worker
+context and reports both SRAM-versus-D2H and SRAM-versus-expected difference
+counts. `IPU_GEMM_SRAM_CHECK_BLOCK=ROW,COLUMN` forces that comparison on a
+passing run.
