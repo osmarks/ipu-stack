@@ -341,11 +341,33 @@ impl Device {
         if bytes.len() != 12 + count * 8 {
             return Err(DriverError::Invalid("bad configuration image size".into()));
         }
+        let mut skipped_host_sync_writes = 0usize;
         for index in 0..count {
-            self.write_config(
-                read_u32(bytes, 12 + index * 8)?,
-                read_u32(bytes, 16 + index * 8)?,
-            )?;
+            let offset = read_u32(bytes, 12 + index * 8)?;
+            let value = read_u32(bytes, 16 + index * 8)?;
+            if matches!(offset, pci::HSP_GS1_CONTROL | pci::HSP_GS2_CONTROL) {
+                skipped_host_sync_writes += 1;
+            } else {
+                self.write_config(offset, value)?;
+            }
+        }
+        self.clear_host_sync_marks()?;
+        debug!(
+            skipped_host_sync_writes,
+            "discarded captured HSP protocol writes"
+        );
+        Ok(())
+    }
+
+    fn clear_host_sync_marks(&self) -> Result<(), DriverError> {
+        for register in [pci::HSP_GS1_CONTROL, pci::HSP_GS2_CONTROL] {
+            self.write_config(register, 0)?;
+            let observed = self.read_config(register)? & HSP_MARK_MASK;
+            if observed != 0 {
+                return Err(DriverError::Invalid(format!(
+                    "HSP register 0x{register:x} did not clear: observed {observed}"
+                )));
+            }
         }
         Ok(())
     }
