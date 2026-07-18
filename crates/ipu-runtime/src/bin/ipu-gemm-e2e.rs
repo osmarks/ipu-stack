@@ -131,8 +131,32 @@ fn main() {
                 .map(|value| value.parse().expect("IPU_CLOCK_HZ must be an integer"))
                 .unwrap_or(1_500_000_000);
             let report = layout.decode(&actual, clock_hz).unwrap();
+            let graph_cycles = report
+                .tiles
+                .iter()
+                .filter_map(|tile| {
+                    Some(
+                        tile.samples
+                            .last()?
+                            .end_cycle
+                            .wrapping_sub(tile.samples.first()?.start_cycle),
+                    )
+                })
+                .max()
+                .unwrap_or(0);
+            let graph_seconds = f64::from(graph_cycles) / clock_hz as f64;
+            let floating_point_operations = 2.0 * f64::from(dimension).powi(3);
+            let tflops = (graph_seconds != 0.0)
+                .then_some(floating_point_operations / graph_seconds / 1.0e12);
             report.write(fs::File::create(path).unwrap()).unwrap();
-            info!(path = %path.display(), tiles = report.tiles.len(), "wrote cycle profile");
+            info!(
+                path = %path.display(),
+                tiles = report.tiles.len(),
+                graph_cycles,
+                graph_ms = graph_seconds * 1.0e3,
+                tflops,
+                "wrote cycle profile"
+            );
         }
         info!(
             dimension,
@@ -157,8 +181,12 @@ fn gemm_graph_and_input(dimension: u16, plan: BlockedGemmPlan) -> (ExecutableGra
     let left_binding = block_binding("left", dimension, block_bytes, &plan.left);
     let right_binding = block_binding("right", dimension, block_bytes, &plan.right);
     let output_binding = block_binding("output", dimension, block_bytes, &plan.output);
-    let mut input = blocked_matrix(dimension, left_value);
-    input.extend(blocked_matrix(dimension, right_value));
+    let mut input = blocked_matrix(dimension, BlockLayout::RowMajor, left_value);
+    input.extend(blocked_matrix(
+        dimension,
+        BlockLayout::ColumnMajor,
+        right_value,
+    ));
     (
         ExecutableGraph {
             schedule: plan.schedule,
@@ -195,13 +223,23 @@ fn block_binding(
     }
 }
 
-fn blocked_matrix(dimension: u16, value: impl Fn(u16, u16) -> f32) -> Vec<u8> {
+#[derive(Clone, Copy)]
+enum BlockLayout {
+    RowMajor,
+    ColumnMajor,
+}
+
+fn blocked_matrix(dimension: u16, layout: BlockLayout, value: impl Fn(u16, u16) -> f32) -> Vec<u8> {
     let grid = dimension / BLOCK_DIMENSION;
     let mut bytes = Vec::with_capacity(usize::from(dimension) * usize::from(dimension) * 4);
     for block_row in 0..grid {
         for block_column in 0..grid {
-            for row in 0..BLOCK_DIMENSION {
-                for column in 0..BLOCK_DIMENSION {
+            for major in 0..BLOCK_DIMENSION {
+                for minor in 0..BLOCK_DIMENSION {
+                    let (row, column) = match layout {
+                        BlockLayout::RowMajor => (major, minor),
+                        BlockLayout::ColumnMajor => (minor, major),
+                    };
                     bytes.extend_from_slice(
                         &value(
                             block_row * BLOCK_DIMENSION + row,
