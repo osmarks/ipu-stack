@@ -43,3 +43,27 @@ compile-time model. `device/graph_runtime.S` and the role-based command table ar
 legacy bring-up machinery and must not be extended. They remain only until the
 static tile emitter covers synchronization, exchange, compute, completion, and
 host actions and passes the existing hardware gates.
+
+## Static-lowering hardware evidence
+
+A discarded static-emitter prototype established two useful boundaries on the
+C600. It consumed `LoweredTileProgram` directly, emitted distinct straight-line
+programs, and branched to per-tile executable exchange rows without a command
+table. A 64-word transfer from logical tile 1 to logical tile 274 returned the
+exact randomized payload. This verifies the direct plan call, absolute SRAM
+address patches, per-tile image selection, and diagnostic readback independently
+of the runtime dispatcher.
+
+The same program exposed an unresolved global-synchronization transition. When
+physical tile 0 generated the GSP packet and then entered a payload or inactive
+exchange row, it remained in exchange wait. Removing the row's duplicate leading
+`sync 3` allowed completion, but an active receiver consumed the one-word GSP
+release token (`[1, 0, ...]`) instead of the payload. Delays, an unarmed `sync 0`,
+`DCOUNT=2`, moving plan code, and naively shifting the GSP hierarchy root did not
+fix this and were removed. A second direct GSP barrier also stalled; the legacy
+runtime only performs its GSP pre-sync once.
+
+The next static implementation therefore needs an explicit, hardware-verified
+GSP-to-exchange phase transition and a reusable device barrier. It must not hide
+the issue by reserving physical tile 0, choosing a completion tile that ignores a
+waiting origin, serializing through the host, or restoring runtime roles.
