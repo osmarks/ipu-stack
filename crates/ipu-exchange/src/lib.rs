@@ -30,6 +30,9 @@ const PUT_SPECIAL_FROM_M8_OPCODE: u32 = 0x4380_8000;
 const INCOMING_MUX_REGISTER: u8 = 0xa0;
 const INCOMING_DCOUNT_REGISTER: u8 = 0xa6;
 const TILE_TO_HOST_CLOSE_DELAY_CYCLES: u32 = 1;
+// Time reserved by the SDK supervisor schedule between receiving a host
+// command and injecting that command into the device-side dispatch path.
+const HOST_COMMAND_ROUTE_CYCLES: u32 = 73;
 
 pub const SANS_INACTIVE_INSTRUCTION: u32 = sans(0);
 pub const SYNC_RECEIVE_INSTRUCTION: u32 = sync(0);
@@ -292,6 +295,11 @@ pub fn assemble_host_command_read_program(
         SYNC_RECEIVE_INSTRUCTION,
     ];
     append_local_host_completion(&mut instructions);
+    instructions.extend([
+        SYNC_SUPERVISOR_INSTRUCTION,
+        delay(HOST_COMMAND_ROUTE_CYCLES - 1),
+        encode_send(0, 3, destination_address >> 2)?,
+    ]);
     instructions.push(RETURN_M10_INSTRUCTION);
     Ok(TileToHostProgram {
         instructions,
@@ -592,7 +600,7 @@ pub fn assemble_tile_to_host_source_program(
     let close = zero_byte_read_packet(physical_tile, command_address)?;
     packet_words.extend([close.word0, close.word1]);
     if physical_tile == 0 {
-        packet_words.extend([2, 0]);
+        packet_words.extend([1, 0]);
     }
     Ok(TileToHostProgram {
         instructions: tile_to_host_source_instructions(
@@ -658,11 +666,6 @@ fn tile_to_host_source_instructions(
 fn append_local_host_completion(instructions: &mut Vec<u32>) {
     instructions.extend([
         SYNC_ALL_INSTRUCTION,
-        setzi_m(8, TILE_MUX_EXCHANGE),
-        put_special_from_m8(INCOMING_MUX_REGISTER),
-        setzi_m(8, TILE_MUX_HOST),
-        put_special_from_m8(INCOMING_MUX_REGISTER),
-        SYNC_HOST_INSTRUCTION,
         setzi_m(8, TILE_MUX_EXCHANGE),
         put_special_from_m8(INCOMING_MUX_REGISTER),
     ]);
@@ -1490,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_multi_packet_host_to_tile_between_two_host_handoffs() {
+    fn groups_multi_packet_host_to_tile_under_one_host_handoff() {
         let chunks = plan_host_to_tile(63, 0x50000, 0x40, 4096).unwrap();
         let plan = assemble_host_to_tile_program(63, 0x50000, 0x40, 4096, 0x54000).unwrap();
         assert_eq!(
@@ -1498,7 +1501,7 @@ mod tests {
                 .iter()
                 .filter(|instruction| **instruction == SYNC_HOST_INSTRUCTION)
                 .count(),
-            2
+            1
         );
         assert!(plan.instructions.contains(&SYNC_ALL_INSTRUCTION));
         assert_eq!(
@@ -1524,9 +1527,11 @@ mod tests {
                 .iter()
                 .filter(|instruction| **instruction == SYNC_HOST_INSTRUCTION)
                 .count(),
-            2
+            1
         );
         assert!(plan.instructions.contains(&SYNC_ALL_INSTRUCTION));
+        let command_send = plan.instructions[plan.instructions.len() - 2];
+        assert_eq!(send_address(command_send), 0x50180);
     }
 
     fn host_packet_words(header: HostPacketHeader) -> [u32; 2] {

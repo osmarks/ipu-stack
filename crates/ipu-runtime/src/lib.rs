@@ -697,7 +697,7 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
     let host_phases = inputs
         .len()
         .checked_add(outputs.len())
-        .and_then(|transfers| transfers.checked_mul(2))
+        .and_then(|commands| commands.checked_add(1))
         .ok_or("host phase count overflow")?;
     Ok(HostLayout {
         inputs,
@@ -1384,7 +1384,7 @@ mod tests {
         }));
         assert_eq!(
             call.phases,
-            u32::try_from((layout.inputs.len() + layout.outputs.len()) * 2).unwrap()
+            u32::try_from(layout.inputs.len() + layout.outputs.len() + 1).unwrap()
         );
         let output = layout
             .outputs

@@ -149,13 +149,19 @@ production host-completion protocol; that still depends on completing native
 host exchange.
 
 Native host-output lowering is partially recovered. Rust independently emits
-the short and long host packet headers, arbitrary-range chunk plans, the tile-0
-`[1, 0]` command-read XREQ, the `[2, 0]` D2H XREQ, and the source command,
-payload, and zero-byte-close sequence. Disassembly of the SDK fixture shows
-that D2H is a two-role operation. Tile 0 preissues `[2, 0]` after `sync 3` and
-the 73-cycle route envelope. During the host command it executes `sync 15`,
-sends a two-word zero command packet, then restores exchange muxing after
-`sync 7`. A remote source waits on `sans 1; sync 1`, selects
+the short and long host packet headers, arbitrary-range chunk plans, and the
+source command, payload, and zero-byte-close sequence. Local physical-tile-0
+D2H uses an inline `[1, 0]` XREQ. An automated hardware test initializes 64
+bytes in tile-0 SRAM, poisons the attached host page, executes the generated
+control-read and D2H programs, and verifies exact output equality. Its host
+phase count is derived from the two generated commands plus the final runtime
+completion transition.
+
+Remote D2H is a distinct two-role operation and remains unresolved. Tile 0
+preissues `[2, 0]` after `sync 3` and the 73-cycle route envelope. During the
+host command it executes `sync 15`, sends a two-word zero command packet, then
+restores exchange muxing after `sync 7`. A remote source waits on
+`sans 1; sync 1`, selects
 `0x600 + (physicalTile & ~2)`, and executes `DCOUNT=1`, header send, payload
 send, encoded one-cycle delay, zero-byte close, `sync 0`, and `sync 7`.
 Nonparticipants remain in `sans 255; sync 1`. A command-page H2D read precedes
@@ -174,7 +180,7 @@ Reproducing all visible roles above for the SDK fixture's exact physical tile
 page. A post-payload host rendezvous also left the page untouched. This rules
 out a mere readback race and leaves an unmodeled host-exchange state transition
 or command-packet field. Hardware acceptance deliberately remains red for
-every D2H-dependent capability.
+remote D2H and for H2D followed by D2H in one generated graph call.
 
 TDI reports both inactive and WAEX as context state zero. Architectural
 exceptions are only classified when exception metadata is nonzero; attempting

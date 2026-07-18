@@ -141,13 +141,9 @@ ipu_stack_command_table_address:
 .Lhost_idle:
 	.long OPCODE_SANS | SANS_HOST_FOLLOWER
 	.long OPCODE_SYNC | SYNC_EXTERNAL
-	.long OPCODE_SANS | SANS_HOST_FOLLOWER
-	.long OPCODE_SYNC | SYNC_EXTERNAL
 	bri .Lhost_launch_complete
 
 .Lhost_idle_unbarriered:
-	.long OPCODE_SANS | SANS_HOST_FOLLOWER
-	.long OPCODE_SYNC | SYNC_EXTERNAL
 	.long OPCODE_SANS | SANS_HOST_FOLLOWER
 	.long OPCODE_SYNC | SYNC_EXTERNAL
 	bri .Lhost_launch_complete_unbarriered
@@ -177,7 +173,6 @@ ipu_stack_command_table_address:
 .Lhost_launch_complete:
 	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
-	call $m7, ipu_stack_device_sync_dispatch
 	bri .Lcommand_loop
 
 .Lhost_launch_complete_unbarriered:
