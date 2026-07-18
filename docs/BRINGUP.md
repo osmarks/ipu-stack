@@ -153,9 +153,18 @@ the short and long host packet headers, arbitrary-range chunk plans, and the
 source command, payload, and zero-byte-close sequence. Local physical-tile-0
 D2H uses an inline `[1, 0]` XREQ. An automated hardware test initializes 64
 bytes in tile-0 SRAM, poisons the attached host page, executes the generated
-control-read and D2H programs, and verifies exact output equality. Its host
-phase count is derived from the two generated commands plus the final runtime
-completion transition.
+control-read and D2H programs, verifies exact output equality, releases the
+terminal receive, and checks the runtime completion store. A second hardware
+test uploads a random 64-byte payload and reads it back exactly. Host transfers
+are separate calls with recovered write selector 2 and read selector 1; each
+has its own control read. Nonterminal calls wait for the following command
+rendezvous. The terminal call instead issues its last GS2 release without
+waiting for a rendezvous from an application that has already completed.
+
+Multi-packet H2D is not working yet. A 2048-byte H2D stalls while processing
+the second planned packet even when the host phase count is derived from the
+number of generated receive completions. Remote 64-byte H2D also stalls. The
+large H2D/D2D/D2H and remote host-transfer hardware tests remain red.
 
 Remote D2H is a distinct two-role operation and remains unresolved. Tile 0
 preissues `[2, 0]` after `sync 3` and the 73-cycle route envelope. During the
@@ -180,7 +189,8 @@ Reproducing all visible roles above for the SDK fixture's exact physical tile
 page. A post-payload host rendezvous also left the page untouched. This rules
 out a mere readback race and leaves an unmodeled host-exchange state transition
 or command-packet field. Hardware acceptance deliberately remains red for
-remote D2H and for H2D followed by D2H in one generated graph call.
+remote D2H. Local single-packet H2D followed by D2H now passes as two generated
+host calls and reaches the runtime completion marker.
 
 TDI reports both inactive and WAEX as context state zero. Architectural
 exceptions are only classified when exception metadata is nonzero; attempting
