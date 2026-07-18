@@ -36,7 +36,7 @@ fn main() {
     .unwrap();
     let device = std::env::var("IPU_DEVICE").unwrap_or_else(|_| "/dev/ipu0".into());
     let output = std::env::temp_dir().join(format!("ipu-stack-e2e-{}", std::process::id()));
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/graph_runtime.S");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/static_runtime.S");
     let toolchain = Toolchain::from_sdk(sdk);
     let artifact = toolchain
         .compile(&source, &output, "exchange-e2e", &[])

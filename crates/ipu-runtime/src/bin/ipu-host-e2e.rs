@@ -26,7 +26,7 @@ fn main() {
     .unwrap();
     let device = std::env::var("IPU_DEVICE").unwrap_or_else(|_| "/dev/ipu0".into());
     let output = std::env::temp_dir().join(format!("ipu-stack-host-e2e-{}", std::process::id()));
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/graph_runtime.S");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/static_runtime.S");
     let mut compile_flags = Vec::new();
     for (environment, define) in [
         ("IPU_STACK_TRACE_MILESTONES", "IPU_STACK_TRACE_MILESTONES"),

@@ -30,7 +30,7 @@ fn main() {
     assert!(case_count != 0, "IPU_RANDOM_CASES must be nonzero");
     let output =
         std::env::temp_dir().join(format!("ipu-stack-randomized-e2e-{}", std::process::id()));
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/graph_runtime.S");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/static_runtime.S");
     let artifact = Toolchain::from_sdk(sdk)
         .compile(&source, &output, "randomized-e2e", &[])
         .unwrap();

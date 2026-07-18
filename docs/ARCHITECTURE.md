@@ -26,10 +26,9 @@ A D2D exchange has source and destination actions. Other tiles participate only
 in synchronization required by the phase; they are not modeled as forwarding
 tiles. Multiple transfers in one phase are placed on one static event timeline.
 
-Host operations are also compiled into the tile streams in declared call order.
-Only the host endpoint owner and transfer target receive host-exchange actions.
-Host-page layout and HSP transitions remain whole-device metadata in `.ipuexe`.
-There is no all-tile command broadcast or device command dispatch loop.
+Host operations are not yet accepted by the static packager. Host-page layout
+and HSP transitions remain whole-device metadata in `.ipuexe`; adding them must
+not reintroduce an all-tile command broadcast or device command dispatch loop.
 
 The linker resolves calls from generated tile programs to kernel ELF symbols.
 Kernel artifacts stay reusable and independent of the final tile and device
@@ -38,21 +37,19 @@ and generated instruction streams.
 
 ## Migration boundary
 
-`LoweredTileProgram` and the exchange scheduler already implement the intended
-compile-time model. `device/graph_runtime.S` and the role-based command table are
-legacy bring-up machinery and must not be extended. They remain only until the
-static tile emitter covers synchronization, exchange, compute, completion, and
-host actions and passes the existing hardware gates.
+`LoweredTileProgram` and the exchange scheduler implement the compile-time
+model. `device/static_runtime.S` supplies startup, worker rendezvous, and
+completion. The Rust emitter generates the ordered exchange and compute calls
+for each tile. The role-based command table and its dispatcher have been
+removed.
 
 ## Static-lowering hardware evidence
 
-A discarded static-emitter prototype established two useful boundaries on the
-C600. It consumed `LoweredTileProgram` directly, emitted distinct straight-line
-programs, and branched to per-tile executable exchange rows without a command
-table. A 64-word transfer from logical tile 1 to logical tile 274 returned the
-exact randomized payload. This verifies the direct plan call, absolute SRAM
-address patches, per-tile image selection, and diagnostic readback independently
-of the runtime dispatcher.
+The static emitter consumes `LoweredTileProgram` directly, emits distinct
+straight-line programs, and branches to per-tile executable exchange rows
+without a command table. Hardware tests verify a 64-word point transfer,
+fanout, multicast, an all-tile permutation, and an 11-stage reduction with
+compute between exchanges. Diagnostic readback verified every expected output.
 
 The same program exposed an unresolved global-synchronization transition. When
 physical tile 0 generated the GSP packet and then entered a payload or inactive
