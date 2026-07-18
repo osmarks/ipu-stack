@@ -1374,7 +1374,7 @@ fn run_host_impl(
             output[start..end].copy_from_slice(&call_output[start..end]);
         }
     }
-    device.write_config(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+    device.write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
     verify_runtime_completion(&device, app)?;
     debug!(states = %supervisor_state_summary(&device, app), "host exchange supervisor states");
     debug!(sources = %host_source_summary(&device, app), "host exchange device sources");
@@ -1544,7 +1544,7 @@ pub fn run_diagnostic(
         ipu_driver::pci::EXCHANGE_WINDOW_BASE,
         ipu_driver::pci::EXCHANGE_WINDOW_HEXOPT,
     )?;
-    device.write_config(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+    device.write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
     device.set_mark(1)?;
     for phase in 1..entry.external_syncs {
         if let Err(error) =
@@ -1557,7 +1557,7 @@ pub fn run_diagnostic(
             )
             .into());
         }
-        device.write_config(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+        device.write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     let output_tiles = app

@@ -404,10 +404,21 @@ impl Device {
     }
 
     pub fn set_mark(&self, mark: u32) -> Result<(), DriverError> {
+        self.write_sync_mark(pci::HSP_GS1_CONTROL, mark)
+    }
+
+    pub fn write_sync_mark(&self, register: u32, mark: u32) -> Result<(), DriverError> {
         if mark > HSP_MARK_MASK {
             return Err(DriverError::Invalid("HSP mark out of range".into()));
         }
-        self.write_config(pci::HSP_GS1_CONTROL, mark)
+        if !matches!(register, pci::HSP_GS1_CONTROL | pci::HSP_GS2_CONTROL) {
+            return Err(DriverError::Invalid(format!(
+                "0x{register:x} is not an HSP synchronization control register"
+            )));
+        }
+        self.write_config(register, mark)?;
+        let _ = self.read_config(register)?;
+        Ok(())
     }
 
     pub fn set_hexopt_identity_table(&self) -> Result<(), DriverError> {
@@ -1126,7 +1137,7 @@ impl<'a> HostSession<'a> {
 
     fn acknowledge_device(&mut self) -> Result<(), DriverError> {
         self.delay_host_write();
-        self.device.write_config(pci::HSP_GS2_CONTROL, 1)
+        self.device.write_sync_mark(pci::HSP_GS2_CONTROL, 1)
     }
 
     pub fn attach(&mut self) -> Result<(), DriverError> {
