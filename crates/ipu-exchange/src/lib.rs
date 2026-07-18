@@ -239,7 +239,7 @@ pub struct HostHierarchy {
 pub fn host_hierarchy(target_physical_tile: u16) -> Result<HostHierarchy, ExchangeError> {
     validate_host_tile(target_physical_tile)?;
     Ok(HostHierarchy {
-        xreq_physical_tile: target_physical_tile >> 6,
+        xreq_physical_tile: target_physical_tile & 0x3d,
         target_physical_tile,
     })
 }
@@ -257,7 +257,7 @@ pub fn assemble_host_xreq_program(
             encode_send(1, 3, packet_address >> 2)?,
             RETURN_M10_INSTRUCTION,
         ],
-        packet_words: vec![u32::from(target_physical_tile) & !0x3f, 0],
+        packet_words: vec![u32::from(target_physical_tile) & !0x3d, 0],
     })
 }
 
@@ -1521,6 +1521,14 @@ mod tests {
         let xreq = assemble_host_xreq_program(260, 0x50120).unwrap();
         assert_eq!(xreq.instructions, [0x782a_0243, 0x43a0_0000]);
         assert_eq!(xreq.packet_words, [0x100, 0]);
+        let first_group = host_hierarchy(31).unwrap();
+        assert_eq!(first_group.xreq_physical_tile, 29);
+        assert_eq!(
+            assemble_host_xreq_program(31, 0x50120)
+                .unwrap()
+                .packet_words,
+            [2, 0]
+        );
         let wrapped_xreq =
             wrap_host_xreq_operation(hierarchy.xreq_physical_tile, &xreq.instructions).unwrap();
         assert_eq!(&wrapped_xreq[..3], &[0x1980_0604, 0x4380_80a0, 0x4180_000f]);

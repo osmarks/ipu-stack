@@ -418,11 +418,15 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
         .iter()
         .flat_map(|call| call.outputs.iter().cloned())
         .collect();
-    let transfer_count = inputs.len() + outputs.len();
+    let transfer_count = u32::try_from(inputs.len() + outputs.len())?;
+    let phases = transfer_count
+        .checked_mul(2)
+        .and_then(|count| count.checked_sub(1))
+        .ok_or("host phase count overflow")?;
     calls = vec![HostCall {
         name: "graph".into(),
         command: 0,
-        phases: u32::try_from(transfer_count + 1)?,
+        phases,
         inputs: call_inputs,
         outputs: call_outputs,
     }];
@@ -465,57 +469,66 @@ fn append_host_bindings(
         let binding_base = align_up(*host_cursor, 64);
         let binding_file_base = *file_cursor;
         for slice in &binding.slices {
-            let host_offset = binding_base
+            let mut host_offset = binding_base
                 .checked_add(u32::try_from(slice.file_offset)?)
                 .ok_or("host binding offset overflow")?;
-            let transfer = StaticHostTransfer {
-                direction,
-                physical_tile: u16::try_from(slice.tile)?,
-                tile_address: slice.tile_address,
-                host_offset,
-                bytes: u32::try_from(slice.size)?,
-            };
-            match direction {
-                HostDirection::ToTile => {
-                    ipu_exchange::plan_host_to_tile(
+            let mut tile_address = slice.tile_address;
+            let mut file_offset = binding_file_base + slice.file_offset;
+            let mut remaining = u32::try_from(slice.size)?;
+            while remaining != 0 {
+                let page_bytes =
+                    ipu_exchange::HOST_PAGE_BYTES - host_offset % ipu_exchange::HOST_PAGE_BYTES;
+                let bytes = remaining.min(page_bytes);
+                let transfer = StaticHostTransfer {
+                    direction,
+                    physical_tile: u16::try_from(slice.tile)?,
+                    tile_address,
+                    host_offset,
+                    bytes,
+                };
+                match direction {
+                    HostDirection::ToTile => ipu_exchange::plan_host_to_tile(
                         transfer.physical_tile,
                         transfer.tile_address,
                         transfer.host_offset,
                         transfer.bytes,
-                    )?;
-                }
-                HostDirection::ToHost => {
-                    ipu_exchange::plan_tile_to_host(
+                    )?,
+                    HostDirection::ToHost => ipu_exchange::plan_tile_to_host(
                         transfer.physical_tile,
                         transfer.tile_address,
                         transfer.host_offset,
                         transfer.bytes,
-                    )?;
-                }
+                    )?,
+                };
+                let mut host_slices = Vec::new();
+                append_host_slices(&mut host_slices, host_offset, file_offset, u64::from(bytes))?;
+                let index = transfers.len();
+                transfers.push(transfer);
+                calls.push(HostCall {
+                    name: match direction {
+                        HostDirection::ToTile => format!("host-input-{index}"),
+                        HostDirection::ToHost => format!("host-output-{index}"),
+                    },
+                    command: 0,
+                    phases: 0,
+                    inputs: matches!(direction, HostDirection::ToTile)
+                        .then_some(host_slices.clone())
+                        .unwrap_or_default(),
+                    outputs: matches!(direction, HostDirection::ToHost)
+                        .then_some(host_slices)
+                        .unwrap_or_default(),
+                });
+                host_offset = host_offset
+                    .checked_add(bytes)
+                    .ok_or("host transfer offset overflow")?;
+                tile_address = tile_address
+                    .checked_add(bytes)
+                    .ok_or("host transfer tile range overflow")?;
+                file_offset = file_offset
+                    .checked_add(u64::from(bytes))
+                    .ok_or("host transfer file range overflow")?;
+                remaining -= bytes;
             }
-            let mut host_slices = Vec::new();
-            append_host_slices(
-                &mut host_slices,
-                host_offset,
-                binding_file_base + slice.file_offset,
-                slice.size,
-            )?;
-            let index = transfers.len();
-            transfers.push(transfer);
-            calls.push(HostCall {
-                name: match direction {
-                    HostDirection::ToTile => format!("host-input-{index}"),
-                    HostDirection::ToHost => format!("host-output-{index}"),
-                },
-                command: 0,
-                phases: 0,
-                inputs: matches!(direction, HostDirection::ToTile)
-                    .then_some(host_slices.clone())
-                    .unwrap_or_default(),
-                outputs: matches!(direction, HostDirection::ToHost)
-                    .then_some(host_slices)
-                    .unwrap_or_default(),
-            });
         }
         let size = binding_size(binding)?;
         *host_cursor = u32::try_from(u64::from(binding_base) + size)?;
@@ -642,7 +655,7 @@ fn append_static_host_segments(
         } else {
             (
                 vec![
-                    ipu_exchange::sans(255),
+                    ipu_exchange::sans(1),
                     ipu_exchange::SYNC_ANS_INSTRUCTION,
                     ipu_exchange::RETURN_M10_INSTRUCTION,
                 ],
