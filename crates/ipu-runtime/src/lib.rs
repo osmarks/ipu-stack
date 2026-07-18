@@ -83,6 +83,7 @@ struct RuntimeLayout {
     host_packet_stride: u32,
     command_address: u32,
     completion_address: u32,
+    milestone_address: u32,
     sync_packet_address: u32,
     sync_release_address: u32,
     host_command_address: u32,
@@ -115,6 +116,7 @@ impl RuntimeLayout {
             )
             .ok_or("command address overflow")?;
         let completion_address = align_up(command_end, 64);
+        let milestone_address = completion_address + 4;
         let sync_packet_address = align_up(completion_address + 4, 8);
         let sync_release_address = sync_packet_address + 16;
         let runtime_end = sync_release_address + 4;
@@ -169,6 +171,7 @@ impl RuntimeLayout {
             host_packet_stride,
             command_address,
             completion_address,
+            milestone_address,
             sync_packet_address,
             sync_release_address,
             host_command_address: host_packet_end,
@@ -332,6 +335,17 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     let worker_sync_offset = symbol_offset("ipu_stack_loop_worker_sync_base")?;
     let command_offset = symbol_offset("ipu_stack_command_table_address")?;
     let completion_offset = symbol_offset("ipu_stack_completion_address")?;
+    let milestone_offset = image
+        .symbols
+        .get("ipu_stack_milestone_address")
+        .copied()
+        .map(|address| {
+            address
+                .checked_sub(image.base)
+                .ok_or("ipu_stack_milestone_address precedes the linked image")
+                .map(|offset| offset as usize)
+        })
+        .transpose()?;
     let completion_master_offset = symbol_offset("ipu_stack_completion_master_flag")?;
     let pre_sync_master_offset = symbol_offset("ipu_stack_pre_sync_master_flag")?;
     let device_sync_master_offset = symbol_offset("ipu_stack_device_sync_master_flag")?;
@@ -352,6 +366,9 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         patch_setzi_immediate(&mut code, worker_sync_offset, u32::from(logical) * 8)?;
         patch_setzi_immediate(&mut code, command_offset, layout.command_address)?;
         patch_setzi_immediate(&mut code, completion_offset, layout.completion_address)?;
+        if let Some(offset) = milestone_offset {
+            patch_setzi_immediate(&mut code, offset, layout.milestone_address)?;
+        }
         let is_sync_master = physical == u32::from(global_sync.packet_origin_physical_tile);
         for offset in [
             completion_master_offset,
@@ -394,9 +411,11 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                 &mut commands,
                 *transfer,
                 physical as u16,
-                &layout,
-                command_index,
-                true,
+                HostCommandContext {
+                    layout: &layout,
+                    command_index,
+                    barrier_after: true,
+                },
             )?;
             command_index += 1;
         }
@@ -498,9 +517,11 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                 &mut commands,
                 *transfer,
                 physical as u16,
-                &layout,
-                command_index,
-                false,
+                HostCommandContext {
+                    layout: &layout,
+                    command_index,
+                    barrier_after: false,
+                },
             )?;
             command_index += 1;
         }
@@ -514,6 +535,15 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             blob_offset: 0,
             file_size: commands.len() as u32,
             flags: SEGMENT_READ,
+        });
+        let milestone_blob = app.add_blob(vec![0; 4]);
+        segments.push(Segment {
+            address: layout.milestone_address,
+            memory_size: 4,
+            blob: milestone_blob,
+            blob_offset: 0,
+            file_size: 4,
+            flags: SEGMENT_READ | SEGMENT_WRITE,
         });
 
         let mut allocations = BTreeMap::<(u32, u32), Vec<u8>>::new();
@@ -911,16 +941,25 @@ enum HostProgramRole {
     Source,
 }
 
+struct HostCommandContext<'a> {
+    layout: &'a RuntimeLayout,
+    command_index: usize,
+    barrier_after: bool,
+}
+
 fn append_host_command(
     app: &mut Application,
     segments: &mut Vec<Segment>,
     commands: &mut Vec<u8>,
     transfer: HostTransfer,
     physical_tile: u16,
-    layout: &RuntimeLayout,
-    command_index: usize,
-    barrier_after: bool,
+    context: HostCommandContext<'_>,
 ) -> Result<()> {
+    let HostCommandContext {
+        layout,
+        command_index,
+        barrier_after,
+    } = context;
     const HOST_COORDINATOR_TILE: u16 = 0;
     let program_role = match transfer.direction {
         HostDirection::ControlRead => {
@@ -1151,8 +1190,29 @@ fn supervisor_state_summary(device: &Device, app: &Application) -> String {
             format!("{}:{pc}", tile.physical_tile)
         })
         .collect::<Vec<_>>();
+    let milestones = app
+        .tiles
+        .iter()
+        .take(8)
+        .map(|tile| {
+            let physical_tile = tile.physical_tile as u16;
+            let address = tile.diagnostic_address + 4;
+            let value = device
+                .tile_context_state(physical_tile, 0)
+                .and_then(|state| {
+                    if state == 0 {
+                        device.read_tile_word_from_inactive_context(physical_tile, 1, address)
+                    } else {
+                        device.read_tile_word(physical_tile, address)
+                    }
+                })
+                .map(|value| format!("0x{value:x}"))
+                .unwrap_or_else(|error| format!("error({error})"));
+            format!("{}:{value}", tile.physical_tile)
+        })
+        .collect::<Vec<_>>();
     format!(
-        "0={} {:?}, 1={} {:?}, 2={} {:?}, 3={} {:?}, errors={read_errors}, pc={program_counters:?}",
+        "0={} {:?}, 1={} {:?}, 2={} {:?}, 3={} {:?}, errors={read_errors}, pc={program_counters:?}, milestones={milestones:?}",
         counts[0], samples[0], counts[1], samples[1], counts[2], samples[2], counts[3], samples[3]
     )
 }

@@ -27,8 +27,11 @@ fn main() {
     let device = std::env::var("IPU_DEVICE").unwrap_or_else(|_| "/dev/ipu0".into());
     let output = std::env::temp_dir().join(format!("ipu-stack-host-e2e-{}", std::process::id()));
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/graph_runtime.S");
+    let compile_flags = std::env::var_os("IPU_STACK_TRACE_MILESTONES")
+        .map(|_| vec!["-DIPU_STACK_TRACE_MILESTONES".into()])
+        .unwrap_or_default();
     let artifact = Toolchain::from_sdk(sdk)
-        .compile(&source, &output, "host-e2e", &[])
+        .compile(&source, &output, "host-e2e", &compile_flags)
         .unwrap();
     let runtime_object = fs::read(artifact.object).unwrap();
     let transfer_bytes = std::env::var("IPU_HOST_TEST_BYTES")
@@ -311,7 +314,7 @@ fn host_exchange_graph(
     }];
     let mut output_address = source_address;
     let phases = if exchange {
-        let relay_live_until = if remote_d2h { 1 } else { 2 };
+        let relay_live_until = 1;
         let relay_address = find_free_region(
             &allocations,
             relay_tile,
@@ -329,13 +332,11 @@ fn host_exchange_graph(
             live_until: relay_live_until,
             kind: AllocationKind::ExchangeStaging { phase: 0 },
         });
-        let mut phases = vec![Phase::Exchange {
-            transfers: vec![Transfer {
-                source_tile: HOST_CONTROLLER_TILE,
-                destination_tile: relay_tile,
-                tensor,
-                bytes: transfer_bytes,
-            }],
+        let mut transfers = vec![Transfer {
+            source_tile: HOST_CONTROLLER_TILE,
+            destination_tile: relay_tile,
+            tensor,
+            bytes: transfer_bytes,
         }];
         if remote_d2h {
             output_address = relay_address;
@@ -344,8 +345,8 @@ fn host_exchange_graph(
                 &allocations,
                 HOST_CONTROLLER_TILE,
                 transfer_bytes,
+                0,
                 1,
-                2,
                 exchange_constraint,
             )?;
             allocations.push(Allocation {
@@ -353,20 +354,18 @@ fn host_exchange_graph(
                 tile: HOST_CONTROLLER_TILE,
                 address: output_address,
                 size: transfer_bytes,
-                live_from: 1,
-                live_until: 2,
-                kind: AllocationKind::ExchangeStaging { phase: 1 },
+                live_from: 0,
+                live_until: 1,
+                kind: AllocationKind::ExchangeStaging { phase: 0 },
             });
-            phases.push(Phase::Exchange {
-                transfers: vec![Transfer {
-                    source_tile: relay_tile,
-                    destination_tile: HOST_CONTROLLER_TILE,
-                    tensor,
-                    bytes: transfer_bytes,
-                }],
+            transfers.push(Transfer {
+                source_tile: relay_tile,
+                destination_tile: HOST_CONTROLLER_TILE,
+                tensor,
+                bytes: transfer_bytes,
             });
         }
-        phases
+        vec![Phase::Exchange { transfers }]
     } else {
         Vec::new()
     };

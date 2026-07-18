@@ -30,6 +30,7 @@
 	.set GLOBAL_SYNC_RELEASE_DELAY, 72
 	.set COMMAND_TABLE_PLACEHOLDER, 0x59000
 	.set COMPLETION_ADDRESS_PLACEHOLDER, 0
+	.set MILESTONE_ADDRESS_PLACEHOLDER, 0
 
 	.section .text.ipu_stack_exchange_loop_start,"ax",@progbits
 	.globl ipu_stack_exchange_loop_start
@@ -83,9 +84,17 @@ ipu_stack_command_table_address:
 	cmpeq $m8, $m5, ROLE_EXCHANGE_ABSOLUTE
 	brz $m8, .Llaunch_workers
 .Lpre_sync_exchange:
+#ifdef IPU_STACK_TRACE_MILESTONES
+	setzi $m8, 0x10
+	call $m11, .Lrecord_milestone
+#endif
 	brz $m14, .Llaunch_workers
 	call $m7, ipu_stack_pre_sync_dispatch
 	zero $m14
+#ifdef IPU_STACK_TRACE_MILESTONES
+	setzi $m8, 0x11
+	call $m11, .Lrecord_milestone
+#endif
 .Llaunch_workers:
 	setzi $m0, ipu_stack_exchange_loop_worker_barrier
 	runall $m0, $m15, 0
@@ -123,6 +132,10 @@ ipu_stack_command_table_address:
 .Larm_plan:
 	setzi $m8, 1
 	put 0xa6, $m8
+#ifdef IPU_STACK_TRACE_MILESTONES
+	setzi $m8, 0x20
+	call $m11, .Lrecord_milestone
+#endif
 	setzi $m10, .Lplan_complete
 	br $m1
 
@@ -149,6 +162,10 @@ ipu_stack_command_table_address:
 	bri .Lhost_launch_complete_unbarriered
 
 .Lplan_complete:
+#ifdef IPU_STACK_TRACE_MILESTONES
+	setzi $m8, 0x21
+	call $m11, .Lrecord_milestone
+#endif
 #ifdef IPU_STACK_TRAP_AFTER_RECEIVE
 	zero $m0
 	br $m0
@@ -199,6 +216,15 @@ ipu_stack_master_completion:
 .Lhalt:
 	bri .Lhalt
 	.size ipu_stack_exchange_loop_start, .-ipu_stack_exchange_loop_start
+
+#ifdef IPU_STACK_TRACE_MILESTONES
+.Lrecord_milestone:
+	.globl ipu_stack_milestone_address
+ipu_stack_milestone_address:
+	setzi $m9, MILESTONE_ADDRESS_PLACEHOLDER
+	st32 $m8, $m9, $m15, 0
+	br $m11
+#endif
 
 	.section .text.ipu_stack_exchange_loop_worker_init,"ax",@progbits
 	.globl ipu_stack_exchange_loop_worker_init
