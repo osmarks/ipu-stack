@@ -95,6 +95,9 @@ fn main() {
         (graph, payload.clone(), payload)
     };
     let app = package_graph(&graph, &[runtime_object]).unwrap();
+    if let Some(path) = std::env::var_os("IPU_HOST_TEST_PACKAGE") {
+        app.write(fs::File::create(path).unwrap()).unwrap();
+    }
     if d2h_only {
         let source = &graph.host_outputs[0].slices[0];
         let tile = app

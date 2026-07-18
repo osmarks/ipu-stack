@@ -128,7 +128,7 @@ impl RuntimeLayout {
             )
             .ok_or("host packet address overflow")?;
         let host_control_end = host_packet_end
-            .checked_add(2 * HOST_PACKET_ALIGNMENT)
+            .checked_add(HOST_PACKET_ALIGNMENT)
             .ok_or("host control address overflow")?;
         if host_control_end
             > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES
@@ -190,7 +190,7 @@ impl RuntimeLayout {
 
 #[derive(Clone, Copy, Debug)]
 enum HostDirection {
-    CommandRead,
+    ControlRead,
     ToTile,
     ToHost,
 }
@@ -246,10 +246,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             "lowered host output command"
         );
     }
-    let command_count = host.inputs.len()
-        + graph.schedule.phases.len()
-        + host.outputs.len()
-        + usize::from(!host.inputs.is_empty() || !host.outputs.is_empty());
+    let command_count = host.inputs.len() + graph.schedule.phases.len() + host.outputs.len();
     let mut plan_bytes = Vec::new();
     let mut packet_bytes = Vec::new();
     plan_bytes.extend(
@@ -333,12 +330,9 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     let worker_sync_offset = symbol_offset("ipu_stack_loop_worker_sync_base")?;
     let command_offset = symbol_offset("ipu_stack_command_table_address")?;
     let completion_offset = symbol_offset("ipu_stack_completion_address")?;
-    let completion_dispatch_offset = symbol_offset("ipu_stack_completion_dispatch")?;
-    let nonmaster_completion_offset = symbol_offset("ipu_stack_nonmaster_completion_redirect")?;
-    let pre_sync_offset = symbol_offset("ipu_stack_pre_sync_dispatch")?;
-    let nonmaster_redirect_offset = symbol_offset("ipu_stack_nonmaster_pre_sync_redirect")?;
-    let device_sync_offset = symbol_offset("ipu_stack_device_sync_dispatch")?;
-    let nonmaster_device_sync_offset = symbol_offset("ipu_stack_nonmaster_device_sync_redirect")?;
+    let completion_master_offset = symbol_offset("ipu_stack_completion_master_flag")?;
+    let pre_sync_master_offset = symbol_offset("ipu_stack_pre_sync_master_flag")?;
+    let device_sync_master_offset = symbol_offset("ipu_stack_device_sync_master_flag")?;
     let endpoint_offset = symbol_offset("ipu_stack_loop_global_sync_endpoint")?;
     let send0_offset = symbol_offset("ipu_stack_loop_global_sync_send0")?;
     let send1_offset = symbol_offset("ipu_stack_loop_global_sync_send1")?;
@@ -356,7 +350,15 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         patch_setzi_immediate(&mut code, worker_sync_offset, u32::from(logical) * 8)?;
         patch_setzi_immediate(&mut code, command_offset, layout.command_address)?;
         patch_setzi_immediate(&mut code, completion_offset, layout.completion_address)?;
-        if physical == u32::from(global_sync.packet_origin_physical_tile) {
+        let is_sync_master = physical == u32::from(global_sync.packet_origin_physical_tile);
+        for offset in [
+            completion_master_offset,
+            pre_sync_master_offset,
+            device_sync_master_offset,
+        ] {
+            patch_setzi_immediate(&mut code, offset, u32::from(is_sync_master))?;
+        }
+        if is_sync_master {
             for (offset, address) in [
                 (send0_offset, layout.sync_packet_address),
                 (send1_offset, layout.sync_packet_address + 8),
@@ -368,14 +370,6 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                 &ipu_exchange::encode_send(0, 3, layout.sync_release_address >> 2)?.to_le_bytes(),
             );
             patch_setzi_immediate(&mut code, endpoint_offset, TILE_MUX_HOST_BASE + physical)?;
-        } else {
-            copy_instruction(&mut code, nonmaster_redirect_offset, pre_sync_offset);
-            copy_instruction(&mut code, nonmaster_device_sync_offset, device_sync_offset);
-            copy_instruction(
-                &mut code,
-                nonmaster_completion_offset,
-                completion_dispatch_offset,
-            );
         }
 
         let mut segments = Vec::new();
@@ -508,16 +502,6 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             )?;
             command_index += 1;
         }
-        if !host.inputs.is_empty() || !host.outputs.is_empty() {
-            commands.extend_from_slice(&words_to_bytes(&[
-                RuntimeRole::HostIdleUnbarriered.word(),
-                0,
-                0,
-                0,
-                0,
-            ]));
-            command_index += 1;
-        }
         debug_assert_eq!(command_index, command_count);
         commands.extend_from_slice(&words_to_bytes(&[0, 0, 0, 0, 0]));
         let command_blob = app.add_blob(commands.clone());
@@ -640,9 +624,13 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
 
-    if !graph.host_inputs.is_empty() {
-        inputs.push(command_read_transfer(command_host_offset)?);
-    }
+    inputs.push(HostTransfer {
+        direction: HostDirection::ControlRead,
+        physical_tile: 0,
+        tile_address: ipu_exchange::EXCHANGE_WINDOW_BASE,
+        host_offset: command_host_offset,
+        bytes: 4,
+    });
     for binding in &graph.host_inputs {
         let size = binding_size(binding)?;
         let page_base = u64::from(align_up(page_cursor, 64));
@@ -674,15 +662,11 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
             .checked_add(size)
             .ok_or("host input size overflow")?;
     }
-    if !graph.schedule.phases.is_empty() {
-        inputs.push(command_read_transfer(command_host_offset)?);
-    }
     page_cursor = output_start;
     for binding in &graph.host_outputs {
         let size = binding_size(binding)?;
         let page_base = u64::from(align_up(page_cursor, 64));
         for slice in &binding.slices {
-            outputs.push(command_read_transfer(command_host_offset)?);
             let host_offset = u32::try_from(page_base + slice.file_offset)?;
             append_host_slices(
                 &mut output_slices,
@@ -710,13 +694,10 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
             .checked_add(size)
             .ok_or("host output size overflow")?;
     }
-    if !graph.host_outputs.is_empty() {
-        outputs.push(command_read_transfer(command_host_offset)?);
-    }
     let host_phases = inputs
         .len()
         .checked_add(outputs.len())
-        .and_then(|phases| phases.checked_add(1))
+        .and_then(|transfers| transfers.checked_mul(2))
         .ok_or("host phase count overflow")?;
     Ok(HostLayout {
         inputs,
@@ -782,16 +763,6 @@ fn append_host_slices(
     Ok(())
 }
 
-fn command_read_transfer(host_offset: u32) -> Result<HostTransfer> {
-    Ok(HostTransfer {
-        direction: HostDirection::CommandRead,
-        physical_tile: 0,
-        tile_address: ipu_exchange::EXCHANGE_WINDOW_BASE,
-        host_offset,
-        bytes: 4,
-    })
-}
-
 fn binding_size(binding: &Binding) -> Result<u64> {
     binding
         .slices
@@ -845,7 +816,7 @@ fn assemble_host_program(
     command_address: u32,
 ) -> Result<TileToHostProgram> {
     match transfer.direction {
-        HostDirection::CommandRead if role == HostProgramRole::Complete => {
+        HostDirection::ControlRead if role == HostProgramRole::Complete => {
             Ok(ipu_exchange::assemble_host_command_read_program(
                 packet_address,
                 command_address,
@@ -889,6 +860,7 @@ fn assemble_host_program(
                 transfer.host_offset,
                 transfer.bytes,
                 packet_address,
+                command_address,
             )?)
         }
         _ => Err("host program role does not match transfer direction".into()),
@@ -914,7 +886,7 @@ fn append_host_command(
 ) -> Result<()> {
     const HOST_COORDINATOR_TILE: u16 = 0;
     let program_role = match transfer.direction {
-        HostDirection::CommandRead => {
+        HostDirection::ControlRead => {
             (physical_tile == HOST_COORDINATOR_TILE).then_some(HostProgramRole::Complete)
         }
         HostDirection::ToTile if transfer.physical_tile == HOST_COORDINATOR_TILE => {
@@ -999,10 +971,10 @@ pub fn run_host(
     let device = Device::open(device_path)?;
     device.initialize()?;
     device.replay_configuration(configuration)?;
+    Loader::new(&device, bootloader)?.load(app, app.host_exchange.startup_mark)?;
     for write in &app.device_config_writes {
         device.write_config(write.offset, write.value)?;
     }
-    Loader::new(&device, bootloader)?.load(app, app.host_exchange.startup_mark)?;
     let mut session = HostSession::new(&device, app.host_exchange.clone())?;
     let calls = app.host_exchange.calls.clone();
     let first = &calls[0];
@@ -1022,8 +994,9 @@ pub fn run_host(
             Ok(output) => output,
             Err(error) => {
                 let states = supervisor_state_summary(&device, app);
+                let sources = host_source_summary(&device, app);
                 return Err(format!(
-                    "generated host call {}: {error}; supervisor states: {states}",
+                    "generated host call {}: {error}; supervisor states: {states}; device outputs: {sources}",
                     call.name
                 )
                 .into());
@@ -1031,6 +1004,38 @@ pub fn run_host(
         };
     }
     Ok(output)
+}
+
+fn host_source_summary(device: &Device, app: &Application) -> String {
+    app.outputs
+        .iter()
+        .filter(|binding| binding.name != "runtime-completion")
+        .flat_map(|binding| {
+            binding.slices.iter().map(|slice| {
+                let physical_tile = slice.tile as u16;
+                let value = device
+                    .tile_context_state(physical_tile, 0)
+                    .and_then(|state| {
+                        if state == 0 {
+                            device.read_tile_word_from_inactive_context(
+                                physical_tile,
+                                1,
+                                slice.tile_address,
+                            )
+                        } else {
+                            device.read_tile_word(physical_tile, slice.tile_address)
+                        }
+                    })
+                    .map(|word| format!("0x{word:08x}"))
+                    .unwrap_or_else(|error| format!("error({error})"));
+                format!(
+                    "{}@{}:{:#x}={value}",
+                    binding.name, slice.tile, slice.tile_address
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn supervisor_state_summary(device: &Device, app: &Application) -> String {
@@ -1086,10 +1091,10 @@ pub fn run_diagnostic(
     let device = Device::open(device_path)?;
     device.initialize()?;
     device.replay_configuration(configuration)?;
+    Loader::new(&device, bootloader)?.load(app, 0)?;
     for write in &app.device_config_writes {
         device.write_config(write.offset, write.value)?;
     }
-    Loader::new(&device, bootloader)?.load(app, 0)?;
     device.write_config(
         ipu_driver::pci::EXCHANGE_WINDOW_BASE,
         ipu_driver::pci::EXCHANGE_WINDOW_HEXOPT,
@@ -1097,11 +1102,19 @@ pub fn run_diagnostic(
     device.write_config(ipu_driver::pci::HSP_GS2_CONTROL, entry.external_syncs)?;
     device.set_mark(1)?;
     let deadline = Instant::now() + Duration::from_secs(10);
-    while device.read_tile_word(completion.tile as u16, completion.tile_address)? != 1 {
+    while device.tile_context_state(completion.tile as u16, 0)? != 3 {
         if Instant::now() >= deadline {
-            return Err("diagnostic graph execution timed out".into());
+            return Err(format!(
+                "diagnostic graph did not reach its completion trap; supervisor states: {}; device outputs: {}",
+                supervisor_state_summary(&device, app),
+                host_source_summary(&device, app)
+            )
+            .into());
         }
         std::thread::sleep(Duration::from_micros(100));
+    }
+    if device.read_tile_word(completion.tile as u16, completion.tile_address)? != 1 {
+        return Err("diagnostic completion rendezvous preceded the completion store".into());
     }
 
     let mut bindings = BTreeMap::new();
@@ -1198,11 +1211,6 @@ fn patch_setzi_immediate(code: &mut [u8], offset: usize, value: u32) -> Result<(
     instruction = (instruction & !IMMEDIATE_MASK) | value;
     code[offset..offset + 4].copy_from_slice(&instruction.to_le_bytes());
     Ok(())
-}
-
-fn copy_instruction(code: &mut [u8], source: usize, destination: usize) {
-    let instruction = code[source..source + 4].to_vec();
-    code[destination..destination + 4].copy_from_slice(&instruction);
 }
 
 fn words_to_bytes(words: &[u32]) -> Vec<u8> {
@@ -1353,7 +1361,7 @@ mod tests {
         }));
         assert!(layout.inputs.iter().chain(&layout.outputs).all(|transfer| {
             let chunks = match transfer.direction {
-                HostDirection::CommandRead | HostDirection::ToTile => {
+                HostDirection::ControlRead | HostDirection::ToTile => {
                     ipu_exchange::plan_host_to_tile(
                         transfer.physical_tile,
                         transfer.tile_address,
@@ -1376,7 +1384,7 @@ mod tests {
         }));
         assert_eq!(
             call.phases,
-            u32::try_from(layout.inputs.len() + layout.outputs.len() + 1).unwrap()
+            u32::try_from((layout.inputs.len() + layout.outputs.len()) * 2).unwrap()
         );
         let output = layout
             .outputs

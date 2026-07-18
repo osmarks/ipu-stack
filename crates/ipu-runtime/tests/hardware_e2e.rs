@@ -99,6 +99,18 @@ fn all_tile_permutation_works() {
 }
 
 #[test]
+fn direct_multicast_works() {
+    let _device = device();
+    require_success(
+        "single-source multicast graph",
+        Command::new(env!("CARGO_BIN_EXE_ipu-hardware-e2e"))
+            .env("IPU_GRAPH_TEST", "fanout")
+            .status()
+            .expect("launch direct multicast hardware test runner"),
+    );
+}
+
+#[test]
 fn multicast_with_relay_role_works() {
     let _device = device();
     require_success(

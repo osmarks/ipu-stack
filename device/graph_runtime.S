@@ -21,6 +21,7 @@
 	.set SYNC_RECEIVE, 0
 	.set SANS_INACTIVE, 0
 	.set SANS_EXTERNAL, 1
+	.set SANS_HOST_FOLLOWER, 255
 	.set OPCODE_SYNC, 0x41800000
 	.set OPCODE_SANS, 0x40c00000
 	.set OPCODE_DELAY, 0x40a00000
@@ -61,10 +62,10 @@ ipu_stack_exchange_loop_start:
 	.long OPCODE_SYNC | SYNC_ALL
 	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
-	call $m7, ipu_stack_pre_sync_dispatch
 	.globl ipu_stack_command_table_address
 ipu_stack_command_table_address:
 	setzi $m6, COMMAND_TABLE_PLACEHOLDER
+	setzi $m14, 1
 
 .Lcommand_loop:
 	ld32 $m5, $m6, $m15, 0
@@ -82,7 +83,9 @@ ipu_stack_command_table_address:
 	cmpeq $m8, $m5, ROLE_EXCHANGE_ABSOLUTE
 	brz $m8, .Llaunch_workers
 .Lpre_sync_exchange:
+	brz $m14, .Llaunch_workers
 	call $m7, ipu_stack_pre_sync_dispatch
+	zero $m14
 .Llaunch_workers:
 	setzi $m0, ipu_stack_exchange_loop_worker_barrier
 	runall $m0, $m15, 0
@@ -136,12 +139,16 @@ ipu_stack_command_table_address:
 	br $m1
 
 .Lhost_idle:
-	.long OPCODE_SANS | SANS_EXTERNAL
+	.long OPCODE_SANS | SANS_HOST_FOLLOWER
+	.long OPCODE_SYNC | SYNC_EXTERNAL
+	.long OPCODE_SANS | SANS_HOST_FOLLOWER
 	.long OPCODE_SYNC | SYNC_EXTERNAL
 	bri .Lhost_launch_complete
 
 .Lhost_idle_unbarriered:
-	.long OPCODE_SANS | SANS_EXTERNAL
+	.long OPCODE_SANS | SANS_HOST_FOLLOWER
+	.long OPCODE_SYNC | SYNC_EXTERNAL
+	.long OPCODE_SANS | SANS_HOST_FOLLOWER
 	.long OPCODE_SYNC | SYNC_EXTERNAL
 	bri .Lhost_launch_complete_unbarriered
 
@@ -150,17 +157,21 @@ ipu_stack_command_table_address:
 	zero $m0
 	br $m0
 #endif
-	bri .Llaunch_complete
+	bri .Lexchange_complete
 
 .Linactive_launch:
 	.long OPCODE_SANS | SANS_INACTIVE
 	.long OPCODE_SYNC | SYNC_EXTERNAL
+
+.Lexchange_complete:
+	setzi $m0, ipu_stack_exchange_loop_worker_barrier
+	runall $m0, $m15, 0
+	.long OPCODE_SYNC | SYNC_COMPUTE_SET
 	bri .Llaunch_complete
 
 .Llaunch_complete:
 	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
-	call $m7, ipu_stack_device_sync_dispatch
 	bri .Lcommand_loop
 
 .Lhost_launch_complete:
@@ -182,13 +193,14 @@ ipu_stack_completion_address:
 	st32 $m0, $m1, $m15, 0
 	.globl ipu_stack_completion_dispatch
 ipu_stack_completion_dispatch:
-	bri ipu_stack_master_completion
-	.globl ipu_stack_nonmaster_completion_redirect
-ipu_stack_nonmaster_completion_redirect:
-	bri .Lhalt
+	.globl ipu_stack_completion_master_flag
+ipu_stack_completion_master_flag:
+	setzi $m8, 1
+	brz $m8, .Lhalt
 	.globl ipu_stack_master_completion
 ipu_stack_master_completion:
-	bri .Lhalt
+	zero $m0
+	br $m0
 .Lhalt:
 	bri .Lhalt
 	.size ipu_stack_exchange_loop_start, .-ipu_stack_exchange_loop_start
@@ -224,10 +236,11 @@ ipu_stack_exchange_loop_worker_barrier:
 	.p2align 3
 	.globl ipu_stack_pre_sync_dispatch
 ipu_stack_pre_sync_dispatch:
+	.globl ipu_stack_pre_sync_master_flag
+ipu_stack_pre_sync_master_flag:
+	setzi $m8, 1
+	brz $m8, ipu_stack_nonmaster_pre_sync
 	bri ipu_stack_global_pre_sync
-	.globl ipu_stack_nonmaster_pre_sync_redirect
-ipu_stack_nonmaster_pre_sync_redirect:
-	bri ipu_stack_nonmaster_pre_sync
 	.globl ipu_stack_nonmaster_pre_sync
 ipu_stack_nonmaster_pre_sync:
 	.long OPCODE_SANS | SANS_EXTERNAL
@@ -236,10 +249,11 @@ ipu_stack_nonmaster_pre_sync:
 
 	.globl ipu_stack_device_sync_dispatch
 ipu_stack_device_sync_dispatch:
+	.globl ipu_stack_device_sync_master_flag
+ipu_stack_device_sync_master_flag:
+	setzi $m8, 1
+	brz $m8, ipu_stack_nonmaster_pre_sync
 	bri ipu_stack_global_device_sync
-	.globl ipu_stack_nonmaster_device_sync_redirect
-ipu_stack_nonmaster_device_sync_redirect:
-	bri ipu_stack_nonmaster_pre_sync
 	.globl ipu_stack_global_device_sync
 ipu_stack_global_device_sync:
 	call $m10, .Lglobal_sync_select_endpoint
@@ -250,6 +264,7 @@ ipu_stack_global_device_sync:
 
 	.globl ipu_stack_global_pre_sync
 ipu_stack_global_pre_sync:
+	call $m10, .Lglobal_sync_select_endpoint
 	call $m10, .Lglobal_sync_wait
 	call $m10, .Lglobal_sync_send
 	call $m10, .Lglobal_sync_local
@@ -272,7 +287,6 @@ ipu_stack_loop_global_sync_send1:
 	.long OPCODE_SYNC | SYNC_RECEIVE
 	br $m10
 .Lglobal_sync_wait:
-	call $m10, .Lglobal_sync_select_endpoint
 	.long OPCODE_SYNC | SYNC_HOST
 	br $m10
 .Lglobal_sync_select_endpoint:

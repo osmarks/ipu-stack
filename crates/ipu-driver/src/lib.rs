@@ -405,7 +405,42 @@ impl Device {
         self.write_config(offset, state)
     }
 
+    pub fn clear_tile_exception(
+        &self,
+        physical_tile: u16,
+        context: u32,
+    ) -> Result<(), DriverError> {
+        if context >= 7 {
+            return Err(DriverError::Invalid("tile context out of range".into()));
+        }
+        self.write_tile_debug(physical_tile, TDI_EXCEPTION_CLEAR, 1 << context)
+    }
+
     pub fn read_tile_word(&self, physical_tile: u16, address: u32) -> Result<u32, DriverError> {
+        self.read_tile_word_from_context(physical_tile, 0, address, false)
+    }
+
+    pub fn read_tile_word_from_inactive_context(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        address: u32,
+    ) -> Result<u32, DriverError> {
+        if context == 0 {
+            return Err(DriverError::Invalid(
+                "inactive SRAM diagnostic requires a worker context".into(),
+            ));
+        }
+        self.read_tile_word_from_context(physical_tile, context, address, true)
+    }
+
+    fn read_tile_word_from_context(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        address: u32,
+        inactive_is_quiescent: bool,
+    ) -> Result<u32, DriverError> {
         if address & 3 != 0
             || !(TILE_MEMORY_BASE..=TILE_MEMORY_BASE + TILE_MEMORY_SIZE as u32 - 4)
                 .contains(&address)
@@ -414,14 +449,14 @@ impl Device {
                 "invalid tile memory address 0x{address:x}"
             )));
         }
-        self.with_stopped_tile_context(physical_tile, 0, || {
+        self.with_tile_context(physical_tile, context, inactive_is_quiescent, || {
             self.write_tile_debug(physical_tile, TDI_DATA, address)?;
             for instruction in [
                 tdi_instruction::GET_M1_DEBUG_DATA,
                 tdi_instruction::LOAD_M0_FROM_M1,
                 tdi_instruction::PUT_DEBUG_DATA_M0,
             ] {
-                self.execute_tile_instruction(physical_tile, 0, instruction)?;
+                self.execute_tile_instruction(physical_tile, context, instruction)?;
             }
             self.read_tile_debug(physical_tile, TDI_DATA)
         })
@@ -484,10 +519,21 @@ impl Device {
         context: u32,
         operation: impl FnOnce() -> Result<T, DriverError>,
     ) -> Result<T, DriverError> {
+        self.with_tile_context(physical_tile, context, false, operation)
+    }
+
+    fn with_tile_context<T>(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        inactive_is_quiescent: bool,
+        operation: impl FnOnce() -> Result<T, DriverError>,
+    ) -> Result<T, DriverError> {
         let context_bit = 1 << context;
         let old_run_break = self.read_tile_debug(physical_tile, TDI_RUN_BREAK)?;
         let initial_state = self.tile_context_state(physical_tile, context)?;
-        let already_stopped = matches!(initial_state, 2 | 3);
+        let already_stopped =
+            matches!(initial_state, 2 | 3) || (inactive_is_quiescent && initial_state == 0);
         if !already_stopped {
             self.write_tile_debug(physical_tile, TDI_RUN_BREAK, old_run_break | context_bit)?;
             let deadline = Instant::now() + Duration::from_millis(100);
@@ -991,6 +1037,8 @@ impl<'a> HostSession<'a> {
             startup_mark = self.protocol.startup_mark,
             "starting host exchange session"
         );
+        self.device
+            .write_config(pci::EXCHANGE_WINDOW_BASE, pci::EXCHANGE_WINDOW_HEXOPT)?;
         self.device.set_mark(1)?;
         self.device
             .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;

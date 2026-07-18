@@ -61,7 +61,9 @@ fn main() {
     }
     if let Some(result) = results.bindings.get("multicast-tap") {
         assert_eq!(result, &expected_multicast);
-        assert_eq!(results.bindings["relay-destination"], expected_multicast);
+        if let Some(relay) = results.bindings.get("relay-destination") {
+            assert_eq!(relay, &expected_multicast);
+        }
     }
     assert_eq!(results.bindings["runtime-completion"], [1]);
     let _ = fs::remove_dir_all(output);
@@ -103,8 +105,16 @@ fn acceptance_case(mode: &str) -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
                 .outputs
                 .retain(|binding| binding.name == "permutation");
         }
-        "multicast" => {
+        "point" | "fanout" | "multicast" => {
             graph.schedule.phases = vec![graph.schedule.phases[REDUCTION_PHASES + 1].clone()];
+            if let Phase::Exchange { transfers } = &mut graph.schedule.phases[0] {
+                if mode == "point" {
+                    transfers.truncate(2);
+                    transfers.remove(0);
+                } else if mode == "fanout" {
+                    transfers.last_mut().unwrap().source_tile = 0;
+                }
+            }
             graph.schedule.allocations.retain_mut(|allocation| {
                 let keep = allocation.tensor.0 == usize::from(TILE_COUNT) * 2;
                 if keep {
@@ -120,10 +130,13 @@ fn acceptance_case(mode: &str) -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
                 .initial_buffers
                 .retain(|buffer| buffer.address == MULTICAST_SOURCE_ADDRESS);
             graph.outputs.retain(|binding| {
-                matches!(binding.name.as_str(), "multicast-tap" | "relay-destination")
+                binding.name == "multicast-tap"
+                    || (mode != "point" && binding.name == "relay-destination")
             });
         }
-        _ => panic!("IPU_GRAPH_TEST must be reduction, permutation, multicast, or all"),
+        _ => panic!(
+            "IPU_GRAPH_TEST must be reduction, permutation, point, fanout, multicast, or all"
+        ),
     }
     (graph, sum, permutation, multicast)
 }
