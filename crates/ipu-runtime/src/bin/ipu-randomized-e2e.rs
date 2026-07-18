@@ -30,12 +30,8 @@ fn main() {
     )
     .unwrap();
     let device = std::env::var("IPU_DEVICE").unwrap_or_else(|_| "/dev/ipu0".into());
-    let seed = std::env::var("IPU_RANDOM_SEED")
-        .map(|value| value.parse().expect("IPU_RANDOM_SEED must be a u64"))
-        .unwrap_or(DEFAULT_SEED);
-    let case_count = std::env::var("IPU_RANDOM_CASES")
-        .map(|value| value.parse().expect("IPU_RANDOM_CASES must be a usize"))
-        .unwrap_or(DEFAULT_CASES);
+    let seed = env_number("IPU_RANDOM_SEED", DEFAULT_SEED);
+    let case_count = env_number("IPU_RANDOM_CASES", DEFAULT_CASES as u64) as usize;
     assert!(case_count != 0, "IPU_RANDOM_CASES must be nonzero");
 
     let output =
@@ -296,4 +292,18 @@ fn binding(name: &str, regions: Vec<(u16, u32, u32)>) -> Binding {
 
 fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set for the hardware test"))
+}
+
+fn env_number(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .map(|value| {
+            if let Some(hex) = value.strip_prefix("0x") {
+                u64::from_str_radix(hex, 16).unwrap_or_else(|_| panic!("{name} must be an integer"))
+            } else {
+                value
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{name} must be an integer"))
+            }
+        })
+        .unwrap_or(default)
 }
