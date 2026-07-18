@@ -16,14 +16,7 @@ ranges. Host calls map input and output ranges onto driver-attached pages and
 specify the number of HSP phases. This keeps offline application packaging
 separate from the Linux transport used to load or invoke it.
 
-Per-tile compiler commands are eight little-endian 32-bit words. They are a
-compiler IR, not Colossus instructions:
-
-- `Exchange`: opcode, phase, source tile, destination tile, tensor, byte count.
-- `Compute`: opcode, phase, operation, output tensor, input count, input tensors.
-- `End`: opcode `0xff`.
-
-Executable lowering resolves tensor IDs through SRAM allocations, emits exchange
-plan instructions, chooses specialized kernel sections, and applies ELF
-relocations. Keeping this intermediate form explicit avoids coupling graph
-scheduling to the device runtime ABI.
+The command graph is not serialized into tile SRAM. Executable lowering resolves
+tensor IDs through SRAM allocations, emits final exchange rows, chooses
+specialized kernel sections, and generates one straight-line machine-code
+program per tile. The resulting code and data are ordinary package segments.

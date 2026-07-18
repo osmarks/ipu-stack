@@ -10,8 +10,8 @@ There are three deliberately separate artifact levels:
 
 1. A kernel artifact is a `.gp`, extracted Colossus ELF32 relocatable object,
    and compiler metadata JSON. It represents one specialized tile operation.
-2. A tile program is linked machine code plus a fixed-width declarative command
-   stream. Tiles may select different kernel specializations and code sections.
+2. A tile program is a distinct straight-line supervisor program linked with
+   the specialized kernels and constants used by that tile.
 3. An `.ipuexe` is a Cap'n Proto whole-device application. It contains
    content-addressed blobs, final segments for every physical tile, tensor
    bindings, host-exchange pages, device-configuration writes, and named entry
@@ -25,13 +25,13 @@ instruction assembler is required.
 
 - `ipu-elf`: invokes `popc`, extracts ELF and metadata, and links tile images.
 - `ipu-compiler`: fixed-shape graph IR, layouts, exchange phases, SRAM liveness,
-  specialization keys, per-tile commands, and a CPU encoder reference.
+  specialization keys, static per-tile programs, and a CPU encoder reference.
 - `ipu-package`: Cap'n Proto `.ipuexe` serialization, validation, compression,
   and semantic digests.
 - `ipu-driver`: direct Linux device setup, bootloader framing, application load,
   HSP synchronization, and attached host exchange pages.
-- `ipu-runtime`: graph-schedule packaging, dynamic kernel retention, per-tile
-  command generation, direct host execution, and automated diagnostics.
+- `ipu-runtime`: static tile code generation, graph packaging, direct host
+  execution, and automated diagnostics.
 - `ipu-cli`: build, inspect, plan, probe, and load commands.
 
 ## Build and inspect
