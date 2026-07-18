@@ -19,14 +19,16 @@ const PLAN_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHAN
 const TILE_MUX_HOST_BASE: u32 = 0x600;
 const WORKER_CONTEXTS: u32 = 7;
 const WORKER_CONTEXT_BYTES: u32 = 0x30;
-const HOST_PACKET_ALIGNMENT: u32 = 32;
+const HOST_PACKET_BASE_ALIGNMENT: u32 = 32;
+const HOST_PACKET_ALIGNMENT: u32 = 8;
+const HOST_CONTROL_ALIGNMENT: u32 = 32;
 const INVALID_HOST_COMMAND: u32 = u32::MAX;
 const HOST_COMMAND_RUN: u32 = 0;
 const HOST_COMMAND_TILE_TO_HOST: u32 = 1;
 const HOST_COMMAND_HOST_TO_TILE: u32 = 2;
 const HOST_PACKET_BASE: u32 = align_up(
     ipu_exchange::EXCHANGE_WINDOW_BASE + WORKER_CONTEXTS * WORKER_CONTEXT_BYTES,
-    HOST_PACKET_ALIGNMENT,
+    HOST_PACKET_BASE_ALIGNMENT,
 );
 
 pub fn init_tracing() {
@@ -85,10 +87,10 @@ impl RuntimeRole {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RuntimeLayout {
-    plan_stride: u32,
-    host_packet_stride: u32,
+    plan_addresses: Vec<u32>,
+    host_packet_addresses: Vec<u32>,
     command_address: u32,
     completion_address: u32,
     milestone_address: u32,
@@ -104,17 +106,7 @@ impl RuntimeLayout {
         packet_bytes: &[usize],
         command_count: usize,
     ) -> Result<Self> {
-        let plan_stride = align_up(
-            u32::try_from(plan_bytes.iter().copied().max().unwrap_or(1))?,
-            8,
-        );
-        let plan_end = PLAN_BASE
-            .checked_add(
-                u32::try_from(command_count)?
-                    .checked_mul(plan_stride)
-                    .ok_or("plan size overflow")?,
-            )
-            .ok_or("plan address overflow")?;
+        let (plan_addresses, plan_end) = packed_addresses(PLAN_BASE, plan_bytes, 8)?;
         let command_address = align_up(plan_end, 64);
         let command_end = command_address
             .checked_add(
@@ -128,19 +120,11 @@ impl RuntimeLayout {
         let sync_packet_address = align_up(completion_address + 4, 8);
         let sync_release_address = sync_packet_address + 16;
         let runtime_end = sync_release_address + 4;
-        let host_packet_stride = align_up(
-            u32::try_from(packet_bytes.iter().copied().max().unwrap_or(1))?,
-            HOST_PACKET_ALIGNMENT,
-        );
-        let host_packet_end = HOST_PACKET_BASE
-            .checked_add(
-                u32::try_from(command_count)?
-                    .checked_mul(host_packet_stride)
-                    .ok_or("host packet size overflow")?,
-            )
-            .ok_or("host packet address overflow")?;
-        let host_control_end = host_packet_end
-            .checked_add(HOST_PACKET_ALIGNMENT)
+        let (host_packet_addresses, host_packet_end) =
+            packed_addresses(HOST_PACKET_BASE, packet_bytes, HOST_PACKET_ALIGNMENT)?;
+        let host_command_address = align_up(host_packet_end, HOST_CONTROL_ALIGNMENT);
+        let host_control_end = host_command_address
+            .checked_add(4)
             .ok_or("host control address overflow")?;
         if host_control_end
             > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES
@@ -161,7 +145,7 @@ impl RuntimeLayout {
                     allocation_end,
                 )
                 || ranges_overlap(
-                    host_packet_end,
+                    host_command_address,
                     host_control_end,
                     allocation.address,
                     allocation_end,
@@ -175,30 +159,43 @@ impl RuntimeLayout {
             }
         }
         Ok(Self {
-            plan_stride,
-            host_packet_stride,
+            plan_addresses,
+            host_packet_addresses,
             command_address,
             completion_address,
             milestone_address,
             sync_packet_address,
             sync_release_address,
-            host_command_address: host_packet_end,
+            host_command_address,
         })
     }
 
-    fn plan_address(self, command: usize) -> Result<u32> {
-        Ok(PLAN_BASE
-            + u32::try_from(command)?
-                .checked_mul(self.plan_stride)
-                .ok_or("plan address overflow")?)
+    fn plan_address(&self, command: usize) -> Result<u32> {
+        self.plan_addresses
+            .get(command)
+            .copied()
+            .ok_or_else(|| "plan command index out of range".into())
     }
 
-    fn host_packet_address(self, command: usize) -> Result<u32> {
-        Ok(HOST_PACKET_BASE
-            + u32::try_from(command)?
-                .checked_mul(self.host_packet_stride)
-                .ok_or("host packet address overflow")?)
+    fn host_packet_address(&self, command: usize) -> Result<u32> {
+        self.host_packet_addresses
+            .get(command)
+            .copied()
+            .ok_or_else(|| "host packet command index out of range".into())
     }
+}
+
+fn packed_addresses(base: u32, sizes: &[usize], alignment: u32) -> Result<(Vec<u32>, u32)> {
+    let mut addresses = Vec::with_capacity(sizes.len());
+    let mut cursor = base;
+    for &size in sizes {
+        cursor = align_up(cursor, alignment);
+        addresses.push(cursor);
+        cursor = cursor
+            .checked_add(u32::try_from(size)?)
+            .ok_or("packed runtime region overflow")?;
+    }
+    Ok((addresses, cursor))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -690,7 +687,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             });
         }
         if physical == u32::from(global_sync.packet_origin_physical_tile) {
-            add_global_sync_segments(&mut app, &mut segments, global_sync, layout);
+            add_global_sync_segments(&mut app, &mut segments, global_sync, &layout);
         }
         app.tiles.push(TileImage {
             physical_tile: physical,
@@ -1052,20 +1049,8 @@ fn assemble_host_program(
                 packet_address,
             )?)
         }
-        HostDirection::ToTile if role == HostProgramRole::Coordinator => {
-            Ok(ipu_exchange::assemble_host_to_tile_coordinator_program(
-                packet_address,
-                ipu_exchange::plan_host_to_tile(
-                    transfer.physical_tile,
-                    transfer.tile_address,
-                    transfer.host_offset,
-                    transfer.bytes,
-                )?
-                .len(),
-            )?)
-        }
         HostDirection::ToTile if role == HostProgramRole::Source => {
-            Ok(ipu_exchange::assemble_host_to_tile_receiver_program(
+            Ok(ipu_exchange::assemble_remote_host_to_tile_program(
                 transfer.physical_tile,
                 transfer.tile_address,
                 transfer.host_offset,
@@ -1090,7 +1075,6 @@ fn assemble_host_program(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HostProgramRole {
     Complete,
-    Coordinator,
     Source,
 }
 
@@ -1129,9 +1113,6 @@ fn append_host_command(
         }
         HostDirection::ToTile if transfer.physical_tile == HOST_COORDINATOR_TILE => {
             (physical_tile == HOST_COORDINATOR_TILE).then_some(HostProgramRole::Complete)
-        }
-        HostDirection::ToTile if physical_tile == HOST_COORDINATOR_TILE => {
-            Some(HostProgramRole::Coordinator)
         }
         HostDirection::ToTile if physical_tile == transfer.physical_tile => {
             Some(HostProgramRole::Source)
@@ -1235,8 +1216,6 @@ pub fn run_host(
     }
     let mut session = HostSession::new(&device, app.host_exchange.clone())?;
     let calls = app.host_exchange.calls.clone();
-    let first = &calls[0];
-    session.prepare(&first.name, call_input(first, input)?)?;
     if let Err(error) = session.start() {
         return Err(format!(
             "generated host startup rendezvous: {error}; supervisor states: {}; device outputs: {}",
@@ -1252,11 +1231,8 @@ pub fn run_host(
         .max()
         .unwrap_or(0);
     let mut output = vec![0; usize::try_from(output_size)?];
-    for (index, call) in calls.iter().enumerate() {
-        if index != 0 {
-            session.prepare(&call.name, call_input(call, input)?)?;
-        }
-        let call_output = match session.invoke_prepared(&call.name) {
+    for call in &calls {
+        let call_output = match session.invoke(&call.name, call_input(call, input)?) {
             Ok(output) => output,
             Err(error) => {
                 let states = supervisor_state_summary(&device, app);
@@ -1480,7 +1456,7 @@ fn add_global_sync_segments(
     app: &mut Application,
     segments: &mut Vec<Segment>,
     global_sync: GlobalSyncProgram,
-    layout: RuntimeLayout,
+    layout: &RuntimeLayout,
 ) {
     for (address, bytes) in [
         (

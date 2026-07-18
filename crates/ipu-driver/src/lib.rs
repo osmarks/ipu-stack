@@ -990,19 +990,46 @@ impl<'a> Loader<'a> {
 pub struct HostSession<'a> {
     device: &'a Device,
     protocol: HostExchange,
-    pages: HashMap<u32, HostBuffer>,
+    storage: HostBuffer,
+    pages: HashMap<u32, HostPageRange>,
     attached_pages: Vec<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct HostPageRange {
+    offset: usize,
+    size: usize,
 }
 
 impl<'a> HostSession<'a> {
     pub fn new(device: &'a Device, protocol: HostExchange) -> Result<Self, DriverError> {
         let mut pages = HashMap::new();
+        let page_alignment = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|alignment| alignment.is_power_of_two())
+            .ok_or_else(|| DriverError::Invalid("invalid host page size".into()))?;
+        let mut storage_size = 0usize;
         for page in &protocol.pages {
-            pages.insert(page.index, HostBuffer::new(page.size as usize)?);
+            storage_size = storage_size
+                .checked_add(page_alignment - 1)
+                .map(|size| size & !(page_alignment - 1))
+                .ok_or_else(|| DriverError::Invalid("host page arena is too large".into()))?;
+            let size = page.size as usize;
+            pages.insert(
+                page.index,
+                HostPageRange {
+                    offset: storage_size,
+                    size,
+                },
+            );
+            storage_size = storage_size
+                .checked_add(size)
+                .ok_or_else(|| DriverError::Invalid("host page arena is too large".into()))?;
         }
         Ok(Self {
             device,
             protocol,
+            storage: HostBuffer::new(storage_size)?,
             pages,
             attached_pages: Vec::new(),
         })
@@ -1021,7 +1048,8 @@ impl<'a> HostSession<'a> {
                 .ok_or_else(|| DriverError::Invalid(format!("missing host page {index}")))?;
             self.device
                 .write_config(pci::EXCHANGE_WINDOW_BASE, pci::EXCHANGE_WINDOW_HEXOPT)?;
-            if let Err(error) = self.device.attach_buffer(*index, page.data, page.size) {
+            let address = unsafe { self.storage.data.add(page.offset) };
+            if let Err(error) = self.device.attach_buffer(*index, address, page.size) {
                 for attached in self.attached_pages.drain(..).rev() {
                     self.device.detach_buffer(attached);
                 }
@@ -1066,14 +1094,15 @@ impl<'a> HostSession<'a> {
             .find(|call| call.name == name)
             .cloned()
             .ok_or_else(|| DriverError::Invalid(format!("unknown host call {name}")))?;
-        copy_input(&mut self.pages, &call, input)?;
-        poison_output(&mut self.pages, &call)?;
+        copy_input(&mut self.storage, &self.pages, &call, input)?;
+        poison_output(&mut self.storage, &self.pages, &call)?;
         let command = self
             .pages
-            .get_mut(&self.protocol.command_page)
+            .get(&self.protocol.command_page)
             .ok_or_else(|| DriverError::Invalid("missing command page".into()))?;
         let offset = self.protocol.command_offset as usize;
-        command.bytes_mut()[offset..offset + 4].copy_from_slice(&call.command.to_le_bytes());
+        let offset = command.offset + offset;
+        self.storage.bytes_mut()[offset..offset + 4].copy_from_slice(&call.command.to_le_bytes());
         fence(Ordering::SeqCst);
         Ok(call)
     }
@@ -1112,7 +1141,7 @@ impl<'a> HostSession<'a> {
                     ))
                 })?;
         }
-        let output = copy_output(&mut self.pages, &call)?;
+        let output = copy_output(&mut self.storage, &self.pages, &call)?;
         info!(
             call = call.name,
             output_bytes = output.len(),
@@ -1130,19 +1159,24 @@ impl Drop for HostSession<'_> {
     }
 }
 
-fn poison_output(pages: &mut HashMap<u32, HostBuffer>, call: &HostCall) -> Result<(), DriverError> {
+fn poison_output(
+    storage: &mut HostBuffer,
+    pages: &HashMap<u32, HostPageRange>,
+    call: &HostCall,
+) -> Result<(), DriverError> {
     for slice in &call.outputs {
         let page = pages
-            .get_mut(&slice.page)
+            .get(&slice.page)
             .ok_or_else(|| DriverError::Invalid("missing output page".into()))?;
-        let start = slice.page_offset as usize;
-        page.bytes_mut()[start..start + slice.size as usize].fill(0xa5);
+        let start = page.offset + slice.page_offset as usize;
+        storage.bytes_mut()[start..start + slice.size as usize].fill(0xa5);
     }
     Ok(())
 }
 
 fn copy_input(
-    pages: &mut HashMap<u32, HostBuffer>,
+    storage: &mut HostBuffer,
+    pages: &HashMap<u32, HostPageRange>,
     call: &HostCall,
     input: &[u8],
 ) -> Result<(), DriverError> {
@@ -1160,18 +1194,19 @@ fn copy_input(
     }
     for slice in &call.inputs {
         let page = pages
-            .get_mut(&slice.page)
+            .get(&slice.page)
             .ok_or_else(|| DriverError::Invalid("missing input page".into()))?;
-        let destination = slice.page_offset as usize;
+        let destination = page.offset + slice.page_offset as usize;
         let source = slice.file_offset as usize;
-        page.bytes_mut()[destination..destination + slice.size as usize]
+        storage.bytes_mut()[destination..destination + slice.size as usize]
             .copy_from_slice(&input[source..source + slice.size as usize]);
     }
     Ok(())
 }
 
 fn copy_output(
-    pages: &mut HashMap<u32, HostBuffer>,
+    storage: &mut HostBuffer,
+    pages: &HashMap<u32, HostPageRange>,
     call: &HostCall,
 ) -> Result<Vec<u8>, DriverError> {
     let size = call
@@ -1184,12 +1219,12 @@ fn copy_output(
     fence(Ordering::SeqCst);
     for slice in &call.outputs {
         let page = pages
-            .get_mut(&slice.page)
+            .get(&slice.page)
             .ok_or_else(|| DriverError::Invalid("missing output page".into()))?;
-        let source = slice.page_offset as usize;
+        let source = page.offset + slice.page_offset as usize;
         let destination = slice.file_offset as usize;
         output[destination..destination + slice.size as usize]
-            .copy_from_slice(&page.bytes_mut()[source..source + slice.size as usize]);
+            .copy_from_slice(&storage.bytes_mut()[source..source + slice.size as usize]);
     }
     Ok(output)
 }

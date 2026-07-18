@@ -352,33 +352,7 @@ pub fn assemble_host_to_tile_program(
     })
 }
 
-pub fn assemble_host_to_tile_coordinator_program(
-    packet_address: u32,
-    request_count: usize,
-) -> Result<TileToHostProgram, ExchangeError> {
-    if packet_address & 7 != 0 || request_count == 0 {
-        return Err(ExchangeError::HostPacket);
-    }
-    let mut instructions = vec![
-        setzi_m(8, TILE_MUX_HOST),
-        put_special_from_m8(INCOMING_MUX_REGISTER),
-        SYNC_HOST_INSTRUCTION,
-    ];
-    for index in 0..request_count {
-        instructions.push(encode_send(
-            1,
-            3,
-            host_packet_entry_address(packet_address, index)? >> 2,
-        )?);
-    }
-    instructions.push(RETURN_M10_INSTRUCTION);
-    Ok(TileToHostProgram {
-        instructions,
-        packet_words: [1, 0].repeat(request_count),
-    })
-}
-
-pub fn assemble_host_to_tile_receiver_program(
+pub fn assemble_remote_host_to_tile_program(
     physical_tile: u16,
     tile_address: u32,
     host_offset: u32,
@@ -390,20 +364,19 @@ pub fn assemble_host_to_tile_receiver_program(
         return Err(ExchangeError::HostPacket);
     }
     let mut instructions = vec![
-        sans(1),
-        SYNC_EXTERNAL_INSTRUCTION,
         setzi_m(8, host_tile_mux(physical_tile)?),
         put_special_from_m8(INCOMING_MUX_REGISTER),
+        SYNC_ALL_INSTRUCTION,
+        setzi_m(8, bytes / 4),
+        put_special_from_m8(INCOMING_DCOUNT_REGISTER),
     ];
-    for (index, chunk) in chunks.iter().enumerate() {
-        instructions.extend([
-            setzi_m(8, chunk.bytes / 4),
-            put_special_from_m8(INCOMING_DCOUNT_REGISTER),
-            encode_send(1, 3, host_packet_entry_address(packet_address, index)? >> 2)?,
-            SYNC_RECEIVE_INSTRUCTION,
-        ]);
+    instructions.push(encode_send(1, 3, packet_address >> 2)?);
+    for _ in 1..chunks.len() {
+        instructions.push(send_off(1, 3, 0));
     }
     instructions.extend([
+        SYNC_RECEIVE_INSTRUCTION,
+        SYNC_ALL_INSTRUCTION,
         setzi_m(8, TILE_MUX_EXCHANGE),
         put_special_from_m8(INCOMING_MUX_REGISTER),
         RETURN_M10_INSTRUCTION,
@@ -412,7 +385,15 @@ pub fn assemble_host_to_tile_receiver_program(
         instructions,
         packet_words: chunks
             .iter()
-            .flat_map(|chunk| [chunk.header.word0, chunk.header.word1])
+            .enumerate()
+            .flat_map(|(index, chunk)| {
+                let word0 = if index + 1 == chunks.len() {
+                    chunk.header.word0
+                } else {
+                    chunk.header.word0 & !HOST_TO_TILE_STREAM_END_BITS
+                };
+                [word0, chunk.header.word1]
+            })
             .collect(),
     })
 }
@@ -719,15 +700,6 @@ fn validate_host_tile(physical_tile: u16) -> Result<(), ExchangeError> {
     Ok(())
 }
 
-fn host_packet_entry_address(base: u32, index: usize) -> Result<u32, ExchangeError> {
-    let byte_offset = u32::try_from(index)
-        .ok()
-        .and_then(|index| index.checked_mul(8))
-        .ok_or(ExchangeError::HostPacket)?;
-    base.checked_add(byte_offset)
-        .ok_or(ExchangeError::HostPacket)
-}
-
 fn host_tile_mux(physical_tile: u16) -> Result<u32, ExchangeError> {
     validate_host_tile(physical_tile)?;
     Ok(TILE_MUX_HOST + u32::from((physical_tile & 0x3f) & !2))
@@ -949,7 +921,11 @@ impl Topology {
             let mut row = [0; PLAN_WORDS];
             row[0] = SYNC_SUPERVISOR_INSTRUCTION;
             row[1] = delay_xpic(receive_cycle as u32, 0, source_physical);
-            if count <= 51 {
+            if count == 1 {
+                row[2] = delay_pic(51 + receiver_phase, 0, 0) | 0x0001_4000;
+                row[3] = delay(5);
+                row[4] = RETURN_M10_INSTRUCTION;
+            } else if count <= 51 {
                 row[2] = delay_xpic(count - 1, 0, TILE_MUX_EXCHANGE);
                 row[3] = delay_pic(51 - count + receiver_phase, 0, 0) | 0x0001_4000;
                 row[4] = delay(count + 4);
@@ -1231,6 +1207,29 @@ mod tests {
         let boundary = topology.multicast(736, &[100, 900], 52, 0).unwrap();
         assert_eq!(boundary.receivers[0][2], 0x61d14000);
         assert_eq!(boundary.receivers[0][3], 0x64000640);
+    }
+
+    #[test]
+    fn one_word_multicast_omits_zero_length_xpic_stage() {
+        let topology = Topology::c600();
+        let receivers = (1..topology.tile_count() as u16).collect::<Vec<_>>();
+        let plan = topology.multicast(0, &receivers, 1, 0).unwrap();
+        for mut receiver in plan.receivers {
+            assert_eq!(
+                receiver
+                    .iter()
+                    .filter(|instruction| **instruction & OPCODE_MASK == DELAY_XPIC_OPCODE)
+                    .count(),
+                1
+            );
+            let cycles = plan_event_cycles(&receiver).unwrap();
+            patch_multicast_receiver_address(&mut receiver, EXCHANGE_WINDOW_BASE).unwrap();
+            assert_eq!(plan_event_cycles(&receiver).unwrap(), cycles);
+            assert_eq!(
+                receiver.iter().rfind(|instruction| **instruction != 0),
+                Some(&RETURN_M10_INSTRUCTION)
+            );
+        }
     }
 
     #[test]
