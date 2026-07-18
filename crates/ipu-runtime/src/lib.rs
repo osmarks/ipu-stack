@@ -702,17 +702,10 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
     let mut calls = Vec::with_capacity(operations);
     for (index, commands) in inputs.chunks_exact(2).enumerate() {
         let transfer = commands[1];
-        let chunks = ipu_exchange::plan_host_to_tile(
-            transfer.physical_tile,
-            transfer.tile_address,
-            transfer.host_offset,
-            transfer.bytes,
-        )?
-        .len();
         calls.push(HostCall {
             name: format!("host-input-{index}"),
             command: HOST_COMMAND_HOST_TO_TILE,
-            phases: 2 + u32::try_from(chunks)? + u32::from(index + 1 != operations),
+            phases: 3 + u32::from(index + 1 != operations),
             inputs: transfer_host_slices(&input_slices, transfer)?,
             outputs: Vec::new(),
         });
@@ -1495,15 +1488,7 @@ mod tests {
             })
         }));
         assert_eq!(calls[0].command, HOST_COMMAND_HOST_TO_TILE);
-        let input_transfer = layout.inputs[1];
-        let input_chunks = ipu_exchange::plan_host_to_tile(
-            input_transfer.physical_tile,
-            input_transfer.tile_address,
-            input_transfer.host_offset,
-            input_transfer.bytes,
-        )
-        .unwrap();
-        assert_eq!(calls[0].phases, input_chunks.len() as u32 + 3);
+        assert_eq!(calls[0].phases, 4);
         assert_eq!(calls[1].command, HOST_COMMAND_TILE_TO_HOST);
         assert_eq!(calls[1].phases, 3);
         let output = layout

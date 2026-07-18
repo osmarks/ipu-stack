@@ -30,6 +30,7 @@ const PUT_SPECIAL_FROM_M8_OPCODE: u32 = 0x4380_8000;
 const INCOMING_MUX_REGISTER: u8 = 0xa0;
 const INCOMING_DCOUNT_REGISTER: u8 = 0xa6;
 const TILE_TO_HOST_CLOSE_DELAY_CYCLES: u32 = 1;
+const HOST_TO_TILE_STREAM_END_BITS: u32 = 0x0c00_0000;
 // Time reserved by the SDK supervisor schedule between receiving a host
 // command and injecting that command into the device-side dispatch path.
 const HOST_COMMAND_ROUTE_CYCLES: u32 = 73;
@@ -318,31 +319,33 @@ pub fn assemble_host_to_tile_program(
     if packet_address & 7 != 0 {
         return Err(ExchangeError::HostPacket);
     }
-    let header_base = host_packet_entry_address(packet_address, chunks.len())?;
+    let header_base = packet_address
+        .checked_add(8)
+        .ok_or(ExchangeError::HostPacket)?;
     let mut instructions = vec![
         setzi_m(8, TILE_MUX_HOST),
         put_special_from_m8(INCOMING_MUX_REGISTER),
         SYNC_HOST_INSTRUCTION,
+        setzi_m(8, bytes / 4),
+        put_special_from_m8(INCOMING_DCOUNT_REGISTER),
+        encode_send(1, 3, packet_address >> 2)?,
+        encode_send(1, 3, header_base >> 2)?,
     ];
-    for (index, chunk) in chunks.iter().enumerate() {
-        let request_address = host_packet_entry_address(packet_address, index)?;
-        let header_address = host_packet_entry_address(header_base, index)?;
-        instructions.extend([
-            setzi_m(8, chunk.bytes / 4),
-            put_special_from_m8(INCOMING_DCOUNT_REGISTER),
-            encode_send(1, 3, request_address >> 2)?,
-            encode_send(1, 3, header_address >> 2)?,
-            SYNC_RECEIVE_INSTRUCTION,
-        ]);
+    for _ in 1..chunks.len() {
+        instructions.push(send_off(1, 3, 0));
     }
+    instructions.push(SYNC_RECEIVE_INSTRUCTION);
     append_local_host_completion(&mut instructions);
     instructions.push(RETURN_M10_INSTRUCTION);
-    let mut packet_words = [1, 0].repeat(chunks.len());
-    packet_words.extend(
-        chunks
-            .iter()
-            .flat_map(|chunk| [chunk.header.word0, chunk.header.word1]),
-    );
+    let mut packet_words = vec![1, 0];
+    packet_words.extend(chunks.iter().enumerate().flat_map(|(index, chunk)| {
+        let word0 = if index + 1 == chunks.len() {
+            chunk.header.word0
+        } else {
+            chunk.header.word0 & !HOST_TO_TILE_STREAM_END_BITS
+        };
+        [word0, chunk.header.word1]
+    }));
     Ok(TileToHostProgram {
         instructions,
         packet_words,
@@ -1493,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_multi_packet_host_to_tile_under_one_host_handoff() {
+    fn groups_multi_packet_host_to_tile_as_one_stream_copy() {
         let chunks = plan_host_to_tile(63, 0x50000, 0x40, 4096).unwrap();
         let plan = assemble_host_to_tile_program(63, 0x50000, 0x40, 4096, 0x54000).unwrap();
         assert_eq!(
@@ -1509,9 +1512,25 @@ mod tests {
                 .iter()
                 .filter(|instruction| **instruction == SYNC_RECEIVE_INSTRUCTION)
                 .count(),
-            chunks.len()
+            1
         );
-        assert_eq!(plan.packet_words.len(), chunks.len() * 4);
+        assert_eq!(plan.packet_words.len(), 2 + chunks.len() * 2);
+        assert!(
+            plan.packet_words[2..plan.packet_words.len() - 2]
+                .chunks_exact(2)
+                .all(|header| header[0] & HOST_TO_TILE_STREAM_END_BITS == 0)
+        );
+        assert_eq!(
+            plan.packet_words[plan.packet_words.len() - 2] & HOST_TO_TILE_STREAM_END_BITS,
+            HOST_TO_TILE_STREAM_END_BITS
+        );
+        assert_eq!(
+            plan.instructions
+                .iter()
+                .filter(|instruction| **instruction & LONG_OPCODE_MASK == SEND_OFF_OPCODE)
+                .count(),
+            chunks.len() - 1
+        );
     }
 
     #[test]

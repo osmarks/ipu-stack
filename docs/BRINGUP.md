@@ -161,10 +161,13 @@ has its own control read. Nonterminal calls wait for the following command
 rendezvous. The terminal call instead issues its last GS2 release without
 waiting for a rendezvous from an application that has already completed.
 
-Multi-packet H2D is not working yet. A 2048-byte H2D stalls while processing
-the second planned packet even when the host phase count is derived from the
-number of generated receive completions. Remote 64-byte H2D also stalls. The
-large H2D/D2D/D2H and remote host-transfer hardware tests remain red.
+Multi-packet local H2D uses one stream: total-word `DCOUNT`, one XREQ, an
+initial two-word header, `sendoff` for each continuation header, and one
+`sync0`. Only the final header carries the `0x0c00_0000` stream-end field. A
+direct random 2048-byte H2D-to-D2H round trip passes exactly and reaches
+runtime completion. The same payload routed through two 2048-byte D2D passes
+currently returns zeros, so the combined large-transfer gate remains red for
+D2D rather than host transport. Remote 64-byte H2D also stalls.
 
 Remote D2H is a distinct two-role operation and remains unresolved. Tile 0
 preissues `[2, 0]` after `sync 3` and the 73-cycle route envelope. During the
