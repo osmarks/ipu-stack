@@ -27,9 +27,18 @@ fn main() {
     let device = std::env::var("IPU_DEVICE").unwrap_or_else(|_| "/dev/ipu0".into());
     let output = std::env::temp_dir().join(format!("ipu-stack-host-e2e-{}", std::process::id()));
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/graph_runtime.S");
-    let compile_flags = std::env::var_os("IPU_STACK_TRACE_MILESTONES")
-        .map(|_| vec!["-DIPU_STACK_TRACE_MILESTONES".into()])
-        .unwrap_or_default();
+    let mut compile_flags = Vec::new();
+    for (environment, define) in [
+        ("IPU_STACK_TRACE_MILESTONES", "IPU_STACK_TRACE_MILESTONES"),
+        (
+            "IPU_STACK_TRAP_AFTER_RECEIVE",
+            "IPU_STACK_TRAP_AFTER_RECEIVE",
+        ),
+    ] {
+        if std::env::var_os(environment).is_some() {
+            compile_flags.push(format!("-D{define}"));
+        }
+    }
     let artifact = Toolchain::from_sdk(sdk)
         .compile(&source, &output, "host-e2e", &compile_flags)
         .unwrap();
@@ -77,7 +86,7 @@ fn main() {
     );
     let payload_count = second_tile.map_or(output_count, |_| 2);
     let payload = test_payload(transfer_bytes * payload_count);
-    let (graph, input, expected) = if d2h_only {
+    let (mut graph, input, expected) = if d2h_only {
         assert!(second_tile.is_none());
         (
             d2h_only_graph(transfer_bytes, host_tile, &payload).unwrap(),
@@ -114,6 +123,25 @@ fn main() {
         .unwrap();
         (graph, payload.clone(), payload)
     };
+    if exchange && std::env::var_os("IPU_STACK_TRAP_AFTER_RECEIVE").is_some() {
+        let relay = graph
+            .schedule
+            .allocations
+            .iter()
+            .find(|allocation| {
+                allocation.tile == EXCHANGE_RELAY_TILE
+                    && allocation.kind == AllocationKind::ExchangeStaging { phase: 0 }
+            })
+            .unwrap();
+        graph.outputs.push(binding(
+            "diagnostic-relay",
+            ipu_exchange::Topology::c600()
+                .physical(EXCHANGE_RELAY_TILE)
+                .unwrap(),
+            relay.address,
+            transfer_bytes,
+        ));
+    }
     let app = package_graph(&graph, &[runtime_object]).unwrap();
     if let Some(path) = std::env::var_os("IPU_HOST_TEST_PACKAGE") {
         app.write(fs::File::create(path).unwrap()).unwrap();

@@ -1055,9 +1055,14 @@ pub fn run_host(
     let calls = app.host_exchange.calls.clone();
     let first = &calls[0];
     session.prepare(&first.name, call_input(first, input)?)?;
-    session
-        .start()
-        .map_err(|error| format!("generated host startup rendezvous: {error}"))?;
+    if let Err(error) = session.start() {
+        return Err(format!(
+            "generated host startup rendezvous: {error}; supervisor states: {}; device outputs: {}",
+            supervisor_state_summary(&device, app),
+            host_source_summary(&device, app)
+        )
+        .into());
+    }
     let output_size = calls
         .iter()
         .flat_map(|call| &call.outputs)
