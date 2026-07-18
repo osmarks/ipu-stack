@@ -8,22 +8,21 @@ const INCOMING_SBASE: u8 = 0xa7;
 
 pub(crate) const WORKER_BARRIER: &str = "ipu_stack_static_worker_barrier";
 pub(crate) const COMPLETE: &str = "ipu_stack_static_complete";
-pub(crate) const COPY_U32: &str = "ipu_stack_static_copy_u32";
+pub(crate) const HOST_RUN: &str = "ipu_stack_static_host_run";
 pub(crate) const REPEAT_CALL: &str = "ipu_stack_static_repeat_call";
 pub(crate) const SAMPLE_CYCLE: &str = "ipu_stack_static_sample_cycle";
 
 #[derive(Clone, Copy)]
-pub(crate) struct HostCopy {
-    pub source: u32,
-    pub destination: u32,
-    pub words: u32,
-}
-
-#[derive(Clone, Copy)]
 pub(crate) struct HostPhaseCall {
     pub address: u32,
-    pub copy: Option<HostCopy>,
     pub active: bool,
+    pub run_table: Option<u32>,
+}
+
+pub(crate) struct HostCode<'a> {
+    pub inputs: &'a [HostPhaseCall],
+    pub outputs: &'a [HostPhaseCall],
+    pub run_state: u32,
 }
 
 pub(crate) fn emit(
@@ -31,8 +30,7 @@ pub(crate) fn emit(
     base: u32,
     symbols: &BTreeMap<String, u32>,
     plan_addresses: &[u32],
-    host_inputs: &[HostPhaseCall],
-    host_outputs: &[HostPhaseCall],
+    host: HostCode<'_>,
     profile_addresses: &[u32],
 ) -> Result<Vec<u8>> {
     if !profile_addresses.is_empty() && profile_addresses.len() != program.steps.len() {
@@ -40,7 +38,7 @@ pub(crate) fn emit(
     }
     let mut code = TileCode::new(base);
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
-    emit_host_phases(&mut code, symbols, host_inputs)?;
+    emit_host_phases(&mut code, symbols, host.inputs, host.run_state)?;
     let mut plan_index = 0usize;
     for (step_index, step) in program.steps.iter().enumerate() {
         if let Some(&address) = profile_addresses.get(step_index) {
@@ -92,7 +90,7 @@ pub(crate) fn emit(
     if plan_index != plan_addresses.len() {
         return Err("unused exchange plan address".into());
     }
-    emit_host_phases(&mut code, symbols, host_outputs)?;
+    emit_host_phases(&mut code, symbols, host.outputs, host.run_state)?;
     code.jump(symbol(symbols, COMPLETE)?)?;
     Ok(code.words.into_iter().flat_map(u32::to_le_bytes).collect())
 }
@@ -110,16 +108,25 @@ fn emit_host_phases(
     code: &mut TileCode,
     symbols: &BTreeMap<String, u32>,
     phases: &[HostPhaseCall],
+    host_run_state: u32,
 ) -> Result<()> {
     let repeat_call = symbol(symbols, REPEAT_CALL)?;
     let mut index = 0;
     while index < phases.len() {
         if phases[index].active {
-            code.call(phases[index].address, 10)?;
-            if let Some(copy) = phases[index].copy {
-                emit_copy(code, symbols, copy)?;
+            let start = index;
+            while index < phases.len() && phases[index].active {
+                index += 1;
             }
-            index += 1;
+            code.setzi(2, u32::try_from(index - start)?)?;
+            code.setzi(
+                3,
+                phases[start]
+                    .run_table
+                    .ok_or("active host run has no descriptor table")?,
+            )?;
+            code.setzi(4, host_run_state)?;
+            code.call(symbol(symbols, HOST_RUN)?, 9)?;
             continue;
         }
         let start = index;
@@ -131,13 +138,6 @@ fn emit_host_phases(
         code.call(repeat_call, 9)?;
     }
     Ok(())
-}
-
-fn emit_copy(code: &mut TileCode, symbols: &BTreeMap<String, u32>, copy: HostCopy) -> Result<()> {
-    code.setzi(2, copy.destination)?;
-    code.setzi(3, copy.source)?;
-    code.setzi(4, copy.words)?;
-    code.call(symbol(symbols, COPY_U32)?, 10)
 }
 
 fn symbol(symbols: &BTreeMap<String, u32>, name: &str) -> Result<u32> {

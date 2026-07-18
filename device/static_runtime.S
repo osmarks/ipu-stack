@@ -118,6 +118,39 @@ ipu_stack_static_repeat_call:
 	br $m9
 	.size ipu_stack_static_repeat_call, .-ipu_stack_static_repeat_call
 
+	.section .text.ipu_stack_static_host_run,"ax",@progbits
+	.globl ipu_stack_static_host_run
+	.p2align 2
+	.type ipu_stack_static_host_run,@function
+ipu_stack_static_host_run:
+	.supervisor
+.Lhost_run_next:
+	ld32 $m0, $m3, $m15, 0
+	st32 $m2, $m4, $m15, 0
+	st32 $m3, $m4, $m15, 1
+	setzi $m10, .Lhost_run_return
+	br $m0
+.Lhost_run_return:
+	ld32 $m2, $m4, $m15, 0
+	ld32 $m3, $m4, $m15, 1
+	ld32 $m5, $m3, $m15, 3
+	brz $m5, .Lhost_run_advance
+	ld32 $m6, $m3, $m15, 1
+	ld32 $m7, $m3, $m15, 2
+.Lhost_run_copy:
+	ld32 $m0, $m7, $m15, 0
+	st32 $m0, $m6, $m15, 0
+	add $m7, $m7, 4
+	add $m6, $m6, 4
+	sub $m5, $m5, 1
+	brnz $m5, .Lhost_run_copy
+.Lhost_run_advance:
+	add $m3, $m3, 16
+	sub $m2, $m2, 1
+	brnz $m2, .Lhost_run_next
+	br $m9
+	.size ipu_stack_static_host_run, .-ipu_stack_static_host_run
+
 	.section .text.ipu_stack_static_sample_cycle,"ax",@progbits
 	.globl ipu_stack_static_sample_cycle
 	.p2align 2

@@ -42,6 +42,8 @@ struct StaticHostLayout {
 
 struct TileHostPlans {
     addresses: Vec<u32>,
+    run_tables: Vec<Option<u32>>,
+    run_state: u32,
     end: u32,
 }
 pub fn init_tracing() {
@@ -562,8 +564,44 @@ fn package_graph_impl(
                     addresses.push(follower_address);
                 }
             }
-            let end = cursor;
-            Ok(TileHostPlans { addresses, end })
+            let mut run_tables = vec![None; host_transfers.len()];
+            for range in [
+                0..host.inputs.len(),
+                host.inputs.len()..host_transfers.len(),
+            ] {
+                let mut index = range.start;
+                while index < range.end {
+                    if !host_phase_is_active(physical, &host_transfers[index]) {
+                        index += 1;
+                        continue;
+                    }
+                    let start = index;
+                    while index < range.end
+                        && host_phase_is_active(physical, &host_transfers[index])
+                    {
+                        index += 1;
+                    }
+                    cursor = align_up(cursor, 4);
+                    run_tables[start] = Some(cursor);
+                    cursor = cursor
+                        .checked_add(
+                            u32::try_from(index - start)?
+                                .checked_mul(16)
+                                .ok_or("static host run descriptor size overflow")?,
+                        )
+                        .ok_or("static host run descriptor address overflow")?;
+                }
+            }
+            let run_state = align_up(cursor, 4);
+            let end = run_state
+                .checked_add(8)
+                .ok_or("static host run state address overflow")?;
+            Ok(TileHostPlans {
+                addresses,
+                run_tables,
+                run_state,
+                end,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     let completion_addresses = tile_host_plans
@@ -574,7 +612,7 @@ fn package_graph_impl(
     let mut retained_symbols = vec![
         static_codegen::WORKER_BARRIER.into(),
         static_codegen::COMPLETE.into(),
-        static_codegen::COPY_U32.into(),
+        static_codegen::HOST_RUN.into(),
         static_codegen::REPEAT_CALL.into(),
     ];
     if !profile_addresses.is_empty() {
@@ -617,40 +655,39 @@ fn package_graph_impl(
                 let host_inputs = host_plans.addresses[..host.inputs.len()]
                     .iter()
                     .copied()
+                    .zip(&host_plans.run_tables[..host.inputs.len()])
                     .zip(&host.inputs)
-                    .map(|(address, transfer)| {
-                        let copy = (transfer.physical_tile == physical)
-                            .then_some(transfer.copy_destination)
-                            .flatten()
-                            .map(|destination| static_codegen::HostCopy {
-                                source: transfer.tile_address,
-                                destination,
-                                words: transfer.bytes / 4,
-                            });
-                        static_codegen::HostPhaseCall {
+                    .map(
+                        |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
                             address,
-                            copy,
                             active: host_phase_is_active(physical, transfer),
-                        }
-                    })
+                            run_table,
+                        },
+                    )
                     .collect::<Vec<_>>();
                 let host_outputs = host_plans.addresses[host.inputs.len()..]
                     .iter()
                     .copied()
+                    .zip(&host_plans.run_tables[host.inputs.len()..])
                     .zip(&host.outputs)
-                    .map(|(address, transfer)| static_codegen::HostPhaseCall {
-                        address,
-                        copy: None,
-                        active: host_phase_is_active(physical, transfer),
-                    })
+                    .map(
+                        |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
+                            address,
+                            active: host_phase_is_active(physical, transfer),
+                            run_table,
+                        },
+                    )
                     .collect::<Vec<_>>();
                 static_codegen::emit(
                     program,
                     program_base,
                     &image.symbols,
                     &plan_addresses,
-                    &host_inputs,
-                    &host_outputs,
+                    static_codegen::HostCode {
+                        inputs: &host_inputs,
+                        outputs: &host_outputs,
+                        run_state: host_plans.run_state,
+                    },
                     profile_addresses
                         .get(program_index)
                         .map(Vec::as_slice)
@@ -777,9 +814,12 @@ fn package_graph_impl(
             &mut app,
             &mut segments,
             physical as u16,
-            &host_transfers,
-            &host_plans.addresses,
-            &host_packet_addresses,
+            StaticHostPacketLayout {
+                transfers: &host_transfers,
+                plan_addresses: &host_plans.addresses,
+                packet_addresses: &host_packet_addresses,
+                run_tables: &host_plans.run_tables,
+            },
             &mut plan_region,
         )?;
         if !plan_region.is_empty() {
@@ -958,10 +998,14 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
 }
 
 fn host_transfer_phase_count(transfers: u32) -> Result<u32> {
-    // Each transfer has an entry and completion rendezvous. The graph-close
-    // acknowledgement is issued separately after HostSession copies D2H data.
+    if transfers == 0 {
+        return Ok(0);
+    }
+    // Leave the final transfer and graph-close rendezvous to state-driven
+    // finalization, before D2H pages are copied out of the host arena.
     transfers
         .checked_mul(2)
+        .and_then(|phases| phases.checked_sub(1))
         .ok_or_else(|| "host phase count overflow".into())
 }
 
@@ -1157,18 +1201,34 @@ fn host_packet_size(transfer: StaticHostTransfer) -> Result<usize> {
     Ok(8 + target.packet_words.len() * 4)
 }
 
+struct StaticHostPacketLayout<'a> {
+    transfers: &'a [StaticHostTransfer],
+    plan_addresses: &'a [u32],
+    packet_addresses: &'a [u32],
+    run_tables: &'a [Option<u32>],
+}
+
 fn append_static_host_packets(
     app: &mut Application,
     segments: &mut Vec<Segment>,
     physical_tile: u16,
-    transfers: &[StaticHostTransfer],
-    plan_addresses: &[u32],
-    packet_addresses: &[u32],
+    layout: StaticHostPacketLayout<'_>,
     plan_region: &mut [u8],
 ) -> Result<()> {
+    let StaticHostPacketLayout {
+        transfers,
+        plan_addresses,
+        packet_addresses,
+        run_tables,
+    } = layout;
+    let mut follower_written = false;
     for ((transfer, &plan_address), &packet_address) in
         transfers.iter().zip(plan_addresses).zip(packet_addresses)
     {
+        let active = host_phase_is_active(physical_tile, transfer);
+        if !active && follower_written {
+            continue;
+        }
         let hierarchy = ipu_exchange::host_hierarchy(transfer.physical_tile)?;
         let (instructions, packet_words) =
             host_phase_instructions(physical_tile, *transfer, packet_address)?;
@@ -1194,6 +1254,31 @@ fn append_static_host_packets(
                 flags: SEGMENT_READ,
             });
         }
+        follower_written |= !active;
+    }
+    for (start, &table_address) in run_tables.iter().enumerate() {
+        let Some(table_address) = table_address else {
+            continue;
+        };
+        let mut descriptors = Vec::new();
+        let mut index = start;
+        while index < transfers.len()
+            && (index == start || run_tables[index].is_none())
+            && host_phase_is_active(physical_tile, &transfers[index])
+        {
+            let transfer = transfers[index];
+            let copy = (transfer.physical_tile == physical_tile)
+                .then_some(transfer.copy_destination)
+                .flatten();
+            descriptors.extend_from_slice(&[
+                plan_addresses[index],
+                copy.unwrap_or(0),
+                copy.map_or(0, |_| transfer.tile_address),
+                copy.map_or(0, |_| transfer.bytes / 4),
+            ]);
+            index += 1;
+        }
+        write_plan_bytes(plan_region, table_address, &words_to_bytes(&descriptors))?;
     }
     Ok(())
 }
@@ -1358,28 +1443,29 @@ fn run_host_impl(
         .map(|slice| slice.file_offset + slice.size)
         .max()
         .unwrap_or(0);
-    let mut output = vec![0; usize::try_from(output_size)?];
-    for call in &calls {
-        let call_output = match session.invoke(&call.name, call_input(call, input)?) {
-            Ok(output) => output,
-            Err(error) => {
-                let states = supervisor_state_summary(&device, app);
-                let sources = host_source_summary(&device, app);
-                return Err(format!(
-                    "generated host call {}: {error}; supervisor states: {states}; device outputs: {sources}",
-                    call.name
-                )
-                .into());
-            }
-        };
-        for slice in &call.outputs {
-            let start = usize::try_from(slice.file_offset)?;
-            let end = usize::try_from(slice.file_offset + slice.size)?;
-            output[start..end].copy_from_slice(&call_output[start..end]);
-        }
+    if calls.len() != 1 {
+        return Err("the static host runtime requires exactly one generated call".into());
     }
-    device.write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+    let call = &calls[0];
+    let deferred = session
+        .invoke_deferred(&call.name, call_input(call, input)?)
+        .map_err(|error| {
+            format!(
+                "generated host call {}: {error}; supervisor states: {}; device outputs: {}",
+                call.name,
+                supervisor_state_summary(&device, app),
+                host_source_summary(&device, app)
+            )
+        })?;
+    finish_host_graph(&device, app)?;
     verify_runtime_completion(&device, app)?;
+    let call_output = session.collect(&deferred)?;
+    let mut output = vec![0; usize::try_from(output_size)?];
+    for slice in &call.outputs {
+        let start = usize::try_from(slice.file_offset)?;
+        let end = usize::try_from(slice.file_offset + slice.size)?;
+        output[start..end].copy_from_slice(&call_output[start..end]);
+    }
     debug!(states = %supervisor_state_summary(&device, app), "host exchange supervisor states");
     debug!(sources = %host_source_summary(&device, app), "host exchange device sources");
     drop(session);
@@ -1387,6 +1473,36 @@ fn run_host_impl(
         inspector(&device, &output)?;
     }
     Ok(output)
+}
+
+fn finish_host_graph(device: &Device, app: &Application) -> Result<()> {
+    let completion_tile = app
+        .outputs
+        .iter()
+        .find(|binding| binding.name == "runtime-completion")
+        .and_then(|binding| binding.slices.first())
+        .map(|slice| slice.tile as u16)
+        .ok_or("application has no runtime completion binding")?;
+    for _ in 0..2 {
+        if completion_reached(device, completion_tile)? {
+            return Ok(());
+        }
+        device.write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if completion_reached(device, completion_tile)? {
+                return Ok(());
+            }
+            if device.read_config(ipu_driver::pci::HSP_GS2_CONTROL)? == 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("host graph did not consume its final acknowledgement".into());
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+    Ok(())
 }
 
 fn verify_runtime_completion(device: &Device, app: &Application) -> Result<()> {
@@ -1659,11 +1775,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_phase_count_has_two_rendezvous_per_transfer() {
-        for transfers in 0..1024 {
+    fn host_phase_count_defers_the_last_rendezvous() {
+        assert_eq!(host_transfer_phase_count(0).unwrap(), 0);
+        for transfers in 1..1024 {
             let phases = host_transfer_phase_count(transfers).unwrap();
-            assert_eq!(phases / 2, transfers);
-            assert_eq!(phases % 2, 0);
+            assert_eq!(phases.div_ceil(2), transfers);
+            assert_eq!(phases % 2, 1);
         }
     }
 

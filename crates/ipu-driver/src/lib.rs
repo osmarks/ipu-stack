@@ -1192,6 +1192,19 @@ impl<'a> HostSession<'a> {
         self.drive(call)
     }
 
+    pub fn invoke_deferred(&mut self, name: &str, input: &[u8]) -> Result<HostCall, DriverError> {
+        if self.attached_pages.len() != self.protocol.attach_order.len() {
+            return Err(DriverError::Invalid("host session not attached".into()));
+        }
+        let call = self.prepare(name, input)?;
+        self.drive_handshake(&call)?;
+        Ok(call)
+    }
+
+    pub fn collect(&mut self, call: &HostCall) -> Result<Vec<u8>, DriverError> {
+        copy_output(&mut self.storage, &self.pages, call)
+    }
+
     pub fn prepare(&mut self, name: &str, input: &[u8]) -> Result<HostCall, DriverError> {
         let call = self
             .protocol
@@ -1228,6 +1241,17 @@ impl<'a> HostSession<'a> {
     }
 
     fn drive(&mut self, call: HostCall) -> Result<Vec<u8>, DriverError> {
+        self.drive_handshake(&call)?;
+        let output = self.collect(&call)?;
+        info!(
+            call = call.name,
+            output_bytes = output.len(),
+            "host exchange call completed"
+        );
+        Ok(output)
+    }
+
+    fn drive_handshake(&mut self, call: &HostCall) -> Result<(), DriverError> {
         info!(
             call = call.name,
             command = call.command,
@@ -1247,13 +1271,7 @@ impl<'a> HostSession<'a> {
                     ))
                 })?;
         }
-        let output = copy_output(&mut self.storage, &self.pages, &call)?;
-        info!(
-            call = call.name,
-            output_bytes = output.len(),
-            "host exchange call completed"
-        );
-        Ok(output)
+        Ok(())
     }
 }
 
