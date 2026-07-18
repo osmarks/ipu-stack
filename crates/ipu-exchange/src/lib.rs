@@ -230,6 +230,37 @@ pub struct TileToHostProgram {
     pub packet_words: Vec<u32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostHierarchy {
+    pub xreq_physical_tile: u16,
+    pub target_physical_tile: u16,
+}
+
+pub fn host_hierarchy(target_physical_tile: u16) -> Result<HostHierarchy, ExchangeError> {
+    validate_host_tile(target_physical_tile)?;
+    Ok(HostHierarchy {
+        xreq_physical_tile: target_physical_tile >> 6,
+        target_physical_tile,
+    })
+}
+
+pub fn assemble_host_xreq_program(
+    target_physical_tile: u16,
+    packet_address: u32,
+) -> Result<TileToHostProgram, ExchangeError> {
+    validate_host_tile(target_physical_tile)?;
+    if packet_address & 7 != 0 {
+        return Err(ExchangeError::HostPacket);
+    }
+    Ok(TileToHostProgram {
+        instructions: vec![
+            encode_send(1, 3, packet_address >> 2)?,
+            RETURN_M10_INSTRUCTION,
+        ],
+        packet_words: vec![u32::from(target_physical_tile) & !0x3f, 0],
+    })
+}
+
 pub fn assemble_host_command_read_program(
     packet_address: u32,
     destination_address: u32,
@@ -1443,6 +1474,15 @@ mod tests {
 
     #[test]
     fn target_operations_match_sdk_logical_tile_100_oracle() {
+        let hierarchy = host_hierarchy(260).unwrap();
+        assert_eq!(hierarchy.xreq_physical_tile, 4);
+        let xreq = assemble_host_xreq_program(260, 0x50120).unwrap();
+        assert_eq!(xreq.instructions, [0x782a_0243, 0x43a0_0000]);
+        assert_eq!(xreq.packet_words, [0x100, 0]);
+        let wrapped_xreq =
+            wrap_host_target_operation(hierarchy.xreq_physical_tile, &xreq.instructions).unwrap();
+        assert_eq!(&wrapped_xreq[..3], &[0x1980_0604, 0x4380_80a0, 0x4180_000f]);
+
         let d2h =
             assemble_tile_to_host_target_program(260, 0x50120, 0x40, 64, 0x50160, 0x50180).unwrap();
         assert_eq!(

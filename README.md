@@ -118,7 +118,9 @@ D2H and H2D target-operation encoders match the SDK's logical-tile-100
 the physical row's host mux and enters through sync 15; the operation sets its
 downcount, performs the packet sends, and ends at sync 0; the handler then uses
 sync 7 and restores the exchange mux. Controller activation and the other
-tiles in the host hierarchy are not generated yet. The attached destination
+tiles in the host hierarchy are not generated yet. The recovered XREQ role is
+encoded separately: physical tile `target >> 6` sends a two-word packet that
+selects the target's 64-tile block. The attached destination
 remains untouched in direct Rust hardware acceptance, so encoder agreement is
 not treated as working D2H.
 
