@@ -922,11 +922,7 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
         .iter()
         .flat_map(|call| call.outputs.iter().cloned())
         .collect();
-    let transfer_count = u32::try_from(inputs.len() + outputs.len())?;
-    let phases = transfer_count
-        .checked_mul(2)
-        .and_then(|count| count.checked_sub(1))
-        .ok_or("host phase count overflow")?;
+    let phases = host_transfer_phase_count(u32::try_from(inputs.len() + outputs.len())?)?;
     calls = vec![HostCall {
         name: "graph".into(),
         command: 0,
@@ -959,6 +955,14 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
             calls,
         },
     })
+}
+
+fn host_transfer_phase_count(transfers: u32) -> Result<u32> {
+    // Each transfer has an entry and completion rendezvous. The graph-close
+    // acknowledgement is issued separately after HostSession copies D2H data.
+    transfers
+        .checked_mul(2)
+        .ok_or_else(|| "host phase count overflow".into())
 }
 
 fn append_host_bindings(
@@ -1395,8 +1399,10 @@ fn verify_runtime_completion(device: &Device, app: &Application) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(1);
     while !completion_reached(device, completion.tile as u16)? {
         if Instant::now() >= deadline {
+            let gs1 = device.read_config(ipu_driver::pci::HSP_GS1_CONTROL);
+            let gs2 = device.read_config(ipu_driver::pci::HSP_GS2_CONTROL);
             return Err(format!(
-                "host graph did not complete; supervisor states: {}; device outputs: {}",
+                "host graph did not complete; HSP GS1={gs1:?} GS2={gs2:?}; supervisor states: {}; device outputs: {}",
                 supervisor_state_summary(device, app),
                 host_source_summary(device, app)
             )
@@ -1651,6 +1657,15 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_phase_count_has_two_rendezvous_per_transfer() {
+        for transfers in 0..1024 {
+            let phases = host_transfer_phase_count(transfers).unwrap();
+            assert_eq!(phases / 2, transfers);
+            assert_eq!(phases % 2, 0);
+        }
+    }
 
     #[test]
     fn host_packet_allocator_covers_every_physical_tile_in_both_directions() {
