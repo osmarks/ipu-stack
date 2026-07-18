@@ -8,14 +8,7 @@
 	.set SYNC_ALL, 7
 	.set SYNC_COMPUTE_SET, 2
 	.set SYNC_SUPERVISOR, 3
-	.set SYNC_RECEIVE, 0
-	.set SYNC_EXTERNAL_SLAVE, 1
-	.set SYNC_EXTERNAL_MASTER, 15
-	.set SANS_EXTERNAL_SLAVE, 1
 	.set OPCODE_SYNC, 0x41800000
-	.set OPCODE_SANS, 0x40c00000
-	.set SEND_PACKET_PLACEHOLDER, 0x78200003
-	.set EXCHANGE_PLAN_PLACEHOLDER, 0
 	.set PROGRAM_ADDRESS_PLACEHOLDER, 0
 	.set COMPLETION_ADDRESS_PLACEHOLDER, 0
 
@@ -93,64 +86,6 @@ ipu_stack_static_worker_barrier_worker:
 	.worker
 	exitz $m15
 	.size ipu_stack_static_worker_barrier_worker, .-ipu_stack_static_worker_barrier_worker
-
-	.section .text.ipu_stack_static_global_barrier_master,"ax",@progbits
-	.globl ipu_stack_static_global_barrier_master
-	.p2align 2
-	.type ipu_stack_static_global_barrier_master,@function
-ipu_stack_static_global_barrier_master:
-	.supervisor
-	call $m10, .Lglobal_sync_wait
-	call $m10, .Lglobal_sync_send
-	call $m10, .Lglobal_sync_local
-	call $m10, .Lglobal_sync_release
-	br $m7
-.Lglobal_sync_local:
-	.long OPCODE_SYNC | SYNC_ALL
-	setzi $m8, TILE_MUX_EXCHANGE
-	put 0xa0, $m8
-	br $m10
-.Lglobal_sync_send:
-	setzi $m8, 1
-	put 0xa6, $m8
-	.globl ipu_stack_static_global_barrier_send0
-ipu_stack_static_global_barrier_send0:
-	.long SEND_PACKET_PLACEHOLDER
-	.globl ipu_stack_static_global_barrier_send1
-ipu_stack_static_global_barrier_send1:
-	.long SEND_PACKET_PLACEHOLDER
-	.long OPCODE_SYNC | SYNC_RECEIVE
-	br $m10
-.Lglobal_sync_wait:
-	setzi $m8, TILE_MUX_HOST
-	put 0xa0, $m8
-	.long OPCODE_SYNC | SYNC_EXTERNAL_MASTER
-	br $m10
-.Lglobal_sync_release:
-	.globl ipu_stack_static_global_barrier_master_release_plan
-ipu_stack_static_global_barrier_master_release_plan:
-	.long EXCHANGE_PLAN_PLACEHOLDER
-	.long EXCHANGE_PLAN_PLACEHOLDER
-	.long EXCHANGE_PLAN_PLACEHOLDER
-	br $m10
-	.size ipu_stack_static_global_barrier_master, .-ipu_stack_static_global_barrier_master
-
-	.section .text.ipu_stack_static_global_barrier_follower,"ax",@progbits
-	.globl ipu_stack_static_global_barrier_follower
-	.p2align 2
-	.type ipu_stack_static_global_barrier_follower,@function
-ipu_stack_static_global_barrier_follower:
-	.supervisor
-	.long OPCODE_SANS | SANS_EXTERNAL_SLAVE
-	.long OPCODE_SYNC | SYNC_EXTERNAL_SLAVE
-	.globl ipu_stack_static_global_barrier_follower_release_plan
-ipu_stack_static_global_barrier_follower_release_plan:
-	.long EXCHANGE_PLAN_PLACEHOLDER
-	.long EXCHANGE_PLAN_PLACEHOLDER
-	.long EXCHANGE_PLAN_PLACEHOLDER
-	.long EXCHANGE_PLAN_PLACEHOLDER
-	br $m7
-	.size ipu_stack_static_global_barrier_follower, .-ipu_stack_static_global_barrier_follower
 
 	.section .text.ipu_stack_static_complete,"ax",@progbits
 	.globl ipu_stack_static_complete

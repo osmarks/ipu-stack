@@ -34,13 +34,16 @@ oracle. The static runtime executes those plans directly with:
 - one straight-line instruction stream generated for each tile;
 - per-tile worker sync bases and local supervisor/worker rendezvous;
 - `A6=1` on senders and receivers;
-- `sans 0; sync 1` on every tile without a plan in an exchange launch;
+- `sans 0; sync ANS` on every tile without a plan in an exchange launch;
 - plan code in a separately allocated executable SRAM region.
 
-The loader's startup rendezvous releases all tile supervisors together. Later
-exchange launches use the SDK-derived command barrier and a generated one-word
-release multicast. There is no command loop or reserved synchronization tile;
-physical tile 0 participates in payload work normally.
+The loader's startup rendezvous releases all tile supervisors together. Each
+later exchange launch uses the SDK sequence recovered from tile ELF
+disassembly: every supervisor enters the internal sync zone, active tiles
+perform the local worker rendezvous and execute a plan beginning with its own
+internal sync, and inactive tiles execute the `sans`/ANS sequence. No host or
+GSP transaction occurs between D2D launches. There is no command loop or
+reserved synchronization tile; physical tile 0 participates normally.
 
 Hardware acceptance with the checked-in configuration and master route
 now covers:

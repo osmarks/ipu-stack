@@ -1,10 +1,10 @@
-use ipu_compiler::{MemoryConstraint, MemoryPlacement, Schedule, find_free_region};
+use ipu_compiler::Schedule;
 use ipu_driver::{Device, DriverError, HostSession, Loader, block_device_interrupt_signals};
 use ipu_elf::{LinkOptions, link};
 use ipu_exchange::Topology;
 use ipu_package::{
-    Application, Binding, EntryPoint, HostCall, HostExchange, HostPage, RegionSlice,
-    SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
+    Application, Binding, EntryPoint, HostCall, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ,
+    SEGMENT_WRITE, Segment, TileImage,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -14,10 +14,6 @@ use tracing_subscriber::EnvFilter;
 mod static_codegen;
 
 const PLAN_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
-const GLOBAL_SYNC_PACKET_ORIGIN: u16 = 0;
-const GLOBAL_SYNC_HOST_PAGE: u32 = 1;
-const GLOBAL_SYNC_HOST_OFFSET: u32 = GLOBAL_SYNC_HOST_PAGE * ipu_exchange::HOST_PAGE_BYTES;
-
 pub fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt()
@@ -96,12 +92,6 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     }) {
         return Err("per-tile programs disagree on exchange launch count".into());
     }
-    let startup_exchange = matches!(
-        graph.schedule.phases.first(),
-        Some(ipu_compiler::Phase::Exchange { .. })
-    );
-    let barrier_count = exchange_count - usize::from(startup_exchange && exchange_count != 0);
-
     let plan_sizes = (0..exchange_count)
         .map(|index| {
             programs
@@ -123,23 +113,6 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let (plan_addresses, plan_end) = packed_addresses(PLAN_BASE, &plan_sizes, 8)?;
-    let global_sync_origin_logical = (0..graph.schedule.tile_count)
-        .find(|logical| topology.physical(*logical) == Ok(GLOBAL_SYNC_PACKET_ORIGIN))
-        .ok_or("schedule does not contain the global sync packet origin")?;
-    let global_sync_packet_address = find_free_region(
-        &graph.schedule.allocations,
-        global_sync_origin_logical,
-        64,
-        0,
-        usize::MAX,
-        MemoryConstraint {
-            base: ipu_exchange::EXCHANGE_WINDOW_BASE,
-            limit: ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES,
-            alignment: 32,
-            placement: MemoryPlacement::High,
-        },
-    )?;
-    let global_sync_release_address = global_sync_packet_address + 32;
     let completion_address = align_up(plan_end, 64);
     let runtime_end = completion_address
         .checked_add(4)
@@ -147,8 +120,6 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
 
     let mut retained_symbols = vec![
         static_codegen::WORKER_BARRIER.into(),
-        static_codegen::GLOBAL_BARRIER_MASTER.into(),
-        static_codegen::GLOBAL_BARRIER_FOLLOWER.into(),
         static_codegen::COMPLETE.into(),
     ];
     retained_symbols.extend(programs.iter().flat_map(|program| {
@@ -179,21 +150,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     );
     let generated = programs
         .iter()
-        .map(|program| {
-            let barrier = if topology.physical(program.tile)? == GLOBAL_SYNC_PACKET_ORIGIN {
-                static_codegen::GLOBAL_BARRIER_MASTER
-            } else {
-                static_codegen::GLOBAL_BARRIER_FOLLOWER
-            };
-            static_codegen::emit(
-                program,
-                program_base,
-                &image.symbols,
-                &plan_addresses,
-                image.symbols[barrier],
-                startup_exchange,
-            )
-        })
+        .map(|program| static_codegen::emit(program, program_base, &image.symbols, &plan_addresses))
         .collect::<Result<Vec<_>>>()?;
     let program_end = generated.iter().try_fold(program_base, |end, code| {
         let code_end = program_base
@@ -232,36 +189,6 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     let program_offset = symbol_offset("ipu_stack_static_program_address")?;
     let worker_sync_offset = symbol_offset("ipu_stack_static_worker_sync_base")?;
     let completion_offset = symbol_offset("ipu_stack_static_completion_address")?;
-    let global_sync_send0_offset = symbol_offset("ipu_stack_static_global_barrier_send0")?;
-    let global_sync_send1_offset = symbol_offset("ipu_stack_static_global_barrier_send1")?;
-    let global_sync_master_release_offset =
-        symbol_offset("ipu_stack_static_global_barrier_master_release_plan")?;
-    let global_sync_follower_release_offset =
-        symbol_offset("ipu_stack_static_global_barrier_follower_release_plan")?;
-    let global_sync_header = ipu_exchange::host_to_tile_packet(
-        GLOBAL_SYNC_PACKET_ORIGIN,
-        global_sync_release_address,
-        GLOBAL_SYNC_HOST_OFFSET,
-        4,
-    )?;
-    let global_sync_receivers = (0..graph.schedule.tile_count)
-        .filter(|logical| *logical != global_sync_origin_logical)
-        .collect::<Vec<_>>();
-    let mut global_sync_release =
-        topology.multicast(global_sync_origin_logical, &global_sync_receivers, 1, 0)?;
-    ipu_exchange::patch_sender_address(
-        &mut global_sync_release.sender,
-        global_sync_release_address,
-    )?;
-    let mut global_sync_receiver_rows = BTreeMap::new();
-    for (logical, row) in global_sync_receivers
-        .iter()
-        .copied()
-        .zip(&mut global_sync_release.receivers)
-    {
-        ipu_exchange::patch_multicast_receiver_address(row, global_sync_release_address)?;
-        global_sync_receiver_rows.insert(logical, *row);
-    }
     let initial: HashMap<_, _> = graph
         .initial_buffers
         .iter()
@@ -293,32 +220,6 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
             u32::from(logical) * 8,
         )?;
         patch_setzi_immediate(&mut support_code, completion_offset, completion_address)?;
-        if physical == u32::from(GLOBAL_SYNC_PACKET_ORIGIN) {
-            patch_instruction(
-                &mut support_code,
-                global_sync_send0_offset,
-                ipu_exchange::encode_send(1, 3, global_sync_packet_address >> 2)?,
-            )?;
-            patch_instruction(
-                &mut support_code,
-                global_sync_send1_offset,
-                ipu_exchange::encode_send(1, 3, (global_sync_packet_address + 8) >> 2)?,
-            )?;
-            patch_plan_body(
-                &mut support_code,
-                global_sync_master_release_offset,
-                &global_sync_release.sender,
-                3,
-            )?;
-        } else {
-            patch_plan_body(
-                &mut support_code,
-                global_sync_follower_release_offset,
-                &global_sync_receiver_rows[&logical],
-                4,
-            )?;
-        }
-
         let mut segments = Vec::new();
         let support_blob = app.add_blob(support_code);
         segments.push(Segment {
@@ -357,31 +258,6 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                 exchange_index += 1;
             }
         }
-        if physical == u32::from(GLOBAL_SYNC_PACKET_ORIGIN) {
-            let packet = app.add_blob(words_to_bytes(&[
-                1,
-                0,
-                global_sync_header.word0,
-                global_sync_header.word1,
-            ]));
-            segments.push(Segment {
-                address: global_sync_packet_address,
-                memory_size: 16,
-                blob: packet,
-                blob_offset: 0,
-                file_size: 16,
-                flags: SEGMENT_READ,
-            });
-            let release = app.add_blob(vec![0; 4]);
-            segments.push(Segment {
-                address: global_sync_release_address,
-                memory_size: 4,
-                blob: release,
-                blob_offset: 0,
-                file_size: 4,
-                flags: SEGMENT_READ | SEGMENT_WRITE,
-            });
-        }
         append_initial_segments(&mut app, &mut segments, graph, &initial, logical)?;
         app.tiles.push(TileImage {
             physical_tile: physical,
@@ -407,21 +283,8 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     app.entry_points.push(EntryPoint {
         name: "graph".into(),
         command: 0,
-        external_syncs: u32::try_from(barrier_count)?
-            .checked_mul(2)
-            .and_then(|syncs| syncs.checked_add(1))
-            .ok_or("external sync count overflow")?,
+        external_syncs: 1,
     });
-    if barrier_count != 0 {
-        app.host_exchange = HostExchange {
-            pages: vec![HostPage {
-                index: GLOBAL_SYNC_HOST_PAGE,
-                size: u64::from(ipu_exchange::HOST_PAGE_BYTES),
-            }],
-            attach_order: vec![GLOBAL_SYNC_HOST_PAGE],
-            ..HostExchange::default()
-        };
-    }
     app.validate()?;
     info!(
         tiles = app.tiles.len(),
@@ -786,36 +649,6 @@ fn completion_reached(device: &Device, physical_tile: u16) -> Result<bool> {
         Ok(_) | Err(DriverError::Timeout(_)) => Ok(false),
         Err(error) => Err(error.into()),
     }
-}
-
-fn patch_instruction(code: &mut [u8], offset: usize, instruction: u32) -> Result<()> {
-    let word = code
-        .get_mut(offset..offset + 4)
-        .ok_or("instruction patch is outside the linked image")?;
-    word.copy_from_slice(&instruction.to_le_bytes());
-    Ok(())
-}
-
-fn patch_plan_body(
-    code: &mut [u8],
-    offset: usize,
-    row: &ipu_exchange::PlanRow,
-    expected_words: usize,
-) -> Result<()> {
-    let end = row
-        .iter()
-        .position(|word| *word == ipu_exchange::RETURN_M10_INSTRUCTION)
-        .ok_or("global synchronization plan has no return")?;
-    if end != expected_words {
-        return Err(format!(
-            "global synchronization plan has {end} body words, runtime reserves {expected_words}"
-        )
-        .into());
-    }
-    for (index, instruction) in row[..end].iter().copied().enumerate() {
-        patch_instruction(code, offset + index * 4, instruction)?;
-    }
-    Ok(())
 }
 
 fn words_to_bytes(words: &[u32]) -> Vec<u8> {

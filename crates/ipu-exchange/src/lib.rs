@@ -37,7 +37,7 @@ const HOST_COMMAND_ROUTE_CYCLES: u32 = 73;
 
 pub const SANS_INACTIVE_INSTRUCTION: u32 = sans(0);
 pub const SYNC_RECEIVE_INSTRUCTION: u32 = sync(0);
-pub const SYNC_EXTERNAL_INSTRUCTION: u32 = sync(1);
+pub const SYNC_ANS_INSTRUCTION: u32 = sync(1);
 pub const SYNC_SUPERVISOR_INSTRUCTION: u32 = sync(3);
 pub const SYNC_ALL_INSTRUCTION: u32 = sync(7);
 pub const SYNC_HOST_INSTRUCTION: u32 = sync(15);

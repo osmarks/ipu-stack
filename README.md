@@ -99,8 +99,9 @@ coalesces transfers sharing a source tensor into multicast groups. The same
 single-packet multicast plan passes under Poplar orchestration, but the Rust
 end-to-end randomized test cannot establish its result until native D2H works.
 The static runtime executes a distinct straight-line program per tile and calls
-separately linked compute kernels. Hardware acceptance covers a 1,472-value
-reduction, an all-tile affine permutation, multicast, and a dependent relay.
+separately linked compute kernels. Hardware acceptance separately covers a
+1,472-value reduction, an all-tile affine permutation, multicast, and a
+dependent relay.
 
 The scheduler treats the on-chip fabric as non-blocking. Tile-disjoint groups
 run concurrently; local endpoint conflicts become statically timed slots in the same
@@ -108,9 +109,9 @@ launch, with one synchronization and a shared event horizon. Compute is a
 following graph phase: each tile program calls a separately compiled kernel
 symbol and exchange commands perform no arithmetic. The randomized hardware
 acceptance path executes initialized multicast, sparse compute, and a second
-random matching as one static program. Compute-to-exchange transitions use the
-SDK-derived command barrier, including a topology-generated one-word release
-multicast. D2H lowering currently emits the SDK-derived source-tile host packet
+random matching as one static program. D2D transitions use the SDK-derived
+internal sync and ANS non-participation protocol without host intervention.
+D2H lowering currently emits the SDK-derived source-tile host packet
 routine. Oracle disassembly shows that `A6` is one for each transaction and the
 payload send count is the chunk's 32-bit word count minus one. The attached
 destination remains untouched in direct hardware acceptance. The generated

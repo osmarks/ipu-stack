@@ -4,7 +4,7 @@ use tracing::{debug, info};
 
 use ipu_exchange::{
     MulticastPlan, PlanProgramBuilder, PlanRow, RETURN_M10_INSTRUCTION, SANS_INACTIVE_INSTRUCTION,
-    SYNC_EXTERNAL_INSTRUCTION, Topology, patch_multicast_receiver_address, patch_sender_address,
+    SYNC_ANS_INSTRUCTION, Topology, patch_multicast_receiver_address, patch_sender_address,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -529,7 +529,7 @@ impl LoweredExchangeEpoch {
             // The runtime performs the all-tile epoch barrier. Inactive tiles
             // then use the SDK's local non-participation sequence.
             row[0] = SANS_INACTIVE_INSTRUCTION;
-            row[1] = SYNC_EXTERNAL_INSTRUCTION;
+            row[1] = SYNC_ANS_INSTRUCTION;
             row[2] = RETURN_M10_INSTRUCTION;
             row
         })
@@ -1630,7 +1630,7 @@ mod tests {
         assert_eq!(lowered[0].epochs[0].tile_rows.len(), 5);
         let inactive = lowered[0].epochs[0].row_for(15);
         assert_eq!(inactive[0], SANS_INACTIVE_INSTRUCTION);
-        assert_eq!(inactive[1], SYNC_EXTERNAL_INSTRUCTION);
+        assert_eq!(inactive[1], SYNC_ANS_INSTRUCTION);
     }
 
     #[test]
