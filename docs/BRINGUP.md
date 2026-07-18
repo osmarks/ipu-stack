@@ -142,6 +142,12 @@ rejects host bindings explicitly. The packet encoders and driver-side HSP
 primitives remain available as reference material, but encoder agreement alone
 is not treated as a working host-transfer capability.
 
+SDK archive members are named by physical tile. For a tensor mapped to logical
+tile 100, the host operation is inline in `t_260.elf`, not `t_100.elf`. The
+Rust target-operation encoders reproduce that member's 64-byte H2D and D2H
+instruction and packet words. Their sync-15 entry and sync-7 mux restoration
+belong to the surrounding command handler, not to the operation body.
+
 TDI reports both inactive and WAEX as context state zero. Architectural
 exceptions are only classified when exception metadata is nonzero; attempting
 retirement break or instruction injection against WAEX is not a reliable way

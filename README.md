@@ -113,12 +113,14 @@ symbol and exchange commands perform no arithmetic. The randomized hardware
 acceptance path executes initialized multicast, sparse compute, and a second
 random matching as one static program. D2D transitions use the SDK-derived
 internal sync and ANS non-participation protocol without host intervention.
-D2H lowering currently emits the SDK-derived source-tile host packet
-routine. Oracle disassembly shows that `A6` is one for each transaction and the
-payload send count is the chunk's 32-bit word count minus one. The attached
-destination remains untouched in direct hardware acceptance. The generated
-wrapper and close sequencing are still under investigation; encoder-level
-agreement does not establish D2H capability.
+D2H and H2D target-operation encoders match the SDK's logical-tile-100
+(physical-tile-260) instruction and packet words. The command handler selects
+the physical row's host mux and enters through sync 15; the operation sets its
+downcount, performs the packet sends, and ends at sync 0; the handler then uses
+sync 7 and restores the exchange mux. Controller activation and the other
+tiles in the host hierarchy are not generated yet. The attached destination
+remains untouched in direct Rust hardware acceptance, so encoder agreement is
+not treated as working D2H.
 
 Offline unit tests verify encodings, allocation, lowering, and package structure;
 they do not count as evidence that a transport capability works. The seeded
