@@ -1,7 +1,7 @@
 use ipu_compiler::{BlockedGemmConfig, BlockedGemmPlan, plan_blocked_gemm};
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
-use ipu_runtime::{ExecutableGraph, package_graph, run_host};
+use ipu_runtime::{ExecutableGraph, package_graph, package_graph_profiled, run_host};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -57,7 +57,23 @@ fn main() {
         fs::read(runtime.object).unwrap(),
         fs::read(kernel.object).unwrap(),
     ];
-    let app = package_graph(&graph, &objects).unwrap();
+    let profile_output = std::env::var_os("IPU_PROFILE_OUTPUT").map(PathBuf::from);
+    let load_package = std::env::var_os("IPU_GEMM_LOAD_PACKAGE").map(PathBuf::from);
+    assert!(
+        profile_output.is_none() || load_package.is_none(),
+        "a cached package does not carry this run's profile layout"
+    );
+    let (app, profile_layout) = if let Some(path) = load_package {
+        (
+            ipu_package::Application::read(fs::File::open(path).unwrap()).unwrap(),
+            None,
+        )
+    } else if profile_output.is_some() {
+        let (app, layout) = package_graph_profiled(&graph, &objects).unwrap();
+        (app, Some(layout))
+    } else {
+        (package_graph(&graph, &objects).unwrap(), None)
+    };
     info!(
         dimension,
         compile_ms = compile_start.elapsed().as_millis(),
@@ -74,7 +90,16 @@ fn main() {
 
     let run_start = Instant::now();
     let actual = run_host(&app, &bootloader, &configuration, &device, &input).unwrap();
-    verify_output(dimension, &actual);
+    let matrix_bytes = usize::from(dimension) * usize::from(dimension) * 4;
+    verify_output(dimension, &actual[..matrix_bytes]);
+    if let (Some(path), Some(layout)) = (profile_output, profile_layout) {
+        let clock_hz = std::env::var("IPU_CLOCK_HZ")
+            .map(|value| value.parse().expect("IPU_CLOCK_HZ must be an integer"))
+            .unwrap_or(1_500_000_000);
+        let report = layout.decode(&actual, clock_hz).unwrap();
+        report.write(fs::File::create(&path).unwrap()).unwrap();
+        info!(path = %path.display(), tiles = report.tiles.len(), "wrote cycle profile");
+    }
     info!(
         dimension,
         run_ms = run_start.elapsed().as_millis(),
@@ -156,6 +181,13 @@ fn verify_output(dimension: u16, actual: &[u8]) {
     let expected_bytes = usize::from(dimension) * usize::from(dimension) * 4;
     assert_eq!(actual.len(), expected_bytes, "GEMM output byte count");
     let grid = dimension / BLOCK_DIMENSION;
+    let expected = (0..7)
+        .map(|row| {
+            (0..5)
+                .map(|column| expected_value(dimension, row, column))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let mut offset = 0;
     for block_row in 0..grid {
         for block_column in 0..grid {
@@ -165,7 +197,8 @@ fn verify_output(dimension: u16, actual: &[u8]) {
                     let global_column = block_column * BLOCK_DIMENSION + column;
                     let actual_value =
                         f32::from_le_bytes(actual[offset..offset + 4].try_into().unwrap());
-                    let expected = expected_value(dimension, global_row, global_column);
+                    let expected =
+                        expected[usize::from(global_row % 7)][usize::from(global_column % 5)];
                     assert_eq!(
                         actual_value.to_bits(),
                         expected.to_bits(),

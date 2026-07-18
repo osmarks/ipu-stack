@@ -73,6 +73,57 @@ pub struct ExecutableGraph {
 }
 
 #[derive(Clone, Debug)]
+pub struct ProfileTileLayout {
+    pub physical_tile: u32,
+    pub file_offset: usize,
+    pub steps: Vec<ipu_package::ProfileStep>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProfileLayout {
+    pub output_offset: usize,
+    pub tiles: Vec<ProfileTileLayout>,
+}
+
+impl ProfileLayout {
+    pub fn decode(&self, output: &[u8], clock_hz: u64) -> Result<ipu_package::ProfileReport> {
+        let profile = output
+            .get(self.output_offset..)
+            .ok_or("profile output offset exceeds host result")?;
+        let mut tiles = Vec::with_capacity(self.tiles.len());
+        for tile in &self.tiles {
+            let size = tile
+                .steps
+                .len()
+                .checked_mul(8)
+                .ok_or("profile sample size overflow")?;
+            let bytes = profile
+                .get(tile.file_offset..tile.file_offset + size)
+                .ok_or("profile tile range exceeds host result")?;
+            let samples = tile
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(index, step)| ipu_package::CycleSample {
+                    step: step.clone(),
+                    start_cycle: u32::from_le_bytes(
+                        bytes[index * 8..index * 8 + 4].try_into().unwrap(),
+                    ),
+                    end_cycle: u32::from_le_bytes(
+                        bytes[index * 8 + 4..index * 8 + 8].try_into().unwrap(),
+                    ),
+                })
+                .collect();
+            tiles.push(ipu_package::TileProfile {
+                physical_tile: tile.physical_tile,
+                samples,
+            });
+        }
+        Ok(ipu_package::ProfileReport { clock_hz, tiles })
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct DiagnosticResults {
     pub bindings: BTreeMap<String, Vec<u32>>,
 }
@@ -226,11 +277,165 @@ fn range_is_free(
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<Application> {
+    package_graph_impl(graph, objects, &[], None)
+}
+
+pub fn package_graph_profiled(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+) -> Result<(Application, ProfileLayout)> {
+    let topology = Topology::c600();
+    let programs = graph.schedule.lower_tile_programs(&topology)?;
+    let output_offset = graph
+        .host_outputs
+        .iter()
+        .try_fold(0u64, |offset, binding| {
+            binding_size(binding).and_then(|size| {
+                offset
+                    .checked_add(size)
+                    .ok_or_else(|| "profile output offset overflow".into())
+            })
+        })?;
+    let mut profile_graph = graph.clone();
+    let mut profile_addresses = Vec::with_capacity(programs.len());
+    let mut profile_tiles = Vec::with_capacity(programs.len());
+    let mut slices = Vec::with_capacity(programs.len());
+    let mut file_offset = 0usize;
+    let profile_tensor_base = profile_graph
+        .schedule
+        .allocations
+        .iter()
+        .map(|allocation| allocation.tensor.0)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or("profile tensor id overflow")?;
+    for program in &programs {
+        let size = u32::try_from(
+            program
+                .steps
+                .len()
+                .checked_mul(8)
+                .ok_or("profile size overflow")?,
+        )?;
+        if size == 0 {
+            profile_addresses.push(Vec::new());
+            continue;
+        }
+        let address = align_up(
+            profile_graph
+                .schedule
+                .allocations
+                .iter()
+                .filter(|allocation| allocation.tile == program.tile)
+                .map(|allocation| allocation.address.saturating_add(allocation.size))
+                .max()
+                .unwrap_or(PLAN_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES)
+                .max(PLAN_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES),
+            8,
+        );
+        if address
+            .checked_add(size)
+            .is_none_or(|end| end > ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE)
+        {
+            return Err(format!("profile samples exhaust SRAM on tile {}", program.tile).into());
+        }
+        let physical = u32::from(topology.physical(program.tile)?);
+        profile_graph
+            .schedule
+            .allocations
+            .push(ipu_compiler::Allocation {
+                tensor: ipu_compiler::TensorId(profile_tensor_base + usize::from(program.tile)),
+                tile: program.tile,
+                address,
+                size,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: ipu_compiler::AllocationKind::Home,
+            });
+        let steps = program
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(local_index, step)| match step {
+                ipu_compiler::LoweredTileStep::Exchange { phase, epoch, .. } => {
+                    ipu_package::ProfileStep {
+                        local_index: local_index as u32,
+                        phase: *phase as u32,
+                        epoch: *epoch as u32,
+                        operation: "exchange".into(),
+                        kind: ipu_package::ProfileStepKind::Exchange,
+                    }
+                }
+                ipu_compiler::LoweredTileStep::Compute(command) => ipu_package::ProfileStep {
+                    local_index: local_index as u32,
+                    phase: command.phase as u32,
+                    epoch: 0,
+                    operation: command.specialization.operation.clone(),
+                    kind: ipu_package::ProfileStepKind::Compute,
+                },
+                ipu_compiler::LoweredTileStep::IdleCompute { op, phase } => {
+                    ipu_package::ProfileStep {
+                        local_index: local_index as u32,
+                        phase: *phase as u32,
+                        epoch: 0,
+                        operation: format!("idle-op-{}", op.0),
+                        kind: ipu_package::ProfileStepKind::Compute,
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        profile_addresses.push(
+            (0..program.steps.len())
+                .map(|index| address + index as u32 * 8)
+                .collect(),
+        );
+        slices.push(RegionSlice {
+            tile: physical,
+            tile_address: address,
+            file_offset: file_offset as u64,
+            size: u64::from(size),
+        });
+        profile_tiles.push(ProfileTileLayout {
+            physical_tile: physical,
+            file_offset,
+            steps,
+        });
+        file_offset += size as usize;
+    }
+    profile_graph.host_outputs.push(Binding {
+        name: "runtime-profile".into(),
+        dtype: "u32".into(),
+        shape: vec![(file_offset / 4) as u32],
+        slices,
+    });
+    let app = package_graph_impl(&profile_graph, objects, &profile_addresses, Some(programs))?;
+    Ok((
+        app,
+        ProfileLayout {
+            output_offset: usize::try_from(output_offset)?,
+            tiles: profile_tiles,
+        },
+    ))
+}
+
+fn package_graph_impl(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+    profile_addresses: &[Vec<u32>],
+    lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
+) -> Result<Application> {
     let topology = Topology::c600();
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
         return Err("the direct C600 runtime requires a schedule for every discovered tile".into());
     }
-    let programs = graph.schedule.lower_tile_programs(&topology)?;
+    let programs = match lowered_programs {
+        Some(programs) => programs,
+        None => graph.schedule.lower_tile_programs(&topology)?,
+    };
+    if !profile_addresses.is_empty() && profile_addresses.len() != programs.len() {
+        return Err("profile layout tile count differs from schedule".into());
+    }
     let exchange_count = programs
         .first()
         .map(|program| {
@@ -328,11 +533,15 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
         static_codegen::COPY_U32.into(),
         static_codegen::REPEAT_CALL.into(),
     ];
+    if !profile_addresses.is_empty() {
+        retained_symbols.push(static_codegen::SAMPLE_CYCLE.into());
+    }
     retained_symbols.extend(programs.iter().flat_map(|program| {
         program.steps.iter().filter_map(|step| match step {
             ipu_compiler::LoweredTileStep::Compute(command) => {
                 Some(format!("ipu_stack_{}", command.specialization.operation))
             }
+            ipu_compiler::LoweredTileStep::IdleCompute { .. } => None,
             _ => None,
         })
     }));
@@ -357,47 +566,54 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     let generated = programs
         .iter()
         .zip(&tile_host_plans)
-        .map(|(program, host_plans)| -> Result<Vec<u8>> {
-            let physical = topology.physical(program.tile)?;
-            let host_inputs = host_plans.addresses[..host.inputs.len()]
-                .iter()
-                .copied()
-                .zip(&host.inputs)
-                .map(|(address, transfer)| {
-                    let copy = (transfer.physical_tile == physical)
-                        .then_some(transfer.copy_destination)
-                        .flatten()
-                        .map(|destination| static_codegen::HostCopy {
-                            source: transfer.tile_address,
-                            destination,
-                            words: transfer.bytes / 4,
-                        });
-                    static_codegen::HostPhaseCall {
+        .enumerate()
+        .map(
+            |(program_index, (program, host_plans))| -> Result<Vec<u8>> {
+                let physical = topology.physical(program.tile)?;
+                let host_inputs = host_plans.addresses[..host.inputs.len()]
+                    .iter()
+                    .copied()
+                    .zip(&host.inputs)
+                    .map(|(address, transfer)| {
+                        let copy = (transfer.physical_tile == physical)
+                            .then_some(transfer.copy_destination)
+                            .flatten()
+                            .map(|destination| static_codegen::HostCopy {
+                                source: transfer.tile_address,
+                                destination,
+                                words: transfer.bytes / 4,
+                            });
+                        static_codegen::HostPhaseCall {
+                            address,
+                            copy,
+                            active: host_phase_is_active(physical, transfer),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let host_outputs = host_plans.addresses[host.inputs.len()..]
+                    .iter()
+                    .copied()
+                    .zip(&host.outputs)
+                    .map(|(address, transfer)| static_codegen::HostPhaseCall {
                         address,
-                        copy,
+                        copy: None,
                         active: host_phase_is_active(physical, transfer),
-                    }
-                })
-                .collect::<Vec<_>>();
-            let host_outputs = host_plans.addresses[host.inputs.len()..]
-                .iter()
-                .copied()
-                .zip(&host.outputs)
-                .map(|(address, transfer)| static_codegen::HostPhaseCall {
-                    address,
-                    copy: None,
-                    active: host_phase_is_active(physical, transfer),
-                })
-                .collect::<Vec<_>>();
-            static_codegen::emit(
-                program,
-                program_base,
-                &image.symbols,
-                &plan_addresses,
-                &host_inputs,
-                &host_outputs,
-            )
-        })
+                    })
+                    .collect::<Vec<_>>();
+                static_codegen::emit(
+                    program,
+                    program_base,
+                    &image.symbols,
+                    &plan_addresses,
+                    &host_inputs,
+                    &host_outputs,
+                    profile_addresses
+                        .get(program_index)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                )
+            },
+        )
         .collect::<Result<Vec<_>>>()?;
     let program_end = generated.iter().try_fold(program_base, |end, code| {
         let code_end = program_base

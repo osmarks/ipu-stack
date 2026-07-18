@@ -8,6 +8,123 @@ pub mod application_capnp {
     include!(concat!(env!("OUT_DIR"), "/application_capnp.rs"));
 }
 
+pub mod profile_capnp {
+    include!(concat!(env!("OUT_DIR"), "/profile_capnp.rs"));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileStepKind {
+    Exchange,
+    Compute,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileStep {
+    pub local_index: u32,
+    pub phase: u32,
+    pub epoch: u32,
+    pub operation: String,
+    pub kind: ProfileStepKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CycleSample {
+    pub step: ProfileStep,
+    pub start_cycle: u32,
+    pub end_cycle: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileProfile {
+    pub physical_tile: u32,
+    pub samples: Vec<CycleSample>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileReport {
+    pub clock_hz: u64,
+    pub tiles: Vec<TileProfile>,
+}
+
+impl ProfileReport {
+    pub fn write(&self, mut output: impl Write) -> Result<(), PackageError> {
+        let mut message = message::Builder::new_default();
+        let mut root = message.init_root::<profile_capnp::profile::Builder>();
+        root.set_schema_version(1);
+        root.set_clock_hz(self.clock_hz);
+        let mut tiles = root.reborrow().init_tiles(self.tiles.len() as u32);
+        for (tile_index, tile) in self.tiles.iter().enumerate() {
+            let mut output_tile = tiles.reborrow().get(tile_index as u32);
+            output_tile.set_physical_tile(tile.physical_tile);
+            let mut samples = output_tile
+                .reborrow()
+                .init_samples(tile.samples.len() as u32);
+            for (sample_index, sample) in tile.samples.iter().enumerate() {
+                let mut output_sample = samples.reborrow().get(sample_index as u32);
+                output_sample.set_start_cycle(sample.start_cycle);
+                output_sample.set_end_cycle(sample.end_cycle);
+                let mut step = output_sample.reborrow().init_step();
+                step.set_local_index(sample.step.local_index);
+                step.set_phase(sample.step.phase);
+                step.set_epoch(sample.step.epoch);
+                step.set_operation(&sample.step.operation);
+                step.set_kind(match sample.step.kind {
+                    ProfileStepKind::Exchange => profile_capnp::StepKind::Exchange,
+                    ProfileStepKind::Compute => profile_capnp::StepKind::Compute,
+                });
+            }
+        }
+        serialize::write_message(&mut output, &message)?;
+        Ok(())
+    }
+
+    pub fn read(mut input: impl Read) -> Result<Self, PackageError> {
+        let message = serialize::read_message(&mut input, message::ReaderOptions::new())?;
+        let root = message.get_root::<profile_capnp::profile::Reader>()?;
+        if root.get_schema_version() != 1 {
+            return Err(PackageError::Invalid(format!(
+                "unsupported profile schema version {}",
+                root.get_schema_version()
+            )));
+        }
+        let tiles = root
+            .get_tiles()?
+            .iter()
+            .map(|tile| {
+                let samples = tile
+                    .get_samples()?
+                    .iter()
+                    .map(|sample| {
+                        let step = sample.get_step()?;
+                        Ok(CycleSample {
+                            step: ProfileStep {
+                                local_index: step.get_local_index(),
+                                phase: step.get_phase(),
+                                epoch: step.get_epoch(),
+                                operation: step.get_operation()?.to_str()?.into(),
+                                kind: match step.get_kind()? {
+                                    profile_capnp::StepKind::Exchange => ProfileStepKind::Exchange,
+                                    profile_capnp::StepKind::Compute => ProfileStepKind::Compute,
+                                },
+                            },
+                            start_cycle: sample.get_start_cycle(),
+                            end_cycle: sample.get_end_cycle(),
+                        })
+                    })
+                    .collect::<Result<_, PackageError>>()?;
+                Ok(TileProfile {
+                    physical_tile: tile.get_physical_tile(),
+                    samples,
+                })
+            })
+            .collect::<Result<_, PackageError>>()?;
+        Ok(Self {
+            clock_hz: root.get_clock_hz(),
+            tiles,
+        })
+    }
+}
+
 pub const SCHEMA_VERSION: u32 = 2;
 pub const TARGET_IPU21: &str = "ipu21";
 pub const TILE_MEMORY_BASE: u32 = 0x4c000;
@@ -951,5 +1068,29 @@ mod tests {
             },
         ];
         assert!(app.validate().is_err());
+    }
+
+    #[test]
+    fn profile_round_trip() {
+        let profile = ProfileReport {
+            clock_hz: 1_500_000_000,
+            tiles: vec![TileProfile {
+                physical_tile: 17,
+                samples: vec![CycleSample {
+                    step: ProfileStep {
+                        local_index: 3,
+                        phase: 5,
+                        epoch: 8,
+                        operation: "accumulate".into(),
+                        kind: ProfileStepKind::Compute,
+                    },
+                    start_cycle: u32::MAX - 10,
+                    end_cycle: 7,
+                }],
+            }],
+        };
+        let mut encoded = Vec::new();
+        profile.write(&mut encoded).unwrap();
+        assert_eq!(ProfileReport::read(encoded.as_slice()).unwrap(), profile);
     }
 }

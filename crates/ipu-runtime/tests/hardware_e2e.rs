@@ -1,3 +1,4 @@
+use std::fs;
 use std::process::{Command, ExitStatus};
 use std::sync::{Mutex, MutexGuard};
 
@@ -236,6 +237,37 @@ fn randomized_static_d2d_graphs_work() {
                 .expect("launch randomized hardware test runner"),
         );
     }
+}
+
+#[test]
+fn blocked_gemm_with_cycle_profile_works() {
+    let _device = device();
+    let path = std::env::temp_dir().join(format!(
+        "ipu-stack-gemm-profile-{}.capnp",
+        std::process::id()
+    ));
+    let status = Command::new(env!("CARGO_BIN_EXE_ipu-gemm-e2e"))
+        .env("IPU_GEMM_DIMENSION", "128")
+        .env("IPU_PROFILE_OUTPUT", &path)
+        .status()
+        .expect("launch profiled blocked GEMM hardware test runner");
+    require_success("blocked GEMM with per-tile cycle profile", status);
+
+    let profile = ipu_package::ProfileReport::read(fs::File::open(&path).unwrap()).unwrap();
+    assert_eq!(profile.tiles.len(), 1472);
+    assert!(profile.clock_hz > 0);
+    assert!(profile.tiles.iter().all(|tile| !tile.samples.is_empty()));
+    assert!(profile.tiles.iter().any(|tile| {
+        tile.samples
+            .iter()
+            .any(|sample| sample.step.kind == ipu_package::ProfileStepKind::Exchange)
+    }));
+    assert!(profile.tiles.iter().any(|tile| {
+        tile.samples
+            .iter()
+            .any(|sample| sample.step.kind == ipu_package::ProfileStepKind::Compute)
+    }));
+    fs::remove_file(path).unwrap();
 }
 
 fn device() -> MutexGuard<'static, ()> {

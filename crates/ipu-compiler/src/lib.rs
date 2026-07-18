@@ -786,6 +786,7 @@ pub struct LoweredExchangePhase {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoweredComputeCommand {
     pub op: OpId,
+    pub phase: usize,
     pub output_address: u32,
     pub input_addresses: Vec<u32>,
     pub specialization: SpecializationKey,
@@ -799,6 +800,10 @@ pub enum LoweredTileStep {
         row: Vec<u32>,
     },
     Compute(LoweredComputeCommand),
+    IdleCompute {
+        op: OpId,
+        phase: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1173,7 +1178,9 @@ impl Schedule {
                         }
                     }
                     Phase::Compute { op, commands } => {
+                        let mut active = false;
                         for command in commands.iter().filter(|command| command.tile == tile) {
+                            active = true;
                             let output_address = self.home_address(command.output, tile)?;
                             let input_addresses = command
                                 .inputs
@@ -1182,10 +1189,17 @@ impl Schedule {
                                 .collect::<Result<_, _>>()?;
                             steps.push(LoweredTileStep::Compute(LoweredComputeCommand {
                                 op: *op,
+                                phase: phase_index,
                                 output_address,
                                 input_addresses,
                                 specialization: command.specialization.clone(),
                             }));
+                        }
+                        if !active {
+                            steps.push(LoweredTileStep::IdleCompute {
+                                op: *op,
+                                phase: phase_index,
+                            });
                         }
                     }
                 }

@@ -118,6 +118,35 @@ ipu_stack_static_repeat_call:
 	br $m9
 	.size ipu_stack_static_repeat_call, .-ipu_stack_static_repeat_call
 
+	.section .text.ipu_stack_static_sample_cycle,"ax",@progbits
+	.globl ipu_stack_static_sample_cycle
+	.p2align 2
+	.type ipu_stack_static_sample_cycle,@function
+ipu_stack_static_sample_cycle:
+	.supervisor
+	setzi $m5, WORKER_BASE_START
+	st32 $m2, $m5, $m15, 0
+	setzi $m0, ipu_stack_static_sample_cycle_worker
+	runall $m0, $m5, 0
+	.long OPCODE_SYNC | SYNC_COMPUTE_SET
+	br $m10
+	.size ipu_stack_static_sample_cycle, .-ipu_stack_static_sample_cycle
+
+	.section .text.ipu_stack_static_sample_cycle_worker,"ax",@progbits
+	.p2align 2
+	.type ipu_stack_static_sample_cycle_worker,@function
+ipu_stack_static_sample_cycle_worker:
+	.worker
+	get $m1, $WSR
+	and $m1, $m1, 7
+	brnz $m1, .Lsample_cycle_exit
+	get $m0, $COUNT_L
+	ld32 $m2, $mvertex_base, $m15, 0
+	st32 $m0, $m2, $m15, 0
+.Lsample_cycle_exit:
+	exitz $m15
+	.size ipu_stack_static_sample_cycle_worker, .-ipu_stack_static_sample_cycle_worker
+
 	.section .text.ipu_stack_static_complete,"ax",@progbits
 	.globl ipu_stack_static_complete
 	.p2align 2

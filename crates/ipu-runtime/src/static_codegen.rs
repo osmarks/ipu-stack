@@ -10,6 +10,7 @@ pub(crate) const WORKER_BARRIER: &str = "ipu_stack_static_worker_barrier";
 pub(crate) const COMPLETE: &str = "ipu_stack_static_complete";
 pub(crate) const COPY_U32: &str = "ipu_stack_static_copy_u32";
 pub(crate) const REPEAT_CALL: &str = "ipu_stack_static_repeat_call";
+pub(crate) const SAMPLE_CYCLE: &str = "ipu_stack_static_sample_cycle";
 
 #[derive(Clone, Copy)]
 pub(crate) struct HostCopy {
@@ -32,12 +33,19 @@ pub(crate) fn emit(
     plan_addresses: &[u32],
     host_inputs: &[HostPhaseCall],
     host_outputs: &[HostPhaseCall],
+    profile_addresses: &[u32],
 ) -> Result<Vec<u8>> {
+    if !profile_addresses.is_empty() && profile_addresses.len() != program.steps.len() {
+        return Err("profile address count differs from tile step count".into());
+    }
     let mut code = TileCode::new(base);
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
     emit_host_phases(&mut code, symbols, host_inputs)?;
     let mut plan_index = 0usize;
-    for step in &program.steps {
+    for (step_index, step) in program.steps.iter().enumerate() {
+        if let Some(&address) = profile_addresses.get(step_index) {
+            emit_cycle_sample(&mut code, symbols, address)?;
+        }
         match step {
             LoweredTileStep::Exchange { row, .. } => {
                 code.instruction(ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
@@ -75,6 +83,10 @@ pub(crate) fn emit(
                 code.setzi(4, command.input_addresses[1])?;
                 code.call(kernel, 10)?;
             }
+            LoweredTileStep::IdleCompute { .. } => {}
+        }
+        if let Some(&address) = profile_addresses.get(step_index) {
+            emit_cycle_sample(&mut code, symbols, address + 4)?;
         }
     }
     if plan_index != plan_addresses.len() {
@@ -83,6 +95,15 @@ pub(crate) fn emit(
     emit_host_phases(&mut code, symbols, host_outputs)?;
     code.jump(symbol(symbols, COMPLETE)?)?;
     Ok(code.words.into_iter().flat_map(u32::to_le_bytes).collect())
+}
+
+fn emit_cycle_sample(
+    code: &mut TileCode,
+    symbols: &BTreeMap<String, u32>,
+    address: u32,
+) -> Result<()> {
+    code.setzi(2, address)?;
+    code.call(symbol(symbols, SAMPLE_CYCLE)?, 10)
 }
 
 fn emit_host_phases(

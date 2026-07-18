@@ -83,6 +83,12 @@ places the command page after the data pages, and derives one self-contained
 call's HSP phase count from its generated operations. Multi-page layouts and
 packet boundaries pass direct hardware acceptance.
 
+Large sparse host schedules do not duplicate one follower call per 4 KiB page
+on every tile. The packager emits the tile's specialized active transfers and
+compresses consecutive inactive phases into calls to a static counted loop.
+For the 2048 GEMM this keeps the largest generated tile program below 13 KiB
+despite 12,288 host attachment phases.
+
 Host binding sizes and D2H source addresses must be word aligned. Direct H2D
 destinations must be 32-byte aligned; aligned destinations outside the directly
 encodable packet window are staged automatically.
@@ -131,3 +137,32 @@ randomized hardware runner uses generated payloads and destinations. Each case
 performs D2D fanout to one through six destinations, sparse compute, and a
 second disjoint matching. Default cases sample 1, 15, 16, 17, 52, 64, 65, 127,
 512, and 1,024 words. Diagnostic readback verifies every result.
+
+## Blocked GEMM and profiling
+
+`ipu-gemm-e2e` builds and runs a square FP32 GEMM whose matrices originate on
+the host. Matrices use 64x64 blocks. Each output tile owns one A block, one B
+block, and one C block; each K iteration multicasts the A row blocks, preserves
+the received A block, multicasts the B column blocks through the reused receive
+window, and invokes a six-worker specialized GEMM kernel. A 2048 square GEMM
+uses 1,024 output tiles and 64 device exchange launches. Exact output checking
+has passed on hardware at dimensions 64, 128, 1,024, 1,600, and 2,048.
+
+```sh
+IPU_GEMM_DIMENSION=2048 cargo run -p ipu-runtime --bin ipu-gemm-e2e
+
+IPU_GEMM_DIMENSION=128 \
+IPU_PROFILE_OUTPUT=/tmp/gemm-profile.capnp \
+  cargo run -p ipu-runtime --bin ipu-gemm-e2e
+capnp decode schemas/profile.capnp Profile </tmp/gemm-profile.capnp
+```
+
+Profiling is optional and absent from an ordinary package. A profiled package
+samples the per-tile 32-bit cycle counter before and after each static exchange
+or compute step, reads the samples back through the normal D2H path, and writes
+the separate `schemas/profile.capnp` format. Durations must use wrapping
+subtraction. Sampling dispatches a worker to read the counter and therefore
+perturbs short steps; the records are intended for graph-level attribution,
+not instruction-level benchmarking. The hardware acceptance suite runs a
+profiled 128 GEMM, parses records for all 1,472 tiles, and requires exchange and
+compute samples.
