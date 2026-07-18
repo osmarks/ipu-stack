@@ -460,19 +460,6 @@ pub struct Schedule {
     pub peak_sram: BTreeMap<u16, u32>,
 }
 
-pub const TILE_COMMAND_WORDS: usize = 8;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum TileOpcode {
-    Exchange = 1,
-    Compute = 2,
-    End = 0xff,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EncodedTileCommand(pub [u32; TILE_COMMAND_WORDS]);
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoweredExchangeGroup {
     pub source_tile: u16,
@@ -549,71 +536,7 @@ impl LoweredExchangeEpoch {
     }
 }
 
-impl EncodedTileCommand {
-    pub fn to_le_bytes(self) -> [u8; TILE_COMMAND_WORDS * 4] {
-        let mut bytes = [0; TILE_COMMAND_WORDS * 4];
-        for (index, word) in self.0.iter().enumerate() {
-            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
-        }
-        bytes
-    }
-}
-
 impl Schedule {
-    /// Encode the per-tile declarative command stream. Exchange records describe
-    /// routing intent; a later lowering pass replaces them with executable plans.
-    pub fn tile_commands(&self, tile: u16) -> Result<Vec<EncodedTileCommand>, CompileError> {
-        if tile >= self.tile_count {
-            return Err(CompileError::Graph(format!("tile {tile} is out of range")));
-        }
-        let mut encoded = Vec::new();
-        for (phase_index, phase) in self.phases.iter().enumerate() {
-            match phase {
-                Phase::Exchange { transfers } => {
-                    for transfer in transfers.iter().filter(|transfer| {
-                        transfer.source_tile == tile || transfer.destination_tile == tile
-                    }) {
-                        encoded.push(EncodedTileCommand([
-                            TileOpcode::Exchange as u32,
-                            phase_index as u32,
-                            u32::from(transfer.source_tile),
-                            u32::from(transfer.destination_tile),
-                            transfer.tensor.0 as u32,
-                            transfer.bytes,
-                            0,
-                            0,
-                        ]));
-                    }
-                }
-                Phase::Compute { op, commands } => {
-                    for command in commands.iter().filter(|command| command.tile == tile) {
-                        let mut words = [0; TILE_COMMAND_WORDS];
-                        words[0] = TileOpcode::Compute as u32;
-                        words[1] = phase_index as u32;
-                        words[2] = op.0 as u32;
-                        words[3] = command.output.0 as u32;
-                        words[4] = command.inputs.len() as u32;
-                        for (index, input) in command.inputs.iter().take(3).enumerate() {
-                            words[5 + index] = input.0 as u32;
-                        }
-                        encoded.push(EncodedTileCommand(words));
-                    }
-                }
-            }
-        }
-        encoded.push(EncodedTileCommand([
-            TileOpcode::End as u32,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ]));
-        Ok(encoded)
-    }
-
     pub fn lower_exchanges(
         &self,
         topology: &Topology,
@@ -1647,9 +1570,6 @@ mod tests {
         let programs = first.lower_tile_programs(&Topology::c600()).unwrap();
         assert_eq!(programs.len(), usize::from(first.tile_count));
         assert!(programs.iter().all(|program| !program.steps.is_empty()));
-        let commands = first.tile_commands(0).unwrap();
-        assert_eq!(commands.last().unwrap().0[0], TileOpcode::End as u32);
-        assert_eq!(commands.last().unwrap().to_le_bytes().len(), 32);
     }
 
     #[test]
