@@ -58,6 +58,7 @@ fn main() {
         })
         .ok();
     let d2h_only = std::env::var_os("IPU_HOST_TEST_D2H_ONLY").is_some();
+    let initialized_exchange = std::env::var_os("IPU_HOST_TEST_INITIALIZED_EXCHANGE").is_some();
     assert!(output_count != 0, "IPU_HOST_TEST_OUTPUTS must be nonzero");
     let host_tile = std::env::var("IPU_HOST_TEST_TILE")
         .map(|value| {
@@ -83,6 +84,22 @@ fn main() {
             Vec::new(),
             payload,
         )
+    } else if initialized_exchange {
+        assert!(exchange);
+        assert!(second_tile.is_none());
+        let mut graph =
+            host_exchange_graph(transfer_bytes, true, host_tile, remote_d2h, output_count).unwrap();
+        let source = graph.host_inputs[0].slices[0].clone();
+        graph.host_inputs.clear();
+        graph.initial_buffers.push(InitialBuffer {
+            tile: HOST_CONTROLLER_TILE,
+            address: source.tile_address,
+            words: payload
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect(),
+        });
+        (graph, Vec::new(), payload)
     } else if let Some(second_tile) = second_tile {
         let graph = two_tile_host_graph(transfer_bytes, host_tile, second_tile).unwrap();
         (graph, payload.clone(), payload)

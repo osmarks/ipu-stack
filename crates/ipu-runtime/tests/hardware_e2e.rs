@@ -25,6 +25,18 @@ fn local_h2d_and_d2h_round_trip_works() {
 }
 
 #[test]
+fn initialized_d2d_relay_and_d2h_work() {
+    let _device = device();
+    require_success(
+        "initialized D2D relay and D2H",
+        host_test(&[
+            ("IPU_HOST_TEST_EXCHANGE", "1"),
+            ("IPU_HOST_TEST_INITIALIZED_EXCHANGE", "1"),
+        ]),
+    );
+}
+
+#[test]
 fn large_multi_epoch_host_and_device_transfers_work() {
     let _device = device();
     require_success(
