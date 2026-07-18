@@ -46,10 +46,10 @@ cargo run -p ipu-cli -- kernel-compile device/runtime.S /tmp/runtime \
 cargo run -p ipu-cli -- encoder-plan -o /tmp/encoder.json --tiles 1472
 ```
 
-`cargo test --workspace` does not claim device-transfer coverage. The exclusive
-hardware acceptance gate is `scripts/hardware-e2e.sh`; its tests are ignored by
-the ordinary test command so that package builds cannot reset an attached IPU.
-It requires
+`cargo test --workspace` includes the exclusive hardware capability gate and
+therefore requires an attached C600. The gate runs serially in dependency order
+and fails at the first broken capability. `scripts/hardware-e2e.sh` runs that
+test directly. It requires
 `POPLAR_SDK_ENABLED` and `IPU_CONFIG`, and accepts optional `IPU_BOOTLOADER` and
 `IPU_DEVICE` overrides. The suite includes seeded randomized exchange graphs;
 run one reproducible case directly with `IPU_RANDOM_SEED=0x1234 cargo run -p
@@ -111,7 +111,9 @@ encoder now follows that rule. The attached destination remains untouched in
 direct hardware acceptance, so transaction ownership or host stream setup is
 still incomplete.
 
-The seeded randomized hardware runner uses allocated addresses and generated
+Offline unit tests verify encodings, allocation, lowering, and package structure;
+they do not count as evidence that a transport capability works. The seeded
+randomized hardware runner uses allocated addresses and generated
 payloads. Each case performs H2D, generated D2D fanout to one through four
 random destinations, a generated gather into distinct tile-0 ranges, and D2H
 verification. Default cases cover 1, 2, 15, 16, 17, 31, 63, and 64 words;
