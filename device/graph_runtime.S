@@ -7,6 +7,8 @@
 	.set ROLE_COMPUTE_NOOP, 12
 	.set ROLE_HOST_PROGRAM, 13
 	.set ROLE_HOST_IDLE, 14
+	.set ROLE_HOST_PROGRAM_UNBARRIERED, 15
+	.set ROLE_HOST_IDLE_UNBARRIERED, 16
 	.set TILE_MUX_HOST, 0x600
 	.set TILE_MUX_EXCHANGE, 0x640
 	.set WORKER_BASE_START, 0x50000
@@ -71,6 +73,10 @@ ipu_stack_command_table_address:
 	brnz $m8, .Lload_host_command
 	cmpeq $m8, $m5, ROLE_HOST_IDLE
 	brnz $m8, .Lload_host_command
+	cmpeq $m8, $m5, ROLE_HOST_PROGRAM_UNBARRIERED
+	brnz $m8, .Lload_host_command
+	cmpeq $m8, $m5, ROLE_HOST_IDLE_UNBARRIERED
+	brnz $m8, .Lload_host_command
 	cmpeq $m8, $m5, ROLE_INACTIVE
 	brnz $m8, .Lpre_sync_exchange
 	cmpeq $m8, $m5, ROLE_EXCHANGE_ABSOLUTE
@@ -103,6 +109,10 @@ ipu_stack_command_table_address:
 	brnz $m8, .Lrun_host_program
 	cmpeq $m8, $m5, ROLE_HOST_IDLE
 	brnz $m8, .Lhost_idle
+	cmpeq $m8, $m5, ROLE_HOST_PROGRAM_UNBARRIERED
+	brnz $m8, .Lrun_host_program_unbarriered
+	cmpeq $m8, $m5, ROLE_HOST_IDLE_UNBARRIERED
+	brnz $m8, .Lhost_idle_unbarriered
 	bri .Lhalt
 .Lset_absolute_exchange_bases:
 	put 0xa7, $m15
@@ -121,10 +131,19 @@ ipu_stack_command_table_address:
 	setzi $m10, .Lhost_launch_complete
 	br $m1
 
+.Lrun_host_program_unbarriered:
+	setzi $m10, .Lhost_launch_complete_unbarriered
+	br $m1
+
 .Lhost_idle:
 	.long OPCODE_SANS | SANS_EXTERNAL
 	.long OPCODE_SYNC | SYNC_EXTERNAL
 	bri .Lhost_launch_complete
+
+.Lhost_idle_unbarriered:
+	.long OPCODE_SANS | SANS_EXTERNAL
+	.long OPCODE_SYNC | SYNC_EXTERNAL
+	bri .Lhost_launch_complete_unbarriered
 
 .Lplan_complete:
 #ifdef IPU_STACK_TRAP_AFTER_RECEIVE
@@ -148,6 +167,11 @@ ipu_stack_command_table_address:
 	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
 	call $m7, ipu_stack_device_sync_dispatch
+	bri .Lcommand_loop
+
+.Lhost_launch_complete_unbarriered:
+	setzi $m0, TILE_MUX_EXCHANGE
+	put 0xa0, $m0
 	bri .Lcommand_loop
 
 .Ldone:

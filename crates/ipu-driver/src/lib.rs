@@ -1019,6 +1019,7 @@ impl<'a> HostSession<'a> {
             .cloned()
             .ok_or_else(|| DriverError::Invalid(format!("unknown host call {name}")))?;
         copy_input(&mut self.pages, &call, input)?;
+        poison_output(&mut self.pages, &call)?;
         let command = self
             .pages
             .get_mut(&self.protocol.command_page)
@@ -1079,6 +1080,17 @@ impl Drop for HostSession<'_> {
             self.device.detach_buffer(index);
         }
     }
+}
+
+fn poison_output(pages: &mut HashMap<u32, HostBuffer>, call: &HostCall) -> Result<(), DriverError> {
+    for slice in &call.outputs {
+        let page = pages
+            .get_mut(&slice.page)
+            .ok_or_else(|| DriverError::Invalid("missing output page".into()))?;
+        let start = slice.page_offset as usize;
+        page.bytes_mut()[start..start + slice.size as usize].fill(0xa5);
+    }
+    Ok(())
 }
 
 fn copy_input(

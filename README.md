@@ -74,7 +74,8 @@ Host transfers are split at the recovered short/long packet limits and 4 KiB
 attachment boundaries. The runtime allocates one attached buffer per page,
 places the command page after the data pages, and derives one self-contained
 call's HSP phase count from its generated operations. Multi-page layouts and
-packet boundaries are covered by unit tests and hardware runs.
+packet boundaries have static coverage; hardware acceptance remains red on the
+base 64-byte D2H case.
 
 Exchange Tx/Rx staging addresses are selected from explicit memory constraints:
 tile, byte range, alignment, placement direction, and half-open phase lifetime.
@@ -103,10 +104,12 @@ symbol and exchange commands perform no arithmetic. A randomized hardware
 acceptance path attempts H2D to the controller tile, two generated tile-exchange
 epochs via a relay tile, and D2H from the automatically allocated return range.
 Command boundaries use the generated C600 GSP program before the next exchange
-can begin. D2H lowering emits separate tile-0 transaction ownership and
-source-tile payload programs in one host phase. Multi-packet D2H uses one XREQ
-and close around 256-byte packet/payload pairs, matching the recovered SDK
-schedule.
+can begin. D2H lowering currently emits the SDK-derived source-tile host packet
+routine. Oracle disassembly shows that `A6` carries the total 32-bit payload
+word count while every host payload send uses a send count of one; the Rust
+encoder now follows that rule. The attached destination remains untouched in
+direct hardware acceptance, so transaction ownership or host stream setup is
+still incomplete.
 
 The seeded randomized hardware runner uses allocated addresses and generated
 payloads. Each case performs H2D, generated D2D fanout to one through four

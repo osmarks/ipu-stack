@@ -4,7 +4,7 @@ use ipu_compiler::{
 };
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
-use ipu_runtime::{ExecutableGraph, package_graph, run_host};
+use ipu_runtime::{ExecutableGraph, InitialBuffer, package_graph, run_host};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -54,6 +54,7 @@ fn main() {
                 .expect("IPU_HOST_TEST_SECOND_TILE must be an integer")
         })
         .ok();
+    let d2h_only = std::env::var_os("IPU_HOST_TEST_D2H_ONLY").is_some();
     assert!(output_count != 0, "IPU_HOST_TEST_OUTPUTS must be nonzero");
     let host_tile = std::env::var("IPU_HOST_TEST_TILE")
         .map(|value| {
@@ -71,22 +72,47 @@ fn main() {
         "multiple output slices are only supported by the direct host test"
     );
     let payload_count = second_tile.map_or(output_count, |_| 2);
-    let input = test_payload(transfer_bytes * payload_count);
-    let graph = if let Some(second_tile) = second_tile {
-        two_tile_host_graph(transfer_bytes, host_tile, second_tile).unwrap()
+    let payload = test_payload(transfer_bytes * payload_count);
+    let (graph, input, expected) = if d2h_only {
+        assert!(second_tile.is_none());
+        (
+            d2h_only_graph(transfer_bytes, host_tile, &payload).unwrap(),
+            Vec::new(),
+            payload,
+        )
+    } else if let Some(second_tile) = second_tile {
+        let graph = two_tile_host_graph(transfer_bytes, host_tile, second_tile).unwrap();
+        (graph, payload.clone(), payload)
     } else {
-        host_exchange_graph(
+        let graph = host_exchange_graph(
             transfer_bytes,
             exchange || remote_d2h,
             host_tile,
             remote_d2h,
             output_count,
         )
-        .unwrap()
+        .unwrap();
+        (graph, payload.clone(), payload)
     };
     let app = package_graph(&graph, &[runtime_object]).unwrap();
+    if d2h_only {
+        let source = &graph.host_outputs[0].slices[0];
+        let tile = app
+            .tiles
+            .iter()
+            .find(|tile| tile.physical_tile == source.tile)
+            .unwrap();
+        let segment = tile
+            .segments
+            .iter()
+            .find(|segment| segment.address == source.tile_address)
+            .unwrap();
+        let blob = &app.blobs[segment.blob].bytes;
+        let start = segment.blob_offset as usize;
+        assert_eq!(&blob[start..start + expected.len()], expected);
+    }
     let result = run_host(&app, &bootloader, &configuration, &device, &input).unwrap();
-    assert_eq!(result, input);
+    assert_eq!(result, expected);
     println!(
         "hostBytes={} h2d=PASS exchange={} d2h=PASS",
         result.len(),
@@ -97,6 +123,55 @@ fn main() {
         }
     );
     let _ = fs::remove_dir_all(output);
+}
+
+fn d2h_only_graph(
+    transfer_bytes: u32,
+    tile: u16,
+    payload: &[u8],
+) -> Result<ExecutableGraph, ipu_compiler::CompileError> {
+    let topology = ipu_exchange::Topology::c600();
+    let tensor = TensorId(0);
+    let address = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x3000;
+    let words = payload
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    Ok(ExecutableGraph {
+        schedule: Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![Allocation {
+                tensor,
+                tile,
+                address,
+                size: transfer_bytes,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            }],
+            tile_count: TILE_COUNT,
+            peak_sram: BTreeMap::new(),
+        },
+        initial_buffers: vec![InitialBuffer {
+            tile,
+            address,
+            words,
+        }],
+        outputs: Vec::new(),
+        host_inputs: Vec::new(),
+        host_outputs: vec![Binding {
+            name: "output".into(),
+            dtype: "u8".into(),
+            shape: vec![transfer_bytes],
+            slices: vec![RegionSlice {
+                tile: u32::from(topology.physical(tile)?),
+                tile_address: address,
+                file_offset: 0,
+                size: u64::from(transfer_bytes),
+            }],
+        }],
+    })
 }
 
 fn two_tile_host_graph(

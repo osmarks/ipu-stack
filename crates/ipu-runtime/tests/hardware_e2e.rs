@@ -22,6 +22,18 @@ fn generated_host_exchange_graph_runs_end_to_end() {
 }
 
 #[test]
+fn generated_d2h_from_initialized_tile_runs_end_to_end() {
+    let status = Command::new(env!("CARGO_BIN_EXE_ipu-host-e2e"))
+        .env("IPU_HOST_TEST_D2H_ONLY", "1")
+        .status()
+        .expect("launch initialized-tile C600 D2H test runner");
+    assert!(
+        status.success(),
+        "C600 initialized-tile D2H test runner failed with {status}"
+    );
+}
+
+#[test]
 #[ignore = "requires exclusive access to a physical C600"]
 fn generated_multi_epoch_host_exchange_runs_end_to_end() {
     let status = Command::new(env!("CARGO_BIN_EXE_ipu-host-e2e"))

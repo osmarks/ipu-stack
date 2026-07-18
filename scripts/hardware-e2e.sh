@@ -15,6 +15,11 @@ tests=(
   randomized_exchange_graphs_run_end_to_end
 )
 failed=()
+if ! cargo test --manifest-path "$root/Cargo.toml" -p ipu-runtime \
+  --test hardware_e2e generated_d2h_from_initialized_tile_runs_end_to_end \
+  -- --nocapture --test-threads=1; then
+  failed+=("generated_d2h_from_initialized_tile_runs_end_to_end")
+fi
 for test in "${tests[@]}"; do
   if ! cargo test --manifest-path "$root/Cargo.toml" -p ipu-runtime \
     --test hardware_e2e "$test" -- --ignored --nocapture --test-threads=1; then

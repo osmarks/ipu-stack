@@ -276,6 +276,7 @@ pub fn assemble_host_command_read_program(
         return Err(ExchangeError::HostPacket);
     }
     let request = host_to_tile_packet(0, destination_address, host_offset, 4)?;
+    let close = zero_byte_read_packet(0, destination_address)?;
     Ok(TileToHostProgram {
         instructions: vec![
             setzi_m(8, TILE_MUX_HOST),
@@ -290,10 +291,10 @@ pub fn assemble_host_command_read_program(
             put_special_from_m8(INCOMING_MUX_REGISTER),
             SYNC_SUPERVISOR_INSTRUCTION,
             delay(72),
-            encode_send(0, 3, destination_address >> 2)?,
+            encode_send(0, 3, (packet_address + 8) >> 2)?,
             RETURN_M10_INSTRUCTION,
         ],
-        packet_words: vec![1, 0, 0, 0, request.word0, request.word1],
+        packet_words: vec![1, 0, close.word0, close.word1, request.word0, request.word1],
     })
 }
 
@@ -550,38 +551,14 @@ pub fn assemble_tile_to_host_program(
     host_offset: u32,
     bytes: u32,
     packet_address: u32,
-    dummy_tile_address: u32,
 ) -> Result<TileToHostProgram, ExchangeError> {
-    let chunks = plan_tile_to_host(physical_tile, tile_address, host_offset, bytes)?;
-    let xreq_address = packet_address + (chunks.len() as u32 + 1) * 8;
-    let coordinator = tile_to_host_coordinator_instructions(xreq_address)?;
-    let source = tile_to_host_source_instructions(physical_tile, &chunks, packet_address)?;
-    let mut instructions = coordinator;
-    instructions.extend(source);
-    Ok(TileToHostProgram {
-        instructions,
-        packet_words: tile_to_host_packet_words(
-            physical_tile,
-            tile_address,
-            host_offset,
-            bytes,
-            dummy_tile_address,
-            true,
-        )?,
-    })
-}
-
-pub fn assemble_tile_to_host_coordinator_program(
-    packet_address: u32,
-    header_count: usize,
-) -> Result<TileToHostProgram, ExchangeError> {
-    let xreq_address = packet_address + (header_count as u32 + 1) * 8;
-    let mut packet_words = vec![0; (header_count + 1) * 2];
-    packet_words.extend([2, 0]);
-    Ok(TileToHostProgram {
-        instructions: tile_to_host_coordinator_instructions(xreq_address)?,
-        packet_words,
-    })
+    assemble_tile_to_host_source_program(
+        physical_tile,
+        tile_address,
+        host_offset,
+        bytes,
+        packet_address,
+    )
 }
 
 pub fn assemble_tile_to_host_source_program(
@@ -590,34 +567,16 @@ pub fn assemble_tile_to_host_source_program(
     host_offset: u32,
     bytes: u32,
     packet_address: u32,
-    dummy_tile_address: u32,
 ) -> Result<TileToHostProgram, ExchangeError> {
     let chunks = plan_tile_to_host(physical_tile, tile_address, host_offset, bytes)?;
+    let packet_words = chunks
+        .iter()
+        .flat_map(|chunk| [chunk.header.word0, chunk.header.word1])
+        .collect();
     Ok(TileToHostProgram {
         instructions: tile_to_host_source_instructions(physical_tile, &chunks, packet_address)?,
-        packet_words: tile_to_host_packet_words(
-            physical_tile,
-            tile_address,
-            host_offset,
-            bytes,
-            dummy_tile_address,
-            false,
-        )?,
+        packet_words,
     })
-}
-
-fn tile_to_host_coordinator_instructions(xreq_address: u32) -> Result<Vec<u32>, ExchangeError> {
-    if xreq_address & 7 != 0 {
-        return Err(ExchangeError::HostPacket);
-    }
-    Ok(vec![
-        setzi_m(8, TILE_MUX_HOST),
-        put_special_from_m8(INCOMING_MUX_REGISTER),
-        SYNC_HOST_INSTRUCTION,
-        encode_send(1, 3, xreq_address >> 2)?,
-        SYNC_ALL_INSTRUCTION,
-        RETURN_M10_INSTRUCTION,
-    ])
 }
 
 fn tile_to_host_source_instructions(
@@ -628,28 +587,27 @@ fn tile_to_host_source_instructions(
     if chunks.is_empty() || packet_address & 7 != 0 {
         return Err(ExchangeError::HostPacket);
     }
+    let payload_words = chunks.iter().try_fold(0_u32, |words, chunk| {
+        words
+            .checked_add(chunk.bytes / 4)
+            .ok_or(ExchangeError::HostPacket)
+    })?;
     let mut instructions = vec![
-        sans(1),
-        SYNC_EXTERNAL_INSTRUCTION,
         setzi_m(8, host_tile_mux(physical_tile)?),
         put_special_from_m8(INCOMING_MUX_REGISTER),
-        setzi_m(8, 1),
+        if physical_tile == 0 {
+            SYNC_HOST_INSTRUCTION
+        } else {
+            SYNC_ALL_INSTRUCTION
+        },
+        setzi_m(8, payload_words),
         put_special_from_m8(INCOMING_DCOUNT_REGISTER),
     ];
     for (index, chunk) in chunks.iter().enumerate() {
         instructions.push(encode_send(1, 3, (packet_address + index as u32 * 8) >> 2)?);
-        let words = chunk.bytes / 4;
-        for offset in (0..words).step_by(64) {
-            instructions.push(encode_send(
-                (words - offset).min(64) - 1,
-                3,
-                (chunk.tile_address >> 2) + offset,
-            )?);
-        }
+        instructions.push(encode_send(1, 3, chunk.tile_address >> 2)?);
     }
     instructions.extend([
-        delay(1),
-        encode_send(1, 3, (packet_address + chunks.len() as u32 * 8) >> 2)?,
         SYNC_RECEIVE_INSTRUCTION,
         SYNC_ALL_INSTRUCTION,
         setzi_m(8, TILE_MUX_EXCHANGE),
@@ -657,27 +615,6 @@ fn tile_to_host_source_instructions(
         RETURN_M10_INSTRUCTION,
     ]);
     Ok(instructions)
-}
-
-fn tile_to_host_packet_words(
-    physical_tile: u16,
-    tile_address: u32,
-    host_offset: u32,
-    bytes: u32,
-    dummy_tile_address: u32,
-    include_xreq: bool,
-) -> Result<Vec<u32>, ExchangeError> {
-    let chunks = plan_tile_to_host(physical_tile, tile_address, host_offset, bytes)?;
-    let close = zero_byte_read_packet(physical_tile, dummy_tile_address)?;
-    let mut words = Vec::with_capacity((chunks.len() + 2) * 2);
-    for chunk in chunks {
-        words.extend([chunk.header.word0, chunk.header.word1]);
-    }
-    words.extend([close.word0, close.word1]);
-    if include_xreq {
-        words.extend([2, 0]);
-    }
-    Ok(words)
 }
 
 fn plan_host_transfer(
@@ -1398,57 +1335,41 @@ mod tests {
 
     #[test]
     fn assembles_tile_to_host_program() {
-        let plan = assemble_tile_to_host_program(2, 0x50120, 0x40, 64, 0x50160, 0x50180).unwrap();
+        let plan = assemble_tile_to_host_program(2, 0x50120, 0x40, 64, 0x50160).unwrap();
         assert_eq!(
             &plan.packet_words[..2],
             &host_packet_words(tile_to_host_packet(2, 0x40, 64).unwrap())
         );
-        assert_eq!(
-            &plan.packet_words[2..4],
-            &host_packet_words(zero_byte_read_packet(2, 0x50180).unwrap())
-        );
-        assert_eq!(&plan.packet_words[4..], &[2, 0]);
+        assert_eq!(plan.packet_words.len(), 2);
         let sends = plan
             .instructions
             .iter()
             .copied()
             .filter(|word| word & LONG_OPCODE_MASK == SEND_OPCODE)
             .collect::<Vec<_>>();
-        assert_eq!(sends.len(), 4);
-        assert_eq!(send_address(sends[0]), 0x50170);
-        assert_eq!(send_address(sends[1]), 0x50160);
-        assert_eq!(send_address(sends[2]), 0x50120);
-        assert_eq!(send_address(sends[3]), 0x50168);
-        assert_eq!(instruction_advance(sends[2]), 16);
+        assert_eq!(sends.len(), 2);
+        assert_eq!(send_address(sends[0]), 0x50160);
+        assert_eq!(send_address(sends[1]), 0x50120);
+        assert_eq!(instruction_advance(sends[1]), 2);
+        assert_eq!(plan.instructions[3], setzi_m(8, 16));
         assert!(plan.instructions.contains(&SYNC_RECEIVE_INSTRUCTION));
     }
 
     #[test]
-    fn splits_tile_to_host_coordinator_and_source_roles() {
-        let coordinator = assemble_tile_to_host_coordinator_program(0x50160, 1).unwrap();
-        let source =
-            assemble_tile_to_host_source_program(2, 0x50120, 0x40, 64, 0x50160, 0x50180).unwrap();
+    fn assembles_remote_tile_to_host_source_role() {
+        let source = assemble_tile_to_host_source_program(2, 0x50120, 0x40, 64, 0x50160).unwrap();
 
-        assert_eq!(coordinator.packet_words, [0, 0, 0, 0, 2, 0]);
-        assert!(coordinator.instructions.contains(&SYNC_HOST_INSTRUCTION));
-        assert_eq!(
-            coordinator.instructions.last(),
-            Some(&RETURN_M10_INSTRUCTION)
-        );
+        assert!(source.instructions.contains(&SYNC_ALL_INSTRUCTION));
         assert!(!source.instructions.contains(&SYNC_HOST_INSTRUCTION));
-        assert_eq!(source.packet_words.len(), 4);
+        assert_eq!(source.packet_words.len(), 2);
         assert_eq!(
-            &source.packet_words[..2],
+            &source.packet_words,
             &host_packet_words(tile_to_host_packet(2, 0x40, 64).unwrap())
-        );
-        assert_eq!(
-            &source.packet_words[2..],
-            &host_packet_words(zero_byte_read_packet(2, 0x50180).unwrap())
         );
     }
 
     #[test]
-    fn groups_multi_packet_tile_to_host_under_one_xreq_and_close() {
+    fn groups_multi_packet_tile_to_host_payloads() {
         let chunks = plan_tile_to_host(2, 0x52000, 0x40, 2048).unwrap();
         assert_eq!(chunks.len(), 8);
         assert!(
@@ -1457,25 +1378,18 @@ mod tests {
                 .all(|chunk| chunk.bytes == TILE_TO_HOST_MAX_BYTES)
         );
 
-        let combined =
-            assemble_tile_to_host_program(2, 0x52000, 0x40, 2048, 0x50160, 0x50140).unwrap();
-        let source =
-            assemble_tile_to_host_source_program(2, 0x52000, 0x40, 2048, 0x50160, 0x50140).unwrap();
-        let coordinator = assemble_tile_to_host_coordinator_program(0x50160, chunks.len()).unwrap();
+        let combined = assemble_tile_to_host_program(2, 0x52000, 0x40, 2048, 0x50160).unwrap();
+        let source = assemble_tile_to_host_source_program(2, 0x52000, 0x40, 2048, 0x50160).unwrap();
 
-        assert_eq!(source.packet_words.len(), (chunks.len() + 1) * 2);
-        assert_eq!(coordinator.packet_words.len(), (chunks.len() + 2) * 2);
-        assert_eq!(
-            &coordinator.packet_words[coordinator.packet_words.len() - 2..],
-            &[2, 0]
-        );
-        assert_eq!(
-            &combined.packet_words[combined.packet_words.len() - 2..],
-            &[2, 0]
-        );
-        assert_eq!(
-            &source.packet_words[source.packet_words.len() - 2..],
-            &host_packet_words(zero_byte_read_packet(2, 0x50140).unwrap())
+        assert_eq!(source.packet_words.len(), chunks.len() * 2);
+        assert_eq!(combined.packet_words, source.packet_words);
+        assert_eq!(source.instructions[3], setzi_m(8, 2048 / 4));
+        assert!(
+            source
+                .instructions
+                .iter()
+                .filter(|word| **word & LONG_OPCODE_MASK == SEND_OPCODE)
+                .all(|word| instruction_advance(*word) == 2)
         );
         assert_eq!(
             source
@@ -1483,7 +1397,7 @@ mod tests {
                 .iter()
                 .filter(|word| **word & LONG_OPCODE_MASK == SEND_OPCODE)
                 .count(),
-            chunks.len() * 2 + 1
+            chunks.len() * 2
         );
     }
 
@@ -1531,11 +1445,15 @@ mod tests {
     #[test]
     fn assembles_host_command_read_program() {
         let plan = assemble_host_command_read_program(0x50160, 0x50180, 0x1000).unwrap();
-        assert_eq!(plan.packet_words, [1, 0, 0, 0, 0xcc00_020c, 0x4001]);
+        assert_eq!(
+            plan.packet_words,
+            [1, 0, 0xcc00_020c, 0, 0xcc00_020c, 0x4001]
+        );
         assert_eq!(
             plan.instructions[5..8],
             [0x782a_02c3, 0x782a_02e3, SYNC_RECEIVE_INSTRUCTION]
         );
+        assert_eq!(send_address(plan.instructions[12]), 0x50168);
     }
 
     fn host_packet_words(header: HostPacketHeader) -> [u32; 2] {

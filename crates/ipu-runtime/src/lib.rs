@@ -65,6 +65,8 @@ enum RuntimeRole {
     ComputeNoop = 12,
     HostProgram = 13,
     HostIdle = 14,
+    HostProgramUnbarriered = 15,
+    HostIdleUnbarriered = 16,
 }
 
 impl RuntimeRole {
@@ -82,7 +84,6 @@ struct RuntimeLayout {
     sync_packet_address: u32,
     sync_release_address: u32,
     host_command_address: u32,
-    host_zero_read_address: u32,
 }
 
 impl RuntimeLayout {
@@ -169,7 +170,6 @@ impl RuntimeLayout {
             sync_packet_address,
             sync_release_address,
             host_command_address: host_packet_end,
-            host_zero_read_address: host_packet_end + HOST_PACKET_ALIGNMENT,
         })
     }
 
@@ -400,6 +400,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                 physical as u16,
                 &layout,
                 command_index,
+                true,
             )?;
             command_index += 1;
         }
@@ -503,12 +504,13 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
                 physical as u16,
                 &layout,
                 command_index,
+                false,
             )?;
             command_index += 1;
         }
         if !host.inputs.is_empty() || !host.outputs.is_empty() {
             commands.extend_from_slice(&words_to_bytes(&[
-                RuntimeRole::ComputeNoop.word(),
+                RuntimeRole::HostIdleUnbarriered.word(),
                 0,
                 0,
                 0,
@@ -641,7 +643,6 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
     if !graph.host_inputs.is_empty() {
         inputs.push(command_read_transfer(command_host_offset)?);
     }
-
     for binding in &graph.host_inputs {
         let size = binding_size(binding)?;
         let page_base = u64::from(align_up(page_cursor, 64));
@@ -676,14 +677,12 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
     if !graph.schedule.phases.is_empty() {
         inputs.push(command_read_transfer(command_host_offset)?);
     }
-    if !graph.host_outputs.is_empty() {
-        outputs.push(command_read_transfer(command_host_offset)?);
-    }
     page_cursor = output_start;
     for binding in &graph.host_outputs {
         let size = binding_size(binding)?;
         let page_base = u64::from(align_up(page_cursor, 64));
         for slice in &binding.slices {
+            outputs.push(command_read_transfer(command_host_offset)?);
             let host_offset = u32::try_from(page_base + slice.file_offset)?;
             append_host_slices(
                 &mut output_slices,
@@ -711,10 +710,13 @@ fn build_host_layout(graph: &ExecutableGraph) -> Result<HostLayout> {
             .checked_add(size)
             .ok_or("host output size overflow")?;
     }
-
+    if !graph.host_outputs.is_empty() {
+        outputs.push(command_read_transfer(command_host_offset)?);
+    }
     let host_phases = inputs
         .len()
         .checked_add(outputs.len())
+        .and_then(|phases| phases.checked_add(1))
         .ok_or("host phase count overflow")?;
     Ok(HostLayout {
         inputs,
@@ -807,10 +809,9 @@ fn binding_size(binding: &Binding) -> Result<u64> {
 fn host_plan_size(transfer: &HostTransfer) -> Result<usize> {
     Ok(assemble_host_program(
         *transfer,
-        HostProgramRole::Complete,
+        sizing_host_role(transfer.direction),
         HOST_PACKET_BASE,
         ipu_exchange::EXCHANGE_WINDOW_BASE,
-        ipu_exchange::EXCHANGE_WINDOW_BASE + HOST_PACKET_ALIGNMENT,
     )?
     .instructions
     .len()
@@ -820,14 +821,21 @@ fn host_plan_size(transfer: &HostTransfer) -> Result<usize> {
 fn host_packet_size(transfer: &HostTransfer) -> Result<usize> {
     Ok(assemble_host_program(
         *transfer,
-        HostProgramRole::Complete,
+        sizing_host_role(transfer.direction),
         HOST_PACKET_BASE,
         ipu_exchange::EXCHANGE_WINDOW_BASE,
-        ipu_exchange::EXCHANGE_WINDOW_BASE + HOST_PACKET_ALIGNMENT,
     )?
     .packet_words
     .len()
         * 4)
+}
+
+fn sizing_host_role(direction: HostDirection) -> HostProgramRole {
+    if matches!(direction, HostDirection::ToHost) {
+        HostProgramRole::Source
+    } else {
+        HostProgramRole::Complete
+    }
 }
 
 fn assemble_host_program(
@@ -835,7 +843,6 @@ fn assemble_host_program(
     role: HostProgramRole,
     packet_address: u32,
     command_address: u32,
-    zero_read_address: u32,
 ) -> Result<TileToHostProgram> {
     match transfer.direction {
         HostDirection::CommandRead if role == HostProgramRole::Complete => {
@@ -875,37 +882,15 @@ fn assemble_host_program(
                 packet_address,
             )?)
         }
-        HostDirection::ToHost => match role {
-            HostProgramRole::Complete => Ok(ipu_exchange::assemble_tile_to_host_program(
+        HostDirection::ToHost if role == HostProgramRole::Source => {
+            Ok(ipu_exchange::assemble_tile_to_host_source_program(
                 transfer.physical_tile,
                 transfer.tile_address,
                 transfer.host_offset,
                 transfer.bytes,
                 packet_address,
-                zero_read_address,
-            )?),
-            HostProgramRole::Coordinator => {
-                let header_count = ipu_exchange::plan_tile_to_host(
-                    transfer.physical_tile,
-                    transfer.tile_address,
-                    transfer.host_offset,
-                    transfer.bytes,
-                )?
-                .len();
-                Ok(ipu_exchange::assemble_tile_to_host_coordinator_program(
-                    packet_address,
-                    header_count,
-                )?)
-            }
-            HostProgramRole::Source => Ok(ipu_exchange::assemble_tile_to_host_source_program(
-                transfer.physical_tile,
-                transfer.tile_address,
-                transfer.host_offset,
-                transfer.bytes,
-                packet_address,
-                zero_read_address,
-            )?),
-        },
+            )?)
+        }
         _ => Err("host program role does not match transfer direction".into()),
     }
 }
@@ -925,6 +910,7 @@ fn append_host_command(
     physical_tile: u16,
     layout: &RuntimeLayout,
     command_index: usize,
+    barrier_after: bool,
 ) -> Result<()> {
     const HOST_COORDINATOR_TILE: u16 = 0;
     let program_role = match transfer.direction {
@@ -941,12 +927,6 @@ fn append_host_command(
             Some(HostProgramRole::Source)
         }
         HostDirection::ToTile => None,
-        HostDirection::ToHost if transfer.physical_tile == HOST_COORDINATOR_TILE => {
-            (physical_tile == HOST_COORDINATOR_TILE).then_some(HostProgramRole::Complete)
-        }
-        HostDirection::ToHost if physical_tile == HOST_COORDINATOR_TILE => {
-            Some(HostProgramRole::Coordinator)
-        }
         HostDirection::ToHost if physical_tile == transfer.physical_tile => {
             Some(HostProgramRole::Source)
         }
@@ -960,7 +940,6 @@ fn append_host_command(
             program_role,
             packet_address,
             layout.host_command_address,
-            layout.host_zero_read_address,
         )?;
         let instructions = words_to_bytes(&program.instructions);
         let size = u32::try_from(instructions.len())?;
@@ -984,9 +963,23 @@ fn append_host_command(
             file_size: packet_size,
             flags: SEGMENT_READ,
         });
-        (RuntimeRole::HostProgram, plan_address)
+        (
+            if barrier_after {
+                RuntimeRole::HostProgram
+            } else {
+                RuntimeRole::HostProgramUnbarriered
+            },
+            plan_address,
+        )
     } else {
-        (RuntimeRole::HostIdle, 0)
+        (
+            if barrier_after {
+                RuntimeRole::HostIdle
+            } else {
+                RuntimeRole::HostIdleUnbarriered
+            },
+            0,
+        )
     };
     commands.extend_from_slice(&words_to_bytes(&[role.word(), address, 0, 0, 0]));
     Ok(())
@@ -1383,8 +1376,7 @@ mod tests {
         }));
         assert_eq!(
             call.phases,
-            u32::try_from(layout.inputs.len() + usize::from(!layout.outputs.is_empty()) * 2)
-                .unwrap()
+            u32::try_from(layout.inputs.len() + layout.outputs.len() + 1).unwrap()
         );
         let output = layout
             .outputs
