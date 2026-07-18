@@ -8,19 +8,30 @@ const INCOMING_SBASE: u8 = 0xa7;
 
 pub(crate) const WORKER_BARRIER: &str = "ipu_stack_static_worker_barrier";
 pub(crate) const COMPLETE: &str = "ipu_stack_static_complete";
+pub(crate) const COPY_U32: &str = "ipu_stack_static_copy_u32";
+
+#[derive(Clone, Copy)]
+pub(crate) struct HostCopy {
+    pub source: u32,
+    pub destination: u32,
+    pub words: u32,
+}
 
 pub(crate) fn emit(
     program: &LoweredTileProgram,
     base: u32,
     symbols: &BTreeMap<String, u32>,
     plan_addresses: &[u32],
-    host_input_addresses: &[u32],
-    host_output_addresses: &[u32],
+    host_inputs: &[(u32, Option<HostCopy>)],
+    host_outputs: &[(u32, Option<HostCopy>)],
 ) -> Result<Vec<u8>> {
     let mut code = TileCode::new(base);
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
-    for &address in host_input_addresses {
+    for &(address, copy) in host_inputs {
         code.call(address, 10)?;
+        if let Some(copy) = copy {
+            emit_copy(&mut code, symbols, copy)?;
+        }
     }
     let mut plan_index = 0usize;
     for step in &program.steps {
@@ -66,11 +77,21 @@ pub(crate) fn emit(
     if plan_index != plan_addresses.len() {
         return Err("unused exchange plan address".into());
     }
-    for &address in host_output_addresses {
+    for &(address, copy) in host_outputs {
+        if let Some(copy) = copy {
+            emit_copy(&mut code, symbols, copy)?;
+        }
         code.call(address, 10)?;
     }
     code.jump(symbol(symbols, COMPLETE)?)?;
     Ok(code.words.into_iter().flat_map(u32::to_le_bytes).collect())
+}
+
+fn emit_copy(code: &mut TileCode, symbols: &BTreeMap<String, u32>, copy: HostCopy) -> Result<()> {
+    code.setzi(2, copy.destination)?;
+    code.setzi(3, copy.source)?;
+    code.setzi(4, copy.words)?;
+    code.call(symbol(symbols, COPY_U32)?, 10)
 }
 
 fn symbol(symbols: &BTreeMap<String, u32>, name: &str) -> Result<u32> {

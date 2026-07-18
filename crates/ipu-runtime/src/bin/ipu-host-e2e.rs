@@ -59,11 +59,15 @@ fn main() {
                 .expect("IPU_HOST_TEST_OUTPUTS must be an integer")
         })
         .unwrap_or(1);
-    let second_tile = std::env::var("IPU_HOST_TEST_SECOND_TILE")
+    let host_tiles = std::env::var("IPU_HOST_TEST_TILES")
         .map(|value| {
             value
-                .parse::<u16>()
-                .expect("IPU_HOST_TEST_SECOND_TILE must be an integer")
+                .split(',')
+                .map(|tile| {
+                    tile.parse::<u16>()
+                        .expect("IPU_HOST_TEST_TILES must contain integers")
+                })
+                .collect::<Vec<_>>()
         })
         .ok();
     let d2h_only = std::env::var_os("IPU_HOST_TEST_D2H_ONLY").is_some();
@@ -84,10 +88,12 @@ fn main() {
         output_count == 1 || (!exchange && !remote_d2h),
         "multiple output slices are only supported by the direct host test"
     );
-    let payload_count = second_tile.map_or(output_count, |_| 2);
+    let payload_count = host_tiles
+        .as_ref()
+        .map_or(output_count, |tiles| tiles.len() as u32);
     let payload = test_payload(transfer_bytes * payload_count);
     let (mut graph, input, expected) = if d2h_only {
-        assert!(second_tile.is_none());
+        assert!(host_tiles.is_none());
         (
             d2h_only_graph(transfer_bytes, host_tile, &payload).unwrap(),
             Vec::new(),
@@ -95,7 +101,7 @@ fn main() {
         )
     } else if initialized_exchange {
         assert!(exchange);
-        assert!(second_tile.is_none());
+        assert!(host_tiles.is_none());
         let mut graph =
             host_exchange_graph(transfer_bytes, true, host_tile, remote_d2h, output_count).unwrap();
         let source = graph.host_inputs[0].slices[0].clone();
@@ -109,8 +115,8 @@ fn main() {
                 .collect(),
         });
         (graph, Vec::new(), payload)
-    } else if let Some(second_tile) = second_tile {
-        let graph = two_tile_host_graph(transfer_bytes, host_tile, second_tile).unwrap();
+    } else if let Some(host_tiles) = host_tiles {
+        let graph = multi_tile_host_graph(transfer_bytes, &host_tiles).unwrap();
         (graph, payload.clone(), payload)
     } else {
         let graph = host_exchange_graph(
@@ -123,6 +129,9 @@ fn main() {
         .unwrap();
         (graph, payload.clone(), payload)
     };
+    if let Some(address) = host_test_address() {
+        relocate_direct_host_graph(&mut graph, address);
+    }
     if exchange
         && (std::env::var_os("IPU_STACK_TRAP_AFTER_RECEIVE").is_some()
             || std::env::var_os("IPU_STACK_TRACE_MILESTONES").is_some())
@@ -195,6 +204,35 @@ fn main() {
     let _ = fs::remove_dir_all(output);
 }
 
+fn relocate_direct_host_graph(graph: &mut ExecutableGraph, address: u32) {
+    assert!(
+        graph.schedule.phases.is_empty(),
+        "IPU_HOST_TEST_ADDRESS requires a direct host graph"
+    );
+    assert_eq!(
+        graph.schedule.allocations.len(),
+        1,
+        "IPU_HOST_TEST_ADDRESS requires one allocation"
+    );
+    let old_address = graph.schedule.allocations[0].address;
+    graph.schedule.allocations[0].address = address;
+    for slice in graph
+        .host_inputs
+        .iter_mut()
+        .chain(&mut graph.host_outputs)
+        .flat_map(|binding| &mut binding.slices)
+    {
+        slice.tile_address = address + (slice.tile_address - old_address);
+    }
+}
+
+fn host_test_address() -> Option<u32> {
+    std::env::var("IPU_HOST_TEST_ADDRESS").ok().map(|address| {
+        u32::from_str_radix(address.trim_start_matches("0x"), 16)
+            .expect("IPU_HOST_TEST_ADDRESS must be hexadecimal")
+    })
+}
+
 fn assert_transfer_eq(actual: &[u8], expected: &[u8]) {
     assert_eq!(
         actual.len(),
@@ -262,12 +300,20 @@ fn d2h_only_graph(
     })
 }
 
-fn two_tile_host_graph(
+fn multi_tile_host_graph(
     transfer_bytes: u32,
-    first_tile: u16,
-    second_tile: u16,
+    tiles: &[u16],
 ) -> Result<ExecutableGraph, ipu_compiler::CompileError> {
-    assert_ne!(first_tile, second_tile);
+    assert!(!tiles.is_empty());
+    assert_eq!(
+        tiles
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        tiles.len(),
+        "IPU_HOST_TEST_TILES must not contain duplicates"
+    );
     let topology = ipu_exchange::Topology::c600();
     let constraint = MemoryConstraint {
         base: ipu_exchange::EXCHANGE_WINDOW_BASE,
@@ -277,7 +323,7 @@ fn two_tile_host_graph(
     };
     let mut allocations = Vec::new();
     let mut slices = Vec::new();
-    for (index, tile) in [first_tile, second_tile].into_iter().enumerate() {
+    for (index, &tile) in tiles.iter().enumerate() {
         let address = find_free_region(
             &allocations,
             tile,
@@ -305,7 +351,7 @@ fn two_tile_host_graph(
     let input_binding = Binding {
         name: "input".into(),
         dtype: "u8".into(),
-        shape: vec![transfer_bytes * 2],
+        shape: vec![transfer_bytes * tiles.len() as u32],
         slices,
     };
     Ok(ExecutableGraph {
@@ -359,14 +405,29 @@ fn host_exchange_graph(
     };
     let source_live_until = if exchange { 1 } else { usize::MAX };
     let input_bytes = transfer_bytes * output_count;
-    let source_address = find_free_region(
-        &[],
-        source_tile,
-        input_bytes,
-        0,
-        source_live_until,
-        host_constraint,
-    )?;
+    let source_address = if !exchange {
+        if let Some(address) = host_test_address() {
+            address
+        } else {
+            find_free_region(
+                &[],
+                source_tile,
+                input_bytes,
+                0,
+                source_live_until,
+                host_constraint,
+            )?
+        }
+    } else {
+        find_free_region(
+            &[],
+            source_tile,
+            input_bytes,
+            0,
+            source_live_until,
+            host_constraint,
+        )?
+    };
     let mut allocations = vec![Allocation {
         tensor,
         tile: source_tile,

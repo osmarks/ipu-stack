@@ -61,6 +61,19 @@ fn remote_tile_h2d_and_d2h_work() {
 }
 
 #[test]
+fn high_address_large_h2d_and_d2h_work() {
+    let _device = device();
+    require_success(
+        "64-KiB high-address H2D and D2H",
+        host_test(&[
+            ("IPU_HOST_TEST_TILE", "100"),
+            ("IPU_HOST_TEST_BYTES", "65536"),
+            ("IPU_HOST_TEST_ADDRESS", "0x60000"),
+        ]),
+    );
+}
+
+#[test]
 fn initialized_remote_tile_d2h_works() {
     let _device = device();
     require_success(
@@ -79,11 +92,64 @@ fn distinct_sources_can_write_disjoint_host_ranges() {
     require_success(
         "distinct multi-source D2H",
         host_test(&[
-            ("IPU_HOST_TEST_TILE", "1471"),
-            ("IPU_HOST_TEST_SECOND_TILE", "274"),
+            ("IPU_HOST_TEST_TILES", "1471,274"),
             ("IPU_HOST_TEST_BYTES", "64"),
         ]),
     );
+}
+
+#[test]
+fn host_routes_cover_every_endpoint_field() {
+    let _device = device();
+    let topology = ipu_exchange::Topology::c600();
+    let physical_tiles = (0..64)
+        .chain((1..23).map(|row| row * 64 + 17))
+        .collect::<Vec<_>>();
+    let logical_tiles = physical_tiles
+        .iter()
+        .map(|&physical| {
+            (0..1472)
+                .find(|&logical| topology.physical(logical).unwrap() == physical)
+                .expect("physical C600 tile must have a logical tile")
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    require_success(
+        "host routes spanning every endpoint field",
+        host_test(&[
+            ("IPU_HOST_TEST_TILES", &logical_tiles),
+            ("IPU_HOST_TEST_BYTES", "64"),
+        ]),
+    );
+}
+
+#[test]
+fn randomized_multi_tile_host_round_trips_work() {
+    let _device = device();
+    for (seed, bytes) in [
+        (0x243f_6a88_85a3_08d3, 4u32),
+        (0x1319_8a2e_0370_7344, 1024),
+        (0xa409_3822_299f_31d0, 8192),
+    ] {
+        let mut rng = fastrand::Rng::with_seed(seed);
+        let mut tiles = std::collections::BTreeSet::new();
+        while tiles.len() < 8 {
+            tiles.insert(rng.u16(0..1472));
+        }
+        let tile_list = tiles
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        require_success(
+            &format!("randomized host round trip seed={seed:#x} bytes={bytes} tiles={tile_list}"),
+            host_test(&[
+                ("IPU_HOST_TEST_TILES", &tile_list),
+                ("IPU_HOST_TEST_BYTES", &bytes.to_string()),
+            ]),
+        );
+    }
 }
 
 #[test]

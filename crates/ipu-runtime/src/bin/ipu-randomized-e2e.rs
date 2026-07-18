@@ -69,7 +69,7 @@ fn main() {
 fn randomized_case(seed: u64, case: usize) -> (ExecutableGraph, BTreeMap<String, Vec<u32>>) {
     let topology = ipu_exchange::Topology::c600();
     let mut rng = fastrand::Rng::with_seed(seed);
-    let source = if case % 3 == 0 {
+    let source = if case.is_multiple_of(3) {
         0
     } else {
         rng.u16(0..TILE_COUNT)

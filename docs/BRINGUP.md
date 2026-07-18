@@ -118,14 +118,9 @@ program rather than assuming the original nine-word row size.
 validates diagnostic bindings. The passing hardware paths cover an all-tile
 affine permutation, multicast with a dependent relay in one exchange phase, and
 18 seeded two-launch randomized graphs. Exchange rows only move data; following
-compute phases call the linked kernel directly. The full script remains red
-while the deeper reduction tests below fail.
-
-The 11-stage reduction followed by the unrelated dense permutation is still a
-mandatory red gate. With the generated command barrier, an intermediate sparse
-reduction launch leaves its participating tiles in exchange while the remaining
-tiles await the next phase. This deeper-launch failure is not hidden by reducing
-the completion set or excluding physical tile 0.
+compute phases call the linked kernel directly. The 11-stage reduction followed
+by the unrelated dense permutation also passes with device-internal phase
+synchronization.
 
 `run-diagnostic` places its completion trap on the first output tile, falling
 back to the first scheduled tile when the graph has no output binding. Every
@@ -136,17 +131,24 @@ host exchange.
 
 ## Native host exchange
 
-The prior command-dispatch implementation and its partially recovered H2D/D2H
-paths were removed with the device interpreter. `package_graph` currently
-rejects host bindings explicitly. The packet encoders and driver-side HSP
-primitives remain available as reference material, but encoder agreement alone
-is not treated as a working host-transfer capability.
+The prior command-dispatch implementation was removed with the device
+interpreter. `package_graph` lowers host bindings to static per-tile host phases
+before and after graph work. Inactive payload tiles use `sans 1; sync 1`; the
+XREQ owner and target execute independently generated straight-line programs.
 
 SDK archive members are named by physical tile. For a tensor mapped to logical
 tile 100, the host operation is inline in `t_260.elf`, not `t_100.elf`. The
 Rust target-operation encoders reproduce that member's 64-byte H2D and D2H
-instruction and packet words. Their sync-15 entry and sync-7 mux restoration
-belong to the surrounding command handler, not to the operation body.
+instruction and packet words. Physical tile 31 provides a second route oracle:
+the XREQ owner is `target & 0x3d`. The two XREQ words are a 46-bit bitmap; the
+target selects bit `2 * (target / 64) + ((target >> 1) & 1)`, with bits 0-23
+in word 0 and bits 24-45 in word 1. Extracted SDK vectors for physical tiles
+31, 81, 260, and 785 verify the row, pair, and word-boundary fields.
+
+Transfers are split at 4-KiB attached-page boundaries. H2D destinations outside
+the packet field's 16-KiB tile window use an automatically allocated staging
+range and a generated target-tile copy. A 64-KiB round trip at `0x60000` passes
+on hardware; D2H reads directly from that high address.
 
 TDI reports both inactive and WAEX as context state zero. Architectural
 exceptions are only classified when exception metadata is nonzero; attempting

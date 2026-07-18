@@ -26,9 +26,10 @@ A D2D exchange has source and destination actions. Other tiles participate only
 in synchronization required by the phase; they are not modeled as forwarding
 tiles. Multiple transfers in one phase are placed on one static event timeline.
 
-Host operations are not yet accepted by the static packager. Host-page layout
-and HSP transitions remain whole-device metadata in `.ipuexe`; adding them must
-not reintroduce an all-tile command broadcast or device command dispatch loop.
+Host operations are lowered to straight-line calls before and after graph
+phases. Each payload phase contains generated XREQ/target code and synchronization
+followers; host-page layout and HSP phase counts remain whole-device metadata in
+`.ipuexe`. There is no all-tile command broadcast or device dispatch loop.
 
 The linker resolves calls from generated tile programs to kernel ELF symbols.
 Kernel artifacts stay reusable and independent of the final tile and device

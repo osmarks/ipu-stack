@@ -13,6 +13,7 @@ pub const HOST_PAGE_BYTES: u32 = 4096;
 pub const HOST_TO_TILE_WINDOW_BYTES: u32 = 0x4000;
 pub const TILE_MUX_HOST: u32 = 0x600;
 pub const TILE_MUX_EXCHANGE: u32 = 0x640;
+const XREQ_BITMAP0_BITS: u32 = 24;
 
 const OPCODE_MASK: u32 = 0xfc00_0000;
 const LONG_OPCODE_MASK: u32 = 0xf800_0000;
@@ -252,12 +253,20 @@ pub fn assemble_host_xreq_program(
     if packet_address & 7 != 0 {
         return Err(ExchangeError::HostPacket);
     }
+    let bitmap_index =
+        u32::from(target_physical_tile / 64) * 2 + u32::from((target_physical_tile >> 1) & 1);
+    let mut bitmap = [0u32; 2];
+    if bitmap_index < XREQ_BITMAP0_BITS {
+        bitmap[0] = 1 << bitmap_index;
+    } else {
+        bitmap[1] = 1 << (bitmap_index - XREQ_BITMAP0_BITS);
+    }
     Ok(TileToHostProgram {
         instructions: vec![
             encode_send(1, 3, packet_address >> 2)?,
             RETURN_M10_INSTRUCTION,
         ],
-        packet_words: vec![u32::from(target_physical_tile) & !0x3d, 0],
+        packet_words: bitmap.to_vec(),
     })
 }
 
@@ -566,7 +575,8 @@ pub fn wrap_host_target_operation(
     wrap_host_operation(physical_tile, operation, SYNC_ALL_INSTRUCTION)
 }
 
-pub fn wrap_local_host_operation(
+pub fn wrap_combined_host_operation(
+    physical_tile: u16,
     operation: &[u32],
     xreq_packet_address: u32,
 ) -> Result<Vec<u32>, ExchangeError> {
@@ -577,7 +587,7 @@ pub fn wrap_local_host_operation(
         return Err(ExchangeError::Schedule("local host operation prefix"));
     }
     let mut instructions = vec![
-        setzi_m(8, TILE_MUX_HOST),
+        setzi_m(8, host_mux_for_tile(physical_tile)?),
         put_special_from_m8(INCOMING_MUX_REGISTER),
         SYNC_HOST_INSTRUCTION,
     ];
@@ -1529,6 +1539,24 @@ mod tests {
                 .packet_words,
             [2, 0]
         );
+        assert_eq!(
+            assemble_host_xreq_program(81, 0x50120)
+                .unwrap()
+                .packet_words,
+            [4, 0]
+        );
+        assert_eq!(
+            assemble_host_xreq_program(768, 0x50120)
+                .unwrap()
+                .packet_words,
+            [0, 1]
+        );
+        assert_eq!(
+            assemble_host_xreq_program(1471, 0x50120)
+                .unwrap()
+                .packet_words,
+            [0, 1 << 21]
+        );
         let wrapped_xreq =
             wrap_host_xreq_operation(hierarchy.xreq_physical_tile, &xreq.instructions).unwrap();
         assert_eq!(&wrapped_xreq[..3], &[0x1980_0604, 0x4380_80a0, 0x4180_000f]);
@@ -1571,11 +1599,15 @@ mod tests {
         );
 
         let local = assemble_host_to_tile_target_program(0, 0x50120, 0x40, 64, 0x50168).unwrap();
-        let wrapped_local = wrap_local_host_operation(&local.instructions, 0x50160).unwrap();
+        let wrapped_local = wrap_combined_host_operation(0, &local.instructions, 0x50160).unwrap();
         assert_eq!(
             &wrapped_local[..3],
             &[0x1980_0600, 0x4380_80a0, 0x4180_000f]
         );
+
+        let wrapped_tile_nine =
+            wrap_combined_host_operation(9, &local.instructions, 0x50160).unwrap();
+        assert_eq!(wrapped_tile_nine[0], 0x1980_0609);
         assert_eq!(send_address(wrapped_local[5]), 0x50160);
     }
 

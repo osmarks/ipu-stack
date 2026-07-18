@@ -64,35 +64,35 @@ Logging uses `tracing`. Set `RUST_LOG`, for example
 ## Current hardware boundary
 
 The Rust path resets and configures a C600, loads linked code onto all 1472
-tiles, attaches host pages, and drives HSP without Poplar. Local physical-tile-0
-H2D followed by D2H passes with random 64-byte and 2-KiB payloads in disjoint
-host regions, and the runtime completion store is checked. Device-only point,
+tiles, attaches host pages, and drives HSP without Poplar. Device-only point,
 multicast, relay, permutation, and all-tile reduction graphs pass from
 initialized SRAM.
 
-Host/device composition is not accepted as working. A valid random H2D payload
-is visible at its tile-0 source address, but routing it through generated D2D
-passes currently leaves the destination zero. Remote H2D and arbitrary-tile
-D2H also remain red, including the 8-KiB hardware gates. These failures are
-required integration-test failures; passing crate-local unit tests does not
-change the capability status.
+Host/device composition passes with randomized payloads. Required hardware
+tests cover local and remote H2D/D2H, distinct host slices on different tiles,
+an 8-KiB remote round trip, and H2D -> D2D relay -> D2H. A 64-KiB round trip at
+tile address `0x60000` also passes: H2D is automatically staged through the
+packet-addressable exchange window and copied to ordinary SRAM, while D2H sends
+directly from the high address.
 
 Host transfers are split at the recovered short/long packet limits and 4 KiB
 attachment boundaries. The runtime allocates one attached buffer per page,
 places the command page after the data pages, and derives one self-contained
 call's HSP phase count from its generated operations. Multi-page layouts and
-packet boundaries have static coverage; hardware acceptance remains red on the
-base 64-byte D2H case.
+packet boundaries pass direct hardware acceptance.
+
+Host binding sizes and D2H source addresses must be word aligned. Direct H2D
+destinations must be 32-byte aligned; aligned destinations outside the directly
+encodable packet window are staged automatically.
 
 Exchange Tx/Rx staging addresses are selected from explicit memory constraints:
 tile, byte range, alignment, placement direction, and half-open phase lifetime.
 The allocator rejects exhaustion and permits the same address on different
-tiles or across disjoint lifetimes. The host H2D destination is constrained to
-the protocol's directly encodable 16 KiB host-to-tile window; runtime control
-storage within that window reduces the largest contiguous allocation currently
-available to an application. Ordinary exchange receivers use the full 32 KiB
-exchange window. No concrete staging address is specified by the host exchange
-acceptance graph.
+tiles or across disjoint lifetimes. The H2D packet field directly encodes a
+16-KiB tile window. The packager allocates packet tables and reusable staging
+space there, splits transfers at attached-page boundaries, and emits target-tile
+copies when the requested destination lies elsewhere in SRAM. Ordinary
+exchange receivers use the full 32-KiB exchange window.
 
 The exchange planner lowers an independent one-to-one transfer with the
 point-to-point scheduler and converts its receiver to the compiler-allocated
@@ -113,16 +113,15 @@ symbol and exchange commands perform no arithmetic. The randomized hardware
 acceptance path executes initialized multicast, sparse compute, and a second
 random matching as one static program. D2D transitions use the SDK-derived
 internal sync and ANS non-participation protocol without host intervention.
-D2H and H2D target-operation encoders match the SDK's logical-tile-100
-(physical-tile-260) instruction and packet words. The command handler selects
-the physical row's host mux and enters through sync 15; the operation sets its
-downcount, performs the packet sends, and ends at sync 0; the handler then uses
-sync 7 and restores the exchange mux. Controller activation and the other
-tiles in the host hierarchy are not generated yet. The recovered XREQ role is
-encoded separately: physical tile `target >> 6` sends a two-word packet that
-selects the target's 64-tile block. The attached destination
-remains untouched in direct Rust hardware acceptance, so encoder agreement is
-not treated as working D2H.
+D2H and H2D target-operation encoders match SDK images for physical tiles 31
+and 260. The XREQ owner is `target & 0x3d`, and its route word is
+the bit at `2 * (target / 64) + ((target >> 1) & 1)` in the 46-bit XREQ
+bitmap, split 24/22 bits across its two words; both formulas are checked
+against extracted SDK code and direct hardware. Static host phases use
+`sans 1; sync 1` followers, an XREQ
+owner entering through sync 15, and a target entering and completing through
+sync 7 around its sync-0 payload operation. No device command dispatcher is
+used.
 
 Offline unit tests verify encodings, allocation, lowering, and package structure;
 they do not count as evidence that a transport capability works. The seeded

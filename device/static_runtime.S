@@ -87,6 +87,22 @@ ipu_stack_static_worker_barrier_worker:
 	exitz $m15
 	.size ipu_stack_static_worker_barrier_worker, .-ipu_stack_static_worker_barrier_worker
 
+	.section .text.ipu_stack_static_copy_u32,"ax",@progbits
+	.globl ipu_stack_static_copy_u32
+	.p2align 2
+	.type ipu_stack_static_copy_u32,@function
+ipu_stack_static_copy_u32:
+	.supervisor
+.Lcopy_u32:
+	ld32 $m0, $m3, $m15, 0
+	st32 $m0, $m2, $m15, 0
+	add $m3, $m3, 4
+	add $m2, $m2, 4
+	sub $m4, $m4, 1
+	brnz $m4, .Lcopy_u32
+	br $m10
+	.size ipu_stack_static_copy_u32, .-ipu_stack_static_copy_u32
+
 	.section .text.ipu_stack_static_complete,"ax",@progbits
 	.globl ipu_stack_static_complete
 	.p2align 2
