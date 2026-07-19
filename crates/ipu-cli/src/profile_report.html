@@ -190,7 +190,6 @@ let timelineGeom = null;
 let flameHits = [];
 let drag = null;
 const zoomHistory = [];
-const flameHistory = [];
 let flameTotal = 0;
 document.getElementById("stats").textContent =
   `${DATA.tileCount} tiles, ${DATA.sampleCount} samples, ${formatRangeValue(0, fullEnd())} range, ${formatHz(DATA.clockHz)}`;
@@ -253,21 +252,21 @@ function sameFocus(a, b) {
 function focusLabel(focus) {
   if (!focus) return "profile";
   if (focus.metadata) return focus.metadata;
-  if (focus.phase !== undefined) return `${focus.operation} phase ${focus.phase} epoch ${focus.epoch}`;
   if (focus.operation) return focus.operation;
+  if (focus.phase !== undefined) return `phase ${focus.phase} epoch ${focus.epoch}`;
   if (focus.kernel) return focus.kernel;
   return focus.kind || "profile";
 }
 function flamePath(sample) {
   const kernel = sample.kernel ? { kind: sample.kind, kernel: sample.kernel } : null;
-  const operation = { ...kernel, kind: sample.kind, operation: sample.operation };
-  const phase = { ...operation, phase: sample.phase, epoch: sample.epoch };
+  const phase = { ...kernel, kind: sample.kind, phase: sample.phase, epoch: sample.epoch };
+  const operation = { ...phase, operation: sample.operation };
   const levels = [{ kind: sample.kind }];
   if (kernel) levels.push(kernel);
-  levels.push(operation, phase);
-  if (state.focus?.phase !== undefined) {
+  levels.push(phase, operation);
+  if (state.focus?.operation) {
     for (const entry of metadataEntries(sample)) {
-      levels.push({ ...phase, metadata: `${entry.name}: ${entry.value}` });
+      levels.push({ ...operation, metadata: `${entry.name}: ${entry.value}` });
     }
   }
   if (!state.focus) return levels;
@@ -294,22 +293,30 @@ function appendFlameSample(root, sample) {
   }
   root.value += sample.duration;
 }
-function pushFlameHistory() {
-  const current = state.focus ? { ...state.focus } : null;
-  const previous = flameHistory[flameHistory.length - 1];
-  if (!flameHistory.length || !sameFocus(previous, current)) flameHistory.push(current);
-}
 function focusFlame(nextFocus) {
   if (sameFocus(state.focus, nextFocus)) return;
-  pushFlameHistory();
   state.focus = nextFocus ? { ...nextFocus } : null;
   render();
 }
-function undoFlameFocus() {
-  if (!flameHistory.length) return;
-  const previous = flameHistory.pop();
-  state.focus = previous ? { ...previous } : null;
-  render();
+function parentFlameFocus(focus) {
+  if (!focus) return null;
+  const parent = { ...focus };
+  if (parent.metadata !== undefined) {
+    delete parent.metadata;
+  } else if (parent.operation !== undefined) {
+    delete parent.operation;
+  } else if (parent.phase !== undefined) {
+    delete parent.phase;
+    delete parent.epoch;
+  } else if (parent.kernel !== undefined) {
+    delete parent.kernel;
+  } else {
+    return null;
+  }
+  return Object.keys(parent).length ? parent : null;
+}
+function zoomOutFlame() {
+  if (state.focus) focusFlame(parentFlameFocus(state.focus));
 }
 function showTip(event, lines) {
   tooltip.innerHTML = lines.map(line => `<div>${escapeHtml(line)}</div>`).join("");
@@ -690,7 +697,6 @@ function undoZoom() {
 function resetView() {
   pushZoomHistory();
   state.focus = null;
-  flameHistory.length = 0;
   state.time = null;
   state.viewStart = 0;
   state.viewEnd = fullEnd();
@@ -724,8 +730,8 @@ function zoomToRange(start, end) {
   const rangeEnd = Math.max(rangeStart + 1, Math.min(Math.max(start, end), maxEnd));
   applyView(rangeStart, rangeEnd);
 }
-document.getElementById("search").addEventListener("input", () => { state.focus = null; flameHistory.length = 0; render(); });
-document.getElementById("kind").addEventListener("change", () => { state.focus = null; flameHistory.length = 0; render(); });
+document.getElementById("search").addEventListener("input", () => { state.focus = null; render(); });
+document.getElementById("kind").addEventListener("change", () => { state.focus = null; render(); });
 document.getElementById("zoomIn").addEventListener("click", () => zoomView(1.35));
 document.getElementById("zoomOut").addEventListener("click", () => zoomView(1 / 1.35));
 document.getElementById("reset").addEventListener("click", resetView);
@@ -835,7 +841,7 @@ flame.addEventListener("click", event => {
 });
 flame.addEventListener("contextmenu", event => {
   event.preventDefault();
-  undoFlameFocus();
+  zoomOutFlame();
 });
 window.addEventListener("keydown", event => {
   if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
