@@ -622,20 +622,29 @@ pub fn gemm_row_block_candidates_for(
 }
 
 pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, CompileError> {
+    let inner_micro_dimension = match config.data_type {
+        GemmDataType::F16 => 16,
+        GemmDataType::F32 => 8,
+    };
     if config.rows == 0
         || config.inner_dimension == 0
         || config.columns == 0
-        || config.block_dimension != 64
-        || !matches!(config.inner_block_dimension, 32 | 64)
+        || !matches!(
+            (config.data_type, config.block_dimension),
+            (GemmDataType::F16, 64 | 128) | (GemmDataType::F32, 64)
+        )
+        || !config
+            .inner_block_dimension
+            .is_multiple_of(inner_micro_dimension)
         || !config.columns.is_multiple_of(config.block_dimension)
         || !config
             .inner_dimension
             .is_multiple_of(config.inner_block_dimension)
         || config.data_base >= config.data_limit
     {
-        return Err(CompileError::Graph(
-            "blocked GEMM requires 64-column blocks and 32- or 64-wide inner blocks".into(),
-        ));
+        return Err(CompileError::Graph(format!(
+            "blocked GEMM requires a supported column block and inner blocks divisible by {inner_micro_dimension}"
+        )));
     }
     let column_grid = config.columns / config.block_dimension;
     let inner_grid = config.inner_dimension / config.inner_block_dimension;

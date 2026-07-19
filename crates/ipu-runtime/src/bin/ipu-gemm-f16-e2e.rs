@@ -2,22 +2,27 @@ use half::f16;
 use ipu_compiler::{BlockedGemmConfig, GemmDataType, choose_gemm_row_block_for, plan_blocked_gemm};
 use ipu_elf::Toolchain;
 use ipu_runtime::{
-    BlockLayout, ExecutableGraph, HostRunOptions, block_binding_typed, block_coordinates,
-    blocked_matrix_f16, normal_f16, package_graph, run_host_with_options,
+    BlockLayout, ExecutableGraph, HostRunOptions, ProfileGranularity, block_binding_typed,
+    block_coordinates, blocked_matrix_f16, normal_f16, package_graph, package_graph_profiled_with,
+    run_host_with_options,
 };
 use std::fs;
 use std::path::PathBuf;
 use tracing::info;
 
 const TILE_COUNT: u16 = 1472;
-const BLOCK_DIMENSION: u16 = 64;
-const INNER_BLOCK_DIMENSION: u16 = 64;
+const DEFAULT_BLOCK_DIMENSION: u16 = 64;
+const DEFAULT_INNER_BLOCK_DIMENSION: u16 = 64;
 const GEMM_DATA_BASE: u32 = 0xa0000;
+const DEFAULT_CLOCK_HZ: u64 = 1_500_000_000;
+const FP16_FLOPS_PER_TILE_CYCLE: f64 = 128.0;
 
 fn main() {
     ipu_runtime::init_tracing();
     let dimension = env_u16("IPU_GEMM_DIMENSION", 128);
-    assert!(dimension.is_multiple_of(BLOCK_DIMENSION));
+    let block_dimension = env_u16("IPU_GEMM_BLOCK", DEFAULT_BLOCK_DIMENSION);
+    let inner_block_dimension = env_u16("IPU_GEMM_INNER_BLOCK", DEFAULT_INNER_BLOCK_DIMENSION);
+    assert!(dimension.is_multiple_of(block_dimension));
     let seed = env_u64("IPU_GEMM_SEED", 0x05ee_df16);
     let max_error_limit = env_f32("IPU_F16_MAX_ERROR", 0.005);
     let row_block_dimension = std::env::var("IPU_GEMM_ROW_BLOCK")
@@ -25,9 +30,9 @@ fn main() {
         .unwrap_or_else(|_| {
             choose_gemm_row_block_for(
                 dimension,
-                INNER_BLOCK_DIMENSION,
+                inner_block_dimension,
                 dimension,
-                BLOCK_DIMENSION,
+                block_dimension,
                 TILE_COUNT,
                 GemmDataType::F16,
             )
@@ -37,8 +42,8 @@ fn main() {
         rows: dimension,
         inner_dimension: dimension,
         columns: dimension,
-        block_dimension: BLOCK_DIMENSION,
-        inner_block_dimension: INNER_BLOCK_DIMENSION,
+        block_dimension,
+        inner_block_dimension,
         row_block_dimension,
         tile_count: TILE_COUNT,
         data_base: GEMM_DATA_BASE,
@@ -108,22 +113,30 @@ fn main() {
             &artifact_dir,
             "gemm-f16",
             &[
-                format!("-DGEMM_INNER_BLOCK_DIMENSION={INNER_BLOCK_DIMENSION}"),
+                format!("-DGEMM_INNER_BLOCK_DIMENSION={inner_block_dimension}"),
+                format!("-DGEMM_OUTPUT_COLUMNS={block_dimension}"),
                 format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
                 format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
             ],
         )
         .unwrap();
-    let app = package_graph(
-        &graph,
-        &[
-            fs::read(runtime.object).unwrap(),
-            fs::read(kernel.object).unwrap(),
-        ],
-    )
-    .unwrap();
+    let objects = [
+        fs::read(runtime.object).unwrap(),
+        fs::read(kernel.object).unwrap(),
+    ];
+    let profile_output = std::env::var_os("IPU_PROFILE_OUTPUT").map(PathBuf::from);
+    let (app, profile_layout) = if profile_output.is_some() {
+        let granularity = ProfileGranularity::from_environment().unwrap();
+        let (app, layout) = package_graph_profiled_with(&graph, &objects, granularity).unwrap();
+        info!(?granularity, "enabled FP16 GEMM cycle profiling");
+        (app, Some(layout))
+    } else {
+        (package_graph(&graph, &objects).unwrap(), None)
+    };
     info!(
         dimension,
+        block_dimension,
+        inner_block_dimension,
         seed,
         row_block_dimension,
         input_bytes = input.len(),
@@ -146,23 +159,63 @@ fn main() {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
-    let errors = verify_output(
-        dimension,
-        &actual,
-        &output_placements,
-        &left,
-        &right,
-        max_error_limit,
-    )
-    .unwrap();
-    info!(
-        dimension,
-        max_abs_error = errors.max_abs,
-        rmse = errors.rmse,
-        max_error_limit,
-        "randomized FP16/16 GEMM passed"
-    );
+    if let (Some(path), Some(layout)) = (&profile_output, &profile_layout) {
+        let clock_hz = env_u64("IPU_CLOCK_HZ", DEFAULT_CLOCK_HZ);
+        let report = layout.decode(&actual, clock_hz).unwrap();
+        let graph_cycles = graph_cycles(&report);
+        let graph_seconds = f64::from(graph_cycles) / clock_hz as f64;
+        let flops = 2.0 * f64::from(dimension).powi(3);
+        let tflops = flops / graph_seconds / 1.0e12;
+        let peak_tflops =
+            clock_hz as f64 * f64::from(TILE_COUNT) * FP16_FLOPS_PER_TILE_CYCLE / 1.0e12;
+        report.write(fs::File::create(path).unwrap()).unwrap();
+        info!(
+            path = %path.display(),
+            graph_cycles,
+            graph_ms = graph_seconds * 1.0e3,
+            tflops,
+            peak_tflops,
+            efficiency_percent = tflops / peak_tflops * 100.0,
+            "wrote FP16 GEMM cycle profile"
+        );
+    }
+    if env_bool("IPU_F16_VALIDATE", true) {
+        let errors = verify_output(
+            dimension,
+            &actual,
+            &output_placements,
+            &left,
+            &right,
+            max_error_limit,
+        )
+        .unwrap();
+        info!(
+            dimension,
+            max_abs_error = errors.max_abs,
+            rmse = errors.rmse,
+            max_error_limit,
+            "randomized FP16/16 GEMM passed"
+        );
+    } else {
+        info!(dimension, "skipped FP16 GEMM host reference");
+    }
     let _ = fs::remove_dir_all(artifact_dir);
+}
+
+fn graph_cycles(report: &ipu_package::ProfileReport) -> u32 {
+    report
+        .tiles
+        .iter()
+        .filter_map(|tile| {
+            Some(
+                tile.samples
+                    .last()?
+                    .end_cycle
+                    .wrapping_sub(tile.samples.first()?.start_cycle),
+            )
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 struct ErrorStatistics {
@@ -260,6 +313,16 @@ fn env_f32(name: &str, default: f32) -> f32 {
             value
                 .parse()
                 .unwrap_or_else(|_| panic!("{name} must be an f32"))
+        })
+        .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|value| match value.as_str() {
+            "0" | "false" => false,
+            "1" | "true" => true,
+            _ => panic!("{name} must be 0, 1, false, or true"),
         })
         .unwrap_or(default)
 }

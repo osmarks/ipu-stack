@@ -9,11 +9,14 @@
 #ifndef GEMM_LARGE_ROWS
 #define GEMM_LARGE_ROWS GEMM_SMALL_ROWS
 #endif
+#ifndef GEMM_OUTPUT_COLUMNS
+#define GEMM_OUTPUT_COLUMNS 64
+#endif
 
 	.text
 	.allow_optimizations
 
-	.set OUTPUT_COLUMNS, 64
+	.set OUTPUT_COLUMNS, GEMM_OUTPUT_COLUMNS
 	.set INNER_MICRO_DIMENSION, 16
 	.set INNER_GROUPS, GEMM_INNER_BLOCK_DIMENSION / INNER_MICRO_DIMENSION
 	.set COLUMN_MICRO_DIMENSION, 16
@@ -22,15 +25,18 @@
 	.set CLEAR_AACC, 1 << CSR_W_FP_CLR__ZAACC__SHIFT
 	.set ENABLE_STOCHASTIC_ROUNDING, 1 << CSR_S_FP_ICTL__ESR__SHIFT
 
-	.macro PARTITION_ROWS
+	.macro PARTITION_ROWS count
 	get $m4, $WSR
 	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
-	mov $m5, $m8
-	cmpult $m6, $m4, $m9
-	add $m5, $m5, $m6
-	mul $m6, $m4, $m8
+	setzi $m5, (\count) / 6
+	mul $m6, $m4, (\count) / 6
+	.if (\count) % 6
+	setzi $m9, (\count) % 6
+	cmpult $m7, $m4, $m9
+	add $m5, $m5, $m7
 	min $m7, $m4, $m9
 	add $m6, $m6, $m7
+	.endif
 	.endm
 
 	.macro LOAD_AMP16_WEIGHTS
@@ -100,7 +106,7 @@
 	ld64putcs 63
 	.endm
 
-	.macro GEMM_SUPERVISOR name, initial
+	.macro GEMM_SUPERVISOR name, initial, rows, worker
 	.section .text.\name,"ax",@progbits
 	.globl \name
 	.p2align 2
@@ -110,9 +116,6 @@
 	add $m11, $m11, -32
 	st32 $m2, $m11, $m15, 0
 	st32 $m3, $m11, $m15, 1
-	st32 $m5, $m11, $m15, 2
-	st32 $m6, $m11, $m15, 3
-	st32 $m7, $m11, $m15, 4
 	setzi $m8, \initial
 	st32 $m8, $m11, $m15, 5
 	st32 $m8, $m11, $m15, 7
@@ -130,8 +133,8 @@
 	zero $m7
 .Linner_group_\@:
 	LOAD_AMP16_WEIGHTS
-	ld32 $m9, $m11, $m15, 2
-	mul $m8, $m9, OUTPUT_COLUMNS / 2
+	setzi $m9, \rows
+	mul $m8, $m9, COLUMN_MICRO_DIMENSION * 2
 	mul $m8, $m8, $m6
 	add $m8, $m2, $m8
 	st32 $m8, $m11, $m15, 0
@@ -146,7 +149,7 @@
 	setzi $m0, 1
 .Lstore_initial_\@:
 	st32 $m0, $m11, $m15, 5
-	setzi $m0, .Lgemm_f16_amp_worker
+	setzi $m0, \worker
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
 	add $m7, $m7, 1
@@ -159,50 +162,30 @@
 	brnz $m8, .Lcolumn_group_\@
 	ld32 $m8, $m11, $m15, 6
 	put $FP_ICTL, $m8
-	sync SYNC_COMPUTE_SET
 	add $m11, $m11, 32
 	br $m10
 	.size \name, .-\name
 	.endm
 
-	GEMM_SUPERVISOR ipu_stack_gemm_f16_init_common, 1
-	GEMM_SUPERVISOR ipu_stack_gemm_f16_accumulate_common, 0
-
-	.macro GEMM_SPECIALIZATION name, rows, target
-	.section .text.\name,"ax",@progbits
-	.globl \name
-	.p2align 2
-	.type \name,@function
-\name:
-	.supervisor
-	setzi $m5, \rows
-	setzi $m6, (\rows) / 6
-	setzi $m7, (\rows) % 6
-	setzi $m0, \target
-	br $m0
-	.size \name, .-\name
-	.endm
-
-	GEMM_SPECIALIZATION ipu_stack_gemm_f16_init_small_rows, GEMM_SMALL_ROWS, ipu_stack_gemm_f16_init_common
-	GEMM_SPECIALIZATION ipu_stack_gemm_f16_init_large_rows, GEMM_LARGE_ROWS, ipu_stack_gemm_f16_init_common
-	GEMM_SPECIALIZATION ipu_stack_gemm_f16_accumulate_small_rows, GEMM_SMALL_ROWS, ipu_stack_gemm_f16_accumulate_common
-	GEMM_SPECIALIZATION ipu_stack_gemm_f16_accumulate_large_rows, GEMM_LARGE_ROWS, ipu_stack_gemm_f16_accumulate_common
+	GEMM_SUPERVISOR ipu_stack_gemm_f16_init_small_rows, 1, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small
+	GEMM_SUPERVISOR ipu_stack_gemm_f16_init_large_rows, 1, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large
+	GEMM_SUPERVISOR ipu_stack_gemm_f16_accumulate_small_rows, 0, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small
+	GEMM_SUPERVISOR ipu_stack_gemm_f16_accumulate_large_rows, 0, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large
 
 	.worker
+	.macro GEMM_WORKER name, rows
 	.p2align 3
-.Lgemm_f16_amp_worker:
+\name:
+	PARTITION_ROWS \rows
 	ld32 $m0, $mvertex_base, $m15, 0
 	ld32 $m1, $mvertex_base, $m15, 1
-	ld32 $m8, $mvertex_base, $m15, 3
-	ld32 $m9, $mvertex_base, $m15, 4
-	PARTITION_ROWS
 	shl $m6, $m6, 5
 	add $m9, $m0, $m6
 	add $m2, $m1, $m6
 	add $m3, $m9, 32
 	add $m8, $m5, -1
 	ld32 $m7, $mvertex_base, $m15, 5
-	brz $m7, .Lf16_accumulate
+	brz $m7, .Lf16_accumulate_\@
 
 	setzi $a6, CLEAR_AACC
 	uput $FP_CLR, $a6
@@ -263,7 +246,7 @@
 	st64pace $a6:7, $m10:11+=, $mzero, 0b00
 	exitz $mzero
 
-.Lf16_accumulate:
+.Lf16_accumulate_\@:
 	setzi $a6, CLEAR_AACC
 	uput $FP_CLR, $a6
 	ld128 $a0:3, $m9, $m15, 0
@@ -335,3 +318,7 @@
 	st64pace $a6:7, $m10:11+=, $mzero, 0b00
 	st64pace $a4:5, $m10:11+=, $mzero, 0b00
 	exitz $mzero
+	.endm
+
+	GEMM_WORKER .Lgemm_f16_amp_worker_small, GEMM_SMALL_ROWS
+	GEMM_WORKER .Lgemm_f16_amp_worker_large, GEMM_LARGE_ROWS

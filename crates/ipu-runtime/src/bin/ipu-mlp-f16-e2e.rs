@@ -2,8 +2,9 @@ use half::f16;
 use ipu_compiler::{BlockedMlpConfig, GemmDataType, choose_gemm_row_block_for, plan_blocked_mlp};
 use ipu_elf::Toolchain;
 use ipu_runtime::{
-    BlockLayout, ExecutableGraph, HostRunOptions, block_binding_typed, block_coordinates,
-    blocked_matrix_f16, normal_f16, package_graph, run_host_with_options,
+    BlockLayout, ExecutableGraph, HostRunOptions, ProfileGranularity, block_binding_typed,
+    block_coordinates, blocked_matrix_f16, normal_f16, package_graph, package_graph_profiled_with,
+    run_host_with_options,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -11,14 +12,17 @@ use tracing::info;
 
 const TILE_COUNT: u16 = 1472;
 const BLOCK_DIMENSION: u16 = 64;
-const INNER_BLOCK_DIMENSION: u16 = 64;
+const DEFAULT_INNER_BLOCK_DIMENSION: u16 = 64;
 const MLP_DATA_BASE: u32 = 0xa0000;
+const DEFAULT_CLOCK_HZ: u64 = 1_500_000_000;
+const FP16_FLOPS_PER_TILE_CYCLE: f64 = 128.0;
 
 fn main() {
     ipu_runtime::init_tracing();
     let batch = env_u16("IPU_MLP_BATCH", 64);
     let width = env_u16("IPU_MLP_WIDTH", 256);
     let layers = env_u16("IPU_MLP_LAYERS", 4);
+    let inner_block_dimension = env_u16("IPU_MLP_INNER_BLOCK", DEFAULT_INNER_BLOCK_DIMENSION);
     let seed = env_u64("IPU_MLP_SEED", 0x5eed_1616);
     let max_error_limit = env_f32("IPU_F16_MAX_ERROR", 0.005);
     assert!(width.is_multiple_of(BLOCK_DIMENSION));
@@ -27,7 +31,7 @@ fn main() {
         .unwrap_or_else(|_| {
             choose_gemm_row_block_for(
                 batch,
-                INNER_BLOCK_DIMENSION,
+                inner_block_dimension,
                 width,
                 BLOCK_DIMENSION,
                 TILE_COUNT,
@@ -40,7 +44,7 @@ fn main() {
         width,
         layers,
         block_dimension: BLOCK_DIMENSION,
-        inner_block_dimension: INNER_BLOCK_DIMENSION,
+        inner_block_dimension,
         row_block_dimension,
         tile_count: TILE_COUNT,
         data_base: MLP_DATA_BASE,
@@ -128,7 +132,7 @@ fn main() {
             &artifact_dir,
             "gemm-f16",
             &[
-                format!("-DGEMM_INNER_BLOCK_DIMENSION={INNER_BLOCK_DIMENSION}"),
+                format!("-DGEMM_INNER_BLOCK_DIMENSION={inner_block_dimension}"),
                 format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
                 format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
             ],
@@ -142,19 +146,25 @@ fn main() {
             &[],
         )
         .unwrap();
-    let app = package_graph(
-        &graph,
-        &[
-            fs::read(runtime.object).unwrap(),
-            fs::read(gemm.object).unwrap(),
-            fs::read(gelu.object).unwrap(),
-        ],
-    )
-    .unwrap();
+    let objects = [
+        fs::read(runtime.object).unwrap(),
+        fs::read(gemm.object).unwrap(),
+        fs::read(gelu.object).unwrap(),
+    ];
+    let profile_output = std::env::var_os("IPU_PROFILE_OUTPUT").map(PathBuf::from);
+    let (app, profile_layout) = if profile_output.is_some() {
+        let granularity = ProfileGranularity::from_environment().unwrap();
+        let (app, layout) = package_graph_profiled_with(&graph, &objects, granularity).unwrap();
+        info!(?granularity, "enabled FP16 MLP cycle profiling");
+        (app, Some(layout))
+    } else {
+        (package_graph(&graph, &objects).unwrap(), None)
+    };
     info!(
         batch,
         width,
         layers,
+        inner_block_dimension,
         seed,
         row_block_dimension,
         phases = graph.schedule.phases.len(),
@@ -178,26 +188,66 @@ fn main() {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
-    let reference = reference_mlp(batch, width, &input_values, &weights);
-    let errors = verify_output(
-        batch,
-        width,
-        &actual,
-        &output_placements,
-        &reference,
-        max_error_limit,
-    )
-    .unwrap();
-    info!(
-        batch,
-        width,
-        layers,
-        max_abs_error = errors.max_abs,
-        rmse = errors.rmse,
-        max_error_limit,
-        "randomized FP16/16 MLP passed"
-    );
+    if let (Some(path), Some(layout)) = (&profile_output, &profile_layout) {
+        let clock_hz = env_u64("IPU_CLOCK_HZ", DEFAULT_CLOCK_HZ);
+        let report = layout.decode(&actual, clock_hz).unwrap();
+        let graph_cycles = graph_cycles(&report);
+        let graph_seconds = f64::from(graph_cycles) / clock_hz as f64;
+        let gemm_flops = 2.0 * f64::from(batch) * f64::from(width).powi(2) * f64::from(layers);
+        let gemm_tflops = gemm_flops / graph_seconds / 1.0e12;
+        let peak_tflops =
+            clock_hz as f64 * f64::from(TILE_COUNT) * FP16_FLOPS_PER_TILE_CYCLE / 1.0e12;
+        report.write(fs::File::create(path).unwrap()).unwrap();
+        info!(
+            path = %path.display(),
+            graph_cycles,
+            graph_ms = graph_seconds * 1.0e3,
+            gemm_tflops,
+            peak_tflops,
+            efficiency_percent = gemm_tflops / peak_tflops * 100.0,
+            "wrote FP16 MLP cycle profile"
+        );
+    }
+    if env_bool("IPU_F16_VALIDATE", true) {
+        let reference = reference_mlp(batch, width, &input_values, &weights);
+        let errors = verify_output(
+            batch,
+            width,
+            &actual,
+            &output_placements,
+            &reference,
+            max_error_limit,
+        )
+        .unwrap();
+        info!(
+            batch,
+            width,
+            layers,
+            max_abs_error = errors.max_abs,
+            rmse = errors.rmse,
+            max_error_limit,
+            "randomized FP16/16 MLP passed"
+        );
+    } else {
+        info!(batch, width, layers, "skipped FP16 MLP host reference");
+    }
     let _ = fs::remove_dir_all(artifact_dir);
+}
+
+fn graph_cycles(report: &ipu_package::ProfileReport) -> u32 {
+    report
+        .tiles
+        .iter()
+        .filter_map(|tile| {
+            Some(
+                tile.samples
+                    .last()?
+                    .end_cycle
+                    .wrapping_sub(tile.samples.first()?.start_cycle),
+            )
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn reference_mlp(batch: u16, width: u16, input: &[f16], weights: &[Vec<f16>]) -> Vec<f16> {
@@ -314,6 +364,16 @@ fn env_f32(name: &str, default: f32) -> f32 {
             value
                 .parse()
                 .unwrap_or_else(|_| panic!("{name} must be an f32"))
+        })
+        .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|value| match value.as_str() {
+            "0" | "false" => false,
+            "1" | "true" => true,
+            _ => panic!("{name} must be 0, 1, false, or true"),
         })
         .unwrap_or(default)
 }

@@ -276,3 +276,19 @@ IPU_MLP_BATCH=64 IPU_MLP_WIDTH=512 IPU_MLP_LAYERS=8 \
 The FP16 runners accept the same shape and row-block environment variables as
 their FP32 counterparts. `IPU_GEMM_SEED` and `IPU_MLP_SEED` select host test
 data, while `IPU_F16_MAX_ERROR` can override the acceptance threshold.
+`IPU_GEMM_BLOCK`, `IPU_GEMM_INNER_BLOCK`, and `IPU_MLP_INNER_BLOCK` expose the
+kernel blocking parameters for benchmarking and future autotuning.
+
+FP16 GEMM row specialization is static. The planner derives the two row counts
+needed to distribute a row shard across the tiles, compiles them into the
+kernel object, and selects one of four concrete supervisor symbols
+(`init`/`accumulate` by small/large rows) in each tile program. Those supervisors
+also target distinct small/large worker bodies with immediate operands; there
+is no runtime row-count dispatch.
+
+At 1.5 GHz, the architectural FP16/16 peak used by the runners is
+`1472 tiles * 128 FLOP/tile/cycle * 1.5 GHz = 282.624 TFLOP/s`. On the attached
+C600, graph-level cycle profiles measured a 4096-square FP16 GEMM at 2,262,696
+cycles (91.11 TFLOP/s, 32.24% of peak) and the 512x2048, eight-layer FP16 MLP at
+2,740,434 cycles (18.81 effective GEMM TFLOP/s, 6.65% of peak). The MLP rate
+counts only GEMM FLOPs while its interval includes GeLU and exchange work.
