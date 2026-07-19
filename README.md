@@ -348,5 +348,11 @@ sequence 64, 98,274 cycles for sequence 128, and 192,516 cycles for sequence
 useful QK/PV TFLOP/s. These graph intervals start after H2D and end before D2H.
 At sequence 1024 and batch 1, the 768/1024/1152-hidden cases measure
 691,794/840,528/1,059,462 cycles and 6.98/7.66/6.84 useful TFLOP/s. Canonical
-K/V blocks are striped over each head's query tiles so long sequences do not
-concentrate the complete K/V tensor in one tile's SRAM.
+K/V storage is striped across each head's query tiles, allowing the same
+sequence length to scale beyond batch 1 without concentrating all blocks in
+one tile's SRAM. At batch 2, the three hidden sizes measure
+1,202,256/1,453,266/1,758,102 cycles and 8.04/8.87/8.24 useful TFLOP/s; at
+batch 3 they measure 1,693,080/2,036,178/2,450,580 cycles and
+8.56/9.49/8.87 useful TFLOP/s. A batch-8, 1152-hidden run also passes the host
+reference with a 64.2 MB input, measuring 5,929,026 cycles and 9.78 useful
+TFLOP/s.
