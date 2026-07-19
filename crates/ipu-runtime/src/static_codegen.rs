@@ -34,16 +34,38 @@ pub(crate) fn emit(
     plan_addresses: &[u32],
     host: HostCode<'_>,
     profile_addresses: &[u32],
+    aggregate_profile: bool,
 ) -> Result<Vec<u8>> {
-    if !profile_addresses.is_empty() && profile_addresses.len() != program.steps.len() {
+    if aggregate_profile && profile_addresses.len() != 1 {
+        return Err("aggregate profile requires one address".into());
+    }
+    if !aggregate_profile
+        && !profile_addresses.is_empty()
+        && profile_addresses.len() != program.steps.len()
+    {
         return Err("profile address count differs from tile step count".into());
     }
     let mut code = TileCode::new(base);
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
     emit_host_phases(&mut code, symbols, host.inputs, host.run_state)?;
+    if program.steps.iter().any(|step| {
+        matches!(
+            step,
+            LoweredTileStep::Exchange { row, .. }
+                if row.first() != Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION)
+        )
+    }) {
+        code.put_special(INCOMING_SBASE, 15)?;
+        code.put_special(INCOMING_DBASE, 15)?;
+        code.setzi(8, 1)?;
+        code.put_special(INCOMING_DCOUNT, 8)?;
+    }
+    if aggregate_profile {
+        emit_cycle_sample(&mut code, symbols, profile_addresses[0])?;
+    }
     let mut plan_index = 0usize;
     for (step_index, step) in program.steps.iter().enumerate() {
-        if let Some(&address) = profile_addresses.get(step_index) {
+        if !aggregate_profile && let Some(&address) = profile_addresses.get(step_index) {
             emit_cycle_sample(&mut code, symbols, address)?;
         }
         match step {
@@ -52,10 +74,6 @@ pub(crate) fn emit(
                 let active = row.first() != Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION);
                 if active {
                     code.call(worker_barrier, 7)?;
-                    code.put_special(INCOMING_SBASE, 15)?;
-                    code.put_special(INCOMING_DBASE, 15)?;
-                    code.setzi(8, 1)?;
-                    code.put_special(INCOMING_DCOUNT, 8)?;
                 }
                 let target = plan_addresses
                     .get(plan_index)
@@ -91,12 +109,15 @@ pub(crate) fn emit(
             }
             LoweredTileStep::IdleCompute { .. } => {}
         }
-        if let Some(&address) = profile_addresses.get(step_index) {
+        if !aggregate_profile && let Some(&address) = profile_addresses.get(step_index) {
             emit_cycle_sample(&mut code, symbols, address + 4)?;
         }
     }
     if plan_index != plan_addresses.len() {
         return Err("unused exchange plan address".into());
+    }
+    if aggregate_profile {
+        emit_cycle_sample(&mut code, symbols, profile_addresses[0] + 4)?;
     }
     emit_host_phases(&mut code, symbols, host.outputs, host.run_state)?;
     code.jump(symbol(symbols, COMPLETE)?)?;

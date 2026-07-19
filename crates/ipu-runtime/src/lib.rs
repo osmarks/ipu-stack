@@ -244,12 +244,27 @@ fn optional_environment_number(name: &str) -> Result<Option<u64>> {
 }
 
 pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<Application> {
-    package_graph_impl(graph, objects, &[], None)
+    package_graph_impl(graph, objects, &[], None, false)
 }
 
 pub fn package_graph_profiled(
     graph: &ExecutableGraph,
     objects: &[Vec<u8>],
+) -> Result<(Application, ProfileLayout)> {
+    package_graph_with_profile(graph, objects, false)
+}
+
+pub fn package_graph_timed(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+) -> Result<(Application, ProfileLayout)> {
+    package_graph_with_profile(graph, objects, true)
+}
+
+fn package_graph_with_profile(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+    aggregate: bool,
 ) -> Result<(Application, ProfileLayout)> {
     let topology = Topology::c600();
     let programs = graph.schedule.lower_tile_programs(&topology)?;
@@ -278,13 +293,8 @@ pub fn package_graph_profiled(
         .checked_add(1)
         .ok_or("profile tensor id overflow")?;
     for program in &programs {
-        let size = u32::try_from(
-            program
-                .steps
-                .len()
-                .checked_mul(8)
-                .ok_or("profile size overflow")?,
-        )?;
+        let sample_count = if aggregate { 1 } else { program.steps.len() };
+        let size = u32::try_from(sample_count.checked_mul(8).ok_or("profile size overflow")?)?;
         if size == 0 {
             profile_addresses.push(Vec::new());
             continue;
@@ -320,40 +330,50 @@ pub fn package_graph_profiled(
                 live_until: usize::MAX,
                 kind: ipu_compiler::AllocationKind::Home,
             });
-        let steps = program
-            .steps
-            .iter()
-            .enumerate()
-            .map(|(local_index, step)| match step {
-                ipu_compiler::LoweredTileStep::Exchange { phase, epoch, .. } => {
-                    ipu_package::ProfileStep {
-                        local_index: local_index as u32,
-                        phase: *phase as u32,
-                        epoch: *epoch as u32,
-                        operation: "exchange".into(),
-                        kind: ipu_package::ProfileStepKind::Exchange,
+        let steps = if aggregate {
+            vec![ipu_package::ProfileStep {
+                local_index: 0,
+                phase: 0,
+                epoch: 0,
+                operation: "graph".into(),
+                kind: ipu_package::ProfileStepKind::Compute,
+            }]
+        } else {
+            program
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(local_index, step)| match step {
+                    ipu_compiler::LoweredTileStep::Exchange { phase, epoch, .. } => {
+                        ipu_package::ProfileStep {
+                            local_index: local_index as u32,
+                            phase: *phase as u32,
+                            epoch: *epoch as u32,
+                            operation: "exchange".into(),
+                            kind: ipu_package::ProfileStepKind::Exchange,
+                        }
                     }
-                }
-                ipu_compiler::LoweredTileStep::Compute(command) => ipu_package::ProfileStep {
-                    local_index: local_index as u32,
-                    phase: command.phase as u32,
-                    epoch: 0,
-                    operation: command.specialization.operation.clone(),
-                    kind: ipu_package::ProfileStepKind::Compute,
-                },
-                ipu_compiler::LoweredTileStep::IdleCompute { op, phase } => {
-                    ipu_package::ProfileStep {
+                    ipu_compiler::LoweredTileStep::Compute(command) => ipu_package::ProfileStep {
                         local_index: local_index as u32,
-                        phase: *phase as u32,
+                        phase: command.phase as u32,
                         epoch: 0,
-                        operation: format!("idle-op-{}", op.0),
+                        operation: command.specialization.operation.clone(),
                         kind: ipu_package::ProfileStepKind::Compute,
+                    },
+                    ipu_compiler::LoweredTileStep::IdleCompute { op, phase } => {
+                        ipu_package::ProfileStep {
+                            local_index: local_index as u32,
+                            phase: *phase as u32,
+                            epoch: 0,
+                            operation: format!("idle-op-{}", op.0),
+                            kind: ipu_package::ProfileStepKind::Compute,
+                        }
                     }
-                }
-            })
-            .collect::<Vec<_>>();
+                })
+                .collect::<Vec<_>>()
+        };
         profile_addresses.push(
-            (0..program.steps.len())
+            (0..sample_count)
                 .map(|index| address + index as u32 * 8)
                 .collect(),
         );
@@ -376,7 +396,13 @@ pub fn package_graph_profiled(
         shape: vec![(file_offset / 4) as u32],
         slices,
     });
-    let app = package_graph_impl(&profile_graph, objects, &profile_addresses, Some(programs))?;
+    let app = package_graph_impl(
+        &profile_graph,
+        objects,
+        &profile_addresses,
+        Some(programs),
+        aggregate,
+    )?;
     Ok((
         app,
         ProfileLayout {
@@ -391,6 +417,7 @@ fn package_graph_impl(
     objects: &[Vec<u8>],
     profile_addresses: &[Vec<u32>],
     lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
+    aggregate_profile: bool,
 ) -> Result<Application> {
     let topology = Topology::c600();
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
@@ -645,6 +672,7 @@ fn package_graph_impl(
                         .get(program_index)
                         .map(Vec::as_slice)
                         .unwrap_or_default(),
+                    aggregate_profile,
                 )
             },
         )

@@ -492,9 +492,16 @@ pub struct BlockedGemmPlan {
 }
 
 pub fn choose_gemm_row_block(dimension: u16, block_dimension: u16, tile_count: u16) -> Option<u16> {
-    gemm_row_block_candidates(dimension, block_dimension, tile_count)
-        .into_iter()
-        .find(|&target| target >= 32)
+    let candidates = gemm_row_block_candidates(dimension, block_dimension, tile_count);
+    let column_blocks = dimension.checked_div(block_dimension)?;
+    if usize::from(column_blocks) * usize::from(column_blocks) >= usize::from(tile_count) {
+        return candidates.last().copied();
+    }
+    candidates.into_iter().find(|&target| {
+        usize::from(dimension.div_ceil(target)) * usize::from(column_blocks)
+            <= usize::from(tile_count)
+            && target >= 32
+    })
 }
 
 pub fn gemm_row_block_candidates(
@@ -509,13 +516,11 @@ pub fn gemm_row_block_candidates(
     {
         return Vec::new();
     }
-    let column_blocks = dimension / block_dimension;
     let mut row_shard_counts = BTreeSet::new();
     (12..=64)
         .filter(|&target| {
             let row_shards = dimension.div_ceil(target);
-            usize::from(row_shards) * usize::from(column_blocks) <= usize::from(tile_count)
-                && row_shard_counts.insert(row_shards)
+            row_shard_counts.insert(row_shards)
         })
         .collect()
 }
@@ -536,12 +541,6 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
     let base_rows = config.dimension / row_grid;
     let larger_row_shards = config.dimension % row_grid;
     let output_block_count = usize::from(row_grid) * usize::from(grid);
-    if output_block_count > usize::from(config.tile_count) {
-        return Err(CompileError::Graph(format!(
-            "blocked GEMM requires {output_block_count} output tiles but only {} are available",
-            config.tile_count
-        )));
-    }
     let block_bytes = u32::from(config.block_dimension)
         .checked_mul(u32::from(config.block_dimension))
         .and_then(|elements| elements.checked_mul(4))
@@ -551,7 +550,8 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
             "{block_bytes}-byte GEMM blocks exceed one exchange transfer"
         )));
     }
-    let max_left_bytes = u32::from(config.row_block_dimension)
+    let maximum_rows = base_rows + u16::from(larger_row_shards != 0);
+    let max_left_bytes = u32::from(maximum_rows)
         .checked_mul(u32::from(config.block_dimension))
         .and_then(|elements| elements.checked_mul(4))
         .ok_or_else(|| CompileError::Memory("GEMM left block size overflow".into()))?;
@@ -578,10 +578,12 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
     let left_count = output_block_count;
     let right_count = usize::from(grid) * usize::from(grid);
     let output_tensor_base = left_count + right_count;
+    let scratch_tensor_base = output_tensor_base + output_block_count;
     let mut allocations = Vec::new();
     let mut left = Vec::with_capacity(left_count);
     let mut right = Vec::with_capacity(right_count);
     let mut output = Vec::with_capacity(output_block_count);
+    let mut data_cursors = vec![config.data_base; usize::from(config.tile_count)];
 
     for block_row in 0..row_grid {
         let rows = base_rows + u16::from(block_row < larger_row_shards);
@@ -589,44 +591,43 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         let size = u32::from(rows) * u32::from(config.block_dimension) * 4;
         for block_column in 0..grid {
             let index = usize::from(block_row) * usize::from(grid) + usize::from(block_column);
-            let tile = u16::try_from(index)
+            let tile = u16::try_from(index % usize::from(config.tile_count))
                 .map_err(|_| CompileError::Graph("GEMM tile index overflow".into()))?;
-            for (tensor, address, placements) in [
-                (TensorId(index), config.data_base, &mut left),
-                (
-                    TensorId(output_tensor_base + index),
-                    output_address,
-                    &mut output,
-                ),
-            ] {
-                allocations.push(Allocation {
-                    tensor,
-                    tile,
-                    address,
-                    size,
-                    live_from: 0,
-                    live_until: usize::MAX,
-                    kind: AllocationKind::Home,
-                });
-                placements.push(BlockPlacement {
-                    tensor,
-                    tile,
-                    address,
-                    block_row,
-                    block_column,
-                    row_start,
-                    rows,
-                });
-            }
+            let address = data_cursors[usize::from(tile)];
+            data_cursors[usize::from(tile)] = address
+                .checked_add(size)
+                .ok_or_else(|| CompileError::Memory("GEMM data address overflow".into()))?;
+            let tensor = TensorId(index);
+            allocations.push(Allocation {
+                tensor,
+                tile,
+                address,
+                size,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            });
+            left.push(BlockPlacement {
+                tensor,
+                tile,
+                address,
+                block_row,
+                block_column,
+                row_start,
+                rows,
+            });
         }
     }
     for block_row in 0..grid {
         for block_column in 0..grid {
             let index = usize::from(block_row) * usize::from(grid) + usize::from(block_column);
-            let tile = u16::try_from(index)
+            let tile = u16::try_from((left_count + index) % usize::from(config.tile_count))
                 .map_err(|_| CompileError::Graph("GEMM tile index overflow".into()))?;
             let tensor = TensorId(left_count + index);
-            let address = config.data_base + max_left_bytes;
+            let address = data_cursors[usize::from(tile)];
+            data_cursors[usize::from(tile)] = address
+                .checked_add(block_bytes)
+                .ok_or_else(|| CompileError::Memory("GEMM data address overflow".into()))?;
             allocations.push(Allocation {
                 tensor,
                 tile,
@@ -648,91 +649,139 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         }
     }
 
-    let mut phases = Vec::with_capacity(usize::from(grid) * 2);
-    for inner_block in 0..grid {
-        let exchange_phase = phases.len();
-        let mut transfers = Vec::new();
-        for block_row in 0..row_grid {
-            let source_index =
-                usize::from(block_row) * usize::from(grid) + usize::from(inner_block);
-            let source = left[source_index];
-            for block_column in 0..grid {
-                if block_column == inner_block {
-                    continue;
-                }
-                let destination_index =
-                    usize::from(block_row) * usize::from(grid) + usize::from(block_column);
-                let destination_tile = output[destination_index].tile;
-                transfers.push(Transfer {
-                    source_tile: source.tile,
-                    destination_tile,
-                    tensor: source.tensor,
-                    bytes: u32::from(source.rows) * u32::from(config.block_dimension) * 4,
-                });
-                allocations.push(Allocation {
-                    tensor: source.tensor,
-                    tile: destination_tile,
-                    address: left_exchange_address,
-                    size: u32::from(source.rows) * u32::from(config.block_dimension) * 4,
-                    live_from: exchange_phase,
-                    live_until: exchange_phase + 1,
-                    kind: AllocationKind::ExchangeStaging {
-                        phase: exchange_phase,
-                    },
-                });
-            }
-        }
+    for block_row in 0..row_grid {
+        let rows = base_rows + u16::from(block_row < larger_row_shards);
+        let row_start = block_row * base_rows + block_row.min(larger_row_shards);
+        let size = u32::from(rows) * u32::from(config.block_dimension) * 4;
         for block_column in 0..grid {
-            let source_index =
-                usize::from(inner_block) * usize::from(grid) + usize::from(block_column);
-            let source = right[source_index];
-            for block_row in 0..row_grid {
-                if block_row == inner_block {
-                    continue;
-                }
-                let destination_index =
-                    usize::from(block_row) * usize::from(grid) + usize::from(block_column);
-                let destination_tile = output[destination_index].tile;
-                transfers.push(Transfer {
-                    source_tile: source.tile,
-                    destination_tile,
-                    tensor: source.tensor,
-                    bytes: block_bytes,
-                });
-                allocations.push(Allocation {
-                    tensor: source.tensor,
-                    tile: destination_tile,
-                    address: right_exchange_address,
-                    size: block_bytes,
-                    live_from: exchange_phase,
-                    live_until: exchange_phase + 1,
-                    kind: AllocationKind::ExchangeStaging {
-                        phase: exchange_phase,
-                    },
-                });
-            }
+            let index = usize::from(block_row) * usize::from(grid) + usize::from(block_column);
+            let tile = u16::try_from((index + 1) % usize::from(config.tile_count))
+                .map_err(|_| CompileError::Graph("GEMM tile index overflow".into()))?;
+            let address = data_cursors[usize::from(tile)];
+            data_cursors[usize::from(tile)] = address
+                .checked_add(size)
+                .ok_or_else(|| CompileError::Memory("GEMM data address overflow".into()))?;
+            output.push(BlockPlacement {
+                tensor: TensorId(output_tensor_base + index),
+                tile,
+                address,
+                block_row,
+                block_column,
+                row_start,
+                rows,
+            });
+            allocations.push(Allocation {
+                tensor: TensorId(output_tensor_base + index),
+                tile,
+                address,
+                size,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            });
         }
-        phases.push(Phase::Exchange { transfers });
+    }
+    if let Some((tile, end)) = data_cursors
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, end)| *end > config.data_limit)
+    {
+        return Err(CompileError::Memory(format!(
+            "GEMM resident data exhausts tile {tile}: 0x{end:x} exceeds 0x{:x}",
+            config.data_limit
+        )));
+    }
 
-        let gemm_phase = phases.len();
-        let mut gemm_commands = Vec::with_capacity(output_block_count);
-        for block_row in 0..row_grid {
-            for block_column in 0..grid {
-                let index = usize::from(block_row) * usize::from(grid) + usize::from(block_column);
-                let left_tensor = left
-                    [usize::from(block_row) * usize::from(grid) + usize::from(inner_block)]
+    let output_waves = output.len().div_ceil(usize::from(config.tile_count));
+    let mut phases = Vec::with_capacity(output_waves * (usize::from(grid) * 2 + 2));
+    for (wave, wave_outputs) in output.chunks(usize::from(config.tile_count)).enumerate() {
+        let wave_start = phases.len();
+        for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
+            let output_index = wave * usize::from(config.tile_count) + wave_tile;
+            allocations.push(Allocation {
+                tensor: TensorId(scratch_tensor_base + output_index),
+                tile: u16::try_from(wave_tile)
+                    .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?,
+                address: output_address,
+                size: u32::from(output_block.rows) * u32::from(config.block_dimension) * 4,
+                live_from: wave_start,
+                live_until: wave_start + usize::from(grid) * 2 + 1,
+                kind: AllocationKind::Home,
+            });
+        }
+        for inner_block in 0..grid {
+            let exchange_phase = phases.len();
+            let mut transfers = Vec::new();
+            for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
+                let destination_tile = u16::try_from(wave_tile)
+                    .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?;
+                let source_index = usize::from(output_block.block_row) * usize::from(grid)
+                    + usize::from(inner_block);
+                let source = left[source_index];
+                if source.tile != destination_tile {
+                    transfers.push(Transfer {
+                        source_tile: source.tile,
+                        destination_tile,
+                        tensor: source.tensor,
+                        bytes: u32::from(source.rows) * u32::from(config.block_dimension) * 4,
+                    });
+                    allocations.push(Allocation {
+                        tensor: source.tensor,
+                        tile: destination_tile,
+                        address: left_exchange_address,
+                        size: u32::from(source.rows) * u32::from(config.block_dimension) * 4,
+                        live_from: exchange_phase,
+                        live_until: exchange_phase + 1,
+                        kind: AllocationKind::ExchangeStaging {
+                            phase: exchange_phase,
+                        },
+                    });
+                }
+                let source_index = usize::from(inner_block) * usize::from(grid)
+                    + usize::from(output_block.block_column);
+                let source = right[source_index];
+                if source.tile != destination_tile {
+                    transfers.push(Transfer {
+                        source_tile: source.tile,
+                        destination_tile,
+                        tensor: source.tensor,
+                        bytes: block_bytes,
+                    });
+                    allocations.push(Allocation {
+                        tensor: source.tensor,
+                        tile: destination_tile,
+                        address: right_exchange_address,
+                        size: block_bytes,
+                        live_from: exchange_phase,
+                        live_until: exchange_phase + 1,
+                        kind: AllocationKind::ExchangeStaging {
+                            phase: exchange_phase,
+                        },
+                    });
+                }
+            }
+            phases.push(Phase::Exchange { transfers });
+
+            let gemm_phase = phases.len();
+            let mut gemm_commands = Vec::with_capacity(wave_outputs.len());
+            for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
+                let output_index = wave * usize::from(config.tile_count) + wave_tile;
+                let left_tensor = left[usize::from(output_block.block_row) * usize::from(grid)
+                    + usize::from(inner_block)]
                 .tensor;
-                let right_tensor = right
-                    [usize::from(inner_block) * usize::from(grid) + usize::from(block_column)]
+                let right_tensor = right[usize::from(inner_block) * usize::from(grid)
+                    + usize::from(output_block.block_column)]
                 .tensor;
                 gemm_commands.push(KernelCommand {
-                    tile: output[index].tile,
-                    output: output[index].tensor,
+                    tile: u16::try_from(wave_tile)
+                        .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?,
+                    output: TensorId(scratch_tensor_base + output_index),
                     inputs: vec![left_tensor, right_tensor],
                     arguments: vec![
-                        u32::from(output[index].rows),
-                        u32::from(output[index].rows / 6),
-                        u32::from(output[index].rows % 6),
+                        u32::from(output_block.rows),
+                        u32::from(output_block.rows / 6),
+                        u32::from(output_block.rows % 6),
                     ],
                     specialization: SpecializationKey {
                         operation: if inner_block == 0 {
@@ -742,7 +791,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                         }
                         .into(),
                         shape: vec![
-                            usize::from(output[index].rows),
+                            usize::from(output_block.rows),
                             usize::from(config.block_dimension),
                             usize::from(config.block_dimension),
                         ],
@@ -752,10 +801,62 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     },
                 });
             }
+            phases.push(Phase::Compute {
+                op: OpId(gemm_phase),
+                commands: gemm_commands,
+            });
+        }
+        let evacuation_phase = phases.len();
+        let mut transfers = Vec::with_capacity(wave_outputs.len());
+        for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
+            let output_index = wave * usize::from(config.tile_count) + wave_tile;
+            let scratch_tensor = TensorId(scratch_tensor_base + output_index);
+            let source_tile = u16::try_from(wave_tile)
+                .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?;
+            transfers.push(Transfer {
+                source_tile,
+                destination_tile: output_block.tile,
+                tensor: scratch_tensor,
+                bytes: u32::from(output_block.rows) * u32::from(config.block_dimension) * 4,
+            });
+            allocations.push(Allocation {
+                tensor: scratch_tensor,
+                tile: output_block.tile,
+                address: left_exchange_address,
+                size: u32::from(output_block.rows) * u32::from(config.block_dimension) * 4,
+                live_from: evacuation_phase,
+                live_until: evacuation_phase + 1,
+                kind: AllocationKind::ExchangeStaging {
+                    phase: evacuation_phase,
+                },
+            });
+        }
+        phases.push(Phase::Exchange { transfers });
+        let copy_phase = phases.len();
+        let mut copy_commands = Vec::with_capacity(wave_outputs.len());
+        for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
+            let output_index = wave * usize::from(config.tile_count) + wave_tile;
+            let scratch_tensor = TensorId(scratch_tensor_base + output_index);
+            let units = u32::from(output_block.rows) * u32::from(config.block_dimension) / 2;
+            copy_commands.push(KernelCommand {
+                tile: output_block.tile,
+                output: output_block.tensor,
+                inputs: vec![scratch_tensor, scratch_tensor],
+                arguments: vec![units, units / 6, units % 6],
+                specialization: SpecializationKey {
+                    operation: "copy_u64".into(),
+                    shape: vec![usize::try_from(units).map_err(|_| {
+                        CompileError::Graph("GEMM output copy size overflow".into())
+                    })?],
+                    worker_count: 6,
+                    role: format!("output-wave-{wave}"),
+                    alignment: 8,
+                },
+            });
         }
         phases.push(Phase::Compute {
-            op: OpId(gemm_phase),
-            commands: gemm_commands,
+            op: OpId(copy_phase),
+            commands: copy_commands,
         });
     }
 
@@ -1888,11 +1989,10 @@ mod tests {
 
         assert_eq!(plan.left.len(), plan.right.len());
         assert_eq!(plan.right.len(), plan.output.len());
-        assert!(
-            plan.output
-                .iter()
-                .all(|block| { block.address == ipu_package::IPU21_INTERLEAVED_MEMORY_BASE })
-        );
+        assert!(plan.output.iter().all(|block| {
+            (0xa0000..0xe8000).contains(&block.address)
+                && block.address != ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+        }));
         assert_eq!(
             plan.output
                 .iter()
@@ -1901,7 +2001,16 @@ mod tests {
                 .len(),
             plan.output.len()
         );
-        assert!(plan.schedule.phases.chunks_exact(2).all(|round| {
+        let rounds = &plan.schedule.phases[..plan.schedule.phases.len() - 2];
+        assert!(matches!(
+            plan.schedule.phases[plan.schedule.phases.len() - 2],
+            Phase::Exchange { .. }
+        ));
+        assert!(matches!(
+            plan.schedule.phases.last().unwrap(),
+            Phase::Compute { .. }
+        ));
+        assert!(rounds.chunks_exact(2).all(|round| {
             matches!(round[0], Phase::Exchange { .. }) && matches!(round[1], Phase::Compute { .. })
         }));
         assert!(plan.schedule.phases.iter().all(|phase| {
@@ -1910,20 +2019,12 @@ mod tests {
                     .iter()
                     .all(|transfer| transfer.bytes <= ipu_exchange::MAX_TRANSFER_WORDS * 4),
                 Phase::Compute { commands, .. } => commands.iter().all(|command| {
-                    let Some(block) = plan.output.iter().find(|block| block.tile == command.tile)
-                    else {
-                        return false;
-                    };
+                    let units = u32::try_from(command.specialization.shape[0]).unwrap();
                     command.inputs.len() == 2
-                        && command.arguments
-                            == [
-                                u32::from(block.rows),
-                                u32::from(block.rows / 6),
-                                u32::from(block.rows % 6),
-                            ]
+                        && command.arguments == [units, units / 6, units % 6]
                         && matches!(
                             command.specialization.operation.as_str(),
-                            "gemm_f32_init" | "gemm_f32_accumulate"
+                            "gemm_f32_init" | "gemm_f32_accumulate" | "copy_u64"
                         )
                 }),
             }
@@ -1932,7 +2033,7 @@ mod tests {
 
     #[test]
     fn blocked_gemm_balances_rows_without_gaps_or_tile_overcommitment() {
-        for dimension in [64, 128, 256, 1024, 1920, 2048, 2304] {
+        for dimension in [64, 128, 256, 1024, 1920, 2048, 2304, 4096] {
             let target = choose_gemm_row_block(dimension, 64, 1472).unwrap();
             let plan = plan_blocked_gemm(BlockedGemmConfig {
                 dimension,
@@ -1962,13 +2063,16 @@ mod tests {
             let minimum = first_column.iter().map(|block| block.rows).min().unwrap();
             let maximum = first_column.iter().map(|block| block.rows).max().unwrap();
             assert!(maximum - minimum <= 1);
-            assert!(plan.output.len() <= 1472);
+            assert!(plan.schedule.phases.iter().all(|phase| match phase {
+                Phase::Compute { commands, .. } => commands.len() <= 1472,
+                Phase::Exchange { .. } => true,
+            }));
         }
     }
 
     #[test]
     fn gemm_tuning_candidates_are_feasible_and_layout_distinct() {
-        for dimension in [64, 128, 256, 1024, 1920, 2048, 2304] {
+        for dimension in [64, 128, 256, 1024, 1920, 2048, 2304, 4096] {
             let candidates = gemm_row_block_candidates(dimension, 64, 1472);
             assert!(!candidates.is_empty());
             assert!(candidates.windows(2).all(|pair| pair[0] < pair[1]));
@@ -1977,9 +2081,6 @@ mod tests {
                 .map(|target| dimension.div_ceil(*target))
                 .collect();
             assert_eq!(row_shards.len(), candidates.len());
-            assert!(candidates.iter().all(|target| {
-                usize::from(dimension.div_ceil(*target)) * usize::from(dimension / 64) <= 1472
-            }));
             assert!(candidates.contains(&choose_gemm_row_block(dimension, 64, 1472).unwrap()));
         }
         assert!(choose_gemm_row_block(65, 64, 1472).is_none());

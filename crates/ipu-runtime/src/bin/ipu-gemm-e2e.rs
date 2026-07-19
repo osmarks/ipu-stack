@@ -2,7 +2,8 @@ use ipu_compiler::{BlockedGemmConfig, BlockedGemmPlan, choose_gemm_row_block, pl
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    ExecutableGraph, HostRunOptions, package_graph, package_graph_profiled, run_host_with_inspector,
+    ExecutableGraph, HostRunOptions, package_graph, package_graph_profiled, package_graph_timed,
+    run_host_with_inspector,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -95,7 +96,11 @@ fn main() {
             None,
         )
     } else if profile_output.is_some() {
-        let (app, layout) = package_graph_profiled(&graph, &objects).unwrap();
+        let (app, layout) = if std::env::var_os("IPU_PROFILE_AGGREGATE").is_some() {
+            package_graph_timed(&graph, &objects).unwrap()
+        } else {
+            package_graph_profiled(&graph, &objects).unwrap()
+        };
         (app, Some(layout))
     } else {
         (package_graph(&graph, &objects).unwrap(), None)
