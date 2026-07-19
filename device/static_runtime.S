@@ -228,6 +228,24 @@ ipu_stack_static_sample_worker_base:
 	br $m10
 	.size ipu_stack_static_sample_cycle, .-ipu_stack_static_sample_cycle
 
+	.section .text.ipu_stack_static_sample_cycle_next,"ax",@progbits
+	.globl ipu_stack_static_sample_cycle_next
+	.p2align 2
+	.type ipu_stack_static_sample_cycle_next,@function
+ipu_stack_static_sample_cycle_next:
+	.supervisor
+	.globl ipu_stack_static_sample_next_worker_base
+ipu_stack_static_sample_next_worker_base:
+	setzi $m5, WORKER_BASE_PLACEHOLDER
+	ld32 $m2, $m5, $m15, 0
+	add $m2, $m2, 4
+	st32 $m2, $m5, $m15, 0
+	setzi $m0, ipu_stack_static_sample_cycle_worker
+	runall $m0, $m5, 0
+	.long OPCODE_SYNC | SYNC_COMPUTE_SET
+	br $m10
+	.size ipu_stack_static_sample_cycle_next, .-ipu_stack_static_sample_cycle_next
+
 	.section .text.ipu_stack_static_sample_cycle_worker,"ax",@progbits
 	.p2align 2
 	.type ipu_stack_static_sample_cycle_worker,@function

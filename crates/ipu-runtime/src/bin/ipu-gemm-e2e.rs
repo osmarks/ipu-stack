@@ -1,8 +1,8 @@
 use ipu_compiler::{BlockedGemmConfig, BlockedGemmPlan, choose_gemm_row_block, plan_blocked_gemm};
 use ipu_elf::Toolchain;
 use ipu_runtime::{
-    BlockLayout, ExecutableGraph, HostRunOptions, allocator_memory_profile, block_binding,
-    block_coordinates, blocked_matrix, package_graph, package_graph_profiled, package_graph_timed,
+    BlockLayout, ExecutableGraph, HostRunOptions, ProfileGranularity, allocator_memory_profile,
+    block_binding, block_coordinates, blocked_matrix, package_graph, package_graph_profiled_with,
     run_host_with_inspector,
 };
 use std::fs;
@@ -123,11 +123,9 @@ fn main() {
             None,
         )
     } else if profile_output.is_some() {
-        let (app, layout) = if std::env::var_os("IPU_PROFILE_AGGREGATE").is_some() {
-            package_graph_timed(&graph, &objects).unwrap()
-        } else {
-            package_graph_profiled(&graph, &objects).unwrap()
-        };
+        let granularity = ProfileGranularity::from_environment().unwrap();
+        let (app, layout) = package_graph_profiled_with(&graph, &objects, granularity).unwrap();
+        info!(?granularity, "enabled cycle profiling");
         (app, Some(layout))
     } else {
         (package_graph(&graph, &objects).unwrap(), None)

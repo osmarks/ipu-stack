@@ -104,6 +104,33 @@ pub struct ProfileLayout {
     pub tiles: Vec<ProfileTileLayout>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileGranularity {
+    Graph,
+    Phase,
+    Step,
+}
+
+impl ProfileGranularity {
+    pub fn from_environment() -> Result<Self> {
+        if std::env::var_os("IPU_PROFILE_AGGREGATE").is_some() {
+            return Ok(Self::Graph);
+        }
+        match std::env::var("IPU_PROFILE_GRANULARITY")
+            .unwrap_or_else(|_| "phase".into())
+            .as_str()
+        {
+            "graph" => Ok(Self::Graph),
+            "phase" => Ok(Self::Phase),
+            "step" => Ok(Self::Step),
+            value => Err(format!(
+                "IPU_PROFILE_GRANULARITY must be graph, phase, or step; got {value:?}"
+            )
+            .into()),
+        }
+    }
+}
+
 impl ProfileLayout {
     pub fn decode(&self, output: &[u8], clock_hz: u64) -> Result<ipu_package::ProfileReport> {
         let profile = output
@@ -375,14 +402,22 @@ pub fn package_graph_profiled(
     graph: &ExecutableGraph,
     objects: &[Vec<u8>],
 ) -> Result<(Application, ProfileLayout)> {
-    package_graph_with_profile(graph, objects, false)
+    package_graph_with_profile(graph, objects, ProfileGranularity::Step)
 }
 
 pub fn package_graph_timed(
     graph: &ExecutableGraph,
     objects: &[Vec<u8>],
 ) -> Result<(Application, ProfileLayout)> {
-    package_graph_with_profile(graph, objects, true)
+    package_graph_with_profile(graph, objects, ProfileGranularity::Graph)
+}
+
+pub fn package_graph_profiled_with(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+    granularity: ProfileGranularity,
+) -> Result<(Application, ProfileLayout)> {
+    package_graph_with_profile(graph, objects, granularity)
 }
 
 fn profile_metadata(name: impl Into<String>, value: impl ToString) -> ipu_package::ProfileMetadata {
@@ -612,10 +647,84 @@ fn exchange_profile_step(
     }
 }
 
+fn lowered_step_phase(step: &ipu_compiler::LoweredTileStep) -> usize {
+    match step {
+        ipu_compiler::LoweredTileStep::Exchange { phase, .. }
+        | ipu_compiler::LoweredTileStep::IdleCompute { phase, .. } => *phase,
+        ipu_compiler::LoweredTileStep::Compute(command) => command.phase,
+    }
+}
+
+fn phase_profile_step(
+    schedule: &ipu_compiler::Schedule,
+    tile: u16,
+    local_index: usize,
+    phase: usize,
+) -> ipu_package::ProfileStep {
+    match &schedule.phases[phase] {
+        ipu_compiler::Phase::Exchange { .. } => {
+            let mut step = exchange_profile_step(schedule, tile, local_index, phase, 0);
+            step.metadata.retain(|entry| {
+                matches!(
+                    entry.name.as_str(),
+                    "send_count" | "receive_count" | "send_bytes" | "receive_bytes"
+                ) || entry.name.starts_with("next_")
+            });
+            step
+        }
+        ipu_compiler::Phase::Compute { op, commands } => {
+            let active_commands = commands
+                .iter()
+                .filter(|command| command.tile == tile)
+                .collect::<Vec<_>>();
+            let Some(command) = active_commands.first().copied() else {
+                return idle_compute_profile_step(schedule, local_index, *op, phase);
+            };
+            let kernel = command.specialization.operation.clone();
+            let operation = command
+                .metadata
+                .get("label")
+                .cloned()
+                .unwrap_or_else(|| kernel.clone());
+            let mut metadata = vec![
+                profile_metadata("role", &command.specialization.role),
+                profile_metadata(
+                    "shape",
+                    command
+                        .specialization
+                        .shape
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join("x"),
+                ),
+                profile_metadata("worker_count", command.specialization.worker_count),
+                profile_metadata("active_commands", active_commands.len()),
+            ];
+            metadata.extend(
+                command
+                    .metadata
+                    .iter()
+                    .filter(|(name, _)| name.as_str() != "label")
+                    .map(|(name, value)| profile_metadata(name, value)),
+            );
+            ipu_package::ProfileStep {
+                local_index: local_index as u32,
+                phase: phase as u32,
+                epoch: 0,
+                operation,
+                kind: ipu_package::ProfileStepKind::Compute,
+                kernel,
+                metadata,
+            }
+        }
+    }
+}
+
 fn package_graph_with_profile(
     graph: &ExecutableGraph,
     objects: &[Vec<u8>],
-    aggregate: bool,
+    granularity: ProfileGranularity,
 ) -> Result<(Application, ProfileLayout)> {
     let topology = Topology::c600();
     let programs = graph.schedule.lower_tile_programs(&topology)?;
@@ -644,16 +753,33 @@ fn package_graph_with_profile(
         .checked_add(1)
         .ok_or("profile tensor id overflow")?;
     for program in &programs {
-        let sample_count = if aggregate {
-            1
-        } else {
-            program
-                .steps
-                .len()
-                .checked_add(1)
-                .ok_or("profile sample count overflow")?
+        let phase_groups = program.steps.iter().enumerate().fold(
+            Vec::<(usize, usize)>::new(),
+            |mut groups, (index, step)| {
+                let phase = lowered_step_phase(step);
+                if groups.last().is_none_or(|(_, previous)| *previous != phase) {
+                    groups.push((index, phase));
+                }
+                groups
+            },
+        );
+        let interval_count = match granularity {
+            ProfileGranularity::Graph => 1,
+            ProfileGranularity::Phase => phase_groups.len(),
+            ProfileGranularity::Step => program.steps.len(),
         };
-        let sample_bytes = if aggregate { 8 } else { 4 };
+        let sample_count =
+            match granularity {
+                ProfileGranularity::Graph => 1,
+                ProfileGranularity::Phase | ProfileGranularity::Step => interval_count
+                    .checked_add(1)
+                    .ok_or("profile sample count overflow")?,
+            };
+        let sample_bytes = if granularity == ProfileGranularity::Graph {
+            8
+        } else {
+            4
+        };
         let size = u32::try_from(
             sample_count
                 .checked_mul(sample_bytes)
@@ -694,8 +820,8 @@ fn package_graph_with_profile(
                 live_until: usize::MAX,
                 kind: ipu_compiler::AllocationKind::Home,
             });
-        let steps = if aggregate {
-            vec![ipu_package::ProfileStep {
+        let steps = match granularity {
+            ProfileGranularity::Graph => vec![ipu_package::ProfileStep {
                 local_index: 0,
                 phase: 0,
                 epoch: 0,
@@ -703,9 +829,15 @@ fn package_graph_with_profile(
                 kind: ipu_package::ProfileStepKind::Compute,
                 kernel: String::new(),
                 metadata: Vec::new(),
-            }]
-        } else {
-            program
+            }],
+            ProfileGranularity::Phase => phase_groups
+                .iter()
+                .enumerate()
+                .map(|(local_index, (_, phase))| {
+                    phase_profile_step(&graph.schedule, program.tile, local_index, *phase)
+                })
+                .collect(),
+            ProfileGranularity::Step => program
                 .steps
                 .iter()
                 .enumerate()
@@ -726,13 +858,27 @@ fn package_graph_with_profile(
                         idle_compute_profile_step(&graph.schedule, local_index, *op, *phase)
                     }
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         };
-        profile_addresses.push(
-            (0..sample_count)
+        let addresses = match granularity {
+            ProfileGranularity::Graph => vec![address],
+            ProfileGranularity::Step => (0..sample_count)
                 .map(|index| address + index as u32 * sample_bytes as u32)
                 .collect(),
-        );
+            ProfileGranularity::Phase => {
+                let mut addresses = vec![0; program.steps.len() + 1];
+                addresses[0] = address;
+                for (group_index, &(start, _)) in phase_groups.iter().enumerate() {
+                    let end = phase_groups
+                        .get(group_index + 1)
+                        .map_or(program.steps.len(), |(next, _)| *next);
+                    debug_assert!(end > start);
+                    addresses[end] = address + (group_index as u32 + 1) * 4;
+                }
+                addresses
+            }
+        };
+        profile_addresses.push(addresses);
         slices.push(RegionSlice {
             tile: physical,
             tile_address: address,
@@ -743,7 +889,7 @@ fn package_graph_with_profile(
             physical_tile: physical,
             file_offset,
             steps,
-            boundary_samples: !aggregate,
+            boundary_samples: granularity != ProfileGranularity::Graph,
         });
         file_offset += size as usize;
     }
@@ -758,7 +904,7 @@ fn package_graph_with_profile(
         objects,
         &profile_addresses,
         Some(programs),
-        aggregate,
+        granularity == ProfileGranularity::Graph,
     )?;
     Ok((
         app,
@@ -995,6 +1141,7 @@ fn package_graph_impl(
     ];
     if !profile_addresses.is_empty() {
         retained_symbols.push(static_codegen::SAMPLE_CYCLE.into());
+        retained_symbols.push(static_codegen::SAMPLE_CYCLE_NEXT.into());
     }
     retained_symbols.extend(programs.iter().flat_map(|program| {
         program.steps.iter().filter_map(|step| match step {
@@ -1126,6 +1273,9 @@ fn package_graph_impl(
     let sample_worker_base_offset = (!profile_addresses.is_empty())
         .then(|| symbol_offset("ipu_stack_static_sample_worker_base"))
         .transpose()?;
+    let sample_next_worker_base_offset = (!profile_addresses.is_empty())
+        .then(|| symbol_offset("ipu_stack_static_sample_next_worker_base"))
+        .transpose()?;
     let completion_offset = symbol_offset("ipu_stack_static_completion_address")?;
     let initial: HashMap<_, _> = graph
         .initial_buffers
@@ -1173,6 +1323,9 @@ fn package_graph_impl(
         let worker_base = worker_sync_addresses[tile_index];
         patch_setzi_immediate(&mut support_code, worker_base_offset, worker_base)?;
         if let Some(offset) = sample_worker_base_offset {
+            patch_setzi_immediate(&mut support_code, offset, worker_base)?;
+        }
+        if let Some(offset) = sample_next_worker_base_offset {
             patch_setzi_immediate(&mut support_code, offset, worker_base)?;
         }
         patch_setzi_immediate(&mut support_code, completion_offset, completion_address)?;
@@ -2282,6 +2435,53 @@ mod tests {
                 .iter()
                 .any(|entry| entry.name == "output_block_row" && entry.value == "2")
         );
+    }
+
+    #[test]
+    fn phase_profile_groups_commands_and_keeps_compact_semantics() {
+        let command = |tile, label: &str| ipu_compiler::KernelCommand {
+            tile,
+            output: ipu_compiler::TensorId(3),
+            inputs: vec![ipu_compiler::TensorId(1), ipu_compiler::TensorId(2)],
+            arguments: vec![64],
+            specialization: ipu_compiler::SpecializationKey {
+                operation: "gelu_c16_to_a8".into(),
+                shape: vec![64, 64],
+                worker_count: 6,
+                role: "activation".into(),
+                alignment: 32,
+            },
+            metadata: BTreeMap::from([
+                ("label".into(), label.into()),
+                ("layer".into(), "3".into()),
+            ]),
+        };
+        let schedule = ipu_compiler::Schedule {
+            layouts: Vec::new(),
+            phases: vec![ipu_compiler::Phase::Compute {
+                op: ipu_compiler::OpId(9),
+                commands: vec![command(7, "layer 3 GeLU"), command(7, "second command")],
+            }],
+            allocations: Vec::new(),
+            tile_count: 8,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let step = phase_profile_step(&schedule, 7, 0, 0);
+
+        assert_eq!(step.operation, "layer 3 GeLU");
+        assert_eq!(step.kernel, "gelu_c16_to_a8");
+        assert!(
+            step.metadata
+                .iter()
+                .any(|entry| entry.name == "active_commands" && entry.value == "2")
+        );
+        assert!(
+            step.metadata
+                .iter()
+                .any(|entry| entry.name == "layer" && entry.value == "3")
+        );
+        assert!(!step.metadata.iter().any(|entry| entry.name == "label"));
     }
 
     #[test]

@@ -98,6 +98,7 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
     let mut allocations = Vec::new();
     let mut previous_output: Option<Vec<BlockPlacement>> = None;
     for (layer, mut plan) in layer_plans.into_iter().enumerate() {
+        annotate_layer(&mut plan.schedule, layer);
         if let Some(source) = previous_output.as_ref() {
             append_activation_transition(
                 &mut phases,
@@ -141,6 +142,20 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
         weights,
         output,
     })
+}
+
+fn annotate_layer(schedule: &mut Schedule, layer: usize) {
+    for phase in &mut schedule.phases {
+        let Phase::Compute { commands, .. } = phase else {
+            continue;
+        };
+        for command in commands {
+            command.metadata.insert("layer".into(), layer.to_string());
+            if let Some(label) = command.metadata.get_mut("label") {
+                *label = format!("MLP layer {layer}: {label}");
+            }
+        }
+    }
 }
 
 fn resident_end(plan: &crate::BlockedGemmPlan) -> Result<u32, CompileError> {

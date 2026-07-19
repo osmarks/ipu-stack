@@ -5,6 +5,35 @@
 shell tools do not need to decode the Cap'n Proto schema or load the HTML
 renderer.
 
+## Collection granularity
+
+Set `IPU_PROFILE_OUTPUT` to enable profiling and select one of three levels with
+`IPU_PROFILE_GRANULARITY`:
+
+| Value | Intervals on each tile | Intended use |
+| --- | --- | --- |
+| `graph` | One for the complete graph | Low-overhead benchmark timing |
+| `phase` | One per static exchange or compute phase | Coarse semantic analysis; default |
+| `step` | One per lowered exchange epoch or kernel call | Detailed code-generation diagnostics |
+
+`phase` retains operation and kernel names plus compact planner metadata such as
+layer, block, shape, and transfer-byte counts. `step` additionally retains
+individual operands, arguments, and transfer details. Every setting samples all
+tiles. Instrumentation itself runs workers and device barriers at interval
+boundaries, so compare performance using an unprofiled run. The legacy
+`IPU_PROFILE_AGGREGATE` variable selects `graph` for compatibility.
+
+For example, collect and render the coarse semantic view of the MLP:
+
+```sh
+IPU_PROFILE_GRANULARITY=phase \
+IPU_PROFILE_OUTPUT=profiles/mlp-512x2048x8-phase.capnp \
+  cargo run --release -q -p ipu-runtime --bin ipu-mlp-e2e
+cargo run --release -q -p ipu-cli -- profile-render \
+  profiles/mlp-512x2048x8-phase.capnp \
+  -o profiles/mlp-512x2048x8-phase.html
+```
+
 The default query attributes phase-critical time by kernel:
 
 ```sh

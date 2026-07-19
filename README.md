@@ -201,6 +201,20 @@ kernel and summarize the local sends and receives. `IPU_MEMORY_PROFILE_OUTPUT`
 writes a separate all-tile allocator report containing every tensor region,
 address, size, lifetime, allocation kind, and matching host binding name.
 
+`IPU_PROFILE_GRANULARITY` controls cycle instrumentation:
+
+- `graph` records one interval per tile for low-overhead whole-graph timing.
+- `phase` records one interval per static exchange or compute phase per tile.
+  This is the default and the recommended semantic overview: exchanges, GEMM,
+  GeLU, layout kernels, layers, and blocks remain distinct.
+- `step` records every lowered exchange epoch and kernel invocation per tile.
+  It provides the finest diagnostics and produces the largest reports.
+
+The older `IPU_PROFILE_AGGREGATE` setting is retained as an alias for `graph`.
+All modes instrument every tile; granularity changes time resolution, not tile
+coverage. Sampling inserts device work and barriers, so use an unprofiled run
+for final performance numbers.
+
 The GEMM verifier runs while the application remains loaded. On any mismatch it
 bulk-reads the owning tile's complete 64x64 C block through an inactive worker
 context and reports both SRAM-versus-D2H and SRAM-versus-expected difference
@@ -218,8 +232,8 @@ layout conversion. Diagonal validation weights keep host verification linear
 in activation size while the IPU still executes dense GEMMs.
 
 ```sh
-IPU_PROFILE_AGGREGATE=1 \
-IPU_PROFILE_OUTPUT=/tmp/mlp-512x2048x8.capnp \
+IPU_PROFILE_GRANULARITY=phase \
+IPU_PROFILE_OUTPUT=profiles/mlp-512x2048x8-phase.capnp \
   cargo run --release -p ipu-runtime --bin ipu-mlp-e2e
 ```
 

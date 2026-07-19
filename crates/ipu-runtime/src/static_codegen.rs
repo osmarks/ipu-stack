@@ -13,6 +13,7 @@ pub(crate) const COMPLETE: &str = "ipu_stack_static_complete";
 pub(crate) const HOST_RUN: &str = "ipu_stack_static_host_run";
 pub(crate) const REPEAT_CALL: &str = "ipu_stack_static_repeat_call";
 pub(crate) const SAMPLE_CYCLE: &str = "ipu_stack_static_sample_cycle";
+pub(crate) const SAMPLE_CYCLE_NEXT: &str = "ipu_stack_static_sample_cycle_next";
 
 #[derive(Clone, Copy)]
 pub(crate) struct HostPhaseCall {
@@ -61,7 +62,9 @@ pub(crate) fn emit(
     }
     if aggregate_profile {
         emit_cycle_sample(&mut code, symbols, profile_addresses[0])?;
-    } else if let Some(&address) = profile_addresses.first() {
+    } else if let Some(&address) = profile_addresses.first()
+        && address != 0
+    {
         emit_cycle_sample(&mut code, symbols, address)?;
     }
     let mut plan_index = 0usize;
@@ -107,8 +110,11 @@ pub(crate) fn emit(
             }
             LoweredTileStep::IdleCompute { .. } => {}
         }
-        if !aggregate_profile && let Some(&address) = profile_addresses.get(step_index + 1) {
-            emit_cycle_sample(&mut code, symbols, address)?;
+        if !aggregate_profile
+            && let Some(&address) = profile_addresses.get(step_index + 1)
+            && address != 0
+        {
+            code.call(symbol(symbols, SAMPLE_CYCLE_NEXT)?, 10)?;
         }
     }
     if plan_index != plan_addresses.len() {
