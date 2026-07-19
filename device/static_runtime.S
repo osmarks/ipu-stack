@@ -3,8 +3,9 @@
 
 	.set TILE_MUX_HOST, 0x600
 	.set TILE_MUX_EXCHANGE, 0x640
-	.set WORKER_BASE_START, 0x50000
+	.set WORKER_BASE_PLACEHOLDER, 0
 	.set WORKER_BASE_STRIDE, 0x30
+	.set HOST_RUN_DESCRIPTOR_BYTES, 7 * 4
 	.set SYNC_ALL, 7
 	.set SYNC_COMPUTE_SET, 2
 	.set SYNC_SUPERVISOR, 3
@@ -23,19 +24,21 @@ ipu_stack_static_start:
 	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
 	put 0xa7, $m15
-	setzi $m11, WORKER_BASE_START
+	.globl ipu_stack_static_worker_base
+ipu_stack_static_worker_base:
+	setzi $m11, WORKER_BASE_PLACEHOLDER
 	put 0x21, $m11
-	setzi $m11, WORKER_BASE_START + WORKER_BASE_STRIDE
+	add $m11, $m11, WORKER_BASE_STRIDE
 	put 0x22, $m11
-	setzi $m11, WORKER_BASE_START + 2 * WORKER_BASE_STRIDE
+	add $m11, $m11, WORKER_BASE_STRIDE
 	put 0x23, $m11
-	setzi $m11, WORKER_BASE_START + 3 * WORKER_BASE_STRIDE
+	add $m11, $m11, WORKER_BASE_STRIDE
 	put 0x24, $m11
-	setzi $m11, WORKER_BASE_START + 4 * WORKER_BASE_STRIDE
+	add $m11, $m11, WORKER_BASE_STRIDE
 	put 0x25, $m11
-	setzi $m11, WORKER_BASE_START + 5 * WORKER_BASE_STRIDE
+	add $m11, $m11, WORKER_BASE_STRIDE
 	put 0x26, $m11
-	setzi $m11, WORKER_BASE_START + 6 * WORKER_BASE_STRIDE
+	add $m11, $m11, WORKER_BASE_STRIDE
 	setzi $m0, ipu_stack_static_worker_init
 	runall $m0, $m15, 0
 	setzi $m0, TILE_MUX_HOST
@@ -55,8 +58,8 @@ ipu_stack_static_program_address:
 	.type ipu_stack_static_worker_init,@function
 ipu_stack_static_worker_init:
 	.worker
-	.globl ipu_stack_static_worker_sync_base
-ipu_stack_static_worker_sync_base:
+	.globl ipu_stack_static_worker_sync_context_base
+ipu_stack_static_worker_sync_context_base:
 	setzi $m0, 0
 	get $m1, 1
 	and $m1, $m1, 7
@@ -125,9 +128,21 @@ ipu_stack_static_repeat_call:
 ipu_stack_static_host_run:
 	.supervisor
 .Lhost_run_next:
-	ld32 $m0, $m3, $m15, 0
+	ld32 $m5, $m3, $m15, 6
+	brz $m5, .Lhost_run_call
+	ld32 $m6, $m3, $m15, 4
+	ld32 $m7, $m3, $m15, 5
+.Lhost_run_packet_copy:
+	ld32 $m0, $m7, $m15, 0
+	st32 $m0, $m6, $m15, 0
+	add $m7, $m7, 4
+	add $m6, $m6, 4
+	sub $m5, $m5, 1
+	brnz $m5, .Lhost_run_packet_copy
+.Lhost_run_call:
 	st32 $m2, $m4, $m15, 0
 	st32 $m3, $m4, $m15, 1
+	ld32 $m0, $m3, $m15, 0
 	setzi $m10, .Lhost_run_return
 	br $m0
 .Lhost_run_return:
@@ -145,7 +160,7 @@ ipu_stack_static_host_run:
 	sub $m5, $m5, 1
 	brnz $m5, .Lhost_run_copy
 .Lhost_run_advance:
-	add $m3, $m3, 16
+	add $m3, $m3, HOST_RUN_DESCRIPTOR_BYTES
 	sub $m2, $m2, 1
 	brnz $m2, .Lhost_run_next
 	br $m9
@@ -157,7 +172,9 @@ ipu_stack_static_host_run:
 	.type ipu_stack_static_sample_cycle,@function
 ipu_stack_static_sample_cycle:
 	.supervisor
-	setzi $m5, WORKER_BASE_START
+	.globl ipu_stack_static_sample_worker_base
+ipu_stack_static_sample_worker_base:
+	setzi $m5, WORKER_BASE_PLACEHOLDER
 	st32 $m2, $m5, $m15, 0
 	setzi $m0, ipu_stack_static_sample_cycle_worker
 	runall $m0, $m5, 0

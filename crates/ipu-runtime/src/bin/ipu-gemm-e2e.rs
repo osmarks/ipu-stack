@@ -486,6 +486,10 @@ fn expected_value(dimension: u16, row: u16, column: u16) -> f32 {
         .sum()
 }
 
+fn required_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,8 +513,4 @@ mod tests {
             );
         }
     }
-}
-
-fn required_env(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
 }
