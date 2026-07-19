@@ -29,6 +29,8 @@ pub use memory_profile::{MemoryProfile, MemoryRegion, TileMemory};
 pub enum ProfileStepKind {
     Exchange,
     Compute,
+    Synchronization,
+    Idle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,7 +73,7 @@ impl ProfileReport {
     pub fn write(&self, mut output: impl Write) -> Result<(), PackageError> {
         let mut message = message::Builder::new_default();
         let mut root = message.init_root::<profile_capnp::profile::Builder>();
-        root.set_schema_version(2);
+        root.set_schema_version(3);
         root.set_clock_hz(self.clock_hz);
         let mut tiles = root.reborrow().init_tiles(self.tiles.len() as u32);
         for (tile_index, tile) in self.tiles.iter().enumerate() {
@@ -92,6 +94,8 @@ impl ProfileReport {
                 step.set_kind(match sample.step.kind {
                     ProfileStepKind::Exchange => profile_capnp::StepKind::Exchange,
                     ProfileStepKind::Compute => profile_capnp::StepKind::Compute,
+                    ProfileStepKind::Synchronization => profile_capnp::StepKind::Synchronization,
+                    ProfileStepKind::Idle => profile_capnp::StepKind::Idle,
                 });
                 step.set_kernel(&sample.step.kernel);
                 let mut metadata = step
@@ -111,7 +115,7 @@ impl ProfileReport {
     pub fn read(mut input: impl Read) -> Result<Self, PackageError> {
         let message = serialize::read_message(&mut input, capnp_reader_options())?;
         let root = message.get_root::<profile_capnp::profile::Reader>()?;
-        if !matches!(root.get_schema_version(), 1 | 2) {
+        if !matches!(root.get_schema_version(), 1..=3) {
             return Err(PackageError::Invalid(format!(
                 "unsupported profile schema version {}",
                 root.get_schema_version()
@@ -135,6 +139,10 @@ impl ProfileReport {
                                 kind: match step.get_kind()? {
                                     profile_capnp::StepKind::Exchange => ProfileStepKind::Exchange,
                                     profile_capnp::StepKind::Compute => ProfileStepKind::Compute,
+                                    profile_capnp::StepKind::Synchronization => {
+                                        ProfileStepKind::Synchronization
+                                    }
+                                    profile_capnp::StepKind::Idle => ProfileStepKind::Idle,
                                 },
                                 kernel: step.get_kernel()?.to_str()?.into(),
                                 metadata: step
@@ -1132,22 +1140,31 @@ mod tests {
             clock_hz: 1_500_000_000,
             tiles: vec![TileProfile {
                 physical_tile: 17,
-                samples: vec![CycleSample {
+                samples: [
+                    ProfileStepKind::Exchange,
+                    ProfileStepKind::Compute,
+                    ProfileStepKind::Synchronization,
+                    ProfileStepKind::Idle,
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, kind)| CycleSample {
                     step: ProfileStep {
-                        local_index: 3,
+                        local_index: index as u32,
                         phase: 5,
                         epoch: 8,
                         operation: "accumulate".into(),
-                        kind: ProfileStepKind::Compute,
+                        kind,
                         kernel: "gemm_f32_accumulate".into(),
                         metadata: vec![ProfileMetadata {
                             name: "innerBlock".into(),
                             value: "8".into(),
                         }],
                     },
-                    start_cycle: u32::MAX - 10,
-                    end_cycle: 7,
-                }],
+                    start_cycle: (u32::MAX - 10).wrapping_add(index as u32),
+                    end_cycle: 7 + index as u32,
+                })
+                .collect(),
             }],
         };
         let mut encoded = Vec::new();

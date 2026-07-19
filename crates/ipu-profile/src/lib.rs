@@ -27,6 +27,8 @@ pub enum SortBy {
 pub enum StepKind {
     Exchange,
     Compute,
+    Synchronization,
+    Idle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -325,6 +327,8 @@ fn kind_of(sample: &CycleSample) -> StepKind {
     match sample.step.kind {
         ProfileStepKind::Exchange => StepKind::Exchange,
         ProfileStepKind::Compute => StepKind::Compute,
+        ProfileStepKind::Synchronization => StepKind::Synchronization,
+        ProfileStepKind::Idle => StepKind::Idle,
     }
 }
 
@@ -332,6 +336,8 @@ fn kind_name(sample: &CycleSample) -> &'static str {
     match kind_of(sample) {
         StepKind::Exchange => "exchange",
         StepKind::Compute => "compute",
+        StepKind::Synchronization => "synchronization",
+        StepKind::Idle => "idle",
     }
 }
 

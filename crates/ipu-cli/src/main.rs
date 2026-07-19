@@ -49,6 +49,8 @@ enum ProfileSortArgument {
 enum ProfileKindArgument {
     Compute,
     Exchange,
+    Synchronization,
+    Idle,
 }
 
 #[derive(Subcommand)]
@@ -476,6 +478,8 @@ fn main() -> Result<()> {
                     kind: kind.map(|kind| match kind {
                         ProfileKindArgument::Compute => StepKind::Compute,
                         ProfileKindArgument::Exchange => StepKind::Exchange,
+                        ProfileKindArgument::Synchronization => StepKind::Synchronization,
+                        ProfileKindArgument::Idle => StepKind::Idle,
                     }),
                     kernel,
                     operation_contains,
@@ -1090,6 +1094,8 @@ fn render_profile_html(report: &ProfileReport) -> Result<String> {
                         kind: match sample.step.kind {
                             ProfileStepKind::Exchange => 0,
                             ProfileStepKind::Compute => 1,
+                            ProfileStepKind::Synchronization => 2,
+                            ProfileStepKind::Idle => 3,
                         },
                     };
                     let step = *step_indices.entry(step).or_insert_with(|| {

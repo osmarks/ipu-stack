@@ -271,6 +271,16 @@ fn blocked_gemm_with_cycle_profile_works() {
             .iter()
             .any(|sample| sample.step.kind == ipu_package::ProfileStepKind::Compute)
     }));
+    assert!(profile.tiles.iter().any(|tile| {
+        tile.samples
+            .iter()
+            .any(|sample| sample.step.kind == ipu_package::ProfileStepKind::Synchronization)
+    }));
+    assert!(profile.tiles.iter().any(|tile| {
+        tile.samples
+            .iter()
+            .any(|sample| sample.step.kind == ipu_package::ProfileStepKind::Idle)
+    }));
     fs::remove_file(path).unwrap();
 }
 

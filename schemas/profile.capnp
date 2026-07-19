@@ -3,6 +3,8 @@
 enum StepKind {
   exchange @0;
   compute @1;
+  synchronization @2;
+  idle @3;
 }
 
 struct ProfileStep {

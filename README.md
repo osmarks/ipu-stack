@@ -204,16 +204,22 @@ address, size, lifetime, allocation kind, and matching host binding name.
 `IPU_PROFILE_GRANULARITY` controls cycle instrumentation:
 
 - `graph` records one interval per tile for low-overhead whole-graph timing.
-- `phase` records one interval per static exchange or compute phase per tile.
-  This is the default and the recommended semantic overview: exchanges, GEMM,
-  GeLU, layout kernels, layers, and blocks remain distinct.
-- `step` records every lowered exchange epoch and kernel invocation per tile.
+- `phase` records each static compute phase and separates every exchange epoch
+  into synchronization wait and active exchange intervals. This is the default
+  and the recommended semantic overview: exchanges, GEMM, GeLU, layout kernels,
+  layers, and blocks remain distinct.
+- `step` additionally preserves every lowered kernel invocation per tile.
   It provides the finest diagnostics and produces the largest reports.
 
 The older `IPU_PROFILE_AGGREGATE` setting is retained as an alias for `graph`.
 All modes instrument every tile; granularity changes time resolution, not tile
 coverage. Sampling inserts device work and barriers, so use an unprofiled run
 for final performance numbers.
+
+Profile kinds are `synchronization`, `exchange`, `compute`, and `idle`. An idle
+sample means that the tile has no kernel command in that compute phase; the
+following synchronization sample accounts for time spent waiting for other
+tiles to finish.
 
 The GEMM verifier runs while the application remains loaded. On any mismatch it
 bulk-reads the owning tile's complete 64x64 C block through an inactive worker

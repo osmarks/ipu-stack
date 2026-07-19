@@ -13,8 +13,8 @@ Set `IPU_PROFILE_OUTPUT` to enable profiling and select one of three levels with
 | Value | Intervals on each tile | Intended use |
 | --- | --- | --- |
 | `graph` | One for the complete graph | Low-overhead benchmark timing |
-| `phase` | One per static exchange or compute phase | Coarse semantic analysis; default |
-| `step` | One per lowered exchange epoch or kernel call | Detailed code-generation diagnostics |
+| `phase` | Compute phases plus separate sync/exchange intervals | Coarse semantic analysis; default |
+| `step` | Sync/exchange intervals plus every lowered kernel call | Detailed code-generation diagnostics |
 
 `phase` retains operation and kernel names plus compact planner metadata such as
 layer, block, shape, and transfer-byte counts. `step` additionally retains
@@ -22,6 +22,13 @@ individual operands, arguments, and transfer details. Every setting samples all
 tiles. Instrumentation itself runs workers and device barriers at interval
 boundaries, so compare performance using an unprofiled run. The legacy
 `IPU_PROFILE_AGGREGATE` variable selects `graph` for compatibility.
+
+Exchange epochs produce a `synchronization` interval ending immediately after
+the supervisor sync instruction returns, followed by an `exchange` interval
+covering the worker barrier and exchange plan. Compute phases use `compute` on
+tiles with a scheduled kernel and `idle` on the others. Idle tiles normally
+reach the following synchronization early, so their wait for active compute
+tiles is attributed to that synchronization rather than to idle compute.
 
 For example, collect and render the coarse semantic view of the MLP:
 

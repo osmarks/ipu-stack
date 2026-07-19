@@ -28,22 +28,26 @@ pub(crate) struct HostCode<'a> {
     pub run_state: u32,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ProfileCode {
+    pub initial: u32,
+    pub after_sync: Vec<bool>,
+    pub after_step: Vec<bool>,
+    pub aggregate_end: Option<u32>,
+}
+
 pub(crate) fn emit(
     program: &LoweredTileProgram,
     symbols: &BTreeMap<String, u32>,
     plan_addresses: &[u32],
     host: HostCode<'_>,
-    profile_addresses: &[u32],
-    aggregate_profile: bool,
+    profile: Option<&ProfileCode>,
 ) -> Result<Vec<u8>> {
-    if aggregate_profile && profile_addresses.len() != 1 {
-        return Err("aggregate profile requires one address".into());
-    }
-    if !aggregate_profile
-        && !profile_addresses.is_empty()
-        && profile_addresses.len() != program.steps.len() + 1
+    if let Some(profile) = profile
+        && (profile.after_sync.len() != program.steps.len()
+            || profile.after_step.len() != program.steps.len())
     {
-        return Err("profile address count differs from tile step count".into());
+        return Err("profile boundary count differs from tile step count".into());
     }
     let mut code = TileCode::new();
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
@@ -60,18 +64,19 @@ pub(crate) fn emit(
         code.setzi(8, 1)?;
         code.put_special(INCOMING_DCOUNT, 8)?;
     }
-    if aggregate_profile {
-        emit_cycle_sample(&mut code, symbols, profile_addresses[0])?;
-    } else if let Some(&address) = profile_addresses.first()
-        && address != 0
-    {
-        emit_cycle_sample(&mut code, symbols, address)?;
+    if let Some(profile) = profile {
+        emit_cycle_sample(&mut code, symbols, profile.initial)?;
     }
     let mut plan_index = 0usize;
     for (step_index, step) in program.steps.iter().enumerate() {
         match step {
             LoweredTileStep::Exchange { row, .. } => {
                 code.instruction(ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
+                emit_next_cycle_sample(
+                    &mut code,
+                    symbols,
+                    profile.and_then(|profile| profile.after_sync.get(step_index).copied()),
+                )?;
                 let active = row.first() != Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION);
                 if active {
                     code.call(worker_barrier, 7)?;
@@ -110,22 +115,32 @@ pub(crate) fn emit(
             }
             LoweredTileStep::IdleCompute { .. } => {}
         }
-        if !aggregate_profile
-            && let Some(&address) = profile_addresses.get(step_index + 1)
-            && address != 0
-        {
-            code.call(symbol(symbols, SAMPLE_CYCLE_NEXT)?, 10)?;
-        }
+        emit_next_cycle_sample(
+            &mut code,
+            symbols,
+            profile.and_then(|profile| profile.after_step.get(step_index).copied()),
+        )?;
     }
     if plan_index != plan_addresses.len() {
         return Err("unused exchange plan address".into());
     }
-    if aggregate_profile {
-        emit_cycle_sample(&mut code, symbols, profile_addresses[0] + 4)?;
+    if let Some(address) = profile.and_then(|profile| profile.aggregate_end) {
+        emit_cycle_sample(&mut code, symbols, address)?;
     }
     emit_host_phases(&mut code, symbols, host.outputs, host.run_state)?;
     code.jump(symbol(symbols, COMPLETE)?)?;
     Ok(code.words.into_iter().flat_map(u32::to_le_bytes).collect())
+}
+
+fn emit_next_cycle_sample(
+    code: &mut TileCode,
+    symbols: &BTreeMap<String, u32>,
+    enabled: Option<bool>,
+) -> Result<()> {
+    if enabled == Some(true) {
+        code.call(symbol(symbols, SAMPLE_CYCLE_NEXT)?, 10)?;
+    }
+    Ok(())
 }
 
 fn emit_cycle_sample(

@@ -14,6 +14,8 @@
   --line: #000000;
   --exchange: #006b3f;
   --compute: #b00020;
+  --synchronization: #8a6500;
+  --idle: #777777;
   --selected: #0057ff;
 }
 * { box-sizing: border-box; }
@@ -130,7 +132,7 @@ canvas {
   </div>
   <div class="controls">
     <label>Search <input id="search" type="search" placeholder="operation"></label>
-    <label>Kind <select id="kind"><option value="all">all</option><option value="compute">compute</option><option value="exchange">exchange</option></select></label>
+    <label>Kind <select id="kind"><option value="all">all</option><option value="compute">compute</option><option value="exchange">exchange</option><option value="synchronization">synchronization</option><option value="idle">idle</option></select></label>
     <button id="zoomOut" type="button" title="Zoom out (-)">-</button>
     <button id="zoomIn" type="button" title="Zoom in (+ or =)">+</button>
     <button id="reset" type="button" title="Reset zoom and selection (0 or Esc); undo zoom (right click)">reset</button>
@@ -162,14 +164,21 @@ const metadataSets = DATA.metadataSets.map(([start, count]) => {
   }
   return entries;
 });
-const steps = DATA.steps.map(([phase, epoch, operation, kernel, metadata, kind]) => ({
-  phase,
-  epoch,
-  operation: DATA.strings[operation],
-  kernel: DATA.strings[kernel],
-  metadata: metadataSets[metadata],
-  kind: kind ? "compute" : "exchange",
-}));
+const kindNames = ["exchange", "compute", "synchronization", "idle"];
+const steps = DATA.steps.map(([phase, epoch, operation, kernel, metadata, kind]) => {
+  const entries = metadataSets[metadata];
+  const reportedKind = kindNames[kind];
+  const inactiveCompute = reportedKind === "compute"
+    && entries.some(entry => entry.name === "active" && entry.value === "false");
+  return {
+    phase,
+    epoch,
+    operation: DATA.strings[operation],
+    kernel: DATA.strings[kernel],
+    metadata: entries,
+    kind: inactiveCompute ? "idle" : reportedKind,
+  };
+});
 for (const tile of DATA.tiles) {
   tile.samples = tile.samples.map(([step, offset, duration]) => ({
     ...steps[step],
@@ -183,8 +192,8 @@ const overview = document.getElementById("overview");
 const timeline = document.getElementById("timeline");
 const tooltip = document.getElementById("tooltip");
 const details = document.getElementById("details");
-const colors = { exchange: "#006b3f", compute: "#b00020" };
-const textColor = { exchange: "#ffffff", compute: "#ffffff" };
+const colors = { exchange: "#006b3f", compute: "#b00020", synchronization: "#8a6500", idle: "#777777" };
+const textColor = { exchange: "#ffffff", compute: "#ffffff", synchronization: "#ffffff", idle: "#ffffff" };
 const tiles = DATA.tiles.slice().sort((a, b) => a.physicalTile - b.physicalTile);
 let timelineGeom = null;
 let flameHits = [];
@@ -421,39 +430,33 @@ function drawOverview() {
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, width, height);
-  const computeDelta = new Int32Array(width + 1);
-  const exchangeDelta = new Int32Array(width + 1);
+  const kinds = ["compute", "exchange", "synchronization", "idle"];
+  const deltas = Object.fromEntries(kinds.map(kind => [kind, new Int32Array(width + 1)]));
   const scale = width / maxEnd;
   for (const tile of tiles) {
     for (const sample of tile.samples) {
       const start = Math.max(0, Math.floor(sample.offset * scale));
       const end = Math.min(width - 1, Math.ceil((sample.offset + sample.duration) * scale));
-      const target = sample.kind === "compute" ? computeDelta : exchangeDelta;
+      const target = deltas[sample.kind];
       target[start]++;
       target[end + 1]--;
     }
   }
   const denominator = Math.max(1, tiles.length);
-  let computeActive = 0;
-  let exchangeActive = 0;
+  const active = Object.fromEntries(kinds.map(kind => [kind, 0]));
   for (let x = 0; x < width; x++) {
-    computeActive += computeDelta[x];
-    exchangeActive += exchangeDelta[x];
-    const computeH = Math.round((height - 2) * computeActive / denominator);
-    const exchangeH = Math.round((height - 2) * exchangeActive / denominator);
-    const totalH = Math.min(height - 2, computeH + exchangeH);
+    for (const kind of kinds) active[kind] += deltas[kind][x];
+    const heights = Object.fromEntries(kinds.map(kind => [kind, Math.round((height - 2) * active[kind] / denominator)]));
+    const totalH = Math.min(height - 2, kinds.reduce((sum, kind) => sum + heights[kind], 0));
     let y = height - 1;
-    if (computeH > 0) {
-      ctx.fillStyle = colors.compute;
-      const h = Math.min(computeH, totalH);
+    let remaining = totalH;
+    for (const kind of kinds) {
+      const h = Math.min(heights[kind], remaining);
+      if (!h) continue;
+      ctx.fillStyle = colors[kind];
       y -= h;
       ctx.fillRect(x, y, 1, h);
-    }
-    if (exchangeH > 0 && totalH > computeH) {
-      ctx.fillStyle = colors.exchange;
-      const h = totalH - Math.min(computeH, totalH);
-      y -= h;
-      ctx.fillRect(x, y, 1, h);
+      remaining -= h;
     }
   }
   const viewStart = Math.max(0, Math.min(state.viewStart, maxEnd));
@@ -551,8 +554,7 @@ function drawDetails() {
   ];
   if (state.time !== null) {
     let active = 0;
-    let compute = 0;
-    let exchange = 0;
+    const activeKinds = { compute: 0, exchange: 0, synchronization: 0, idle: 0 };
     const byOperation = new Map();
     const byKernel = new Map();
     const byMetadata = new Map();
@@ -560,8 +562,7 @@ function drawDetails() {
       for (const sample of tile.samples) {
         if (!activeAt(sample, state.time)) continue;
         active++;
-        if (sample.kind === "compute") compute++;
-        if (sample.kind === "exchange") exchange++;
+        activeKinds[sample.kind]++;
         byOperation.set(sample.operation, (byOperation.get(sample.operation) || 0) + 1);
         if (sample.kernel) byKernel.set(sample.kernel, (byKernel.get(sample.kernel) || 0) + 1);
         for (const entry of metadataEntries(sample)) {
@@ -587,7 +588,7 @@ function drawDetails() {
     items.unshift(
       ["Offset", formatOffset(state.time)],
       ["Active tiles", active],
-      ["Active kinds", `compute ${compute}, exchange ${exchange}`],
+      ["Active kinds", Object.entries(activeKinds).map(([kind, count]) => `${kind} ${count}`).join(", ")],
       ["Top active ops", topOperations.length ? { links: topOperations } : "none"],
       ["Top kernels", topKernels.length ? { links: topKernels } : "none"],
       ["Top metadata", top(byMetadata) || "none"]
