@@ -151,31 +151,31 @@ second disjoint matching. Default cases sample 1, 15, 16, 17, 52, 64, 65, 127,
 ## Blocked GEMM and profiling
 
 `ipu-gemm-e2e` builds and runs a square FP32 GEMM whose matrices originate on
-the host. Matrices use 64x64 blocks. Each output tile owns one A block, one B
-block, and one C block; each K iteration multicasts the A row blocks, preserves
-the received A block, multicasts the B column blocks through the reused receive
-window, and invokes a six-worker specialized GEMM kernel. A 2048 square GEMM
-uses 1,024 output tiles and 64 device exchange launches. Exact output checking
-has passed on hardware at dimensions 64, 128, 1,024, 1,600, and 2,048.
+the host. The planner selects row sharding from the matrix shape and tile count;
+the K and N block dimensions are separately configurable. Each K iteration
+multicasts A row blocks and B column blocks before invoking a six-worker
+specialized GEMM kernel. Exact output checking has passed on hardware through
+dimension 4,096. Use release builds for large graphs: most construction time is
+compiler/runtime code rather than Cap'n Proto I/O.
 
 ```sh
-IPU_GEMM_DIMENSION=2048 cargo run -p ipu-runtime --bin ipu-gemm-e2e
+IPU_GEMM_DIMENSION=2048 cargo run --release -p ipu-runtime --bin ipu-gemm-e2e
 
 IPU_GEMM_DIMENSION=128 \
 IPU_PROFILE_OUTPUT=/tmp/gemm-profile.capnp \
-  cargo run -p ipu-runtime --bin ipu-gemm-e2e
+  cargo run --release -p ipu-runtime --bin ipu-gemm-e2e
 capnp decode schemas/profile.capnp Profile </tmp/gemm-profile.capnp
-cargo run -p ipu-cli -- profile-render /tmp/gemm-profile.capnp -o /tmp/gemm-profile.html
+cargo run --release -p ipu-cli -- profile-render /tmp/gemm-profile.capnp -o /tmp/gemm-profile.html
 
 IPU_MEMORY_PROFILE_OUTPUT=/tmp/gemm-memory.capnp \
   IPU_GEMM_PACKAGE_ONLY=1 \
-  cargo run -p ipu-runtime --bin ipu-gemm-e2e
-cargo run -p ipu-cli -- memory-inspect /tmp/gemm-memory.capnp --tile 0
+  cargo run --release -p ipu-runtime --bin ipu-gemm-e2e
+cargo run --release -p ipu-cli -- memory-inspect /tmp/gemm-memory.capnp --tile 0
 
 # Compare one completed output block directly in tile SRAM against D2H.
 IPU_GEMM_LOAD_PACKAGE=/tmp/gemm.ipuexe \
 IPU_GEMM_SRAM_CHECK_BLOCK=15,24 \
-  cargo run -p ipu-runtime --bin ipu-gemm-e2e
+  cargo run --release -p ipu-runtime --bin ipu-gemm-e2e
 ```
 
 Profiling is optional and absent from an ordinary package. A profiled package

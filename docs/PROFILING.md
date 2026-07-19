@@ -8,31 +8,31 @@ renderer.
 The default query attributes phase-critical time by kernel:
 
 ```sh
-cargo run -q -p ipu-cli -- profile-query profile.capnp
+cargo run --release -q -p ipu-cli -- profile-query profile.capnp
 ```
 
 Useful drilldowns include:
 
 ```sh
 # Scheduled steps within the GEMM accumulation kernel.
-cargo run -q -p ipu-cli -- profile-query profile.capnp \
+cargo run --release -q -p ipu-cli -- profile-query profile.capnp \
   --kernel gemm_f32_accumulate --group-by phase --limit 20
 
 # Operations active at one normalized graph offset, with two complete samples.
-cargo run -q -p ipu-cli -- profile-query profile.capnp \
+cargo run --release -q -p ipu-cli -- profile-query profile.capnp \
   --at 1000000 --group-by operation --samples 2 --json
 
 # The slowest samples for one block coordinate.
-cargo run -q -p ipu-cli -- profile-query profile.capnp \
+cargo run --release -q -p ipu-cli -- profile-query profile.capnp \
   --kind compute --metadata output_block_row=12 --metadata inner_block=31 \
   --group-by tile --sort-by maximum-cycles --samples 8 --json
 
 # Exchange phases preceding one kernel.
-cargo run -q -p ipu-cli -- profile-query profile.capnp \
+cargo run --release -q -p ipu-cli -- profile-query profile.capnp \
   --kind exchange --metadata next_kernel=gemm_f32_accumulate --group-by phase
 
 # Compare accumulation cost by inner block number.
-cargo run -q -p ipu-cli -- profile-query profile.capnp \
+cargo run --release -q -p ipu-cli -- profile-query profile.capnp \
   --kernel gemm_f32_accumulate --group-by metadata --metadata-key inner_block
 ```
 
