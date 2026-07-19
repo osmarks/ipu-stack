@@ -212,6 +212,9 @@ fn allocate_host_packet_addresses(
             ));
         }
     }
+    for ranges in occupied.values_mut() {
+        normalize_ranges(ranges);
+    }
 
     let mut addresses = Vec::with_capacity(transfers.len());
     for (transfer, &size) in transfers.iter().zip(sizes) {
@@ -235,45 +238,87 @@ fn allocate_host_packet_addresses(
             } else {
                 (candidate + 8, end)
             };
-            if range_is_free(&occupied, hierarchy.xreq_physical_tile, owner_range)
-                && range_is_free(&occupied, transfer.physical_tile, target_range)
-            {
+            let owner_conflict =
+                first_range_conflict(&occupied, hierarchy.xreq_physical_tile, owner_range);
+            let target_conflict =
+                first_range_conflict(&occupied, transfer.physical_tile, target_range);
+            if owner_conflict.is_none() && target_conflict.is_none() {
                 break candidate;
             }
-            candidate = candidate
-                .checked_add(8)
-                .ok_or("host packet address overflow")?;
+            let target_offset = target_range.0 - candidate;
+            let after_owner = owner_conflict.map_or(candidate, |(_, end)| align_up(end, 8));
+            let after_target = target_conflict.map_or(candidate, |(_, end)| {
+                align_up(end.saturating_sub(target_offset), 8)
+            });
+            candidate = after_owner.max(after_target);
         };
         let end = address + size;
-        occupied
-            .entry(hierarchy.xreq_physical_tile)
-            .or_default()
-            .push((address, address + 8));
+        insert_range(
+            occupied.entry(hierarchy.xreq_physical_tile).or_default(),
+            (address, address + 8),
+        );
         let target_range = if hierarchy.xreq_physical_tile == transfer.physical_tile {
             (address, end)
         } else {
             (address + 8, end)
         };
-        occupied
-            .entry(transfer.physical_tile)
-            .or_default()
-            .push(target_range);
+        insert_range(
+            occupied.entry(transfer.physical_tile).or_default(),
+            target_range,
+        );
         addresses.push(address);
     }
     Ok(addresses)
 }
 
-fn range_is_free(
+fn first_range_conflict(
     occupied: &HashMap<u16, Vec<(u32, u32)>>,
     physical_tile: u16,
     candidate: (u32, u32),
-) -> bool {
-    candidate.0 == candidate.1
-        || occupied.get(&physical_tile).is_none_or(|ranges| {
-            ranges
-                .iter()
-                .all(|&(start, end)| !ranges_overlap(candidate.0, candidate.1, start, end))
-        })
+) -> Option<(u32, u32)> {
+    if candidate.0 == candidate.1 {
+        return None;
+    }
+    let ranges = occupied.get(&physical_tile)?;
+    let index = ranges.partition_point(|&(_, end)| end <= candidate.0);
+    ranges
+        .get(index)
+        .copied()
+        .filter(|&(start, _)| start < candidate.1)
+}
+
+fn normalize_ranges(ranges: &mut Vec<(u32, u32)>) {
+    ranges.retain(|&(start, end)| start < end);
+    ranges.sort_unstable();
+    let mut write = 0;
+    for read in 0..ranges.len() {
+        let range = ranges[read];
+        if write != 0 && range.0 <= ranges[write - 1].1 {
+            ranges[write - 1].1 = ranges[write - 1].1.max(range.1);
+        } else {
+            ranges[write] = range;
+            write += 1;
+        }
+    }
+    ranges.truncate(write);
+}
+
+fn insert_range(ranges: &mut Vec<(u32, u32)>, range: (u32, u32)) {
+    if range.0 == range.1 {
+        return;
+    }
+    let start = ranges.partition_point(|&(_, end)| end < range.0);
+    let mut end = start;
+    let mut merged = range;
+    while let Some(&(next_start, next_end)) = ranges.get(end) {
+        if next_start > merged.1 {
+            break;
+        }
+        merged.0 = merged.0.min(next_start);
+        merged.1 = merged.1.max(next_end);
+        end += 1;
+    }
+    ranges.splice(start..end, [merged]);
 }
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -1773,6 +1818,77 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ipu_compiler::{Allocation, AllocationKind, TensorId};
+
+    fn allocate_host_packet_addresses_linear(
+        schedule: &Schedule,
+        transfers: &[StaticHostTransfer],
+        sizes: &[usize],
+    ) -> Result<Vec<u32>> {
+        let topology = Topology::c600();
+        let limit = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES;
+        let mut occupied = HashMap::<u16, Vec<(u32, u32)>>::new();
+        for allocation in &schedule.allocations {
+            occupied
+                .entry(topology.physical(allocation.tile)?)
+                .or_default()
+                .push((allocation.address, allocation.address + allocation.size));
+        }
+        for transfer in transfers {
+            if transfer.copy_destination.is_some() {
+                occupied.entry(transfer.physical_tile).or_default().push((
+                    transfer.tile_address,
+                    transfer.tile_address + transfer.bytes,
+                ));
+            }
+        }
+
+        let mut addresses = Vec::with_capacity(transfers.len());
+        for (transfer, &size) in transfers.iter().zip(sizes) {
+            let size = u32::try_from(size)?;
+            let hierarchy = ipu_exchange::host_hierarchy(transfer.physical_tile)?;
+            let mut candidate = align_up(HOST_PACKET_SEARCH_BASE, 8);
+            let address = loop {
+                let end = candidate + size;
+                if end > limit {
+                    return Err("reference host packet allocation failed".into());
+                }
+                let owner_range = (candidate, candidate + 8);
+                let target_range = if hierarchy.xreq_physical_tile == transfer.physical_tile {
+                    (candidate, end)
+                } else {
+                    (candidate + 8, end)
+                };
+                let free = |tile, range: (u32, u32)| {
+                    occupied.get(&tile).is_none_or(|ranges| {
+                        ranges
+                            .iter()
+                            .all(|&(start, end)| !ranges_overlap(range.0, range.1, start, end))
+                    })
+                };
+                if free(hierarchy.xreq_physical_tile, owner_range)
+                    && free(transfer.physical_tile, target_range)
+                {
+                    break candidate;
+                }
+                candidate += 8;
+            };
+            let end = address + size;
+            occupied
+                .entry(hierarchy.xreq_physical_tile)
+                .or_default()
+                .push((address, address + 8));
+            occupied.entry(transfer.physical_tile).or_default().push(
+                if hierarchy.xreq_physical_tile == transfer.physical_tile {
+                    (address, end)
+                } else {
+                    (address + 8, end)
+                },
+            );
+            addresses.push(address);
+        }
+        Ok(addresses)
+    }
 
     #[test]
     fn host_phase_count_defers_the_last_rendezvous() {
@@ -1818,5 +1934,55 @@ mod tests {
                 ..ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES)
                 .contains(&address)
         }));
+    }
+
+    #[test]
+    fn host_packet_allocator_matches_linear_first_fit() {
+        let mut rng = fastrand::Rng::with_seed(0xc600_5eed);
+        for _ in 0..64 {
+            let allocations = (0..rng.usize(0..48))
+                .map(|index| Allocation {
+                    tensor: TensorId(index),
+                    tile: rng.u16(0..128),
+                    address: HOST_PACKET_SEARCH_BASE + 8 * rng.u32(0..512),
+                    size: 8 * rng.u32(1..32),
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                })
+                .collect();
+            let schedule = Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations,
+                tile_count: 1472,
+                peak_sram: BTreeMap::new(),
+            };
+            let transfers = (0..rng.usize(1..96))
+                .map(|_| StaticHostTransfer {
+                    direction: if rng.bool() {
+                        HostDirection::ToTile
+                    } else {
+                        HostDirection::ToHost
+                    },
+                    physical_tile: rng.u16(0..128),
+                    tile_address: HOST_PACKET_SEARCH_BASE + 8 * rng.u32(512..768),
+                    host_offset: HOST_DATA_START,
+                    bytes: 8 * rng.u32(1..64),
+                    copy_destination: rng
+                        .bool()
+                        .then_some(ipu_exchange::EXCHANGE_WINDOW_BASE + 8 * rng.u32(768..1024)),
+                })
+                .collect::<Vec<_>>();
+            let sizes = transfers
+                .iter()
+                .map(|_| 8 * rng.usize(2..65))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                allocate_host_packet_addresses(&schedule, &transfers, &sizes).unwrap(),
+                allocate_host_packet_addresses_linear(&schedule, &transfers, &sizes).unwrap()
+            );
+        }
     }
 }
