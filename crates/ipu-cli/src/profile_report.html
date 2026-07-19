@@ -93,6 +93,15 @@ canvas {
 }
 .detail b { display: block; font-size: 11px; color: var(--muted); font-weight: 600; }
 .detail span { font-variant-numeric: tabular-nums; }
+.detail-links { display: flex; flex-wrap: wrap; gap: 2px 8px; }
+.detail-link {
+  height: auto;
+  border: 0;
+  padding: 0;
+  color: var(--selected);
+  text-decoration: underline;
+  text-align: left;
+}
 #tooltip {
   position: fixed;
   max-width: 360px;
@@ -244,27 +253,31 @@ function sameFocus(a, b) {
 function focusLabel(focus) {
   if (!focus) return "profile";
   if (focus.metadata) return focus.metadata;
-  if (focus.kernel) return focus.kernel;
   if (focus.phase !== undefined) return `${focus.operation} phase ${focus.phase} epoch ${focus.epoch}`;
   if (focus.operation) return focus.operation;
+  if (focus.kernel) return focus.kernel;
   return focus.kind || "profile";
 }
 function flamePath(sample) {
-  const phase = { kind: sample.kind, operation: sample.operation, phase: sample.phase, epoch: sample.epoch };
-  const levels = [
-    { kind: sample.kind },
-    { kind: sample.kind, operation: sample.operation },
-    phase,
-  ];
-  if (sample.kernel) levels.push({ ...phase, kernel: sample.kernel });
-  if (state.focus && (state.focus.phase !== undefined || state.focus.kernel)) {
+  const kernel = sample.kernel ? { kind: sample.kind, kernel: sample.kernel } : null;
+  const operation = { ...kernel, kind: sample.kind, operation: sample.operation };
+  const phase = { ...operation, phase: sample.phase, epoch: sample.epoch };
+  const levels = [{ kind: sample.kind }];
+  if (kernel) levels.push(kernel);
+  levels.push(operation, phase);
+  if (state.focus?.phase !== undefined) {
     for (const entry of metadataEntries(sample)) {
-      levels.push({ ...phase, kernel: sample.kernel || undefined, metadata: `${entry.name}: ${entry.value}` });
+      levels.push({ ...phase, metadata: `${entry.name}: ${entry.value}` });
     }
   }
   if (!state.focus) return levels;
   if (!sampleMatchesFocus(sample, state.focus)) return [];
-  const focusIndex = levels.findIndex(level => sameFocus(level, state.focus));
+  let focusIndex = levels.findIndex(level => sameFocus(level, state.focus));
+  if (focusIndex < 0) {
+    focusIndex = levels.findIndex(level =>
+      Object.entries(state.focus).every(([name, value]) => level[name] === value)
+    );
+  }
   return focusIndex < 0 ? levels : levels.slice(focusIndex + 1);
 }
 function appendFlameSample(root, sample) {
@@ -550,26 +563,37 @@ function drawDetails() {
         }
       }
     }
-    const top = map => [...map.entries()]
+    const topEntries = map => [...map.entries()]
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-      .slice(0, 4)
+      .slice(0, 4);
+    const top = map => topEntries(map)
       .map(([name, count]) => `${name} (${count})`)
       .join(", ");
-    const topOperations = [...byOperation.entries()]
-      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-      .slice(0, 4)
-      .map(([operation, count]) => `${operation} (${count})`)
-      .join(", ");
+    const topOperations = topEntries(byOperation).map(([operation, count]) => ({
+      label: `${operation} (${count})`,
+      focus: { operation },
+    }));
+    const topKernels = topEntries(byKernel).map(([kernel, count]) => ({
+      label: `${kernel} (${count})`,
+      focus: { kernel },
+    }));
     items.unshift(
       ["Offset", formatOffset(state.time)],
       ["Active tiles", active],
       ["Active kinds", `compute ${compute}, exchange ${exchange}`],
-      ["Top active ops", topOperations || "none"],
-      ["Top kernels", top(byKernel) || "none"],
+      ["Top active ops", topOperations.length ? { links: topOperations } : "none"],
+      ["Top kernels", topKernels.length ? { links: topKernels } : "none"],
       ["Top metadata", top(byMetadata) || "none"]
     );
   }
-  details.innerHTML = items.map(([key, value]) => `<div class="detail"><b>${escapeHtml(key)}</b><span>${escapeHtml(value)}</span></div>`).join("");
+  const renderValue = value => {
+    if (!value?.links) return `<span>${escapeHtml(value)}</span>`;
+    const links = value.links.map(link =>
+      `<button class="detail-link" type="button" data-profile-focus="${escapeHtml(JSON.stringify(link.focus))}">${escapeHtml(link.label)}</button>`
+    ).join("");
+    return `<div class="detail-links">${links}</div>`;
+  };
+  details.innerHTML = items.map(([key, value]) => `<div class="detail"><b>${escapeHtml(key)}</b>${renderValue(value)}</div>`).join("");
 }
 function render() {
   state.query = document.getElementById("search").value.trim().toLowerCase();
@@ -705,6 +729,10 @@ document.getElementById("kind").addEventListener("change", () => { state.focus =
 document.getElementById("zoomIn").addEventListener("click", () => zoomView(1.35));
 document.getElementById("zoomOut").addEventListener("click", () => zoomView(1 / 1.35));
 document.getElementById("reset").addEventListener("click", resetView);
+details.addEventListener("click", event => {
+  const link = event.target.closest("[data-profile-focus]");
+  if (link) focusFlame(JSON.parse(link.dataset.profileFocus));
+});
 timeline.addEventListener("mousemove", event => {
   if (drag?.suppressClick) {
     hideTip();
