@@ -13,6 +13,18 @@
 	// Packed increments for contiguous 8-float A and 16-float C rows.
 	.set PACE_ROW_STRIDE, (1 << 10) | 1
 
+	.macro PARTITION_64BIT_UNITS units
+	get $m4, $WSR
+	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
+	setzi $m5, (\units) / 6
+	cmpult $m6, $m4, (\units) % 6
+	add $m5, $m5, $m6
+	mul $m6, $m4, (\units) / 6
+	min $m7, $m4, (\units) % 6
+	add $m6, $m6, $m7
+	shl $m6, $m6, 3
+	.endm
+
 	.section .text.ipu_stack_copy_4096_u32,"ax",@progbits
 	.globl ipu_stack_copy_4096_u32
 	.p2align 2
@@ -34,15 +46,7 @@ ipu_stack_copy_4096_u32:
 .Lcopy_4096_u32_worker:
 	ld32 $m2, $mvertex_base, $m15, 0
 	ld32 $m3, $mvertex_base, $m15, 1
-	get $m4, $WSR
-	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
-	setzi $m5, (BLOCK_DIMENSION * BLOCK_DIMENSION / 2) / 6
-	cmpult $m6, $m4, (BLOCK_DIMENSION * BLOCK_DIMENSION / 2) % 6
-	add $m5, $m5, $m6
-	mul $m6, $m4, (BLOCK_DIMENSION * BLOCK_DIMENSION / 2) / 6
-	min $m7, $m4, (BLOCK_DIMENSION * BLOCK_DIMENSION / 2) % 6
-	add $m6, $m6, $m7
-	shl $m6, $m6, 3
+	PARTITION_64BIT_UNITS BLOCK_DIMENSION * BLOCK_DIMENSION / 2
 	add $m2, $m2, $m6
 	add $m3, $m3, $m6
 .Lcopy_64:
@@ -52,6 +56,19 @@ ipu_stack_copy_4096_u32:
 	add $m2, $m2, 8
 	sub $m5, $m5, 1
 	brnz $m5, .Lcopy_64
+	exitz $mzero
+
+	.worker
+	.p2align 2
+.Lzero_4096_u32_worker:
+	mov $m2, $mvertex_base
+	PARTITION_64BIT_UNITS BLOCK_DIMENSION * BLOCK_DIMENSION / 2
+	add $m2, $m2, $m6
+.Lzero_64:
+	st64 $azeros, $m2, $m15, 0
+	add $m2, $m2, 8
+	sub $m5, $m5, 1
+	brnz $m5, .Lzero_64
 	exitz $mzero
 
 	.macro LOAD_AMP16_WEIGHTS
@@ -129,13 +146,9 @@ ipu_stack_copy_4096_u32:
 \name:
 	.supervisor
 	.if \clear_output
-	mov $m5, $m2
-	setzi $m6, BLOCK_DIMENSION * BLOCK_DIMENSION
-.Lzero_\@:
-	st32 $m15, $m5, $m15, 0
-	add $m5, $m5, 4
-	sub $m6, $m6, 1
-	brnz $m6, .Lzero_\@
+	setzi $m0, .Lzero_4096_u32_worker
+	runall $m0, $m2, 0
+	sync SYNC_COMPUTE_SET
 	.endif
 	add $m11, $m11, -8
 	setzi $m5, CLEAR_CWEI
