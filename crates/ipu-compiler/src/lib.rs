@@ -8,6 +8,9 @@ use ipu_exchange::{
     patch_sender_address,
 };
 
+mod mlp;
+pub use mlp::{BlockedMlpConfig, BlockedMlpPlan, plan_blocked_mlp};
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_TILE_COUNT: u16 = 64;
 
@@ -478,7 +481,9 @@ pub struct BlockPlacement {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockedGemmConfig {
-    pub dimension: u16,
+    pub rows: u16,
+    pub inner_dimension: u16,
+    pub columns: u16,
     pub block_dimension: u16,
     pub inner_block_dimension: u16,
     pub row_block_dimension: u16,
@@ -496,21 +501,23 @@ pub struct BlockedGemmPlan {
 }
 
 pub fn choose_gemm_row_block(
-    dimension: u16,
+    rows: u16,
     inner_block_dimension: u16,
+    columns: u16,
     block_dimension: u16,
     tile_count: u16,
 ) -> Option<u16> {
     let candidates = gemm_row_block_candidates(
-        dimension,
+        rows,
         inner_block_dimension,
+        columns,
         block_dimension,
         tile_count,
     );
-    let column_blocks = dimension.checked_div(block_dimension)?;
+    let column_blocks = columns.checked_div(block_dimension)?;
     candidates.into_iter().min_by_key(|&target| {
-        let row_shards = dimension.div_ceil(target);
-        let maximum_rows = dimension.div_ceil(row_shards);
+        let row_shards = rows.div_ceil(target);
+        let maximum_rows = rows.div_ceil(row_shards);
         let output_blocks = usize::from(row_shards) * usize::from(column_blocks);
         let waves = output_blocks.div_ceil(usize::from(tile_count));
         let unused_tiles = waves * usize::from(tile_count) - output_blocks;
@@ -522,17 +529,18 @@ pub fn choose_gemm_row_block(
 }
 
 pub fn gemm_row_block_candidates(
-    dimension: u16,
+    rows: u16,
     inner_block_dimension: u16,
+    columns: u16,
     block_dimension: u16,
     tile_count: u16,
 ) -> Vec<u16> {
-    if dimension == 0
+    if rows == 0
+        || columns == 0
         || block_dimension == 0
         || inner_block_dimension == 0
         || tile_count == 0
-        || !dimension.is_multiple_of(block_dimension)
-        || !dimension.is_multiple_of(inner_block_dimension)
+        || !columns.is_multiple_of(block_dimension)
     {
         return Vec::new();
     }
@@ -545,19 +553,21 @@ pub fn gemm_row_block_candidates(
         ) as u16;
     (12..=maximum_rows)
         .filter(|&target| {
-            let row_shards = dimension.div_ceil(target);
-            row_shard_counts.insert(row_shards)
+            let row_shards = rows.div_ceil(target);
+            rows / row_shards >= 12 && row_shard_counts.insert(row_shards)
         })
         .collect()
 }
 
 pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, CompileError> {
-    if config.dimension == 0
+    if config.rows == 0
+        || config.inner_dimension == 0
+        || config.columns == 0
         || config.block_dimension != 64
         || !matches!(config.inner_block_dimension, 32 | 64)
-        || !config.dimension.is_multiple_of(config.block_dimension)
+        || !config.columns.is_multiple_of(config.block_dimension)
         || !config
-            .dimension
+            .inner_dimension
             .is_multiple_of(config.inner_block_dimension)
         || config.data_base >= config.data_limit
     {
@@ -565,11 +575,16 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
             "blocked GEMM requires 64-column blocks and 32- or 64-wide inner blocks".into(),
         ));
     }
-    let column_grid = config.dimension / config.block_dimension;
-    let inner_grid = config.dimension / config.inner_block_dimension;
-    let row_grid = config.dimension.div_ceil(config.row_block_dimension);
-    let base_rows = config.dimension / row_grid;
-    let larger_row_shards = config.dimension % row_grid;
+    let column_grid = config.columns / config.block_dimension;
+    let inner_grid = config.inner_dimension / config.inner_block_dimension;
+    let row_grid = config.rows.div_ceil(config.row_block_dimension);
+    let base_rows = config.rows / row_grid;
+    let larger_row_shards = config.rows % row_grid;
+    if base_rows < 12 {
+        return Err(CompileError::Graph(
+            "blocked GEMM requires at least 12 rows in every balanced row shard".into(),
+        ));
+    }
     let output_block_count = usize::from(row_grid) * usize::from(column_grid);
     let block_bytes = u32::from(config.inner_block_dimension)
         .checked_mul(u32::from(config.block_dimension))
@@ -2120,7 +2135,9 @@ mod tests {
     #[test]
     fn blocked_gemm_plan_preserves_block_ownership_and_phase_dependencies() {
         let plan = plan_blocked_gemm(BlockedGemmConfig {
-            dimension: 128,
+            rows: 128,
+            inner_dimension: 128,
+            columns: 128,
             block_dimension: 64,
             inner_block_dimension: 32,
             row_block_dimension: 64,
@@ -2182,9 +2199,11 @@ mod tests {
     #[test]
     fn blocked_gemm_balances_rows_without_gaps_or_tile_overcommitment() {
         for dimension in [64, 128, 256, 1024, 1920, 2048, 2304, 4096] {
-            let target = choose_gemm_row_block(dimension, 32, 64, 1472).unwrap();
+            let target = choose_gemm_row_block(dimension, 32, dimension, 64, 1472).unwrap();
             let plan = plan_blocked_gemm(BlockedGemmConfig {
-                dimension,
+                rows: dimension,
+                inner_dimension: dimension,
+                columns: dimension,
                 block_dimension: 64,
                 inner_block_dimension: 32,
                 row_block_dimension: target,
@@ -2228,7 +2247,7 @@ mod tests {
     #[test]
     fn gemm_tuning_candidates_are_feasible_and_layout_distinct() {
         for dimension in [64, 128, 256, 1024, 1920, 2048, 2304, 4096] {
-            let candidates = gemm_row_block_candidates(dimension, 32, 64, 1472);
+            let candidates = gemm_row_block_candidates(dimension, 32, dimension, 64, 1472);
             assert!(!candidates.is_empty());
             assert!(candidates.windows(2).all(|pair| pair[0] < pair[1]));
             let row_shards: BTreeSet<_> = candidates
@@ -2236,9 +2255,12 @@ mod tests {
                 .map(|target| dimension.div_ceil(*target))
                 .collect();
             assert_eq!(row_shards.len(), candidates.len());
-            assert!(candidates.contains(&choose_gemm_row_block(dimension, 32, 64, 1472).unwrap()));
+            assert!(
+                candidates
+                    .contains(&choose_gemm_row_block(dimension, 32, dimension, 64, 1472).unwrap())
+            );
         }
-        assert!(choose_gemm_row_block(65, 32, 64, 1472).is_none());
+        assert!(choose_gemm_row_block(65, 32, 65, 64, 1472).is_none());
     }
 
     fn exchange_schedule(transfers: Vec<Transfer>) -> Schedule {

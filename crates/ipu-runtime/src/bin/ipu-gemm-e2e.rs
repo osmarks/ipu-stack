@@ -1,9 +1,9 @@
 use ipu_compiler::{BlockedGemmConfig, BlockedGemmPlan, choose_gemm_row_block, plan_blocked_gemm};
 use ipu_elf::Toolchain;
-use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    ExecutableGraph, HostRunOptions, allocator_memory_profile, package_graph,
-    package_graph_profiled, package_graph_timed, run_host_with_inspector,
+    BlockLayout, ExecutableGraph, HostRunOptions, allocator_memory_profile, block_binding,
+    block_coordinates, blocked_matrix, package_graph, package_graph_profiled, package_graph_timed,
+    run_host_with_inspector,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -13,8 +13,6 @@ use tracing::info;
 const TILE_COUNT: u16 = 1472;
 const BLOCK_DIMENSION: u16 = 64;
 const DEFAULT_INNER_BLOCK_DIMENSION: u16 = 64;
-const INNER_MICRO_DIMENSION: u16 = 8;
-const COLUMN_MICRO_DIMENSION: u16 = 16;
 // The 12,288 static host attachment phases occupy the lower runtime arena.
 const GEMM_DATA_BASE: u32 = 0xa0000;
 
@@ -74,13 +72,16 @@ fn main() {
             choose_gemm_row_block(
                 dimension,
                 inner_block_dimension,
+                dimension,
                 BLOCK_DIMENSION,
                 TILE_COUNT,
             )
             .expect("GEMM shape has no feasible row blocking")
         });
     let plan = plan_blocked_gemm(BlockedGemmConfig {
-        dimension,
+        rows: dimension,
+        inner_dimension: dimension,
+        columns: dimension,
         block_dimension: BLOCK_DIMENSION,
         inner_block_dimension,
         row_block_dimension,
@@ -240,9 +241,9 @@ fn main() {
 }
 
 fn gemm_graph_and_input(dimension: u16, plan: BlockedGemmPlan) -> (ExecutableGraph, Vec<u8>) {
-    let left_binding = block_binding("left", dimension, &plan.left);
-    let right_binding = block_binding("right", dimension, &plan.right);
-    let output_binding = block_binding("output", dimension, &plan.output);
+    let left_binding = block_binding("left", dimension, dimension, &plan.left);
+    let right_binding = block_binding("right", dimension, dimension, &plan.right);
+    let output_binding = block_binding("output", dimension, dimension, &plan.output);
     let mut input = blocked_matrix(&plan.left, BlockLayout::AmpA8, left_value);
     input.extend(blocked_matrix(
         &plan.right,
@@ -259,101 +260,6 @@ fn gemm_graph_and_input(dimension: u16, plan: BlockedGemmPlan) -> (ExecutableGra
         },
         input,
     )
-}
-
-fn block_binding(
-    name: &str,
-    dimension: u16,
-    placements: &[ipu_compiler::BlockPlacement],
-) -> Binding {
-    let topology = ipu_exchange::Topology::c600();
-    Binding {
-        name: name.into(),
-        dtype: "f32".into(),
-        shape: vec![u32::from(dimension), u32::from(dimension)],
-        slices: placements
-            .iter()
-            .scan(0u64, |file_offset, placement| {
-                let size = u64::from(placement.rows) * u64::from(placement.columns) * 4;
-                let slice = RegionSlice {
-                    tile: u32::from(topology.physical(placement.tile).unwrap()),
-                    tile_address: placement.address,
-                    file_offset: *file_offset,
-                    size,
-                };
-                *file_offset += size;
-                Some(slice)
-            })
-            .collect(),
-    }
-}
-
-#[derive(Clone, Copy)]
-enum BlockLayout {
-    AmpA8,
-    AmpB8x16,
-    AmpC16,
-}
-
-fn block_coordinates(layout: BlockLayout, rows: u16, _columns: u16, linear: u16) -> (u16, u16) {
-    match layout {
-        BlockLayout::AmpA8 => {
-            let panel_elements = rows * INNER_MICRO_DIMENSION;
-            let panel = linear / panel_elements;
-            let panel_offset = linear % panel_elements;
-            (
-                panel_offset / INNER_MICRO_DIMENSION,
-                panel * INNER_MICRO_DIMENSION + panel_offset % INNER_MICRO_DIMENSION,
-            )
-        }
-        BlockLayout::AmpB8x16 => {
-            let panel_elements = INNER_MICRO_DIMENSION * COLUMN_MICRO_DIMENSION;
-            let panel = linear / panel_elements;
-            let panel_offset = linear % panel_elements;
-            let inner_groups = rows / INNER_MICRO_DIMENSION;
-            let column_group = panel / inner_groups;
-            let inner_group = panel % inner_groups;
-            let load_channel = panel_offset / INNER_MICRO_DIMENSION;
-            let inner_in_group = panel_offset % INNER_MICRO_DIMENSION;
-            let load_pair = load_channel / 2;
-            let logical_pair = (load_pair % 2) * 4 + load_pair / 2;
-            let column_in_group = logical_pair * 2 + load_channel % 2;
-            (
-                inner_group * INNER_MICRO_DIMENSION + inner_in_group,
-                column_group * COLUMN_MICRO_DIMENSION + column_in_group,
-            )
-        }
-        BlockLayout::AmpC16 => {
-            let panel_elements = rows * COLUMN_MICRO_DIMENSION;
-            let panel = linear / panel_elements;
-            let panel_offset = linear % panel_elements;
-            let physical_column = panel_offset % COLUMN_MICRO_DIMENSION;
-            let physical_pair = physical_column / 2;
-            let logical_pair = (physical_pair % 2) * 4 + physical_pair / 2;
-            (
-                panel_offset / COLUMN_MICRO_DIMENSION,
-                panel * COLUMN_MICRO_DIMENSION + logical_pair * 2 + physical_column % 2,
-            )
-        }
-    }
-}
-
-fn blocked_matrix(
-    placements: &[ipu_compiler::BlockPlacement],
-    layout: BlockLayout,
-    value: impl Fn(u16, u16) -> f32,
-) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for placement in placements {
-        for linear in 0..placement.rows * placement.columns {
-            let (row, column) =
-                block_coordinates(layout, placement.rows, placement.columns, linear);
-            bytes.extend_from_slice(
-                &value(placement.row_start + row, placement.column_start + column).to_le_bytes(),
-            );
-        }
-    }
-    bytes
 }
 
 #[derive(Clone, Copy)]

@@ -14,6 +14,9 @@ use tracing_subscriber::EnvFilter;
 
 mod static_codegen;
 
+mod blocked_data;
+pub use blocked_data::{BlockLayout, block_binding, block_coordinates, blocked_matrix};
+
 const PLAN_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
 const HOST_DATA_START: u32 = 64;
 const HOST_CLOSE_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x160;
