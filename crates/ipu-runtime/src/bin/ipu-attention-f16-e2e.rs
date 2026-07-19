@@ -1,6 +1,7 @@
 use half::f16;
 use ipu_compiler::{
-    AttentionTaskPlacement, FlashAttentionConfig, FlashAttentionPlan, plan_flash_attention,
+    AttentionKeyValuePlacement, AttentionTaskPlacement, FlashAttentionConfig, FlashAttentionPlan,
+    plan_flash_attention,
 };
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
@@ -20,6 +21,8 @@ fn main() {
     let hidden_sizes = env_u16_list("IPU_ATTENTION_HIDDEN_SIZES", &[768, 1024, 1152]);
     let batch_sizes = env_u16_list("IPU_ATTENTION_BATCH_SIZES", &[1, 3]);
     let sequence_length = env_u16("IPU_ATTENTION_SEQUENCE_LENGTH", 64);
+    let query_block_rows = env_u16("IPU_ATTENTION_QUERY_BLOCK_ROWS", 16);
+    let key_block_rows = env_u16("IPU_ATTENTION_KEY_BLOCK_ROWS", 0);
     let seed = env_u64("IPU_ATTENTION_SEED", 0xfa57_a77e_1616);
     let max_error_limit = env_f32("IPU_F16_MAX_ERROR", 0.001);
     let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
@@ -38,6 +41,8 @@ fn main() {
                 batch_size,
                 sequence_length,
                 hidden_size,
+                query_block_rows,
+                key_block_rows,
                 seed: seed
                     ^ (hidden_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
                     ^ (batch_index as u64).wrapping_mul(0xd1b5_4a32_d192_ed03),
@@ -55,6 +60,8 @@ struct Case<'a> {
     batch_size: u16,
     sequence_length: u16,
     hidden_size: u16,
+    query_block_rows: u16,
+    key_block_rows: u16,
     seed: u64,
     max_error_limit: f32,
     sdk: &'a Path,
@@ -69,6 +76,8 @@ fn run_case(case: Case<'_>) {
         sequence_length: case.sequence_length,
         hidden_size: case.hidden_size,
         attention_heads: ATTENTION_HEADS,
+        query_block_rows: case.query_block_rows,
+        key_block_rows: case.key_block_rows,
         tile_count: TILE_COUNT,
         data_base: ATTENTION_DATA_BASE,
         data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
@@ -99,9 +108,9 @@ fn run_case(case: Case<'_>) {
                 ],
                 &plan.tasks,
                 |task| task.query_address,
-                u64::from(case.sequence_length) * u64::from(plan.head_dimension) * 2,
+                |task| u64::from(task.query_rows) * u64::from(plan.head_dimension) * 2,
             ),
-            task_binding(
+            key_value_binding(
                 "key_value",
                 "f16",
                 vec![
@@ -111,9 +120,7 @@ fn run_case(case: Case<'_>) {
                     u32::from(case.sequence_length),
                     u32::from(plan.head_dimension),
                 ],
-                &plan.tasks,
-                |task| task.key_value_address,
-                u64::from(case.sequence_length) * u64::from(plan.head_dimension) * 4,
+                &plan.key_values,
             ),
         ],
         host_outputs: vec![task_binding(
@@ -127,7 +134,7 @@ fn run_case(case: Case<'_>) {
             ],
             &plan.tasks,
             |task| task.output_address,
-            u64::from(case.sequence_length) * u64::from(plan.head_dimension) * 2,
+            |task| u64::from(task.query_rows) * u64::from(plan.head_dimension) * 2,
         )],
     };
 
@@ -151,10 +158,10 @@ fn run_case(case: Case<'_>) {
             source("flash_attention_f16.cpp"),
             &artifact_dir,
             "flash-attention-codelet",
-            &[
-                format!("-DATTENTION_SEQUENCE_LENGTH={}", case.sequence_length),
-                format!("-DATTENTION_HEAD_DIMENSION={}", plan.head_dimension),
-            ],
+            &[format!(
+                "-DATTENTION_HEAD_DIMENSION={}",
+                plan.head_dimension
+            )],
         )
         .unwrap();
     let wrapper = toolchain
@@ -181,6 +188,10 @@ fn run_case(case: Case<'_>) {
         heads = ATTENTION_HEADS,
         head_dimension = plan.head_dimension,
         tasks = plan.tasks.len(),
+        query_block_rows = plan.query_block_rows,
+        key_block_rows = plan.key_block_rows,
+        exchange_phases =
+            plan.key_values.len() / (usize::from(case.batch_size) * usize::from(ATTENTION_HEADS)),
         input_bytes = input.len(),
         "packaged FP16 FlashAttention"
     );
@@ -214,21 +225,54 @@ fn task_binding(
     shape: Vec<u32>,
     tasks: &[AttentionTaskPlacement],
     address: impl Fn(&AttentionTaskPlacement) -> u32,
-    task_bytes: u64,
+    size: impl Fn(&AttentionTaskPlacement) -> u64,
 ) -> Binding {
     let topology = ipu_exchange::Topology::c600();
+    let mut file_offset = 0u64;
     Binding {
         name: name.into(),
         dtype: dtype.into(),
         shape,
         slices: tasks
             .iter()
-            .enumerate()
-            .map(|(index, task)| RegionSlice {
-                tile: u32::from(topology.physical(task.tile).unwrap()),
-                tile_address: address(task),
-                file_offset: index as u64 * task_bytes,
-                size: task_bytes,
+            .map(|task| {
+                let size = size(task);
+                let slice = RegionSlice {
+                    tile: u32::from(topology.physical(task.tile).unwrap()),
+                    tile_address: address(task),
+                    file_offset,
+                    size,
+                };
+                file_offset += size;
+                slice
+            })
+            .collect(),
+    }
+}
+
+fn key_value_binding(
+    name: &str,
+    dtype: &str,
+    shape: Vec<u32>,
+    blocks: &[AttentionKeyValuePlacement],
+) -> Binding {
+    let topology = ipu_exchange::Topology::c600();
+    let mut file_offset = 0u64;
+    Binding {
+        name: name.into(),
+        dtype: dtype.into(),
+        shape,
+        slices: blocks
+            .iter()
+            .map(|block| {
+                let slice = RegionSlice {
+                    tile: u32::from(topology.physical(block.tile).unwrap()),
+                    tile_address: block.address,
+                    file_offset,
+                    size: u64::from(block.size),
+                };
+                file_offset += u64::from(block.size);
+                slice
             })
             .collect(),
     }
@@ -241,33 +285,59 @@ fn pack_inputs(
     key: &[f16],
     value: &[f16],
 ) -> (Vec<u8>, Vec<u8>) {
-    let task_elements = usize::from(config.sequence_length) * usize::from(plan.head_dimension);
-    let mut query_bytes = Vec::with_capacity(plan.tasks.len() * task_elements * 2);
-    let mut key_value_bytes = Vec::with_capacity(plan.tasks.len() * task_elements * 4);
+    let mut query_bytes = Vec::new();
+    let mut key_value_bytes = Vec::new();
     for task in &plan.tasks {
-        append_task(&mut query_bytes, query, task, config, plan.head_dimension);
-        append_task(&mut key_value_bytes, key, task, config, plan.head_dimension);
-        append_task(
+        append_rows(
+            &mut query_bytes,
+            query,
+            config,
+            task.batch,
+            task.head,
+            task.query_row_start,
+            task.query_rows,
+            plan.head_dimension,
+        );
+    }
+    for block in &plan.key_values {
+        append_rows(
+            &mut key_value_bytes,
+            key,
+            config,
+            block.batch,
+            block.head,
+            block.key_row_start,
+            block.key_rows,
+            plan.head_dimension,
+        );
+        append_rows(
             &mut key_value_bytes,
             value,
-            task,
             config,
+            block.batch,
+            block.head,
+            block.key_row_start,
+            block.key_rows,
             plan.head_dimension,
         );
     }
     (query_bytes, key_value_bytes)
 }
 
-fn append_task(
+#[allow(clippy::too_many_arguments)]
+fn append_rows(
     target: &mut Vec<u8>,
     source: &[f16],
-    task: &AttentionTaskPlacement,
     config: FlashAttentionConfig,
+    batch: u16,
+    head: u16,
+    row_start: u16,
+    rows: u16,
     head_dimension: u16,
 ) {
-    for row in 0..config.sequence_length {
+    for row in row_start..row_start + rows {
         for column in 0..head_dimension {
-            let index = tensor_index(config, task.batch, task.head, row, column);
+            let index = tensor_index(config, batch, head, row, column);
             target.extend_from_slice(&source[index].to_bits().to_le_bytes());
         }
     }

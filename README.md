@@ -295,12 +295,15 @@ counts only GEMM FLOPs while its interval includes GeLU and exchange work.
 
 ## FlashAttention
 
-`plan_flash_attention` builds non-causal FP16 attention over independent
-batch/head tasks. The device kernel performs scaled QK dot products and a
-numerically stable online softmax recurrence while accumulating V in FP32. It
-does not allocate or write a sequence-squared score or probability tensor. A
-six-worker finalizer converts the result to FP16 with stochastic rounding.
-Sequence length and head dimension are compile-time kernel specializations.
+`plan_flash_attention` builds non-causal FP16 attention with FP32 online-softmax
+state. Queries are sharded by row across tiles. Each batch/head stores one
+canonical K/V copy, which is split into exchange-window-sized row blocks and
+multicast to its query tiles. The kernel carries its maximum, denominator, and
+FP32 value accumulator across block phases, without allocating a
+sequence-squared score or probability tensor. A six-worker finalizer converts
+the result to FP16 with stochastic rounding. Head dimension is a compile-time
+kernel specialization; query and key row counts are scalar parameters so tail
+blocks do not require additional objects.
 
 The hardware runner defaults to 16 heads, sequence length 64, hidden sizes
 768/1024/1152 (head dimensions 48/64/72), and batch sizes 1 and 3. Inputs are
@@ -317,9 +320,9 @@ IPU_ATTENTION_SEQUENCE_LENGTH=128 \
   cargo run --release -p ipu-runtime --bin ipu-attention-f16-e2e
 ```
 
-The current placement is deliberately simple: one tile owns one complete
-batch/head task, with Q and packed K/V supplied as the two kernel inputs. Its
-per-task SRAM use is `12 * sequence_length * head_dimension` bytes and is
-linear in sequence length. Query blocking across additional tiles and D2D
-multicast of shared K/V are the next performance step; they are not required
-for the present correctness path.
+`IPU_ATTENTION_QUERY_BLOCK_ROWS` selects query sharding (default 16, zero picks
+the finest value that fits the available tiles). `IPU_ATTENTION_KEY_BLOCK_ROWS`
+selects K/V blocking; zero, the default, derives the largest legal block from
+the head dimension and exchange transfer limit. Hardware tests include a
+multi-block 128-token, 1152-hidden case, exercising exchange and FP32 recurrence
+state across three K/V passes.

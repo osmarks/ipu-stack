@@ -11,7 +11,8 @@ use ipu_exchange::{
 mod attention;
 mod mlp;
 pub use attention::{
-    AttentionTaskPlacement, FlashAttentionConfig, FlashAttentionPlan, plan_flash_attention,
+    AttentionKeyValuePlacement, AttentionTaskPlacement, FlashAttentionConfig, FlashAttentionPlan,
+    plan_flash_attention,
 };
 pub use mlp::{BlockedMlpConfig, BlockedMlpPlan, plan_blocked_mlp};
 
