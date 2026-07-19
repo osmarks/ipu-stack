@@ -28,6 +28,7 @@ const SEND_OFF_OPCODE: u32 = 0x7000_0000;
 const SYNC_OPCODE: u32 = 0x4180_0000;
 const SANS_OPCODE: u32 = 0x40c0_0000;
 const BR_M_OPCODE: u32 = 0x4300_0000;
+const CALL_M_IMMEDIATE_OPCODE: u32 = 0x1800_0000;
 const SETZI_M_OPCODE: u32 = 0x1900_0000;
 const PUT_SPECIAL_M_OPCODE: u32 = 0x4300_8000;
 const INCOMING_MUX_REGISTER: u8 = 0xa0;
@@ -63,6 +64,16 @@ pub fn encode_br_m(register: u8) -> Result<u32, ExchangeError> {
         return Err(ExchangeError::Schedule("branch register"));
     }
     Ok(br_m(register))
+}
+
+pub fn encode_call_m_immediate(
+    return_register: u8,
+    target_address: u32,
+) -> Result<u32, ExchangeError> {
+    if return_register >= 16 || target_address & 3 != 0 || target_address >= 1 << 21 {
+        return Err(ExchangeError::Schedule("call operand"));
+    }
+    Ok(CALL_M_IMMEDIATE_OPCODE | (u32::from(return_register) << 20) | (target_address >> 2))
 }
 
 pub fn encode_setzi_m(register: u8, immediate: u32) -> Result<u32, ExchangeError> {
@@ -1104,10 +1115,17 @@ mod tests {
         assert_eq!(put & 0xff, 0xa6);
         assert_eq!((encode_br_m(10).unwrap() >> 20) & 0xf, 10);
 
+        let call = encode_call_m_immediate(10, 0x4c100).unwrap();
+        assert_eq!((call >> 20) & 0xf, 10);
+        assert_eq!((call & 0x7ffff) << 2, 0x4c100);
+
         assert!(encode_setzi_m(16, 0).is_err());
         assert!(encode_setzi_m(0, 1 << 20).is_err());
         assert!(encode_put_special_m(0, 16).is_err());
         assert!(encode_br_m(16).is_err());
+        assert!(encode_call_m_immediate(16, 0).is_err());
+        assert!(encode_call_m_immediate(0, 2).is_err());
+        assert!(encode_call_m_immediate(0, 1 << 21).is_err());
     }
 
     #[test]

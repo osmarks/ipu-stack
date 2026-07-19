@@ -91,6 +91,7 @@ pub struct ProfileTileLayout {
     pub physical_tile: u32,
     pub file_offset: usize,
     pub steps: Vec<ipu_package::ProfileStep>,
+    pub boundary_samples: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -106,11 +107,15 @@ impl ProfileLayout {
             .ok_or("profile output offset exceeds host result")?;
         let mut tiles = Vec::with_capacity(self.tiles.len());
         for tile in &self.tiles {
-            let size = tile
-                .steps
-                .len()
-                .checked_mul(8)
-                .ok_or("profile sample size overflow")?;
+            let size = if tile.boundary_samples {
+                tile.steps
+                    .len()
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(4))
+            } else {
+                tile.steps.len().checked_mul(8)
+            }
+            .ok_or("profile sample size overflow")?;
             let bytes = profile
                 .get(tile.file_offset..tile.file_offset + size)
                 .ok_or("profile tile range exceeds host result")?;
@@ -118,14 +123,19 @@ impl ProfileLayout {
                 .steps
                 .iter()
                 .enumerate()
-                .map(|(index, step)| ipu_package::CycleSample {
-                    step: step.clone(),
-                    start_cycle: u32::from_le_bytes(
-                        bytes[index * 8..index * 8 + 4].try_into().unwrap(),
-                    ),
-                    end_cycle: u32::from_le_bytes(
-                        bytes[index * 8 + 4..index * 8 + 8].try_into().unwrap(),
-                    ),
+                .map(|(index, step)| {
+                    let (start, end) = if tile.boundary_samples {
+                        (index * 4, index * 4 + 4)
+                    } else {
+                        (index * 8, index * 8 + 4)
+                    };
+                    ipu_package::CycleSample {
+                        step: step.clone(),
+                        start_cycle: u32::from_le_bytes(
+                            bytes[start..start + 4].try_into().unwrap(),
+                        ),
+                        end_cycle: u32::from_le_bytes(bytes[end..end + 4].try_into().unwrap()),
+                    }
                 })
                 .collect();
             tiles.push(ipu_package::TileProfile {
@@ -293,8 +303,21 @@ fn package_graph_with_profile(
         .checked_add(1)
         .ok_or("profile tensor id overflow")?;
     for program in &programs {
-        let sample_count = if aggregate { 1 } else { program.steps.len() };
-        let size = u32::try_from(sample_count.checked_mul(8).ok_or("profile size overflow")?)?;
+        let sample_count = if aggregate {
+            1
+        } else {
+            program
+                .steps
+                .len()
+                .checked_add(1)
+                .ok_or("profile sample count overflow")?
+        };
+        let sample_bytes = if aggregate { 8 } else { 4 };
+        let size = u32::try_from(
+            sample_count
+                .checked_mul(sample_bytes)
+                .ok_or("profile size overflow")?,
+        )?;
         if size == 0 {
             profile_addresses.push(Vec::new());
             continue;
@@ -374,7 +397,7 @@ fn package_graph_with_profile(
         };
         profile_addresses.push(
             (0..sample_count)
-                .map(|index| address + index as u32 * 8)
+                .map(|index| address + index as u32 * sample_bytes as u32)
                 .collect(),
         );
         slices.push(RegionSlice {
@@ -387,6 +410,7 @@ fn package_graph_with_profile(
             physical_tile: physical,
             file_offset,
             steps,
+            boundary_samples: !aggregate,
         });
         file_offset += size as usize;
     }
@@ -660,7 +684,6 @@ fn package_graph_impl(
                     .collect::<Vec<_>>();
                 static_codegen::emit(
                     program,
-                    program_base,
                     &image.symbols,
                     &plan_addresses,
                     static_codegen::HostCode {
@@ -684,8 +707,16 @@ fn package_graph_impl(
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(end.max(code_end))
     })?;
     if program_end > ipu_exchange::EXCHANGE_WINDOW_BASE {
-        return Err("static tile program exceeds the application code region".into());
+        return Err(format!(
+            "generated tile program 0x{program_base:x}..0x{program_end:x} exceeds the executable span ending at 0x{:x}",
+            ipu_exchange::EXCHANGE_WINDOW_BASE
+        )
+        .into());
     }
+    let image_end = image
+        .base
+        .checked_add(u32::try_from(image.bytes.len())?)
+        .ok_or("linked image address overflow")?;
     for allocation in &graph.schedule.allocations {
         let end = allocation
             .address
@@ -694,7 +725,8 @@ fn package_graph_impl(
         let runtime_end = completion_addresses[usize::from(allocation.tile)]
             .checked_add(4)
             .ok_or("static runtime address overflow")?;
-        if ranges_overlap(image.base, program_end, allocation.address, end)
+        if ranges_overlap(image.base, image_end, allocation.address, end)
+            || ranges_overlap(program_base, program_end, allocation.address, end)
             || ranges_overlap(PLAN_BASE, runtime_end, allocation.address, end)
         {
             return Err(format!(
@@ -860,6 +892,7 @@ fn package_graph_impl(
         host_inputs = graph.host_inputs.len(),
         host_outputs = graph.host_outputs.len(),
         max_program_bytes = program_end - program_base,
+        program_base = format_args!("0x{program_base:x}"),
         "packaged static executable graph"
     );
     Ok(app)
@@ -1780,6 +1813,36 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boundary_profile_reuses_adjacent_timestamps() {
+        let step = |local_index| ipu_package::ProfileStep {
+            local_index,
+            phase: local_index,
+            epoch: 0,
+            operation: format!("step-{local_index}"),
+            kind: ipu_package::ProfileStepKind::Compute,
+        };
+        let layout = ProfileLayout {
+            output_offset: 0,
+            tiles: vec![ProfileTileLayout {
+                physical_tile: 7,
+                file_offset: 0,
+                steps: vec![step(0), step(1)],
+                boundary_samples: true,
+            }],
+        };
+        let output = [11u32, 23, 47]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let report = layout.decode(&output, 1_500_000_000).unwrap();
+
+        assert_eq!(report.tiles[0].samples[0].start_cycle, 11);
+        assert_eq!(report.tiles[0].samples[0].end_cycle, 23);
+        assert_eq!(report.tiles[0].samples[1].start_cycle, 23);
+        assert_eq!(report.tiles[0].samples[1].end_cycle, 47);
+    }
 
     #[test]
     fn host_phase_count_defers_the_last_rendezvous() {

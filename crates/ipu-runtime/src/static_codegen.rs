@@ -29,7 +29,6 @@ pub(crate) struct HostCode<'a> {
 
 pub(crate) fn emit(
     program: &LoweredTileProgram,
-    base: u32,
     symbols: &BTreeMap<String, u32>,
     plan_addresses: &[u32],
     host: HostCode<'_>,
@@ -41,11 +40,11 @@ pub(crate) fn emit(
     }
     if !aggregate_profile
         && !profile_addresses.is_empty()
-        && profile_addresses.len() != program.steps.len()
+        && profile_addresses.len() != program.steps.len() + 1
     {
         return Err("profile address count differs from tile step count".into());
     }
-    let mut code = TileCode::new(base);
+    let mut code = TileCode::new();
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
     emit_host_phases(&mut code, symbols, host.inputs, host.run_state)?;
     if program.steps.iter().any(|step| {
@@ -62,12 +61,11 @@ pub(crate) fn emit(
     }
     if aggregate_profile {
         emit_cycle_sample(&mut code, symbols, profile_addresses[0])?;
+    } else if let Some(&address) = profile_addresses.first() {
+        emit_cycle_sample(&mut code, symbols, address)?;
     }
     let mut plan_index = 0usize;
     for (step_index, step) in program.steps.iter().enumerate() {
-        if !aggregate_profile && let Some(&address) = profile_addresses.get(step_index) {
-            emit_cycle_sample(&mut code, symbols, address)?;
-        }
         match step {
             LoweredTileStep::Exchange { row, .. } => {
                 code.instruction(ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
@@ -109,8 +107,8 @@ pub(crate) fn emit(
             }
             LoweredTileStep::IdleCompute { .. } => {}
         }
-        if !aggregate_profile && let Some(&address) = profile_addresses.get(step_index) {
-            emit_cycle_sample(&mut code, symbols, address + 4)?;
+        if !aggregate_profile && let Some(&address) = profile_addresses.get(step_index + 1) {
+            emit_cycle_sample(&mut code, symbols, address)?;
         }
     }
     if plan_index != plan_addresses.len() {
@@ -177,31 +175,12 @@ fn symbol(symbols: &BTreeMap<String, u32>, name: &str) -> Result<u32> {
 }
 
 struct TileCode {
-    base: u32,
     words: Vec<u32>,
 }
 
 impl TileCode {
-    fn new(base: u32) -> Self {
-        Self {
-            base,
-            words: Vec::new(),
-        }
-    }
-
-    fn address_after(&self, words: usize) -> Result<u32> {
-        let words = self
-            .words
-            .len()
-            .checked_add(words)
-            .ok_or("tile program size overflow")?;
-        self.base
-            .checked_add(
-                u32::try_from(words)?
-                    .checked_mul(4)
-                    .ok_or("tile program size overflow")?,
-            )
-            .ok_or_else(|| "tile program address overflow".into())
+    fn new() -> Self {
+        Self { words: Vec::new() }
     }
 
     fn setzi(&mut self, register: u8, immediate: u32) -> Result<()> {
@@ -221,10 +200,10 @@ impl TileCode {
     }
 
     fn call(&mut self, target: u32, return_register: u8) -> Result<()> {
-        let return_address = self.address_after(3)?;
-        self.setzi(return_register, return_address)?;
-        self.setzi(0, target)?;
-        self.words.push(ipu_exchange::encode_br_m(0)?);
+        self.words.push(ipu_exchange::encode_call_m_immediate(
+            return_register,
+            target,
+        )?);
         Ok(())
     }
 
