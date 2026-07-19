@@ -26,7 +26,8 @@ const HOST_CLOSE_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x160;
 const HOST_PACKET_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE;
 const HOST_STAGING_SEARCH_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x180;
 const HOST_RUN_DESCRIPTOR_WORDS: u32 = 7;
-const WORKER_SYNC_STRIDE: u32 = 0x30;
+const WORKER_STACK_HEADROOM: u32 = 0xe0;
+const WORKER_SYNC_STRIDE: u32 = 0x100;
 const WORKER_SYNC_REGISTERS: u32 = 7;
 
 #[derive(Clone, Copy, Debug)]
@@ -1238,7 +1239,12 @@ fn package_graph_impl(
         .collect::<Vec<_>>();
     let completion_addresses = worker_sync_addresses
         .iter()
-        .map(|&address| align_up(address + WORKER_SYNC_REGISTERS * WORKER_SYNC_STRIDE, 64))
+        .map(|&address| {
+            align_up(
+                address + WORKER_STACK_HEADROOM + WORKER_SYNC_REGISTERS * WORKER_SYNC_STRIDE,
+                64,
+            )
+        })
         .collect::<Vec<_>>();
 
     let mut retained_symbols = vec![
@@ -1425,7 +1431,7 @@ fn package_graph_impl(
             worker_context_offset,
             u32::from(logical) * 8,
         )?;
-        let worker_base = worker_sync_addresses[tile_index];
+        let worker_base = worker_sync_addresses[tile_index] + WORKER_STACK_HEADROOM;
         patch_setzi_immediate(&mut support_code, worker_base_offset, worker_base)?;
         let prng_seed_base = (physical + 1) << 3;
         patch_setzi_immediate(&mut support_code, prng_seed_base_offset, prng_seed_base)?;

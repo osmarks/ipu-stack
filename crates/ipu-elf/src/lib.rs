@@ -1,4 +1,6 @@
-use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind, SymbolKind};
+use object::{
+    Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind, SymbolKind, SymbolSection,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -293,19 +295,28 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
     let mut symbols = BTreeMap::new();
     for (object_index, file) in parsed.iter().enumerate() {
         for symbol in file.symbols() {
-            if !symbol.is_definition() || symbol.name().unwrap_or_default().is_empty() {
+            if (!symbol.is_definition() && symbol.section() != SymbolSection::Absolute)
+                || symbol.name().unwrap_or_default().is_empty()
+                || (symbol.section() == SymbolSection::Absolute && !symbol.is_global())
+            {
                 continue;
             }
-            let Some(section_index) = symbol.section_index() else {
-                continue;
+            let value = match symbol.section() {
+                SymbolSection::Absolute => u32::try_from(symbol.address())
+                    .map_err(|_| ElfError::Link("absolute symbol value overflow".into()))?,
+                _ => {
+                    let Some(section_index) = symbol.section_index() else {
+                        continue;
+                    };
+                    let Ok(placement) = placement(&placements, object_index, section_index) else {
+                        continue;
+                    };
+                    placement
+                        .address
+                        .checked_add(symbol.address() as u32)
+                        .ok_or_else(|| ElfError::Link("symbol address overflow".into()))?
+                }
             };
-            let Ok(placement) = placement(&placements, object_index, section_index) else {
-                continue;
-            };
-            let value = placement
-                .address
-                .checked_add(symbol.address() as u32)
-                .ok_or_else(|| ElfError::Link("symbol address overflow".into()))?;
             let name = symbol.name()?.to_owned();
             if symbols.insert(name.clone(), value).is_some() {
                 return Err(ElfError::Link(format!("duplicate symbol {name}")));
@@ -336,12 +347,20 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
                                 ))
                             })? as i64
                         } else {
-                            let target_section = symbol.section_index().ok_or_else(|| {
-                                ElfError::Link("absolute symbol unsupported".into())
-                            })?;
-                            let target_place =
-                                placement(&placements, object_index, target_section)?;
-                            i64::from(target_place.address) + symbol.address() as i64
+                            match symbol.section() {
+                                SymbolSection::Absolute => symbol.address() as i64,
+                                _ => {
+                                    let target_section =
+                                        symbol.section_index().ok_or_else(|| {
+                                            ElfError::Link(
+                                                "relocation symbol has no section".into(),
+                                            )
+                                        })?;
+                                    let target_place =
+                                        placement(&placements, object_index, target_section)?;
+                                    i64::from(target_place.address) + symbol.address() as i64
+                                }
+                            }
                         }
                     }
                     RelocationTarget::Section(index) => {
