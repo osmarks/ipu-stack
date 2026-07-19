@@ -1,0 +1,829 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IPU Profile</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #ffffff;
+  --panel: #ffffff;
+  --ink: #050505;
+  --muted: #303030;
+  --line: #000000;
+  --exchange: #006b3f;
+  --compute: #b00020;
+  --selected: #0057ff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+header, main { padding: 16px 20px; }
+header {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: 0; }
+.stats { color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; margin-top: 2px; }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+input, select, button {
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: #fff;
+  color: var(--ink);
+  padding: 0 9px;
+  font: inherit;
+}
+input[type="number"] { width: 78px; }
+button { cursor: pointer; }
+button.active { border-color: var(--selected); color: var(--selected); }
+main { display: grid; gap: 18px; }
+section {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 0;
+  overflow: hidden;
+}
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.section-title { font-weight: 700; }
+.svg-wrap, .timeline-wrap { overflow: auto; }
+.overview-wrap {
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+svg { display: block; min-width: 100%; background: #fff; }
+.bar { stroke: #000000; stroke-width: 1; cursor: pointer; }
+.bar.dim { opacity: .55; }
+.bar.selected { stroke: var(--selected); stroke-width: 2; }
+.label { pointer-events: none; fill: #fff; font-size: 11px; dominant-baseline: middle; }
+.axis, .tile-label { fill: var(--muted); font-size: 11px; }
+.grid { stroke: #b8b8b8; stroke-width: 1; }
+canvas {
+  display: block;
+  background: #ffffff;
+  cursor: crosshair;
+}
+#details {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 10px;
+  padding: 12px;
+  border-top: 1px solid var(--line);
+}
+.detail b { display: block; font-size: 11px; color: var(--muted); font-weight: 600; }
+.detail span { font-variant-numeric: tabular-nums; }
+#tooltip {
+  position: fixed;
+  max-width: 360px;
+  pointer-events: none;
+  background: #000000;
+  color: #fff;
+  border: 1px solid #ffffff;
+  border-radius: 0;
+  padding: 8px 9px;
+  font-size: 12px;
+  display: none;
+  z-index: 20;
+}
+@media (max-width: 760px) {
+  header { grid-template-columns: 1fr; }
+  .controls { justify-content: flex-start; }
+  #details { grid-template-columns: 1fr 1fr; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>IPU Profile</h1>
+    <div class="stats" id="stats"></div>
+  </div>
+  <div class="controls">
+    <label>Search <input id="search" type="search" placeholder="operation"></label>
+    <label>Kind <select id="kind"><option value="all">all</option><option value="compute">compute</option><option value="exchange">exchange</option></select></label>
+    <button id="zoomOut" type="button" title="Zoom out (-)">-</button>
+    <button id="zoomIn" type="button" title="Zoom in (+ or =)">+</button>
+    <button id="reset" type="button" title="Reset zoom and selection (0 or Esc); undo zoom (right click)">reset</button>
+  </div>
+</header>
+<main>
+  <section>
+    <div class="section-head">
+      <div class="section-title">Flamegraph</div>
+    </div>
+    <div class="svg-wrap"><canvas id="flame"></canvas></div>
+  </section>
+  <section>
+    <div class="section-head">
+      <div class="section-title">Tilewise Timeline</div>
+    </div>
+    <div class="overview-wrap"><canvas id="overview"></canvas></div>
+    <div class="timeline-wrap"><canvas id="timeline"></canvas></div>
+    <div id="details"></div>
+  </section>
+</main>
+<div id="tooltip"></div>
+<script>
+const DATA = __PROFILE_JSON__;
+const metadataSets = DATA.metadataSets.map(([start, count]) => {
+  const entries = [];
+  for (let index = start; index < start + count * 2; index += 2) {
+    entries.push({ name: DATA.strings[DATA.metadata[index]], value: DATA.strings[DATA.metadata[index + 1]] });
+  }
+  return entries;
+});
+const steps = DATA.steps.map(([phase, epoch, operation, kernel, metadata, kind]) => ({
+  phase,
+  epoch,
+  operation: DATA.strings[operation],
+  kernel: DATA.strings[kernel],
+  metadata: metadataSets[metadata],
+  kind: kind ? "compute" : "exchange",
+}));
+for (const tile of DATA.tiles) {
+  tile.samples = tile.samples.map(([step, offset, duration]) => ({
+    ...steps[step],
+    offset,
+    duration,
+  }));
+}
+const state = { query: "", kind: "all", focus: null, time: null, viewStart: 0, viewEnd: null };
+const flame = document.getElementById("flame");
+const overview = document.getElementById("overview");
+const timeline = document.getElementById("timeline");
+const tooltip = document.getElementById("tooltip");
+const details = document.getElementById("details");
+const colors = { exchange: "#006b3f", compute: "#b00020" };
+const textColor = { exchange: "#ffffff", compute: "#ffffff" };
+const tiles = DATA.tiles.slice().sort((a, b) => a.physicalTile - b.physicalTile);
+let timelineGeom = null;
+let flameHits = [];
+let drag = null;
+const zoomHistory = [];
+const flameHistory = [];
+let flameTotal = 0;
+document.getElementById("stats").textContent =
+  `${DATA.tileCount} tiles, ${DATA.sampleCount} samples, ${formatRangeValue(0, fullEnd())} range, ${formatHz(DATA.clockHz)}`;
+
+function formatHz(hz) {
+  if (!hz) return "clock unknown";
+  if (hz >= 1e9) return `${(hz / 1e9).toFixed(2)} GHz`;
+  if (hz >= 1e6) return `${(hz / 1e6).toFixed(1)} MHz`;
+  return `${hz} Hz`;
+}
+function formatCount(value) {
+  return Math.round(value).toString().replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+}
+function formatOffset(value) {
+  return formatCount(value);
+}
+function formatRange(sample) {
+  return formatRangeValue(sample.offset, sample.offset + sample.duration);
+}
+function formatRangeValue(start, end) {
+  return `${formatOffset(start)} / ${formatOffset(end)}`;
+}
+function metadataEntries(sample) {
+  return Array.isArray(sample.metadata) ? sample.metadata.filter(entry => entry.name || entry.value) : [];
+}
+function formatMetadata(sample) {
+  return metadataEntries(sample).map(entry => `${entry.name}: ${entry.value}`).join(", ");
+}
+function sampleTitle(sample) {
+  return sample.kernel || sample.operation;
+}
+function fullEnd() {
+  return tiles.reduce((maxEnd, tile) => Math.max(maxEnd, ...tile.samples.map(sample => sample.offset + sample.duration)), 1);
+}
+state.viewEnd = fullEnd();
+function matches(sample) {
+  if (state.kind !== "all" && sample.kind !== state.kind) return false;
+  if (state.query && !sample.operation.toLowerCase().includes(state.query)) return false;
+  return sampleMatchesFocus(sample, state.focus);
+}
+function activeAt(sample, time) {
+  return time !== null && time >= sample.offset && time < sample.offset + sample.duration;
+}
+function sampleMatchesFocus(sample, focus) {
+  if (!focus) return true;
+  if (focus.kind && sample.kind !== focus.kind) return false;
+  if (focus.operation && sample.operation !== focus.operation) return false;
+  if (focus.phase !== undefined && sample.phase !== focus.phase) return false;
+  if (focus.epoch !== undefined && sample.epoch !== focus.epoch) return false;
+  if (focus.kernel && sample.kernel !== focus.kernel) return false;
+  if (focus.metadata) {
+    const entries = metadataEntries(sample);
+    if (!entries.some(entry => `${entry.name}: ${entry.value}` === focus.metadata)) return false;
+  }
+  return true;
+}
+function sameFocus(a, b) {
+  return JSON.stringify(a || null) === JSON.stringify(b || null);
+}
+function focusLabel(focus) {
+  if (!focus) return "profile";
+  if (focus.metadata) return focus.metadata;
+  if (focus.kernel) return focus.kernel;
+  if (focus.phase !== undefined) return `${focus.operation} phase ${focus.phase} epoch ${focus.epoch}`;
+  if (focus.operation) return focus.operation;
+  return focus.kind || "profile";
+}
+function flamePath(sample) {
+  const phase = { kind: sample.kind, operation: sample.operation, phase: sample.phase, epoch: sample.epoch };
+  const levels = [
+    { kind: sample.kind },
+    { kind: sample.kind, operation: sample.operation },
+    phase,
+  ];
+  if (sample.kernel) levels.push({ ...phase, kernel: sample.kernel });
+  if (state.focus && (state.focus.phase !== undefined || state.focus.kernel)) {
+    for (const entry of metadataEntries(sample)) {
+      levels.push({ ...phase, kernel: sample.kernel || undefined, metadata: `${entry.name}: ${entry.value}` });
+    }
+  }
+  if (!state.focus) return levels;
+  if (!sampleMatchesFocus(sample, state.focus)) return [];
+  const focusIndex = levels.findIndex(level => sameFocus(level, state.focus));
+  return focusIndex < 0 ? levels : levels.slice(focusIndex + 1);
+}
+function appendFlameSample(root, sample) {
+  let parent = root;
+  for (const focus of flamePath(sample)) {
+    const key = JSON.stringify(focus);
+    let child = parent.children.get(key);
+    if (!child) {
+      child = { name: focusLabel(focus), value: 0, focus, kind: focus.kind, children: new Map() };
+      parent.children.set(key, child);
+    }
+    child.value += sample.duration;
+    parent = child;
+  }
+  root.value += sample.duration;
+}
+function pushFlameHistory() {
+  const current = state.focus ? { ...state.focus } : null;
+  const previous = flameHistory[flameHistory.length - 1];
+  if (!flameHistory.length || !sameFocus(previous, current)) flameHistory.push(current);
+}
+function focusFlame(nextFocus) {
+  if (sameFocus(state.focus, nextFocus)) return;
+  pushFlameHistory();
+  state.focus = nextFocus ? { ...nextFocus } : null;
+  render();
+}
+function undoFlameFocus() {
+  if (!flameHistory.length) return;
+  const previous = flameHistory.pop();
+  state.focus = previous ? { ...previous } : null;
+  render();
+}
+function showTip(event, lines) {
+  tooltip.innerHTML = lines.map(line => `<div>${escapeHtml(line)}</div>`).join("");
+  tooltip.style.display = "block";
+  tooltip.style.left = `${Math.min(window.innerWidth - 380, event.clientX + 12)}px`;
+  tooltip.style.top = `${event.clientY + 12}px`;
+}
+function hideTip() { tooltip.style.display = "none"; }
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function drawFlame() {
+  const ctx = flame.getContext("2d");
+  const width = Math.max(960, Math.round(flame.parentElement.clientWidth - 2));
+  const rowH = 24, top = 18;
+  const root = { name: focusLabel(state.focus), value: 0, depth: 0, children: new Map() };
+  for (const tile of tiles) {
+    for (const sample of tile.samples) {
+      if (state.kind !== "all" && sample.kind !== state.kind) continue;
+      if (state.query && !sample.operation.toLowerCase().includes(state.query)) continue;
+      if (!sampleMatchesFocus(sample, state.focus)) continue;
+      appendFlameSample(root, sample);
+    }
+  }
+  flameTotal = root.value;
+  const nodes = [];
+  if (root.value > 0) {
+    nodes.push({
+      name: root.name,
+      value: root.value,
+      depth: 0,
+      x: 0,
+      w: width,
+      focus: state.focus,
+      kind: state.focus?.kind,
+      children: root.children,
+      root: true,
+    });
+  }
+  layout([...root.children.values()].sort(byValue), 0, width, 1, nodes);
+  const maxDepth = nodes.reduce((depth, node) => Math.max(depth, node.depth), 0);
+  const height = top + (maxDepth + 1) * rowH + 8;
+  flame.style.width = `${width}px`;
+  flame.style.height = `${height}px`;
+  flame.width = width;
+  flame.height = height;
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, width, height);
+  ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#303030";
+  ctx.fillText(root.value ? `${formatCount(root.value)} total shown` : "No samples match", 8, 9);
+  flameHits = [];
+  for (const node of nodes) {
+    if (node.w < 1) continue;
+    const x = node.x;
+    const y = top + node.depth * rowH;
+    const w = Math.max(1, node.w - 1);
+    const h = rowH - 3;
+    ctx.fillStyle = node.kind ? colors[node.kind] : "#73808f";
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = "#000000";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + 0.5, y + 0.5, Math.max(1, w - 1), Math.max(1, h - 1));
+    flameHits.push({ x, y, w, h, node });
+    if (node.w > 54) {
+      ctx.fillStyle = textColor[node.kind] || "#fff";
+      const label = node.name.length > node.w / 7 ? node.name.slice(0, Math.max(3, Math.floor(node.w / 7) - 1)) + "..." : node.name;
+      ctx.fillText(label, x + 5, y + h / 2);
+    }
+  }
+}
+function layout(children, x, w, depth, out) {
+  const total = children.reduce((sum, child) => sum + child.value, 0);
+  let cursor = x;
+  for (const child of children) {
+    const childW = total ? w * child.value / total : 0;
+    if (childW >= 0.75) {
+      out.push({ ...child, x: cursor, w: childW, depth });
+      layout([...child.children.values()].sort(byValue), cursor, childW, depth + 1, out);
+    }
+    cursor += childW;
+  }
+}
+function byValue(a, b) { return b.value - a.value || a.name.localeCompare(b.name); }
+function tooltipLines(node) {
+  const pct = flameTotal ? `${(100 * node.value / flameTotal).toFixed(2)}% shown` : "";
+  return [node.name, `${formatCount(node.value)} total`, pct, node.kind || ""].filter(Boolean);
+}
+function drawOverview() {
+  const ctx = overview.getContext("2d");
+  const width = Math.max(1024, Math.round(overview.parentElement.clientWidth - 2));
+  const height = 96;
+  const maxEnd = fullEnd();
+  overview.style.width = `${width}px`;
+  overview.style.height = `${height}px`;
+  overview.width = width;
+  overview.height = height;
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, width, height);
+  const computeDelta = new Int32Array(width + 1);
+  const exchangeDelta = new Int32Array(width + 1);
+  const scale = width / maxEnd;
+  for (const tile of tiles) {
+    for (const sample of tile.samples) {
+      const start = Math.max(0, Math.floor(sample.offset * scale));
+      const end = Math.min(width - 1, Math.ceil((sample.offset + sample.duration) * scale));
+      const target = sample.kind === "compute" ? computeDelta : exchangeDelta;
+      target[start]++;
+      target[end + 1]--;
+    }
+  }
+  const denominator = Math.max(1, tiles.length);
+  let computeActive = 0;
+  let exchangeActive = 0;
+  for (let x = 0; x < width; x++) {
+    computeActive += computeDelta[x];
+    exchangeActive += exchangeDelta[x];
+    const computeH = Math.round((height - 2) * computeActive / denominator);
+    const exchangeH = Math.round((height - 2) * exchangeActive / denominator);
+    const totalH = Math.min(height - 2, computeH + exchangeH);
+    let y = height - 1;
+    if (computeH > 0) {
+      ctx.fillStyle = colors.compute;
+      const h = Math.min(computeH, totalH);
+      y -= h;
+      ctx.fillRect(x, y, 1, h);
+    }
+    if (exchangeH > 0 && totalH > computeH) {
+      ctx.fillStyle = colors.exchange;
+      const h = totalH - Math.min(computeH, totalH);
+      y -= h;
+      ctx.fillRect(x, y, 1, h);
+    }
+  }
+  const viewStart = Math.max(0, Math.min(state.viewStart, maxEnd));
+  const viewEnd = Math.max(viewStart + 1, Math.min(state.viewEnd || maxEnd, maxEnd));
+  const x = Math.round(width * viewStart / maxEnd);
+  const w = Math.max(1, Math.round(width * (viewEnd - viewStart) / maxEnd));
+  ctx.fillStyle = "rgba(0, 0, 0, 0.22)";
+  if (x > 0) ctx.fillRect(0, 0, x, height);
+  if (x + w < width) ctx.fillRect(x + w, 0, width - x - w, height);
+  ctx.strokeStyle = "#0057ff";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x + 0.5, 1.5, Math.min(width - x - 1, w), height - 3);
+}
+function drawTimeline() {
+  const ctx = timeline.getContext("2d");
+  const ratio = 1;
+  const left = 0, top = 0, right = 0, rowH = 1;
+  const maxEnd = fullEnd();
+  const viewStart = Math.max(0, Math.min(state.viewStart, maxEnd));
+  const viewEnd = Math.max(viewStart + 1, Math.min(state.viewEnd || maxEnd, maxEnd));
+  const width = Math.max(1024, Math.round(timeline.parentElement.clientWidth - 2));
+  const plotW = width - left - right;
+  const height = top + Math.max(1, tiles.length) * rowH;
+  timelineGeom = { left, top, right, rowH, width, height, plotW, maxEnd, viewStart, viewEnd };
+  timeline.style.width = `${width}px`;
+  timeline.style.height = `${height}px`;
+  timeline.width = Math.ceil(width * ratio);
+  timeline.height = Math.ceil(height * ratio);
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, width, height);
+  ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+  ctx.textBaseline = "alphabetic";
+  ctx.strokeStyle = "#777777";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 10; i++) {
+    const x = left + plotW * i / 10;
+    ctx.beginPath();
+    ctx.moveTo(x, top);
+    ctx.lineTo(x, height);
+    ctx.stroke();
+  }
+  tiles.forEach((tile, index) => {
+    const y = top + index * rowH;
+    for (const sample of tile.samples) {
+      const sampleStart = sample.offset;
+      const sampleEnd = sample.offset + sample.duration;
+      if (sampleEnd < viewStart || sampleStart > viewEnd) continue;
+      const clippedStart = Math.max(sampleStart, viewStart);
+      const clippedEnd = Math.min(sampleEnd, viewEnd);
+      const x = left + plotW * (clippedStart - viewStart) / (viewEnd - viewStart);
+      const w = Math.max(1, plotW * (clippedEnd - clippedStart) / (viewEnd - viewStart));
+      const selected = matches(sample);
+      ctx.fillStyle = selected ? colors[sample.kind] : "#9b9b9b";
+      ctx.fillRect(x, y, w, rowH);
+    }
+  });
+  if (state.time !== null) {
+    const x = left + plotW * (state.time - viewStart) / (viewEnd - viewStart);
+    if (x < left || x > width - right) return;
+    ctx.strokeStyle = "#0057ff";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(Math.round(x) + 0.5, top);
+    ctx.lineTo(Math.round(x) + 0.5, height);
+    ctx.stroke();
+  }
+}
+function drawDetails() {
+  let selected = 0;
+  let total = 0;
+  let longest = null;
+  let longestTile = null;
+  const operations = new Set();
+  for (const tile of tiles) {
+    for (const sample of tile.samples) {
+      if (!matches(sample)) continue;
+      selected++;
+      total += sample.duration;
+      operations.add(sample.operation);
+      if (!longest || sample.duration > longest.duration) {
+        longest = sample;
+        longestTile = tile.physicalTile;
+      }
+    }
+  }
+  const items = [
+    ["Selected samples", selected],
+    ["Selected total", formatCount(total)],
+    ["Operations", operations.size],
+    ["Longest range", longest ? formatRange(longest) : "none"],
+    ["Longest owner", longest ? `tile ${longestTile} ${longest.operation}` : "none"],
+  ];
+  if (state.time !== null) {
+    let active = 0;
+    let compute = 0;
+    let exchange = 0;
+    const byOperation = new Map();
+    const byKernel = new Map();
+    const byMetadata = new Map();
+    for (const tile of tiles) {
+      for (const sample of tile.samples) {
+        if (!activeAt(sample, state.time)) continue;
+        active++;
+        if (sample.kind === "compute") compute++;
+        if (sample.kind === "exchange") exchange++;
+        byOperation.set(sample.operation, (byOperation.get(sample.operation) || 0) + 1);
+        if (sample.kernel) byKernel.set(sample.kernel, (byKernel.get(sample.kernel) || 0) + 1);
+        for (const entry of metadataEntries(sample)) {
+          const key = `${entry.name}: ${entry.value}`;
+          byMetadata.set(key, (byMetadata.get(key) || 0) + 1);
+        }
+      }
+    }
+    const top = map => [...map.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, 4)
+      .map(([name, count]) => `${name} (${count})`)
+      .join(", ");
+    const topOperations = [...byOperation.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, 4)
+      .map(([operation, count]) => `${operation} (${count})`)
+      .join(", ");
+    items.unshift(
+      ["Offset", formatOffset(state.time)],
+      ["Active tiles", active],
+      ["Active kinds", `compute ${compute}, exchange ${exchange}`],
+      ["Top active ops", topOperations || "none"],
+      ["Top kernels", top(byKernel) || "none"],
+      ["Top metadata", top(byMetadata) || "none"]
+    );
+  }
+  details.innerHTML = items.map(([key, value]) => `<div class="detail"><b>${escapeHtml(key)}</b><span>${escapeHtml(value)}</span></div>`).join("");
+}
+function render() {
+  state.query = document.getElementById("search").value.trim().toLowerCase();
+  state.kind = document.getElementById("kind").value;
+  drawFlame();
+  drawOverview();
+  drawTimeline();
+  drawDetails();
+}
+function timelineHit(event) {
+  const rect = timeline.getBoundingClientRect();
+  const scaleX = timeline.width / rect.width;
+  const scaleY = timeline.height / rect.height;
+  const x = (event.clientX - rect.left) * scaleX;
+  const y = (event.clientY - rect.top) * scaleY;
+  if (!timelineGeom || y < timelineGeom.top || y >= timelineGeom.height) return null;
+  const tile = tiles[Math.floor((y - timelineGeom.top) / timelineGeom.rowH)];
+  if (!tile) return null;
+  const time = timelineGeom.viewStart
+    + (x - timelineGeom.left) * (timelineGeom.viewEnd - timelineGeom.viewStart) / timelineGeom.plotW;
+  const sample = tile.samples.find(candidate => activeAt(candidate, time));
+  if (sample) return { tile: tile.physicalTile, sample };
+  return null;
+}
+function flameHit(event) {
+  const rect = flame.getBoundingClientRect();
+  const x = (event.clientX - rect.left) * flame.width / rect.width;
+  const y = (event.clientY - rect.top) * flame.height / rect.height;
+  for (let index = flameHits.length - 1; index >= 0; index--) {
+    const hit = flameHits[index];
+    if (x >= hit.x && x <= hit.x + hit.w && y >= hit.y && y <= hit.y + hit.h) return hit.node;
+  }
+  return null;
+}
+function canvasGeom(canvas) {
+  if (canvas === timeline) return timelineGeom;
+  if (canvas === overview) {
+    return {
+      left: 0,
+      top: 0,
+      right: 0,
+      width: overview.width,
+      height: overview.height,
+      plotW: overview.width,
+      viewStart: 0,
+      viewEnd: fullEnd(),
+      maxEnd: fullEnd(),
+    };
+  }
+  return null;
+}
+function canvasTime(event, canvas = event.currentTarget) {
+  const geom = canvasGeom(canvas);
+  if (!geom) return null;
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const x = (event.clientX - rect.left) * scaleX;
+  const y = (event.clientY - rect.top) * scaleY;
+  if (x < geom.left || x >= geom.width - geom.right || y < geom.top || y >= geom.height) return null;
+  return Math.round(geom.viewStart + (x - geom.left) * (geom.viewEnd - geom.viewStart) / geom.plotW);
+}
+function canvasPoint(event, canvas = event.currentTarget) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: (event.clientX - rect.left) * canvas.width / rect.width,
+    y: (event.clientY - rect.top) * canvas.height / rect.height,
+  };
+}
+function currentView() {
+  return { start: state.viewStart, end: state.viewEnd || fullEnd() };
+}
+function pushZoomHistory() {
+  const view = currentView();
+  const previous = zoomHistory[zoomHistory.length - 1];
+  if (!previous || previous.start !== view.start || previous.end !== view.end) {
+    zoomHistory.push(view);
+  }
+}
+function applyView(start, end, record = true) {
+  const maxEnd = fullEnd();
+  const nextStart = Math.max(0, Math.min(start, maxEnd));
+  const nextEnd = Math.max(nextStart + 1, Math.min(end, maxEnd));
+  if (record) pushZoomHistory();
+  state.viewStart = Math.round(nextStart);
+  state.viewEnd = Math.round(nextEnd);
+  render();
+}
+function undoZoom() {
+  const previous = zoomHistory.pop();
+  if (!previous) return;
+  applyView(previous.start, previous.end, false);
+}
+function resetView() {
+  pushZoomHistory();
+  state.focus = null;
+  flameHistory.length = 0;
+  state.time = null;
+  state.viewStart = 0;
+  state.viewEnd = fullEnd();
+  document.getElementById("search").value = "";
+  document.getElementById("kind").value = "all";
+  render();
+}
+function zoomView(factor, center = state.time) {
+  const maxEnd = fullEnd();
+  const currentStart = Math.max(0, Math.min(state.viewStart, maxEnd));
+  const currentEnd = Math.max(currentStart + 1, Math.min(state.viewEnd || maxEnd, maxEnd));
+  const currentSpan = currentEnd - currentStart;
+  const nextSpan = Math.max(1, Math.min(maxEnd, currentSpan / factor));
+  const anchor = center === null ? currentStart + currentSpan / 2 : Math.max(currentStart, Math.min(center, currentEnd));
+  const ratio = currentSpan <= 0 ? 0.5 : (anchor - currentStart) / currentSpan;
+  let nextStart = anchor - nextSpan * ratio;
+  let nextEnd = nextStart + nextSpan;
+  if (nextStart < 0) {
+    nextEnd -= nextStart;
+    nextStart = 0;
+  }
+  if (nextEnd > maxEnd) {
+    nextStart = Math.max(0, nextStart - (nextEnd - maxEnd));
+    nextEnd = maxEnd;
+  }
+  applyView(nextStart, nextEnd);
+}
+function zoomToRange(start, end) {
+  const maxEnd = fullEnd();
+  const rangeStart = Math.max(0, Math.min(start, end, maxEnd));
+  const rangeEnd = Math.max(rangeStart + 1, Math.min(Math.max(start, end), maxEnd));
+  applyView(rangeStart, rangeEnd);
+}
+document.getElementById("search").addEventListener("input", () => { state.focus = null; flameHistory.length = 0; render(); });
+document.getElementById("kind").addEventListener("change", () => { state.focus = null; flameHistory.length = 0; render(); });
+document.getElementById("zoomIn").addEventListener("click", () => zoomView(1.35));
+document.getElementById("zoomOut").addEventListener("click", () => zoomView(1 / 1.35));
+document.getElementById("reset").addEventListener("click", resetView);
+timeline.addEventListener("mousemove", event => {
+  if (drag?.suppressClick) {
+    hideTip();
+    return;
+  }
+  const hit = timelineHit(event);
+  if (!hit) { hideTip(); return; }
+  showTip(event, [
+    `tile ${hit.tile}`,
+    sampleTitle(hit.sample),
+    `${hit.sample.kind} phase ${hit.sample.phase} epoch ${hit.sample.epoch}`,
+    `range ${formatRange(hit.sample)}`,
+    formatMetadata(hit.sample),
+  ]);
+});
+timeline.addEventListener("mouseleave", hideTip);
+timeline.addEventListener("click", event => {
+  if (drag?.suppressClick) {
+    drag = null;
+    return;
+  }
+  const time = canvasTime(event, timeline);
+  if (time === null) {
+    state.time = null;
+    render();
+    return;
+  }
+  const tolerance = timelineGeom ? Math.ceil(timelineGeom.maxEnd / timelineGeom.plotW * 2) : 0;
+  state.time = state.time !== null && Math.abs(state.time - time) <= tolerance ? null : time;
+  render();
+});
+overview.addEventListener("click", event => {
+  if (drag?.suppressClick) {
+    drag = null;
+    return;
+  }
+  const time = canvasTime(event, overview);
+  if (time === null) {
+    state.time = null;
+    render();
+    return;
+  }
+  const tolerance = Math.ceil(fullEnd() / Math.max(1, overview.width) * 2);
+  state.time = state.time !== null && Math.abs(state.time - time) <= tolerance ? null : time;
+  render();
+});
+function beginZoomDrag(event, canvas) {
+  const time = canvasTime(event, canvas);
+  if (time === null) return;
+  const point = canvasPoint(event, canvas);
+  drag = { canvas, startX: point.x, startY: point.y, startTime: time, lastTime: time, suppressClick: false };
+  canvas.setPointerCapture(event.pointerId);
+}
+function updateZoomDrag(event, canvas) {
+  if (!drag) return;
+  const time = canvasTime(event, canvas);
+  if (time !== null) drag.lastTime = time;
+  const point = canvasPoint(event, canvas);
+  if (Math.abs(point.x - drag.startX) > 6 || Math.abs(point.y - drag.startY) > 6) {
+    drag.suppressClick = true;
+    hideTip();
+  }
+}
+function endZoomDrag(event, canvas) {
+  if (!drag) return;
+  const pending = drag;
+  drag = null;
+  canvas.releasePointerCapture(event.pointerId);
+  if (pending.suppressClick && Math.abs(pending.lastTime - pending.startTime) > 0) {
+    zoomToRange(pending.startTime, pending.lastTime);
+    drag = { suppressClick: true };
+  }
+}
+for (const canvas of [overview, timeline]) {
+  canvas.addEventListener("wheel", event => {
+    event.preventDefault();
+    const factor = event.deltaY < 0 ? 1.2 : 1 / 1.2;
+    zoomView(factor, canvasTime(event, canvas));
+  }, { passive: false });
+  canvas.addEventListener("pointerdown", event => beginZoomDrag(event, canvas));
+  canvas.addEventListener("pointermove", event => updateZoomDrag(event, canvas));
+  canvas.addEventListener("pointerup", event => endZoomDrag(event, canvas));
+  canvas.addEventListener("pointercancel", () => { drag = null; });
+}
+for (const canvas of [overview, timeline]) {
+  canvas.addEventListener("contextmenu", event => {
+    event.preventDefault();
+    undoZoom();
+  });
+}
+flame.addEventListener("mousemove", event => {
+  const node = flameHit(event);
+  if (!node) { hideTip(); return; }
+  showTip(event, tooltipLines(node));
+});
+flame.addEventListener("mouseleave", hideTip);
+flame.addEventListener("click", event => {
+  const node = flameHit(event);
+  if (node && !node.root) focusFlame(node.focus);
+});
+flame.addEventListener("contextmenu", event => {
+  event.preventDefault();
+  undoFlameFocus();
+});
+window.addEventListener("keydown", event => {
+  if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
+  if (event.key === "+" || event.key === "=") {
+    event.preventDefault();
+    zoomView(1.35);
+  } else if (event.key === "-") {
+    event.preventDefault();
+    zoomView(1 / 1.35);
+  } else if (event.key === "0" || event.key === "Escape") {
+    event.preventDefault();
+    resetView();
+  }
+});
+window.addEventListener("resize", render);
+render();
+</script>
+</body>
+</html>
