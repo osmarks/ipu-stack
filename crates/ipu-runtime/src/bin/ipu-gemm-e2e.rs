@@ -12,6 +12,7 @@ use tracing::info;
 
 const TILE_COUNT: u16 = 1472;
 const BLOCK_DIMENSION: u16 = 64;
+const DEFAULT_INNER_BLOCK_DIMENSION: u16 = 64;
 const INNER_MICRO_DIMENSION: u16 = 8;
 const COLUMN_MICRO_DIMENSION: u16 = 16;
 // The 12,288 static host attachment phases occupy the lower runtime arena.
@@ -26,6 +27,13 @@ fn main() {
                 .expect("IPU_GEMM_DIMENSION must be a u16")
         })
         .unwrap_or(2048);
+    let inner_block_dimension = std::env::var("IPU_GEMM_INNER_BLOCK")
+        .map(|value| {
+            value
+                .parse::<u16>()
+                .expect("IPU_GEMM_INNER_BLOCK must be a u16")
+        })
+        .unwrap_or(DEFAULT_INNER_BLOCK_DIMENSION);
     let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
     let configuration = fs::read(required_env("IPU_CONFIG")).unwrap();
     let bootloader = fs::read(
@@ -45,7 +53,14 @@ fn main() {
     let kernel_source =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/gemm_f32_64_amp.S");
     let kernel = toolchain
-        .compile(&kernel_source, &output, "gemm-f32-64", &[])
+        .compile(
+            &kernel_source,
+            &output,
+            "gemm-f32-64",
+            &[format!(
+                "-DGEMM_INNER_BLOCK_DIMENSION={inner_block_dimension}"
+            )],
+        )
         .unwrap();
 
     let compile_start = Instant::now();
@@ -56,12 +71,18 @@ fn main() {
                 .expect("IPU_GEMM_ROW_BLOCK must be a u16")
         })
         .unwrap_or_else(|_| {
-            choose_gemm_row_block(dimension, BLOCK_DIMENSION, TILE_COUNT)
-                .expect("GEMM shape has no feasible row blocking")
+            choose_gemm_row_block(
+                dimension,
+                inner_block_dimension,
+                BLOCK_DIMENSION,
+                TILE_COUNT,
+            )
+            .expect("GEMM shape has no feasible row blocking")
         });
     let plan = plan_blocked_gemm(BlockedGemmConfig {
         dimension,
         block_dimension: BLOCK_DIMENSION,
+        inner_block_dimension,
         row_block_dimension,
         tile_count: TILE_COUNT,
         data_base: GEMM_DATA_BASE,
@@ -112,6 +133,7 @@ fn main() {
     };
     info!(
         dimension,
+        inner_block_dimension,
         row_block_dimension,
         row_shards = output_placements
             .iter()
@@ -252,7 +274,7 @@ fn block_binding(
         slices: placements
             .iter()
             .scan(0u64, |file_offset, placement| {
-                let size = u64::from(placement.rows) * u64::from(BLOCK_DIMENSION) * 4;
+                let size = u64::from(placement.rows) * u64::from(placement.columns) * 4;
                 let slice = RegionSlice {
                     tile: u32::from(topology.physical(placement.tile).unwrap()),
                     tile_address: placement.address,
@@ -273,7 +295,7 @@ enum BlockLayout {
     AmpC16,
 }
 
-fn block_coordinates(layout: BlockLayout, rows: u16, linear: u16) -> (u16, u16) {
+fn block_coordinates(layout: BlockLayout, rows: u16, _columns: u16, linear: u16) -> (u16, u16) {
     match layout {
         BlockLayout::AmpA8 => {
             let panel_elements = rows * INNER_MICRO_DIMENSION;
@@ -288,8 +310,9 @@ fn block_coordinates(layout: BlockLayout, rows: u16, linear: u16) -> (u16, u16) 
             let panel_elements = INNER_MICRO_DIMENSION * COLUMN_MICRO_DIMENSION;
             let panel = linear / panel_elements;
             let panel_offset = linear % panel_elements;
-            let column_group = panel / INNER_MICRO_DIMENSION;
-            let inner_group = panel % INNER_MICRO_DIMENSION;
+            let inner_groups = rows / INNER_MICRO_DIMENSION;
+            let column_group = panel / inner_groups;
+            let inner_group = panel % inner_groups;
             let load_channel = panel_offset / INNER_MICRO_DIMENSION;
             let inner_in_group = panel_offset % INNER_MICRO_DIMENSION;
             let load_pair = load_channel / 2;
@@ -322,14 +345,11 @@ fn blocked_matrix(
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
     for placement in placements {
-        for linear in 0..placement.rows * BLOCK_DIMENSION {
-            let (row, column) = block_coordinates(layout, placement.rows, linear);
+        for linear in 0..placement.rows * placement.columns {
+            let (row, column) =
+                block_coordinates(layout, placement.rows, placement.columns, linear);
             bytes.extend_from_slice(
-                &value(
-                    placement.row_start + row,
-                    placement.block_column * BLOCK_DIMENSION + column,
-                )
-                .to_le_bytes(),
+                &value(placement.row_start + row, placement.column_start + column).to_le_bytes(),
             );
         }
     }
@@ -413,10 +433,15 @@ fn find_mismatch(
         .collect::<Vec<_>>();
     let mut offset = 0;
     for placement in placements {
-        for linear in 0..placement.rows * BLOCK_DIMENSION {
-            let (row, column) = block_coordinates(BlockLayout::AmpC16, placement.rows, linear);
+        for linear in 0..placement.rows * placement.columns {
+            let (row, column) = block_coordinates(
+                BlockLayout::AmpC16,
+                placement.rows,
+                placement.columns,
+                linear,
+            );
             let global_row = placement.row_start + row;
-            let global_column = placement.block_column * BLOCK_DIMENSION + column;
+            let global_column = placement.column_start + column;
             let actual_value = f32::from_le_bytes(actual[offset..offset + 4].try_into().unwrap());
             let expected = expected[usize::from(global_row % 7)][usize::from(global_column % 5)];
             if actual_value.to_bits() != expected.to_bits() {
@@ -451,7 +476,7 @@ fn compare_sram_block(
         .ok_or("diagnostic GEMM block is outside the placement table")?;
     let placement = &placements[block_index];
     let physical_tile = ipu_exchange::Topology::c600().physical(placement.tile)?;
-    let block_words = u32::from(placement.rows) * u32::from(BLOCK_DIMENSION);
+    let block_words = u32::from(placement.rows) * u32::from(placement.columns);
     let sram = device.read_tile_words_from_inactive_context(
         physical_tile,
         1,
@@ -460,7 +485,7 @@ fn compare_sram_block(
     )?;
     let d2h_start = placements[..block_index]
         .iter()
-        .map(|placement| usize::from(placement.rows) * usize::from(BLOCK_DIMENSION) * 4)
+        .map(|placement| usize::from(placement.rows) * usize::from(placement.columns) * 4)
         .sum::<usize>();
     let block_bytes = usize::try_from(block_words)? * 4;
     let d2h = &d2h[d2h_start..d2h_start + block_bytes];
@@ -473,10 +498,14 @@ fn compare_sram_block(
             transport_differences += 1;
             first_transport_difference.get_or_insert((index, d2h_word, sram_word));
         }
-        let (row, column) =
-            block_coordinates(BlockLayout::AmpC16, placement.rows, u16::try_from(index)?);
+        let (row, column) = block_coordinates(
+            BlockLayout::AmpC16,
+            placement.rows,
+            placement.columns,
+            u16::try_from(index)?,
+        );
         let row = placement.row_start + row;
-        let column = block_column * BLOCK_DIMENSION + column;
+        let column = placement.column_start + column;
         if sram_word != expected_value(dimension, row, column).to_bits() {
             sram_expected_differences += 1;
         }
@@ -548,19 +577,19 @@ mod tests {
 
     #[test]
     fn amp_block_layouts_are_bijections() {
-        for layout in [
-            BlockLayout::AmpA8,
-            BlockLayout::AmpB8x16,
-            BlockLayout::AmpC16,
+        for (layout, rows, columns) in [
+            (BlockLayout::AmpA8, 128, 32),
+            (BlockLayout::AmpB8x16, 32, 64),
+            (BlockLayout::AmpC16, 128, 64),
         ] {
-            let coordinates = (0..BLOCK_DIMENSION * BLOCK_DIMENSION)
-                .map(|linear| block_coordinates(layout, BLOCK_DIMENSION, linear))
+            let coordinates = (0..rows * columns)
+                .map(|linear| block_coordinates(layout, rows, columns, linear))
                 .collect::<BTreeSet<_>>();
-            assert_eq!(coordinates.len(), usize::from(BLOCK_DIMENSION).pow(2));
+            assert_eq!(coordinates.len(), usize::from(rows) * usize::from(columns));
             assert!(
                 coordinates
                     .iter()
-                    .all(|&(row, column)| { row < BLOCK_DIMENSION && column < BLOCK_DIMENSION })
+                    .all(|&(row, column)| { row < rows && column < columns })
             );
         }
     }

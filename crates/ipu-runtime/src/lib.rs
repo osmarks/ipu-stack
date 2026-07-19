@@ -825,6 +825,10 @@ fn package_graph_impl(
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let (plan_addresses, plan_end) = packed_addresses(PLAN_BASE, &plan_sizes, 8)?;
+    debug!(
+        plan_end = format_args!("0x{plan_end:x}"),
+        "packed device exchange plans"
+    );
     let host = build_static_host_layout(graph)?;
     let host_transfers = host
         .inputs
@@ -858,23 +862,41 @@ fn package_graph_impl(
             };
             let mut addresses = Vec::with_capacity(host_transfers.len());
             let mut packet_copies = Vec::with_capacity(host_transfers.len());
+            let mut instruction_addresses = HashMap::<Vec<u32>, u32>::new();
+            let mut packet_addresses = HashMap::<Vec<u32>, u32>::new();
             for &transfer in &host_transfers {
                 if host_phase_is_active(physical, &transfer) {
-                    cursor = align_up(cursor, 8);
-                    addresses.push(cursor);
                     let (instructions, packet_words) =
                         host_phase_instructions(physical, transfer, HOST_PACKET_ADDRESS)?;
-                    let bytes = u32::try_from(instructions.len() * 4)?;
-                    cursor = cursor
-                        .checked_add(bytes)
-                        .ok_or("static host plan address overflow")?;
-                    cursor = align_up(cursor, 4);
-                    let source = cursor;
                     let packet_words = packet_words.ok_or("active host phase has no packet")?;
+                    let address = if let Some(&address) = instruction_addresses.get(&instructions) {
+                        address
+                    } else {
+                        cursor = align_up(cursor, 8);
+                        let address = cursor;
+                        cursor = cursor
+                            .checked_add(u32::try_from(instructions.len() * 4)?)
+                            .ok_or("static host plan address overflow")?;
+                        instruction_addresses.insert(instructions, address);
+                        address
+                    };
+                    addresses.push(address);
+                    let source = if let Some(&source) = packet_addresses.get(&packet_words) {
+                        source
+                    } else {
+                        cursor = align_up(cursor, 4);
+                        let source = cursor;
+                        cursor = cursor
+                            .checked_add(
+                                u32::try_from(packet_words.len())?
+                                    .checked_mul(4)
+                                    .ok_or("host packet size overflow")?,
+                            )
+                            .ok_or("static host packet address overflow")?;
+                        packet_addresses.insert(packet_words.clone(), source);
+                        source
+                    };
                     let words = u32::try_from(packet_words.len())?;
-                    cursor = cursor
-                        .checked_add(words.checked_mul(4).ok_or("host packet size overflow")?)
-                        .ok_or("static host packet address overflow")?;
                     let hierarchy = ipu_exchange::host_hierarchy(transfer.physical_tile)?;
                     let destination = if physical == transfer.physical_tile
                         && hierarchy.xreq_physical_tile != transfer.physical_tile
@@ -934,6 +956,25 @@ fn package_graph_impl(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    debug!(
+        minimum_end = format_args!(
+            "0x{:x}",
+            tile_host_plans
+                .iter()
+                .map(|plans| plans.end)
+                .min()
+                .unwrap_or(plan_end)
+        ),
+        maximum_end = format_args!(
+            "0x{:x}",
+            tile_host_plans
+                .iter()
+                .map(|plans| plans.end)
+                .max()
+                .unwrap_or(plan_end)
+        ),
+        "packed host exchange plans"
+    );
     let worker_sync_addresses = tile_host_plans
         .iter()
         .map(|plans| align_up(plans.end, 8))
@@ -1645,37 +1686,63 @@ fn append_initial_segments(
     initial: &HashMap<(u16, u32), Vec<u8>>,
     logical: u16,
 ) -> Result<()> {
-    let mut allocations = BTreeMap::<(u32, u32), Vec<u8>>::new();
-    for allocation in graph
+    let mut ranges = graph
         .schedule
         .allocations
         .iter()
         .filter(|allocation| allocation.tile == logical)
-    {
-        let key = (allocation.address, allocation.size);
-        let bytes = initial
-            .get(&(logical, allocation.address))
-            .cloned()
-            .unwrap_or_else(|| vec![0; allocation.size as usize]);
-        if bytes.len() > allocation.size as usize {
-            return Err(format!("initializer exceeds allocation on tile {logical}").into());
-        }
-        let mut padded = vec![0; allocation.size as usize];
-        padded[..bytes.len()].copy_from_slice(&bytes);
-        if let Some(previous) = allocations.insert(key, padded.clone())
-            && previous != padded
+        .filter(|allocation| allocation.size != 0)
+        .map(|allocation| {
+            Ok((
+                allocation.address,
+                allocation
+                    .address
+                    .checked_add(allocation.size)
+                    .ok_or("allocation range overflow")?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ranges.sort_unstable();
+    let mut merged = Vec::<(u32, u32)>::new();
+    for (start, end) in ranges {
+        if let Some(previous) = merged.last_mut()
+            && start <= previous.1
         {
-            return Err(format!("conflicting initializers on tile {logical}").into());
+            previous.1 = previous.1.max(end);
+        } else {
+            merged.push((start, end));
         }
     }
-    for ((address, size), bytes) in allocations {
+    for (address, end) in merged {
+        let size = usize::try_from(end - address)?;
+        let mut bytes = vec![0; size];
+        let mut initialized = vec![false; size];
+        for (&(initial_tile, initial_address), contents) in initial {
+            if initial_tile != logical || contents.is_empty() {
+                continue;
+            }
+            let initial_end = initial_address
+                .checked_add(u32::try_from(contents.len())?)
+                .ok_or("initializer range overflow")?;
+            if initial_address < address || initial_end > end {
+                continue;
+            }
+            let offset = usize::try_from(initial_address - address)?;
+            for (index, &value) in contents.iter().enumerate() {
+                if initialized[offset + index] && bytes[offset + index] != value {
+                    return Err(format!("conflicting initializers on tile {logical}").into());
+                }
+                bytes[offset + index] = value;
+                initialized[offset + index] = true;
+            }
+        }
         let blob = app.add_blob(bytes);
         segments.push(Segment {
             address,
-            memory_size: size,
+            memory_size: u32::try_from(size)?,
             blob,
             blob_offset: 0,
-            file_size: size,
+            file_size: u32::try_from(size)?,
             flags: SEGMENT_READ | SEGMENT_WRITE,
         });
     }

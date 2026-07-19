@@ -470,10 +470,10 @@ impl Application {
                 .map(|segment| (segment.address, segment.address + segment.memory_size))
                 .collect();
             ranges.sort_unstable();
-            if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            if let Some(pair) = ranges.windows(2).find(|pair| pair[0].1 > pair[1].0) {
                 return Err(PackageError::Invalid(format!(
-                    "overlapping segments on tile {}",
-                    tile.physical_tile
+                    "overlapping segments on tile {}: 0x{:x}..0x{:x} and 0x{:x}..0x{:x}",
+                    tile.physical_tile, pair[0].0, pair[0].1, pair[1].0, pair[1].1
                 )));
             }
         }

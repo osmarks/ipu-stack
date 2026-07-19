@@ -1,10 +1,15 @@
 #include "arch/gc_tile_defines.h"
 
+#ifndef GEMM_INNER_BLOCK_DIMENSION
+#define GEMM_INNER_BLOCK_DIMENSION 64
+#endif
+
 	.text
 	.allow_optimizations
 
 	.set OUTPUT_COLUMNS, 64
 	.set INNER_MICRO_DIMENSION, 8
+	.set INNER_GROUPS, GEMM_INNER_BLOCK_DIMENSION / INNER_MICRO_DIMENSION
 	.set COLUMN_MICRO_DIMENSION, 16
 	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
 	// The SDK's supervisor CR header does not expose this shift to assembly.
@@ -151,7 +156,7 @@
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
 	add $m7, $m7, 1
-	setzi $m8, INNER_MICRO_DIMENSION
+	setzi $m8, INNER_GROUPS
 	cmpult $m8, $m7, $m8
 	brnz $m8, .Linner_group_\@
 	add $m6, $m6, 1
