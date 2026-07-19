@@ -946,6 +946,26 @@ pub fn patch_receiver_address(row: &mut PlanRow, byte_address: u32) -> Result<()
     Ok(())
 }
 
+/// Delays every timed event in a plan row while preserving route-relative timing.
+pub fn offset_plan(row: &mut PlanRow, cycles: u32) -> Result<(), ExchangeError> {
+    if cycles == 0 {
+        return Ok(());
+    }
+    if row[0] != SYNC_SUPERVISOR_INSTRUCTION {
+        return Err(ExchangeError::Schedule("plan offset entry"));
+    }
+    let end = row
+        .iter()
+        .position(|instruction| *instruction == RETURN_M10_INSTRUCTION)
+        .ok_or(ExchangeError::Schedule("plan offset return"))?;
+    if end + 1 >= row.len() || cycles > 0x8_0000 {
+        return Err(ExchangeError::Schedule("plan offset range"));
+    }
+    row.copy_within(1..=end, 2);
+    row[1] = delay(cycles - 1);
+    Ok(())
+}
+
 pub fn finalize_point_receiver(
     row: &PlanRow,
     source_physical: u16,
@@ -1365,6 +1385,26 @@ mod tests {
         );
         assert_eq!(h2d.last().unwrap().tile_address + 36, 0x50064);
         assert!(plan_host_to_tile(0, 0x50004, 0, 4).is_err());
+    }
+
+    #[test]
+    fn plan_offsets_extend_beyond_route_timing_fields() {
+        let topology = Topology::c600();
+        let mut plan = topology.multicast(0, &[1, 2], 4096, 0).unwrap();
+        let sender_cycles = plan_event_cycles(&plan.sender).unwrap();
+        let receiver_cycles = plan_event_cycles(&plan.receivers[0]).unwrap();
+
+        offset_plan(&mut plan.sender, 5000).unwrap();
+        offset_plan(&mut plan.receivers[0], 5000).unwrap();
+
+        assert_eq!(
+            plan_event_cycles(&plan.sender).unwrap(),
+            sender_cycles + 5000
+        );
+        assert_eq!(
+            plan_event_cycles(&plan.receivers[0]).unwrap(),
+            receiver_cycles + 5000
+        );
     }
 
     #[test]

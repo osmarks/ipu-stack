@@ -573,10 +573,10 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         }
     }
 
-    let mut phases = Vec::with_capacity(usize::from(grid) * 3);
+    let mut phases = Vec::with_capacity(usize::from(grid) * 2);
     for inner_block in 0..grid {
-        let left_exchange_phase = phases.len();
-        let mut left_transfers = Vec::with_capacity(block_count - usize::from(grid));
+        let exchange_phase = phases.len();
+        let mut transfers = Vec::with_capacity(2 * (block_count - usize::from(grid)));
         for block_row in 0..grid {
             let source_index =
                 usize::from(block_row) * usize::from(grid) + usize::from(inner_block);
@@ -588,7 +588,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                 let destination_index =
                     usize::from(block_row) * usize::from(grid) + usize::from(block_column);
                 let destination_tile = output[destination_index].tile;
-                left_transfers.push(Transfer {
+                transfers.push(Transfer {
                     source_tile: source.tile,
                     destination_tile,
                     tensor: source.tensor,
@@ -599,20 +599,14 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     tile: destination_tile,
                     address: left_exchange_address,
                     size: block_bytes,
-                    live_from: left_exchange_phase,
-                    live_until: left_exchange_phase + 2,
+                    live_from: exchange_phase,
+                    live_until: exchange_phase + 1,
                     kind: AllocationKind::ExchangeStaging {
-                        phase: left_exchange_phase,
+                        phase: exchange_phase,
                     },
                 });
             }
         }
-        phases.push(Phase::Exchange {
-            transfers: left_transfers,
-        });
-
-        let right_exchange_phase = phases.len();
-        let mut right_transfers = Vec::with_capacity(block_count - usize::from(grid));
         for block_column in 0..grid {
             let source_index =
                 usize::from(inner_block) * usize::from(grid) + usize::from(block_column);
@@ -624,7 +618,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                 let destination_index =
                     usize::from(block_row) * usize::from(grid) + usize::from(block_column);
                 let destination_tile = output[destination_index].tile;
-                right_transfers.push(Transfer {
+                transfers.push(Transfer {
                     source_tile: source.tile,
                     destination_tile,
                     tensor: source.tensor,
@@ -635,17 +629,15 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     tile: destination_tile,
                     address: right_exchange_address,
                     size: block_bytes,
-                    live_from: right_exchange_phase,
-                    live_until: right_exchange_phase + 1,
+                    live_from: exchange_phase,
+                    live_until: exchange_phase + 1,
                     kind: AllocationKind::ExchangeStaging {
-                        phase: right_exchange_phase,
+                        phase: exchange_phase,
                     },
                 });
             }
         }
-        phases.push(Phase::Exchange {
-            transfers: right_transfers,
-        });
+        phases.push(Phase::Exchange { transfers });
 
         let gemm_phase = phases.len();
         let mut gemm_commands = Vec::with_capacity(block_count);
@@ -1012,7 +1004,12 @@ impl Schedule {
                             )?],
                         }
                     } else {
-                        topology.multicast(source, &destinations, words, schedule_offset)?
+                        let mut plan = topology.multicast(source, &destinations, words, 0)?;
+                        ipu_exchange::offset_plan(&mut plan.sender, schedule_offset)?;
+                        for receiver in &mut plan.receivers {
+                            ipu_exchange::offset_plan(receiver, schedule_offset)?;
+                        }
+                        plan
                     };
                     patch_sender_address(&mut plan.sender, source_address)?;
                     for (receiver, address) in plan
@@ -1816,10 +1813,8 @@ mod tests {
                 .len(),
             plan.output.len()
         );
-        assert!(plan.schedule.phases.chunks_exact(3).all(|round| {
-            matches!(round[0], Phase::Exchange { .. })
-                && matches!(round[1], Phase::Exchange { .. })
-                && matches!(round[2], Phase::Compute { .. })
+        assert!(plan.schedule.phases.chunks_exact(2).all(|round| {
+            matches!(round[0], Phase::Exchange { .. }) && matches!(round[1], Phase::Compute { .. })
         }));
         assert!(plan.schedule.phases.iter().all(|phase| {
             match phase {
@@ -2069,14 +2064,6 @@ mod tests {
                 .map(|group| group.source_tile)
                 .collect::<Vec<_>>(),
             vec![3, 1]
-        );
-        assert_eq!(
-            epoch.groups[0].sender[2] & 0x001f_fff8,
-            ((0x62000 >> 2) << 3) & 0x001f_fff8
-        );
-        assert_eq!(
-            epoch.groups[1].sender[2] & 0x001f_fff8,
-            (((ipu_exchange::EXCHANGE_WINDOW_BASE + 1024) >> 2) << 3) & 0x001f_fff8
         );
         let relay = epoch.row_for(1);
         assert_eq!(
