@@ -180,12 +180,14 @@ pub fn plan_flash_attention(
     let mut key_values = Vec::with_capacity(head_count * usize::from(key_blocks));
     for batch in 0..config.batch_size {
         for head in 0..config.attention_heads {
-            let owner = tasks
+            let head_tiles = tasks
                 .iter()
-                .find(|task| task.batch == batch && task.head == head)
-                .expect("each head has a query task")
-                .tile;
+                .filter(|task| task.batch == batch && task.head == head)
+                .map(|task| task.tile)
+                .collect::<Vec<_>>();
+            debug_assert!(!head_tiles.is_empty());
             for key_block in 0..key_blocks {
+                let owner = head_tiles[usize::from(key_block) % head_tiles.len()];
                 let key_row_start = key_block * key_block_rows;
                 let key_rows = key_block_rows.min(config.sequence_length - key_row_start);
                 let size = key_value_storage_bytes(key_block_columns, padded_head_dimension);
@@ -607,6 +609,7 @@ fn task_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn attention_plan_shards_queries_and_bounds_exchange_blocks() {
@@ -674,5 +677,33 @@ mod tests {
         .unwrap();
         assert!(plan.tasks.len() <= 1472);
         assert!(plan.query_block_rows >= 23);
+    }
+
+    #[test]
+    fn long_sequence_stripes_key_value_storage() {
+        let plan = plan_flash_attention(FlashAttentionConfig {
+            batch_size: 1,
+            sequence_length: 1024,
+            hidden_size: 1152,
+            attention_heads: 16,
+            query_block_rows: 0,
+            key_block_rows: 0,
+            tile_count: 1472,
+            data_base: 0xa0000,
+            data_limit: 0xe8000,
+        })
+        .unwrap();
+        for head in 0..16 {
+            let blocks = plan
+                .key_values
+                .iter()
+                .filter(|block| block.head == head)
+                .collect::<Vec<_>>();
+            let owners = blocks
+                .iter()
+                .map(|block| block.tile)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(owners.len(), blocks.len());
+        }
     }
 }

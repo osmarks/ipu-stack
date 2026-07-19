@@ -346,3 +346,7 @@ On the attached C600, the 1152-hidden/16-head path measures 50,520 cycles for
 sequence 64, 98,274 cycles for sequence 128, and 192,516 cycles for sequence
 256 at batch 1. The sequence-128 batch-3 case measures 101,160 cycles and 3.36
 useful QK/PV TFLOP/s. These graph intervals start after H2D and end before D2H.
+At sequence 1024 and batch 1, the 768/1024/1152-hidden cases measure
+691,794/840,528/1,059,462 cycles and 6.98/7.66/6.84 useful TFLOP/s. Canonical
+K/V blocks are striped over each head's query tiles so long sequences do not
+concentrate the complete K/V tensor in one tile's SRAM.
