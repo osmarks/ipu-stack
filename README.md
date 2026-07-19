@@ -324,10 +324,11 @@ IPU_ATTENTION_SEQUENCE_LENGTH=128 \
 `IPU_ATTENTION_QUERY_BLOCK_ROWS` selects query sharding (zero, the default,
 picks the smallest value that fills all six worker contexts and fits the
 available tiles). `IPU_ATTENTION_KEY_BLOCK_ROWS`
-selects K/V blocking; zero, the default, derives the largest legal block from
-the head dimension and exchange transfer limit. Hardware tests include a
+selects K/V blocking; zero, the default, derives the legal limit and minimizes
+a static cost for padded AMP rows and per-block synchronization/kernel setup.
+Hardware tests include a
 multi-block 128-token, 1152-hidden case, exercising exchange and FP32 recurrence
-state across three K/V passes.
+state across multiple K/V passes.
 
 Set `IPU_PROFILE_OUTPUT` to write an all-tile Cap'n Proto cycle profile; the
 usual `IPU_PROFILE_GRANULARITY=graph|phase|step` setting applies. The runner

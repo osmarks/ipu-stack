@@ -109,7 +109,7 @@ pub fn plan_flash_attention(
             CompileError::Graph("one attention key row exceeds the exchange limit".into())
         })?;
     let key_block_rows = if config.key_block_rows == 0 {
-        maximum_key_rows
+        select_key_block_rows(config.sequence_length, maximum_key_rows)
     } else {
         config.key_block_rows
     }
@@ -516,6 +516,19 @@ fn key_value_block_bytes(rows: u16, padded_dimension: u16) -> u32 {
 fn key_value_storage_bytes(storage_rows: u16, padded_dimension: u16) -> u32 {
     // K and V are independently padded and packed as AMP B16x16 matrices.
     u32::from(padded_dimension) * u32::from(storage_rows) * 4
+}
+
+fn select_key_block_rows(sequence_length: u16, maximum_rows: u16) -> u16 {
+    // Each additional block pays a sync and four kernel launches. Model that
+    // fixed work as one 16-row AMP micro-panel, then account for padded rows.
+    (1..=maximum_rows)
+        .min_by_key(|&rows| {
+            let blocks = u32::from(sequence_length.div_ceil(rows));
+            let storage_rows = u32::from(rows.div_ceil(16) * 16);
+            let padded_rows = blocks * storage_rows;
+            (padded_rows + blocks * 16, padded_rows, maximum_rows - rows)
+        })
+        .expect("maximum key rows is non-zero")
 }
 
 fn validate(config: FlashAttentionConfig) -> Result<(), CompileError> {
