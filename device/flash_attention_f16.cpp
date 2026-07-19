@@ -107,13 +107,11 @@ DEFINE_SOFTMAX_VERTEX(AttentionSoftmaxLargeQuerySmallKeyF16,
 DEFINE_SOFTMAX_VERTEX(AttentionSoftmaxLargeQueryLargeKeyF16,
                       ATTENTION_LARGE_QUERY_ROWS, ATTENTION_LARGE_KEY_ROWS);
 
-template <unsigned QueryRows, typename BlockValues, typename BlockState,
-          typename Accumulator>
+template <unsigned QueryRows, bool InitialBlock, bool FinalBlock,
+          typename BlockValues, typename BlockState, typename Accumulator>
 __attribute__((always_inline)) bool mergeBlock(const BlockValues &blockValues,
                                                const BlockState &blockState,
                                                Accumulator &accumulator,
-                                               unsigned initialBlock,
-                                               unsigned finalBlock,
                                                unsigned worker) {
   constexpr unsigned dimension = ATTENTION_HEAD_DIMENSION;
   const float *blockMaxima = reinterpret_cast<const float *>(
@@ -126,7 +124,7 @@ __attribute__((always_inline)) bool mergeBlock(const BlockValues &blockValues,
     float *output = &accumulator[row * dimension];
     const float blockMaximum = blockMaxima[row];
     const float blockDenominator = blockDenominators[row];
-    if (initialBlock) {
+    if (InitialBlock) {
       for (unsigned column = 0; column < dimension; ++column)
         output[column] =
             float(blockValues[c16Index<QueryRows>(row, column)]);
@@ -144,7 +142,7 @@ __attribute__((always_inline)) bool mergeBlock(const BlockValues &blockValues,
                           blockDenominator * blockScale;
       maxima[row] = maximum;
     }
-    if (finalBlock) {
+    if (FinalBlock) {
       const float reciprocal = 1.0f / denominators[row];
       for (unsigned column = 0; column < dimension; ++column)
         output[column] *= reciprocal;
@@ -153,22 +151,31 @@ __attribute__((always_inline)) bool mergeBlock(const BlockValues &blockValues,
   return true;
 }
 
-#define DEFINE_MERGE_VERTEX(Name, QueryRows)                                   \
+#define DEFINE_MERGE_VERTEX(Name, QueryRows, InitialBlock, FinalBlock)          \
   class Name : public MultiVertex {                                            \
   public:                                                                      \
     Input<Vector<half, VectorLayout::ONE_PTR>> blockValues;                     \
     Input<Vector<half, VectorLayout::ONE_PTR>> blockState;                      \
     Output<Vector<float, VectorLayout::ONE_PTR>> accumulator;                   \
-    unsigned initialBlock;                                                      \
-    unsigned finalBlock;                                                        \
-                                                                               \
     bool compute(unsigned worker) {                                             \
-      return mergeBlock<QueryRows>(blockValues, blockState, accumulator,        \
-                                   initialBlock, finalBlock, worker);            \
+      return mergeBlock<QueryRows, InitialBlock, FinalBlock>(                   \
+          blockValues, blockState, accumulator, worker);                        \
     }                                                                          \
   }
 
-DEFINE_MERGE_VERTEX(AttentionMergeSmallQueryF16,
-                    ATTENTION_SMALL_QUERY_ROWS);
-DEFINE_MERGE_VERTEX(AttentionMergeLargeQueryF16,
-                    ATTENTION_LARGE_QUERY_ROWS);
+DEFINE_MERGE_VERTEX(AttentionMergeSmallQuerySingleBlockF16,
+                    ATTENTION_SMALL_QUERY_ROWS, true, true);
+DEFINE_MERGE_VERTEX(AttentionMergeSmallQueryInitialBlockF16,
+                    ATTENTION_SMALL_QUERY_ROWS, true, false);
+DEFINE_MERGE_VERTEX(AttentionMergeSmallQueryMiddleBlockF16,
+                    ATTENTION_SMALL_QUERY_ROWS, false, false);
+DEFINE_MERGE_VERTEX(AttentionMergeSmallQueryFinalBlockF16,
+                    ATTENTION_SMALL_QUERY_ROWS, false, true);
+DEFINE_MERGE_VERTEX(AttentionMergeLargeQuerySingleBlockF16,
+                    ATTENTION_LARGE_QUERY_ROWS, true, true);
+DEFINE_MERGE_VERTEX(AttentionMergeLargeQueryInitialBlockF16,
+                    ATTENTION_LARGE_QUERY_ROWS, true, false);
+DEFINE_MERGE_VERTEX(AttentionMergeLargeQueryMiddleBlockF16,
+                    ATTENTION_LARGE_QUERY_ROWS, false, false);
+DEFINE_MERGE_VERTEX(AttentionMergeLargeQueryFinalBlockF16,
+                    ATTENTION_LARGE_QUERY_ROWS, false, true);

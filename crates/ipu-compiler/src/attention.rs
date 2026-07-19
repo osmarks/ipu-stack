@@ -277,6 +277,12 @@ pub fn plan_flash_attention(
         let merge_phase = exchange_phase + 4;
         let initial = u32::from(key_block == 0);
         let final_block = u32::from(key_block + 1 == key_blocks);
+        let merge_role = match (initial != 0, final_block != 0) {
+            (true, true) => "single",
+            (true, false) => "initial",
+            (false, true) => "final",
+            (false, false) => "middle",
+        };
         let mut transfers = Vec::new();
         let mut qk_commands = Vec::with_capacity(tasks.len());
         let mut softmax_commands = Vec::with_capacity(tasks.len());
@@ -408,9 +414,9 @@ pub fn plan_flash_attention(
                 tile: task.tile,
                 output: task.accumulator,
                 inputs: vec![task.scores, task.weights],
-                arguments: vec![initial, final_block],
+                arguments: Vec::new(),
                 specialization: SpecializationKey {
-                    operation: format!("attention_merge_{query_size}_query_f16"),
+                    operation: format!("attention_merge_{query_size}_query_{merge_role}_block_f16"),
                     shape: vec![usize::from(task.query_rows), usize::from(head_dimension)],
                     worker_count: 6,
                     role: format!("attention-merge-batch-{}-head-{}", task.batch, task.head),

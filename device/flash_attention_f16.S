@@ -54,8 +54,6 @@ _stackoverflow:
 	st32 $m3, $m11, $m15, 0
 	st32 $m4, $m11, $m15, 1
 	st32 $m2, $m11, $m15, 2
-	st32 $m5, $m11, $m15, 3
-	st32 $m6, $m11, $m15, 4
 	setzi $m0, \codelet
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
@@ -64,8 +62,14 @@ _stackoverflow:
 	.size \name, .-\name
 	.endm
 
-	ATTENTION_MERGE_WRAPPER ipu_stack_attention_merge_small_query_f16, __runCodelet_AttentionMergeSmallQueryF16
-	ATTENTION_MERGE_WRAPPER ipu_stack_attention_merge_large_query_f16, __runCodelet_AttentionMergeLargeQueryF16
+	ATTENTION_MERGE_WRAPPER ipu_stack_attention_merge_small_query_single_block_f16, __runCodelet_AttentionMergeSmallQuerySingleBlockF16
+	ATTENTION_MERGE_WRAPPER ipu_stack_attention_merge_small_query_initial_block_f16, __runCodelet_AttentionMergeSmallQueryInitialBlockF16
+	ATTENTION_MERGE_WRAPPER ipu_stack_attention_merge_small_query_middle_block_f16, __runCodelet_AttentionMergeSmallQueryMiddleBlockF16
+	ATTENTION_MERGE_WRAPPER ipu_stack_attention_merge_small_query_final_block_f16, __runCodelet_AttentionMergeSmallQueryFinalBlockF16
+	ATTENTION_MERGE_WRAPPER ipu_stack_attention_merge_large_query_single_block_f16, __runCodelet_AttentionMergeLargeQuerySingleBlockF16
+	ATTENTION_MERGE_WRAPPER ipu_stack_attention_merge_large_query_initial_block_f16, __runCodelet_AttentionMergeLargeQueryInitialBlockF16
+	ATTENTION_MERGE_WRAPPER ipu_stack_attention_merge_large_query_middle_block_f16, __runCodelet_AttentionMergeLargeQueryMiddleBlockF16
+	ATTENTION_MERGE_WRAPPER ipu_stack_attention_merge_large_query_final_block_f16, __runCodelet_AttentionMergeLargeQueryFinalBlockF16
 
 	.section .text.ipu_stack_attention_f32_to_f16,"ax",@progbits
 	.globl ipu_stack_attention_f32_to_f16
