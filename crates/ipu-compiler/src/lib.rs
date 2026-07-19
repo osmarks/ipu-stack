@@ -644,7 +644,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     specialization: SpecializationKey {
                         operation: "copy_4096_u32".into(),
                         shape: vec![usize::from(config.block_dimension); 2],
-                        worker_count: 1,
+                        worker_count: 6,
                         role: "left-block-staging".into(),
                         alignment: 32,
                     },

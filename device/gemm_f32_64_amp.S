@@ -3,7 +3,6 @@
 	.text
 	.allow_optimizations
 
-	.set WORKER_ARGUMENTS, 0x50000
 	.set BLOCK_DIMENSION, 64
 	.set INNER_MICRO_DIMENSION, 8
 	.set COLUMN_MICRO_DIMENSION, 16
@@ -20,16 +19,40 @@
 	.type ipu_stack_copy_4096_u32,@function
 ipu_stack_copy_4096_u32:
 	.supervisor
-	setzi $m4, BLOCK_DIMENSION * BLOCK_DIMENSION
-.Lcopy_word:
-	ld32 $m0, $m3, $m15, 0
-	st32 $m0, $m2, $m15, 0
-	add $m3, $m3, 4
-	add $m2, $m2, 4
-	sub $m4, $m4, 1
-	brnz $m4, .Lcopy_word
+	add $m11, $m11, -8
+	st32 $m2, $m11, $m15, 0
+	st32 $m3, $m11, $m15, 1
+	setzi $m0, .Lcopy_4096_u32_worker
+	runall $m0, $m11, 0
+	sync SYNC_COMPUTE_SET
+	add $m11, $m11, 8
 	br $m10
 	.size ipu_stack_copy_4096_u32, .-ipu_stack_copy_4096_u32
+
+	.worker
+	.p2align 2
+.Lcopy_4096_u32_worker:
+	ld32 $m2, $mvertex_base, $m15, 0
+	ld32 $m3, $mvertex_base, $m15, 1
+	get $m4, $WSR
+	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
+	setzi $m5, (BLOCK_DIMENSION * BLOCK_DIMENSION / 2) / 6
+	cmpult $m6, $m4, (BLOCK_DIMENSION * BLOCK_DIMENSION / 2) % 6
+	add $m5, $m5, $m6
+	mul $m6, $m4, (BLOCK_DIMENSION * BLOCK_DIMENSION / 2) / 6
+	min $m7, $m4, (BLOCK_DIMENSION * BLOCK_DIMENSION / 2) % 6
+	add $m6, $m6, $m7
+	shl $m6, $m6, 3
+	add $m2, $m2, $m6
+	add $m3, $m3, $m6
+.Lcopy_64:
+	ld64 $a0:1, $m3, $m15, 0
+	st64 $a0:1, $m2, $m15, 0
+	add $m3, $m3, 8
+	add $m2, $m2, 8
+	sub $m5, $m5, 1
+	brnz $m5, .Lcopy_64
+	exitz $mzero
 
 	.macro LOAD_AMP16_WEIGHTS
 	ld64putcs 0
@@ -114,6 +137,7 @@ ipu_stack_copy_4096_u32:
 	sub $m6, $m6, 1
 	brnz $m6, .Lzero_\@
 	.endif
+	add $m11, $m11, -8
 	setzi $m5, CLEAR_CWEI
 	put $CR, $m5
 	put $CCCSLOAD, $m4
@@ -123,7 +147,7 @@ ipu_stack_copy_4096_u32:
 	zero $m7
 .Linner_group_\@:
 	LOAD_AMP16_WEIGHTS
-	setzi $m5, WORKER_ARGUMENTS
+	mov $m5, $m11
 	shl $m8, $m6, 12
 	add $m8, $m2, $m8
 	st32 $m8, $m5, $m15, 0
@@ -142,6 +166,7 @@ ipu_stack_copy_4096_u32:
 	cmpult $m8, $m6, $m8
 	brnz $m8, .Lcolumn_group_\@
 	sync SYNC_COMPUTE_SET
+	add $m11, $m11, 8
 	br $m10
 	.size \name, .-\name
 	.endm

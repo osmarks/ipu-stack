@@ -7,11 +7,11 @@ use ipu_driver::{Device, HostBuffer, HostSession, Loader, block_device_interrupt
 use ipu_elf::{LinkOptions, Toolchain, inspect_object, link};
 use ipu_exchange::Topology;
 use ipu_package::{
-    Application, EntryPoint, HostCall, HostExchange, HostPage, HostSlice, SEGMENT_EXECUTE,
-    SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
+    Application, EntryPoint, HostCall, HostExchange, HostPage, HostSlice, ProfileReport,
+    SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
 };
 use object::{Object, ObjectSegment};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use tracing::{info, info_span};
@@ -67,6 +67,9 @@ enum Command {
     EncoderReference,
     PackageInspect {
         package: PathBuf,
+    },
+    ProfileInspect {
+        profile: PathBuf,
     },
     PackageExtractTile {
         package: PathBuf,
@@ -312,6 +315,35 @@ fn main() -> Result<()> {
                 app.entry_points.len(),
                 app.device_config_writes.len()
             );
+        }
+        Command::ProfileInspect { profile } => {
+            let report = ProfileReport::read(fs::File::open(profile)?)?;
+            let mut phases = BTreeMap::<(u32, u32, String), u32>::new();
+            for tile in &report.tiles {
+                for sample in &tile.samples {
+                    let cycles = sample.end_cycle.wrapping_sub(sample.start_cycle);
+                    phases
+                        .entry((
+                            sample.step.phase,
+                            sample.step.epoch,
+                            sample.step.operation.clone(),
+                        ))
+                        .and_modify(|maximum| *maximum = (*maximum).max(cycles))
+                        .or_insert(cycles);
+                }
+            }
+            let mut operations = BTreeMap::<String, (usize, u64, u32)>::new();
+            for ((_, _, operation), cycles) in phases {
+                let entry = operations.entry(operation).or_default();
+                entry.0 += 1;
+                entry.1 += u64::from(cycles);
+                entry.2 = entry.2.max(cycles);
+            }
+            for (operation, (phases, cycles, maximum)) in operations {
+                println!(
+                    "operation={operation} phases={phases} cycles={cycles} maxPhaseCycles={maximum}"
+                );
+            }
         }
         Command::PackageExtractTile {
             package,
@@ -736,6 +768,7 @@ impl Command {
             Self::EncoderPlan { .. } => "encoder-plan",
             Self::EncoderReference => "encoder-reference",
             Self::PackageInspect { .. } => "package-inspect",
+            Self::ProfileInspect { .. } => "profile-inspect",
             Self::PackageExtractTile { .. } => "package-extract-tile",
             Self::PackageImportIpuimg { .. } => "package-import-ipuimg",
             Self::PackageElfDirectory { .. } => "package-elf-directory",
