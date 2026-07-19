@@ -11,6 +11,8 @@ use tracing::info;
 
 const TILE_COUNT: u16 = 1472;
 const BLOCK_DIMENSION: u16 = 64;
+const INNER_MICRO_DIMENSION: u16 = 8;
+const COLUMN_MICRO_DIMENSION: u16 = 16;
 // The 12,288 static host attachment phases occupy the lower runtime arena.
 const GEMM_DATA_BASE: u32 = 0xa0000;
 
@@ -40,7 +42,7 @@ fn main() {
         .compile(&runtime_source, &output, "gemm-runtime", &[])
         .unwrap();
     let kernel_source =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/gemm_f32_64.S");
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/gemm_f32_64_amp.S");
     let kernel = toolchain
         .compile(&kernel_source, &output, "gemm-f32-64", &[])
         .unwrap();
@@ -182,11 +184,7 @@ fn gemm_graph_and_input(dimension: u16, plan: BlockedGemmPlan) -> (ExecutableGra
     let right_binding = block_binding("right", dimension, block_bytes, &plan.right);
     let output_binding = block_binding("output", dimension, block_bytes, &plan.output);
     let mut input = blocked_matrix(dimension, BlockLayout::RowMajor, left_value);
-    input.extend(blocked_matrix(
-        dimension,
-        BlockLayout::ColumnMajor,
-        right_value,
-    ));
+    input.extend(blocked_matrix(dimension, BlockLayout::Amp8x16, right_value));
     (
         ExecutableGraph {
             schedule: plan.schedule,
@@ -226,7 +224,7 @@ fn block_binding(
 #[derive(Clone, Copy)]
 enum BlockLayout {
     RowMajor,
-    ColumnMajor,
+    Amp8x16,
 }
 
 fn blocked_matrix(dimension: u16, layout: BlockLayout, value: impl Fn(u16, u16) -> f32) -> Vec<u8> {
@@ -238,7 +236,23 @@ fn blocked_matrix(dimension: u16, layout: BlockLayout, value: impl Fn(u16, u16) 
                 for minor in 0..BLOCK_DIMENSION {
                     let (row, column) = match layout {
                         BlockLayout::RowMajor => (major, minor),
-                        BlockLayout::ColumnMajor => (minor, major),
+                        BlockLayout::Amp8x16 => {
+                            let linear = major * BLOCK_DIMENSION + minor;
+                            let panel_elements = INNER_MICRO_DIMENSION * COLUMN_MICRO_DIMENSION;
+                            let panel = linear / panel_elements;
+                            let panel_offset = linear % panel_elements;
+                            let column_group = panel / INNER_MICRO_DIMENSION;
+                            let inner_group = panel % INNER_MICRO_DIMENSION;
+                            let load_channel = panel_offset / INNER_MICRO_DIMENSION;
+                            let inner_in_group = panel_offset % INNER_MICRO_DIMENSION;
+                            let load_pair = load_channel / 2;
+                            let logical_pair = (load_pair % 2) * 4 + load_pair / 2;
+                            let column_in_group = logical_pair * 2 + load_channel % 2;
+                            (
+                                inner_group * INNER_MICRO_DIMENSION + inner_in_group,
+                                column_group * COLUMN_MICRO_DIMENSION + column_in_group,
+                            )
+                        }
                     };
                     bytes.extend_from_slice(
                         &value(
