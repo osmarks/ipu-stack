@@ -9,6 +9,8 @@ using namespace poplar;
 
 static_assert(ATTENTION_HEAD_DIMENSION > 0);
 
+extern "C" float ipu_stack_attention_dot(const half *, const half *);
+
 class FlashAttentionF16 : public MultiVertex {
 public:
   Input<Vector<half, VectorLayout::ONE_PTR>> query;
@@ -77,9 +79,7 @@ private:
   static __attribute__((always_inline)) float dot(const half *left,
                                                    const half *right,
                                                    float scale) {
-    float result = 0.0f;
-    for (unsigned column = 0; column < ATTENTION_HEAD_DIMENSION; ++column)
-      result += float(left[column]) * float(right[column]);
-    return result * scale;
+    static_assert(ATTENTION_HEAD_DIMENSION % 4 == 0);
+    return ipu_stack_attention_dot(left, right) * scale;
   }
 };

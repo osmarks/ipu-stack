@@ -6,7 +6,8 @@ use ipu_compiler::{
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    ExecutableGraph, HostRunOptions, normal_f16, package_graph, run_host_with_options,
+    ExecutableGraph, HostRunOptions, ProfileGranularity, normal_f16, package_graph,
+    package_graph_profiled_with, run_host_with_options,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,13 +16,15 @@ use tracing::info;
 const TILE_COUNT: u16 = 1472;
 const ATTENTION_HEADS: u16 = 16;
 const ATTENTION_DATA_BASE: u32 = 0xa0000;
+const DEFAULT_CLOCK_HZ: u64 = 1_500_000_000;
+const FP16_FLOPS_PER_TILE_CYCLE: f64 = 128.0;
 
 fn main() {
     ipu_runtime::init_tracing();
     let hidden_sizes = env_u16_list("IPU_ATTENTION_HIDDEN_SIZES", &[768, 1024, 1152]);
     let batch_sizes = env_u16_list("IPU_ATTENTION_BATCH_SIZES", &[1, 3]);
     let sequence_length = env_u16("IPU_ATTENTION_SEQUENCE_LENGTH", 64);
-    let query_block_rows = env_u16("IPU_ATTENTION_QUERY_BLOCK_ROWS", 16);
+    let query_block_rows = env_u16("IPU_ATTENTION_QUERY_BLOCK_ROWS", 0);
     let key_block_rows = env_u16("IPU_ATTENTION_KEY_BLOCK_ROWS", 0);
     let seed = env_u64("IPU_ATTENTION_SEED", 0xfa57_a77e_1616);
     let max_error_limit = env_f32("IPU_F16_MAX_ERROR", 0.001);
@@ -169,18 +172,26 @@ fn run_case(case: Case<'_>) {
             source("flash_attention_f16.S"),
             &artifact_dir,
             "flash-attention-wrapper",
-            &[],
+            &[format!(
+                "-DATTENTION_HEAD_DIMENSION={}",
+                plan.head_dimension
+            )],
         )
         .unwrap();
-    let app = package_graph(
-        &graph,
-        &[
-            fs::read(runtime.object).unwrap(),
-            fs::read(codelet.object).unwrap(),
-            fs::read(wrapper.object).unwrap(),
-        ],
-    )
-    .unwrap();
+    let objects = [
+        fs::read(runtime.object).unwrap(),
+        fs::read(codelet.object).unwrap(),
+        fs::read(wrapper.object).unwrap(),
+    ];
+    let profile_output = profile_path(&case);
+    let (app, profile_layout) = if profile_output.is_some() {
+        let granularity = ProfileGranularity::from_environment().unwrap();
+        let (app, layout) = package_graph_profiled_with(&graph, &objects, granularity).unwrap();
+        info!(?granularity, "enabled FlashAttention cycle profiling");
+        (app, Some(layout))
+    } else {
+        (package_graph(&graph, &objects).unwrap(), None)
+    };
     info!(
         batch_size = case.batch_size,
         sequence_length = case.sequence_length,
@@ -204,6 +215,31 @@ fn run_case(case: Case<'_>) {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
+    if let (Some(path), Some(layout)) = (&profile_output, &profile_layout) {
+        let clock_hz = env_u64("IPU_CLOCK_HZ", DEFAULT_CLOCK_HZ);
+        let report = layout.decode(&actual, clock_hz).unwrap();
+        let graph_cycles = graph_cycles(&report);
+        let graph_seconds = f64::from(graph_cycles) / clock_hz as f64;
+        // QK and PV each perform one multiply and one add per attention pair.
+        let flops = 4.0
+            * f64::from(case.batch_size)
+            * f64::from(ATTENTION_HEADS)
+            * f64::from(case.sequence_length).powi(2)
+            * f64::from(plan.head_dimension);
+        let tflops = flops / graph_seconds / 1.0e12;
+        let peak_tflops =
+            clock_hz as f64 * f64::from(TILE_COUNT) * FP16_FLOPS_PER_TILE_CYCLE / 1.0e12;
+        report.write(fs::File::create(path).unwrap()).unwrap();
+        info!(
+            path = %path.display(),
+            graph_cycles,
+            graph_ms = graph_seconds * 1.0e3,
+            attention_tflops = tflops,
+            peak_tflops,
+            efficiency_percent = tflops / peak_tflops * 100.0,
+            "wrote FlashAttention cycle profile"
+        );
+    }
     let expected = attention_reference(config, &query, &key, &value);
     let errors = verify_output(&actual, &expected, case.max_error_limit).unwrap();
     info!(
@@ -217,6 +253,44 @@ fn run_case(case: Case<'_>) {
         "FP16 FlashAttention passed host softmax reference"
     );
     let _ = fs::remove_dir_all(artifact_dir);
+}
+
+fn profile_path(case: &Case<'_>) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("IPU_PROFILE_OUTPUT")?);
+    let multiple_cases = env_u16_list("IPU_ATTENTION_HIDDEN_SIZES", &[768, 1024, 1152]).len()
+        * env_u16_list("IPU_ATTENTION_BATCH_SIZES", &[1, 3]).len()
+        > 1;
+    if !multiple_cases {
+        return Some(path);
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("capnp");
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attention");
+    Some(path.with_file_name(format!(
+        "{stem}-h{}-b{}.{}",
+        case.hidden_size, case.batch_size, extension
+    )))
+}
+
+fn graph_cycles(report: &ipu_package::ProfileReport) -> u32 {
+    report
+        .tiles
+        .iter()
+        .filter_map(|tile| {
+            Some(
+                tile.samples
+                    .last()?
+                    .end_cycle
+                    .wrapping_sub(tile.samples.first()?.start_cycle),
+            )
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn task_binding(

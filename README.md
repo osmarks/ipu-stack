@@ -320,9 +320,16 @@ IPU_ATTENTION_SEQUENCE_LENGTH=128 \
   cargo run --release -p ipu-runtime --bin ipu-attention-f16-e2e
 ```
 
-`IPU_ATTENTION_QUERY_BLOCK_ROWS` selects query sharding (default 16, zero picks
-the finest value that fits the available tiles). `IPU_ATTENTION_KEY_BLOCK_ROWS`
+`IPU_ATTENTION_QUERY_BLOCK_ROWS` selects query sharding (zero, the default,
+picks the finest value that fits the available tiles). `IPU_ATTENTION_KEY_BLOCK_ROWS`
 selects K/V blocking; zero, the default, derives the largest legal block from
 the head dimension and exchange transfer limit. Hardware tests include a
 multi-block 128-token, 1152-hidden case, exercising exchange and FP32 recurrence
 state across three K/V passes.
+
+Set `IPU_PROFILE_OUTPUT` to write an all-tile Cap'n Proto cycle profile; the
+usual `IPU_PROFILE_GRANULARITY=graph|phase|step` setting applies. The runner
+reports useful QK/PV FLOP rate (`4 * batch * heads * sequence^2 * head_dimension`)
+against the C600's 282.624 TFLOP/s FP16 architectural peak. QK dot products use
+the tile FP accumulator, retaining FP32 accumulation while processing four
+FP16 products per instruction group.
