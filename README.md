@@ -297,9 +297,10 @@ counts only GEMM FLOPs while its interval includes GeLU and exchange work.
 
 `plan_flash_attention` builds non-causal FP16 attention with FP32 online-softmax
 state. Queries are sharded by row across tiles. Each batch/head stores one
-canonical K/V copy, which is split into exchange-window-sized row blocks and
-multicast to its query tiles. The kernel carries its maximum, denominator, and
-FP32 value accumulator across block phases, without allocating a
+canonical, AMP-packed K/V copy, which is split into exchange-window-sized row
+blocks and multicast to its query tiles. AMP computes both QK and each block's
+weighted V product. The kernel merges each FP16 block result into an FP32
+maximum, denominator, and value accumulator, without allocating a
 sequence-squared score or probability tensor. A six-worker finalizer converts
 the result to FP16 with stochastic rounding. Head dimension is a compile-time
 kernel specialization; query and key row counts are scalar parameters so tail
@@ -330,8 +331,8 @@ state across three K/V passes.
 Set `IPU_PROFILE_OUTPUT` to write an all-tile Cap'n Proto cycle profile; the
 usual `IPU_PROFILE_GRANULARITY=graph|phase|step` setting applies. The runner
 reports useful QK/PV FLOP rate (`4 * batch * heads * sequence^2 * head_dimension`)
-against the C600's 282.624 TFLOP/s FP16 architectural peak. QK dot products use
-the tile AMP unit. The planner pads head and key-block dimensions to 16-element
-micro-panels, packs Q/K in the existing AMP A/B layouts, and places temporary
-scores in the IPU21 interleaved SRAM required by the AMP paired memory
-instructions. Softmax and the persistent V accumulator remain FP32.
+against the C600's 282.624 TFLOP/s FP16 architectural peak. The planner pads
+head and key-block dimensions to 16-element micro-panels, packs Q/weights in
+AMP A layout and K/V in AMP B layout, and places temporary QK/PV products in
+the IPU21 interleaved SRAM required by the AMP paired memory instructions.
+Softmax statistics and the persistent V accumulator remain FP32.

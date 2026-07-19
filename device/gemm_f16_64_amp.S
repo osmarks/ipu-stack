@@ -12,6 +12,21 @@
 #ifndef GEMM_OUTPUT_COLUMNS
 #define GEMM_OUTPUT_COLUMNS 64
 #endif
+#ifndef GEMM_RIGHT_BYTE_OFFSET
+#define GEMM_RIGHT_BYTE_OFFSET 0
+#endif
+#ifndef GEMM_INIT_SMALL_SYMBOL
+#define GEMM_INIT_SMALL_SYMBOL ipu_stack_gemm_f16_init_small_rows
+#endif
+#ifndef GEMM_INIT_LARGE_SYMBOL
+#define GEMM_INIT_LARGE_SYMBOL ipu_stack_gemm_f16_init_large_rows
+#endif
+#ifndef GEMM_ACCUMULATE_SMALL_SYMBOL
+#define GEMM_ACCUMULATE_SMALL_SYMBOL ipu_stack_gemm_f16_accumulate_small_rows
+#endif
+#ifndef GEMM_ACCUMULATE_LARGE_SYMBOL
+#define GEMM_ACCUMULATE_LARGE_SYMBOL ipu_stack_gemm_f16_accumulate_large_rows
+#endif
 
 	.text
 	.allow_optimizations
@@ -126,6 +141,7 @@
 	put $FP_ICTL, $m8
 	setzi $m8, CLEAR_CWEI
 	put $CR, $m8
+	add $m4, $m4, GEMM_RIGHT_BYTE_OFFSET
 	put $CCCSLOAD, $m4
 	sync SYNC_COMPUTE_SET
 	zero $m6
@@ -167,10 +183,10 @@
 	.size \name, .-\name
 	.endm
 
-	GEMM_SUPERVISOR ipu_stack_gemm_f16_init_small_rows, 1, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small
-	GEMM_SUPERVISOR ipu_stack_gemm_f16_init_large_rows, 1, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large
-	GEMM_SUPERVISOR ipu_stack_gemm_f16_accumulate_small_rows, 0, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small
-	GEMM_SUPERVISOR ipu_stack_gemm_f16_accumulate_large_rows, 0, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large
+	GEMM_SUPERVISOR GEMM_INIT_SMALL_SYMBOL, 1, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small
+	GEMM_SUPERVISOR GEMM_INIT_LARGE_SYMBOL, 1, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large
+	GEMM_SUPERVISOR GEMM_ACCUMULATE_SMALL_SYMBOL, 0, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small
+	GEMM_SUPERVISOR GEMM_ACCUMULATE_LARGE_SYMBOL, 0, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large
 
 	.worker
 	.macro GEMM_WORKER name, rows

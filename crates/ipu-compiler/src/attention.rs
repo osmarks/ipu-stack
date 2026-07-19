@@ -30,10 +30,12 @@ pub struct AttentionTaskPlacement {
     pub query: TensorId,
     pub accumulator: TensorId,
     pub scores: TensorId,
+    pub weights: TensorId,
     pub output: TensorId,
     pub query_address: u32,
     pub accumulator_address: u32,
     pub scores_address: u32,
+    pub weights_address: u32,
     pub output_address: u32,
 }
 
@@ -100,9 +102,7 @@ pub fn plan_flash_attention(
     let padded_head_dimension = head_dimension.div_ceil(16) * 16;
     let transfer_limit = ipu_exchange::MAX_TRANSFER_WORDS * 4;
     let maximum_key_rows = (1..=config.sequence_length)
-        .take_while(|&rows| {
-            key_value_block_bytes(rows, head_dimension, padded_head_dimension) <= transfer_limit
-        })
+        .take_while(|&rows| key_value_block_bytes(rows, padded_head_dimension) <= transfer_limit)
         .last()
         .ok_or_else(|| {
             CompileError::Graph("one attention key row exceeds the exchange limit".into())
@@ -137,6 +137,7 @@ pub fn plan_flash_attention(
                 // The online state is [accumulator rows][maximum per row][denominator per row].
                 let accumulator_bytes = elements * 4 + u32::from(query_rows) * 8;
                 let scores_bytes = u32::from(query_rows) * u32::from(key_block_columns) * 2;
+                let weights_bytes = scores_bytes + u32::from(query_rows) * 8;
                 let output_bytes = elements * 2;
                 let cursor = &mut cursors[usize::from(tile)];
                 let query_address = allocate(cursor, query_bytes, 8)?;
@@ -147,10 +148,12 @@ pub fn plan_flash_attention(
                         "attention score block for tile {tile} exceeds interleaved SRAM"
                     )));
                 }
+                let weights_address = allocate(cursor, weights_bytes, 8)?;
                 let output_address = allocate(cursor, output_bytes, 8)?;
                 let query = fresh_tensor(&mut next_tensor);
                 let accumulator = fresh_tensor(&mut next_tensor);
                 let scores = fresh_tensor(&mut next_tensor);
+                let weights = fresh_tensor(&mut next_tensor);
                 let output = fresh_tensor(&mut next_tensor);
                 tasks.push(AttentionTaskPlacement {
                     batch,
@@ -161,10 +164,12 @@ pub fn plan_flash_attention(
                     query,
                     accumulator,
                     scores,
+                    weights,
                     output,
                     query_address,
                     accumulator_address,
                     scores_address,
+                    weights_address,
                     output_address,
                 });
             }
@@ -182,12 +187,7 @@ pub fn plan_flash_attention(
             for key_block in 0..key_blocks {
                 let key_row_start = key_block * key_block_rows;
                 let key_rows = key_block_rows.min(config.sequence_length - key_row_start);
-                let size = key_value_storage_bytes(
-                    key_rows,
-                    key_block_columns,
-                    head_dimension,
-                    padded_head_dimension,
-                );
+                let size = key_value_storage_bytes(key_block_columns, padded_head_dimension);
                 let address = allocate(&mut cursors[usize::from(owner)], size, 8)?;
                 key_values.push(AttentionKeyValuePlacement {
                     batch,
@@ -211,7 +211,7 @@ pub fn plan_flash_attention(
         }
     }
 
-    let final_phase = usize::from(key_blocks) * 3 + 1;
+    let final_phase = usize::from(key_blocks) * 5 + 1;
     for task in &tasks {
         allocations.extend([
             home(
@@ -235,6 +235,14 @@ pub fn plan_flash_attention(
                 task.tile,
                 task.scores_address,
                 u32::from(task.query_rows) * u32::from(key_block_columns) * 2,
+                0,
+                final_phase,
+            ),
+            home(
+                task.weights,
+                task.tile,
+                task.weights_address,
+                u32::from(task.query_rows) * (u32::from(key_block_columns) * 2 + 8),
                 0,
                 final_phase,
             ),
@@ -263,12 +271,16 @@ pub fn plan_flash_attention(
     for key_block in 0..key_blocks {
         let exchange_phase = phases.len();
         let qk_phase = exchange_phase + 1;
-        let compute_phase = exchange_phase + 2;
+        let softmax_phase = exchange_phase + 2;
+        let pv_phase = exchange_phase + 3;
+        let merge_phase = exchange_phase + 4;
         let initial = u32::from(key_block == 0);
         let final_block = u32::from(key_block + 1 == key_blocks);
         let mut transfers = Vec::new();
         let mut qk_commands = Vec::with_capacity(tasks.len());
-        let mut commands = Vec::with_capacity(tasks.len());
+        let mut softmax_commands = Vec::with_capacity(tasks.len());
+        let mut pv_commands = Vec::with_capacity(tasks.len());
+        let mut merge_commands = Vec::with_capacity(tasks.len());
         for task in &tasks {
             let block = key_values
                 .iter()
@@ -291,7 +303,7 @@ pub fn plan_flash_attention(
                     address: ipu_exchange::EXCHANGE_WINDOW_BASE,
                     size: block.size,
                     live_from: exchange_phase,
-                    live_until: compute_phase,
+                    live_until: pv_phase,
                     kind: AllocationKind::ExchangeStaging {
                         phase: exchange_phase,
                     },
@@ -336,26 +348,17 @@ pub fn plan_flash_attention(
                     ("key_rows".into(), block.key_rows.to_string()),
                 ]),
             });
-            commands.push(KernelCommand {
+            softmax_commands.push(KernelCommand {
                 tile: task.tile,
-                output: task.accumulator,
-                inputs: vec![task.scores, block.tensor],
-                arguments: vec![
-                    u32::from(task.query_rows),
-                    u32::from(block.key_rows),
-                    initial,
-                    final_block,
-                ],
+                output: task.weights,
+                inputs: vec![task.scores, task.scores],
+                arguments: vec![u32::from(task.query_rows), u32::from(block.key_rows)],
                 specialization: SpecializationKey {
-                    operation: "flash_attention_f16".into(),
-                    shape: vec![
-                        usize::from(task.query_rows),
-                        usize::from(block.key_rows),
-                        usize::from(head_dimension),
-                    ],
+                    operation: "attention_softmax_f16".into(),
+                    shape: vec![usize::from(task.query_rows), usize::from(block.key_rows)],
                     worker_count: 6,
                     role: format!(
-                        "batch-{}-head-{}-queries-{}-{}-keys-{}-{}",
+                        "attention-softmax-batch-{}-head-{}-queries-{}-{}-keys-{}-{}",
                         task.batch,
                         task.head,
                         task.query_row_start,
@@ -365,7 +368,64 @@ pub fn plan_flash_attention(
                     ),
                     alignment: 8,
                 },
-                metadata: task_metadata(task, block, config, head_dimension),
+                metadata: task_metadata(
+                    task,
+                    block,
+                    config,
+                    head_dimension,
+                    "FlashAttention block softmax",
+                ),
+            });
+            pv_commands.push(KernelCommand {
+                tile: task.tile,
+                output: task.scores,
+                inputs: vec![task.weights, block.tensor],
+                arguments: Vec::new(),
+                specialization: SpecializationKey {
+                    operation: format!(
+                        "attention_pv_init_{}_rows",
+                        if task.query_rows == query_block_rows {
+                            "large"
+                        } else {
+                            "small"
+                        }
+                    ),
+                    shape: vec![
+                        usize::from(task.query_rows),
+                        usize::from(key_block_columns),
+                        usize::from(padded_head_dimension),
+                    ],
+                    worker_count: 6,
+                    role: format!("attention-pv-batch-{}-head-{}", task.batch, task.head),
+                    alignment: 8,
+                },
+                metadata: task_metadata(
+                    task,
+                    block,
+                    config,
+                    head_dimension,
+                    "FlashAttention PV AMP",
+                ),
+            });
+            merge_commands.push(KernelCommand {
+                tile: task.tile,
+                output: task.accumulator,
+                inputs: vec![task.scores, task.weights],
+                arguments: vec![u32::from(task.query_rows), initial, final_block],
+                specialization: SpecializationKey {
+                    operation: "attention_merge_f16".into(),
+                    shape: vec![usize::from(task.query_rows), usize::from(head_dimension)],
+                    worker_count: 6,
+                    role: format!("attention-merge-batch-{}-head-{}", task.batch, task.head),
+                    alignment: 8,
+                },
+                metadata: task_metadata(
+                    task,
+                    block,
+                    config,
+                    head_dimension,
+                    "FlashAttention FP32 block merge",
+                ),
             });
         }
         phases.push(Phase::Exchange { transfers });
@@ -374,8 +434,16 @@ pub fn plan_flash_attention(
             commands: qk_commands,
         });
         phases.push(Phase::Compute {
-            op: OpId(compute_phase),
-            commands,
+            op: OpId(softmax_phase),
+            commands: softmax_commands,
+        });
+        phases.push(Phase::Compute {
+            op: OpId(pv_phase),
+            commands: pv_commands,
+        });
+        phases.push(Phase::Compute {
+            op: OpId(merge_phase),
+            commands: merge_commands,
         });
     }
 
@@ -437,19 +505,14 @@ pub fn plan_flash_attention(
     })
 }
 
-fn key_value_block_bytes(rows: u16, dimension: u16, padded_dimension: u16) -> u32 {
+fn key_value_block_bytes(rows: u16, padded_dimension: u16) -> u32 {
     let padded_rows = rows.div_ceil(16) * 16;
-    key_value_storage_bytes(rows, padded_rows, dimension, padded_dimension)
+    key_value_storage_bytes(padded_rows, padded_dimension)
 }
 
-fn key_value_storage_bytes(
-    rows: u16,
-    storage_rows: u16,
-    dimension: u16,
-    padded_dimension: u16,
-) -> u32 {
-    u32::from(padded_dimension) * u32::from(storage_rows) * 2
-        + u32::from(rows) * u32::from(dimension) * 2
+fn key_value_storage_bytes(storage_rows: u16, padded_dimension: u16) -> u32 {
+    // K and V are independently padded and packed as AMP B16x16 matrices.
+    u32::from(padded_dimension) * u32::from(storage_rows) * 4
 }
 
 fn validate(config: FlashAttentionConfig) -> Result<(), CompileError> {
@@ -509,9 +572,10 @@ fn task_metadata(
     block: &AttentionKeyValuePlacement,
     config: FlashAttentionConfig,
     head_dimension: u16,
+    label: &str,
 ) -> BTreeMap<String, String> {
     BTreeMap::from([
-        ("label".into(), "FlashAttention online softmax".into()),
+        ("label".into(), label.into()),
         ("batch".into(), task.batch.to_string()),
         ("head".into(), task.head.to_string()),
         ("sequence_length".into(), config.sequence_length.to_string()),

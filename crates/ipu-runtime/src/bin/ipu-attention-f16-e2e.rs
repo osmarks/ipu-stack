@@ -197,11 +197,34 @@ fn run_case(case: Case<'_>) {
             ],
         )
         .unwrap();
+    let value_offset =
+        u32::from(plan.padded_head_dimension) * u32::from(plan.key_block_columns) * 2;
+    let pv = toolchain
+        .compile(
+            source("gemm_f16_64_amp.S"),
+            &artifact_dir,
+            "attention-pv",
+            &[
+                format!("-DGEMM_INNER_BLOCK_DIMENSION={}", plan.key_block_columns),
+                format!("-DGEMM_OUTPUT_COLUMNS={}", plan.padded_head_dimension),
+                format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
+                format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
+                format!("-DGEMM_RIGHT_BYTE_OFFSET={value_offset}"),
+                "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_attention_pv_init_small_rows".into(),
+                "-DGEMM_INIT_LARGE_SYMBOL=ipu_stack_attention_pv_init_large_rows".into(),
+                "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_attention_pv_accumulate_small_rows"
+                    .into(),
+                "-DGEMM_ACCUMULATE_LARGE_SYMBOL=ipu_stack_attention_pv_accumulate_large_rows"
+                    .into(),
+            ],
+        )
+        .unwrap();
     let objects = [
         fs::read(runtime.object).unwrap(),
         fs::read(codelet.object).unwrap(),
         fs::read(wrapper.object).unwrap(),
         fs::read(qk.object).unwrap(),
+        fs::read(pv.object).unwrap(),
     ];
     let profile_output = profile_path(&case);
     let (app, profile_layout) = if profile_output.is_some() {
@@ -428,37 +451,29 @@ fn pack_inputs(
             };
             key_value_bytes.extend_from_slice(&bits.to_le_bytes());
         }
-        append_rows(
-            &mut key_value_bytes,
-            value,
-            config,
-            block.batch,
-            block.head,
-            block.key_row_start,
-            block.key_rows,
-            plan.head_dimension,
-        );
-    }
-    (query_bytes, key_value_bytes)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_rows(
-    target: &mut Vec<u8>,
-    source: &[f16],
-    config: FlashAttentionConfig,
-    batch: u16,
-    head: u16,
-    row_start: u16,
-    rows: u16,
-    head_dimension: u16,
-) {
-    for row in row_start..row_start + rows {
-        for column in 0..head_dimension {
-            let index = tensor_index(config, batch, head, row, column);
-            target.extend_from_slice(&source[index].to_bits().to_le_bytes());
+        for linear in 0..plan.padded_head_dimension * plan.key_block_columns {
+            let (key_row, column) = block_coordinates(
+                BlockLayout::AmpB16x16,
+                plan.key_block_columns,
+                plan.padded_head_dimension,
+                linear,
+            );
+            let bits = if key_row < block.key_rows && column < plan.head_dimension {
+                value[tensor_index(
+                    config,
+                    block.batch,
+                    block.head,
+                    block.key_row_start + key_row,
+                    column,
+                )]
+                .to_bits()
+            } else {
+                0
+            };
+            key_value_bytes.extend_from_slice(&bits.to_le_bytes());
         }
     }
+    (query_bytes, key_value_bytes)
 }
 
 fn attention_reference(
