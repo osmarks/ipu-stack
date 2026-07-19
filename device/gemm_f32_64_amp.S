@@ -3,7 +3,7 @@
 	.text
 	.allow_optimizations
 
-	.set BLOCK_DIMENSION, 64
+	.set OUTPUT_COLUMNS, 64
 	.set INNER_MICRO_DIMENSION, 8
 	.set COLUMN_MICRO_DIMENSION, 16
 	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
@@ -25,12 +25,21 @@
 	shl $m6, $m6, 3
 	.endm
 
+	.macro ZERO_WORKER_ENTRY name, rows
 	.worker
 	.p2align 2
-.Lzero_4096_u32_worker:
+\name:
 	mov $m2, $mvertex_base
-	PARTITION_64BIT_UNITS BLOCK_DIMENSION * BLOCK_DIMENSION / 2
+	PARTITION_64BIT_UNITS \rows * OUTPUT_COLUMNS / 2
 	add $m2, $m2, $m6
+	brz $mzero, .Lzero_output_64
+	.endm
+
+	ZERO_WORKER_ENTRY .Lzero_64x64_worker, 64
+	ZERO_WORKER_ENTRY .Lzero_48x64_worker, 48
+	ZERO_WORKER_ENTRY .Lzero_32x64_worker, 32
+
+.Lzero_output_64:
 .Lzero_64:
 	st64 $azeros, $m2, $m15, 0
 	add $m2, $m2, 8
@@ -105,7 +114,7 @@
 	ld64putcs 63
 	.endm
 
-	.macro GEMM_SUPERVISOR name, clear_output
+	.macro GEMM_SUPERVISOR name, rows, worker, zero_worker, clear_output
 	.section .text.\name,"ax",@progbits
 	.globl \name
 	.p2align 2
@@ -113,7 +122,7 @@
 \name:
 	.supervisor
 	.if \clear_output
-	setzi $m0, .Lzero_4096_u32_worker
+	setzi $m0, \zero_worker
 	runall $m0, $m2, 0
 	sync SYNC_COMPUTE_SET
 	.endif
@@ -128,13 +137,13 @@
 .Linner_group_\@:
 	LOAD_AMP16_WEIGHTS
 	mov $m5, $m11
-	shl $m8, $m6, 12
+	mul $m8, $m6, \rows * OUTPUT_COLUMNS
 	add $m8, $m2, $m8
 	st32 $m8, $m5, $m15, 0
-	shl $m8, $m7, 11
+	mul $m8, $m7, \rows * INNER_MICRO_DIMENSION * 4
 	add $m8, $m3, $m8
 	st32 $m8, $m5, $m15, 1
-	setzi $m0, .Lgemm_amp_pace_worker
+	setzi $m0, \worker
 	runall $m0, $m5, 0
 	sync SYNC_COMPUTE_SET
 	add $m7, $m7, 1
@@ -142,7 +151,7 @@
 	cmpult $m8, $m7, $m8
 	brnz $m8, .Linner_group_\@
 	add $m6, $m6, 1
-	setzi $m8, BLOCK_DIMENSION / COLUMN_MICRO_DIMENSION
+	setzi $m8, OUTPUT_COLUMNS / COLUMN_MICRO_DIMENSION
 	cmpult $m8, $m6, $m8
 	brnz $m8, .Lcolumn_group_\@
 	sync SYNC_COMPUTE_SET
@@ -151,26 +160,39 @@
 	.size \name, .-\name
 	.endm
 
-	GEMM_SUPERVISOR ipu_stack_gemm_f32_64_init, 1
-	GEMM_SUPERVISOR ipu_stack_gemm_f32_64_accumulate, 0
+	GEMM_SUPERVISOR ipu_stack_gemm_f32_64_init, 64, .Lgemm_amp_pace_worker_64, .Lzero_64x64_worker, 1
+	GEMM_SUPERVISOR ipu_stack_gemm_f32_64_accumulate, 64, .Lgemm_amp_pace_worker_64, .Lzero_64x64_worker, 0
+	GEMM_SUPERVISOR ipu_stack_gemm_f32_48_init, 48, .Lgemm_amp_pace_worker_48, .Lzero_48x64_worker, 1
+	GEMM_SUPERVISOR ipu_stack_gemm_f32_48_accumulate, 48, .Lgemm_amp_pace_worker_48, .Lzero_48x64_worker, 0
+	GEMM_SUPERVISOR ipu_stack_gemm_f32_32_init, 32, .Lgemm_amp_pace_worker_32, .Lzero_32x64_worker, 1
+	GEMM_SUPERVISOR ipu_stack_gemm_f32_32_accumulate, 32, .Lgemm_amp_pace_worker_32, .Lzero_32x64_worker, 0
 
+	.macro GEMM_WORKER_ENTRY name, rows
 	.worker
 	.p2align 3
-.Lgemm_amp_pace_worker:
+\name:
 	ld32 $m2, $mvertex_base, $m15, 0
 	ld32 $m3, $mvertex_base, $m15, 1
 	get $m4, $WSR
 	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
-	setzi $m5, BLOCK_DIMENSION / 6
-	cmpult $m6, $m4, BLOCK_DIMENSION % 6
+	setzi $m5, \rows / 6
+	cmpult $m6, $m4, \rows % 6
 	add $m5, $m5, $m6
-	mul $m6, $m4, BLOCK_DIMENSION / 6
-	min $m7, $m4, BLOCK_DIMENSION % 6
+	mul $m6, $m4, \rows / 6
+	min $m7, $m4, \rows % 6
 	add $m6, $m6, $m7
 	shl $m7, $m6, 6
 	shl $m6, $m6, 5
 	add $m2, $m2, $m7
 	add $m3, $m3, $m6
+	brz $mzero, .Lgemm_amp_pace_worker_common
+	.endm
+
+	GEMM_WORKER_ENTRY .Lgemm_amp_pace_worker_64, 64
+	GEMM_WORKER_ENTRY .Lgemm_amp_pace_worker_48, 48
+	GEMM_WORKER_ENTRY .Lgemm_amp_pace_worker_32, 32
+
+.Lgemm_amp_pace_worker_common:
 	add $m5, $m5, -1
 	add $m4, $m5, -1
 	setzi $m7, PACE_ROW_STRIDE
