@@ -292,3 +292,34 @@ C600, graph-level cycle profiles measured a 4096-square FP16 GEMM at 2,262,696
 cycles (91.11 TFLOP/s, 32.24% of peak) and the 512x2048, eight-layer FP16 MLP at
 2,740,434 cycles (18.81 effective GEMM TFLOP/s, 6.65% of peak). The MLP rate
 counts only GEMM FLOPs while its interval includes GeLU and exchange work.
+
+## FlashAttention
+
+`plan_flash_attention` builds non-causal FP16 attention over independent
+batch/head tasks. The device kernel performs scaled QK dot products and a
+numerically stable online softmax recurrence while accumulating V in FP32. It
+does not allocate or write a sequence-squared score or probability tensor. A
+six-worker finalizer converts the result to FP16 with stochastic rounding.
+Sequence length and head dimension are compile-time kernel specializations.
+
+The hardware runner defaults to 16 heads, sequence length 64, hidden sizes
+768/1024/1152 (head dimensions 48/64/72), and batch sizes 1 and 3. Inputs are
+random Gaussian FP16 values. Its independent host reference materializes each
+ordinary score row, applies stable softmax, and computes the weighted V sum.
+
+```sh
+IPU_CONFIG=/path/to/c600-init.ipucfg \
+  cargo run --release -p ipu-runtime --bin ipu-attention-f16-e2e
+
+IPU_ATTENTION_HIDDEN_SIZES=1152 \
+IPU_ATTENTION_BATCH_SIZES=2 \
+IPU_ATTENTION_SEQUENCE_LENGTH=128 \
+  cargo run --release -p ipu-runtime --bin ipu-attention-f16-e2e
+```
+
+The current placement is deliberately simple: one tile owns one complete
+batch/head task, with Q and packed K/V supplied as the two kernel inputs. Its
+per-task SRAM use is `12 * sequence_length * head_dimension` bytes and is
+linear in sequence length. Query blocking across additional tiles and D2D
+multicast of shared K/V are the next performance step; they are not required
+for the present correctness path.

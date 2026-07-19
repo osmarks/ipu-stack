@@ -8,7 +8,11 @@ use ipu_exchange::{
     patch_sender_address,
 };
 
+mod attention;
 mod mlp;
+pub use attention::{
+    AttentionTaskPlacement, FlashAttentionConfig, FlashAttentionPlan, plan_flash_attention,
+};
 pub use mlp::{BlockedMlpConfig, BlockedMlpPlan, plan_blocked_mlp};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

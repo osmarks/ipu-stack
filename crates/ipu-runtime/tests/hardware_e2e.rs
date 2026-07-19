@@ -284,6 +284,17 @@ fn blocked_gemm_with_cycle_profile_works() {
     fs::remove_file(path).unwrap();
 }
 
+#[test]
+fn flash_attention_matches_host_softmax_across_encoder_shapes() {
+    let _device = device();
+    require_success(
+        "FP16 FlashAttention for encoder head dimensions and batch sizes",
+        Command::new(env!("CARGO_BIN_EXE_ipu-attention-f16-e2e"))
+            .status()
+            .expect("launch FlashAttention hardware test runner"),
+    );
+}
+
 fn device() -> MutexGuard<'static, ()> {
     DEVICE
         .lock()
