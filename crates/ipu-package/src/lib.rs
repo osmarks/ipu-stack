@@ -250,6 +250,7 @@ pub struct Application {
     pub host_exchange: HostExchange,
     pub entry_points: Vec<EntryPoint>,
     pub device_config_writes: Vec<DeviceConfigWrite>,
+    blob_indices: HashMap<[u8; 32], usize>,
 }
 
 impl Default for Application {
@@ -264,6 +265,7 @@ impl Default for Application {
             host_exchange: HostExchange::default(),
             entry_points: Vec::new(),
             device_config_writes: Vec::new(),
+            blob_indices: HashMap::new(),
         }
     }
 }
@@ -370,11 +372,14 @@ impl Application {
 
     pub fn add_blob(&mut self, bytes: Vec<u8>) -> usize {
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        if let Some(index) = self.blobs.iter().position(|blob| blob.digest == digest) {
+        if let Some(&index) = self.blob_indices.get(&digest) {
+            debug_assert_eq!(self.blobs[index].bytes, bytes);
             return index;
         }
+        let index = self.blobs.len();
         self.blobs.push(Blob { digest, bytes });
-        self.blobs.len() - 1
+        self.blob_indices.insert(digest, index);
+        index
     }
 
     pub fn validate(&self) -> Result<(), PackageError> {
@@ -607,6 +612,12 @@ impl Application {
             let digest: [u8; 32] = Sha256::digest(&bytes).into();
             if item.get_sha256()? != digest {
                 return Err(PackageError::Invalid("blob digest mismatch".into()));
+            }
+            let index = app.blobs.len();
+            if app.blob_indices.insert(digest, index).is_some() {
+                return Err(PackageError::Invalid(
+                    "duplicate package blob digest".into(),
+                ));
             }
             app.blobs.push(Blob { digest, bytes });
         }
