@@ -337,3 +337,6 @@ head and key-block dimensions to 16-element micro-panels, packs Q/weights in
 AMP A layout and K/V in AMP B layout, and places temporary QK/PV products in
 the IPU21 interleaved SRAM required by the AMP paired memory instructions.
 Softmax statistics and the persistent V accumulator remain FP32.
+The runner compiles the plan's full and tail query/key row counts into distinct
+softmax and merge codelets, so their layout arithmetic and loop bounds are
+static rather than scalar runtime dispatch.

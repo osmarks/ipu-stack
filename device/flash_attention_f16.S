@@ -19,30 +19,36 @@ _stackoverflow:
 	trap 0
 	.size _stackoverflow, .-_stackoverflow
 
-	.section .text.ipu_stack_attention_softmax_f16,"ax",@progbits
-	.globl ipu_stack_attention_softmax_f16
+	.macro ATTENTION_SOFTMAX_WRAPPER name, codelet
+	.section .text.\name,"ax",@progbits
+	.globl \name
 	.p2align 2
-	.type ipu_stack_attention_softmax_f16,@function
-ipu_stack_attention_softmax_f16:
+	.type \name,@function
+\name:
 	.supervisor
-	add $m11, $m11, -32
+	add $m11, $m11, -16
 	st32 $m3, $m11, $m15, 0
 	st32 $m4, $m11, $m15, 1
 	st32 $m2, $m11, $m15, 2
-	st32 $m5, $m11, $m15, 3
-	st32 $m6, $m11, $m15, 4
-	setzi $m0, __runCodelet_AttentionSoftmaxF16
+	setzi $m0, \codelet
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
-	add $m11, $m11, 32
+	add $m11, $m11, 16
 	br $m10
-	.size ipu_stack_attention_softmax_f16, .-ipu_stack_attention_softmax_f16
+	.size \name, .-\name
+	.endm
 
-	.section .text.ipu_stack_attention_merge_f16,"ax",@progbits
-	.globl ipu_stack_attention_merge_f16
+	ATTENTION_SOFTMAX_WRAPPER ipu_stack_attention_softmax_small_query_small_key_f16, __runCodelet_AttentionSoftmaxSmallQuerySmallKeyF16
+	ATTENTION_SOFTMAX_WRAPPER ipu_stack_attention_softmax_small_query_large_key_f16, __runCodelet_AttentionSoftmaxSmallQueryLargeKeyF16
+	ATTENTION_SOFTMAX_WRAPPER ipu_stack_attention_softmax_large_query_small_key_f16, __runCodelet_AttentionSoftmaxLargeQuerySmallKeyF16
+	ATTENTION_SOFTMAX_WRAPPER ipu_stack_attention_softmax_large_query_large_key_f16, __runCodelet_AttentionSoftmaxLargeQueryLargeKeyF16
+
+	.macro ATTENTION_MERGE_WRAPPER name, codelet
+	.section .text.\name,"ax",@progbits
+	.globl \name
 	.p2align 2
-	.type ipu_stack_attention_merge_f16,@function
-ipu_stack_attention_merge_f16:
+	.type \name,@function
+\name:
 	.supervisor
 	add $m11, $m11, -32
 	st32 $m3, $m11, $m15, 0
@@ -50,13 +56,16 @@ ipu_stack_attention_merge_f16:
 	st32 $m2, $m11, $m15, 2
 	st32 $m5, $m11, $m15, 3
 	st32 $m6, $m11, $m15, 4
-	st32 $m7, $m11, $m15, 5
-	setzi $m0, __runCodelet_AttentionMergeF16
+	setzi $m0, \codelet
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
 	add $m11, $m11, 32
 	br $m10
-	.size ipu_stack_attention_merge_f16, .-ipu_stack_attention_merge_f16
+	.size \name, .-\name
+	.endm
+
+	ATTENTION_MERGE_WRAPPER ipu_stack_attention_merge_small_query_f16, __runCodelet_AttentionMergeSmallQueryF16
+	ATTENTION_MERGE_WRAPPER ipu_stack_attention_merge_large_query_f16, __runCodelet_AttentionMergeLargeQueryF16
 
 	.section .text.ipu_stack_attention_f32_to_f16,"ax",@progbits
 	.globl ipu_stack_attention_f32_to_f16

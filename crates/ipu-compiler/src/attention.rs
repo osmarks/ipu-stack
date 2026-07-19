@@ -291,6 +291,16 @@ pub fn plan_flash_attention(
                         && block.key_row_start == key_block * key_block_rows
                 })
                 .expect("each head has every key block");
+            let query_size = if task.query_rows == query_block_rows {
+                "large"
+            } else {
+                "small"
+            };
+            let key_size = if block.key_rows == key_block_rows {
+                "large"
+            } else {
+                "small"
+            };
             if task.tile != block.tile {
                 transfers.push(Transfer {
                     source_tile: block.tile,
@@ -316,14 +326,7 @@ pub fn plan_flash_attention(
                 inputs: vec![task.query, block.tensor],
                 arguments: Vec::new(),
                 specialization: SpecializationKey {
-                    operation: format!(
-                        "gemm_f16_init_{}_rows",
-                        if task.query_rows == query_block_rows {
-                            "large"
-                        } else {
-                            "small"
-                        }
-                    ),
+                    operation: format!("gemm_f16_init_{}_rows", query_size),
                     shape: vec![
                         usize::from(task.query_rows),
                         usize::from(padded_head_dimension),
@@ -353,9 +356,9 @@ pub fn plan_flash_attention(
                 tile: task.tile,
                 output: task.weights,
                 inputs: vec![task.scores, task.scores],
-                arguments: vec![u32::from(task.query_rows), u32::from(block.key_rows)],
+                arguments: Vec::new(),
                 specialization: SpecializationKey {
-                    operation: "attention_softmax_f16".into(),
+                    operation: format!("attention_softmax_{query_size}_query_{key_size}_key_f16"),
                     shape: vec![usize::from(task.query_rows), usize::from(block.key_rows)],
                     worker_count: 6,
                     role: format!(
@@ -383,14 +386,7 @@ pub fn plan_flash_attention(
                 inputs: vec![task.weights, block.tensor],
                 arguments: Vec::new(),
                 specialization: SpecializationKey {
-                    operation: format!(
-                        "attention_pv_init_{}_rows",
-                        if task.query_rows == query_block_rows {
-                            "large"
-                        } else {
-                            "small"
-                        }
-                    ),
+                    operation: format!("attention_pv_init_{}_rows", query_size),
                     shape: vec![
                         usize::from(task.query_rows),
                         usize::from(key_block_columns),
@@ -412,9 +408,9 @@ pub fn plan_flash_attention(
                 tile: task.tile,
                 output: task.accumulator,
                 inputs: vec![task.scores, task.weights],
-                arguments: vec![u32::from(task.query_rows), initial, final_block],
+                arguments: vec![initial, final_block],
                 specialization: SpecializationKey {
-                    operation: "attention_merge_f16".into(),
+                    operation: format!("attention_merge_{query_size}_query_f16"),
                     shape: vec![usize::from(task.query_rows), usize::from(head_dimension)],
                     worker_count: 6,
                     role: format!("attention-merge-batch-{}-head-{}", task.batch, task.head),

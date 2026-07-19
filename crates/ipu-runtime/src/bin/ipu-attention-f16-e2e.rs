@@ -156,6 +156,20 @@ fn run_case(case: Case<'_>) {
     let runtime = toolchain
         .compile(source("static_runtime.S"), &artifact_dir, "runtime", &[])
         .unwrap();
+    let minimum_rows = plan.tasks.iter().map(|task| task.query_rows).min().unwrap();
+    let maximum_rows = plan.tasks.iter().map(|task| task.query_rows).max().unwrap();
+    let minimum_key_rows = plan
+        .key_values
+        .iter()
+        .map(|block| block.key_rows)
+        .min()
+        .unwrap();
+    let maximum_key_rows = plan
+        .key_values
+        .iter()
+        .map(|block| block.key_rows)
+        .max()
+        .unwrap();
     let codelet = toolchain
         .compile(
             source("flash_attention_f16.cpp"),
@@ -168,6 +182,10 @@ fn run_case(case: Case<'_>) {
                     plan.padded_head_dimension
                 ),
                 format!("-DATTENTION_KEY_BLOCK_COLUMNS={}", plan.key_block_columns),
+                format!("-DATTENTION_SMALL_QUERY_ROWS={minimum_rows}"),
+                format!("-DATTENTION_LARGE_QUERY_ROWS={maximum_rows}"),
+                format!("-DATTENTION_SMALL_KEY_ROWS={minimum_key_rows}"),
+                format!("-DATTENTION_LARGE_KEY_ROWS={maximum_key_rows}"),
             ],
         )
         .unwrap();
@@ -179,8 +197,6 @@ fn run_case(case: Case<'_>) {
             &[],
         )
         .unwrap();
-    let minimum_rows = plan.tasks.iter().map(|task| task.query_rows).min().unwrap();
-    let maximum_rows = plan.tasks.iter().map(|task| task.query_rows).max().unwrap();
     let qk = toolchain
         .compile(
             source("gemm_f16_64_amp.S"),
