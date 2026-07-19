@@ -535,13 +535,12 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
             "GEMM operands do not fit their required IPU21 memory elements".into(),
         ));
     }
-    let exchange_address =
-        ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES - block_bytes;
+    let left_exchange_address = ipu_exchange::EXCHANGE_WINDOW_BASE;
+    let right_exchange_address = left_exchange_address + block_bytes;
     let mut allocations = Vec::with_capacity(block_count * (usize::from(grid) * 3 + 5));
     let mut left = Vec::with_capacity(block_count);
     let mut right = Vec::with_capacity(block_count);
     let mut output = Vec::with_capacity(block_count);
-    let mut local_left_addresses = vec![0; block_count];
 
     for block_row in 0..grid {
         for block_column in 0..grid {
@@ -571,12 +570,10 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     block_column,
                 });
             }
-            local_left_addresses[index] = config.data_base + 2 * block_bytes;
         }
     }
 
-    let mut phases = Vec::with_capacity(usize::from(grid) * 4);
-    let temporary_base = 3 * block_count;
+    let mut phases = Vec::with_capacity(usize::from(grid) * 3);
     for inner_block in 0..grid {
         let left_exchange_phase = phases.len();
         let mut left_transfers = Vec::with_capacity(block_count - usize::from(grid));
@@ -600,10 +597,10 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                 allocations.push(Allocation {
                     tensor: source.tensor,
                     tile: destination_tile,
-                    address: exchange_address,
+                    address: left_exchange_address,
                     size: block_bytes,
                     live_from: left_exchange_phase,
-                    live_until: left_exchange_phase + 1,
+                    live_until: left_exchange_phase + 2,
                     kind: AllocationKind::ExchangeStaging {
                         phase: left_exchange_phase,
                     },
@@ -612,48 +609,6 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         }
         phases.push(Phase::Exchange {
             transfers: left_transfers,
-        });
-
-        let copy_phase = phases.len();
-        let mut copy_commands = Vec::with_capacity(block_count - usize::from(grid));
-        for block_row in 0..grid {
-            let left_tensor =
-                left[usize::from(block_row) * usize::from(grid) + usize::from(inner_block)].tensor;
-            for block_column in 0..grid {
-                if block_column == inner_block {
-                    continue;
-                }
-                let destination_index =
-                    usize::from(block_row) * usize::from(grid) + usize::from(block_column);
-                let temporary = TensorId(
-                    temporary_base + usize::from(inner_block) * block_count + destination_index,
-                );
-                allocations.push(Allocation {
-                    tensor: temporary,
-                    tile: output[destination_index].tile,
-                    address: local_left_addresses[destination_index],
-                    size: block_bytes,
-                    live_from: copy_phase,
-                    live_until: copy_phase + 2,
-                    kind: AllocationKind::Home,
-                });
-                copy_commands.push(KernelCommand {
-                    tile: output[destination_index].tile,
-                    output: temporary,
-                    inputs: vec![left_tensor, left_tensor],
-                    specialization: SpecializationKey {
-                        operation: "copy_4096_u32".into(),
-                        shape: vec![usize::from(config.block_dimension); 2],
-                        worker_count: 6,
-                        role: "left-block-staging".into(),
-                        alignment: 32,
-                    },
-                });
-            }
-        }
-        phases.push(Phase::Compute {
-            op: OpId(copy_phase),
-            commands: copy_commands,
         });
 
         let right_exchange_phase = phases.len();
@@ -678,7 +633,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                 allocations.push(Allocation {
                     tensor: source.tensor,
                     tile: destination_tile,
-                    address: exchange_address,
+                    address: right_exchange_address,
                     size: block_bytes,
                     live_from: right_exchange_phase,
                     live_until: right_exchange_phase + 1,
@@ -697,12 +652,9 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         for block_row in 0..grid {
             for block_column in 0..grid {
                 let index = usize::from(block_row) * usize::from(grid) + usize::from(block_column);
-                let left_tensor = if block_column == inner_block {
-                    left[usize::from(block_row) * usize::from(grid) + usize::from(inner_block)]
-                        .tensor
-                } else {
-                    TensorId(temporary_base + usize::from(inner_block) * block_count + index)
-                };
+                let left_tensor = left
+                    [usize::from(block_row) * usize::from(grid) + usize::from(inner_block)]
+                .tensor;
                 let right_tensor = right
                     [usize::from(inner_block) * usize::from(grid) + usize::from(block_column)]
                 .tensor;
@@ -1864,11 +1816,10 @@ mod tests {
                 .len(),
             plan.output.len()
         );
-        assert!(plan.schedule.phases.chunks_exact(4).all(|round| {
+        assert!(plan.schedule.phases.chunks_exact(3).all(|round| {
             matches!(round[0], Phase::Exchange { .. })
-                && matches!(round[1], Phase::Compute { .. })
-                && matches!(round[2], Phase::Exchange { .. })
-                && matches!(round[3], Phase::Compute { .. })
+                && matches!(round[1], Phase::Exchange { .. })
+                && matches!(round[2], Phase::Compute { .. })
         }));
         assert!(plan.schedule.phases.iter().all(|phase| {
             match phase {

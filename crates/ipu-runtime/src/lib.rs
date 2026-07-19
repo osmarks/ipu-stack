@@ -174,6 +174,7 @@ fn allocate_low_runtime_range(
                     .physical(allocation.tile)
                     .map(|physical_tile| {
                         !physical_tiles.contains(&physical_tile)
+                            || allocation.kind != ipu_compiler::AllocationKind::Home
                             || !ranges_overlap(
                                 candidate,
                                 end,

@@ -25,39 +25,6 @@
 	shl $m6, $m6, 3
 	.endm
 
-	.section .text.ipu_stack_copy_4096_u32,"ax",@progbits
-	.globl ipu_stack_copy_4096_u32
-	.p2align 2
-	.type ipu_stack_copy_4096_u32,@function
-ipu_stack_copy_4096_u32:
-	.supervisor
-	add $m11, $m11, -8
-	st32 $m2, $m11, $m15, 0
-	st32 $m3, $m11, $m15, 1
-	setzi $m0, .Lcopy_4096_u32_worker
-	runall $m0, $m11, 0
-	sync SYNC_COMPUTE_SET
-	add $m11, $m11, 8
-	br $m10
-	.size ipu_stack_copy_4096_u32, .-ipu_stack_copy_4096_u32
-
-	.worker
-	.p2align 2
-.Lcopy_4096_u32_worker:
-	ld32 $m2, $mvertex_base, $m15, 0
-	ld32 $m3, $mvertex_base, $m15, 1
-	PARTITION_64BIT_UNITS BLOCK_DIMENSION * BLOCK_DIMENSION / 2
-	add $m2, $m2, $m6
-	add $m3, $m3, $m6
-.Lcopy_64:
-	ld64 $a0:1, $m3, $m15, 0
-	st64 $a0:1, $m2, $m15, 0
-	add $m3, $m3, 8
-	add $m2, $m2, 8
-	sub $m5, $m5, 1
-	brnz $m5, .Lcopy_64
-	exitz $mzero
-
 	.worker
 	.p2align 2
 .Lzero_4096_u32_worker:
