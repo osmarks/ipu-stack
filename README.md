@@ -341,3 +341,8 @@ Softmax statistics and the persistent V accumulator remain FP32.
 The runner compiles the plan's full and tail query/key row counts into distinct
 softmax and merge codelets, so their layout arithmetic and loop bounds are
 static rather than scalar runtime dispatch.
+
+On the attached C600, the 1152-hidden/16-head path measures 50,520 cycles for
+sequence 64, 98,274 cycles for sequence 128, and 192,516 cycles for sequence
+256 at batch 1. The sequence-128 batch-3 case measures 101,160 cycles and 3.36
+useful QK/PV TFLOP/s. These graph intervals start after H2D and end before D2H.
