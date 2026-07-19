@@ -250,3 +250,29 @@ IPU_PROFILE_OUTPUT=profiles/mlp-512x2048x8-phase.capnp \
 `IPU_MLP_PACKAGE_ONLY`, `IPU_MLP_PACKAGE`, and
 `IPU_MEMORY_PROFILE_OUTPUT` provide package-only and allocator inspection
 paths analogous to the GEMM executable.
+
+## FP16 inference
+
+`ipu-gemm-f16-e2e` and `ipu-mlp-f16-e2e` use FP16 inputs, weights,
+inter-block partials, activations, and outputs. The kernels enable IPU21
+stochastic rounding while they execute. The static runtime seeds every worker
+once from its physical tile and worker IDs and preserves the resulting PRNG
+stream across graph steps. This does not add seed tensors or kernel arguments.
+
+The runners generate deterministic Gaussian FP16 inputs. Activations have
+standard deviation 0.5; Xavier-scaled weights have standard deviation
+`1 / sqrt(K)`. Validation compares against an FP32 host reference computed
+from the exact uploaded FP16 values and rejects non-finite outputs or a maximum
+absolute error above 0.005 by default.
+
+```sh
+cargo run -p ipu-runtime --bin ipu-gemm-f16-e2e
+cargo run -p ipu-runtime --bin ipu-mlp-f16-e2e
+
+IPU_MLP_BATCH=64 IPU_MLP_WIDTH=512 IPU_MLP_LAYERS=8 \
+  cargo run --release -p ipu-runtime --bin ipu-mlp-f16-e2e
+```
+
+The FP16 runners accept the same shape and row-block environment variables as
+their FP32 counterparts. `IPU_GEMM_SEED` and `IPU_MLP_SEED` select host test
+data, while `IPU_F16_MAX_ERROR` can override the acceptance threshold.
