@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tracing::{debug, info};
 
 use ipu_exchange::{
@@ -328,6 +328,7 @@ pub struct KernelCommand {
     pub tile: u16,
     pub output: TensorId,
     pub inputs: Vec<TensorId>,
+    pub arguments: Vec<u32>,
     pub specialization: SpecializationKey,
 }
 
@@ -490,21 +491,50 @@ pub struct BlockedGemmPlan {
     pub output: Vec<BlockPlacement>,
 }
 
+pub fn choose_gemm_row_block(dimension: u16, block_dimension: u16, tile_count: u16) -> Option<u16> {
+    gemm_row_block_candidates(dimension, block_dimension, tile_count)
+        .into_iter()
+        .find(|&target| target >= 32)
+}
+
+pub fn gemm_row_block_candidates(
+    dimension: u16,
+    block_dimension: u16,
+    tile_count: u16,
+) -> Vec<u16> {
+    if dimension == 0
+        || block_dimension == 0
+        || tile_count == 0
+        || !dimension.is_multiple_of(block_dimension)
+    {
+        return Vec::new();
+    }
+    let column_blocks = dimension / block_dimension;
+    let mut row_shard_counts = BTreeSet::new();
+    (12..=64)
+        .filter(|&target| {
+            let row_shards = dimension.div_ceil(target);
+            usize::from(row_shards) * usize::from(column_blocks) <= usize::from(tile_count)
+                && row_shard_counts.insert(row_shards)
+        })
+        .collect()
+}
+
 pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, CompileError> {
-    let tail_rows = config.dimension % config.row_block_dimension;
     if config.dimension == 0
         || config.block_dimension != 64
-        || !matches!(config.row_block_dimension, 32 | 48 | 64)
-        || !matches!(tail_rows, 0 | 32)
+        || !(12..=64).contains(&config.row_block_dimension)
         || !config.dimension.is_multiple_of(config.block_dimension)
         || config.data_base >= config.data_limit
     {
         return Err(CompileError::Graph(
-            "blocked GEMM requires 64-column blocks and supported 32/48/64-row shards".into(),
+            "blocked GEMM requires 64-column blocks and a row target in 12..=64".into(),
         ));
     }
     let grid = config.dimension / config.block_dimension;
     let row_grid = config.dimension.div_ceil(config.row_block_dimension);
+    let base_rows = config.dimension / row_grid;
+    let larger_row_shards = config.dimension % row_grid;
     let output_block_count = usize::from(row_grid) * usize::from(grid);
     if output_block_count > usize::from(config.tile_count) {
         return Err(CompileError::Graph(format!(
@@ -554,10 +584,8 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
     let mut output = Vec::with_capacity(output_block_count);
 
     for block_row in 0..row_grid {
-        let rows = config
-            .dimension
-            .saturating_sub(block_row * config.row_block_dimension)
-            .min(config.row_block_dimension);
+        let rows = base_rows + u16::from(block_row < larger_row_shards);
+        let row_start = block_row * base_rows + block_row.min(larger_row_shards);
         let size = u32::from(rows) * u32::from(config.block_dimension) * 4;
         for block_column in 0..grid {
             let index = usize::from(block_row) * usize::from(grid) + usize::from(block_column);
@@ -586,7 +614,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     address,
                     block_row,
                     block_column,
-                    row_start: block_row * config.row_block_dimension,
+                    row_start,
                     rows,
                 });
             }
@@ -701,16 +729,18 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     tile: output[index].tile,
                     output: output[index].tensor,
                     inputs: vec![left_tensor, right_tensor],
+                    arguments: vec![
+                        u32::from(output[index].rows),
+                        u32::from(output[index].rows / 6),
+                        u32::from(output[index].rows % 6),
+                    ],
                     specialization: SpecializationKey {
-                        operation: format!(
-                            "gemm_f32_{}_{}",
-                            output[index].rows,
-                            if inner_block == 0 {
-                                "init"
-                            } else {
-                                "accumulate"
-                            }
-                        ),
+                        operation: if inner_block == 0 {
+                            "gemm_f32_init"
+                        } else {
+                            "gemm_f32_accumulate"
+                        }
+                        .into(),
                         shape: vec![
                             usize::from(output[index].rows),
                             usize::from(config.block_dimension),
@@ -787,6 +817,7 @@ pub struct LoweredComputeCommand {
     pub phase: usize,
     pub output_address: u32,
     pub input_addresses: Vec<u32>,
+    pub arguments: Vec<u32>,
     pub specialization: SpecializationKey,
 }
 
@@ -1197,6 +1228,7 @@ impl Schedule {
                                 phase: phase_index,
                                 output_address,
                                 input_addresses,
+                                arguments: command.arguments.clone(),
                                 specialization: command.specialization.clone(),
                             }));
                         }
@@ -1360,6 +1392,7 @@ pub fn compile(graph: &Graph, options: &CompilerOptions) -> Result<Schedule, Com
                 tile: *tile,
                 output: op.output,
                 inputs: op.inputs.clone(),
+                arguments: Vec::new(),
                 specialization: SpecializationKey {
                     operation: operation.into(),
                     shape: graph.tensors[op.output.0].shape.clone(),
@@ -1877,11 +1910,79 @@ mod tests {
                     .iter()
                     .all(|transfer| transfer.bytes <= ipu_exchange::MAX_TRANSFER_WORDS * 4),
                 Phase::Compute { commands, .. } => commands.iter().all(|command| {
+                    let Some(block) = plan.output.iter().find(|block| block.tile == command.tile)
+                    else {
+                        return false;
+                    };
                     command.inputs.len() == 2
-                        && plan.output.iter().any(|block| block.tile == command.tile)
+                        && command.arguments
+                            == [
+                                u32::from(block.rows),
+                                u32::from(block.rows / 6),
+                                u32::from(block.rows % 6),
+                            ]
+                        && matches!(
+                            command.specialization.operation.as_str(),
+                            "gemm_f32_init" | "gemm_f32_accumulate"
+                        )
                 }),
             }
         }));
+    }
+
+    #[test]
+    fn blocked_gemm_balances_rows_without_gaps_or_tile_overcommitment() {
+        for dimension in [64, 128, 256, 1024, 1920, 2048, 2304] {
+            let target = choose_gemm_row_block(dimension, 64, 1472).unwrap();
+            let plan = plan_blocked_gemm(BlockedGemmConfig {
+                dimension,
+                block_dimension: 64,
+                row_block_dimension: target,
+                tile_count: 1472,
+                data_base: 0xa0000,
+                data_limit: 0xe8000,
+            })
+            .unwrap();
+            let first_column: Vec<_> = plan
+                .output
+                .iter()
+                .filter(|block| block.block_column == 0)
+                .collect();
+
+            assert_eq!(first_column.first().unwrap().row_start, 0);
+            assert_eq!(
+                first_column.last().unwrap().row_start + first_column.last().unwrap().rows,
+                dimension
+            );
+            assert!(
+                first_column
+                    .windows(2)
+                    .all(|blocks| { blocks[0].row_start + blocks[0].rows == blocks[1].row_start })
+            );
+            let minimum = first_column.iter().map(|block| block.rows).min().unwrap();
+            let maximum = first_column.iter().map(|block| block.rows).max().unwrap();
+            assert!(maximum - minimum <= 1);
+            assert!(plan.output.len() <= 1472);
+        }
+    }
+
+    #[test]
+    fn gemm_tuning_candidates_are_feasible_and_layout_distinct() {
+        for dimension in [64, 128, 256, 1024, 1920, 2048, 2304] {
+            let candidates = gemm_row_block_candidates(dimension, 64, 1472);
+            assert!(!candidates.is_empty());
+            assert!(candidates.windows(2).all(|pair| pair[0] < pair[1]));
+            let row_shards: BTreeSet<_> = candidates
+                .iter()
+                .map(|target| dimension.div_ceil(*target))
+                .collect();
+            assert_eq!(row_shards.len(), candidates.len());
+            assert!(candidates.iter().all(|target| {
+                usize::from(dimension.div_ceil(*target)) * usize::from(dimension / 64) <= 1472
+            }));
+            assert!(candidates.contains(&choose_gemm_row_block(dimension, 64, 1472).unwrap()));
+        }
+        assert!(choose_gemm_row_block(65, 64, 1472).is_none());
     }
 
     fn exchange_schedule(transfers: Vec<Transfer>) -> Schedule {

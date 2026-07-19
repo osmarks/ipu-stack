@@ -1,4 +1,4 @@
-use ipu_compiler::{BlockedGemmConfig, BlockedGemmPlan, plan_blocked_gemm};
+use ipu_compiler::{BlockedGemmConfig, BlockedGemmPlan, choose_gemm_row_block, plan_blocked_gemm};
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
@@ -48,16 +48,36 @@ fn main() {
         .unwrap();
 
     let compile_start = Instant::now();
+    let row_block_dimension = std::env::var("IPU_GEMM_ROW_BLOCK")
+        .map(|value| {
+            value
+                .parse::<u16>()
+                .expect("IPU_GEMM_ROW_BLOCK must be a u16")
+        })
+        .unwrap_or_else(|_| {
+            choose_gemm_row_block(dimension, BLOCK_DIMENSION, TILE_COUNT)
+                .expect("GEMM shape has no feasible row blocking")
+        });
     let plan = plan_blocked_gemm(BlockedGemmConfig {
         dimension,
         block_dimension: BLOCK_DIMENSION,
-        row_block_dimension: if dimension == 2048 { 48 } else { 64 },
+        row_block_dimension,
         tile_count: TILE_COUNT,
         data_base: GEMM_DATA_BASE,
         data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
     })
     .unwrap();
     let output_placements = plan.output.clone();
+    let minimum_rows = output_placements
+        .iter()
+        .map(|block| block.rows)
+        .min()
+        .unwrap();
+    let maximum_rows = output_placements
+        .iter()
+        .map(|block| block.rows)
+        .max()
+        .unwrap();
     let (graph, input) = gemm_graph_and_input(dimension, plan);
     let objects = [
         fs::read(runtime.object).unwrap(),
@@ -82,6 +102,14 @@ fn main() {
     };
     info!(
         dimension,
+        row_block_dimension,
+        row_shards = output_placements
+            .iter()
+            .map(|block| block.block_row)
+            .max()
+            .map_or(0, |row| row + 1),
+        minimum_rows,
+        maximum_rows,
         compile_ms = compile_start.elapsed().as_millis(),
         input_bytes = input.len(),
         "packaged blocked FP32 GEMM"

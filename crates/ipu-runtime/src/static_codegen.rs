@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 const INCOMING_DBASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;
 const INCOMING_SBASE: u8 = 0xa7;
+const KERNEL_ARGUMENT_BASE: u8 = 5;
+const KERNEL_ARGUMENT_REGISTERS: usize = 5;
 
 pub(crate) const WORKER_BARRIER: &str = "ipu_stack_static_worker_barrier";
 pub(crate) const COMPLETE: &str = "ipu_stack_static_complete";
@@ -79,6 +81,12 @@ pub(crate) fn emit(
                 code.setzi(2, command.output_address)?;
                 code.setzi(3, command.input_addresses[0])?;
                 code.setzi(4, command.input_addresses[1])?;
+                if command.arguments.len() > KERNEL_ARGUMENT_REGISTERS {
+                    return Err("kernel scalar arguments exceed the register ABI".into());
+                }
+                for (index, &argument) in command.arguments.iter().enumerate() {
+                    code.setzi(u8::try_from(index)? + KERNEL_ARGUMENT_BASE, argument)?;
+                }
                 code.call(kernel, 10)?;
             }
             LoweredTileStep::IdleCompute { .. } => {}

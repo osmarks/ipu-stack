@@ -13,38 +13,35 @@
 	// Packed increments for contiguous 8-float A and 16-float C rows.
 	.set PACE_ROW_STRIDE, (1 << 10) | 1
 
-	.macro PARTITION_64BIT_UNITS units
+	.macro PARTITION_ROWS
 	get $m4, $WSR
 	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
-	setzi $m5, (\units) / 6
-	cmpult $m6, $m4, (\units) % 6
+	mov $m5, $m8
+	cmpult $m6, $m4, $m9
 	add $m5, $m5, $m6
-	mul $m6, $m4, (\units) / 6
-	min $m7, $m4, (\units) % 6
+	mul $m6, $m4, $m8
+	min $m7, $m4, $m9
 	add $m6, $m6, $m7
-	shl $m6, $m6, 3
 	.endm
 
-	.macro ZERO_WORKER_ENTRY name, rows
 	.worker
 	.p2align 2
-\name:
-	mov $m2, $mvertex_base
-	PARTITION_64BIT_UNITS \rows * OUTPUT_COLUMNS / 2
+.Lzero_output_worker:
+	ld32 $m2, $mvertex_base, $m15, 0
+	ld32 $m8, $mvertex_base, $m15, 3
+	ld32 $m9, $mvertex_base, $m15, 4
+	PARTITION_ROWS
+	shl $m6, $m6, 8
 	add $m2, $m2, $m6
-	brz $mzero, .Lzero_output_64
-	.endm
-
-	ZERO_WORKER_ENTRY .Lzero_64x64_worker, 64
-	ZERO_WORKER_ENTRY .Lzero_48x64_worker, 48
-	ZERO_WORKER_ENTRY .Lzero_32x64_worker, 32
-
-.Lzero_output_64:
-.Lzero_64:
+.Lzero_row:
+	setzi $m7, OUTPUT_COLUMNS / 2
+.Lzero_row_words:
 	st64 $azeros, $m2, $m15, 0
 	add $m2, $m2, 8
+	sub $m7, $m7, 1
+	brnz $m7, .Lzero_row_words
 	sub $m5, $m5, 1
-	brnz $m5, .Lzero_64
+	brnz $m5, .Lzero_row
 	exitz $mzero
 
 	.macro LOAD_AMP16_WEIGHTS
@@ -114,19 +111,24 @@
 	ld64putcs 63
 	.endm
 
-	.macro GEMM_SUPERVISOR name, rows, worker, zero_worker, clear_output
+	.macro GEMM_SUPERVISOR name, clear_output
 	.section .text.\name,"ax",@progbits
 	.globl \name
 	.p2align 2
 	.type \name,@function
 \name:
 	.supervisor
+	add $m11, $m11, -24
+	st32 $m2, $m11, $m15, 0
+	st32 $m3, $m11, $m15, 1
+	st32 $m5, $m11, $m15, 2
+	st32 $m6, $m11, $m15, 3
+	st32 $m7, $m11, $m15, 4
 	.if \clear_output
-	setzi $m0, \zero_worker
-	runall $m0, $m2, 0
+	setzi $m0, .Lzero_output_worker
+	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
 	.endif
-	add $m11, $m11, -8
 	setzi $m5, CLEAR_CWEI
 	put $CR, $m5
 	put $CCCSLOAD, $m4
@@ -136,15 +138,17 @@
 	zero $m7
 .Linner_group_\@:
 	LOAD_AMP16_WEIGHTS
-	mov $m5, $m11
-	mul $m8, $m6, \rows * OUTPUT_COLUMNS
+	ld32 $m9, $m11, $m15, 2
+	mul $m8, $m9, OUTPUT_COLUMNS
+	mul $m8, $m8, $m6
 	add $m8, $m2, $m8
-	st32 $m8, $m5, $m15, 0
-	mul $m8, $m7, \rows * INNER_MICRO_DIMENSION * 4
+	st32 $m8, $m11, $m15, 0
+	mul $m8, $m9, INNER_MICRO_DIMENSION * 4
+	mul $m8, $m8, $m7
 	add $m8, $m3, $m8
-	st32 $m8, $m5, $m15, 1
-	setzi $m0, \worker
-	runall $m0, $m5, 0
+	st32 $m8, $m11, $m15, 1
+	setzi $m0, .Lgemm_amp_pace_worker
+	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
 	add $m7, $m7, 1
 	setzi $m8, INNER_MICRO_DIMENSION
@@ -155,44 +159,26 @@
 	cmpult $m8, $m6, $m8
 	brnz $m8, .Lcolumn_group_\@
 	sync SYNC_COMPUTE_SET
-	add $m11, $m11, 8
+	add $m11, $m11, 24
 	br $m10
 	.size \name, .-\name
 	.endm
 
-	GEMM_SUPERVISOR ipu_stack_gemm_f32_64_init, 64, .Lgemm_amp_pace_worker_64, .Lzero_64x64_worker, 1
-	GEMM_SUPERVISOR ipu_stack_gemm_f32_64_accumulate, 64, .Lgemm_amp_pace_worker_64, .Lzero_64x64_worker, 0
-	GEMM_SUPERVISOR ipu_stack_gemm_f32_48_init, 48, .Lgemm_amp_pace_worker_48, .Lzero_48x64_worker, 1
-	GEMM_SUPERVISOR ipu_stack_gemm_f32_48_accumulate, 48, .Lgemm_amp_pace_worker_48, .Lzero_48x64_worker, 0
-	GEMM_SUPERVISOR ipu_stack_gemm_f32_32_init, 32, .Lgemm_amp_pace_worker_32, .Lzero_32x64_worker, 1
-	GEMM_SUPERVISOR ipu_stack_gemm_f32_32_accumulate, 32, .Lgemm_amp_pace_worker_32, .Lzero_32x64_worker, 0
+	GEMM_SUPERVISOR ipu_stack_gemm_f32_init, 1
+	GEMM_SUPERVISOR ipu_stack_gemm_f32_accumulate, 0
 
-	.macro GEMM_WORKER_ENTRY name, rows
 	.worker
 	.p2align 3
-\name:
+.Lgemm_amp_pace_worker:
 	ld32 $m2, $mvertex_base, $m15, 0
 	ld32 $m3, $mvertex_base, $m15, 1
-	get $m4, $WSR
-	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
-	setzi $m5, \rows / 6
-	cmpult $m6, $m4, \rows % 6
-	add $m5, $m5, $m6
-	mul $m6, $m4, \rows / 6
-	min $m7, $m4, \rows % 6
-	add $m6, $m6, $m7
+	ld32 $m8, $mvertex_base, $m15, 3
+	ld32 $m9, $mvertex_base, $m15, 4
+	PARTITION_ROWS
 	shl $m7, $m6, 6
 	shl $m6, $m6, 5
 	add $m2, $m2, $m7
 	add $m3, $m3, $m6
-	brz $mzero, .Lgemm_amp_pace_worker_common
-	.endm
-
-	GEMM_WORKER_ENTRY .Lgemm_amp_pace_worker_64, 64
-	GEMM_WORKER_ENTRY .Lgemm_amp_pace_worker_48, 48
-	GEMM_WORKER_ENTRY .Lgemm_amp_pace_worker_32, 32
-
-.Lgemm_amp_pace_worker_common:
 	add $m5, $m5, -1
 	add $m4, $m5, -1
 	setzi $m7, PACE_ROW_STRIDE

@@ -396,6 +396,7 @@ fn add_u32(
         tile,
         output: accumulator,
         inputs: vec![accumulator, received],
+        arguments: Vec::new(),
         specialization: SpecializationKey {
             operation: "add_u32".into(),
             shape: vec![1],

@@ -377,6 +377,7 @@ fn add_u32(tile: u16, output: TensorId, input: TensorId, role: &str) -> KernelCo
         tile,
         output,
         inputs: vec![input, input],
+        arguments: Vec::new(),
         specialization: SpecializationKey {
             operation: "add_u32".into(),
             shape: vec![1],

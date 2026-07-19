@@ -134,6 +134,7 @@ fn randomized_case(seed: u64, case: usize) -> (ExecutableGraph, BTreeMap<String,
             tile: compute_tile,
             output: accumulator_tensor,
             inputs: vec![accumulator_tensor, payload_tensor],
+            arguments: Vec::new(),
             specialization: SpecializationKey {
                 operation: "add_u32".into(),
                 shape: vec![1],
