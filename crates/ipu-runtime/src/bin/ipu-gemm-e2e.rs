@@ -183,8 +183,12 @@ fn gemm_graph_and_input(dimension: u16, plan: BlockedGemmPlan) -> (ExecutableGra
     let left_binding = block_binding("left", dimension, block_bytes, &plan.left);
     let right_binding = block_binding("right", dimension, block_bytes, &plan.right);
     let output_binding = block_binding("output", dimension, block_bytes, &plan.output);
-    let mut input = blocked_matrix(dimension, BlockLayout::RowMajor, left_value);
-    input.extend(blocked_matrix(dimension, BlockLayout::Amp8x16, right_value));
+    let mut input = blocked_matrix(dimension, BlockLayout::AmpA8, left_value);
+    input.extend(blocked_matrix(
+        dimension,
+        BlockLayout::AmpB8x16,
+        right_value,
+    ));
     (
         ExecutableGraph {
             schedule: plan.schedule,
@@ -223,8 +227,51 @@ fn block_binding(
 
 #[derive(Clone, Copy)]
 enum BlockLayout {
-    RowMajor,
-    Amp8x16,
+    AmpA8,
+    AmpB8x16,
+    AmpC16,
+}
+
+fn block_coordinates(layout: BlockLayout, linear: u16) -> (u16, u16) {
+    match layout {
+        BlockLayout::AmpA8 => {
+            let panel_elements = BLOCK_DIMENSION * INNER_MICRO_DIMENSION;
+            let panel = linear / panel_elements;
+            let panel_offset = linear % panel_elements;
+            (
+                panel_offset / INNER_MICRO_DIMENSION,
+                panel * INNER_MICRO_DIMENSION + panel_offset % INNER_MICRO_DIMENSION,
+            )
+        }
+        BlockLayout::AmpB8x16 => {
+            let panel_elements = INNER_MICRO_DIMENSION * COLUMN_MICRO_DIMENSION;
+            let panel = linear / panel_elements;
+            let panel_offset = linear % panel_elements;
+            let column_group = panel / INNER_MICRO_DIMENSION;
+            let inner_group = panel % INNER_MICRO_DIMENSION;
+            let load_channel = panel_offset / INNER_MICRO_DIMENSION;
+            let inner_in_group = panel_offset % INNER_MICRO_DIMENSION;
+            let load_pair = load_channel / 2;
+            let logical_pair = (load_pair % 2) * 4 + load_pair / 2;
+            let column_in_group = logical_pair * 2 + load_channel % 2;
+            (
+                inner_group * INNER_MICRO_DIMENSION + inner_in_group,
+                column_group * COLUMN_MICRO_DIMENSION + column_in_group,
+            )
+        }
+        BlockLayout::AmpC16 => {
+            let panel_elements = BLOCK_DIMENSION * COLUMN_MICRO_DIMENSION;
+            let panel = linear / panel_elements;
+            let panel_offset = linear % panel_elements;
+            let physical_column = panel_offset % COLUMN_MICRO_DIMENSION;
+            let physical_pair = physical_column / 2;
+            let logical_pair = (physical_pair % 2) * 4 + physical_pair / 2;
+            (
+                panel_offset / COLUMN_MICRO_DIMENSION,
+                panel * COLUMN_MICRO_DIMENSION + logical_pair * 2 + physical_column % 2,
+            )
+        }
+    }
 }
 
 fn blocked_matrix(dimension: u16, layout: BlockLayout, value: impl Fn(u16, u16) -> f32) -> Vec<u8> {
@@ -232,36 +279,15 @@ fn blocked_matrix(dimension: u16, layout: BlockLayout, value: impl Fn(u16, u16) 
     let mut bytes = Vec::with_capacity(usize::from(dimension) * usize::from(dimension) * 4);
     for block_row in 0..grid {
         for block_column in 0..grid {
-            for major in 0..BLOCK_DIMENSION {
-                for minor in 0..BLOCK_DIMENSION {
-                    let (row, column) = match layout {
-                        BlockLayout::RowMajor => (major, minor),
-                        BlockLayout::Amp8x16 => {
-                            let linear = major * BLOCK_DIMENSION + minor;
-                            let panel_elements = INNER_MICRO_DIMENSION * COLUMN_MICRO_DIMENSION;
-                            let panel = linear / panel_elements;
-                            let panel_offset = linear % panel_elements;
-                            let column_group = panel / INNER_MICRO_DIMENSION;
-                            let inner_group = panel % INNER_MICRO_DIMENSION;
-                            let load_channel = panel_offset / INNER_MICRO_DIMENSION;
-                            let inner_in_group = panel_offset % INNER_MICRO_DIMENSION;
-                            let load_pair = load_channel / 2;
-                            let logical_pair = (load_pair % 2) * 4 + load_pair / 2;
-                            let column_in_group = logical_pair * 2 + load_channel % 2;
-                            (
-                                inner_group * INNER_MICRO_DIMENSION + inner_in_group,
-                                column_group * COLUMN_MICRO_DIMENSION + column_in_group,
-                            )
-                        }
-                    };
-                    bytes.extend_from_slice(
-                        &value(
-                            block_row * BLOCK_DIMENSION + row,
-                            block_column * BLOCK_DIMENSION + column,
-                        )
-                        .to_le_bytes(),
-                    );
-                }
+            for linear in 0..BLOCK_DIMENSION * BLOCK_DIMENSION {
+                let (row, column) = block_coordinates(layout, linear);
+                bytes.extend_from_slice(
+                    &value(
+                        block_row * BLOCK_DIMENSION + row,
+                        block_column * BLOCK_DIMENSION + column,
+                    )
+                    .to_le_bytes(),
+                );
             }
         }
     }
@@ -340,24 +366,23 @@ fn find_mismatch(dimension: u16, actual: &[u8]) -> Option<GemmMismatch> {
     let mut offset = 0;
     for block_row in 0..grid {
         for block_column in 0..grid {
-            for row in 0..BLOCK_DIMENSION {
-                for column in 0..BLOCK_DIMENSION {
-                    let global_row = block_row * BLOCK_DIMENSION + row;
-                    let global_column = block_column * BLOCK_DIMENSION + column;
-                    let actual_value =
-                        f32::from_le_bytes(actual[offset..offset + 4].try_into().unwrap());
-                    let expected =
-                        expected[usize::from(global_row % 7)][usize::from(global_column % 5)];
-                    if actual_value.to_bits() != expected.to_bits() {
-                        return Some(GemmMismatch {
-                            row: global_row,
-                            column: global_column,
-                            actual: actual_value.to_bits(),
-                            expected: expected.to_bits(),
-                        });
-                    }
-                    offset += 4;
+            for linear in 0..BLOCK_DIMENSION * BLOCK_DIMENSION {
+                let (row, column) = block_coordinates(BlockLayout::AmpC16, linear);
+                let global_row = block_row * BLOCK_DIMENSION + row;
+                let global_column = block_column * BLOCK_DIMENSION + column;
+                let actual_value =
+                    f32::from_le_bytes(actual[offset..offset + 4].try_into().unwrap());
+                let expected =
+                    expected[usize::from(global_row % 7)][usize::from(global_column % 5)];
+                if actual_value.to_bits() != expected.to_bits() {
+                    return Some(GemmMismatch {
+                        row: global_row,
+                        column: global_column,
+                        actual: actual_value.to_bits(),
+                        expected: expected.to_bits(),
+                    });
                 }
+                offset += 4;
             }
         }
     }
@@ -398,9 +423,9 @@ fn compare_sram_block(
             transport_differences += 1;
             first_transport_difference.get_or_insert((index, d2h_word, sram_word));
         }
-        let block_dimension = usize::from(BLOCK_DIMENSION);
-        let row = block_row * BLOCK_DIMENSION + u16::try_from(index / block_dimension)?;
-        let column = block_column * BLOCK_DIMENSION + u16::try_from(index % block_dimension)?;
+        let (row, column) = block_coordinates(BlockLayout::AmpC16, u16::try_from(index)?);
+        let row = block_row * BLOCK_DIMENSION + row;
+        let column = block_column * BLOCK_DIMENSION + column;
         if sram_word != expected_value(dimension, row, column).to_bits() {
             sram_expected_differences += 1;
         }
@@ -459,6 +484,31 @@ fn expected_value(dimension: u16, row: u16, column: u16) -> f32 {
     (0..dimension)
         .map(|inner| left_value(row, inner) * right_value(inner, column))
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn amp_block_layouts_are_bijections() {
+        for layout in [
+            BlockLayout::AmpA8,
+            BlockLayout::AmpB8x16,
+            BlockLayout::AmpC16,
+        ] {
+            let coordinates = (0..BLOCK_DIMENSION * BLOCK_DIMENSION)
+                .map(|linear| block_coordinates(layout, linear))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(coordinates.len(), usize::from(BLOCK_DIMENSION).pow(2));
+            assert!(
+                coordinates
+                    .iter()
+                    .all(|&(row, column)| { row < BLOCK_DIMENSION && column < BLOCK_DIMENSION })
+            );
+        }
+    }
 }
 
 fn required_env(name: &str) -> String {

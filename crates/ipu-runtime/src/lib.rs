@@ -575,6 +575,20 @@ fn package_graph_impl(
         .chain(&host.outputs)
         .copied()
         .collect::<Vec<_>>();
+    for (index, transfer) in host_transfers.iter().enumerate() {
+        let hierarchy = ipu_exchange::host_hierarchy(transfer.physical_tile)?;
+        debug!(
+            index,
+            direction = ?transfer.direction,
+            physical_tile = transfer.physical_tile,
+            xreq_physical_tile = hierarchy.xreq_physical_tile,
+            tile_address = format_args!("0x{:x}", transfer.tile_address),
+            host_offset = format_args!("0x{:x}", transfer.host_offset),
+            bytes = transfer.bytes,
+            copy_destination = transfer.copy_destination.map(|address| format!("0x{address:x}")),
+            "planned static host transfer"
+        );
+    }
     let host_packet_sizes = host_transfers
         .iter()
         .map(|transfer| host_packet_size(*transfer))
@@ -1670,8 +1684,39 @@ fn supervisor_state_summary(device: &Device, app: &Application) -> String {
             format!("{}:{value}", tile.physical_tile)
         })
         .collect::<Vec<_>>();
+    let active_contexts = app
+        .tiles
+        .iter()
+        .filter(|tile| device.tile_context_state(tile.physical_tile as u16, 0).ok() == Some(1))
+        .map(|tile| {
+            let states = (0..7)
+                .map(|context| device.tile_context_state(tile.physical_tile as u16, context))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map(|states| {
+                    let exceptions = (1..7)
+                        .filter(|&context| states[context as usize] == 3)
+                        .map(|context| {
+                            let status =
+                                device.read_tile_worker_status(tile.physical_tile as u16, context);
+                            let pc = device
+                                .read_tile_program_counter(tile.physical_tile as u16, context);
+                            match (status, pc) {
+                                (Ok(status), Ok(pc)) => format!(
+                                    "c{context}:{}@0x{pc:x}",
+                                    ipu_driver::TileException::from_status(status)
+                                ),
+                                (status, pc) => format!("c{context}:status={status:?},pc={pc:?}"),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    format!("{states:?}/{exceptions:?}")
+                })
+                .unwrap_or_else(|error| format!("error({error})"));
+            format!("{}:{states}", tile.physical_tile)
+        })
+        .collect::<Vec<_>>();
     format!(
-        "0={} {:?}, 1={} {:?}, 2={} {:?}, 3={} {:?}, errors={read_errors}, pc={program_counters:?}, milestones={milestones:?}",
+        "0={} {:?}, 1={} {:?}, 2={} {:?}, 3={} {:?}, errors={read_errors}, active_contexts={active_contexts:?}, pc={program_counters:?}, milestones={milestones:?}",
         counts[0], samples[0], counts[1], samples[1], counts[2], samples[2], counts[3], samples[3]
     )
 }

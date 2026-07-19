@@ -129,6 +129,10 @@ pub const SCHEMA_VERSION: u32 = 2;
 pub const TARGET_IPU21: &str = "ipu21";
 pub const TILE_MEMORY_BASE: u32 = 0x4c000;
 pub const TILE_MEMORY_SIZE: u32 = 624 * 1024;
+// From Target::getMemoryElementOffsets() for IPU21. PACE kernels use this
+// element for operands declared with an interleaved-memory constraint.
+pub const IPU21_INTERLEAVED_MEMORY_BASE: u32 = TILE_MEMORY_BASE + 0x34000;
+pub const IPU21_INTERLEAVED_MEMORY_LIMIT: u32 = TILE_MEMORY_BASE + 0x3c000;
 pub const SEGMENT_READ: u32 = 1;
 pub const SEGMENT_WRITE: u32 = 2;
 pub const SEGMENT_EXECUTE: u32 = 4;

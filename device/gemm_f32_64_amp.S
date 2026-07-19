@@ -11,6 +11,8 @@
 	// The SDK's supervisor CR header does not expose this shift to assembly.
 	.set CLEAR_CWEI, 1 << 2
 	.set CLEAR_AACC, 1 << CSR_W_FP_CLR__ZAACC__SHIFT
+	// Packed increments for contiguous 8-float A and 16-float C rows.
+	.set PACE_ROW_STRIDE, (1 << 10) | 1
 
 	.section .text.ipu_stack_copy_4096_u32,"ax",@progbits
 	.globl ipu_stack_copy_4096_u32
@@ -122,13 +124,13 @@ ipu_stack_copy_4096_u32:
 .Linner_group_\@:
 	LOAD_AMP16_WEIGHTS
 	setzi $m5, WORKER_ARGUMENTS
-	shl $m8, $m6, 6
+	shl $m8, $m6, 12
 	add $m8, $m2, $m8
 	st32 $m8, $m5, $m15, 0
-	shl $m8, $m7, 5
+	shl $m8, $m7, 11
 	add $m8, $m3, $m8
 	st32 $m8, $m5, $m15, 1
-	setzi $m0, .Lgemm_amp_worker
+	setzi $m0, .Lgemm_amp_pace_worker
 	runall $m0, $m5, 0
 	sync SYNC_COMPUTE_SET
 	add $m7, $m7, 1
@@ -139,6 +141,7 @@ ipu_stack_copy_4096_u32:
 	setzi $m8, BLOCK_DIMENSION / COLUMN_MICRO_DIMENSION
 	cmpult $m8, $m6, $m8
 	brnz $m8, .Lcolumn_group_\@
+	sync SYNC_COMPUTE_SET
 	br $m10
 	.size \name, .-\name
 	.endm
@@ -146,38 +149,9 @@ ipu_stack_copy_4096_u32:
 	GEMM_SUPERVISOR ipu_stack_gemm_f32_64_init, 1
 	GEMM_SUPERVISOR ipu_stack_gemm_f32_64_accumulate, 0
 
-	.macro AMP_WARM phase, c_offset
-	ld64 $a0:1, $m2, $m15, \c_offset
-	f32sisov2amp $azeros, $azero, $a0:1, \phase
-	.endm
-
-	.macro AMP_FIRST phase, a_offset, c_offset
-	ld32 $a2, $m3, $m15, \a_offset
-	ld64 $a0:1, $m2, $m15, (\c_offset + 32)
-	f32sisov2amp $azeros, $a2, $a0:1, \phase
-	.endm
-
-	.macro AMP_MIDDLE phase, a_offset, c_offset
-	ld32 $a2, $m3, $m15, \a_offset
-	ld64 $a0:1, $m2, $m15, (\c_offset + 32)
-	f32sisov2amp $a4:5, $a2, $a0:1, \phase
-	st64 $a4:5, $m8, $m15, \c_offset
-	.endm
-
-	.macro AMP_LAST phase, a_offset, c_offset
-	ld32 $a2, $m3, $m15, \a_offset
-	f32sisov2amp $a4:5, $a2, $azeros, \phase
-	st64 $a4:5, $m8, $m15, \c_offset
-	.endm
-
-	.macro AMP_DRAIN phase, c_offset
-	f32sisov2amp $a4:5, $azero, $azeros, \phase
-	st64 $a4:5, $m2, $m15, \c_offset
-	.endm
-
 	.worker
 	.p2align 3
-.Lgemm_amp_worker:
+.Lgemm_amp_pace_worker:
 	ld32 $m2, $mvertex_base, $m15, 0
 	ld32 $m3, $mvertex_base, $m15, 1
 	get $m4, $WSR
@@ -188,67 +162,176 @@ ipu_stack_copy_4096_u32:
 	mul $m6, $m4, BLOCK_DIMENSION / 6
 	min $m7, $m4, BLOCK_DIMENSION % 6
 	add $m6, $m6, $m7
-	shl $m6, $m6, 8
-	add $m2, $m2, $m6
+	shl $m7, $m6, 6
+	shl $m6, $m6, 5
+	add $m2, $m2, $m7
 	add $m3, $m3, $m6
-	setzi $a0, CLEAR_AACC
-	uput $FP_CLR, $a0
+	add $m5, $m5, -1
+	add $m4, $m5, -1
+	setzi $m7, PACE_ROW_STRIDE
+	setzi $a7, CLEAR_AACC
+	uput $FP_CLR, $a7
+	add $m9, $m2, COLUMN_MICRO_DIMENSION * 4
 
-	AMP_WARM TAMP_F32_E4_P0, 0
-	AMP_WARM TAMP_F32_E4_P1, 4
-	AMP_WARM TAMP_F32_E4_P2, 1
-	AMP_WARM TAMP_F32_E4_P3, 5
-	AMP_WARM TAMP_F32_E4_P4, 2
-	AMP_WARM TAMP_F32_E4_P5, 6
-	AMP_WARM TAMP_F32_E4_P6, 3
-	AMP_WARM TAMP_F32_E4_P7, 7
+	ld128 $a0:3, $m2, 0
+	f32sisov2amp $a4:5, $azero, $a0:1, TAMP_F32_E4_P0
+	{
+		ld128 $a0:3, $m2, 1
+		f32sisov2amp $a4:5, $azero, $a2:3, TAMP_F32_E4_P1
+	}
+	f32sisov2amp $a4:5, $azero, $a0:1, TAMP_F32_E4_P2
+	{
+		ld128 $a0:3, $m2, 2
+		f32sisov2amp $a4:5, $azero, $a2:3, TAMP_F32_E4_P3
+	}
+	f32sisov2amp $a4:5, $azero, $a0:1, TAMP_F32_E4_P4
+	{
+		ld128 $a0:3, $m2, 3
+		f32sisov2amp $a4:5, $azero, $a2:3, TAMP_F32_E4_P5
+	}
+	{
+		tapack $m10:11, $m3, $m9, $m2
+		f32sisov2amp $a4:5, $azero, $a0:1, TAMP_F32_E4_P6
+	}
+	{
+		ld2x64pace $a0:1, $a2:3, $m10:11+=, $m7, 0b1000
+		f32sisov2amp $a4:5, $azero, $a2:3, TAMP_F32_E4_P7
+	}
+	{
+		ld2x64pace $azeros, $a2:3, $m10:11+=, $m7, 0b1011
+		f32sisov2amp $a4:5, $a0, $a2:3, TAMP_F32_E4_P0
+	}
+	{
+		ld2x64pace $a0:1, $a2:3, $m10:11+=, $m7, 0b1000
+		f32sisov2amp $a4:5, $a1, $a2:3, TAMP_F32_E4_P1
+	}
+	{
+		ld2x64pace $azeros, $a2:3, $m10:11+=, $m7, 0b1011
+		f32sisov2amp $a4:5, $a0, $a2:3, TAMP_F32_E4_P2
+	}
+	{
+		ld2x64pace $a0:1, $a2:3, $m10:11+=, $m7, 0b1000
+		f32sisov2amp $a4:5, $a1, $a2:3, TAMP_F32_E4_P3
+	}
+	{
+		ld2x64pace $azeros, $a2:3, $m10:11+=, $m7, 0b1011
+		f32sisov2amp $a4:5, $a0, $a2:3, TAMP_F32_E4_P4
+	}
+	{
+		ld2x64pace $a0:1, $a2:3, $m10:11+=, $m7, 0b1001
+		f32sisov2amp $a4:5, $a1, $a2:3, TAMP_F32_E4_P5
+	}
+	{
+		ld2x64pace $azeros, $a2:3, $m10:11+=, $m7, 0b1011
+		f32sisov2amp $a4:5, $a0, $a2:3, TAMP_F32_E4_P6
+	}
+	{
+		ld2x64pace $a0:1, $a2:3, $m10:11+=, $m7, 0b1010
+		f32sisov2amp $a4:5, $a1, $a2:3, TAMP_F32_E4_P7
+	}
+	{
+		ld2x64pace $azeros, $a2:3, $m10:11+=, $m7, 0b1011
+		f32sisov2amp $a4:5, $a0, $a2:3, TAMP_F32_E4_P0
+	}
+	{
+		ld2x64pace $a0:1, $a2:3, $m10:11+=, $m7, 0b1011
+		f32sisov2amp $a6:7, $a1, $a2:3, TAMP_F32_E4_P1
+	}
+	{
+		ld2xst64pace $a0:3, $a4:5, $m10:11+=, $mzero, 0b0000
+		f32sisov2amp $a4:5, $a0, $a2:3, TAMP_F32_E4_P2
+	}
+	{
+		ld2xst64pace $a0:3, $a6:7, $m10:11+=, $mzero, 0b000001
+		f32sisov2amp $a6:7, $a1, $a2:3, TAMP_F32_E4_P3
+	}
+	{
+		ld2xst64pace $a0:3, $a4:5, $m10:11+=, $mzero, 0b000000
+		f32sisov2amp $a4:5, $a0, $a2:3, TAMP_F32_E4_P4
+	}
 
-	AMP_FIRST TAMP_F32_E4_P0, 0, 0
-	AMP_FIRST TAMP_F32_E4_P1, 1, 4
-	AMP_FIRST TAMP_F32_E4_P2, 2, 1
-	AMP_FIRST TAMP_F32_E4_P3, 3, 5
-	AMP_FIRST TAMP_F32_E4_P4, 4, 2
-	AMP_FIRST TAMP_F32_E4_P5, 5, 6
-	AMP_FIRST TAMP_F32_E4_P6, 6, 3
-	AMP_FIRST TAMP_F32_E4_P7, 7, 7
-	add $m8, $m2, 0
-	add $m2, $m2, BLOCK_DIMENSION * 4
-	add $m3, $m3, BLOCK_DIMENSION * 4
-	sub $m5, $m5, 1
-
-.Lmiddle_row:
-	cmpeq $m6, $m5, 1
-	brnz $m6, .Llast_row
-	AMP_MIDDLE TAMP_F32_E4_P0, 0, 0
-	AMP_MIDDLE TAMP_F32_E4_P1, 1, 4
-	AMP_MIDDLE TAMP_F32_E4_P2, 2, 1
-	AMP_MIDDLE TAMP_F32_E4_P3, 3, 5
-	AMP_MIDDLE TAMP_F32_E4_P4, 4, 2
-	AMP_MIDDLE TAMP_F32_E4_P5, 5, 6
-	AMP_MIDDLE TAMP_F32_E4_P6, 6, 3
-	AMP_MIDDLE TAMP_F32_E4_P7, 7, 7
-	add $m8, $m8, BLOCK_DIMENSION * 4
-	add $m2, $m2, BLOCK_DIMENSION * 4
-	add $m3, $m3, BLOCK_DIMENSION * 4
-	sub $m5, $m5, 1
-	bri .Lmiddle_row
-
-.Llast_row:
-	AMP_LAST TAMP_F32_E4_P0, 0, 0
-	AMP_LAST TAMP_F32_E4_P1, 1, 4
-	AMP_LAST TAMP_F32_E4_P2, 2, 1
-	AMP_LAST TAMP_F32_E4_P3, 3, 5
-	AMP_LAST TAMP_F32_E4_P4, 4, 2
-	AMP_LAST TAMP_F32_E4_P5, 5, 6
-	AMP_LAST TAMP_F32_E4_P6, 6, 3
-	AMP_LAST TAMP_F32_E4_P7, 7, 7
-
-	AMP_DRAIN TAMP_F32_E4_P0, 0
-	AMP_DRAIN TAMP_F32_E4_P1, 4
-	AMP_DRAIN TAMP_F32_E4_P2, 1
-	AMP_DRAIN TAMP_F32_E4_P3, 5
-	AMP_DRAIN TAMP_F32_E4_P4, 2
-	AMP_DRAIN TAMP_F32_E4_P5, 6
-	AMP_DRAIN TAMP_F32_E4_P6, 3
-	AMP_DRAIN TAMP_F32_E4_P7, 7
-	exitz $m15
+	{
+		rpt $m4, (.Lpace_loop_end - .Lpace_loop_start) / 8 - 1
+		fnop
+	}
+.Lpace_loop_start:
+	{
+		ld2xst64pace $a0:3, $a6:7, $m10:11+=, $mzero, 0b000001
+		f32sisov2amp $a6:7, $a1, $a2:3, TAMP_F32_E4_P5
+	}
+	{
+		ld2xst64pace $a0:3, $a4:5, $m10:11+=, $m7, 0b000001
+		f32sisov2amp $a4:5, $a0, $a2:3, TAMP_F32_E4_P6
+	}
+	{
+		ld2xst64pace $a0:3, $a6:7, $m10:11+=, $mzero, 0b000001
+		f32sisov2amp $a6:7, $a1, $a2:3, TAMP_F32_E4_P7
+	}
+	{
+		ld2xst64pace $a0:3, $a4:5, $m10:11+=, $mzero, 0b000000
+		f32sisov2amp $a4:5, $a0, $a2:3, TAMP_F32_E4_P0
+	}
+	{
+		ld2xst64pace $a0:3, $a6:7, $m10:11+=, $mzero, 0b000001
+		f32sisov2amp $a6:7, $a1, $a2:3, TAMP_F32_E4_P1
+	}
+	{
+		ld2xst64pace $a0:3, $a4:5, $m10:11+=, $mzero, 0b000000
+		f32sisov2amp $a4:5, $a0, $a2:3, TAMP_F32_E4_P2
+	}
+	{
+		ld2xst64pace $a0:3, $a6:7, $m10:11+=, $mzero, 0b000001
+		f32sisov2amp $a6:7, $a1, $a2:3, TAMP_F32_E4_P3
+	}
+	{
+		ld2xst64pace $a0:3, $a4:5, $m10:11+=, $mzero, 0b000000
+		f32sisov2amp $a4:5, $a0, $a2:3, TAMP_F32_E4_P4
+	}
+.Lpace_loop_end:
+	{
+		ld2xst64pace $a0:3, $a6:7, $m10:11+=, $mzero, 0b000001
+		f32sisov2amp $a6:7, $a1, $a2:3, TAMP_F32_E4_P5
+	}
+	{
+		ld2xst64pace $a0:3, $a4:5, $m10:11+=, $mzero, 0b001111
+		f32sisov2amp $a4:5, $a0, $a2:3, TAMP_F32_E4_P6
+	}
+	{
+		st64pace $a6:7, $m10:11+=, $mzero, 0b00
+		f32sisov2amp $a6:7, $a1, $a2:3, TAMP_F32_E4_P7
+	}
+	{
+		st64pace $a4:5, $m10:11+=, $mzero, 0b00
+		f32sisov2amp $a4:5, $azero, $azeros, TAMP_F32_E4_P0
+	}
+	{
+		st64pace $a6:7, $m10:11+=, $mzero, 0b00
+		f32sisov2amp $a6:7, $azero, $azeros, TAMP_F32_E4_P1
+	}
+	{
+		st64pace $a4:5, $m10:11+=, $mzero, 0b00
+		f32sisov2amp $a4:5, $azero, $azeros, TAMP_F32_E4_P2
+	}
+	{
+		st64pace $a6:7, $m10:11+=, $mzero, 0b00
+		f32sisov2amp $a6:7, $azero, $azeros, TAMP_F32_E4_P3
+	}
+	{
+		st64pace $a4:5, $m10:11+=, $mzero, 0b00
+		f32sisov2amp $a4:5, $azero, $azeros, TAMP_F32_E4_P4
+	}
+	{
+		st64pace $a6:7, $m10:11+=, $mzero, 0b00
+		f32sisov2amp $a6:7, $azero, $azeros, TAMP_F32_E4_P5
+	}
+	{
+		st64pace $a4:5, $m10:11+=, $mzero, 0b00
+		f32sisov2amp $a4:5, $azero, $azeros, TAMP_F32_E4_P6
+	}
+	{
+		st64pace $a6:7, $m10:11+=, $mzero, 0b00
+		f32sisov2amp $a6:7, $azero, $azeros, TAMP_F32_E4_P7
+	}
+	st64pace $a4:5, $m10:11+=, $mzero, 0b00
+	st64pace $a6:7, $m10:11+=, $mzero, 0b00
+	exitz $mzero

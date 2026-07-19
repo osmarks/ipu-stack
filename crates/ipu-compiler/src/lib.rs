@@ -518,13 +518,21 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         .data_base
         .checked_add(
             block_bytes
-                .checked_mul(4)
+                .checked_mul(3)
                 .ok_or_else(|| CompileError::Memory("GEMM per-tile data size overflow".into()))?,
         )
         .ok_or_else(|| CompileError::Memory("GEMM per-tile data address overflow".into()))?;
-    if config.data_base & 31 != 0 || tile_data_end > config.data_limit {
+    let output_address = ipu_package::IPU21_INTERLEAVED_MEMORY_BASE;
+    let output_end = output_address
+        .checked_add(block_bytes)
+        .ok_or_else(|| CompileError::Memory("GEMM output address overflow".into()))?;
+    if config.data_base & 31 != 0
+        || tile_data_end > config.data_limit
+        || output_end > ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
+        || (config.data_base < output_end && output_address < tile_data_end)
+    {
         return Err(CompileError::Memory(
-            "four GEMM blocks do not fit the aligned per-tile data range".into(),
+            "GEMM operands do not fit their required IPU21 memory elements".into(),
         ));
     }
     let exchange_address =
@@ -540,13 +548,12 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
             let index = usize::from(block_row) * usize::from(grid) + usize::from(block_column);
             let tile = u16::try_from(index)
                 .map_err(|_| CompileError::Graph("GEMM tile index overflow".into()))?;
-            for (slot, tensor_offset, placements) in [
-                (0, 0, &mut left),
-                (1, block_count, &mut right),
-                (2, 2 * block_count, &mut output),
+            for (address, tensor_offset, placements) in [
+                (config.data_base, 0, &mut left),
+                (config.data_base + block_bytes, block_count, &mut right),
+                (output_address, 2 * block_count, &mut output),
             ] {
                 let tensor = TensorId(tensor_offset + index);
-                let address = config.data_base + slot * block_bytes;
                 allocations.push(Allocation {
                     tensor,
                     tile,
@@ -564,7 +571,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     block_column,
                 });
             }
-            local_left_addresses[index] = config.data_base + 3 * block_bytes;
+            local_left_addresses[index] = config.data_base + 2 * block_bytes;
         }
     }
 
@@ -1844,6 +1851,11 @@ mod tests {
 
         assert_eq!(plan.left.len(), plan.right.len());
         assert_eq!(plan.right.len(), plan.output.len());
+        assert!(
+            plan.output
+                .iter()
+                .all(|block| { block.address == ipu_package::IPU21_INTERLEAVED_MEMORY_BASE })
+        );
         assert_eq!(
             plan.output
                 .iter()
