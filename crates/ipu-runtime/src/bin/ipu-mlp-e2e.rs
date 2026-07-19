@@ -60,16 +60,6 @@ fn main() {
             &[],
         )
         .unwrap();
-    let gemm = toolchain
-        .compile(
-            source("gemm_f32_64_amp.S"),
-            &artifact_dir,
-            "mlp-gemm",
-            &[format!(
-                "-DGEMM_INNER_BLOCK_DIMENSION={INNER_BLOCK_DIMENSION}"
-            )],
-        )
-        .unwrap();
     let gelu = toolchain
         .compile(
             source("gelu_relayout_f32.S"),
@@ -93,6 +83,28 @@ fn main() {
     })
     .unwrap();
     let output_placements = plan.output.clone();
+    let minimum_rows = output_placements
+        .iter()
+        .map(|block| block.rows)
+        .min()
+        .unwrap();
+    let maximum_rows = output_placements
+        .iter()
+        .map(|block| block.rows)
+        .max()
+        .unwrap();
+    let gemm = toolchain
+        .compile(
+            source("gemm_f32_64_amp.S"),
+            &artifact_dir,
+            "mlp-gemm",
+            &[
+                format!("-DGEMM_INNER_BLOCK_DIMENSION={INNER_BLOCK_DIMENSION}"),
+                format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
+                format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
+            ],
+        )
+        .unwrap();
     let input_binding = block_binding("input", batch, width, &plan.input);
     let mut host_inputs = vec![input_binding];
     let mut input = blocked_matrix(&plan.input, BlockLayout::AmpA8, input_value);

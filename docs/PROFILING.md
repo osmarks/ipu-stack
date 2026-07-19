@@ -52,7 +52,7 @@ Useful drilldowns include:
 ```sh
 # Scheduled steps within the GEMM accumulation kernel.
 cargo run --release -q -p ipu-cli -- profile-query profile.capnp \
-  --kernel gemm_f32_accumulate --group-by phase --limit 20
+  --kernel gemm_f32_accumulate_large_rows --group-by phase --limit 20
 
 # Operations active at one normalized graph offset, with two complete samples.
 cargo run --release -q -p ipu-cli -- profile-query profile.capnp \
@@ -65,11 +65,11 @@ cargo run --release -q -p ipu-cli -- profile-query profile.capnp \
 
 # Exchange phases preceding one kernel.
 cargo run --release -q -p ipu-cli -- profile-query profile.capnp \
-  --kind exchange --metadata next_kernel=gemm_f32_accumulate --group-by phase
+  --kind exchange --metadata next_kernel=gemm_f32_accumulate_large_rows --group-by phase
 
 # Compare accumulation cost by inner block number.
 cargo run --release -q -p ipu-cli -- profile-query profile.capnp \
-  --kernel gemm_f32_accumulate --group-by metadata --metadata-key inner_block
+  --kernel gemm_f32_accumulate_large_rows --group-by metadata --metadata-key inner_block
 ```
 
 Filters on `--tile`, `--phase`, and `--metadata` are repeatable. Repeated

@@ -838,18 +838,21 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                         .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?,
                     output: TensorId(scratch_tensor_base + output_index),
                     inputs: vec![left_tensor, right_tensor],
-                    arguments: vec![
-                        u32::from(output_block.rows),
-                        u32::from(output_block.rows / 6),
-                        u32::from(output_block.rows % 6),
-                    ],
+                    arguments: Vec::new(),
                     specialization: SpecializationKey {
-                        operation: if inner_block == 0 {
-                            "gemm_f32_init"
-                        } else {
-                            "gemm_f32_accumulate"
-                        }
-                        .into(),
+                        operation: format!(
+                            "gemm_f32_{}_{}",
+                            if inner_block == 0 {
+                                "init"
+                            } else {
+                                "accumulate"
+                            },
+                            if output_block.rows == base_rows {
+                                "small_rows"
+                            } else {
+                                "large_rows"
+                            }
+                        ),
                         shape: vec![
                             usize::from(output_block.rows),
                             usize::from(config.inner_block_dimension),
@@ -2181,12 +2184,15 @@ mod tests {
                     .all(|transfer| transfer.bytes <= ipu_exchange::MAX_TRANSFER_WORDS * 4),
                 Phase::Compute { commands, .. } => commands.iter().all(|command| {
                     let units = u32::try_from(command.specialization.shape[0]).unwrap();
+                    let operation = command.specialization.operation.as_str();
+                    let valid_arguments = if operation.starts_with("gemm_f32_") {
+                        command.arguments.is_empty()
+                    } else {
+                        command.arguments == [units, units / 6, units % 6]
+                    };
                     command.inputs.len() == 2
-                        && command.arguments == [units, units / 6, units % 6]
-                        && matches!(
-                            command.specialization.operation.as_str(),
-                            "gemm_f32_init" | "gemm_f32_accumulate" | "copy_u64"
-                        )
+                        && valid_arguments
+                        && (operation.starts_with("gemm_f32_") || operation == "copy_u64")
                         && command.metadata.contains_key("label")
                         && command.metadata.contains_key("wave")
                         && command.metadata.contains_key("output_block_row")

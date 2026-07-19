@@ -48,19 +48,6 @@ fn main() {
     let runtime = toolchain
         .compile(&runtime_source, &output, "gemm-runtime", &[])
         .unwrap();
-    let kernel_source =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/gemm_f32_64_amp.S");
-    let kernel = toolchain
-        .compile(
-            &kernel_source,
-            &output,
-            "gemm-f32-64",
-            &[format!(
-                "-DGEMM_INNER_BLOCK_DIMENSION={inner_block_dimension}"
-            )],
-        )
-        .unwrap();
-
     let compile_start = Instant::now();
     let row_block_dimension = std::env::var("IPU_GEMM_ROW_BLOCK")
         .map(|value| {
@@ -100,6 +87,20 @@ fn main() {
         .iter()
         .map(|block| block.rows)
         .max()
+        .unwrap();
+    let kernel_source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/gemm_f32_64_amp.S");
+    let kernel = toolchain
+        .compile(
+            &kernel_source,
+            &output,
+            "gemm-f32-64",
+            &[
+                format!("-DGEMM_INNER_BLOCK_DIMENSION={inner_block_dimension}"),
+                format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
+                format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
+            ],
+        )
         .unwrap();
     let (graph, input) = gemm_graph_and_input(dimension, plan);
     if let Some(path) = std::env::var_os("IPU_MEMORY_PROFILE_OUTPUT") {
