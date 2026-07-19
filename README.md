@@ -165,6 +165,7 @@ IPU_GEMM_DIMENSION=128 \
 IPU_PROFILE_OUTPUT=/tmp/gemm-profile.capnp \
   cargo run -p ipu-runtime --bin ipu-gemm-e2e
 capnp decode schemas/profile.capnp Profile </tmp/gemm-profile.capnp
+cargo run -p ipu-cli -- profile-render /tmp/gemm-profile.capnp -o /tmp/gemm-profile.html
 
 # Compare one completed output block directly in tile SRAM against D2H.
 IPU_GEMM_LOAD_PACKAGE=/tmp/gemm.ipuexe \

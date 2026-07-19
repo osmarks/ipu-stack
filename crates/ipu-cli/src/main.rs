@@ -8,7 +8,7 @@ use ipu_elf::{LinkOptions, Toolchain, inspect_object, link};
 use ipu_exchange::Topology;
 use ipu_package::{
     Application, EntryPoint, HostCall, HostExchange, HostPage, HostSlice, ProfileReport,
-    SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
+    ProfileStepKind, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
 };
 use object::{Object, ObjectSegment};
 use std::collections::{BTreeMap, HashMap};
@@ -70,6 +70,11 @@ enum Command {
     },
     ProfileInspect {
         profile: PathBuf,
+    },
+    ProfileRender {
+        profile: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
     },
     PackageExtractTile {
         package: PathBuf,
@@ -344,6 +349,16 @@ fn main() -> Result<()> {
                     "operation={operation} phases={phases} cycles={cycles} maxPhaseCycles={maximum}"
                 );
             }
+        }
+        Command::ProfileRender { profile, output } => {
+            let report = ProfileReport::read(fs::File::open(&profile)?)?;
+            fs::write(&output, render_profile_html(&report)?)?;
+            println!(
+                "profile={} tiles={} output={}",
+                profile.display(),
+                report.tiles.len(),
+                output.display()
+            );
         }
         Command::PackageExtractTile {
             package,
@@ -769,6 +784,7 @@ impl Command {
             Self::EncoderReference => "encoder-reference",
             Self::PackageInspect { .. } => "package-inspect",
             Self::ProfileInspect { .. } => "profile-inspect",
+            Self::ProfileRender { .. } => "profile-render",
             Self::PackageExtractTile { .. } => "package-extract-tile",
             Self::PackageImportIpuimg { .. } => "package-import-ipuimg",
             Self::PackageElfDirectory { .. } => "package-elf-directory",
@@ -780,6 +796,415 @@ impl Command {
         }
     }
 }
+
+fn render_profile_html(report: &ProfileReport) -> Result<String> {
+    let tiles = report
+        .tiles
+        .iter()
+        .map(|tile| {
+            let samples = tile
+                .samples
+                .iter()
+                .map(|sample| {
+                    serde_json::json!({
+                        "phase": sample.step.phase,
+                        "epoch": sample.step.epoch,
+                        "localIndex": sample.step.local_index,
+                        "operation": sample.step.operation,
+                        "kind": match sample.step.kind {
+                            ProfileStepKind::Exchange => "exchange",
+                            ProfileStepKind::Compute => "compute",
+                        },
+                        "start": sample.start_cycle,
+                        "end": sample.end_cycle,
+                        "duration": sample.end_cycle.wrapping_sub(sample.start_cycle),
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "physicalTile": tile.physical_tile,
+                "samples": samples,
+            })
+        })
+        .collect::<Vec<_>>();
+    let total_samples: usize = report.tiles.iter().map(|tile| tile.samples.len()).sum();
+    let payload = serde_json::json!({
+        "clockHz": report.clock_hz,
+        "tileCount": report.tiles.len(),
+        "sampleCount": total_samples,
+        "tiles": tiles,
+    });
+    let payload = serde_json::to_string(&payload)?
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026");
+    Ok(PROFILE_REPORT_HTML.replace("__PROFILE_JSON__", &payload))
+}
+
+const PROFILE_REPORT_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IPU Profile</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f7f8fa;
+  --panel: #ffffff;
+  --ink: #18202a;
+  --muted: #637083;
+  --line: #d8dee8;
+  --exchange: #1f8a70;
+  --compute: #c15a2e;
+  --selected: #335cff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+header, main { padding: 16px 20px; }
+header {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: 0; }
+.stats { color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; margin-top: 2px; }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+input, select, button {
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink);
+  padding: 0 9px;
+  font: inherit;
+}
+input[type="number"] { width: 78px; }
+button { cursor: pointer; }
+button.active { border-color: var(--selected); color: var(--selected); }
+main { display: grid; gap: 18px; }
+section {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.section-title { font-weight: 700; }
+.hint { color: var(--muted); }
+.svg-wrap { overflow: auto; }
+svg { display: block; min-width: 100%; background: #fff; }
+.bar { stroke: rgba(0,0,0,.16); stroke-width: 1; cursor: pointer; }
+.bar.dim { opacity: .18; }
+.bar.selected { stroke: var(--selected); stroke-width: 2; }
+.label { pointer-events: none; fill: #fff; font-size: 11px; dominant-baseline: middle; }
+.axis, .tile-label { fill: var(--muted); font-size: 11px; }
+.grid { stroke: #edf0f5; stroke-width: 1; }
+#details {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 10px;
+  padding: 12px;
+  border-top: 1px solid var(--line);
+}
+.detail b { display: block; font-size: 11px; color: var(--muted); font-weight: 600; }
+.detail span { font-variant-numeric: tabular-nums; }
+#tooltip {
+  position: fixed;
+  max-width: 360px;
+  pointer-events: none;
+  background: #111827;
+  color: #fff;
+  border-radius: 6px;
+  padding: 8px 9px;
+  font-size: 12px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.18);
+  display: none;
+  z-index: 20;
+}
+@media (max-width: 760px) {
+  header { grid-template-columns: 1fr; }
+  .controls { justify-content: flex-start; }
+  #details { grid-template-columns: 1fr 1fr; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>IPU Profile</h1>
+    <div class="stats" id="stats"></div>
+  </div>
+  <div class="controls">
+    <label>Search <input id="search" type="search" placeholder="operation"></label>
+    <label>Kind <select id="kind"><option value="all">all</option><option value="compute">compute</option><option value="exchange">exchange</option></select></label>
+    <label>Tiles <input id="tileStart" type="number" min="0" value="0"> to <input id="tileEnd" type="number" min="0" value="63"></label>
+    <button id="zoomOut" type="button">-</button>
+    <button id="zoomIn" type="button">+</button>
+    <button id="reset" type="button">reset</button>
+  </div>
+</header>
+<main>
+  <section>
+    <div class="section-head">
+      <div class="section-title">Flamegraph</div>
+      <div class="hint">Click a bar to focus matching timeline samples.</div>
+    </div>
+    <div class="svg-wrap"><svg id="flame"></svg></div>
+  </section>
+  <section>
+    <div class="section-head">
+      <div class="section-title">Tilewise Timeline</div>
+      <div class="hint">Rendered by physical tile; horizontal scale is cycle count.</div>
+    </div>
+    <div class="svg-wrap"><svg id="timeline"></svg></div>
+    <div id="details"></div>
+  </section>
+</main>
+<div id="tooltip"></div>
+<script>
+const DATA = __PROFILE_JSON__;
+const state = { query: "", kind: "all", tileStart: 0, tileEnd: 63, zoom: 1, selected: null };
+const ns = "http://www.w3.org/2000/svg";
+const flame = document.getElementById("flame");
+const timeline = document.getElementById("timeline");
+const tooltip = document.getElementById("tooltip");
+const details = document.getElementById("details");
+const colors = { exchange: "#1f8a70", compute: "#c15a2e" };
+const textColor = { exchange: "#ffffff", compute: "#ffffff" };
+const tiles = DATA.tiles.slice().sort((a, b) => a.physicalTile - b.physicalTile);
+const maxTile = tiles.reduce((m, t) => Math.max(m, t.physicalTile), 0);
+document.getElementById("tileEnd").value = Math.min(maxTile, 63);
+state.tileEnd = Math.min(maxTile, 63);
+document.getElementById("stats").textContent =
+  `${DATA.tileCount} tiles  ${DATA.sampleCount} samples  ${formatCycles(totalCycles())} aggregate cycles  ${formatHz(DATA.clockHz)}`;
+
+function totalCycles() {
+  return tiles.flatMap(t => t.samples).reduce((sum, s) => sum + s.duration, 0);
+}
+function formatHz(hz) {
+  if (!hz) return "clock unknown";
+  if (hz >= 1e9) return `${(hz / 1e9).toFixed(2)} GHz`;
+  if (hz >= 1e6) return `${(hz / 1e6).toFixed(1)} MHz`;
+  return `${hz} Hz`;
+}
+function formatCycles(value) {
+  if (value >= 1e9) return `${(value / 1e9).toFixed(2)}G`;
+  if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
+  if (value >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
+  return `${value}`;
+}
+function clear(svg) {
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+}
+function el(name, attrs = {}, text = "") {
+  const node = document.createElementNS(ns, name);
+  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+  if (text) node.textContent = text;
+  return node;
+}
+function matches(sample) {
+  if (state.kind !== "all" && sample.kind !== state.kind) return false;
+  if (state.query && !sample.operation.toLowerCase().includes(state.query)) return false;
+  if (state.selected) {
+    if (state.selected.kind && sample.kind !== state.selected.kind) return false;
+    if (state.selected.operation && sample.operation !== state.selected.operation) return false;
+    if (state.selected.phase !== undefined && sample.phase !== state.selected.phase) return false;
+    if (state.selected.epoch !== undefined && sample.epoch !== state.selected.epoch) return false;
+  }
+  return true;
+}
+function showTip(event, lines) {
+  tooltip.innerHTML = lines.map(line => `<div>${escapeHtml(line)}</div>`).join("");
+  tooltip.style.display = "block";
+  tooltip.style.left = `${Math.min(window.innerWidth - 380, event.clientX + 12)}px`;
+  tooltip.style.top = `${event.clientY + 12}px`;
+}
+function hideTip() { tooltip.style.display = "none"; }
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function drawFlame() {
+  clear(flame);
+  const width = Math.max(960, flame.parentElement.clientWidth - 2);
+  const rowH = 24, top = 18;
+  const root = { name: "profile", value: 0, depth: 0, children: new Map() };
+  for (const tile of tiles) {
+    for (const sample of tile.samples) {
+      if (state.kind !== "all" && sample.kind !== state.kind) continue;
+      if (state.query && !sample.operation.toLowerCase().includes(state.query)) continue;
+      let kind = root.children.get(sample.kind);
+      if (!kind) root.children.set(sample.kind, kind = { name: sample.kind, kind: sample.kind, value: 0, depth: 1, children: new Map() });
+      let op = kind.children.get(sample.operation);
+      if (!op) kind.children.set(sample.operation, op = { name: sample.operation, kind: sample.kind, operation: sample.operation, value: 0, depth: 2, children: new Map() });
+      const phaseKey = `phase ${sample.phase} epoch ${sample.epoch}`;
+      let phase = op.children.get(phaseKey);
+      if (!phase) op.children.set(phaseKey, phase = { name: phaseKey, kind: sample.kind, operation: sample.operation, phase: sample.phase, epoch: sample.epoch, value: 0, depth: 3, children: new Map() });
+      phase.value += sample.duration;
+      op.value += sample.duration;
+      kind.value += sample.duration;
+      root.value += sample.duration;
+    }
+  }
+  const rows = [root, ...[...root.children.values()].sort(byValue)];
+  const nodes = [];
+  layout([...root.children.values()].sort(byValue), 0, width, 1, nodes);
+  const height = top + 4 * rowH + 8;
+  flame.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  flame.setAttribute("width", width);
+  flame.setAttribute("height", height);
+  flame.appendChild(el("text", { x: 8, y: 12, class: "axis" }, root.value ? `${formatCycles(root.value)} cycles shown` : "No samples match"));
+  for (const node of nodes) {
+    if (node.w < 1) continue;
+    const rect = el("rect", {
+      x: node.x, y: top + node.depth * rowH, width: Math.max(1, node.w - 1), height: rowH - 3,
+      fill: node.kind ? colors[node.kind] : "#73808f", class: "bar"
+    });
+    rect.addEventListener("mousemove", event => showTip(event, tooltipLines(node)));
+    rect.addEventListener("mouseleave", hideTip);
+    rect.addEventListener("click", () => {
+      state.selected = { kind: node.kind, operation: node.operation, phase: node.phase, epoch: node.epoch };
+      render();
+    });
+    flame.appendChild(rect);
+    if (node.w > 54) {
+      flame.appendChild(el("text", {
+        x: node.x + 5, y: top + node.depth * rowH + rowH / 2 - 1, class: "label", fill: textColor[node.kind] || "#fff"
+      }, node.name.length > node.w / 7 ? node.name.slice(0, Math.max(3, Math.floor(node.w / 7) - 1)) + "..." : node.name));
+    }
+  }
+}
+function layout(children, x, w, depth, out) {
+  const total = children.reduce((sum, child) => sum + child.value, 0);
+  let cursor = x;
+  for (const child of children) {
+    const childW = total ? w * child.value / total : 0;
+    out.push({ ...child, x: cursor, w: childW, depth });
+    layout([...child.children.values()].sort(byValue), cursor, childW, depth + 1, out);
+    cursor += childW;
+  }
+}
+function byValue(a, b) { return b.value - a.value || a.name.localeCompare(b.name); }
+function tooltipLines(node) {
+  const pct = totalCycles() ? `${(100 * node.value / totalCycles()).toFixed(2)}% aggregate` : "";
+  return [node.name, `${formatCycles(node.value)} cycles ${pct}`, node.kind || ""].filter(Boolean);
+}
+function drawTimeline() {
+  clear(timeline);
+  const visibleTiles = tiles.filter(t => t.physicalTile >= state.tileStart && t.physicalTile <= state.tileEnd);
+  const left = 64, top = 22, right = 16, rowH = 17;
+  let maxEnd = 1;
+  for (const tile of visibleTiles) {
+    for (const sample of tile.samples) {
+      maxEnd = Math.max(maxEnd, sample.start + sample.duration);
+    }
+  }
+  const width = Math.max(1024, Math.round((timeline.parentElement.clientWidth - 2) * state.zoom));
+  const plotW = width - left - right;
+  const height = top + Math.max(1, visibleTiles.length) * rowH + 28;
+  timeline.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  timeline.setAttribute("width", width);
+  timeline.setAttribute("height", height);
+  for (let i = 0; i <= 10; i++) {
+    const x = left + plotW * i / 10;
+    timeline.appendChild(el("line", { x1: x, y1: top - 12, x2: x, y2: height - 20, class: "grid" }));
+    timeline.appendChild(el("text", { x: x + 2, y: 12, class: "axis" }, formatCycles(Math.round(maxEnd * i / 10))));
+  }
+  visibleTiles.forEach((tile, index) => {
+    const y = top + index * rowH;
+    timeline.appendChild(el("text", { x: 8, y: y + 11, class: "tile-label" }, `tile ${tile.physicalTile}`));
+    timeline.appendChild(el("line", { x1: left, y1: y + rowH - 2, x2: width - right, y2: y + rowH - 2, class: "grid" }));
+    for (const sample of tile.samples) {
+      const x = left + plotW * sample.start / maxEnd;
+      const w = Math.max(1, plotW * sample.duration / maxEnd);
+      const selected = matches(sample);
+      const rect = el("rect", {
+        x, y: y + 2, width: w, height: rowH - 5, fill: colors[sample.kind],
+        class: `bar ${selected ? "" : "dim"} ${sampleSelected(sample) ? "selected" : ""}`,
+      });
+      rect.addEventListener("mousemove", event => showTip(event, [
+        `tile ${tile.physicalTile}`,
+        sample.operation,
+        `${sample.kind} phase ${sample.phase} epoch ${sample.epoch}`,
+        `start ${sample.start}  duration ${sample.duration} cycles`,
+      ]));
+      rect.addEventListener("mouseleave", hideTip);
+      rect.addEventListener("click", () => {
+        state.selected = { kind: sample.kind, operation: sample.operation, phase: sample.phase, epoch: sample.epoch };
+        render();
+      });
+      timeline.appendChild(rect);
+    }
+  });
+}
+function sampleSelected(sample) {
+  return state.selected &&
+    (!state.selected.kind || sample.kind === state.selected.kind) &&
+    (!state.selected.operation || sample.operation === state.selected.operation) &&
+    (state.selected.phase === undefined || sample.phase === state.selected.phase) &&
+    (state.selected.epoch === undefined || sample.epoch === state.selected.epoch);
+}
+function drawDetails() {
+  const samples = tiles.flatMap(tile => tile.samples.map(sample => ({ tile: tile.physicalTile, ...sample }))).filter(matches);
+  const cycles = samples.reduce((sum, sample) => sum + sample.duration, 0);
+  const longest = samples.reduce((best, sample) => sample.duration > (best?.duration || 0) ? sample : best, null);
+  const ops = new Set(samples.map(sample => sample.operation)).size;
+  details.innerHTML = [
+    ["Selected samples", samples.length],
+    ["Selected cycles", formatCycles(cycles)],
+    ["Operations", ops],
+    ["Longest sample", longest ? `${formatCycles(longest.duration)} cycles` : "none"],
+    ["Longest owner", longest ? `tile ${longest.tile} ${longest.operation}` : "none"],
+  ].map(([key, value]) => `<div class="detail"><b>${escapeHtml(key)}</b><span>${escapeHtml(value)}</span></div>`).join("");
+}
+function render() {
+  state.query = document.getElementById("search").value.trim().toLowerCase();
+  state.kind = document.getElementById("kind").value;
+  state.tileStart = Number(document.getElementById("tileStart").value || 0);
+  state.tileEnd = Number(document.getElementById("tileEnd").value || maxTile);
+  if (state.tileStart > state.tileEnd) [state.tileStart, state.tileEnd] = [state.tileEnd, state.tileStart];
+  drawFlame();
+  drawTimeline();
+  drawDetails();
+}
+document.getElementById("search").addEventListener("input", () => { state.selected = null; render(); });
+document.getElementById("kind").addEventListener("change", () => { state.selected = null; render(); });
+document.getElementById("tileStart").addEventListener("change", render);
+document.getElementById("tileEnd").addEventListener("change", render);
+document.getElementById("zoomIn").addEventListener("click", () => { state.zoom = Math.min(8, state.zoom * 1.35); render(); });
+document.getElementById("zoomOut").addEventListener("click", () => { state.zoom = Math.max(1, state.zoom / 1.35); render(); });
+document.getElementById("reset").addEventListener("click", () => {
+  state.selected = null; state.zoom = 1;
+  document.getElementById("search").value = "";
+  document.getElementById("kind").value = "all";
+  document.getElementById("tileStart").value = 0;
+  document.getElementById("tileEnd").value = Math.min(maxTile, 63);
+  render();
+});
+window.addEventListener("resize", render);
+render();
+</script>
+</body>
+</html>
+"##;
 
 fn format_plan_row(row: &[u32]) -> String {
     row.iter().map(|word| format!(" 0x{word:08x}")).collect()
