@@ -280,6 +280,7 @@ dependencies = [
  "ipu-elf",
  "ipu-exchange",
  "ipu-package",
+ "ipu-profile",
  "object",
  "serde_json",
  "tracing",
@@ -341,6 +342,14 @@ dependencies = [
  "thiserror",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "ipu-profile"
+version = "0.1.0"
+dependencies = [
+ "ipu-package",
+ "serde",
 ]
 
 [[package]]

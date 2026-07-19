@@ -188,6 +188,11 @@ not instruction-level benchmarking. The hardware acceptance suite runs a
 profiled 128 GEMM, parses records for all 1,472 tiles, and requires exchange and
 compute samples.
 
+For bounded table or JSON analysis, use `profile-query`; it groups by kernel,
+operation, phase, tile, or kind and filters by timeline offset and semantic
+metadata. See [docs/PROFILING.md](docs/PROFILING.md) for query examples and the
+definitions of phase-critical versus aggregate work cycles.
+
 Compute samples include the exact kernel symbol, specialization role and shape,
 tensor and SRAM operands, scalar arguments, and planner-supplied semantic
 metadata. The blocked GEMM planner adds output wave, output block coordinates,

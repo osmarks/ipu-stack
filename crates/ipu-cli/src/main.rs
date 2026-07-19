@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use ipu_compiler::{
     CompilerOptions, EncoderConfig, EncoderWeights, compile, encoder_graph, encoder_reference,
 };
@@ -11,8 +11,9 @@ use ipu_package::{
     ProfileReport, ProfileStepKind, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment,
     TileImage,
 };
+use ipu_profile::{GroupBy, MetadataFilter, Query, SortBy, StepKind, query as query_profile};
 use object::{Object, ObjectSegment};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use tracing::{info, info_span};
@@ -23,6 +24,31 @@ use tracing_subscriber::EnvFilter;
 struct Arguments {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProfileGroupArgument {
+    Kind,
+    Kernel,
+    Operation,
+    Phase,
+    Tile,
+    Metadata,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProfileSortArgument {
+    PhaseCycles,
+    WorkCycles,
+    MaximumCycles,
+    Samples,
+    Name,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProfileKindArgument {
+    Compute,
+    Exchange,
 }
 
 #[derive(Subcommand)]
@@ -76,6 +102,49 @@ enum Command {
         profile: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
+    },
+    ProfileQuery {
+        /// Cap'n Proto cycle profile to query.
+        profile: PathBuf,
+        /// Dimension used to aggregate matching samples.
+        #[arg(long, value_enum, default_value = "kernel")]
+        group_by: ProfileGroupArgument,
+        /// Ordering for aggregate rows.
+        #[arg(long, value_enum, default_value = "phase-cycles")]
+        sort_by: ProfileSortArgument,
+        /// Select only compute or exchange samples.
+        #[arg(long, value_enum)]
+        kind: Option<ProfileKindArgument>,
+        /// Select an exact kernel symbol.
+        #[arg(long)]
+        kernel: Option<String>,
+        /// Select operation labels containing this case-sensitive text.
+        #[arg(long)]
+        operation_contains: Option<String>,
+        /// Select a physical tile; repeat for multiple tiles.
+        #[arg(long)]
+        tile: Vec<u32>,
+        /// Select a scheduled phase; repeat for multiple phases.
+        #[arg(long)]
+        phase: Vec<u32>,
+        /// Require metadata NAME or NAME=VALUE; repeat to combine filters.
+        #[arg(long, value_parser = parse_metadata_filter)]
+        metadata: Vec<MetadataFilter>,
+        /// Metadata field used by --group-by metadata.
+        #[arg(long)]
+        metadata_key: Option<String>,
+        /// Select samples active at this per-tile normalized cycle offset.
+        #[arg(long)]
+        at: Option<u64>,
+        /// Maximum aggregate rows; zero means unlimited.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Include this many longest matching samples with full metadata.
+        #[arg(long, default_value_t = 0)]
+        samples: usize,
+        /// Emit a stable machine-readable JSON result.
+        #[arg(long)]
+        json: bool,
     },
     MemoryInspect {
         profile: PathBuf,
@@ -365,6 +434,110 @@ fn main() -> Result<()> {
                 report.tiles.len(),
                 output.display()
             );
+        }
+        Command::ProfileQuery {
+            profile,
+            group_by,
+            sort_by,
+            kind,
+            kernel,
+            operation_contains,
+            tile,
+            phase,
+            metadata,
+            metadata_key,
+            at,
+            limit,
+            samples,
+            json,
+        } => {
+            if matches!(group_by, ProfileGroupArgument::Metadata) && metadata_key.is_none() {
+                bail!("--group-by metadata requires --metadata-key NAME");
+            }
+            let profile = ProfileReport::read(fs::File::open(profile)?)?;
+            let result = query_profile(
+                &profile,
+                &Query {
+                    group_by: match group_by {
+                        ProfileGroupArgument::Kind => GroupBy::Kind,
+                        ProfileGroupArgument::Kernel => GroupBy::Kernel,
+                        ProfileGroupArgument::Operation => GroupBy::Operation,
+                        ProfileGroupArgument::Phase => GroupBy::Phase,
+                        ProfileGroupArgument::Tile => GroupBy::Tile,
+                        ProfileGroupArgument::Metadata => GroupBy::Metadata,
+                    },
+                    sort_by: match sort_by {
+                        ProfileSortArgument::PhaseCycles => SortBy::PhaseCycles,
+                        ProfileSortArgument::WorkCycles => SortBy::WorkCycles,
+                        ProfileSortArgument::MaximumCycles => SortBy::MaximumCycles,
+                        ProfileSortArgument::Samples => SortBy::Samples,
+                        ProfileSortArgument::Name => SortBy::Name,
+                    },
+                    kind: kind.map(|kind| match kind {
+                        ProfileKindArgument::Compute => StepKind::Compute,
+                        ProfileKindArgument::Exchange => StepKind::Exchange,
+                    }),
+                    kernel,
+                    operation_contains,
+                    tiles: tile.into_iter().collect::<BTreeSet<_>>(),
+                    phases: phase.into_iter().collect::<BTreeSet<_>>(),
+                    metadata,
+                    metadata_key,
+                    at_offset: at,
+                    limit: (limit != 0).then_some(limit),
+                    sample_limit: samples,
+                },
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "tiles={} samples={}/{} spanCycles={} spanMs={:.6} clockHz={} at={}",
+                    result.tile_count,
+                    result.matched_sample_count,
+                    result.sample_count,
+                    result.profile_span_cycles,
+                    result.profile_span_ms,
+                    result.clock_hz,
+                    result
+                        .at_offset
+                        .map_or_else(|| "-".into(), |offset| offset.to_string())
+                );
+                println!(
+                    "name\tphases\ttiles\tsamples\tphaseCycles\tphaseMs\tworkCycles\tavgActiveTiles\tmean\tp50\tp95\tmax"
+                );
+                for group in &result.groups {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{:.2}\t{:.2}\t{}\t{}\t{}",
+                        group.name,
+                        group.phase_count,
+                        group.tile_count,
+                        group.sample_count,
+                        group.phase_cycles,
+                        group.phase_ms,
+                        group.work_cycles,
+                        group.average_active_tiles,
+                        group.mean_cycles,
+                        group.p50_cycles,
+                        group.p95_cycles,
+                        group.maximum_cycles,
+                    );
+                }
+                for sample in &result.samples {
+                    println!(
+                        "sample tile={} offset={} duration={} phase={}/{} kind={} kernel={:?} operation={:?} metadata={}",
+                        sample.physical_tile,
+                        sample.offset,
+                        sample.duration,
+                        sample.phase,
+                        sample.epoch,
+                        sample.kind,
+                        sample.kernel,
+                        sample.operation,
+                        serde_json::to_string(&sample.metadata)?,
+                    );
+                }
+            }
         }
         Command::MemoryInspect { profile, tile } => {
             let report = MemoryProfile::read(fs::File::open(profile)?)?;
@@ -826,6 +999,7 @@ impl Command {
             Self::PackageInspect { .. } => "package-inspect",
             Self::ProfileInspect { .. } => "profile-inspect",
             Self::ProfileRender { .. } => "profile-render",
+            Self::ProfileQuery { .. } => "profile-query",
             Self::MemoryInspect { .. } => "memory-inspect",
             Self::PackageExtractTile { .. } => "package-extract-tile",
             Self::PackageImportIpuimg { .. } => "package-import-ipuimg",
@@ -1023,6 +1197,19 @@ fn parse_named_path(value: &str) -> Result<(String, PathBuf), String> {
         return Err("expected non-empty NAME=PATH".into());
     }
     Ok((name.into(), path.into()))
+}
+
+fn parse_metadata_filter(value: &str) -> Result<MetadataFilter, String> {
+    let (name, expected) = value
+        .split_once('=')
+        .map_or((value, None), |(name, expected)| (name, Some(expected)));
+    if name.is_empty() {
+        return Err("metadata filter name is empty".into());
+    }
+    Ok(MetadataFilter {
+        name: name.into(),
+        value: expected.map(Into::into),
+    })
 }
 
 fn parse_host_manifest(text: &str) -> Result<HostExchange> {

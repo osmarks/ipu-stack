@@ -17,6 +17,7 @@ ipu-driver = { path = "../ipu-driver" }
 ipu-elf = { path = "../ipu-elf" }
 ipu-exchange = { path = "../ipu-exchange" }
 ipu-package = { path = "../ipu-package" }
+ipu-profile = { path = "../ipu-profile" }
 object.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

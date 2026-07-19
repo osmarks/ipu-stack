@@ -1,0 +1,9 @@
+[package]
+name = "ipu-profile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ipu-package = { path = "../ipu-package" }
+serde.workspace = true

@@ -6,6 +6,7 @@ members = [
   "crates/ipu-compiler",
   "crates/ipu-driver",
   "crates/ipu-runtime",
+  "crates/ipu-profile",
   "crates/ipu-cli",
 ]
 resolver = "3"
