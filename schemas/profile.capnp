@@ -11,6 +11,13 @@ struct ProfileStep {
   epoch @2 :UInt32;
   operation @3 :Text;
   kind @4 :StepKind;
+  kernel @5 :Text;
+  metadata @6 :List(MetadataEntry);
+}
+
+struct MetadataEntry {
+  name @0 :Text;
+  value @1 :Text;
 }
 
 struct CycleSample {

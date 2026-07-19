@@ -330,6 +330,7 @@ pub struct KernelCommand {
     pub inputs: Vec<TensorId>,
     pub arguments: Vec<u32>,
     pub specialization: SpecializationKey,
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -799,6 +800,33 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                         role: format!("inner-block-{inner_block}"),
                         alignment: 32,
                     },
+                    metadata: BTreeMap::from([
+                        (
+                            "label".into(),
+                            format!(
+                                "GEMM block ({}, {}) inner block {}",
+                                output_block.block_row, output_block.block_column, inner_block
+                            ),
+                        ),
+                        ("wave".into(), wave.to_string()),
+                        (
+                            "output_block_row".into(),
+                            output_block.block_row.to_string(),
+                        ),
+                        (
+                            "output_block_column".into(),
+                            output_block.block_column.to_string(),
+                        ),
+                        ("inner_block".into(), inner_block.to_string()),
+                        ("row_start".into(), output_block.row_start.to_string()),
+                        ("rows".into(), output_block.rows.to_string()),
+                        (
+                            "output_bytes".into(),
+                            (u32::from(output_block.rows) * u32::from(config.block_dimension) * 4)
+                                .to_string(),
+                        ),
+                        ("block_dimension".into(), config.block_dimension.to_string()),
+                    ]),
                 });
             }
             phases.push(Phase::Compute {
@@ -852,6 +880,31 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     role: format!("output-wave-{wave}"),
                     alignment: 8,
                 },
+                metadata: BTreeMap::from([
+                    (
+                        "label".into(),
+                        format!(
+                            "store GEMM block ({}, {})",
+                            output_block.block_row, output_block.block_column
+                        ),
+                    ),
+                    ("wave".into(), wave.to_string()),
+                    (
+                        "output_block_row".into(),
+                        output_block.block_row.to_string(),
+                    ),
+                    (
+                        "output_block_column".into(),
+                        output_block.block_column.to_string(),
+                    ),
+                    ("row_start".into(), output_block.row_start.to_string()),
+                    ("rows".into(), output_block.rows.to_string()),
+                    (
+                        "bytes".into(),
+                        (u32::from(output_block.rows) * u32::from(config.block_dimension) * 4)
+                            .to_string(),
+                    ),
+                ]),
             });
         }
         phases.push(Phase::Compute {
@@ -916,10 +969,13 @@ pub struct LoweredExchangePhase {
 pub struct LoweredComputeCommand {
     pub op: OpId,
     pub phase: usize,
+    pub output: TensorId,
+    pub inputs: Vec<TensorId>,
     pub output_address: u32,
     pub input_addresses: Vec<u32>,
     pub arguments: Vec<u32>,
     pub specialization: SpecializationKey,
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1327,10 +1383,13 @@ impl Schedule {
                             steps.push(LoweredTileStep::Compute(LoweredComputeCommand {
                                 op: *op,
                                 phase: phase_index,
+                                output: command.output,
+                                inputs: command.inputs.clone(),
                                 output_address,
                                 input_addresses,
                                 arguments: command.arguments.clone(),
                                 specialization: command.specialization.clone(),
+                                metadata: command.metadata.clone(),
                             }));
                         }
                         if !active {
@@ -1505,6 +1564,7 @@ pub fn compile(graph: &Graph, options: &CompilerOptions) -> Result<Schedule, Com
                     },
                     alignment: output_layout.alignment,
                 },
+                metadata: BTreeMap::new(),
             })
             .collect();
         phases.push(Phase::Compute {
@@ -2026,6 +2086,10 @@ mod tests {
                             command.specialization.operation.as_str(),
                             "gemm_f32_init" | "gemm_f32_accumulate" | "copy_u64"
                         )
+                        && command.metadata.contains_key("label")
+                        && command.metadata.contains_key("wave")
+                        && command.metadata.contains_key("output_block_row")
+                        && command.metadata.contains_key("output_block_column")
                 }),
             }
         }));

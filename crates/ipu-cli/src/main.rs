@@ -7,8 +7,9 @@ use ipu_driver::{Device, HostBuffer, HostSession, Loader, block_device_interrupt
 use ipu_elf::{LinkOptions, Toolchain, inspect_object, link};
 use ipu_exchange::Topology;
 use ipu_package::{
-    Application, EntryPoint, HostCall, HostExchange, HostPage, HostSlice, ProfileReport,
-    ProfileStepKind, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
+    Application, EntryPoint, HostCall, HostExchange, HostPage, HostSlice, MemoryProfile,
+    ProfileReport, ProfileStepKind, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment,
+    TileImage,
 };
 use object::{Object, ObjectSegment};
 use std::collections::{BTreeMap, HashMap};
@@ -75,6 +76,11 @@ enum Command {
         profile: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
+    },
+    MemoryInspect {
+        profile: PathBuf,
+        #[arg(long)]
+        tile: Vec<u16>,
     },
     PackageExtractTile {
         package: PathBuf,
@@ -359,6 +365,41 @@ fn main() -> Result<()> {
                 report.tiles.len(),
                 output.display()
             );
+        }
+        Command::MemoryInspect { profile, tile } => {
+            let report = MemoryProfile::read(fs::File::open(profile)?)?;
+            for memory in report.tiles.iter().filter(|memory| {
+                tile.is_empty()
+                    || tile.contains(&memory.logical_tile)
+                    || tile.contains(&memory.physical_tile)
+            }) {
+                println!(
+                    "logicalTile={} physicalTile={} regions={}",
+                    memory.logical_tile,
+                    memory.physical_tile,
+                    memory.regions.len()
+                );
+                for region in &memory.regions {
+                    let live_until = if region.live_until == usize::MAX {
+                        "end".into()
+                    } else {
+                        region.live_until.to_string()
+                    };
+                    println!(
+                        "  address=0x{:x} size={} end=0x{:x} category={} tensor={} live={}..{} name={:?}",
+                        region.address,
+                        region.size,
+                        region.address + region.size,
+                        region.category,
+                        region
+                            .tensor
+                            .map_or_else(|| "-".into(), |tensor| tensor.to_string()),
+                        region.live_from,
+                        live_until,
+                        region.name
+                    );
+                }
+            }
         }
         Command::PackageExtractTile {
             package,
@@ -785,6 +826,7 @@ impl Command {
             Self::PackageInspect { .. } => "package-inspect",
             Self::ProfileInspect { .. } => "profile-inspect",
             Self::ProfileRender { .. } => "profile-render",
+            Self::MemoryInspect { .. } => "memory-inspect",
             Self::PackageExtractTile { .. } => "package-extract-tile",
             Self::PackageImportIpuimg { .. } => "package-import-ipuimg",
             Self::PackageElfDirectory { .. } => "package-elf-directory",

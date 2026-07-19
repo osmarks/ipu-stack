@@ -404,6 +404,7 @@ fn add_u32(
             role: format!("reduction-{operation}"),
             alignment: 4,
         },
+        metadata: Default::default(),
     }
 }
 

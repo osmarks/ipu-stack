@@ -385,6 +385,7 @@ fn add_u32(tile: u16, output: TensorId, input: TensorId, role: &str) -> KernelCo
             role: role.into(),
             alignment: 4,
         },
+        metadata: Default::default(),
     }
 }
 

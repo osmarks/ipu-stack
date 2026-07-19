@@ -3,8 +3,9 @@ use ipu_driver::{Device, DriverError, HostSession, Loader, block_device_interrup
 use ipu_elf::{LinkOptions, link};
 use ipu_exchange::Topology;
 use ipu_package::{
-    Application, Binding, EntryPoint, HostCall, HostExchange, HostPage, HostSlice, RegionSlice,
-    SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
+    Application, Binding, EntryPoint, HostCall, HostExchange, HostPage, HostSlice, MemoryProfile,
+    MemoryRegion, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
+    TileMemory,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
@@ -257,6 +258,116 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     package_graph_impl(graph, objects, &[], None, false)
 }
 
+pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile> {
+    let topology = Topology::c600();
+    let bindings = graph
+        .host_inputs
+        .iter()
+        .chain(&graph.host_outputs)
+        .chain(&graph.outputs)
+        .collect::<Vec<_>>();
+    let mut tiles = Vec::with_capacity(usize::from(graph.schedule.tile_count));
+    for logical_tile in 0..graph.schedule.tile_count {
+        let physical_tile = topology.physical(logical_tile)?;
+        let mut regions = graph
+            .schedule
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.tile == logical_tile)
+            .map(|allocation| {
+                let allocation_end = allocation.address.saturating_add(allocation.size);
+                let names = bindings
+                    .iter()
+                    .filter(|binding| {
+                        binding.slices.iter().any(|slice| {
+                            slice.tile == u32::from(physical_tile)
+                                && slice.tile_address < allocation_end
+                                && allocation.address
+                                    < slice.tile_address.saturating_add(
+                                        u32::try_from(slice.size).unwrap_or(u32::MAX),
+                                    )
+                        })
+                    })
+                    .map(|binding| binding.name.as_str())
+                    .collect::<Vec<_>>();
+                let category = match allocation.kind {
+                    ipu_compiler::AllocationKind::Home => "home",
+                    ipu_compiler::AllocationKind::ExchangeStaging { .. } => "exchange_staging",
+                };
+                let name = allocation_profile_name(graph, allocation, &names);
+                MemoryRegion {
+                    address: allocation.address,
+                    size: allocation.size,
+                    category: category.into(),
+                    name,
+                    tensor: Some(allocation.tensor.0),
+                    live_from: allocation.live_from,
+                    live_until: allocation.live_until,
+                }
+            })
+            .collect::<Vec<_>>();
+        regions.sort_by_key(|region| (region.address, region.live_from, region.live_until));
+        tiles.push(TileMemory {
+            logical_tile,
+            physical_tile,
+            regions,
+        });
+    }
+    Ok(MemoryProfile {
+        memory_base: ipu_package::TILE_MEMORY_BASE,
+        memory_size: ipu_package::TILE_MEMORY_SIZE,
+        tiles,
+    })
+}
+
+fn allocation_profile_name(
+    graph: &ExecutableGraph,
+    allocation: &ipu_compiler::Allocation,
+    binding_names: &[&str],
+) -> String {
+    if !binding_names.is_empty() {
+        return binding_names.join(", ");
+    }
+    let command_label = |command: &ipu_compiler::KernelCommand| {
+        command
+            .metadata
+            .get("label")
+            .cloned()
+            .unwrap_or_else(|| command.specialization.operation.clone())
+    };
+    if let Some(command) = graph.schedule.phases.iter().find_map(|phase| match phase {
+        ipu_compiler::Phase::Compute { commands, .. } => commands
+            .iter()
+            .find(|command| command.tile == allocation.tile && command.output == allocation.tensor),
+        ipu_compiler::Phase::Exchange { .. } => None,
+    }) {
+        if command.specialization.operation.starts_with("gemm_")
+            && let (Some(row), Some(column)) = (
+                command.metadata.get("output_block_row"),
+                command.metadata.get("output_block_column"),
+            )
+        {
+            return format!("GEMM accumulator block ({row}, {column})");
+        }
+        return format!("output of {}", command_label(command));
+    }
+    if let ipu_compiler::AllocationKind::ExchangeStaging { phase } = allocation.kind
+        && let Some(ipu_compiler::Phase::Compute { commands, .. }) =
+            graph.schedule.phases.get(phase + 1)
+        && let Some(command) = commands.iter().find(|command| {
+            command.tile == allocation.tile && command.inputs.contains(&allocation.tensor)
+        })
+    {
+        return format!("input to {}", command_label(command));
+    }
+    match allocation.kind {
+        ipu_compiler::AllocationKind::Home => format!("tensor {} home", allocation.tensor.0),
+        ipu_compiler::AllocationKind::ExchangeStaging { phase } => {
+            format!("tensor {} staging for phase {phase}", allocation.tensor.0)
+        }
+    }
+}
+
 pub fn package_graph_profiled(
     graph: &ExecutableGraph,
     objects: &[Vec<u8>],
@@ -269,6 +380,233 @@ pub fn package_graph_timed(
     objects: &[Vec<u8>],
 ) -> Result<(Application, ProfileLayout)> {
     package_graph_with_profile(graph, objects, true)
+}
+
+fn profile_metadata(name: impl Into<String>, value: impl ToString) -> ipu_package::ProfileMetadata {
+    ipu_package::ProfileMetadata {
+        name: name.into(),
+        value: value.to_string(),
+    }
+}
+
+fn compute_profile_step(
+    local_index: usize,
+    command: &ipu_compiler::LoweredComputeCommand,
+) -> ipu_package::ProfileStep {
+    let kernel = command.specialization.operation.clone();
+    let operation = command.metadata.get("label").cloned().unwrap_or_else(|| {
+        if command.specialization.role.is_empty() {
+            kernel.clone()
+        } else {
+            format!("{} ({})", kernel, command.specialization.role)
+        }
+    });
+    let mut metadata = vec![
+        profile_metadata("role", &command.specialization.role),
+        profile_metadata(
+            "shape",
+            command
+                .specialization
+                .shape
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("x"),
+        ),
+        profile_metadata("worker_count", command.specialization.worker_count),
+        profile_metadata("alignment", command.specialization.alignment),
+        profile_metadata("output_tensor", command.output.0),
+        profile_metadata("output_address", format!("0x{:x}", command.output_address)),
+    ];
+    for (index, (&tensor, &address)) in command
+        .inputs
+        .iter()
+        .zip(&command.input_addresses)
+        .enumerate()
+    {
+        metadata.push(profile_metadata(format!("input_{index}_tensor"), tensor.0));
+        metadata.push(profile_metadata(
+            format!("input_{index}_address"),
+            format!("0x{address:x}"),
+        ));
+    }
+    for (index, argument) in command.arguments.iter().enumerate() {
+        metadata.push(profile_metadata(format!("argument_{index}"), argument));
+    }
+    metadata.extend(
+        command
+            .metadata
+            .iter()
+            .map(|(name, value)| profile_metadata(name, value)),
+    );
+    ipu_package::ProfileStep {
+        local_index: local_index as u32,
+        phase: command.phase as u32,
+        epoch: 0,
+        operation,
+        kind: ipu_package::ProfileStepKind::Compute,
+        kernel,
+        metadata,
+    }
+}
+
+fn idle_compute_profile_step(
+    schedule: &ipu_compiler::Schedule,
+    local_index: usize,
+    op: ipu_compiler::OpId,
+    phase: usize,
+) -> ipu_package::ProfileStep {
+    let commands = match &schedule.phases[phase] {
+        ipu_compiler::Phase::Compute { commands, .. } => commands.as_slice(),
+        ipu_compiler::Phase::Exchange { .. } => &[],
+    };
+    let first = commands.first();
+    let (operation, metadata) = if let Some(command) = first {
+        let mut common = command.metadata.clone();
+        common.retain(|name, value| {
+            name != "label"
+                && commands
+                    .iter()
+                    .all(|candidate| candidate.metadata.get(name) == Some(value))
+        });
+        let mut metadata = vec![
+            profile_metadata("active", "false"),
+            profile_metadata("scheduled_kernel", &command.specialization.operation),
+            profile_metadata("scheduled_role", &command.specialization.role),
+            profile_metadata(
+                "scheduled_shape",
+                command
+                    .specialization
+                    .shape
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join("x"),
+            ),
+        ];
+        metadata.extend(
+            common
+                .into_iter()
+                .map(|(name, value)| profile_metadata(name, value)),
+        );
+        (
+            format!(
+                "idle during {} ({})",
+                command.specialization.operation, command.specialization.role
+            ),
+            metadata,
+        )
+    } else {
+        (
+            format!("idle compute op {}", op.0),
+            vec![profile_metadata("active", "false")],
+        )
+    };
+    ipu_package::ProfileStep {
+        local_index: local_index as u32,
+        phase: phase as u32,
+        epoch: 0,
+        operation,
+        kind: ipu_package::ProfileStepKind::Compute,
+        kernel: String::new(),
+        metadata,
+    }
+}
+
+fn exchange_profile_step(
+    schedule: &ipu_compiler::Schedule,
+    tile: u16,
+    local_index: usize,
+    phase: usize,
+    epoch: usize,
+) -> ipu_package::ProfileStep {
+    let transfers = match &schedule.phases[phase] {
+        ipu_compiler::Phase::Exchange { transfers } => transfers.as_slice(),
+        ipu_compiler::Phase::Compute { .. } => &[],
+    };
+    let sends = transfers
+        .iter()
+        .filter(|transfer| transfer.source_tile == tile)
+        .collect::<Vec<_>>();
+    let receives = transfers
+        .iter()
+        .filter(|transfer| transfer.destination_tile == tile)
+        .collect::<Vec<_>>();
+    let next_command = schedule.phases.get(phase + 1).and_then(|next| match next {
+        ipu_compiler::Phase::Compute { commands, .. } => commands
+            .iter()
+            .find(|command| command.tile == tile)
+            .or_else(|| commands.first()),
+        ipu_compiler::Phase::Exchange { .. } => None,
+    });
+    let operation = next_command.map_or_else(
+        || format!("exchange phase {phase}"),
+        |command| {
+            format!(
+                "exchange for {} ({})",
+                command.specialization.operation, command.specialization.role
+            )
+        },
+    );
+    let mut metadata = vec![
+        profile_metadata("send_count", sends.len()),
+        profile_metadata("receive_count", receives.len()),
+        profile_metadata(
+            "send_bytes",
+            sends
+                .iter()
+                .map(|transfer| u64::from(transfer.bytes))
+                .sum::<u64>(),
+        ),
+        profile_metadata(
+            "receive_bytes",
+            receives
+                .iter()
+                .map(|transfer| u64::from(transfer.bytes))
+                .sum::<u64>(),
+        ),
+    ];
+    for (index, transfer) in sends.iter().enumerate() {
+        metadata.push(profile_metadata(
+            format!("send_{index}"),
+            format!(
+                "tensor={},destination_tile={},bytes={}",
+                transfer.tensor.0, transfer.destination_tile, transfer.bytes
+            ),
+        ));
+    }
+    for (index, transfer) in receives.iter().enumerate() {
+        metadata.push(profile_metadata(
+            format!("receive_{index}"),
+            format!(
+                "tensor={},source_tile={},bytes={}",
+                transfer.tensor.0, transfer.source_tile, transfer.bytes
+            ),
+        ));
+    }
+    if let Some(command) = next_command {
+        metadata.push(profile_metadata(
+            "next_kernel",
+            &command.specialization.operation,
+        ));
+        metadata.push(profile_metadata("next_role", &command.specialization.role));
+        metadata.extend(
+            command
+                .metadata
+                .iter()
+                .filter(|(name, _)| name.as_str() != "label")
+                .map(|(name, value)| profile_metadata(format!("next_{name}"), value)),
+        );
+    }
+    ipu_package::ProfileStep {
+        local_index: local_index as u32,
+        phase: phase as u32,
+        epoch: epoch as u32,
+        operation,
+        kind: ipu_package::ProfileStepKind::Exchange,
+        kernel: String::new(),
+        metadata,
+    }
 }
 
 fn package_graph_with_profile(
@@ -360,6 +698,8 @@ fn package_graph_with_profile(
                 epoch: 0,
                 operation: "graph".into(),
                 kind: ipu_package::ProfileStepKind::Compute,
+                kernel: String::new(),
+                metadata: Vec::new(),
             }]
         } else {
             program
@@ -368,29 +708,19 @@ fn package_graph_with_profile(
                 .enumerate()
                 .map(|(local_index, step)| match step {
                     ipu_compiler::LoweredTileStep::Exchange { phase, epoch, .. } => {
-                        ipu_package::ProfileStep {
-                            local_index: local_index as u32,
-                            phase: *phase as u32,
-                            epoch: *epoch as u32,
-                            operation: "exchange".into(),
-                            kind: ipu_package::ProfileStepKind::Exchange,
-                        }
+                        exchange_profile_step(
+                            &graph.schedule,
+                            program.tile,
+                            local_index,
+                            *phase,
+                            *epoch,
+                        )
                     }
-                    ipu_compiler::LoweredTileStep::Compute(command) => ipu_package::ProfileStep {
-                        local_index: local_index as u32,
-                        phase: command.phase as u32,
-                        epoch: 0,
-                        operation: command.specialization.operation.clone(),
-                        kind: ipu_package::ProfileStepKind::Compute,
-                    },
+                    ipu_compiler::LoweredTileStep::Compute(command) => {
+                        compute_profile_step(local_index, command)
+                    }
                     ipu_compiler::LoweredTileStep::IdleCompute { op, phase } => {
-                        ipu_package::ProfileStep {
-                            local_index: local_index as u32,
-                            phase: *phase as u32,
-                            epoch: 0,
-                            operation: format!("idle-op-{}", op.0),
-                            kind: ipu_package::ProfileStepKind::Compute,
-                        }
+                        idle_compute_profile_step(&graph.schedule, local_index, *op, *phase)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1822,6 +2152,8 @@ mod tests {
             epoch: 0,
             operation: format!("step-{local_index}"),
             kind: ipu_package::ProfileStepKind::Compute,
+            kernel: "test_kernel".into(),
+            metadata: Vec::new(),
         };
         let layout = ProfileLayout {
             output_offset: 0,
@@ -1842,6 +2174,91 @@ mod tests {
         assert_eq!(report.tiles[0].samples[0].end_cycle, 23);
         assert_eq!(report.tiles[0].samples[1].start_cycle, 23);
         assert_eq!(report.tiles[0].samples[1].end_cycle, 47);
+    }
+
+    #[test]
+    fn compute_profile_preserves_kernel_semantics() {
+        let command = ipu_compiler::LoweredComputeCommand {
+            op: ipu_compiler::OpId(4),
+            phase: 7,
+            output: ipu_compiler::TensorId(11),
+            inputs: vec![ipu_compiler::TensorId(9), ipu_compiler::TensorId(10)],
+            output_address: 0x80000,
+            input_addresses: vec![0x50000, 0x54000],
+            arguments: vec![64],
+            specialization: ipu_compiler::SpecializationKey {
+                operation: "gemm_f32_accumulate".into(),
+                shape: vec![64, 64, 64],
+                worker_count: 6,
+                role: "inner-block-3".into(),
+                alignment: 32,
+            },
+            metadata: BTreeMap::from([
+                ("label".into(), "GEMM block (2, 5) inner block 3".into()),
+                ("output_block_row".into(), "2".into()),
+            ]),
+        };
+        let step = compute_profile_step(8, &command);
+
+        assert_eq!(step.kernel, "gemm_f32_accumulate");
+        assert_eq!(step.operation, "GEMM block (2, 5) inner block 3");
+        assert!(
+            step.metadata
+                .iter()
+                .any(|entry| entry.name == "shape" && entry.value == "64x64x64")
+        );
+        assert!(
+            step.metadata
+                .iter()
+                .any(|entry| entry.name == "output_block_row" && entry.value == "2")
+        );
+    }
+
+    #[test]
+    fn allocator_profile_covers_every_tile_and_labels_bindings() {
+        let graph = ExecutableGraph {
+            schedule: ipu_compiler::Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: vec![ipu_compiler::Allocation {
+                    tensor: ipu_compiler::TensorId(3),
+                    tile: 0,
+                    address: 0xa0000,
+                    size: 4096,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: ipu_compiler::AllocationKind::Home,
+                }],
+                tile_count: 1472,
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_inputs: vec![Binding {
+                name: "left".into(),
+                dtype: "f32".into(),
+                shape: vec![1024],
+                slices: vec![RegionSlice {
+                    tile: u32::from(Topology::c600().physical(0).unwrap()),
+                    tile_address: 0xa0000,
+                    file_offset: 0,
+                    size: 4096,
+                }],
+            }],
+            host_outputs: Vec::new(),
+        };
+        let profile = allocator_memory_profile(&graph).unwrap();
+
+        assert_eq!(profile.tiles.len(), 1472);
+        assert_eq!(profile.tiles[0].regions.len(), 1);
+        assert_eq!(profile.tiles[0].regions[0].name, "left");
+        assert!(
+            profile
+                .tiles
+                .iter()
+                .skip(1)
+                .all(|tile| tile.regions.is_empty())
+        );
     }
 
     #[test]

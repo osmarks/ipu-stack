@@ -167,6 +167,11 @@ IPU_PROFILE_OUTPUT=/tmp/gemm-profile.capnp \
 capnp decode schemas/profile.capnp Profile </tmp/gemm-profile.capnp
 cargo run -p ipu-cli -- profile-render /tmp/gemm-profile.capnp -o /tmp/gemm-profile.html
 
+IPU_MEMORY_PROFILE_OUTPUT=/tmp/gemm-memory.capnp \
+  IPU_GEMM_PACKAGE_ONLY=1 \
+  cargo run -p ipu-runtime --bin ipu-gemm-e2e
+cargo run -p ipu-cli -- memory-inspect /tmp/gemm-memory.capnp --tile 0
+
 # Compare one completed output block directly in tile SRAM against D2H.
 IPU_GEMM_LOAD_PACKAGE=/tmp/gemm.ipuexe \
 IPU_GEMM_SRAM_CHECK_BLOCK=15,24 \
@@ -182,6 +187,14 @@ perturbs short steps; the records are intended for graph-level attribution,
 not instruction-level benchmarking. The hardware acceptance suite runs a
 profiled 128 GEMM, parses records for all 1,472 tiles, and requires exchange and
 compute samples.
+
+Compute samples include the exact kernel symbol, specialization role and shape,
+tensor and SRAM operands, scalar arguments, and planner-supplied semantic
+metadata. The blocked GEMM planner adds output wave, output block coordinates,
+inner block, row range, and byte count. Exchange samples identify the following
+kernel and summarize the local sends and receives. `IPU_MEMORY_PROFILE_OUTPUT`
+writes a separate all-tile allocator report containing every tensor region,
+address, size, lifetime, allocation kind, and matching host binding name.
 
 The GEMM verifier runs while the application remains loaded. On any mismatch it
 bulk-reads the owning tile's complete 64x64 C block through an inactive worker

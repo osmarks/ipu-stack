@@ -12,6 +12,13 @@ pub mod profile_capnp {
     include!(concat!(env!("OUT_DIR"), "/profile_capnp.rs"));
 }
 
+pub mod memory_profile_capnp {
+    include!(concat!(env!("OUT_DIR"), "/memory_profile_capnp.rs"));
+}
+
+mod memory_profile;
+pub use memory_profile::{MemoryProfile, MemoryRegion, TileMemory};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProfileStepKind {
     Exchange,
@@ -25,6 +32,14 @@ pub struct ProfileStep {
     pub epoch: u32,
     pub operation: String,
     pub kind: ProfileStepKind,
+    pub kernel: String,
+    pub metadata: Vec<ProfileMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileMetadata {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,7 +65,7 @@ impl ProfileReport {
     pub fn write(&self, mut output: impl Write) -> Result<(), PackageError> {
         let mut message = message::Builder::new_default();
         let mut root = message.init_root::<profile_capnp::profile::Builder>();
-        root.set_schema_version(1);
+        root.set_schema_version(2);
         root.set_clock_hz(self.clock_hz);
         let mut tiles = root.reborrow().init_tiles(self.tiles.len() as u32);
         for (tile_index, tile) in self.tiles.iter().enumerate() {
@@ -72,6 +87,15 @@ impl ProfileReport {
                     ProfileStepKind::Exchange => profile_capnp::StepKind::Exchange,
                     ProfileStepKind::Compute => profile_capnp::StepKind::Compute,
                 });
+                step.set_kernel(&sample.step.kernel);
+                let mut metadata = step
+                    .reborrow()
+                    .init_metadata(sample.step.metadata.len() as u32);
+                for (index, entry) in sample.step.metadata.iter().enumerate() {
+                    let mut output_entry = metadata.reborrow().get(index as u32);
+                    output_entry.set_name(&entry.name);
+                    output_entry.set_value(&entry.value);
+                }
             }
         }
         serialize::write_message(&mut output, &message)?;
@@ -81,7 +105,7 @@ impl ProfileReport {
     pub fn read(mut input: impl Read) -> Result<Self, PackageError> {
         let message = serialize::read_message(&mut input, message::ReaderOptions::new())?;
         let root = message.get_root::<profile_capnp::profile::Reader>()?;
-        if root.get_schema_version() != 1 {
+        if !matches!(root.get_schema_version(), 1 | 2) {
             return Err(PackageError::Invalid(format!(
                 "unsupported profile schema version {}",
                 root.get_schema_version()
@@ -106,6 +130,17 @@ impl ProfileReport {
                                     profile_capnp::StepKind::Exchange => ProfileStepKind::Exchange,
                                     profile_capnp::StepKind::Compute => ProfileStepKind::Compute,
                                 },
+                                kernel: step.get_kernel()?.to_str()?.into(),
+                                metadata: step
+                                    .get_metadata()?
+                                    .iter()
+                                    .map(|entry| {
+                                        Ok(ProfileMetadata {
+                                            name: entry.get_name()?.to_str()?.into(),
+                                            value: entry.get_value()?.to_str()?.into(),
+                                        })
+                                    })
+                                    .collect::<Result<_, PackageError>>()?,
                             },
                             start_cycle: sample.get_start_cycle(),
                             end_cycle: sample.get_end_cycle(),
@@ -1098,6 +1133,11 @@ mod tests {
                         epoch: 8,
                         operation: "accumulate".into(),
                         kind: ProfileStepKind::Compute,
+                        kernel: "gemm_f32_accumulate".into(),
+                        metadata: vec![ProfileMetadata {
+                            name: "innerBlock".into(),
+                            value: "8".into(),
+                        }],
                     },
                     start_cycle: u32::MAX - 10,
                     end_cycle: 7,

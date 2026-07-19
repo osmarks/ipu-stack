@@ -142,6 +142,7 @@ fn randomized_case(seed: u64, case: usize) -> (ExecutableGraph, BTreeMap<String,
                 role: "randomized-sparse-compute".into(),
                 alignment: 4,
             },
+            metadata: Default::default(),
         }],
     };
 

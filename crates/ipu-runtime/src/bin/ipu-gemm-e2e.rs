@@ -2,8 +2,8 @@ use ipu_compiler::{BlockedGemmConfig, BlockedGemmPlan, choose_gemm_row_block, pl
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    ExecutableGraph, HostRunOptions, package_graph, package_graph_profiled, package_graph_timed,
-    run_host_with_inspector,
+    ExecutableGraph, HostRunOptions, allocator_memory_profile, package_graph,
+    package_graph_profiled, package_graph_timed, run_host_with_inspector,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -80,6 +80,11 @@ fn main() {
         .max()
         .unwrap();
     let (graph, input) = gemm_graph_and_input(dimension, plan);
+    if let Some(path) = std::env::var_os("IPU_MEMORY_PROFILE_OUTPUT") {
+        let profile = allocator_memory_profile(&graph).unwrap();
+        profile.write(fs::File::create(&path).unwrap()).unwrap();
+        info!(path = %PathBuf::from(path).display(), tiles = profile.tiles.len(), "wrote allocator memory profile");
+    }
     let objects = [
         fs::read(runtime.object).unwrap(),
         fs::read(kernel.object).unwrap(),
