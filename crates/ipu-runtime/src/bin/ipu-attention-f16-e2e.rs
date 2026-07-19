@@ -213,8 +213,6 @@ fn run_case(case: Case<'_>) {
             ],
         )
         .unwrap();
-    let value_offset =
-        u32::from(plan.padded_head_dimension) * u32::from(plan.key_block_columns) * 2;
     let pv = toolchain
         .compile(
             source("gemm_f16_64_amp.S"),
@@ -225,7 +223,6 @@ fn run_case(case: Case<'_>) {
                 format!("-DGEMM_OUTPUT_COLUMNS={}", plan.padded_head_dimension),
                 format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
                 format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
-                format!("-DGEMM_RIGHT_BYTE_OFFSET={value_offset}"),
                 "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_attention_pv_init_small_rows".into(),
                 "-DGEMM_INIT_LARGE_SYMBOL=ipu_stack_attention_pv_init_large_rows".into(),
                 "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_attention_pv_accumulate_small_rows"
@@ -399,15 +396,17 @@ fn key_value_binding(
         shape,
         slices: blocks
             .iter()
-            .map(|block| {
-                let slice = RegionSlice {
-                    tile: u32::from(topology.physical(block.tile).unwrap()),
-                    tile_address: block.address,
-                    file_offset,
-                    size: u64::from(block.size),
-                };
-                file_offset += u64::from(block.size);
-                slice
+            .flat_map(|block| {
+                [block.key_address, block.value_address].map(|tile_address| {
+                    let slice = RegionSlice {
+                        tile: u32::from(topology.physical(block.tile).unwrap()),
+                        tile_address,
+                        file_offset,
+                        size: u64::from(block.matrix_size),
+                    };
+                    file_offset += u64::from(block.matrix_size);
+                    slice
+                })
             })
             .collect(),
     }

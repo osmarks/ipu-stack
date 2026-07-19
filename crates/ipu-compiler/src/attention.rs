@@ -46,9 +46,11 @@ pub struct AttentionKeyValuePlacement {
     pub key_row_start: u16,
     pub key_rows: u16,
     pub tile: u16,
-    pub tensor: TensorId,
-    pub address: u32,
-    pub size: u32,
+    pub key_tensor: TensorId,
+    pub value_tensor: TensorId,
+    pub key_address: u32,
+    pub value_address: u32,
+    pub matrix_size: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,17 +192,20 @@ pub fn plan_flash_attention(
                 let owner = head_tiles[usize::from(key_block) % head_tiles.len()];
                 let key_row_start = key_block * key_block_rows;
                 let key_rows = key_block_rows.min(config.sequence_length - key_row_start);
-                let size = key_value_storage_bytes(key_block_columns, padded_head_dimension);
-                let address = allocate(&mut cursors[usize::from(owner)], size, 8)?;
+                let matrix_size = matrix_storage_bytes(key_block_columns, padded_head_dimension);
+                let key_address = allocate(&mut cursors[usize::from(owner)], matrix_size, 8)?;
+                let value_address = allocate(&mut cursors[usize::from(owner)], matrix_size, 8)?;
                 key_values.push(AttentionKeyValuePlacement {
                     batch,
                     head,
                     key_row_start,
                     key_rows,
                     tile: owner,
-                    tensor: fresh_tensor(&mut next_tensor),
-                    address,
-                    size,
+                    key_tensor: fresh_tensor(&mut next_tensor),
+                    value_tensor: fresh_tensor(&mut next_tensor),
+                    key_address,
+                    value_address,
+                    matrix_size,
                 });
             }
         }
@@ -260,14 +265,24 @@ pub fn plan_flash_attention(
         ]);
     }
     for block in &key_values {
-        allocations.push(home(
-            block.tensor,
-            block.tile,
-            block.address,
-            block.size,
-            0,
-            final_phase,
-        ));
+        allocations.extend([
+            home(
+                block.key_tensor,
+                block.tile,
+                block.key_address,
+                block.matrix_size,
+                0,
+                final_phase,
+            ),
+            home(
+                block.value_tensor,
+                block.tile,
+                block.value_address,
+                block.matrix_size,
+                0,
+                final_phase,
+            ),
+        ]);
     }
 
     let mut phases = Vec::with_capacity(final_phase);
@@ -310,28 +325,49 @@ pub fn plan_flash_attention(
                 "small"
             };
             if task.tile != block.tile {
-                transfers.push(Transfer {
-                    source_tile: block.tile,
-                    destination_tile: task.tile,
-                    tensor: block.tensor,
-                    bytes: block.size,
-                });
-                allocations.push(Allocation {
-                    tensor: block.tensor,
-                    tile: task.tile,
-                    address: ipu_exchange::EXCHANGE_WINDOW_BASE,
-                    size: block.size,
-                    live_from: exchange_phase,
-                    live_until: pv_phase,
-                    kind: AllocationKind::ExchangeStaging {
-                        phase: exchange_phase,
+                transfers.extend([
+                    Transfer {
+                        source_tile: block.tile,
+                        destination_tile: task.tile,
+                        tensor: block.key_tensor,
+                        bytes: block.matrix_size,
                     },
-                });
+                    Transfer {
+                        source_tile: block.tile,
+                        destination_tile: task.tile,
+                        tensor: block.value_tensor,
+                        bytes: block.matrix_size,
+                    },
+                ]);
+                allocations.extend([
+                    Allocation {
+                        tensor: block.key_tensor,
+                        tile: task.tile,
+                        address: ipu_exchange::EXCHANGE_WINDOW_BASE,
+                        size: block.matrix_size,
+                        live_from: exchange_phase,
+                        live_until: qk_phase,
+                        kind: AllocationKind::ExchangeStaging {
+                            phase: exchange_phase,
+                        },
+                    },
+                    Allocation {
+                        tensor: block.value_tensor,
+                        tile: task.tile,
+                        address: ipu_exchange::EXCHANGE_WINDOW_BASE + block.matrix_size,
+                        size: block.matrix_size,
+                        live_from: exchange_phase,
+                        live_until: pv_phase,
+                        kind: AllocationKind::ExchangeStaging {
+                            phase: exchange_phase,
+                        },
+                    },
+                ]);
             }
             qk_commands.push(KernelCommand {
                 tile: task.tile,
                 output: task.scores,
-                inputs: vec![task.query, block.tensor],
+                inputs: vec![task.query, block.key_tensor],
                 arguments: Vec::new(),
                 specialization: SpecializationKey {
                     operation: format!("gemm_f16_init_{}_rows", query_size),
@@ -391,7 +427,7 @@ pub fn plan_flash_attention(
             pv_commands.push(KernelCommand {
                 tile: task.tile,
                 output: task.scores,
-                inputs: vec![task.weights, block.tensor],
+                inputs: vec![task.weights, block.value_tensor],
                 arguments: Vec::new(),
                 specialization: SpecializationKey {
                     operation: format!("attention_pv_init_{}_rows", query_size),
@@ -512,12 +548,11 @@ pub fn plan_flash_attention(
 
 fn key_value_block_bytes(rows: u16, padded_dimension: u16) -> u32 {
     let padded_rows = rows.div_ceil(16) * 16;
-    key_value_storage_bytes(padded_rows, padded_dimension)
+    matrix_storage_bytes(padded_rows, padded_dimension)
 }
 
-fn key_value_storage_bytes(storage_rows: u16, padded_dimension: u16) -> u32 {
-    // K and V are independently padded and packed as AMP B16x16 matrices.
-    u32::from(padded_dimension) * u32::from(storage_rows) * 4
+fn matrix_storage_bytes(storage_rows: u16, padded_dimension: u16) -> u32 {
+    u32::from(padded_dimension) * u32::from(storage_rows) * 2
 }
 
 fn select_key_block_rows(sequence_length: u16, maximum_rows: u16) -> u16 {
@@ -632,7 +667,7 @@ mod tests {
                 assert!(
                     plan.key_values
                         .iter()
-                        .all(|block| { block.size <= ipu_exchange::MAX_TRANSFER_WORDS * 4 })
+                        .all(|block| { block.matrix_size <= ipu_exchange::MAX_TRANSFER_WORDS * 4 })
                 );
                 for batch in 0..batch_size {
                     for head in 0..16 {
@@ -693,6 +728,11 @@ mod tests {
             data_limit: 0xe8000,
         })
         .unwrap();
+        assert!(
+            plan.key_values
+                .iter()
+                .any(|block| { block.matrix_size * 2 > ipu_exchange::MAX_TRANSFER_WORDS * 4 })
+        );
         for head in 0..16 {
             let blocks = plan
                 .key_values
