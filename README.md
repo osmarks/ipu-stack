@@ -297,14 +297,15 @@ counts only GEMM FLOPs while its interval includes GeLU and exchange work.
 
 `plan_flash_attention` builds non-causal FP16 attention with FP32 online-softmax
 state. Queries are sharded by row across tiles. Each batch/head stores one
-canonical, AMP-packed K/V copy, which is split into exchange-window-sized row
-blocks and multicast to its query tiles. AMP computes both QK and each block's
-weighted V product. The kernel merges each FP16 block result into an FP32
+canonical, AMP-packed K/V copy, split into row blocks and striped across its
+query tiles. K and V are separate tensors, so each can use the full exchange
+packet and both transfers run in the same static exchange phase. AMP computes
+both QK and each block's weighted V product. The kernel merges each FP16 block
+result into an FP32
 maximum, denominator, and value accumulator, without allocating a
 sequence-squared score or probability tensor. A six-worker finalizer converts
-the result to FP16 with stochastic rounding. Head dimension is a compile-time
-kernel specialization; query and key row counts are scalar parameters so tail
-blocks do not require additional objects.
+the result to FP16 with stochastic rounding. Head dimension and full/tail query
+and key row counts are compile-time kernel specializations.
 
 The hardware runner defaults to 16 heads, sequence length 64, hidden sizes
 768/1024/1152 (head dimensions 48/64/72), and batch sizes 1 and 3. Inputs are
@@ -342,17 +343,12 @@ The runner compiles the plan's full and tail query/key row counts into distinct
 softmax and merge codelets, so their layout arithmetic and loop bounds are
 static rather than scalar runtime dispatch.
 
-On the attached C600, the 1152-hidden/16-head path measures 50,520 cycles for
-sequence 64, 98,274 cycles for sequence 128, and 192,516 cycles for sequence
-256 at batch 1. The sequence-128 batch-3 case measures 101,160 cycles and 3.36
-useful QK/PV TFLOP/s. These graph intervals start after H2D and end before D2H.
-At sequence 1024 and batch 1, the 768/1024/1152-hidden cases measure
-691,794/840,528/1,059,462 cycles and 6.98/7.66/6.84 useful TFLOP/s. Canonical
-K/V storage is striped across each head's query tiles, allowing the same
-sequence length to scale beyond batch 1 without concentrating all blocks in
-one tile's SRAM. At batch 2, the three hidden sizes measure
-1,202,256/1,453,266/1,758,102 cycles and 8.04/8.87/8.24 useful TFLOP/s; at
-batch 3 they measure 1,693,080/2,036,178/2,450,580 cycles and
-8.56/9.49/8.87 useful TFLOP/s. A batch-8, 1152-hidden run also passes the host
-reference with a 64.2 MB input, measuring 5,929,026 cycles and 9.78 useful
-TFLOP/s.
+On the attached C600, graph-only profiles for sequence 1024 and batch 1 measure
+348,378/426,132/524,616 cycles for 768/1024/1152 hidden dimensions. These are
+0.232/0.284/0.350 ms and 13.87/15.12/13.82 useful QK/PV TFLOP/s. Twenty-seven
+serial 1152-hidden attention layers therefore take 9.44 ms, corresponding to
+about 106 attention-only forward passes/s. At batch 8, the 1152-hidden case
+measures 1,903,842 cycles (1.269 ms) and 30.46 useful TFLOP/s with a 64.2 MB
+input. These graph intervals start after H2D and end before D2H. All cases pass
+the independent host softmax reference with maximum absolute error below
+`8e-5`.
