@@ -234,8 +234,10 @@ static graph. The default is an eight-layer FP32 network with batch 512 and
 width 2,048. All weights and the input are uploaded before execution;
 intermediate activations remain on-device, and only the final activation is
 read back. Layer boundaries fuse GeLU with the required AMP-C16 to AMP-A8
-layout conversion. Diagonal validation weights keep host verification linear
-in activation size while the IPU still executes dense GEMMs.
+layout conversion. Non-final layers forward their GEMM accumulators directly
+into that transition instead of evacuating and copying an intermediate home
+tensor. Diagonal validation weights keep host verification linear in activation
+size while the IPU still executes dense GEMMs.
 
 ```sh
 IPU_PROFILE_GRANULARITY=phase \

@@ -99,6 +99,11 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
     let mut previous_output: Option<Vec<BlockPlacement>> = None;
     for (layer, mut plan) in layer_plans.into_iter().enumerate() {
         annotate_layer(&mut plan.schedule, layer);
+        let deferred_output = if layer + 1 < usize::from(config.layers) {
+            Some(defer_single_wave_output(&mut plan)?)
+        } else {
+            None
+        };
         if let Some(source) = previous_output.as_ref() {
             append_activation_transition(
                 &mut phases,
@@ -109,7 +114,7 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
             )?;
         }
         append_schedule(&mut phases, &mut allocations, &mut plan.schedule)?;
-        previous_output = Some(plan.output);
+        previous_output = Some(deferred_output.unwrap_or(plan.output));
     }
     for placement in &output {
         allocations.push(Allocation {
@@ -142,6 +147,59 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
         weights,
         output,
     })
+}
+
+fn defer_single_wave_output(
+    plan: &mut crate::BlockedGemmPlan,
+) -> Result<Vec<BlockPlacement>, CompileError> {
+    if plan.output.len() > usize::from(plan.schedule.tile_count) || plan.schedule.phases.len() < 3 {
+        return Err(CompileError::Graph(
+            "MLP accumulator forwarding requires a single-wave GEMM".into(),
+        ));
+    }
+    let evacuation_phase = plan.schedule.phases.len() - 2;
+    let commands = match &plan.schedule.phases[evacuation_phase - 1] {
+        Phase::Compute { commands, .. } if commands.len() == plan.output.len() => commands,
+        _ => {
+            return Err(CompileError::Graph(
+                "MLP could not identify the final GEMM accumulator phase".into(),
+            ));
+        }
+    };
+    let mut accumulators = Vec::with_capacity(plan.output.len());
+    for (output, command) in plan.output.iter().zip(commands) {
+        let allocation = plan
+            .schedule
+            .allocations
+            .iter()
+            .find(|allocation| {
+                allocation.tensor == command.output
+                    && allocation.tile == command.tile
+                    && allocation.kind == AllocationKind::Home
+            })
+            .ok_or_else(|| CompileError::Graph("MLP accumulator has no home allocation".into()))?;
+        accumulators.push(BlockPlacement {
+            tensor: command.output,
+            tile: command.tile,
+            address: allocation.address,
+            block_row: output.block_row,
+            block_column: output.block_column,
+            row_start: output.row_start,
+            rows: output.rows,
+            column_start: output.column_start,
+            columns: output.columns,
+        });
+    }
+    let discarded_outputs = plan
+        .output
+        .iter()
+        .map(|placement| placement.tensor)
+        .collect::<HashSet<_>>();
+    plan.schedule.allocations.retain(|allocation| {
+        allocation.live_from < evacuation_phase && !discarded_outputs.contains(&allocation.tensor)
+    });
+    plan.schedule.phases.truncate(evacuation_phase);
+    Ok(accumulators)
 }
 
 fn annotate_layer(schedule: &mut Schedule, layer: usize) {
@@ -381,6 +439,17 @@ mod tests {
             })
             .count();
         assert_eq!(gelu_phases, usize::from(layers));
+        let copy_phases = plan
+            .schedule
+            .phases
+            .iter()
+            .filter(|phase| {
+                matches!(phase, Phase::Compute { commands, .. }
+                    if commands.first().is_some_and(|command|
+                        command.specialization.operation == "copy_u64"))
+            })
+            .count();
+        assert_eq!(copy_phases, 1);
         let homes = plan
             .schedule
             .allocations
