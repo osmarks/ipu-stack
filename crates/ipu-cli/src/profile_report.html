@@ -15,7 +15,7 @@
   --exchange: #006b3f;
   --compute: #b00020;
   --synchronization: #8a6500;
-  --idle: #777777;
+  --idle: #ffffff;
   --selected: #0057ff;
 }
 * { box-sizing: border-box; }
@@ -192,8 +192,8 @@ const overview = document.getElementById("overview");
 const timeline = document.getElementById("timeline");
 const tooltip = document.getElementById("tooltip");
 const details = document.getElementById("details");
-const colors = { exchange: "#006b3f", compute: "#b00020", synchronization: "#8a6500", idle: "#777777" };
-const textColor = { exchange: "#ffffff", compute: "#ffffff", synchronization: "#ffffff", idle: "#ffffff" };
+const colors = { exchange: "#006b3f", compute: "#b00020", synchronization: "#8a6500", idle: "#ffffff" };
+const textColor = { exchange: "#ffffff", compute: "#ffffff", synchronization: "#ffffff", idle: "#050505" };
 const tiles = DATA.tiles.slice().sort((a, b) => a.physicalTile - b.physicalTile);
 let timelineGeom = null;
 let flameHits = [];
