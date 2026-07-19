@@ -16,6 +16,12 @@ pub mod memory_profile_capnp {
     include!(concat!(env!("OUT_DIR"), "/memory_profile_capnp.rs"));
 }
 
+fn capnp_reader_options() -> message::ReaderOptions {
+    let mut options = message::ReaderOptions::new();
+    options.traversal_limit_in_words(None);
+    options
+}
+
 mod memory_profile;
 pub use memory_profile::{MemoryProfile, MemoryRegion, TileMemory};
 
@@ -103,7 +109,7 @@ impl ProfileReport {
     }
 
     pub fn read(mut input: impl Read) -> Result<Self, PackageError> {
-        let message = serialize::read_message(&mut input, message::ReaderOptions::new())?;
+        let message = serialize::read_message(&mut input, capnp_reader_options())?;
         let root = message.get_root::<profile_capnp::profile::Reader>()?;
         if !matches!(root.get_schema_version(), 1 | 2) {
             return Err(PackageError::Invalid(format!(
@@ -623,7 +629,7 @@ impl Application {
 
     pub fn read(mut input: impl Read) -> Result<Self, PackageError> {
         info!("reading application package");
-        let reader = serialize::read_message(&mut input, message::ReaderOptions::new())?;
+        let reader = serialize::read_message(&mut input, capnp_reader_options())?;
         let root = reader.get_root::<application_capnp::application::Reader>()?;
         if root.get_schema_version() != SCHEMA_VERSION
             || root.get_target()?.to_str()? != TARGET_IPU21

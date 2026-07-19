@@ -1,4 +1,4 @@
-use crate::{PackageError, memory_profile_capnp};
+use crate::{PackageError, capnp_reader_options, memory_profile_capnp};
 use capnp::{message, serialize};
 use std::io::{Read, Write};
 
@@ -59,7 +59,7 @@ impl MemoryProfile {
     }
 
     pub fn read(mut input: impl Read) -> Result<Self, PackageError> {
-        let message = serialize::read_message(&mut input, message::ReaderOptions::new())?;
+        let message = serialize::read_message(&mut input, capnp_reader_options())?;
         let root = message.get_root::<memory_profile_capnp::memory_profile::Reader>()?;
         if root.get_schema_version() != 1 {
             return Err(PackageError::Invalid(format!(
