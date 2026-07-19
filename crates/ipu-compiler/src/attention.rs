@@ -11,7 +11,7 @@ pub struct FlashAttentionConfig {
     pub sequence_length: u16,
     pub hidden_size: u16,
     pub attention_heads: u16,
-    /// Zero selects as many rows as fit while using at most one task per tile.
+    /// Zero selects the smallest worker-saturating block that fits on the tiles.
     pub query_block_rows: u16,
     /// Zero selects the largest exchange block supported by the fabric window.
     pub key_block_rows: u16,
@@ -75,8 +75,9 @@ pub fn plan_flash_attention(
     }
 
     let head_count = usize::from(config.batch_size) * usize::from(config.attention_heads);
+    const WORKER_COUNT: u16 = 6;
     let query_block_rows = if config.query_block_rows == 0 {
-        (1..=config.sequence_length)
+        (WORKER_COUNT.min(config.sequence_length)..=config.sequence_length)
             .find(|&rows| {
                 head_count * usize::from(config.sequence_length.div_ceil(rows))
                     <= usize::from(config.tile_count)

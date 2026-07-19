@@ -322,7 +322,8 @@ IPU_ATTENTION_SEQUENCE_LENGTH=128 \
 ```
 
 `IPU_ATTENTION_QUERY_BLOCK_ROWS` selects query sharding (zero, the default,
-picks the finest value that fits the available tiles). `IPU_ATTENTION_KEY_BLOCK_ROWS`
+picks the smallest value that fills all six worker contexts and fits the
+available tiles). `IPU_ATTENTION_KEY_BLOCK_ROWS`
 selects K/V blocking; zero, the default, derives the largest legal block from
 the head dimension and exchange transfer limit. Hardware tests include a
 multi-block 128-token, 1152-hidden case, exercising exchange and FP32 recurrence
