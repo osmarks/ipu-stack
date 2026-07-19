@@ -331,5 +331,7 @@ Set `IPU_PROFILE_OUTPUT` to write an all-tile Cap'n Proto cycle profile; the
 usual `IPU_PROFILE_GRANULARITY=graph|phase|step` setting applies. The runner
 reports useful QK/PV FLOP rate (`4 * batch * heads * sequence^2 * head_dimension`)
 against the C600's 282.624 TFLOP/s FP16 architectural peak. QK dot products use
-the tile FP accumulator, retaining FP32 accumulation while processing four
-FP16 products per instruction group.
+the tile AMP unit. The planner pads head and key-block dimensions to 16-element
+micro-panels, packs Q/K in the existing AMP A/B layouts, and places temporary
+scores in the IPU21 interleaved SRAM required by the AMP paired memory
+instructions. Softmax and the persistent V accumulator remain FP32.

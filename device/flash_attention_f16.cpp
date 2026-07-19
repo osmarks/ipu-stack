@@ -4,16 +4,20 @@
 #ifndef ATTENTION_HEAD_DIMENSION
 #define ATTENTION_HEAD_DIMENSION 64
 #endif
+#ifndef ATTENTION_PADDED_HEAD_DIMENSION
+#define ATTENTION_PADDED_HEAD_DIMENSION ATTENTION_HEAD_DIMENSION
+#endif
+#ifndef ATTENTION_KEY_BLOCK_COLUMNS
+#define ATTENTION_KEY_BLOCK_COLUMNS 64
+#endif
 
 using namespace poplar;
 
 static_assert(ATTENTION_HEAD_DIMENSION > 0);
 
-extern "C" float ipu_stack_attention_dot(const half *, const half *);
-
 class FlashAttentionF16 : public MultiVertex {
 public:
-  Input<Vector<half, VectorLayout::ONE_PTR>> query;
+  Input<Vector<half, VectorLayout::ONE_PTR>> scores;
   Input<Vector<half, VectorLayout::ONE_PTR>> keyValue;
   Output<Vector<float, VectorLayout::ONE_PTR>> accumulator;
   unsigned queryRows;
@@ -28,15 +32,14 @@ public:
     float *denominators = &maxima[queryRows];
 
     for (unsigned row = worker; row < queryRows; row += 6) {
-      const half *q = &query[row * dimension];
       float *output = &accumulator[row * dimension];
       unsigned keyRow = 0;
       float maximum;
       float denominator;
       if (initialBlock) {
-        maximum = dot(q, &keyValue[0], scale);
+        maximum = float(scores[scoreIndex(row, 0)]) * scale;
         denominator = 1.0f;
-        const half *firstValue = &keyValue[keyRows * dimension];
+        const half *firstValue = values();
         for (unsigned column = 0; column < dimension; ++column)
           output[column] = float(firstValue[column]);
         keyRow = 1;
@@ -46,9 +49,8 @@ public:
       }
 
       for (; keyRow < keyRows; ++keyRow) {
-        const half *key = &keyValue[keyRow * dimension];
-        const half *value = &keyValue[(keyRows + keyRow) * dimension];
-        const float score = dot(q, key, scale);
+        const half *value = &values()[keyRow * dimension];
+        const float score = float(scores[scoreIndex(row, keyRow)]) * scale;
         if (score <= maximum) {
           const float weight = __builtin_expf(score - maximum);
           denominator += weight;
@@ -76,10 +78,16 @@ public:
   }
 
 private:
-  static __attribute__((always_inline)) float dot(const half *left,
-                                                   const half *right,
-                                                   float scale) {
-    static_assert(ATTENTION_HEAD_DIMENSION % 4 == 0);
-    return ipu_stack_attention_dot(left, right) * scale;
+  __attribute__((always_inline)) unsigned scoreIndex(unsigned row,
+                                                     unsigned column) const {
+    const unsigned panel = column / 16;
+    const unsigned logicalPair = (column % 16) / 2;
+    const unsigned physicalPair = (logicalPair % 4) * 2 + logicalPair / 4;
+    return panel * queryRows * 16 + row * 16 + physicalPair * 2 + column % 2;
+  }
+
+  const half *values() const {
+    return &keyValue[ATTENTION_PADDED_HEAD_DIMENSION *
+                     ATTENTION_KEY_BLOCK_COLUMNS];
   }
 };

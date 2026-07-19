@@ -6,15 +6,6 @@
 	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
 	.set ATTENTION_WORKER_STACK_BYTES, 0xe0
 	.set ENABLE_STOCHASTIC_ROUNDING, 1 << CSR_S_FP_ICTL__ESR__SHIFT
-	.set CLEAR_FP_ACCUMULATOR, 1 << CSR_W_FP_CLR__ZAACC__SHIFT
-
-#ifndef ATTENTION_HEAD_DIMENSION
-#define ATTENTION_HEAD_DIMENSION 64
-#endif
-
-#if ATTENTION_HEAD_DIMENSION % 4 != 0
-#error "ATTENTION_HEAD_DIMENSION must be divisible by four"
-#endif
 
 	.globl __worker_stack_max_growth_plus_one
 	.set __worker_stack_max_growth_plus_one, ATTENTION_WORKER_STACK_BYTES + 1
@@ -48,27 +39,6 @@ ipu_stack_flash_attention_f16:
 	add $m11, $m11, 32
 	br $m10
 	.size ipu_stack_flash_attention_f16, .-ipu_stack_flash_attention_f16
-
-	.section .text.ipu_stack_attention_dot,"ax",@progbits
-	.globl ipu_stack_attention_dot
-	.p2align 3
-	.type ipu_stack_attention_dot,@function
-ipu_stack_attention_dot:
-	.worker
-	setzi $a4, CLEAR_FP_ACCUMULATOR
-	uput $FP_CLR, $a4
-	.rept ATTENTION_HEAD_DIMENSION / 4
-	ld64step $a0:1, $mzero, $m0+=, 1
-	ld64step $a2:3, $mzero, $m1+=, 1
-	f16v4mul $a0:1, $a0:1, $a2:3
-	f16v4acc $a0:1
-	.endr
-	f32v2gina $a0:1, $azeros, 0
-	f32v2gina $a2:3, $azeros, 0
-	f32v2add $a0:1, $a0:1, $a2:3
-	f32add $a0, $a0, $a1
-	br $m10
-	.size ipu_stack_attention_dot, .-ipu_stack_attention_dot
 
 	.section .text.ipu_stack_attention_f32_to_f16,"ax",@progbits
 	.globl ipu_stack_attention_f32_to_f16

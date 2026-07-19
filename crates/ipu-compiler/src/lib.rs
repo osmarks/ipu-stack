@@ -1641,7 +1641,8 @@ impl<'a> AllocationIndex<'a> {
         compute_phase: usize,
     ) -> Result<u32, CompileError> {
         if let Some(staging) = self.at(tensor, tile).iter().copied().find(|allocation| {
-            allocation.live_until == compute_phase
+            allocation.live_from < compute_phase
+                && allocation.live_until >= compute_phase
                 && matches!(allocation.kind, AllocationKind::ExchangeStaging { .. })
         }) {
             return Ok(staging.address);

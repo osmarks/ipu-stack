@@ -177,6 +177,9 @@
 	.p2align 3
 \name:
 	PARTITION_ROWS \rows
+	brnz $m5, .Lgemm_f16_has_rows_\@
+	exitz $mzero
+.Lgemm_f16_has_rows_\@:
 	ld32 $m0, $mvertex_base, $m15, 0
 	ld32 $m1, $mvertex_base, $m15, 1
 	shl $m6, $m6, 5

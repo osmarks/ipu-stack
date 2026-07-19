@@ -6,8 +6,8 @@ use ipu_compiler::{
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    ExecutableGraph, HostRunOptions, ProfileGranularity, normal_f16, package_graph,
-    package_graph_profiled_with, run_host_with_options,
+    BlockLayout, ExecutableGraph, HostRunOptions, ProfileGranularity, block_coordinates,
+    normal_f16, package_graph, package_graph_profiled_with, run_host_with_options,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -111,7 +111,7 @@ fn run_case(case: Case<'_>) {
                 ],
                 &plan.tasks,
                 |task| task.query_address,
-                |task| u64::from(task.query_rows) * u64::from(plan.head_dimension) * 2,
+                |task| u64::from(task.query_rows) * u64::from(plan.padded_head_dimension) * 2,
             ),
             key_value_binding(
                 "key_value",
@@ -161,10 +161,14 @@ fn run_case(case: Case<'_>) {
             source("flash_attention_f16.cpp"),
             &artifact_dir,
             "flash-attention-codelet",
-            &[format!(
-                "-DATTENTION_HEAD_DIMENSION={}",
-                plan.head_dimension
-            )],
+            &[
+                format!("-DATTENTION_HEAD_DIMENSION={}", plan.head_dimension),
+                format!(
+                    "-DATTENTION_PADDED_HEAD_DIMENSION={}",
+                    plan.padded_head_dimension
+                ),
+                format!("-DATTENTION_KEY_BLOCK_COLUMNS={}", plan.key_block_columns),
+            ],
         )
         .unwrap();
     let wrapper = toolchain
@@ -172,16 +176,32 @@ fn run_case(case: Case<'_>) {
             source("flash_attention_f16.S"),
             &artifact_dir,
             "flash-attention-wrapper",
-            &[format!(
-                "-DATTENTION_HEAD_DIMENSION={}",
-                plan.head_dimension
-            )],
+            &[],
+        )
+        .unwrap();
+    let minimum_rows = plan.tasks.iter().map(|task| task.query_rows).min().unwrap();
+    let maximum_rows = plan.tasks.iter().map(|task| task.query_rows).max().unwrap();
+    let qk = toolchain
+        .compile(
+            source("gemm_f16_64_amp.S"),
+            &artifact_dir,
+            "attention-qk",
+            &[
+                format!(
+                    "-DGEMM_INNER_BLOCK_DIMENSION={}",
+                    plan.padded_head_dimension
+                ),
+                format!("-DGEMM_OUTPUT_COLUMNS={}", plan.key_block_columns),
+                format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
+                format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
+            ],
         )
         .unwrap();
     let objects = [
         fs::read(runtime.object).unwrap(),
         fs::read(codelet.object).unwrap(),
         fs::read(wrapper.object).unwrap(),
+        fs::read(qk.object).unwrap(),
     ];
     let profile_output = profile_path(&case);
     let (app, profile_layout) = if profile_output.is_some() {
@@ -201,6 +221,8 @@ fn run_case(case: Case<'_>) {
         tasks = plan.tasks.len(),
         query_block_rows = plan.query_block_rows,
         key_block_rows = plan.key_block_rows,
+        padded_head_dimension = plan.padded_head_dimension,
+        key_block_columns = plan.key_block_columns,
         exchange_phases =
             plan.key_values.len() / (usize::from(case.batch_size) * usize::from(ATTENTION_HEADS)),
         input_bytes = input.len(),
@@ -362,28 +384,50 @@ fn pack_inputs(
     let mut query_bytes = Vec::new();
     let mut key_value_bytes = Vec::new();
     for task in &plan.tasks {
-        append_rows(
-            &mut query_bytes,
-            query,
-            config,
-            task.batch,
-            task.head,
-            task.query_row_start,
-            task.query_rows,
-            plan.head_dimension,
-        );
+        for linear in 0..task.query_rows * plan.padded_head_dimension {
+            let (row, column) = block_coordinates(
+                BlockLayout::AmpA16,
+                task.query_rows,
+                plan.padded_head_dimension,
+                linear,
+            );
+            let bits = if column < plan.head_dimension {
+                query[tensor_index(
+                    config,
+                    task.batch,
+                    task.head,
+                    task.query_row_start + row,
+                    column,
+                )]
+                .to_bits()
+            } else {
+                0
+            };
+            query_bytes.extend_from_slice(&bits.to_le_bytes());
+        }
     }
     for block in &plan.key_values {
-        append_rows(
-            &mut key_value_bytes,
-            key,
-            config,
-            block.batch,
-            block.head,
-            block.key_row_start,
-            block.key_rows,
-            plan.head_dimension,
-        );
+        for linear in 0..plan.padded_head_dimension * plan.key_block_columns {
+            let (inner, key_column) = block_coordinates(
+                BlockLayout::AmpB16x16,
+                plan.padded_head_dimension,
+                plan.key_block_columns,
+                linear,
+            );
+            let bits = if inner < plan.head_dimension && key_column < block.key_rows {
+                key[tensor_index(
+                    config,
+                    block.batch,
+                    block.head,
+                    block.key_row_start + key_column,
+                    inner,
+                )]
+                .to_bits()
+            } else {
+                0
+            };
+            key_value_bytes.extend_from_slice(&bits.to_le_bytes());
+        }
         append_rows(
             &mut key_value_bytes,
             value,
