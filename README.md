@@ -206,3 +206,25 @@ bulk-reads the owning tile's complete 64x64 C block through an inactive worker
 context and reports both SRAM-versus-D2H and SRAM-versus-expected difference
 counts. `IPU_GEMM_SRAM_CHECK_BLOCK=ROW,COLUMN` forces that comparison on a
 passing run.
+
+## Composed MLP
+
+`ipu-mlp-e2e` composes rectangular blocked GEMMs and GeLU activations into one
+static graph. The default is an eight-layer FP32 network with batch 512 and
+width 2,048. All weights and the input are uploaded before execution;
+intermediate activations remain on-device, and only the final activation is
+read back. Layer boundaries fuse GeLU with the required AMP-C16 to AMP-A8
+layout conversion. Diagonal validation weights keep host verification linear
+in activation size while the IPU still executes dense GEMMs.
+
+```sh
+IPU_PROFILE_AGGREGATE=1 \
+IPU_PROFILE_OUTPUT=/tmp/mlp-512x2048x8.capnp \
+  cargo run --release -p ipu-runtime --bin ipu-mlp-e2e
+```
+
+`IPU_MLP_BATCH`, `IPU_MLP_WIDTH`, `IPU_MLP_LAYERS`, and
+`IPU_MLP_ROW_BLOCK` override the shape and row specialization.
+`IPU_MLP_PACKAGE_ONLY`, `IPU_MLP_PACKAGE`, and
+`IPU_MEMORY_PROFILE_OUTPUT` provide package-only and allocator inspection
+paths analogous to the GEMM executable.
