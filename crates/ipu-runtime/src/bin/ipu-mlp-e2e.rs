@@ -1,4 +1,4 @@
-use ipu_compiler::{BlockedMlpConfig, choose_gemm_row_block, plan_blocked_mlp};
+use ipu_compiler::{BlockedMlpConfig, GemmDataType, choose_gemm_row_block, plan_blocked_mlp};
 use ipu_elf::Toolchain;
 use ipu_runtime::{
     BlockLayout, ExecutableGraph, HostRunOptions, ProfileGranularity, allocator_memory_profile,
@@ -80,6 +80,7 @@ fn main() {
         tile_count: TILE_COUNT,
         data_base: MLP_DATA_BASE,
         data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        data_type: GemmDataType::F32,
     })
     .unwrap();
     let output_placements = plan.output.clone();

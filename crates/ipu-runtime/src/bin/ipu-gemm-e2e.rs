@@ -1,4 +1,6 @@
-use ipu_compiler::{BlockedGemmConfig, BlockedGemmPlan, choose_gemm_row_block, plan_blocked_gemm};
+use ipu_compiler::{
+    BlockedGemmConfig, BlockedGemmPlan, GemmDataType, choose_gemm_row_block, plan_blocked_gemm,
+};
 use ipu_elf::Toolchain;
 use ipu_runtime::{
     BlockLayout, ExecutableGraph, HostRunOptions, ProfileGranularity, allocator_memory_profile,
@@ -75,6 +77,7 @@ fn main() {
         tile_count: TILE_COUNT,
         data_base: GEMM_DATA_BASE,
         data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        data_type: GemmDataType::F32,
     })
     .unwrap();
     let output_placements = plan.output.clone();
@@ -484,8 +487,11 @@ mod tests {
     fn amp_block_layouts_are_bijections() {
         for (layout, rows, columns) in [
             (BlockLayout::AmpA8, 128, 32),
+            (BlockLayout::AmpA16, 128, 32),
             (BlockLayout::AmpB8x16, 32, 64),
+            (BlockLayout::AmpB16x16, 32, 64),
             (BlockLayout::AmpC16, 128, 64),
+            (BlockLayout::AmpC16F16, 128, 64),
         ] {
             let coordinates = (0..rows * columns)
                 .map(|linear| block_coordinates(layout, rows, columns, linear))

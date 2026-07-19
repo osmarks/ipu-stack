@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 fastrand.workspace = true
+half.workspace = true
 ipu-compiler = { path = "../ipu-compiler" }
 ipu-driver = { path = "../ipu-driver" }
 ipu-elf = { path = "../ipu-elf" }

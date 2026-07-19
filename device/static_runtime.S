@@ -14,6 +14,8 @@
 	.set OPCODE_SYNC, 0x41800000
 	.set PROGRAM_ADDRESS_PLACEHOLDER, 0
 	.set COMPLETION_ADDRESS_PLACEHOLDER, 0
+	.set PRNG_SEED_BASE_PLACEHOLDER, 0
+	.set PRNG_WARMUP_REPEAT_COUNT, 15
 
 	.section .text.ipu_stack_static_start,"ax",@progbits
 	.globl ipu_stack_static_start
@@ -69,6 +71,17 @@ ipu_stack_static_worker_sync_context_base:
 	st32 $m0, $m12, $m15, 0
 	ld32 $a0, $m12, $m15, 0
 	put 0x7, $a0
+	.globl ipu_stack_static_prng_seed_base
+ipu_stack_static_prng_seed_base:
+	setzi $m0, PRNG_SEED_BASE_PLACEHOLDER
+	or $m0, $m0, $m1
+	st32 $m0, $m12, $m15, 0
+	ld32 $a0, $m12, $m15, 0
+	uput $PRNG_SEED, $a0
+	{ rpt PRNG_WARMUP_REPEAT_COUNT, 0
+	  fnop }
+	{ nop
+	  urand64 $azeros }
 	exitnz $m15
 	.size ipu_stack_static_worker_init, .-ipu_stack_static_worker_init
 

@@ -1,6 +1,6 @@
 use crate::{
-    Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, CompileError, KernelCommand,
-    OpId, Phase, Schedule, SpecializationKey, TensorId, Transfer, plan_blocked_gemm,
+    Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, CompileError, GemmDataType,
+    KernelCommand, OpId, Phase, Schedule, SpecializationKey, TensorId, Transfer, plan_blocked_gemm,
 };
 use std::collections::{BTreeMap, HashSet};
 
@@ -15,6 +15,7 @@ pub struct BlockedMlpConfig {
     pub tile_count: u16,
     pub data_base: u32,
     pub data_limit: u32,
+    pub data_type: GemmDataType,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +32,7 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
             "blocked MLP requires at least one layer".into(),
         ));
     }
+    let element_bytes = config.data_type.element_bytes();
     let mut layer_plans = Vec::with_capacity(usize::from(config.layers));
     let mut data_base = config.data_base;
     let mut tensor_base = 0usize;
@@ -45,8 +47,9 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
             tile_count: config.tile_count,
             data_base,
             data_limit: config.data_limit,
+            data_type: config.data_type,
         })?;
-        data_base = resident_end(&plan)?
+        data_base = resident_end(&plan, element_bytes)?
             .checked_add(31)
             .map(|address| address & !31)
             .ok_or_else(|| CompileError::Memory("MLP data arena alignment overflow".into()))?;
@@ -63,7 +66,7 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
     for (index, source) in layer_plans.last().unwrap().output.iter().enumerate() {
         let tile = u16::try_from(index % usize::from(config.tile_count))
             .map_err(|_| CompileError::Graph("MLP output tile overflow".into()))?;
-        let size = u32::from(source.rows) * u32::from(source.columns) * 4;
+        let size = u32::from(source.rows) * u32::from(source.columns) * element_bytes;
         let address = final_cursors[usize::from(tile)];
         final_cursors[usize::from(tile)] = address
             .checked_add(size)
@@ -111,6 +114,7 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
                 source,
                 &plan.left,
                 layer - 1,
+                config.data_type,
             )?;
         }
         append_schedule(&mut phases, &mut allocations, &mut plan.schedule)?;
@@ -121,7 +125,7 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
             tensor: placement.tensor,
             tile: placement.tile,
             address: placement.address,
-            size: u32::from(placement.rows) * u32::from(placement.columns) * 4,
+            size: u32::from(placement.rows) * u32::from(placement.columns) * element_bytes,
             live_from: 0,
             live_until: usize::MAX,
             kind: AllocationKind::Home,
@@ -133,6 +137,7 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
         previous_output.as_ref().unwrap(),
         &output,
         usize::from(config.layers) - 1,
+        config.data_type,
     )?;
 
     Ok(BlockedMlpPlan {
@@ -216,7 +221,7 @@ fn annotate_layer(schedule: &mut Schedule, layer: usize) {
     }
 }
 
-fn resident_end(plan: &crate::BlockedGemmPlan) -> Result<u32, CompileError> {
+fn resident_end(plan: &crate::BlockedGemmPlan, element_bytes: u32) -> Result<u32, CompileError> {
     plan.left
         .iter()
         .chain(&plan.right)
@@ -224,7 +229,9 @@ fn resident_end(plan: &crate::BlockedGemmPlan) -> Result<u32, CompileError> {
         .map(|placement| {
             placement
                 .address
-                .checked_add(u32::from(placement.rows) * u32::from(placement.columns) * 4)
+                .checked_add(
+                    u32::from(placement.rows) * u32::from(placement.columns) * element_bytes,
+                )
                 .ok_or_else(|| CompileError::Memory("MLP resident range overflow".into()))
         })
         .collect::<Result<Vec<_>, _>>()?
@@ -316,6 +323,7 @@ fn append_activation_transition(
     source: &[BlockPlacement],
     destination: &[BlockPlacement],
     layer: usize,
+    data_type: GemmDataType,
 ) -> Result<(), CompileError> {
     if source.len() != destination.len() {
         return Err(CompileError::Graph(
@@ -337,7 +345,7 @@ fn append_activation_transition(
                 "MLP activation block layouts differ between layers".into(),
             ));
         }
-        let bytes = u32::from(source.rows) * u32::from(source.columns) * 4;
+        let bytes = u32::from(source.rows) * u32::from(source.columns) * data_type.element_bytes();
         if source.tile != destination.tile {
             if !occupied_destinations.insert(destination.tile) {
                 return Err(CompileError::Graph(
@@ -372,7 +380,11 @@ fn append_activation_transition(
                 u32::from(source.rows % 6),
             ],
             specialization: SpecializationKey {
-                operation: "gelu_c16_to_a8".into(),
+                operation: match data_type {
+                    GemmDataType::F16 => "gelu_f16_c16_to_a16",
+                    GemmDataType::F32 => "gelu_c16_to_a8",
+                }
+                .into(),
                 shape: vec![usize::from(source.rows), usize::from(source.columns)],
                 worker_count: 6,
                 role: format!("layer-{layer}"),
@@ -417,6 +429,7 @@ mod tests {
             tile_count: 1472,
             data_base: 0xa0000,
             data_limit: 0xe8000,
+            data_type: GemmDataType::F32,
         })
         .unwrap();
 

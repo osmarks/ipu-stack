@@ -15,7 +15,10 @@ use tracing_subscriber::EnvFilter;
 mod static_codegen;
 
 mod blocked_data;
-pub use blocked_data::{BlockLayout, block_binding, block_coordinates, blocked_matrix};
+pub use blocked_data::{
+    BlockLayout, block_binding, block_binding_typed, block_coordinates, blocked_matrix,
+    blocked_matrix_f16, normal_f16,
+};
 
 const PLAN_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
 const HOST_DATA_START: u32 = 64;
@@ -1371,6 +1374,7 @@ fn package_graph_impl(
     let program_offset = symbol_offset("ipu_stack_static_program_address")?;
     let worker_context_offset = symbol_offset("ipu_stack_static_worker_sync_context_base")?;
     let worker_base_offset = symbol_offset("ipu_stack_static_worker_base")?;
+    let prng_seed_base_offset = symbol_offset("ipu_stack_static_prng_seed_base")?;
     let sample_worker_base_offset = (!profile_code.is_empty())
         .then(|| symbol_offset("ipu_stack_static_sample_worker_base"))
         .transpose()?;
@@ -1423,6 +1427,8 @@ fn package_graph_impl(
         )?;
         let worker_base = worker_sync_addresses[tile_index];
         patch_setzi_immediate(&mut support_code, worker_base_offset, worker_base)?;
+        let prng_seed_base = (physical + 1) << 3;
+        patch_setzi_immediate(&mut support_code, prng_seed_base_offset, prng_seed_base)?;
         if let Some(offset) = sample_worker_base_offset {
             patch_setzi_immediate(&mut support_code, offset, worker_base)?;
         }
