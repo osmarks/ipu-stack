@@ -1,8 +1,9 @@
 use half::f16;
 use ipu_compiler::{
-    Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, GemmDataType, KernelCommand,
-    OpId, Phase, RowShardPlacement, RowShardTransitionConfig, SpecializationKey, TensorId,
-    append_c16_to_a16_row_shards, choose_gemm_row_block_for, plan_blocked_gemm,
+    Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
+    GemmDataType, KernelCommand, OpId, Phase, RowShardPlacement, RowShardTransitionConfig,
+    SpecializationKey, TensorId, append_affine_layer_norm_f16, append_c16_to_a16_row_shards,
+    choose_gemm_row_block_for, plan_blocked_gemm,
 };
 use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -116,6 +117,30 @@ fn main() {
         },
     )
     .unwrap();
+    let norm = append_affine_layer_norm_f16(
+        &mut plan.schedule,
+        &row_shards,
+        AppendAffineLayerNormConfig {
+            data_base: transition_base,
+            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            epsilon_bits: config.layer_norm_eps.to_bits(),
+        },
+    )
+    .unwrap();
+    let norm_weight = model
+        .tensor_f32("vision_model.encoder.layers.0.layer_norm1.weight")
+        .unwrap();
+    let norm_bias = model
+        .tensor_f32("vision_model.encoder.layers.0.layer_norm1.bias")
+        .unwrap();
+    for _ in &norm.affine {
+        host_input.extend(
+            norm_weight
+                .iter()
+                .chain(&norm_bias)
+                .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes()),
+        );
+    }
     let objects = compile_objects(&plan).unwrap();
     let graph = ExecutableGraph {
         schedule: plan.schedule,
@@ -125,12 +150,13 @@ fn main() {
             block_binding_typed("patches", rows, inner, &plan.left, "f16", 2),
             block_binding_typed("patch_weight", inner, columns, &plan.right, "f16", 2),
             block_binding_typed("position_bias", rows, columns, &adjustment, "f16", 2),
+            row_shard_binding("layer_norm1_affine", 2, columns, &norm.affine),
         ],
         host_outputs: vec![row_shard_binding(
             "patch_and_position",
             rows,
             columns,
-            &row_shards,
+            &norm.output,
         )],
     };
     let app = package_graph(&graph, &objects).unwrap();
@@ -151,8 +177,16 @@ fn main() {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
-    let expected = reference.tensor_f32("patch_and_position").unwrap();
-    let max_error = verify(&actual, &row_shards, columns, &expected);
+    let embedding = reference.tensor_f32("patch_and_position").unwrap();
+    let expected = layer_norm_reference(
+        &embedding,
+        usize::from(rows),
+        usize::from(columns),
+        &norm_weight,
+        &norm_bias,
+        config.layer_norm_eps,
+    );
+    let max_error = verify(&actual, &norm.output, columns, &expected);
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.1);
     assert!(
         max_error <= limit,
@@ -168,7 +202,7 @@ fn main() {
         columns,
         row_block_dimension,
         max_error,
-        "SigLIP patch embedding passed against Hugging Face"
+        "SigLIP patch embedding and encoder layer norm passed against Hugging Face"
     );
 }
 
@@ -291,11 +325,25 @@ fn compile_objects(plan: &ipu_compiler::BlockedGemmPlan) -> ipu_runtime::Result<
     )?;
     let add = toolchain.compile(source("add_f16.S"), &artifacts, "add-f16", &[])?;
     let relayout = toolchain.compile(source("relayout_f16.S"), &artifacts, "relayout-f16", &[])?;
+    let norm_codelet = toolchain.compile(
+        source("layer_norm_f16.cpp"),
+        &artifacts,
+        "layer-norm-codelet",
+        &[],
+    )?;
+    let norm_wrapper = toolchain.compile(
+        source("layer_norm_f16.S"),
+        &artifacts,
+        "layer-norm-wrapper",
+        &[],
+    )?;
     Ok(vec![
         fs::read(runtime.object)?,
         fs::read(gemm.object)?,
         fs::read(add.object)?,
         fs::read(relayout.object)?,
+        fs::read(norm_codelet.object)?,
+        fs::read(norm_wrapper.object)?,
     ])
 }
 
@@ -346,6 +394,29 @@ fn verify(actual: &[u8], output: &[RowShardPlacement], columns: u16, expected: &
         }
     }
     max_error
+}
+
+fn layer_norm_reference(
+    input: &[f32],
+    rows: usize,
+    columns: usize,
+    weight: &[f32],
+    bias: &[f32],
+    epsilon: f32,
+) -> Vec<f32> {
+    let mut output = Vec::with_capacity(input.len());
+    for row in input.chunks_exact(columns).take(rows) {
+        let mean = row.iter().sum::<f32>() / columns as f32;
+        let variance = row.iter().map(|value| (value - mean).powi(2)).sum::<f32>() / columns as f32;
+        let scale = (variance + epsilon).sqrt().recip();
+        output.extend(
+            row.iter()
+                .zip(weight)
+                .zip(bias)
+                .map(|((&value, &weight), &bias)| (value - mean) * scale * weight + bias),
+        );
+    }
+    output
 }
 
 fn required_env(name: &str) -> String {
