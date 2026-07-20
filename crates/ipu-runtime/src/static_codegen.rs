@@ -83,6 +83,8 @@ enum StaticTemplateStep {
     Exchange {
         sender_word_offset: Option<u16>,
         dynamic_sender_offset: bool,
+        active: bool,
+        dynamic_active: bool,
     },
     Compute {
         operation: String,
@@ -191,6 +193,19 @@ pub(crate) fn plan_static_templates(
                     .into());
                 }
                 for epoch in 0..epoch_count {
+                    let actives = phase_steps
+                        .iter()
+                        .map(|steps| {
+                            let LoweredTileStep::Exchange { row, .. } =
+                                &program.steps[steps[epoch]]
+                            else {
+                                unreachable!();
+                            };
+                            row.first() != Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION)
+                        })
+                        .collect::<Vec<_>>();
+                    let active = actives[0];
+                    let dynamic_active = actives[1..].iter().any(|&value| value != active);
                     let sender_word_offsets = phase_steps
                         .iter()
                         .filter_map(|steps| {
@@ -203,13 +218,8 @@ pub(crate) fn plan_static_templates(
                     });
                     for (instance, steps) in phase_steps.iter().enumerate() {
                         let step_index = steps[epoch];
-                        let LoweredTileStep::Exchange { row, .. } = &program.steps[step_index]
-                        else {
-                            unreachable!();
-                        };
                         let address = plan_by_step[step_index]
                             .ok_or("template exchange has no plan address")?;
-                        let active = row.first() != Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION);
                         if sender_word_offset.is_some() {
                             let patch = patch_by_step[step_index];
                             if dynamic_sender_offset {
@@ -222,11 +232,17 @@ pub(crate) fn plan_static_templates(
                             ));
                         }
                         records[instance].push(StaticTemplateRecordWord::Value(address));
-                        records[instance].push(StaticTemplateRecordWord::Value(u32::from(active)));
+                        if dynamic_active {
+                            records[instance].push(StaticTemplateRecordWord::Value(u32::from(
+                                actives[instance],
+                            )));
+                        }
                     }
                     template_steps.push(StaticTemplateStep::Exchange {
                         sender_word_offset,
                         dynamic_sender_offset,
+                        active,
+                        dynamic_active,
                     });
                 }
             } else if all_compute {
@@ -691,12 +707,15 @@ pub(crate) fn emit(
     }
     emit_host_phases(&mut code, symbols, host.outputs, host.run_state)?;
     code.jump(symbol(symbols, COMPLETE)?)?;
-    let template_exchange = if templates.is_empty() {
+    let template_exchanges = if templates.is_empty() {
         None
     } else {
-        let address = generated_address(generated_base, code.words.len())?;
-        emit_static_template_exchange(&mut code, worker_barrier, generated_base)?;
-        Some(address)
+        let mut addresses = [0; 3];
+        for (index, active) in [Some(false), Some(true), None].into_iter().enumerate() {
+            addresses[index] = generated_address(generated_base, code.words.len())?;
+            emit_static_template_exchange(&mut code, worker_barrier, generated_base, active)?;
+        }
+        Some(addresses)
     };
     let mut template_bodies = Vec::with_capacity(templates.len());
     for template in templates {
@@ -705,7 +724,7 @@ pub(crate) fn emit(
             &mut code,
             template,
             symbols,
-            template_exchange.unwrap(),
+            template_exchanges.unwrap(),
             generated_base,
         )?;
     }
@@ -720,11 +739,16 @@ fn emit_static_template_exchange(
     code: &mut TileCode,
     worker_barrier: u32,
     generated_base: u32,
+    active: Option<bool>,
 ) -> Result<()> {
     code.ld32(2, 11, 15, 0)?;
     code.ld32(8, 2, 15, 0)?;
-    code.ld32(0, 2, 15, 1)?;
-    code.add_immediate(2, 2, 8)?;
+    if active.is_none() {
+        code.ld32(0, 2, 15, 1)?;
+    } else {
+        code.setzi(0, u32::from(active == Some(true)))?;
+    }
+    code.add_immediate(2, 2, if active.is_none() { 8 } else { 4 })?;
     code.st32(2, 11, 15, 0)?;
     code.instruction(ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
     let skip_barrier = code.words.len();
@@ -743,7 +767,7 @@ fn emit_static_template_body(
     code: &mut TileCode,
     template: &StaticTemplatePlan,
     symbols: &BTreeMap<String, u32>,
-    template_exchange: u32,
+    template_exchanges: [u32; 3],
     generated_base: u32,
 ) -> Result<()> {
     code.add_immediate(11, 11, -16)?;
@@ -754,6 +778,8 @@ fn emit_static_template_body(
             StaticTemplateStep::Exchange {
                 sender_word_offset,
                 dynamic_sender_offset,
+                active,
+                dynamic_active,
             } => {
                 if let Some(word_offset) = sender_word_offset {
                     code.ld32(1, 11, 15, 0)?;
@@ -777,7 +803,12 @@ fn emit_static_template_body(
                     let after_patch = generated_address(generated_base, code.words.len())?;
                     code.words[skip_patch] = ipu_exchange::encode_brz_m_immediate(3, after_patch)?;
                 }
-                code.call(template_exchange, 9)?;
+                let helper = if *dynamic_active {
+                    2
+                } else {
+                    usize::from(*active)
+                };
+                code.call(template_exchanges[helper], 9)?;
             }
             StaticTemplateStep::Compute {
                 operation,
@@ -1081,6 +1112,8 @@ mod tests {
             StaticTemplateStep::Exchange {
                 sender_word_offset: Some(1),
                 dynamic_sender_offset: false,
+                active: true,
+                dynamic_active: true,
             }
         ));
         assert!(matches!(

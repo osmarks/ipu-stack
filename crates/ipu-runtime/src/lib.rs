@@ -1261,6 +1261,12 @@ fn package_graph_impl(
                 let sender = templated
                     .then(|| ipu_exchange::normalize_sender_instruction(&mut stored_row))
                     .flatten();
+                if let Some(return_word) = stored_row
+                    .iter()
+                    .position(|&instruction| instruction == ipu_exchange::RETURN_M10_INSTRUCTION)
+                {
+                    stored_row.truncate(return_word + 1);
+                }
                 let address = if let Some(&address) = unique.get(&stored_row) {
                     address
                 } else {
