@@ -1,13 +1,13 @@
 use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
-    FlashAttentionConfig, FlashAttentionPlan, GemmDataType, KernelCommand, OpId, Phase,
-    RowShardPlacement, RowShardTransitionConfig, SpecializationKey, TensorId,
-    append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
-    append_blocked_gemm_f16_with_a16_input, append_c16_to_a16_blocks_gelu_f16,
-    append_c16_to_a16_row_shards, append_flash_attention_from_a16_qkv,
-    append_flash_attention_to_a16_row_shards, choose_gemm_row_block_for, end_tensor_lifetimes,
-    plan_blocked_gemm,
+    FlashAttentionConfig, FlashAttentionPlan, GemmDataType, KernelCommand, MemoryConstraint,
+    MemoryPlacement, OpId, Phase, RowShardPlacement, RowShardTransitionConfig, SpecializationKey,
+    TensorId, append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
+    append_blocked_gemm_f16_with_a16_blocks, append_blocked_gemm_f16_with_a16_input,
+    append_c16_to_a16_blocks_gelu_f16, append_c16_to_a16_row_shards,
+    append_flash_attention_from_a16_qkv, append_flash_attention_to_a16_row_shards,
+    choose_gemm_row_block_for, end_tensor_lifetimes, plan_blocked_gemm,
 };
 use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -24,7 +24,7 @@ use tracing::info;
 const TILE_COUNT: u16 = 1472;
 const BLOCK_DIMENSION: u16 = 64;
 const INNER_BLOCK_DIMENSION: u16 = 64;
-const DATA_BASE: u32 = 0xa0000;
+const DATA_BASE: u32 = ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
 
 fn main() {
     ipu_runtime::init_tracing();
@@ -242,7 +242,6 @@ fn main() {
         ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
     )
     .unwrap();
-    let output_projection_base = resident_data_end(&plan.schedule);
     let output_projection = append_blocked_gemm_f16_with_a16_input(
         &mut plan.schedule,
         &attention_shards,
@@ -254,7 +253,7 @@ fn main() {
             inner_block_dimension: INNER_BLOCK_DIMENSION,
             row_block_dimension,
             tile_count: TILE_COUNT,
-            data_base: output_projection_base,
+            data_base: DATA_BASE,
             data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
             data_type: GemmDataType::F16,
         },
@@ -278,13 +277,12 @@ fn main() {
         BlockLayout::AmpC16F16,
         |_row, column| output_bias[usize::from(column)],
     ));
-    let projected_shards_base = resident_data_end(&plan.schedule);
     let projected_shards = append_c16_to_a16_row_shards(
         &mut plan.schedule,
         &output_projection.output,
         RowShardTransitionConfig {
             columns,
-            data_base: projected_shards_base,
+            data_base: DATA_BASE,
             data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
         },
     )
@@ -322,7 +320,6 @@ fn main() {
         );
     }
     let intermediate_columns = u16::try_from(config.intermediate_size.div_ceil(64) * 64).unwrap();
-    let mlp_up_base = resident_data_end(&plan.schedule);
     let mlp_up = append_blocked_gemm_f16_with_a16_input(
         &mut plan.schedule,
         &norm2.output,
@@ -334,7 +331,7 @@ fn main() {
             inner_block_dimension: INNER_BLOCK_DIMENSION,
             row_block_dimension,
             tile_count: TILE_COUNT,
-            data_base: mlp_up_base,
+            data_base: DATA_BASE,
             data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
             data_type: GemmDataType::F16,
         },
@@ -370,6 +367,59 @@ fn main() {
         ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
     )
     .unwrap();
+    let mlp_down = append_blocked_gemm_f16_with_a16_blocks(
+        &mut plan.schedule,
+        &mlp_gelu,
+        BlockedGemmConfig {
+            rows,
+            inner_dimension: intermediate_columns,
+            columns,
+            block_dimension: BLOCK_DIMENSION,
+            inner_block_dimension: INNER_BLOCK_DIMENSION,
+            row_block_dimension,
+            tile_count: TILE_COUNT,
+            data_base: DATA_BASE,
+            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            data_type: GemmDataType::F16,
+        },
+    )
+    .unwrap();
+    let mlp_down_weight = model
+        .tensor_f32("vision_model.encoder.layers.0.mlp.fc2.weight")
+        .unwrap();
+    host_input.extend(blocked_matrix_f16(
+        &mlp_down.right,
+        BlockLayout::AmpB16x16,
+        |row, column| {
+            if usize::from(row) < config.intermediate_size {
+                mlp_down_weight[usize::from(column) * config.intermediate_size + usize::from(row)]
+            } else {
+                0.0
+            }
+        },
+    ));
+    let mlp_down_bias = model
+        .tensor_f32("vision_model.encoder.layers.0.mlp.fc2.bias")
+        .unwrap();
+    let mlp_down_adjustment = append_bias_phase(&mut plan.schedule, &mlp_down.output).unwrap();
+    host_input.extend(blocked_matrix_f16(
+        &mlp_down_adjustment,
+        BlockLayout::AmpC16F16,
+        |_row, column| mlp_down_bias[usize::from(column)],
+    ));
+    let layer_output = append_c16_to_a16_row_shards(
+        &mut plan.schedule,
+        &mlp_down.output,
+        RowShardTransitionConfig {
+            columns,
+            data_base: DATA_BASE,
+            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        },
+    )
+    .unwrap();
+    let layer_output =
+        append_add_f16_row_shards_in_place(&mut plan.schedule, &layer_output, &attention_residual)
+            .unwrap();
     let objects = compile_objects(&plan, &attention).unwrap();
     let graph = ExecutableGraph {
         schedule: plan.schedule,
@@ -415,13 +465,36 @@ fn main() {
                 "f16",
                 2,
             ),
+            block_binding_typed(
+                "mlp_down_weight",
+                intermediate_columns,
+                columns,
+                &mlp_down.right,
+                "f16",
+                2,
+            ),
+            block_binding_typed(
+                "mlp_down_bias",
+                u16::try_from(mlp_down_adjustment.len()).unwrap(),
+                BLOCK_DIMENSION,
+                &mlp_down_adjustment,
+                "f16",
+                2,
+            ),
         ],
         host_outputs: vec![
             row_shard_binding("layer_norm2", rows, columns, &norm2.output),
             block_binding_typed("mlp_gelu", rows, intermediate_columns, &mlp_gelu, "f16", 2),
+            row_shard_binding("encoder_layer_00", rows, columns, &layer_output),
         ],
     };
     let app = package_graph(&graph, &objects).unwrap();
+    if let Some(path) = std::env::var_os("IPU_SIGLIP_PACKAGE_OUTPUT") {
+        app.write(fs::File::create(path).unwrap()).unwrap();
+    }
+    if let Some(path) = std::env::var_os("IPU_SIGLIP_INPUT_OUTPUT") {
+        fs::write(path, &host_input).unwrap();
+    }
     let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
     let configuration = fs::read(required_env("IPU_CONFIG")).unwrap();
     let bootloader = fs::read(
@@ -462,6 +535,15 @@ fn main() {
         &mlp_gelu,
     );
     let max_error = verify_linear_f16(&actual[norm2_bytes..], &expected);
+    let mlp_gelu_bytes = usize::from(rows) * usize::from(intermediate_columns) * 2;
+    let expected_layer = reference.tensor_f32("encoder_layer_00").unwrap();
+    let expected_layer = serialize_a16_row_shards(
+        &expected_layer,
+        usize::from(rows),
+        usize::from(columns),
+        &layer_output,
+    );
+    let layer_error = verify_linear_f16(&actual[norm2_bytes + mlp_gelu_bytes..], &expected_layer);
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
     assert!(
         norm2_error <= limit,
@@ -470,6 +552,10 @@ fn main() {
     assert!(
         max_error <= limit,
         "MLP GeLU max error {max_error} exceeds {limit}"
+    );
+    assert!(
+        layer_error <= limit,
+        "encoder layer max error {layer_error} exceeds {limit}"
     );
     info!(
         image_size = config.image_size,
@@ -483,7 +569,8 @@ fn main() {
         row_block_dimension,
         norm2_error,
         max_error,
-        "SigLIP layer 0 attention and MLP GeLU passed against Hugging Face"
+        layer_error,
+        "SigLIP encoder layer 0 passed against Hugging Face"
     );
 }
 
@@ -513,17 +600,9 @@ fn append_adjustment_phase(
     schedule: &mut ipu_compiler::Schedule,
     output: &[BlockPlacement],
 ) -> ipu_runtime::Result<Vec<BlockPlacement>> {
-    let mut cursors = vec![DATA_BASE; usize::from(TILE_COUNT)];
     let mut maximum_tensor = 0usize;
     for allocation in &schedule.allocations {
         maximum_tensor = maximum_tensor.max(allocation.tensor.0);
-        if allocation.kind == AllocationKind::Home && allocation.address >= DATA_BASE {
-            let end = allocation
-                .address
-                .checked_add(allocation.size)
-                .ok_or("SRAM overflow")?;
-            cursors[usize::from(allocation.tile)] = cursors[usize::from(allocation.tile)].max(end);
-        }
     }
     let phase = schedule.phases.len();
     let mut placements = Vec::with_capacity(output.len());
@@ -531,15 +610,19 @@ fn append_adjustment_phase(
     for (index, output) in output.iter().enumerate() {
         let tensor = TensorId(maximum_tensor + 1 + index);
         let bytes = u32::from(output.rows) * u32::from(output.columns) * 2;
-        let cursor = &mut cursors[usize::from(output.tile)];
-        *cursor = (*cursor + 7) & !7;
-        let address = *cursor;
-        *cursor = cursor
-            .checked_add(bytes)
-            .ok_or("adjustment allocation overflow")?;
-        if *cursor > ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE {
-            return Err(format!("position adjustment exhausts tile {} SRAM", output.tile).into());
-        }
+        let address = ipu_compiler::find_free_region(
+            &schedule.allocations,
+            output.tile,
+            bytes,
+            0,
+            phase,
+            MemoryConstraint {
+                base: DATA_BASE,
+                limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                alignment: 8,
+                placement: MemoryPlacement::Low,
+            },
+        )?;
         let placement = BlockPlacement {
             tensor,
             address,
@@ -582,6 +665,83 @@ fn append_adjustment_phase(
     Ok(placements)
 }
 
+fn append_bias_phase(
+    schedule: &mut ipu_compiler::Schedule,
+    output: &[BlockPlacement],
+) -> ipu_runtime::Result<Vec<BlockPlacement>> {
+    let phase = schedule.phases.len();
+    let mut next_tensor = schedule
+        .allocations
+        .iter()
+        .map(|allocation| allocation.tensor.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut biases = Vec::with_capacity(output.len());
+    let mut commands = Vec::with_capacity(output.len());
+    for output in output {
+        let bytes = u32::from(output.columns) * 2;
+        let address = ipu_compiler::find_free_region(
+            &schedule.allocations,
+            output.tile,
+            bytes,
+            0,
+            phase,
+            MemoryConstraint {
+                base: DATA_BASE,
+                limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                alignment: 8,
+                placement: MemoryPlacement::Low,
+            },
+        )?;
+        let bias = BlockPlacement {
+            tensor: TensorId(next_tensor),
+            address,
+            rows: 1,
+            row_start: 0,
+            ..*output
+        };
+        next_tensor += 1;
+        schedule.allocations.push(Allocation {
+            tensor: bias.tensor,
+            tile: bias.tile,
+            address,
+            size: bytes,
+            live_from: 0,
+            live_until: phase,
+            kind: AllocationKind::Home,
+        });
+        commands.push(KernelCommand {
+            tile: output.tile,
+            output: output.tensor,
+            inputs: vec![output.tensor, bias.tensor],
+            arguments: vec![
+                u32::from(output.rows),
+                u32::from(output.rows / 6),
+                u32::from(output.rows % 6),
+            ],
+            specialization: SpecializationKey {
+                operation: "add_bias_f16_c16".into(),
+                shape: vec![usize::from(output.rows), usize::from(output.columns)],
+                worker_count: 6,
+                role: "blocked-bias".into(),
+                alignment: 8,
+            },
+            metadata: BTreeMap::from([
+                ("label".into(), "blocked bias add".into()),
+                ("row_start".into(), output.row_start.to_string()),
+                ("column_start".into(), output.column_start.to_string()),
+            ]),
+        });
+        biases.push(bias);
+    }
+    schedule.phases.push(Phase::Compute {
+        op: OpId(phase),
+        commands,
+    });
+    Ok(biases)
+}
+
 fn compile_objects(
     plan: &ipu_compiler::BlockedGemmPlan,
     attention: &FlashAttentionPlan,
@@ -609,6 +769,7 @@ fn compile_objects(
         ],
     )?;
     let add = toolchain.compile(source("add_f16.S"), &artifacts, "add-f16", &[])?;
+    let add_bias = toolchain.compile(source("add_bias_f16.S"), &artifacts, "add-bias-f16", &[])?;
     let relayout = toolchain.compile(source("relayout_f16.S"), &artifacts, "relayout-f16", &[])?;
     let gelu_relayout = toolchain.compile(
         source("gelu_relayout_f16.S"),
@@ -740,6 +901,7 @@ fn compile_objects(
         fs::read(runtime.object)?,
         fs::read(gemm.object)?,
         fs::read(add.object)?,
+        fs::read(add_bias.object)?,
         fs::read(relayout.object)?,
         fs::read(gelu_relayout.object)?,
         fs::read(norm_codelet.object)?,

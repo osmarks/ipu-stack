@@ -484,6 +484,67 @@ pub fn find_free_region(
     )))
 }
 
+fn allocate_from_occupied(
+    occupied: &mut Vec<(u32, u32)>,
+    size: u32,
+    constraint: MemoryConstraint,
+) -> Result<u32, CompileError> {
+    let alignment = constraint.alignment;
+    let address = match constraint.placement {
+        MemoryPlacement::Low => {
+            let mut cursor = constraint.base;
+            let mut found = None;
+            for &(start, end) in occupied.iter() {
+                if cursor < start {
+                    let candidate = align_u32(cursor, alignment);
+                    if candidate
+                        .checked_add(size)
+                        .is_some_and(|candidate_end| candidate_end <= start)
+                    {
+                        found = Some(candidate);
+                        break;
+                    }
+                }
+                cursor = cursor.max(end);
+            }
+            found.or_else(|| {
+                let candidate = align_u32(cursor, alignment);
+                candidate
+                    .checked_add(size)
+                    .filter(|&end| end <= constraint.limit)
+                    .map(|_| candidate)
+            })
+        }
+        MemoryPlacement::High => {
+            let mut cursor = constraint.limit;
+            let mut found = None;
+            for &(start, end) in occupied.iter().rev() {
+                if end < cursor {
+                    let candidate = cursor
+                        .checked_sub(size)
+                        .map(|value| value & !(alignment - 1));
+                    if candidate.is_some_and(|candidate| candidate >= end) {
+                        found = candidate;
+                        break;
+                    }
+                }
+                cursor = cursor.min(start);
+            }
+            found.or_else(|| {
+                cursor
+                    .checked_sub(size)
+                    .map(|value| value & !(alignment - 1))
+                    .filter(|&candidate| candidate >= constraint.base)
+            })
+        }
+    }
+    .ok_or_else(|| CompileError::Memory(format!("no {size}-byte region in SRAM arena")))?;
+    let end = address + size;
+    let insertion = occupied.partition_point(|&(start, _)| start < address);
+    occupied.insert(insertion, (address, end));
+    Ok(address)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schedule {
     pub layouts: Vec<Layout>,
@@ -566,7 +627,7 @@ pub fn append_blocked_gemm_f16_with_a16_input(
             "A16 composition requires an FP16 GEMM".into(),
         ));
     }
-    let mut plan = plan_blocked_gemm(config)?;
+    let mut plan = plan_appended_blocked_gemm(schedule, config)?;
     let tensor_base = schedule
         .allocations
         .iter()
@@ -587,6 +648,8 @@ pub fn append_blocked_gemm_f16_with_a16_input(
     let compute_phase = exchange_phase + 1;
     let mut transfers = Vec::with_capacity(plan.left.len());
     let mut commands = Vec::with_capacity(plan.left.len());
+    let mut staging_cursors =
+        vec![ipu_exchange::EXCHANGE_WINDOW_BASE; usize::from(config.tile_count)];
     for block in &plan.left {
         let shard = input
             .iter()
@@ -618,6 +681,20 @@ pub fn append_blocked_gemm_f16_with_a16_input(
             kind: AllocationKind::Home,
         });
         if shard.tile != block.tile {
+            let cursor = &mut staging_cursors[usize::from(block.tile)];
+            let staging_address = *cursor;
+            *cursor = align_u32(
+                cursor
+                    .checked_add(bytes)
+                    .ok_or_else(|| CompileError::Memory("A16 staging address overflow".into()))?,
+                32,
+            );
+            if *cursor > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES {
+                return Err(CompileError::Memory(format!(
+                    "A16 GEMM input staging exhausts tile {} exchange window",
+                    block.tile
+                )));
+            }
             transfers.push(Transfer {
                 source_tile: shard.tile,
                 destination_tile: block.tile,
@@ -627,7 +704,7 @@ pub fn append_blocked_gemm_f16_with_a16_input(
             schedule.allocations.push(Allocation {
                 tensor: alias,
                 tile: block.tile,
-                address: ipu_exchange::EXCHANGE_WINDOW_BASE,
+                address: staging_address,
                 size: bytes,
                 live_from: exchange_phase,
                 live_until: compute_phase,
@@ -681,7 +758,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks(
             "A16 block composition requires an FP16 GEMM".into(),
         ));
     }
-    let mut plan = plan_blocked_gemm(config)?;
+    let mut plan = plan_appended_blocked_gemm(schedule, config)?;
     let tensor_base = schedule
         .allocations
         .iter()
@@ -694,6 +771,8 @@ pub fn append_blocked_gemm_f16_with_a16_blocks(
     let compute_phase = exchange_phase + 1;
     let mut transfers = Vec::with_capacity(plan.left.len());
     let mut commands = Vec::with_capacity(plan.left.len());
+    let mut staging_cursors =
+        vec![ipu_exchange::EXCHANGE_WINDOW_BASE; usize::from(config.tile_count)];
     for destination in &plan.left {
         let source = input
             .iter()
@@ -711,6 +790,20 @@ pub fn append_blocked_gemm_f16_with_a16_blocks(
             })?;
         let bytes = u32::from(destination.rows) * u32::from(destination.columns) * 2;
         if source.tile != destination.tile {
+            let cursor = &mut staging_cursors[usize::from(destination.tile)];
+            let staging_address = *cursor;
+            *cursor = align_u32(
+                cursor
+                    .checked_add(bytes)
+                    .ok_or_else(|| CompileError::Memory("A16 staging address overflow".into()))?,
+                32,
+            );
+            if *cursor > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES {
+                return Err(CompileError::Memory(format!(
+                    "distributed A16 GEMM input staging exhausts tile {} exchange window",
+                    destination.tile
+                )));
+            }
             transfers.push(Transfer {
                 source_tile: source.tile,
                 destination_tile: destination.tile,
@@ -720,7 +813,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks(
             schedule.allocations.push(Allocation {
                 tensor: source.tensor,
                 tile: destination.tile,
-                address: ipu_exchange::EXCHANGE_WINDOW_BASE,
+                address: staging_address,
                 size: bytes,
                 live_from: exchange_phase,
                 live_until: compute_phase,
@@ -762,6 +855,113 @@ pub fn append_blocked_gemm_f16_with_a16_blocks(
         right: plan.right,
         output: plan.output,
     })
+}
+
+fn plan_appended_blocked_gemm(
+    parent: &Schedule,
+    config: BlockedGemmConfig,
+) -> Result<BlockedGemmPlan, CompileError> {
+    let mut plan = plan_blocked_gemm(config)?;
+    let provisional_is_free = plan.schedule.allocations.iter().all(|candidate| {
+        candidate.kind != AllocationKind::Home
+            || candidate.address < config.data_base
+            || parent.allocations.iter().all(|allocation| {
+                allocation.tile != candidate.tile
+                    || candidate.address.saturating_add(candidate.size) <= allocation.address
+                    || allocation.address.saturating_add(allocation.size) <= candidate.address
+            })
+    });
+    if provisional_is_free {
+        return Ok(plan);
+    }
+    let mut regions = plan
+        .left
+        .iter()
+        .chain(&plan.output)
+        .map(|placement| {
+            (
+                placement.tensor,
+                placement.tile,
+                placement.address,
+                u32::from(placement.rows) * u32::from(placement.columns) * 2,
+                MemoryPlacement::Low,
+            )
+        })
+        .collect::<Vec<_>>();
+    regions.extend(plan.right.iter().map(|placement| {
+        (
+            placement.tensor,
+            placement.tile,
+            placement.address,
+            u32::from(placement.rows) * u32::from(placement.columns) * 2,
+            MemoryPlacement::High,
+        )
+    }));
+    regions.sort_unstable_by_key(|&(_, _, _, size, _)| std::cmp::Reverse(size));
+    let mut occupied = vec![Vec::<(u32, u32)>::new(); usize::from(parent.tile_count)];
+    for allocation in &parent.allocations {
+        let start = allocation.address.max(config.data_base);
+        let end = allocation
+            .address
+            .saturating_add(allocation.size)
+            .min(config.data_limit);
+        if start < end {
+            occupied[usize::from(allocation.tile)].push((start, end));
+        }
+    }
+    for intervals in &mut occupied {
+        intervals.sort_unstable();
+        let mut merged = Vec::<(u32, u32)>::with_capacity(intervals.len());
+        for &(start, end) in intervals.iter() {
+            if let Some(previous) = merged.last_mut()
+                && start <= previous.1
+            {
+                previous.1 = previous.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        *intervals = merged;
+    }
+    let mut relocated = HashMap::<TensorId, u32>::new();
+    for &(tensor, tile, _old_address, size, placement) in &regions {
+        let address = allocate_from_occupied(
+            &mut occupied[usize::from(tile)],
+            size,
+            MemoryConstraint {
+                base: config.data_base,
+                limit: config.data_limit,
+                alignment: 32,
+                placement,
+            },
+        )?;
+        relocated.insert(tensor, address);
+    }
+    for placement in plan
+        .left
+        .iter_mut()
+        .chain(&mut plan.right)
+        .chain(&mut plan.output)
+    {
+        placement.address = relocated[&placement.tensor];
+    }
+    for allocation in &mut plan.schedule.allocations {
+        if allocation.kind != AllocationKind::Home || allocation.address < config.data_base {
+            continue;
+        }
+        if let Some(&address) = relocated.get(&allocation.tensor) {
+            allocation.address = address;
+            continue;
+        }
+        if let Some(owner) = regions.iter().find(|region| {
+            region.1 == allocation.tile
+                && allocation.address >= region.2
+                && allocation.address.saturating_add(allocation.size) <= region.2 + region.3
+        }) {
+            allocation.address = relocated[&owner.0] + allocation.address - owner.2;
+        }
+    }
+    Ok(plan)
 }
 
 fn remap_gemm_tensors(plan: &mut BlockedGemmPlan, base: usize) -> Result<(), CompileError> {
@@ -2645,6 +2845,86 @@ mod tests {
             &schedule.phases[1],
             Phase::Compute { commands, .. } if commands.len() == 1
         ));
+    }
+
+    #[test]
+    fn distributed_a16_prelude_assigns_disjoint_staging_ranges() {
+        let mut tile_offsets = [0u32; 2];
+        let mut input = Vec::new();
+        let mut allocations = Vec::new();
+        for block_row in 0..2u16 {
+            for block_column in 0..3u16 {
+                let index = usize::from(block_row * 3 + block_column);
+                let destination_tile = index as u16 % 2;
+                let tile = 1 - destination_tile;
+                let address = 0xa0000 + tile_offsets[usize::from(tile)];
+                tile_offsets[usize::from(tile)] += 12 * 64 * 2;
+                let tensor = TensorId(index);
+                input.push(BlockPlacement {
+                    tensor,
+                    tile,
+                    address,
+                    block_row,
+                    block_column,
+                    row_start: block_row * 12,
+                    column_start: block_column * 64,
+                    rows: 12,
+                    columns: 64,
+                });
+                allocations.push(Allocation {
+                    tensor,
+                    tile,
+                    address,
+                    size: 12 * 64 * 2,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                });
+            }
+        }
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations,
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+
+        append_blocked_gemm_f16_with_a16_blocks(
+            &mut schedule,
+            &input,
+            BlockedGemmConfig {
+                rows: 24,
+                inner_dimension: 192,
+                columns: 64,
+                block_dimension: 64,
+                inner_block_dimension: 64,
+                row_block_dimension: 12,
+                tile_count: 2,
+                data_base: 0xb0000,
+                data_limit: 0xe8000,
+                data_type: GemmDataType::F16,
+            },
+        )
+        .unwrap();
+
+        for tile in 0..2 {
+            let mut ranges = schedule
+                .allocations
+                .iter()
+                .filter(|allocation| {
+                    allocation.tile == tile
+                        && matches!(
+                            allocation.kind,
+                            AllocationKind::ExchangeStaging { phase: 0 }
+                        )
+                })
+                .map(|allocation| (allocation.address, allocation.address + allocation.size))
+                .collect::<Vec<_>>();
+            ranges.sort_unstable();
+            assert!(ranges.len() > 1);
+            assert!(ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0));
+        }
     }
 
     #[test]

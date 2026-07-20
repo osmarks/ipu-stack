@@ -1606,7 +1606,7 @@ fn package_graph_impl(
                 flags: SEGMENT_READ | SEGMENT_EXECUTE,
             });
         }
-        append_initial_segments(&mut app, &mut segments, graph, &initial, logical)?;
+        append_initial_segments(&mut app, &mut segments, &initial, logical)?;
         app.tiles.push(TileImage {
             physical_tile: physical,
             entry_point: ipu_driver::APPLICATION_LOAD_BASE,
@@ -2063,23 +2063,18 @@ fn write_plan_bytes(plan_region: &mut [u8], address: u32, bytes: &[u8]) -> Resul
 fn append_initial_segments(
     app: &mut Application,
     segments: &mut Vec<Segment>,
-    graph: &ExecutableGraph,
     initial: &HashMap<(u16, u32), Vec<u8>>,
     logical: u16,
 ) -> Result<()> {
-    let mut ranges = graph
-        .schedule
-        .allocations
+    let mut ranges = initial
         .iter()
-        .filter(|allocation| allocation.tile == logical)
-        .filter(|allocation| allocation.size != 0)
-        .map(|allocation| {
+        .filter(|((tile, _), contents)| *tile == logical && !contents.is_empty())
+        .map(|((_, address), contents)| {
             Ok((
-                allocation.address,
-                allocation
-                    .address
-                    .checked_add(allocation.size)
-                    .ok_or("allocation range overflow")?,
+                *address,
+                address
+                    .checked_add(u32::try_from(contents.len())?)
+                    .ok_or("initializer range overflow")?,
             ))
         })
         .collect::<Result<Vec<_>>>()?;
