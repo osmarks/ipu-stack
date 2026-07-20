@@ -113,7 +113,16 @@ fn main() {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
-    let max_error = verify(rows, columns, epsilon, &input, &gamma, &beta, &actual);
+    let max_error = verify(
+        rows,
+        columns,
+        epsilon,
+        &input,
+        &gamma,
+        &beta,
+        &actual,
+        &plan.output,
+    );
     assert!(
         max_error <= max_error_limit,
         "FP16 layer norm max error {max_error:.7} exceeds {max_error_limit:.7}"
@@ -163,13 +172,16 @@ fn row_binding(
 fn pack_rows(values: &[f16], columns: u16, shards: &[RowShardPlacement]) -> Vec<u8> {
     let mut bytes = Vec::new();
     for shard in shards {
-        let start = usize::from(shard.row_start) * usize::from(columns);
-        let end = start + usize::from(shard.rows) * usize::from(columns);
-        bytes.extend(
-            values[start..end]
-                .iter()
-                .flat_map(|value| value.to_bits().to_le_bytes()),
-        );
+        for linear in 0..shard.rows * columns {
+            let panel_elements = shard.rows * 16;
+            let panel = linear / panel_elements;
+            let panel_offset = linear % panel_elements;
+            let row = panel_offset / 16;
+            let column = panel * 16 + panel_offset % 16;
+            let index =
+                usize::from(shard.row_start + row) * usize::from(columns) + usize::from(column);
+            bytes.extend_from_slice(&values[index].to_bits().to_le_bytes());
+        }
     }
     bytes
 }
@@ -182,23 +194,32 @@ fn verify(
     gamma: &[f16],
     beta: &[f16],
     actual: &[u8],
+    shards: &[RowShardPlacement],
 ) -> f32 {
     let mut max_error = 0.0f32;
-    for row in 0..usize::from(rows) {
-        let values = &input[row * usize::from(columns)..(row + 1) * usize::from(columns)];
-        let mean = values.iter().map(|value| value.to_f32()).sum::<f32>() / f32::from(columns);
-        let variance = values
-            .iter()
-            .map(|value| (value.to_f32() - mean).powi(2))
-            .sum::<f32>()
-            / f32::from(columns);
-        let scale = (variance + epsilon).sqrt().recip();
-        for (column, value) in values.iter().enumerate() {
-            let expected =
-                (value.to_f32() - mean) * scale * gamma[column].to_f32() + beta[column].to_f32();
-            let index = row * usize::from(columns) + column;
+    let mut byte_offset = 0usize;
+    for shard in shards {
+        for linear in 0..shard.rows * columns {
+            let panel_elements = shard.rows * 16;
+            let panel = linear / panel_elements;
+            let panel_offset = linear % panel_elements;
+            let local_row = panel_offset / 16;
+            let column = panel * 16 + panel_offset % 16;
+            let row = shard.row_start + local_row;
+            let values = &input[usize::from(row) * usize::from(columns)
+                ..usize::from(row + 1) * usize::from(columns)];
+            let mean = values.iter().map(|value| value.to_f32()).sum::<f32>() / f32::from(columns);
+            let variance = values
+                .iter()
+                .map(|value| (value.to_f32() - mean).powi(2))
+                .sum::<f32>()
+                / f32::from(columns);
+            let expected = (values[usize::from(column)].to_f32() - mean)
+                * (variance + epsilon).sqrt().recip()
+                * gamma[usize::from(column)].to_f32()
+                + beta[usize::from(column)].to_f32();
             let observed = f16::from_bits(u16::from_le_bytes(
-                actual[index * 2..index * 2 + 2].try_into().unwrap(),
+                actual[byte_offset..byte_offset + 2].try_into().unwrap(),
             ))
             .to_f32();
             assert!(
@@ -206,8 +227,10 @@ fn verify(
                 "non-finite output at [{row}, {column}]"
             );
             max_error = max_error.max((observed - expected).abs());
+            byte_offset += 2;
         }
     }
+    assert_eq!(byte_offset, usize::from(rows) * usize::from(columns) * 2);
     max_error
 }
 

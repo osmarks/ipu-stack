@@ -41,7 +41,7 @@ pub fn plan_affine_layer_norm_f16(
     let epsilon_q30 = (epsilon * (1u64 << 30) as f32).round() as u32;
     if config.rows == 0
         || config.columns == 0
-        || !config.columns.is_multiple_of(2)
+        || !config.columns.is_multiple_of(16)
         || config.row_block_dimension == 0
         || config.tile_count == 0
         || config.data_base >= config.data_limit
@@ -51,7 +51,7 @@ pub fn plan_affine_layer_norm_f16(
         || epsilon_q30 >= 1 << 20
     {
         return Err(CompileError::Graph(
-            "FP16 affine layer norm requires nonzero dimensions, an even column count, tiles, and aligned SRAM".into(),
+            "FP16 affine layer norm requires nonzero dimensions, columns divisible by 16, tiles, and aligned SRAM".into(),
         ));
     }
 

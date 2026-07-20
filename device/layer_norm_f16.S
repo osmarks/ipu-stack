@@ -5,7 +5,7 @@
 
 	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
 	.set ENABLE_STOCHASTIC_ROUNDING, 1 << CSR_S_FP_ICTL__ESR__SHIFT
-	.set LAYER_NORM_WORKER_STACK_BYTES, 0x80
+	.set LAYER_NORM_WORKER_STACK_BYTES, 0x100
 
 	.globl __worker_stack_max_growth_plus_one
 	.set __worker_stack_max_growth_plus_one, LAYER_NORM_WORKER_STACK_BYTES + 1
