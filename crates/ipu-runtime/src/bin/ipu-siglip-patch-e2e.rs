@@ -4,8 +4,8 @@ use ipu_compiler::{
     FlashAttentionConfig, FlashAttentionPlan, GemmDataType, KernelCommand, OpId, Phase,
     RowShardPlacement, RowShardTransitionConfig, SpecializationKey, TensorId,
     append_affine_layer_norm_f16, append_blocked_gemm_f16_with_a16_input,
-    append_c16_to_a16_row_shards, append_flash_attention_from_a16_qkv, choose_gemm_row_block_for,
-    plan_blocked_gemm,
+    append_c16_to_a16_row_shards, append_flash_attention_from_a16_qkv,
+    append_flash_attention_to_a16_row_shards, choose_gemm_row_block_for, plan_blocked_gemm,
 };
 use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -229,6 +229,14 @@ fn main() {
         },
     )
     .unwrap();
+    let attention_output_base = resident_data_end(&plan.schedule);
+    let attention_shards = append_flash_attention_to_a16_row_shards(
+        &mut plan.schedule,
+        &attention,
+        attention_output_base,
+        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+    )
+    .unwrap();
     let objects = compile_objects(&plan, &attention).unwrap();
     let graph = ExecutableGraph {
         schedule: plan.schedule,
@@ -242,7 +250,12 @@ fn main() {
             block_binding_typed("qkv_weight", columns, columns * 3, &qkv.right, "f16", 2),
             block_binding_typed("qkv_bias", rows, columns * 3, &qkv_bias, "f16", 2),
         ],
-        host_outputs: vec![attention_output_binding(&attention)],
+        host_outputs: vec![row_shard_binding(
+            "attention_hidden",
+            rows,
+            columns,
+            &attention_shards,
+        )],
     };
     let app = package_graph(&graph, &objects).unwrap();
     let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
@@ -265,6 +278,18 @@ fn main() {
     let expected = reference
         .tensor_f32("encoder_layer_00_attention_heads")
         .unwrap();
+    let expected = attention_heads_to_hidden(
+        &expected,
+        usize::from(rows),
+        usize::from(attention.head_dimension),
+        usize::try_from(config.num_attention_heads).unwrap(),
+    );
+    let expected = serialize_a16_row_shards(
+        &expected,
+        usize::from(rows),
+        usize::from(columns),
+        &attention_shards,
+    );
     let max_error = verify_linear_f16(&actual, &expected);
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
     assert!(
@@ -445,6 +470,21 @@ fn compile_objects(
         "attention-pack-wrapper",
         &[],
     )?;
+    let unpack_codelet = toolchain.compile(
+        source("attention_unpack_f16.cpp"),
+        &artifacts,
+        "attention-unpack-codelet",
+        &[
+            "-O1".into(),
+            format!("-DATTENTION_HEAD_DIMENSION={}", attention.head_dimension),
+        ],
+    )?;
+    let unpack_wrapper = toolchain.compile(
+        source("attention_unpack_f16.S"),
+        &artifacts,
+        "attention-unpack-wrapper",
+        &[],
+    )?;
     let attention_codelet = toolchain.compile(
         source("flash_attention_f16.cpp"),
         &artifacts,
@@ -522,6 +562,8 @@ fn compile_objects(
         fs::read(norm_wrapper.object)?,
         fs::read(pack_codelet.object)?,
         fs::read(pack_wrapper.object)?,
+        fs::read(unpack_codelet.object)?,
+        fs::read(unpack_wrapper.object)?,
         fs::read(attention_codelet.object)?,
         fs::read(attention_wrapper.object)?,
         fs::read(attention_qk.object)?,
@@ -551,44 +593,6 @@ fn row_shard_binding(name: &str, rows: u16, columns: u16, shards: &[RowShardPlac
         name: name.into(),
         dtype: "f16".into(),
         shape: vec![u32::from(rows), u32::from(columns)],
-        slices,
-    }
-}
-
-fn attention_output_binding(plan: &FlashAttentionPlan) -> Binding {
-    let topology = ipu_exchange::Topology::c600();
-    let mut file_offset = 0u64;
-    let slices = plan
-        .tasks
-        .iter()
-        .map(|task| {
-            let size = u64::from(task.query_rows) * u64::from(plan.head_dimension) * 2;
-            let slice = RegionSlice {
-                tile: u32::from(topology.physical(task.tile).unwrap()),
-                tile_address: task.output_address,
-                file_offset,
-                size,
-            };
-            file_offset += size;
-            slice
-        })
-        .collect();
-    let heads = plan.tasks.iter().map(|task| task.head).max().unwrap() + 1;
-    let sequence = plan
-        .tasks
-        .iter()
-        .filter(|task| task.batch == 0 && task.head == 0)
-        .map(|task| task.query_rows)
-        .sum::<u16>();
-    Binding {
-        name: "attention_heads".into(),
-        dtype: "f16".into(),
-        shape: vec![
-            1,
-            u32::from(heads),
-            u32::from(sequence),
-            u32::from(plan.head_dimension),
-        ],
         slices,
     }
 }
@@ -624,6 +628,48 @@ fn verify_linear_f16(actual: &[u8], expected: &[f32]) -> f32 {
         max_error = max_error.max((observed - expected).abs());
     }
     max_error
+}
+
+fn attention_heads_to_hidden(
+    heads: &[f32],
+    rows: usize,
+    head_dimension: usize,
+    head_count: usize,
+) -> Vec<f32> {
+    assert_eq!(heads.len(), rows * head_dimension * head_count);
+    let mut hidden = vec![0.0; heads.len()];
+    for head in 0..head_count {
+        for row in 0..rows {
+            let source = (head * rows + row) * head_dimension;
+            let destination = row * head_count * head_dimension + head * head_dimension;
+            hidden[destination..destination + head_dimension]
+                .copy_from_slice(&heads[source..source + head_dimension]);
+        }
+    }
+    hidden
+}
+
+fn serialize_a16_row_shards(
+    values: &[f32],
+    rows: usize,
+    columns: usize,
+    shards: &[RowShardPlacement],
+) -> Vec<f32> {
+    assert_eq!(values.len(), rows * columns);
+    let mut serialized = Vec::with_capacity(values.len());
+    for shard in shards {
+        for panel in 0..usize::from(shard.columns) / 16 {
+            for row in 0..usize::from(shard.rows) {
+                for column in 0..16 {
+                    serialized.push(
+                        values
+                            [(usize::from(shard.row_start) + row) * columns + panel * 16 + column],
+                    );
+                }
+            }
+        }
+    }
+    serialized
 }
 
 fn resident_data_end(schedule: &ipu_compiler::Schedule) -> u32 {
