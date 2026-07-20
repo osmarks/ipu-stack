@@ -964,11 +964,10 @@ impl<'a> Loader<'a> {
             for slot in 0..TILES_PER_BATCH {
                 let tile = &app.tiles[first + slot];
                 let physical = tile.physical_tile;
-                if tile.segments.iter().map(|segment| segment.address).min()
-                    != Some(APPLICATION_LOAD_BASE)
-                {
+                let minimum_address = tile.segments.iter().map(|segment| segment.address).min();
+                if minimum_address != Some(APPLICATION_LOAD_BASE) {
                     return Err(DriverError::Invalid(format!(
-                        "tile {physical} does not begin at secondary-loader address 0x{APPLICATION_LOAD_BASE:x}"
+                        "tile {physical} begins at {minimum_address:?}, not secondary-loader address 0x{APPLICATION_LOAD_BASE:x}"
                     )));
                 }
                 let mut image = app.tile_image(physical)?;
