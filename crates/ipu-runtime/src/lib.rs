@@ -280,19 +280,6 @@ pub struct DiagnosticResults {
     pub bindings: BTreeMap<String, Vec<u32>>,
 }
 
-fn packed_addresses(base: u32, sizes: &[usize], alignment: u32) -> Result<(Vec<u32>, u32)> {
-    let mut addresses = Vec::with_capacity(sizes.len());
-    let mut cursor = base;
-    for &size in sizes {
-        cursor = align_up(cursor, alignment);
-        addresses.push(cursor);
-        cursor = cursor
-            .checked_add(u32::try_from(size)?)
-            .ok_or("packed runtime region overflow")?;
-    }
-    Ok((addresses, cursor))
-}
-
 fn allocate_low_runtime_range(
     schedule: &Schedule,
     size: u32,
@@ -1155,30 +1142,50 @@ fn package_graph_impl(
     }) {
         return Err("per-tile programs disagree on exchange launch count".into());
     }
-    let plan_sizes = (0..exchange_count)
-        .map(|index| {
-            programs
-                .iter()
-                .filter_map(|program| {
-                    program
-                        .steps
-                        .iter()
-                        .filter_map(|step| match step {
-                            ipu_compiler::LoweredTileStep::Exchange { row, .. } => Some(row.len()),
-                            _ => None,
-                        })
-                        .nth(index)
-                })
-                .max()
-                .unwrap_or(0)
-                .checked_mul(4)
-                .ok_or("exchange plan size overflow")
+    let tile_exchange_plans = programs
+        .iter()
+        .map(|program| -> Result<(Vec<u32>, u32)> {
+            let mut cursor = PLAN_BASE;
+            let mut unique = HashMap::<Vec<u32>, u32>::new();
+            let mut addresses = Vec::with_capacity(exchange_count);
+            for row in program.steps.iter().filter_map(|step| match step {
+                ipu_compiler::LoweredTileStep::Exchange { row, .. } => Some(row),
+                _ => None,
+            }) {
+                let address = if let Some(&address) = unique.get(row) {
+                    address
+                } else {
+                    cursor = align_up(cursor, 8);
+                    let address = cursor;
+                    cursor = cursor
+                        .checked_add(u32::try_from(row.len() * 4)?)
+                        .ok_or("exchange plan address overflow")?;
+                    unique.insert(row.clone(), address);
+                    address
+                };
+                addresses.push(address);
+            }
+            Ok((addresses, cursor))
         })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let (plan_addresses, plan_end) = packed_addresses(PLAN_BASE, &plan_sizes, 8)?;
+        .collect::<Result<Vec<_>>>()?;
     debug!(
-        plan_end = format_args!("0x{plan_end:x}"),
-        "packed device exchange plans"
+        minimum_plan_end = format_args!(
+            "0x{:x}",
+            tile_exchange_plans
+                .iter()
+                .map(|(_, end)| *end)
+                .min()
+                .unwrap_or(PLAN_BASE)
+        ),
+        maximum_plan_end = format_args!(
+            "0x{:x}",
+            tile_exchange_plans
+                .iter()
+                .map(|(_, end)| *end)
+                .max()
+                .unwrap_or(PLAN_BASE)
+        ),
+        "deduplicated device exchange plans"
     );
     let host = build_static_host_layout(graph)?;
     let host_transfers = host
@@ -1203,7 +1210,9 @@ fn package_graph_impl(
     }
     let tile_host_plans = programs
         .iter()
-        .map(|program| -> Result<TileHostPlans> {
+        .zip(&tile_exchange_plans)
+        .map(|(program, (_, plan_end))| -> Result<TileHostPlans> {
+            let plan_end = *plan_end;
             let physical = topology.physical(program.tile)?;
             let follower_address = align_up(plan_end, 8);
             let mut cursor = if host_transfers.is_empty() {
@@ -1314,7 +1323,7 @@ fn package_graph_impl(
                 .iter()
                 .map(|plans| plans.end)
                 .min()
-                .unwrap_or(plan_end)
+                .unwrap_or(PLAN_BASE)
         ),
         maximum_end = format_args!(
             "0x{:x}",
@@ -1322,7 +1331,7 @@ fn package_graph_impl(
                 .iter()
                 .map(|plans| plans.end)
                 .max()
-                .unwrap_or(plan_end)
+                .unwrap_or(PLAN_BASE)
         ),
         "packed host exchange plans"
     );
@@ -1426,7 +1435,7 @@ fn package_graph_impl(
         static_codegen::emit(
             program,
             symbols,
-            &plan_addresses,
+            &tile_exchange_plans[program_index].0,
             static_codegen::HostCode {
                 inputs: &host_inputs,
                 outputs: &host_outputs,
@@ -1657,12 +1666,15 @@ fn package_graph_impl(
 
         let plan_region_size = usize::try_from(host_plans.end - PLAN_BASE)?;
         let mut plan_region = vec![0; plan_region_size];
-        let mut exchange_index = 0usize;
-        for step in &program.steps {
+        for (step, &plan_address) in program
+            .steps
+            .iter()
+            .filter(|step| matches!(step, ipu_compiler::LoweredTileStep::Exchange { .. }))
+            .zip(&tile_exchange_plans[tile_index].0)
+        {
             if let ipu_compiler::LoweredTileStep::Exchange { row, .. } = step {
                 let bytes = words_to_bytes(row);
-                write_plan_bytes(&mut plan_region, plan_addresses[exchange_index], &bytes)?;
-                exchange_index += 1;
+                write_plan_bytes(&mut plan_region, plan_address, &bytes)?;
             }
         }
         write_static_host_plans(
