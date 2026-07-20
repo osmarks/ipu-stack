@@ -190,7 +190,7 @@ fn main() {
             qkv_weights[projection][output * usize::from(columns) + usize::from(row)]
         },
     ));
-    let qkv_bias = append_adjustment_phase(&mut plan.schedule, &qkv.output).unwrap();
+    let qkv_bias = append_bias_phase(&mut plan.schedule, &qkv.output).unwrap();
     host_input.extend(blocked_matrix_f16(
         &qkv_bias,
         BlockLayout::AmpC16F16,
@@ -271,7 +271,7 @@ fn main() {
         .tensor_f32("vision_model.encoder.layers.0.self_attn.out_proj.bias")
         .unwrap();
     let output_adjustment =
-        append_adjustment_phase(&mut plan.schedule, &output_projection.output).unwrap();
+        append_bias_phase(&mut plan.schedule, &output_projection.output).unwrap();
     host_input.extend(blocked_matrix_f16(
         &output_adjustment,
         BlockLayout::AmpC16F16,
@@ -354,7 +354,7 @@ fn main() {
     let mlp_up_bias = model
         .tensor_f32("vision_model.encoder.layers.0.mlp.fc1.bias")
         .unwrap();
-    let mlp_up_adjustment = append_adjustment_phase(&mut plan.schedule, &mlp_up.output).unwrap();
+    let mlp_up_adjustment = append_bias_phase(&mut plan.schedule, &mlp_up.output).unwrap();
     host_input.extend(blocked_matrix_f16(
         &mlp_up_adjustment,
         BlockLayout::AmpC16F16,
@@ -431,7 +431,14 @@ fn main() {
             block_binding_typed("position_bias", rows, columns, &adjustment, "f16", 2),
             row_shard_binding("layer_norm1_affine", 2, columns, &norm.affine),
             block_binding_typed("qkv_weight", columns, columns * 3, &qkv.right, "f16", 2),
-            block_binding_typed("qkv_bias", rows, columns * 3, &qkv_bias, "f16", 2),
+            block_binding_typed(
+                "qkv_bias",
+                u16::try_from(qkv_bias.len()).unwrap(),
+                BLOCK_DIMENSION,
+                &qkv_bias,
+                "f16",
+                2,
+            ),
             block_binding_typed(
                 "attention_output_weight",
                 columns,
@@ -442,8 +449,8 @@ fn main() {
             ),
             block_binding_typed(
                 "attention_output_bias",
-                rows,
-                columns,
+                u16::try_from(output_adjustment.len()).unwrap(),
+                BLOCK_DIMENSION,
                 &output_adjustment,
                 "f16",
                 2,
@@ -459,8 +466,8 @@ fn main() {
             ),
             block_binding_typed(
                 "mlp_up_bias",
-                rows,
-                intermediate_columns,
+                u16::try_from(mlp_up_adjustment.len()).unwrap(),
+                BLOCK_DIMENSION,
                 &mlp_up_adjustment,
                 "f16",
                 2,
