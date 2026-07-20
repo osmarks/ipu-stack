@@ -3,9 +3,10 @@ use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
     FlashAttentionConfig, FlashAttentionPlan, GemmDataType, KernelCommand, OpId, Phase,
     RowShardPlacement, RowShardTransitionConfig, SpecializationKey, TensorId,
-    append_affine_layer_norm_f16, append_blocked_gemm_f16_with_a16_input,
-    append_c16_to_a16_row_shards, append_flash_attention_from_a16_qkv,
-    append_flash_attention_to_a16_row_shards, choose_gemm_row_block_for, plan_blocked_gemm,
+    append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
+    append_blocked_gemm_f16_with_a16_input, append_c16_to_a16_row_shards,
+    append_flash_attention_from_a16_qkv, append_flash_attention_to_a16_row_shards,
+    choose_gemm_row_block_for, plan_blocked_gemm,
 };
 use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -237,6 +238,56 @@ fn main() {
         ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
     )
     .unwrap();
+    let output_projection_base = resident_data_end(&plan.schedule);
+    let output_projection = append_blocked_gemm_f16_with_a16_input(
+        &mut plan.schedule,
+        &attention_shards,
+        BlockedGemmConfig {
+            rows,
+            inner_dimension: columns,
+            columns,
+            block_dimension: BLOCK_DIMENSION,
+            inner_block_dimension: INNER_BLOCK_DIMENSION,
+            row_block_dimension,
+            tile_count: TILE_COUNT,
+            data_base: output_projection_base,
+            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            data_type: GemmDataType::F16,
+        },
+    )
+    .unwrap();
+    let output_weight = model
+        .tensor_f32("vision_model.encoder.layers.0.self_attn.out_proj.weight")
+        .unwrap();
+    host_input.extend(blocked_matrix_f16(
+        &output_projection.right,
+        BlockLayout::AmpB16x16,
+        |row, column| output_weight[usize::from(column) * usize::from(columns) + usize::from(row)],
+    ));
+    let output_bias = model
+        .tensor_f32("vision_model.encoder.layers.0.self_attn.out_proj.bias")
+        .unwrap();
+    let output_adjustment =
+        append_adjustment_phase(&mut plan.schedule, &output_projection.output).unwrap();
+    host_input.extend(blocked_matrix_f16(
+        &output_adjustment,
+        BlockLayout::AmpC16F16,
+        |_row, column| output_bias[usize::from(column)],
+    ));
+    let projected_shards_base = resident_data_end(&plan.schedule);
+    let projected_shards = append_c16_to_a16_row_shards(
+        &mut plan.schedule,
+        &output_projection.output,
+        RowShardTransitionConfig {
+            columns,
+            data_base: projected_shards_base,
+            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        },
+    )
+    .unwrap();
+    let attention_residual =
+        append_add_f16_row_shards_in_place(&mut plan.schedule, &projected_shards, &row_shards)
+            .unwrap();
     let objects = compile_objects(&plan, &attention).unwrap();
     let graph = ExecutableGraph {
         schedule: plan.schedule,
@@ -249,12 +300,28 @@ fn main() {
             row_shard_binding("layer_norm1_affine", 2, columns, &norm.affine),
             block_binding_typed("qkv_weight", columns, columns * 3, &qkv.right, "f16", 2),
             block_binding_typed("qkv_bias", rows, columns * 3, &qkv_bias, "f16", 2),
+            block_binding_typed(
+                "attention_output_weight",
+                columns,
+                columns,
+                &output_projection.right,
+                "f16",
+                2,
+            ),
+            block_binding_typed(
+                "attention_output_bias",
+                rows,
+                columns,
+                &output_adjustment,
+                "f16",
+                2,
+            ),
         ],
         host_outputs: vec![row_shard_binding(
-            "attention_hidden",
+            "attention_residual",
             rows,
             columns,
-            &attention_shards,
+            &attention_residual,
         )],
     };
     let app = package_graph(&graph, &objects).unwrap();
@@ -276,19 +343,13 @@ fn main() {
     )
     .unwrap();
     let expected = reference
-        .tensor_f32("encoder_layer_00_attention_heads")
+        .tensor_f32("encoder_layer_00_attention_residual")
         .unwrap();
-    let expected = attention_heads_to_hidden(
-        &expected,
-        usize::from(rows),
-        usize::from(attention.head_dimension),
-        usize::try_from(config.num_attention_heads).unwrap(),
-    );
     let expected = serialize_a16_row_shards(
         &expected,
         usize::from(rows),
         usize::from(columns),
-        &attention_shards,
+        &attention_residual,
     );
     let max_error = verify_linear_f16(&actual, &expected);
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
@@ -306,7 +367,7 @@ fn main() {
         columns,
         row_block_dimension,
         max_error,
-        "SigLIP embedding, QKV, and FlashAttention passed against Hugging Face"
+        "SigLIP layer 0 attention and residual passed against Hugging Face"
     );
 }
 
@@ -628,25 +689,6 @@ fn verify_linear_f16(actual: &[u8], expected: &[f32]) -> f32 {
         max_error = max_error.max((observed - expected).abs());
     }
     max_error
-}
-
-fn attention_heads_to_hidden(
-    heads: &[f32],
-    rows: usize,
-    head_dimension: usize,
-    head_count: usize,
-) -> Vec<f32> {
-    assert_eq!(heads.len(), rows * head_dimension * head_count);
-    let mut hidden = vec![0.0; heads.len()];
-    for head in 0..head_count {
-        for row in 0..rows {
-            let source = (head * rows + row) * head_dimension;
-            let destination = row * head_count * head_dimension + head * head_dimension;
-            hidden[destination..destination + head_dimension]
-                .copy_from_slice(&heads[source..source + head_dimension]);
-        }
-    }
-    hidden
 }
 
 fn serialize_a16_row_shards(

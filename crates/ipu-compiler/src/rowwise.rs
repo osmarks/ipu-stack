@@ -54,6 +54,89 @@ pub struct RowShardTransitionConfig {
     pub data_limit: u32,
 }
 
+pub fn append_add_f16_row_shards_in_place(
+    schedule: &mut Schedule,
+    destination: &[RowShardPlacement],
+    source: &[RowShardPlacement],
+) -> Result<Vec<RowShardPlacement>, CompileError> {
+    if destination.is_empty() || destination.len() != source.len() {
+        return Err(CompileError::Graph(
+            "row-sharded add requires matching non-empty inputs".into(),
+        ));
+    }
+    let exchange_phase = schedule.phases.len();
+    let compute_phase = exchange_phase + 1;
+    let mut transfers = Vec::new();
+    let mut commands = Vec::with_capacity(destination.len());
+    for destination in destination {
+        let source = source
+            .iter()
+            .find(|source| {
+                source.row_start == destination.row_start && source.rows == destination.rows
+            })
+            .ok_or_else(|| CompileError::Graph("row-sharded add source is missing".into()))?;
+        if source.columns != destination.columns || destination.columns % 2 != 0 {
+            return Err(CompileError::Graph(
+                "row-sharded add inputs have incompatible columns".into(),
+            ));
+        }
+        let bytes = u32::from(destination.rows) * u32::from(destination.columns) * 2;
+        if source.tile != destination.tile {
+            if bytes > ipu_exchange::EXCHANGE_WINDOW_BYTES {
+                return Err(CompileError::Graph(
+                    "row-sharded add source exceeds the exchange window".into(),
+                ));
+            }
+            transfers.push(Transfer {
+                source_tile: source.tile,
+                destination_tile: destination.tile,
+                tensor: source.tensor,
+                bytes,
+            });
+            schedule.allocations.push(Allocation {
+                tensor: source.tensor,
+                tile: destination.tile,
+                address: ipu_exchange::EXCHANGE_WINDOW_BASE,
+                size: bytes,
+                live_from: exchange_phase,
+                live_until: compute_phase,
+                kind: AllocationKind::ExchangeStaging {
+                    phase: exchange_phase,
+                },
+            });
+        }
+        let units = bytes / 4;
+        commands.push(KernelCommand {
+            tile: destination.tile,
+            output: destination.tensor,
+            inputs: vec![destination.tensor, source.tensor],
+            arguments: vec![units, units / 6, units % 6],
+            specialization: SpecializationKey {
+                operation: "add_f16".into(),
+                shape: vec![
+                    usize::from(destination.rows),
+                    usize::from(destination.columns),
+                ],
+                worker_count: 6,
+                role: "row-sharded-residual".into(),
+                alignment: 4,
+            },
+            metadata: BTreeMap::from([
+                ("label".into(), "row-sharded residual add".into()),
+                ("row_start".into(), destination.row_start.to_string()),
+                ("rows".into(), destination.rows.to_string()),
+                ("columns".into(), destination.columns.to_string()),
+            ]),
+        });
+    }
+    schedule.phases.push(Phase::Exchange { transfers });
+    schedule.phases.push(Phase::Compute {
+        op: OpId(compute_phase),
+        commands,
+    });
+    Ok(destination.to_vec())
+}
+
 pub fn append_c16_to_a16_row_shards(
     schedule: &mut Schedule,
     source: &[BlockPlacement],
@@ -437,5 +520,39 @@ mod tests {
         assert_eq!(plan.input.iter().map(|shard| shard.rows).sum::<u16>(), 729);
         assert_eq!(plan.input.last().unwrap().rows, 9);
         assert!(plan.output.iter().all(|shard| shard.address & 7 == 0));
+    }
+
+    #[test]
+    fn row_sharded_add_stages_only_remote_sources() {
+        let shard = |tile, row_start, tensor| RowShardPlacement {
+            tile,
+            row_start,
+            rows: 4,
+            columns: 16,
+            tensor: TensorId(tensor),
+            address: 0x90000,
+        };
+        let destination = vec![shard(0, 0, 0), shard(1, 4, 1)];
+        let source = vec![shard(0, 0, 2), shard(2, 4, 3)];
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: Vec::new(),
+            tile_count: 3,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let output =
+            append_add_f16_row_shards_in_place(&mut schedule, &destination, &source).unwrap();
+
+        assert_eq!(output, destination);
+        assert!(matches!(
+            &schedule.phases[0],
+            Phase::Exchange { transfers } if transfers.len() == 1
+        ));
+        assert!(matches!(
+            &schedule.phases[1],
+            Phase::Compute { commands, .. } if commands.len() == destination.len()
+        ));
     }
 }

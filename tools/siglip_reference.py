@@ -152,6 +152,15 @@ def main() -> None:
             .detach()
             .clone()
         )
+        attention_hidden = (
+            tensors["encoder_layer_00_attention_heads"]
+            .transpose(1, 2)
+            .reshape(args.batch_size, -1, vision.hidden_size)
+        )
+        tensors["encoder_layer_00_attention_residual"] = (
+            tensors["patch_and_position"]
+            + first_layer.self_attn.out_proj(attention_hidden)
+        ).detach().clone()
     tensors["last_hidden_state"] = output.last_hidden_state
     tensors["pooler_output"] = output.pooler_output
 
