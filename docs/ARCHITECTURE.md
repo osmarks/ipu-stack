@@ -36,6 +36,28 @@ Kernel artifacts stay reusable and independent of the final tile and device
 images. Content-addressed package blobs deduplicate identical linked sections
 and generated instruction streams.
 
+## Tile-memory placement
+
+The compiler distinguishes placement lifetime from instruction-specific memory
+requirements. `MemoryPolicy` contains ordered resident arenas for model
+parameters and ordered transient arenas for activations and ordinary scratch.
+An allocation may spill to a later arena but never spans an arena boundary.
+Resident placement is checked against every allocation in the complete schedule
+because parameters are loaded before execution and remain live throughout it;
+transient placement only considers overlapping phase lifetimes.
+
+FP16 GEMM B blocks use ordinary 64-bit loads and do not require interleaved
+SRAM. The AMP accumulator/output block still uses paired PACE accesses and is
+fixed in the IPU21 interleaved element. Kernel-fixed allocations are included
+in policy placement, so resident data may use otherwise-free interleaved space
+without overlapping active AMP scratch.
+
+The SigLIP runner defaults to placing resident data high-to-low and transient
+data in low ordinary SRAM, then interleaved SRAM, then high ordinary SRAM.
+`IPU_SIGLIP_RESIDENT_ARENAS` and `IPU_SIGLIP_TRANSIENT_ARENAS` accept ordered
+comma-separated `base..limit` address ranges for placement experiments. These
+controls change allocation preference, not kernel memory semantics.
+
 ## Migration boundary
 
 `LoweredTileProgram` and the exchange scheduler implement the compile-time
