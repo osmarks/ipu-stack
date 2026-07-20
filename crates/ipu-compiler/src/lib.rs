@@ -21,6 +21,7 @@ pub use rowwise::{
     AffineLayerNormConfig, AffineLayerNormPlan, AppendAffineLayerNormConfig,
     AppendedAffineLayerNorm, RowShardPlacement, RowShardTransitionConfig,
     append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
+    append_affine_layer_norm_f16_in_arenas, append_affine_layer_norm_f16_with_memory_policy,
     append_c16_to_a16_blocks_gelu_f16, append_c16_to_a16_row_shards,
     append_c16_to_a16_row_shards_gelu_f16, end_tensor_lifetimes, make_tensors_resident,
     plan_affine_layer_norm_f16,
@@ -396,6 +397,46 @@ pub enum MemoryPlacement {
     High,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryArena {
+    /// Inclusive first address available for ordinary tensors.
+    pub base: u32,
+    /// Exclusive end address. Allocations never span arena boundaries.
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryPolicy {
+    /// Ordered arenas for long-lived tensors. Earlier arenas are preferred.
+    pub resident: Vec<MemoryArena>,
+    /// Ordered arenas for short-lived activations and ordinary kernel scratch.
+    pub transient: Vec<MemoryArena>,
+}
+
+impl MemoryPolicy {
+    pub fn contiguous(base: u32, limit: u32) -> Self {
+        let arena = MemoryArena { base, limit };
+        Self {
+            resident: vec![arena],
+            transient: vec![arena],
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), CompileError> {
+        if self.resident.is_empty()
+            || self.transient.is_empty()
+            || self
+                .resident
+                .iter()
+                .chain(&self.transient)
+                .any(|arena| arena.base >= arena.limit)
+        {
+            return Err(CompileError::Memory("invalid tile-memory policy".into()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryConstraint {
     /// Inclusive first byte available for allocation.
@@ -492,6 +533,52 @@ pub fn find_free_region(
     )))
 }
 
+pub fn find_free_region_in_arenas(
+    allocations: &[Allocation],
+    tile: u16,
+    size: u32,
+    live_from: usize,
+    live_until: usize,
+    arenas: &[MemoryArena],
+    alignment: u32,
+    placement: MemoryPlacement,
+) -> Result<u32, CompileError> {
+    let base = arenas
+        .iter()
+        .map(|arena| arena.base)
+        .min()
+        .ok_or_else(|| CompileError::Memory("allocation requires an SRAM arena".into()))?;
+    let limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
+    let mut intervals = allocations
+        .iter()
+        .filter(|allocation| {
+            allocation.tile == tile
+                && live_from < allocation.live_until
+                && allocation.live_from < live_until
+        })
+        .filter_map(|allocation| {
+            let start = allocation.address.max(base);
+            let end = allocation
+                .address
+                .saturating_add(allocation.size)
+                .min(limit);
+            (start < end).then_some((start, end))
+        })
+        .collect::<Vec<_>>();
+    intervals.sort_unstable();
+    let mut occupied = Vec::<(u32, u32)>::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        if let Some(previous) = occupied.last_mut()
+            && start <= previous.1
+        {
+            previous.1 = previous.1.max(end);
+        } else {
+            occupied.push((start, end));
+        }
+    }
+    allocate_from_occupied_arenas(&mut occupied, size, arenas, alignment, placement)
+}
+
 pub(crate) fn allocate_from_occupied(
     occupied: &mut Vec<(u32, u32)>,
     size: u32,
@@ -553,6 +640,54 @@ pub(crate) fn allocate_from_occupied(
     Ok(address)
 }
 
+pub(crate) fn allocate_from_occupied_arenas(
+    occupied: &mut Vec<(u32, u32)>,
+    size: u32,
+    arenas: &[MemoryArena],
+    alignment: u32,
+    placement: MemoryPlacement,
+) -> Result<u32, CompileError> {
+    if size == 0
+        || arenas.is_empty()
+        || !alignment.is_power_of_two()
+        || arenas.iter().any(|arena| arena.base >= arena.limit)
+    {
+        return Err(CompileError::Memory("invalid SRAM arena allocation".into()));
+    }
+    for arena in arenas {
+        let mut arena_occupied = occupied
+            .iter()
+            .filter_map(|&(start, end)| {
+                let start = start.max(arena.base);
+                let end = end.min(arena.limit);
+                (start < end).then_some((start, end))
+            })
+            .collect::<Vec<_>>();
+        let address = allocate_from_occupied(
+            &mut arena_occupied,
+            size,
+            MemoryConstraint {
+                base: arena.base,
+                limit: arena.limit,
+                alignment,
+                placement,
+            },
+        );
+        let Ok(address) = address else {
+            continue;
+        };
+        let end = address
+            .checked_add(size)
+            .ok_or_else(|| CompileError::Memory("SRAM arena allocation overflow".into()))?;
+        let insertion = occupied.partition_point(|&(start, _)| start < address);
+        occupied.insert(insertion, (address, end));
+        return Ok(address);
+    }
+    Err(CompileError::Memory(format!(
+        "no arena can hold a {size}-byte SRAM allocation"
+    )))
+}
+
 pub(crate) fn occupied_intervals_by_tile(
     allocations: &[Allocation],
     tile_count: u16,
@@ -590,6 +725,23 @@ pub(crate) fn occupied_intervals_by_tile(
         *intervals = merged;
     }
     occupied
+}
+
+fn merge_occupied_intervals(occupied: &mut [Vec<(u32, u32)>]) {
+    for intervals in occupied {
+        intervals.sort_unstable();
+        let mut merged = Vec::<(u32, u32)>::with_capacity(intervals.len());
+        for &(start, end) in intervals.iter() {
+            if let Some(previous) = merged.last_mut()
+                && start <= previous.1
+            {
+                previous.1 = previous.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        *intervals = merged;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -670,6 +822,23 @@ pub fn append_bias_f16_c16(
     data_base: u32,
     data_limit: u32,
 ) -> Result<Vec<BlockPlacement>, CompileError> {
+    append_bias_f16_c16_in_arenas(
+        schedule,
+        output,
+        &[MemoryArena {
+            base: data_base,
+            limit: data_limit,
+        }],
+    )
+}
+
+pub fn append_bias_f16_c16_in_arenas(
+    schedule: &mut Schedule,
+    output: &[BlockPlacement],
+    arenas: &[MemoryArena],
+) -> Result<Vec<BlockPlacement>, CompileError> {
+    let data_base = arenas.iter().map(|arena| arena.base).min().unwrap_or(0);
+    let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap_or(0);
     if output.is_empty()
         || data_base & 7 != 0
         || data_base >= data_limit
@@ -695,18 +864,15 @@ pub fn append_bias_f16_c16(
             .find(|block| block.block_column == block_column)
             .ok_or_else(|| CompileError::Graph("C16 output has a missing column block".into()))?;
         let size = u32::from(owner.columns) * 2;
-        let address = find_free_region(
+        let address = find_free_region_in_arenas(
             &schedule.allocations,
             owner.tile,
             size,
             0,
-            compute_phase,
-            MemoryConstraint {
-                base: data_base,
-                limit: data_limit,
-                alignment: 8,
-                placement: MemoryPlacement::Low,
-            },
+            usize::MAX,
+            arenas,
+            8,
+            MemoryPlacement::Low,
         )?;
         let bias = BlockPlacement {
             tensor: TensorId(next_tensor),
@@ -722,7 +888,7 @@ pub fn append_bias_f16_c16(
             address,
             size,
             live_from: 0,
-            live_until: compute_phase,
+            live_until: usize::MAX,
             kind: AllocationKind::Home,
         });
         biases.push(bias);
@@ -806,12 +972,46 @@ pub fn append_blocked_gemm_f16_with_a16_input(
     input: &[RowShardPlacement],
     config: BlockedGemmConfig,
 ) -> Result<AppendedBlockedGemm, CompileError> {
+    let arenas = [MemoryArena {
+        base: config.data_base,
+        limit: config.data_limit,
+    }];
+    append_blocked_gemm_f16_with_a16_input_in_arenas(schedule, input, config, &arenas)
+}
+
+pub fn append_blocked_gemm_f16_with_a16_input_in_arenas(
+    schedule: &mut Schedule,
+    input: &[RowShardPlacement],
+    config: BlockedGemmConfig,
+    arenas: &[MemoryArena],
+) -> Result<AppendedBlockedGemm, CompileError> {
+    append_blocked_gemm_f16_with_a16_input_with_memory_policy(
+        schedule,
+        input,
+        config,
+        &MemoryPolicy {
+            resident: arenas.to_vec(),
+            transient: vec![MemoryArena {
+                base: config.data_base,
+                limit: config.data_limit,
+            }],
+        },
+    )
+}
+
+pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
+    schedule: &mut Schedule,
+    input: &[RowShardPlacement],
+    config: BlockedGemmConfig,
+    memory: &MemoryPolicy,
+) -> Result<AppendedBlockedGemm, CompileError> {
     if config.data_type != GemmDataType::F16 {
         return Err(CompileError::Graph(
             "A16 composition requires an FP16 GEMM".into(),
         ));
     }
-    let mut plan = plan_appended_blocked_gemm(schedule, config)?;
+    memory.validate()?;
+    let mut plan = plan_appended_blocked_gemm_with_memory_policy(schedule, config, memory)?;
     let tensor_base = schedule
         .allocations
         .iter()
@@ -944,12 +1144,46 @@ pub fn append_blocked_gemm_f16_with_a16_blocks(
     input: &[BlockPlacement],
     config: BlockedGemmConfig,
 ) -> Result<AppendedBlockedGemm, CompileError> {
+    let arenas = [MemoryArena {
+        base: config.data_base,
+        limit: config.data_limit,
+    }];
+    append_blocked_gemm_f16_with_a16_blocks_in_arenas(schedule, input, config, &arenas)
+}
+
+pub fn append_blocked_gemm_f16_with_a16_blocks_in_arenas(
+    schedule: &mut Schedule,
+    input: &[BlockPlacement],
+    config: BlockedGemmConfig,
+    arenas: &[MemoryArena],
+) -> Result<AppendedBlockedGemm, CompileError> {
+    append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
+        schedule,
+        input,
+        config,
+        &MemoryPolicy {
+            resident: arenas.to_vec(),
+            transient: vec![MemoryArena {
+                base: config.data_base,
+                limit: config.data_limit,
+            }],
+        },
+    )
+}
+
+pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
+    schedule: &mut Schedule,
+    input: &[BlockPlacement],
+    config: BlockedGemmConfig,
+    memory: &MemoryPolicy,
+) -> Result<AppendedBlockedGemm, CompileError> {
     if config.data_type != GemmDataType::F16 {
         return Err(CompileError::Graph(
             "A16 block composition requires an FP16 GEMM".into(),
         ));
     }
-    let mut plan = plan_appended_blocked_gemm(schedule, config)?;
+    memory.validate()?;
+    let mut plan = plan_appended_blocked_gemm_with_memory_policy(schedule, config, memory)?;
     let tensor_base = schedule
         .allocations
         .iter()
@@ -1094,12 +1328,14 @@ fn set_appended_gemm_left_start(
     }
 }
 
-fn plan_appended_blocked_gemm(
+fn plan_appended_blocked_gemm_with_memory_policy(
     parent: &Schedule,
     config: BlockedGemmConfig,
+    memory: &MemoryPolicy,
 ) -> Result<BlockedGemmPlan, CompileError> {
     let mut plan = plan_blocked_gemm(config)?;
-    let tile_rotation = choose_resident_tile_rotation(parent, &plan.schedule, config.data_base);
+    let tile_rotation =
+        choose_resident_tile_rotation_in_arenas(parent, &plan.schedule, &memory.resident);
     rotate_gemm_plan_tiles(&mut plan, tile_rotation)?;
     let mut regions = plan
         .left
@@ -1112,6 +1348,7 @@ fn plan_appended_blocked_gemm(
                 placement.address,
                 u32::from(placement.rows) * u32::from(placement.columns) * 2,
                 MemoryPlacement::Low,
+                false,
             )
         })
         .collect::<Vec<_>>();
@@ -1122,29 +1359,92 @@ fn plan_appended_blocked_gemm(
             placement.address,
             u32::from(placement.rows) * u32::from(placement.columns) * 2,
             MemoryPlacement::High,
+            true,
         )
     }));
-    regions.sort_unstable_by_key(|&(_, _, _, size, _)| std::cmp::Reverse(size));
-    let mut occupied = occupied_intervals_by_tile(
+    regions.sort_unstable_by_key(|&(_, _, _, size, _, _)| std::cmp::Reverse(size));
+    let arena_base = memory
+        .resident
+        .iter()
+        .chain(&memory.transient)
+        .map(|arena| arena.base)
+        .min()
+        .ok_or_else(|| {
+            CompileError::Memory("appended GEMM requires at least one SRAM arena".into())
+        })?;
+    let arena_limit = memory
+        .resident
+        .iter()
+        .chain(&memory.transient)
+        .map(|arena| arena.limit)
+        .max()
+        .unwrap();
+    let mut occupied_current = occupied_intervals_by_tile(
         &parent.allocations,
         parent.tile_count,
         parent.phases.len(),
         usize::MAX,
-        config.data_base,
-        config.data_limit,
+        arena_base,
+        arena_limit,
     );
+    let mut occupied_all = occupied_intervals_by_tile(
+        &parent.allocations,
+        parent.tile_count,
+        0,
+        usize::MAX,
+        arena_base,
+        arena_limit,
+    );
+    let movable = regions
+        .iter()
+        .map(|&(tensor, ..)| tensor)
+        .collect::<HashSet<_>>();
+    for allocation in &plan.schedule.allocations {
+        if allocation.kind != AllocationKind::Home || movable.contains(&allocation.tensor) {
+            continue;
+        }
+        let start = allocation.address.max(arena_base);
+        let end = allocation
+            .address
+            .saturating_add(allocation.size)
+            .min(arena_limit);
+        if start < end {
+            occupied_current[usize::from(allocation.tile)].push((start, end));
+            occupied_all[usize::from(allocation.tile)].push((start, end));
+        }
+    }
+    merge_occupied_intervals(&mut occupied_current);
+    merge_occupied_intervals(&mut occupied_all);
     let mut relocated = HashMap::<TensorId, u32>::new();
-    for &(tensor, tile, _old_address, size, placement) in &regions {
-        let address = allocate_from_occupied(
+    for &(tensor, tile, _old_address, size, placement, resident) in &regions {
+        let allocation_arenas = if resident {
+            &memory.resident
+        } else {
+            &memory.transient
+        };
+        let occupied = if resident {
+            &mut occupied_all
+        } else {
+            &mut occupied_current
+        };
+        let address = allocate_from_occupied_arenas(
             &mut occupied[usize::from(tile)],
             size,
-            MemoryConstraint {
-                base: config.data_base,
-                limit: config.data_limit,
-                alignment: 32,
-                placement,
-            },
+            allocation_arenas,
+            32,
+            placement,
         )?;
+        let end = address.checked_add(size).ok_or_else(|| {
+            CompileError::Memory("appended GEMM allocation address overflow".into())
+        })?;
+        let other = if resident {
+            &mut occupied_current
+        } else {
+            &mut occupied_all
+        };
+        let intervals = &mut other[usize::from(tile)];
+        let insertion = intervals.partition_point(|&(start, _)| start < address);
+        intervals.insert(insertion, (address, end));
         relocated.insert(tensor, address);
     }
     for placement in plan
@@ -1174,7 +1474,11 @@ fn plan_appended_blocked_gemm(
     Ok(plan)
 }
 
-fn choose_resident_tile_rotation(parent: &Schedule, child: &Schedule, data_base: u32) -> u16 {
+fn choose_resident_tile_rotation_in_arenas(
+    parent: &Schedule,
+    child: &Schedule,
+    arenas: &[MemoryArena],
+) -> u16 {
     let tile_count = usize::from(parent.tile_count);
     if tile_count == 0 {
         return 0;
@@ -1182,7 +1486,11 @@ fn choose_resident_tile_rotation(parent: &Schedule, child: &Schedule, data_base:
     let resident_bytes = |schedule: &Schedule| {
         let mut bytes = vec![0u64; tile_count];
         for allocation in &schedule.allocations {
-            if allocation.kind == AllocationKind::Home && allocation.address >= data_base {
+            if allocation.kind == AllocationKind::Home
+                && arenas.iter().any(|arena| {
+                    allocation.address >= arena.base && allocation.address < arena.limit
+                })
+            {
                 bytes[usize::from(allocation.tile)] += u64::from(allocation.size);
             }
         }
@@ -2530,14 +2838,6 @@ pub struct CompilerOptions {
     pub data_arenas: Vec<MemoryArena>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryArena {
-    /// Inclusive first address available for ordinary tensors.
-    pub base: u32,
-    /// Exclusive end address. Allocations never span arena boundaries.
-    pub limit: u32,
-}
-
 impl Default for CompilerOptions {
     fn default() -> Self {
         Self {
@@ -3361,56 +3661,17 @@ mod tests {
         let parent = schedule(vec![allocation(0, 0, 128)]);
         let child = schedule(vec![allocation(1, 0, 64), allocation(2, 1, 64)]);
 
-        let rotation = choose_resident_tile_rotation(&parent, &child, 0xa0000);
+        let rotation = choose_resident_tile_rotation_in_arenas(
+            &parent,
+            &child,
+            &[MemoryArena {
+                base: 0xa0000,
+                limit: 0xe8000,
+            }],
+        );
 
         assert_ne!(rotation, 0);
         assert_ne!(rotation, 3);
-    }
-
-    #[test]
-    fn appended_gemm_ignores_allocations_dead_before_its_first_phase() {
-        let parent = Schedule {
-            layouts: Vec::new(),
-            phases: vec![Phase::Compute {
-                op: OpId(0),
-                commands: Vec::new(),
-            }],
-            allocations: (0..4)
-                .map(|tile| Allocation {
-                    tensor: TensorId(usize::from(tile)),
-                    tile,
-                    address: 0xa0000,
-                    size: 0x48000,
-                    live_from: 0,
-                    live_until: 1,
-                    kind: AllocationKind::Home,
-                })
-                .collect(),
-            tile_count: 4,
-            peak_sram: BTreeMap::new(),
-        };
-        let config = BlockedGemmConfig {
-            rows: 64,
-            inner_dimension: 64,
-            columns: 64,
-            block_dimension: 64,
-            inner_block_dimension: 64,
-            row_block_dimension: 64,
-            tile_count: 4,
-            data_base: 0xa0000,
-            data_limit: 0xe8000,
-            data_type: GemmDataType::F16,
-        };
-
-        let appended = plan_appended_blocked_gemm(&parent, config).unwrap();
-
-        assert!(
-            appended
-                .right
-                .iter()
-                .chain(&appended.output)
-                .all(|block| (config.data_base..config.data_limit).contains(&block.address))
-        );
     }
 
     #[test]
@@ -3967,6 +4228,76 @@ mod tests {
         }];
 
         assert!(find_free_region(&allocations, 7, 32, 4, 6, constraint).is_err());
+    }
+
+    #[test]
+    fn occupied_allocator_spills_without_crossing_arena_boundaries() {
+        let arenas = [
+            MemoryArena {
+                base: 0x1000,
+                limit: 0x1040,
+            },
+            MemoryArena {
+                base: 0x2000,
+                limit: 0x2080,
+            },
+        ];
+        let mut occupied = vec![(arenas[0].base, arenas[0].limit)];
+        let size = 32;
+        let address =
+            allocate_from_occupied_arenas(&mut occupied, size, &arenas, 16, MemoryPlacement::Low)
+                .unwrap();
+
+        assert_eq!(address % 16, 0);
+        assert!(
+            arenas
+                .iter()
+                .any(|arena| address >= arena.base && address + size <= arena.limit)
+        );
+        assert!(occupied.windows(2).all(|pair| pair[0].1 <= pair[1].0));
+    }
+
+    #[test]
+    fn resident_allocation_does_not_reuse_expired_transient_storage() {
+        let arena = MemoryArena {
+            base: 0x1000,
+            limit: 0x1100,
+        };
+        let expired = Allocation {
+            tensor: TensorId(1),
+            tile: 0,
+            address: arena.base,
+            size: 64,
+            live_from: 0,
+            live_until: 1,
+            kind: AllocationKind::Home,
+        };
+
+        let transient = find_free_region_in_arenas(
+            std::slice::from_ref(&expired),
+            0,
+            64,
+            1,
+            2,
+            &[arena],
+            16,
+            MemoryPlacement::Low,
+        )
+        .unwrap();
+        let resident = find_free_region_in_arenas(
+            &[expired],
+            0,
+            64,
+            0,
+            usize::MAX,
+            &[arena],
+            16,
+            MemoryPlacement::Low,
+        )
+        .unwrap();
+
+        assert_eq!(transient, arena.base);
+        assert_ne!(resident, transient);
     }
 
     #[test]

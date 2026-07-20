@@ -1,7 +1,8 @@
 use crate::{
-    Allocation, AllocationKind, BlockPlacement, CompileError, KernelCommand, MemoryConstraint,
-    MemoryPlacement, OpId, Phase, Schedule, SpecializationKey, TensorId, Transfer,
-    allocate_from_occupied, find_free_region, occupied_intervals_by_tile,
+    Allocation, AllocationKind, BlockPlacement, CompileError, KernelCommand, MemoryArena,
+    MemoryConstraint, MemoryPlacement, MemoryPolicy, OpId, Phase, Schedule, SpecializationKey,
+    TensorId, Transfer, allocate_from_occupied, allocate_from_occupied_arenas,
+    find_free_region_in_arenas, occupied_intervals_by_tile,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -627,6 +628,44 @@ pub fn append_affine_layer_norm_f16(
     input: &[RowShardPlacement],
     config: AppendAffineLayerNormConfig,
 ) -> Result<AppendedAffineLayerNorm, CompileError> {
+    append_affine_layer_norm_f16_in_arenas(
+        schedule,
+        input,
+        config,
+        &[MemoryArena {
+            base: config.data_base,
+            limit: config.data_limit,
+        }],
+    )
+}
+
+pub fn append_affine_layer_norm_f16_in_arenas(
+    schedule: &mut Schedule,
+    input: &[RowShardPlacement],
+    config: AppendAffineLayerNormConfig,
+    affine_arenas: &[MemoryArena],
+) -> Result<AppendedAffineLayerNorm, CompileError> {
+    append_affine_layer_norm_f16_with_memory_policy(
+        schedule,
+        input,
+        config,
+        &MemoryPolicy {
+            resident: affine_arenas.to_vec(),
+            transient: vec![MemoryArena {
+                base: config.data_base,
+                limit: config.data_limit,
+            }],
+        },
+    )
+}
+
+pub fn append_affine_layer_norm_f16_with_memory_policy(
+    schedule: &mut Schedule,
+    input: &[RowShardPlacement],
+    config: AppendAffineLayerNormConfig,
+    memory: &MemoryPolicy,
+) -> Result<AppendedAffineLayerNorm, CompileError> {
+    memory.validate()?;
     let epsilon = f32::from_bits(config.epsilon_bits);
     let epsilon_q30 = (epsilon * (1u64 << 30) as f32).round() as u32;
     let columns = input.first().map(|shard| shard.columns).unwrap_or(0);
@@ -665,7 +704,9 @@ pub fn append_affine_layer_norm_f16(
                 .iter()
                 .filter(|allocation| {
                     allocation.tile == candidate.tile
-                        && allocation.address >= config.data_base
+                        && memory.resident.iter().any(|arena| {
+                            allocation.address >= arena.base && allocation.address < arena.limit
+                        })
                         && allocation.live_from < compute_phase
                         && allocation.live_until > 0
                 })
@@ -680,13 +721,15 @@ pub fn append_affine_layer_norm_f16(
         alignment: 8,
         placement: MemoryPlacement::High,
     };
-    let affine_address = find_free_region(
+    let affine_address = find_free_region_in_arenas(
         &schedule.allocations,
         owner.tile,
         affine_bytes,
         0,
-        compute_phase,
-        constraint,
+        usize::MAX,
+        &memory.resident,
+        8,
+        MemoryPlacement::High,
     )?;
     let affine_tensors = [TensorId(next_tensor), TensorId(next_tensor + 1)];
     next_tensor += 2;
@@ -709,7 +752,7 @@ pub fn append_affine_layer_norm_f16(
             address: placement.address,
             size: affine_row_bytes,
             live_from: 0,
-            live_until: compute_phase,
+            live_until: usize::MAX,
             kind: AllocationKind::Home,
         });
     }
@@ -717,25 +760,36 @@ pub fn append_affine_layer_norm_f16(
     let mut transfers = Vec::with_capacity(input.len().saturating_sub(1) * 2);
     let mut output = Vec::with_capacity(input.len());
     let mut commands = Vec::with_capacity(input.len());
+    let transient_base = memory
+        .transient
+        .iter()
+        .map(|arena| arena.base)
+        .min()
+        .unwrap();
+    let transient_limit = memory
+        .transient
+        .iter()
+        .map(|arena| arena.limit)
+        .max()
+        .unwrap();
     let mut output_occupied = occupied_intervals_by_tile(
         &schedule.allocations,
         schedule.tile_count,
         compute_phase,
         usize::MAX,
-        config.data_base,
-        config.data_limit,
+        transient_base,
+        transient_limit,
     );
     for shard in input {
         let activation_bytes = u32::from(shard.rows) * u32::from(columns) * 2;
         let output_tensor = TensorId(next_tensor);
         next_tensor += 1;
-        let output_address = allocate_from_occupied(
+        let output_address = allocate_from_occupied_arenas(
             &mut output_occupied[usize::from(shard.tile)],
             activation_bytes,
-            MemoryConstraint {
-                placement: MemoryPlacement::Low,
-                ..constraint
-            },
+            &memory.transient,
+            constraint.alignment,
+            MemoryPlacement::Low,
         )?;
         if shard.tile != owner.tile {
             for (row, &tensor) in affine_tensors.iter().enumerate() {

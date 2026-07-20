@@ -1,10 +1,10 @@
 use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, FlashAttentionConfig,
-    FlashAttentionPlan, GemmDataType, KernelCommand, MemoryConstraint, MemoryPlacement, OpId,
-    Phase, RowShardPlacement, RowShardTransitionConfig, SpecializationKey, TensorId,
-    append_c16_to_a16_row_shards, choose_gemm_row_block_for, plan_blocked_gemm,
-    plan_flash_attention,
+    FlashAttentionPlan, GemmDataType, KernelCommand, MemoryArena, MemoryConstraint,
+    MemoryPlacement, MemoryPolicy, OpId, Phase, RowShardPlacement, RowShardTransitionConfig,
+    SpecializationKey, TensorId, append_c16_to_a16_row_shards, choose_gemm_row_block_for,
+    plan_blocked_gemm, plan_flash_attention,
 };
 use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -24,6 +24,8 @@ const TILE_COUNT: u16 = 1472;
 const BLOCK_DIMENSION: u16 = 64;
 const INNER_BLOCK_DIMENSION: u16 = 64;
 const DATA_BASE: u32 = ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
+const DEFAULT_RESIDENT_LOW_BASE: u32 =
+    ipu_package::TILE_MEMORY_BASE + 7 * ipu_package::TILE_MEMORY_ELEMENT_SIZE;
 
 fn main() {
     ipu_runtime::init_tracing();
@@ -142,6 +144,12 @@ fn main() {
         .unwrap_or(1);
     assert!((1..=config.num_hidden_layers).contains(&layer_count));
     let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
+    let memory = encoder_memory_policy(data_limit);
+    info!(
+        transient = ?memory.transient,
+        resident = ?memory.resident,
+        "configured encoder tile-memory policy"
+    );
     let detailed_diagnostics = layer_count == 1;
     let mut current = row_shards;
     let mut last_layer = None;
@@ -157,8 +165,7 @@ fn main() {
             columns,
             row_block_dimension,
             TILE_COUNT,
-            DATA_BASE,
-            data_limit,
+            &memory,
             detailed_diagnostics && layer + 1 == layer_count,
             &mut host,
         )
@@ -484,6 +491,56 @@ fn write_memory_profile(graph: &ExecutableGraph) {
         tiles = profile.tiles.len(),
         "wrote SigLIP allocator memory profile"
     );
+}
+
+fn encoder_memory_policy(data_limit: u32) -> MemoryPolicy {
+    let resident_low_base = std::env::var("IPU_SIGLIP_LOW_RESIDENT_BASE")
+        .map(|value| parse_hex_address(&value))
+        .unwrap_or(DEFAULT_RESIDENT_LOW_BASE);
+    let high = MemoryArena {
+        base: DATA_BASE,
+        limit: data_limit,
+    };
+    let low = MemoryArena {
+        base: resident_low_base,
+        limit: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+    };
+    let interleaved = MemoryArena {
+        base: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+        limit: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+    };
+    let resident = std::env::var("IPU_SIGLIP_RESIDENT_ARENAS")
+        .map(|value| parse_memory_arenas(&value))
+        .unwrap_or_else(|_| vec![high, low, interleaved]);
+    let transient = std::env::var("IPU_SIGLIP_TRANSIENT_ARENAS")
+        .map(|value| parse_memory_arenas(&value))
+        .unwrap_or_else(|_| vec![low, interleaved, high]);
+    MemoryPolicy {
+        resident,
+        transient,
+    }
+}
+
+fn parse_memory_arenas(value: &str) -> Vec<MemoryArena> {
+    let arenas = value
+        .split(',')
+        .map(|range| {
+            let (base, limit) = range
+                .split_once("..")
+                .unwrap_or_else(|| panic!("invalid SRAM arena {range}"));
+            MemoryArena {
+                base: parse_hex_address(base),
+                limit: parse_hex_address(limit),
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(!arenas.is_empty(), "SRAM arena list is empty");
+    arenas
+}
+
+fn parse_hex_address(value: &str) -> u32 {
+    u32::from_str_radix(value.trim().trim_start_matches("0x"), 16)
+        .unwrap_or_else(|_| panic!("invalid SRAM address {value}"))
 }
 
 fn patch_value(

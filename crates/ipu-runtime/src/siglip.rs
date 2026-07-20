@@ -3,12 +3,16 @@ use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
     FlashAttentionConfig, FlashAttentionPlan, GemmDataType, MemoryConstraint, MemoryPlacement,
-    RowShardPlacement, RowShardTransitionConfig, Schedule, TensorId,
-    append_add_f16_row_shards_in_place, append_affine_layer_norm_f16, append_bias_f16_c16,
-    append_blocked_gemm_f16_with_a16_blocks, append_blocked_gemm_f16_with_a16_input,
-    append_c16_to_a16_blocks_gelu_f16, append_c16_to_a16_row_shards,
-    append_flash_attention_from_a16_qkv, append_flash_attention_to_a16_row_shards,
-    end_tensor_lifetimes, find_free_region, make_tensors_resident,
+    MemoryPolicy, RowShardPlacement, RowShardTransitionConfig, Schedule, TensorId,
+    append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
+    append_affine_layer_norm_f16_with_memory_policy, append_bias_f16_c16,
+    append_bias_f16_c16_in_arenas, append_blocked_gemm_f16_with_a16_blocks,
+    append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
+    append_blocked_gemm_f16_with_a16_input,
+    append_blocked_gemm_f16_with_a16_input_with_memory_policy, append_c16_to_a16_blocks_gelu_f16,
+    append_c16_to_a16_row_shards, append_flash_attention_from_a16_qkv,
+    append_flash_attention_to_a16_row_shards, end_tensor_lifetimes, find_free_region,
+    make_tensors_resident,
 };
 use ipu_models::SiglipWeights;
 use ipu_package::{Binding, RegionSlice};
@@ -459,17 +463,21 @@ pub fn append_siglip_encoder_layer(
     columns: u16,
     row_block_dimension: u16,
     tile_count: u16,
-    data_base: u32,
-    data_limit: u32,
+    memory: &MemoryPolicy,
     retain_diagnostics: bool,
     host: &mut HostTensorSet,
 ) -> Result<SiglipEncoderLayer> {
+    memory.validate()?;
+    // The standalone kernel planners use this ordinary-memory window before
+    // policy-aware composition relocates movable operands into their arenas.
+    let data_base = ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
+    let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
     let span = info_span!("siglip_encoder_layer", layer);
     let _guard = span.enter();
     let config = &model.config;
     let prefix = format!("encoder_layer_{layer:02}");
     info!(stage = "norm1_qkv", "planning SigLIP encoder stage");
-    let norm = append_affine_layer_norm_f16(
+    let norm = append_affine_layer_norm_f16_with_memory_policy(
         schedule,
         input,
         AppendAffineLayerNormConfig {
@@ -477,6 +485,7 @@ pub fn append_siglip_encoder_layer(
             data_limit,
             epsilon_bits: config.layer_norm_eps.to_bits(),
         },
+        memory,
     )?;
     push_layer_norm_affine(
         schedule,
@@ -488,7 +497,7 @@ pub fn append_siglip_encoder_layer(
         &norm.affine,
     )?;
 
-    let qkv = append_blocked_gemm_f16_with_a16_input(
+    let qkv = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         &norm.output,
         gemm_config(
@@ -500,6 +509,7 @@ pub fn append_siglip_encoder_layer(
             data_base,
             data_limit,
         ),
+        memory,
     )?;
     let projection_names = ["q_proj", "k_proj", "v_proj"];
     let projection_weights = projection_names.map(|projection| {
@@ -538,7 +548,7 @@ pub fn append_siglip_encoder_layer(
             )
             .unwrap()
     });
-    let qkv_bias = append_bias_f16_c16(schedule, &qkv.output, data_base, data_limit)?;
+    let qkv_bias = append_bias_f16_c16_in_arenas(schedule, &qkv.output, &memory.resident)?;
     host.push(
         block_binding_typed(
             &format!("{prefix}.qkv.bias"),
@@ -597,7 +607,7 @@ pub fn append_siglip_encoder_layer(
     let attention_shards =
         append_flash_attention_to_a16_row_shards(schedule, &attention, data_base, data_limit)?;
     info!(stage = "attention_output", "planning SigLIP encoder stage");
-    let output_projection = append_blocked_gemm_f16_with_a16_input(
+    let output_projection = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         &attention_shards,
         gemm_config(
@@ -609,6 +619,7 @@ pub fn append_siglip_encoder_layer(
             data_base,
             data_limit,
         ),
+        memory,
     )?;
     let output_weight = model.tensor_f32(&model.layer_name(layer, "self_attn.out_proj.weight")?)?;
     host.push(
@@ -635,7 +646,7 @@ pub fn append_siglip_encoder_layer(
     end_tensor_lifetimes(schedule, attention_shards.iter().map(|shard| shard.tensor))?;
     let output_bias = model.tensor_f32(&model.layer_name(layer, "self_attn.out_proj.bias")?)?;
     let output_adjustment =
-        append_bias_f16_c16(schedule, &output_projection.output, data_base, data_limit)?;
+        append_bias_f16_c16_in_arenas(schedule, &output_projection.output, &memory.resident)?;
     host.push(
         block_binding_typed(
             &format!("{prefix}.attention_output.bias"),
@@ -670,7 +681,7 @@ pub fn append_siglip_encoder_layer(
     end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
 
     info!(stage = "norm2_mlp", "planning SigLIP encoder stage");
-    let norm2 = append_affine_layer_norm_f16(
+    let norm2 = append_affine_layer_norm_f16_with_memory_policy(
         schedule,
         &attention_residual,
         AppendAffineLayerNormConfig {
@@ -678,6 +689,7 @@ pub fn append_siglip_encoder_layer(
             data_limit,
             epsilon_bits: config.layer_norm_eps.to_bits(),
         },
+        memory,
     )?;
     push_layer_norm_affine(
         schedule,
@@ -689,7 +701,7 @@ pub fn append_siglip_encoder_layer(
         &norm2.affine,
     )?;
     let intermediate_columns = u16::try_from(config.intermediate_size.div_ceil(64) * 64)?;
-    let mlp_up = append_blocked_gemm_f16_with_a16_input(
+    let mlp_up = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         &norm2.output,
         gemm_config(
@@ -701,6 +713,7 @@ pub fn append_siglip_encoder_layer(
             data_base,
             data_limit,
         ),
+        memory,
     )?;
     let mlp_up_weight = model.tensor_f32(&model.layer_name(layer, "mlp.fc1.weight")?)?;
     host.push(
@@ -725,7 +738,8 @@ pub fn append_siglip_encoder_layer(
         end_tensor_lifetimes(schedule, norm2.output.iter().map(|shard| shard.tensor))?;
     }
     let mlp_up_bias = model.tensor_f32(&model.layer_name(layer, "mlp.fc1.bias")?)?;
-    let mlp_up_adjustment = append_bias_f16_c16(schedule, &mlp_up.output, data_base, data_limit)?;
+    let mlp_up_adjustment =
+        append_bias_f16_c16_in_arenas(schedule, &mlp_up.output, &memory.resident)?;
     host.push(
         block_binding_typed(
             &format!("{prefix}.mlp_up.bias"),
@@ -745,7 +759,7 @@ pub fn append_siglip_encoder_layer(
     let mlp_gelu =
         append_c16_to_a16_blocks_gelu_f16(schedule, &mlp_up.output, data_base, data_limit)?;
     end_tensor_lifetimes(schedule, mlp_up.output.iter().map(|block| block.tensor))?;
-    let mlp_down = append_blocked_gemm_f16_with_a16_blocks(
+    let mlp_down = append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
         schedule,
         &mlp_gelu,
         gemm_config(
@@ -757,6 +771,7 @@ pub fn append_siglip_encoder_layer(
             data_base,
             data_limit,
         ),
+        memory,
     )?;
     let mlp_down_weight = model.tensor_f32(&model.layer_name(layer, "mlp.fc2.weight")?)?;
     host.push(
@@ -782,7 +797,7 @@ pub fn append_siglip_encoder_layer(
     }
     let mlp_down_bias = model.tensor_f32(&model.layer_name(layer, "mlp.fc2.bias")?)?;
     let mlp_down_adjustment =
-        append_bias_f16_c16(schedule, &mlp_down.output, data_base, data_limit)?;
+        append_bias_f16_c16_in_arenas(schedule, &mlp_down.output, &memory.resident)?;
     host.push(
         block_binding_typed(
             &format!("{prefix}.mlp_down.bias"),
