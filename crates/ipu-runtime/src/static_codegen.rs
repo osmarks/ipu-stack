@@ -65,6 +65,13 @@ pub(crate) struct StaticTemplatePlan {
     steps: Vec<StaticTemplateStep>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StaticPlanPatch {
+    pub word_address: u32,
+    pub word_offset: u16,
+    pub instruction: u32,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum StaticTemplateRecordWord {
     Value(u32),
@@ -73,7 +80,10 @@ pub(crate) enum StaticTemplateRecordWord {
 
 #[derive(Clone, Debug)]
 enum StaticTemplateStep {
-    Exchange,
+    Exchange {
+        sender_word_offset: Option<u16>,
+        dynamic_sender_offset: bool,
+    },
     Compute {
         operation: String,
         operands: Vec<u32>,
@@ -87,18 +97,25 @@ enum StaticTemplateStep {
 pub(crate) fn plan_static_templates(
     program: &LoweredTileProgram,
     plan_addresses: &[u32],
+    plan_patches: &[Option<StaticPlanPatch>],
     regions: &[crate::StaticTemplateRegion],
     mut cursor: u32,
 ) -> Result<(Vec<StaticTemplatePlan>, u32)> {
     let mut plan_by_step = vec![None; program.steps.len()];
+    let mut patch_by_step = vec![None; program.steps.len()];
     let mut plans = plan_addresses.iter().copied();
+    let mut patches = plan_patches.iter().copied();
     for (step_index, step) in program.steps.iter().enumerate() {
         if matches!(step, LoweredTileStep::Exchange { .. }) {
             plan_by_step[step_index] = plans.next();
+            patch_by_step[step_index] = patches.next().flatten();
         }
     }
     if plans.next().is_some() {
         return Err("unused exchange plan while planning static templates".into());
+    }
+    if patches.next().is_some() {
+        return Err("unused exchange plan patch while planning static templates".into());
     }
 
     let mut templates = Vec::with_capacity(regions.len());
@@ -174,6 +191,16 @@ pub(crate) fn plan_static_templates(
                     .into());
                 }
                 for epoch in 0..epoch_count {
+                    let sender_word_offsets = phase_steps
+                        .iter()
+                        .filter_map(|steps| {
+                            patch_by_step[steps[epoch]].map(|patch| patch.word_offset)
+                        })
+                        .collect::<Vec<_>>();
+                    let sender_word_offset = sender_word_offsets.first().copied();
+                    let dynamic_sender_offset = sender_word_offsets.first().is_some_and(|first| {
+                        sender_word_offsets.iter().any(|offset| offset != first)
+                    });
                     for (instance, steps) in phase_steps.iter().enumerate() {
                         let step_index = steps[epoch];
                         let LoweredTileStep::Exchange { row, .. } = &program.steps[step_index]
@@ -183,10 +210,24 @@ pub(crate) fn plan_static_templates(
                         let address = plan_by_step[step_index]
                             .ok_or("template exchange has no plan address")?;
                         let active = row.first() != Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION);
+                        if sender_word_offset.is_some() {
+                            let patch = patch_by_step[step_index];
+                            if dynamic_sender_offset {
+                                records[instance].push(StaticTemplateRecordWord::Value(
+                                    patch.map_or(0, |patch| patch.word_address),
+                                ));
+                            }
+                            records[instance].push(StaticTemplateRecordWord::Value(
+                                patch.map_or(0, |patch| patch.instruction),
+                            ));
+                        }
                         records[instance].push(StaticTemplateRecordWord::Value(address));
                         records[instance].push(StaticTemplateRecordWord::Value(u32::from(active)));
                     }
-                    template_steps.push(StaticTemplateStep::Exchange);
+                    template_steps.push(StaticTemplateStep::Exchange {
+                        sender_word_offset,
+                        dynamic_sender_offset,
+                    });
                 }
             } else if all_compute {
                 let commands = phase_steps
@@ -710,7 +751,32 @@ fn emit_static_template_body(
     code.st32(9, 11, 15, 1)?;
     for planned in &template.steps {
         match planned {
-            StaticTemplateStep::Exchange => {
+            StaticTemplateStep::Exchange {
+                sender_word_offset,
+                dynamic_sender_offset,
+            } => {
+                if let Some(word_offset) = sender_word_offset {
+                    code.ld32(1, 11, 15, 0)?;
+                    if *dynamic_sender_offset {
+                        code.ld32(8, 1, 15, 0)?;
+                        code.ld32(3, 1, 15, 1)?;
+                        code.add_immediate(1, 1, 8)?;
+                    } else {
+                        code.ld32(3, 1, 15, 0)?;
+                        code.add_immediate(1, 1, 4)?;
+                    }
+                    code.st32(1, 11, 15, 0)?;
+                    let skip_patch = code.words.len();
+                    code.brz(3, 0)?;
+                    if *dynamic_sender_offset {
+                        code.st32(3, 8, 15, 0)?;
+                    } else {
+                        code.ld32(8, 1, 15, 0)?;
+                        code.st32(3, 8, 15, *word_offset)?;
+                    }
+                    let after_patch = generated_address(generated_base, code.words.len())?;
+                    code.words[skip_patch] = ipu_exchange::encode_brz_m_immediate(3, after_patch)?;
+                }
                 code.call(template_exchange, 9)?;
             }
             StaticTemplateStep::Compute {
@@ -993,15 +1059,30 @@ mod tests {
             phase_instances: vec![0..2, 2..4],
         }];
 
+        let patches = [
+            Some(StaticPlanPatch {
+                word_address: 0x52004,
+                word_offset: 1,
+                instruction: 0x7800_1238,
+            }),
+            None,
+        ];
         let (templates, end) =
-            plan_static_templates(&program, &[0x52000, 0x52020], &regions, 0x53002).unwrap();
+            plan_static_templates(&program, &[0x52000, 0x52020], &patches, &regions, 0x53002)
+                .unwrap();
 
         assert_eq!(templates.len(), 1);
         let template = &templates[0];
         assert_eq!(template.name, "encoder_layer");
         assert_eq!(template.instance_steps, [0..3, 3..5]);
         assert_eq!(template.steps.len(), 3);
-        assert!(matches!(template.steps[0], StaticTemplateStep::Exchange));
+        assert!(matches!(
+            template.steps[0],
+            StaticTemplateStep::Exchange {
+                sender_word_offset: Some(1),
+                dynamic_sender_offset: false,
+            }
+        ));
         assert!(matches!(
             template.steps[1],
             StaticTemplateStep::Compute {

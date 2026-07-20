@@ -68,6 +68,7 @@ struct TileHostPlans {
 
 struct TileExchangePlans {
     addresses: Vec<u32>,
+    rows: Vec<(u32, Vec<u32>)>,
     compute_runs: Vec<static_codegen::ExchangeComputeRun>,
     templates: Vec<static_codegen::StaticTemplatePlan>,
     end: u32,
@@ -1242,22 +1243,50 @@ fn package_graph_impl(
             let mut cursor = PLAN_BASE;
             let mut unique = HashMap::<Vec<u32>, u32>::new();
             let mut addresses = Vec::with_capacity(exchange_count);
-            for row in program.steps.iter().filter_map(|step| match step {
-                ipu_compiler::LoweredTileStep::Exchange { row, .. } => Some(row),
+            let mut rows = Vec::new();
+            let mut patches = Vec::with_capacity(exchange_count);
+            for (row, templated) in program.steps.iter().filter_map(|step| match step {
+                ipu_compiler::LoweredTileStep::Exchange { phase, row, .. } => Some((
+                    row,
+                    template_regions.iter().any(|region| {
+                        region
+                            .phase_instances
+                            .iter()
+                            .any(|phases| phases.contains(phase))
+                    }),
+                )),
                 _ => None,
             }) {
-                let address = if let Some(&address) = unique.get(row) {
+                let mut stored_row = row.clone();
+                let sender = templated
+                    .then(|| ipu_exchange::normalize_sender_instruction(&mut stored_row))
+                    .flatten();
+                let address = if let Some(&address) = unique.get(&stored_row) {
                     address
                 } else {
                     cursor = align_up(cursor, 8);
                     let address = cursor;
                     cursor = cursor
-                        .checked_add(u32::try_from(row.len() * 4)?)
+                        .checked_add(u32::try_from(stored_row.len() * 4)?)
                         .ok_or("exchange plan address overflow")?;
-                    unique.insert(row.clone(), address);
+                    unique.insert(stored_row.clone(), address);
+                    rows.push((address, stored_row));
                     address
                 };
                 addresses.push(address);
+                patches.push(
+                    sender
+                        .map(|(word, instruction)| -> Result<_> {
+                            Ok(static_codegen::StaticPlanPatch {
+                                word_address: address
+                                    .checked_add(u32::try_from(word * 4)?)
+                                    .ok_or("exchange plan patch address overflow")?,
+                                word_offset: u16::try_from(word)?,
+                                instruction,
+                            })
+                        })
+                        .transpose()?,
+                );
             }
             let (compute_runs, end) = static_codegen::plan_exchange_compute_runs(
                 program,
@@ -1265,10 +1294,16 @@ fn package_graph_impl(
                 cursor,
                 profile_code.is_empty() && template_regions.is_empty(),
             )?;
-            let (templates, end) =
-                static_codegen::plan_static_templates(program, &addresses, template_regions, end)?;
+            let (templates, end) = static_codegen::plan_static_templates(
+                program,
+                &addresses,
+                &patches,
+                template_regions,
+                end,
+            )?;
             Ok(TileExchangePlans {
                 addresses,
+                rows,
                 compute_runs,
                 templates,
                 end,
@@ -1839,16 +1874,8 @@ fn package_graph_impl(
 
         let plan_region_size = usize::try_from(host_plans.end - PLAN_BASE)?;
         let mut plan_region = vec![0; plan_region_size];
-        for (step, &plan_address) in program
-            .steps
-            .iter()
-            .filter(|step| matches!(step, ipu_compiler::LoweredTileStep::Exchange { .. }))
-            .zip(&tile_exchange_plans[tile_index].addresses)
-        {
-            if let ipu_compiler::LoweredTileStep::Exchange { row, .. } = step {
-                let bytes = words_to_bytes(row);
-                write_plan_bytes(&mut plan_region, plan_address, &bytes)?;
-            }
+        for (plan_address, row) in &tile_exchange_plans[tile_index].rows {
+            write_plan_bytes(&mut plan_region, *plan_address, &words_to_bytes(row))?;
         }
         for run in &tile_exchange_plans[tile_index].compute_runs {
             write_plan_bytes(
@@ -1892,7 +1919,7 @@ fn package_graph_impl(
                 blob: plan_blob,
                 blob_offset: 0,
                 file_size: plan_size,
-                flags: SEGMENT_READ | SEGMENT_EXECUTE,
+                flags: SEGMENT_READ | SEGMENT_WRITE | SEGMENT_EXECUTE,
             });
         }
         append_initial_segments(&mut app, &mut segments, &initial, logical)?;

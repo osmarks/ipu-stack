@@ -24,6 +24,7 @@ const DELAY_XPIC_OPCODE: u32 = 0x6400_0000;
 const PIC_ABSOLUTE_RECEIVE_BITS: u32 = (1 << 16) | (1 << 14);
 const PIC_RECEIVE_ADDRESS_MASK: u32 = 0x1fff;
 const SEND_OPCODE: u32 = 0x7800_0000;
+const SEND_ADDRESS_MASK: u32 = 0x001f_fff8;
 const SEND_OFF_OPCODE: u32 = 0x7000_0000;
 const SYNC_OPCODE: u32 = 0x4180_0000;
 const SANS_OPCODE: u32 = 0x40c0_0000;
@@ -1006,11 +1007,24 @@ pub fn patch_sender_address(row: &mut PlanRow, byte_address: u32) -> Result<(), 
     let word_address = byte_address >> 2;
     for instruction in row {
         if *instruction & 0xf800_0000 == 0x7800_0000 {
-            *instruction = (*instruction & !0x001f_fff8) | ((word_address << 3) & 0x001f_fff8);
+            *instruction =
+                (*instruction & !SEND_ADDRESS_MASK) | ((word_address << 3) & SEND_ADDRESS_MASK);
             return Ok(());
         }
     }
     Err(ExchangeError::Address(byte_address))
+}
+
+/// Clears the address field of a tile-to-tile SEND for structural plan deduplication.
+/// Returns the word offset and original instruction needed to restore this instance.
+pub fn normalize_sender_instruction(row: &mut [u32]) -> Option<(usize, u32)> {
+    let (index, instruction) = row
+        .iter_mut()
+        .enumerate()
+        .find(|(_, instruction)| **instruction & LONG_OPCODE_MASK == SEND_OPCODE)?;
+    let original = *instruction;
+    *instruction &= !SEND_ADDRESS_MASK;
+    Some((index, original))
 }
 
 pub fn patch_receiver_address(row: &mut PlanRow, byte_address: u32) -> Result<(), ExchangeError> {
@@ -1206,6 +1220,24 @@ mod tests {
         assert_eq!(encode_add_m_immediate(11, 11, -32).unwrap(), 0x22bb_ffe0);
         assert_eq!(encode_and_m_immediate(0, 8, 1).unwrap(), 0x4280_0001);
         assert_eq!(encode_brz_m_immediate(0, 0x4c100).unwrap(), 0x1301_3040);
+    }
+
+    #[test]
+    fn normalizes_only_the_sender_address_field() {
+        let mut row = [
+            SYNC_SUPERVISOR_INSTRUCTION,
+            encode_send(1, 3, 0x1a048).unwrap(),
+            RETURN_M10_INSTRUCTION,
+        ];
+        let original = row;
+
+        let (index, instruction) = normalize_sender_instruction(&mut row).unwrap();
+
+        assert_eq!(index, 1);
+        assert_eq!(instruction, original[1]);
+        assert_eq!(row[1] ^ original[1], original[1] & SEND_ADDRESS_MASK);
+        assert_eq!(row[0], original[0]);
+        assert_eq!(row[2], original[2]);
     }
 
     #[test]
