@@ -11,6 +11,7 @@ use ipu_compiler::{
 };
 use ipu_models::SiglipWeights;
 use ipu_package::{Binding, RegionSlice};
+use tracing::{info, info_span};
 
 #[derive(Default)]
 pub struct HostTensorSet {
@@ -58,8 +59,11 @@ pub fn append_siglip_encoder_layer(
     retain_diagnostics: bool,
     host: &mut HostTensorSet,
 ) -> Result<SiglipEncoderLayer> {
+    let span = info_span!("siglip_encoder_layer", layer);
+    let _guard = span.enter();
     let config = &model.config;
     let prefix = format!("encoder_layer_{layer:02}");
+    info!(stage = "norm1_qkv", "planning SigLIP encoder stage");
     let norm = append_affine_layer_norm_f16(
         schedule,
         input,
@@ -151,6 +155,7 @@ pub fn append_siglip_encoder_layer(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     end_tensor_lifetimes(schedule, qkv.output.iter().map(|block| block.tensor))?;
 
+    info!(stage = "attention", "planning SigLIP encoder stage");
     let attention = append_flash_attention_from_a16_qkv(
         schedule,
         &qkv_shards[0],
@@ -176,6 +181,7 @@ pub fn append_siglip_encoder_layer(
     )?;
     let attention_shards =
         append_flash_attention_to_a16_row_shards(schedule, &attention, data_base, data_limit)?;
+    info!(stage = "attention_output", "planning SigLIP encoder stage");
     let output_projection = append_blocked_gemm_f16_with_a16_input(
         schedule,
         &attention_shards,
@@ -247,6 +253,7 @@ pub fn append_siglip_encoder_layer(
         append_add_f16_row_shards_in_place(schedule, &projected_shards, input)?;
     end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
 
+    info!(stage = "norm2_mlp", "planning SigLIP encoder stage");
     let norm2 = append_affine_layer_norm_f16(
         schedule,
         &attention_residual,
@@ -381,6 +388,7 @@ pub fn append_siglip_encoder_layer(
         schedule,
         attention_residual.iter().map(|shard| shard.tensor),
     )?;
+    info!(stage = "complete", "planned SigLIP encoder layer");
     Ok(SiglipEncoderLayer {
         output,
         norm2: norm2.output,
@@ -423,13 +431,21 @@ fn push_layer_norm_affine(
     let weight = model.tensor_f32(&model.layer_name(layer, &format!("{norm}.weight"))?)?;
     let bias = model.tensor_f32(&model.layer_name(layer, &format!("{norm}.bias"))?)?;
     let mut bytes = Vec::with_capacity(placements.len() * usize::from(columns) * 4);
-    for _ in placements {
-        bytes.extend(
-            weight
-                .iter()
-                .chain(&bias)
-                .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes()),
-        );
+    for placement in placements {
+        for row in placement.row_start..placement.row_start + placement.rows {
+            let values = match row {
+                0 => weight.as_slice(),
+                1 => bias.as_slice(),
+                _ => {
+                    return Err(format!("layer norm affine row {row} is outside scale/bias").into());
+                }
+            };
+            bytes.extend(
+                values
+                    .iter()
+                    .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes()),
+            );
+        }
     }
     host.push(
         row_shard_binding(

@@ -461,16 +461,23 @@ pub fn find_free_region(
     if cursor < constraint.limit {
         gaps.push((cursor, constraint.limit));
     }
+    let occupied_bytes = (constraint.limit - constraint.base)
+        .saturating_sub(gaps.iter().map(|(start, end)| end - start).sum::<u32>());
+    let largest_gap = gaps
+        .iter()
+        .map(|(start, end)| end - start)
+        .max()
+        .unwrap_or(0);
     let alignment = constraint.alignment;
     let candidate = match constraint.placement {
-        MemoryPlacement::Low => gaps.into_iter().find_map(|(start, end)| {
+        MemoryPlacement::Low => gaps.iter().copied().find_map(|(start, end)| {
             let address = align_u32(start, alignment);
             address
                 .checked_add(size)
                 .filter(|&candidate_end| candidate_end <= end)
                 .map(|_| address)
         }),
-        MemoryPlacement::High => gaps.into_iter().rev().find_map(|(start, end)| {
+        MemoryPlacement::High => gaps.iter().copied().rev().find_map(|(start, end)| {
             let address = end.checked_sub(size)? & !(alignment - 1);
             (address >= start).then_some(address)
         }),
@@ -479,8 +486,8 @@ pub fn find_free_region(
         return Ok(address);
     }
     Err(CompileError::Memory(format!(
-        "no {size}-byte region for tile {tile} in 0x{:x}..0x{:x}",
-        constraint.base, constraint.limit
+        "no {size}-byte region for tile {tile} in 0x{:x}..0x{:x}: {occupied_bytes} live bytes, {largest_gap}-byte largest gap",
+        constraint.base, constraint.limit,
     )))
 }
 
@@ -917,7 +924,14 @@ pub fn append_blocked_gemm_f16_with_a16_input(
         op: OpId(compute_phase),
         commands,
     });
+    prepare_appended_gemm_lifetimes(&mut plan);
+    let left_tensors = plan
+        .left
+        .iter()
+        .map(|block| block.tensor)
+        .collect::<HashSet<_>>();
     append_child_schedule(schedule, &mut plan.schedule)?;
+    set_appended_gemm_left_start(schedule, &left_tensors, compute_phase);
     Ok(AppendedBlockedGemm {
         right: plan.right,
         output: plan.output,
@@ -1026,11 +1040,57 @@ pub fn append_blocked_gemm_f16_with_a16_blocks(
         op: OpId(compute_phase),
         commands,
     });
+    prepare_appended_gemm_lifetimes(&mut plan);
+    let left_tensors = plan
+        .left
+        .iter()
+        .map(|block| block.tensor)
+        .collect::<HashSet<_>>();
     append_child_schedule(schedule, &mut plan.schedule)?;
+    set_appended_gemm_left_start(schedule, &left_tensors, compute_phase);
     Ok(AppendedBlockedGemm {
         right: plan.right,
         output: plan.output,
     })
+}
+
+fn prepare_appended_gemm_lifetimes(plan: &mut BlockedGemmPlan) {
+    let completion = plan.schedule.phases.len();
+    let left = plan
+        .left
+        .iter()
+        .map(|block| block.tensor)
+        .collect::<HashSet<_>>();
+    for allocation in &mut plan.schedule.allocations {
+        if allocation.kind == AllocationKind::Home && left.contains(&allocation.tensor) {
+            allocation.live_until = completion;
+        }
+    }
+    let output = plan
+        .output
+        .iter()
+        .map(|block| block.tensor)
+        .collect::<HashSet<_>>();
+    for allocation in &mut plan.schedule.allocations {
+        if allocation.kind == AllocationKind::Home
+            && output.contains(&allocation.tensor)
+            && allocation.live_from == 0
+        {
+            allocation.live_from = 1;
+        }
+    }
+}
+
+fn set_appended_gemm_left_start(
+    schedule: &mut Schedule,
+    left_tensors: &HashSet<TensorId>,
+    live_from: usize,
+) {
+    for allocation in &mut schedule.allocations {
+        if allocation.kind == AllocationKind::Home && left_tensors.contains(&allocation.tensor) {
+            allocation.live_from = live_from;
+        }
+    }
 }
 
 fn plan_appended_blocked_gemm(
@@ -3071,6 +3131,42 @@ mod tests {
             &schedule.phases[1],
             Phase::Compute { commands, .. } if commands.len() == 1
         ));
+        let placed_input = match &schedule.phases[1] {
+            Phase::Compute { commands, .. } => commands[0].output,
+            _ => unreachable!(),
+        };
+        assert!(
+            schedule
+                .allocations
+                .iter()
+                .filter(|allocation| {
+                    allocation.tensor == placed_input && allocation.kind == AllocationKind::Home
+                })
+                .all(|allocation| {
+                    allocation.live_from > 0 && allocation.live_until < usize::MAX
+                })
+        );
+        end_tensor_lifetimes(
+            &mut schedule,
+            appended.output.iter().map(|block| block.tensor),
+        )
+        .unwrap();
+        for output in &appended.output {
+            let output_end =
+                output.address + u32::from(output.rows) * u32::from(output.columns) * 2;
+            assert!(
+                schedule
+                    .allocations
+                    .iter()
+                    .filter(|allocation| {
+                        allocation.kind == AllocationKind::Home
+                            && allocation.tile == output.tile
+                            && allocation.address >= output.address
+                            && allocation.address + allocation.size <= output_end
+                    })
+                    .all(|allocation| allocation.live_until < usize::MAX)
+            );
+        }
     }
 
     #[test]

@@ -143,6 +143,11 @@ pub fn append_flash_attention_from_a16_qkv(
         &plan,
         AttentionPackKind::Value,
     )?;
+    for allocation in &mut plan.schedule.allocations {
+        if allocation.kind == AllocationKind::Home && allocation.live_from == 0 {
+            allocation.live_from = 1;
+        }
+    }
     crate::append_child_schedule(schedule, &mut plan.schedule)?;
     Ok(plan)
 }

@@ -60,29 +60,57 @@ pub fn end_tensor_lifetimes(
     tensors: impl IntoIterator<Item = TensorId>,
 ) -> Result<(), CompileError> {
     let phase = schedule.phases.len();
-    for tensor in tensors {
-        let mut found = false;
-        for allocation in schedule
-            .allocations
-            .iter_mut()
-            .filter(|allocation| allocation.tensor == tensor)
-        {
-            found = true;
-            if allocation.live_until == usize::MAX {
-                if allocation.live_from >= phase {
-                    return Err(CompileError::Graph(format!(
-                        "tensor {} cannot end before it becomes live",
-                        tensor.0
-                    )));
-                }
-                allocation.live_until = phase;
+    let tensors = tensors
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let mut found = std::collections::HashSet::new();
+    let mut regions = vec![Vec::<(u32, u32)>::new(); usize::from(schedule.tile_count)];
+    for allocation in &schedule.allocations {
+        if tensors.contains(&allocation.tensor) {
+            found.insert(allocation.tensor);
+            if allocation.kind == AllocationKind::Home {
+                regions[usize::from(allocation.tile)].push((
+                    allocation.address,
+                    allocation.address.saturating_add(allocation.size),
+                ));
             }
         }
-        if !found {
-            return Err(CompileError::Graph(format!(
-                "cannot end unknown tensor {}",
-                tensor.0
-            )));
+    }
+    if let Some(tensor) = tensors.difference(&found).next() {
+        return Err(CompileError::Graph(format!(
+            "cannot end unknown tensor {}",
+            tensor.0
+        )));
+    }
+    for tile_regions in &mut regions {
+        tile_regions.sort_unstable();
+        let mut merged = Vec::<(u32, u32)>::with_capacity(tile_regions.len());
+        for &(start, end) in tile_regions.iter() {
+            if let Some(previous) = merged.last_mut()
+                && start <= previous.1
+            {
+                previous.1 = previous.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        *tile_regions = merged;
+    }
+    for allocation in &mut schedule.allocations {
+        if allocation.kind != AllocationKind::Home || allocation.live_until != usize::MAX {
+            continue;
+        }
+        let allocation_end = allocation.address.saturating_add(allocation.size);
+        let aliases_target = regions[usize::from(allocation.tile)]
+            .iter()
+            .any(|&(start, end)| allocation.address >= start && allocation_end <= end);
+        if aliases_target {
+            if allocation.live_from >= phase {
+                return Err(CompileError::Graph(
+                    "tensor cannot end before an alias becomes live".into(),
+                ));
+            }
+            allocation.live_until = phase;
         }
     }
     Ok(())
@@ -591,55 +619,106 @@ pub fn append_affine_layer_norm_f16(
         .max()
         .unwrap_or(0)
         + 1;
-    let phase = schedule.phases.len();
-    let affine_bytes = u32::from(columns) * 4;
-    let mut affine = Vec::with_capacity(input.len());
+    let exchange_phase = schedule.phases.len();
+    let compute_phase = exchange_phase + 1;
+    let affine_row_bytes = u32::from(columns) * 2;
+    let affine_bytes = affine_row_bytes * 2;
+    let owner = input
+        .iter()
+        .min_by_key(|candidate| {
+            let pressure = schedule
+                .allocations
+                .iter()
+                .filter(|allocation| {
+                    allocation.tile == candidate.tile
+                        && allocation.address >= config.data_base
+                        && allocation.live_from < compute_phase
+                        && allocation.live_until > 0
+                })
+                .map(|allocation| u64::from(allocation.size))
+                .sum::<u64>();
+            (pressure, candidate.tile)
+        })
+        .unwrap();
+    let constraint = MemoryConstraint {
+        base: config.data_base,
+        limit: config.data_limit,
+        alignment: 8,
+        placement: MemoryPlacement::High,
+    };
+    let affine_address = find_free_region(
+        &schedule.allocations,
+        owner.tile,
+        affine_bytes,
+        0,
+        compute_phase,
+        constraint,
+    )?;
+    let affine_tensors = [TensorId(next_tensor), TensorId(next_tensor + 1)];
+    next_tensor += 2;
+    let affine = affine_tensors
+        .iter()
+        .enumerate()
+        .map(|(row, &tensor)| RowShardPlacement {
+            tile: owner.tile,
+            row_start: row as u16,
+            rows: 1,
+            columns,
+            tensor,
+            address: affine_address + row as u32 * affine_row_bytes,
+        })
+        .collect::<Vec<_>>();
+    for placement in &affine {
+        schedule.allocations.push(Allocation {
+            tensor: placement.tensor,
+            tile: placement.tile,
+            address: placement.address,
+            size: affine_row_bytes,
+            live_from: 0,
+            live_until: compute_phase,
+            kind: AllocationKind::Home,
+        });
+    }
+
+    let mut transfers = Vec::with_capacity(input.len().saturating_sub(1) * 2);
     let mut output = Vec::with_capacity(input.len());
     let mut commands = Vec::with_capacity(input.len());
     for shard in input {
         let activation_bytes = u32::from(shard.rows) * u32::from(columns) * 2;
-        let constraint = MemoryConstraint {
-            base: config.data_base,
-            limit: config.data_limit,
-            alignment: 8,
-            placement: MemoryPlacement::Low,
-        };
-        let affine_address = find_free_region(
-            &schedule.allocations,
-            shard.tile,
-            affine_bytes,
-            0,
-            usize::MAX,
-            constraint,
-        )?;
-        let affine_tensor = TensorId(next_tensor);
-        let output_tensor = TensorId(next_tensor + 1);
-        next_tensor += 2;
-        schedule.allocations.push(Allocation {
-            tensor: affine_tensor,
-            tile: shard.tile,
-            address: affine_address,
-            size: affine_bytes,
-            live_from: 0,
-            live_until: usize::MAX,
-            kind: AllocationKind::Home,
-        });
+        let output_tensor = TensorId(next_tensor);
+        next_tensor += 1;
         let output_address = find_free_region(
             &schedule.allocations,
             shard.tile,
             activation_bytes,
-            phase,
+            compute_phase,
             usize::MAX,
-            constraint,
+            MemoryConstraint {
+                placement: MemoryPlacement::Low,
+                ..constraint
+            },
         )?;
-        affine.push(RowShardPlacement {
-            tile: shard.tile,
-            row_start: 0,
-            rows: 2,
-            columns,
-            tensor: affine_tensor,
-            address: affine_address,
-        });
+        if shard.tile != owner.tile {
+            for (row, &tensor) in affine_tensors.iter().enumerate() {
+                transfers.push(Transfer {
+                    source_tile: owner.tile,
+                    destination_tile: shard.tile,
+                    tensor,
+                    bytes: affine_row_bytes,
+                });
+                schedule.allocations.push(Allocation {
+                    tensor,
+                    tile: shard.tile,
+                    address: ipu_exchange::EXCHANGE_WINDOW_BASE + row as u32 * affine_row_bytes,
+                    size: affine_row_bytes,
+                    live_from: exchange_phase,
+                    live_until: compute_phase,
+                    kind: AllocationKind::ExchangeStaging {
+                        phase: exchange_phase,
+                    },
+                });
+            }
+        }
         output.push(RowShardPlacement {
             tensor: output_tensor,
             address: output_address,
@@ -650,14 +729,14 @@ pub fn append_affine_layer_norm_f16(
             tile: shard.tile,
             address: output_address,
             size: activation_bytes,
-            live_from: phase,
+            live_from: compute_phase,
             live_until: usize::MAX,
             kind: AllocationKind::Home,
         });
         commands.push(KernelCommand {
             tile: shard.tile,
             output: output_tensor,
-            inputs: vec![shard.tensor, affine_tensor],
+            inputs: vec![shard.tensor, affine_tensors[0]],
             arguments: vec![u32::from(shard.rows), u32::from(columns), epsilon_q30],
             specialization: SpecializationKey {
                 operation: "layer_norm_affine_f16".into(),
@@ -673,8 +752,9 @@ pub fn append_affine_layer_norm_f16(
             ]),
         });
     }
+    schedule.phases.push(Phase::Exchange { transfers });
     schedule.phases.push(Phase::Compute {
-        op: OpId(phase),
+        op: OpId(compute_phase),
         commands,
     });
     Ok(AppendedAffineLayerNorm { affine, output })
