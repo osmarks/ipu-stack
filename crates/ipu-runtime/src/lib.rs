@@ -86,11 +86,17 @@ fn executable_region_base(
     runtime_end: u32,
     required_size: u32,
 ) -> Result<u32> {
-    executable_region_base_for_tile(graph, None, runtime_end, required_size, &[])
+    let allocations = graph
+        .schedule
+        .allocations
+        .iter()
+        .map(allocation_range)
+        .collect::<Result<Vec<_>>>()?;
+    executable_region_base_for_tile(&allocations, None, runtime_end, required_size, &[])
 }
 
 fn executable_region_base_for_tile(
-    graph: &ExecutableGraph,
+    allocation_ranges: &[(u32, u32)],
     tile: Option<u16>,
     runtime_end: u32,
     required_size: u32,
@@ -111,23 +117,7 @@ fn executable_region_base_for_tile(
         ),
         (PLAN_BASE, runtime_end),
     ];
-    reserved.extend(
-        graph
-            .schedule
-            .allocations
-            .iter()
-            .filter(|allocation| tile.is_none_or(|tile| allocation.tile == tile))
-            .map(|allocation| {
-                Ok((
-                    allocation.address,
-                    allocation
-                        .address
-                        .checked_add(allocation.size)
-                        .ok_or("allocation address overflow")?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?,
-    );
+    reserved.extend_from_slice(allocation_ranges);
     reserved.extend_from_slice(additional_reserved);
     let mut reserved = reserved
         .into_iter()
@@ -164,6 +154,16 @@ fn executable_region_base_for_tile(
         )
         .into())
     }
+}
+
+fn allocation_range(allocation: &ipu_compiler::Allocation) -> Result<(u32, u32)> {
+    Ok((
+        allocation.address,
+        allocation
+            .address
+            .checked_add(allocation.size)
+            .ok_or("allocation address overflow")?,
+    ))
 }
 pub fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -1128,6 +1128,13 @@ fn package_graph_impl(
     if !profile_code.is_empty() && profile_code.len() != programs.len() {
         return Err("profile layout tile count differs from schedule".into());
     }
+    let mut allocation_ranges_by_tile = vec![Vec::new(); usize::from(graph.schedule.tile_count)];
+    for allocation in &graph.schedule.allocations {
+        let ranges = allocation_ranges_by_tile
+            .get_mut(usize::from(allocation.tile))
+            .ok_or("allocation tile exceeds schedule tile count")?;
+        ranges.push(allocation_range(allocation)?);
+    }
     let exchange_count = programs
         .first()
         .map(|program| {
@@ -1471,7 +1478,7 @@ fn package_graph_impl(
         .zip(&completion_addresses)
         .map(|((program, preliminary), &completion_address)| {
             executable_region_base_for_tile(
-                graph,
+                &allocation_ranges_by_tile[usize::from(program.tile)],
                 Some(program.tile),
                 completion_address
                     .checked_add(4)
@@ -1560,7 +1567,7 @@ fn package_graph_impl(
                 .checked_add(u32::try_from(image.bytes.len())?)
                 .ok_or("linked image address overflow")?;
             executable_region_base_for_tile(
-                graph,
+                &allocation_ranges_by_tile[usize::from(program.tile)],
                 Some(program.tile),
                 tile_runtime_end
                     .checked_add(4)
