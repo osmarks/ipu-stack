@@ -2,7 +2,8 @@ use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
     GemmDataType, KernelCommand, OpId, Phase, RowShardPlacement, RowShardTransitionConfig,
-    SpecializationKey, TensorId, append_affine_layer_norm_f16, append_c16_to_a16_row_shards,
+    SpecializationKey, TensorId, append_affine_layer_norm_f16,
+    append_blocked_gemm_f16_with_a16_input, append_c16_to_a16_row_shards,
     choose_gemm_row_block_for, plan_blocked_gemm,
 };
 use ipu_elf::Toolchain;
@@ -87,7 +88,7 @@ fn main() {
         },
     ));
 
-    let adjustment = append_adjustment_phase(&mut plan).unwrap();
+    let adjustment = append_adjustment_phase(&mut plan.schedule, &plan.output).unwrap();
     host_input.extend(blocked_matrix_f16(
         &adjustment,
         BlockLayout::AmpC16F16,
@@ -141,6 +142,57 @@ fn main() {
                 .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes()),
         );
     }
+    let qkv_data_base = resident_data_end(&plan.schedule);
+    let qkv = append_blocked_gemm_f16_with_a16_input(
+        &mut plan.schedule,
+        &norm.output,
+        BlockedGemmConfig {
+            rows,
+            inner_dimension: columns,
+            columns: columns * 3,
+            block_dimension: BLOCK_DIMENSION,
+            inner_block_dimension: INNER_BLOCK_DIMENSION,
+            row_block_dimension,
+            tile_count: TILE_COUNT,
+            data_base: qkv_data_base,
+            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            data_type: GemmDataType::F16,
+        },
+    )
+    .unwrap();
+    let qkv_weight_names = ["q_proj", "k_proj", "v_proj"];
+    let qkv_weights = qkv_weight_names.map(|projection| {
+        model
+            .tensor_f32(&format!(
+                "vision_model.encoder.layers.0.self_attn.{projection}.weight"
+            ))
+            .unwrap()
+    });
+    let qkv_biases = qkv_weight_names.map(|projection| {
+        model
+            .tensor_f32(&format!(
+                "vision_model.encoder.layers.0.self_attn.{projection}.bias"
+            ))
+            .unwrap()
+    });
+    host_input.extend(blocked_matrix_f16(
+        &qkv.right,
+        BlockLayout::AmpB16x16,
+        |row, column| {
+            let projection = usize::from(column / columns);
+            let output = usize::from(column % columns);
+            qkv_weights[projection][output * usize::from(columns) + usize::from(row)]
+        },
+    ));
+    let qkv_bias = append_adjustment_phase(&mut plan.schedule, &qkv.output).unwrap();
+    host_input.extend(blocked_matrix_f16(
+        &qkv_bias,
+        BlockLayout::AmpC16F16,
+        |_row, column| {
+            let projection = usize::from(column / columns);
+            qkv_biases[projection][usize::from(column % columns)]
+        },
+    ));
     let objects = compile_objects(&plan).unwrap();
     let graph = ExecutableGraph {
         schedule: plan.schedule,
@@ -151,12 +203,16 @@ fn main() {
             block_binding_typed("patch_weight", inner, columns, &plan.right, "f16", 2),
             block_binding_typed("position_bias", rows, columns, &adjustment, "f16", 2),
             row_shard_binding("layer_norm1_affine", 2, columns, &norm.affine),
+            block_binding_typed("qkv_weight", columns, columns * 3, &qkv.right, "f16", 2),
+            block_binding_typed("qkv_bias", rows, columns * 3, &qkv_bias, "f16", 2),
         ],
-        host_outputs: vec![row_shard_binding(
-            "patch_and_position",
+        host_outputs: vec![block_binding_typed(
+            "qkv",
             rows,
-            columns,
-            &norm.output,
+            columns * 3,
+            &qkv.output,
+            "f16",
+            2,
         )],
     };
     let app = package_graph(&graph, &objects).unwrap();
@@ -186,8 +242,15 @@ fn main() {
         &norm_bias,
         config.layer_norm_eps,
     );
-    let max_error = verify(&actual, &norm.output, columns, &expected);
-    let limit = env_f32("IPU_F16_MAX_ERROR", 0.1);
+    let max_error = verify_qkv_samples(
+        &actual,
+        &qkv.output,
+        columns,
+        &expected,
+        &qkv_weights,
+        &qkv_biases,
+    );
+    let limit = env_f32("IPU_F16_MAX_ERROR", 0.15);
     assert!(
         max_error <= limit,
         "patch embedding max error {max_error} exceeds {limit}"
@@ -202,7 +265,7 @@ fn main() {
         columns,
         row_block_dimension,
         max_error,
-        "SigLIP patch embedding and encoder layer norm passed against Hugging Face"
+        "SigLIP embedding, layer norm, and QKV projection passed against Hugging Face"
     );
 }
 
@@ -229,11 +292,12 @@ fn patch_value(
 }
 
 fn append_adjustment_phase(
-    plan: &mut ipu_compiler::BlockedGemmPlan,
+    schedule: &mut ipu_compiler::Schedule,
+    output: &[BlockPlacement],
 ) -> ipu_runtime::Result<Vec<BlockPlacement>> {
     let mut cursors = vec![DATA_BASE; usize::from(TILE_COUNT)];
     let mut maximum_tensor = 0usize;
-    for allocation in &plan.schedule.allocations {
+    for allocation in &schedule.allocations {
         maximum_tensor = maximum_tensor.max(allocation.tensor.0);
         if allocation.kind == AllocationKind::Home && allocation.address >= DATA_BASE {
             let end = allocation
@@ -243,10 +307,10 @@ fn append_adjustment_phase(
             cursors[usize::from(allocation.tile)] = cursors[usize::from(allocation.tile)].max(end);
         }
     }
-    let phase = plan.schedule.phases.len();
-    let mut placements = Vec::with_capacity(plan.output.len());
-    let mut commands = Vec::with_capacity(plan.output.len());
-    for (index, output) in plan.output.iter().enumerate() {
+    let phase = schedule.phases.len();
+    let mut placements = Vec::with_capacity(output.len());
+    let mut commands = Vec::with_capacity(output.len());
+    for (index, output) in output.iter().enumerate() {
         let tensor = TensorId(maximum_tensor + 1 + index);
         let bytes = u32::from(output.rows) * u32::from(output.columns) * 2;
         let cursor = &mut cursors[usize::from(output.tile)];
@@ -264,7 +328,7 @@ fn append_adjustment_phase(
             ..*output
         };
         placements.push(placement);
-        plan.schedule.allocations.push(Allocation {
+        schedule.allocations.push(Allocation {
             tensor,
             tile: output.tile,
             address,
@@ -293,7 +357,7 @@ fn append_adjustment_phase(
             ]),
         });
     }
-    plan.schedule.phases.push(Phase::Compute {
+    schedule.phases.push(Phase::Compute {
         op: OpId(phase),
         commands,
     });
@@ -372,28 +436,66 @@ fn row_shard_binding(name: &str, rows: u16, columns: u16, shards: &[RowShardPlac
     }
 }
 
-fn verify(actual: &[u8], output: &[RowShardPlacement], columns: u16, expected: &[f32]) -> f32 {
+fn verify_qkv_samples(
+    actual: &[u8],
+    output: &[BlockPlacement],
+    hidden: u16,
+    input: &[f32],
+    weights: &[Vec<f32>; 3],
+    biases: &[Vec<f32>; 3],
+) -> f32 {
+    let output_columns = hidden * 3;
+    let mut decoded = vec![0.0f32; input.len() * 3];
     let mut offset = 0usize;
-    let mut max_error = 0.0f32;
     for block in output {
         for linear in 0..block.rows * block.columns {
-            let panel_elements = block.rows * 16;
-            let panel = linear / panel_elements;
-            let panel_offset = linear % panel_elements;
-            let row = panel_offset / 16;
-            let column = panel * 16 + panel_offset % 16;
-            let observed = f16::from_bits(u16::from_le_bytes(
+            let (row, column) = ipu_runtime::block_coordinates(
+                BlockLayout::AmpC16F16,
+                block.rows,
+                block.columns,
+                linear,
+            );
+            decoded[usize::from(block.row_start + row) * usize::from(output_columns)
+                + usize::from(block.column_start + column)] = f16::from_bits(u16::from_le_bytes(
                 actual[offset..offset + 2].try_into().unwrap(),
             ))
             .to_f32();
-            let expected = expected
-                [usize::from(block.row_start + row) * usize::from(columns) + usize::from(column)];
-            assert!(observed.is_finite());
-            max_error = max_error.max((observed - expected).abs());
             offset += 2;
         }
     }
+    let mut rng = fastrand::Rng::with_seed(0x51_61_51_61);
+    let mut max_error = 0.0f32;
+    for _ in 0..4096 {
+        let row = rng.usize(0..input.len() / usize::from(hidden));
+        let column = rng.usize(0..usize::from(output_columns));
+        let projection = column / usize::from(hidden);
+        let projection_column = column % usize::from(hidden);
+        let expected = input[row * usize::from(hidden)..(row + 1) * usize::from(hidden)]
+            .iter()
+            .enumerate()
+            .map(|(inner, value)| {
+                value * weights[projection][projection_column * usize::from(hidden) + inner]
+            })
+            .sum::<f32>()
+            + biases[projection][projection_column];
+        let observed = decoded[row * usize::from(output_columns) + column];
+        assert!(observed.is_finite());
+        max_error = max_error.max((observed - expected).abs());
+    }
     max_error
+}
+
+fn resident_data_end(schedule: &ipu_compiler::Schedule) -> u32 {
+    schedule
+        .allocations
+        .iter()
+        .filter(|allocation| {
+            allocation.kind == AllocationKind::Home && allocation.address >= DATA_BASE
+        })
+        .map(|allocation| allocation.address + allocation.size)
+        .max()
+        .map(|address| (address + 31) & !31)
+        .unwrap_or(DATA_BASE)
 }
 
 fn layer_norm_reference(

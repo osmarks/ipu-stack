@@ -534,6 +534,211 @@ pub struct BlockedGemmPlan {
     pub output: Vec<BlockPlacement>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendedBlockedGemm {
+    pub right: Vec<BlockPlacement>,
+    pub output: Vec<BlockPlacement>,
+}
+
+pub fn append_blocked_gemm_f16_with_a16_input(
+    schedule: &mut Schedule,
+    input: &[RowShardPlacement],
+    config: BlockedGemmConfig,
+) -> Result<AppendedBlockedGemm, CompileError> {
+    if config.data_type != GemmDataType::F16 {
+        return Err(CompileError::Graph(
+            "A16 composition requires an FP16 GEMM".into(),
+        ));
+    }
+    let mut plan = plan_blocked_gemm(config)?;
+    let tensor_base = schedule
+        .allocations
+        .iter()
+        .map(|allocation| allocation.tensor.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    remap_gemm_tensors(&mut plan, tensor_base)?;
+    let mut next_tensor = plan
+        .schedule
+        .allocations
+        .iter()
+        .map(|allocation| allocation.tensor.0)
+        .max()
+        .unwrap_or(tensor_base)
+        + 1;
+    let exchange_phase = schedule.phases.len();
+    let compute_phase = exchange_phase + 1;
+    let mut transfers = Vec::with_capacity(plan.left.len());
+    let mut commands = Vec::with_capacity(plan.left.len());
+    for block in &plan.left {
+        let shard = input
+            .iter()
+            .find(|shard| shard.row_start == block.row_start && shard.rows == block.rows)
+            .ok_or_else(|| {
+                CompileError::Graph(format!(
+                    "GEMM row block {}..{} has no matching A16 input shard",
+                    block.row_start,
+                    block.row_start + block.rows
+                ))
+            })?;
+        if shard.columns != config.inner_dimension {
+            return Err(CompileError::Graph(format!(
+                "A16 input has {} columns, expected {}",
+                shard.columns, config.inner_dimension
+            )));
+        }
+        let alias = TensorId(next_tensor);
+        next_tensor += 1;
+        let address = shard.address + u32::from(block.column_start) * u32::from(block.rows) * 2;
+        let bytes = u32::from(block.rows) * u32::from(block.columns) * 2;
+        schedule.allocations.push(Allocation {
+            tensor: alias,
+            tile: shard.tile,
+            address,
+            size: bytes,
+            live_from: 0,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        });
+        if shard.tile != block.tile {
+            transfers.push(Transfer {
+                source_tile: shard.tile,
+                destination_tile: block.tile,
+                tensor: alias,
+                bytes,
+            });
+            schedule.allocations.push(Allocation {
+                tensor: alias,
+                tile: block.tile,
+                address: ipu_exchange::EXCHANGE_WINDOW_BASE,
+                size: bytes,
+                live_from: exchange_phase,
+                live_until: compute_phase,
+                kind: AllocationKind::ExchangeStaging {
+                    phase: exchange_phase,
+                },
+            });
+        }
+        let units = bytes / 8;
+        commands.push(KernelCommand {
+            tile: block.tile,
+            output: block.tensor,
+            inputs: vec![alias, alias],
+            arguments: vec![units, units / 6, units % 6],
+            specialization: SpecializationKey {
+                operation: "copy_u64".into(),
+                shape: vec![
+                    usize::try_from(units)
+                        .map_err(|_| CompileError::Graph("A16 copy size overflow".into()))?,
+                ],
+                worker_count: 6,
+                role: "A16 GEMM input placement".into(),
+                alignment: 8,
+            },
+            metadata: BTreeMap::from([
+                ("label".into(), "place row-sharded GEMM input".into()),
+                ("row_start".into(), block.row_start.to_string()),
+                ("column_start".into(), block.column_start.to_string()),
+            ]),
+        });
+    }
+    schedule.phases.push(Phase::Exchange { transfers });
+    schedule.phases.push(Phase::Compute {
+        op: OpId(compute_phase),
+        commands,
+    });
+    append_child_schedule(schedule, &mut plan.schedule)?;
+    Ok(AppendedBlockedGemm {
+        right: plan.right,
+        output: plan.output,
+    })
+}
+
+fn remap_gemm_tensors(plan: &mut BlockedGemmPlan, base: usize) -> Result<(), CompileError> {
+    let remap = |tensor: &mut TensorId| -> Result<(), CompileError> {
+        tensor.0 = tensor
+            .0
+            .checked_add(base)
+            .ok_or_else(|| CompileError::Graph("GEMM tensor ID overflow".into()))?;
+        Ok(())
+    };
+    for placement in plan
+        .left
+        .iter_mut()
+        .chain(&mut plan.right)
+        .chain(&mut plan.output)
+    {
+        remap(&mut placement.tensor)?;
+    }
+    for allocation in &mut plan.schedule.allocations {
+        remap(&mut allocation.tensor)?;
+    }
+    for phase in &mut plan.schedule.phases {
+        match phase {
+            Phase::Exchange { transfers } => {
+                for transfer in transfers {
+                    remap(&mut transfer.tensor)?;
+                }
+            }
+            Phase::Compute { commands, .. } => {
+                for command in commands {
+                    remap(&mut command.output)?;
+                    for input in &mut command.inputs {
+                        remap(input)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_child_schedule(parent: &mut Schedule, child: &mut Schedule) -> Result<(), CompileError> {
+    if parent.tile_count != child.tile_count {
+        return Err(CompileError::Graph(
+            "composed schedules have different tile counts".into(),
+        ));
+    }
+    let phase_base = parent.phases.len();
+    for allocation in &mut child.allocations {
+        if allocation.live_from != 0 {
+            allocation.live_from = allocation
+                .live_from
+                .checked_add(phase_base)
+                .ok_or_else(|| CompileError::Graph("allocation phase overflow".into()))?;
+        }
+        if allocation.live_until != usize::MAX {
+            allocation.live_until = allocation
+                .live_until
+                .checked_add(phase_base)
+                .ok_or_else(|| CompileError::Graph("allocation phase overflow".into()))?;
+        }
+        if let AllocationKind::ExchangeStaging { phase } = &mut allocation.kind {
+            *phase = phase
+                .checked_add(phase_base)
+                .ok_or_else(|| CompileError::Graph("staging phase overflow".into()))?;
+        }
+    }
+    for phase in &mut child.phases {
+        if let Phase::Compute { op, .. } = phase {
+            op.0 =
+                op.0.checked_add(phase_base)
+                    .ok_or_else(|| CompileError::Graph("operation ID overflow".into()))?;
+        }
+    }
+    parent.allocations.append(&mut child.allocations);
+    parent.phases.append(&mut child.phases);
+    for (&tile, &peak) in &child.peak_sram {
+        parent
+            .peak_sram
+            .entry(tile)
+            .and_modify(|current| *current = (*current).max(peak))
+            .or_insert(peak);
+    }
+    Ok(())
+}
+
 pub fn choose_gemm_row_block(
     rows: u16,
     inner_block_dimension: u16,
@@ -1338,7 +1543,18 @@ impl Schedule {
                             .all(|group| available.contains(&(group.tensor, group.source)))
                     })
                     .ok_or_else(|| {
-                        CompileError::Graph("exchange staging dependencies contain a cycle".into())
+                        let blocked = colored_groups
+                            .iter()
+                            .flat_map(|slot| slot.iter())
+                            .filter(|group| !available.contains(&(group.tensor, group.source)))
+                            .map(|group| {
+                                format!("tensor {} on tile {}", group.tensor.0, group.source)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        CompileError::Graph(format!(
+                            "exchange phase {phase_index} staging dependencies contain a cycle or missing source: {blocked}"
+                        ))
                     })?;
                 let slot = colored_groups.remove(ready);
                 for group in &slot {
