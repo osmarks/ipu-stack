@@ -4,16 +4,17 @@ use ipu_compiler::{
     FlashAttentionConfig, FlashAttentionPlan, GemmDataType, KernelCommand, OpId, Phase,
     RowShardPlacement, RowShardTransitionConfig, SpecializationKey, TensorId,
     append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
-    append_blocked_gemm_f16_with_a16_input, append_c16_to_a16_row_shards,
-    append_flash_attention_from_a16_qkv, append_flash_attention_to_a16_row_shards,
-    choose_gemm_row_block_for, end_tensor_lifetimes, plan_blocked_gemm,
+    append_blocked_gemm_f16_with_a16_input, append_c16_to_a16_blocks_gelu_f16,
+    append_c16_to_a16_row_shards, append_flash_attention_from_a16_qkv,
+    append_flash_attention_to_a16_row_shards, choose_gemm_row_block_for, end_tensor_lifetimes,
+    plan_blocked_gemm,
 };
 use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    BlockLayout, ExecutableGraph, HostRunOptions, block_binding_typed, blocked_matrix_f16,
-    package_graph, run_host_with_options,
+    BlockLayout, ExecutableGraph, HostRunOptions, block_binding_typed, block_coordinates,
+    blocked_matrix_f16, package_graph, run_host_with_options,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -42,7 +43,7 @@ fn main() {
     let patch_elements = config.num_channels * config.patch_size.pow(2);
     let inner = u16::try_from(patch_elements.div_ceil(64) * 64).unwrap();
     let columns = u16::try_from(config.hidden_size).unwrap();
-    let row_block_dimension = choose_gemm_row_block_for(
+    let automatic_row_block_dimension = choose_gemm_row_block_for(
         rows,
         INNER_BLOCK_DIMENSION,
         columns,
@@ -51,6 +52,9 @@ fn main() {
         GemmDataType::F16,
     )
     .unwrap();
+    let row_block_dimension = std::env::var("IPU_SIGLIP_ROW_BLOCK_ROWS")
+        .map(|value| value.parse().unwrap())
+        .unwrap_or(automatic_row_block_dimension);
     let mut plan = plan_blocked_gemm(BlockedGemmConfig {
         rows,
         inner_dimension: inner,
@@ -317,6 +321,55 @@ fn main() {
                 .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes()),
         );
     }
+    let intermediate_columns = u16::try_from(config.intermediate_size.div_ceil(64) * 64).unwrap();
+    let mlp_up_base = resident_data_end(&plan.schedule);
+    let mlp_up = append_blocked_gemm_f16_with_a16_input(
+        &mut plan.schedule,
+        &norm2.output,
+        BlockedGemmConfig {
+            rows,
+            inner_dimension: columns,
+            columns: intermediate_columns,
+            block_dimension: BLOCK_DIMENSION,
+            inner_block_dimension: INNER_BLOCK_DIMENSION,
+            row_block_dimension,
+            tile_count: TILE_COUNT,
+            data_base: mlp_up_base,
+            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            data_type: GemmDataType::F16,
+        },
+    )
+    .unwrap();
+    let mlp_up_weight = model
+        .tensor_f32("vision_model.encoder.layers.0.mlp.fc1.weight")
+        .unwrap();
+    host_input.extend(blocked_matrix_f16(
+        &mlp_up.right,
+        BlockLayout::AmpB16x16,
+        |row, column| {
+            if usize::from(column) < config.intermediate_size {
+                mlp_up_weight[usize::from(column) * usize::from(columns) + usize::from(row)]
+            } else {
+                0.0
+            }
+        },
+    ));
+    let mlp_up_bias = model
+        .tensor_f32("vision_model.encoder.layers.0.mlp.fc1.bias")
+        .unwrap();
+    let mlp_up_adjustment = append_adjustment_phase(&mut plan.schedule, &mlp_up.output).unwrap();
+    host_input.extend(blocked_matrix_f16(
+        &mlp_up_adjustment,
+        BlockLayout::AmpC16F16,
+        |_row, column| mlp_up_bias.get(usize::from(column)).copied().unwrap_or(0.0),
+    ));
+    let mlp_gelu = append_c16_to_a16_blocks_gelu_f16(
+        &mut plan.schedule,
+        &mlp_up.output,
+        DATA_BASE,
+        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+    )
+    .unwrap();
     let objects = compile_objects(&plan, &attention).unwrap();
     let graph = ExecutableGraph {
         schedule: plan.schedule,
@@ -346,13 +399,27 @@ fn main() {
                 2,
             ),
             row_shard_binding("layer_norm2_affine", 2, columns, &norm2.affine),
+            block_binding_typed(
+                "mlp_up_weight",
+                columns,
+                intermediate_columns,
+                &mlp_up.right,
+                "f16",
+                2,
+            ),
+            block_binding_typed(
+                "mlp_up_bias",
+                rows,
+                intermediate_columns,
+                &mlp_up_adjustment,
+                "f16",
+                2,
+            ),
         ],
-        host_outputs: vec![row_shard_binding(
-            "layer_norm2",
-            rows,
-            columns,
-            &norm2.output,
-        )],
+        host_outputs: vec![
+            row_shard_binding("layer_norm2", rows, columns, &norm2.output),
+            block_binding_typed("mlp_gelu", rows, intermediate_columns, &mlp_gelu, "f16", 2),
+        ],
     };
     let app = package_graph(&graph, &objects).unwrap();
     let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
@@ -372,18 +439,37 @@ fn main() {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
-    let expected = reference.tensor_f32("encoder_layer_00_norm2").unwrap();
-    let expected = serialize_a16_row_shards(
-        &expected,
+    let norm2_bytes = usize::from(rows) * usize::from(columns) * 2;
+    let expected_norm2 = reference.tensor_f32("encoder_layer_00_norm2").unwrap();
+    let expected_norm2 = serialize_a16_row_shards(
+        &expected_norm2,
         usize::from(rows),
         usize::from(columns),
         &norm2.output,
     );
-    let max_error = verify_linear_f16(&actual, &expected);
+    let norm2_error = verify_linear_f16(&actual[..norm2_bytes], &expected_norm2);
+    let expected = reference.tensor_f32("encoder_layer_00_mlp_gelu").unwrap();
+    let expected = pad_columns(
+        &expected,
+        usize::from(rows),
+        config.intermediate_size,
+        usize::from(intermediate_columns),
+    );
+    let expected = serialize_a16_blocks(
+        &expected,
+        usize::from(rows),
+        usize::from(intermediate_columns),
+        &mlp_gelu,
+    );
+    let max_error = verify_linear_f16(&actual[norm2_bytes..], &expected);
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
     assert!(
+        norm2_error <= limit,
+        "norm2 max error {norm2_error} exceeds {limit}"
+    );
+    assert!(
         max_error <= limit,
-        "attention max error {max_error} exceeds {limit}"
+        "MLP GeLU max error {max_error} exceeds {limit}"
     );
     info!(
         image_size = config.image_size,
@@ -393,9 +479,11 @@ fn main() {
         rows,
         inner,
         columns,
+        intermediate_columns,
         row_block_dimension,
+        norm2_error,
         max_error,
-        "SigLIP layer 0 attention, residual, and second norm passed against Hugging Face"
+        "SigLIP layer 0 attention and MLP GeLU passed against Hugging Face"
     );
 }
 
@@ -522,6 +610,12 @@ fn compile_objects(
     )?;
     let add = toolchain.compile(source("add_f16.S"), &artifacts, "add-f16", &[])?;
     let relayout = toolchain.compile(source("relayout_f16.S"), &artifacts, "relayout-f16", &[])?;
+    let gelu_relayout = toolchain.compile(
+        source("gelu_relayout_f16.S"),
+        &artifacts,
+        "gelu-relayout-f16",
+        &[],
+    )?;
     let norm_codelet = toolchain.compile(
         source("layer_norm_f16.cpp"),
         &artifacts,
@@ -647,6 +741,7 @@ fn compile_objects(
         fs::read(gemm.object)?,
         fs::read(add.object)?,
         fs::read(relayout.object)?,
+        fs::read(gelu_relayout.object)?,
         fs::read(norm_codelet.object)?,
         fs::read(norm_wrapper.object)?,
         fs::read(pack_codelet.object)?,
@@ -740,6 +835,38 @@ fn serialize_a16_row_shards(
         }
     }
     serialized
+}
+
+fn serialize_a16_blocks(
+    values: &[f32],
+    rows: usize,
+    columns: usize,
+    blocks: &[BlockPlacement],
+) -> Vec<f32> {
+    assert_eq!(values.len(), rows * columns);
+    let mut serialized = Vec::with_capacity(values.len());
+    for block in blocks {
+        for linear in 0..block.rows * block.columns {
+            let (row, column) =
+                block_coordinates(BlockLayout::AmpA16, block.rows, block.columns, linear);
+            serialized.push(
+                values[(usize::from(block.row_start + row)) * columns
+                    + usize::from(block.column_start + column)],
+            );
+        }
+    }
+    serialized
+}
+
+fn pad_columns(values: &[f32], rows: usize, columns: usize, padded_columns: usize) -> Vec<f32> {
+    assert_eq!(values.len(), rows * columns);
+    assert!(padded_columns >= columns);
+    let mut padded = vec![0.0; rows * padded_columns];
+    for row in 0..rows {
+        padded[row * padded_columns..row * padded_columns + columns]
+            .copy_from_slice(&values[row * columns..(row + 1) * columns]);
+    }
+    padded
 }
 
 fn resident_data_end(schedule: &ipu_compiler::Schedule) -> u32 {

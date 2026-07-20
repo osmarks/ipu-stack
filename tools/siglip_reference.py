@@ -166,6 +166,10 @@ def main() -> None:
             tensors["patch_and_position"]
             + first_layer.self_attn.out_proj(attention_hidden)
         ).detach().clone()
+        with torch.inference_mode():
+            tensors["encoder_layer_00_mlp_gelu"] = first_layer.mlp.activation_fn(
+                first_layer.mlp.fc1(tensors["encoder_layer_00_norm2"])
+            ).detach().clone()
     tensors["last_hidden_state"] = output.last_hidden_state
     tensors["pooler_output"] = output.pooler_output
 

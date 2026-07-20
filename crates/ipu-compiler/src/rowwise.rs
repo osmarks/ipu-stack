@@ -176,6 +176,113 @@ pub fn append_c16_to_a16_row_shards(
     source: &[BlockPlacement],
     config: RowShardTransitionConfig,
 ) -> Result<Vec<RowShardPlacement>, CompileError> {
+    append_c16_to_a16_row_shards_impl(schedule, source, config, false)
+}
+
+pub fn append_c16_to_a16_row_shards_gelu_f16(
+    schedule: &mut Schedule,
+    source: &[BlockPlacement],
+    config: RowShardTransitionConfig,
+) -> Result<Vec<RowShardPlacement>, CompileError> {
+    append_c16_to_a16_row_shards_impl(schedule, source, config, true)
+}
+
+/// Applies GeLU while converting independently placed C16 blocks to A16.
+/// Keeping the 64-column blocks distributed avoids requiring a contiguous
+/// full-width row shard for wide MLP intermediates.
+pub fn append_c16_to_a16_blocks_gelu_f16(
+    schedule: &mut Schedule,
+    source: &[BlockPlacement],
+    data_base: u32,
+    data_limit: u32,
+) -> Result<Vec<BlockPlacement>, CompileError> {
+    if source.is_empty()
+        || data_base & 7 != 0
+        || data_base >= data_limit
+        || source.iter().any(|block| block.columns != 64)
+    {
+        return Err(CompileError::Graph(
+            "blocked C16-to-A16 GeLU requires 64-column blocks and aligned SRAM".into(),
+        ));
+    }
+    let phase = schedule.phases.len();
+    let mut next_tensor = schedule
+        .allocations
+        .iter()
+        .map(|allocation| allocation.tensor.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut output = Vec::with_capacity(source.len());
+    let mut commands = Vec::with_capacity(source.len());
+    for block in source {
+        let bytes = u32::from(block.rows) * u32::from(block.columns) * 2;
+        let address = find_free_region(
+            &schedule.allocations,
+            block.tile,
+            bytes,
+            phase,
+            usize::MAX,
+            MemoryConstraint {
+                base: data_base,
+                limit: data_limit,
+                alignment: 8,
+                placement: MemoryPlacement::Low,
+            },
+        )?;
+        let tensor = TensorId(next_tensor);
+        next_tensor += 1;
+        let placement = BlockPlacement {
+            tensor,
+            address,
+            ..*block
+        };
+        schedule.allocations.push(Allocation {
+            tensor,
+            tile: block.tile,
+            address,
+            size: bytes,
+            live_from: phase,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        });
+        commands.push(KernelCommand {
+            tile: block.tile,
+            output: tensor,
+            inputs: vec![block.tensor, block.tensor],
+            arguments: vec![
+                u32::from(block.rows),
+                u32::from(block.rows / 6),
+                u32::from(block.rows % 6),
+            ],
+            specialization: SpecializationKey {
+                operation: "gelu_f16_c16_to_a16".into(),
+                shape: vec![usize::from(block.rows), usize::from(block.columns)],
+                worker_count: 6,
+                role: "blocked-gelu".into(),
+                alignment: 8,
+            },
+            metadata: BTreeMap::from([
+                ("label".into(), "blocked GeLU".into()),
+                ("row_start".into(), block.row_start.to_string()),
+                ("column_start".into(), block.column_start.to_string()),
+            ]),
+        });
+        output.push(placement);
+    }
+    schedule.phases.push(Phase::Compute {
+        op: OpId(phase),
+        commands,
+    });
+    Ok(output)
+}
+
+fn append_c16_to_a16_row_shards_impl(
+    schedule: &mut Schedule,
+    source: &[BlockPlacement],
+    config: RowShardTransitionConfig,
+    gelu: bool,
+) -> Result<Vec<RowShardPlacement>, CompileError> {
     if source.is_empty()
         || config.columns == 0
         || !config.columns.is_multiple_of(16)
@@ -198,13 +305,9 @@ pub fn append_c16_to_a16_row_shards(
         .max()
         .unwrap_or(0)
         + 1;
-    let exchange_phase = schedule.phases.len();
-    let compute_phase = exchange_phase + 1;
-    let mut transfers = Vec::new();
-    let mut commands = Vec::new();
+    let first_compute_phase = schedule.phases.len() + 1;
     let mut destinations = Vec::with_capacity(rows.len());
-    let mut cursors = vec![config.data_base; usize::from(schedule.tile_count)];
-
+    let mut destination_blocks = Vec::with_capacity(rows.len());
     for (destination_tile, (_block_row, mut blocks)) in rows.into_iter().enumerate() {
         let destination_tile = u16::try_from(destination_tile)
             .map_err(|_| CompileError::Graph("row-shard destination tile overflow".into()))?;
@@ -214,6 +317,7 @@ pub fn append_c16_to_a16_row_shards(
         for block in &blocks {
             if block.row_start != first.row_start
                 || block.rows != first.rows
+                || block.columns != 64
                 || block.column_start != next_column
             {
                 return Err(CompileError::Graph(
@@ -231,12 +335,19 @@ pub fn append_c16_to_a16_row_shards(
             )));
         }
         let bytes = u32::from(first.rows) * u32::from(config.columns) * 2;
-        let address = allocate(&mut cursors[usize::from(destination_tile)], bytes, 8)?;
-        if cursors[usize::from(destination_tile)] > config.data_limit {
-            return Err(CompileError::Memory(format!(
-                "A16 row shard on tile {destination_tile} exceeds its SRAM arena"
-            )));
-        }
+        let address = find_free_region(
+            &schedule.allocations,
+            destination_tile,
+            bytes,
+            first_compute_phase,
+            usize::MAX,
+            MemoryConstraint {
+                base: config.data_base,
+                limit: config.data_limit,
+                alignment: 8,
+                placement: MemoryPlacement::Low,
+            },
+        )?;
         let destination_tensor = TensorId(next_tensor);
         next_tensor += 1;
         schedule.allocations.push(Allocation {
@@ -244,7 +355,7 @@ pub fn append_c16_to_a16_row_shards(
             tile: destination_tile,
             address,
             size: bytes,
-            live_from: compute_phase,
+            live_from: first_compute_phase,
             live_until: usize::MAX,
             kind: AllocationKind::Home,
         });
@@ -256,68 +367,116 @@ pub fn append_c16_to_a16_row_shards(
             tensor: destination_tensor,
             address,
         });
+        destination_blocks.push((destination_tile, address, blocks));
+    }
 
-        for block in blocks {
-            let block_bytes = u32::from(block.rows) * u32::from(block.columns) * 2;
-            if block.tile != destination_tile {
-                let staging_address = ipu_exchange::EXCHANGE_WINDOW_BASE
-                    + u32::from(block.column_start) * u32::from(block.rows) * 2;
-                transfers.push(Transfer {
-                    source_tile: block.tile,
-                    destination_tile,
-                    tensor: block.tensor,
-                    bytes: block_bytes,
-                });
+    let maximum_rows = destination_blocks
+        .iter()
+        .flat_map(|(_, _, blocks)| blocks.iter().map(|block| block.rows))
+        .max()
+        .unwrap();
+    let maximum_block_bytes = u32::from(maximum_rows) * 64 * 2;
+    let blocks_per_pass =
+        usize::try_from(ipu_exchange::EXCHANGE_WINDOW_BYTES / maximum_block_bytes)
+            .map_err(|_| CompileError::Graph("row-shard pass size overflow".into()))?;
+    if blocks_per_pass == 0 {
+        return Err(CompileError::Graph(
+            "one row-shard block exceeds the exchange window".into(),
+        ));
+    }
+    let block_count = destination_blocks[0].2.len();
+    for first_block in (0..block_count).step_by(blocks_per_pass) {
+        let exchange_phase = schedule.phases.len();
+        let compute_phase = exchange_phase + 1;
+        let mut transfers = Vec::new();
+        let mut commands = Vec::new();
+        for &(destination_tile, address, ref blocks) in &destination_blocks {
+            for block in blocks.iter().skip(first_block).take(blocks_per_pass) {
+                let block_bytes = u32::from(block.rows) * u32::from(block.columns) * 2;
+                if block.tile != destination_tile {
+                    let staging_address = ipu_exchange::EXCHANGE_WINDOW_BASE
+                        + u32::from(block.block_column - first_block as u16) * block_bytes;
+                    transfers.push(Transfer {
+                        source_tile: block.tile,
+                        destination_tile,
+                        tensor: block.tensor,
+                        bytes: block_bytes,
+                    });
+                    schedule.allocations.push(Allocation {
+                        tensor: block.tensor,
+                        tile: destination_tile,
+                        address: staging_address,
+                        size: block_bytes,
+                        live_from: exchange_phase,
+                        live_until: compute_phase,
+                        kind: AllocationKind::ExchangeStaging {
+                            phase: exchange_phase,
+                        },
+                    });
+                }
+                let output_alias = TensorId(next_tensor);
+                next_tensor += 1;
+                let output_address =
+                    address + u32::from(block.column_start) * u32::from(block.rows) * 2;
                 schedule.allocations.push(Allocation {
-                    tensor: block.tensor,
+                    tensor: output_alias,
                     tile: destination_tile,
-                    address: staging_address,
+                    address: output_address,
                     size: block_bytes,
-                    live_from: exchange_phase,
+                    live_from: compute_phase,
                     live_until: compute_phase,
-                    kind: AllocationKind::ExchangeStaging {
-                        phase: exchange_phase,
+                    kind: AllocationKind::Home,
+                });
+                let units_per_worker = u32::from(block.rows / 6);
+                let extra_workers = u32::from(block.rows % 6);
+                commands.push(KernelCommand {
+                    tile: destination_tile,
+                    output: output_alias,
+                    inputs: vec![block.tensor, block.tensor],
+                    arguments: if gelu {
+                        vec![u32::from(block.rows), units_per_worker, extra_workers]
+                    } else {
+                        vec![u32::from(block.rows)]
                     },
+                    specialization: SpecializationKey {
+                        operation: if gelu {
+                            "gelu_f16_c16_to_a16"
+                        } else {
+                            "relayout_f16_c16_to_a16"
+                        }
+                        .into(),
+                        shape: vec![usize::from(block.rows), usize::from(block.columns)],
+                        worker_count: 6,
+                        role: if gelu {
+                            "blocked-to-row-sharded-gelu"
+                        } else {
+                            "blocked-to-row-sharded"
+                        }
+                        .into(),
+                        alignment: 8,
+                    },
+                    metadata: BTreeMap::from([
+                        (
+                            "label".into(),
+                            if gelu {
+                                "gather blocked activation with GeLU"
+                            } else {
+                                "gather blocked activation"
+                            }
+                            .into(),
+                        ),
+                        ("row_start".into(), block.row_start.to_string()),
+                        ("column_start".into(), block.column_start.to_string()),
+                    ]),
                 });
             }
-            let output_alias = TensorId(next_tensor);
-            next_tensor += 1;
-            let output_address =
-                address + u32::from(block.column_start) * u32::from(block.rows) * 2;
-            schedule.allocations.push(Allocation {
-                tensor: output_alias,
-                tile: destination_tile,
-                address: output_address,
-                size: block_bytes,
-                live_from: compute_phase,
-                live_until: compute_phase,
-                kind: AllocationKind::Home,
-            });
-            commands.push(KernelCommand {
-                tile: destination_tile,
-                output: output_alias,
-                inputs: vec![block.tensor, block.tensor],
-                arguments: vec![u32::from(block.rows)],
-                specialization: SpecializationKey {
-                    operation: "relayout_f16_c16_to_a16".into(),
-                    shape: vec![usize::from(block.rows), usize::from(block.columns)],
-                    worker_count: 6,
-                    role: "blocked-to-row-sharded".into(),
-                    alignment: 8,
-                },
-                metadata: BTreeMap::from([
-                    ("label".into(), "gather blocked activation".into()),
-                    ("row_start".into(), block.row_start.to_string()),
-                    ("column_start".into(), block.column_start.to_string()),
-                ]),
-            });
         }
+        schedule.phases.push(Phase::Exchange { transfers });
+        schedule.phases.push(Phase::Compute {
+            op: OpId(compute_phase),
+            commands,
+        });
     }
-    schedule.phases.push(Phase::Exchange { transfers });
-    schedule.phases.push(Phase::Compute {
-        op: OpId(compute_phase),
-        commands,
-    });
     Ok(destinations)
 }
 
@@ -521,17 +680,6 @@ pub fn append_affine_layer_norm_f16(
     Ok(AppendedAffineLayerNorm { affine, output })
 }
 
-fn allocate(cursor: &mut u32, bytes: u32, alignment: u32) -> Result<u32, CompileError> {
-    let address = cursor
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
-        .ok_or_else(|| CompileError::Memory("row-sharded allocation overflow".into()))?;
-    *cursor = address
-        .checked_add(bytes)
-        .ok_or_else(|| CompileError::Memory("row-sharded allocation overflow".into()))?;
-    Ok(address)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +733,68 @@ mod tests {
         assert!(matches!(
             &schedule.phases[1],
             Phase::Compute { commands, .. } if commands.len() == destination.len()
+        ));
+    }
+
+    #[test]
+    fn blocked_gelu_keeps_blocks_distributed_and_allocates_by_lifetime() {
+        let source = vec![
+            BlockPlacement {
+                tensor: TensorId(0),
+                tile: 0,
+                address: 0xa0000,
+                block_row: 0,
+                block_column: 0,
+                row_start: 0,
+                column_start: 0,
+                rows: 13,
+                columns: 64,
+            },
+            BlockPlacement {
+                tensor: TensorId(1),
+                tile: 1,
+                address: 0xa0000,
+                block_row: 0,
+                block_column: 1,
+                row_start: 0,
+                column_start: 64,
+                rows: 13,
+                columns: 64,
+            },
+        ];
+        let bytes = 13 * 64 * 2;
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: source
+                .iter()
+                .map(|block| Allocation {
+                    tensor: block.tensor,
+                    tile: block.tile,
+                    address: block.address,
+                    size: bytes,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                })
+                .collect(),
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let output =
+            append_c16_to_a16_blocks_gelu_f16(&mut schedule, &source, 0xa0000, 0xe8000).unwrap();
+
+        assert_eq!(output.len(), source.len());
+        assert!(output.iter().zip(&source).all(|(output, source)| {
+            output.tile == source.tile
+                && output.row_start == source.row_start
+                && output.column_start == source.column_start
+                && output.address >= source.address + bytes
+        }));
+        assert!(matches!(
+            &schedule.phases[0],
+            Phase::Compute { commands, .. } if commands.len() == source.len()
         ));
     }
 

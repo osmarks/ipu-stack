@@ -20,12 +20,16 @@ pub use mlp::{BlockedMlpConfig, BlockedMlpPlan, plan_blocked_mlp};
 pub use rowwise::{
     AffineLayerNormConfig, AffineLayerNormPlan, AppendAffineLayerNormConfig,
     AppendedAffineLayerNorm, RowShardPlacement, RowShardTransitionConfig,
-    append_add_f16_row_shards_in_place, append_affine_layer_norm_f16, append_c16_to_a16_row_shards,
-    end_tensor_lifetimes, plan_affine_layer_norm_f16,
+    append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
+    append_c16_to_a16_blocks_gelu_f16, append_c16_to_a16_row_shards,
+    append_c16_to_a16_row_shards_gelu_f16, end_tensor_lifetimes, plan_affine_layer_norm_f16,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_TILE_COUNT: u16 = 64;
+// The AMP worker pipeline uses a repeat count of `worker_rows - 1`. Keep at
+// least two rows on each of the six workers so that repeat never sees zero.
+const GEMM_MINIMUM_ROW_SHARD: u16 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TensorId(pub usize);
@@ -667,6 +671,99 @@ pub fn append_blocked_gemm_f16_with_a16_input(
     })
 }
 
+pub fn append_blocked_gemm_f16_with_a16_blocks(
+    schedule: &mut Schedule,
+    input: &[BlockPlacement],
+    config: BlockedGemmConfig,
+) -> Result<AppendedBlockedGemm, CompileError> {
+    if config.data_type != GemmDataType::F16 {
+        return Err(CompileError::Graph(
+            "A16 block composition requires an FP16 GEMM".into(),
+        ));
+    }
+    let mut plan = plan_blocked_gemm(config)?;
+    let tensor_base = schedule
+        .allocations
+        .iter()
+        .map(|allocation| allocation.tensor.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    remap_gemm_tensors(&mut plan, tensor_base)?;
+    let exchange_phase = schedule.phases.len();
+    let compute_phase = exchange_phase + 1;
+    let mut transfers = Vec::with_capacity(plan.left.len());
+    let mut commands = Vec::with_capacity(plan.left.len());
+    for destination in &plan.left {
+        let source = input
+            .iter()
+            .find(|source| {
+                source.row_start == destination.row_start
+                    && source.rows == destination.rows
+                    && source.column_start == destination.column_start
+                    && source.columns == destination.columns
+            })
+            .ok_or_else(|| {
+                CompileError::Graph(format!(
+                    "GEMM input block ({}, {}) is missing",
+                    destination.block_row, destination.block_column
+                ))
+            })?;
+        let bytes = u32::from(destination.rows) * u32::from(destination.columns) * 2;
+        if source.tile != destination.tile {
+            transfers.push(Transfer {
+                source_tile: source.tile,
+                destination_tile: destination.tile,
+                tensor: source.tensor,
+                bytes,
+            });
+            schedule.allocations.push(Allocation {
+                tensor: source.tensor,
+                tile: destination.tile,
+                address: ipu_exchange::EXCHANGE_WINDOW_BASE,
+                size: bytes,
+                live_from: exchange_phase,
+                live_until: compute_phase,
+                kind: AllocationKind::ExchangeStaging {
+                    phase: exchange_phase,
+                },
+            });
+        }
+        let units = bytes / 8;
+        commands.push(KernelCommand {
+            tile: destination.tile,
+            output: destination.tensor,
+            inputs: vec![source.tensor, source.tensor],
+            arguments: vec![units, units / 6, units % 6],
+            specialization: SpecializationKey {
+                operation: "copy_u64".into(),
+                shape: vec![
+                    usize::try_from(units)
+                        .map_err(|_| CompileError::Graph("A16 copy size overflow".into()))?,
+                ],
+                worker_count: 6,
+                role: "distributed A16 GEMM input placement".into(),
+                alignment: 8,
+            },
+            metadata: BTreeMap::from([
+                ("label".into(), "place distributed GEMM input".into()),
+                ("row_start".into(), destination.row_start.to_string()),
+                ("column_start".into(), destination.column_start.to_string()),
+            ]),
+        });
+    }
+    schedule.phases.push(Phase::Exchange { transfers });
+    schedule.phases.push(Phase::Compute {
+        op: OpId(compute_phase),
+        commands,
+    });
+    append_child_schedule(schedule, &mut plan.schedule)?;
+    Ok(AppendedBlockedGemm {
+        right: plan.right,
+        output: plan.output,
+    })
+}
+
 fn remap_gemm_tensors(plan: &mut BlockedGemmPlan, base: usize) -> Result<(), CompileError> {
     let remap = |tensor: &mut TensorId| -> Result<(), CompileError> {
         tensor.0 = tensor
@@ -841,10 +938,10 @@ pub fn gemm_row_block_candidates_for(
                 - ipu_package::IPU21_INTERLEAVED_MEMORY_BASE)
                 / (u32::from(block_dimension) * element_bytes),
         ) as u16;
-    (12..=maximum_rows)
+    (GEMM_MINIMUM_ROW_SHARD..=maximum_rows)
         .filter(|&target| {
             let row_shards = rows.div_ceil(target);
-            rows / row_shards >= 12 && row_shard_counts.insert(row_shards)
+            rows / row_shards >= GEMM_MINIMUM_ROW_SHARD && row_shard_counts.insert(row_shards)
         })
         .collect()
 }
@@ -879,10 +976,10 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
     let row_grid = config.rows.div_ceil(config.row_block_dimension);
     let base_rows = config.rows / row_grid;
     let larger_row_shards = config.rows % row_grid;
-    if base_rows < 12 {
-        return Err(CompileError::Graph(
-            "blocked GEMM requires at least 12 rows in every balanced row shard".into(),
-        ));
+    if base_rows < GEMM_MINIMUM_ROW_SHARD {
+        return Err(CompileError::Graph(format!(
+            "blocked GEMM requires at least {GEMM_MINIMUM_ROW_SHARD} rows in every balanced row shard"
+        )));
     }
     let output_block_count = usize::from(row_grid) * usize::from(column_grid);
     let element_bytes = config.data_type.element_bytes();
@@ -2491,6 +2588,64 @@ fn gelu(value: f32) -> f32 {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn distributed_a16_blocks_feed_gemm_without_a_full_row_shard() {
+        let source = BlockPlacement {
+            tensor: TensorId(0),
+            tile: 1,
+            address: 0xa0000,
+            block_row: 0,
+            block_column: 0,
+            row_start: 0,
+            column_start: 0,
+            rows: 12,
+            columns: 64,
+        };
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![Allocation {
+                tensor: source.tensor,
+                tile: source.tile,
+                address: source.address,
+                size: 12 * 64 * 2,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            }],
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let appended = append_blocked_gemm_f16_with_a16_blocks(
+            &mut schedule,
+            &[source],
+            BlockedGemmConfig {
+                rows: 12,
+                inner_dimension: 64,
+                columns: 64,
+                block_dimension: 64,
+                inner_block_dimension: 64,
+                row_block_dimension: 12,
+                tile_count: 2,
+                data_base: 0xb0000,
+                data_limit: 0xe8000,
+                data_type: GemmDataType::F16,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(appended.output.len(), 1);
+        assert!(matches!(
+            &schedule.phases[0],
+            Phase::Exchange { transfers } if transfers.len() == 1
+        ));
+        assert!(matches!(
+            &schedule.phases[1],
+            Phase::Compute { commands, .. } if commands.len() == 1
+        ));
+    }
 
     #[test]
     fn blocked_gemm_plan_preserves_block_ownership_and_phase_dependencies() {
