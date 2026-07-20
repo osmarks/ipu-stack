@@ -225,10 +225,15 @@ fn data_region_base_for_tile(
     reserved.sort_unstable();
 
     let mut cursor = align_up(ipu_package::TILE_MEMORY_BASE, alignment);
+    let mut free_bytes = 0u32;
+    let mut largest_gap = 0u32;
     for (start, end) in reserved {
         if end <= cursor || start >= memory_end {
             continue;
         }
+        let gap = start.saturating_sub(cursor);
+        free_bytes = free_bytes.saturating_add(gap);
+        largest_gap = largest_gap.max(gap);
         let candidate_end = cursor
             .checked_add(required_size)
             .ok_or("data region address overflow")?;
@@ -237,6 +242,9 @@ fn data_region_base_for_tile(
         }
         cursor = align_up(cursor.max(end), alignment);
     }
+    let final_gap = memory_end.saturating_sub(cursor);
+    free_bytes = free_bytes.saturating_add(final_gap);
+    largest_gap = largest_gap.max(final_gap);
     if cursor
         .checked_add(required_size)
         .is_some_and(|end| end <= memory_end)
@@ -244,7 +252,7 @@ fn data_region_base_for_tile(
         Ok(cursor)
     } else {
         Err(format!(
-            "no tile-memory interval can hold {required_size} bytes of static data on tile {tile}"
+            "no tile-memory interval can hold {required_size} bytes of static data on tile {tile}: {free_bytes} free bytes, {largest_gap}-byte largest gap"
         )
         .into())
     }
@@ -1561,6 +1569,37 @@ fn package_graph_impl(
         })
         .collect::<Vec<_>>();
     let mut template_record_ranges = vec![Vec::new(); programs.len()];
+    if let Some((tile_index, template, words, changed_words)) = tile_exchange_plans
+        .iter()
+        .enumerate()
+        .flat_map(|(tile_index, plans)| {
+            plans.templates.iter().map(move |template| {
+                let words = template.records.iter().map(Vec::len).sum::<usize>();
+                let changed_words = template
+                    .records
+                    .windows(2)
+                    .map(|records| {
+                        records[0]
+                            .iter()
+                            .zip(&records[1])
+                            .filter(|(left, right)| left != right)
+                            .count()
+                    })
+                    .sum::<usize>();
+                (tile_index, template, words, changed_words)
+            })
+        })
+        .max_by_key(|(_, _, words, _)| *words)
+    {
+        info!(
+            logical_tile = programs[tile_index].tile,
+            template = template.name,
+            instances = template.records.len(),
+            record_words = words,
+            adjacent_changed_words = changed_words,
+            "largest static template record set"
+        );
+    }
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
         let runtime_end = completion_addresses[tile_index]

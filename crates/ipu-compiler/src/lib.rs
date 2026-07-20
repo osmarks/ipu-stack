@@ -1335,7 +1335,7 @@ fn plan_appended_blocked_gemm_with_memory_policy(
 ) -> Result<BlockedGemmPlan, CompileError> {
     let mut plan = plan_blocked_gemm(config)?;
     let tile_rotation =
-        choose_resident_tile_rotation_in_arenas(parent, &plan.schedule, &memory.resident);
+        choose_resident_tile_rotation_in_arenas(parent, &plan.right, &memory.resident);
     rotate_gemm_plan_tiles(&mut plan, tile_rotation)?;
     let mut regions = plan
         .left
@@ -1433,7 +1433,14 @@ fn plan_appended_blocked_gemm_with_memory_policy(
             allocation_arenas,
             32,
             placement,
-        )?;
+        )
+        .map_err(|error| {
+            let lifetime = if resident { "resident" } else { "transient" };
+            CompileError::Memory(format!(
+                "cannot place {size}-byte {lifetime} GEMM tensor {} on tile {tile}: {error}",
+                tensor.0
+            ))
+        })?;
         let end = address.checked_add(size).ok_or_else(|| {
             CompileError::Memory("appended GEMM allocation address overflow".into())
         })?;
@@ -1476,28 +1483,41 @@ fn plan_appended_blocked_gemm_with_memory_policy(
 
 fn choose_resident_tile_rotation_in_arenas(
     parent: &Schedule,
-    child: &Schedule,
+    child_resident: &[BlockPlacement],
     arenas: &[MemoryArena],
 ) -> u16 {
     let tile_count = usize::from(parent.tile_count);
     if tile_count == 0 {
         return 0;
     }
-    let resident_bytes = |schedule: &Schedule| {
-        let mut bytes = vec![0u64; tile_count];
-        for allocation in &schedule.allocations {
-            if allocation.kind == AllocationKind::Home
-                && arenas.iter().any(|arena| {
-                    allocation.address >= arena.base && allocation.address < arena.limit
+    let arena_base = arenas.iter().map(|arena| arena.base).min().unwrap_or(0);
+    let arena_limit = arenas.iter().map(|arena| arena.limit).max().unwrap_or(0);
+    let occupied = occupied_intervals_by_tile(
+        &parent.allocations,
+        parent.tile_count,
+        0,
+        usize::MAX,
+        arena_base,
+        arena_limit,
+    );
+    let parent_bytes = occupied
+        .iter()
+        .map(|intervals| {
+            intervals
+                .iter()
+                .flat_map(|&(start, end)| {
+                    arenas.iter().map(move |arena| {
+                        u64::from(end.min(arena.limit).saturating_sub(start.max(arena.base)))
+                    })
                 })
-            {
-                bytes[usize::from(allocation.tile)] += u64::from(allocation.size);
-            }
-        }
-        bytes
-    };
-    let parent_bytes = resident_bytes(parent);
-    let child_bytes = resident_bytes(child);
+                .sum::<u64>()
+        })
+        .collect::<Vec<_>>();
+    let mut child_bytes = vec![0u64; tile_count];
+    for block in child_resident {
+        child_bytes[usize::from(block.tile)] +=
+            u64::from(block.rows) * u64::from(block.columns) * 2;
+    }
     (0..tile_count)
         .min_by_key(|&rotation| {
             let loads = (0..tile_count).map(|tile| {
@@ -3659,7 +3679,30 @@ mod tests {
             peak_sram: BTreeMap::new(),
         };
         let parent = schedule(vec![allocation(0, 0, 128)]);
-        let child = schedule(vec![allocation(1, 0, 64), allocation(2, 1, 64)]);
+        let child = vec![
+            BlockPlacement {
+                tensor: TensorId(1),
+                tile: 0,
+                address: 0xa0000,
+                block_row: 0,
+                block_column: 0,
+                row_start: 0,
+                rows: 1,
+                column_start: 0,
+                columns: 32,
+            },
+            BlockPlacement {
+                tensor: TensorId(2),
+                tile: 1,
+                address: 0xa0000,
+                block_row: 0,
+                block_column: 1,
+                row_start: 0,
+                rows: 1,
+                column_start: 32,
+                columns: 32,
+            },
+        ];
 
         let rotation = choose_resident_tile_rotation_in_arenas(
             &parent,

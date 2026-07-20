@@ -4,7 +4,7 @@ use ipu_compiler::{
     FlashAttentionPlan, GemmDataType, KernelCommand, MemoryArena, MemoryConstraint,
     MemoryPlacement, MemoryPolicy, OpId, Phase, RowShardPlacement, RowShardTransitionConfig,
     SpecializationKey, TensorId, append_c16_to_a16_row_shards, choose_gemm_row_block_for,
-    plan_blocked_gemm, plan_flash_attention,
+    end_tensor_lifetimes, plan_blocked_gemm, plan_flash_attention,
 };
 use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -137,6 +137,14 @@ fn main() {
             data_base: transition_base,
             data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
         },
+    )
+    .unwrap();
+    end_tensor_lifetimes(
+        &mut plan.schedule,
+        plan.left
+            .iter()
+            .chain(&plan.output)
+            .map(|block| block.tensor),
     )
     .unwrap();
     let layer_count = std::env::var("IPU_SIGLIP_LAYER_COUNT")

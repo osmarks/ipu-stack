@@ -72,7 +72,7 @@ pub(crate) struct StaticPlanPatch {
     pub instruction: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StaticTemplateRecordWord {
     Value(u32),
     Symbol(String),
