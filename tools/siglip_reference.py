@@ -116,6 +116,11 @@ def main() -> None:
                         "encoder_layer_00_norm1", output.detach().clone()
                     )
                 ),
+                first_layer.layer_norm2.register_forward_hook(
+                    lambda _module, _inputs, output: tensors.__setitem__(
+                        "encoder_layer_00_norm2", output.detach().clone()
+                    )
+                ),
                 first_layer.self_attn.q_proj.register_forward_hook(
                     lambda _module, _inputs, output: tensors.__setitem__(
                         "encoder_layer_00_query", output.detach().clone()

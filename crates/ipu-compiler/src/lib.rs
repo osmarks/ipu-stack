@@ -21,7 +21,7 @@ pub use rowwise::{
     AffineLayerNormConfig, AffineLayerNormPlan, AppendAffineLayerNormConfig,
     AppendedAffineLayerNorm, RowShardPlacement, RowShardTransitionConfig,
     append_add_f16_row_shards_in_place, append_affine_layer_norm_f16, append_c16_to_a16_row_shards,
-    plan_affine_layer_norm_f16,
+    end_tensor_lifetimes, plan_affine_layer_norm_f16,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -419,50 +419,60 @@ pub fn find_free_region(
     {
         return Err(CompileError::Memory("invalid allocation constraint".into()));
     }
+    let mut occupied = allocations
+        .iter()
+        .filter(|allocation| {
+            allocation.tile == tile
+                && live_from < allocation.live_until
+                && allocation.live_from < live_until
+        })
+        .filter_map(|allocation| {
+            let start = allocation.address.max(constraint.base);
+            let end = allocation
+                .address
+                .saturating_add(allocation.size)
+                .min(constraint.limit);
+            (start < end).then_some((start, end))
+        })
+        .collect::<Vec<_>>();
+    occupied.sort_unstable();
+    let mut merged = Vec::<(u32, u32)>::new();
+    for (start, end) in occupied {
+        if let Some(previous) = merged.last_mut()
+            && start <= previous.1
+        {
+            previous.1 = previous.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    let mut gaps = Vec::with_capacity(merged.len() + 1);
+    let mut cursor = constraint.base;
+    for (start, end) in merged {
+        if cursor < start {
+            gaps.push((cursor, start));
+        }
+        cursor = cursor.max(end);
+    }
+    if cursor < constraint.limit {
+        gaps.push((cursor, constraint.limit));
+    }
     let alignment = constraint.alignment;
-    let start = match constraint.placement {
-        MemoryPlacement::Low => align_u32(constraint.base, alignment),
-        MemoryPlacement::High => (constraint.limit - size) & !(alignment - 1),
+    let candidate = match constraint.placement {
+        MemoryPlacement::Low => gaps.into_iter().find_map(|(start, end)| {
+            let address = align_u32(start, alignment);
+            address
+                .checked_add(size)
+                .filter(|&candidate_end| candidate_end <= end)
+                .map(|_| address)
+        }),
+        MemoryPlacement::High => gaps.into_iter().rev().find_map(|(start, end)| {
+            let address = end.checked_sub(size)? & !(alignment - 1);
+            (address >= start).then_some(address)
+        }),
     };
-    let fits = |address: u32| {
-        let end = address + size;
-        end <= constraint.limit
-            && allocations.iter().all(|allocation| {
-                allocation.tile != tile
-                    || live_from >= allocation.live_until
-                    || allocation.live_from >= live_until
-                    || end <= allocation.address
-                    || address >= allocation.address.saturating_add(allocation.size)
-            })
-    };
-
-    match constraint.placement {
-        MemoryPlacement::Low => {
-            let mut address = start;
-            while address <= constraint.limit - size {
-                if fits(address) {
-                    return Ok(address);
-                }
-                address = address
-                    .checked_add(alignment)
-                    .ok_or_else(|| CompileError::Memory("allocation address overflow".into()))?;
-            }
-        }
-        MemoryPlacement::High => {
-            let mut address = start;
-            loop {
-                if address >= constraint.base && fits(address) {
-                    return Ok(address);
-                }
-                let Some(previous) = address.checked_sub(alignment) else {
-                    break;
-                };
-                address = previous;
-                if address < constraint.base {
-                    break;
-                }
-            }
-        }
+    if let Some(address) = candidate {
+        return Ok(address);
     }
     Err(CompileError::Memory(format!(
         "no {size}-byte region for tile {tile} in 0x{:x}..0x{:x}",
@@ -600,7 +610,7 @@ pub fn append_blocked_gemm_f16_with_a16_input(
             address,
             size: bytes,
             live_from: 0,
-            live_until: usize::MAX,
+            live_until: compute_phase + 1,
             kind: AllocationKind::Home,
         });
         if shard.tile != block.tile {

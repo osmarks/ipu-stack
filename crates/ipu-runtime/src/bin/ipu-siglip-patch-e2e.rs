@@ -6,7 +6,7 @@ use ipu_compiler::{
     append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
     append_blocked_gemm_f16_with_a16_input, append_c16_to_a16_row_shards,
     append_flash_attention_from_a16_qkv, append_flash_attention_to_a16_row_shards,
-    choose_gemm_row_block_for, plan_blocked_gemm,
+    choose_gemm_row_block_for, end_tensor_lifetimes, plan_blocked_gemm,
 };
 use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -288,6 +288,35 @@ fn main() {
     let attention_residual =
         append_add_f16_row_shards_in_place(&mut plan.schedule, &projected_shards, &row_shards)
             .unwrap();
+    end_tensor_lifetimes(
+        &mut plan.schedule,
+        attention_shards.iter().map(|shard| shard.tensor),
+    )
+    .unwrap();
+    let norm2 = append_affine_layer_norm_f16(
+        &mut plan.schedule,
+        &attention_residual,
+        AppendAffineLayerNormConfig {
+            data_base: DATA_BASE,
+            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            epsilon_bits: config.layer_norm_eps.to_bits(),
+        },
+    )
+    .unwrap();
+    let norm2_weight = model
+        .tensor_f32("vision_model.encoder.layers.0.layer_norm2.weight")
+        .unwrap();
+    let norm2_bias = model
+        .tensor_f32("vision_model.encoder.layers.0.layer_norm2.bias")
+        .unwrap();
+    for _ in &norm2.affine {
+        host_input.extend(
+            norm2_weight
+                .iter()
+                .chain(&norm2_bias)
+                .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes()),
+        );
+    }
     let objects = compile_objects(&plan, &attention).unwrap();
     let graph = ExecutableGraph {
         schedule: plan.schedule,
@@ -316,12 +345,13 @@ fn main() {
                 "f16",
                 2,
             ),
+            row_shard_binding("layer_norm2_affine", 2, columns, &norm2.affine),
         ],
         host_outputs: vec![row_shard_binding(
-            "attention_residual",
+            "layer_norm2",
             rows,
             columns,
-            &attention_residual,
+            &norm2.output,
         )],
     };
     let app = package_graph(&graph, &objects).unwrap();
@@ -342,14 +372,12 @@ fn main() {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
-    let expected = reference
-        .tensor_f32("encoder_layer_00_attention_residual")
-        .unwrap();
+    let expected = reference.tensor_f32("encoder_layer_00_norm2").unwrap();
     let expected = serialize_a16_row_shards(
         &expected,
         usize::from(rows),
         usize::from(columns),
-        &attention_residual,
+        &norm2.output,
     );
     let max_error = verify_linear_f16(&actual, &expected);
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
@@ -367,7 +395,7 @@ fn main() {
         columns,
         row_block_dimension,
         max_error,
-        "SigLIP layer 0 attention and residual passed against Hugging Face"
+        "SigLIP layer 0 attention, residual, and second norm passed against Hugging Face"
     );
 }
 

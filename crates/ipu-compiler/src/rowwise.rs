@@ -1,6 +1,7 @@
 use crate::{
-    Allocation, AllocationKind, BlockPlacement, CompileError, KernelCommand, OpId, Phase, Schedule,
-    SpecializationKey, TensorId, Transfer,
+    Allocation, AllocationKind, BlockPlacement, CompileError, KernelCommand, MemoryConstraint,
+    MemoryPlacement, OpId, Phase, Schedule, SpecializationKey, TensorId, Transfer,
+    find_free_region,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -52,6 +53,39 @@ pub struct RowShardTransitionConfig {
     pub columns: u16,
     pub data_base: u32,
     pub data_limit: u32,
+}
+
+pub fn end_tensor_lifetimes(
+    schedule: &mut Schedule,
+    tensors: impl IntoIterator<Item = TensorId>,
+) -> Result<(), CompileError> {
+    let phase = schedule.phases.len();
+    for tensor in tensors {
+        let mut found = false;
+        for allocation in schedule
+            .allocations
+            .iter_mut()
+            .filter(|allocation| allocation.tensor == tensor)
+        {
+            found = true;
+            if allocation.live_until == usize::MAX {
+                if allocation.live_from >= phase {
+                    return Err(CompileError::Graph(format!(
+                        "tensor {} cannot end before it becomes live",
+                        tensor.0
+                    )));
+                }
+                allocation.live_until = phase;
+            }
+        }
+        if !found {
+            return Err(CompileError::Graph(format!(
+                "cannot end unknown tensor {}",
+                tensor.0
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn append_add_f16_row_shards_in_place(
@@ -391,16 +425,6 @@ pub fn append_affine_layer_norm_f16(
             "appended FP16 affine layer norm has incompatible row shards, SRAM, or epsilon".into(),
         ));
     }
-    let mut cursors = vec![config.data_base; usize::from(schedule.tile_count)];
-    for allocation in &schedule.allocations {
-        if allocation.kind == AllocationKind::Home
-            && allocation.address >= config.data_base
-            && allocation.address < config.data_limit
-        {
-            cursors[usize::from(allocation.tile)] = cursors[usize::from(allocation.tile)]
-                .max(allocation.address.saturating_add(allocation.size));
-        }
-    }
     let mut next_tensor = schedule
         .allocations
         .iter()
@@ -415,18 +439,40 @@ pub fn append_affine_layer_norm_f16(
     let mut commands = Vec::with_capacity(input.len());
     for shard in input {
         let activation_bytes = u32::from(shard.rows) * u32::from(columns) * 2;
-        let cursor = &mut cursors[usize::from(shard.tile)];
-        let affine_address = allocate(cursor, affine_bytes, 8)?;
-        let output_address = allocate(cursor, activation_bytes, 8)?;
-        if *cursor > config.data_limit {
-            return Err(CompileError::Memory(format!(
-                "appended layer norm exhausts tile {} SRAM",
-                shard.tile
-            )));
-        }
+        let constraint = MemoryConstraint {
+            base: config.data_base,
+            limit: config.data_limit,
+            alignment: 8,
+            placement: MemoryPlacement::Low,
+        };
+        let affine_address = find_free_region(
+            &schedule.allocations,
+            shard.tile,
+            affine_bytes,
+            0,
+            usize::MAX,
+            constraint,
+        )?;
         let affine_tensor = TensorId(next_tensor);
         let output_tensor = TensorId(next_tensor + 1);
         next_tensor += 2;
+        schedule.allocations.push(Allocation {
+            tensor: affine_tensor,
+            tile: shard.tile,
+            address: affine_address,
+            size: affine_bytes,
+            live_from: 0,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        });
+        let output_address = find_free_region(
+            &schedule.allocations,
+            shard.tile,
+            activation_bytes,
+            phase,
+            usize::MAX,
+            constraint,
+        )?;
         affine.push(RowShardPlacement {
             tile: shard.tile,
             row_start: 0,
@@ -440,20 +486,15 @@ pub fn append_affine_layer_norm_f16(
             address: output_address,
             ..*shard
         });
-        for (tensor, address, size) in [
-            (affine_tensor, affine_address, affine_bytes),
-            (output_tensor, output_address, activation_bytes),
-        ] {
-            schedule.allocations.push(Allocation {
-                tensor,
-                tile: shard.tile,
-                address,
-                size,
-                live_from: 0,
-                live_until: usize::MAX,
-                kind: AllocationKind::Home,
-            });
-        }
+        schedule.allocations.push(Allocation {
+            tensor: output_tensor,
+            tile: shard.tile,
+            address: output_address,
+            size: activation_bytes,
+            live_from: phase,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        });
         commands.push(KernelCommand {
             tile: shard.tile,
             output: output_tensor,
@@ -477,15 +518,6 @@ pub fn append_affine_layer_norm_f16(
         op: OpId(phase),
         commands,
     });
-    for (tile, cursor) in cursors.into_iter().enumerate() {
-        if cursor > config.data_base {
-            schedule
-                .peak_sram
-                .entry(tile as u16)
-                .and_modify(|peak| *peak = (*peak).max(cursor - config.data_base))
-                .or_insert(cursor - config.data_base);
-        }
-    }
     Ok(AppendedAffineLayerNorm { affine, output })
 }
 
@@ -554,5 +586,62 @@ mod tests {
             &schedule.phases[1],
             Phase::Compute { commands, .. } if commands.len() == destination.len()
         ));
+    }
+
+    #[test]
+    fn appended_norm_reuses_storage_after_tensor_lifetime_ends() {
+        let dead = TensorId(0);
+        let input = RowShardPlacement {
+            tile: 0,
+            row_start: 0,
+            rows: 4,
+            columns: 16,
+            tensor: TensorId(1),
+            address: 0xb0000,
+        };
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: vec![Phase::Compute {
+                op: OpId(0),
+                commands: Vec::new(),
+            }],
+            allocations: vec![
+                Allocation {
+                    tensor: dead,
+                    tile: 0,
+                    address: 0xa0000,
+                    size: 128,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                },
+                Allocation {
+                    tensor: input.tensor,
+                    tile: 0,
+                    address: input.address,
+                    size: 128,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                },
+            ],
+            tile_count: 1,
+            peak_sram: BTreeMap::new(),
+        };
+        end_tensor_lifetimes(&mut schedule, [dead]).unwrap();
+
+        let appended = append_affine_layer_norm_f16(
+            &mut schedule,
+            &[input],
+            AppendAffineLayerNormConfig {
+                data_base: 0xa0000,
+                data_limit: 0xa00c0,
+                epsilon_bits: 1e-6f32.to_bits(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(appended.output[0].address, 0xa0000);
+        assert_ne!(appended.affine[0].address, appended.output[0].address);
     }
 }
