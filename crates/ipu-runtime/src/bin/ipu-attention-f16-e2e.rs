@@ -24,6 +24,7 @@ fn main() {
     let hidden_sizes = env_u16_list("IPU_ATTENTION_HIDDEN_SIZES", &[768, 1024, 1152]);
     let batch_sizes = env_u16_list("IPU_ATTENTION_BATCH_SIZES", &[1, 3]);
     let sequence_length = env_u16("IPU_ATTENTION_SEQUENCE_LENGTH", 64);
+    let query_sequence_length = env_u16("IPU_ATTENTION_QUERY_SEQUENCE_LENGTH", sequence_length);
     let query_block_rows = env_u16("IPU_ATTENTION_QUERY_BLOCK_ROWS", 0);
     let key_block_rows = env_u16("IPU_ATTENTION_KEY_BLOCK_ROWS", 0);
     let seed = env_u64("IPU_ATTENTION_SEED", 0xfa57_a77e_1616);
@@ -42,6 +43,7 @@ fn main() {
         for (batch_index, &batch_size) in batch_sizes.iter().enumerate() {
             run_case(Case {
                 batch_size,
+                query_sequence_length,
                 sequence_length,
                 hidden_size,
                 query_block_rows,
@@ -61,6 +63,7 @@ fn main() {
 
 struct Case<'a> {
     batch_size: u16,
+    query_sequence_length: u16,
     sequence_length: u16,
     hidden_size: u16,
     query_block_rows: u16,
@@ -76,7 +79,7 @@ struct Case<'a> {
 fn run_case(case: Case<'_>) {
     let config = FlashAttentionConfig {
         batch_size: case.batch_size,
-        query_sequence_length: 0,
+        query_sequence_length: case.query_sequence_length,
         sequence_length: case.sequence_length,
         hidden_size: case.hidden_size,
         attention_heads: ATTENTION_HEADS,
@@ -87,12 +90,15 @@ fn run_case(case: Case<'_>) {
         data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
     };
     let plan = plan_flash_attention(config).unwrap();
-    let elements = usize::from(case.batch_size)
+    let query_elements = usize::from(case.batch_size)
+        * usize::from(case.query_sequence_length)
+        * usize::from(case.hidden_size);
+    let key_value_elements = usize::from(case.batch_size)
         * usize::from(case.sequence_length)
         * usize::from(case.hidden_size);
-    let query = normal_f16(elements, case.seed, 0.5);
-    let key = normal_f16(elements, case.seed ^ 0xa076_1d64_78bd_642f, 0.5);
-    let value = normal_f16(elements, case.seed ^ 0xe703_7ed1_a0b4_28db, 0.5);
+    let query = normal_f16(query_elements, case.seed, 0.5);
+    let key = normal_f16(key_value_elements, case.seed ^ 0xa076_1d64_78bd_642f, 0.5);
+    let value = normal_f16(key_value_elements, case.seed ^ 0xe703_7ed1_a0b4_28db, 0.5);
     let (query_bytes, key_value_bytes) = pack_inputs(&plan, config, &query, &key, &value);
     let mut input = query_bytes;
     input.extend(key_value_bytes);
@@ -107,7 +113,7 @@ fn run_case(case: Case<'_>) {
                 vec![
                     u32::from(case.batch_size),
                     u32::from(ATTENTION_HEADS),
-                    u32::from(case.sequence_length),
+                    u32::from(case.query_sequence_length),
                     u32::from(plan.head_dimension),
                 ],
                 &plan.tasks,
@@ -133,7 +139,7 @@ fn run_case(case: Case<'_>) {
             vec![
                 u32::from(case.batch_size),
                 u32::from(ATTENTION_HEADS),
-                u32::from(case.sequence_length),
+                u32::from(case.query_sequence_length),
                 u32::from(plan.head_dimension),
             ],
             &plan.tasks,
@@ -266,6 +272,7 @@ fn run_case(case: Case<'_>) {
     };
     info!(
         batch_size = case.batch_size,
+        query_sequence_length = case.query_sequence_length,
         sequence_length = case.sequence_length,
         hidden_size = case.hidden_size,
         heads = ATTENTION_HEADS,
@@ -298,7 +305,8 @@ fn run_case(case: Case<'_>) {
         let flops = 4.0
             * f64::from(case.batch_size)
             * f64::from(ATTENTION_HEADS)
-            * f64::from(case.sequence_length).powi(2)
+            * f64::from(case.query_sequence_length)
+            * f64::from(case.sequence_length)
             * f64::from(plan.head_dimension);
         let tflops = flops / graph_seconds / 1.0e12;
         let peak_tflops =
@@ -318,6 +326,7 @@ fn run_case(case: Case<'_>) {
     let errors = verify_output(&actual, &expected, case.max_error_limit).unwrap();
     info!(
         batch_size = case.batch_size,
+        query_sequence_length = case.query_sequence_length,
         sequence_length = case.sequence_length,
         hidden_size = case.hidden_size,
         heads = ATTENTION_HEADS,
@@ -446,7 +455,7 @@ fn pack_inputs(
                 linear,
             );
             let bits = if column < plan.head_dimension {
-                query[tensor_index(
+                query[query_tensor_index(
                     config,
                     task.batch,
                     task.head,
@@ -518,12 +527,13 @@ fn attention_reference(
     let mut output = Vec::with_capacity(query.len());
     for batch in 0..config.batch_size {
         for head in 0..config.attention_heads {
-            for query_row in 0..config.sequence_length {
+            for query_row in 0..config.query_sequence_length {
                 let mut scores = Vec::with_capacity(usize::from(config.sequence_length));
                 for key_row in 0..config.sequence_length {
                     let score = (0..head_dimension)
                         .map(|column| {
-                            query[tensor_index(config, batch, head, query_row, column)].to_f32()
+                            query[query_tensor_index(config, batch, head, query_row, column)]
+                                .to_f32()
                                 * key[tensor_index(config, batch, head, key_row, column)].to_f32()
                         })
                         .sum::<f32>()
@@ -567,6 +577,19 @@ fn tensor_index(
     column: u16,
 ) -> usize {
     ((usize::from(batch) * usize::from(config.sequence_length) + usize::from(row))
+        * usize::from(config.hidden_size))
+        + usize::from(head) * usize::from(config.hidden_size / config.attention_heads)
+        + usize::from(column)
+}
+
+fn query_tensor_index(
+    config: FlashAttentionConfig,
+    batch: u16,
+    head: u16,
+    row: u16,
+    column: u16,
+) -> usize {
+    ((usize::from(batch) * usize::from(config.query_sequence_length) + usize::from(row))
         * usize::from(config.hidden_size))
         + usize::from(head) * usize::from(config.hidden_size / config.attention_heads)
         + usize::from(column)
