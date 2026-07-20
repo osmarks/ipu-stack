@@ -52,11 +52,12 @@ fixed in the IPU21 interleaved element. Kernel-fixed allocations are included
 in policy placement, so resident data may use otherwise-free interleaved space
 without overlapping active AMP scratch.
 
-The SigLIP runner defaults to placing resident data high-to-low and transient
-data in low ordinary SRAM, then interleaved SRAM, then high ordinary SRAM.
-`IPU_SIGLIP_RESIDENT_ARENAS` and `IPU_SIGLIP_TRANSIENT_ARENAS` accept ordered
-comma-separated `base..limit` address ranges for placement experiments. These
-controls change allocation preference, not kernel memory semantics.
+The SigLIP runner defaults to placing resident data in high ordinary SRAM, low
+ordinary SRAM, then interleaved SRAM. Transient data uses low ordinary SRAM,
+interleaved SRAM, then high ordinary SRAM. `IPU_SIGLIP_RESIDENT_ORDER` and
+`IPU_SIGLIP_TRANSIENT_ORDER` accept an ordered comma-separated selection of
+`ordinary-low`, `interleaved`, and `ordinary-high`. These controls change
+allocation preference, not kernel memory semantics or physical address bounds.
 
 ## Migration boundary
 

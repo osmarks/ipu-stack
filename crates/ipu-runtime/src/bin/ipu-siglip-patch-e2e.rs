@@ -1,7 +1,7 @@
 use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, FlashAttentionConfig,
-    FlashAttentionPlan, GemmDataType, KernelCommand, MemoryArena, MemoryConstraint,
+    FlashAttentionPlan, GemmDataType, Ipu21MemoryRegion, KernelCommand, MemoryConstraint,
     MemoryPlacement, MemoryPolicy, OpId, Phase, RowShardPlacement, RowShardTransitionConfig,
     SpecializationKey, TensorId, append_c16_to_a16_row_shards, choose_gemm_row_block_for,
     end_tensor_lifetimes, plan_blocked_gemm, plan_flash_attention,
@@ -502,53 +502,40 @@ fn write_memory_profile(graph: &ExecutableGraph) {
 }
 
 fn encoder_memory_policy(data_limit: u32) -> MemoryPolicy {
-    let resident_low_base = std::env::var("IPU_SIGLIP_LOW_RESIDENT_BASE")
-        .map(|value| parse_hex_address(&value))
-        .unwrap_or(DEFAULT_RESIDENT_LOW_BASE);
-    let high = MemoryArena {
-        base: DATA_BASE,
-        limit: data_limit,
-    };
-    let low = MemoryArena {
-        base: resident_low_base,
-        limit: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
-    };
-    let interleaved = MemoryArena {
-        base: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
-        limit: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
-    };
-    let resident = std::env::var("IPU_SIGLIP_RESIDENT_ARENAS")
-        .map(|value| parse_memory_arenas(&value))
-        .unwrap_or_else(|_| vec![high, low, interleaved]);
-    let transient = std::env::var("IPU_SIGLIP_TRANSIENT_ARENAS")
-        .map(|value| parse_memory_arenas(&value))
-        .unwrap_or_else(|_| vec![low, interleaved, high]);
-    MemoryPolicy {
-        resident,
-        transient,
-    }
+    let resident = memory_region_order(
+        "IPU_SIGLIP_RESIDENT_ORDER",
+        &[
+            Ipu21MemoryRegion::OrdinaryHigh,
+            Ipu21MemoryRegion::OrdinaryLow,
+            Ipu21MemoryRegion::Interleaved,
+        ],
+    );
+    let transient = memory_region_order(
+        "IPU_SIGLIP_TRANSIENT_ORDER",
+        &[
+            Ipu21MemoryRegion::OrdinaryLow,
+            Ipu21MemoryRegion::Interleaved,
+            Ipu21MemoryRegion::OrdinaryHigh,
+        ],
+    );
+    MemoryPolicy::ipu21(DEFAULT_RESIDENT_LOW_BASE, data_limit, &resident, &transient).unwrap()
 }
 
-fn parse_memory_arenas(value: &str) -> Vec<MemoryArena> {
-    let arenas = value
+fn memory_region_order(name: &str, default: &[Ipu21MemoryRegion]) -> Vec<Ipu21MemoryRegion> {
+    let Ok(value) = std::env::var(name) else {
+        return default.to_vec();
+    };
+    let regions = value
         .split(',')
-        .map(|range| {
-            let (base, limit) = range
-                .split_once("..")
-                .unwrap_or_else(|| panic!("invalid SRAM arena {range}"));
-            MemoryArena {
-                base: parse_hex_address(base),
-                limit: parse_hex_address(limit),
-            }
+        .map(|region| match region.trim() {
+            "ordinary-low" => Ipu21MemoryRegion::OrdinaryLow,
+            "interleaved" => Ipu21MemoryRegion::Interleaved,
+            "ordinary-high" => Ipu21MemoryRegion::OrdinaryHigh,
+            region => panic!("invalid IPU21 SRAM region {region}"),
         })
         .collect::<Vec<_>>();
-    assert!(!arenas.is_empty(), "SRAM arena list is empty");
-    arenas
-}
-
-fn parse_hex_address(value: &str) -> u32 {
-    u32::from_str_radix(value.trim().trim_start_matches("0x"), 16)
-        .unwrap_or_else(|_| panic!("invalid SRAM address {value}"))
+    assert!(!regions.is_empty(), "IPU21 SRAM region order is empty");
+    regions
 }
 
 fn patch_value(

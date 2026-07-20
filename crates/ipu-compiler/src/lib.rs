@@ -413,6 +413,33 @@ pub struct MemoryPolicy {
     pub transient: Vec<MemoryArena>,
 }
 
+/// Allocatable IPU21 SRAM regions, excluding executable and exchange storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ipu21MemoryRegion {
+    OrdinaryLow,
+    Interleaved,
+    OrdinaryHigh,
+}
+
+impl Ipu21MemoryRegion {
+    fn arena(self, ordinary_low_base: u32, data_limit: u32) -> MemoryArena {
+        match self {
+            Self::OrdinaryLow => MemoryArena {
+                base: ordinary_low_base,
+                limit: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+            },
+            Self::Interleaved => MemoryArena {
+                base: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+                limit: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+            },
+            Self::OrdinaryHigh => MemoryArena {
+                base: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+                limit: data_limit,
+            },
+        }
+    }
+}
+
 impl MemoryPolicy {
     pub fn contiguous(base: u32, limit: u32) -> Self {
         let arena = MemoryArena { base, limit };
@@ -420,6 +447,42 @@ impl MemoryPolicy {
             resident: vec![arena],
             transient: vec![arena],
         }
+    }
+
+    /// Builds a policy from the physical IPU21 SRAM regions.
+    ///
+    /// `ordinary_low_base` is the first address left free by runtime code and
+    /// fixed runtime data. `data_limit` is the end of tile SRAM. Ordering is a
+    /// placement preference; allocations may spill to later regions.
+    pub fn ipu21(
+        ordinary_low_base: u32,
+        data_limit: u32,
+        resident_order: &[Ipu21MemoryRegion],
+        transient_order: &[Ipu21MemoryRegion],
+    ) -> Result<Self, CompileError> {
+        if ordinary_low_base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+            || data_limit <= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
+            || data_limit > ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE
+            || !unique_ipu21_regions(resident_order)
+            || !unique_ipu21_regions(transient_order)
+        {
+            return Err(CompileError::Memory(
+                "invalid allocatable IPU21 SRAM bounds".into(),
+            ));
+        }
+        let expand = |order: &[Ipu21MemoryRegion]| {
+            order
+                .iter()
+                .copied()
+                .map(|region| region.arena(ordinary_low_base, data_limit))
+                .collect::<Vec<_>>()
+        };
+        let policy = Self {
+            resident: expand(resident_order),
+            transient: expand(transient_order),
+        };
+        policy.validate()?;
+        Ok(policy)
     }
 
     pub fn validate(&self) -> Result<(), CompileError> {
@@ -435,6 +498,14 @@ impl MemoryPolicy {
         }
         Ok(())
     }
+}
+
+fn unique_ipu21_regions(regions: &[Ipu21MemoryRegion]) -> bool {
+    !regions.is_empty()
+        && regions
+            .iter()
+            .enumerate()
+            .all(|(index, region)| !regions[..index].iter().any(|previous| previous == region))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4298,6 +4369,37 @@ mod tests {
                 .any(|arena| address >= arena.base && address + size <= arena.limit)
         );
         assert!(occupied.windows(2).all(|pair| pair[0].1 <= pair[1].0));
+    }
+
+    #[test]
+    fn ipu21_policy_maps_named_regions_without_overlap() {
+        let ordinary_low_base =
+            ipu_package::TILE_MEMORY_BASE + 7 * ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
+        let regions = [
+            Ipu21MemoryRegion::OrdinaryHigh,
+            Ipu21MemoryRegion::OrdinaryLow,
+            Ipu21MemoryRegion::Interleaved,
+        ];
+        let policy =
+            MemoryPolicy::ipu21(ordinary_low_base, data_limit, &regions, &regions).unwrap();
+
+        assert_eq!(policy.resident.len(), regions.len());
+        assert!(policy.resident.iter().all(|arena| arena.base < arena.limit));
+        assert!(policy.resident.iter().enumerate().all(|(index, arena)| {
+            policy.resident[..index]
+                .iter()
+                .all(|previous| previous.limit <= arena.base || arena.limit <= previous.base)
+        }));
+        assert!(
+            MemoryPolicy::ipu21(
+                ordinary_low_base,
+                data_limit,
+                &[Ipu21MemoryRegion::OrdinaryHigh; 2],
+                &regions,
+            )
+            .is_err()
+        );
     }
 
     #[test]
