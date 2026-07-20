@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
+mod siglip;
 mod static_codegen;
+pub use siglip::{HostTensorSet, SiglipEncoderLayer, append_siglip_encoder_layer};
 
 mod blocked_data;
 pub use blocked_data::{
