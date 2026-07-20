@@ -60,7 +60,8 @@ struct StaticHostLayout {
 
 struct TileHostPlans {
     start: u32,
-    objects: Vec<Range<u32>>,
+    ordinary_objects: Vec<Range<u32>>,
+    data_objects: Vec<Range<u32>>,
     addresses: Vec<u32>,
     packet_copies: Vec<Option<HostPacketCopy>>,
     run_tables: Vec<Option<u32>>,
@@ -269,6 +270,8 @@ fn pack_data_objects_for_tile(
     tile: u16,
     runtime_end: u32,
     objects: &[Range<u32>],
+    allow_interleaved: bool,
+    additional_reserved: &[(u32, u32)],
 ) -> Result<(BTreeMap<u32, u32>, Vec<(u32, u32)>)> {
     let memory_end = ipu_package::TILE_MEMORY_BASE
         .checked_add(ipu_package::TILE_MEMORY_SIZE)
@@ -282,13 +285,16 @@ fn pack_data_objects_for_tile(
             ipu_exchange::EXCHANGE_WINDOW_BASE,
             ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
         ),
-        (
-            ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
-            ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
-        ),
         (PLAN_BASE, runtime_end),
     ];
+    if !allow_interleaved {
+        reserved.push((
+            ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+            ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+        ));
+    }
     reserved.extend_from_slice(allocation_ranges);
+    reserved.extend_from_slice(additional_reserved);
     reserved.sort_unstable();
     let mut gaps = Vec::new();
     let mut cursor = ipu_package::TILE_MEMORY_BASE;
@@ -1530,7 +1536,8 @@ fn package_graph_impl(
             let plan_end = exchange_plans.end;
             let physical = topology.physical(program.tile)?;
             let follower_address = align_up(plan_end, 64);
-            let mut objects = vec![follower_address..follower_address + 3 * 4];
+            let mut ordinary_objects = vec![follower_address..follower_address + 3 * 4];
+            let mut data_objects = Vec::new();
             let mut cursor = if host_transfers.is_empty() {
                 plan_end
             } else {
@@ -1554,7 +1561,7 @@ fn package_graph_impl(
                             .checked_add(u32::try_from(instructions.len() * 4)?)
                             .ok_or("static host plan address overflow")?;
                         instruction_addresses.insert(instructions, address);
-                        objects.push(address..cursor);
+                        ordinary_objects.push(address..cursor);
                         address
                     };
                     addresses.push(address);
@@ -1571,7 +1578,7 @@ fn package_graph_impl(
                             )
                             .ok_or("static host packet address overflow")?;
                         packet_addresses.insert(packet_words.clone(), source);
-                        objects.push(source..cursor);
+                        data_objects.push(source..cursor);
                         source
                     };
                     let words = u32::try_from(packet_words.len())?;
@@ -1619,7 +1626,7 @@ fn package_graph_impl(
                                 .ok_or("static host run descriptor size overflow")?,
                         )
                         .ok_or("static host run descriptor address overflow")?;
-                    objects.push(run_tables[start].unwrap()..cursor);
+                    data_objects.push(run_tables[start].unwrap()..cursor);
                 }
             }
             let run_state = align_up(cursor, 4);
@@ -1628,9 +1635,10 @@ fn package_graph_impl(
                 .ok_or("static host run state address overflow")?;
             Ok(TileHostPlans {
                 start: follower_address,
-                objects: {
-                    objects.push(run_state..end);
-                    objects
+                ordinary_objects,
+                data_objects: {
+                    data_objects.push(run_state..end);
+                    data_objects
                 },
                 addresses,
                 packet_copies,
@@ -1652,14 +1660,27 @@ fn package_graph_impl(
         let old_end = old_completion
             .checked_add(4)
             .ok_or("static host runtime address overflow")?;
-        plans.objects.push(old_worker_sync..old_end);
+        plans.ordinary_objects.push(old_worker_sync..old_end);
         let tile = programs[tile_index].tile;
-        let (relocations, ranges) = pack_data_objects_for_tile(
+        let (mut relocations, mut ranges) = pack_data_objects_for_tile(
             &allocation_ranges_by_tile[usize::from(tile)],
             tile,
             tile_exchange_plans[tile_index].end,
-            &plans.objects,
+            &plans.ordinary_objects,
+            false,
+            &[],
         )?;
+        let (data_relocations, data_ranges) = pack_data_objects_for_tile(
+            &allocation_ranges_by_tile[usize::from(tile)],
+            tile,
+            tile_exchange_plans[tile_index].end,
+            &plans.data_objects,
+            true,
+            &ranges,
+        )?;
+        relocations.extend(data_relocations);
+        ranges.extend(data_ranges);
+        ranges.sort_unstable();
         let relocate = |address: u32| -> Result<u32> {
             relocations
                 .get(&address)
@@ -3597,7 +3618,7 @@ mod tests {
         let objects = [0x1000..0x1080, 0x2000..0x2080];
 
         let (relocations, ranges) =
-            pack_data_objects_for_tile(&allocations, 0, PLAN_BASE, &objects).unwrap();
+            pack_data_objects_for_tile(&allocations, 0, PLAN_BASE, &objects, false, &[]).unwrap();
 
         assert_eq!(ranges.len(), 2);
         assert!(objects.iter().all(|object| {
