@@ -157,6 +157,84 @@ pub fn blocked_matrix_f16(
     bytes
 }
 
+pub fn f143_scale(values: impl IntoIterator<Item = f32>) -> i8 {
+    let maximum = values
+        .into_iter()
+        .filter(|value| value.is_finite())
+        .map(f32::abs)
+        .fold(0.0f32, f32::max);
+    if maximum == 0.0 {
+        return 0;
+    }
+    (maximum / 240.0).log2().ceil().clamp(-32.0, 31.0) as i8
+}
+
+pub fn f143_from_f32(value: f32, scale: i8) -> u8 {
+    let sign = u8::from(value.is_sign_negative()) << 7;
+    let magnitude = value.abs() * 2.0f32.powi(-i32::from(scale));
+    if magnitude.is_nan() {
+        return 0x80;
+    }
+    if magnitude == 0.0 {
+        return 0;
+    }
+    if !magnitude.is_finite() || magnitude >= 240.0 {
+        return sign | 0x7f;
+    }
+    if magnitude < 2.0f32.powi(-7) {
+        let mantissa = (magnitude * 1024.0).round_ties_even() as u8;
+        return sign | mantissa.min(8);
+    }
+
+    let exponent = magnitude.log2().floor() as i32;
+    let mut encoded_exponent = exponent + 8;
+    let unit = 2.0f32.powi(exponent);
+    let mut mantissa = ((magnitude / unit - 1.0) * 8.0).round_ties_even() as i32;
+    if mantissa == 8 {
+        mantissa = 0;
+        encoded_exponent += 1;
+    }
+    if encoded_exponent > 15 {
+        return sign | 0x7f;
+    }
+    sign | ((encoded_exponent as u8) << 3) | mantissa as u8
+}
+
+pub fn f143_to_f32(bits: u8, scale: i8) -> f32 {
+    if bits == 0x80 {
+        return f32::NAN;
+    }
+    let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exponent = (bits >> 3) & 0xf;
+    let mantissa = bits & 7;
+    let value = if exponent == 0 {
+        f32::from(mantissa) * 2.0f32.powi(-10)
+    } else {
+        (1.0 + f32::from(mantissa) / 8.0) * 2.0f32.powi(i32::from(exponent) - 8)
+    };
+    sign * value * 2.0f32.powi(i32::from(scale))
+}
+
+pub fn blocked_matrix_f8_f143(
+    placements: &[BlockPlacement],
+    layout: BlockLayout,
+    scale: i8,
+    value: impl Fn(u16, u16) -> f32,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for placement in placements {
+        for linear in 0..placement.rows * placement.columns {
+            let (row, column) =
+                block_coordinates(layout, placement.rows, placement.columns, linear);
+            bytes.push(f143_from_f32(
+                value(placement.row_start + row, placement.column_start + column),
+                scale,
+            ));
+        }
+    }
+    bytes
+}
+
 pub fn normal_f16(elements: usize, seed: u64, standard_deviation: f32) -> Vec<half::f16> {
     let mut rng = fastrand::Rng::with_seed(seed);
     let mut values = Vec::with_capacity(elements);
@@ -173,4 +251,48 @@ pub fn normal_f16(elements: usize, seed: u64, standard_deviation: f32) -> Vec<ha
         }
     }
     values
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f143_encoding_matches_documented_rounding_examples() {
+        let examples = [
+            (7.0, 0x56),
+            (7.25, 0x56),
+            (7.5, 0x57),
+            (7.75, 0x58),
+            (8.0, 0x58),
+            (8.5, 0x58),
+            (9.0, 0x59),
+            (9.5, 0x5a),
+        ];
+        for (value, bits) in examples {
+            assert_eq!(f143_from_f32(value, 0), bits);
+        }
+    }
+
+    #[test]
+    fn finite_f143_values_round_trip_for_every_scale() {
+        for scale in -32..=31 {
+            for bits in 0u8..=u8::MAX {
+                if bits == 0x80 {
+                    continue;
+                }
+                assert_eq!(f143_from_f32(f143_to_f32(bits, scale), scale), bits);
+            }
+        }
+    }
+
+    #[test]
+    fn selected_scale_uses_the_available_normal_range() {
+        for maximum in [0.001, 0.1, 1.0, 100.0, 10_000.0] {
+            let scale = f143_scale([maximum, -maximum]);
+            let scaled = maximum * 2.0f32.powi(-i32::from(scale));
+            assert!(scaled <= 240.0);
+            assert!(scale == -32 || scaled > 120.0);
+        }
+    }
 }

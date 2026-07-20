@@ -3,8 +3,8 @@ use ipu_compiler::{BlockedGemmConfig, GemmDataType, choose_gemm_row_block_for, p
 use ipu_elf::Toolchain;
 use ipu_runtime::{
     BlockLayout, ExecutableGraph, HostRunOptions, ProfileGranularity, block_binding_typed,
-    block_coordinates, blocked_matrix_f16, normal_f16, package_graph, package_graph_profiled_with,
-    run_host_with_options,
+    block_coordinates, blocked_matrix_f8_f143, blocked_matrix_f16, f143_from_f32, f143_scale,
+    f143_to_f32, normal_f16, package_graph, package_graph_profiled_with, run_host_with_options,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -25,6 +25,22 @@ fn main() {
     assert!(dimension.is_multiple_of(block_dimension));
     let seed = env_u64("IPU_GEMM_SEED", 0x05ee_df16);
     let max_error_limit = env_f32("IPU_F16_MAX_ERROR", 0.005);
+    let fp8_weights = env_bool("IPU_GEMM_FP8_WEIGHTS", false);
+    let elements = usize::from(dimension).pow(2);
+    let left = normal_f16(elements, seed, 0.5);
+    let right = normal_f16(
+        elements,
+        seed ^ 0x9e37_79b9_7f4a_7c15,
+        f32::from(dimension).sqrt().recip(),
+    );
+    let weight_scale = f143_scale(right.iter().map(|value| value.to_f32()));
+    let data_type = if fp8_weights {
+        GemmDataType::F16F8Weights {
+            scale: weight_scale,
+        }
+    } else {
+        GemmDataType::F16
+    };
     let row_block_dimension = std::env::var("IPU_GEMM_ROW_BLOCK")
         .map(|value| value.parse().expect("IPU_GEMM_ROW_BLOCK must be a u16"))
         .unwrap_or_else(|_| {
@@ -34,7 +50,7 @@ fn main() {
                 dimension,
                 block_dimension,
                 TILE_COUNT,
-                GemmDataType::F16,
+                data_type,
             )
             .expect("FP16 GEMM shape has no feasible row blocking")
         });
@@ -48,7 +64,7 @@ fn main() {
         tile_count: TILE_COUNT,
         data_base: GEMM_DATA_BASE,
         data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-        data_type: GemmDataType::F16,
+        data_type,
     })
     .unwrap();
     let output_placements = plan.output.clone();
@@ -63,28 +79,48 @@ fn main() {
         .max()
         .unwrap();
 
-    let elements = usize::from(dimension).pow(2);
-    let left = normal_f16(elements, seed, 0.5);
-    let right = normal_f16(
-        elements,
-        seed ^ 0x9e37_79b9_7f4a_7c15,
-        f32::from(dimension).sqrt().recip(),
-    );
     let mut input = blocked_matrix_f16(&plan.left, BlockLayout::AmpA16, |row, column| {
         left[matrix_index(dimension, row, column)].to_f32()
     });
-    input.extend(blocked_matrix_f16(
-        &plan.right,
-        BlockLayout::AmpB16x16,
-        |row, column| right[matrix_index(dimension, row, column)].to_f32(),
-    ));
+    if fp8_weights {
+        input.extend(blocked_matrix_f8_f143(
+            &plan.right,
+            BlockLayout::AmpB16x16,
+            weight_scale,
+            |row, column| right[matrix_index(dimension, row, column)].to_f32(),
+        ));
+    } else {
+        input.extend(blocked_matrix_f16(
+            &plan.right,
+            BlockLayout::AmpB16x16,
+            |row, column| right[matrix_index(dimension, row, column)].to_f32(),
+        ));
+    }
+    let reference_right = right
+        .iter()
+        .map(|value| {
+            let value = value.to_f32();
+            if fp8_weights {
+                f143_to_f32(f143_from_f32(value, weight_scale), weight_scale)
+            } else {
+                value
+            }
+        })
+        .collect::<Vec<_>>();
     let graph = ExecutableGraph {
         schedule: plan.schedule,
         initial_buffers: Vec::new(),
         outputs: Vec::new(),
         host_inputs: vec![
             block_binding_typed("left", dimension, dimension, &plan.left, "f16", 2),
-            block_binding_typed("right", dimension, dimension, &plan.right, "f16", 2),
+            block_binding_typed(
+                "right",
+                dimension,
+                dimension,
+                &plan.right,
+                if fp8_weights { "f8-f143" } else { "f16" },
+                u64::from(data_type.weight_element_bytes()),
+            ),
         ],
         host_outputs: vec![block_binding_typed(
             "output",
@@ -120,10 +156,39 @@ fn main() {
             ],
         )
         .unwrap();
-    let objects = [
+    let mut objects = vec![
         fs::read(runtime.object).unwrap(),
         fs::read(kernel.object).unwrap(),
     ];
+    if fp8_weights {
+        let expand_codelet = toolchain
+            .compile(
+                source("expand_f8_f143_to_f16.cpp"),
+                &artifact_dir,
+                "expand-f8-codelet",
+                &[],
+            )
+            .unwrap();
+        let expand_wrapper = toolchain
+            .compile(
+                source("expand_f8_f143_to_f16.S"),
+                &artifact_dir,
+                "expand-f8-wrapper",
+                &[],
+            )
+            .unwrap();
+        let worker_support = toolchain
+            .compile(
+                source("worker_support.S"),
+                &artifact_dir,
+                "worker-support",
+                &[],
+            )
+            .unwrap();
+        objects.push(fs::read(expand_codelet.object).unwrap());
+        objects.push(fs::read(expand_wrapper.object).unwrap());
+        objects.push(fs::read(worker_support.object).unwrap());
+    }
     let profile_output = std::env::var_os("IPU_PROFILE_OUTPUT").map(PathBuf::from);
     let (app, profile_layout) = if profile_output.is_some() {
         let granularity = ProfileGranularity::from_environment().unwrap();
@@ -137,6 +202,8 @@ fn main() {
         dimension,
         block_dimension,
         inner_block_dimension,
+        fp8_weights,
+        weight_scale,
         seed,
         row_block_dimension,
         input_bytes = input.len(),
@@ -185,7 +252,7 @@ fn main() {
             &actual,
             &output_placements,
             &left,
-            &right,
+            &reference_right,
             max_error_limit,
         )
         .unwrap();
@@ -228,7 +295,7 @@ fn verify_output(
     actual: &[u8],
     placements: &[ipu_compiler::BlockPlacement],
     left: &[f16],
-    right: &[f16],
+    right: &[f32],
     max_error_limit: f32,
 ) -> ipu_runtime::Result<ErrorStatistics> {
     let actual = actual
@@ -255,7 +322,7 @@ fn verify_output(
             let expected = (0..dimension)
                 .map(|inner| {
                     left[matrix_index(dimension, row, inner)].to_f32()
-                        * right[matrix_index(dimension, inner, column)].to_f32()
+                        * right[matrix_index(dimension, inner, column)]
                 })
                 .sum::<f32>();
             if !observed.is_finite() {

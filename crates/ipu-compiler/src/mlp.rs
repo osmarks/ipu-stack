@@ -381,7 +381,7 @@ fn append_activation_transition(
             ],
             specialization: SpecializationKey {
                 operation: match data_type {
-                    GemmDataType::F16 => "gelu_f16_c16_to_a16",
+                    GemmDataType::F16 | GemmDataType::F16F8Weights { .. } => "gelu_f16_c16_to_a16",
                     GemmDataType::F32 => "gelu_c16_to_a8",
                 }
                 .into(),
