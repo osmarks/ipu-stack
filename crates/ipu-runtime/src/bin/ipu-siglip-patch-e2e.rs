@@ -9,9 +9,9 @@ use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, append_siglip_encoder_layer,
-    block_binding_typed, block_coordinates, blocked_matrix_f16, package_graph,
-    run_host_with_options,
+    BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, append_host_a16_matrix,
+    append_siglip_encoder_layer, append_siglip_map_head, block_binding_typed, block_coordinates,
+    blocked_matrix_f16, package_graph, run_host_with_options,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -35,6 +35,10 @@ fn main() {
     );
     let model = SiglipWeights::open(&model_directory).unwrap();
     let reference = TensorArchive::open(&reference_path).unwrap();
+    if std::env::var_os("IPU_SIGLIP_MAP_ONLY").is_some() {
+        run_map_only(&model, &reference);
+        return;
+    }
     let config = &model.config;
     let rows = u16::try_from(model.sequence_length()).unwrap();
     let patch_elements = config.num_channels * config.patch_size.pow(2);
@@ -302,6 +306,110 @@ fn main() {
         layer_error,
         "SigLIP encoder prefix passed against Hugging Face"
     );
+}
+
+fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
+    let config = &model.config;
+    let rows = u16::try_from(model.sequence_length()).unwrap();
+    let columns = u16::try_from(config.hidden_size).unwrap();
+    let row_block_dimension = choose_gemm_row_block_for(
+        rows,
+        INNER_BLOCK_DIMENSION,
+        columns,
+        BLOCK_DIMENSION,
+        TILE_COUNT,
+        GemmDataType::F16,
+    )
+    .unwrap();
+    let compilation_plan = plan_blocked_gemm(BlockedGemmConfig {
+        rows,
+        inner_dimension: columns,
+        columns,
+        block_dimension: BLOCK_DIMENSION,
+        inner_block_dimension: INNER_BLOCK_DIMENSION,
+        row_block_dimension,
+        tile_count: TILE_COUNT,
+        data_base: DATA_BASE,
+        data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        data_type: GemmDataType::F16,
+    })
+    .unwrap();
+    let mut schedule = ipu_compiler::Schedule {
+        layouts: Vec::new(),
+        phases: Vec::new(),
+        allocations: Vec::new(),
+        tile_count: TILE_COUNT,
+        peak_sram: BTreeMap::new(),
+    };
+    let mut host = HostTensorSet::default();
+    let input_values = reference.tensor_f32("post_layernorm").unwrap();
+    let input = append_host_a16_matrix(
+        &mut schedule,
+        "map.input",
+        &input_values,
+        rows,
+        columns,
+        row_block_dimension,
+        DATA_BASE,
+        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        &mut host,
+    )
+    .unwrap();
+    let map = append_siglip_map_head(
+        &mut schedule,
+        &input,
+        model,
+        rows,
+        row_block_dimension,
+        TILE_COUNT,
+        DATA_BASE,
+        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        &mut host,
+    )
+    .unwrap();
+    let objects = compile_objects(&compilation_plan, &map.attention).unwrap();
+    let HostTensorSet {
+        bindings: host_inputs,
+        bytes: host_input,
+    } = host;
+    let graph = ExecutableGraph {
+        schedule,
+        initial_buffers: Vec::new(),
+        outputs: Vec::new(),
+        host_inputs,
+        host_outputs: vec![row_shard_binding("pooler_output", 12, columns, &map.output)],
+    };
+    let app = package_graph(&graph, &objects).unwrap();
+    if std::env::var_os("IPU_SIGLIP_BUILD_ONLY").is_some() {
+        info!("SigLIP MAP executable built without device execution");
+        return;
+    }
+    let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
+    let configuration = fs::read(required_env("IPU_CONFIG")).unwrap();
+    let bootloader = fs::read(
+        std::env::var_os("IPU_BOOTLOADER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| sdk.join("bin/ipu/tile_bootloader_ipu2.elf")),
+    )
+    .unwrap();
+    let actual = run_host_with_options(
+        &app,
+        &bootloader,
+        &configuration,
+        &std::env::var("IPU_DEVICE").unwrap_or_else(|_| "/dev/ipu0".into()),
+        &host_input,
+        HostRunOptions::from_environment().unwrap(),
+    )
+    .unwrap();
+    let expected = reference.tensor_f32("pooler_output").unwrap();
+    let expected = (0..12)
+        .flat_map(|_| expected.iter().copied())
+        .collect::<Vec<_>>();
+    let expected = serialize_a16_row_shards(&expected, 12, usize::from(columns), &map.output);
+    let error = verify_linear_f16(&actual, &expected);
+    let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
+    info!(error, limit, "SigLIP MAP verification result");
+    assert!(error <= limit, "MAP max error {error} exceeds {limit}");
 }
 
 fn patch_value(

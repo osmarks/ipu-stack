@@ -14,7 +14,10 @@ use tracing_subscriber::EnvFilter;
 
 mod siglip;
 mod static_codegen;
-pub use siglip::{HostTensorSet, SiglipEncoderLayer, append_siglip_encoder_layer};
+pub use siglip::{
+    HostTensorSet, SiglipEncoderLayer, SiglipMapHead, append_host_a16_matrix,
+    append_siglip_encoder_layer, append_siglip_map_head, append_siglip_post_layer_norm,
+};
 
 mod blocked_data;
 pub use blocked_data::{
