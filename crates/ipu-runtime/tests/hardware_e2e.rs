@@ -62,6 +62,18 @@ fn h2d_compute_d2d_compute_d2h_works() {
 }
 
 #[test]
+fn compiler_segmented_allocation_executes_on_hardware() {
+    let _device = device();
+    require_success(
+        "compiler-generated add spanning segmented SRAM arenas",
+        Command::new(env!("CARGO_BIN_EXE_ipu-hardware-e2e"))
+            .env("IPU_GRAPH_TEST", "compiler-segmented-add")
+            .status()
+            .expect("launch compiler allocation hardware test runner"),
+    );
+}
+
+#[test]
 fn remote_tile_h2d_and_d2h_work() {
     let _device = device();
     require_success(

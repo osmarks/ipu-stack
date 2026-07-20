@@ -1,10 +1,10 @@
 use ipu_compiler::{
-    Allocation, AllocationKind, KernelCommand, OpId, Phase, Schedule, SpecializationKey, TensorId,
-    Transfer,
+    Allocation, AllocationKind, CompilerOptions, Graph, KernelCommand, MemoryArena, OpId, Phase,
+    Schedule, SpecializationKey, TensorId, Transfer, compile,
 };
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
-use ipu_runtime::{ExecutableGraph, InitialBuffer, package_graph, run_diagnostic};
+use ipu_runtime::{ExecutableGraph, InitialBuffer, package_graph, run_diagnostic, run_host};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -49,6 +49,16 @@ fn main() {
     let kernel_object = fs::read(kernel.object).unwrap();
 
     let mode = std::env::var("IPU_GRAPH_TEST").unwrap_or_else(|_| "all".into());
+    if mode == "compiler-segmented-add" {
+        run_compiler_segmented_add(
+            &[runtime_object, kernel_object],
+            &bootloader,
+            &configuration,
+            &device,
+        );
+        let _ = fs::remove_dir_all(output);
+        return;
+    }
     let (graph, expected_sum, expected_permutation, expected_multicast) = acceptance_case(&mode);
     let app = package_graph(&graph, &[runtime_object, kernel_object]).unwrap();
     let results = run_diagnostic(&app, &bootloader, &configuration, &device).unwrap();
@@ -66,6 +76,87 @@ fn main() {
     }
     assert_eq!(results.bindings["runtime-completion"], [1]);
     let _ = fs::remove_dir_all(output);
+}
+
+fn run_compiler_segmented_add(
+    objects: &[Vec<u8>],
+    bootloader: &[u8],
+    configuration: &[u8],
+    device: &str,
+) {
+    let mut graph = Graph::default();
+    let left = graph.input("left", &[1]);
+    let right = graph.input("right", &[1]);
+    let sum = graph.add("sum", left, right).unwrap();
+    graph.mark_output(sum);
+    let first_arena_base = ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
+    let second_arena_base = first_arena_base + 4096;
+    let schedule = compile(
+        &graph,
+        &CompilerOptions {
+            tile_count: TILE_COUNT,
+            data_arenas: vec![
+                MemoryArena {
+                    base: first_arena_base,
+                    limit: first_arena_base + 32,
+                },
+                MemoryArena {
+                    base: second_arena_base,
+                    limit: second_arena_base + 256,
+                },
+            ],
+            ..CompilerOptions::default()
+        },
+    )
+    .unwrap();
+    let location = |tensor| {
+        schedule
+            .allocations
+            .iter()
+            .find(|allocation| {
+                allocation.tensor == tensor
+                    && allocation.tile == 0
+                    && allocation.kind == AllocationKind::Home
+            })
+            .unwrap()
+    };
+    let left_allocation = location(left);
+    let right_allocation = location(right);
+    let sum_allocation = location(sum);
+    assert!(sum_allocation.address >= second_arena_base);
+    let left_address = left_allocation.address;
+    let right_address = right_allocation.address;
+    let sum_address = sum_allocation.address;
+
+    let binding = |name: &str, address: u32| Binding {
+        name: name.into(),
+        dtype: "u32".into(),
+        shape: vec![1],
+        slices: vec![RegionSlice {
+            tile: 0,
+            tile_address: address,
+            file_offset: 0,
+            size: 4,
+        }],
+    };
+    let executable = ExecutableGraph {
+        schedule,
+        initial_buffers: Vec::new(),
+        outputs: Vec::new(),
+        host_inputs: vec![
+            binding("left", left_address),
+            binding("right", right_address),
+        ],
+        host_outputs: vec![binding("sum", sum_address)],
+    };
+    let mut rng = fastrand::Rng::with_seed(0x7365_676d_656e_7465);
+    let left_value = rng.f32() * 2.0 - 1.0;
+    let right_value = rng.f32() * 2.0 - 1.0;
+    let input = [left_value.to_le_bytes(), right_value.to_le_bytes()].concat();
+    let app = package_graph(&executable, objects).unwrap();
+    let output = run_host(&app, bootloader, configuration, device, &input).unwrap();
+    let actual = f32::from_le_bytes(output.try_into().unwrap());
+    assert!((actual - (left_value + right_value)).abs() <= f32::EPSILON);
 }
 
 fn acceptance_case(mode: &str) -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {

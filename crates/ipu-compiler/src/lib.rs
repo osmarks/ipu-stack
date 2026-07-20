@@ -1889,12 +1889,12 @@ fn plan_memory(
                 let operation = &graph.ops[op.0];
                 produced[operation.output.0] = phase_index;
                 for input in &operation.inputs {
-                    consumed[input.0] = consumed[input.0].max(phase_index);
+                    consumed[input.0] = consumed[input.0].max(phase_index + 1);
                 }
             }
             Phase::Exchange { transfers } => {
                 for transfer in transfers {
-                    consumed[transfer.tensor.0] = consumed[transfer.tensor.0].max(phase_index);
+                    consumed[transfer.tensor.0] = consumed[transfer.tensor.0].max(phase_index + 1);
                 }
             }
         }
