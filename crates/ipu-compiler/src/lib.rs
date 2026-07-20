@@ -17,8 +17,9 @@ pub use attention::{
 };
 pub use mlp::{BlockedMlpConfig, BlockedMlpPlan, plan_blocked_mlp};
 pub use siglip::{
-    SiglipMemoryPlan, SiglipResidencyOptions, SiglipVisionConfig, SiglipWeightStage,
-    SiglipWeightTensor, plan_siglip_memory,
+    SiglipMemoryClass, SiglipMemoryPlan, SiglipResidencyOptions, SiglipVisionConfig,
+    SiglipWeightLayout, SiglipWeightShard, SiglipWeightStage, SiglipWeightTensor,
+    plan_siglip_memory,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -95,6 +95,13 @@ pub struct SiglipWeightTensor {
     pub logical_shape: Vec<u32>,
     pub resident_shape: Vec<u32>,
     pub bytes: u64,
+    pub layout: SiglipWeightLayout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SiglipWeightLayout {
+    Linear,
+    AmpB16x16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,7 +122,7 @@ impl Default for SiglipResidencyOptions {
             tile_count: 1472,
             code_bytes_per_tile: 4096,
             exchange_scratch_bytes_per_tile: 12 * 1024,
-            working_bytes_per_tile: 16 * 1024,
+            working_bytes_per_tile: 12 * 1024,
             shard_alignment: 32,
         }
     }
@@ -161,31 +168,32 @@ struct Arena {
 #[derive(Clone)]
 struct TileCursor {
     arenas: Vec<Arena>,
-    arena: usize,
-    address: u32,
+    addresses: Vec<u32>,
 }
 
 impl TileCursor {
     fn new(arenas: Vec<Arena>) -> Self {
-        let address = arenas.first().map_or(0, |arena| arena.base);
-        Self {
-            arenas,
-            arena: 0,
-            address,
-        }
+        let addresses = arenas.iter().map(|arena| arena.base).collect();
+        Self { arenas, addresses }
     }
 
-    fn allocate(&mut self, maximum: u32, alignment: u32) -> Option<(u32, u32, SiglipMemoryClass)> {
-        while let Some(arena) = self.arenas.get(self.arena).copied() {
-            self.address = align(self.address.max(arena.base), alignment);
-            if self.address < arena.limit {
-                let bytes = maximum.min(arena.limit - self.address);
-                let result = (self.address, bytes, arena.class);
-                self.address += bytes;
-                return Some(result);
+    fn allocate(
+        &mut self,
+        maximum: u32,
+        alignment: u32,
+        contiguous: bool,
+    ) -> Option<(u32, u32, SiglipMemoryClass)> {
+        for (index, arena) in self.arenas.iter().copied().enumerate() {
+            let address = align(self.addresses[index].max(arena.base), alignment);
+            if address < arena.limit {
+                let available = arena.limit - address;
+                if !contiguous || available >= maximum {
+                    let bytes = maximum.min(available);
+                    let result = (address, bytes, arena.class);
+                    self.addresses[index] = address + bytes;
+                    return Some(result);
+                }
             }
-            self.arena += 1;
-            self.address = self.arenas.get(self.arena).map_or(0, |next| next.base);
         }
         None
     }
@@ -271,20 +279,43 @@ pub fn plan_siglip_memory(
         }
         let mut offset = 0u64;
         while offset < tensor.bytes {
-            let Reverse((tile_bytes, tile)) = tile_loads.pop().unwrap();
-            let tile_index = usize::from(tile);
             let desired = u32::try_from((tensor.bytes - offset).min(8 * 1024))
                 .map_err(|_| CompileError::Memory("SigLIP shard size overflow".into()))?;
+            let contiguous = tensor.layout == SiglipWeightLayout::AmpB16x16;
+            let mut skipped = Vec::new();
+            let (tile_bytes, tile, first_allocation) = loop {
+                let Some(Reverse((tile_bytes, tile))) = tile_loads.pop() else {
+                    return Err(CompileError::Memory(format!(
+                        "SigLIP encoder has no contiguous tile region for {}",
+                        tensor.name
+                    )));
+                };
+                if let Some(allocation) = cursors[usize::from(tile)].allocate(
+                    desired,
+                    options.shard_alignment,
+                    contiguous,
+                ) {
+                    break (tile_bytes, tile, allocation);
+                }
+                skipped.push(Reverse((tile_bytes, tile)));
+            };
+            tile_loads.extend(skipped);
             let mut remaining = desired;
+            let mut next_allocation = Some(first_allocation);
             while remaining != 0 {
-                let (address, bytes, memory_class) = cursors[tile_index]
-                    .allocate(remaining, options.shard_alignment)
-                    .ok_or_else(|| {
-                        CompileError::Memory(format!(
-                            "SigLIP encoder allocation exhausted tile {tile} while placing {}",
-                            tensor.name
-                        ))
-                    })?;
+                let (address, bytes, memory_class) =
+                    if let Some(allocation) = next_allocation.take() {
+                        allocation
+                    } else {
+                        cursors[usize::from(tile)]
+                        .allocate(remaining, options.shard_alignment, contiguous)
+                        .ok_or_else(|| {
+                            CompileError::Memory(format!(
+                                "SigLIP encoder allocation exhausted tile {tile} while placing {}",
+                                tensor.name
+                            ))
+                        })?
+                    };
                 shards.push(SiglipWeightShard {
                     tensor: tensor_index,
                     tensor_offset: offset,
@@ -359,7 +390,7 @@ fn weight_manifest(config: SiglipVisionConfig) -> Vec<SiglipWeightTensor> {
     let patch_features = u32::from(config.patch_size).pow(2) * u32::from(config.channels);
     let sequence = config.sequence_length();
     let mut weights = vec![
-        tensor(
+        matrix(
             "embeddings.patch_embedding.weight",
             SiglipWeightStage::Embedding,
             &[hidden, patch_features],
@@ -389,7 +420,7 @@ fn weight_manifest(config: SiglipVisionConfig) -> Vec<SiglipWeightTensor> {
                 stage(EncoderWeightOperation::LayerNorm1),
                 hidden,
             ),
-            tensor(
+            matrix(
                 &format!("encoder.layers.{layer}.self_attn.qkv.weight"),
                 stage(EncoderWeightOperation::QueryKeyValue),
                 &[hidden * 3, hidden],
@@ -401,7 +432,7 @@ fn weight_manifest(config: SiglipVisionConfig) -> Vec<SiglipWeightTensor> {
                 &[hidden * 3],
                 &[hidden * 3],
             ),
-            tensor(
+            matrix(
                 &format!("encoder.layers.{layer}.self_attn.out_proj.weight"),
                 stage(EncoderWeightOperation::AttentionOutput),
                 &[hidden, hidden],
@@ -418,7 +449,7 @@ fn weight_manifest(config: SiglipVisionConfig) -> Vec<SiglipWeightTensor> {
                 stage(EncoderWeightOperation::LayerNorm2),
                 hidden,
             ),
-            tensor(
+            matrix(
                 &format!("encoder.layers.{layer}.mlp.fc1.weight"),
                 stage(EncoderWeightOperation::MlpInput),
                 &[intermediate, hidden],
@@ -430,7 +461,7 @@ fn weight_manifest(config: SiglipVisionConfig) -> Vec<SiglipWeightTensor> {
                 &[intermediate],
                 &[padded_intermediate],
             ),
-            tensor(
+            matrix(
                 &format!("encoder.layers.{layer}.mlp.fc2.weight"),
                 stage(EncoderWeightOperation::MlpOutput),
                 &[hidden, intermediate],
@@ -470,7 +501,7 @@ fn map_head_weights(
     let stage = SiglipWeightStage::MapHead;
     vec![
         tensor("head.probe", stage, &[1, hidden], &[1, hidden]),
-        tensor(
+        matrix(
             "head.attention.in_proj_weight",
             stage,
             &[hidden * 3, hidden],
@@ -482,7 +513,7 @@ fn map_head_weights(
             &[hidden * 3],
             &[hidden * 3],
         ),
-        tensor(
+        matrix(
             "head.attention.out_proj.weight",
             stage,
             &[hidden, hidden],
@@ -490,7 +521,7 @@ fn map_head_weights(
         ),
         tensor("head.attention.out_proj.bias", stage, &[hidden], &[hidden]),
         tensor_pair("head.layernorm", stage, hidden),
-        tensor(
+        matrix(
             "head.mlp.fc1.weight",
             stage,
             &[intermediate, hidden],
@@ -502,7 +533,7 @@ fn map_head_weights(
             &[intermediate],
             &[padded_intermediate],
         ),
-        tensor(
+        matrix(
             "head.mlp.fc2.weight",
             stage,
             &[hidden, intermediate],
@@ -528,6 +559,19 @@ fn tensor(
             .map(|&value| u64::from(value))
             .product::<u64>()
             * FP16_BYTES,
+        layout: SiglipWeightLayout::Linear,
+    }
+}
+
+fn matrix(
+    name: &str,
+    stage: SiglipWeightStage,
+    logical_shape: &[u32],
+    resident_shape: &[u32],
+) -> SiglipWeightTensor {
+    SiglipWeightTensor {
+        layout: SiglipWeightLayout::AmpB16x16,
+        ..tensor(name, stage, logical_shape, resident_shape)
     }
 }
 
@@ -553,10 +597,13 @@ mod tests {
         assert!(plan.encoder_bytes <= plan.bootstrap_capacity);
         let minimum_bootstrap = plan.encoder_bytes - plan.normal_capacity;
         assert!(plan.bootstrap_bytes >= minimum_bootstrap);
-        assert!(
-            plan.bootstrap_bytes - minimum_bootstrap
-                <= u64::from(SiglipResidencyOptions::default().tile_count)
-                    * u64::from(SiglipResidencyOptions::default().shard_alignment)
+        assert!(plan.bootstrap_bytes < plan.bootstrap_capacity - plan.normal_capacity);
+        assert_eq!(
+            plan.shards
+                .iter()
+                .map(|shard| u64::from(shard.bytes))
+                .sum::<u64>(),
+            plan.encoder_bytes
         );
         let minimum = plan.per_tile_bytes.values().min().unwrap();
         let maximum = plan.per_tile_bytes.values().max().unwrap();
