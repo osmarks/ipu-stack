@@ -1038,6 +1038,8 @@ fn plan_appended_blocked_gemm(
     config: BlockedGemmConfig,
 ) -> Result<BlockedGemmPlan, CompileError> {
     let mut plan = plan_blocked_gemm(config)?;
+    let tile_rotation = choose_resident_tile_rotation(parent, &plan.schedule, config.data_base);
+    rotate_gemm_plan_tiles(&mut plan, tile_rotation)?;
     let provisional_is_free = plan.schedule.allocations.iter().all(|candidate| {
         candidate.kind != AllocationKind::Home
             || candidate.address < config.data_base
@@ -1121,6 +1123,83 @@ fn plan_appended_blocked_gemm(
         }
     }
     Ok(plan)
+}
+
+fn choose_resident_tile_rotation(parent: &Schedule, child: &Schedule, data_base: u32) -> u16 {
+    let tile_count = usize::from(parent.tile_count);
+    if tile_count == 0 {
+        return 0;
+    }
+    let resident_bytes = |schedule: &Schedule| {
+        let mut bytes = vec![0u64; tile_count];
+        for allocation in &schedule.allocations {
+            if allocation.kind == AllocationKind::Home && allocation.address >= data_base {
+                bytes[usize::from(allocation.tile)] += u64::from(allocation.size);
+            }
+        }
+        bytes
+    };
+    let parent_bytes = resident_bytes(parent);
+    let child_bytes = resident_bytes(child);
+    (0..tile_count)
+        .min_by_key(|&rotation| {
+            let loads = (0..tile_count).map(|tile| {
+                parent_bytes[tile] + child_bytes[(tile + tile_count - rotation) % tile_count]
+            });
+            let maximum = loads.clone().max().unwrap_or(0);
+            let squared = loads
+                .map(|load| u128::from(load) * u128::from(load))
+                .sum::<u128>();
+            (maximum, squared, rotation)
+        })
+        .unwrap_or(0) as u16
+}
+
+fn rotate_gemm_plan_tiles(plan: &mut BlockedGemmPlan, rotation: u16) -> Result<(), CompileError> {
+    if rotation == 0 {
+        return Ok(());
+    }
+    let tile_count = plan.schedule.tile_count;
+    let rotate = |tile: &mut u16| {
+        *tile = ((*tile as u32 + rotation as u32) % u32::from(tile_count)) as u16;
+    };
+    for placement in plan
+        .left
+        .iter_mut()
+        .chain(&mut plan.right)
+        .chain(&mut plan.output)
+    {
+        rotate(&mut placement.tile);
+    }
+    for allocation in &mut plan.schedule.allocations {
+        rotate(&mut allocation.tile);
+    }
+    for phase in &mut plan.schedule.phases {
+        match phase {
+            Phase::Exchange { transfers } => {
+                for transfer in transfers {
+                    rotate(&mut transfer.source_tile);
+                    rotate(&mut transfer.destination_tile);
+                }
+            }
+            Phase::Compute { commands, .. } => {
+                for command in commands {
+                    rotate(&mut command.tile);
+                }
+            }
+        }
+    }
+    let mut peak_sram = BTreeMap::new();
+    for (mut tile, bytes) in std::mem::take(&mut plan.schedule.peak_sram) {
+        rotate(&mut tile);
+        if peak_sram.insert(tile, bytes).is_some() {
+            return Err(CompileError::Graph(
+                "GEMM tile rotation produced duplicate peak SRAM entries".into(),
+            ));
+        }
+    }
+    plan.schedule.peak_sram = peak_sram;
+    Ok(())
 }
 
 fn remap_gemm_tensors(plan: &mut BlockedGemmPlan, base: usize) -> Result<(), CompileError> {
@@ -3135,6 +3214,33 @@ mod tests {
             &schedule.phases[1],
             Phase::Compute { commands, .. } if commands.len() == output.len()
         ));
+    }
+
+    #[test]
+    fn appended_gemm_rotation_avoids_resident_tile_pressure() {
+        let allocation = |tensor, tile, size| Allocation {
+            tensor: TensorId(tensor),
+            tile,
+            address: 0xa0000,
+            size,
+            live_from: 0,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        };
+        let schedule = |allocations| Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations,
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+        let parent = schedule(vec![allocation(0, 0, 128)]);
+        let child = schedule(vec![allocation(1, 0, 64), allocation(2, 1, 64)]);
+
+        let rotation = choose_resident_tile_rotation(&parent, &child, 0xa0000);
+
+        assert_ne!(rotation, 0);
+        assert_ne!(rotation, 3);
     }
 
     #[test]
