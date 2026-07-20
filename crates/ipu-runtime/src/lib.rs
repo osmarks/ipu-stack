@@ -423,12 +423,46 @@ pub fn package_graph_with_templates(
 
 pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile> {
     let topology = Topology::c600();
-    let bindings = graph
+    let mut binding_intervals = vec![Vec::<(u32, u32, &str)>::new(); topology.tile_count()];
+    for binding in graph
         .host_inputs
         .iter()
         .chain(&graph.host_outputs)
         .chain(&graph.outputs)
+    {
+        for slice in &binding.slices {
+            let tile = usize::try_from(slice.tile)?;
+            let end = slice
+                .tile_address
+                .saturating_add(u32::try_from(slice.size).unwrap_or(u32::MAX));
+            binding_intervals[tile].push((slice.tile_address, end, &binding.name));
+        }
+    }
+    let binding_prefix_ends = binding_intervals
+        .iter_mut()
+        .map(|intervals| {
+            intervals.sort_unstable_by_key(|&(start, end, _)| (start, end));
+            let mut maximum = 0;
+            intervals
+                .iter()
+                .map(|&(_, end, _)| {
+                    maximum = maximum.max(end);
+                    maximum
+                })
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
+    let mut output_names = HashMap::<(u16, ipu_compiler::TensorId), String>::new();
+    for phase in &graph.schedule.phases {
+        let ipu_compiler::Phase::Compute { commands, .. } = phase else {
+            continue;
+        };
+        for command in commands {
+            output_names
+                .entry((command.tile, command.output))
+                .or_insert_with(|| allocation_command_name(command));
+        }
+    }
     let mut tiles = Vec::with_capacity(usize::from(graph.schedule.tile_count));
     for logical_tile in 0..graph.schedule.tile_count {
         let physical_tile = topology.physical(logical_tile)?;
@@ -439,25 +473,24 @@ pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile
             .filter(|allocation| allocation.tile == logical_tile)
             .map(|allocation| {
                 let allocation_end = allocation.address.saturating_add(allocation.size);
-                let names = bindings
-                    .iter()
-                    .filter(|binding| {
-                        binding.slices.iter().any(|slice| {
-                            slice.tile == u32::from(physical_tile)
-                                && slice.tile_address < allocation_end
-                                && allocation.address
-                                    < slice.tile_address.saturating_add(
-                                        u32::try_from(slice.size).unwrap_or(u32::MAX),
-                                    )
-                        })
-                    })
-                    .map(|binding| binding.name.as_str())
-                    .collect::<Vec<_>>();
+                let intervals = &binding_intervals[usize::from(physical_tile)];
+                let prefix_ends = &binding_prefix_ends[usize::from(physical_tile)];
+                let mut interval =
+                    intervals.partition_point(|&(start, _, _)| start < allocation_end);
+                let mut names = Vec::new();
+                while interval != 0 && prefix_ends[interval - 1] > allocation.address {
+                    interval -= 1;
+                    let (_, end, name) = intervals[interval];
+                    if end > allocation.address && !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                names.sort_unstable();
                 let category = match allocation.kind {
                     ipu_compiler::AllocationKind::Home => "home",
                     ipu_compiler::AllocationKind::ExchangeStaging { .. } => "exchange_staging",
                 };
-                let name = allocation_profile_name(graph, allocation, &names);
+                let name = allocation_profile_name(graph, allocation, &names, &output_names);
                 MemoryRegion {
                     address: allocation.address,
                     size: allocation.size,
@@ -483,36 +516,35 @@ pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile
     })
 }
 
+fn allocation_command_name(command: &ipu_compiler::KernelCommand) -> String {
+    let label = command
+        .metadata
+        .get("label")
+        .cloned()
+        .unwrap_or_else(|| command.specialization.operation.clone());
+    if command.specialization.operation.starts_with("gemm_")
+        && let (Some(row), Some(column)) = (
+            command.metadata.get("output_block_row"),
+            command.metadata.get("output_block_column"),
+        )
+    {
+        format!("GEMM accumulator block ({row}, {column})")
+    } else {
+        format!("output of {label}")
+    }
+}
+
 fn allocation_profile_name(
     graph: &ExecutableGraph,
     allocation: &ipu_compiler::Allocation,
     binding_names: &[&str],
+    output_names: &HashMap<(u16, ipu_compiler::TensorId), String>,
 ) -> String {
     if !binding_names.is_empty() {
         return binding_names.join(", ");
     }
-    let command_label = |command: &ipu_compiler::KernelCommand| {
-        command
-            .metadata
-            .get("label")
-            .cloned()
-            .unwrap_or_else(|| command.specialization.operation.clone())
-    };
-    if let Some(command) = graph.schedule.phases.iter().find_map(|phase| match phase {
-        ipu_compiler::Phase::Compute { commands, .. } => commands
-            .iter()
-            .find(|command| command.tile == allocation.tile && command.output == allocation.tensor),
-        ipu_compiler::Phase::Exchange { .. } => None,
-    }) {
-        if command.specialization.operation.starts_with("gemm_")
-            && let (Some(row), Some(column)) = (
-                command.metadata.get("output_block_row"),
-                command.metadata.get("output_block_column"),
-            )
-        {
-            return format!("GEMM accumulator block ({row}, {column})");
-        }
-        return format!("output of {}", command_label(command));
+    if let Some(name) = output_names.get(&(allocation.tile, allocation.tensor)) {
+        return name.clone();
     }
     if let ipu_compiler::AllocationKind::ExchangeStaging { phase } = allocation.kind
         && let Some(ipu_compiler::Phase::Compute { commands, .. }) =
@@ -521,7 +553,12 @@ fn allocation_profile_name(
             command.tile == allocation.tile && command.inputs.contains(&allocation.tensor)
         })
     {
-        return format!("input to {}", command_label(command));
+        let label = command
+            .metadata
+            .get("label")
+            .cloned()
+            .unwrap_or_else(|| command.specialization.operation.clone());
+        return format!("input to {label}");
     }
     match allocation.kind {
         ipu_compiler::AllocationKind::Home => format!("tensor {} home", allocation.tensor.0),

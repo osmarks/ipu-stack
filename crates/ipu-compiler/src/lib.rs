@@ -1128,7 +1128,7 @@ fn plan_appended_blocked_gemm(
     let mut occupied = occupied_intervals_by_tile(
         &parent.allocations,
         parent.tile_count,
-        0,
+        parent.phases.len(),
         usize::MAX,
         config.data_base,
         config.data_limit,
@@ -3365,6 +3365,52 @@ mod tests {
 
         assert_ne!(rotation, 0);
         assert_ne!(rotation, 3);
+    }
+
+    #[test]
+    fn appended_gemm_ignores_allocations_dead_before_its_first_phase() {
+        let parent = Schedule {
+            layouts: Vec::new(),
+            phases: vec![Phase::Compute {
+                op: OpId(0),
+                commands: Vec::new(),
+            }],
+            allocations: (0..4)
+                .map(|tile| Allocation {
+                    tensor: TensorId(usize::from(tile)),
+                    tile,
+                    address: 0xa0000,
+                    size: 0x48000,
+                    live_from: 0,
+                    live_until: 1,
+                    kind: AllocationKind::Home,
+                })
+                .collect(),
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+        let config = BlockedGemmConfig {
+            rows: 64,
+            inner_dimension: 64,
+            columns: 64,
+            block_dimension: 64,
+            inner_block_dimension: 64,
+            row_block_dimension: 64,
+            tile_count: 4,
+            data_base: 0xa0000,
+            data_limit: 0xe8000,
+            data_type: GemmDataType::F16,
+        };
+
+        let appended = plan_appended_blocked_gemm(&parent, config).unwrap();
+
+        assert!(
+            appended
+                .right
+                .iter()
+                .chain(&appended.output)
+                .all(|block| (config.data_base..config.data_limit).contains(&block.address))
+        );
     }
 
     #[test]
