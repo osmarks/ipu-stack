@@ -209,20 +209,18 @@ fn main() {
     let qkv_shards = (0..3)
         .map(|projection| {
             let blocks = projection_blocks(&qkv.output, projection, columns);
-            let data_base = resident_data_end(&plan.schedule);
             append_c16_to_a16_row_shards(
                 &mut plan.schedule,
                 &blocks,
                 RowShardTransitionConfig {
                     columns,
-                    data_base,
+                    data_base: DATA_BASE,
                     data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
                 },
             )
             .unwrap()
         })
         .collect::<Vec<_>>();
-    let attention_data_base = resident_data_end(&plan.schedule);
     let attention = append_flash_attention_from_a16_qkv(
         &mut plan.schedule,
         &qkv_shards[0],
@@ -236,16 +234,15 @@ fn main() {
             query_block_rows: 0,
             key_block_rows: 0,
             tile_count: TILE_COUNT,
-            data_base: attention_data_base,
+            data_base: DATA_BASE,
             data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
         },
     )
     .unwrap();
-    let attention_output_base = resident_data_end(&plan.schedule);
     let attention_shards = append_flash_attention_to_a16_row_shards(
         &mut plan.schedule,
         &attention,
-        attention_output_base,
+        DATA_BASE,
         ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
     )
     .unwrap();

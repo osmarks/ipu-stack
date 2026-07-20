@@ -1,6 +1,7 @@
 use crate::{
-    Allocation, AllocationKind, CompileError, KernelCommand, OpId, Phase, RowShardPlacement,
-    Schedule, SpecializationKey, TensorId, Transfer,
+    Allocation, AllocationKind, CompileError, KernelCommand, MemoryConstraint, MemoryPlacement,
+    OpId, Phase, RowShardPlacement, Schedule, SpecializationKey, TensorId, Transfer,
+    allocate_from_occupied, occupied_intervals_by_tile,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -103,6 +104,7 @@ pub fn append_flash_attention_from_a16_qkv(
         key_block_rows,
         ..config
     })?;
+    relocate_appended_attention(schedule, &mut plan, config.data_base, config.data_limit)?;
     let tensor_base = schedule
         .allocations
         .iter()
@@ -145,6 +147,102 @@ pub fn append_flash_attention_from_a16_qkv(
     Ok(plan)
 }
 
+fn relocate_appended_attention(
+    parent: &Schedule,
+    plan: &mut FlashAttentionPlan,
+    data_base: u32,
+    data_limit: u32,
+) -> Result<(), CompileError> {
+    let live_from = parent.phases.len();
+    let mut occupied = occupied_intervals_by_tile(
+        &parent.allocations,
+        parent.tile_count,
+        live_from,
+        usize::MAX,
+        data_base,
+        data_limit,
+    );
+    let mut regions = Vec::<(TensorId, u16, u32, u32)>::new();
+    for task in &plan.tasks {
+        regions.extend([
+            (
+                task.query,
+                task.tile,
+                task.query_address,
+                u32::from(task.query_rows) * u32::from(plan.padded_head_dimension) * 2,
+            ),
+            (
+                task.accumulator,
+                task.tile,
+                task.accumulator_address,
+                u32::from(task.query_rows) * (u32::from(plan.head_dimension) * 4 + 8),
+            ),
+            (
+                task.weights,
+                task.tile,
+                task.weights_address,
+                u32::from(task.query_rows) * (u32::from(plan.key_block_columns) * 2 + 8),
+            ),
+            (
+                task.output,
+                task.tile,
+                task.output_address,
+                u32::from(task.query_rows) * u32::from(plan.head_dimension) * 2,
+            ),
+        ]);
+    }
+    for key_value in &plan.key_values {
+        regions.extend([
+            (
+                key_value.key_tensor,
+                key_value.tile,
+                key_value.key_address,
+                key_value.matrix_size,
+            ),
+            (
+                key_value.value_tensor,
+                key_value.tile,
+                key_value.value_address,
+                key_value.matrix_size,
+            ),
+        ]);
+    }
+    regions.sort_unstable_by_key(|&(_, _, _, size)| std::cmp::Reverse(size));
+    let mut relocated = BTreeMap::<usize, u32>::new();
+    for &(tensor, tile, _address, size) in &regions {
+        let address = allocate_from_occupied(
+            &mut occupied[usize::from(tile)],
+            size,
+            MemoryConstraint {
+                base: data_base,
+                limit: data_limit,
+                alignment: 8,
+                placement: MemoryPlacement::Low,
+            },
+        )?;
+        relocated.insert(tensor.0, address);
+    }
+    for task in &mut plan.tasks {
+        task.query_address = relocated[&task.query.0];
+        task.accumulator_address = relocated[&task.accumulator.0];
+        task.weights_address = relocated[&task.weights.0];
+        task.output_address = relocated[&task.output.0];
+    }
+    for key_value in &mut plan.key_values {
+        key_value.key_address = relocated[&key_value.key_tensor.0];
+        key_value.value_address = relocated[&key_value.value_tensor.0];
+    }
+    for allocation in &mut plan.schedule.allocations {
+        if allocation.kind == AllocationKind::Home
+            && let Some(&address) = relocated.get(&allocation.tensor.0)
+        {
+            allocation.address = address;
+        }
+    }
+    plan.schedule.peak_sram.clear();
+    Ok(())
+}
+
 pub fn append_flash_attention_to_a16_row_shards(
     schedule: &mut Schedule,
     plan: &FlashAttentionPlan,
@@ -184,8 +282,6 @@ pub fn append_flash_attention_to_a16_row_shards(
     let mut transfers = Vec::new();
     let mut commands = Vec::new();
     let mut destinations = Vec::with_capacity(groups.len());
-    let mut cursors = vec![data_base; usize::from(schedule.tile_count)];
-
     for (destination_index, ((row_start, rows), mut tasks)) in groups.into_iter().enumerate() {
         tasks.sort_by_key(|task| task.head);
         if tasks.len() != usize::from(head_count)
@@ -211,16 +307,19 @@ pub fn append_flash_attention_to_a16_row_shards(
                 "attention row shard is {activation_bytes} bytes, larger than the exchange window"
             )));
         }
-        let address = allocate(
-            &mut cursors[usize::from(destination_tile)],
+        let address = crate::find_free_region(
+            &schedule.allocations,
+            destination_tile,
             activation_bytes,
-            8,
+            compute_phase,
+            usize::MAX,
+            MemoryConstraint {
+                base: data_base,
+                limit: data_limit,
+                alignment: 8,
+                placement: MemoryPlacement::Low,
+            },
         )?;
-        if cursors[usize::from(destination_tile)] > data_limit {
-            return Err(CompileError::Memory(format!(
-                "attention output shard on tile {destination_tile} exceeds its SRAM arena"
-            )));
-        }
         let destination_tensor = fresh_tensor(&mut next_tensor);
         schedule.allocations.push(Allocation {
             tensor: destination_tensor,

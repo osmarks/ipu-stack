@@ -484,7 +484,7 @@ pub fn find_free_region(
     )))
 }
 
-fn allocate_from_occupied(
+pub(crate) fn allocate_from_occupied(
     occupied: &mut Vec<(u32, u32)>,
     size: u32,
     constraint: MemoryConstraint,
@@ -543,6 +543,45 @@ fn allocate_from_occupied(
     let insertion = occupied.partition_point(|&(start, _)| start < address);
     occupied.insert(insertion, (address, end));
     Ok(address)
+}
+
+pub(crate) fn occupied_intervals_by_tile(
+    allocations: &[Allocation],
+    tile_count: u16,
+    live_from: usize,
+    live_until: usize,
+    base: u32,
+    limit: u32,
+) -> Vec<Vec<(u32, u32)>> {
+    let mut occupied = vec![Vec::<(u32, u32)>::new(); usize::from(tile_count)];
+    for allocation in allocations {
+        if live_from >= allocation.live_until || allocation.live_from >= live_until {
+            continue;
+        }
+        let start = allocation.address.max(base);
+        let end = allocation
+            .address
+            .saturating_add(allocation.size)
+            .min(limit);
+        if start < end {
+            occupied[usize::from(allocation.tile)].push((start, end));
+        }
+    }
+    for intervals in &mut occupied {
+        intervals.sort_unstable();
+        let mut merged = Vec::<(u32, u32)>::with_capacity(intervals.len());
+        for &(start, end) in intervals.iter() {
+            if let Some(previous) = merged.last_mut()
+                && start <= previous.1
+            {
+                previous.1 = previous.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        *intervals = merged;
+    }
+    occupied
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1035,31 +1074,14 @@ fn plan_appended_blocked_gemm(
         )
     }));
     regions.sort_unstable_by_key(|&(_, _, _, size, _)| std::cmp::Reverse(size));
-    let mut occupied = vec![Vec::<(u32, u32)>::new(); usize::from(parent.tile_count)];
-    for allocation in &parent.allocations {
-        let start = allocation.address.max(config.data_base);
-        let end = allocation
-            .address
-            .saturating_add(allocation.size)
-            .min(config.data_limit);
-        if start < end {
-            occupied[usize::from(allocation.tile)].push((start, end));
-        }
-    }
-    for intervals in &mut occupied {
-        intervals.sort_unstable();
-        let mut merged = Vec::<(u32, u32)>::with_capacity(intervals.len());
-        for &(start, end) in intervals.iter() {
-            if let Some(previous) = merged.last_mut()
-                && start <= previous.1
-            {
-                previous.1 = previous.1.max(end);
-            } else {
-                merged.push((start, end));
-            }
-        }
-        *intervals = merged;
-    }
+    let mut occupied = occupied_intervals_by_tile(
+        &parent.allocations,
+        parent.tile_count,
+        0,
+        usize::MAX,
+        config.data_base,
+        config.data_limit,
+    );
     let mut relocated = HashMap::<TensorId, u32>::new();
     for &(tensor, tile, _old_address, size, placement) in &regions {
         let address = allocate_from_occupied(
