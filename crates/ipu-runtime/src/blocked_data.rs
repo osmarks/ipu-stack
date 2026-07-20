@@ -183,7 +183,8 @@ pub fn f143_from_f32(value: f32, scale: i8) -> u8 {
     }
     if magnitude < 2.0f32.powi(-7) {
         let mantissa = (magnitude * 1024.0).round_ties_even() as u8;
-        return sign | mantissa.min(8);
+        let mantissa = mantissa.min(8);
+        return if mantissa == 0 { 0 } else { sign | mantissa };
     }
 
     let exponent = magnitude.log2().floor() as i32;
@@ -284,6 +285,11 @@ mod tests {
                 assert_eq!(f143_from_f32(f143_to_f32(bits, scale), scale), bits);
             }
         }
+    }
+
+    #[test]
+    fn negative_underflow_encodes_zero_instead_of_nanoo() {
+        assert_eq!(f143_from_f32(-0.0001, 0), 0);
     }
 
     #[test]
