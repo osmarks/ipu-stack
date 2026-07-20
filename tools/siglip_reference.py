@@ -98,6 +98,7 @@ def main() -> None:
                 )
             )
     if args.checkpoints == "all":
+        first_layer = model.vision_model.encoder.layers[0]
         hooks.extend(
             [
                 model.vision_model.embeddings.register_forward_hook(
@@ -110,6 +111,26 @@ def main() -> None:
                         "post_layernorm", output.detach().clone()
                     )
                 ),
+                first_layer.layer_norm1.register_forward_hook(
+                    lambda _module, _inputs, output: tensors.__setitem__(
+                        "encoder_layer_00_norm1", output.detach().clone()
+                    )
+                ),
+                first_layer.self_attn.q_proj.register_forward_hook(
+                    lambda _module, _inputs, output: tensors.__setitem__(
+                        "encoder_layer_00_query", output.detach().clone()
+                    )
+                ),
+                first_layer.self_attn.k_proj.register_forward_hook(
+                    lambda _module, _inputs, output: tensors.__setitem__(
+                        "encoder_layer_00_key", output.detach().clone()
+                    )
+                ),
+                first_layer.self_attn.v_proj.register_forward_hook(
+                    lambda _module, _inputs, output: tensors.__setitem__(
+                        "encoder_layer_00_value", output.detach().clone()
+                    )
+                ),
             ]
         )
 
@@ -117,6 +138,20 @@ def main() -> None:
         output = model(pixel_values=pixels, interpolate_pos_encoding=False)
     for hook in hooks:
         hook.remove()
+    if args.checkpoints == "all":
+        heads = vision.num_attention_heads
+        head_dimension = vision.hidden_size // heads
+        query, key, value = (
+            tensors[f"encoder_layer_00_{name}"]
+            .reshape(args.batch_size, -1, heads, head_dimension)
+            .transpose(1, 2)
+            for name in ("query", "key", "value")
+        )
+        tensors["encoder_layer_00_attention_heads"] = (
+            torch.nn.functional.scaled_dot_product_attention(query, key, value)
+            .detach()
+            .clone()
+        )
     tensors["last_hidden_state"] = output.last_hidden_state
     tensors["pooler_output"] = output.pooler_output
 

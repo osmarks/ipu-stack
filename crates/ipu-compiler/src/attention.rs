@@ -1,6 +1,6 @@
 use crate::{
-    Allocation, AllocationKind, CompileError, KernelCommand, OpId, Phase, Schedule,
-    SpecializationKey, TensorId, Transfer,
+    Allocation, AllocationKind, CompileError, KernelCommand, OpId, Phase, RowShardPlacement,
+    Schedule, SpecializationKey, TensorId, Transfer,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -63,6 +63,270 @@ pub struct FlashAttentionPlan {
     pub query_block_rows: u16,
     pub key_block_rows: u16,
     pub key_block_columns: u16,
+}
+
+pub fn append_flash_attention_from_a16_qkv(
+    schedule: &mut Schedule,
+    query: &[RowShardPlacement],
+    key: &[RowShardPlacement],
+    value: &[RowShardPlacement],
+    config: FlashAttentionConfig,
+) -> Result<FlashAttentionPlan, CompileError> {
+    if config.batch_size != 1
+        || query.is_empty()
+        || query.len() != key.len()
+        || key.len() != value.len()
+    {
+        return Err(CompileError::Graph(
+            "row-sharded FlashAttention composition currently requires one batch and matching Q/K/V shards"
+                .into(),
+        ));
+    }
+    for ((query, key), value) in query.iter().zip(key).zip(value) {
+        if query.row_start != key.row_start
+            || query.row_start != value.row_start
+            || query.rows != key.rows
+            || query.rows != value.rows
+            || query.columns != config.hidden_size
+            || key.columns != config.hidden_size
+            || value.columns != config.hidden_size
+        {
+            return Err(CompileError::Graph(
+                "row-sharded Q/K/V layouts do not match the attention configuration".into(),
+            ));
+        }
+    }
+    let query_block_rows = query.iter().map(|shard| shard.rows).max().unwrap();
+    let key_block_rows = key.iter().map(|shard| shard.rows).max().unwrap();
+    let mut plan = plan_flash_attention(FlashAttentionConfig {
+        query_block_rows,
+        key_block_rows,
+        ..config
+    })?;
+    let tensor_base = schedule
+        .allocations
+        .iter()
+        .map(|allocation| allocation.tensor.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    remap_attention_tensors(&mut plan, tensor_base)?;
+    let mut next_tensor = schedule
+        .allocations
+        .iter()
+        .chain(&plan.schedule.allocations)
+        .map(|allocation| allocation.tensor.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
+
+    append_attention_pack_phase(
+        schedule,
+        &mut next_tensor,
+        query,
+        &plan,
+        AttentionPackKind::Query,
+    )?;
+    append_attention_pack_phase(
+        schedule,
+        &mut next_tensor,
+        key,
+        &plan,
+        AttentionPackKind::Key,
+    )?;
+    append_attention_pack_phase(
+        schedule,
+        &mut next_tensor,
+        value,
+        &plan,
+        AttentionPackKind::Value,
+    )?;
+    crate::append_child_schedule(schedule, &mut plan.schedule)?;
+    Ok(plan)
+}
+
+#[derive(Clone, Copy)]
+enum AttentionPackKind {
+    Query,
+    Key,
+    Value,
+}
+
+fn append_attention_pack_phase(
+    schedule: &mut Schedule,
+    next_tensor: &mut usize,
+    source: &[RowShardPlacement],
+    plan: &FlashAttentionPlan,
+    kind: AttentionPackKind,
+) -> Result<(), CompileError> {
+    let exchange_phase = schedule.phases.len();
+    let compute_phase = exchange_phase + 1;
+    let mut transfers = Vec::new();
+    let mut commands = Vec::new();
+    let mut append = |shard: &RowShardPlacement,
+                      head: u16,
+                      destination_tile: u16,
+                      output: TensorId,
+                      operation: &str|
+     -> Result<(), CompileError> {
+        let source_panel = head * plan.head_dimension / 16;
+        let source_offset = head * plan.head_dimension % 16;
+        let source_columns = (source_offset + plan.head_dimension).div_ceil(16) * 16;
+        let bytes = u32::from(shard.rows) * u32::from(source_columns) * 2;
+        if bytes > ipu_exchange::MAX_TRANSFER_WORDS * 4 {
+            return Err(CompileError::Graph(format!(
+                "attention source shard is {bytes} bytes, larger than one exchange transfer"
+            )));
+        }
+        let alias = TensorId(*next_tensor);
+        *next_tensor += 1;
+        let source_address = shard
+            .address
+            .checked_add(u32::from(source_panel) * u32::from(shard.rows) * 32)
+            .ok_or_else(|| CompileError::Memory("attention source address overflow".into()))?;
+        schedule.allocations.push(Allocation {
+            tensor: alias,
+            tile: shard.tile,
+            address: source_address,
+            size: bytes,
+            live_from: 0,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        });
+        if shard.tile != destination_tile {
+            transfers.push(Transfer {
+                source_tile: shard.tile,
+                destination_tile,
+                tensor: alias,
+                bytes,
+            });
+            schedule.allocations.push(Allocation {
+                tensor: alias,
+                tile: destination_tile,
+                address: ipu_exchange::EXCHANGE_WINDOW_BASE,
+                size: bytes,
+                live_from: exchange_phase,
+                live_until: compute_phase,
+                kind: AllocationKind::ExchangeStaging {
+                    phase: exchange_phase,
+                },
+            });
+        }
+        commands.push(KernelCommand {
+            tile: destination_tile,
+            output,
+            inputs: vec![alias, alias],
+            arguments: vec![
+                u32::from(shard.rows),
+                u32::from(source_columns),
+                u32::from(source_offset),
+            ],
+            specialization: SpecializationKey {
+                operation: operation.into(),
+                shape: vec![usize::from(shard.rows), usize::from(plan.head_dimension)],
+                worker_count: 6,
+                role: format!("head-{head}-rows-{}", shard.row_start),
+                alignment: 8,
+            },
+            metadata: BTreeMap::from([
+                ("row_start".into(), shard.row_start.to_string()),
+                ("rows".into(), shard.rows.to_string()),
+                ("head".into(), head.to_string()),
+            ]),
+        });
+        Ok(())
+    };
+    match kind {
+        AttentionPackKind::Query => {
+            for task in &plan.tasks {
+                let shard = source
+                    .iter()
+                    .find(|shard| {
+                        shard.row_start == task.query_row_start && shard.rows == task.query_rows
+                    })
+                    .ok_or_else(|| {
+                        CompileError::Graph("attention query shard is missing".into())
+                    })?;
+                append(
+                    shard,
+                    task.head,
+                    task.tile,
+                    task.query,
+                    "attention_pack_query_f16",
+                )?;
+            }
+        }
+        AttentionPackKind::Key | AttentionPackKind::Value => {
+            for block in &plan.key_values {
+                let shard = source
+                    .iter()
+                    .find(|shard| {
+                        shard.row_start == block.key_row_start && shard.rows == block.key_rows
+                    })
+                    .ok_or_else(|| {
+                        CompileError::Graph("attention key/value shard is missing".into())
+                    })?;
+                let (output, operation) = match kind {
+                    AttentionPackKind::Key => (block.key_tensor, "attention_pack_key_f16"),
+                    AttentionPackKind::Value => (block.value_tensor, "attention_pack_value_f16"),
+                    AttentionPackKind::Query => unreachable!(),
+                };
+                append(shard, block.head, block.tile, output, operation)?;
+            }
+        }
+    }
+    schedule.phases.push(Phase::Exchange { transfers });
+    schedule.phases.push(Phase::Compute {
+        op: OpId(compute_phase),
+        commands,
+    });
+    Ok(())
+}
+
+fn remap_attention_tensors(plan: &mut FlashAttentionPlan, base: usize) -> Result<(), CompileError> {
+    let remap = |tensor: &mut TensorId| -> Result<(), CompileError> {
+        tensor.0 = tensor
+            .0
+            .checked_add(base)
+            .ok_or_else(|| CompileError::Graph("attention tensor ID overflow".into()))?;
+        Ok(())
+    };
+    for task in &mut plan.tasks {
+        for tensor in [
+            &mut task.query,
+            &mut task.accumulator,
+            &mut task.scores,
+            &mut task.weights,
+            &mut task.output,
+        ] {
+            remap(tensor)?;
+        }
+    }
+    for block in &mut plan.key_values {
+        remap(&mut block.key_tensor)?;
+        remap(&mut block.value_tensor)?;
+    }
+    for allocation in &mut plan.schedule.allocations {
+        remap(&mut allocation.tensor)?;
+    }
+    for phase in &mut plan.schedule.phases {
+        match phase {
+            Phase::Exchange { transfers } => {
+                for transfer in transfers {
+                    remap(&mut transfer.tensor)?;
+                }
+            }
+            Phase::Compute { commands, .. } => {
+                for command in commands {
+                    remap(&mut command.output)?;
+                    for input in &mut command.inputs {
+                        remap(input)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn plan_flash_attention(
@@ -131,8 +395,8 @@ pub fn plan_flash_attention(
     for batch in 0..config.batch_size {
         for head in 0..config.attention_heads {
             for query_block in 0..query_blocks {
-                let query_row_start = query_block * query_block_rows;
-                let query_rows = query_block_rows.min(config.sequence_length - query_row_start);
+                let (query_row_start, query_rows) =
+                    balanced_partition(config.sequence_length, query_blocks, query_block);
                 let tile = u16::try_from(tasks.len())
                     .map_err(|_| CompileError::Graph("attention tile index overflow".into()))?;
                 let elements = u32::from(query_rows) * u32::from(head_dimension);
@@ -190,8 +454,8 @@ pub fn plan_flash_attention(
             debug_assert!(!head_tiles.is_empty());
             for key_block in 0..key_blocks {
                 let owner = head_tiles[usize::from(key_block) % head_tiles.len()];
-                let key_row_start = key_block * key_block_rows;
-                let key_rows = key_block_rows.min(config.sequence_length - key_row_start);
+                let (key_row_start, key_rows) =
+                    balanced_partition(config.sequence_length, key_blocks, key_block);
                 let matrix_size = matrix_storage_bytes(key_block_columns, padded_head_dimension);
                 let key_address = allocate(&mut cursors[usize::from(owner)], matrix_size, 8)?;
                 let value_address = allocate(&mut cursors[usize::from(owner)], matrix_size, 8)?;
@@ -306,12 +570,14 @@ pub fn plan_flash_attention(
         let mut pv_commands = Vec::with_capacity(tasks.len());
         let mut merge_commands = Vec::with_capacity(tasks.len());
         for task in &tasks {
+            let (key_row_start, _) =
+                balanced_partition(config.sequence_length, key_blocks, key_block);
             let block = key_values
                 .iter()
                 .find(|block| {
                     block.batch == task.batch
                         && block.head == task.head
-                        && block.key_row_start == key_block * key_block_rows
+                        && block.key_row_start == key_row_start
                 })
                 .expect("each head has every key block");
             let query_size = if task.query_rows == query_block_rows {
@@ -370,7 +636,7 @@ pub fn plan_flash_attention(
                 inputs: vec![task.query, block.key_tensor],
                 arguments: Vec::new(),
                 specialization: SpecializationKey {
-                    operation: format!("gemm_f16_init_{}_rows", query_size),
+                    operation: format!("attention_qk_init_{}_rows", query_size),
                     shape: vec![
                         usize::from(task.query_rows),
                         usize::from(padded_head_dimension),
@@ -544,6 +810,13 @@ pub fn plan_flash_attention(
         key_block_rows,
         key_block_columns,
     })
+}
+
+fn balanced_partition(total: u16, parts: u16, index: u16) -> (u16, u16) {
+    let base = total / parts;
+    let larger = total % parts;
+    let start = index * base + index.min(larger);
+    (start, base + u16::from(index < larger))
 }
 
 fn key_value_block_bytes(rows: u16, padded_dimension: u16) -> u32 {
@@ -745,5 +1018,73 @@ mod tests {
                 .collect::<BTreeSet<_>>();
             assert_eq!(owners.len(), blocks.len());
         }
+    }
+
+    #[test]
+    fn row_sharded_qkv_composes_into_static_attention_programs() {
+        let rows = [6, 6, 5];
+        let mut row_start = 0u16;
+        let mut allocations = Vec::new();
+        let shards = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, shard_rows)| {
+                let shard = RowShardPlacement {
+                    tile: index as u16,
+                    row_start,
+                    rows: shard_rows,
+                    columns: 88,
+                    tensor: TensorId(index),
+                    address: 0x90000,
+                };
+                row_start += shard_rows;
+                allocations.push(Allocation {
+                    tensor: shard.tensor,
+                    tile: shard.tile,
+                    address: shard.address,
+                    size: u32::from(shard.rows) * u32::from(shard.columns) * 2,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                });
+                shard
+            })
+            .collect::<Vec<_>>();
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations,
+            tile_count: 32,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let plan = append_flash_attention_from_a16_qkv(
+            &mut schedule,
+            &shards,
+            &shards,
+            &shards,
+            FlashAttentionConfig {
+                batch_size: 1,
+                sequence_length: row_start,
+                hidden_size: 88,
+                attention_heads: 4,
+                query_block_rows: 0,
+                key_block_rows: 0,
+                tile_count: 32,
+                data_base: 0xa0000,
+                data_limit: 0xe8000,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.tasks.iter().map(|task| task.query_rows).max(), Some(6));
+        assert!(schedule.phases.iter().any(|phase| matches!(
+            phase,
+            Phase::Compute { commands, .. }
+                if commands.iter().any(|command| command.specialization.operation == "attention_pack_query_f16")
+        )));
+        schedule
+            .lower_tile_programs(&ipu_exchange::Topology::c600())
+            .unwrap();
     }
 }

@@ -197,6 +197,14 @@ fn run_case(case: Case<'_>) {
             &[],
         )
         .unwrap();
+    let worker_support = toolchain
+        .compile(
+            source("worker_support.S"),
+            &artifact_dir,
+            "worker-support",
+            &[],
+        )
+        .unwrap();
     let qk = toolchain
         .compile(
             source("gemm_f16_64_amp.S"),
@@ -210,6 +218,12 @@ fn run_case(case: Case<'_>) {
                 format!("-DGEMM_OUTPUT_COLUMNS={}", plan.key_block_columns),
                 format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
                 format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
+                "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_attention_qk_init_small_rows".into(),
+                "-DGEMM_INIT_LARGE_SYMBOL=ipu_stack_attention_qk_init_large_rows".into(),
+                "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_attention_qk_accumulate_small_rows"
+                    .into(),
+                "-DGEMM_ACCUMULATE_LARGE_SYMBOL=ipu_stack_attention_qk_accumulate_large_rows"
+                    .into(),
             ],
         )
         .unwrap();
@@ -238,6 +252,7 @@ fn run_case(case: Case<'_>) {
         fs::read(wrapper.object).unwrap(),
         fs::read(qk.object).unwrap(),
         fs::read(pv.object).unwrap(),
+        fs::read(worker_support.object).unwrap(),
     ];
     let profile_output = profile_path(&case);
     let (app, profile_layout) = if profile_output.is_some() {

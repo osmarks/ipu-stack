@@ -4,20 +4,7 @@
 	.allow_optimizations
 
 	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
-	.set ATTENTION_WORKER_STACK_BYTES, 0xe0
 	.set ENABLE_STOCHASTIC_ROUNDING, 1 << CSR_S_FP_ICTL__ESR__SHIFT
-
-	.globl __worker_stack_max_growth_plus_one
-	.set __worker_stack_max_growth_plus_one, ATTENTION_WORKER_STACK_BYTES + 1
-
-	.section .text._stackoverflow,"ax",@progbits
-	.globl _stackoverflow
-	.p2align 2
-	.type _stackoverflow,@function
-_stackoverflow:
-	.worker
-	trap 0
-	.size _stackoverflow, .-_stackoverflow
 
 	.macro ATTENTION_SOFTMAX_WRAPPER name, codelet
 	.section .text.\name,"ax",@progbits

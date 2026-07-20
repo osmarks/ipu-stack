@@ -88,12 +88,21 @@ fn main() {
             &[],
         )
         .unwrap();
+    let worker_support = toolchain
+        .compile(
+            source("worker_support.S"),
+            &artifact_dir,
+            "worker-support",
+            &[],
+        )
+        .unwrap();
     let app = package_graph(
         &graph,
         &[
             fs::read(runtime.object).unwrap(),
             fs::read(codelet.object).unwrap(),
             fs::read(wrapper.object).unwrap(),
+            fs::read(worker_support.object).unwrap(),
         ],
     )
     .unwrap();

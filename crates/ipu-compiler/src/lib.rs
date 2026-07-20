@@ -13,7 +13,7 @@ mod mlp;
 mod rowwise;
 pub use attention::{
     AttentionKeyValuePlacement, AttentionTaskPlacement, FlashAttentionConfig, FlashAttentionPlan,
-    plan_flash_attention,
+    append_flash_attention_from_a16_qkv, plan_flash_attention,
 };
 pub use mlp::{BlockedMlpConfig, BlockedMlpPlan, plan_blocked_mlp};
 pub use rowwise::{
