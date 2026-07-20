@@ -36,6 +36,29 @@ pub(crate) struct ProfileCode {
     pub aggregate_end: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct StepCodeSize {
+    pub exchange: usize,
+    pub compute: usize,
+}
+
+pub(crate) fn step_code_size(program: &LoweredTileProgram) -> StepCodeSize {
+    let mut size = StepCodeSize::default();
+    for step in &program.steps {
+        match step {
+            LoweredTileStep::Exchange { row, .. } => {
+                let active = row.first() != Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION);
+                size.exchange += (2 + usize::from(active)) * 4;
+            }
+            LoweredTileStep::Compute(command) => {
+                size.compute += (4 + command.arguments.len()) * 4;
+            }
+            LoweredTileStep::IdleCompute { .. } => {}
+        }
+    }
+    size
+}
+
 pub(crate) fn emit(
     program: &LoweredTileProgram,
     symbols: &BTreeMap<String, u32>,

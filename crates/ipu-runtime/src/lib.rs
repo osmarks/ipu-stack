@@ -1499,6 +1499,27 @@ fn package_graph_impl(
         .enumerate()
         .map(|(index, image)| emit_program(index, &image.symbols))
         .collect::<Result<Vec<_>>>()?;
+    if let Some((index, generated_code)) = generated
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, code)| code.len())
+    {
+        let steps = static_codegen::step_code_size(&programs[index]);
+        let step_bytes = steps.exchange + steps.compute;
+        let plan_bytes = tile_exchange_plans[index].1 - PLAN_BASE;
+        let host_runtime_bytes = tile_host_plans[index].end - tile_exchange_plans[index].1;
+        info!(
+            logical_tile = programs[index].tile,
+            generated_bytes = generated_code.len(),
+            generated_exchange_bytes = steps.exchange,
+            generated_compute_bytes = steps.compute,
+            generated_host_and_control_bytes = generated_code.len().saturating_sub(step_bytes),
+            support_image_bytes = images[index].bytes.len(),
+            exchange_plan_bytes = plan_bytes,
+            host_plan_and_state_bytes = host_runtime_bytes,
+            "largest generated tile program breakdown"
+        );
+    }
     let program_bases = programs
         .iter()
         .zip(&generated)

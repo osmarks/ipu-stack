@@ -10,10 +10,10 @@ use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, append_host_a16_matrix,
-    append_siglip_encoder_layer, append_siglip_map_head, append_siglip_post_layer_norm,
-    block_binding_typed, block_coordinates, blocked_matrix_f16, package_graph,
-    run_host_with_options,
+    BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, allocator_memory_profile,
+    append_host_a16_matrix, append_siglip_encoder_layer, append_siglip_map_head,
+    append_siglip_post_layer_norm, block_binding_typed, block_coordinates, blocked_matrix_f16,
+    package_graph, run_host_with_options,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -200,6 +200,7 @@ fn main() {
         host_inputs,
         host_outputs,
     };
+    write_memory_profile(&graph);
     let app = package_graph(&graph, &objects).unwrap();
     if let Some(path) = std::env::var_os("IPU_SIGLIP_PACKAGE_OUTPUT") {
         app.write(fs::File::create(path).unwrap()).unwrap();
@@ -427,6 +428,7 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
             &output,
         )],
     };
+    write_memory_profile(&graph);
     let app = package_graph(&graph, &objects).unwrap();
     if std::env::var_os("IPU_SIGLIP_BUILD_ONLY").is_some() {
         info!("SigLIP MAP executable built without device execution");
@@ -459,6 +461,19 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
     info!(error, limit, "SigLIP MAP verification result");
     assert!(error <= limit, "MAP max error {error} exceeds {limit}");
+}
+
+fn write_memory_profile(graph: &ExecutableGraph) {
+    let Some(path) = std::env::var_os("IPU_MEMORY_PROFILE_OUTPUT") else {
+        return;
+    };
+    let profile = allocator_memory_profile(graph).unwrap();
+    profile.write(fs::File::create(&path).unwrap()).unwrap();
+    info!(
+        path = %PathBuf::from(path).display(),
+        tiles = profile.tiles.len(),
+        "wrote SigLIP allocator memory profile"
+    );
 }
 
 fn patch_value(
