@@ -74,10 +74,21 @@ struct HostPacketCopy {
 
 const ENTRY_TRAMPOLINE_BYTES: u32 = 8;
 
+#[cfg(test)]
 fn executable_region_base(
     graph: &ExecutableGraph,
     runtime_end: u32,
     required_size: u32,
+) -> Result<u32> {
+    executable_region_base_for_tile(graph, None, runtime_end, required_size, &[])
+}
+
+fn executable_region_base_for_tile(
+    graph: &ExecutableGraph,
+    tile: Option<u16>,
+    runtime_end: u32,
+    required_size: u32,
+    additional_reserved: &[(u32, u32)],
 ) -> Result<u32> {
     let element_size = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
     let memory_end = ipu_package::TILE_MEMORY_BASE
@@ -99,6 +110,7 @@ fn executable_region_base(
             .schedule
             .allocations
             .iter()
+            .filter(|allocation| tile.is_none_or(|tile| allocation.tile == tile))
             .map(|allocation| {
                 Ok((
                     allocation.address,
@@ -110,6 +122,7 @@ fn executable_region_base(
             })
             .collect::<Result<Vec<_>>>()?,
     );
+    reserved.extend_from_slice(additional_reserved);
     let mut reserved = reserved
         .into_iter()
         .map(|(start, end)| (align_down(start, element_size), align_up(end, element_size)))
@@ -140,7 +153,8 @@ fn executable_region_base(
         Ok(cursor)
     } else {
         Err(format!(
-            "no common tile-memory interval can hold {required_size} bytes of executable code"
+            "no {}tile-memory interval can hold {required_size} bytes of executable code",
+            tile.map_or("common ".into(), |tile| format!("tile {tile} "))
         )
         .into())
     }
@@ -1356,103 +1370,118 @@ fn package_graph_impl(
             externals: HashMap::new(),
         },
     )?;
-    let emit_programs = |symbols: &BTreeMap<String, u32>| {
-        programs
+    let emit_program = |program_index: usize, symbols: &BTreeMap<String, u32>| {
+        let program = &programs[program_index];
+        let host_plans = &tile_host_plans[program_index];
+        let physical = topology.physical(program.tile)?;
+        let host_inputs = host_plans.addresses[..host.inputs.len()]
             .iter()
-            .zip(&tile_host_plans)
-            .enumerate()
+            .copied()
+            .zip(&host_plans.run_tables[..host.inputs.len()])
+            .zip(&host.inputs)
             .map(
-                |(program_index, (program, host_plans))| -> Result<Vec<u8>> {
-                    let physical = topology.physical(program.tile)?;
-                    let host_inputs = host_plans.addresses[..host.inputs.len()]
-                        .iter()
-                        .copied()
-                        .zip(&host_plans.run_tables[..host.inputs.len()])
-                        .zip(&host.inputs)
-                        .map(
-                            |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
-                                address,
-                                active: host_phase_is_active(physical, transfer),
-                                run_table,
-                            },
-                        )
-                        .collect::<Vec<_>>();
-                    let host_outputs = host_plans.addresses[host.inputs.len()..]
-                        .iter()
-                        .copied()
-                        .zip(&host_plans.run_tables[host.inputs.len()..])
-                        .zip(&host.outputs)
-                        .map(
-                            |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
-                                address,
-                                active: host_phase_is_active(physical, transfer),
-                                run_table,
-                            },
-                        )
-                        .collect::<Vec<_>>();
-                    static_codegen::emit(
-                        program,
-                        symbols,
-                        &plan_addresses,
-                        static_codegen::HostCode {
-                            inputs: &host_inputs,
-                            outputs: &host_outputs,
-                            run_state: host_plans.run_state,
-                        },
-                        profile_code.get(program_index),
-                    )
+                |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
+                    address,
+                    active: host_phase_is_active(physical, transfer),
+                    run_table,
                 },
             )
-            .collect::<Result<Vec<_>>>()
+            .collect::<Vec<_>>();
+        let host_outputs = host_plans.addresses[host.inputs.len()..]
+            .iter()
+            .copied()
+            .zip(&host_plans.run_tables[host.inputs.len()..])
+            .zip(&host.outputs)
+            .map(
+                |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
+                    address,
+                    active: host_phase_is_active(physical, transfer),
+                    run_table,
+                },
+            )
+            .collect::<Vec<_>>();
+        static_codegen::emit(
+            program,
+            symbols,
+            &plan_addresses,
+            static_codegen::HostCode {
+                inputs: &host_inputs,
+                outputs: &host_outputs,
+                run_state: host_plans.run_state,
+            },
+            profile_code.get(program_index),
+        )
     };
-    let preliminary_generated = emit_programs(&preliminary_image.symbols)?;
     let image_size = u32::try_from(preliminary_image.bytes.len())?;
-    let max_program_size = preliminary_generated
+    let image_bases = programs
         .iter()
-        .map(|code| u32::try_from(code.len()))
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .max()
-        .unwrap_or(0);
-    let executable_size = align_up(image_size, 8)
-        .checked_add(max_program_size)
-        .ok_or("executable region size overflow")?;
-    let runtime_end = completion_addresses
-        .iter()
-        .map(|address| {
-            address
-                .checked_add(4)
-                .ok_or("static runtime address overflow")
+        .zip(&completion_addresses)
+        .map(|(program, &completion_address)| {
+            executable_region_base_for_tile(
+                graph,
+                Some(program.tile),
+                completion_address
+                    .checked_add(4)
+                    .ok_or("static runtime address overflow")?,
+                image_size,
+                &[],
+            )
         })
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .max()
-        .unwrap_or(PLAN_BASE);
-    let image_base = executable_region_base(graph, runtime_end, executable_size)?;
-    let image = link(
-        objects,
-        &LinkOptions {
-            image_base,
-            entry_symbol: "ipu_stack_static_start".into(),
-            retained_symbols,
-            externals: HashMap::new(),
-        },
-    )?;
-    if u32::try_from(image.bytes.len())? != image_size {
-        return Err("linked image size changed after executable placement".into());
+        .collect::<Result<Vec<_>>>()?;
+    let mut image_cache = HashMap::<u32, ipu_elf::LinkedImage>::new();
+    for &image_base in &image_bases {
+        if image_cache.contains_key(&image_base) {
+            continue;
+        }
+        let image = link(
+            objects,
+            &LinkOptions {
+                image_base,
+                entry_symbol: "ipu_stack_static_start".into(),
+                retained_symbols: retained_symbols.clone(),
+                externals: HashMap::new(),
+            },
+        )?;
+        if u32::try_from(image.bytes.len())? != image_size {
+            return Err("linked image size changed after executable placement".into());
+        }
+        image_cache.insert(image_base, image);
     }
-    let program_base = align_up(image_base + image_size, 8);
-    let generated = emit_programs(&image.symbols)?;
-    let program_end = generated.iter().try_fold(program_base, |end, code| {
-        let code_end = program_base
-            .checked_add(u32::try_from(code.len())?)
-            .ok_or("generated tile program address overflow")?;
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(end.max(code_end))
-    })?;
-    let image_end = image
-        .base
-        .checked_add(u32::try_from(image.bytes.len())?)
-        .ok_or("linked image address overflow")?;
+    let images = image_bases
+        .iter()
+        .map(|base| -> Result<ipu_elf::LinkedImage> {
+            Ok(image_cache
+                .get(base)
+                .ok_or("missing linked tile image")?
+                .clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let generated = images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| emit_program(index, &image.symbols))
+        .collect::<Result<Vec<_>>>()?;
+    let program_bases = programs
+        .iter()
+        .zip(&generated)
+        .zip(&images)
+        .zip(&completion_addresses)
+        .map(|(((program, code), image), &tile_runtime_end)| {
+            let image_end = image
+                .base
+                .checked_add(u32::try_from(image.bytes.len())?)
+                .ok_or("linked image address overflow")?;
+            executable_region_base_for_tile(
+                graph,
+                Some(program.tile),
+                tile_runtime_end
+                    .checked_add(4)
+                    .ok_or("static runtime address overflow")?,
+                u32::try_from(code.len())?,
+                &[(image.base, image_end)],
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     for allocation in &graph.schedule.allocations {
         let end = allocation
             .address
@@ -1461,6 +1490,17 @@ fn package_graph_impl(
         let runtime_end = completion_addresses[usize::from(allocation.tile)]
             .checked_add(4)
             .ok_or("static runtime address overflow")?;
+        let program_base = program_bases[usize::from(allocation.tile)];
+        let program_end = program_base
+            .checked_add(u32::try_from(
+                generated[usize::from(allocation.tile)].len(),
+            )?)
+            .ok_or("generated tile program address overflow")?;
+        let image = &images[usize::from(allocation.tile)];
+        let image_end = image
+            .base
+            .checked_add(u32::try_from(image.bytes.len())?)
+            .ok_or("linked image address overflow")?;
         if ranges_overlap(image.base, image_end, allocation.address, end)
             || ranges_overlap(program_base, program_end, allocation.address, end)
             || ranges_overlap(PLAN_BASE, runtime_end, allocation.address, end)
@@ -1474,12 +1514,12 @@ fn package_graph_impl(
     }
 
     let symbol_offset = |name: &str| -> Result<usize> {
-        Ok(image
+        Ok(preliminary_image
             .symbols
             .get(name)
             .copied()
             .ok_or_else(|| format!("static runtime has no {name} symbol"))?
-            .checked_sub(image.base)
+            .checked_sub(preliminary_image.base)
             .ok_or_else(|| format!("{name} precedes the linked image"))? as usize)
     };
     let program_offset = symbol_offset("ipu_stack_static_program_address")?;
@@ -1519,20 +1559,26 @@ fn package_graph_impl(
         })
         .map(|program| program.tile)
         .ok_or("diagnostic completion tile is outside the schedule")?;
+    let max_program_bytes = generated.iter().map(Vec::len).max().unwrap_or(0);
     let mut app = Application::default();
-    let mut entry_code = Vec::with_capacity(ENTRY_TRAMPOLINE_BYTES as usize);
-    entry_code.extend_from_slice(&ipu_exchange::encode_setzi_m(0, image.entry)?.to_le_bytes());
-    entry_code.extend_from_slice(&ipu_exchange::encode_br_m(0)?.to_le_bytes());
-    let entry_blob = app.add_blob(entry_code);
-    for (tile_index, (((program, generated_code), host_plans), &completion_address)) in programs
+    for (
+        tile_index,
+        (((((program, generated_code), &program_base), image), host_plans), &completion_address),
+    ) in programs
         .iter()
         .zip(generated)
+        .zip(&program_bases)
+        .zip(&images)
         .zip(&tile_host_plans)
         .zip(&completion_addresses)
         .enumerate()
     {
         let logical = program.tile;
         let physical = u32::from(topology.physical(logical)?);
+        let mut entry_code = Vec::with_capacity(ENTRY_TRAMPOLINE_BYTES as usize);
+        entry_code.extend_from_slice(&ipu_exchange::encode_setzi_m(0, image.entry)?.to_le_bytes());
+        entry_code.extend_from_slice(&ipu_exchange::encode_br_m(0)?.to_le_bytes());
+        let entry_blob = app.add_blob(entry_code);
         let mut support_code = image.bytes.clone();
         patch_setzi_immediate(&mut support_code, program_offset, program_base)?;
         patch_setzi_immediate(
@@ -1647,9 +1693,14 @@ fn package_graph_impl(
         exchange_launches = exchange_count,
         host_inputs = graph.host_inputs.len(),
         host_outputs = graph.host_outputs.len(),
-        max_program_bytes = program_end - program_base,
-        image_base = format_args!("0x{image_base:x}"),
-        program_base = format_args!("0x{program_base:x}"),
+        max_program_bytes,
+        distinct_image_bases = image_cache.len(),
+        minimum_image_base = format_args!("0x{:x}", image_bases.iter().min().copied().unwrap_or(0)),
+        maximum_image_base = format_args!("0x{:x}", image_bases.iter().max().copied().unwrap_or(0)),
+        minimum_program_base =
+            format_args!("0x{:x}", program_bases.iter().min().copied().unwrap_or(0)),
+        maximum_program_base =
+            format_args!("0x{:x}", program_bases.iter().max().copied().unwrap_or(0)),
         "packaged static executable graph"
     );
     Ok(app)
