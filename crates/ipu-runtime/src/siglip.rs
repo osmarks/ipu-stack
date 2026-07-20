@@ -175,7 +175,7 @@ pub fn append_siglip_post_layer_norm(
     )?;
     push_named_layer_norm_affine(
         host,
-        "post_layernorm",
+        "post_layernorm.affine",
         columns,
         &norm.affine,
         &model.tensor_f32("vision_model.post_layernorm.weight")?,

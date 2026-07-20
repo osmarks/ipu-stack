@@ -1,17 +1,19 @@
 use half::f16;
 use ipu_compiler::{
-    Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, FlashAttentionPlan,
-    GemmDataType, KernelCommand, MemoryConstraint, MemoryPlacement, OpId, Phase, RowShardPlacement,
-    RowShardTransitionConfig, SpecializationKey, TensorId, append_c16_to_a16_row_shards,
-    choose_gemm_row_block_for, plan_blocked_gemm,
+    Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, FlashAttentionConfig,
+    FlashAttentionPlan, GemmDataType, KernelCommand, MemoryConstraint, MemoryPlacement, OpId,
+    Phase, RowShardPlacement, RowShardTransitionConfig, SpecializationKey, TensorId,
+    append_c16_to_a16_row_shards, choose_gemm_row_block_for, plan_blocked_gemm,
+    plan_flash_attention,
 };
 use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
     BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, append_host_a16_matrix,
-    append_siglip_encoder_layer, append_siglip_map_head, block_binding_typed, block_coordinates,
-    blocked_matrix_f16, package_graph, run_host_with_options,
+    append_siglip_encoder_layer, append_siglip_map_head, append_siglip_post_layer_norm,
+    block_binding_typed, block_coordinates, blocked_matrix_f16, package_graph,
+    run_host_with_options,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -342,7 +344,7 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         peak_sram: BTreeMap::new(),
     };
     let mut host = HostTensorSet::default();
-    let input_values = reference.tensor_f32("post_layernorm").unwrap();
+    let input_values = reference.tensor_f32("encoder_layer_26").unwrap();
     let input = append_host_a16_matrix(
         &mut schedule,
         "map.input",
@@ -355,19 +357,56 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         &mut host,
     )
     .unwrap();
-    let map = append_siglip_map_head(
+    let input = append_siglip_post_layer_norm(
         &mut schedule,
         &input,
         model,
-        rows,
-        row_block_dimension,
-        TILE_COUNT,
         DATA_BASE,
         ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
         &mut host,
     )
     .unwrap();
-    let objects = compile_objects(&compilation_plan, &map.attention).unwrap();
+    let post_norm_only = std::env::var_os("IPU_SIGLIP_POST_NORM_ONLY").is_some();
+    let (output, output_rows, attention, expected) = if post_norm_only {
+        let attention = plan_flash_attention(FlashAttentionConfig {
+            batch_size: 1,
+            query_sequence_length: 12,
+            sequence_length: rows,
+            hidden_size: columns,
+            attention_heads: u16::try_from(config.num_attention_heads).unwrap(),
+            query_block_rows: 12,
+            key_block_rows: 0,
+            tile_count: TILE_COUNT,
+            data_base: DATA_BASE,
+            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        })
+        .unwrap();
+        (
+            input,
+            rows,
+            attention,
+            reference.tensor_f32("post_layernorm").unwrap(),
+        )
+    } else {
+        let map = append_siglip_map_head(
+            &mut schedule,
+            &input,
+            model,
+            rows,
+            row_block_dimension,
+            TILE_COUNT,
+            DATA_BASE,
+            ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            &mut host,
+        )
+        .unwrap();
+        let expected = reference.tensor_f32("pooler_output").unwrap();
+        let expected = (0..12)
+            .flat_map(|_| expected.iter().copied())
+            .collect::<Vec<_>>();
+        (map.output, 12, map.attention, expected)
+    };
+    let objects = compile_objects(&compilation_plan, &attention).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
         bytes: host_input,
@@ -377,7 +416,16 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         initial_buffers: Vec::new(),
         outputs: Vec::new(),
         host_inputs,
-        host_outputs: vec![row_shard_binding("pooler_output", 12, columns, &map.output)],
+        host_outputs: vec![row_shard_binding(
+            if post_norm_only {
+                "post_layernorm"
+            } else {
+                "pooler_output"
+            },
+            output_rows,
+            columns,
+            &output,
+        )],
     };
     let app = package_graph(&graph, &objects).unwrap();
     if std::env::var_os("IPU_SIGLIP_BUILD_ONLY").is_some() {
@@ -401,11 +449,12 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
-    let expected = reference.tensor_f32("pooler_output").unwrap();
-    let expected = (0..12)
-        .flat_map(|_| expected.iter().copied())
-        .collect::<Vec<_>>();
-    let expected = serialize_a16_row_shards(&expected, 12, usize::from(columns), &map.output);
+    let expected = serialize_a16_row_shards(
+        &expected,
+        usize::from(output_rows),
+        usize::from(columns),
+        &output,
+    );
     let error = verify_linear_f16(&actual, &expected);
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
     info!(error, limit, "SigLIP MAP verification result");
@@ -707,14 +756,31 @@ fn row_shard_binding(name: &str, rows: u16, columns: u16, shards: &[RowShardPlac
 fn verify_linear_f16(actual: &[u8], expected: &[f32]) -> f32 {
     assert!(actual.len() >= expected.len() * 2);
     let mut max_error = 0.0f32;
+    let mut worst = (0usize, 0.0f32, 0.0f32);
+    let mut observed_min = f32::INFINITY;
+    let mut observed_max = f32::NEG_INFINITY;
     for (index, &expected) in expected.iter().enumerate() {
         let observed = f16::from_bits(u16::from_le_bytes(
             actual[index * 2..index * 2 + 2].try_into().unwrap(),
         ))
         .to_f32();
         assert!(observed.is_finite());
-        max_error = max_error.max((observed - expected).abs());
+        observed_min = observed_min.min(observed);
+        observed_max = observed_max.max(observed);
+        let error = (observed - expected).abs();
+        if error > max_error {
+            max_error = error;
+            worst = (index, observed, expected);
+        }
     }
+    info!(
+        worst_index = worst.0,
+        worst_observed = worst.1,
+        worst_expected = worst.2,
+        observed_min,
+        observed_max,
+        "FP16 comparison diagnostics"
+    );
     max_error
 }
 
