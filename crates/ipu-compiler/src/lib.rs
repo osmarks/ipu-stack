@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Range;
+use std::sync::Arc;
 use tracing::{debug, info};
 
 use ipu_exchange::{
@@ -2491,9 +2493,9 @@ pub enum LoweredTileStep {
     Exchange {
         phase: usize,
         epoch: usize,
-        row: Vec<u32>,
+        row: Arc<[u32]>,
     },
-    Compute(LoweredComputeCommand),
+    Compute(Box<LoweredComputeCommand>),
     IdleCompute {
         op: OpId,
         phase: usize,
@@ -2521,6 +2523,21 @@ impl LoweredExchangeEpoch {
 }
 
 impl Schedule {
+    /// Releases command annotations used only to construct semantic profiles.
+    /// Kernel operation identity and invocation operands remain intact.
+    pub fn discard_profile_metadata(&mut self, phases: Range<usize>) {
+        for phase in &mut self.phases[phases] {
+            let Phase::Compute { commands, .. } = phase else {
+                continue;
+            };
+            for command in commands {
+                command.specialization.shape = Vec::new();
+                command.specialization.role = String::new();
+                command.metadata = BTreeMap::new();
+            }
+        }
+    }
+
     pub fn lower_exchanges(
         &self,
         topology: &Topology,
@@ -2894,6 +2911,11 @@ impl Schedule {
             .map(|exchange| (exchange.phase, exchange))
             .collect();
         let allocation_index = AllocationIndex::new(&self.allocations);
+        let mut inactive_row = vec![0; ipu_exchange::PLAN_WORDS];
+        inactive_row[0] = SANS_INACTIVE_INSTRUCTION;
+        inactive_row[1] = SYNC_ANS_INSTRUCTION;
+        inactive_row[2] = RETURN_M10_INSTRUCTION;
+        let inactive_row = Arc::<[u32]>::from(inactive_row);
         let mut programs = (0..self.tile_count)
             .map(|tile| LoweredTileProgram {
                 tile,
@@ -2911,7 +2933,11 @@ impl Schedule {
                             program.steps.push(LoweredTileStep::Exchange {
                                 phase: phase_index,
                                 epoch,
-                                row: lowered.row_for(program.tile),
+                                row: lowered
+                                    .tile_rows
+                                    .get(&program.tile)
+                                    .map(|row| Arc::<[u32]>::from(row.as_slice()))
+                                    .unwrap_or_else(|| inactive_row.clone()),
                             });
                         }
                     }
@@ -2936,9 +2962,8 @@ impl Schedule {
                                 allocation_index.compute_input_address(*input, tile, phase_index)
                             })
                             .collect::<Result<_, _>>()?;
-                        program
-                            .steps
-                            .push(LoweredTileStep::Compute(LoweredComputeCommand {
+                        program.steps.push(LoweredTileStep::Compute(Box::new(
+                            LoweredComputeCommand {
                                 op: *op,
                                 phase: phase_index,
                                 output: command.output,
@@ -2948,7 +2973,8 @@ impl Schedule {
                                 arguments: command.arguments.clone(),
                                 specialization: command.specialization.clone(),
                                 metadata: command.metadata.clone(),
-                            }));
+                            },
+                        )));
                     }
                     for (program, active) in programs.iter_mut().zip(active) {
                         if !active {

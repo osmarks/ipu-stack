@@ -256,7 +256,7 @@ pub(crate) fn plan_static_templates(
                                 else {
                                     return None;
                                 };
-                                Some(command)
+                                Some(command.as_ref())
                             })
                             .collect::<Vec<_>>()
                     })
@@ -1040,7 +1040,8 @@ mod tests {
                 ipu_exchange::sans(1)
             } else {
                 ipu_exchange::SANS_INACTIVE_INSTRUCTION
-            }],
+            }]
+            .into(),
         }
     }
 
@@ -1054,7 +1055,7 @@ mod tests {
         arguments: Vec<u32>,
         operation: &str,
     ) -> LoweredTileStep {
-        LoweredTileStep::Compute(LoweredComputeCommand {
+        LoweredTileStep::Compute(Box::new(LoweredComputeCommand {
             op: OpId(phase),
             phase,
             output: TensorId(3),
@@ -1070,7 +1071,7 @@ mod tests {
                 alignment: 32,
             },
             metadata: BTreeMap::new(),
-        })
+        }))
     }
 
     #[test]

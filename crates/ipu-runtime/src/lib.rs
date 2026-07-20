@@ -59,6 +59,7 @@ struct StaticHostLayout {
 }
 
 struct TileHostPlans {
+    start: u32,
     addresses: Vec<u32>,
     packet_copies: Vec<Option<HostPacketCopy>>,
     run_tables: Vec<Option<u32>>,
@@ -1329,7 +1330,7 @@ fn package_graph_impl(
                 )),
                 _ => None,
             }) {
-                let mut stored_row = row.clone();
+                let mut stored_row = row.to_vec();
                 let sender = templated
                     .then(|| ipu_exchange::normalize_sender_instruction(&mut stored_row))
                     .flatten();
@@ -1428,13 +1429,13 @@ fn package_graph_impl(
             "planned static host transfer"
         );
     }
-    let tile_host_plans = programs
+    let mut tile_host_plans = programs
         .iter()
         .zip(&tile_exchange_plans)
         .map(|(program, exchange_plans)| -> Result<TileHostPlans> {
             let plan_end = exchange_plans.end;
             let physical = topology.physical(program.tile)?;
-            let follower_address = align_up(plan_end, 8);
+            let follower_address = align_up(plan_end, 64);
             let mut cursor = if host_transfers.is_empty() {
                 plan_end
             } else {
@@ -1528,6 +1529,7 @@ fn package_graph_impl(
                 .checked_add(8)
                 .ok_or("static host run state address overflow")?;
             Ok(TileHostPlans {
+                start: follower_address,
                 addresses,
                 packet_copies,
                 run_tables,
@@ -1536,6 +1538,47 @@ fn package_graph_impl(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut host_runtime_ranges = Vec::with_capacity(tile_host_plans.len());
+    for (tile_index, plans) in tile_host_plans.iter_mut().enumerate() {
+        let worker_sync = align_up(plans.end, 8);
+        let completion = align_up(
+            worker_sync + WORKER_STACK_HEADROOM + WORKER_SYNC_REGISTERS * WORKER_SYNC_STRIDE,
+            64,
+        );
+        let old_end = completion
+            .checked_add(4)
+            .ok_or("static host runtime address overflow")?;
+        let size = old_end
+            .checked_sub(plans.start)
+            .ok_or("static host runtime range underflow")?;
+        let tile = programs[tile_index].tile;
+        let start = data_region_base_for_tile(
+            &allocation_ranges_by_tile[usize::from(tile)],
+            tile,
+            tile_exchange_plans[tile_index].end,
+            size,
+            64,
+            &[],
+        )?;
+        let delta = i64::from(start) - i64::from(plans.start);
+        let relocate = |address: u32| -> Result<u32> {
+            u32::try_from(i64::from(address) + delta)
+                .map_err(|_| "static host runtime relocation overflow".into())
+        };
+        for address in &mut plans.addresses {
+            *address = relocate(*address)?;
+        }
+        for copy in plans.packet_copies.iter_mut().flatten() {
+            copy.source = relocate(copy.source)?;
+        }
+        for address in plans.run_tables.iter_mut().flatten() {
+            *address = relocate(*address)?;
+        }
+        plans.run_state = relocate(plans.run_state)?;
+        plans.end = relocate(plans.end)?;
+        plans.start = start;
+        host_runtime_ranges.push((start, start + size));
+    }
     debug!(
         minimum_end = format_args!(
             "0x{:x}",
@@ -1602,9 +1645,7 @@ fn package_graph_impl(
     }
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
-        let runtime_end = completion_addresses[tile_index]
-            .checked_add(4)
-            .ok_or("static runtime address overflow")?;
+        let runtime_end = plans.end;
         for template in &mut plans.templates {
             for (record_address, record) in
                 template.record_addresses.iter_mut().zip(&template.records)
@@ -1622,7 +1663,9 @@ fn package_graph_impl(
                     runtime_end,
                     size,
                     4,
-                    &template_record_ranges[tile_index],
+                    &std::iter::once(host_runtime_ranges[tile_index])
+                        .chain(template_record_ranges[tile_index].iter().copied())
+                        .collect::<Vec<_>>(),
                 )?;
                 let end = address
                     .checked_add(size)
@@ -1745,22 +1788,19 @@ fn package_graph_impl(
         .iter()
         .zip(&preliminary_images)
         .zip(&preliminary_generated)
-        .zip(&completion_addresses)
         .zip(&template_record_ranges)
-        .map(
-            |((((program, image), generated), &completion_address), template_records)| {
-                executable_region_bases_for_tile(
-                    &allocation_ranges_by_tile[usize::from(program.tile)],
-                    program.tile,
-                    completion_address
-                        .checked_add(4)
-                        .ok_or("static runtime address overflow")?,
-                    u32::try_from(image.bytes.len())?,
-                    u32::try_from(generated.len())?,
-                    template_records,
-                )
-            },
-        )
+        .map(|(((program, image), generated), template_records)| {
+            executable_region_bases_for_tile(
+                &allocation_ranges_by_tile[usize::from(program.tile)],
+                program.tile,
+                tile_exchange_plans[usize::from(program.tile)].end,
+                u32::try_from(image.bytes.len())?,
+                u32::try_from(generated.len())?,
+                &std::iter::once(host_runtime_ranges[usize::from(program.tile)])
+                    .chain(template_records.iter().copied())
+                    .collect::<Vec<_>>(),
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     let image_bases = executable_bases
         .iter()
@@ -1810,7 +1850,7 @@ fn package_graph_impl(
         .max_by_key(|(_, code)| code.len())
     {
         let plan_bytes = tile_exchange_plans[index].end - PLAN_BASE;
-        let host_runtime_bytes = tile_host_plans[index].end - tile_exchange_plans[index].end;
+        let host_runtime_bytes = host_runtime_ranges[index].1 - host_runtime_ranges[index].0;
         let templates = &tile_exchange_plans[index].templates;
         if templates.is_empty() {
             let steps = static_codegen::step_code_size(
@@ -1879,9 +1919,7 @@ fn package_graph_impl(
             .address
             .checked_add(allocation.size)
             .ok_or("allocation address overflow")?;
-        let runtime_end = completion_addresses[usize::from(allocation.tile)]
-            .checked_add(4)
-            .ok_or("static runtime address overflow")?;
+        let runtime_end = tile_exchange_plans[usize::from(allocation.tile)].end;
         let program_base = program_bases[usize::from(allocation.tile)];
         let program_end = program_base
             .checked_add(u32::try_from(
@@ -1896,6 +1934,12 @@ fn package_graph_impl(
         if ranges_overlap(image.base, image_end, allocation.address, end)
             || ranges_overlap(program_base, program_end, allocation.address, end)
             || ranges_overlap(PLAN_BASE, runtime_end, allocation.address, end)
+            || ranges_overlap(
+                host_runtime_ranges[usize::from(allocation.tile)].0,
+                host_runtime_ranges[usize::from(allocation.tile)].1,
+                allocation.address,
+                end,
+            )
             || template_record_ranges[usize::from(allocation.tile)]
                 .iter()
                 .any(|&(start, stop)| ranges_overlap(start, stop, allocation.address, end))
@@ -2021,7 +2065,7 @@ fn package_graph_impl(
             flags: SEGMENT_READ | SEGMENT_EXECUTE,
         });
 
-        let plan_region_size = usize::try_from(host_plans.end - PLAN_BASE)?;
+        let plan_region_size = usize::try_from(tile_exchange_plans[tile_index].end - PLAN_BASE)?;
         let mut plan_region = vec![0; plan_region_size];
         for (plan_address, row) in &tile_exchange_plans[tile_index].rows {
             write_plan_bytes(&mut plan_region, *plan_address, &words_to_bytes(row))?;
@@ -2033,15 +2077,18 @@ fn package_graph_impl(
                 &words_to_bytes(&run.table_entries),
             )?;
         }
+        let mut host_region =
+            vec![0; usize::try_from(host_runtime_ranges[tile_index].1 - host_plans.start)?];
         write_static_host_plans(
             physical as u16,
             StaticHostPacketLayout {
+                base: host_plans.start,
                 transfers: &host_transfers,
                 plan_addresses: &host_plans.addresses,
                 packet_copies: &host_plans.packet_copies,
                 run_tables: &host_plans.run_tables,
             },
-            &mut plan_region,
+            &mut host_region,
         )?;
         if !plan_region.is_empty() {
             let plan_size = u32::try_from(plan_region.len())?;
@@ -2055,6 +2102,16 @@ fn package_graph_impl(
                 flags: SEGMENT_READ | SEGMENT_WRITE | SEGMENT_EXECUTE,
             });
         }
+        let host_size = u32::try_from(host_region.len())?;
+        let host_blob = app.add_blob(host_region);
+        segments.push(Segment {
+            address: host_plans.start,
+            memory_size: host_size,
+            blob: host_blob,
+            blob_offset: 0,
+            file_size: host_size,
+            flags: SEGMENT_READ | SEGMENT_WRITE | SEGMENT_EXECUTE,
+        });
         let mut template_segments = Vec::<(u32, Vec<u8>)>::new();
         for template in &tile_exchange_plans[tile_index].templates {
             for (&address, record) in template.record_addresses.iter().zip(&template.records) {
@@ -2464,6 +2521,7 @@ fn host_phase_instructions(
 }
 
 struct StaticHostPacketLayout<'a> {
+    base: u32,
     transfers: &'a [StaticHostTransfer],
     plan_addresses: &'a [u32],
     packet_copies: &'a [Option<HostPacketCopy>],
@@ -2476,6 +2534,7 @@ fn write_static_host_plans(
     plan_region: &mut [u8],
 ) -> Result<()> {
     let StaticHostPacketLayout {
+        base,
         transfers,
         plan_addresses,
         packet_copies,
@@ -2492,14 +2551,15 @@ fn write_static_host_plans(
         let (instructions, packet_words) =
             host_phase_instructions(physical_tile, *transfer, HOST_PACKET_ADDRESS)?;
         let instruction_bytes = words_to_bytes(&instructions);
-        write_plan_bytes(plan_region, plan_address, &instruction_bytes)?;
+        write_region_bytes(plan_region, base, plan_address, &instruction_bytes)?;
         if let Some(packet_words) = packet_words {
             let packet_copy = packet_copy.ok_or("active host phase has no packet copy")?;
             if packet_copy.words != u32::try_from(packet_words.len())? {
                 return Err("host packet copy size changed after layout".into());
             }
-            write_plan_bytes(
+            write_region_bytes(
                 plan_region,
+                base,
                 packet_copy.source,
                 &words_to_bytes(&packet_words),
             )?;
@@ -2532,21 +2592,30 @@ fn write_static_host_plans(
             ]);
             index += 1;
         }
-        write_plan_bytes(plan_region, table_address, &words_to_bytes(&descriptors))?;
+        write_region_bytes(
+            plan_region,
+            base,
+            table_address,
+            &words_to_bytes(&descriptors),
+        )?;
     }
     Ok(())
 }
 
 fn write_plan_bytes(plan_region: &mut [u8], address: u32, bytes: &[u8]) -> Result<()> {
+    write_region_bytes(plan_region, PLAN_BASE, address, bytes)
+}
+
+fn write_region_bytes(region: &mut [u8], base: u32, address: u32, bytes: &[u8]) -> Result<()> {
     let start = usize::try_from(
         address
-            .checked_sub(PLAN_BASE)
-            .ok_or("static plan address precedes plan region")?,
+            .checked_sub(base)
+            .ok_or("static data address precedes its region")?,
     )?;
     let end = start
         .checked_add(bytes.len())
         .ok_or("static plan range overflow")?;
-    let destination = plan_region
+    let destination = region
         .get_mut(start..end)
         .ok_or("static plan exceeds reserved plan region")?;
     destination.copy_from_slice(bytes);
@@ -3306,7 +3375,7 @@ mod tests {
                 ipu_compiler::LoweredTileStep::Exchange {
                     phase: 0,
                     epoch: 0,
-                    row: vec![ipu_exchange::SANS_INACTIVE_INSTRUCTION],
+                    row: vec![ipu_exchange::SANS_INACTIVE_INSTRUCTION].into(),
                 },
                 ipu_compiler::LoweredTileStep::IdleCompute {
                     op: ipu_compiler::OpId(2),

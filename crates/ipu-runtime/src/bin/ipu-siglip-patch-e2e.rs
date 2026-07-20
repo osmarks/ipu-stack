@@ -188,7 +188,33 @@ fn main() {
         .unwrap();
         current = appended.output.clone();
         last_layer = Some(appended);
-        layer_phase_ranges.push(phase_start..plan.schedule.phases.len());
+        let phase_range = phase_start..plan.schedule.phases.len();
+        if std::env::var_os("IPU_SIGLIP_RETAIN_PROFILE_METADATA").is_none() {
+            plan.schedule.discard_profile_metadata(phase_range.clone());
+        }
+        layer_phase_ranges.push(phase_range);
+        let (compute_commands, transfers) =
+            plan.schedule
+                .phases
+                .iter()
+                .fold((0usize, 0usize), |(compute, exchange), phase| match phase {
+                    ipu_compiler::Phase::Compute { commands, .. } => {
+                        (compute + commands.len(), exchange)
+                    }
+                    ipu_compiler::Phase::Exchange { transfers } => {
+                        (compute, exchange + transfers.len())
+                    }
+                });
+        info!(
+            layer,
+            phases = plan.schedule.phases.len(),
+            compute_commands,
+            transfers,
+            allocations = plan.schedule.allocations.len(),
+            host_bindings = host.bindings.len(),
+            host_bytes = host.bytes.len(),
+            "accumulated SigLIP compiler state"
+        );
     }
     let last_layer = last_layer.unwrap();
     let norm2 = last_layer.norm2;
