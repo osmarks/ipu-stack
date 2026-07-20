@@ -1670,8 +1670,15 @@ pub struct CompilerOptions {
     pub tile_count: u16,
     pub exchange_base: u32,
     pub exchange_limit: u32,
-    pub data_base: u32,
-    pub data_limit: u32,
+    pub data_arenas: Vec<MemoryArena>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryArena {
+    /// Inclusive first address available for ordinary tensors.
+    pub base: u32,
+    /// Exclusive end address. Allocations never span arena boundaries.
+    pub limit: u32,
 }
 
 impl Default for CompilerOptions {
@@ -1680,8 +1687,16 @@ impl Default for CompilerOptions {
             tile_count: DEFAULT_TILE_COUNT,
             exchange_base: 0x50000,
             exchange_limit: 0x58000,
-            data_base: 0x58000,
-            data_limit: 0xe0000,
+            data_arenas: vec![
+                MemoryArena {
+                    base: 0x58000,
+                    limit: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+                },
+                MemoryArena {
+                    base: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+                    limit: 0xe0000,
+                },
+            ],
         }
     }
 }
@@ -1698,8 +1713,19 @@ pub fn compile(graph: &Graph, options: &CompilerOptions) -> Result<Schedule, Com
         || options.exchange_base < ipu_exchange::EXCHANGE_WINDOW_BASE
         || options.exchange_limit > ipu_exchange::EXCHANGE_WINDOW_BASE + 0x8000
         || options.exchange_base >= options.exchange_limit
-        || options.exchange_limit > options.data_base
-        || options.data_base >= options.data_limit
+        || options.data_arenas.is_empty()
+        || options
+            .data_arenas
+            .iter()
+            .any(|arena| arena.base >= arena.limit)
+        || options
+            .data_arenas
+            .windows(2)
+            .any(|arenas| arenas[0].base >= arenas[1].base || arenas[0].limit > arenas[1].base)
+        || options
+            .data_arenas
+            .iter()
+            .any(|arena| arena.base < options.exchange_limit)
     {
         return Err(CompileError::Graph("invalid compiler options".into()));
     }
@@ -1765,7 +1791,11 @@ pub fn compile(graph: &Graph, options: &CompilerOptions) -> Result<Schedule, Com
     let allocations = plan_memory(graph, &layouts, &phases, options)?;
     let mut peak_sram: BTreeMap<u16, u32> = BTreeMap::new();
     for allocation in &allocations {
-        let memory_base = options.exchange_base.min(options.data_base);
+        let memory_base = options
+            .data_arenas
+            .first()
+            .map_or(options.exchange_base, |arena| arena.base)
+            .min(options.exchange_base);
         peak_sram
             .entry(allocation.tile)
             .and_modify(|peak| {
@@ -1889,8 +1919,7 @@ fn plan_memory(
                 consumed[tensor.id.0],
                 layout.alignment,
                 AllocationKind::Home,
-                options.data_base,
-                options.data_limit,
+                &options.data_arenas,
                 &tensor.name,
             )?;
         }
@@ -1917,8 +1946,10 @@ fn plan_memory(
                 phase_index + 1,
                 16,
                 AllocationKind::ExchangeStaging { phase: phase_index },
-                options.exchange_base,
-                options.exchange_limit,
+                &[MemoryArena {
+                    base: options.exchange_base,
+                    limit: options.exchange_limit,
+                }],
                 &format!("tensor {} exchange staging", transfer.tensor.0),
             )?;
         }
@@ -1937,55 +1968,57 @@ fn allocate_region(
     live_until: usize,
     alignment: u32,
     kind: AllocationKind,
-    allocation_base: u32,
-    allocation_limit: u32,
+    arenas: &[MemoryArena],
     label: &str,
 ) -> Result<(), CompileError> {
     let existing = by_tile.entry(tile).or_default();
-    let mut address = allocation_base;
-    loop {
-        let end = address
-            .checked_add(size)
-            .ok_or_else(|| CompileError::Memory("address overflow".into()))?;
-        let conflict = existing
-            .iter()
-            .filter(|allocation| {
-                lifetimes_overlap(
-                    live_from,
-                    live_until,
-                    allocation.live_from,
-                    allocation.live_until,
-                )
-            })
-            .find(|allocation| {
-                address < allocation.address + allocation.size && allocation.address < end
-            });
-        if let Some(conflict) = conflict {
-            address = align_u32(conflict.address + conflict.size, alignment);
-            continue;
+    for arena in arenas {
+        let mut address = align_u32(arena.base, alignment);
+        while address < arena.limit {
+            let end = address
+                .checked_add(size)
+                .ok_or_else(|| CompileError::Memory("address overflow".into()))?;
+            if end > arena.limit {
+                break;
+            }
+            let conflict = existing
+                .iter()
+                .filter(|allocation| {
+                    lifetimes_overlap(
+                        live_from,
+                        live_until,
+                        allocation.live_from,
+                        allocation.live_until,
+                    )
+                })
+                .find(|allocation| {
+                    address < allocation.address + allocation.size && allocation.address < end
+                });
+            if let Some(conflict) = conflict {
+                address = align_u32(conflict.address + conflict.size, alignment);
+                continue;
+            }
+            let allocation = Allocation {
+                tensor,
+                tile,
+                address,
+                size,
+                live_from,
+                live_until,
+                kind,
+            };
+            existing.push(allocation.clone());
+            allocations.push(allocation);
+            return Ok(());
         }
-        if end > allocation_limit {
-            return Err(CompileError::Memory(format!(
-                "tile {tile} exceeds data limit allocating {label}"
-            )));
-        }
-        let allocation = Allocation {
-            tensor,
-            tile,
-            address,
-            size,
-            live_from,
-            live_until,
-            kind,
-        };
-        existing.push(allocation.clone());
-        allocations.push(allocation);
-        return Ok(());
     }
+    Err(CompileError::Memory(format!(
+        "tile {tile} has no arena for {size} bytes allocating {label}"
+    )))
 }
 
 fn lifetimes_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
-    a_start <= b_end && b_start <= a_end
+    a_start < b_end && b_start < a_end
 }
 
 fn align_u32(value: u32, alignment: u32) -> u32 {
@@ -2779,6 +2812,60 @@ mod tests {
         }];
 
         assert!(find_free_region(&allocations, 7, 32, 4, 6, constraint).is_err());
+    }
+
+    #[test]
+    fn segmented_allocator_never_spans_holes_and_reuses_lifetimes() {
+        let arenas = [
+            MemoryArena {
+                base: 0x58000,
+                limit: 0x58100,
+            },
+            MemoryArena {
+                base: 0x60000,
+                limit: 0x60400,
+            },
+        ];
+        let mut allocations = Vec::new();
+        let mut by_tile = HashMap::new();
+        allocate_region(
+            &mut allocations,
+            &mut by_tile,
+            TensorId(0),
+            3,
+            512,
+            0,
+            2,
+            32,
+            AllocationKind::Home,
+            &arenas,
+            "large tensor",
+        )
+        .unwrap();
+        allocate_region(
+            &mut allocations,
+            &mut by_tile,
+            TensorId(1),
+            3,
+            512,
+            2,
+            4,
+            32,
+            AllocationKind::Home,
+            &arenas,
+            "later tensor",
+        )
+        .unwrap();
+
+        assert!(
+            allocations
+                .iter()
+                .all(|allocation| arenas.iter().any(|arena| {
+                    allocation.address >= arena.base
+                        && allocation.address + allocation.size <= arena.limit
+                }))
+        );
+        assert_eq!(allocations[0].address, allocations[1].address);
     }
 
     #[test]
