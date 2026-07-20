@@ -1340,36 +1340,59 @@ fn package_graph_impl(
         })
         .collect::<Vec<_>>();
 
-    let mut retained_symbols = vec![
+    let mut runtime_symbols = vec![
         static_codegen::WORKER_BARRIER.into(),
         static_codegen::COMPLETE.into(),
         static_codegen::HOST_RUN.into(),
         static_codegen::REPEAT_CALL.into(),
     ];
     if !profile_code.is_empty() {
-        retained_symbols.push(static_codegen::SAMPLE_CYCLE.into());
-        retained_symbols.push(static_codegen::SAMPLE_CYCLE_NEXT.into());
+        runtime_symbols.push(static_codegen::SAMPLE_CYCLE.into());
+        runtime_symbols.push(static_codegen::SAMPLE_CYCLE_NEXT.into());
     }
-    retained_symbols.extend(programs.iter().flat_map(|program| {
-        program.steps.iter().filter_map(|step| match step {
-            ipu_compiler::LoweredTileStep::Compute(command) => {
-                Some(format!("ipu_stack_{}", command.specialization.operation))
-            }
-            ipu_compiler::LoweredTileStep::IdleCompute { .. } => None,
-            _ => None,
+    let tile_retained_symbols = programs
+        .iter()
+        .map(|program| {
+            let mut symbols = runtime_symbols.clone();
+            symbols.extend(program.steps.iter().filter_map(|step| match step {
+                ipu_compiler::LoweredTileStep::Compute(command) => {
+                    Some(format!("ipu_stack_{}", command.specialization.operation))
+                }
+                ipu_compiler::LoweredTileStep::IdleCompute { .. } => None,
+                _ => None,
+            }));
+            symbols.sort();
+            symbols.dedup();
+            symbols
         })
-    }));
-    retained_symbols.sort();
-    retained_symbols.dedup();
-    let preliminary_image = link(
-        objects,
-        &LinkOptions {
-            image_base: ipu_driver::APPLICATION_LOAD_BASE,
-            entry_symbol: "ipu_stack_static_start".into(),
-            retained_symbols: retained_symbols.clone(),
-            externals: HashMap::new(),
-        },
-    )?;
+        .collect::<Vec<_>>();
+    let mut preliminary_cache = HashMap::<Vec<String>, ipu_elf::LinkedImage>::new();
+    for symbols in &tile_retained_symbols {
+        if preliminary_cache.contains_key(symbols) {
+            continue;
+        }
+        preliminary_cache.insert(
+            symbols.clone(),
+            link(
+                objects,
+                &LinkOptions {
+                    image_base: ipu_driver::APPLICATION_LOAD_BASE,
+                    entry_symbol: "ipu_stack_static_start".into(),
+                    retained_symbols: symbols.clone(),
+                    externals: HashMap::new(),
+                },
+            )?,
+        );
+    }
+    let preliminary_images = tile_retained_symbols
+        .iter()
+        .map(|symbols| -> Result<ipu_elf::LinkedImage> {
+            Ok(preliminary_cache
+                .get(symbols)
+                .ok_or("missing preliminary tile image")?
+                .clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
     let emit_program = |program_index: usize, symbols: &BTreeMap<String, u32>| {
         let program = &programs[program_index];
         let host_plans = &tile_host_plans[program_index];
@@ -1412,25 +1435,30 @@ fn package_graph_impl(
             profile_code.get(program_index),
         )
     };
-    let image_size = u32::try_from(preliminary_image.bytes.len())?;
     let image_bases = programs
         .iter()
+        .zip(&preliminary_images)
         .zip(&completion_addresses)
-        .map(|(program, &completion_address)| {
+        .map(|((program, preliminary), &completion_address)| {
             executable_region_base_for_tile(
                 graph,
                 Some(program.tile),
                 completion_address
                     .checked_add(4)
                     .ok_or("static runtime address overflow")?,
-                image_size,
+                u32::try_from(preliminary.bytes.len())?,
                 &[],
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut image_cache = HashMap::<u32, ipu_elf::LinkedImage>::new();
-    for &image_base in &image_bases {
-        if image_cache.contains_key(&image_base) {
+    let mut image_cache = HashMap::<(u32, Vec<String>), ipu_elf::LinkedImage>::new();
+    for ((&image_base, symbols), preliminary) in image_bases
+        .iter()
+        .zip(&tile_retained_symbols)
+        .zip(&preliminary_images)
+    {
+        let key = (image_base, symbols.clone());
+        if image_cache.contains_key(&key) {
             continue;
         }
         let image = link(
@@ -1438,20 +1466,21 @@ fn package_graph_impl(
             &LinkOptions {
                 image_base,
                 entry_symbol: "ipu_stack_static_start".into(),
-                retained_symbols: retained_symbols.clone(),
+                retained_symbols: symbols.clone(),
                 externals: HashMap::new(),
             },
         )?;
-        if u32::try_from(image.bytes.len())? != image_size {
+        if image.bytes.len() != preliminary.bytes.len() {
             return Err("linked image size changed after executable placement".into());
         }
-        image_cache.insert(image_base, image);
+        image_cache.insert(key, image);
     }
     let images = image_bases
         .iter()
-        .map(|base| -> Result<ipu_elf::LinkedImage> {
+        .zip(&tile_retained_symbols)
+        .map(|(&base, symbols)| -> Result<ipu_elf::LinkedImage> {
             Ok(image_cache
-                .get(base)
+                .get(&(base, symbols.clone()))
                 .ok_or("missing linked tile image")?
                 .clone())
         })
@@ -1513,26 +1542,6 @@ fn package_graph_impl(
         }
     }
 
-    let symbol_offset = |name: &str| -> Result<usize> {
-        Ok(preliminary_image
-            .symbols
-            .get(name)
-            .copied()
-            .ok_or_else(|| format!("static runtime has no {name} symbol"))?
-            .checked_sub(preliminary_image.base)
-            .ok_or_else(|| format!("{name} precedes the linked image"))? as usize)
-    };
-    let program_offset = symbol_offset("ipu_stack_static_program_address")?;
-    let worker_context_offset = symbol_offset("ipu_stack_static_worker_sync_context_base")?;
-    let worker_base_offset = symbol_offset("ipu_stack_static_worker_base")?;
-    let prng_seed_base_offset = symbol_offset("ipu_stack_static_prng_seed_base")?;
-    let sample_worker_base_offset = (!profile_code.is_empty())
-        .then(|| symbol_offset("ipu_stack_static_sample_worker_base"))
-        .transpose()?;
-    let sample_next_worker_base_offset = (!profile_code.is_empty())
-        .then(|| symbol_offset("ipu_stack_static_sample_next_worker_base"))
-        .transpose()?;
-    let completion_offset = symbol_offset("ipu_stack_static_completion_address")?;
     let initial: HashMap<_, _> = graph
         .initial_buffers
         .iter()
@@ -1580,6 +1589,27 @@ fn package_graph_impl(
         entry_code.extend_from_slice(&ipu_exchange::encode_br_m(0)?.to_le_bytes());
         let entry_blob = app.add_blob(entry_code);
         let mut support_code = image.bytes.clone();
+        let symbol_offset = |name: &str| -> Result<usize> {
+            Ok(image
+                .symbols
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("static runtime has no {name} symbol"))?
+                .checked_sub(image.base)
+                .ok_or_else(|| format!("{name} precedes the linked image"))?
+                as usize)
+        };
+        let program_offset = symbol_offset("ipu_stack_static_program_address")?;
+        let worker_context_offset = symbol_offset("ipu_stack_static_worker_sync_context_base")?;
+        let worker_base_offset = symbol_offset("ipu_stack_static_worker_base")?;
+        let prng_seed_base_offset = symbol_offset("ipu_stack_static_prng_seed_base")?;
+        let sample_worker_base_offset = (!profile_code.is_empty())
+            .then(|| symbol_offset("ipu_stack_static_sample_worker_base"))
+            .transpose()?;
+        let sample_next_worker_base_offset = (!profile_code.is_empty())
+            .then(|| symbol_offset("ipu_stack_static_sample_next_worker_base"))
+            .transpose()?;
+        let completion_offset = symbol_offset("ipu_stack_static_completion_address")?;
         patch_setzi_immediate(&mut support_code, program_offset, program_base)?;
         patch_setzi_immediate(
             &mut support_code,
