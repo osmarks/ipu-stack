@@ -180,6 +180,57 @@ ipu_stack_static_repeat_call:
 	br $m9
 	.size ipu_stack_static_repeat_call, .-ipu_stack_static_repeat_call
 
+	.section .text.ipu_stack_static_exchange_compute_run,"ax",@progbits
+	.globl ipu_stack_static_exchange_compute_run
+	.p2align 2
+	.type ipu_stack_static_exchange_compute_run,@function
+ipu_stack_static_exchange_compute_run:
+	.supervisor
+	add $m11, $m11, -32
+	st32 $m2, $m11, $m15, 0
+	st32 $m3, $m11, $m15, 1
+	st32 $m4, $m11, $m15, 2
+	st32 $m5, $m11, $m15, 3
+	st32 $m6, $m11, $m15, 4
+	st32 $m7, $m11, $m15, 5
+	st32 $m9, $m11, $m15, 6
+.Lexchange_compute_next:
+	ld32 $m8, $m11, $m15, 1
+	ld32 $m8, $m8, $m15, 0
+	.long OPCODE_SYNC | SYNC_SUPERVISOR
+	and $m0, $m8, 1
+	brz $m0, .Lexchange_compute_no_worker_barrier
+	setzi $m7, .Lexchange_compute_after_worker_barrier
+	setzi $m1, ipu_stack_static_worker_barrier
+	br $m1
+.Lexchange_compute_after_worker_barrier:
+	ld32 $m8, $m11, $m15, 1
+	ld32 $m8, $m8, $m15, 0
+	setzi $m0, 1
+.Lexchange_compute_no_worker_barrier:
+	sub $m8, $m8, $m0
+	setzi $m10, .Lexchange_compute_after_exchange
+	br $m8
+.Lexchange_compute_after_exchange:
+	ld32 $m2, $m11, $m15, 2
+	ld32 $m3, $m11, $m15, 3
+	ld32 $m4, $m11, $m15, 4
+	ld32 $m0, $m11, $m15, 5
+	setzi $m10, .Lexchange_compute_after_kernel
+	br $m0
+.Lexchange_compute_after_kernel:
+	ld32 $m3, $m11, $m15, 1
+	add $m3, $m3, 4
+	st32 $m3, $m11, $m15, 1
+	ld32 $m2, $m11, $m15, 0
+	sub $m2, $m2, 1
+	st32 $m2, $m11, $m15, 0
+	brnz $m2, .Lexchange_compute_next
+	ld32 $m9, $m11, $m15, 6
+	add $m11, $m11, 32
+	br $m9
+	.size ipu_stack_static_exchange_compute_run, .-ipu_stack_static_exchange_compute_run
+
 	.section .text.ipu_stack_static_host_run,"ax",@progbits
 	.globl ipu_stack_static_host_run
 	.p2align 2

@@ -65,6 +65,12 @@ struct TileHostPlans {
     end: u32,
 }
 
+struct TileExchangePlans {
+    addresses: Vec<u32>,
+    compute_runs: Vec<static_codegen::ExchangeComputeRun>,
+    end: u32,
+}
+
 #[derive(Clone, Copy)]
 struct HostPacketCopy {
     source: u32,
@@ -1144,7 +1150,7 @@ fn package_graph_impl(
     }
     let tile_exchange_plans = programs
         .iter()
-        .map(|program| -> Result<(Vec<u32>, u32)> {
+        .map(|program| -> Result<TileExchangePlans> {
             let mut cursor = PLAN_BASE;
             let mut unique = HashMap::<Vec<u32>, u32>::new();
             let mut addresses = Vec::with_capacity(exchange_count);
@@ -1165,7 +1171,17 @@ fn package_graph_impl(
                 };
                 addresses.push(address);
             }
-            Ok((addresses, cursor))
+            let (compute_runs, end) = static_codegen::plan_exchange_compute_runs(
+                program,
+                &addresses,
+                cursor,
+                profile_code.is_empty(),
+            )?;
+            Ok(TileExchangePlans {
+                addresses,
+                compute_runs,
+                end,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     debug!(
@@ -1173,7 +1189,7 @@ fn package_graph_impl(
             "0x{:x}",
             tile_exchange_plans
                 .iter()
-                .map(|(_, end)| *end)
+                .map(|plans| plans.end)
                 .min()
                 .unwrap_or(PLAN_BASE)
         ),
@@ -1181,7 +1197,7 @@ fn package_graph_impl(
             "0x{:x}",
             tile_exchange_plans
                 .iter()
-                .map(|(_, end)| *end)
+                .map(|plans| plans.end)
                 .max()
                 .unwrap_or(PLAN_BASE)
         ),
@@ -1211,8 +1227,8 @@ fn package_graph_impl(
     let tile_host_plans = programs
         .iter()
         .zip(&tile_exchange_plans)
-        .map(|(program, (_, plan_end))| -> Result<TileHostPlans> {
-            let plan_end = *plan_end;
+        .map(|(program, exchange_plans)| -> Result<TileHostPlans> {
+            let plan_end = exchange_plans.end;
             let physical = topology.physical(program.tile)?;
             let follower_address = align_up(plan_end, 8);
             let mut cursor = if host_transfers.is_empty() {
@@ -1361,8 +1377,12 @@ fn package_graph_impl(
     }
     let tile_retained_symbols = programs
         .iter()
-        .map(|program| {
+        .zip(&tile_exchange_plans)
+        .map(|(program, exchange_plans)| {
             let mut symbols = runtime_symbols.clone();
+            if !exchange_plans.compute_runs.is_empty() {
+                symbols.push(static_codegen::EXCHANGE_COMPUTE_RUN.into());
+            }
             symbols.extend(program.steps.iter().filter_map(|step| match step {
                 ipu_compiler::LoweredTileStep::Compute(command) => {
                     Some(format!("ipu_stack_{}", command.specialization.operation))
@@ -1435,7 +1455,8 @@ fn package_graph_impl(
         static_codegen::emit(
             program,
             symbols,
-            &tile_exchange_plans[program_index].0,
+            &tile_exchange_plans[program_index].addresses,
+            &tile_exchange_plans[program_index].compute_runs,
             static_codegen::HostCode {
                 inputs: &host_inputs,
                 outputs: &host_outputs,
@@ -1504,15 +1525,23 @@ fn package_graph_impl(
         .enumerate()
         .max_by_key(|(_, code)| code.len())
     {
-        let steps = static_codegen::step_code_size(&programs[index]);
-        let step_bytes = steps.exchange + steps.compute;
-        let plan_bytes = tile_exchange_plans[index].1 - PLAN_BASE;
-        let host_runtime_bytes = tile_host_plans[index].end - tile_exchange_plans[index].1;
+        let steps = static_codegen::step_code_size(
+            &programs[index],
+            &tile_exchange_plans[index].compute_runs,
+        );
+        let step_bytes = steps.exchange + steps.compute + steps.fused_run;
+        let plan_bytes = tile_exchange_plans[index].end - PLAN_BASE;
+        let host_runtime_bytes = tile_host_plans[index].end - tile_exchange_plans[index].end;
         info!(
             logical_tile = programs[index].tile,
             generated_bytes = generated_code.len(),
             generated_exchange_bytes = steps.exchange,
             generated_compute_bytes = steps.compute,
+            generated_unrolled_compute_calls = steps.compute_calls,
+            generated_fused_compute_calls = steps.fused_compute_calls,
+            generated_compute_argument_words = steps.compute_argument_words,
+            generated_fused_run_bytes = steps.fused_run,
+            generated_fused_runs = tile_exchange_plans[index].compute_runs.len(),
             generated_host_and_control_bytes = generated_code.len().saturating_sub(step_bytes),
             support_image_bytes = images[index].bytes.len(),
             exchange_plan_bytes = plan_bytes,
@@ -1691,12 +1720,19 @@ fn package_graph_impl(
             .steps
             .iter()
             .filter(|step| matches!(step, ipu_compiler::LoweredTileStep::Exchange { .. }))
-            .zip(&tile_exchange_plans[tile_index].0)
+            .zip(&tile_exchange_plans[tile_index].addresses)
         {
             if let ipu_compiler::LoweredTileStep::Exchange { row, .. } = step {
                 let bytes = words_to_bytes(row);
                 write_plan_bytes(&mut plan_region, plan_address, &bytes)?;
             }
+        }
+        for run in &tile_exchange_plans[tile_index].compute_runs {
+            write_plan_bytes(
+                &mut plan_region,
+                run.table_address,
+                &words_to_bytes(&run.table_entries),
+            )?;
         }
         write_static_host_plans(
             physical as u16,
