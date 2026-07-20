@@ -165,9 +165,18 @@ fn executable_region_bases_for_tile(
     runtime_end: u32,
     image_size: u32,
     program_size: u32,
+    additional_reserved: &[(u32, u32)],
 ) -> Result<(u32, u32)> {
     let place = |size, reserved: &[(u32, u32)]| {
-        executable_region_base_for_tile(allocation_ranges, Some(tile), runtime_end, size, reserved)
+        let mut all_reserved = additional_reserved.to_vec();
+        all_reserved.extend_from_slice(reserved);
+        executable_region_base_for_tile(
+            allocation_ranges,
+            Some(tile),
+            runtime_end,
+            size,
+            &all_reserved,
+        )
     };
     if program_size >= image_size {
         let program_base = place(program_size, &[])?;
@@ -183,6 +192,61 @@ fn executable_region_bases_for_tile(
             .ok_or("linked image address overflow")?;
         let program_base = place(program_size, &[(image_base, image_end)])?;
         Ok((image_base, program_base))
+    }
+}
+
+fn data_region_base_for_tile(
+    allocation_ranges: &[(u32, u32)],
+    tile: u16,
+    runtime_end: u32,
+    required_size: u32,
+    alignment: u32,
+    additional_reserved: &[(u32, u32)],
+) -> Result<u32> {
+    if required_size == 0 || !alignment.is_power_of_two() {
+        return Err("data region size must be nonzero and alignment must be a power of two".into());
+    }
+    let memory_end = ipu_package::TILE_MEMORY_BASE
+        .checked_add(ipu_package::TILE_MEMORY_SIZE)
+        .ok_or("tile memory range overflow")?;
+    let mut reserved = vec![
+        (
+            ipu_driver::APPLICATION_LOAD_BASE,
+            ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES,
+        ),
+        (
+            ipu_exchange::EXCHANGE_WINDOW_BASE,
+            ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+        ),
+        (PLAN_BASE, runtime_end),
+    ];
+    reserved.extend_from_slice(allocation_ranges);
+    reserved.extend_from_slice(additional_reserved);
+    reserved.sort_unstable();
+
+    let mut cursor = align_up(ipu_package::TILE_MEMORY_BASE, alignment);
+    for (start, end) in reserved {
+        if end <= cursor || start >= memory_end {
+            continue;
+        }
+        let candidate_end = cursor
+            .checked_add(required_size)
+            .ok_or("data region address overflow")?;
+        if candidate_end <= start {
+            return Ok(cursor);
+        }
+        cursor = align_up(cursor.max(end), alignment);
+    }
+    if cursor
+        .checked_add(required_size)
+        .is_some_and(|end| end <= memory_end)
+    {
+        Ok(cursor)
+    } else {
+        Err(format!(
+            "no tile-memory interval can hold {required_size} bytes of static data on tile {tile}"
+        )
+        .into())
     }
 }
 
@@ -1237,7 +1301,7 @@ fn package_graph_impl(
     }) {
         return Err("per-tile programs disagree on exchange launch count".into());
     }
-    let tile_exchange_plans = programs
+    let mut tile_exchange_plans = programs
         .iter()
         .map(|program| -> Result<TileExchangePlans> {
             let mut cursor = PLAN_BASE;
@@ -1300,12 +1364,12 @@ fn package_graph_impl(
                 cursor,
                 profile_code.is_empty() && template_regions.is_empty(),
             )?;
-            let (templates, end) = static_codegen::plan_static_templates(
+            let (templates, _) = static_codegen::plan_static_templates(
                 program,
                 &addresses,
                 &patches,
                 template_regions,
-                end,
+                0,
             )?;
             Ok(TileExchangePlans {
                 addresses,
@@ -1496,6 +1560,39 @@ fn package_graph_impl(
             )
         })
         .collect::<Vec<_>>();
+    let mut template_record_ranges = vec![Vec::new(); programs.len()];
+    for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
+        let tile = programs[tile_index].tile;
+        let runtime_end = completion_addresses[tile_index]
+            .checked_add(4)
+            .ok_or("static runtime address overflow")?;
+        for template in &mut plans.templates {
+            for (record_address, record) in
+                template.record_addresses.iter_mut().zip(&template.records)
+            {
+                let size = u32::try_from(record.len())?
+                    .checked_mul(4)
+                    .ok_or("static template record size overflow")?;
+                if size == 0 {
+                    *record_address = ipu_package::TILE_MEMORY_BASE;
+                    continue;
+                }
+                let address = data_region_base_for_tile(
+                    &allocation_ranges_by_tile[usize::from(tile)],
+                    tile,
+                    runtime_end,
+                    size,
+                    4,
+                    &template_record_ranges[tile_index],
+                )?;
+                let end = address
+                    .checked_add(size)
+                    .ok_or("static template record address overflow")?;
+                *record_address = address;
+                template_record_ranges[tile_index].push((address, end));
+            }
+        }
+    }
 
     let mut runtime_symbols = vec![
         static_codegen::WORKER_BARRIER.into(),
@@ -1610,17 +1707,21 @@ fn package_graph_impl(
         .zip(&preliminary_images)
         .zip(&preliminary_generated)
         .zip(&completion_addresses)
-        .map(|(((program, image), generated), &completion_address)| {
-            executable_region_bases_for_tile(
-                &allocation_ranges_by_tile[usize::from(program.tile)],
-                program.tile,
-                completion_address
-                    .checked_add(4)
-                    .ok_or("static runtime address overflow")?,
-                u32::try_from(image.bytes.len())?,
-                u32::try_from(generated.len())?,
-            )
-        })
+        .zip(&template_record_ranges)
+        .map(
+            |((((program, image), generated), &completion_address), template_records)| {
+                executable_region_bases_for_tile(
+                    &allocation_ranges_by_tile[usize::from(program.tile)],
+                    program.tile,
+                    completion_address
+                        .checked_add(4)
+                        .ok_or("static runtime address overflow")?,
+                    u32::try_from(image.bytes.len())?,
+                    u32::try_from(generated.len())?,
+                    template_records,
+                )
+            },
+        )
         .collect::<Result<Vec<_>>>()?;
     let image_bases = executable_bases
         .iter()
@@ -1715,7 +1816,7 @@ fn package_graph_impl(
                 template_instances,
                 template_record_bytes,
                 support_image_bytes = images[index].bytes.len(),
-                exchange_plan_and_template_bytes = plan_bytes,
+                exchange_plan_bytes = plan_bytes,
                 host_plan_and_state_bytes = host_runtime_bytes,
                 "largest generated tile program uses static templates"
             );
@@ -1756,6 +1857,9 @@ fn package_graph_impl(
         if ranges_overlap(image.base, image_end, allocation.address, end)
             || ranges_overlap(program_base, program_end, allocation.address, end)
             || ranges_overlap(PLAN_BASE, runtime_end, allocation.address, end)
+            || template_record_ranges[usize::from(allocation.tile)]
+                .iter()
+                .any(|&(start, stop)| ranges_overlap(start, stop, allocation.address, end))
         {
             return Err(format!(
                 "static runtime 0x{PLAN_BASE:x}..0x{runtime_end:x} overlaps tensor {} on tile {} at 0x{:x}..0x{end:x}",
@@ -1890,22 +1994,6 @@ fn package_graph_impl(
                 &words_to_bytes(&run.table_entries),
             )?;
         }
-        for template in &tile_exchange_plans[tile_index].templates {
-            for (&address, record) in template.record_addresses.iter().zip(&template.records) {
-                let words = record
-                    .iter()
-                    .map(|word| match word {
-                        static_codegen::StaticTemplateRecordWord::Value(value) => Ok(*value),
-                        static_codegen::StaticTemplateRecordWord::Symbol(name) => image
-                            .symbols
-                            .get(name)
-                            .copied()
-                            .ok_or_else(|| format!("static template references missing {name}")),
-                    })
-                    .collect::<std::result::Result<Vec<_>, String>>()?;
-                write_plan_bytes(&mut plan_region, address, &words_to_bytes(&words))?;
-            }
-        }
         write_static_host_plans(
             physical as u16,
             StaticHostPacketLayout {
@@ -1926,6 +2014,45 @@ fn package_graph_impl(
                 blob_offset: 0,
                 file_size: plan_size,
                 flags: SEGMENT_READ | SEGMENT_WRITE | SEGMENT_EXECUTE,
+            });
+        }
+        let mut template_segments = Vec::<(u32, Vec<u8>)>::new();
+        for template in &tile_exchange_plans[tile_index].templates {
+            for (&address, record) in template.record_addresses.iter().zip(&template.records) {
+                if record.is_empty() {
+                    continue;
+                }
+                let words = record
+                    .iter()
+                    .map(|word| match word {
+                        static_codegen::StaticTemplateRecordWord::Value(value) => Ok(*value),
+                        static_codegen::StaticTemplateRecordWord::Symbol(name) => image
+                            .symbols
+                            .get(name)
+                            .copied()
+                            .ok_or_else(|| format!("static template references missing {name}")),
+                    })
+                    .collect::<std::result::Result<Vec<_>, String>>()?;
+                let bytes = words_to_bytes(&words);
+                if let Some((start, contents)) = template_segments.last_mut() {
+                    if start.checked_add(u32::try_from(contents.len())?) == Some(address) {
+                        contents.extend_from_slice(&bytes);
+                        continue;
+                    }
+                }
+                template_segments.push((address, bytes));
+            }
+        }
+        for (address, bytes) in template_segments {
+            let size = u32::try_from(bytes.len())?;
+            let blob = app.add_blob(bytes);
+            segments.push(Segment {
+                address,
+                memory_size: size,
+                blob,
+                blob_offset: 0,
+                file_size: size,
+                flags: SEGMENT_READ,
             });
         }
         append_initial_segments(&mut app, &mut segments, &initial, logical)?;
@@ -2945,6 +3072,45 @@ mod tests {
             align_down(allocation_address, element),
             align_up(allocation_address + 4, element),
         ));
+    }
+
+    #[test]
+    fn static_data_placement_uses_multiple_available_intervals() {
+        let memory_base = ipu_package::TILE_MEMORY_BASE;
+        let first_gap_start = PLAN_BASE + 0x1000;
+        let first_gap_end = first_gap_start + 20;
+        let allocations = vec![
+            (
+                memory_base + ENTRY_TRAMPOLINE_BYTES,
+                ipu_exchange::EXCHANGE_WINDOW_BASE,
+            ),
+            (first_gap_end, first_gap_end + 0x1000),
+        ];
+        let first =
+            data_region_base_for_tile(&allocations, 0, first_gap_start, 16, 4, &[]).unwrap();
+        let second = data_region_base_for_tile(
+            &allocations,
+            0,
+            first_gap_start,
+            16,
+            4,
+            &[(first, first + 16)],
+        )
+        .unwrap();
+
+        for address in [first, second] {
+            assert_eq!(address % 4, 0);
+            assert!(address >= memory_base);
+            assert!(address + 16 <= memory_base + ipu_package::TILE_MEMORY_SIZE);
+            assert!(allocations.iter().all(|&(start, end)| !ranges_overlap(
+                address,
+                address + 16,
+                start,
+                end
+            )));
+        }
+        assert!(!ranges_overlap(first, first + 16, second, second + 16));
+        assert!(second >= first_gap_end + 0x1000);
     }
 
     #[test]
