@@ -1,7 +1,7 @@
 use crate::{
     Allocation, AllocationKind, BlockPlacement, CompileError, KernelCommand, MemoryConstraint,
     MemoryPlacement, OpId, Phase, Schedule, SpecializationKey, TensorId, Transfer,
-    find_free_region,
+    allocate_from_occupied, find_free_region, occupied_intervals_by_tile,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -243,14 +243,19 @@ pub fn append_c16_to_a16_blocks_gelu_f16(
         + 1;
     let mut output = Vec::with_capacity(source.len());
     let mut commands = Vec::with_capacity(source.len());
+    let mut occupied = occupied_intervals_by_tile(
+        &schedule.allocations,
+        schedule.tile_count,
+        phase,
+        usize::MAX,
+        data_base,
+        data_limit,
+    );
     for block in source {
         let bytes = u32::from(block.rows) * u32::from(block.columns) * 2;
-        let address = find_free_region(
-            &schedule.allocations,
-            block.tile,
+        let address = allocate_from_occupied(
+            &mut occupied[usize::from(block.tile)],
             bytes,
-            phase,
-            usize::MAX,
             MemoryConstraint {
                 base: data_base,
                 limit: data_limit,
@@ -336,6 +341,14 @@ fn append_c16_to_a16_row_shards_impl(
     let first_compute_phase = schedule.phases.len() + 1;
     let mut destinations = Vec::with_capacity(rows.len());
     let mut destination_blocks = Vec::with_capacity(rows.len());
+    let mut occupied = occupied_intervals_by_tile(
+        &schedule.allocations,
+        schedule.tile_count,
+        first_compute_phase,
+        usize::MAX,
+        config.data_base,
+        config.data_limit,
+    );
     for (destination_tile, (_block_row, mut blocks)) in rows.into_iter().enumerate() {
         let destination_tile = u16::try_from(destination_tile)
             .map_err(|_| CompileError::Graph("row-shard destination tile overflow".into()))?;
@@ -363,12 +376,9 @@ fn append_c16_to_a16_row_shards_impl(
             )));
         }
         let bytes = u32::from(first.rows) * u32::from(config.columns) * 2;
-        let address = find_free_region(
-            &schedule.allocations,
-            destination_tile,
+        let address = allocate_from_occupied(
+            &mut occupied[usize::from(destination_tile)],
             bytes,
-            first_compute_phase,
-            usize::MAX,
             MemoryConstraint {
                 base: config.data_base,
                 limit: config.data_limit,
@@ -683,16 +693,21 @@ pub fn append_affine_layer_norm_f16(
     let mut transfers = Vec::with_capacity(input.len().saturating_sub(1) * 2);
     let mut output = Vec::with_capacity(input.len());
     let mut commands = Vec::with_capacity(input.len());
+    let mut output_occupied = occupied_intervals_by_tile(
+        &schedule.allocations,
+        schedule.tile_count,
+        compute_phase,
+        usize::MAX,
+        config.data_base,
+        config.data_limit,
+    );
     for shard in input {
         let activation_bytes = u32::from(shard.rows) * u32::from(columns) * 2;
         let output_tensor = TensorId(next_tensor);
         next_tensor += 1;
-        let output_address = find_free_region(
-            &schedule.allocations,
-            shard.tile,
+        let output_address = allocate_from_occupied(
+            &mut output_occupied[usize::from(shard.tile)],
             activation_bytes,
-            compute_phase,
-            usize::MAX,
             MemoryConstraint {
                 placement: MemoryPlacement::Low,
                 ..constraint

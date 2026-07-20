@@ -2026,8 +2026,41 @@ impl Schedule {
             destinations: Vec<u16>,
         }
 
+        let mut staging_additions = vec![Vec::new(); self.phases.len() + 1];
+        let mut staging_removals = vec![Vec::new(); self.phases.len() + 1];
+        for allocation in &self.allocations {
+            let AllocationKind::ExchangeStaging { phase } = allocation.kind else {
+                continue;
+            };
+            let available_from = allocation.live_from.max(phase.saturating_add(1));
+            if available_from >= allocation.live_until || available_from >= self.phases.len() {
+                continue;
+            }
+            let location = (allocation.tensor, allocation.tile);
+            staging_additions[available_from].push(location);
+            if allocation.live_until < staging_removals.len() {
+                staging_removals[allocation.live_until].push(location);
+            }
+        }
+        let mut available_staging = HashSet::<(TensorId, u16)>::new();
+        let mut available_staging_counts = HashMap::<(TensorId, u16), usize>::new();
+
         let mut lowered_phases = Vec::new();
         for (phase_index, phase) in self.phases.iter().enumerate() {
+            for location in &staging_removals[phase_index] {
+                let count = available_staging_counts.get_mut(location).ok_or_else(|| {
+                    CompileError::Graph("staging lifetime removal underflow".into())
+                })?;
+                *count -= 1;
+                if *count == 0 {
+                    available_staging_counts.remove(location);
+                    available_staging.remove(location);
+                }
+            }
+            for &location in &staging_additions[phase_index] {
+                *available_staging_counts.entry(location).or_default() += 1;
+                available_staging.insert(location);
+            }
             let Phase::Exchange { transfers } = phase else {
                 continue;
             };
@@ -2114,34 +2147,31 @@ impl Schedule {
                     color.ok_or_else(|| CompileError::Graph("uncolored exchange group".into()))?;
                 colored_groups[color].push(group);
             }
-            let mut available: HashSet<_> = self
-                .allocations
-                .iter()
-                .filter(|allocation| {
-                    allocation.kind == AllocationKind::Home
-                        || matches!(
-                            allocation.kind,
-                            AllocationKind::ExchangeStaging { phase }
-                                if phase < phase_index
-                        ) && allocation.live_from <= phase_index
-                            && allocation.live_until > phase_index
-                })
-                .map(|allocation| (allocation.tensor, allocation.tile))
-                .collect();
+            let mut available = available_staging.clone();
             let available_before_phase = available.clone();
+            let location_available = |available: &HashSet<_>, tensor, tile| {
+                available.contains(&(tensor, tile))
+                    || allocation_index
+                        .at(tensor, tile)
+                        .iter()
+                        .any(|allocation| allocation.kind == AllocationKind::Home)
+            };
             let mut epoch_groups = Vec::with_capacity(colored_groups.len());
             while !colored_groups.is_empty() {
                 let ready = colored_groups
                     .iter()
                     .position(|slot| {
-                        slot.iter()
-                            .all(|group| available.contains(&(group.tensor, group.source)))
+                        slot.iter().all(|group| {
+                            location_available(&available, group.tensor, group.source)
+                        })
                     })
                     .ok_or_else(|| {
                         let blocked = colored_groups
                             .iter()
                             .flat_map(|slot| slot.iter())
-                            .filter(|group| !available.contains(&(group.tensor, group.source)))
+                            .filter(|group| {
+                                !location_available(&available, group.tensor, group.source)
+                            })
                             .map(|group| {
                                 format!("tensor {} on tile {}", group.tensor.0, group.source)
                             })
@@ -2209,18 +2239,19 @@ impl Schedule {
                             .copied()
                             .find(|allocation| allocation.kind == AllocationKind::Home)
                     };
-                    let source_address = if available_before_phase.contains(&(tensor, source)) {
-                        earlier_staging().or_else(home).or_else(same_phase_staging)
-                    } else {
-                        same_phase_staging().or_else(earlier_staging).or_else(home)
-                    }
-                    .ok_or_else(|| {
-                        CompileError::Memory(format!(
-                            "missing source allocation for tensor {} on tile {source}",
-                            tensor.0
-                        ))
-                    })?
-                    .address;
+                    let source_address =
+                        if location_available(&available_before_phase, tensor, source) {
+                            earlier_staging().or_else(home).or_else(same_phase_staging)
+                        } else {
+                            same_phase_staging().or_else(earlier_staging).or_else(home)
+                        }
+                        .ok_or_else(|| {
+                            CompileError::Memory(format!(
+                                "missing source allocation for tensor {} on tile {source}",
+                                tensor.0
+                            ))
+                        })?
+                        .address;
                     let destination_addresses = destinations
                         .iter()
                         .map(|destination| {
@@ -2350,43 +2381,51 @@ impl Schedule {
             .map(|exchange| (exchange.phase, exchange))
             .collect();
         let allocation_index = AllocationIndex::new(&self.allocations);
-        let mut programs = Vec::with_capacity(usize::from(self.tile_count));
-        for tile in 0..self.tile_count {
-            let mut steps = Vec::new();
-            for (phase_index, phase) in self.phases.iter().enumerate() {
-                match phase {
-                    Phase::Exchange { .. } => {
-                        let exchange = exchange_by_phase.get(&phase_index).ok_or_else(|| {
-                            CompileError::Graph(format!(
-                                "missing lowered exchange phase {phase_index}"
-                            ))
-                        })?;
-                        for (epoch, lowered) in exchange.epochs.iter().enumerate() {
-                            steps.push(LoweredTileStep::Exchange {
+        let mut programs = (0..self.tile_count)
+            .map(|tile| LoweredTileProgram {
+                tile,
+                steps: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        for (phase_index, phase) in self.phases.iter().enumerate() {
+            match phase {
+                Phase::Exchange { .. } => {
+                    let exchange = exchange_by_phase.get(&phase_index).ok_or_else(|| {
+                        CompileError::Graph(format!("missing lowered exchange phase {phase_index}"))
+                    })?;
+                    for (epoch, lowered) in exchange.epochs.iter().enumerate() {
+                        for program in &mut programs {
+                            program.steps.push(LoweredTileStep::Exchange {
                                 phase: phase_index,
                                 epoch,
-                                row: lowered.row_for(tile),
+                                row: lowered.row_for(program.tile),
                             });
                         }
                     }
-                    Phase::Compute { op, commands } => {
-                        let mut active = false;
-                        for command in commands.iter().filter(|command| command.tile == tile) {
-                            active = true;
-                            let output_address =
-                                allocation_index.home_address(command.output, tile)?;
-                            let input_addresses = command
-                                .inputs
-                                .iter()
-                                .map(|input| {
-                                    allocation_index.compute_input_address(
-                                        *input,
-                                        tile,
-                                        phase_index,
-                                    )
-                                })
-                                .collect::<Result<_, _>>()?;
-                            steps.push(LoweredTileStep::Compute(LoweredComputeCommand {
+                }
+                Phase::Compute { op, commands } => {
+                    let mut active = vec![false; usize::from(self.tile_count)];
+                    for command in commands {
+                        let tile = command.tile;
+                        let tile_index = usize::from(tile);
+                        let program = programs.get_mut(tile_index).ok_or_else(|| {
+                            CompileError::Graph(format!(
+                                "compute command tile {tile} exceeds tile count {}",
+                                self.tile_count
+                            ))
+                        })?;
+                        active[tile_index] = true;
+                        let output_address = allocation_index.home_address(command.output, tile)?;
+                        let input_addresses = command
+                            .inputs
+                            .iter()
+                            .map(|input| {
+                                allocation_index.compute_input_address(*input, tile, phase_index)
+                            })
+                            .collect::<Result<_, _>>()?;
+                        program
+                            .steps
+                            .push(LoweredTileStep::Compute(LoweredComputeCommand {
                                 op: *op,
                                 phase: phase_index,
                                 output: command.output,
@@ -2397,9 +2436,10 @@ impl Schedule {
                                 specialization: command.specialization.clone(),
                                 metadata: command.metadata.clone(),
                             }));
-                        }
+                    }
+                    for (program, active) in programs.iter_mut().zip(active) {
                         if !active {
-                            steps.push(LoweredTileStep::IdleCompute {
+                            program.steps.push(LoweredTileStep::IdleCompute {
                                 op: *op,
                                 phase: phase_index,
                             });
@@ -2407,7 +2447,6 @@ impl Schedule {
                     }
                 }
             }
-            programs.push(LoweredTileProgram { tile, steps });
         }
         info!(tiles = programs.len(), "lowered per-tile programs");
         Ok(programs)
