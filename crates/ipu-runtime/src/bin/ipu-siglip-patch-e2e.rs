@@ -10,10 +10,11 @@ use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, StaticTemplateRegion,
-    allocator_memory_profile, append_host_a16_matrix, append_siglip_encoder_layer,
-    append_siglip_map_head, append_siglip_post_layer_norm, block_binding_typed, block_coordinates,
-    blocked_matrix_f16, package_graph, package_graph_with_templates, run_host_with_options,
+    BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, SiglipWeightStorage,
+    StaticTemplateRegion, allocator_memory_profile, append_host_a16_matrix,
+    append_siglip_encoder_layer, append_siglip_map_head, append_siglip_post_layer_norm,
+    block_binding_typed, block_coordinates, blocked_matrix_f16, package_graph,
+    package_graph_with_templates, run_host_with_options,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -153,9 +154,15 @@ fn main() {
     assert!((1..=config.num_hidden_layers).contains(&layer_count));
     let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
     let memory = encoder_memory_policy(data_limit);
+    let weight_storage = match std::env::var("IPU_SIGLIP_WEIGHT_STORAGE").as_deref() {
+        Ok("f16") => SiglipWeightStorage::F16,
+        Ok("f143") | Err(_) => SiglipWeightStorage::F143,
+        Ok(value) => panic!("unsupported SigLIP weight storage {value}"),
+    };
     info!(
         transient = ?memory.transient,
         resident = ?memory.resident,
+        ?weight_storage,
         "configured encoder tile-memory policy"
     );
     let detailed_diagnostics = layer_count == 1;
@@ -174,6 +181,7 @@ fn main() {
             row_block_dimension,
             TILE_COUNT,
             &memory,
+            weight_storage,
             detailed_diagnostics && layer + 1 == layer_count,
             &mut host,
         )
@@ -655,6 +663,29 @@ fn compile_objects(
             format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
         ],
     )?;
+    let uses_fp8_weights = plan.schedule.phases.iter().any(|phase| {
+        matches!(phase, Phase::Compute { commands, .. } if commands.iter().any(|command| {
+            command.specialization.operation == "expand_f8_f143_to_f16"
+        }))
+    });
+    let fp8_expander = uses_fp8_weights
+        .then(|| {
+            Ok::<_, ipu_elf::ElfError>((
+                toolchain.compile(
+                    source("expand_f8_f143_to_f16.cpp"),
+                    &artifacts,
+                    "expand-f8-codelet",
+                    &[],
+                )?,
+                toolchain.compile(
+                    source("expand_f8_f143_to_f16.S"),
+                    &artifacts,
+                    "expand-f8-wrapper",
+                    &[],
+                )?,
+            ))
+        })
+        .transpose()?;
     let add = toolchain.compile(source("add_f16.S"), &artifacts, "add-f16", &[])?;
     let add_bias = toolchain.compile(source("add_bias_f16.S"), &artifacts, "add-bias-f16", &[])?;
     let relayout = toolchain.compile(source("relayout_f16.S"), &artifacts, "relayout-f16", &[])?;
@@ -784,7 +815,7 @@ fn compile_objects(
         "worker-support",
         &[],
     )?;
-    Ok(vec![
+    let mut objects = vec![
         fs::read(runtime.object)?,
         fs::read(gemm.object)?,
         fs::read(add.object)?,
@@ -802,7 +833,12 @@ fn compile_objects(
         fs::read(attention_qk.object)?,
         fs::read(attention_pv.object)?,
         fs::read(worker_support.object)?,
-    ])
+    ];
+    if let Some((codelet, wrapper)) = fp8_expander {
+        objects.push(fs::read(codelet.object)?);
+        objects.push(fs::read(wrapper.object)?);
+    }
+    Ok(objects)
 }
 
 fn row_shard_binding(name: &str, rows: u16, columns: u16, shards: &[RowShardPlacement]) -> Binding {

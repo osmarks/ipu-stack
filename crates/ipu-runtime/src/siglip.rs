@@ -1,4 +1,7 @@
-use crate::{BlockLayout, Result, block_binding_typed, blocked_matrix_f16};
+use crate::{
+    BlockLayout, Result, block_binding_typed, blocked_matrix_f8_f143, blocked_matrix_f16,
+    f143_scale,
+};
 use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
@@ -52,6 +55,23 @@ pub struct SiglipEncoderLayer {
 pub struct SiglipMapHead {
     pub output: Vec<RowShardPlacement>,
     pub attention: FlashAttentionPlan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiglipWeightStorage {
+    F16,
+    F143,
+}
+
+impl SiglipWeightStorage {
+    fn gemm_data_type(self, values: impl IntoIterator<Item = f32>) -> GemmDataType {
+        match self {
+            Self::F16 => GemmDataType::F16,
+            Self::F143 => GemmDataType::F16F8Weights {
+                scale: f143_scale(values),
+            },
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -400,6 +420,7 @@ pub fn append_siglip_map_head(
             tile_count,
             data_base,
             data_limit,
+            GemmDataType::F16,
         ),
     )?;
     let down_weight = model.tensor_f32("vision_model.head.mlp.fc2.weight")?;
@@ -464,6 +485,7 @@ pub fn append_siglip_encoder_layer(
     row_block_dimension: u16,
     tile_count: u16,
     memory: &MemoryPolicy,
+    weight_storage: SiglipWeightStorage,
     retain_diagnostics: bool,
     host: &mut HostTensorSet,
 ) -> Result<SiglipEncoderLayer> {
@@ -497,6 +519,21 @@ pub fn append_siglip_encoder_layer(
         &norm.affine,
     )?;
 
+    let projection_names = ["q_proj", "k_proj", "v_proj"];
+    let projection_weights = projection_names.map(|projection| {
+        model
+            .tensor_f32(
+                &model
+                    .layer_name(layer, &format!("self_attn.{projection}.weight"))
+                    .unwrap(),
+            )
+            .unwrap()
+    });
+    let qkv_data_type = weight_storage.gemm_data_type(
+        projection_weights
+            .iter()
+            .flat_map(|weights| weights.iter().copied()),
+    );
     let qkv = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         &norm.output,
@@ -508,33 +545,22 @@ pub fn append_siglip_encoder_layer(
             tile_count,
             data_base,
             data_limit,
+            qkv_data_type,
         ),
         memory,
     )?;
-    let projection_names = ["q_proj", "k_proj", "v_proj"];
-    let projection_weights = projection_names.map(|projection| {
-        model
-            .tensor_f32(
-                &model
-                    .layer_name(layer, &format!("self_attn.{projection}.weight"))
-                    .unwrap(),
-            )
-            .unwrap()
-    });
-    host.push(
-        block_binding_typed(
-            &format!("{prefix}.qkv.weight"),
-            columns,
-            columns * 3,
-            &qkv.right,
-            "f16",
-            2,
-        ),
-        blocked_matrix_f16(&qkv.right, BlockLayout::AmpB16x16, |row, column| {
+    push_gemm_weight(
+        host,
+        &format!("{prefix}.qkv.weight"),
+        columns,
+        columns * 3,
+        &qkv.right,
+        qkv_data_type,
+        |row, column| {
             let projection = usize::from(column / columns);
             let output = usize::from(column % columns);
             projection_weights[projection][output * usize::from(columns) + usize::from(row)]
-        }),
+        },
     )?;
     make_tensors_resident(schedule, qkv.right.iter().map(|block| block.tensor))?;
     end_tensor_lifetimes(schedule, norm.output.iter().map(|shard| shard.tensor))?;
@@ -607,6 +633,8 @@ pub fn append_siglip_encoder_layer(
     let attention_shards =
         append_flash_attention_to_a16_row_shards(schedule, &attention, data_base, data_limit)?;
     info!(stage = "attention_output", "planning SigLIP encoder stage");
+    let output_weight = model.tensor_f32(&model.layer_name(layer, "self_attn.out_proj.weight")?)?;
+    let output_data_type = weight_storage.gemm_data_type(output_weight.iter().copied());
     let output_projection = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         &attention_shards,
@@ -618,26 +646,18 @@ pub fn append_siglip_encoder_layer(
             tile_count,
             data_base,
             data_limit,
+            output_data_type,
         ),
         memory,
     )?;
-    let output_weight = model.tensor_f32(&model.layer_name(layer, "self_attn.out_proj.weight")?)?;
-    host.push(
-        block_binding_typed(
-            &format!("{prefix}.attention_output.weight"),
-            columns,
-            columns,
-            &output_projection.right,
-            "f16",
-            2,
-        ),
-        blocked_matrix_f16(
-            &output_projection.right,
-            BlockLayout::AmpB16x16,
-            |row, column| {
-                output_weight[usize::from(column) * usize::from(columns) + usize::from(row)]
-            },
-        ),
+    push_gemm_weight(
+        host,
+        &format!("{prefix}.attention_output.weight"),
+        columns,
+        columns,
+        &output_projection.right,
+        output_data_type,
+        |row, column| output_weight[usize::from(column) * usize::from(columns) + usize::from(row)],
     )?;
     make_tensors_resident(
         schedule,
@@ -701,6 +721,8 @@ pub fn append_siglip_encoder_layer(
         &norm2.affine,
     )?;
     let intermediate_columns = u16::try_from(config.intermediate_size.div_ceil(64) * 64)?;
+    let mlp_up_weight = model.tensor_f32(&model.layer_name(layer, "mlp.fc1.weight")?)?;
+    let mlp_up_data_type = weight_storage.gemm_data_type(mlp_up_weight.iter().copied());
     let mlp_up = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         &norm2.output,
@@ -712,26 +734,24 @@ pub fn append_siglip_encoder_layer(
             tile_count,
             data_base,
             data_limit,
+            mlp_up_data_type,
         ),
         memory,
     )?;
-    let mlp_up_weight = model.tensor_f32(&model.layer_name(layer, "mlp.fc1.weight")?)?;
-    host.push(
-        block_binding_typed(
-            &format!("{prefix}.mlp_up.weight"),
-            columns,
-            intermediate_columns,
-            &mlp_up.right,
-            "f16",
-            2,
-        ),
-        blocked_matrix_f16(&mlp_up.right, BlockLayout::AmpB16x16, |row, column| {
+    push_gemm_weight(
+        host,
+        &format!("{prefix}.mlp_up.weight"),
+        columns,
+        intermediate_columns,
+        &mlp_up.right,
+        mlp_up_data_type,
+        |row, column| {
             if usize::from(column) < config.intermediate_size {
                 mlp_up_weight[usize::from(column) * usize::from(columns) + usize::from(row)]
             } else {
                 0.0
             }
-        }),
+        },
     )?;
     make_tensors_resident(schedule, mlp_up.right.iter().map(|block| block.tensor))?;
     if !retain_diagnostics {
@@ -759,6 +779,8 @@ pub fn append_siglip_encoder_layer(
     let mlp_gelu =
         append_c16_to_a16_blocks_gelu_f16(schedule, &mlp_up.output, data_base, data_limit)?;
     end_tensor_lifetimes(schedule, mlp_up.output.iter().map(|block| block.tensor))?;
+    let mlp_down_weight = model.tensor_f32(&model.layer_name(layer, "mlp.fc2.weight")?)?;
+    let mlp_down_data_type = weight_storage.gemm_data_type(mlp_down_weight.iter().copied());
     let mlp_down = append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
         schedule,
         &mlp_gelu,
@@ -770,26 +792,24 @@ pub fn append_siglip_encoder_layer(
             tile_count,
             data_base,
             data_limit,
+            mlp_down_data_type,
         ),
         memory,
     )?;
-    let mlp_down_weight = model.tensor_f32(&model.layer_name(layer, "mlp.fc2.weight")?)?;
-    host.push(
-        block_binding_typed(
-            &format!("{prefix}.mlp_down.weight"),
-            intermediate_columns,
-            columns,
-            &mlp_down.right,
-            "f16",
-            2,
-        ),
-        blocked_matrix_f16(&mlp_down.right, BlockLayout::AmpB16x16, |row, column| {
+    push_gemm_weight(
+        host,
+        &format!("{prefix}.mlp_down.weight"),
+        intermediate_columns,
+        columns,
+        &mlp_down.right,
+        mlp_down_data_type,
+        |row, column| {
             if usize::from(row) < config.intermediate_size {
                 mlp_down_weight[usize::from(column) * config.intermediate_size + usize::from(row)]
             } else {
                 0.0
             }
-        }),
+        },
     )?;
     make_tensors_resident(schedule, mlp_down.right.iter().map(|block| block.tensor))?;
     if !retain_diagnostics {
@@ -849,6 +869,7 @@ fn gemm_config(
     tile_count: u16,
     data_base: u32,
     data_limit: u32,
+    data_type: GemmDataType,
 ) -> BlockedGemmConfig {
     BlockedGemmConfig {
         rows,
@@ -860,8 +881,41 @@ fn gemm_config(
         tile_count,
         data_base,
         data_limit,
-        data_type: GemmDataType::F16,
+        data_type,
     }
+}
+
+fn push_gemm_weight(
+    host: &mut HostTensorSet,
+    name: &str,
+    rows: u16,
+    columns: u16,
+    placements: &[BlockPlacement],
+    data_type: GemmDataType,
+    value: impl Fn(u16, u16) -> f32,
+) -> Result<()> {
+    let (dtype, bytes) = match data_type {
+        GemmDataType::F16 => (
+            "f16",
+            blocked_matrix_f16(placements, BlockLayout::AmpB16x16, value),
+        ),
+        GemmDataType::F16F8Weights { scale } => (
+            "f8-f143",
+            blocked_matrix_f8_f143(placements, BlockLayout::AmpB16x16, scale, value),
+        ),
+        GemmDataType::F32 => return Err("SigLIP weights require FP16 graph operands".into()),
+    };
+    host.push(
+        block_binding_typed(
+            name,
+            rows,
+            columns,
+            placements,
+            dtype,
+            u64::from(data_type.weight_element_bytes()),
+        ),
+        bytes,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -899,6 +953,7 @@ fn append_a16_linear_c16(
             tile_count,
             data_base,
             data_limit,
+            GemmDataType::F16,
         ),
     )?;
     host.push(
