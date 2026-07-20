@@ -163,6 +163,7 @@ pub fn append_siglip_encoder_layer(
         &qkv_shards[2],
         FlashAttentionConfig {
             batch_size: 1,
+            query_sequence_length: 0,
             sequence_length: rows,
             hidden_size: columns,
             attention_heads: u16::try_from(config.num_attention_heads)?,

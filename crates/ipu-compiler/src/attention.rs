@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlashAttentionConfig {
     pub batch_size: u16,
+    /// Zero uses `sequence_length`, preserving self-attention behavior.
+    pub query_sequence_length: u16,
     pub sequence_length: u16,
     pub hidden_size: u16,
     pub attention_heads: u16,
@@ -73,27 +75,35 @@ pub fn append_flash_attention_from_a16_qkv(
     value: &[RowShardPlacement],
     config: FlashAttentionConfig,
 ) -> Result<FlashAttentionPlan, CompileError> {
-    if config.batch_size != 1
-        || query.is_empty()
-        || query.len() != key.len()
-        || key.len() != value.len()
-    {
+    let query_sequence_length = if config.query_sequence_length == 0 {
+        config.sequence_length
+    } else {
+        config.query_sequence_length
+    };
+    if config.batch_size != 1 || query.is_empty() || key.is_empty() || key.len() != value.len() {
         return Err(CompileError::Graph(
-            "row-sharded FlashAttention composition currently requires one batch and matching Q/K/V shards"
+            "row-sharded FlashAttention composition currently requires one batch and matching K/V shards"
                 .into(),
         ));
     }
-    for ((query, key), value) in query.iter().zip(key).zip(value) {
-        if query.row_start != key.row_start
-            || query.row_start != value.row_start
-            || query.rows != key.rows
-            || query.rows != value.rows
-            || query.columns != config.hidden_size
+    if query.iter().map(|shard| shard.rows).sum::<u16>() != query_sequence_length
+        || key.iter().map(|shard| shard.rows).sum::<u16>() != config.sequence_length
+        || query
+            .iter()
+            .any(|shard| shard.columns != config.hidden_size)
+    {
+        return Err(CompileError::Graph(
+            "row-sharded query layout does not match the attention configuration".into(),
+        ));
+    }
+    for (key, value) in key.iter().zip(value) {
+        if key.row_start != value.row_start
+            || key.rows != value.rows
             || key.columns != config.hidden_size
             || value.columns != config.hidden_size
         {
             return Err(CompileError::Graph(
-                "row-sharded Q/K/V layouts do not match the attention configuration".into(),
+                "row-sharded K/V layouts do not match the attention configuration".into(),
             ));
         }
     }
@@ -593,6 +603,11 @@ pub fn plan_flash_attention(
     config: FlashAttentionConfig,
 ) -> Result<FlashAttentionPlan, CompileError> {
     validate(config)?;
+    let query_sequence_length = if config.query_sequence_length == 0 {
+        config.sequence_length
+    } else {
+        config.query_sequence_length
+    };
     let head_dimension = config.hidden_size / config.attention_heads;
     if !head_dimension.is_multiple_of(2) {
         return Err(CompileError::Graph(
@@ -603,9 +618,9 @@ pub fn plan_flash_attention(
     let head_count = usize::from(config.batch_size) * usize::from(config.attention_heads);
     const WORKER_COUNT: u16 = 6;
     let query_block_rows = if config.query_block_rows == 0 {
-        (WORKER_COUNT.min(config.sequence_length)..=config.sequence_length)
+        (WORKER_COUNT.min(query_sequence_length)..=query_sequence_length)
             .find(|&rows| {
-                head_count * usize::from(config.sequence_length.div_ceil(rows))
+                head_count * usize::from(query_sequence_length.div_ceil(rows))
                     <= usize::from(config.tile_count)
             })
             .ok_or_else(|| {
@@ -616,8 +631,8 @@ pub fn plan_flash_attention(
     } else {
         config.query_block_rows
     }
-    .min(config.sequence_length);
-    let query_blocks = config.sequence_length.div_ceil(query_block_rows);
+    .min(query_sequence_length);
+    let query_blocks = query_sequence_length.div_ceil(query_block_rows);
     let task_count = head_count * usize::from(query_blocks);
     if task_count > usize::from(config.tile_count) {
         return Err(CompileError::Graph(format!(
@@ -656,7 +671,7 @@ pub fn plan_flash_attention(
         for head in 0..config.attention_heads {
             for query_block in 0..query_blocks {
                 let (query_row_start, query_rows) =
-                    balanced_partition(config.sequence_length, query_blocks, query_block);
+                    balanced_partition(query_sequence_length, query_blocks, query_block);
                 let tile = u16::try_from(tasks.len())
                     .map_err(|_| CompileError::Graph("attention tile index overflow".into()))?;
                 let elements = u32::from(query_rows) * u32::from(head_dimension);
@@ -713,7 +728,17 @@ pub fn plan_flash_attention(
                 .collect::<Vec<_>>();
             debug_assert!(!head_tiles.is_empty());
             for key_block in 0..key_blocks {
-                let owner = head_tiles[usize::from(key_block) % head_tiles.len()];
+                let owner = if head_tiles.len() == 1 {
+                    let global_head = usize::from(batch) * usize::from(config.attention_heads)
+                        + usize::from(head);
+                    u16::try_from(
+                        (global_head * usize::from(key_blocks) + usize::from(key_block))
+                            % usize::from(config.tile_count),
+                    )
+                    .map_err(|_| CompileError::Graph("attention owner tile overflow".into()))?
+                } else {
+                    head_tiles[usize::from(key_block) % head_tiles.len()]
+                };
                 let (key_row_start, key_rows) =
                     balanced_partition(config.sequence_length, key_blocks, key_block);
                 let matrix_size = matrix_storage_bytes(key_block_columns, padded_head_dimension);
@@ -1104,6 +1129,7 @@ fn select_key_block_rows(sequence_length: u16, maximum_rows: u16) -> u16 {
 fn validate(config: FlashAttentionConfig) -> Result<(), CompileError> {
     if config.batch_size == 0
         || config.sequence_length == 0
+        || (config.query_sequence_length != 0 && config.query_sequence_length < 6)
         || config.hidden_size == 0
         || config.attention_heads == 0
         || config.tile_count == 0
@@ -1185,6 +1211,7 @@ mod tests {
             for batch_size in [1, 2, 5] {
                 let config = FlashAttentionConfig {
                     batch_size,
+                    query_sequence_length: 0,
                     sequence_length: 128,
                     hidden_size,
                     attention_heads: 16,
@@ -1233,6 +1260,7 @@ mod tests {
     fn automatic_query_blocking_never_oversubscribes_tiles() {
         let plan = plan_flash_attention(FlashAttentionConfig {
             batch_size: 8,
+            query_sequence_length: 0,
             sequence_length: 256,
             hidden_size: 1024,
             attention_heads: 16,
@@ -1251,6 +1279,7 @@ mod tests {
     fn long_sequence_stripes_key_value_storage() {
         let plan = plan_flash_attention(FlashAttentionConfig {
             batch_size: 1,
+            query_sequence_length: 0,
             sequence_length: 1024,
             hidden_size: 1152,
             attention_heads: 16,
@@ -1277,6 +1306,36 @@ mod tests {
                 .map(|block| block.tile)
                 .collect::<BTreeSet<_>>();
             assert_eq!(owners.len(), blocks.len());
+        }
+    }
+
+    #[test]
+    fn short_queries_attend_to_a_long_key_value_sequence() {
+        let plan = plan_flash_attention(FlashAttentionConfig {
+            batch_size: 1,
+            query_sequence_length: 12,
+            sequence_length: 729,
+            hidden_size: 1152,
+            attention_heads: 16,
+            query_block_rows: 12,
+            key_block_rows: 13,
+            tile_count: 1472,
+            data_base: 0xa0000,
+            data_limit: 0xe8000,
+        })
+        .unwrap();
+
+        assert_eq!(plan.tasks.len(), 16);
+        assert!(plan.tasks.iter().all(|task| task.query_rows == 12));
+        for head in 0..16 {
+            assert_eq!(
+                plan.key_values
+                    .iter()
+                    .filter(|block| block.head == head)
+                    .map(|block| block.key_rows)
+                    .sum::<u16>(),
+                729
+            );
         }
     }
 
@@ -1325,6 +1384,7 @@ mod tests {
             &shards,
             FlashAttentionConfig {
                 batch_size: 1,
+                query_sequence_length: 0,
                 sequence_length: row_start,
                 hidden_size: 88,
                 attention_heads: 4,

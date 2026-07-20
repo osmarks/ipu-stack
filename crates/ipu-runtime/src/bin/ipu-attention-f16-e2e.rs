@@ -76,6 +76,7 @@ struct Case<'a> {
 fn run_case(case: Case<'_>) {
     let config = FlashAttentionConfig {
         batch_size: case.batch_size,
+        query_sequence_length: 0,
         sequence_length: case.sequence_length,
         hidden_size: case.hidden_size,
         attention_heads: ATTENTION_HEADS,
