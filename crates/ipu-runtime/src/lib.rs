@@ -8,6 +8,7 @@ use ipu_package::{
     TileMemory,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Range;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
@@ -68,6 +69,7 @@ struct TileHostPlans {
 struct TileExchangePlans {
     addresses: Vec<u32>,
     compute_runs: Vec<static_codegen::ExchangeComputeRun>,
+    templates: Vec<static_codegen::StaticTemplatePlan>,
     end: u32,
 }
 
@@ -191,6 +193,12 @@ pub struct ExecutableGraph {
     pub outputs: Vec<Binding>,
     pub host_inputs: Vec<Binding>,
     pub host_outputs: Vec<Binding>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StaticTemplateRegion {
+    pub name: String,
+    pub phase_instances: Vec<Range<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -375,7 +383,15 @@ fn optional_environment_number(name: &str) -> Result<Option<u64>> {
 }
 
 pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<Application> {
-    package_graph_impl(graph, objects, &[], None)
+    package_graph_impl(graph, objects, &[], None, &[])
+}
+
+pub fn package_graph_with_templates(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+    templates: &[StaticTemplateRegion],
+) -> Result<Application> {
+    package_graph_impl(graph, objects, &[], None, templates)
 }
 
 pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile> {
@@ -1101,7 +1117,7 @@ fn package_graph_with_profile(
         shape: vec![(file_offset / 4) as u32],
         slices,
     });
-    let app = package_graph_impl(&profile_graph, objects, &profile_code, Some(programs))?;
+    let app = package_graph_impl(&profile_graph, objects, &profile_code, Some(programs), &[])?;
     Ok((
         app,
         ProfileLayout {
@@ -1116,6 +1132,7 @@ fn package_graph_impl(
     objects: &[Vec<u8>],
     profile_code: &[static_codegen::ProfileCode],
     lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
+    template_regions: &[StaticTemplateRegion],
 ) -> Result<Application> {
     let topology = Topology::c600();
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
@@ -1182,11 +1199,14 @@ fn package_graph_impl(
                 program,
                 &addresses,
                 cursor,
-                profile_code.is_empty(),
+                profile_code.is_empty() && template_regions.is_empty(),
             )?;
+            let (templates, end) =
+                static_codegen::plan_static_templates(program, &addresses, template_regions, end)?;
             Ok(TileExchangePlans {
                 addresses,
                 compute_runs,
+                templates,
                 end,
             })
         })
@@ -1429,49 +1449,52 @@ fn package_graph_impl(
                 .clone())
         })
         .collect::<Result<Vec<_>>>()?;
-    let emit_program = |program_index: usize, symbols: &BTreeMap<String, u32>| {
-        let program = &programs[program_index];
-        let host_plans = &tile_host_plans[program_index];
-        let physical = topology.physical(program.tile)?;
-        let host_inputs = host_plans.addresses[..host.inputs.len()]
-            .iter()
-            .copied()
-            .zip(&host_plans.run_tables[..host.inputs.len()])
-            .zip(&host.inputs)
-            .map(
-                |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
-                    address,
-                    active: host_phase_is_active(physical, transfer),
-                    run_table,
+    let emit_program =
+        |program_index: usize, symbols: &BTreeMap<String, u32>, generated_base: u32| {
+            let program = &programs[program_index];
+            let host_plans = &tile_host_plans[program_index];
+            let physical = topology.physical(program.tile)?;
+            let host_inputs = host_plans.addresses[..host.inputs.len()]
+                .iter()
+                .copied()
+                .zip(&host_plans.run_tables[..host.inputs.len()])
+                .zip(&host.inputs)
+                .map(
+                    |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
+                        address,
+                        active: host_phase_is_active(physical, transfer),
+                        run_table,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let host_outputs = host_plans.addresses[host.inputs.len()..]
+                .iter()
+                .copied()
+                .zip(&host_plans.run_tables[host.inputs.len()..])
+                .zip(&host.outputs)
+                .map(
+                    |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
+                        address,
+                        active: host_phase_is_active(physical, transfer),
+                        run_table,
+                    },
+                )
+                .collect::<Vec<_>>();
+            static_codegen::emit(
+                program,
+                symbols,
+                &tile_exchange_plans[program_index].addresses,
+                &tile_exchange_plans[program_index].compute_runs,
+                &tile_exchange_plans[program_index].templates,
+                static_codegen::HostCode {
+                    inputs: &host_inputs,
+                    outputs: &host_outputs,
+                    run_state: host_plans.run_state,
                 },
+                profile_code.get(program_index),
+                generated_base,
             )
-            .collect::<Vec<_>>();
-        let host_outputs = host_plans.addresses[host.inputs.len()..]
-            .iter()
-            .copied()
-            .zip(&host_plans.run_tables[host.inputs.len()..])
-            .zip(&host.outputs)
-            .map(
-                |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
-                    address,
-                    active: host_phase_is_active(physical, transfer),
-                    run_table,
-                },
-            )
-            .collect::<Vec<_>>();
-        static_codegen::emit(
-            program,
-            symbols,
-            &tile_exchange_plans[program_index].addresses,
-            &tile_exchange_plans[program_index].compute_runs,
-            static_codegen::HostCode {
-                inputs: &host_inputs,
-                outputs: &host_outputs,
-                run_state: host_plans.run_state,
-            },
-            profile_code.get(program_index),
-        )
-    };
+        };
     let image_bases = programs
         .iter()
         .zip(&preliminary_images)
@@ -1522,12 +1545,12 @@ fn package_graph_impl(
                 .clone())
         })
         .collect::<Result<Vec<_>>>()?;
-    let generated = images
+    let preliminary_generated = images
         .iter()
         .enumerate()
-        .map(|(index, image)| emit_program(index, &image.symbols))
+        .map(|(index, image)| emit_program(index, &image.symbols, 0))
         .collect::<Result<Vec<_>>>()?;
-    if let Some((index, generated_code)) = generated
+    if let Some((index, generated_code)) = preliminary_generated
         .iter()
         .enumerate()
         .max_by_key(|(_, code)| code.len())
@@ -1558,7 +1581,7 @@ fn package_graph_impl(
     }
     let program_bases = programs
         .iter()
-        .zip(&generated)
+        .zip(&preliminary_generated)
         .zip(&images)
         .zip(&completion_addresses)
         .map(|(((program, code), image), &tile_runtime_end)| {
@@ -1577,6 +1600,19 @@ fn package_graph_impl(
             )
         })
         .collect::<Result<Vec<_>>>()?;
+    let generated = images
+        .iter()
+        .zip(&program_bases)
+        .enumerate()
+        .map(|(index, (image, &base))| emit_program(index, &image.symbols, base))
+        .collect::<Result<Vec<_>>>()?;
+    if generated
+        .iter()
+        .zip(&preliminary_generated)
+        .any(|(final_code, preliminary)| final_code.len() != preliminary.len())
+    {
+        return Err("generated program size changed after executable placement".into());
+    }
     for allocation in &graph.schedule.allocations {
         let end = allocation
             .address
@@ -1740,6 +1776,22 @@ fn package_graph_impl(
                 run.table_address,
                 &words_to_bytes(&run.table_entries),
             )?;
+        }
+        for template in &tile_exchange_plans[tile_index].templates {
+            for (&address, record) in template.record_addresses.iter().zip(&template.records) {
+                let words = record
+                    .iter()
+                    .map(|word| match word {
+                        static_codegen::StaticTemplateRecordWord::Value(value) => Ok(*value),
+                        static_codegen::StaticTemplateRecordWord::Symbol(name) => image
+                            .symbols
+                            .get(name)
+                            .copied()
+                            .ok_or_else(|| format!("static template references missing {name}")),
+                    })
+                    .collect::<std::result::Result<Vec<_>, String>>()?;
+                write_plan_bytes(&mut plan_region, address, &words_to_bytes(&words))?;
+            }
         }
         write_static_host_plans(
             physical as u16,

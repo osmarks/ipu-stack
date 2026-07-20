@@ -1,6 +1,7 @@
 use crate::Result;
 use ipu_compiler::{LoweredTileProgram, LoweredTileStep};
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 const INCOMING_DBASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;
@@ -53,6 +54,325 @@ pub(crate) struct ExchangeComputeRun {
     pub iterations: usize,
     pub table_address: u32,
     pub table_entries: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StaticTemplatePlan {
+    pub name: String,
+    pub instance_steps: Vec<Range<usize>>,
+    pub record_addresses: Vec<u32>,
+    pub records: Vec<Vec<StaticTemplateRecordWord>>,
+    steps: Vec<StaticTemplateStep>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum StaticTemplateRecordWord {
+    Value(u32),
+    Symbol(String),
+}
+
+#[derive(Clone, Debug)]
+enum StaticTemplateStep {
+    Exchange,
+    Compute {
+        operation: String,
+        operands: Vec<u32>,
+        dynamic_operands: Vec<bool>,
+        dynamic_kernel: bool,
+        conditional: bool,
+    },
+    Idle,
+}
+
+pub(crate) fn plan_static_templates(
+    program: &LoweredTileProgram,
+    plan_addresses: &[u32],
+    regions: &[crate::StaticTemplateRegion],
+    mut cursor: u32,
+) -> Result<(Vec<StaticTemplatePlan>, u32)> {
+    let mut plan_by_step = vec![None; program.steps.len()];
+    let mut plans = plan_addresses.iter().copied();
+    for (step_index, step) in program.steps.iter().enumerate() {
+        if matches!(step, LoweredTileStep::Exchange { .. }) {
+            plan_by_step[step_index] = plans.next();
+        }
+    }
+    if plans.next().is_some() {
+        return Err("unused exchange plan while planning static templates".into());
+    }
+
+    let mut templates = Vec::with_capacity(regions.len());
+    let mut previous_end = 0;
+    for region in regions {
+        if region.phase_instances.len() < 2 {
+            return Err(format!("template {} requires at least two instances", region.name).into());
+        }
+        let instance_steps = region
+            .phase_instances
+            .iter()
+            .map(|phases| phase_range_to_step_range(program, phases))
+            .collect::<Result<Vec<_>>>()?;
+        if instance_steps[0].start < previous_end
+            || instance_steps
+                .windows(2)
+                .any(|pair| pair[0].end != pair[1].start)
+        {
+            return Err(format!(
+                "template {} instances must be ordered, contiguous, and non-overlapping",
+                region.name
+            )
+            .into());
+        }
+        let phase_count = region.phase_instances[0].len();
+        if phase_count == 0
+            || region
+                .phase_instances
+                .iter()
+                .any(|phases| phases.len() != phase_count)
+        {
+            return Err(format!(
+                "template {} instances have different phase counts",
+                region.name
+            )
+            .into());
+        }
+        let mut records = vec![Vec::new(); instance_steps.len()];
+        let mut template_steps = Vec::new();
+        for relative_phase in 0..phase_count {
+            let phase_steps = instance_steps
+                .iter()
+                .zip(&region.phase_instances)
+                .map(|(steps, phases)| {
+                    let phase = phases.start + relative_phase;
+                    steps
+                        .clone()
+                        .filter(|&index| step_phase(&program.steps[index]) == phase)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let all_exchange = phase_steps.iter().all(|steps| {
+                !steps.is_empty()
+                    && steps.iter().all(|&index| {
+                        matches!(program.steps[index], LoweredTileStep::Exchange { .. })
+                    })
+            });
+            let all_compute = phase_steps.iter().all(|steps| {
+                steps.iter().all(|&index| {
+                    matches!(
+                        program.steps[index],
+                        LoweredTileStep::Compute(_) | LoweredTileStep::IdleCompute { .. }
+                    )
+                })
+            });
+            if all_exchange {
+                let epoch_count = phase_steps[0].len();
+                if phase_steps.iter().any(|steps| steps.len() != epoch_count) {
+                    return Err(format!(
+                        "template {} changes exchange epoch count in phase {relative_phase}",
+                        region.name
+                    )
+                    .into());
+                }
+                for epoch in 0..epoch_count {
+                    for (instance, steps) in phase_steps.iter().enumerate() {
+                        let step_index = steps[epoch];
+                        let LoweredTileStep::Exchange { row, .. } = &program.steps[step_index]
+                        else {
+                            unreachable!();
+                        };
+                        let address = plan_by_step[step_index]
+                            .ok_or("template exchange has no plan address")?;
+                        let active = row.first() != Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION);
+                        records[instance].push(StaticTemplateRecordWord::Value(address));
+                        records[instance].push(StaticTemplateRecordWord::Value(u32::from(active)));
+                    }
+                    template_steps.push(StaticTemplateStep::Exchange);
+                }
+            } else if all_compute {
+                let commands = phase_steps
+                    .iter()
+                    .map(|steps| {
+                        steps
+                            .iter()
+                            .filter_map(|&index| {
+                                let LoweredTileStep::Compute(command) = &program.steps[index]
+                                else {
+                                    return None;
+                                };
+                                Some(command)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let command_count = commands.iter().map(Vec::len).max().unwrap_or(0);
+                if command_count == 0 {
+                    template_steps.push(StaticTemplateStep::Idle);
+                } else {
+                    for command_index in 0..command_count {
+                        template_steps.push(plan_template_compute_step(
+                            &commands,
+                            command_index,
+                            &mut records,
+                            &region.name,
+                            relative_phase,
+                        )?);
+                    }
+                }
+            } else {
+                return Err(format!(
+                    "template {} changes phase kind in phase {relative_phase}",
+                    region.name
+                )
+                .into());
+            }
+        }
+        let mut record_addresses = Vec::with_capacity(records.len());
+        for record in &records {
+            cursor = (cursor + 3) & !3;
+            record_addresses.push(cursor);
+            cursor = cursor
+                .checked_add(
+                    u32::try_from(record.len())?
+                        .checked_mul(4)
+                        .ok_or("static template record size overflow")?,
+                )
+                .ok_or("static template record address overflow")?;
+        }
+        previous_end = instance_steps.last().unwrap().end;
+        templates.push(StaticTemplatePlan {
+            name: region.name.clone(),
+            instance_steps,
+            record_addresses,
+            records,
+            steps: template_steps,
+        });
+    }
+    Ok((templates, cursor))
+}
+
+fn plan_template_compute_step(
+    commands: &[Vec<&ipu_compiler::LoweredComputeCommand>],
+    command_index: usize,
+    records: &mut [Vec<StaticTemplateRecordWord>],
+    template_name: &str,
+    relative_phase: usize,
+) -> Result<StaticTemplateStep> {
+    let active = commands
+        .iter()
+        .filter_map(|commands| commands.get(command_index).copied())
+        .collect::<Vec<_>>();
+    let first = active[0];
+    if active.iter().any(|command| {
+        command.input_addresses.len() != first.input_addresses.len()
+            || command.arguments.len() != first.arguments.len()
+    }) {
+        return Err(format!(
+            "template {template_name} changes compute ABI in phase {relative_phase} call {command_index}"
+        )
+        .into());
+    }
+    if first.input_addresses.len() != 2 || first.arguments.len() > KERNEL_ARGUMENT_REGISTERS {
+        return Err(format!(
+            "template {template_name} has unsupported compute ABI in phase {relative_phase} call {command_index}"
+        )
+        .into());
+    }
+    let operands = active
+        .iter()
+        .map(|command| {
+            std::iter::once(command.output_address)
+                .chain(command.input_addresses.iter().copied())
+                .chain(command.arguments.iter().copied())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let dynamic_operands = (0..operands[0].len())
+        .map(|operand| {
+            operands[1..]
+                .iter()
+                .any(|values| values[operand] != operands[0][operand])
+        })
+        .collect::<Vec<_>>();
+    let conditional = active.len() != commands.len();
+    let dynamic_kernel = active
+        .iter()
+        .any(|command| command.specialization.operation != first.specialization.operation);
+    for (record, instance_commands) in records.iter_mut().zip(commands) {
+        let command = instance_commands.get(command_index).copied();
+        if conditional {
+            record.push(StaticTemplateRecordWord::Value(u32::from(
+                command.is_some(),
+            )));
+        }
+        if dynamic_kernel {
+            match command {
+                Some(command) => record.push(StaticTemplateRecordWord::Symbol(format!(
+                    "ipu_stack_{}",
+                    command.specialization.operation
+                ))),
+                None => record.push(StaticTemplateRecordWord::Value(0)),
+            }
+        }
+        let values = command
+            .map(|command| {
+                std::iter::once(command.output_address)
+                    .chain(command.input_addresses.iter().copied())
+                    .chain(command.arguments.iter().copied())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| operands[0].clone());
+        record.extend(
+            values
+                .iter()
+                .zip(&dynamic_operands)
+                .filter_map(|(&value, &dynamic)| {
+                    dynamic.then_some(StaticTemplateRecordWord::Value(value))
+                }),
+        );
+    }
+    Ok(StaticTemplateStep::Compute {
+        operation: first.specialization.operation.clone(),
+        operands: operands[0].clone(),
+        dynamic_operands,
+        dynamic_kernel,
+        conditional,
+    })
+}
+
+fn phase_range_to_step_range(
+    program: &LoweredTileProgram,
+    phases: &Range<usize>,
+) -> Result<Range<usize>> {
+    if phases.start >= phases.end {
+        return Err("static template phase range is empty".into());
+    }
+    let start = program
+        .steps
+        .iter()
+        .position(|step| step_phase(step) >= phases.start)
+        .unwrap_or(program.steps.len());
+    let end = program
+        .steps
+        .iter()
+        .position(|step| step_phase(step) >= phases.end)
+        .unwrap_or(program.steps.len());
+    if start == end
+        || program.steps[start..end]
+            .iter()
+            .any(|step| !phases.contains(&step_phase(step)))
+    {
+        return Err("static template phase range does not map to contiguous tile steps".into());
+    }
+    Ok(start..end)
+}
+
+fn step_phase(step: &LoweredTileStep) -> usize {
+    match step {
+        LoweredTileStep::Exchange { phase, .. } | LoweredTileStep::IdleCompute { phase, .. } => {
+            *phase
+        }
+        LoweredTileStep::Compute(command) => command.phase,
+    }
 }
 
 pub(crate) fn plan_exchange_compute_runs(
@@ -187,14 +507,19 @@ pub(crate) fn emit(
     symbols: &BTreeMap<String, u32>,
     plan_addresses: &[u32],
     compute_runs: &[ExchangeComputeRun],
+    templates: &[StaticTemplatePlan],
     host: HostCode<'_>,
     profile: Option<&ProfileCode>,
+    generated_base: u32,
 ) -> Result<Vec<u8>> {
     if let Some(profile) = profile
         && (profile.after_sync.len() != program.steps.len()
             || profile.after_step.len() != program.steps.len())
     {
         return Err("profile boundary count differs from tile step count".into());
+    }
+    if profile.is_some() && !templates.is_empty() {
+        return Err("profiled code cannot use static templates".into());
     }
     let mut code = TileCode::new();
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
@@ -217,7 +542,28 @@ pub(crate) fn emit(
     let mut plan_index = 0usize;
     let mut step_index = 0;
     let mut run_index = 0;
+    let mut template_index = 0;
+    let mut template_calls = Vec::<(usize, usize)>::new();
     while step_index < program.steps.len() {
+        if let Some(template) = templates.get(template_index)
+            && template.instance_steps[0].start == step_index
+        {
+            for &record_address in &template.record_addresses {
+                code.setzi(2, record_address)?;
+                let call = code.words.len();
+                code.call(0, 9)?;
+                template_calls.push((call, template_index));
+            }
+            plan_index += template
+                .instance_steps
+                .iter()
+                .flat_map(|range| &program.steps[range.clone()])
+                .filter(|step| matches!(step, LoweredTileStep::Exchange { .. }))
+                .count();
+            step_index = template.instance_steps.last().unwrap().end;
+            template_index += 1;
+            continue;
+        }
         if let Some(run) = compute_runs.get(run_index)
             && run.start_step == step_index
         {
@@ -304,7 +650,119 @@ pub(crate) fn emit(
     }
     emit_host_phases(&mut code, symbols, host.outputs, host.run_state)?;
     code.jump(symbol(symbols, COMPLETE)?)?;
+    let mut template_bodies = Vec::with_capacity(templates.len());
+    for template in templates {
+        template_bodies.push(code.words.len());
+        emit_static_template_body(&mut code, template, symbols, worker_barrier, generated_base)?;
+    }
+    for (call, template) in template_calls {
+        let target = generated_address(generated_base, template_bodies[template])?;
+        code.words[call] = ipu_exchange::encode_call_m_immediate(9, target)?;
+    }
     Ok(code.words.into_iter().flat_map(u32::to_le_bytes).collect())
+}
+
+fn emit_static_template_body(
+    code: &mut TileCode,
+    template: &StaticTemplatePlan,
+    symbols: &BTreeMap<String, u32>,
+    worker_barrier: u32,
+    generated_base: u32,
+) -> Result<()> {
+    code.add_immediate(11, 11, -16)?;
+    code.st32(2, 11, 15, 0)?;
+    code.st32(9, 11, 15, 1)?;
+    for planned in &template.steps {
+        match planned {
+            StaticTemplateStep::Exchange => {
+                code.ld32(1, 11, 15, 0)?;
+                code.ld32(8, 1, 15, 0)?;
+                code.ld32(0, 1, 15, 1)?;
+                code.add_immediate(1, 1, 8)?;
+                code.st32(1, 11, 15, 0)?;
+                code.st32(8, 11, 15, 2)?;
+                code.instruction(ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
+                let skip_barrier = code.words.len();
+                code.brz(0, 0)?;
+                code.call(worker_barrier, 7)?;
+                let after_barrier = generated_address(generated_base, code.words.len())?;
+                code.words[skip_barrier] = ipu_exchange::encode_brz_m_immediate(0, after_barrier)?;
+                code.ld32(8, 11, 15, 2)?;
+                let return_address = generated_address(generated_base, code.words.len() + 2)?;
+                code.setzi(10, return_address)?;
+                code.branch(8)?;
+            }
+            StaticTemplateStep::Compute {
+                operation,
+                operands,
+                dynamic_operands,
+                dynamic_kernel,
+                conditional,
+            } => {
+                let dynamic_count = dynamic_operands.iter().filter(|&&dynamic| dynamic).count();
+                let record_words =
+                    dynamic_count + usize::from(*conditional) + usize::from(*dynamic_kernel);
+                if record_words != 0 {
+                    code.ld32(1, 11, 15, 0)?;
+                }
+                if *conditional {
+                    code.ld32(0, 1, 15, 0)?;
+                }
+                let kernel_offset = u16::from(*conditional);
+                if *dynamic_kernel {
+                    code.ld32(8, 1, 15, kernel_offset)?;
+                }
+                let mut dynamic_offset = kernel_offset + u16::from(*dynamic_kernel);
+                for (operand, (&value, &dynamic)) in
+                    operands.iter().zip(dynamic_operands).enumerate()
+                {
+                    let register = u8::try_from(operand)? + 2;
+                    if dynamic {
+                        code.ld32(register, 1, 15, dynamic_offset)?;
+                        dynamic_offset += 1;
+                    } else {
+                        code.setzi(register, value)?;
+                    }
+                }
+                if record_words != 0 {
+                    code.add_immediate(1, 1, i32::try_from(record_words * 4)?)?;
+                    code.st32(1, 11, 15, 0)?;
+                }
+                let skip_call = if *conditional {
+                    let branch = code.words.len();
+                    code.brz(0, 0)?;
+                    Some(branch)
+                } else {
+                    None
+                };
+                if *dynamic_kernel {
+                    let return_address = generated_address(generated_base, code.words.len() + 2)?;
+                    code.setzi(10, return_address)?;
+                    code.branch(8)?;
+                } else {
+                    code.call(symbol(symbols, &format!("ipu_stack_{operation}"))?, 10)?;
+                }
+                if let Some(branch) = skip_call {
+                    let after_call = generated_address(generated_base, code.words.len())?;
+                    code.words[branch] = ipu_exchange::encode_brz_m_immediate(0, after_call)?;
+                }
+            }
+            StaticTemplateStep::Idle => {}
+        }
+    }
+    code.ld32(9, 11, 15, 1)?;
+    code.add_immediate(11, 11, 16)?;
+    code.branch(9)?;
+    Ok(())
+}
+
+fn generated_address(base: u32, word: usize) -> Result<u32> {
+    base.checked_add(
+        u32::try_from(word)?
+            .checked_mul(4)
+            .ok_or("generated code offset overflow")?,
+    )
+    .ok_or_else(|| "generated code address overflow".into())
 }
 
 fn emit_next_cycle_sample(
@@ -389,6 +847,32 @@ impl TileCode {
         self.words.push(instruction);
     }
 
+    fn ld32(&mut self, destination: u8, base: u8, delta: u8, offset: u16) -> Result<()> {
+        self.words.push(ipu_exchange::encode_ld32_m_immediate(
+            destination,
+            base,
+            delta,
+            offset,
+        )?);
+        Ok(())
+    }
+
+    fn st32(&mut self, source: u8, base: u8, delta: u8, offset: u16) -> Result<()> {
+        self.words.push(ipu_exchange::encode_st32_m_immediate(
+            source, base, delta, offset,
+        )?);
+        Ok(())
+    }
+
+    fn add_immediate(&mut self, destination: u8, source: u8, immediate: i32) -> Result<()> {
+        self.words.push(ipu_exchange::encode_add_m_immediate(
+            destination,
+            source,
+            immediate,
+        )?);
+        Ok(())
+    }
+
     fn put_special(&mut self, special: u8, register: u8) -> Result<()> {
         self.words
             .push(ipu_exchange::encode_put_special_m(special, register)?);
@@ -400,6 +884,17 @@ impl TileCode {
             return_register,
             target,
         )?);
+        Ok(())
+    }
+
+    fn branch(&mut self, register: u8) -> Result<()> {
+        self.words.push(ipu_exchange::encode_br_m(register)?);
+        Ok(())
+    }
+
+    fn brz(&mut self, register: u8, target: u32) -> Result<()> {
+        self.words
+            .push(ipu_exchange::encode_brz_m_immediate(register, target)?);
         Ok(())
     }
 
@@ -432,6 +927,15 @@ mod tests {
     }
 
     fn compute(phase: usize, input_address: u32, arguments: Vec<u32>) -> LoweredTileStep {
+        compute_with_operation(phase, input_address, arguments, "gemm_f16_accumulate")
+    }
+
+    fn compute_with_operation(
+        phase: usize,
+        input_address: u32,
+        arguments: Vec<u32>,
+        operation: &str,
+    ) -> LoweredTileStep {
         LoweredTileStep::Compute(LoweredComputeCommand {
             op: OpId(phase),
             phase,
@@ -441,7 +945,7 @@ mod tests {
             input_addresses: vec![0x50000, input_address],
             arguments,
             specialization: SpecializationKey {
-                operation: "gemm_f16_accumulate".into(),
+                operation: operation.into(),
                 shape: vec![12, 64, 64],
                 worker_count: 6,
                 role: "inner-block".into(),
@@ -449,6 +953,54 @@ mod tests {
             },
             metadata: BTreeMap::new(),
         })
+    }
+
+    #[test]
+    fn templates_align_rotated_tile_work_by_global_phase() {
+        let program = LoweredTileProgram {
+            tile: 7,
+            steps: vec![
+                exchange(0, true),
+                compute_with_operation(1, 0x54000, Vec::new(), "gemm_f16_accumulate"),
+                compute_with_operation(1, 0x58000, Vec::new(), "add_f16"),
+                exchange(2, false),
+                compute_with_operation(3, 0x5c000, Vec::new(), "add_f16"),
+            ],
+        };
+        let regions = [crate::StaticTemplateRegion {
+            name: "encoder_layer".into(),
+            phase_instances: vec![0..2, 2..4],
+        }];
+
+        let (templates, end) =
+            plan_static_templates(&program, &[0x52000, 0x52020], &regions, 0x53002).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        let template = &templates[0];
+        assert_eq!(template.name, "encoder_layer");
+        assert_eq!(template.instance_steps, [0..3, 3..5]);
+        assert_eq!(template.steps.len(), 3);
+        assert!(matches!(template.steps[0], StaticTemplateStep::Exchange));
+        assert!(matches!(
+            template.steps[1],
+            StaticTemplateStep::Compute {
+                dynamic_kernel: true,
+                conditional: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            template.steps[2],
+            StaticTemplateStep::Compute {
+                conditional: true,
+                ..
+            }
+        ));
+        assert_eq!(template.records[0].len(), template.records[1].len());
+        assert_eq!(
+            end - template.record_addresses[0],
+            2 * 4 * template.records[0].len() as u32
+        );
     }
 
     #[test]

@@ -10,10 +10,10 @@ use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, allocator_memory_profile,
-    append_host_a16_matrix, append_siglip_encoder_layer, append_siglip_map_head,
-    append_siglip_post_layer_norm, block_binding_typed, block_coordinates, blocked_matrix_f16,
-    package_graph, run_host_with_options,
+    BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, StaticTemplateRegion,
+    allocator_memory_profile, append_host_a16_matrix, append_siglip_encoder_layer,
+    append_siglip_map_head, append_siglip_post_layer_norm, block_binding_typed, block_coordinates,
+    blocked_matrix_f16, package_graph, package_graph_with_templates, run_host_with_options,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -145,7 +145,9 @@ fn main() {
     let detailed_diagnostics = layer_count == 1;
     let mut current = row_shards;
     let mut last_layer = None;
+    let mut layer_phase_ranges = Vec::with_capacity(layer_count);
     for layer in 0..layer_count {
+        let phase_start = plan.schedule.phases.len();
         let appended = append_siglip_encoder_layer(
             &mut plan.schedule,
             &current,
@@ -163,6 +165,7 @@ fn main() {
         .unwrap();
         current = appended.output.clone();
         last_layer = Some(appended);
+        layer_phase_ranges.push(phase_start..plan.schedule.phases.len());
     }
     let last_layer = last_layer.unwrap();
     let norm2 = last_layer.norm2;
@@ -201,7 +204,14 @@ fn main() {
         host_outputs,
     };
     write_memory_profile(&graph);
-    let app = package_graph(&graph, &objects).unwrap();
+    let templates = (layer_phase_ranges.len() >= 2)
+        .then(|| StaticTemplateRegion {
+            name: "siglip_encoder_layer".into(),
+            phase_instances: layer_phase_ranges,
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    let app = package_graph_with_templates(&graph, &objects, &templates).unwrap();
     if let Some(path) = std::env::var_os("IPU_SIGLIP_PACKAGE_OUTPUT") {
         app.write(fs::File::create(path).unwrap()).unwrap();
     }
