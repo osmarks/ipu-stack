@@ -10,11 +10,15 @@ use ipu_exchange::{
 
 mod attention;
 mod mlp;
+mod rowwise;
 pub use attention::{
     AttentionKeyValuePlacement, AttentionTaskPlacement, FlashAttentionConfig, FlashAttentionPlan,
     plan_flash_attention,
 };
 pub use mlp::{BlockedMlpConfig, BlockedMlpPlan, plan_blocked_mlp};
+pub use rowwise::{
+    AffineLayerNormConfig, AffineLayerNormPlan, RowShardPlacement, plan_affine_layer_norm_f16,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_TILE_COUNT: u16 = 64;
