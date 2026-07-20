@@ -22,7 +22,8 @@ pub use rowwise::{
     AppendedAffineLayerNorm, RowShardPlacement, RowShardTransitionConfig,
     append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
     append_c16_to_a16_blocks_gelu_f16, append_c16_to_a16_row_shards,
-    append_c16_to_a16_row_shards_gelu_f16, end_tensor_lifetimes, plan_affine_layer_norm_f16,
+    append_c16_to_a16_row_shards_gelu_f16, end_tensor_lifetimes, make_tensors_resident,
+    plan_affine_layer_norm_f16,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

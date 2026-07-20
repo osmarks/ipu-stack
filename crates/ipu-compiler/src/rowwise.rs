@@ -116,6 +116,30 @@ pub fn end_tensor_lifetimes(
     Ok(())
 }
 
+pub fn make_tensors_resident(
+    schedule: &mut Schedule,
+    tensors: impl IntoIterator<Item = TensorId>,
+) -> Result<(), CompileError> {
+    let tensors = tensors
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let mut found = std::collections::HashSet::new();
+    for allocation in &mut schedule.allocations {
+        if allocation.kind == AllocationKind::Home && tensors.contains(&allocation.tensor) {
+            found.insert(allocation.tensor);
+            allocation.live_from = 0;
+            allocation.live_until = usize::MAX;
+        }
+    }
+    if let Some(tensor) = tensors.difference(&found).next() {
+        return Err(CompileError::Graph(format!(
+            "cannot retain unknown tensor {}",
+            tensor.0
+        )));
+    }
+    Ok(())
+}
+
 pub fn append_add_f16_row_shards_in_place(
     schedule: &mut Schedule,
     destination: &[RowShardPlacement],
@@ -778,6 +802,34 @@ pub fn append_affine_layer_norm_f16(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_tensors_cover_the_full_execution_lifetime() {
+        let tensor = TensorId(4);
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: vec![Phase::Exchange {
+                transfers: Vec::new(),
+            }],
+            allocations: vec![Allocation {
+                tensor,
+                tile: 0,
+                address: 0x80000,
+                size: 128,
+                live_from: 1,
+                live_until: 2,
+                kind: AllocationKind::Home,
+            }],
+            tile_count: 1,
+            peak_sram: BTreeMap::new(),
+        };
+
+        make_tensors_resident(&mut schedule, [tensor]).unwrap();
+
+        let allocation = &schedule.allocations[0];
+        assert_eq!(allocation.live_from, 0);
+        assert_eq!(allocation.live_until, usize::MAX);
+    }
 
     #[test]
     fn affine_layer_norm_balances_non_divisible_rows() {
