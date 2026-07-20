@@ -440,6 +440,7 @@ dependencies = [
  "ipu-driver",
  "ipu-elf",
  "ipu-exchange",
+ "ipu-models",
  "ipu-package",
  "thiserror",
  "tracing",

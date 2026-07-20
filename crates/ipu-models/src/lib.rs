@@ -48,8 +48,59 @@ struct SiglipConfigFile {
 }
 
 pub struct SiglipWeights {
-    mapping: Mmap,
+    tensors: TensorArchive,
     pub config: SiglipVisionConfig,
+}
+
+pub struct TensorArchive {
+    mapping: Mmap,
+}
+
+impl TensorArchive {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let file = File::open(path)?;
+        // The mapping is read-only and remains owned by the archive for every tensor view.
+        let mapping = unsafe { Mmap::map(&file)? };
+        SafeTensors::deserialize(&mapping)?;
+        Ok(Self { mapping })
+    }
+
+    pub fn tensor_shape(&self, name: &str) -> Result<Vec<usize>> {
+        self.with_tensor(name, |tensor| Ok(tensor.shape().to_vec()))
+    }
+
+    pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>> {
+        self.with_tensor(name, |tensor| {
+            if tensor.dtype() != Dtype::F32 {
+                return Err(ModelError::Invalid(format!(
+                    "{name} has {:?} data, expected F32",
+                    tensor.dtype()
+                )));
+            }
+            Ok(tensor
+                .data()
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+                .collect())
+        })
+    }
+
+    pub fn tensor_f16(&self, name: &str) -> Result<Vec<f16>> {
+        Ok(self
+            .tensor_f32(name)?
+            .into_iter()
+            .map(f16::from_f32)
+            .collect())
+    }
+
+    fn with_tensor<T>(
+        &self,
+        name: &str,
+        operation: impl FnOnce(TensorView<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let tensors = SafeTensors::deserialize(&self.mapping)?;
+        operation(tensors.tensor(name)?)
+    }
 }
 
 impl SiglipWeights {
@@ -57,11 +108,8 @@ impl SiglipWeights {
         let directory = model_directory.as_ref();
         let config: SiglipConfigFile =
             serde_json::from_reader(File::open(directory.join("config.json"))?)?;
-        let weights = File::open(directory.join("model.safetensors"))?;
-        // The mapping is read-only and remains owned by this object for every tensor view.
-        let mapping = unsafe { Mmap::map(&weights)? };
         let model = Self {
-            mapping,
+            tensors: TensorArchive::open(directory.join("model.safetensors"))?,
             config: config.vision_config,
         };
         model.validate()?;
@@ -86,31 +134,19 @@ impl SiglipWeights {
     }
 
     pub fn tensor_shape(&self, name: &str) -> Result<Vec<usize>> {
-        self.with_tensor(name, |tensor| Ok(tensor.shape().to_vec()))
+        self.tensors.tensor_shape(name)
     }
 
     pub fn tensor_f16(&self, name: &str) -> Result<Vec<f16>> {
-        self.with_tensor(name, |tensor| {
-            if tensor.dtype() != Dtype::F32 {
-                return Err(ModelError::Invalid(format!(
-                    "{name} has {:?} data, expected F32",
-                    tensor.dtype()
-                )));
-            }
-            Ok(tensor
-                .data()
-                .chunks_exact(4)
-                .map(|bytes| {
-                    f16::from_f32(f32::from_le_bytes(
-                        bytes.try_into().expect("four-byte chunk"),
-                    ))
-                })
-                .collect())
-        })
+        self.tensors.tensor_f16(name)
+    }
+
+    pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>> {
+        self.tensors.tensor_f32(name)
     }
 
     pub fn vision_parameter_count(&self) -> Result<usize> {
-        let tensors = SafeTensors::deserialize(&self.mapping)?;
+        let tensors = SafeTensors::deserialize(&self.tensors.mapping)?;
         tensors
             .names()
             .into_iter()
@@ -131,15 +167,6 @@ impl SiglipWeights {
             )));
         }
         Ok(format!("vision_model.encoder.layers.{layer}.{suffix}"))
-    }
-
-    fn with_tensor<T>(
-        &self,
-        name: &str,
-        operation: impl FnOnce(TensorView<'_>) -> Result<T>,
-    ) -> Result<T> {
-        let tensors = SafeTensors::deserialize(&self.mapping)?;
-        operation(tensors.tensor(name)?)
     }
 
     fn validate(&self) -> Result<()> {

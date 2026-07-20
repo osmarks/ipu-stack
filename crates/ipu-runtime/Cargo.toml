@@ -11,6 +11,7 @@ ipu-compiler = { path = "../ipu-compiler" }
 ipu-driver = { path = "../ipu-driver" }
 ipu-elf = { path = "../ipu-elf" }
 ipu-exchange = { path = "../ipu-exchange" }
+ipu-models = { path = "../ipu-models" }
 ipu-package = { path = "../ipu-package" }
 thiserror.workspace = true
 tracing.workspace = true
