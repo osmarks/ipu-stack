@@ -7,6 +7,7 @@ members = [
   "crates/ipu-driver",
   "crates/ipu-runtime",
   "crates/ipu-profile",
+  "crates/ipu-models",
   "crates/ipu-cli",
 ]
 resolver = "3"
@@ -25,9 +26,11 @@ fastrand = "2.3.0"
 hex = "0.4.3"
 half = "2.7.1"
 libc = "0.2.180"
+memmap2 = "0.9.9"
 object = { version = "0.39.1", features = ["read_core", "elf"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+safetensors = "0.8.0"
 sha2 = "0.11.0"
 thiserror = "2.0.18"
 tracing = "0.1.44"
