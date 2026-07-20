@@ -1,6 +1,6 @@
 use crate::{
-    Allocation, AllocationKind, CompileError, KernelCommand, OpId, Phase, Schedule,
-    SpecializationKey, TensorId,
+    Allocation, AllocationKind, BlockPlacement, CompileError, KernelCommand, OpId, Phase, Schedule,
+    SpecializationKey, TensorId, Transfer,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -32,6 +32,163 @@ pub struct AffineLayerNormPlan {
     pub input: Vec<RowShardPlacement>,
     pub affine: Vec<RowShardPlacement>,
     pub output: Vec<RowShardPlacement>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowShardTransitionConfig {
+    pub columns: u16,
+    pub data_base: u32,
+    pub data_limit: u32,
+}
+
+pub fn append_c16_to_a16_row_shards(
+    schedule: &mut Schedule,
+    source: &[BlockPlacement],
+    config: RowShardTransitionConfig,
+) -> Result<Vec<RowShardPlacement>, CompileError> {
+    if source.is_empty()
+        || config.columns == 0
+        || !config.columns.is_multiple_of(16)
+        || config.data_base & 7 != 0
+        || config.data_base >= config.data_limit
+    {
+        return Err(CompileError::Graph(
+            "C16 to A16 transition requires blocks, columns divisible by 16, and aligned SRAM"
+                .into(),
+        ));
+    }
+    let mut rows = BTreeMap::<u16, Vec<&BlockPlacement>>::new();
+    for block in source {
+        rows.entry(block.block_row).or_default().push(block);
+    }
+    let mut next_tensor = schedule
+        .allocations
+        .iter()
+        .map(|allocation| allocation.tensor.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let exchange_phase = schedule.phases.len();
+    let compute_phase = exchange_phase + 1;
+    let mut transfers = Vec::new();
+    let mut commands = Vec::new();
+    let mut destinations = Vec::with_capacity(rows.len());
+    let mut cursors = vec![config.data_base; usize::from(schedule.tile_count)];
+
+    for (destination_tile, (_block_row, mut blocks)) in rows.into_iter().enumerate() {
+        let destination_tile = u16::try_from(destination_tile)
+            .map_err(|_| CompileError::Graph("row-shard destination tile overflow".into()))?;
+        blocks.sort_by_key(|block| block.column_start);
+        let first = blocks[0];
+        let mut next_column = 0u16;
+        for block in &blocks {
+            if block.row_start != first.row_start
+                || block.rows != first.rows
+                || block.column_start != next_column
+            {
+                return Err(CompileError::Graph(
+                    "C16 source blocks do not form complete aligned row shards".into(),
+                ));
+            }
+            next_column = next_column
+                .checked_add(block.columns)
+                .ok_or_else(|| CompileError::Graph("row-shard column overflow".into()))?;
+        }
+        if next_column != config.columns {
+            return Err(CompileError::Graph(format!(
+                "C16 row shard covers {next_column} columns, expected {}",
+                config.columns
+            )));
+        }
+        let bytes = u32::from(first.rows) * u32::from(config.columns) * 2;
+        let address = allocate(&mut cursors[usize::from(destination_tile)], bytes, 8)?;
+        if cursors[usize::from(destination_tile)] > config.data_limit {
+            return Err(CompileError::Memory(format!(
+                "A16 row shard on tile {destination_tile} exceeds its SRAM arena"
+            )));
+        }
+        let destination_tensor = TensorId(next_tensor);
+        next_tensor += 1;
+        schedule.allocations.push(Allocation {
+            tensor: destination_tensor,
+            tile: destination_tile,
+            address,
+            size: bytes,
+            live_from: compute_phase,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        });
+        destinations.push(RowShardPlacement {
+            tile: destination_tile,
+            row_start: first.row_start,
+            rows: first.rows,
+            columns: config.columns,
+            tensor: destination_tensor,
+            address,
+        });
+
+        for block in blocks {
+            let block_bytes = u32::from(block.rows) * u32::from(block.columns) * 2;
+            if block.tile != destination_tile {
+                let staging_address = ipu_exchange::EXCHANGE_WINDOW_BASE
+                    + u32::from(block.column_start) * u32::from(block.rows) * 2;
+                transfers.push(Transfer {
+                    source_tile: block.tile,
+                    destination_tile,
+                    tensor: block.tensor,
+                    bytes: block_bytes,
+                });
+                schedule.allocations.push(Allocation {
+                    tensor: block.tensor,
+                    tile: destination_tile,
+                    address: staging_address,
+                    size: block_bytes,
+                    live_from: exchange_phase,
+                    live_until: compute_phase,
+                    kind: AllocationKind::ExchangeStaging {
+                        phase: exchange_phase,
+                    },
+                });
+            }
+            let output_alias = TensorId(next_tensor);
+            next_tensor += 1;
+            let output_address =
+                address + u32::from(block.column_start) * u32::from(block.rows) * 2;
+            schedule.allocations.push(Allocation {
+                tensor: output_alias,
+                tile: destination_tile,
+                address: output_address,
+                size: block_bytes,
+                live_from: compute_phase,
+                live_until: compute_phase,
+                kind: AllocationKind::Home,
+            });
+            commands.push(KernelCommand {
+                tile: destination_tile,
+                output: output_alias,
+                inputs: vec![block.tensor, block.tensor],
+                arguments: vec![u32::from(block.rows)],
+                specialization: SpecializationKey {
+                    operation: "relayout_f16_c16_to_a16".into(),
+                    shape: vec![usize::from(block.rows), usize::from(block.columns)],
+                    worker_count: 6,
+                    role: "blocked-to-row-sharded".into(),
+                    alignment: 8,
+                },
+                metadata: BTreeMap::from([
+                    ("label".into(), "gather blocked activation".into()),
+                    ("row_start".into(), block.row_start.to_string()),
+                    ("column_start".into(), block.column_start.to_string()),
+                ]),
+            });
+        }
+    }
+    schedule.phases.push(Phase::Exchange { transfers });
+    schedule.phases.push(Phase::Compute {
+        op: OpId(compute_phase),
+        commands,
+    });
+    Ok(destinations)
 }
 
 pub fn plan_affine_layer_norm_f16(

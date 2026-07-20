@@ -1,13 +1,15 @@
 use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, GemmDataType, KernelCommand,
-    OpId, Phase, SpecializationKey, TensorId, choose_gemm_row_block_for, plan_blocked_gemm,
+    OpId, Phase, RowShardPlacement, RowShardTransitionConfig, SpecializationKey, TensorId,
+    append_c16_to_a16_row_shards, choose_gemm_row_block_for, plan_blocked_gemm,
 };
 use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
+use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    BlockLayout, ExecutableGraph, HostRunOptions, block_binding_typed, block_coordinates,
-    blocked_matrix_f16, package_graph, run_host_with_options,
+    BlockLayout, ExecutableGraph, HostRunOptions, block_binding_typed, blocked_matrix_f16,
+    package_graph, run_host_with_options,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -93,6 +95,27 @@ fn main() {
                 + bias[usize::from(column)]
         },
     ));
+    let transition_base = plan
+        .schedule
+        .allocations
+        .iter()
+        .filter(|allocation| {
+            allocation.kind == AllocationKind::Home && allocation.address >= DATA_BASE
+        })
+        .map(|allocation| allocation.address + allocation.size)
+        .max()
+        .map(|address| (address + 31) & !31)
+        .unwrap_or(DATA_BASE);
+    let row_shards = append_c16_to_a16_row_shards(
+        &mut plan.schedule,
+        &plan.output,
+        RowShardTransitionConfig {
+            columns,
+            data_base: transition_base,
+            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        },
+    )
+    .unwrap();
     let objects = compile_objects(&plan).unwrap();
     let graph = ExecutableGraph {
         schedule: plan.schedule,
@@ -103,13 +126,11 @@ fn main() {
             block_binding_typed("patch_weight", inner, columns, &plan.right, "f16", 2),
             block_binding_typed("position_bias", rows, columns, &adjustment, "f16", 2),
         ],
-        host_outputs: vec![block_binding_typed(
+        host_outputs: vec![row_shard_binding(
             "patch_and_position",
             rows,
             columns,
-            &plan.output,
-            "f16",
-            2,
+            &row_shards,
         )],
     };
     let app = package_graph(&graph, &objects).unwrap();
@@ -131,7 +152,7 @@ fn main() {
     )
     .unwrap();
     let expected = reference.tensor_f32("patch_and_position").unwrap();
-    let max_error = verify(&actual, &plan.output, columns, &expected);
+    let max_error = verify(&actual, &row_shards, columns, &expected);
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.1);
     assert!(
         max_error <= limit,
@@ -269,26 +290,56 @@ fn compile_objects(plan: &ipu_compiler::BlockedGemmPlan) -> ipu_runtime::Result<
         ],
     )?;
     let add = toolchain.compile(source("add_f16.S"), &artifacts, "add-f16", &[])?;
+    let relayout = toolchain.compile(source("relayout_f16.S"), &artifacts, "relayout-f16", &[])?;
     Ok(vec![
         fs::read(runtime.object)?,
         fs::read(gemm.object)?,
         fs::read(add.object)?,
+        fs::read(relayout.object)?,
     ])
 }
 
-fn verify(actual: &[u8], output: &[BlockPlacement], columns: u16, expected: &[f32]) -> f32 {
+fn row_shard_binding(name: &str, rows: u16, columns: u16, shards: &[RowShardPlacement]) -> Binding {
+    let topology = ipu_exchange::Topology::c600();
+    let mut file_offset = 0u64;
+    let slices = shards
+        .iter()
+        .map(|shard| {
+            let size = u64::from(shard.rows) * u64::from(shard.columns) * 2;
+            let slice = RegionSlice {
+                tile: u32::from(topology.physical(shard.tile).unwrap()),
+                tile_address: shard.address,
+                file_offset,
+                size,
+            };
+            file_offset += size;
+            slice
+        })
+        .collect();
+    Binding {
+        name: name.into(),
+        dtype: "f16".into(),
+        shape: vec![u32::from(rows), u32::from(columns)],
+        slices,
+    }
+}
+
+fn verify(actual: &[u8], output: &[RowShardPlacement], columns: u16, expected: &[f32]) -> f32 {
     let mut offset = 0usize;
     let mut max_error = 0.0f32;
     for block in output {
         for linear in 0..block.rows * block.columns {
-            let (row, column) =
-                block_coordinates(BlockLayout::AmpC16F16, block.rows, block.columns, linear);
+            let panel_elements = block.rows * 16;
+            let panel = linear / panel_elements;
+            let panel_offset = linear % panel_elements;
+            let row = panel_offset / 16;
+            let column = panel * 16 + panel_offset % 16;
             let observed = f16::from_bits(u16::from_le_bytes(
                 actual[offset..offset + 2].try_into().unwrap(),
             ))
             .to_f32();
-            let expected = expected[usize::from(block.row_start + row) * usize::from(columns)
-                + usize::from(block.column_start + column)];
+            let expected = expected
+                [usize::from(block.row_start + row) * usize::from(columns) + usize::from(column)];
             assert!(observed.is_finite());
             max_error = max_error.max((observed - expected).abs());
             offset += 2;

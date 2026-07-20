@@ -17,7 +17,8 @@ pub use attention::{
 };
 pub use mlp::{BlockedMlpConfig, BlockedMlpPlan, plan_blocked_mlp};
 pub use rowwise::{
-    AffineLayerNormConfig, AffineLayerNormPlan, RowShardPlacement, plan_affine_layer_norm_f16,
+    AffineLayerNormConfig, AffineLayerNormPlan, RowShardPlacement, RowShardTransitionConfig,
+    append_c16_to_a16_row_shards, plan_affine_layer_norm_f16,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
