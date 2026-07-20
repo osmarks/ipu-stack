@@ -158,6 +158,33 @@ fn executable_region_base_for_tile(
     }
 }
 
+fn executable_region_bases_for_tile(
+    allocation_ranges: &[(u32, u32)],
+    tile: u16,
+    runtime_end: u32,
+    image_size: u32,
+    program_size: u32,
+) -> Result<(u32, u32)> {
+    let place = |size, reserved: &[(u32, u32)]| {
+        executable_region_base_for_tile(allocation_ranges, Some(tile), runtime_end, size, reserved)
+    };
+    if program_size >= image_size {
+        let program_base = place(program_size, &[])?;
+        let program_end = program_base
+            .checked_add(program_size)
+            .ok_or("generated program address overflow")?;
+        let image_base = place(image_size, &[(program_base, program_end)])?;
+        Ok((image_base, program_base))
+    } else {
+        let image_base = place(image_size, &[])?;
+        let image_end = image_base
+            .checked_add(image_size)
+            .ok_or("linked image address overflow")?;
+        let program_base = place(program_size, &[(image_base, image_end)])?;
+        Ok((image_base, program_base))
+    }
+}
+
 fn allocation_range(allocation: &ipu_compiler::Allocation) -> Result<(u32, u32)> {
     Ok((
         allocation.address,
@@ -1495,22 +1522,36 @@ fn package_graph_impl(
                 generated_base,
             )
         };
-    let image_bases = programs
+    let preliminary_generated = preliminary_images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| emit_program(index, &image.symbols, 0))
+        .collect::<Result<Vec<_>>>()?;
+    let executable_bases = programs
         .iter()
         .zip(&preliminary_images)
+        .zip(&preliminary_generated)
         .zip(&completion_addresses)
-        .map(|((program, preliminary), &completion_address)| {
-            executable_region_base_for_tile(
+        .map(|(((program, image), generated), &completion_address)| {
+            executable_region_bases_for_tile(
                 &allocation_ranges_by_tile[usize::from(program.tile)],
-                Some(program.tile),
+                program.tile,
                 completion_address
                     .checked_add(4)
                     .ok_or("static runtime address overflow")?,
-                u32::try_from(preliminary.bytes.len())?,
-                &[],
+                u32::try_from(image.bytes.len())?,
+                u32::try_from(generated.len())?,
             )
         })
         .collect::<Result<Vec<_>>>()?;
+    let image_bases = executable_bases
+        .iter()
+        .map(|&(image, _)| image)
+        .collect::<Vec<_>>();
+    let program_bases = executable_bases
+        .iter()
+        .map(|&(_, program)| program)
+        .collect::<Vec<_>>();
     let mut image_cache = HashMap::<(u32, Vec<String>), ipu_elf::LinkedImage>::new();
     for ((&image_base, symbols), preliminary) in image_bases
         .iter()
@@ -1545,61 +1586,63 @@ fn package_graph_impl(
                 .clone())
         })
         .collect::<Result<Vec<_>>>()?;
-    let preliminary_generated = images
-        .iter()
-        .enumerate()
-        .map(|(index, image)| emit_program(index, &image.symbols, 0))
-        .collect::<Result<Vec<_>>>()?;
     if let Some((index, generated_code)) = preliminary_generated
         .iter()
         .enumerate()
         .max_by_key(|(_, code)| code.len())
     {
-        let steps = static_codegen::step_code_size(
-            &programs[index],
-            &tile_exchange_plans[index].compute_runs,
-        );
-        let step_bytes = steps.exchange + steps.compute + steps.fused_run;
         let plan_bytes = tile_exchange_plans[index].end - PLAN_BASE;
         let host_runtime_bytes = tile_host_plans[index].end - tile_exchange_plans[index].end;
-        info!(
-            logical_tile = programs[index].tile,
-            generated_bytes = generated_code.len(),
-            generated_exchange_bytes = steps.exchange,
-            generated_compute_bytes = steps.compute,
-            generated_unrolled_compute_calls = steps.compute_calls,
-            generated_fused_compute_calls = steps.fused_compute_calls,
-            generated_compute_argument_words = steps.compute_argument_words,
-            generated_fused_run_bytes = steps.fused_run,
-            generated_fused_runs = tile_exchange_plans[index].compute_runs.len(),
-            generated_host_and_control_bytes = generated_code.len().saturating_sub(step_bytes),
-            support_image_bytes = images[index].bytes.len(),
-            exchange_plan_bytes = plan_bytes,
-            host_plan_and_state_bytes = host_runtime_bytes,
-            "largest generated tile program breakdown"
-        );
+        let templates = &tile_exchange_plans[index].templates;
+        if templates.is_empty() {
+            let steps = static_codegen::step_code_size(
+                &programs[index],
+                &tile_exchange_plans[index].compute_runs,
+            );
+            let step_bytes = steps.exchange + steps.compute + steps.fused_run;
+            info!(
+                logical_tile = programs[index].tile,
+                generated_bytes = generated_code.len(),
+                generated_exchange_bytes = steps.exchange,
+                generated_compute_bytes = steps.compute,
+                generated_unrolled_compute_calls = steps.compute_calls,
+                generated_fused_compute_calls = steps.fused_compute_calls,
+                generated_compute_argument_words = steps.compute_argument_words,
+                generated_fused_run_bytes = steps.fused_run,
+                generated_fused_runs = tile_exchange_plans[index].compute_runs.len(),
+                generated_host_and_control_bytes = generated_code.len().saturating_sub(step_bytes),
+                support_image_bytes = images[index].bytes.len(),
+                exchange_plan_bytes = plan_bytes,
+                host_plan_and_state_bytes = host_runtime_bytes,
+                "largest generated tile program breakdown"
+            );
+        } else {
+            let template_record_bytes = templates
+                .iter()
+                .flat_map(|template| &template.records)
+                .map(|record| record.len() * 4)
+                .sum::<usize>();
+            let template_instances = templates
+                .iter()
+                .map(|template| template.records.len())
+                .sum::<usize>();
+            let template_names = templates
+                .iter()
+                .map(|template| template.name.as_str())
+                .collect::<Vec<_>>();
+            info!(
+                logical_tile = programs[index].tile,
+                generated_bytes = generated_code.len(),
+                template_names = ?template_names,
+                template_instances,
+                template_record_bytes,
+                support_image_bytes = images[index].bytes.len(),
+                exchange_plan_and_template_bytes = plan_bytes,
+                host_plan_and_state_bytes = host_runtime_bytes,
+                "largest generated tile program uses static templates"
+            );
+        }
     }
-    let program_bases = programs
-        .iter()
-        .zip(&preliminary_generated)
-        .zip(&images)
-        .zip(&completion_addresses)
-        .map(|(((program, code), image), &tile_runtime_end)| {
-            let image_end = image
-                .base
-                .checked_add(u32::try_from(image.bytes.len())?)
-                .ok_or("linked image address overflow")?;
-            executable_region_base_for_tile(
-                &allocation_ranges_by_tile[usize::from(program.tile)],
-                Some(program.tile),
-                tile_runtime_end
-                    .checked_add(4)
-                    .ok_or("static runtime address overflow")?,
-                u32::try_from(code.len())?,
-                &[(image.base, image_end)],
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
     let generated = images
         .iter()
         .zip(&program_bases)

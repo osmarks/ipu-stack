@@ -650,10 +650,23 @@ pub(crate) fn emit(
     }
     emit_host_phases(&mut code, symbols, host.outputs, host.run_state)?;
     code.jump(symbol(symbols, COMPLETE)?)?;
+    let template_exchange = if templates.is_empty() {
+        None
+    } else {
+        let address = generated_address(generated_base, code.words.len())?;
+        emit_static_template_exchange(&mut code, worker_barrier, generated_base)?;
+        Some(address)
+    };
     let mut template_bodies = Vec::with_capacity(templates.len());
     for template in templates {
         template_bodies.push(code.words.len());
-        emit_static_template_body(&mut code, template, symbols, worker_barrier, generated_base)?;
+        emit_static_template_body(
+            &mut code,
+            template,
+            symbols,
+            template_exchange.unwrap(),
+            generated_base,
+        )?;
     }
     for (call, template) in template_calls {
         let target = generated_address(generated_base, template_bodies[template])?;
@@ -662,11 +675,34 @@ pub(crate) fn emit(
     Ok(code.words.into_iter().flat_map(u32::to_le_bytes).collect())
 }
 
+fn emit_static_template_exchange(
+    code: &mut TileCode,
+    worker_barrier: u32,
+    generated_base: u32,
+) -> Result<()> {
+    code.ld32(2, 11, 15, 0)?;
+    code.ld32(8, 2, 15, 0)?;
+    code.ld32(0, 2, 15, 1)?;
+    code.add_immediate(2, 2, 8)?;
+    code.st32(2, 11, 15, 0)?;
+    code.instruction(ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
+    let skip_barrier = code.words.len();
+    code.brz(0, 0)?;
+    code.call(worker_barrier, 7)?;
+    let after_barrier = generated_address(generated_base, code.words.len())?;
+    code.words[skip_barrier] = ipu_exchange::encode_brz_m_immediate(0, after_barrier)?;
+    let return_address = generated_address(generated_base, code.words.len() + 2)?;
+    code.setzi(10, return_address)?;
+    code.branch(8)?;
+    code.branch(9)?;
+    Ok(())
+}
+
 fn emit_static_template_body(
     code: &mut TileCode,
     template: &StaticTemplatePlan,
     symbols: &BTreeMap<String, u32>,
-    worker_barrier: u32,
+    template_exchange: u32,
     generated_base: u32,
 ) -> Result<()> {
     code.add_immediate(11, 11, -16)?;
@@ -675,22 +711,7 @@ fn emit_static_template_body(
     for planned in &template.steps {
         match planned {
             StaticTemplateStep::Exchange => {
-                code.ld32(1, 11, 15, 0)?;
-                code.ld32(8, 1, 15, 0)?;
-                code.ld32(0, 1, 15, 1)?;
-                code.add_immediate(1, 1, 8)?;
-                code.st32(1, 11, 15, 0)?;
-                code.st32(8, 11, 15, 2)?;
-                code.instruction(ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
-                let skip_barrier = code.words.len();
-                code.brz(0, 0)?;
-                code.call(worker_barrier, 7)?;
-                let after_barrier = generated_address(generated_base, code.words.len())?;
-                code.words[skip_barrier] = ipu_exchange::encode_brz_m_immediate(0, after_barrier)?;
-                code.ld32(8, 11, 15, 2)?;
-                let return_address = generated_address(generated_base, code.words.len() + 2)?;
-                code.setzi(10, return_address)?;
-                code.branch(8)?;
+                code.call(template_exchange, 9)?;
             }
             StaticTemplateStep::Compute {
                 operation,
