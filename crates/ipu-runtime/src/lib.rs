@@ -2361,20 +2361,9 @@ pub fn run_diagnostic(
     for write in &app.device_config_writes {
         device.write_config(write.offset, write.value)?;
     }
-    let mut host_pages = if app.host_exchange.pages.is_empty() {
-        None
-    } else {
-        let mut session = HostSession::new(&device, app.host_exchange.clone())?;
-        session.attach()?;
-        Some(session)
-    };
-    device.write_config(
-        ipu_driver::pci::EXCHANGE_WINDOW_BASE,
-        ipu_driver::pci::EXCHANGE_WINDOW_HEXOPT,
-    )?;
-    device.write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
-    device.set_mark(1)?;
-    for phase in 1..entry.external_syncs {
+    let mut host_session = HostSession::new(&device, app.host_exchange.clone())?;
+    host_session.start()?;
+    for phase in 0..entry.external_syncs {
         if let Err(error) =
             device.wait_mark(ipu_driver::pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))
         {
@@ -2441,7 +2430,7 @@ pub fn run_diagnostic(
         debug!(binding = %binding.name, words = words.len(), "read diagnostic binding");
         bindings.insert(binding.name.clone(), words);
     }
-    drop(host_pages.take());
+    drop(host_session);
     Ok(DiagnosticResults { bindings })
 }
 

@@ -1112,7 +1112,9 @@ impl<'a> HostSession<'a> {
         Ok(Self {
             device,
             protocol,
-            storage: HostBuffer::new(storage_size)?,
+            // A synchronization-only session has no attached pages, but still
+            // uses the common rendezvous implementation.
+            storage: HostBuffer::new(storage_size.max(1))?,
             pages,
             attached_pages: Vec::new(),
             write_jitter: None,
