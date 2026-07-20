@@ -4,10 +4,11 @@ use ipu_compiler::{
     FlashAttentionConfig, FlashAttentionPlan, GemmDataType, KernelCommand, MemoryConstraint,
     MemoryPlacement, OpId, Phase, RowShardPlacement, RowShardTransitionConfig, SpecializationKey,
     TensorId, append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
-    append_blocked_gemm_f16_with_a16_blocks, append_blocked_gemm_f16_with_a16_input,
-    append_c16_to_a16_blocks_gelu_f16, append_c16_to_a16_row_shards,
-    append_flash_attention_from_a16_qkv, append_flash_attention_to_a16_row_shards,
-    choose_gemm_row_block_for, end_tensor_lifetimes, plan_blocked_gemm,
+    append_bias_f16_c16, append_blocked_gemm_f16_with_a16_blocks,
+    append_blocked_gemm_f16_with_a16_input, append_c16_to_a16_blocks_gelu_f16,
+    append_c16_to_a16_row_shards, append_flash_attention_from_a16_qkv,
+    append_flash_attention_to_a16_row_shards, choose_gemm_row_block_for, end_tensor_lifetimes,
+    plan_blocked_gemm,
 };
 use ipu_elf::Toolchain;
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -190,7 +191,13 @@ fn main() {
             qkv_weights[projection][output * usize::from(columns) + usize::from(row)]
         },
     ));
-    let qkv_bias = append_bias_phase(&mut plan.schedule, &qkv.output).unwrap();
+    let qkv_bias = append_bias_f16_c16(
+        &mut plan.schedule,
+        &qkv.output,
+        DATA_BASE,
+        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+    )
+    .unwrap();
     host_input.extend(blocked_matrix_f16(
         &qkv_bias,
         BlockLayout::AmpC16F16,
@@ -270,8 +277,13 @@ fn main() {
     let output_bias = model
         .tensor_f32("vision_model.encoder.layers.0.self_attn.out_proj.bias")
         .unwrap();
-    let output_adjustment =
-        append_bias_phase(&mut plan.schedule, &output_projection.output).unwrap();
+    let output_adjustment = append_bias_f16_c16(
+        &mut plan.schedule,
+        &output_projection.output,
+        DATA_BASE,
+        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+    )
+    .unwrap();
     host_input.extend(blocked_matrix_f16(
         &output_adjustment,
         BlockLayout::AmpC16F16,
@@ -354,7 +366,13 @@ fn main() {
     let mlp_up_bias = model
         .tensor_f32("vision_model.encoder.layers.0.mlp.fc1.bias")
         .unwrap();
-    let mlp_up_adjustment = append_bias_phase(&mut plan.schedule, &mlp_up.output).unwrap();
+    let mlp_up_adjustment = append_bias_f16_c16(
+        &mut plan.schedule,
+        &mlp_up.output,
+        DATA_BASE,
+        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+    )
+    .unwrap();
     host_input.extend(blocked_matrix_f16(
         &mlp_up_adjustment,
         BlockLayout::AmpC16F16,
@@ -401,7 +419,13 @@ fn main() {
     let mlp_down_bias = model
         .tensor_f32("vision_model.encoder.layers.0.mlp.fc2.bias")
         .unwrap();
-    let mlp_down_adjustment = append_bias_phase(&mut plan.schedule, &mlp_down.output).unwrap();
+    let mlp_down_adjustment = append_bias_f16_c16(
+        &mut plan.schedule,
+        &mlp_down.output,
+        DATA_BASE,
+        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+    )
+    .unwrap();
     host_input.extend(blocked_matrix_f16(
         &mlp_down_adjustment,
         BlockLayout::AmpC16F16,
@@ -670,83 +694,6 @@ fn append_adjustment_phase(
         commands,
     });
     Ok(placements)
-}
-
-fn append_bias_phase(
-    schedule: &mut ipu_compiler::Schedule,
-    output: &[BlockPlacement],
-) -> ipu_runtime::Result<Vec<BlockPlacement>> {
-    let phase = schedule.phases.len();
-    let mut next_tensor = schedule
-        .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
-        .unwrap_or(0)
-        + 1;
-    let mut biases = Vec::with_capacity(output.len());
-    let mut commands = Vec::with_capacity(output.len());
-    for output in output {
-        let bytes = u32::from(output.columns) * 2;
-        let address = ipu_compiler::find_free_region(
-            &schedule.allocations,
-            output.tile,
-            bytes,
-            0,
-            phase,
-            MemoryConstraint {
-                base: DATA_BASE,
-                limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-                alignment: 8,
-                placement: MemoryPlacement::Low,
-            },
-        )?;
-        let bias = BlockPlacement {
-            tensor: TensorId(next_tensor),
-            address,
-            rows: 1,
-            row_start: 0,
-            ..*output
-        };
-        next_tensor += 1;
-        schedule.allocations.push(Allocation {
-            tensor: bias.tensor,
-            tile: bias.tile,
-            address,
-            size: bytes,
-            live_from: 0,
-            live_until: phase,
-            kind: AllocationKind::Home,
-        });
-        commands.push(KernelCommand {
-            tile: output.tile,
-            output: output.tensor,
-            inputs: vec![output.tensor, bias.tensor],
-            arguments: vec![
-                u32::from(output.rows),
-                u32::from(output.rows / 6),
-                u32::from(output.rows % 6),
-            ],
-            specialization: SpecializationKey {
-                operation: "add_bias_f16_c16".into(),
-                shape: vec![usize::from(output.rows), usize::from(output.columns)],
-                worker_count: 6,
-                role: "blocked-bias".into(),
-                alignment: 8,
-            },
-            metadata: BTreeMap::from([
-                ("label".into(), "blocked bias add".into()),
-                ("row_start".into(), output.row_start.to_string()),
-                ("column_start".into(), output.column_start.to_string()),
-            ]),
-        });
-        biases.push(bias);
-    }
-    schedule.phases.push(Phase::Compute {
-        op: OpId(phase),
-        commands,
-    });
-    Ok(biases)
 }
 
 fn compile_objects(

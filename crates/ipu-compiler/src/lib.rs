@@ -617,6 +617,143 @@ pub struct AppendedBlockedGemm {
     pub output: Vec<BlockPlacement>,
 }
 
+pub fn append_bias_f16_c16(
+    schedule: &mut Schedule,
+    output: &[BlockPlacement],
+    data_base: u32,
+    data_limit: u32,
+) -> Result<Vec<BlockPlacement>, CompileError> {
+    if output.is_empty()
+        || data_base & 7 != 0
+        || data_base >= data_limit
+        || output.iter().any(|block| block.columns != 64)
+    {
+        return Err(CompileError::Graph(
+            "C16 bias add requires 64-column output blocks and aligned SRAM".into(),
+        ));
+    }
+    let exchange_phase = schedule.phases.len();
+    let compute_phase = exchange_phase + 1;
+    let mut next_tensor = schedule
+        .allocations
+        .iter()
+        .map(|allocation| allocation.tensor.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut biases = Vec::new();
+    for block_column in 0..=output.iter().map(|block| block.block_column).max().unwrap() {
+        let owner = output
+            .iter()
+            .find(|block| block.block_column == block_column)
+            .ok_or_else(|| CompileError::Graph("C16 output has a missing column block".into()))?;
+        let size = u32::from(owner.columns) * 2;
+        let address = find_free_region(
+            &schedule.allocations,
+            owner.tile,
+            size,
+            0,
+            compute_phase,
+            MemoryConstraint {
+                base: data_base,
+                limit: data_limit,
+                alignment: 8,
+                placement: MemoryPlacement::Low,
+            },
+        )?;
+        let bias = BlockPlacement {
+            tensor: TensorId(next_tensor),
+            address,
+            rows: 1,
+            row_start: 0,
+            ..*owner
+        };
+        next_tensor += 1;
+        schedule.allocations.push(Allocation {
+            tensor: bias.tensor,
+            tile: bias.tile,
+            address,
+            size,
+            live_from: 0,
+            live_until: compute_phase,
+            kind: AllocationKind::Home,
+        });
+        biases.push(bias);
+    }
+    let mut transfers = Vec::new();
+    let mut commands = Vec::with_capacity(output.len());
+    let mut staging_cursors =
+        vec![ipu_exchange::EXCHANGE_WINDOW_BASE; usize::from(schedule.tile_count)];
+    for output in output {
+        let bias = biases
+            .iter()
+            .find(|bias| bias.block_column == output.block_column)
+            .unwrap();
+        let bytes = u32::from(output.columns) * 2;
+        if bias.tile != output.tile {
+            let cursor = &mut staging_cursors[usize::from(output.tile)];
+            let staging_address = *cursor;
+            *cursor = align_u32(
+                cursor.checked_add(bytes).ok_or_else(|| {
+                    CompileError::Memory("C16 bias staging address overflow".into())
+                })?,
+                32,
+            );
+            if *cursor > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES {
+                return Err(CompileError::Memory(format!(
+                    "C16 bias staging exhausts tile {} exchange window",
+                    output.tile
+                )));
+            }
+            transfers.push(Transfer {
+                source_tile: bias.tile,
+                destination_tile: output.tile,
+                tensor: bias.tensor,
+                bytes,
+            });
+            schedule.allocations.push(Allocation {
+                tensor: bias.tensor,
+                tile: output.tile,
+                address: staging_address,
+                size: bytes,
+                live_from: exchange_phase,
+                live_until: compute_phase,
+                kind: AllocationKind::ExchangeStaging {
+                    phase: exchange_phase,
+                },
+            });
+        }
+        commands.push(KernelCommand {
+            tile: output.tile,
+            output: output.tensor,
+            inputs: vec![output.tensor, bias.tensor],
+            arguments: vec![
+                u32::from(output.rows),
+                u32::from(output.rows / 6),
+                u32::from(output.rows % 6),
+            ],
+            specialization: SpecializationKey {
+                operation: "add_bias_f16_c16".into(),
+                shape: vec![usize::from(output.rows), usize::from(output.columns)],
+                worker_count: 6,
+                role: "blocked-bias".into(),
+                alignment: 8,
+            },
+            metadata: BTreeMap::from([
+                ("label".into(), "blocked bias add".into()),
+                ("row_start".into(), output.row_start.to_string()),
+                ("column_start".into(), output.column_start.to_string()),
+            ]),
+        });
+    }
+    schedule.phases.push(Phase::Exchange { transfers });
+    schedule.phases.push(Phase::Compute {
+        op: OpId(compute_phase),
+        commands,
+    });
+    Ok(biases)
+}
+
 pub fn append_blocked_gemm_f16_with_a16_input(
     schedule: &mut Schedule,
     input: &[RowShardPlacement],
@@ -2925,6 +3062,57 @@ mod tests {
             assert!(ranges.len() > 1);
             assert!(ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0));
         }
+    }
+
+    #[test]
+    fn c16_bias_is_stored_once_per_column_block_and_shared_across_rows() {
+        let mut output = Vec::new();
+        let mut allocations = Vec::new();
+        for block_row in 0..2u16 {
+            for block_column in 0..2u16 {
+                let index = usize::from(block_row * 2 + block_column);
+                let block = BlockPlacement {
+                    tensor: TensorId(index),
+                    tile: index as u16,
+                    address: 0xa0000,
+                    block_row,
+                    block_column,
+                    row_start: block_row * 12,
+                    column_start: block_column * 64,
+                    rows: 12,
+                    columns: 64,
+                };
+                output.push(block);
+                allocations.push(Allocation {
+                    tensor: block.tensor,
+                    tile: block.tile,
+                    address: block.address,
+                    size: 12 * 64 * 2,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                });
+            }
+        }
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations,
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let biases = append_bias_f16_c16(&mut schedule, &output, 0xa0000, 0xe8000).unwrap();
+
+        assert_eq!(biases.len(), 2);
+        assert!(matches!(
+            &schedule.phases[0],
+            Phase::Exchange { transfers } if transfers.len() == 2
+        ));
+        assert!(matches!(
+            &schedule.phases[1],
+            Phase::Compute { commands, .. } if commands.len() == output.len()
+        ));
     }
 
     #[test]
