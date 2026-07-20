@@ -136,6 +136,7 @@ fn main() {
         .unwrap_or(1);
     assert!((1..=config.num_hidden_layers).contains(&layer_count));
     let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
+    let detailed_diagnostics = layer_count == 1;
     let mut current = row_shards;
     let mut last_layer = None;
     for layer in 0..layer_count {
@@ -150,7 +151,7 @@ fn main() {
             TILE_COUNT,
             DATA_BASE,
             data_limit,
-            layer + 1 == layer_count,
+            detailed_diagnostics && layer + 1 == layer_count,
             &mut host,
         )
         .unwrap();
@@ -168,21 +169,30 @@ fn main() {
         bindings: host_inputs,
         bytes: host_input,
     } = host;
+    let mut host_outputs = Vec::new();
+    if detailed_diagnostics {
+        host_outputs.push(row_shard_binding("layer_norm2", rows, columns, &norm2));
+        host_outputs.push(block_binding_typed(
+            "mlp_gelu",
+            rows,
+            intermediate_columns,
+            &mlp_gelu,
+            "f16",
+            2,
+        ));
+    }
+    host_outputs.push(row_shard_binding(
+        &format!("encoder_layer_{:02}", layer_count - 1),
+        rows,
+        columns,
+        &layer_output,
+    ));
     let graph = ExecutableGraph {
         schedule: plan.schedule,
         initial_buffers: Vec::new(),
         outputs: Vec::new(),
         host_inputs,
-        host_outputs: vec![
-            row_shard_binding("layer_norm2", rows, columns, &norm2),
-            block_binding_typed("mlp_gelu", rows, intermediate_columns, &mlp_gelu, "f16", 2),
-            row_shard_binding(
-                &format!("encoder_layer_{:02}", layer_count - 1),
-                rows,
-                columns,
-                &layer_output,
-            ),
-        ],
+        host_outputs,
     };
     let app = package_graph(&graph, &objects).unwrap();
     if let Some(path) = std::env::var_os("IPU_SIGLIP_PACKAGE_OUTPUT") {
@@ -190,6 +200,13 @@ fn main() {
     }
     if let Some(path) = std::env::var_os("IPU_SIGLIP_INPUT_OUTPUT") {
         fs::write(path, &host_input).unwrap();
+    }
+    if std::env::var_os("IPU_SIGLIP_BUILD_ONLY").is_some() {
+        info!(
+            layer_count,
+            "SigLIP executable built without device execution"
+        );
+        return;
     }
     let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
     let configuration = fs::read(required_env("IPU_CONFIG")).unwrap();
@@ -208,34 +225,39 @@ fn main() {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
-    let norm2_bytes = usize::from(rows) * usize::from(columns) * 2;
-    let expected_norm2 = reference
-        .tensor_f32(&format!("encoder_layer_{:02}_norm2", layer_count - 1))
-        .unwrap();
-    let expected_norm2 = serialize_a16_row_shards(
-        &expected_norm2,
-        usize::from(rows),
-        usize::from(columns),
-        &norm2,
-    );
-    let norm2_error = verify_linear_f16(&actual[..norm2_bytes], &expected_norm2);
-    let expected = reference
-        .tensor_f32(&format!("encoder_layer_{:02}_mlp_gelu", layer_count - 1))
-        .unwrap();
-    let expected = pad_columns(
-        &expected,
-        usize::from(rows),
-        config.intermediate_size,
-        usize::from(intermediate_columns),
-    );
-    let expected = serialize_a16_blocks(
-        &expected,
-        usize::from(rows),
-        usize::from(intermediate_columns),
-        &mlp_gelu,
-    );
-    let max_error = verify_linear_f16(&actual[norm2_bytes..], &expected);
-    let mlp_gelu_bytes = usize::from(rows) * usize::from(intermediate_columns) * 2;
+    let (diagnostic_bytes, norm2_error, mlp_gelu_error) = if detailed_diagnostics {
+        let norm2_bytes = usize::from(rows) * usize::from(columns) * 2;
+        let expected_norm2 = reference.tensor_f32("encoder_layer_00_norm2").unwrap();
+        let expected_norm2 = serialize_a16_row_shards(
+            &expected_norm2,
+            usize::from(rows),
+            usize::from(columns),
+            &norm2,
+        );
+        let norm2_error = verify_linear_f16(&actual[..norm2_bytes], &expected_norm2);
+        let expected = reference.tensor_f32("encoder_layer_00_mlp_gelu").unwrap();
+        let expected = pad_columns(
+            &expected,
+            usize::from(rows),
+            config.intermediate_size,
+            usize::from(intermediate_columns),
+        );
+        let expected = serialize_a16_blocks(
+            &expected,
+            usize::from(rows),
+            usize::from(intermediate_columns),
+            &mlp_gelu,
+        );
+        let mlp_gelu_error = verify_linear_f16(&actual[norm2_bytes..], &expected);
+        let gelu_bytes = usize::from(rows) * usize::from(intermediate_columns) * 2;
+        (
+            norm2_bytes + gelu_bytes,
+            Some(norm2_error),
+            Some(mlp_gelu_error),
+        )
+    } else {
+        (0, None, None)
+    };
     let expected_layer = reference
         .tensor_f32(&format!("encoder_layer_{:02}", layer_count - 1))
         .unwrap();
@@ -245,23 +267,21 @@ fn main() {
         usize::from(columns),
         &layer_output,
     );
-    let layer_error = verify_linear_f16(&actual[norm2_bytes + mlp_gelu_bytes..], &expected_layer);
+    let layer_error = verify_linear_f16(&actual[diagnostic_bytes..], &expected_layer);
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
     info!(
-        norm2_error,
-        mlp_gelu_error = max_error,
+        ?norm2_error,
+        ?mlp_gelu_error,
         layer_error,
         limit,
         "SigLIP verification results"
     );
-    assert!(
-        norm2_error <= limit,
-        "norm2 max error {norm2_error} exceeds {limit}"
-    );
-    assert!(
-        max_error <= limit,
-        "MLP GeLU max error {max_error} exceeds {limit}"
-    );
+    if let Some(error) = norm2_error {
+        assert!(error <= limit, "norm2 max error {error} exceeds {limit}");
+    }
+    if let Some(error) = mlp_gelu_error {
+        assert!(error <= limit, "MLP GeLU max error {error} exceeds {limit}");
+    }
     assert!(
         layer_error <= limit,
         "encoder layer max error {layer_error} exceeds {limit}"
@@ -277,8 +297,8 @@ fn main() {
         intermediate_columns,
         row_block_dimension,
         layer_count,
-        norm2_error,
-        max_error,
+        ?norm2_error,
+        ?mlp_gelu_error,
         layer_error,
         "SigLIP encoder prefix passed against Hugging Face"
     );

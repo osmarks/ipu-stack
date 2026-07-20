@@ -1040,18 +1040,6 @@ fn plan_appended_blocked_gemm(
     let mut plan = plan_blocked_gemm(config)?;
     let tile_rotation = choose_resident_tile_rotation(parent, &plan.schedule, config.data_base);
     rotate_gemm_plan_tiles(&mut plan, tile_rotation)?;
-    let provisional_is_free = plan.schedule.allocations.iter().all(|candidate| {
-        candidate.kind != AllocationKind::Home
-            || candidate.address < config.data_base
-            || parent.allocations.iter().all(|allocation| {
-                allocation.tile != candidate.tile
-                    || candidate.address.saturating_add(candidate.size) <= allocation.address
-                    || allocation.address.saturating_add(allocation.size) <= candidate.address
-            })
-    });
-    if provisional_is_free {
-        return Ok(plan);
-    }
     let mut regions = plan
         .left
         .iter()
