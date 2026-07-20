@@ -73,14 +73,11 @@ impl Toolchain {
         let object = output_dir.as_ref().join(format!("{name}.o"));
         let metadata = output_dir.as_ref().join(format!("{name}.json"));
         let mut command = Command::new(&self.popc);
-        command
-            .arg("--target")
-            .arg(&self.target)
-            .arg("-O2")
-            .args(flags)
-            .arg(source.as_ref())
-            .arg("-o")
-            .arg(&gp);
+        command.arg("--target").arg(&self.target);
+        if !flags.iter().any(|flag| flag.starts_with("-O")) {
+            command.arg("-O2");
+        }
+        command.args(flags).arg(source.as_ref()).arg("-o").arg(&gp);
         run(&mut command, "popc")?;
 
         let object_file = fs::File::create(&object)?;

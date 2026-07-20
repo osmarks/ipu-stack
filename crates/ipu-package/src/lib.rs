@@ -178,6 +178,8 @@ pub const SCHEMA_VERSION: u32 = 2;
 pub const TARGET_IPU21: &str = "ipu21";
 pub const TILE_MEMORY_BASE: u32 = 0x4c000;
 pub const TILE_MEMORY_SIZE: u32 = 624 * 1024;
+/// IPU21 `TMEM_ELEMSIZE`; instruction fetch and data access cannot share an element.
+pub const TILE_MEMORY_ELEMENT_SIZE: u32 = 0x4000;
 // From Target::getMemoryElementOffsets() for IPU21. PACE kernels use this
 // element for operands declared with an interleaved-memory constraint.
 pub const IPU21_INTERLEAVED_MEMORY_BASE: u32 = TILE_MEMORY_BASE + 0x34000;

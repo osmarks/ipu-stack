@@ -66,6 +66,80 @@ struct HostPacketCopy {
     destination: u32,
     words: u32,
 }
+
+const ENTRY_TRAMPOLINE_BYTES: u32 = 8;
+
+fn executable_region_base(
+    graph: &ExecutableGraph,
+    runtime_end: u32,
+    required_size: u32,
+) -> Result<u32> {
+    let element_size = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+    let memory_end = ipu_package::TILE_MEMORY_BASE
+        .checked_add(ipu_package::TILE_MEMORY_SIZE)
+        .ok_or("tile memory range overflow")?;
+    let mut reserved = vec![
+        (
+            ipu_driver::APPLICATION_LOAD_BASE,
+            ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES,
+        ),
+        (
+            ipu_exchange::EXCHANGE_WINDOW_BASE,
+            ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+        ),
+        (PLAN_BASE, runtime_end),
+    ];
+    reserved.extend(
+        graph
+            .schedule
+            .allocations
+            .iter()
+            .map(|allocation| {
+                Ok((
+                    allocation.address,
+                    allocation
+                        .address
+                        .checked_add(allocation.size)
+                        .ok_or("allocation address overflow")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    let mut reserved = reserved
+        .into_iter()
+        .map(|(start, end)| (align_down(start, element_size), align_up(end, element_size)))
+        .collect::<Vec<_>>();
+    reserved.sort_unstable();
+
+    let mut cursor = align_up(
+        ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES,
+        element_size,
+    );
+    let required_size = align_up(required_size, element_size);
+    for (start, end) in reserved {
+        if end <= cursor || start >= memory_end {
+            continue;
+        }
+        let candidate_end = cursor
+            .checked_add(required_size)
+            .ok_or("executable region address overflow")?;
+        if candidate_end <= start {
+            return Ok(cursor);
+        }
+        cursor = align_up(cursor.max(end), element_size);
+    }
+    if cursor
+        .checked_add(required_size)
+        .is_some_and(|end| end <= memory_end)
+    {
+        Ok(cursor)
+    } else {
+        Err(format!(
+            "no common tile-memory interval can hold {required_size} bytes of executable code"
+        )
+        .into())
+    }
+}
 pub fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt()
@@ -1268,82 +1342,108 @@ fn package_graph_impl(
     }));
     retained_symbols.sort();
     retained_symbols.dedup();
-    let image = link(
+    let preliminary_image = link(
         objects,
         &LinkOptions {
             image_base: ipu_driver::APPLICATION_LOAD_BASE,
+            entry_symbol: "ipu_stack_static_start".into(),
+            retained_symbols: retained_symbols.clone(),
+            externals: HashMap::new(),
+        },
+    )?;
+    let emit_programs = |symbols: &BTreeMap<String, u32>| {
+        programs
+            .iter()
+            .zip(&tile_host_plans)
+            .enumerate()
+            .map(
+                |(program_index, (program, host_plans))| -> Result<Vec<u8>> {
+                    let physical = topology.physical(program.tile)?;
+                    let host_inputs = host_plans.addresses[..host.inputs.len()]
+                        .iter()
+                        .copied()
+                        .zip(&host_plans.run_tables[..host.inputs.len()])
+                        .zip(&host.inputs)
+                        .map(
+                            |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
+                                address,
+                                active: host_phase_is_active(physical, transfer),
+                                run_table,
+                            },
+                        )
+                        .collect::<Vec<_>>();
+                    let host_outputs = host_plans.addresses[host.inputs.len()..]
+                        .iter()
+                        .copied()
+                        .zip(&host_plans.run_tables[host.inputs.len()..])
+                        .zip(&host.outputs)
+                        .map(
+                            |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
+                                address,
+                                active: host_phase_is_active(physical, transfer),
+                                run_table,
+                            },
+                        )
+                        .collect::<Vec<_>>();
+                    static_codegen::emit(
+                        program,
+                        symbols,
+                        &plan_addresses,
+                        static_codegen::HostCode {
+                            inputs: &host_inputs,
+                            outputs: &host_outputs,
+                            run_state: host_plans.run_state,
+                        },
+                        profile_code.get(program_index),
+                    )
+                },
+            )
+            .collect::<Result<Vec<_>>>()
+    };
+    let preliminary_generated = emit_programs(&preliminary_image.symbols)?;
+    let image_size = u32::try_from(preliminary_image.bytes.len())?;
+    let max_program_size = preliminary_generated
+        .iter()
+        .map(|code| u32::try_from(code.len()))
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let executable_size = align_up(image_size, 8)
+        .checked_add(max_program_size)
+        .ok_or("executable region size overflow")?;
+    let runtime_end = completion_addresses
+        .iter()
+        .map(|address| {
+            address
+                .checked_add(4)
+                .ok_or("static runtime address overflow")
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(PLAN_BASE);
+    let image_base = executable_region_base(graph, runtime_end, executable_size)?;
+    let image = link(
+        objects,
+        &LinkOptions {
+            image_base,
             entry_symbol: "ipu_stack_static_start".into(),
             retained_symbols,
             externals: HashMap::new(),
         },
     )?;
-    let program_base = align_up(
-        image
-            .base
-            .checked_add(u32::try_from(image.bytes.len())?)
-            .ok_or("linked image address overflow")?,
-        8,
-    );
-    let generated = programs
-        .iter()
-        .zip(&tile_host_plans)
-        .enumerate()
-        .map(
-            |(program_index, (program, host_plans))| -> Result<Vec<u8>> {
-                let physical = topology.physical(program.tile)?;
-                let host_inputs = host_plans.addresses[..host.inputs.len()]
-                    .iter()
-                    .copied()
-                    .zip(&host_plans.run_tables[..host.inputs.len()])
-                    .zip(&host.inputs)
-                    .map(
-                        |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
-                            address,
-                            active: host_phase_is_active(physical, transfer),
-                            run_table,
-                        },
-                    )
-                    .collect::<Vec<_>>();
-                let host_outputs = host_plans.addresses[host.inputs.len()..]
-                    .iter()
-                    .copied()
-                    .zip(&host_plans.run_tables[host.inputs.len()..])
-                    .zip(&host.outputs)
-                    .map(
-                        |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
-                            address,
-                            active: host_phase_is_active(physical, transfer),
-                            run_table,
-                        },
-                    )
-                    .collect::<Vec<_>>();
-                static_codegen::emit(
-                    program,
-                    &image.symbols,
-                    &plan_addresses,
-                    static_codegen::HostCode {
-                        inputs: &host_inputs,
-                        outputs: &host_outputs,
-                        run_state: host_plans.run_state,
-                    },
-                    profile_code.get(program_index),
-                )
-            },
-        )
-        .collect::<Result<Vec<_>>>()?;
+    if u32::try_from(image.bytes.len())? != image_size {
+        return Err("linked image size changed after executable placement".into());
+    }
+    let program_base = align_up(image_base + image_size, 8);
+    let generated = emit_programs(&image.symbols)?;
     let program_end = generated.iter().try_fold(program_base, |end, code| {
         let code_end = program_base
             .checked_add(u32::try_from(code.len())?)
             .ok_or("generated tile program address overflow")?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(end.max(code_end))
     })?;
-    if program_end > ipu_exchange::EXCHANGE_WINDOW_BASE {
-        return Err(format!(
-            "generated tile program 0x{program_base:x}..0x{program_end:x} exceeds the executable span ending at 0x{:x}",
-            ipu_exchange::EXCHANGE_WINDOW_BASE
-        )
-        .into());
-    }
     let image_end = image
         .base
         .checked_add(u32::try_from(image.bytes.len())?)
@@ -1415,6 +1515,10 @@ fn package_graph_impl(
         .map(|program| program.tile)
         .ok_or("diagnostic completion tile is outside the schedule")?;
     let mut app = Application::default();
+    let mut entry_code = Vec::with_capacity(ENTRY_TRAMPOLINE_BYTES as usize);
+    entry_code.extend_from_slice(&ipu_exchange::encode_setzi_m(0, image.entry)?.to_le_bytes());
+    entry_code.extend_from_slice(&ipu_exchange::encode_br_m(0)?.to_le_bytes());
+    let entry_blob = app.add_blob(entry_code);
     for (tile_index, (((program, generated_code), host_plans), &completion_address)) in programs
         .iter()
         .zip(generated)
@@ -1442,7 +1546,14 @@ fn package_graph_impl(
             patch_setzi_immediate(&mut support_code, offset, worker_base)?;
         }
         patch_setzi_immediate(&mut support_code, completion_offset, completion_address)?;
-        let mut segments = Vec::new();
+        let mut segments = vec![Segment {
+            address: ipu_driver::APPLICATION_LOAD_BASE,
+            memory_size: ENTRY_TRAMPOLINE_BYTES,
+            blob: entry_blob,
+            blob_offset: 0,
+            file_size: ENTRY_TRAMPOLINE_BYTES,
+            flags: SEGMENT_READ | SEGMENT_EXECUTE,
+        }];
         let support_blob = app.add_blob(support_code);
         segments.push(Segment {
             address: image.base,
@@ -1498,7 +1609,7 @@ fn package_graph_impl(
         append_initial_segments(&mut app, &mut segments, graph, &initial, logical)?;
         app.tiles.push(TileImage {
             physical_tile: physical,
-            entry_point: image.base,
+            entry_point: ipu_driver::APPLICATION_LOAD_BASE,
             command_address: 0,
             diagnostic_address: completion_address,
             segments,
@@ -1532,6 +1643,7 @@ fn package_graph_impl(
         host_inputs = graph.host_inputs.len(),
         host_outputs = graph.host_outputs.len(),
         max_program_bytes = program_end - program_base,
+        image_base = format_args!("0x{image_base:x}"),
         program_base = format_args!("0x{program_base:x}"),
         "packaged static executable graph"
     );
@@ -2461,6 +2573,10 @@ const fn align_up(value: u32, alignment: u32) -> u32 {
     (value + alignment - 1) & !(alignment - 1)
 }
 
+const fn align_down(value: u32, alignment: u32) -> u32 {
+    value & !(alignment - 1)
+}
+
 const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_end: u32) -> bool {
     left_start < right_end && right_start < left_end
 }
@@ -2468,6 +2584,46 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executable_placement_reserves_complete_memory_elements() {
+        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        let runtime_end = PLAN_BASE + element / 2;
+        let allocation_address = align_up(runtime_end, element) + element;
+        let graph = ExecutableGraph {
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: vec![ipu_compiler::Allocation {
+                    tensor: ipu_compiler::TensorId(1),
+                    tile: 0,
+                    address: allocation_address,
+                    size: 4,
+                    live_from: 0,
+                    live_until: 1,
+                    kind: ipu_compiler::AllocationKind::Home,
+                }],
+                tile_count: 1,
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+        let required = element + 1;
+        let base = executable_region_base(&graph, runtime_end, required).unwrap();
+        let end = base + align_up(required, element);
+
+        assert_eq!(base % element, 0);
+        assert!(base >= align_up(runtime_end, element));
+        assert!(!ranges_overlap(
+            base,
+            end,
+            align_down(allocation_address, element),
+            align_up(allocation_address + 4, element),
+        ));
+    }
 
     #[test]
     fn boundary_profile_reuses_adjacent_timestamps() {
