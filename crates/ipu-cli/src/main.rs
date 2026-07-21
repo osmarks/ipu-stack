@@ -100,6 +100,8 @@ enum Command {
         bindings: bool,
         #[arg(long)]
         tile: Option<u32>,
+        #[arg(long, requires = "tile")]
+        address: Option<u32>,
     },
     ProfileInspect {
         profile: PathBuf,
@@ -391,6 +393,7 @@ fn main() -> Result<()> {
             package,
             bindings,
             tile,
+            address,
         } => {
             let app = Application::read(fs::File::open(&package)?)?;
             let stored: usize = app.blobs.iter().map(|blob| blob.bytes.len()).sum();
@@ -459,6 +462,31 @@ fn main() -> Result<()> {
                         segment.blob,
                         segment.blob_offset
                     );
+                }
+                if let Some(address) = address {
+                    let segment = tile
+                        .segments
+                        .iter()
+                        .find(|segment| {
+                            address >= segment.address
+                                && address < segment.address + segment.file_size
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "address 0x{address:x} is not stored for tile {physical_tile}"
+                            )
+                        })?;
+                    let offset = usize::try_from(
+                        segment.blob_offset + u64::from(address - segment.address),
+                    )?;
+                    let bytes = &app.blobs[segment.blob].bytes;
+                    for (index, word) in bytes[offset..].chunks_exact(4).take(16).enumerate() {
+                        println!(
+                            "word address={:#x} value={:#010x}",
+                            address + u32::try_from(index * 4)?,
+                            u32::from_le_bytes(word.try_into().unwrap())
+                        );
+                    }
                 }
             }
         }
@@ -1038,7 +1066,12 @@ fn main() -> Result<()> {
                     .map(fs::read)
                     .transpose()?
                     .unwrap_or_default();
-                let result = session.invoke(&call, &bytes)?;
+                let result = session.invoke(&call, &bytes).map_err(|error| {
+                    anyhow::anyhow!(
+                        "{error}; device state: {}",
+                        host_run_device_summary(&device, &app)
+                    )
+                })?;
                 if let Some(path) = output.get(&call) {
                     fs::write(path, &result)?;
                 } else if !result.is_empty() {
@@ -1053,6 +1086,29 @@ fn main() -> Result<()> {
     }
     info!("command completed");
     Ok(())
+}
+
+fn host_run_device_summary(device: &Device, app: &Application) -> String {
+    let mut counts = [0usize; 4];
+    let mut exceptions = Vec::new();
+    let mut read_errors = 0usize;
+    for tile in &app.tiles {
+        let physical = tile.physical_tile as u16;
+        match device.tile_context_state(physical, 0) {
+            Ok(state @ 0..=3) => {
+                counts[state as usize] += 1;
+                if state == 3 && exceptions.len() < 8 {
+                    let status = device
+                        .read_tile_context_status(physical, 0)
+                        .map(ipu_driver::TileException::from_status);
+                    let pc = device.read_tile_program_counter(physical, 0);
+                    exceptions.push(format!("{}:{status:?}@{pc:?}", tile.physical_tile));
+                }
+            }
+            Ok(_) | Err(_) => read_errors += 1,
+        }
+    }
+    format!("context0={counts:?}, read_errors={read_errors}, supervisor_exceptions={exceptions:?}")
 }
 
 impl Command {

@@ -140,9 +140,7 @@ fn executable_regions_for_tile(
     additional_reserved: &[(u32, u32)],
 ) -> Result<Vec<(u32, u32)>> {
     let element_size = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
-    let memory_end = ipu_package::TILE_MEMORY_BASE
-        .checked_add(ipu_package::TILE_MEMORY_SIZE)
-        .ok_or("tile memory range overflow")?;
+    let memory_end = ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT;
     let mut reserved = vec![
         (
             ipu_package::TILE_MEMORY_BASE,
@@ -306,12 +304,16 @@ fn pack_executable_objects_for_tile(
     runtime_end: u32,
     objects: &[Range<u32>],
     additional_reserved: &[(u32, u32)],
-) -> Result<(BTreeMap<u32, u32>, Vec<(u32, u32)>)> {
-    let gaps = executable_regions_for_tile(allocation_ranges, runtime_end, additional_reserved)?;
+    additional_available: &[(u32, u32)],
+) -> Result<(BTreeMap<u32, u32>, Vec<(u32, u32)>, Vec<(u32, u32)>)> {
+    let mut gaps =
+        executable_regions_for_tile(allocation_ranges, runtime_end, additional_reserved)?;
+    gaps.extend_from_slice(additional_available);
     let (relocations, placed) = pack_objects_in_gaps(tile, objects, gaps, "static executable")?;
     let element_size = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
     let mut elements = placed
-        .into_iter()
+        .iter()
+        .copied()
         .map(|(start, end)| (align_down(start, element_size), align_up(end, element_size)))
         .collect::<Vec<_>>();
     elements.sort_unstable();
@@ -325,7 +327,7 @@ fn pack_executable_objects_for_tile(
             merged.push((start, end));
         }
     }
-    Ok((relocations, merged))
+    Ok((relocations, placed, merged))
 }
 
 fn pack_objects_in_gaps(
@@ -1861,23 +1863,29 @@ fn package_graph_impl(
             .ok_or("static host runtime address overflow")?;
         plans.ordinary_data_objects.push(old_worker_sync..old_end);
         let tile = programs[tile_index].tile;
-        let (mut relocations, executable_ranges) = pack_executable_objects_for_tile(
-            &allocation_ranges_by_tile[usize::from(tile)],
-            tile,
-            tile_exchange_plans[tile_index].end,
-            &plans.executable_objects,
-            &[
-                program_reservations[tile_index],
-                support_reservations[tile_index],
-            ],
-        )?;
+        let program_tail_start = program_reservations[tile_index]
+            .0
+            .checked_add(preliminary_program_sizes[tile_index])
+            .ok_or("generated program tail overflow")?;
+        let (mut relocations, executable_ranges, executable_elements) =
+            pack_executable_objects_for_tile(
+                &allocation_ranges_by_tile[usize::from(tile)],
+                tile,
+                tile_exchange_plans[tile_index].end,
+                &plans.executable_objects,
+                &[
+                    program_reservations[tile_index],
+                    support_reservations[tile_index],
+                ],
+                &[(program_tail_start, program_reservations[tile_index].1)],
+            )?;
         let (ordinary_relocations, mut ranges) = pack_data_objects_for_tile(
             &allocation_ranges_by_tile[usize::from(tile)],
             tile,
             tile_exchange_plans[tile_index].end,
             &plans.ordinary_data_objects,
             false,
-            &executable_ranges
+            &executable_elements
                 .iter()
                 .copied()
                 .chain(std::iter::once(program_reservations[tile_index]))
@@ -1895,6 +1903,7 @@ fn package_graph_impl(
             &ranges
                 .iter()
                 .copied()
+                .chain(executable_elements.iter().copied())
                 .chain(std::iter::once(program_reservations[tile_index]))
                 .chain(std::iter::once(support_reservations[tile_index]))
                 .collect::<Vec<_>>(),
@@ -4099,17 +4108,18 @@ mod tests {
         let allocation = (0x60080, 0x60100);
         let objects = [0x1000..0x1080, 0x2000..0x2080];
 
-        let (relocations, ranges) =
-            pack_executable_objects_for_tile(&[allocation], 0, PLAN_BASE, &objects, &[]).unwrap();
+        let (relocations, storage, elements) =
+            pack_executable_objects_for_tile(&[allocation], 0, PLAN_BASE, &objects, &[], &[])
+                .unwrap();
 
         assert_eq!(relocations.len(), objects.len());
-        assert!(ranges.iter().all(|&(start, end)| {
+        assert!(elements.iter().all(|&(start, end)| {
             start % element == 0
                 && end % element == 0
                 && !ranges_overlap(start, end, allocation.0, allocation.1)
         }));
         assert!(relocations.values().all(|&address| {
-            ranges
+            storage
                 .iter()
                 .any(|&(start, end)| address >= start && address < end)
         }));
