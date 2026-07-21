@@ -2,7 +2,8 @@ use crate::{
     Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, CompileError, GemmDataType,
     KernelCommand, OpId, Phase, Schedule, SpecializationKey, TensorId, Transfer, plan_blocked_gemm,
 };
-use std::collections::{BTreeMap, HashSet};
+use rustc_hash::FxHashSet as HashSet;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockedMlpConfig {
@@ -335,7 +336,7 @@ fn append_activation_transition(
     let compute_phase = exchange_phase + 1;
     let mut transfers = Vec::with_capacity(source.len());
     let mut commands = Vec::with_capacity(source.len());
-    let mut occupied_destinations = HashSet::new();
+    let mut occupied_destinations = HashSet::default();
     for (source, destination) in source.iter().zip(destination) {
         if source.row_start != destination.row_start
             || source.rows != destination.rows

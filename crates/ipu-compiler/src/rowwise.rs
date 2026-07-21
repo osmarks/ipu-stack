@@ -4,6 +4,7 @@ use crate::{
     TensorId, Transfer, allocate_from_occupied, allocate_from_occupied_arenas,
     find_free_region_in_arenas, occupied_intervals_by_tile,
 };
+use rustc_hash::FxHashSet as HashSet;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -61,10 +62,8 @@ pub fn end_tensor_lifetimes(
     tensors: impl IntoIterator<Item = TensorId>,
 ) -> Result<(), CompileError> {
     let phase = schedule.phases.len();
-    let tensors = tensors
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>();
-    let mut found = std::collections::HashSet::new();
+    let tensors = tensors.into_iter().collect::<HashSet<_>>();
+    let mut found = HashSet::default();
     let mut regions = vec![Vec::<(u32, u32)>::new(); usize::from(schedule.tile_count)];
     for allocation in &schedule.allocations {
         if tensors.contains(&allocation.tensor) {
@@ -121,10 +120,8 @@ pub fn make_tensors_resident(
     schedule: &mut Schedule,
     tensors: impl IntoIterator<Item = TensorId>,
 ) -> Result<(), CompileError> {
-    let tensors = tensors
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>();
-    let mut found = std::collections::HashSet::new();
+    let tensors = tensors.into_iter().collect::<HashSet<_>>();
+    let mut found = HashSet::default();
     for allocation in &mut schedule.allocations {
         if allocation.kind == AllocationKind::Home && tensors.contains(&allocation.tensor) {
             found.insert(allocation.tensor);

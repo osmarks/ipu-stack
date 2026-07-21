@@ -1,6 +1,7 @@
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
@@ -1712,7 +1713,7 @@ fn plan_appended_blocked_gemm_with_memory_policy(
     }
     merge_occupied_intervals(&mut occupied_current);
     merge_occupied_intervals(&mut occupied_all);
-    let mut relocated = HashMap::<TensorId, u32>::new();
+    let mut relocated = HashMap::<TensorId, u32>::default();
     for &(tensor, tile, _old_address, size, placement, resident) in &regions {
         let allocation_arenas = if resident {
             &memory.resident
@@ -2768,7 +2769,7 @@ impl Schedule {
     /// overlapping SRAM on the same tile.
     pub fn validate_allocations(&self) -> Result<(), CompileError> {
         let mut by_tile = vec![Vec::new(); usize::from(self.tile_count)];
-        let mut home_by_location = HashMap::<(TensorId, u16), Vec<usize>>::new();
+        let mut home_by_location = HashMap::<(TensorId, u16), Vec<usize>>::default();
         for (index, allocation) in self.allocations.iter().enumerate() {
             if allocation.kind.has_home_address() {
                 home_by_location
@@ -3002,8 +3003,8 @@ impl Schedule {
                 staging_removals[allocation.live_until].push(location);
             }
         }
-        let mut available_staging = HashSet::<(TensorId, u16)>::new();
-        let mut available_staging_counts = HashMap::<(TensorId, u16), usize>::new();
+        let mut available_staging = HashSet::<(TensorId, u16)>::default();
+        let mut available_staging_counts = HashMap::<(TensorId, u16), usize>::default();
 
         let mut lowered_phases = Vec::new();
         for (phase_index, phase) in self.phases.iter().enumerate() {
@@ -3026,7 +3027,7 @@ impl Schedule {
             };
             validate_transfers(transfers)?;
             let mut groups: Vec<PendingGroup> = Vec::new();
-            let mut group_indices = HashMap::<(u16, TensorId, u32), usize>::new();
+            let mut group_indices = HashMap::<(u16, TensorId, u32), usize>::default();
             for transfer in transfers {
                 let key = (transfer.source_tile, transfer.tensor, transfer.bytes);
                 if let Some(&index) = group_indices.get(&key) {
@@ -3055,7 +3056,7 @@ impl Schedule {
                     groups_by_tile[usize::from(destination)].push(group_index);
                 }
             }
-            let mut adjacency = vec![HashSet::new(); groups.len()];
+            let mut adjacency = vec![HashSet::default(); groups.len()];
             for tile_groups in groups_by_tile {
                 for (offset, &left) in tile_groups.iter().enumerate() {
                     for &right in &tile_groups[offset + 1..] {
@@ -3065,7 +3066,7 @@ impl Schedule {
                 }
             }
             let mut colors = vec![None; groups.len()];
-            let mut saturation = vec![HashSet::new(); groups.len()];
+            let mut saturation = vec![HashSet::default(); groups.len()];
             for _ in 0..groups.len() {
                 let index = (0..groups.len())
                     .filter(|index| colors[*index].is_none())
@@ -3418,7 +3419,7 @@ struct AllocationIndex<'a> {
 
 impl<'a> AllocationIndex<'a> {
     fn new(allocations: &'a [Allocation]) -> Self {
-        let mut by_location = HashMap::new();
+        let mut by_location = HashMap::default();
         let mut next = vec![usize::MAX; allocations.len()];
         // Build backwards so iteration retains the original allocation order.
         for (index, allocation) in allocations.iter().enumerate().rev() {
@@ -3683,7 +3684,7 @@ fn worker_count(tensor: &Tensor) -> u8 {
 }
 
 fn validate_transfers(transfers: &[Transfer]) -> Result<(), CompileError> {
-    let mut destinations = HashSet::new();
+    let mut destinations = HashSet::default();
     for transfer in transfers {
         if transfer.source_tile == transfer.destination_tile || transfer.bytes == 0 {
             return Err(CompileError::Graph("invalid exchange transfer".into()));
@@ -3726,7 +3727,7 @@ fn plan_memory(
     }
 
     let mut allocations = Vec::new();
-    let mut by_tile: HashMap<u16, Vec<Allocation>> = HashMap::new();
+    let mut by_tile: HashMap<u16, Vec<Allocation>> = HashMap::default();
     for tensor in &graph.tensors {
         let layout = &layouts[tensor.id.0];
         let size = align_u32(local_bytes(tensor, layout) as u32, layout.alignment);
@@ -5164,7 +5165,7 @@ mod tests {
             },
         ];
         let mut allocations = Vec::new();
-        let mut by_tile = HashMap::new();
+        let mut by_tile = HashMap::default();
         allocate_region(
             &mut allocations,
             &mut by_tile,
@@ -5210,7 +5211,7 @@ mod tests {
         let mut rng = fastrand::Rng::with_seed(0x1234_5678);
         for _ in 0..64 {
             let mut transfers = Vec::new();
-            let mut destinations = HashSet::new();
+            let mut destinations = HashSet::default();
             for tensor in 0..12 {
                 let source = rng.u16(0..16);
                 let mut destination = rng.u16(0..16);
