@@ -5,7 +5,7 @@ use ipu_compiler::{
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    ExecutableGraph, HostRunOptions, InitialBuffer, package_graph, run_host_with_options,
+    ExecutableGraph, HostRunOptions, InitialBuffer, package_graph_repeated, run_host_with_options,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -96,7 +96,7 @@ fn main() {
         .as_ref()
         .map_or(output_count, |tiles| tiles.len() as u32);
     let payload = test_payload(transfer_bytes * payload_count);
-    let (mut graph, input, expected) = if compute_relay {
+    let (mut graph, mut input, mut expected) = if compute_relay {
         assert_eq!(transfer_bytes, 4, "compute relay operates on one u32");
         assert!(host_tiles.is_none());
         let input = payload.clone();
@@ -196,7 +196,21 @@ fn main() {
             .unwrap();
         objects.push(fs::read(kernel.object).unwrap());
     }
-    let app = package_graph(&graph, &objects).unwrap();
+    let invocations = std::env::var("IPU_HOST_TEST_INVOCATIONS")
+        .map(|value| value.parse::<u32>().expect("invalid invocation count"))
+        .unwrap_or(1);
+    if invocations > 1 {
+        if graph.host_weights.is_empty() {
+            input = input.repeat(invocations as usize);
+        } else {
+            assert!(
+                graph.host_inputs.is_empty(),
+                "mixed invocation and resident host test inputs require explicit payload construction"
+            );
+        }
+        expected = expected.repeat(invocations as usize);
+    }
+    let app = package_graph_repeated(&graph, &objects, invocations).unwrap();
     if let Some(path) = std::env::var_os("IPU_HOST_TEST_PACKAGE") {
         app.write(fs::File::create(path).unwrap()).unwrap();
     }

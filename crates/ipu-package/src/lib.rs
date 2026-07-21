@@ -266,6 +266,7 @@ pub struct HostCall {
     pub phases: u32,
     pub inputs: Vec<HostSlice>,
     pub outputs: Vec<HostSlice>,
+    pub invocations: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -545,6 +546,12 @@ impl Application {
             ));
         }
         for call in &self.host_exchange.calls {
+            if call.invocations == 0 {
+                return Err(PackageError::Invalid(format!(
+                    "host call {} has no invocations",
+                    call.name
+                )));
+            }
             for slice in call.inputs.iter().chain(&call.outputs) {
                 let Some(page_size) = pages.get(&slice.page) else {
                     return Err(PackageError::Invalid(format!(
@@ -809,6 +816,7 @@ impl Application {
             hash_string(&mut hash, &call.name);
             hash.update(call.command.to_le_bytes());
             hash.update(call.phases.to_le_bytes());
+            hash.update(call.invocations.to_le_bytes());
             for slices in [&call.inputs, &call.outputs] {
                 hash_len(&mut hash, slices.len());
                 for slice in slices {
@@ -1002,6 +1010,7 @@ fn write_host_exchange(
         item.set_name(&call.name);
         item.set_command(call.command);
         item.set_phases(call.phases);
+        item.set_invocations(call.invocations);
         write_host_slices(
             item.reborrow().init_inputs(call.inputs.len() as u32),
             &call.inputs,
@@ -1050,6 +1059,7 @@ fn read_host_exchange(
                     name: call.get_name()?.to_str()?.into(),
                     command: call.get_command(),
                     phases: call.get_phases(),
+                    invocations: call.get_invocations(),
                     inputs: read_host_slices(call.get_inputs()?),
                     outputs: read_host_slices(call.get_outputs()?),
                 })

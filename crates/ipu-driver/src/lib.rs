@@ -1592,6 +1592,7 @@ mod tests {
             name: "graph".into(),
             command: 0,
             phases: 0,
+            invocations: 1,
             inputs: vec![host_slice(1, 0, 4096), host_slice(2, 0, 4096)],
             outputs: vec![host_slice(1, 4096, 4)],
         };

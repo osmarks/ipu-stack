@@ -1052,8 +1052,12 @@ fn main() -> Result<()> {
             let output: HashMap<_, _> = output.into_iter().collect();
             let bootloader = fs::read(bootloader)?;
             let configuration = fs::read(configuration)?;
-            let generated_call =
-                calls.len() == 1 && protocol.calls.len() == 1 && calls[0] == protocol.calls[0].name;
+            let generated_call = calls.as_slice() == ["graph"]
+                && protocol.calls.iter().any(|call| call.name == "graph")
+                && protocol
+                    .calls
+                    .iter()
+                    .all(|call| call.name == "initialize" || call.name == "graph");
             if generated_call {
                 let call = &calls[0];
                 let bytes = input
@@ -1398,6 +1402,7 @@ fn parse_host_manifest(text: &str) -> Result<HostExchange> {
                 name: (*name).into(),
                 command: command.parse()?,
                 phases: phases.parse()?,
+                invocations: 1,
                 inputs: Vec::new(),
                 outputs: Vec::new(),
             }),

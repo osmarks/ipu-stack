@@ -35,6 +35,27 @@ fn resident_h2d_then_d2h_works() {
 }
 
 #[test]
+fn repeated_h2d_and_d2h_works() {
+    let _device = device();
+    require_success(
+        "three statically repeated H2D and D2H invocations",
+        host_test(&[("IPU_HOST_TEST_INVOCATIONS", "3")]),
+    );
+}
+
+#[test]
+fn resident_h2d_and_repeated_d2h_work() {
+    let _device = device();
+    require_success(
+        "resident H2D initialization followed by three static invocations",
+        host_test(&[
+            ("IPU_HOST_TEST_RESIDENT_INPUT", "1"),
+            ("IPU_HOST_TEST_INVOCATIONS", "3"),
+        ]),
+    );
+}
+
+#[test]
 fn initialized_d2d_relay_and_d2h_work() {
     let _device = device();
     require_success(

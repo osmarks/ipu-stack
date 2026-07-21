@@ -841,7 +841,11 @@ pub(crate) fn emit(
     host: HostCode<'_>,
     profile: Option<&ProfileCode>,
     generated_base: u32,
+    invocations: u32,
 ) -> Result<Vec<u8>> {
+    if invocations == 0 {
+        return Err("static graph invocation count must be nonzero".into());
+    }
     if let Some(profile) = profile
         && (profile.after_sync.len() != program.steps.len()
             || profile.after_step.len() != program.steps.len())
@@ -854,6 +858,12 @@ pub(crate) fn emit(
     let mut code = TileCode::new();
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
     emit_host_phases(&mut code, symbols, host.weights)?;
+    if invocations > 1 {
+        code.add_immediate(11, 11, -8)?;
+        code.setzi(0, invocations)?;
+        code.st32(0, 11, 15, 0)?;
+    }
+    let invocation_start = generated_address(generated_base, code.words.len())?;
     emit_host_phases(&mut code, symbols, host.inputs)?;
     if program.steps.iter().any(|step| {
         matches!(
@@ -1003,6 +1013,17 @@ pub(crate) fn emit(
         emit_cycle_sample(&mut code, symbols, address)?;
     }
     emit_host_phases(&mut code, symbols, host.outputs)?;
+    if invocations > 1 {
+        code.ld32(0, 11, 15, 0)?;
+        code.add_immediate(0, 0, -1)?;
+        code.st32(0, 11, 15, 0)?;
+        let done_branch = code.words.len();
+        code.brz(0, 0)?;
+        code.jump(invocation_start)?;
+        let done = generated_address(generated_base, code.words.len())?;
+        code.words[done_branch] = ipu_exchange::encode_brz_m_immediate(0, done)?;
+        code.add_immediate(11, 11, 8)?;
+    }
     code.jump(symbol(symbols, COMPLETE)?)?;
     let template_exchanges = if templates.is_empty() {
         None

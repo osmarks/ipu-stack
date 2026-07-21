@@ -61,6 +61,7 @@ struct HostCall {
   phases @2 :UInt32;
   inputs @3 :List(HostSlice);
   outputs @4 :List(HostSlice);
+  invocations @5 :UInt32 = 1;
 }
 
 struct HostExchange {

@@ -610,7 +610,18 @@ fn optional_environment_number(name: &str) -> Result<Option<u64>> {
 }
 
 pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<Application> {
-    package_graph_impl(graph, objects, &[], None, &[])
+    package_graph_impl(graph, objects, &[], None, &[], 1)
+}
+
+pub fn package_graph_repeated(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+    invocations: u32,
+) -> Result<Application> {
+    if invocations == 0 {
+        return Err("graph invocation count must be nonzero".into());
+    }
+    package_graph_impl(graph, objects, &[], None, &[], invocations)
 }
 
 pub fn package_graph_with_templates(
@@ -618,7 +629,19 @@ pub fn package_graph_with_templates(
     objects: &[Vec<u8>],
     templates: &[StaticTemplateRegion],
 ) -> Result<Application> {
-    package_graph_impl(graph, objects, &[], None, templates)
+    package_graph_impl(graph, objects, &[], None, templates, 1)
+}
+
+pub fn package_graph_repeated_with_templates(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+    templates: &[StaticTemplateRegion],
+    invocations: u32,
+) -> Result<Application> {
+    if invocations == 0 {
+        return Err("graph invocation count must be nonzero".into());
+    }
+    package_graph_impl(graph, objects, &[], None, templates, invocations)
 }
 
 pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile> {
@@ -1386,7 +1409,14 @@ fn package_graph_with_profile(
         shape: vec![(file_offset / 4) as u32],
         slices,
     });
-    let app = package_graph_impl(&profile_graph, objects, &profile_code, Some(programs), &[])?;
+    let app = package_graph_impl(
+        &profile_graph,
+        objects,
+        &profile_code,
+        Some(programs),
+        &[],
+        1,
+    )?;
     Ok((
         app,
         ProfileLayout {
@@ -1402,6 +1432,7 @@ fn package_graph_impl(
     profile_code: &[static_codegen::ProfileCode],
     lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
     template_regions: &[StaticTemplateRegion],
+    invocations: u32,
 ) -> Result<Application> {
     let topology = Topology::c600();
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
@@ -1609,7 +1640,7 @@ fn package_graph_impl(
         ),
         "deduplicated device exchange plans"
     );
-    let host = build_static_host_layout(graph)?;
+    let host = build_static_host_layout(graph, invocations)?;
     let host_transfers = host
         .weights
         .iter()
@@ -1858,6 +1889,7 @@ fn package_graph_impl(
                     },
                     profile_code.get(program_index),
                     0,
+                    invocations,
                 )?
                 .len(),
             )?)
@@ -2222,6 +2254,7 @@ fn package_graph_impl(
                 },
                 profile_code.get(program_index),
                 generated_base,
+                invocations,
             )
         };
     let preliminary_generated = preliminary_images
@@ -2780,7 +2813,7 @@ fn package_graph_impl(
     Ok(app)
 }
 
-fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout> {
+fn build_static_host_layout(graph: &ExecutableGraph, invocations: u32) -> Result<StaticHostLayout> {
     if graph.host_weights.is_empty()
         && graph.host_inputs.is_empty()
         && graph.host_outputs.is_empty()
@@ -2885,12 +2918,20 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
         .iter()
         .flat_map(|call| call.outputs.iter().cloned())
         .collect();
-    let graph_phases = host_transfer_phase_count(u32::try_from(inputs.len() + outputs.len())?)?;
+    let graph_transfers = u32::try_from(inputs.len() + outputs.len())?;
+    let graph_phases = if invocations == 1 {
+        host_transfer_phase_count(graph_transfers)?
+    } else {
+        graph_transfers
+            .checked_mul(2)
+            .ok_or("host graph phase count overflow")?
+    };
     calls = Vec::new();
     if !weights.is_empty() {
         calls.push(HostCall {
             name: "initialize".into(),
             command: 0,
+            invocations: 1,
             phases: u32::try_from(weights.len())?
                 .checked_mul(2)
                 .ok_or("host initialization phase count overflow")?,
@@ -2901,6 +2942,7 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
     calls.push(HostCall {
         name: "graph".into(),
         command: 0,
+        invocations,
         phases: graph_phases,
         inputs: call_inputs,
         outputs: call_outputs,
@@ -2985,6 +3027,7 @@ fn append_host_bindings(
                     },
                     command: 0,
                     phases: 0,
+                    invocations: 1,
                     inputs: matches!(direction, HostDirection::ToTile)
                         .then_some(host_slices.clone())
                         .unwrap_or_default(),
@@ -3411,63 +3454,60 @@ fn run_host_impl(
         )
         .into());
     }
-    let output_size = calls
+    let graph_call = calls
         .iter()
-        .flat_map(|call| &call.outputs)
+        .find(|call| call.name == "graph")
+        .ok_or("application has no generated graph call")?;
+    let output_size = graph_call
+        .outputs
+        .iter()
         .map(|slice| slice.file_offset + slice.size)
         .max()
         .unwrap_or(0);
     let invocation_input_bytes = bindings_size(&app.inputs)?;
     let resident_input_bytes = bindings_size(&app.weights)?;
     let expected_input_bytes = invocation_input_bytes
+        .checked_mul(u64::from(graph_call.invocations))
+        .ok_or("batched host input size overflow")?
         .checked_add(resident_input_bytes)
         .ok_or("host input size overflow")?;
     if input.len() != usize::try_from(expected_input_bytes)? {
         return Err(format!(
-            "application expects {expected_input_bytes} input bytes ({} invocation, {} resident), got {}",
+            "application expects {expected_input_bytes} input bytes ({} invocations of {} bytes, {} resident), got {}",
+            graph_call.invocations,
             invocation_input_bytes,
             resident_input_bytes,
             input.len()
         )
         .into());
     }
-    let (invocation_input, resident_input) =
-        input.split_at(usize::try_from(invocation_input_bytes)?);
-    for call in &calls[..calls.len() - 1] {
-        let call_bytes = match call.name.as_str() {
-            "initialize" => resident_input,
-            "graph" => invocation_input,
-            name => return Err(format!("unsupported generated host call {name}").into()),
-        };
+    let invocation_region_bytes = invocation_input_bytes * u64::from(graph_call.invocations);
+    let (invocation_inputs, resident_input) =
+        input.split_at(usize::try_from(invocation_region_bytes)?);
+    if let Some(call) = calls.iter().find(|call| call.name == "initialize") {
         let completed = session
-            .invoke_streaming_deferred(&call.name, call_input(call, call_bytes)?)
+            .invoke_streaming_deferred(&call.name, call_input(call, resident_input)?)
             .map_err(|error| generated_call_error(&device, app, call, error))?;
         session.collect(&completed)?;
     }
-    let call = calls.last().unwrap();
-    let final_input = match call.name.as_str() {
-        "initialize" => resident_input,
-        "graph" => invocation_input,
-        name => return Err(format!("unsupported generated host call {name}").into()),
-    };
-    let deferred = session
-        .invoke_streaming_deferred(&call.name, call_input(call, final_input)?)
-        .map_err(|error| {
-            format!(
-                "generated host call {}: {error}; supervisor states: {}; device outputs: {}",
-                call.name,
-                supervisor_state_summary(&device, app),
-                host_source_summary(&device, app)
+    let mut output = Vec::with_capacity(
+        usize::try_from(output_size)? * usize::try_from(graph_call.invocations)?,
+    );
+    for invocation in 0..graph_call.invocations {
+        let start = usize::try_from(u64::from(invocation) * invocation_input_bytes)?;
+        let end = start + usize::try_from(invocation_input_bytes)?;
+        let deferred = session
+            .invoke_streaming_deferred(
+                &graph_call.name,
+                call_input(graph_call, &invocation_inputs[start..end])?,
             )
-        })?;
-    finish_host_graph(&device, app)?;
-    verify_runtime_completion(&device, app)?;
-    let call_output = session.collect(&deferred)?;
-    let mut output = vec![0; usize::try_from(output_size)?];
-    for slice in &call.outputs {
-        let start = usize::try_from(slice.file_offset)?;
-        let end = usize::try_from(slice.file_offset + slice.size)?;
-        output[start..end].copy_from_slice(&call_output[start..end]);
+            .map_err(|error| generated_call_error(&device, app, graph_call, error))?;
+        if invocation + 1 == graph_call.invocations {
+            finish_host_graph(&device, app)?;
+            verify_runtime_completion(&device, app)?;
+        }
+        let call_output = session.collect(&deferred)?;
+        output.extend_from_slice(&call_output[..usize::try_from(output_size)?]);
     }
     debug!(states = %supervisor_state_summary(&device, app), "host exchange supervisor states");
     debug!(sources = %host_source_summary(&device, app), "host exchange device sources");

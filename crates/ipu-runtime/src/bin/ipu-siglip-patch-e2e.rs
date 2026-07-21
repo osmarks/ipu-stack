@@ -14,8 +14,8 @@ use ipu_runtime::{
     StaticTemplateRegion, allocator_memory_profile, append_host_a16_matrix,
     append_siglip_encoder_layer, append_siglip_map_head, append_siglip_post_layer_norm,
     block_binding_typed, block_coordinates, blocked_matrix_f16,
-    consolidate_attention_kernel_variants, package_graph, package_graph_with_templates,
-    run_host_with_options,
+    consolidate_attention_kernel_variants, package_graph_repeated,
+    package_graph_repeated_with_templates, run_host_with_options,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -277,10 +277,12 @@ fn main() {
     let objects = compile_objects(&plan, &attentions, attention_variant).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
-        bytes: mut host_input,
+        bytes: host_input,
         resident_bindings: host_weights,
         resident_bytes: host_weight_bytes,
     } = host;
+    let invocations = env_u32("IPU_SIGLIP_INVOCATIONS", 1);
+    let mut host_input = host_input.repeat(invocations as usize);
     host_input.extend(host_weight_bytes);
     let mut host_outputs = Vec::new();
     if detailed_diagnostics {
@@ -326,7 +328,8 @@ fn main() {
         })
         .into_iter()
         .collect::<Vec<_>>();
-    let app = package_graph_with_templates(&graph, &objects, &templates).unwrap();
+    let app =
+        package_graph_repeated_with_templates(&graph, &objects, &templates, invocations).unwrap();
     if let Some(path) = std::env::var_os("IPU_SIGLIP_PACKAGE_OUTPUT") {
         app.write(fs::File::create(path).unwrap()).unwrap();
     }
@@ -357,6 +360,20 @@ fn main() {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
+    let invocation_output_bytes = actual.len() / invocations as usize;
+    assert_eq!(
+        actual.len(),
+        invocation_output_bytes * invocations as usize,
+        "runtime returned a partial invocation output"
+    );
+    let first_actual = &actual[..invocation_output_bytes];
+    for (index, output) in actual.chunks_exact(invocation_output_bytes).enumerate() {
+        assert_eq!(
+            output, first_actual,
+            "identical SigLIP invocation {index} produced a different output"
+        );
+    }
+    let actual = first_actual;
     let (diagnostic_bytes, norm2_error, mlp_gelu_error) = if detailed_diagnostics {
         let norm2_bytes = usize::from(rows) * usize::from(columns) * 2;
         let expected_norm2 = reference.tensor_f32("encoder_layer_00_norm2").unwrap();
@@ -447,6 +464,7 @@ fn main() {
         intermediate_columns,
         row_block_dimension,
         layer_count,
+        invocations,
         ?norm2_error,
         ?mlp_gelu_error,
         layer_error,
@@ -558,10 +576,12 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
     let objects = compile_objects(&compilation_plan, &[attention], attention_variant).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
-        bytes: mut host_input,
+        bytes: host_input,
         resident_bindings: host_weights,
         resident_bytes: host_weight_bytes,
     } = host;
+    let invocations = env_u32("IPU_SIGLIP_INVOCATIONS", 1);
+    let mut host_input = host_input.repeat(invocations as usize);
     host_input.extend(host_weight_bytes);
     let graph = ExecutableGraph {
         host_weights,
@@ -581,7 +601,7 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         )],
     };
     write_memory_profile(&graph);
-    let app = package_graph(&graph, &objects).unwrap();
+    let app = package_graph_repeated(&graph, &objects, invocations).unwrap();
     if let Some(path) = std::env::var_os("IPU_SIGLIP_PACKAGE_OUTPUT") {
         app.write(fs::File::create(path).unwrap()).unwrap();
     }
@@ -609,6 +629,20 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
+    let invocation_output_bytes = actual.len() / invocations as usize;
+    assert_eq!(
+        actual.len(),
+        invocation_output_bytes * invocations as usize,
+        "runtime returned a partial invocation output"
+    );
+    let first_actual = &actual[..invocation_output_bytes];
+    for (index, output) in actual.chunks_exact(invocation_output_bytes).enumerate() {
+        assert_eq!(
+            output, first_actual,
+            "identical SigLIP MAP invocation {index} produced a different output"
+        );
+    }
+    let actual = first_actual;
     let expected = serialize_a16_row_shards(
         &expected,
         usize::from(output_rows),
@@ -1174,6 +1208,12 @@ fn required_env(name: &str) -> String {
 }
 
 fn env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .map(|value| value.parse().unwrap())
+        .unwrap_or(default)
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name)
         .map(|value| value.parse().unwrap())
         .unwrap_or(default)
