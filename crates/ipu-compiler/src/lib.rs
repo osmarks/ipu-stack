@@ -2695,7 +2695,6 @@ impl Schedule {
                 available.contains(&(tensor, tile))
                     || allocation_index
                         .at(tensor, tile)
-                        .iter()
                         .any(|allocation| allocation.kind == AllocationKind::Home)
             };
             let mut epoch_groups = Vec::with_capacity(colored_groups.len());
@@ -2760,13 +2759,13 @@ impl Schedule {
                     let words = bytes / 4;
                     let candidates = allocation_index.at(tensor, source);
                     let same_phase_staging = || {
-                        candidates.iter().copied().find(|allocation| {
+                        candidates.clone().find(|allocation| {
                             allocation.kind
                                 == AllocationKind::ExchangeStaging { phase: phase_index }
                         })
                     };
                     let earlier_staging = || {
-                        candidates.iter().copied().find(|allocation| {
+                        candidates.clone().find(|allocation| {
                             matches!(
                                 allocation.kind,
                                 AllocationKind::ExchangeStaging { phase }
@@ -2777,8 +2776,7 @@ impl Schedule {
                     };
                     let home = || {
                         candidates
-                            .iter()
-                            .copied()
+                            .clone()
                             .find(|allocation| allocation.kind == AllocationKind::Home)
                     };
                     let source_address =
@@ -2799,8 +2797,6 @@ impl Schedule {
                         .map(|destination| {
                             allocation_index
                                 .at(tensor, *destination)
-                                .iter()
-                                .copied()
                                 .find(|allocation| {
                                     allocation.kind
                                         == AllocationKind::ExchangeStaging { phase: phase_index }
@@ -3005,32 +3001,43 @@ impl Schedule {
 }
 
 struct AllocationIndex<'a> {
-    by_location: HashMap<(TensorId, u16), Vec<&'a Allocation>>,
+    allocations: &'a [Allocation],
+    by_location: HashMap<(TensorId, u16), usize>,
+    next: Vec<usize>,
 }
 
 impl<'a> AllocationIndex<'a> {
     fn new(allocations: &'a [Allocation]) -> Self {
-        let mut by_location = HashMap::<_, Vec<_>>::new();
-        for allocation in allocations {
-            by_location
-                .entry((allocation.tensor, allocation.tile))
-                .or_default()
-                .push(allocation);
+        let mut by_location = HashMap::new();
+        let mut next = vec![usize::MAX; allocations.len()];
+        // Build backwards so iteration retains the original allocation order.
+        for (index, allocation) in allocations.iter().enumerate().rev() {
+            if let Some(successor) = by_location.insert((allocation.tensor, allocation.tile), index)
+            {
+                next[index] = successor;
+            }
         }
-        Self { by_location }
+        Self {
+            allocations,
+            by_location,
+            next,
+        }
     }
 
-    fn at(&self, tensor: TensorId, tile: u16) -> &[&'a Allocation] {
-        self.by_location
-            .get(&(tensor, tile))
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+    fn at(&self, tensor: TensorId, tile: u16) -> AllocationCandidates<'_> {
+        AllocationCandidates {
+            allocations: self.allocations,
+            next: &self.next,
+            current: self
+                .by_location
+                .get(&(tensor, tile))
+                .copied()
+                .unwrap_or(usize::MAX),
+        }
     }
 
     fn home_address(&self, tensor: TensorId, tile: u16) -> Result<u32, CompileError> {
         self.at(tensor, tile)
-            .iter()
-            .copied()
             .find(|allocation| allocation.kind == AllocationKind::Home)
             .map(|allocation| allocation.address)
             .ok_or_else(|| {
@@ -3047,7 +3054,7 @@ impl<'a> AllocationIndex<'a> {
         tile: u16,
         compute_phase: usize,
     ) -> Result<u32, CompileError> {
-        if let Some(staging) = self.at(tensor, tile).iter().copied().find(|allocation| {
+        if let Some(staging) = self.at(tensor, tile).find(|allocation| {
             allocation.live_from < compute_phase
                 && allocation.live_until >= compute_phase
                 && matches!(allocation.kind, AllocationKind::ExchangeStaging { .. })
@@ -3055,6 +3062,26 @@ impl<'a> AllocationIndex<'a> {
             return Ok(staging.address);
         }
         self.home_address(tensor, tile)
+    }
+}
+
+#[derive(Clone)]
+struct AllocationCandidates<'a> {
+    allocations: &'a [Allocation],
+    next: &'a [usize],
+    current: usize,
+}
+
+impl<'a> Iterator for AllocationCandidates<'a> {
+    type Item = &'a Allocation;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current == usize::MAX {
+            return None;
+        }
+        let index = self.current;
+        self.current = self.next[index];
+        Some(&self.allocations[index])
     }
 }
 
