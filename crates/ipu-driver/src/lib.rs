@@ -565,6 +565,17 @@ impl Device {
                 "worker status requires a worker context".into(),
             ));
         }
+        self.read_tile_context_status(physical_tile, context)
+    }
+
+    pub fn read_tile_context_status(
+        &self,
+        physical_tile: u16,
+        context: u32,
+    ) -> Result<u32, DriverError> {
+        if context >= 7 {
+            return Err(DriverError::Invalid("tile context out of range".into()));
+        }
         self.with_stopped_tile_context(physical_tile, context, || {
             self.execute_tile_instruction(physical_tile, context, tdi_instruction::GET_M0_WSR)?;
             self.execute_tile_instruction(

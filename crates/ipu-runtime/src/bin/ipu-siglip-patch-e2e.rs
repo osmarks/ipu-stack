@@ -546,6 +546,12 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
     };
     write_memory_profile(&graph);
     let app = package_graph(&graph, &objects).unwrap();
+    if let Some(path) = std::env::var_os("IPU_SIGLIP_PACKAGE_OUTPUT") {
+        app.write(fs::File::create(path).unwrap()).unwrap();
+    }
+    if let Some(path) = std::env::var_os("IPU_SIGLIP_INPUT_OUTPUT") {
+        fs::write(path, &host_input).unwrap();
+    }
     if std::env::var_os("IPU_SIGLIP_BUILD_ONLY").is_some() {
         info!("SigLIP MAP executable built without device execution");
         return;

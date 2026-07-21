@@ -64,7 +64,8 @@ struct StaticHostLayout {
 
 struct TileHostPlans {
     start: u32,
-    ordinary_objects: Vec<Range<u32>>,
+    executable_objects: Vec<Range<u32>>,
+    ordinary_data_objects: Vec<Range<u32>>,
     data_objects: Vec<Range<u32>>,
     addresses: Vec<u32>,
     packet_copies: Vec<Option<HostPacketCopy>>,
@@ -296,6 +297,43 @@ fn pack_data_objects_for_tile(
         gaps.push((gap_start, memory_end));
     }
 
+    pack_objects_in_gaps(tile, objects, gaps, "static data")
+}
+
+fn pack_executable_objects_for_tile(
+    allocation_ranges: &[(u32, u32)],
+    tile: u16,
+    runtime_end: u32,
+    objects: &[Range<u32>],
+    additional_reserved: &[(u32, u32)],
+) -> Result<(BTreeMap<u32, u32>, Vec<(u32, u32)>)> {
+    let gaps = executable_regions_for_tile(allocation_ranges, runtime_end, additional_reserved)?;
+    let (relocations, placed) = pack_objects_in_gaps(tile, objects, gaps, "static executable")?;
+    let element_size = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+    let mut elements = placed
+        .into_iter()
+        .map(|(start, end)| (align_down(start, element_size), align_up(end, element_size)))
+        .collect::<Vec<_>>();
+    elements.sort_unstable();
+    let mut merged = Vec::<(u32, u32)>::new();
+    for (start, end) in elements {
+        if let Some(previous) = merged.last_mut()
+            && start <= previous.1
+        {
+            previous.1 = previous.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    Ok((relocations, merged))
+}
+
+fn pack_objects_in_gaps(
+    tile: u16,
+    objects: &[Range<u32>],
+    mut gaps: Vec<(u32, u32)>,
+    description: &str,
+) -> Result<(BTreeMap<u32, u32>, Vec<(u32, u32)>)> {
     let mut order = (0..objects.len()).collect::<Vec<_>>();
     order.sort_unstable_by_key(|&index| std::cmp::Reverse(objects[index].len()));
     let mut relocations = BTreeMap::new();
@@ -321,7 +359,7 @@ fn pack_data_objects_for_tile(
                     .max()
                     .unwrap_or(0);
                 format!(
-                    "no tile-memory gap can hold a {size}-byte static data object on tile {tile}: {free} free bytes, {largest}-byte largest gap"
+                    "no tile-memory gap can hold a {size}-byte {description} object on tile {tile}: {free} free bytes, {largest}-byte largest gap"
                 )
             })?;
         gaps[gap_index].0 = address + size;
@@ -1588,7 +1626,8 @@ fn package_graph_impl(
             let plan_end = exchange_plans.end;
             let physical = topology.physical(program.tile)?;
             let follower_address = align_up(plan_end, 64);
-            let mut ordinary_objects = vec![follower_address..follower_address + 3 * 4];
+            let mut executable_objects = vec![follower_address..follower_address + 3 * 4];
+            let ordinary_data_objects = Vec::new();
             let mut data_objects = Vec::new();
             let mut cursor = if host_transfers.is_empty() {
                 plan_end
@@ -1613,7 +1652,7 @@ fn package_graph_impl(
                             .checked_add(u32::try_from(instructions.len() * 4)?)
                             .ok_or("static host plan address overflow")?;
                         instruction_addresses.insert(instructions, address);
-                        ordinary_objects.push(address..cursor);
+                        executable_objects.push(address..cursor);
                         address
                     };
                     addresses.push(address);
@@ -1684,7 +1723,8 @@ fn package_graph_impl(
             }
             Ok(TileHostPlans {
                 start: follower_address,
-                ordinary_objects,
+                executable_objects,
+                ordinary_data_objects,
                 data_objects,
                 addresses,
                 packet_copies,
@@ -1819,19 +1859,33 @@ fn package_graph_impl(
         let old_end = old_worker_sync
             .checked_add(WORKER_STACK_HEADROOM + (TILE_CONTEXT_STACKS - 1) * WORKER_SYNC_STRIDE)
             .ok_or("static host runtime address overflow")?;
-        plans.ordinary_objects.push(old_worker_sync..old_end);
+        plans.ordinary_data_objects.push(old_worker_sync..old_end);
         let tile = programs[tile_index].tile;
-        let (mut relocations, mut ranges) = pack_data_objects_for_tile(
+        let (mut relocations, executable_ranges) = pack_executable_objects_for_tile(
             &allocation_ranges_by_tile[usize::from(tile)],
             tile,
             tile_exchange_plans[tile_index].end,
-            &plans.ordinary_objects,
-            false,
+            &plans.executable_objects,
             &[
                 program_reservations[tile_index],
                 support_reservations[tile_index],
             ],
         )?;
+        let (ordinary_relocations, mut ranges) = pack_data_objects_for_tile(
+            &allocation_ranges_by_tile[usize::from(tile)],
+            tile,
+            tile_exchange_plans[tile_index].end,
+            &plans.ordinary_data_objects,
+            false,
+            &executable_ranges
+                .iter()
+                .copied()
+                .chain(std::iter::once(program_reservations[tile_index]))
+                .chain(std::iter::once(support_reservations[tile_index]))
+                .collect::<Vec<_>>(),
+        )?;
+        relocations.extend(ordinary_relocations);
+        ranges.extend(executable_ranges);
         let (data_relocations, data_ranges) = pack_data_objects_for_tile(
             &allocation_ranges_by_tile[usize::from(tile)],
             tile,
@@ -3481,16 +3535,25 @@ fn supervisor_state_summary(device: &Device, app: &Application) -> String {
             Ok(_) | Err(_) => read_errors += 1,
         }
     }
-    let program_counters = app
+    let supervisor_exceptions = app
         .tiles
         .iter()
+        .filter(|tile| device.tile_context_state(tile.physical_tile as u16, 0).ok() == Some(3))
         .take(8)
         .map(|tile| {
+            let status = device.read_tile_context_status(tile.physical_tile as u16, 0);
             let pc = device
                 .read_tile_program_counter(tile.physical_tile as u16, 0)
                 .map(|pc| format!("0x{pc:x}"))
                 .unwrap_or_else(|error| format!("error({error})"));
-            format!("{}:{pc}", tile.physical_tile)
+            match status {
+                Ok(status) => format!(
+                    "{}:{}@{pc}",
+                    tile.physical_tile,
+                    ipu_driver::TileException::from_status(status)
+                ),
+                Err(error) => format!("{}:status=error({error}),pc={pc}", tile.physical_tile),
+            }
         })
         .collect::<Vec<_>>();
     let milestones = app
@@ -3546,7 +3609,7 @@ fn supervisor_state_summary(device: &Device, app: &Application) -> String {
         })
         .collect::<Vec<_>>();
     format!(
-        "0={} {:?}, 1={} {:?}, 2={} {:?}, 3={} {:?}, errors={read_errors}, active_contexts={active_contexts:?}, pc={program_counters:?}, milestones={milestones:?}",
+        "0={} {:?}, 1={} {:?}, 2={} {:?}, 3={} {:?}, errors={read_errors}, supervisor_exceptions={supervisor_exceptions:?}, active_contexts={active_contexts:?}, milestones={milestones:?}",
         counts[0], samples[0], counts[1], samples[1], counts[2], samples[2], counts[3], samples[3]
     )
 }
@@ -4027,6 +4090,28 @@ mod tests {
                     .iter()
                     .any(|&(start, end)| address >= start && address + 0x80 <= end)
             })
+        }));
+    }
+
+    #[test]
+    fn executable_objects_reserve_complete_memory_elements() {
+        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        let allocation = (0x60080, 0x60100);
+        let objects = [0x1000..0x1080, 0x2000..0x2080];
+
+        let (relocations, ranges) =
+            pack_executable_objects_for_tile(&[allocation], 0, PLAN_BASE, &objects, &[]).unwrap();
+
+        assert_eq!(relocations.len(), objects.len());
+        assert!(ranges.iter().all(|&(start, end)| {
+            start % element == 0
+                && end % element == 0
+                && !ranges_overlap(start, end, allocation.0, allocation.1)
+        }));
+        assert!(relocations.values().all(|&address| {
+            ranges
+                .iter()
+                .any(|&(start, end)| address >= start && address < end)
         }));
     }
 }

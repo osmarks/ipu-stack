@@ -98,6 +98,8 @@ enum Command {
         package: PathBuf,
         #[arg(long)]
         bindings: bool,
+        #[arg(long)]
+        tile: Option<u32>,
     },
     ProfileInspect {
         profile: PathBuf,
@@ -385,7 +387,11 @@ fn main() -> Result<()> {
                 output.iter().copied().fold(f32::NEG_INFINITY, f32::max)
             );
         }
-        Command::PackageInspect { package, bindings } => {
+        Command::PackageInspect {
+            package,
+            bindings,
+            tile,
+        } => {
             let app = Application::read(fs::File::open(&package)?)?;
             let stored: usize = app.blobs.iter().map(|blob| blob.bytes.len()).sum();
             println!(
@@ -425,6 +431,34 @@ fn main() -> Result<()> {
                             );
                         }
                     }
+                }
+            }
+            if let Some(physical_tile) = tile {
+                let tile = app
+                    .tiles
+                    .iter()
+                    .find(|tile| tile.physical_tile == physical_tile)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("package has no physical tile {physical_tile}")
+                    })?;
+                println!(
+                    "tile={} entry={:#x} command={:#x} diagnostic={:#x} segments={}",
+                    tile.physical_tile,
+                    tile.entry_point,
+                    tile.command_address,
+                    tile.diagnostic_address,
+                    tile.segments.len()
+                );
+                for segment in &tile.segments {
+                    println!(
+                        "segment address={:#x} memorySize={} fileSize={} flags={:#x} blob={} blobOffset={}",
+                        segment.address,
+                        segment.memory_size,
+                        segment.file_size,
+                        segment.flags,
+                        segment.blob,
+                        segment.blob_offset
+                    );
                 }
             }
         }
