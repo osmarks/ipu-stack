@@ -2606,7 +2606,11 @@ fn package_graph_impl(
                     let mut words = Vec::new();
                     let mut narrow = Vec::new();
                     let mut wide = Vec::new();
-                    for local_base in (0..slots.len()).step_by(32) {
+                    let span = static_codegen::template_patch_group_span(slots.clone(), patch)
+                        .ok_or("nonempty static template patch has no group span")?;
+                    let group_count = span.len().div_ceil(32);
+                    words.push(u32::try_from(span.start)? | (u32::try_from(group_count)? << 16));
+                    for local_base in span.step_by(32) {
                         let slot_base = slots.start + local_base;
                         let slot_limit = (slot_base + 32).min(slots.end);
                         let mut changed_mask = 0u32;

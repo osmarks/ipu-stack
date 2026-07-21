@@ -251,7 +251,15 @@ ipu_stack_static_exchange_compute_run:
 	ld32 $m5, $m11, $m15, 8
 	ld32 $m6, $m11, $m15, 10
 .Ltemplate_patch_segment_ready:
-	add $m2, $m6, 0
+	ld32 $m0, $m3, $m15, 0
+	setzi $m10, 0xffff
+	and $m10, $m0, $m10
+	shl $m10, $m10, 2
+	add $m4, $m4, $m10
+	add $m5, $m5, $m10
+	shr $m2, $m0, 16
+	shl $m2, $m2, 5
+	add $m3, $m3, 4
 	st32 $m4, $m11, $m15, 0
 	st32 $m5, $m11, $m15, 1
 	st32 $m6, $m11, $m15, 2

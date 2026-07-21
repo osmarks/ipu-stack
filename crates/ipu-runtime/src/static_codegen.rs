@@ -102,11 +102,26 @@ pub(crate) fn template_patch_storage_words_range(
             StaticTemplatePatchValue::Delta(_) => (narrow + 1, wide),
             StaticTemplatePatchValue::Word(_) => (narrow, wide + 1),
         });
-    if narrow + wide == 0 {
-        0
-    } else {
-        2 * slots.len().div_ceil(32) + narrow.div_ceil(2) + wide
-    }
+    let Some(span) = template_patch_group_span(slots, patch) else {
+        return 0;
+    };
+    1 + 2 * span.len().div_ceil(32) + narrow.div_ceil(2) + wide
+}
+
+pub(crate) fn template_patch_group_span(
+    slots: Range<usize>,
+    patch: &[(u16, StaticTemplatePatchValue)],
+) -> Option<Range<usize>> {
+    let mut changed = patch
+        .iter()
+        .map(|(slot, _)| usize::from(*slot))
+        .filter(|slot| slots.contains(slot))
+        .map(|slot| slot - slots.start);
+    let first = changed.next()?;
+    let (first, last) = changed.fold((first, first), |(first, last), slot| {
+        (first.min(slot), last.max(slot))
+    });
+    Some((first / 32 * 32)..((last + 1).div_ceil(32) * 32).min(slots.len()))
 }
 
 #[derive(Clone, Debug)]
@@ -1463,6 +1478,20 @@ mod tests {
                 offset: 0x20000,
             }
         );
+    }
+
+    #[test]
+    fn template_patch_span_omits_empty_segment_groups() {
+        let patch = vec![
+            (131, StaticTemplatePatchValue::Delta(4)),
+            (
+                134,
+                StaticTemplatePatchValue::Word(StaticTemplateRecordWord::Value(9)),
+            ),
+        ];
+
+        assert_eq!(template_patch_group_span(64..256, &patch), Some(64..96));
+        assert_eq!(template_patch_storage_words_range(64..256, &patch), 5);
     }
 
     #[test]
