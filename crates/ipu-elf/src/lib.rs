@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::UNIX_EPOCH;
 use tracing::{debug, info};
 
 pub const R_COLOSSUS_NONE: u32 = 0;
@@ -62,53 +63,113 @@ impl Toolchain {
         name: &str,
         flags: &[String],
     ) -> Result<KernelArtifact, ElfError> {
+        let source = source.as_ref();
+        let cache = self.cached_artifact(source, flags)?;
+        if cache.object.is_file() && cache.metadata.is_file() && cache.gp.is_file() {
+            if cache.inspect().is_ok() {
+                debug!(source = %source.display(), name, "using cached kernel artifact");
+                return Ok(cache);
+            }
+        }
         info!(
-            source = %source.as_ref().display(),
+            source = %source.display(),
             name,
             target = %self.target,
             "compiling kernel"
         );
+        // Keep accepting an output directory for API compatibility and for
+        // callers that use it to group a compilation, but immutable artifacts
+        // live in the shared content-addressed cache.
         fs::create_dir_all(output_dir.as_ref())?;
-        let gp = output_dir.as_ref().join(format!("{name}.gp"));
-        let object = output_dir.as_ref().join(format!("{name}.o"));
-        let metadata = output_dir.as_ref().join(format!("{name}.json"));
+        fs::create_dir_all(cache.gp.parent().unwrap())?;
         let mut command = Command::new(&self.popc);
         command.arg("--target").arg(&self.target);
         if !flags.iter().any(|flag| flag.starts_with("-O")) {
             command.arg("-O2");
         }
-        command.args(flags).arg(source.as_ref()).arg("-o").arg(&gp);
+        command.args(flags).arg(source).arg("-o").arg(&cache.gp);
         run(&mut command, "popc")?;
 
-        let object_file = fs::File::create(&object)?;
+        let object_file = fs::File::create(&cache.object)?;
         let mut extract = Command::new(&self.pop_objdump);
         extract
             .arg("extract")
             .arg(&self.target)
-            .arg(&gp)
+            .arg(&cache.gp)
             .stdout(Stdio::from(object_file));
         run(&mut extract, "pop-objdump extract")?;
 
-        let metadata_file = fs::File::create(&metadata)?;
+        let metadata_file = fs::File::create(&cache.metadata)?;
         let mut dump = Command::new(&self.pop_objdump);
         dump.arg("metadata")
             .arg(&self.target)
-            .arg(&gp)
+            .arg(&cache.gp)
             .stdout(Stdio::from(metadata_file));
         run(&mut dump, "pop-objdump metadata")?;
-        let artifact = KernelArtifact {
-            gp,
-            object,
-            metadata,
-        };
-        artifact.inspect()?;
+        cache.inspect()?;
         info!(
-            object = %artifact.object.display(),
-            metadata = %artifact.metadata.display(),
+            object = %cache.object.display(),
+            metadata = %cache.metadata.display(),
             "kernel artifact created"
         );
-        Ok(artifact)
+        Ok(cache)
     }
+
+    fn cached_artifact(&self, source: &Path, flags: &[String]) -> Result<KernelArtifact, ElfError> {
+        let mut digest = Sha256::new();
+        digest.update(b"ipu-stack-kernel-cache-v1\0");
+        digest.update(self.target.as_bytes());
+        digest.update([0]);
+        digest.update(fs::read(source)?);
+        digest.update([0]);
+        if !flags.iter().any(|flag| flag.starts_with("-O")) {
+            digest.update(b"-O2\0");
+        }
+        for flag in flags {
+            digest.update(flag.as_bytes());
+            digest.update([0]);
+        }
+        hash_tool_identity(&mut digest, &self.popc)?;
+        hash_tool_identity(&mut digest, &self.pop_objdump)?;
+        let key = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let directory = kernel_cache_root().join(key);
+        Ok(KernelArtifact {
+            gp: directory.join("kernel.gp"),
+            object: directory.join("kernel.o"),
+            metadata: directory.join("kernel.json"),
+        })
+    }
+}
+
+fn kernel_cache_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("IPU_KERNEL_CACHE") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(path).join("ipu-stack/kernels");
+    }
+    if let Some(path) = std::env::var_os("HOME") {
+        return PathBuf::from(path).join(".cache/ipu-stack/kernels");
+    }
+    std::env::temp_dir().join("ipu-stack-kernels")
+}
+
+fn hash_tool_identity(digest: &mut Sha256, path: &Path) -> Result<(), ElfError> {
+    let path = path.canonicalize()?;
+    let metadata = fs::metadata(&path)?;
+    let modified = metadata
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    digest.update(path.as_os_str().as_encoded_bytes());
+    digest.update(metadata.len().to_le_bytes());
+    digest.update(modified.as_secs().to_le_bytes());
+    digest.update(modified.subsec_nanos().to_le_bytes());
+    Ok(())
 }
 
 fn run(command: &mut Command, name: &str) -> Result<(), ElfError> {
