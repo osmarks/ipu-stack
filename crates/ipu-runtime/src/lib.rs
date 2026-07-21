@@ -1653,12 +1653,8 @@ fn package_graph_impl(
     let mut completion_addresses = Vec::with_capacity(tile_host_plans.len());
     for (tile_index, plans) in tile_host_plans.iter_mut().enumerate() {
         let old_worker_sync = align_up(plans.end, 8);
-        let old_completion = align_up(
-            old_worker_sync + WORKER_STACK_HEADROOM + WORKER_SYNC_REGISTERS * WORKER_SYNC_STRIDE,
-            64,
-        );
-        let old_end = old_completion
-            .checked_add(4)
+        let old_end = old_worker_sync
+            .checked_add(WORKER_STACK_HEADROOM + WORKER_SYNC_REGISTERS * WORKER_SYNC_STRIDE)
             .ok_or("static host runtime address overflow")?;
         plans.ordinary_objects.push(old_worker_sync..old_end);
         let tile = programs[tile_index].tile;
@@ -1698,7 +1694,8 @@ fn package_graph_impl(
         }
         plans.run_state = relocate(plans.run_state)?;
         let worker_sync = relocate(old_worker_sync)?;
-        let completion = worker_sync + (old_completion - old_worker_sync);
+        // Completion is written only after worker stacks are quiescent.
+        let completion = worker_sync;
         plans.start = ranges.iter().map(|&(start, _)| start).min().unwrap_or(0);
         plans.end = ranges.iter().map(|&(_, end)| end).max().unwrap_or(0);
         host_runtime_ranges.push(ranges);
