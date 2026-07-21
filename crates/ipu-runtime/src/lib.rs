@@ -1635,6 +1635,7 @@ fn package_graph_impl(
                 static_codegen::HOST_RUN,
                 static_codegen::REPEAT_CALL,
                 static_codegen::EXCHANGE_COMPUTE_RUN,
+                static_codegen::TEMPLATE_PATCH,
                 static_codegen::SAMPLE_CYCLE,
                 static_codegen::SAMPLE_CYCLE_NEXT,
             ] {
@@ -1842,6 +1843,13 @@ fn package_graph_impl(
             "largest static template record set"
         );
     }
+    #[derive(Clone, Copy)]
+    enum TemplateDataObject {
+        RecordPrimary { template: usize },
+        RecordSecondary { template: usize },
+        Patch { template: usize, instance: usize },
+        Shared { template: usize },
+    }
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
         let runtime_end = plans.end;
@@ -1850,36 +1858,50 @@ fn package_graph_impl(
             .iter()
             .enumerate()
             .flat_map(|(template, plan)| {
-                plan.records
-                    .iter()
-                    .enumerate()
-                    .flat_map(move |(record, words)| {
-                        let split = usize::from(plan.record_split);
-                        [
-                            (template, Some((record, false)), split),
-                            (template, Some((record, true)), words.len() - split),
-                        ]
-                    })
-                    .chain(std::iter::once((template, None, plan.shared.len())))
+                let record_words = plan.records.first().map_or(0, Vec::len);
+                let split = usize::from(plan.record_split);
+                [
+                    (TemplateDataObject::RecordPrimary { template }, split),
+                    (
+                        TemplateDataObject::RecordSecondary { template },
+                        record_words - split,
+                    ),
+                    (TemplateDataObject::Shared { template }, plan.shared.len()),
+                ]
+                .into_iter()
+                .chain(
+                    plan.patches
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .map(move |(instance, patch)| {
+                            (
+                                TemplateDataObject::Patch { template, instance },
+                                patch.len()
+                                    + usize::from(!patch.is_empty()) * record_words.div_ceil(32),
+                            )
+                        }),
+                )
             })
             .collect::<Vec<_>>();
-        records.sort_unstable_by_key(|&(_, _, words)| std::cmp::Reverse(words));
-        for (template, record, words) in records {
+        records.sort_unstable_by_key(|&(_, words)| std::cmp::Reverse(words));
+        for (object, words) in records {
             let size = u32::try_from(words)?
                 .checked_mul(4)
                 .ok_or("static template record size overflow")?;
             if size == 0 {
-                match record {
-                    Some((record, secondary)) => {
-                        if secondary {
-                            plans.templates[template].record_secondary_addresses[record] =
-                                ipu_package::TILE_MEMORY_BASE;
-                        } else {
-                            plans.templates[template].record_addresses[record] =
-                                ipu_package::TILE_MEMORY_BASE;
-                        }
+                match object {
+                    TemplateDataObject::RecordPrimary { template } => plans.templates[template]
+                        .record_addresses
+                        .fill(ipu_package::TILE_MEMORY_BASE),
+                    TemplateDataObject::RecordSecondary { template } => plans.templates[template]
+                        .record_secondary_addresses
+                        .fill(ipu_package::TILE_MEMORY_BASE),
+                    TemplateDataObject::Patch { template, instance } => {
+                        plans.templates[template].patch_addresses[instance] =
+                            ipu_package::TILE_MEMORY_BASE
                     }
-                    None => {
+                    TemplateDataObject::Shared { template } => {
                         plans.templates[template].shared_address = ipu_package::TILE_MEMORY_BASE
                     }
                 }
@@ -1901,14 +1923,19 @@ fn package_graph_impl(
             let end = address
                 .checked_add(size)
                 .ok_or("static template record address overflow")?;
-            match record {
-                Some((record, true)) => {
-                    plans.templates[template].record_secondary_addresses[record] = address
+            match object {
+                TemplateDataObject::RecordPrimary { template } => {
+                    plans.templates[template].record_addresses.fill(address)
                 }
-                Some((record, false)) => {
-                    plans.templates[template].record_addresses[record] = address
+                TemplateDataObject::RecordSecondary { template } => plans.templates[template]
+                    .record_secondary_addresses
+                    .fill(address),
+                TemplateDataObject::Patch { template, instance } => {
+                    plans.templates[template].patch_addresses[instance] = address
                 }
-                None => plans.templates[template].shared_address = address,
+                TemplateDataObject::Shared { template } => {
+                    plans.templates[template].shared_address = address
+                }
             }
             template_record_ranges[tile_index].push((address, end));
         }
@@ -1923,6 +1950,9 @@ fn package_graph_impl(
     if !profile_code.is_empty() {
         runtime_symbols.push(static_codegen::SAMPLE_CYCLE.into());
         runtime_symbols.push(static_codegen::SAMPLE_CYCLE_NEXT.into());
+    }
+    if !template_regions.is_empty() {
+        runtime_symbols.push(static_codegen::TEMPLATE_PATCH.into());
     }
     let tile_retained_symbols = programs
         .iter()
@@ -2121,8 +2151,17 @@ fn package_graph_impl(
             let template_record_bytes = templates
                 .iter()
                 .map(|template| {
-                    (template.shared.len() + template.records.iter().map(Vec::len).sum::<usize>())
-                        * 4
+                    let record = template.records.first().map_or(0, Vec::len) * 4;
+                    let record_words = template.records.first().map_or(0, Vec::len);
+                    let patches = template
+                        .patches
+                        .iter()
+                        .skip(1)
+                        .filter(|patch| !patch.is_empty())
+                        .map(|patch| patch.len() + record_words.div_ceil(32))
+                        .sum::<usize>()
+                        * 4;
+                    template.shared.len() * 4 + record + patches
                 })
                 .sum::<usize>();
             let template_instances = templates
@@ -2368,21 +2407,16 @@ fn package_graph_impl(
         }
         let mut template_segments = Vec::<(u32, Vec<u8>)>::new();
         for template in &tile_exchange_plans[tile_index].templates {
-            for (address, record) in
-                std::iter::once((template.shared_address, template.shared.as_slice())).chain(
-                    template
-                        .records
-                        .iter()
-                        .enumerate()
-                        .flat_map(|(index, record)| {
-                            let split = usize::from(template.record_split);
-                            [
-                                (template.record_addresses[index], &record[..split]),
-                                (template.record_secondary_addresses[index], &record[split..]),
-                            ]
-                        }),
-                )
-            {
+            let first_record = template.records.first().map(Vec::as_slice).unwrap_or(&[]);
+            let split = usize::from(template.record_split);
+            for (address, record) in [
+                (template.shared_address, template.shared.as_slice()),
+                (template.record_addresses[0], &first_record[..split]),
+                (
+                    template.record_secondary_addresses[0],
+                    &first_record[split..],
+                ),
+            ] {
                 if record.is_empty() {
                     continue;
                 }
@@ -2405,6 +2439,39 @@ fn package_graph_impl(
                     }
                 }
                 template_segments.push((address, bytes));
+            }
+            for (instance, patch) in template.patches.iter().enumerate().skip(1) {
+                if patch.is_empty() {
+                    continue;
+                }
+                let mut words = Vec::new();
+                for slot_base in (0..first_record.len()).step_by(32) {
+                    let slot_limit = (slot_base + 32).min(first_record.len());
+                    let mut mask = 0u32;
+                    let mut values = Vec::new();
+                    for (slot, word) in patch
+                        .iter()
+                        .filter(|(slot, _)| (slot_base..slot_limit).contains(&usize::from(*slot)))
+                    {
+                        mask |= 1 << (usize::from(*slot) - slot_base);
+                        values.push(match word {
+                            static_codegen::StaticTemplateRecordWord::Value(value) => Ok(*value),
+                            static_codegen::StaticTemplateRecordWord::Symbol(name) => {
+                                image.symbols.get(name).copied().ok_or_else(|| {
+                                    format!("static template references missing {name}")
+                                })
+                            }
+                        });
+                    }
+                    words.push(mask);
+                    words.extend(
+                        values
+                            .into_iter()
+                            .collect::<std::result::Result<Vec<_>, String>>()?,
+                    );
+                }
+                template_segments
+                    .push((template.patch_addresses[instance], words_to_bytes(&words)));
             }
         }
         for (address, bytes) in template_segments {

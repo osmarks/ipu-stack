@@ -233,6 +233,47 @@ ipu_stack_static_exchange_compute_run:
 	br $m9
 	.size ipu_stack_static_exchange_compute_run, .-ipu_stack_static_exchange_compute_run
 
+	.section .text.ipu_stack_static_template_patch,"ax",@progbits
+	.globl ipu_stack_static_template_patch
+	.p2align 2
+	.type ipu_stack_static_template_patch,@function
+ipu_stack_static_template_patch:
+	.supervisor
+	zero $m7
+.Ltemplate_patch_mask:
+	ld32 $m8, $m3, $m15, 0
+	add $m3, $m3, 4
+	setzi $m1, 32
+.Ltemplate_patch_bit:
+	and $m0, $m8, 1
+	brz $m0, .Ltemplate_patch_advance
+	ld32 $m0, $m3, $m15, 0
+	add $m3, $m3, 4
+	cmpult $m10, $m7, $m6
+	brnz $m10, .Ltemplate_patch_primary
+	sub $m10, $m7, $m6
+	shl $m10, $m10, 2
+	add $m10, $m5, $m10
+	st32 $m0, $m10, $m15, 0
+	setzi $m10, .Ltemplate_patch_advance
+	br $m10
+.Ltemplate_patch_primary:
+	shl $m10, $m7, 2
+	add $m10, $m4, $m10
+	st32 $m0, $m10, $m15, 0
+.Ltemplate_patch_advance:
+	shr $m8, $m8, 1
+	add $m7, $m7, 1
+	sub $m2, $m2, 1
+	brz $m2, .Ltemplate_patch_done
+	sub $m1, $m1, 1
+	brnz $m1, .Ltemplate_patch_bit
+	setzi $m0, .Ltemplate_patch_mask
+	br $m0
+.Ltemplate_patch_done:
+	br $m9
+	.size ipu_stack_static_template_patch, .-ipu_stack_static_template_patch
+
 	.section .text.ipu_stack_static_host_run,"ax",@progbits
 	.globl ipu_stack_static_host_run
 	.p2align 2
