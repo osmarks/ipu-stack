@@ -733,7 +733,7 @@ pub fn find_free_region_in_arenas(
     allocate_from_occupied_arenas(&mut occupied, size, arenas, alignment, placement)
 }
 
-pub(crate) fn allocate_from_occupied(
+pub fn allocate_from_occupied(
     occupied: &mut Vec<(u32, u32)>,
     size: u32,
     constraint: MemoryConstraint,
@@ -842,7 +842,7 @@ pub(crate) fn allocate_from_occupied_arenas(
     )))
 }
 
-pub(crate) fn occupied_intervals_by_tile(
+pub fn occupied_intervals_by_tile(
     allocations: &[Allocation],
     tile_count: u16,
     live_from: usize,

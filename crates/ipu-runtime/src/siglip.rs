@@ -7,15 +7,15 @@ use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
     FlashAttentionConfig, FlashAttentionPlan, GemmDataType, MemoryConstraint, MemoryPlacement,
     MemoryPolicy, RowShardPlacement, RowShardTransitionConfig, Schedule, TensorId,
-    append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
+    allocate_from_occupied, append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
     append_affine_layer_norm_f16_with_memory_policy, append_bias_f16_c16,
     append_bias_f16_c16_in_arenas, append_blocked_gemm_f16_with_a16_blocks,
     append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
     append_blocked_gemm_f16_with_a16_input,
     append_blocked_gemm_f16_with_a16_input_with_memory_policy, append_c16_to_a16_blocks_gelu_f16,
     append_c16_to_a16_row_shards, append_flash_attention_from_a16_qkv,
-    append_flash_attention_to_a16_row_shards, end_tensor_lifetimes, find_free_region,
-    make_tensors_resident, set_f8_weight_block_scales,
+    append_flash_attention_to_a16_row_shards, end_tensor_lifetimes, make_tensors_resident,
+    occupied_intervals_by_tile, set_f8_weight_block_scales,
 };
 use ipu_models::SiglipWeights;
 use ipu_package::{Binding, RegionSlice};
@@ -105,42 +105,46 @@ pub fn append_host_a16_matrix(
     let base_rows = rows / row_grid;
     let larger_shards = rows % row_grid;
     let mut shards = Vec::with_capacity(usize::from(row_grid));
+    let mut resident_pressure = vec![0u64; usize::from(schedule.tile_count)];
+    for allocation in &schedule.allocations {
+        if allocation.kind == AllocationKind::Home
+            && allocation.live_from == 0
+            && allocation.live_until == usize::MAX
+        {
+            resident_pressure[usize::from(allocation.tile)] += u64::from(allocation.size);
+        }
+    }
+    let mut occupied = occupied_intervals_by_tile(
+        &schedule.allocations,
+        schedule.tile_count,
+        0,
+        usize::MAX,
+        data_base,
+        data_limit,
+    );
+    let constraint = MemoryConstraint {
+        base: data_base,
+        limit: data_limit,
+        alignment: 8,
+        placement: MemoryPlacement::High,
+    };
     let mut row_start = 0;
     for shard_index in 0..row_grid {
         let shard_rows = base_rows + u16::from(shard_index < larger_shards);
         let bytes = u32::from(shard_rows) * u32::from(columns) * 2;
         let (tile, address) = (0..schedule.tile_count)
             .filter_map(|tile| {
-                let address = find_free_region(
-                    &schedule.allocations,
-                    tile,
-                    bytes,
-                    0,
-                    usize::MAX,
-                    MemoryConstraint {
-                        base: data_base,
-                        limit: data_limit,
-                        alignment: 8,
-                        placement: MemoryPlacement::High,
-                    },
-                )
-                .ok()?;
-                let pressure = schedule
-                    .allocations
-                    .iter()
-                    .filter(|allocation| {
-                        allocation.tile == tile
-                            && allocation.kind == AllocationKind::Home
-                            && allocation.live_from == 0
-                            && allocation.live_until == usize::MAX
-                    })
-                    .map(|allocation| u64::from(allocation.size))
-                    .sum::<u64>();
-                Some((pressure, tile, address))
+                let mut candidate = occupied[usize::from(tile)].clone();
+                let address = allocate_from_occupied(&mut candidate, bytes, constraint).ok()?;
+                Some((resident_pressure[usize::from(tile)], tile, address))
             })
             .min()
             .map(|(_, tile, address)| (tile, address))
             .ok_or_else(|| format!("no tile can hold {bytes} bytes for host matrix {name}"))?;
+        let allocated =
+            allocate_from_occupied(&mut occupied[usize::from(tile)], bytes, constraint)?;
+        debug_assert_eq!(allocated, address);
+        resident_pressure[usize::from(tile)] += u64::from(bytes);
         let tensor = TensorId(next_tensor);
         next_tensor += 1;
         shards.push(RowShardPlacement {
