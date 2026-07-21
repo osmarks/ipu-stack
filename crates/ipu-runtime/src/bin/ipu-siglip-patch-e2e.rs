@@ -401,11 +401,14 @@ fn main() {
         &output,
     );
     let layer_error = verify_linear_f16(&actual[diagnostic_bytes..], &expected_layer);
+    let cosine_similarity =
+        full_model.then(|| cosine_similarity_f16(&actual[diagnostic_bytes..], &expected_layer));
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
     info!(
         ?norm2_error,
         ?mlp_gelu_error,
         layer_error,
+        ?cosine_similarity,
         limit,
         "SigLIP verification results"
     );
@@ -415,10 +418,18 @@ fn main() {
     if let Some(error) = mlp_gelu_error {
         assert!(error <= limit, "MLP GeLU max error {error} exceeds {limit}");
     }
-    assert!(
-        layer_error <= limit,
-        "encoder layer max error {layer_error} exceeds {limit}"
-    );
+    if let Some(cosine_similarity) = cosine_similarity {
+        let minimum = env_f32("IPU_SIGLIP_MIN_COSINE", 0.995);
+        assert!(
+            cosine_similarity >= f64::from(minimum),
+            "pooler output cosine {cosine_similarity} is below {minimum}"
+        );
+    } else {
+        assert!(
+            layer_error <= limit,
+            "encoder layer max error {layer_error} exceeds {limit}"
+        );
+    }
     info!(
         image_size = config.image_size,
         patch_size = config.patch_size,
@@ -433,6 +444,7 @@ fn main() {
         ?norm2_error,
         ?mlp_gelu_error,
         layer_error,
+        ?cosine_similarity,
         full_model,
         "SigLIP encoder prefix passed against Hugging Face"
     );
@@ -1006,6 +1018,27 @@ fn verify_linear_f16(actual: &[u8], expected: &[f32]) -> f32 {
         "FP16 comparison diagnostics"
     );
     max_error
+}
+
+fn cosine_similarity_f16(actual: &[u8], expected: &[f32]) -> f64 {
+    assert!(actual.len() >= expected.len() * 2);
+    let mut dot = 0.0f64;
+    let mut actual_norm = 0.0f64;
+    let mut expected_norm = 0.0f64;
+    for (index, &expected) in expected.iter().enumerate() {
+        let actual = f16::from_bits(u16::from_le_bytes(
+            actual[index * 2..index * 2 + 2].try_into().unwrap(),
+        ))
+        .to_f32();
+        assert!(actual.is_finite());
+        let actual = f64::from(actual);
+        let expected = f64::from(expected);
+        dot += actual * expected;
+        actual_norm += actual * actual;
+        expected_norm += expected * expected;
+    }
+    assert!(actual_norm > 0.0 && expected_norm > 0.0);
+    dot / (actual_norm * expected_norm).sqrt()
 }
 
 fn serialize_a16_row_shards(
