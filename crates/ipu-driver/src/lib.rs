@@ -1070,6 +1070,7 @@ pub struct HostSession<'a> {
     pages: HashMap<u32, HostPageRange>,
     attached_pages: Vec<u32>,
     write_jitter: Option<HostWriteJitter>,
+    streamed_output: Option<(Vec<u8>, usize)>,
 }
 
 struct HostWriteJitter {
@@ -1117,6 +1118,7 @@ impl<'a> HostSession<'a> {
             pages,
             attached_pages: Vec::new(),
             write_jitter: None,
+            streamed_output: None,
         })
     }
 
@@ -1202,7 +1204,88 @@ impl<'a> HostSession<'a> {
         Ok(call)
     }
 
+    pub fn invoke_streaming_deferred(
+        &mut self,
+        name: &str,
+        input: &[u8],
+    ) -> Result<HostCall, DriverError> {
+        if self.attached_pages.len() != self.protocol.attach_order.len() {
+            return Err(DriverError::Invalid("host session not attached".into()));
+        }
+        let call = self
+            .protocol
+            .calls
+            .iter()
+            .find(|call| call.name == name)
+            .cloned()
+            .ok_or_else(|| DriverError::Invalid(format!("unknown host call {name}")))?;
+        let expected = call
+            .inputs
+            .iter()
+            .map(|slice| slice.file_offset + slice.size)
+            .max()
+            .unwrap_or(0) as usize;
+        if input.len() != expected {
+            return Err(DriverError::Invalid(format!(
+                "{} expects {expected} bytes",
+                call.name
+            )));
+        }
+        let output_size = call
+            .outputs
+            .iter()
+            .map(|slice| slice.file_offset + slice.size)
+            .max()
+            .unwrap_or(0) as usize;
+        self.streamed_output = Some((vec![0; output_size], 0));
+        self.write_command(&call)?;
+
+        info!(
+            call = call.name,
+            command = call.command,
+            phases = call.phases,
+            "invoking streaming host exchange call"
+        );
+        for phase in 0..call.phases {
+            self.device
+                .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
+            if phase & 1 == 0 {
+                let transfer = usize::try_from(phase / 2).unwrap();
+                if let Some(slice) = call.inputs.get(transfer) {
+                    copy_input_slice(&mut self.storage, &self.pages, slice, input)?;
+                } else {
+                    let output = transfer - call.inputs.len();
+                    if output != 0 {
+                        capture_output_slice(
+                            &mut self.storage,
+                            &self.pages,
+                            &call.outputs[output - 1],
+                            self.streamed_output.as_mut().unwrap(),
+                        )?;
+                    }
+                }
+                fence(Ordering::SeqCst);
+            }
+            self.acknowledge_device()?;
+            self.device
+                .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))
+                .map_err(|error| {
+                    DriverError::Timeout(format!(
+                        "host call {} phase {phase}/{}: {error}",
+                        call.name, call.phases
+                    ))
+                })?;
+        }
+        Ok(call)
+    }
+
     pub fn collect(&mut self, call: &HostCall) -> Result<Vec<u8>, DriverError> {
+        if let Some(mut output) = self.streamed_output.take() {
+            for slice in call.outputs.iter().skip(output.1) {
+                capture_output_slice(&mut self.storage, &self.pages, slice, &mut output)?;
+            }
+            return Ok(output.0);
+        }
         copy_output(&mut self.storage, &self.pages, call)
     }
 
@@ -1216,6 +1299,11 @@ impl<'a> HostSession<'a> {
             .ok_or_else(|| DriverError::Invalid(format!("unknown host call {name}")))?;
         copy_input(&mut self.storage, &self.pages, &call, input)?;
         poison_output(&mut self.storage, &self.pages, &call)?;
+        self.write_command(&call)?;
+        Ok(call)
+    }
+
+    fn write_command(&mut self, call: &HostCall) -> Result<(), DriverError> {
         let command = self
             .pages
             .get(&self.protocol.command_page)
@@ -1224,7 +1312,7 @@ impl<'a> HostSession<'a> {
         let offset = command.offset + offset;
         self.storage.bytes_mut()[offset..offset + 4].copy_from_slice(&call.command.to_le_bytes());
         fence(Ordering::SeqCst);
-        Ok(call)
+        Ok(())
     }
 
     pub fn invoke_prepared(&mut self, name: &str) -> Result<Vec<u8>, DriverError> {
@@ -1326,6 +1414,40 @@ fn copy_input(
         storage.bytes_mut()[destination..destination + slice.size as usize]
             .copy_from_slice(&input[source..source + slice.size as usize]);
     }
+    Ok(())
+}
+
+fn copy_input_slice(
+    storage: &mut HostBuffer,
+    pages: &HashMap<u32, HostPageRange>,
+    slice: &ipu_package::HostSlice,
+    input: &[u8],
+) -> Result<(), DriverError> {
+    let page = pages
+        .get(&slice.page)
+        .ok_or_else(|| DriverError::Invalid("missing input page".into()))?;
+    let destination = page.offset + slice.page_offset as usize;
+    let source = slice.file_offset as usize;
+    storage.bytes_mut()[destination..destination + slice.size as usize]
+        .copy_from_slice(&input[source..source + slice.size as usize]);
+    Ok(())
+}
+
+fn capture_output_slice(
+    storage: &mut HostBuffer,
+    pages: &HashMap<u32, HostPageRange>,
+    slice: &ipu_package::HostSlice,
+    output: &mut (Vec<u8>, usize),
+) -> Result<(), DriverError> {
+    let page = pages
+        .get(&slice.page)
+        .ok_or_else(|| DriverError::Invalid("missing output page".into()))?;
+    let source = page.offset + slice.page_offset as usize;
+    let destination = slice.file_offset as usize;
+    fence(Ordering::SeqCst);
+    output.0[destination..destination + slice.size as usize]
+        .copy_from_slice(&storage.bytes()[source..source + slice.size as usize]);
+    output.1 += 1;
     Ok(())
 }
 

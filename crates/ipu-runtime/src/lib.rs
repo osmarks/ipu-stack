@@ -28,7 +28,7 @@ pub use blocked_data::{
 };
 
 const PLAN_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
-const HOST_DATA_START: u32 = 64;
+const HOST_DATA_START: u32 = ipu_exchange::HOST_PAGE_BYTES;
 const HOST_CLOSE_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x160;
 const HOST_PACKET_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE;
 const HOST_STAGING_SEARCH_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x180;
@@ -2759,7 +2759,6 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
         });
     }
 
-    let mut host_cursor = HOST_DATA_START;
     let mut input_file_cursor = 0u64;
     let mut output_file_cursor = 0u64;
     let mut inputs = Vec::new();
@@ -2768,7 +2767,6 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
     append_host_bindings(
         &graph.host_inputs,
         HostDirection::ToTile,
-        &mut host_cursor,
         &mut input_file_cursor,
         &mut inputs,
         &mut calls,
@@ -2776,7 +2774,6 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
     append_host_bindings(
         &graph.host_outputs,
         HostDirection::ToHost,
-        &mut host_cursor,
         &mut output_file_cursor,
         &mut outputs,
         &mut calls,
@@ -2845,11 +2842,8 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
         outputs: call_outputs,
     }];
 
-    let data_page_count = align_up(
-        host_cursor.max(ipu_exchange::HOST_PAGE_BYTES),
-        ipu_exchange::HOST_PAGE_BYTES,
-    ) / ipu_exchange::HOST_PAGE_BYTES;
-    let command_page = data_page_count;
+    let command_page = 0;
+    let data_page = 1;
     Ok(StaticHostLayout {
         inputs,
         outputs,
@@ -2858,15 +2852,14 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
             startup_mark: ipu_driver::HOST_EXCHANGE_HANDOFF_MARK,
             command_page,
             command_offset: 0,
-            pages: (0..=command_page)
+            pages: [command_page, data_page]
+                .into_iter()
                 .map(|index| HostPage {
                     index,
                     size: u64::from(ipu_exchange::HOST_PAGE_BYTES),
                 })
                 .collect(),
-            attach_order: std::iter::once(command_page)
-                .chain(0..data_page_count)
-                .collect(),
+            attach_order: vec![command_page, data_page],
             calls,
         },
     })
@@ -2887,25 +2880,19 @@ fn host_transfer_phase_count(transfers: u32) -> Result<u32> {
 fn append_host_bindings(
     bindings: &[Binding],
     direction: HostDirection,
-    host_cursor: &mut u32,
     file_cursor: &mut u64,
     transfers: &mut Vec<StaticHostTransfer>,
     calls: &mut Vec<HostCall>,
 ) -> Result<()> {
     for binding in bindings {
-        let binding_base = align_up(*host_cursor, 64);
         let binding_file_base = *file_cursor;
         for slice in &binding.slices {
-            let mut host_offset = binding_base
-                .checked_add(u32::try_from(slice.file_offset)?)
-                .ok_or("host binding offset overflow")?;
             let mut tile_address = slice.tile_address;
             let mut file_offset = binding_file_base + slice.file_offset;
             let mut remaining = u32::try_from(slice.size)?;
             while remaining != 0 {
-                let page_bytes =
-                    ipu_exchange::HOST_PAGE_BYTES - host_offset % ipu_exchange::HOST_PAGE_BYTES;
-                let bytes = remaining.min(page_bytes);
+                let host_offset = HOST_DATA_START;
+                let bytes = remaining.min(ipu_exchange::HOST_PAGE_BYTES);
                 let transfer = StaticHostTransfer {
                     direction,
                     physical_tile: u16::try_from(slice.tile)?,
@@ -2940,9 +2927,6 @@ fn append_host_bindings(
                         .then_some(host_slices)
                         .unwrap_or_default(),
                 });
-                host_offset = host_offset
-                    .checked_add(bytes)
-                    .ok_or("host transfer offset overflow")?;
                 tile_address = tile_address
                     .checked_add(bytes)
                     .ok_or("host transfer tile range overflow")?;
@@ -2953,7 +2937,6 @@ fn append_host_bindings(
             }
         }
         let size = binding_size(binding)?;
-        *host_cursor = u32::try_from(u64::from(binding_base) + size)?;
         *file_cursor = file_cursor
             .checked_add(size)
             .ok_or("host binding file range overflow")?;
@@ -3353,7 +3336,7 @@ fn run_host_impl(
     }
     let call = &calls[0];
     let deferred = session
-        .invoke_deferred(&call.name, call_input(call, input)?)
+        .invoke_streaming_deferred(&call.name, call_input(call, input)?)
         .map_err(|error| {
             format!(
                 "generated host call {}: {error}; supervisor states: {}; device outputs: {}",
