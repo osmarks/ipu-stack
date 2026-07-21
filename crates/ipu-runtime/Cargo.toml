@@ -13,6 +13,7 @@ ipu-elf = { path = "../ipu-elf" }
 ipu-exchange = { path = "../ipu-exchange" }
 ipu-models = { path = "../ipu-models" }
 ipu-package = { path = "../ipu-package" }
+rayon.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

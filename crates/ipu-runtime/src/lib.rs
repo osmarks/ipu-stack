@@ -7,6 +7,7 @@ use ipu_package::{
     MemoryRegion, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
     TileMemory,
 };
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -1392,7 +1393,7 @@ fn package_graph_impl(
         return Err("per-tile programs disagree on exchange launch count".into());
     }
     let mut tile_exchange_plans = programs
-        .iter()
+        .par_iter()
         .map(|program| -> Result<TileExchangePlans> {
             let mut cursor = PLAN_BASE;
             let mut unique = HashMap::<Vec<u32>, u32>::new();
@@ -1511,7 +1512,7 @@ fn package_graph_impl(
         );
     }
     let mut tile_host_plans = programs
-        .iter()
+        .par_iter()
         .zip(&tile_exchange_plans)
         .map(|(program, exchange_plans)| -> Result<TileHostPlans> {
             let plan_end = exchange_plans.end;
@@ -1626,7 +1627,7 @@ fn package_graph_impl(
     // address-invariant generated code before relocating host state so data packing can
     // preserve enough complete elements for it.
     let preliminary_program_sizes = programs
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(program_index, program)| -> Result<u32> {
             let mut symbols = BTreeMap::new();
@@ -1697,7 +1698,7 @@ fn package_graph_impl(
         })
         .collect::<Result<Vec<_>>>()?;
     let program_reservations = programs
-        .iter()
+        .par_iter()
         .zip(&tile_exchange_plans)
         .zip(&preliminary_program_sizes)
         .map(|((program, plans), &size)| -> Result<(u32, u32)> {
@@ -1720,7 +1721,7 @@ fn package_graph_impl(
     // least one complete instruction element. Reserve that element before data
     // packing so metadata cannot consume the final executable region.
     let support_reservations = programs
-        .iter()
+        .par_iter()
         .zip(&tile_exchange_plans)
         .zip(&program_reservations)
         .map(
@@ -1998,7 +1999,7 @@ fn package_graph_impl(
         runtime_symbols.push(static_codegen::TEMPLATE_PATCH.into());
     }
     let tile_retained_symbols = programs
-        .iter()
+        .par_iter()
         .zip(&tile_exchange_plans)
         .map(|(program, exchange_plans)| {
             let mut symbols = runtime_symbols.clone();
@@ -2102,7 +2103,7 @@ fn package_graph_impl(
             )
         };
     let preliminary_generated = preliminary_images
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(index, image)| emit_program(index, &image.symbols, 0))
         .collect::<Result<Vec<_>>>()?;
@@ -2118,7 +2119,7 @@ fn package_graph_impl(
         .map(|&(base, _)| base)
         .collect::<Vec<_>>();
     let image_regions = programs
-        .iter()
+        .par_iter()
         .zip(&program_bases)
         .zip(&preliminary_generated)
         .zip(&template_record_ranges)
@@ -2159,7 +2160,7 @@ fn package_graph_impl(
         image_cache.insert(key, image);
     }
     let images = image_regions
-        .iter()
+        .par_iter()
         .zip(&tile_retained_symbols)
         .map(|(regions, symbols)| -> Result<ipu_elf::LinkedImage> {
             Ok(image_cache
@@ -2242,7 +2243,7 @@ fn package_graph_impl(
         }
     }
     let generated = images
-        .iter()
+        .par_iter()
         .zip(&program_bases)
         .enumerate()
         .map(|(index, (image, &base))| emit_program(index, &image.symbols, base))
@@ -2254,42 +2255,46 @@ fn package_graph_impl(
     {
         return Err("generated program size changed after executable placement".into());
     }
-    for allocation in &graph.schedule.allocations {
-        let end = allocation
-            .address
-            .checked_add(allocation.size)
-            .ok_or("allocation address overflow")?;
-        let runtime_end = tile_exchange_plans[usize::from(allocation.tile)].end;
-        let program_base = program_bases[usize::from(allocation.tile)];
-        let program_end = program_base
-            .checked_add(u32::try_from(
-                generated[usize::from(allocation.tile)].len(),
-            )?)
-            .ok_or("generated tile program address overflow")?;
-        let image = &images[usize::from(allocation.tile)];
-        if image.segments.iter().any(|segment| {
-            ranges_overlap(
-                segment.address,
-                segment.address + segment.size as u32,
-                allocation.address,
-                end,
-            )
-        }) || ranges_overlap(program_base, program_end, allocation.address, end)
-            || ranges_overlap(PLAN_BASE, runtime_end, allocation.address, end)
-            || host_runtime_ranges[usize::from(allocation.tile)]
-                .iter()
-                .any(|&(start, stop)| ranges_overlap(start, stop, allocation.address, end))
-            || template_record_ranges[usize::from(allocation.tile)]
-                .iter()
-                .any(|&(start, stop)| ranges_overlap(start, stop, allocation.address, end))
-        {
-            return Err(format!(
-                "static runtime 0x{PLAN_BASE:x}..0x{runtime_end:x} overlaps tensor {} on tile {} at 0x{:x}..0x{end:x}",
-                allocation.tensor.0, allocation.tile, allocation.address
-            )
-            .into());
-        }
-    }
+    graph
+        .schedule
+        .allocations
+        .par_iter()
+        .try_for_each(|allocation| -> Result<()> {
+            let end = allocation
+                .address
+                .checked_add(allocation.size)
+                .ok_or("allocation address overflow")?;
+            let tile = usize::from(allocation.tile);
+            let runtime_end = tile_exchange_plans[tile].end;
+            let program_base = program_bases[tile];
+            let program_end = program_base
+                .checked_add(u32::try_from(generated[tile].len())?)
+                .ok_or("generated tile program address overflow")?;
+            let image = &images[tile];
+            if image.segments.iter().any(|segment| {
+                ranges_overlap(
+                    segment.address,
+                    segment.address + segment.size as u32,
+                    allocation.address,
+                    end,
+                )
+            }) || ranges_overlap(program_base, program_end, allocation.address, end)
+                || ranges_overlap(PLAN_BASE, runtime_end, allocation.address, end)
+                || host_runtime_ranges[tile]
+                    .iter()
+                    .any(|&(start, stop)| ranges_overlap(start, stop, allocation.address, end))
+                || template_record_ranges[tile]
+                    .iter()
+                    .any(|&(start, stop)| ranges_overlap(start, stop, allocation.address, end))
+            {
+                return Err(format!(
+                    "static runtime 0x{PLAN_BASE:x}..0x{runtime_end:x} overlaps tensor {} on tile {} at 0x{:x}..0x{end:x}",
+                    allocation.tensor.0, allocation.tile, allocation.address
+                )
+                .into());
+            }
+            Ok(())
+        })?;
 
     let initial: HashMap<_, _> = graph
         .initial_buffers
