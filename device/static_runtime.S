@@ -238,6 +238,7 @@ ipu_stack_static_exchange_compute_run:
 	.type ipu_stack_static_host_run,@function
 ipu_stack_static_host_run:
 	.supervisor
+	add $m11, $m11, -16
 .Lhost_run_next:
 	ld32 $m0, $m3, $m15, 3
 	shr $m5, $m0, 24
@@ -255,14 +256,14 @@ ipu_stack_static_host_run:
 	sub $m5, $m5, 1
 	brnz $m5, .Lhost_run_packet_copy
 .Lhost_run_call:
-	st32 $m2, $m4, $m15, 0
-	st32 $m3, $m4, $m15, 1
+	st32 $m2, $m11, $m15, 0
+	st32 $m3, $m11, $m15, 1
 	ld32 $m0, $m3, $m15, 0
 	setzi $m10, .Lhost_run_return
 	br $m0
 .Lhost_run_return:
-	ld32 $m2, $m4, $m15, 0
-	ld32 $m3, $m4, $m15, 1
+	ld32 $m2, $m11, $m15, 0
+	ld32 $m3, $m11, $m15, 1
 	ld32 $m5, $m3, $m15, 3
 	shl $m5, $m5, 9
 	shr $m5, $m5, 9
@@ -280,6 +281,7 @@ ipu_stack_static_host_run:
 	add $m3, $m3, HOST_RUN_DESCRIPTOR_BYTES
 	sub $m2, $m2, 1
 	brnz $m2, .Lhost_run_next
+	add $m11, $m11, 16
 	br $m9
 	.size ipu_stack_static_host_run, .-ipu_stack_static_host_run
 

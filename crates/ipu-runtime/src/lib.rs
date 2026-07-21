@@ -65,7 +65,6 @@ struct TileHostPlans {
     addresses: Vec<u32>,
     packet_copies: Vec<Option<HostPacketCopy>>,
     run_tables: Vec<Option<u32>>,
-    run_state: u32,
     end: u32,
 }
 
@@ -1629,22 +1628,14 @@ fn package_graph_impl(
                     data_objects.push(run_tables[start].unwrap()..cursor);
                 }
             }
-            let run_state = align_up(cursor, 4);
-            let end = run_state
-                .checked_add(8)
-                .ok_or("static host run state address overflow")?;
             Ok(TileHostPlans {
                 start: follower_address,
                 ordinary_objects,
-                data_objects: {
-                    data_objects.push(run_state..end);
-                    data_objects
-                },
+                data_objects,
                 addresses,
                 packet_copies,
                 run_tables,
-                run_state,
-                end,
+                end: cursor,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1692,7 +1683,6 @@ fn package_graph_impl(
         for address in plans.run_tables.iter_mut().flatten() {
             *address = relocate(*address)?;
         }
-        plans.run_state = relocate(plans.run_state)?;
         let worker_sync = relocate(old_worker_sync)?;
         // Completion is written only after worker stacks are quiescent.
         let completion = worker_sync;
@@ -1715,7 +1705,6 @@ fn package_graph_impl(
                     .first()
                     .and_then(|address| *address)
                     .map(|address| format!("0x{address:x}")),
-                run_state = format_args!("0x{:x}", plans.run_state),
                 worker_sync = format_args!("0x{worker_sync:x}"),
                 completion = format_args!("0x{completion:x}"),
                 "packed segmented host runtime"
@@ -1926,7 +1915,6 @@ fn package_graph_impl(
                 static_codegen::HostCode {
                     inputs: &host_inputs,
                     outputs: &host_outputs,
-                    run_state: host_plans.run_state,
                 },
                 profile_code.get(program_index),
                 generated_base,

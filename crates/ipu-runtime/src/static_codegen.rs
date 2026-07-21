@@ -27,7 +27,6 @@ pub(crate) struct HostPhaseCall {
 pub(crate) struct HostCode<'a> {
     pub inputs: &'a [HostPhaseCall],
     pub outputs: &'a [HostPhaseCall],
-    pub run_state: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -701,7 +700,7 @@ pub(crate) fn emit(
     }
     let mut code = TileCode::new();
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
-    emit_host_phases(&mut code, symbols, host.inputs, host.run_state)?;
+    emit_host_phases(&mut code, symbols, host.inputs)?;
     if program.steps.iter().any(|step| {
         matches!(
             step,
@@ -826,7 +825,7 @@ pub(crate) fn emit(
     if let Some(address) = profile.and_then(|profile| profile.aggregate_end) {
         emit_cycle_sample(&mut code, symbols, address)?;
     }
-    emit_host_phases(&mut code, symbols, host.outputs, host.run_state)?;
+    emit_host_phases(&mut code, symbols, host.outputs)?;
     code.jump(symbol(symbols, COMPLETE)?)?;
     let template_exchanges = if templates.is_empty() {
         None
@@ -1015,7 +1014,6 @@ fn emit_host_phases(
     code: &mut TileCode,
     symbols: &BTreeMap<String, u32>,
     phases: &[HostPhaseCall],
-    host_run_state: u32,
 ) -> Result<()> {
     let repeat_call = symbol(symbols, REPEAT_CALL)?;
     let mut index = 0;
@@ -1032,7 +1030,6 @@ fn emit_host_phases(
                     .run_table
                     .ok_or("active host run has no descriptor table")?,
             )?;
-            code.setzi(4, host_run_state)?;
             code.call(symbol(symbols, HOST_RUN)?, 9)?;
             continue;
         }
