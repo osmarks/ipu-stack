@@ -962,6 +962,14 @@ pub fn append_bias_f16_c16_in_arenas(
         .max()
         .unwrap_or(0)
         + 1;
+    let mut occupied = occupied_intervals_by_tile(
+        &schedule.allocations,
+        schedule.tile_count,
+        0,
+        usize::MAX,
+        data_base,
+        data_limit,
+    );
     let mut biases = Vec::new();
     for block_column in 0..=output.iter().map(|block| block.block_column).max().unwrap() {
         let owner = output
@@ -969,12 +977,9 @@ pub fn append_bias_f16_c16_in_arenas(
             .find(|block| block.block_column == block_column)
             .ok_or_else(|| CompileError::Graph("C16 output has a missing column block".into()))?;
         let size = u32::from(owner.columns) * 2;
-        let address = find_free_region_in_arenas(
-            &schedule.allocations,
-            owner.tile,
+        let address = allocate_from_occupied_arenas(
+            &mut occupied[usize::from(owner.tile)],
             size,
-            0,
-            usize::MAX,
             arenas,
             8,
             MemoryPlacement::Low,
