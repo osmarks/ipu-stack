@@ -1438,6 +1438,7 @@ fn package_graph_impl(
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
         return Err("the direct C600 runtime requires a schedule for every discovered tile".into());
     }
+    validate_resident_host_bindings(graph, &topology)?;
     graph.schedule.validate_allocations()?;
     let programs = match lowered_programs {
         Some(programs) => programs,
@@ -1611,6 +1612,7 @@ fn package_graph_impl(
                 &patches,
                 template_regions,
                 0,
+                invocations > 1,
             )?;
             Ok(TileExchangePlans {
                 addresses,
@@ -2811,6 +2813,33 @@ fn package_graph_impl(
         "packaged static executable graph"
     );
     Ok(app)
+}
+
+fn validate_resident_host_bindings(graph: &ExecutableGraph, topology: &Topology) -> Result<()> {
+    for binding in &graph.host_weights {
+        for slice in &binding.slices {
+            let end = slice
+                .tile_address
+                .checked_add(u32::try_from(slice.size)?)
+                .ok_or("resident host binding address overflow")?;
+            let resident = graph.schedule.allocations.iter().any(|allocation| {
+                allocation.kind == ipu_compiler::AllocationKind::Home
+                    && allocation.live_from == 0
+                    && allocation.live_until == usize::MAX
+                    && topology.physical(allocation.tile) == Ok(slice.tile as u16)
+                    && allocation.address <= slice.tile_address
+                    && allocation.address.saturating_add(allocation.size) >= end
+            });
+            if !resident {
+                return Err(format!(
+                    "resident host tensor {} slice on physical tile {} at 0x{:x}..0x{end:x} has no permanent allocation",
+                    binding.name, slice.tile, slice.tile_address
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_static_host_layout(graph: &ExecutableGraph, invocations: u32) -> Result<StaticHostLayout> {

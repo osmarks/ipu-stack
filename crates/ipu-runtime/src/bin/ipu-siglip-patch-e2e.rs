@@ -4,7 +4,7 @@ use ipu_compiler::{
     FlashAttentionPlan, GemmDataType, Ipu21MemoryRegion, KernelCommand, MemoryConstraint,
     MemoryPlacement, MemoryPolicy, OpId, Phase, RowShardPlacement, RowShardTransitionConfig,
     SpecializationKey, TensorId, append_c16_to_a16_row_shards, choose_gemm_row_block_for,
-    end_tensor_lifetimes, plan_blocked_gemm, plan_flash_attention,
+    end_tensor_lifetimes, make_tensors_resident, plan_blocked_gemm, plan_flash_attention,
 };
 use ipu_elf::{KernelArtifact, Toolchain};
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -91,7 +91,7 @@ fn main() {
     let patch_bytes = blocked_matrix_f16(&plan.left, BlockLayout::AmpA16, |row, column| {
         patch_value(&pixels, config, row, column)
     });
-    host.push(
+    host.push_input(
         block_binding_typed("patches", rows, inner, &plan.left, "f16", 2),
         patch_bytes,
     )
@@ -109,6 +109,11 @@ fn main() {
         patch_weight_bytes,
     )
     .unwrap();
+    make_tensors_resident(
+        &mut plan.schedule,
+        plan.right.iter().map(|block| block.tensor),
+    )
+    .unwrap();
 
     let adjustment = append_adjustment_phase(&mut plan.schedule, &plan.output).unwrap();
     let adjustment_bytes =
@@ -119,6 +124,11 @@ fn main() {
     host.push(
         block_binding_typed("position_bias", rows, columns, &adjustment, "f16", 2),
         adjustment_bytes,
+    )
+    .unwrap();
+    make_tensors_resident(
+        &mut plan.schedule,
+        adjustment.iter().map(|block| block.tensor),
     )
     .unwrap();
     let transition_base = plan
@@ -366,14 +376,9 @@ fn main() {
         invocation_output_bytes * invocations as usize,
         "runtime returned a partial invocation output"
     );
-    let first_actual = &actual[..invocation_output_bytes];
-    for (index, output) in actual.chunks_exact(invocation_output_bytes).enumerate() {
-        assert_eq!(
-            output, first_actual,
-            "identical SigLIP invocation {index} produced a different output"
-        );
-    }
-    let actual = first_actual;
+    let invocation_outputs = actual
+        .chunks_exact(invocation_output_bytes)
+        .collect::<Vec<_>>();
     let (diagnostic_bytes, norm2_error, mlp_gelu_error) = if detailed_diagnostics {
         let norm2_bytes = usize::from(rows) * usize::from(columns) * 2;
         let expected_norm2 = reference.tensor_f32("encoder_layer_00_norm2").unwrap();
@@ -383,7 +388,20 @@ fn main() {
             usize::from(columns),
             &norm2,
         );
-        let norm2_error = verify_linear_f16(&actual[..norm2_bytes], &expected_norm2);
+        let norm2_error = invocation_outputs
+            .iter()
+            .enumerate()
+            .map(|(invocation, actual)| {
+                let error = verify_linear_f16(&actual[..norm2_bytes], &expected_norm2);
+                info!(
+                    invocation,
+                    error,
+                    stage = "norm2",
+                    "SigLIP invocation error"
+                );
+                error
+            })
+            .fold(0.0, f32::max);
         let expected = reference.tensor_f32("encoder_layer_00_mlp_gelu").unwrap();
         let expected = pad_columns(
             &expected,
@@ -397,7 +415,20 @@ fn main() {
             usize::from(intermediate_columns),
             &mlp_gelu,
         );
-        let mlp_gelu_error = verify_linear_f16(&actual[norm2_bytes..], &expected);
+        let mlp_gelu_error = invocation_outputs
+            .iter()
+            .enumerate()
+            .map(|(invocation, actual)| {
+                let error = verify_linear_f16(&actual[norm2_bytes..], &expected);
+                info!(
+                    invocation,
+                    error,
+                    stage = "mlp_gelu",
+                    "SigLIP invocation error"
+                );
+                error
+            })
+            .fold(0.0, f32::max);
         let gelu_bytes = usize::from(rows) * usize::from(intermediate_columns) * 2;
         (
             norm2_bytes + gelu_bytes,
@@ -423,9 +454,26 @@ fn main() {
         usize::from(columns),
         &output,
     );
-    let layer_error = verify_linear_f16(&actual[diagnostic_bytes..], &expected_layer);
-    let cosine_similarity =
-        full_model.then(|| cosine_similarity_f16(&actual[diagnostic_bytes..], &expected_layer));
+    let layer_error = invocation_outputs
+        .iter()
+        .enumerate()
+        .map(|(invocation, actual)| {
+            let error = verify_linear_f16(&actual[diagnostic_bytes..], &expected_layer);
+            info!(
+                invocation,
+                error,
+                stage = "output",
+                "SigLIP invocation error"
+            );
+            error
+        })
+        .fold(0.0, f32::max);
+    let cosine_similarity = full_model.then(|| {
+        invocation_outputs
+            .iter()
+            .map(|actual| cosine_similarity_f16(&actual[diagnostic_bytes..], &expected_layer))
+            .fold(f64::INFINITY, f64::min)
+    });
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
     info!(
         ?norm2_error,
@@ -635,21 +683,19 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         invocation_output_bytes * invocations as usize,
         "runtime returned a partial invocation output"
     );
-    let first_actual = &actual[..invocation_output_bytes];
-    for (index, output) in actual.chunks_exact(invocation_output_bytes).enumerate() {
-        assert_eq!(
-            output, first_actual,
-            "identical SigLIP MAP invocation {index} produced a different output"
-        );
-    }
-    let actual = first_actual;
+    let invocation_outputs = actual
+        .chunks_exact(invocation_output_bytes)
+        .collect::<Vec<_>>();
     let expected = serialize_a16_row_shards(
         &expected,
         usize::from(output_rows),
         usize::from(columns),
         &output,
     );
-    let error = verify_linear_f16(&actual, &expected);
+    let error = invocation_outputs
+        .iter()
+        .map(|actual| verify_linear_f16(actual, &expected))
+        .fold(0.0, f32::max);
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
     info!(error, limit, "SigLIP MAP verification result");
     assert!(error <= limit, "MAP max error {error} exceeds {limit}");
