@@ -2639,14 +2639,13 @@ impl Schedule {
             };
             validate_transfers(transfers)?;
             let mut groups: Vec<PendingGroup> = Vec::new();
+            let mut group_indices = HashMap::<(u16, TensorId, u32), usize>::new();
             for transfer in transfers {
-                if let Some(group) = groups.iter_mut().find(|group| {
-                    group.source == transfer.source_tile
-                        && group.tensor == transfer.tensor
-                        && group.bytes == transfer.bytes
-                }) {
-                    group.destinations.push(transfer.destination_tile);
+                let key = (transfer.source_tile, transfer.tensor, transfer.bytes);
+                if let Some(&index) = group_indices.get(&key) {
+                    groups[index].destinations.push(transfer.destination_tile);
                 } else {
+                    group_indices.insert(key, groups.len());
                     groups.push(PendingGroup {
                         source: transfer.source_tile,
                         tensor: transfer.tensor,
@@ -2662,52 +2661,45 @@ impl Schedule {
 
             // A tile can execute one exchange role at a time. Color the
             // multicast-hyperedge conflict graph into timed slots with deterministic DSATUR.
-            let adjacency: Vec<HashSet<usize>> = groups
-                .iter()
-                .enumerate()
-                .map(|(left_index, left)| {
-                    groups
-                        .iter()
-                        .enumerate()
-                        .filter(|(right_index, right)| {
-                            left_index != *right_index
-                                && exchange_groups_conflict(
-                                    left.source,
-                                    &left.destinations,
-                                    right.source,
-                                    &right.destinations,
-                                )
-                        })
-                        .map(|(index, _)| index)
-                        .collect()
-                })
-                .collect();
+            let mut groups_by_tile = vec![Vec::new(); topology.tile_count()];
+            for (group_index, group) in groups.iter().enumerate() {
+                groups_by_tile[usize::from(group.source)].push(group_index);
+                for &destination in &group.destinations {
+                    groups_by_tile[usize::from(destination)].push(group_index);
+                }
+            }
+            let mut adjacency = vec![HashSet::new(); groups.len()];
+            for tile_groups in groups_by_tile {
+                for (offset, &left) in tile_groups.iter().enumerate() {
+                    for &right in &tile_groups[offset + 1..] {
+                        adjacency[left].insert(right);
+                        adjacency[right].insert(left);
+                    }
+                }
+            }
             let mut colors = vec![None; groups.len()];
+            let mut saturation = vec![HashSet::new(); groups.len()];
             for _ in 0..groups.len() {
                 let index = (0..groups.len())
                     .filter(|index| colors[*index].is_none())
                     .max_by_key(|index| {
-                        let saturation: HashSet<_> = adjacency[*index]
-                            .iter()
-                            .filter_map(|neighbor| colors[*neighbor])
-                            .collect();
                         (
-                            saturation.len(),
+                            saturation[*index].len(),
                             adjacency[*index].len(),
                             std::cmp::Reverse(groups[*index].source),
                             std::cmp::Reverse(groups[*index].tensor.0),
                         )
                     })
                     .ok_or_else(|| CompileError::Graph("exchange coloring failed".into()))?;
-                let unavailable: HashSet<_> = adjacency[index]
-                    .iter()
-                    .filter_map(|neighbor| colors[*neighbor])
-                    .collect();
-                colors[index] = Some(
-                    (0..)
-                        .find(|color| !unavailable.contains(color))
-                        .ok_or_else(|| CompileError::Graph("exchange color overflow".into()))?,
-                );
+                let color = (0..)
+                    .find(|color| !saturation[index].contains(color))
+                    .ok_or_else(|| CompileError::Graph("exchange color overflow".into()))?;
+                colors[index] = Some(color);
+                for &neighbor in &adjacency[index] {
+                    if colors[neighbor].is_none() {
+                        saturation[neighbor].insert(color);
+                    }
+                }
             }
             let color_count = colors
                 .iter()
@@ -3114,20 +3106,6 @@ impl<'a> Iterator for AllocationCandidates<'a> {
         self.current = self.next[index];
         Some(&self.allocations[index])
     }
-}
-
-fn exchange_groups_conflict(
-    left_source: u16,
-    left_destinations: &[u16],
-    right_source: u16,
-    right_destinations: &[u16],
-) -> bool {
-    left_source == right_source
-        || left_destinations.contains(&right_source)
-        || right_destinations.contains(&left_source)
-        || left_destinations
-            .iter()
-            .any(|tile| right_destinations.contains(tile))
 }
 
 #[derive(Clone, Debug)]
