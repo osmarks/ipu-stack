@@ -421,6 +421,7 @@ pub fn append_siglip_map_head(
             data_base,
             data_limit,
             GemmDataType::F16,
+            true,
         ),
     )?;
     let down_weight = model.tensor_f32("vision_model.head.mlp.fc2.weight")?;
@@ -486,6 +487,7 @@ pub fn append_siglip_encoder_layer(
     tile_count: u16,
     memory: &MemoryPolicy,
     weight_storage: SiglipWeightStorage,
+    retain_profile_metadata: bool,
     retain_diagnostics: bool,
     host: &mut HostTensorSet,
 ) -> Result<SiglipEncoderLayer> {
@@ -546,6 +548,7 @@ pub fn append_siglip_encoder_layer(
             data_base,
             data_limit,
             qkv_data_type,
+            retain_profile_metadata,
         ),
         memory,
     )?;
@@ -647,6 +650,7 @@ pub fn append_siglip_encoder_layer(
             data_base,
             data_limit,
             output_data_type,
+            retain_profile_metadata,
         ),
         memory,
     )?;
@@ -735,6 +739,7 @@ pub fn append_siglip_encoder_layer(
             data_base,
             data_limit,
             mlp_up_data_type,
+            retain_profile_metadata,
         ),
         memory,
     )?;
@@ -793,6 +798,7 @@ pub fn append_siglip_encoder_layer(
             data_base,
             data_limit,
             mlp_down_data_type,
+            retain_profile_metadata,
         ),
         memory,
     )?;
@@ -870,6 +876,7 @@ fn gemm_config(
     data_base: u32,
     data_limit: u32,
     data_type: GemmDataType,
+    retain_profile_metadata: bool,
 ) -> BlockedGemmConfig {
     BlockedGemmConfig {
         rows,
@@ -882,6 +889,7 @@ fn gemm_config(
         data_base,
         data_limit,
         data_type,
+        retain_profile_metadata,
     }
 }
 
@@ -954,6 +962,7 @@ fn append_a16_linear_c16(
             data_base,
             data_limit,
             GemmDataType::F16,
+            true,
         ),
     )?;
     host.push(

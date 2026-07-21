@@ -78,6 +78,7 @@ fn main() {
         data_base: GEMM_DATA_BASE,
         data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
         data_type: GemmDataType::F32,
+        retain_profile_metadata: true,
     })
     .unwrap();
     let output_placements = plan.output.clone();

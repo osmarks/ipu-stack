@@ -852,6 +852,7 @@ pub struct BlockedGemmConfig {
     pub data_base: u32,
     pub data_limit: u32,
     pub data_type: GemmDataType,
+    pub retain_profile_metadata: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2213,20 +2214,28 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                         ],
                         specialization: SpecializationKey {
                             operation: "expand_f8_f143_to_f16".into(),
-                            shape: vec![
-                                usize::from(config.inner_block_dimension),
-                                usize::from(config.block_dimension),
-                            ],
+                            shape: if config.retain_profile_metadata {
+                                vec![
+                                    usize::from(config.inner_block_dimension),
+                                    usize::from(config.block_dimension),
+                                ]
+                            } else {
+                                Vec::new()
+                            },
                             worker_count: 6,
                             role: "weight-expansion".into(),
                             alignment: 4,
                         },
-                        metadata: BTreeMap::from([
-                            ("label".into(), "expand FP8 weights to FP16".into()),
-                            ("wave".into(), wave.to_string()),
-                            ("inner_block".into(), inner_block.to_string()),
-                            ("bytes".into(), expanded_right_block_bytes.to_string()),
-                        ]),
+                        metadata: if config.retain_profile_metadata {
+                            BTreeMap::from([
+                                ("label".into(), "expand FP8 weights to FP16".into()),
+                                ("wave".into(), wave.to_string()),
+                                ("inner_block".into(), inner_block.to_string()),
+                                ("bytes".into(), expanded_right_block_bytes.to_string()),
+                            ])
+                        } else {
+                            BTreeMap::new()
+                        },
                     });
                     expanded_right_tensors.push(expanded_tensor);
                 }
@@ -2263,48 +2272,56 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                             .data_type
                             .kernel_operation(inner_block == 0, output_block.rows == base_rows)
                             .into(),
-                        shape: vec![
-                            usize::from(output_block.rows),
-                            usize::from(config.inner_block_dimension),
-                            usize::from(config.block_dimension),
-                        ],
+                        shape: if config.retain_profile_metadata {
+                            vec![
+                                usize::from(output_block.rows),
+                                usize::from(config.inner_block_dimension),
+                                usize::from(config.block_dimension),
+                            ]
+                        } else {
+                            Vec::new()
+                        },
                         worker_count: 6,
                         role: "blocked-gemm".into(),
                         alignment: 32,
                     },
-                    metadata: BTreeMap::from([
-                        (
-                            "label".into(),
-                            format!(
-                                "GEMM block ({}, {}) inner block {}",
-                                output_block.block_row, output_block.block_column, inner_block
+                    metadata: if config.retain_profile_metadata {
+                        BTreeMap::from([
+                            (
+                                "label".into(),
+                                format!(
+                                    "GEMM block ({}, {}) inner block {}",
+                                    output_block.block_row, output_block.block_column, inner_block
+                                ),
                             ),
-                        ),
-                        ("wave".into(), wave.to_string()),
-                        (
-                            "output_block_row".into(),
-                            output_block.block_row.to_string(),
-                        ),
-                        (
-                            "output_block_column".into(),
-                            output_block.block_column.to_string(),
-                        ),
-                        ("inner_block".into(), inner_block.to_string()),
-                        ("row_start".into(), output_block.row_start.to_string()),
-                        ("rows".into(), output_block.rows.to_string()),
-                        (
-                            "output_bytes".into(),
-                            (u32::from(output_block.rows)
-                                * u32::from(config.block_dimension)
-                                * element_bytes)
-                                .to_string(),
-                        ),
-                        ("block_dimension".into(), config.block_dimension.to_string()),
-                        (
-                            "inner_block_dimension".into(),
-                            config.inner_block_dimension.to_string(),
-                        ),
-                    ]),
+                            ("wave".into(), wave.to_string()),
+                            (
+                                "output_block_row".into(),
+                                output_block.block_row.to_string(),
+                            ),
+                            (
+                                "output_block_column".into(),
+                                output_block.block_column.to_string(),
+                            ),
+                            ("inner_block".into(), inner_block.to_string()),
+                            ("row_start".into(), output_block.row_start.to_string()),
+                            ("rows".into(), output_block.rows.to_string()),
+                            (
+                                "output_bytes".into(),
+                                (u32::from(output_block.rows)
+                                    * u32::from(config.block_dimension)
+                                    * element_bytes)
+                                    .to_string(),
+                            ),
+                            ("block_dimension".into(), config.block_dimension.to_string()),
+                            (
+                                "inner_block_dimension".into(),
+                                config.inner_block_dimension.to_string(),
+                            ),
+                        ])
+                    } else {
+                        BTreeMap::new()
+                    },
                 });
             }
             phases.push(Phase::Compute {
@@ -2383,44 +2400,56 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                 arguments: vec![units, units / 6, units % 6],
                 specialization: SpecializationKey {
                     operation: "copy_u64".into(),
-                    shape: vec![usize::try_from(units).map_err(|_| {
-                        CompileError::Graph("GEMM output copy size overflow".into())
-                    })?],
+                    shape: if config.retain_profile_metadata {
+                        vec![usize::try_from(units).map_err(|_| {
+                            CompileError::Graph("GEMM output copy size overflow".into())
+                        })?]
+                    } else {
+                        Vec::new()
+                    },
                     worker_count: 6,
-                    role: format!(
-                        "output-wave-{wave}-rows-{row_offset}..{}",
-                        row_offset + rows
-                    )
-                    .into(),
+                    role: if config.retain_profile_metadata {
+                        format!(
+                            "output-wave-{wave}-rows-{row_offset}..{}",
+                            row_offset + rows
+                        )
+                        .into()
+                    } else {
+                        "gemm-output".into()
+                    },
                     alignment: 8,
                 },
-                metadata: BTreeMap::from([
-                    (
-                        "label".into(),
-                        format!(
-                            "store GEMM block ({}, {}) rows {}..{}",
-                            output_block.block_row,
-                            output_block.block_column,
-                            row_offset,
-                            row_offset + rows
+                metadata: if config.retain_profile_metadata {
+                    BTreeMap::from([
+                        (
+                            "label".into(),
+                            format!(
+                                "store GEMM block ({}, {}) rows {}..{}",
+                                output_block.block_row,
+                                output_block.block_column,
+                                row_offset,
+                                row_offset + rows
+                            ),
                         ),
-                    ),
-                    ("wave".into(), wave.to_string()),
-                    (
-                        "output_block_row".into(),
-                        output_block.block_row.to_string(),
-                    ),
-                    (
-                        "output_block_column".into(),
-                        output_block.block_column.to_string(),
-                    ),
-                    (
-                        "row_start".into(),
-                        (output_block.row_start + row_offset).to_string(),
-                    ),
-                    ("rows".into(), rows.to_string()),
-                    ("bytes".into(), bytes.to_string()),
-                ]),
+                        ("wave".into(), wave.to_string()),
+                        (
+                            "output_block_row".into(),
+                            output_block.block_row.to_string(),
+                        ),
+                        (
+                            "output_block_column".into(),
+                            output_block.block_column.to_string(),
+                        ),
+                        (
+                            "row_start".into(),
+                            (output_block.row_start + row_offset).to_string(),
+                        ),
+                        ("rows".into(), rows.to_string()),
+                        ("bytes".into(), bytes.to_string()),
+                    ])
+                } else {
+                    BTreeMap::new()
+                },
             });
         }
         phases.push(Phase::Compute {
@@ -3776,6 +3805,7 @@ mod tests {
                 data_base: 0xb0000,
                 data_limit: 0xe8000,
                 data_type: GemmDataType::F16,
+                retain_profile_metadata: true,
             },
         )
         .unwrap();
@@ -3884,6 +3914,7 @@ mod tests {
                 data_base: 0xb0000,
                 data_limit: 0xe8000,
                 data_type: GemmDataType::F16,
+                retain_profile_metadata: true,
             },
         )
         .unwrap();
@@ -4029,6 +4060,7 @@ mod tests {
             data_base: 0xa0000,
             data_limit: 0xe8000,
             data_type: GemmDataType::F32,
+            retain_profile_metadata: true,
         })
         .unwrap();
 
@@ -4097,6 +4129,7 @@ mod tests {
             data_base: 0xa0000,
             data_limit: 0xe8000,
             data_type: GemmDataType::F16F8Weights { scale: 0 },
+            retain_profile_metadata: true,
         })
         .unwrap();
 
@@ -4173,6 +4206,7 @@ mod tests {
             data_base: 0xa0000,
             data_limit: 0xe8000,
             data_type: GemmDataType::F32,
+            retain_profile_metadata: true,
         };
         let f32_plan = plan_blocked_gemm(config).unwrap();
         let f16_plan = plan_blocked_gemm(BlockedGemmConfig {
@@ -4221,6 +4255,7 @@ mod tests {
                 data_base: 0xa0000,
                 data_limit: 0xe8000,
                 data_type: GemmDataType::F32,
+                retain_profile_metadata: true,
             })
             .unwrap();
             let first_column: Vec<_> = plan

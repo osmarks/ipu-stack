@@ -48,6 +48,7 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
             data_base,
             data_limit: config.data_limit,
             data_type: config.data_type,
+            retain_profile_metadata: true,
         })?;
         data_base = resident_end(&plan, element_bytes)?
             .checked_add(31)

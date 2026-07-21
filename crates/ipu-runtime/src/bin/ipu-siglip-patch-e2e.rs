@@ -72,6 +72,7 @@ fn main() {
         data_base: DATA_BASE,
         data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
         data_type: GemmDataType::F16,
+        retain_profile_metadata: true,
     })
     .unwrap();
 
@@ -166,6 +167,7 @@ fn main() {
         "configured encoder tile-memory policy"
     );
     let detailed_diagnostics = layer_count == 1;
+    let retain_profile_metadata = std::env::var_os("IPU_SIGLIP_RETAIN_PROFILE_METADATA").is_some();
     let mut current = row_shards;
     let mut last_layer = None;
     let mut layer_phase_ranges = Vec::with_capacity(layer_count);
@@ -182,6 +184,7 @@ fn main() {
             TILE_COUNT,
             &memory,
             weight_storage,
+            retain_profile_metadata,
             detailed_diagnostics && layer + 1 == layer_count,
             &mut host,
         )
@@ -189,7 +192,7 @@ fn main() {
         current = appended.output.clone();
         last_layer = Some(appended);
         let phase_range = phase_start..plan.schedule.phases.len();
-        if std::env::var_os("IPU_SIGLIP_RETAIN_PROFILE_METADATA").is_none() {
+        if !retain_profile_metadata {
             plan.schedule.discard_profile_metadata(phase_range.clone());
         }
         layer_phase_ranges.push(phase_range);
@@ -394,6 +397,7 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         data_base: DATA_BASE,
         data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
         data_type: GemmDataType::F16,
+        retain_profile_metadata: true,
     })
     .unwrap();
     let mut schedule = ipu_compiler::Schedule {
