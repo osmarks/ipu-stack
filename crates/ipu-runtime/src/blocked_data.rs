@@ -8,8 +8,10 @@ const COLUMN_MICRO_DIMENSION: u16 = 16;
 pub enum BlockLayout {
     AmpA8,
     AmpA16,
+    AmpA32,
     AmpB8x16,
     AmpB16x16,
+    AmpB32x16,
     AmpC16,
     AmpC16F16,
 }
@@ -55,10 +57,11 @@ pub fn block_binding_typed(
 
 pub fn block_coordinates(layout: BlockLayout, rows: u16, _columns: u16, linear: u16) -> (u16, u16) {
     match layout {
-        BlockLayout::AmpA8 | BlockLayout::AmpA16 => {
+        BlockLayout::AmpA8 | BlockLayout::AmpA16 | BlockLayout::AmpA32 => {
             let inner_micro_dimension = match layout {
                 BlockLayout::AmpA8 => INNER_MICRO_DIMENSION,
                 BlockLayout::AmpA16 => 16,
+                BlockLayout::AmpA32 => 32,
                 _ => unreachable!(),
             };
             let panel_elements = rows * inner_micro_dimension;
@@ -69,10 +72,11 @@ pub fn block_coordinates(layout: BlockLayout, rows: u16, _columns: u16, linear: 
                 panel * inner_micro_dimension + panel_offset % inner_micro_dimension,
             )
         }
-        BlockLayout::AmpB8x16 | BlockLayout::AmpB16x16 => {
+        BlockLayout::AmpB8x16 | BlockLayout::AmpB16x16 | BlockLayout::AmpB32x16 => {
             let inner_micro_dimension = match layout {
                 BlockLayout::AmpB8x16 => INNER_MICRO_DIMENSION,
                 BlockLayout::AmpB16x16 => 16,
+                BlockLayout::AmpB32x16 => 32,
                 _ => unreachable!(),
             };
             let panel_elements = inner_micro_dimension * COLUMN_MICRO_DIMENSION;

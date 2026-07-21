@@ -26,6 +26,8 @@ fn main() {
     let seed = env_u64("IPU_GEMM_SEED", 0x05ee_df16);
     let max_error_limit = env_f32("IPU_F16_MAX_ERROR", 0.005);
     let fp8_weights = env_bool("IPU_GEMM_FP8_WEIGHTS", false);
+    let native_fp8 = env_bool("IPU_GEMM_NATIVE_FP8", false);
+    assert!(!(fp8_weights && native_fp8));
     let elements = usize::from(dimension).pow(2);
     let left = normal_f16(elements, seed, 0.5);
     let right = normal_f16(
@@ -34,7 +36,13 @@ fn main() {
         f32::from(dimension).sqrt().recip(),
     );
     let weight_scale = f143_scale(right.iter().map(|value| value.to_f32()));
-    let data_type = if fp8_weights {
+    let input_scale = f143_scale(left.iter().map(|value| value.to_f32()));
+    let data_type = if native_fp8 {
+        GemmDataType::F8F143 {
+            input_scale,
+            weight_scale,
+        }
+    } else if fp8_weights {
         GemmDataType::F16F8Weights {
             scale: weight_scale,
         }
@@ -80,13 +88,22 @@ fn main() {
         .max()
         .unwrap();
 
-    let mut input = blocked_matrix_f16(&plan.left, BlockLayout::AmpA16, |row, column| {
-        left[matrix_index(dimension, row, column)].to_f32()
-    });
-    if fp8_weights {
+    let mut input = if native_fp8 {
+        blocked_matrix_f8_f143(
+            &plan.left,
+            BlockLayout::AmpA32,
+            input_scale,
+            |row, column| left[matrix_index(dimension, row, column)].to_f32(),
+        )
+    } else {
+        blocked_matrix_f16(&plan.left, BlockLayout::AmpA16, |row, column| {
+            left[matrix_index(dimension, row, column)].to_f32()
+        })
+    };
+    if fp8_weights || native_fp8 {
         input.extend(blocked_matrix_f8_f143(
             &plan.right,
-            BlockLayout::AmpB16x16,
+            BlockLayout::AmpB32x16,
             weight_scale,
             |row, column| right[matrix_index(dimension, row, column)].to_f32(),
         ));
@@ -97,11 +114,22 @@ fn main() {
             |row, column| right[matrix_index(dimension, row, column)].to_f32(),
         ));
     }
+    let reference_left = left
+        .iter()
+        .map(|value| {
+            let value = value.to_f32();
+            if native_fp8 {
+                f143_to_f32(f143_from_f32(value, input_scale), input_scale)
+            } else {
+                value
+            }
+        })
+        .collect::<Vec<_>>();
     let reference_right = right
         .iter()
         .map(|value| {
             let value = value.to_f32();
-            if fp8_weights {
+            if fp8_weights || native_fp8 {
                 f143_to_f32(f143_from_f32(value, weight_scale), weight_scale)
             } else {
                 value
@@ -114,13 +142,24 @@ fn main() {
         initial_buffers: Vec::new(),
         outputs: Vec::new(),
         host_inputs: vec![
-            block_binding_typed("left", dimension, dimension, &plan.left, "f16", 2),
+            block_binding_typed(
+                "left",
+                dimension,
+                dimension,
+                &plan.left,
+                if native_fp8 { "f8-f143" } else { "f16" },
+                u64::from(data_type.input_element_bytes()),
+            ),
             block_binding_typed(
                 "right",
                 dimension,
                 dimension,
                 &plan.right,
-                if fp8_weights { "f8-f143" } else { "f16" },
+                if fp8_weights || native_fp8 {
+                    "f8-f143"
+                } else {
+                    "f16"
+                },
                 u64::from(data_type.weight_element_bytes()),
             ),
         ],
@@ -145,17 +184,27 @@ fn main() {
     let runtime = toolchain
         .compile(source("static_runtime.S"), &artifact_dir, "runtime", &[])
         .unwrap();
+    let mut kernel_defines = vec![
+        format!("-DGEMM_INNER_BLOCK_DIMENSION={inner_block_dimension}"),
+        format!("-DGEMM_OUTPUT_COLUMNS={block_dimension}"),
+        format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
+        format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
+    ];
+    if native_fp8 {
+        kernel_defines.extend([
+            "-DGEMM_NATIVE_FP8=1".into(),
+            "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_gemm_f8_init_small_rows".into(),
+            "-DGEMM_INIT_LARGE_SYMBOL=ipu_stack_gemm_f8_init_large_rows".into(),
+            "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_gemm_f8_accumulate_small_rows".into(),
+            "-DGEMM_ACCUMULATE_LARGE_SYMBOL=ipu_stack_gemm_f8_accumulate_large_rows".into(),
+        ]);
+    }
     let kernel = toolchain
         .compile(
             source("gemm_f16_64_amp.S"),
             &artifact_dir,
-            "gemm-f16",
-            &[
-                format!("-DGEMM_INNER_BLOCK_DIMENSION={inner_block_dimension}"),
-                format!("-DGEMM_OUTPUT_COLUMNS={block_dimension}"),
-                format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
-                format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
-            ],
+            if native_fp8 { "gemm-f8" } else { "gemm-f16" },
+            &kernel_defines,
         )
         .unwrap();
     let mut objects = vec![
@@ -205,6 +254,8 @@ fn main() {
         block_dimension,
         inner_block_dimension,
         fp8_weights,
+        native_fp8,
+        input_scale,
         weight_scale,
         seed,
         row_block_dimension,
@@ -253,7 +304,7 @@ fn main() {
             dimension,
             &actual,
             &output_placements,
-            &left,
+            &reference_left,
             &reference_right,
             max_error_limit,
         )
@@ -296,7 +347,7 @@ fn verify_output(
     dimension: u16,
     actual: &[u8],
     placements: &[ipu_compiler::BlockPlacement],
-    left: &[f16],
+    left: &[f32],
     right: &[f32],
     max_error_limit: f32,
 ) -> ipu_runtime::Result<ErrorStatistics> {
@@ -323,7 +374,7 @@ fn verify_output(
             .to_f32();
             let expected = (0..dimension)
                 .map(|inner| {
-                    left[matrix_index(dimension, row, inner)].to_f32()
+                    left[matrix_index(dimension, row, inner)]
                         * right[matrix_index(dimension, inner, column)]
                 })
                 .sum::<f32>();

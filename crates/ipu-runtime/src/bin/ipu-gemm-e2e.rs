@@ -490,8 +490,10 @@ mod tests {
         for (layout, rows, columns) in [
             (BlockLayout::AmpA8, 128, 32),
             (BlockLayout::AmpA16, 128, 32),
+            (BlockLayout::AmpA32, 128, 64),
             (BlockLayout::AmpB8x16, 32, 64),
             (BlockLayout::AmpB16x16, 32, 64),
+            (BlockLayout::AmpB32x16, 64, 64),
             (BlockLayout::AmpC16, 128, 64),
             (BlockLayout::AmpC16F16, 128, 64),
         ] {

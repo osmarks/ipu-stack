@@ -15,6 +15,27 @@
 #ifndef GEMM_RIGHT_BYTE_OFFSET
 #define GEMM_RIGHT_BYTE_OFFSET 0
 #endif
+#ifdef GEMM_NATIVE_FP8
+#define GEMM_AMP f8v8hihov4amp
+#define GEMM_TAMP_P0 TAMP_F8V8_E4_P0
+#define GEMM_TAMP_P1 TAMP_F8V8_E4_P1
+#define GEMM_TAMP_P2 TAMP_F8V8_E4_P2
+#define GEMM_TAMP_P3 TAMP_F8V8_E4_P3
+#define GEMM_INPUT_ELEMENT_BYTES 1
+#define GEMM_INNER_MICRO_DIMENSION 32
+#define GEMM_INPUT_FORMAT 3
+#else
+#define GEMM_AMP f16v4hihov4amp
+#define GEMM_TAMP_P0 TAMP_F16V4_E4_P0
+#define GEMM_TAMP_P1 TAMP_F16V4_E4_P1
+#define GEMM_TAMP_P2 TAMP_F16V4_E4_P2
+#define GEMM_TAMP_P3 TAMP_F16V4_E4_P3
+#define GEMM_INPUT_ELEMENT_BYTES 2
+#define GEMM_INNER_MICRO_DIMENSION 16
+#define GEMM_INPUT_FORMAT 0
+#endif
+// The SDK's IPU21 assembly header omits this adjacent supervisor CSR name.
+#define GEMM_FP_ISCL_INDEX (CSR_S_FP_INFMT__INDEX + 2)
 #ifndef GEMM_INIT_SMALL_SYMBOL
 #define GEMM_INIT_SMALL_SYMBOL ipu_stack_gemm_f16_init_small_rows
 #endif
@@ -32,7 +53,7 @@
 	.allow_optimizations
 
 	.set OUTPUT_COLUMNS, GEMM_OUTPUT_COLUMNS
-	.set INNER_MICRO_DIMENSION, 16
+	.set INNER_MICRO_DIMENSION, GEMM_INNER_MICRO_DIMENSION
 	.set INNER_GROUPS, GEMM_INNER_BLOCK_DIMENSION / INNER_MICRO_DIMENSION
 	.set COLUMN_MICRO_DIMENSION, 16
 	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
@@ -139,6 +160,14 @@
 	setzi $m0, ENABLE_STOCHASTIC_ROUNDING
 	or $m8, $m8, $m0
 	put $FP_ICTL, $m8
+	setzi $m0, GEMM_INPUT_FORMAT
+	put CSR_S_FP_INFMT__INDEX, $m0
+#ifdef GEMM_NATIVE_FP8
+	put GEMM_FP_ISCL_INDEX, $m5
+#else
+	zero $m0
+	put GEMM_FP_ISCL_INDEX, $m0
+#endif
 	setzi $m8, CLEAR_CWEI
 	put $CR, $m8
 	add $m4, $m4, GEMM_RIGHT_BYTE_OFFSET
@@ -154,7 +183,7 @@
 	mul $m8, $m8, $m6
 	add $m8, $m2, $m8
 	st32 $m8, $m11, $m15, 0
-	mul $m8, $m9, INNER_MICRO_DIMENSION * 2
+	mul $m8, $m9, INNER_MICRO_DIMENSION * GEMM_INPUT_ELEMENT_BYTES
 	mul $m8, $m8, $m7
 	add $m8, $m3, $m8
 	st32 $m8, $m11, $m15, 1
@@ -211,23 +240,23 @@
 	ld64step $a0:1, $mzero, $m2+=, 1
 	{
 		ld64step $a0:1, $mzero, $m2+=, 1
-		f16v4hihov4amp $a6:7, $a0:1, $azeros, TAMP_F16V4_E4_P0
+		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P0
 	}
 	{
 		ld64step $a0:1, $mzero, $m2+=, 1
-		f16v4hihov4amp $a6:7, $a0:1, $azeros, TAMP_F16V4_E4_P1
+		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P1
 	}
 	{
 		ld64step $a0:1, $mzero, $m2+=, 1
-		f16v4hihov4amp $a6:7, $a0:1, $azeros, TAMP_F16V4_E4_P2
+		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P2
 	}
 	{
 		ld64step $a0:1, $mzero, $m2+=, 1
-		f16v4hihov4amp $a6:7, $a0:1, $azeros, TAMP_F16V4_E4_P3
+		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P3
 	}
 	{
 		ld64step $a0:1, $mzero, $m2+=, 1
-		f16v4hihov4amp $a6:7, $a0:1, $azeros, TAMP_F16V4_E4_P0
+		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P0
 	}
 	tapack $m10:11, $m2, $m3, $m9
 	{
@@ -236,31 +265,31 @@
 	}
 	{
 		ldst64pace $a0:1, $a6:7, $m10:11+=, $mzero, 0b0000
-		f16v4hihov4amp $a6:7, $a0:1, $azeros, TAMP_F16V4_E4_P1
+		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P1
 	}
 	{
 		ldst64pace $a0:1, $a6:7, $m10:11+=, $mzero, 0b0000
-		f16v4hihov4amp $a6:7, $a0:1, $azeros, TAMP_F16V4_E4_P2
+		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P2
 	}
 	{
 		ldst64pace $a0:1, $a6:7, $m10:11+=, $mzero, 0b0000
-		f16v4hihov4amp $a6:7, $a0:1, $azeros, TAMP_F16V4_E4_P3
+		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P3
 	}
 	{
 		ldst64pace $a0:1, $a6:7, $m10:11+=, $mzero, 0b0000
-		f16v4hihov4amp $a6:7, $a0:1, $azeros, TAMP_F16V4_E4_P0
+		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P0
 	}
 	{
 		st64pace $a6:7, $m10:11+=, $mzero, 0b00
-		f16v4hihov4amp $a6:7, $azeros, $azeros, TAMP_F16V4_E4_P1
+		GEMM_AMP $a6:7, $azeros, $azeros, GEMM_TAMP_P1
 	}
 	{
 		st64pace $a6:7, $m10:11+=, $mzero, 0b00
-		f16v4hihov4amp $a6:7, $azeros, $azeros, TAMP_F16V4_E4_P2
+		GEMM_AMP $a6:7, $azeros, $azeros, GEMM_TAMP_P2
 	}
 	{
 		st64pace $a6:7, $m10:11+=, $mzero, 0b00
-		f16v4hihov4amp $a6:7, $azeros, $azeros, TAMP_F16V4_E4_P3
+		GEMM_AMP $a6:7, $azeros, $azeros, GEMM_TAMP_P3
 	}
 	st64pace $a6:7, $m10:11+=, $mzero, 0b00
 	exitz $mzero
@@ -271,68 +300,68 @@
 	ld128 $a0:3, $m9, $m15, 0
 	{
 		add $m2, $m2, 0
-		f16v4hihov4amp $a6:7, $azeros, $a0:1, TAMP_F16V4_E4_P0
+		GEMM_AMP $a6:7, $azeros, $a0:1, GEMM_TAMP_P0
 	}
 	{
 		ld128 $a0:3, $m9, $m15, 1
-		f16v4hihov4amp $a6:7, $azeros, $a2:3, TAMP_F16V4_E4_P1
+		GEMM_AMP $a6:7, $azeros, $a2:3, GEMM_TAMP_P1
 	}
 	{
 		tapack $m10:11, $m2, $m3, $m9
-		f16v4hihov4amp $a6:7, $azeros, $a0:1, TAMP_F16V4_E4_P2
+		GEMM_AMP $a6:7, $azeros, $a0:1, GEMM_TAMP_P2
 	}
 	{
 		ld2x64pace $a0:1, $a2:3, $m10:11+=, $mzero, 0b0000
-		f16v4hihov4amp $a6:7, $azeros, $a2:3, TAMP_F16V4_E4_P3
+		GEMM_AMP $a6:7, $azeros, $a2:3, GEMM_TAMP_P3
 	}
 	{
 		ld2x64pace $a0:1, $a2:3, $m10:11+=, $mzero, 0b0000
-		f16v4hihov4amp $a6:7, $a0:1, $a2:3, TAMP_F16V4_E4_P0
+		GEMM_AMP $a6:7, $a0:1, $a2:3, GEMM_TAMP_P0
 	}
 	{
 		ld2x64pace $a0:1, $a2:3, $m10:11+=, $mzero, 0b0000
-		f16v4hihov4amp $a6:7, $a0:1, $a2:3, TAMP_F16V4_E4_P1
+		GEMM_AMP $a6:7, $a0:1, $a2:3, GEMM_TAMP_P1
 	}
 	{
 		ld2x64pace $a0:1, $a2:3, $m10:11+=, $mzero, 0b0000
-		f16v4hihov4amp $a6:7, $a0:1, $a2:3, TAMP_F16V4_E4_P2
+		GEMM_AMP $a6:7, $a0:1, $a2:3, GEMM_TAMP_P2
 	}
 	{
 		ld2x64pace $a0:1, $a2:3, $m10:11+=, $mzero, 0b0000
-		f16v4hihov4amp $a6:7, $a0:1, $a2:3, TAMP_F16V4_E4_P3
+		GEMM_AMP $a6:7, $a0:1, $a2:3, GEMM_TAMP_P3
 	}
 	{
 		ld2x64pace $a0:1, $a2:3, $m10:11+=, $mzero, 0b0000
-		f16v4hihov4amp $a6:7, $a0:1, $a2:3, TAMP_F16V4_E4_P0
+		GEMM_AMP $a6:7, $a0:1, $a2:3, GEMM_TAMP_P0
 	}
 	{
 		ld2x64pace $a0:1, $a2:3, $m10:11+=, $mzero, 0b0000
-		f16v4hihov4amp $a4:5, $a0:1, $a2:3, TAMP_F16V4_E4_P1
+		GEMM_AMP $a4:5, $a0:1, $a2:3, GEMM_TAMP_P1
 	}
 	rpt $m8, 3
 	{
 		ld2xst64pace $a0:3, $a6:7, $m10:11+=, $mzero, 0b000000
-		f16v4hihov4amp $a6:7, $a0:1, $a2:3, TAMP_F16V4_E4_P2
+		GEMM_AMP $a6:7, $a0:1, $a2:3, GEMM_TAMP_P2
 	}
 	{
 		ld2xst64pace $a0:3, $a4:5, $m10:11+=, $mzero, 0b000000
-		f16v4hihov4amp $a4:5, $a0:1, $a2:3, TAMP_F16V4_E4_P3
+		GEMM_AMP $a4:5, $a0:1, $a2:3, GEMM_TAMP_P3
 	}
 	{
 		ld2xst64pace $a0:3, $a6:7, $m10:11+=, $mzero, 0b000000
-		f16v4hihov4amp $a6:7, $a0:1, $a2:3, TAMP_F16V4_E4_P0
+		GEMM_AMP $a6:7, $a0:1, $a2:3, GEMM_TAMP_P0
 	}
 	{
 		ld2xst64pace $a0:3, $a4:5, $m10:11+=, $mzero, 0b000000
-		f16v4hihov4amp $a4:5, $a0:1, $a2:3, TAMP_F16V4_E4_P1
+		GEMM_AMP $a4:5, $a0:1, $a2:3, GEMM_TAMP_P1
 	}
 	{
 		st64pace $a6:7, $m10:11+=, $mzero, 0b00
-		f16v4hihov4amp $a6:7, $azeros, $azeros, TAMP_F16V4_E4_P2
+		GEMM_AMP $a6:7, $azeros, $azeros, GEMM_TAMP_P2
 	}
 	{
 		st64pace $a4:5, $m10:11+=, $mzero, 0b00
-		f16v4hihov4amp $a4:5, $azeros, $a2:3, TAMP_F16V4_E4_P3
+		GEMM_AMP $a4:5, $azeros, $a2:3, GEMM_TAMP_P3
 	}
 	st64pace $a6:7, $m10:11+=, $mzero, 0b00
 	st64pace $a4:5, $m10:11+=, $mzero, 0b00

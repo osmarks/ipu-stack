@@ -947,20 +947,33 @@ pub struct BlockedGemmConfig {
 pub enum GemmDataType {
     F16,
     F16F8Weights { scale: i8 },
+    F8F143 { input_scale: i8, weight_scale: i8 },
     F32,
 }
 
 impl GemmDataType {
-    pub const fn element_bytes(self) -> u32 {
+    pub const fn input_element_bytes(self) -> u32 {
         match self {
             Self::F16 | Self::F16F8Weights { .. } => 2,
+            Self::F8F143 { .. } => 1,
             Self::F32 => 4,
         }
     }
 
+    pub const fn output_element_bytes(self) -> u32 {
+        match self {
+            Self::F16 | Self::F16F8Weights { .. } | Self::F8F143 { .. } => 2,
+            Self::F32 => 4,
+        }
+    }
+
+    pub const fn element_bytes(self) -> u32 {
+        self.output_element_bytes()
+    }
+
     pub const fn weight_element_bytes(self) -> u32 {
         match self {
-            Self::F16F8Weights { .. } => 1,
+            Self::F16F8Weights { .. } | Self::F8F143 { .. } => 1,
             Self::F16 => 2,
             Self::F32 => 4,
         }
@@ -973,7 +986,18 @@ impl GemmDataType {
     const fn weight_scale(self) -> i8 {
         match self {
             Self::F16F8Weights { scale } => scale,
+            Self::F8F143 { weight_scale, .. } => weight_scale,
             Self::F16 | Self::F32 => 0,
+        }
+    }
+
+    const fn product_scale(self) -> Option<i16> {
+        match self {
+            Self::F8F143 {
+                input_scale,
+                weight_scale,
+            } => Some(input_scale as i16 + weight_scale as i16),
+            _ => None,
         }
     }
 
@@ -987,6 +1011,10 @@ impl GemmDataType {
             (Self::F16 | Self::F16F8Weights { .. }, false, false) => {
                 "gemm_f16_accumulate_large_rows"
             }
+            (Self::F8F143 { .. }, true, true) => "gemm_f8_init_small_rows",
+            (Self::F8F143 { .. }, true, false) => "gemm_f8_init_large_rows",
+            (Self::F8F143 { .. }, false, true) => "gemm_f8_accumulate_small_rows",
+            (Self::F8F143 { .. }, false, false) => "gemm_f8_accumulate_large_rows",
             (Self::F32, true, true) => "gemm_f32_init_small_rows",
             (Self::F32, true, false) => "gemm_f32_init_large_rows",
             (Self::F32, false, true) => "gemm_f32_accumulate_small_rows",
@@ -2072,14 +2100,12 @@ pub fn gemm_row_block_candidates_for(
         return Vec::new();
     }
     let mut row_shard_counts = BTreeSet::new();
-    let element_bytes = data_type.element_bytes();
     let maximum_rows = (ipu_exchange::MAX_TRANSFER_WORDS * 4
-        / (u32::from(inner_block_dimension) * element_bytes))
-        .min(
-            (ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
-                - ipu_package::IPU21_INTERLEAVED_MEMORY_BASE)
-                / (u32::from(block_dimension) * element_bytes),
-        ) as u16;
+        / (u32::from(inner_block_dimension) * data_type.input_element_bytes()))
+    .min(
+        (ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT - ipu_package::IPU21_INTERLEAVED_MEMORY_BASE)
+            / (u32::from(block_dimension) * data_type.output_element_bytes()),
+    ) as u16;
     (GEMM_MINIMUM_ROW_SHARD..=maximum_rows)
         .filter(|&target| {
             let row_shards = rows.div_ceil(target);
@@ -2091,6 +2117,7 @@ pub fn gemm_row_block_candidates_for(
 pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, CompileError> {
     let inner_micro_dimension = match config.data_type {
         GemmDataType::F16 | GemmDataType::F16F8Weights { .. } => 16,
+        GemmDataType::F8F143 { .. } => 32,
         GemmDataType::F32 => 8,
     };
     if config.rows == 0
@@ -2099,7 +2126,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         || !matches!(
             (config.data_type, config.block_dimension),
             (
-                GemmDataType::F16 | GemmDataType::F16F8Weights { .. },
+                GemmDataType::F16 | GemmDataType::F16F8Weights { .. } | GemmDataType::F8F143 { .. },
                 64 | 128
             ) | (GemmDataType::F32, 64)
         )
@@ -2116,6 +2143,15 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
             "blocked GEMM requires a supported column block and inner blocks divisible by {inner_micro_dimension}"
         )));
     }
+    if config
+        .data_type
+        .product_scale()
+        .is_some_and(|scale| !(-32..=31).contains(&scale))
+    {
+        return Err(CompileError::Graph(
+            "native FP8 GEMM product scale is outside the hardware's signed six-bit range".into(),
+        ));
+    }
     let column_grid = config.columns / config.block_dimension;
     let inner_grid = config.inner_dimension / config.inner_block_dimension;
     let row_grid = config.rows.div_ceil(config.row_block_dimension);
@@ -2127,14 +2163,15 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         )));
     }
     let output_block_count = usize::from(row_grid) * usize::from(column_grid);
-    let element_bytes = config.data_type.element_bytes();
+    let input_element_bytes = config.data_type.input_element_bytes();
+    let output_element_bytes = config.data_type.output_element_bytes();
     let right_block_bytes = u32::from(config.inner_block_dimension)
         .checked_mul(u32::from(config.block_dimension))
         .and_then(|elements| elements.checked_mul(config.data_type.weight_element_bytes()))
         .ok_or_else(|| CompileError::Memory("GEMM block size overflow".into()))?;
     let expanded_right_block_bytes = u32::from(config.inner_block_dimension)
         .checked_mul(u32::from(config.block_dimension))
-        .and_then(|elements| elements.checked_mul(element_bytes))
+        .and_then(|elements| elements.checked_mul(output_element_bytes))
         .ok_or_else(|| CompileError::Memory("expanded GEMM block size overflow".into()))?;
     if right_block_bytes > ipu_exchange::MAX_TRANSFER_WORDS * 4 {
         return Err(CompileError::Graph(format!(
@@ -2144,11 +2181,11 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
     let maximum_rows = base_rows + u16::from(larger_row_shards != 0);
     let max_left_bytes = u32::from(maximum_rows)
         .checked_mul(u32::from(config.inner_block_dimension))
-        .and_then(|elements| elements.checked_mul(element_bytes))
+        .and_then(|elements| elements.checked_mul(input_element_bytes))
         .ok_or_else(|| CompileError::Memory("GEMM left block size overflow".into()))?;
     let max_output_bytes = u32::from(maximum_rows)
         .checked_mul(u32::from(config.block_dimension))
-        .and_then(|elements| elements.checked_mul(element_bytes))
+        .and_then(|elements| elements.checked_mul(output_element_bytes))
         .ok_or_else(|| CompileError::Memory("GEMM output block size overflow".into()))?;
     let tile_data_end = config
         .data_base
@@ -2193,7 +2230,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
     for block_row in 0..row_grid {
         let rows = base_rows + u16::from(block_row < larger_row_shards);
         let row_start = block_row * base_rows + block_row.min(larger_row_shards);
-        let size = u32::from(rows) * u32::from(config.inner_block_dimension) * element_bytes;
+        let size = u32::from(rows) * u32::from(config.inner_block_dimension) * input_element_bytes;
         for block_column in 0..inner_grid {
             let index =
                 usize::from(block_row) * usize::from(inner_grid) + usize::from(block_column);
@@ -2263,7 +2300,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
     for block_row in 0..row_grid {
         let rows = base_rows + u16::from(block_row < larger_row_shards);
         let row_start = block_row * base_rows + block_row.min(larger_row_shards);
-        let size = u32::from(rows) * u32::from(config.block_dimension) * element_bytes;
+        let size = u32::from(rows) * u32::from(config.block_dimension) * output_element_bytes;
         for block_column in 0..column_grid {
             let index =
                 usize::from(block_row) * usize::from(column_grid) + usize::from(block_column);
@@ -2322,7 +2359,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                 address: output_address,
                 size: u32::from(output_block.rows)
                     * u32::from(config.block_dimension)
-                    * element_bytes,
+                    * output_element_bytes,
                 live_from: wave_start,
                 live_until: wave_start + usize::from(inner_grid) * phases_per_inner + 1,
                 kind: AllocationKind::Home,
@@ -2344,7 +2381,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                         tensor: source.tensor,
                         bytes: u32::from(source.rows)
                             * u32::from(config.inner_block_dimension)
-                            * element_bytes,
+                            * input_element_bytes,
                     });
                     allocations.push(Allocation {
                         tensor: source.tensor,
@@ -2352,7 +2389,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                         address: left_exchange_address,
                         size: u32::from(source.rows)
                             * u32::from(config.inner_block_dimension)
-                            * element_bytes,
+                            * input_element_bytes,
                         live_from: exchange_phase,
                         live_until: exchange_phase
                             + 1
@@ -2471,7 +2508,11 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                         .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?,
                     output: TensorId(scratch_tensor_base + output_index),
                     inputs: vec![left_tensor, right_tensor],
-                    arguments: Vec::new(),
+                    arguments: config
+                        .data_type
+                        .product_scale()
+                        .map(|scale| vec![u32::from((scale as u8) & 0x3f)])
+                        .unwrap_or_default(),
                     specialization: SpecializationKey {
                         operation: config
                             .data_type
@@ -2515,7 +2556,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                                 "output_bytes".into(),
                                 (u32::from(output_block.rows)
                                     * u32::from(config.block_dimension)
-                                    * element_bytes)
+                                    * output_element_bytes)
                                     .to_string(),
                             ),
                             ("block_dimension".into(), config.block_dimension.to_string()),
@@ -2537,7 +2578,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         let evacuation_phase = phases.len();
         let max_transfer_rows = u16::try_from(
             ipu_exchange::MAX_TRANSFER_WORDS * 4
-                / (u32::from(config.block_dimension) * element_bytes),
+                / (u32::from(config.block_dimension) * output_element_bytes),
         )
         .map_err(|_| CompileError::Graph("GEMM evacuation row limit overflow".into()))?;
         let mut transfers = Vec::new();
@@ -2549,9 +2590,11 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
             let mut row_offset = 0u16;
             for chunk_index in 0..output_block.rows.div_ceil(max_transfer_rows) {
                 let rows = (output_block.rows - row_offset).min(max_transfer_rows);
-                let byte_offset =
-                    u32::from(row_offset) * u32::from(config.block_dimension) * element_bytes;
-                let bytes = u32::from(rows) * u32::from(config.block_dimension) * element_bytes;
+                let byte_offset = u32::from(row_offset)
+                    * u32::from(config.block_dimension)
+                    * output_element_bytes;
+                let bytes =
+                    u32::from(rows) * u32::from(config.block_dimension) * output_element_bytes;
                 let tensor =
                     TensorId(evacuation_tensor_base + output_index * 2 + usize::from(chunk_index));
                 allocations.push(Allocation {
@@ -4559,6 +4602,61 @@ mod tests {
         plan.schedule
             .lower_tile_programs(&Topology::c600())
             .unwrap();
+    }
+
+    #[test]
+    fn native_fp8_gemm_keeps_fp8_operands_and_fp16_outputs() {
+        let plan = plan_blocked_gemm(BlockedGemmConfig {
+            rows: 128,
+            inner_dimension: 128,
+            columns: 128,
+            block_dimension: 64,
+            inner_block_dimension: 64,
+            row_block_dimension: 64,
+            tile_count: 1472,
+            data_base: 0xa0000,
+            data_limit: 0xe8000,
+            data_type: GemmDataType::F8F143 {
+                input_scale: -6,
+                weight_scale: -9,
+            },
+            retain_profile_metadata: true,
+        })
+        .unwrap();
+
+        let home_size = |block: &BlockPlacement| {
+            plan.schedule
+                .allocations
+                .iter()
+                .find(|allocation| {
+                    allocation.tensor == block.tensor
+                        && allocation.tile == block.tile
+                        && allocation.kind == AllocationKind::Home
+                })
+                .unwrap()
+                .size
+        };
+        assert!(
+            plan.left.iter().all(|block| {
+                home_size(block) == u32::from(block.rows) * u32::from(block.columns)
+            })
+        );
+        assert!(
+            plan.right.iter().all(|block| {
+                home_size(block) == u32::from(block.rows) * u32::from(block.columns)
+            })
+        );
+        assert!(plan.output.iter().all(|block| {
+            home_size(block) == u32::from(block.rows) * u32::from(block.columns) * 2
+        }));
+        assert!(plan.schedule.phases.iter().all(|phase| match phase {
+            Phase::Exchange { .. } => true,
+            Phase::Compute { commands, .. } => commands.iter().all(|command| {
+                command.specialization.operation == "copy_u64"
+                    || (command.specialization.operation.starts_with("gemm_f8_")
+                        && command.arguments == [u32::from((-15i8 as u8) & 0x3f)])
+            }),
+        }));
     }
 
     #[test]

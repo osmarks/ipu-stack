@@ -1141,7 +1141,9 @@ fn push_gemm_weight(
                 blocked_matrix_f8_f143_by_block(placements, BlockLayout::AmpB16x16, &scales, value),
             )
         }
-        GemmDataType::F32 => return Err("SigLIP weights require FP16 graph operands".into()),
+        GemmDataType::F8F143 { .. } | GemmDataType::F32 => {
+            return Err("SigLIP weight serialization does not support this GEMM data type".into());
+        }
     };
     host.push(
         block_binding_typed(
