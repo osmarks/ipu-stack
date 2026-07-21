@@ -120,9 +120,27 @@ pub fn make_tensors_resident(
     schedule: &mut Schedule,
     tensors: impl IntoIterator<Item = TensorId>,
 ) -> Result<(), CompileError> {
+    make_tensors_resident_since(schedule, 0, tensors)
+}
+
+pub fn make_tensors_resident_since(
+    schedule: &mut Schedule,
+    allocation_start: usize,
+    tensors: impl IntoIterator<Item = TensorId>,
+) -> Result<(), CompileError> {
     let tensors = tensors.into_iter().collect::<HashSet<_>>();
+    debug_assert!(
+        schedule.allocations[..allocation_start]
+            .iter()
+            .all(|allocation| !tensors.contains(&allocation.tensor)),
+        "newly appended tensors must not have allocations before allocation_start"
+    );
     let mut found = HashSet::default();
-    for allocation in &mut schedule.allocations {
+    let allocations = schedule
+        .allocations
+        .get_mut(allocation_start..)
+        .ok_or_else(|| CompileError::Graph("resident allocation start is out of range".into()))?;
+    for allocation in allocations {
         if allocation.kind == AllocationKind::Home && tensors.contains(&allocation.tensor) {
             found.insert(allocation.tensor);
             allocation.live_from = 0;
