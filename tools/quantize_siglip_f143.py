@@ -49,8 +49,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threads", type=int)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cpu")
     parser.add_argument("--no-save", action="store_true")
+    parser.add_argument("--report", type=Path)
     parser.add_argument(
         "--no-bias-correction", action="store_false", dest="bias_correction"
+    )
+    parser.add_argument(
+        "--sequential-layers",
+        action="store_true",
+        help="recollect each layer after reconstructing its predecessors",
     )
     return parser.parse_args()
 
@@ -247,6 +253,46 @@ def output_metrics(reference: torch.Tensor, actual: torch.Tensor) -> dict[str, f
     }
 
 
+def reconstruct_modules(
+    model: SiglipVisionModel,
+    modules: dict[str, torch.nn.Linear],
+    batches: list[torch.Tensor],
+    args: argparse.Namespace,
+    objectives: dict,
+    progress: list[int],
+) -> None:
+    hessians, input_sums, input_counts = collect_block_hessians(
+        model, modules, batches, args.block_size
+    )
+    with torch.no_grad():
+        for name, module in modules.items():
+            input_mean = (
+                input_sums.pop(name) / input_counts.pop(name)
+                if args.bias_correction
+                else None
+            )
+            nearest, reconstructed, correction_rms = reconstruct_linear(
+                module,
+                hessians.pop(name),
+                args.block_size,
+                args.damp,
+                args.algorithm,
+                input_mean,
+            )
+            objectives[name] = {
+                "nearest": nearest,
+                "reconstructed": reconstructed,
+                "ratio": reconstructed / nearest if nearest else 0.0,
+                "bias_correction_rms": correction_rms,
+            }
+            progress[0] += 1
+            print(
+                f"[{progress[0]}/{progress[1]}] reconstructed {name} "
+                f"(weighted error {objectives[name]['ratio']:.4f}x)",
+                flush=True,
+            )
+
+
 def main() -> None:
     args = parse_args()
     if args.threads:
@@ -276,36 +322,17 @@ def main() -> None:
             .last_hidden_state.clone()
             for pixels in batches
         ]
-    hessians, input_sums, input_counts = collect_block_hessians(
-        model, modules, batches, args.block_size
-    )
     objectives = {}
-    with torch.no_grad():
-        for index, (name, module) in enumerate(modules.items(), 1):
-            input_mean = (
-                input_sums.pop(name) / input_counts.pop(name)
-                if args.bias_correction
-                else None
-            )
-            nearest, reconstructed, correction_rms = reconstruct_linear(
-                module,
-                hessians.pop(name),
-                args.block_size,
-                args.damp,
-                args.algorithm,
-                input_mean,
-            )
-            objectives[name] = {
-                "nearest": nearest,
-                "reconstructed": reconstructed,
-                "ratio": reconstructed / nearest if nearest else 0.0,
-                "bias_correction_rms": correction_rms,
+    progress = [0, len(modules)]
+    if args.sequential_layers:
+        for layer in range(layer_count):
+            marker = f"vision_model.encoder.layers.{layer}."
+            layer_modules = {
+                name: module for name, module in modules.items() if name.startswith(marker)
             }
-            print(
-                f"[{index}/{len(modules)}] reconstructed {name} "
-                f"(weighted error {objectives[name]['ratio']:.4f}x)",
-                flush=True,
-            )
+            reconstruct_modules(model, layer_modules, batches, args, objectives, progress)
+    else:
+        reconstruct_modules(model, modules, batches, args, objectives, progress)
 
     with torch.inference_mode():
         metrics = [
@@ -324,10 +351,12 @@ def main() -> None:
         "images": [str(path) for path in args.image],
         "damp": args.damp,
         "bias_correction": args.bias_correction,
+        "sequential_layers": args.sequential_layers,
         "layers": layer_count,
         "metrics": metrics,
         "objectives": objectives,
     }
+    report_text = json.dumps(report, indent=2) + "\n"
     if not args.no_save:
         args.output.mkdir(parents=True, exist_ok=True)
         shutil.copy2(args.model / "config.json", args.output / "config.json")
@@ -339,8 +368,26 @@ def main() -> None:
             args.output / "model.safetensors",
             metadata={"format": "pt", "ipu_f143_reconstruction": args.algorithm},
         )
-        (args.output / "quantization.json").write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps(report, indent=2))
+        (args.output / "quantization.json").write_text(report_text)
+    if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(report_text)
+    print(
+        json.dumps(
+            {
+                key: value
+                for key, value in report.items()
+                if key != "objectives"
+            }
+            | {
+                "objective_ratio": sum(
+                    objective["reconstructed"] for objective in objectives.values()
+                )
+                / sum(objective["nearest"] for objective in objectives.values())
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
