@@ -28,7 +28,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-cosine", type=float, default=0.995)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--retries", type=int, default=2)
     return parser.parse_args()
 
 
@@ -83,21 +82,8 @@ def main() -> None:
                 "--output",
                 f"graph={output}",
             ]
-            attempts = []
             started = time.monotonic()
-            for attempt in range(args.retries + 1):
-                attempt_started = time.monotonic()
-                completed = subprocess.run(command, text=True, capture_output=True)
-                attempts.append(
-                    {
-                        "attempt": attempt + 1,
-                        "seconds": time.monotonic() - attempt_started,
-                        "returncode": completed.returncode,
-                        "stderr": completed.stderr if completed.returncode else "",
-                    }
-                )
-                if completed.returncode == 0:
-                    break
+            completed = subprocess.run(command, text=True, capture_output=True)
             elapsed = time.monotonic() - started
             result = {
                 "index": index,
@@ -105,7 +91,6 @@ def main() -> None:
                 "image": sample["image"],
                 "seconds": elapsed,
                 "returncode": completed.returncode,
-                "attempts": attempts,
             }
             if completed.returncode == 0:
                 rows = decode_output(output)
