@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
 use ipu_exchange::{
@@ -418,6 +418,29 @@ pub struct MemoryPolicy {
     /// tiles, or retains the child planner's tile assignment unchanged.
     #[serde(default)]
     pub resident_tile_assignment: ResidentTileAssignment,
+    #[serde(skip)]
+    allocation_occupancy: AllocationOccupancyCache,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AllocationOccupancyCache(Arc<Mutex<Option<CachedAllocationOccupancy>>>);
+
+impl PartialEq for AllocationOccupancyCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for AllocationOccupancyCache {}
+
+#[derive(Debug)]
+struct CachedAllocationOccupancy {
+    schedule: usize,
+    allocation_count: usize,
+    tile_count: u16,
+    base: u32,
+    limit: u32,
+    occupied: Vec<Vec<(u32, u32)>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +487,7 @@ impl MemoryPolicy {
             resident: vec![arena],
             transient: vec![arena],
             resident_tile_assignment: ResidentTileAssignment::Balanced,
+            allocation_occupancy: AllocationOccupancyCache::default(),
         }
     }
 
@@ -499,6 +523,7 @@ impl MemoryPolicy {
             resident: expand(resident_order),
             transient: expand(transient_order),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
+            allocation_occupancy: AllocationOccupancyCache::default(),
         };
         policy.validate()?;
         Ok(policy)
@@ -516,6 +541,45 @@ impl MemoryPolicy {
             return Err(CompileError::Memory("invalid tile-memory policy".into()));
         }
         Ok(())
+    }
+
+    fn occupied_all(&self, schedule: &Schedule, base: u32, limit: u32) -> Vec<Vec<(u32, u32)>> {
+        let schedule_id = schedule as *const Schedule as usize;
+        let mut cache = self.allocation_occupancy.0.lock().unwrap();
+        let reset = cache.as_ref().is_none_or(|cache| {
+            cache.schedule != schedule_id
+                || cache.tile_count != schedule.tile_count
+                || cache.base != base
+                || cache.limit != limit
+                || cache.allocation_count > schedule.allocations.len()
+        });
+        if reset {
+            *cache = Some(CachedAllocationOccupancy {
+                schedule: schedule_id,
+                allocation_count: 0,
+                tile_count: schedule.tile_count,
+                base,
+                limit,
+                occupied: vec![Vec::new(); usize::from(schedule.tile_count)],
+            });
+        }
+        let cache = cache.as_mut().unwrap();
+        for allocation in &schedule.allocations[cache.allocation_count..] {
+            if allocation.live_until == 0 || allocation.live_from == usize::MAX {
+                continue;
+            }
+            let start = allocation.address.max(base);
+            let end = allocation
+                .address
+                .saturating_add(allocation.size)
+                .min(limit);
+            if start < end {
+                cache.occupied[usize::from(allocation.tile)].push((start, end));
+            }
+        }
+        cache.allocation_count = schedule.allocations.len();
+        merge_occupied_intervals(&mut cache.occupied);
+        cache.occupied.clone()
     }
 }
 
@@ -1122,6 +1186,7 @@ pub fn append_blocked_gemm_f16_with_a16_input_in_arenas(
                 limit: config.data_limit,
             }],
             resident_tile_assignment: ResidentTileAssignment::Balanced,
+            allocation_occupancy: AllocationOccupancyCache::default(),
         },
     )
 }
@@ -1298,6 +1363,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_in_arenas(
                 limit: config.data_limit,
             }],
             resident_tile_assignment: ResidentTileAssignment::Balanced,
+            allocation_occupancy: AllocationOccupancyCache::default(),
         },
     )
 }
@@ -1540,14 +1606,7 @@ fn plan_appended_blocked_gemm_with_memory_policy(
         arena_base,
         arena_limit,
     );
-    let mut occupied_all = occupied_intervals_by_tile(
-        &parent.allocations,
-        parent.tile_count,
-        0,
-        usize::MAX,
-        arena_base,
-        arena_limit,
-    );
+    let mut occupied_all = memory.occupied_all(parent, arena_base, arena_limit);
     let movable = regions
         .iter()
         .map(|&(tensor, ..)| tensor)

@@ -173,11 +173,10 @@ fn main() {
     let mut layer_phase_ranges = Vec::with_capacity(layer_count);
     for layer in 0..layer_count {
         let phase_start = plan.schedule.phases.len();
+        let allocation_start = plan.schedule.allocations.len();
         let mut layer_memory = memory.clone();
         layer_memory.resident_tile_assignment =
-            ipu_compiler::ResidentTileAssignment::WindowBalanced {
-                allocation_start: plan.schedule.allocations.len(),
-            };
+            ipu_compiler::ResidentTileAssignment::WindowBalanced { allocation_start };
         let appended = append_siglip_encoder_layer(
             &mut plan.schedule,
             &current,

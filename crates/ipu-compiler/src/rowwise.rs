@@ -656,6 +656,7 @@ pub fn append_affine_layer_norm_f16_in_arenas(
                 limit: config.data_limit,
             }],
             resident_tile_assignment: crate::ResidentTileAssignment::Balanced,
+            allocation_occupancy: crate::AllocationOccupancyCache::default(),
         },
     )
 }
@@ -697,23 +698,25 @@ pub fn append_affine_layer_norm_f16_with_memory_policy(
     let compute_phase = exchange_phase + 1;
     let affine_row_bytes = u32::from(columns) * 2;
     let affine_bytes = affine_row_bytes * 2;
+    let mut resident_pressure = vec![0u64; usize::from(schedule.tile_count)];
+    for allocation in &schedule.allocations {
+        if allocation.live_from < compute_phase
+            && allocation.live_until > 0
+            && memory
+                .resident
+                .iter()
+                .any(|arena| allocation.address >= arena.base && allocation.address < arena.limit)
+        {
+            resident_pressure[usize::from(allocation.tile)] += u64::from(allocation.size);
+        }
+    }
     let owner = input
         .iter()
         .min_by_key(|candidate| {
-            let pressure = schedule
-                .allocations
-                .iter()
-                .filter(|allocation| {
-                    allocation.tile == candidate.tile
-                        && memory.resident.iter().any(|arena| {
-                            allocation.address >= arena.base && allocation.address < arena.limit
-                        })
-                        && allocation.live_from < compute_phase
-                        && allocation.live_until > 0
-                })
-                .map(|allocation| u64::from(allocation.size))
-                .sum::<u64>();
-            (pressure, candidate.tile)
+            (
+                resident_pressure[usize::from(candidate.tile)],
+                candidate.tile,
+            )
         })
         .unwrap();
     let constraint = MemoryConstraint {

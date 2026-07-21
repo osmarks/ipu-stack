@@ -327,28 +327,26 @@ pub(crate) fn plan_static_templates(
             )
             .into());
         }
+        let instance_phase_steps = instance_steps
+            .iter()
+            .zip(&region.phase_instances)
+            .map(|(steps, phases)| phase_step_ranges(program, steps, phases))
+            .collect::<Result<Vec<_>>>()?;
         let mut records = TemplateRecords::new(instance_steps.len());
         let mut template_steps = Vec::new();
         for relative_phase in 0..phase_count {
-            let phase_steps = instance_steps
+            let phase_steps = instance_phase_steps
                 .iter()
-                .zip(&region.phase_instances)
-                .map(|(steps, phases)| {
-                    let phase = phases.start + relative_phase;
-                    steps
-                        .clone()
-                        .filter(|&index| step_phase(&program.steps[index]) == phase)
-                        .collect::<Vec<_>>()
-                })
+                .map(|phases| phases[relative_phase].clone())
                 .collect::<Vec<_>>();
             let all_exchange = phase_steps.iter().all(|steps| {
                 !steps.is_empty()
-                    && steps.iter().all(|&index| {
+                    && steps.clone().all(|index| {
                         matches!(program.steps[index], LoweredTileStep::Exchange { .. })
                     })
             });
             let all_compute = phase_steps.iter().all(|steps| {
-                steps.iter().all(|&index| {
+                steps.clone().all(|index| {
                     matches!(
                         program.steps[index],
                         LoweredTileStep::Compute(_) | LoweredTileStep::IdleCompute { .. }
@@ -369,7 +367,7 @@ pub(crate) fn plan_static_templates(
                         .iter()
                         .map(|steps| {
                             let LoweredTileStep::Exchange { row, .. } =
-                                &program.steps[steps[epoch]]
+                                &program.steps[steps.start + epoch]
                             else {
                                 unreachable!();
                             };
@@ -378,7 +376,7 @@ pub(crate) fn plan_static_templates(
                         .collect::<Vec<_>>();
                     let sender_patches = phase_steps
                         .iter()
-                        .map(|steps| patch_by_step[steps[epoch]])
+                        .map(|steps| patch_by_step[steps.start + epoch])
                         .collect::<Vec<_>>();
                     let sender_word_offset = sender_patches
                         .iter()
@@ -412,7 +410,7 @@ pub(crate) fn plan_static_templates(
                     let instance_rows = phase_steps
                         .iter()
                         .map(|steps| {
-                            row_by_step[steps[epoch]]
+                            row_by_step[steps.start + epoch]
                                 .ok_or_else(|| "template exchange has no normalized row".into())
                         })
                         .collect::<Result<Vec<_>>>()?;
@@ -431,7 +429,7 @@ pub(crate) fn plan_static_templates(
                         phase_steps
                             .iter()
                             .map(|steps| {
-                                plan_by_step[steps[epoch]]
+                                plan_by_step[steps.start + epoch]
                                     .ok_or_else(|| "template exchange has no plan address".into())
                             })
                             .collect::<Result<Vec<_>>>()?,
@@ -450,11 +448,10 @@ pub(crate) fn plan_static_templates(
                 let commands = phase_steps
                     .iter()
                     .map(|steps| {
-                        steps
+                        program.steps[steps.clone()]
                             .iter()
-                            .filter_map(|&index| {
-                                let LoweredTileStep::Compute(command) = &program.steps[index]
-                                else {
+                            .filter_map(|step| {
+                                let LoweredTileStep::Compute(command) = step else {
                                     return None;
                                 };
                                 Some(command.as_ref())
@@ -664,14 +661,10 @@ fn phase_range_to_step_range(
     }
     let start = program
         .steps
-        .iter()
-        .position(|step| step_phase(step) >= phases.start)
-        .unwrap_or(program.steps.len());
+        .partition_point(|step| step_phase(step) < phases.start);
     let end = program
         .steps
-        .iter()
-        .position(|step| step_phase(step) >= phases.end)
-        .unwrap_or(program.steps.len());
+        .partition_point(|step| step_phase(step) < phases.end);
     if start == end
         || program.steps[start..end]
             .iter()
@@ -680,6 +673,26 @@ fn phase_range_to_step_range(
         return Err("static template phase range does not map to contiguous tile steps".into());
     }
     Ok(start..end)
+}
+
+fn phase_step_ranges(
+    program: &LoweredTileProgram,
+    steps: &Range<usize>,
+    phases: &Range<usize>,
+) -> Result<Vec<Range<usize>>> {
+    let mut ranges = Vec::with_capacity(phases.len());
+    let mut cursor = steps.start;
+    for phase in phases.clone() {
+        let start = cursor;
+        while cursor < steps.end && step_phase(&program.steps[cursor]) == phase {
+            cursor += 1;
+        }
+        ranges.push(start..cursor);
+    }
+    if cursor != steps.end {
+        return Err("static template steps are not ordered by phase".into());
+    }
+    Ok(ranges)
 }
 
 fn step_phase(step: &LoweredTileStep) -> usize {
