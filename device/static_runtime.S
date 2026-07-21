@@ -237,12 +237,20 @@ ipu_stack_static_exchange_compute_run:
 	.globl ipu_stack_static_template_patch
 	.p2align 2
 	.type ipu_stack_static_template_patch,@function
-ipu_stack_static_template_patch:
+	ipu_stack_static_template_patch:
 	.supervisor
 	add $m11, $m11, -32
-	ld32 $m4, $m11, $m15, 8
+	brz $m7, .Ltemplate_patch_primary_segment
+	ld32 $m4, $m11, $m15, 9
 	ld32 $m5, $m11, $m15, 9
+	ld32 $m6, $m11, $m15, 11
+	setzi $m0, .Ltemplate_patch_segment_ready
+	br $m0
+.Ltemplate_patch_primary_segment:
+	ld32 $m4, $m11, $m15, 8
+	ld32 $m5, $m11, $m15, 8
 	ld32 $m6, $m11, $m15, 10
+.Ltemplate_patch_segment_ready:
 	st32 $m4, $m11, $m15, 0
 	st32 $m5, $m11, $m15, 1
 	st32 $m6, $m11, $m15, 2

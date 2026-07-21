@@ -64,7 +64,8 @@ pub(crate) struct StaticTemplatePlan {
     pub record_secondary_addresses: Vec<u32>,
     pub record_split: u16,
     pub records: Vec<Vec<StaticTemplateRecordWord>>,
-    pub patch_addresses: Vec<u32>,
+    pub patch_primary_addresses: Vec<u32>,
+    pub patch_secondary_addresses: Vec<u32>,
     pub patches: Vec<Vec<(u16, StaticTemplatePatchValue)>>,
     pub shared_address: u32,
     pub shared: Vec<StaticTemplateRecordWord>,
@@ -90,20 +91,22 @@ pub(crate) enum StaticTemplatePatchValue {
     Word(StaticTemplateRecordWord),
 }
 
-pub(crate) fn template_patch_storage_words(
-    record_words: usize,
+pub(crate) fn template_patch_storage_words_range(
+    slots: Range<usize>,
     patch: &[(u16, StaticTemplatePatchValue)],
 ) -> usize {
-    if patch.is_empty() {
-        return 0;
-    }
     let (narrow, wide) = patch
         .iter()
+        .filter(|(slot, _)| slots.contains(&usize::from(*slot)))
         .fold((0usize, 0usize), |(narrow, wide), (_, value)| match value {
             StaticTemplatePatchValue::Delta(_) => (narrow + 1, wide),
             StaticTemplatePatchValue::Word(_) => (narrow, wide + 1),
         });
-    2 * record_words.div_ceil(32) + narrow.div_ceil(2) + wide
+    if narrow + wide == 0 {
+        0
+    } else {
+        2 * slots.len().div_ceil(32) + narrow.div_ceil(2) + wide
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -491,15 +494,31 @@ pub(crate) fn plan_static_templates(
         cursor = cursor
             .checked_add(u32::try_from(record_words - usize::from(record_split))? * 4)
             .ok_or("static template record address overflow")?;
-        let mut patch_addresses = Vec::with_capacity(patches.len());
+        let mut patch_primary_addresses = Vec::with_capacity(patches.len());
+        let mut patch_secondary_addresses = Vec::with_capacity(patches.len());
         for patch in &patches {
             cursor = (cursor + 3) & !3;
-            patch_addresses.push(cursor);
+            patch_primary_addresses.push(cursor);
             cursor = cursor
                 .checked_add(
-                    u32::try_from(template_patch_storage_words(record_words, patch))?
-                        .checked_mul(4)
-                        .ok_or("static template patch size overflow")?,
+                    u32::try_from(template_patch_storage_words_range(
+                        0..usize::from(record_split),
+                        patch,
+                    ))?
+                    .checked_mul(4)
+                    .ok_or("static template patch size overflow")?,
+                )
+                .ok_or("static template patch address overflow")?;
+            cursor = (cursor + 3) & !3;
+            patch_secondary_addresses.push(cursor);
+            cursor = cursor
+                .checked_add(
+                    u32::try_from(template_patch_storage_words_range(
+                        usize::from(record_split)..record_words,
+                        patch,
+                    ))?
+                    .checked_mul(4)
+                    .ok_or("static template patch size overflow")?,
                 )
                 .ok_or("static template patch address overflow")?;
         }
@@ -510,7 +529,8 @@ pub(crate) fn plan_static_templates(
             record_secondary_addresses: vec![secondary_address; records.rows.len()],
             record_split,
             records: records.rows,
-            patch_addresses,
+            patch_primary_addresses,
+            patch_secondary_addresses,
             patches,
             shared_address: 0,
             shared: records.shared,
@@ -824,51 +844,36 @@ pub(crate) fn emit(
         if let Some(template) = templates.get(template_index)
             && template.instance_steps[0].start == step_index
         {
-            let reusable_record_frame = template
-                .record_addresses
-                .windows(2)
-                .all(|pair| pair[0] == pair[1])
-                && template
-                    .record_secondary_addresses
-                    .windows(2)
-                    .all(|pair| pair[0] == pair[1]);
-            if reusable_record_frame {
-                code.add_immediate(11, 11, -16)?;
-                code.setzi(4, template.record_addresses[0])?;
-                code.setzi(5, template.record_secondary_addresses[0])?;
-                code.setzi(6, u32::from(template.record_split))?;
-                code.st32(4, 11, 15, 0)?;
-                code.st32(5, 11, 15, 1)?;
-                code.st32(6, 11, 15, 2)?;
-            }
-            for (instance, (&record_address, &secondary_address)) in template
-                .record_addresses
-                .iter()
-                .zip(&template.record_secondary_addresses)
-                .enumerate()
-            {
+            let record_words = template.records[0].len();
+            let record_split = usize::from(template.record_split);
+            code.add_immediate(11, 11, -16)?;
+            code.setzi(4, template.record_addresses[0])?;
+            code.setzi(5, template.record_secondary_addresses[0])?;
+            code.setzi(6, u32::from(template.record_split))?;
+            code.setzi(7, u32::try_from(record_words - record_split)?)?;
+            code.st32(4, 11, 15, 0)?;
+            code.st32(5, 11, 15, 1)?;
+            code.st32(6, 11, 15, 2)?;
+            code.st32(7, 11, 15, 3)?;
+            for instance in 0..template.records.len() {
                 let patch = &template.patches[instance];
-                if !patch.is_empty() {
-                    code.setzi(2, u32::try_from(template.records[instance].len())?)?;
-                    code.setzi(3, template.patch_addresses[instance])?;
-                    if !reusable_record_frame {
-                        code.setzi(4, record_address)?;
-                        code.setzi(5, secondary_address)?;
-                        code.setzi(6, u32::from(template.record_split))?;
-                    }
+                if template_patch_storage_words_range(0..record_split, patch) != 0 {
+                    code.setzi(7, 0)?;
+                    code.setzi(2, u32::try_from(record_split)?)?;
+                    code.setzi(3, template.patch_primary_addresses[instance])?;
                     code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
                 }
-                if !reusable_record_frame {
-                    code.setzi(2, record_address)?;
-                    code.setzi(3, secondary_address)?;
+                if template_patch_storage_words_range(record_split..record_words, patch) != 0 {
+                    code.setzi(7, 1)?;
+                    code.setzi(2, u32::try_from(record_words - record_split)?)?;
+                    code.setzi(3, template.patch_secondary_addresses[instance])?;
+                    code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
                 }
                 let call = code.words.len();
                 code.call(0, 9)?;
                 template_calls.push((call, template_index));
             }
-            if reusable_record_frame {
-                code.add_immediate(11, 11, 16)?;
-            }
+            code.add_immediate(11, 11, 16)?;
             plan_index += template
                 .instance_steps
                 .iter()
@@ -1530,13 +1535,9 @@ mod tests {
             }
         ));
         assert_eq!(template.records[0].len(), template.records[1].len());
-        assert_eq!(
-            end - template.record_addresses[0],
-            4 * (template.records[0].len()
-                + template_patch_storage_words(template.records[0].len(), &template.patches[1],))
-                as u32
-        );
-        assert_eq!(template.patch_addresses.len(), 2);
+        assert!(end > template.record_secondary_addresses[0]);
+        assert_eq!(template.patch_primary_addresses.len(), 2);
+        assert_eq!(template.patch_secondary_addresses.len(), 2);
         assert!(template.patches[0].is_empty());
         for &(slot, ref value) in &template.patches[1] {
             let previous = &template.records[0][usize::from(slot)];

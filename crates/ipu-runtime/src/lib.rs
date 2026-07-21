@@ -1960,7 +1960,8 @@ fn package_graph_impl(
     enum TemplateDataObject {
         RecordPrimary { template: usize },
         RecordSecondary { template: usize },
-        Patch { template: usize, instance: usize },
+        PatchPrimary { template: usize, instance: usize },
+        PatchSecondary { template: usize, instance: usize },
         Shared { template: usize },
     }
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
@@ -1982,18 +1983,23 @@ fn package_graph_impl(
                     (TemplateDataObject::Shared { template }, plan.shared.len()),
                 ]
                 .into_iter()
-                .chain(
-                    plan.patches
-                        .iter()
-                        .enumerate()
-                        .skip(1)
-                        .map(move |(instance, patch)| {
+                .chain(plan.patches.iter().enumerate().skip(1).flat_map(
+                    move |(instance, patch)| {
+                        [
                             (
-                                TemplateDataObject::Patch { template, instance },
-                                static_codegen::template_patch_storage_words(record_words, patch),
-                            )
-                        }),
-                )
+                                TemplateDataObject::PatchPrimary { template, instance },
+                                static_codegen::template_patch_storage_words_range(0..split, patch),
+                            ),
+                            (
+                                TemplateDataObject::PatchSecondary { template, instance },
+                                static_codegen::template_patch_storage_words_range(
+                                    split..record_words,
+                                    patch,
+                                ),
+                            ),
+                        ]
+                    },
+                ))
             })
             .collect::<Vec<_>>();
         records.sort_unstable_by_key(|&(_, words)| std::cmp::Reverse(words));
@@ -2009,8 +2015,12 @@ fn package_graph_impl(
                     TemplateDataObject::RecordSecondary { template } => plans.templates[template]
                         .record_secondary_addresses
                         .fill(ipu_package::TILE_MEMORY_BASE),
-                    TemplateDataObject::Patch { template, instance } => {
-                        plans.templates[template].patch_addresses[instance] =
+                    TemplateDataObject::PatchPrimary { template, instance } => {
+                        plans.templates[template].patch_primary_addresses[instance] =
+                            ipu_package::TILE_MEMORY_BASE
+                    }
+                    TemplateDataObject::PatchSecondary { template, instance } => {
+                        plans.templates[template].patch_secondary_addresses[instance] =
                             ipu_package::TILE_MEMORY_BASE
                     }
                     TemplateDataObject::Shared { template } => {
@@ -2043,8 +2053,11 @@ fn package_graph_impl(
                 TemplateDataObject::RecordSecondary { template } => plans.templates[template]
                     .record_secondary_addresses
                     .fill(address),
-                TemplateDataObject::Patch { template, instance } => {
-                    plans.templates[template].patch_addresses[instance] = address
+                TemplateDataObject::PatchPrimary { template, instance } => {
+                    plans.templates[template].patch_primary_addresses[instance] = address
+                }
+                TemplateDataObject::PatchSecondary { template, instance } => {
+                    plans.templates[template].patch_secondary_addresses[instance] = address
                 }
                 TemplateDataObject::Shared { template } => {
                     plans.templates[template].shared_address = address
@@ -2277,13 +2290,18 @@ fn package_graph_impl(
                 .map(|template| {
                     let record = template.records.first().map_or(0, Vec::len) * 4;
                     let record_words = template.records.first().map_or(0, Vec::len);
+                    let split = usize::from(template.record_split);
                     let patches = template
                         .patches
                         .iter()
                         .skip(1)
                         .filter(|patch| !patch.is_empty())
                         .map(|patch| {
-                            static_codegen::template_patch_storage_words(record_words, patch)
+                            static_codegen::template_patch_storage_words_range(0..split, patch)
+                                + static_codegen::template_patch_storage_words_range(
+                                    split..record_words,
+                                    patch,
+                                )
                         })
                         .sum::<usize>()
                         * 4;
@@ -2574,49 +2592,60 @@ fn package_graph_impl(
                 if patch.is_empty() {
                     continue;
                 }
-                let mut words = Vec::new();
-                let mut narrow = Vec::new();
-                let mut wide = Vec::new();
-                for slot_base in (0..first_record.len()).step_by(32) {
-                    let slot_limit = (slot_base + 32).min(first_record.len());
-                    let mut changed_mask = 0u32;
-                    let mut narrow_mask = 0u32;
-                    for (slot, value) in patch
-                        .iter()
-                        .filter(|(slot, _)| (slot_base..slot_limit).contains(&usize::from(*slot)))
+                for (slots, address) in [
+                    (0..split, template.patch_primary_addresses[instance]),
+                    (
+                        split..first_record.len(),
+                        template.patch_secondary_addresses[instance],
+                    ),
+                ] {
+                    if static_codegen::template_patch_storage_words_range(slots.clone(), patch) == 0
                     {
-                        let bit = 1 << (usize::from(*slot) - slot_base);
-                        changed_mask |= bit;
-                        match value {
-                            static_codegen::StaticTemplatePatchValue::Delta(delta) => {
-                                narrow_mask |= bit;
-                                narrow.push(*delta as u16);
-                            }
-                            static_codegen::StaticTemplatePatchValue::Word(word) => {
-                                wide.push(match word {
-                                    static_codegen::StaticTemplateRecordWord::Value(value) => {
-                                        Ok(*value)
-                                    }
-                                    static_codegen::StaticTemplateRecordWord::Symbol(name) => {
-                                        image.symbols.get(name).copied().ok_or_else(|| {
-                                            format!("static template references missing {name}")
-                                        })
-                                    }
-                                });
+                        continue;
+                    }
+                    let mut words = Vec::new();
+                    let mut narrow = Vec::new();
+                    let mut wide = Vec::new();
+                    for local_base in (0..slots.len()).step_by(32) {
+                        let slot_base = slots.start + local_base;
+                        let slot_limit = (slot_base + 32).min(slots.end);
+                        let mut changed_mask = 0u32;
+                        let mut narrow_mask = 0u32;
+                        for (slot, value) in patch.iter().filter(|(slot, _)| {
+                            (slot_base..slot_limit).contains(&usize::from(*slot))
+                        }) {
+                            let bit = 1 << (usize::from(*slot) - slot_base);
+                            changed_mask |= bit;
+                            match value {
+                                static_codegen::StaticTemplatePatchValue::Delta(delta) => {
+                                    narrow_mask |= bit;
+                                    narrow.push(*delta as u16);
+                                }
+                                static_codegen::StaticTemplatePatchValue::Word(word) => {
+                                    wide.push(match word {
+                                        static_codegen::StaticTemplateRecordWord::Value(value) => {
+                                            Ok(*value)
+                                        }
+                                        static_codegen::StaticTemplateRecordWord::Symbol(name) => {
+                                            image.symbols.get(name).copied().ok_or_else(|| {
+                                                format!("static template references missing {name}")
+                                            })
+                                        }
+                                    });
+                                }
                             }
                         }
+                        words.extend_from_slice(&[changed_mask, narrow_mask]);
                     }
-                    words.extend_from_slice(&[changed_mask, narrow_mask]);
+                    words.extend(narrow.chunks(2).map(|pair| {
+                        u32::from(pair[0]) | (u32::from(pair.get(1).copied().unwrap_or(0)) << 16)
+                    }));
+                    words.extend(
+                        wide.into_iter()
+                            .collect::<std::result::Result<Vec<_>, String>>()?,
+                    );
+                    template_segments.push((address, words_to_bytes(&words)));
                 }
-                words.extend(narrow.chunks(2).map(|pair| {
-                    u32::from(pair[0]) | (u32::from(pair.get(1).copied().unwrap_or(0)) << 16)
-                }));
-                words.extend(
-                    wide.into_iter()
-                        .collect::<std::result::Result<Vec<_>, String>>()?,
-                );
-                template_segments
-                    .push((template.patch_addresses[instance], words_to_bytes(&words)));
             }
         }
         for (address, bytes) in template_segments {
