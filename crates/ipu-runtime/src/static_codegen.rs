@@ -100,7 +100,7 @@ enum StaticTemplateStep {
 enum TemplateValue {
     Constant(u32),
     Record(u16),
-    RecordOffset { slot: u16, offset: i16 },
+    RecordOffset { slot: u16, offset: i32 },
 }
 
 struct TemplateRecords {
@@ -136,7 +136,8 @@ impl TemplateRecords {
             .map(|&value| i64::from(value) - i64::from(first))
             .collect::<Vec<_>>();
         if let Some(&(slot, previous_first)) = self.affine_columns.get(&affine_key)
-            && let Ok(offset) = i16::try_from(i64::from(first) - i64::from(previous_first))
+            && let Ok(offset) = i32::try_from(i64::from(first) - i64::from(previous_first))
+            && add_immediate_steps(offset) < self.rows.len()
         {
             return Ok(TemplateValue::RecordOffset { slot, offset });
         }
@@ -161,6 +162,16 @@ impl TemplateRecords {
             row.push(word);
         }
         Ok(slot)
+    }
+}
+
+fn add_immediate_steps(offset: i32) -> usize {
+    if offset >= 0 {
+        usize::try_from(offset).unwrap().div_ceil(i16::MAX as usize)
+    } else {
+        usize::try_from(-i64::from(offset))
+            .unwrap()
+            .div_ceil(usize::try_from(-i32::from(i16::MIN)).unwrap())
     }
 }
 
@@ -844,7 +855,13 @@ fn emit_template_value(code: &mut TileCode, value: TemplateValue, register: u8) 
         TemplateValue::RecordOffset { slot, offset } => {
             code.ld32(1, 11, 15, 0)?;
             code.ld32(register, 1, 15, slot)?;
-            code.add_immediate(register, register, i32::from(offset))
+            let mut remaining = offset;
+            while remaining != 0 {
+                let step = remaining.clamp(i32::from(i16::MIN), i32::from(i16::MAX));
+                code.add_immediate(register, register, step)?;
+                remaining -= step;
+            }
+            Ok(())
         }
     }
 }
@@ -1159,6 +1176,27 @@ mod tests {
                     StaticTemplateRecordWord::Value(0x3f80_0000),
                 ],
             ]
+        );
+    }
+
+    #[test]
+    fn template_affine_reuse_requires_net_sram_savings() {
+        let mut short = TemplateRecords::new(2);
+        short.values(vec![1, 2]).unwrap();
+        assert_eq!(
+            short.values(vec![0x20001, 0x20002]).unwrap(),
+            TemplateValue::Record(1)
+        );
+
+        let mut long = TemplateRecords::new(27);
+        long.values((1..=27).collect()).unwrap();
+        assert_eq!(
+            long.values((1..=27).map(|value| value + 0x20000).collect())
+                .unwrap(),
+            TemplateValue::RecordOffset {
+                slot: 0,
+                offset: 0x20000,
+            }
         );
     }
 
