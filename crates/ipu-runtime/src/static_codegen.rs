@@ -100,11 +100,13 @@ enum StaticTemplateStep {
 enum TemplateValue {
     Constant(u32),
     Record(u16),
+    RecordOffset { slot: u16, offset: i16 },
 }
 
 struct TemplateRecords {
     rows: Vec<Vec<StaticTemplateRecordWord>>,
     columns: HashMap<Vec<StaticTemplateRecordWord>, u16>,
+    affine_columns: HashMap<Vec<i64>, (u16, u32)>,
 }
 
 impl TemplateRecords {
@@ -112,6 +114,7 @@ impl TemplateRecords {
         Self {
             rows: vec![Vec::new(); instances],
             columns: HashMap::new(),
+            affine_columns: HashMap::new(),
         }
     }
 
@@ -119,24 +122,45 @@ impl TemplateRecords {
         if values[0] < 1 << 20 && values.windows(2).all(|pair| pair[0] == pair[1]) {
             return Ok(TemplateValue::Constant(values[0]));
         }
-        self.words(
-            values
-                .into_iter()
-                .map(StaticTemplateRecordWord::Value)
-                .collect(),
-        )
+        let words = values
+            .iter()
+            .copied()
+            .map(StaticTemplateRecordWord::Value)
+            .collect::<Vec<_>>();
+        if let Some(&slot) = self.columns.get(&words) {
+            return Ok(TemplateValue::Record(slot));
+        }
+        let first = values[0];
+        let affine_key = values
+            .iter()
+            .map(|&value| i64::from(value) - i64::from(first))
+            .collect::<Vec<_>>();
+        if let Some(&(slot, previous_first)) = self.affine_columns.get(&affine_key)
+            && let Ok(offset) = i16::try_from(i64::from(first) - i64::from(previous_first))
+        {
+            return Ok(TemplateValue::RecordOffset { slot, offset });
+        }
+        let slot = self.push_column(words.clone())?;
+        self.columns.insert(words, slot);
+        self.affine_columns.insert(affine_key, (slot, first));
+        Ok(TemplateValue::Record(slot))
     }
 
     fn words(&mut self, words: Vec<StaticTemplateRecordWord>) -> Result<TemplateValue> {
         if let Some(&slot) = self.columns.get(&words) {
             return Ok(TemplateValue::Record(slot));
         }
-        let slot = u16::try_from(self.rows.first().map_or(0, Vec::len))?;
-        for (row, word) in self.rows.iter_mut().zip(&words) {
-            row.push(word.clone());
-        }
+        let slot = self.push_column(words.clone())?;
         self.columns.insert(words, slot);
         Ok(TemplateValue::Record(slot))
+    }
+
+    fn push_column(&mut self, words: Vec<StaticTemplateRecordWord>) -> Result<u16> {
+        let slot = u16::try_from(self.rows.first().map_or(0, Vec::len))?;
+        for (row, word) in self.rows.iter_mut().zip(words) {
+            row.push(word);
+        }
+        Ok(slot)
     }
 }
 
@@ -817,6 +841,11 @@ fn emit_template_value(code: &mut TileCode, value: TemplateValue, register: u8) 
             code.ld32(1, 11, 15, 0)?;
             code.ld32(register, 1, 15, slot)
         }
+        TemplateValue::RecordOffset { slot, offset } => {
+            code.ld32(1, 11, 15, 0)?;
+            code.ld32(register, 1, 15, slot)?;
+            code.add_immediate(register, register, i32::from(offset))
+        }
     }
 }
 
@@ -1112,24 +1141,21 @@ mod tests {
 
         assert_eq!(first, TemplateValue::Record(0));
         assert_eq!(repeated, first);
-        assert_eq!(second, TemplateValue::Record(1));
-        assert_eq!(wide_constant, TemplateValue::Record(2));
+        assert_eq!(second, TemplateValue::RecordOffset { slot: 0, offset: 1 });
+        assert_eq!(wide_constant, TemplateValue::Record(1));
         assert_eq!(
             records.rows,
             vec![
                 vec![
                     StaticTemplateRecordWord::Value(10),
-                    StaticTemplateRecordWord::Value(11),
                     StaticTemplateRecordWord::Value(0x3f80_0000),
                 ],
                 vec![
                     StaticTemplateRecordWord::Value(20),
-                    StaticTemplateRecordWord::Value(21),
                     StaticTemplateRecordWord::Value(0x3f80_0000),
                 ],
                 vec![
                     StaticTemplateRecordWord::Value(30),
-                    StaticTemplateRecordWord::Value(31),
                     StaticTemplateRecordWord::Value(0x3f80_0000),
                 ],
             ]
