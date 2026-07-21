@@ -2818,20 +2818,47 @@ fn package_graph_impl(
 }
 
 fn validate_resident_host_bindings(graph: &ExecutableGraph, topology: &Topology) -> Result<()> {
+    let mut resident_ends_by_tile = HashMap::<u16, Vec<(u32, u32)>>::new();
+    for allocation in &graph.schedule.allocations {
+        if allocation.kind != ipu_compiler::AllocationKind::Home
+            || allocation.live_from != 0
+            || allocation.live_until != usize::MAX
+        {
+            continue;
+        }
+        let physical = topology.physical(allocation.tile)?;
+        let end = allocation
+            .address
+            .checked_add(allocation.size)
+            .ok_or("resident allocation address overflow")?;
+        resident_ends_by_tile
+            .entry(physical)
+            .or_default()
+            .push((allocation.address, end));
+    }
+    for intervals in resident_ends_by_tile.values_mut() {
+        intervals.sort_unstable_by_key(|&(start, _)| start);
+        let mut maximum_end = 0;
+        for (_, end) in intervals {
+            maximum_end = maximum_end.max(*end);
+            *end = maximum_end;
+        }
+    }
+
     for binding in &graph.host_weights {
         for slice in &binding.slices {
             let end = slice
                 .tile_address
                 .checked_add(u32::try_from(slice.size)?)
                 .ok_or("resident host binding address overflow")?;
-            let resident = graph.schedule.allocations.iter().any(|allocation| {
-                allocation.kind == ipu_compiler::AllocationKind::Home
-                    && allocation.live_from == 0
-                    && allocation.live_until == usize::MAX
-                    && topology.physical(allocation.tile) == Ok(slice.tile as u16)
-                    && allocation.address <= slice.tile_address
-                    && allocation.address.saturating_add(allocation.size) >= end
-            });
+            let resident = resident_ends_by_tile
+                .get(&(slice.tile as u16))
+                .and_then(|intervals| {
+                    let upper =
+                        intervals.partition_point(|&(start, _)| start <= slice.tile_address);
+                    upper.checked_sub(1).map(|index| intervals[index].1)
+                })
+                .is_some_and(|resident_end| resident_end >= end);
             if !resident {
                 return Err(format!(
                     "resident host tensor {} slice on physical tile {} at 0x{:x}..0x{end:x} has no permanent allocation",
