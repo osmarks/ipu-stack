@@ -60,6 +60,8 @@ pub(crate) struct StaticTemplatePlan {
     pub name: String,
     pub instance_steps: Vec<Range<usize>>,
     pub record_addresses: Vec<u32>,
+    pub record_secondary_addresses: Vec<u32>,
+    pub record_split: u16,
     pub records: Vec<Vec<StaticTemplateRecordWord>>,
     pub shared_address: u32,
     pub shared: Vec<StaticTemplateRecordWord>,
@@ -408,10 +410,18 @@ pub(crate) fn plan_static_templates(
                 .ok_or("static template record address overflow")?;
         }
         previous_end = instance_steps.last().unwrap().end;
+        let record_split = u16::try_from(
+            records
+                .rows
+                .first()
+                .map_or(0, |record| record.len().div_ceil(2)),
+        )?;
         templates.push(StaticTemplatePlan {
             name: region.name.clone(),
             instance_steps,
             record_addresses,
+            record_secondary_addresses: vec![0; records.rows.len()],
+            record_split,
             records: records.rows,
             shared_address: 0,
             shared: records.shared,
@@ -725,8 +735,13 @@ pub(crate) fn emit(
         if let Some(template) = templates.get(template_index)
             && template.instance_steps[0].start == step_index
         {
-            for &record_address in &template.record_addresses {
+            for (&record_address, &secondary_address) in template
+                .record_addresses
+                .iter()
+                .zip(&template.record_secondary_addresses)
+            {
                 code.setzi(2, record_address)?;
+                code.setzi(3, secondary_address)?;
                 let call = code.words.len();
                 code.call(0, 9)?;
                 template_calls.push((call, template_index));
@@ -875,15 +890,26 @@ fn emit_template_value(
     value: TemplateValue,
     register: u8,
     shared_address: u32,
+    record_split: u16,
 ) -> Result<()> {
     match value {
         TemplateValue::Constant(value) => code.setzi(register, value),
         TemplateValue::Record(slot) => {
-            code.ld32(1, 11, 15, 0)?;
-            code.ld32(register, 1, 15, slot)
+            let (base, offset) = if slot < record_split {
+                (0, slot)
+            } else {
+                (1, slot - record_split)
+            };
+            code.ld32(1, 11, 15, base)?;
+            code.ld32(register, 1, 15, offset)
         }
         TemplateValue::RecordOffset { slot, offset } => {
-            code.ld32(1, 11, 15, 0)?;
+            let (base, slot) = if slot < record_split {
+                (0, slot)
+            } else {
+                (1, slot - record_split)
+            };
+            code.ld32(1, 11, 15, base)?;
             code.ld32(register, 1, 15, slot)?;
             let mut remaining = offset;
             while remaining != 0 {
@@ -909,7 +935,8 @@ fn emit_static_template_body(
 ) -> Result<()> {
     code.add_immediate(11, 11, -16)?;
     code.st32(2, 11, 15, 0)?;
-    code.st32(9, 11, 15, 1)?;
+    code.st32(3, 11, 15, 1)?;
+    code.st32(9, 11, 15, 2)?;
     for planned in &template.steps {
         match planned {
             StaticTemplateStep::Exchange {
@@ -920,21 +947,51 @@ fn emit_static_template_body(
                 active,
             } => {
                 if let Some(instruction) = sender_instruction {
-                    emit_template_value(code, *instruction, 3, template.shared_address)?;
+                    emit_template_value(
+                        code,
+                        *instruction,
+                        3,
+                        template.shared_address,
+                        template.record_split,
+                    )?;
                     let skip_patch = code.words.len();
                     code.brz(3, 0)?;
                     if let Some(address) = sender_address {
-                        emit_template_value(code, *address, 8, template.shared_address)?;
+                        emit_template_value(
+                            code,
+                            *address,
+                            8,
+                            template.shared_address,
+                            template.record_split,
+                        )?;
                         code.st32(3, 8, 15, 0)?;
                     } else {
-                        emit_template_value(code, *plan_address, 8, template.shared_address)?;
+                        emit_template_value(
+                            code,
+                            *plan_address,
+                            8,
+                            template.shared_address,
+                            template.record_split,
+                        )?;
                         code.st32(3, 8, 15, sender_word_offset.unwrap())?;
                     }
                     let after_patch = generated_address(generated_base, code.words.len())?;
                     code.words[skip_patch] = ipu_exchange::encode_brz_m_immediate(3, after_patch)?;
                 }
-                emit_template_value(code, *plan_address, 8, template.shared_address)?;
-                emit_template_value(code, *active, 0, template.shared_address)?;
+                emit_template_value(
+                    code,
+                    *plan_address,
+                    8,
+                    template.shared_address,
+                    template.record_split,
+                )?;
+                emit_template_value(
+                    code,
+                    *active,
+                    0,
+                    template.shared_address,
+                    template.record_split,
+                )?;
                 code.call(template_exchange, 9)?;
             }
             StaticTemplateStep::Compute {
@@ -944,14 +1001,32 @@ fn emit_static_template_body(
                 condition,
             } => {
                 if let Some(condition) = condition {
-                    emit_template_value(code, *condition, 0, template.shared_address)?;
+                    emit_template_value(
+                        code,
+                        *condition,
+                        0,
+                        template.shared_address,
+                        template.record_split,
+                    )?;
                 }
                 if let Some(kernel) = kernel {
-                    emit_template_value(code, *kernel, 8, template.shared_address)?;
+                    emit_template_value(
+                        code,
+                        *kernel,
+                        8,
+                        template.shared_address,
+                        template.record_split,
+                    )?;
                 }
                 for (operand, &value) in operands.iter().enumerate() {
                     let register = u8::try_from(operand)? + 2;
-                    emit_template_value(code, value, register, template.shared_address)?;
+                    emit_template_value(
+                        code,
+                        value,
+                        register,
+                        template.shared_address,
+                        template.record_split,
+                    )?;
                 }
                 let skip_call = if condition.is_some() {
                     let branch = code.words.len();
@@ -975,7 +1050,7 @@ fn emit_static_template_body(
             StaticTemplateStep::Idle => {}
         }
     }
-    code.ld32(9, 11, 15, 1)?;
+    code.ld32(9, 11, 15, 2)?;
     code.add_immediate(11, 11, 16)?;
     code.branch(9)?;
     Ok(())

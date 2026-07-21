@@ -1774,7 +1774,13 @@ fn package_graph_impl(
                 plan.records
                     .iter()
                     .enumerate()
-                    .map(move |(record, words)| (template, Some(record), words.len()))
+                    .flat_map(move |(record, words)| {
+                        let split = usize::from(plan.record_split);
+                        [
+                            (template, Some((record, false)), split),
+                            (template, Some((record, true)), words.len() - split),
+                        ]
+                    })
                     .chain(std::iter::once((template, None, plan.shared.len())))
             })
             .collect::<Vec<_>>();
@@ -1785,9 +1791,14 @@ fn package_graph_impl(
                 .ok_or("static template record size overflow")?;
             if size == 0 {
                 match record {
-                    Some(record) => {
-                        plans.templates[template].record_addresses[record] =
-                            ipu_package::TILE_MEMORY_BASE;
+                    Some((record, secondary)) => {
+                        if secondary {
+                            plans.templates[template].record_secondary_addresses[record] =
+                                ipu_package::TILE_MEMORY_BASE;
+                        } else {
+                            plans.templates[template].record_addresses[record] =
+                                ipu_package::TILE_MEMORY_BASE;
+                        }
                     }
                     None => {
                         plans.templates[template].shared_address = ipu_package::TILE_MEMORY_BASE
@@ -1811,7 +1822,12 @@ fn package_graph_impl(
                 .checked_add(size)
                 .ok_or("static template record address overflow")?;
             match record {
-                Some(record) => plans.templates[template].record_addresses[record] = address,
+                Some((record, true)) => {
+                    plans.templates[template].record_secondary_addresses[record] = address
+                }
+                Some((record, false)) => {
+                    plans.templates[template].record_addresses[record] = address
+                }
                 None => plans.templates[template].shared_address = address,
             }
             template_record_ranges[tile_index].push((address, end));
@@ -2262,13 +2278,19 @@ fn package_graph_impl(
         }
         let mut template_segments = Vec::<(u32, Vec<u8>)>::new();
         for template in &tile_exchange_plans[tile_index].templates {
-            for (address, record) in std::iter::once((template.shared_address, &template.shared))
-                .chain(
+            for (address, record) in
+                std::iter::once((template.shared_address, template.shared.as_slice())).chain(
                     template
-                        .record_addresses
+                        .records
                         .iter()
-                        .copied()
-                        .zip(&template.records),
+                        .enumerate()
+                        .flat_map(|(index, record)| {
+                            let split = usize::from(template.record_split);
+                            [
+                                (template.record_addresses[index], &record[..split]),
+                                (template.record_secondary_addresses[index], &record[split..]),
+                            ]
+                        }),
                 )
             {
                 if record.is_empty() {
