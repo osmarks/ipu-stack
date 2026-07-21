@@ -17,8 +17,9 @@ use tracing_subscriber::EnvFilter;
 mod siglip;
 mod static_codegen;
 pub use siglip::{
-    HostTensorSet, SiglipEncoderLayer, SiglipMapHead, SiglipWeightStorage, append_host_a16_matrix,
-    append_siglip_encoder_layer, append_siglip_map_head, append_siglip_post_layer_norm,
+    AttentionKernelVariant, HostTensorSet, SiglipEncoderLayer, SiglipMapHead, SiglipWeightStorage,
+    append_host_a16_matrix, append_siglip_encoder_layer, append_siglip_map_head,
+    append_siglip_post_layer_norm, attention_kernel_variant, consolidate_attention_kernel_variants,
 };
 
 mod blocked_data;
@@ -1740,6 +1741,67 @@ fn package_graph_impl(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut runtime_symbols = vec![
+        static_codegen::WORKER_BARRIER.into(),
+        static_codegen::COMPLETE.into(),
+        static_codegen::HOST_RUN.into(),
+        static_codegen::REPEAT_CALL.into(),
+    ];
+    if !profile_code.is_empty() {
+        runtime_symbols.push(static_codegen::SAMPLE_CYCLE.into());
+        runtime_symbols.push(static_codegen::SAMPLE_CYCLE_NEXT.into());
+    }
+    if !template_regions.is_empty() {
+        runtime_symbols.push(static_codegen::TEMPLATE_PATCH.into());
+    }
+    let tile_retained_symbols = programs
+        .par_iter()
+        .zip(&tile_exchange_plans)
+        .map(|(program, exchange_plans)| {
+            let mut symbols = runtime_symbols.clone();
+            if !exchange_plans.compute_runs.is_empty() {
+                symbols.push(static_codegen::EXCHANGE_COMPUTE_RUN.into());
+            }
+            symbols.extend(program.steps.iter().filter_map(|step| match step {
+                ipu_compiler::LoweredTileStep::Compute(command) => {
+                    Some(format!("ipu_stack_{}", command.specialization.operation))
+                }
+                ipu_compiler::LoweredTileStep::IdleCompute { .. } => None,
+                _ => None,
+            }));
+            symbols.sort();
+            symbols.dedup();
+            symbols
+        })
+        .collect::<Vec<_>>();
+    let mut preliminary_cache = HashMap::<Vec<String>, ipu_elf::LinkedImage>::new();
+    for symbols in &tile_retained_symbols {
+        if preliminary_cache.contains_key(symbols) {
+            continue;
+        }
+        preliminary_cache.insert(
+            symbols.clone(),
+            link(
+                objects,
+                &LinkOptions {
+                    image_base: ipu_driver::APPLICATION_LOAD_BASE,
+                    regions: Vec::new(),
+                    entry_symbol: "ipu_stack_static_start".into(),
+                    retained_symbols: symbols.clone(),
+                    externals: HashMap::new(),
+                },
+            )?,
+        );
+    }
+    let preliminary_images = tile_retained_symbols
+        .iter()
+        .map(|symbols| -> Result<ipu_elf::LinkedImage> {
+            Ok(preliminary_cache
+                .get(symbols)
+                .ok_or("missing preliminary tile image")?
+                .clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
     // Instruction fetch and data access cannot share a tile-memory element. Measure the
     // address-invariant generated code before relocating host state so data packing can
     // preserve enough complete elements for it.
@@ -1834,25 +1896,29 @@ fn package_graph_impl(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    // Support code is linked after static-data relocation, but it still needs at
-    // least one complete instruction element. Reserve that element before data
-    // packing so metadata cannot consume the final executable region.
+    // Reserve complete instruction elements for each tile's measured support image
+    // before data packing so metadata cannot consume its executable region.
     let support_reservations = programs
         .par_iter()
         .zip(&tile_exchange_plans)
         .zip(&program_reservations)
+        .zip(&preliminary_images)
         .map(
-            |((program, plans), &program_reservation)| -> Result<(u32, u32)> {
+            |(((program, plans), &program_reservation), image)| -> Result<(u32, u32)> {
+                let reserved_size = align_up(
+                    u32::try_from(image.bytes.len())?,
+                    ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+                );
                 let base = executable_region_base_for_tile(
                     &allocation_ranges_by_tile[usize::from(program.tile)],
                     Some(program.tile),
                     plans.end,
-                    ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+                    reserved_size,
                     &[program_reservation],
                 )?;
                 Ok((
                     base,
-                    base.checked_add(ipu_package::TILE_MEMORY_ELEMENT_SIZE)
+                    base.checked_add(reserved_size)
                         .ok_or("support image reservation overflow")?,
                 ))
             },
@@ -2146,78 +2212,6 @@ fn package_graph_impl(
         }
     }
 
-    let mut runtime_symbols = vec![
-        static_codegen::WORKER_BARRIER.into(),
-        static_codegen::COMPLETE.into(),
-        static_codegen::HOST_RUN.into(),
-        static_codegen::REPEAT_CALL.into(),
-    ];
-    if !profile_code.is_empty() {
-        runtime_symbols.push(static_codegen::SAMPLE_CYCLE.into());
-        runtime_symbols.push(static_codegen::SAMPLE_CYCLE_NEXT.into());
-    }
-    if !template_regions.is_empty() {
-        runtime_symbols.push(static_codegen::TEMPLATE_PATCH.into());
-    }
-    let tile_retained_symbols = programs
-        .par_iter()
-        .zip(&tile_exchange_plans)
-        .map(|(program, exchange_plans)| {
-            let mut symbols = runtime_symbols.clone();
-            if !exchange_plans.compute_runs.is_empty() {
-                symbols.push(static_codegen::EXCHANGE_COMPUTE_RUN.into());
-            }
-            symbols.extend(program.steps.iter().filter_map(|step| match step {
-                ipu_compiler::LoweredTileStep::Compute(command) => {
-                    Some(format!("ipu_stack_{}", command.specialization.operation))
-                }
-                ipu_compiler::LoweredTileStep::IdleCompute { .. } => None,
-                _ => None,
-            }));
-            symbols.sort();
-            symbols.dedup();
-            symbols
-        })
-        .collect::<Vec<_>>();
-    let mut preliminary_cache = HashMap::<Vec<String>, ipu_elf::LinkedImage>::new();
-    for symbols in &tile_retained_symbols {
-        if preliminary_cache.contains_key(symbols) {
-            continue;
-        }
-        preliminary_cache.insert(
-            symbols.clone(),
-            link(
-                objects,
-                &LinkOptions {
-                    image_base: ipu_driver::APPLICATION_LOAD_BASE,
-                    regions: Vec::new(),
-                    entry_symbol: "ipu_stack_static_start".into(),
-                    retained_symbols: symbols.clone(),
-                    externals: HashMap::new(),
-                },
-            )?,
-        );
-    }
-    let preliminary_images = tile_retained_symbols
-        .iter()
-        .map(|symbols| -> Result<ipu_elf::LinkedImage> {
-            Ok(preliminary_cache
-                .get(symbols)
-                .ok_or("missing preliminary tile image")?
-                .clone())
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if let Some(image) = preliminary_images
-        .iter()
-        .find(|image| image.bytes.len() > ipu_package::TILE_MEMORY_ELEMENT_SIZE as usize)
-    {
-        return Err(format!(
-            "support image uses {} bytes and exceeds its {}-byte executable reservation",
-            image.bytes.len(),
-            ipu_package::TILE_MEMORY_ELEMENT_SIZE
-        )
-        .into());
-    }
     let emit_program =
         |program_index: usize, symbols: &BTreeMap<String, u32>, generated_base: u32| {
             let program = &programs[program_index];

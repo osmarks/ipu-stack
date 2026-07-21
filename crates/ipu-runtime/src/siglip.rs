@@ -57,6 +57,144 @@ pub struct SiglipMapHead {
     pub attention: FlashAttentionPlan,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AttentionKernelVariant {
+    pub small_query_rows: u16,
+    pub large_query_rows: u16,
+    pub small_key_rows: u16,
+    pub large_key_rows: u16,
+}
+
+impl AttentionKernelVariant {
+    pub fn suffix(self) -> String {
+        format!(
+            "q{}_{}_k{}_{}",
+            self.small_query_rows, self.large_query_rows, self.small_key_rows, self.large_key_rows
+        )
+    }
+}
+
+pub fn attention_kernel_variant(plan: &FlashAttentionPlan) -> AttentionKernelVariant {
+    let query_rows = plan.tasks.iter().map(|task| task.query_rows);
+    let key_rows = plan.key_values.iter().map(|block| block.key_rows);
+    AttentionKernelVariant {
+        small_query_rows: query_rows.clone().min().unwrap(),
+        large_query_rows: query_rows.max().unwrap(),
+        small_key_rows: key_rows.clone().min().unwrap(),
+        large_key_rows: key_rows.max().unwrap(),
+    }
+}
+
+pub fn consolidate_attention_kernel_variants(
+    schedule: &mut Schedule,
+    plans: &[FlashAttentionPlan],
+) -> AttentionKernelVariant {
+    let variants = plans
+        .iter()
+        .map(attention_kernel_variant)
+        .collect::<Vec<_>>();
+    let domain = AttentionKernelVariant {
+        small_query_rows: variants
+            .iter()
+            .map(|variant| variant.small_query_rows)
+            .min()
+            .unwrap(),
+        large_query_rows: variants
+            .iter()
+            .map(|variant| variant.large_query_rows)
+            .max()
+            .unwrap(),
+        small_key_rows: variants
+            .iter()
+            .map(|variant| variant.small_key_rows)
+            .min()
+            .unwrap(),
+        large_key_rows: variants
+            .iter()
+            .map(|variant| variant.large_key_rows)
+            .max()
+            .unwrap(),
+    };
+    assert!(variants.iter().all(|variant| {
+        [variant.small_query_rows, variant.large_query_rows]
+            .into_iter()
+            .all(|rows| rows == domain.small_query_rows || rows == domain.large_query_rows)
+            && [variant.small_key_rows, variant.large_key_rows]
+                .into_iter()
+                .all(|rows| rows == domain.small_key_rows || rows == domain.large_key_rows)
+    }));
+    let local_suffixes = variants
+        .iter()
+        .map(|variant| (format!("_{}", variant.suffix()), *variant))
+        .collect::<Vec<_>>();
+
+    for phase in &mut schedule.phases {
+        let ipu_compiler::Phase::Compute { commands, .. } = phase else {
+            continue;
+        };
+        for command in commands {
+            let operation = command.specialization.operation.as_ref();
+            if !operation.starts_with("attention_") {
+                continue;
+            }
+            let Some((suffix, local)) = local_suffixes
+                .iter()
+                .find(|(suffix, _)| operation.ends_with(suffix))
+            else {
+                continue;
+            };
+            let base = operation.strip_suffix(suffix).unwrap();
+            let query_small = row_role(local.small_query_rows, domain.small_query_rows);
+            let query_large = row_role(local.large_query_rows, domain.small_query_rows);
+            let key_small = row_role(local.small_key_rows, domain.small_key_rows);
+            let key_large = row_role(local.large_key_rows, domain.small_key_rows);
+            let base = base
+                .replace("small_query", "@QUERY_SMALL@")
+                .replace("large_query", "@QUERY_LARGE@")
+                .replace("small_key", "@KEY_SMALL@")
+                .replace("large_key", "@KEY_LARGE@")
+                .replace("small_rows", "@QUERY_SMALL_ROWS@")
+                .replace("large_rows", "@QUERY_LARGE_ROWS@")
+                .replace("@QUERY_SMALL@", &format!("{query_small}_query"))
+                .replace("@QUERY_LARGE@", &format!("{query_large}_query"))
+                .replace("@KEY_SMALL@", &format!("{key_small}_key"))
+                .replace("@KEY_LARGE@", &format!("{key_large}_key"))
+                .replace("@QUERY_SMALL_ROWS@", &format!("{query_small}_rows"))
+                .replace("@QUERY_LARGE_ROWS@", &format!("{query_large}_rows"));
+            command.specialization.operation = format!("{base}_{}", domain.suffix()).into();
+        }
+    }
+    domain
+}
+
+fn row_role(rows: u16, small_rows: u16) -> &'static str {
+    if rows == small_rows { "small" } else { "large" }
+}
+
+fn specialize_attention_phases(
+    schedule: &mut Schedule,
+    phase_start: usize,
+    plan: &FlashAttentionPlan,
+) {
+    let suffix = attention_kernel_variant(plan).suffix();
+    for phase in &mut schedule.phases[phase_start..] {
+        let ipu_compiler::Phase::Compute { commands, .. } = phase else {
+            continue;
+        };
+        for command in commands {
+            let operation = command.specialization.operation.as_ref();
+            if operation.starts_with("attention_qk_")
+                || operation.starts_with("attention_pv_")
+                || operation.starts_with("attention_softmax_")
+                || operation.starts_with("attention_merge_")
+                || operation == "attention_f32_to_f16"
+            {
+                command.specialization.operation = format!("{operation}_{suffix}").into();
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SiglipWeightStorage {
     F16,
@@ -317,6 +455,7 @@ pub fn append_siglip_map_head(
     end_tensor_lifetimes(schedule, key_value.iter().map(|block| block.tensor))?;
     end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
 
+    let attention_phase_start = schedule.phases.len();
     let attention = append_flash_attention_from_a16_qkv(
         schedule,
         &query,
@@ -335,6 +474,7 @@ pub fn append_siglip_map_head(
             data_limit,
         },
     )?;
+    specialize_attention_phases(schedule, attention_phase_start, &attention);
     end_tensor_lifetimes(
         schedule,
         query
@@ -630,6 +770,7 @@ pub fn append_siglip_encoder_layer(
     end_tensor_lifetimes(schedule, qkv.output.iter().map(|block| block.tensor))?;
 
     info!(stage = "attention", "planning SigLIP encoder stage");
+    let attention_phase_start = schedule.phases.len();
     let attention = append_flash_attention_from_a16_qkv(
         schedule,
         &qkv_shards[0],
@@ -648,6 +789,7 @@ pub fn append_siglip_encoder_layer(
             data_limit,
         },
     )?;
+    specialize_attention_phases(schedule, attention_phase_start, &attention);
     end_tensor_lifetimes(
         schedule,
         qkv_shards

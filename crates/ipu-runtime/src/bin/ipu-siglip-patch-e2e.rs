@@ -6,15 +6,16 @@ use ipu_compiler::{
     SpecializationKey, TensorId, append_c16_to_a16_row_shards, choose_gemm_row_block_for,
     end_tensor_lifetimes, plan_blocked_gemm, plan_flash_attention,
 };
-use ipu_elf::Toolchain;
+use ipu_elf::{KernelArtifact, Toolchain};
 use ipu_models::{SiglipWeights, TensorArchive};
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
     BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, SiglipWeightStorage,
     StaticTemplateRegion, allocator_memory_profile, append_host_a16_matrix,
     append_siglip_encoder_layer, append_siglip_map_head, append_siglip_post_layer_norm,
-    block_binding_typed, block_coordinates, blocked_matrix_f16, package_graph,
-    package_graph_with_templates, run_host_with_options,
+    block_binding_typed, block_coordinates, blocked_matrix_f16,
+    consolidate_attention_kernel_variants, package_graph, package_graph_with_templates,
+    run_host_with_options,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -272,7 +273,8 @@ fn main() {
             None,
         )
     };
-    let objects = compile_objects(&plan, &attentions).unwrap();
+    let attention_variant = consolidate_attention_kernel_variants(&mut plan.schedule, &attentions);
+    let objects = compile_objects(&plan, &attentions, attention_variant).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
         bytes: host_input,
@@ -547,7 +549,9 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
             .collect::<Vec<_>>();
         (map.output, 12, map.attention, expected)
     };
-    let objects = compile_objects(&compilation_plan, &[attention]).unwrap();
+    let attention_variant =
+        consolidate_attention_kernel_variants(&mut schedule, std::slice::from_ref(&attention));
+    let objects = compile_objects(&compilation_plan, &[attention], attention_variant).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
         bytes: host_input,
@@ -753,6 +757,7 @@ fn append_adjustment_phase(
 fn compile_objects(
     plan: &ipu_compiler::BlockedGemmPlan,
     attentions: &[FlashAttentionPlan],
+    attention_variant: ipu_runtime::AttentionKernelVariant,
 ) -> ipu_runtime::Result<Vec<Vec<u8>>> {
     let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
     let artifacts = std::env::temp_dir().join(format!("ipu-siglip-patch-{}", std::process::id()));
@@ -826,16 +831,6 @@ fn compile_objects(
             && candidate.padded_head_dimension == attention.padded_head_dimension
             && candidate.key_block_columns == attention.key_block_columns
     }));
-    let attention_rows = attentions
-        .iter()
-        .flat_map(|attention| attention.tasks.iter().map(|task| task.query_rows));
-    let minimum_attention_rows = attention_rows.clone().min().unwrap();
-    let maximum_attention_rows = attention_rows.max().unwrap();
-    let key_rows = attentions
-        .iter()
-        .flat_map(|attention| attention.key_values.iter().map(|block| block.key_rows));
-    let minimum_key_rows = key_rows.clone().min().unwrap();
-    let maximum_key_rows = key_rows.max().unwrap();
     let pack_codelet = toolchain.compile(
         source("attention_pack_f16.cpp"),
         &artifacts,
@@ -870,68 +865,8 @@ fn compile_objects(
         "attention-unpack-wrapper",
         &[],
     )?;
-    let attention_codelet = toolchain.compile(
-        source("flash_attention_f16.cpp"),
-        &artifacts,
-        "flash-attention-codelet",
-        &[
-            format!("-DATTENTION_HEAD_DIMENSION={}", attention.head_dimension),
-            format!(
-                "-DATTENTION_PADDED_HEAD_DIMENSION={}",
-                attention.padded_head_dimension
-            ),
-            format!(
-                "-DATTENTION_KEY_BLOCK_COLUMNS={}",
-                attention.key_block_columns
-            ),
-            format!("-DATTENTION_SMALL_QUERY_ROWS={minimum_attention_rows}"),
-            format!("-DATTENTION_LARGE_QUERY_ROWS={maximum_attention_rows}"),
-            format!("-DATTENTION_SMALL_KEY_ROWS={minimum_key_rows}"),
-            format!("-DATTENTION_LARGE_KEY_ROWS={maximum_key_rows}"),
-        ],
-    )?;
-    let attention_wrapper = toolchain.compile(
-        source("flash_attention_f16.S"),
-        &artifacts,
-        "flash-attention-wrapper",
-        &[],
-    )?;
-    let attention_qk = toolchain.compile(
-        source("gemm_f16_64_amp.S"),
-        &artifacts,
-        "attention-qk",
-        &[
-            format!(
-                "-DGEMM_INNER_BLOCK_DIMENSION={}",
-                attention.padded_head_dimension
-            ),
-            format!("-DGEMM_OUTPUT_COLUMNS={}", attention.key_block_columns),
-            format!("-DGEMM_SMALL_ROWS={minimum_attention_rows}"),
-            format!("-DGEMM_LARGE_ROWS={maximum_attention_rows}"),
-            "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_attention_qk_init_small_rows".into(),
-            "-DGEMM_INIT_LARGE_SYMBOL=ipu_stack_attention_qk_init_large_rows".into(),
-            "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_attention_qk_accumulate_small_rows".into(),
-            "-DGEMM_ACCUMULATE_LARGE_SYMBOL=ipu_stack_attention_qk_accumulate_large_rows".into(),
-        ],
-    )?;
-    let attention_pv = toolchain.compile(
-        source("gemm_f16_64_amp.S"),
-        &artifacts,
-        "attention-pv",
-        &[
-            format!(
-                "-DGEMM_INNER_BLOCK_DIMENSION={}",
-                attention.key_block_columns
-            ),
-            format!("-DGEMM_OUTPUT_COLUMNS={}", attention.padded_head_dimension),
-            format!("-DGEMM_SMALL_ROWS={minimum_attention_rows}"),
-            format!("-DGEMM_LARGE_ROWS={maximum_attention_rows}"),
-            "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_attention_pv_init_small_rows".into(),
-            "-DGEMM_INIT_LARGE_SYMBOL=ipu_stack_attention_pv_init_large_rows".into(),
-            "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_attention_pv_accumulate_small_rows".into(),
-            "-DGEMM_ACCUMULATE_LARGE_SYMBOL=ipu_stack_attention_pv_accumulate_large_rows".into(),
-        ],
-    )?;
+    let attention_objects =
+        compile_attention_variant(&toolchain, &artifacts, attention, attention_variant)?;
     let worker_support = toolchain.compile(
         source("worker_support.S"),
         &artifacts,
@@ -951,15 +886,145 @@ fn compile_objects(
         fs::read(pack_wrapper.object)?,
         fs::read(unpack_codelet.object)?,
         fs::read(unpack_wrapper.object)?,
-        fs::read(attention_codelet.object)?,
-        fs::read(attention_wrapper.object)?,
-        fs::read(attention_qk.object)?,
-        fs::read(attention_pv.object)?,
         fs::read(worker_support.object)?,
     ];
+    for object in attention_objects {
+        objects.push(fs::read(object.object)?);
+    }
     if let Some((codelet, wrapper)) = fp8_expander {
         objects.push(fs::read(codelet.object)?);
         objects.push(fs::read(wrapper.object)?);
+    }
+    Ok(objects)
+}
+
+fn compile_attention_variant(
+    toolchain: &Toolchain,
+    artifacts: &std::path::Path,
+    shape: &FlashAttentionPlan,
+    variant: ipu_runtime::AttentionKernelVariant,
+) -> Result<Vec<KernelArtifact>, ipu_elf::ElfError> {
+    let source = |name: &str| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../device")
+            .join(name)
+    };
+    let softmax = [
+        (
+            "AttentionSoftmaxSmallQuerySmallKeyF16",
+            "attention_softmax_small_query_small_key_f16",
+        ),
+        (
+            "AttentionSoftmaxSmallQueryLargeKeyF16",
+            "attention_softmax_small_query_large_key_f16",
+        ),
+        (
+            "AttentionSoftmaxLargeQuerySmallKeyF16",
+            "attention_softmax_large_query_small_key_f16",
+        ),
+        (
+            "AttentionSoftmaxLargeQueryLargeKeyF16",
+            "attention_softmax_large_query_large_key_f16",
+        ),
+    ];
+    let merge = [
+        (
+            "AttentionMergeSmallQuerySingleBlockF16",
+            "attention_merge_small_query_single_block_f16",
+        ),
+        (
+            "AttentionMergeSmallQueryInitialBlockF16",
+            "attention_merge_small_query_initial_block_f16",
+        ),
+        (
+            "AttentionMergeSmallQueryMiddleBlockF16",
+            "attention_merge_small_query_middle_block_f16",
+        ),
+        (
+            "AttentionMergeSmallQueryFinalBlockF16",
+            "attention_merge_small_query_final_block_f16",
+        ),
+        (
+            "AttentionMergeLargeQuerySingleBlockF16",
+            "attention_merge_large_query_single_block_f16",
+        ),
+        (
+            "AttentionMergeLargeQueryInitialBlockF16",
+            "attention_merge_large_query_initial_block_f16",
+        ),
+        (
+            "AttentionMergeLargeQueryMiddleBlockF16",
+            "attention_merge_large_query_middle_block_f16",
+        ),
+        (
+            "AttentionMergeLargeQueryFinalBlockF16",
+            "attention_merge_large_query_final_block_f16",
+        ),
+    ];
+    let mut objects = Vec::with_capacity(4);
+    {
+        let suffix = variant.suffix();
+        let class_suffix = format!(
+            "Q{}_{}K{}_{}",
+            variant.small_query_rows,
+            variant.large_query_rows,
+            variant.small_key_rows,
+            variant.large_key_rows
+        );
+        let mut codelet_flags = vec![
+            format!("-DATTENTION_HEAD_DIMENSION={}", shape.head_dimension),
+            format!(
+                "-DATTENTION_PADDED_HEAD_DIMENSION={}",
+                shape.padded_head_dimension
+            ),
+            format!("-DATTENTION_KEY_BLOCK_COLUMNS={}", shape.key_block_columns),
+            format!("-DATTENTION_SMALL_QUERY_ROWS={}", variant.small_query_rows),
+            format!("-DATTENTION_LARGE_QUERY_ROWS={}", variant.large_query_rows),
+            format!("-DATTENTION_SMALL_KEY_ROWS={}", variant.small_key_rows),
+            format!("-DATTENTION_LARGE_KEY_ROWS={}", variant.large_key_rows),
+        ];
+        let mut wrapper_flags = Vec::new();
+        for &(class, symbol) in softmax.iter().chain(&merge) {
+            let renamed = format!("{class}{class_suffix}");
+            codelet_flags.push(format!("-D{class}={renamed}"));
+            wrapper_flags.push(format!("-D__runCodelet_{class}=__runCodelet_{renamed}"));
+            wrapper_flags.push(format!("-Dipu_stack_{symbol}=ipu_stack_{symbol}_{suffix}"));
+        }
+        wrapper_flags.push(format!(
+            "-Dipu_stack_attention_f32_to_f16=ipu_stack_attention_f32_to_f16_{suffix}"
+        ));
+        objects.push(toolchain.compile(
+            source("flash_attention_f16.cpp"),
+            artifacts,
+            &format!("flash-attention-codelet-{suffix}"),
+            &codelet_flags,
+        )?);
+        objects.push(toolchain.compile(
+            source("flash_attention_f16.S"),
+            artifacts,
+            &format!("flash-attention-wrapper-{suffix}"),
+            &wrapper_flags,
+        )?);
+        for (kind, inner, output) in [
+            ("qk", shape.padded_head_dimension, shape.key_block_columns),
+            ("pv", shape.key_block_columns, shape.padded_head_dimension),
+        ] {
+            objects.push(toolchain.compile(
+                source("gemm_f16_64_amp.S"),
+                artifacts,
+                &format!("attention-{kind}-{suffix}"),
+                &[
+                    format!("-DGEMM_INNER_BLOCK_DIMENSION={inner}"),
+                    format!("-DGEMM_OUTPUT_COLUMNS={output}"),
+                    format!("-DGEMM_SMALL_ROWS={}", variant.small_query_rows),
+                    format!("-DGEMM_LARGE_ROWS={}", variant.large_query_rows),
+                    format!("-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_attention_{kind}_init_small_rows_{suffix}"),
+                    format!("-DGEMM_INIT_LARGE_SYMBOL=ipu_stack_attention_{kind}_init_large_rows_{suffix}"),
+                    format!("-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_attention_{kind}_accumulate_small_rows_{suffix}"),
+                    format!("-DGEMM_ACCUMULATE_LARGE_SYMBOL=ipu_stack_attention_{kind}_accumulate_large_rows_{suffix}"),
+                ],
+            )?);
+        }
     }
     Ok(objects)
 }

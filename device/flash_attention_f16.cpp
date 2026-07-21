@@ -29,7 +29,7 @@ static_assert(ATTENTION_HEAD_DIMENSION > 0);
 static_assert(ATTENTION_KEY_BLOCK_COLUMNS % 16 == 0);
 static_assert(ATTENTION_PADDED_HEAD_DIMENSION % 16 == 0);
 
-__attribute__((always_inline)) void expHalf16(half *values) {
+static __attribute__((always_inline)) void expHalf16(half *values) {
   unsigned loopCount = 4;
   const half4 *input = reinterpret_cast<const half4 *>(values);
   half4 *output = reinterpret_cast<half4 *>(values);
