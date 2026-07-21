@@ -229,7 +229,48 @@ fn main() {
     let layer_output = last_layer.output;
     let attention = last_layer.attention;
     let intermediate_columns = u16::try_from(config.intermediate_size.div_ceil(64) * 64).unwrap();
-    let objects = compile_objects(&plan, &attention).unwrap();
+    let full_model = std::env::var_os("IPU_SIGLIP_FULL_MODEL").is_some();
+    assert!(
+        !full_model || layer_count == config.num_hidden_layers,
+        "full-model execution requires every encoder layer"
+    );
+    let (output, output_rows, output_name, attentions) = if full_model {
+        let post_norm = append_siglip_post_layer_norm(
+            &mut plan.schedule,
+            &layer_output,
+            &model,
+            DATA_BASE,
+            data_limit,
+            &mut host,
+        )
+        .unwrap();
+        let map = append_siglip_map_head(
+            &mut plan.schedule,
+            &post_norm,
+            &model,
+            rows,
+            row_block_dimension,
+            TILE_COUNT,
+            DATA_BASE,
+            data_limit,
+            &mut host,
+        )
+        .unwrap();
+        (
+            map.output,
+            12,
+            "pooler_output".to_string(),
+            vec![attention, map.attention],
+        )
+    } else {
+        (
+            layer_output,
+            rows,
+            format!("encoder_layer_{:02}", layer_count - 1),
+            vec![attention],
+        )
+    };
+    let objects = compile_objects(&plan, &attentions).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
         bytes: host_input,
@@ -247,10 +288,10 @@ fn main() {
         ));
     }
     host_outputs.push(row_shard_binding(
-        &format!("encoder_layer_{:02}", layer_count - 1),
-        rows,
+        &output_name,
+        output_rows,
         columns,
-        &layer_output,
+        &output,
     ));
     let graph = ExecutableGraph {
         schedule: plan.schedule,
@@ -331,14 +372,21 @@ fn main() {
     } else {
         (0, None, None)
     };
-    let expected_layer = reference
-        .tensor_f32(&format!("encoder_layer_{:02}", layer_count - 1))
-        .unwrap();
+    let expected_layer = if full_model {
+        let expected = reference.tensor_f32("pooler_output").unwrap();
+        (0..usize::from(output_rows))
+            .flat_map(|_| expected.iter().copied())
+            .collect()
+    } else {
+        reference
+            .tensor_f32(&format!("encoder_layer_{:02}", layer_count - 1))
+            .unwrap()
+    };
     let expected_layer = serialize_a16_row_shards(
         &expected_layer,
-        usize::from(rows),
+        usize::from(output_rows),
         usize::from(columns),
-        &layer_output,
+        &output,
     );
     let layer_error = verify_linear_f16(&actual[diagnostic_bytes..], &expected_layer);
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
@@ -373,6 +421,7 @@ fn main() {
         ?norm2_error,
         ?mlp_gelu_error,
         layer_error,
+        full_model,
         "SigLIP encoder prefix passed against Hugging Face"
     );
 }
@@ -474,7 +523,7 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
             .collect::<Vec<_>>();
         (map.output, 12, map.attention, expected)
     };
-    let objects = compile_objects(&compilation_plan, &attention).unwrap();
+    let objects = compile_objects(&compilation_plan, &[attention]).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
         bytes: host_input,
@@ -673,7 +722,7 @@ fn append_adjustment_phase(
 
 fn compile_objects(
     plan: &ipu_compiler::BlockedGemmPlan,
-    attention: &FlashAttentionPlan,
+    attentions: &[FlashAttentionPlan],
 ) -> ipu_runtime::Result<Vec<Vec<u8>>> {
     let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
     let artifacts = std::env::temp_dir().join(format!("ipu-siglip-patch-{}", std::process::id()));
@@ -741,10 +790,20 @@ fn compile_objects(
         "layer-norm-wrapper",
         &[],
     )?;
-    let attention_rows = attention.tasks.iter().map(|task| task.query_rows);
+    let attention = &attentions[0];
+    assert!(attentions.iter().all(|candidate| {
+        candidate.head_dimension == attention.head_dimension
+            && candidate.padded_head_dimension == attention.padded_head_dimension
+            && candidate.key_block_columns == attention.key_block_columns
+    }));
+    let attention_rows = attentions
+        .iter()
+        .flat_map(|attention| attention.tasks.iter().map(|task| task.query_rows));
     let minimum_attention_rows = attention_rows.clone().min().unwrap();
     let maximum_attention_rows = attention_rows.max().unwrap();
-    let key_rows = attention.key_values.iter().map(|block| block.key_rows);
+    let key_rows = attentions
+        .iter()
+        .flat_map(|attention| attention.key_values.iter().map(|block| block.key_rows));
     let minimum_key_rows = key_rows.clone().min().unwrap();
     let maximum_key_rows = key_rows.max().unwrap();
     let pack_codelet = toolchain.compile(
