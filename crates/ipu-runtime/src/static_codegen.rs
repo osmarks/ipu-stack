@@ -797,6 +797,25 @@ pub(crate) fn emit(
         if let Some(template) = templates.get(template_index)
             && template.instance_steps[0].start == step_index
         {
+            let reusable_patch_destinations =
+                template.patches.iter().any(|patch| !patch.is_empty())
+                    && template
+                        .record_addresses
+                        .windows(2)
+                        .all(|pair| pair[0] == pair[1])
+                    && template
+                        .record_secondary_addresses
+                        .windows(2)
+                        .all(|pair| pair[0] == pair[1]);
+            if reusable_patch_destinations {
+                code.add_immediate(11, 11, -16)?;
+                code.setzi(4, template.record_addresses[0])?;
+                code.setzi(5, template.record_secondary_addresses[0])?;
+                code.setzi(6, u32::from(template.record_split))?;
+                code.st32(4, 11, 15, 0)?;
+                code.st32(5, 11, 15, 1)?;
+                code.st32(6, 11, 15, 2)?;
+            }
             for (instance, (&record_address, &secondary_address)) in template
                 .record_addresses
                 .iter()
@@ -807,9 +826,11 @@ pub(crate) fn emit(
                 if !patch.is_empty() {
                     code.setzi(2, u32::try_from(template.records[instance].len())?)?;
                     code.setzi(3, template.patch_addresses[instance])?;
-                    code.setzi(4, record_address)?;
-                    code.setzi(5, secondary_address)?;
-                    code.setzi(6, u32::from(template.record_split))?;
+                    if !reusable_patch_destinations {
+                        code.setzi(4, record_address)?;
+                        code.setzi(5, secondary_address)?;
+                        code.setzi(6, u32::from(template.record_split))?;
+                    }
                     code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
                 }
                 code.setzi(2, record_address)?;
@@ -817,6 +838,9 @@ pub(crate) fn emit(
                 let call = code.words.len();
                 code.call(0, 9)?;
                 template_calls.push((call, template_index));
+            }
+            if reusable_patch_destinations {
+                code.add_immediate(11, 11, 16)?;
             }
             plan_index += template
                 .instance_steps
@@ -1309,7 +1333,7 @@ mod tests {
         phase: usize,
         input_address: u32,
         arguments: Vec<u32>,
-        operation: &str,
+        operation: &'static str,
     ) -> LoweredTileStep {
         LoweredTileStep::Compute(Box::new(LoweredComputeCommand {
             op: OpId(phase),

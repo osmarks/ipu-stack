@@ -240,6 +240,9 @@ ipu_stack_static_exchange_compute_run:
 ipu_stack_static_template_patch:
 	.supervisor
 	add $m11, $m11, -32
+	ld32 $m4, $m11, $m15, 8
+	ld32 $m5, $m11, $m15, 9
+	ld32 $m6, $m11, $m15, 10
 	st32 $m4, $m11, $m15, 0
 	st32 $m5, $m11, $m15, 1
 	st32 $m6, $m11, $m15, 2
