@@ -61,6 +61,23 @@ Logging uses `tracing`. Set `RUST_LOG`, for example
 `RUST_LOG=ipu_driver=debug,ipu_elf=info`, to expose batch and linker details. Set
 `IPU_LOG_FORMAT=json` for newline-delimited JSON events.
 
+## F143 weight reconstruction
+
+`tools/quantize_siglip_f143.py` calibrates SigLIP encoder linears from one or
+more SafeTensors files containing `pixel_values`. It uses the runtime's 64x64
+F143 storage blocks, collects block-diagonal activation Hessians, and supports
+nearest rounding or GPTQ error compensation. The output is an ordinary model
+directory accepted by the Rust SigLIP runner.
+
+```sh
+python tools/quantize_siglip_f143.py MODEL OUTPUT \
+  --calibration profiles/siglip/reference-b1.safetensors \
+  --algorithm gptq --device cuda
+```
+
+Use `--no-save` for error measurement without writing the reconstructed model.
+`--device auto` selects CUDA when available and otherwise uses the CPU.
+
 Host-exchange hardware tests can delay every host acknowledgement by an
 independent seeded interval. This verifies that device execution remains at the
 host rendezvous until the write actually occurs:
