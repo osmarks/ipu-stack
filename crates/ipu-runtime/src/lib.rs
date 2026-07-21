@@ -111,16 +111,23 @@ fn executable_region_base_for_tile(
     let regions = executable_regions_for_tile(allocation_ranges, runtime_end, additional_reserved)?;
     let element_size = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
     let required_size = align_up(required_size, element_size);
-    regions
+    if let Some(base) = regions
         .iter()
         .find_map(|&(start, end)| (end - start >= required_size).then_some(start))
-        .ok_or_else(|| {
-            format!(
-                "no {}tile-memory interval can hold {required_size} bytes of executable code",
-                tile.map_or("common ".into(), |tile| format!("tile {tile} "))
-            )
-            .into()
-        })
+    {
+        return Ok(base);
+    }
+    let free_bytes = regions.iter().map(|&(start, end)| end - start).sum::<u32>();
+    let largest_gap = regions
+        .iter()
+        .map(|&(start, end)| end - start)
+        .max()
+        .unwrap_or(0);
+    Err(format!(
+        "no {}tile-memory interval can hold {required_size} bytes of executable code: {free_bytes} executable bytes free, {largest_gap}-byte largest gap",
+        tile.map_or("common ".into(), |tile| format!("tile {tile} "))
+    )
+    .into())
 }
 
 fn executable_regions_for_tile(
