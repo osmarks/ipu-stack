@@ -105,7 +105,8 @@ pub(crate) fn template_patch_storage_words_range(
     let Some(span) = template_patch_group_span(slots, patch) else {
         return 0;
     };
-    1 + 2 * span.len().div_ceil(32) + narrow.div_ceil(2) + wide
+    let changed = narrow + wide;
+    1 + span.len().div_ceil(32) + changed.div_ceil(32) + narrow.div_ceil(2) + wide
 }
 
 pub(crate) fn template_patch_group_span(

@@ -2604,6 +2604,7 @@ fn package_graph_impl(
                         continue;
                     }
                     let mut words = Vec::new();
+                    let mut narrow_bits = Vec::new();
                     let mut narrow = Vec::new();
                     let mut wide = Vec::new();
                     let span = static_codegen::template_patch_group_span(slots.clone(), patch)
@@ -2614,7 +2615,6 @@ fn package_graph_impl(
                         let slot_base = slots.start + local_base;
                         let slot_limit = (slot_base + 32).min(slots.end);
                         let mut changed_mask = 0u32;
-                        let mut narrow_mask = 0u32;
                         for (slot, value) in patch.iter().filter(|(slot, _)| {
                             (slot_base..slot_limit).contains(&usize::from(*slot))
                         }) {
@@ -2622,10 +2622,11 @@ fn package_graph_impl(
                             changed_mask |= bit;
                             match value {
                                 static_codegen::StaticTemplatePatchValue::Delta(delta) => {
-                                    narrow_mask |= bit;
+                                    narrow_bits.push(true);
                                     narrow.push(*delta as u16);
                                 }
                                 static_codegen::StaticTemplatePatchValue::Word(word) => {
+                                    narrow_bits.push(false);
                                     wide.push(match word {
                                         static_codegen::StaticTemplateRecordWord::Value(value) => {
                                             Ok(*value)
@@ -2639,8 +2640,13 @@ fn package_graph_impl(
                                 }
                             }
                         }
-                        words.extend_from_slice(&[changed_mask, narrow_mask]);
+                        words.push(changed_mask);
                     }
+                    words.extend(narrow_bits.chunks(32).map(|bits| {
+                        bits.iter().enumerate().fold(0u32, |mask, (bit, narrow)| {
+                            mask | (u32::from(*narrow) << bit)
+                        })
+                    }));
                     words.extend(narrow.chunks(2).map(|pair| {
                         u32::from(pair[0]) | (u32::from(pair.get(1).copied().unwrap_or(0)) << 16)
                     }));
