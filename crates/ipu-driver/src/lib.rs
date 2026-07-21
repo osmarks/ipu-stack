@@ -1191,6 +1191,16 @@ impl<'a> HostSession<'a> {
         if self.attached_pages.len() != self.protocol.attach_order.len() {
             return Err(DriverError::Invalid("host session not attached".into()));
         }
+        if self
+            .protocol
+            .calls
+            .iter()
+            .find(|call| call.name == name)
+            .is_some_and(host_call_reuses_storage)
+        {
+            let call = self.invoke_streaming_deferred(name, input)?;
+            return self.collect(&call);
+        }
         let call = self.prepare(name, input)?;
         self.drive(call)
     }
@@ -1364,6 +1374,18 @@ impl<'a> HostSession<'a> {
     }
 }
 
+fn host_call_reuses_storage(call: &HostCall) -> bool {
+    let mut ranges = Vec::<(u32, u64, u64)>::with_capacity(call.inputs.len() + call.outputs.len());
+    call.inputs.iter().chain(&call.outputs).any(|slice| {
+        let end = slice.page_offset.saturating_add(slice.size);
+        let overlaps = ranges.iter().any(|&(page, start, previous_end)| {
+            page == slice.page && slice.page_offset < previous_end && start < end
+        });
+        ranges.push((slice.page, slice.page_offset, end));
+        overlaps
+    })
+}
+
 impl Drop for HostSession<'_> {
     fn drop(&mut self) {
         for index in self.attached_pages.drain(..).rev() {
@@ -1526,6 +1548,15 @@ pub fn block_device_interrupt_signals() -> Result<(), DriverError> {
 mod tests {
     use super::*;
 
+    fn host_slice(page: u32, page_offset: u64, size: u64) -> ipu_package::HostSlice {
+        ipu_package::HostSlice {
+            page,
+            page_offset,
+            file_offset: 0,
+            size,
+        }
+    }
+
     #[test]
     fn framing_marks_final_packet() {
         let data = vec![0x5a; FRAME_PAYLOAD_SIZE + 1];
@@ -1542,6 +1573,21 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0xff)
         );
+    }
+
+    #[test]
+    fn detects_reused_host_transfer_storage() {
+        let mut call = HostCall {
+            name: "graph".into(),
+            command: 0,
+            phases: 0,
+            inputs: vec![host_slice(1, 0, 4096), host_slice(2, 0, 4096)],
+            outputs: vec![host_slice(1, 4096, 4)],
+        };
+        assert!(!host_call_reuses_storage(&call));
+
+        call.inputs[1].page = 1;
+        assert!(host_call_reuses_storage(&call));
     }
 
     #[test]
