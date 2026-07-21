@@ -199,6 +199,8 @@ pub fn inspect_object(bytes: &[u8]) -> Result<ObjectSummary, ElfError> {
 #[derive(Clone, Debug)]
 pub struct LinkOptions {
     pub image_base: u32,
+    /// Optional executable intervals used for non-contiguous section placement.
+    pub regions: Vec<(u32, u32)>,
     pub entry_symbol: String,
     /// Symbols reached through runtime dispatch tables rather than ELF relocations.
     pub retained_symbols: Vec<String>,
@@ -210,7 +212,15 @@ pub struct LinkedImage {
     pub base: u32,
     pub entry: u32,
     pub bytes: Vec<u8>,
+    pub segments: Vec<LinkedSegment>,
     pub symbols: BTreeMap<String, u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkedSegment {
+    pub address: u32,
+    pub offset: usize,
+    pub size: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -240,6 +250,18 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
     debug!(sections = kept.len(), "retained reachable sections");
     let mut placements = Vec::new();
     let mut cursor = 0usize;
+    let mut regions = if options.regions.is_empty() {
+        vec![(options.image_base, u32::MAX)]
+    } else {
+        options.regions.clone()
+    };
+    regions.sort_unstable();
+    if regions.iter().any(|&(start, end)| start >= end) {
+        return Err(ElfError::Link("invalid executable region".into()));
+    }
+    let image_base = regions[0].0;
+    let mut region_index = 0usize;
+    let mut address = image_base;
     for (object_index, file) in parsed.iter().enumerate() {
         for section in file.sections() {
             if !kept.contains(&(object_index, section.index())) {
@@ -258,13 +280,36 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
             }
             let alignment = usize::try_from(section.align().max(1))
                 .map_err(|_| ElfError::Link("section alignment overflow".into()))?;
-            cursor = align_image_offset(options.image_base, cursor, alignment)?;
             let size = usize::try_from(section.size())
                 .map_err(|_| ElfError::Link("section size overflow".into()))?;
-            let address = options
-                .image_base
-                .checked_add(cursor as u32)
-                .ok_or_else(|| ElfError::Link("image address overflow".into()))?;
+            let previous_address = address;
+            let previous_region = region_index;
+            loop {
+                address = align_address(address.max(regions[region_index].0), alignment)?;
+                if address
+                    .checked_add(
+                        u32::try_from(size).map_err(|_| {
+                            ElfError::Link("section size exceeds address space".into())
+                        })?,
+                    )
+                    .is_some_and(|end| end <= regions[region_index].1)
+                {
+                    break;
+                }
+                region_index += 1;
+                if region_index == regions.len() {
+                    return Err(ElfError::Link(format!(
+                        "retained section {} cannot fit executable regions",
+                        section.name().unwrap_or("?")
+                    )));
+                }
+                address = regions[region_index].0;
+            }
+            if region_index == previous_region {
+                cursor = cursor
+                    .checked_add((address - previous_address) as usize)
+                    .ok_or_else(|| ElfError::Link("image size overflow".into()))?;
+            }
             placements.push(PlacedSection {
                 object_index,
                 section_index: section.index(),
@@ -275,6 +320,9 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
             cursor = cursor
                 .checked_add(size)
                 .ok_or_else(|| ElfError::Link("image size overflow".into()))?;
+            address = address
+                .checked_add(u32::try_from(size).unwrap())
+                .ok_or_else(|| ElfError::Link("image address overflow".into()))?;
         }
     }
     let mut image = vec![0u8; cursor];
@@ -382,23 +430,33 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
                 let object::RelocationFlags::Elf { r_type } = relocation.flags() else {
                     return Err(ElfError::Link("non-ELF relocation".into()));
                 };
-                apply_relocation(
-                    &mut image,
-                    location,
-                    r_type,
-                    value as u64,
-                    options.image_base,
-                )?;
+                apply_relocation(&mut image, location, r_type, value as u64, image_base)?;
             }
         }
     }
     let entry = *symbols
         .get(&options.entry_symbol)
         .ok_or_else(|| ElfError::Link(format!("missing entry symbol {}", options.entry_symbol)))?;
+    let mut segments = Vec::<LinkedSegment>::new();
+    for placement in &placements {
+        if let Some(previous) = segments.last_mut()
+            && previous.address + previous.size as u32 == placement.address
+            && previous.offset + previous.size == placement.offset
+        {
+            previous.size += placement.size;
+        } else {
+            segments.push(LinkedSegment {
+                address: placement.address,
+                offset: placement.offset,
+                size: placement.size,
+            });
+        }
+    }
     let linked = LinkedImage {
-        base: options.image_base,
+        base: image_base,
         entry,
         bytes: image,
+        segments,
         symbols,
     };
     info!(
@@ -489,14 +547,9 @@ fn align(value: usize, alignment: usize) -> Result<usize, ElfError> {
         .ok_or_else(|| ElfError::Link("alignment overflow".into()))
 }
 
-fn align_image_offset(base: u32, offset: usize, alignment: usize) -> Result<usize, ElfError> {
-    let address = usize::try_from(base)
-        .map_err(|_| ElfError::Link("image base overflow".into()))?
-        .checked_add(offset)
-        .ok_or_else(|| ElfError::Link("image address overflow".into()))?;
-    align(address, alignment)?
-        .checked_sub(base as usize)
-        .ok_or_else(|| ElfError::Link("aligned image address precedes base".into()))
+fn align_address(address: u32, alignment: usize) -> Result<u32, ElfError> {
+    u32::try_from(align(address as usize, alignment)?)
+        .map_err(|_| ElfError::Link("aligned address overflow".into()))
 }
 
 pub fn apply_relocation(
@@ -660,8 +713,8 @@ mod tests {
 
     #[test]
     fn section_alignment_uses_absolute_image_address() {
-        assert_eq!(align_image_offset(0x4c014, 0xc8, 16).unwrap(), 0xcc);
+        assert_eq!(align_address(0x4c014 + 0xc8, 16).unwrap(), 0x4c0e0);
         assert_eq!(0x4c014 + 0xcc, 0x4c0e0);
-        assert_eq!(align_image_offset(0x4c014, 0xcc, 16).unwrap(), 0xcc);
+        assert_eq!(align_address(0x4c014 + 0xcc, 16).unwrap(), 0x4c0e0);
     }
 }

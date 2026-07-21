@@ -108,6 +108,26 @@ fn executable_region_base_for_tile(
     required_size: u32,
     additional_reserved: &[(u32, u32)],
 ) -> Result<u32> {
+    let regions = executable_regions_for_tile(allocation_ranges, runtime_end, additional_reserved)?;
+    let element_size = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+    let required_size = align_up(required_size, element_size);
+    regions
+        .iter()
+        .find_map(|&(start, end)| (end - start >= required_size).then_some(start))
+        .ok_or_else(|| {
+            format!(
+                "no {}tile-memory interval can hold {required_size} bytes of executable code",
+                tile.map_or("common ".into(), |tile| format!("tile {tile} "))
+            )
+            .into()
+        })
+}
+
+fn executable_regions_for_tile(
+    allocation_ranges: &[(u32, u32)],
+    runtime_end: u32,
+    additional_reserved: &[(u32, u32)],
+) -> Result<Vec<(u32, u32)>> {
     let element_size = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
     let memory_end = ipu_package::TILE_MEMORY_BASE
         .checked_add(ipu_package::TILE_MEMORY_SIZE)
@@ -139,67 +159,20 @@ fn executable_region_base_for_tile(
         ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES,
         element_size,
     );
-    let required_size = align_up(required_size, element_size);
+    let mut regions = Vec::new();
     for (start, end) in reserved {
         if end <= cursor || start >= memory_end {
             continue;
         }
-        let candidate_end = cursor
-            .checked_add(required_size)
-            .ok_or("executable region address overflow")?;
-        if candidate_end <= start {
-            return Ok(cursor);
+        if cursor < start {
+            regions.push((cursor, start.min(memory_end)));
         }
         cursor = align_up(cursor.max(end), element_size);
     }
-    if cursor
-        .checked_add(required_size)
-        .is_some_and(|end| end <= memory_end)
-    {
-        Ok(cursor)
-    } else {
-        Err(format!(
-            "no {}tile-memory interval can hold {required_size} bytes of executable code",
-            tile.map_or("common ".into(), |tile| format!("tile {tile} "))
-        )
-        .into())
+    if cursor < memory_end {
+        regions.push((cursor, memory_end));
     }
-}
-
-fn executable_region_bases_for_tile(
-    allocation_ranges: &[(u32, u32)],
-    tile: u16,
-    runtime_end: u32,
-    image_size: u32,
-    program_size: u32,
-    additional_reserved: &[(u32, u32)],
-) -> Result<(u32, u32)> {
-    let place = |size, reserved: &[(u32, u32)]| {
-        let mut all_reserved = additional_reserved.to_vec();
-        all_reserved.extend_from_slice(reserved);
-        executable_region_base_for_tile(
-            allocation_ranges,
-            Some(tile),
-            runtime_end,
-            size,
-            &all_reserved,
-        )
-    };
-    if program_size >= image_size {
-        let program_base = place(program_size, &[])?;
-        let program_end = program_base
-            .checked_add(program_size)
-            .ok_or("generated program address overflow")?;
-        let image_base = place(image_size, &[(program_base, program_end)])?;
-        Ok((image_base, program_base))
-    } else {
-        let image_base = place(image_size, &[])?;
-        let image_end = image_base
-            .checked_add(image_size)
-            .ok_or("linked image address overflow")?;
-        let program_base = place(program_size, &[(image_base, image_end)])?;
-        Ok((image_base, program_base))
-    }
+    Ok(regions)
 }
 
 fn data_region_base_for_tile(
@@ -1876,6 +1849,7 @@ fn package_graph_impl(
                 objects,
                 &LinkOptions {
                     image_base: ipu_driver::APPLICATION_LOAD_BASE,
+                    regions: Vec::new(),
                     entry_symbol: "ipu_stack_static_start".into(),
                     retained_symbols: symbols.clone(),
                     externals: HashMap::new(),
@@ -1942,17 +1916,15 @@ fn package_graph_impl(
         .enumerate()
         .map(|(index, image)| emit_program(index, &image.symbols, 0))
         .collect::<Result<Vec<_>>>()?;
-    let executable_bases = programs
+    let program_bases = programs
         .iter()
-        .zip(&preliminary_images)
         .zip(&preliminary_generated)
         .zip(&template_record_ranges)
-        .map(|(((program, image), generated), template_records)| {
-            executable_region_bases_for_tile(
+        .map(|((program, generated), template_records)| {
+            executable_region_base_for_tile(
                 &allocation_ranges_by_tile[usize::from(program.tile)],
-                program.tile,
+                Some(program.tile),
                 tile_exchange_plans[usize::from(program.tile)].end,
-                u32::try_from(image.bytes.len())?,
                 u32::try_from(generated.len())?,
                 &host_runtime_ranges[usize::from(program.tile)]
                     .iter()
@@ -1962,44 +1934,53 @@ fn package_graph_impl(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    let image_bases = executable_bases
+    let image_regions = programs
         .iter()
-        .map(|&(image, _)| image)
-        .collect::<Vec<_>>();
-    let program_bases = executable_bases
-        .iter()
-        .map(|&(_, program)| program)
-        .collect::<Vec<_>>();
-    let mut image_cache = HashMap::<(u32, Vec<String>), ipu_elf::LinkedImage>::new();
-    for ((&image_base, symbols), preliminary) in image_bases
-        .iter()
-        .zip(&tile_retained_symbols)
-        .zip(&preliminary_images)
-    {
-        let key = (image_base, symbols.clone());
+        .zip(&program_bases)
+        .zip(&preliminary_generated)
+        .zip(&template_record_ranges)
+        .map(
+            |(((program, &program_base), generated), template_records)| {
+                let program_end = program_base
+                    .checked_add(u32::try_from(generated.len())?)
+                    .ok_or("generated program address overflow")?;
+                executable_regions_for_tile(
+                    &allocation_ranges_by_tile[usize::from(program.tile)],
+                    tile_exchange_plans[usize::from(program.tile)].end,
+                    &host_runtime_ranges[usize::from(program.tile)]
+                        .iter()
+                        .copied()
+                        .chain(template_records.iter().copied())
+                        .chain(std::iter::once((program_base, program_end)))
+                        .collect::<Vec<_>>(),
+                )
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    let mut image_cache = HashMap::<(Vec<(u32, u32)>, Vec<String>), ipu_elf::LinkedImage>::new();
+    for (regions, symbols) in image_regions.iter().zip(&tile_retained_symbols) {
+        let key = (regions.clone(), symbols.clone());
         if image_cache.contains_key(&key) {
             continue;
         }
         let image = link(
             objects,
             &LinkOptions {
-                image_base,
+                image_base: regions.first().ok_or("tile has no executable region")?.0,
+                regions: regions.clone(),
                 entry_symbol: "ipu_stack_static_start".into(),
                 retained_symbols: symbols.clone(),
                 externals: HashMap::new(),
             },
         )?;
-        if image.bytes.len() != preliminary.bytes.len() {
-            return Err("linked image size changed after executable placement".into());
-        }
         image_cache.insert(key, image);
     }
-    let images = image_bases
+    let images = image_regions
         .iter()
         .zip(&tile_retained_symbols)
-        .map(|(&base, symbols)| -> Result<ipu_elf::LinkedImage> {
+        .map(|(regions, symbols)| -> Result<ipu_elf::LinkedImage> {
             Ok(image_cache
-                .get(&(base, symbols.clone()))
+                .get(&(regions.clone(), symbols.clone()))
                 .ok_or("missing linked tile image")?
                 .clone())
         })
@@ -2092,12 +2073,14 @@ fn package_graph_impl(
             )?)
             .ok_or("generated tile program address overflow")?;
         let image = &images[usize::from(allocation.tile)];
-        let image_end = image
-            .base
-            .checked_add(u32::try_from(image.bytes.len())?)
-            .ok_or("linked image address overflow")?;
-        if ranges_overlap(image.base, image_end, allocation.address, end)
-            || ranges_overlap(program_base, program_end, allocation.address, end)
+        if image.segments.iter().any(|segment| {
+            ranges_overlap(
+                segment.address,
+                segment.address + segment.size as u32,
+                allocation.address,
+                end,
+            )
+        }) || ranges_overlap(program_base, program_end, allocation.address, end)
             || ranges_overlap(PLAN_BASE, runtime_end, allocation.address, end)
             || host_runtime_ranges[usize::from(allocation.tile)]
                 .iter()
@@ -2162,14 +2145,19 @@ fn package_graph_impl(
         let entry_blob = app.add_blob(entry_code);
         let mut support_code = image.bytes.clone();
         let symbol_offset = |name: &str| -> Result<usize> {
-            Ok(image
+            let address = image
                 .symbols
                 .get(name)
                 .copied()
-                .ok_or_else(|| format!("static runtime has no {name} symbol"))?
-                .checked_sub(image.base)
-                .ok_or_else(|| format!("{name} precedes the linked image"))?
-                as usize)
+                .ok_or_else(|| format!("static runtime has no {name} symbol"))?;
+            let segment = image
+                .segments
+                .iter()
+                .find(|segment| {
+                    address >= segment.address && address < segment.address + segment.size as u32
+                })
+                .ok_or_else(|| format!("{name} is outside linked image segments"))?;
+            Ok(segment.offset + usize::try_from(address - segment.address)?)
         };
         let program_offset = symbol_offset("ipu_stack_static_program_address")?;
         let worker_context_offset = symbol_offset("ipu_stack_static_worker_sync_context_base")?;
@@ -2210,14 +2198,14 @@ fn package_graph_impl(
             flags: SEGMENT_READ | SEGMENT_EXECUTE,
         }];
         let support_blob = app.add_blob(support_code);
-        segments.push(Segment {
-            address: image.base,
-            memory_size: image.bytes.len() as u32,
+        segments.extend(image.segments.iter().map(|segment| Segment {
+            address: segment.address,
+            memory_size: segment.size as u32,
             blob: support_blob,
-            blob_offset: 0,
-            file_size: image.bytes.len() as u32,
+            blob_offset: segment.offset as u64,
+            file_size: segment.size as u32,
             flags: SEGMENT_READ | SEGMENT_EXECUTE,
-        });
+        }));
         let generated_size = u32::try_from(generated_code.len())?;
         let generated_blob = app.add_blob(generated_code);
         segments.push(Segment {
@@ -2370,8 +2358,24 @@ fn package_graph_impl(
         host_outputs = graph.host_outputs.len(),
         max_program_bytes,
         distinct_image_bases = image_cache.len(),
-        minimum_image_base = format_args!("0x{:x}", image_bases.iter().min().copied().unwrap_or(0)),
-        maximum_image_base = format_args!("0x{:x}", image_bases.iter().max().copied().unwrap_or(0)),
+        minimum_image_base = format_args!(
+            "0x{:x}",
+            images
+                .iter()
+                .flat_map(|image| &image.segments)
+                .map(|segment| segment.address)
+                .min()
+                .unwrap_or(0)
+        ),
+        maximum_image_base = format_args!(
+            "0x{:x}",
+            images
+                .iter()
+                .flat_map(|image| &image.segments)
+                .map(|segment| segment.address)
+                .max()
+                .unwrap_or(0)
+        ),
         minimum_program_base =
             format_args!("0x{:x}", program_bases.iter().min().copied().unwrap_or(0)),
         maximum_program_base =

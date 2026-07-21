@@ -297,6 +297,7 @@ fn main() -> Result<()> {
                 &objects,
                 &LinkOptions {
                     image_base: base,
+                    regions: Vec::new(),
                     entry_symbol: entry,
                     retained_symbols: Vec::new(),
                     externals: symbol.into_iter().collect::<HashMap<_, _>>(),
