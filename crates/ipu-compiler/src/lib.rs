@@ -1006,7 +1006,7 @@ pub fn set_f8_weight_block_scales(
         }
     }
     let mut applied = BTreeSet::new();
-    for phase in &mut schedule.phases {
+    for phase in schedule.phases.iter_mut().rev() {
         let Phase::Compute { commands, .. } = phase else {
             continue;
         };
@@ -1031,6 +1031,9 @@ pub fn set_f8_weight_block_scales(
                     .insert("f143_scale".into(), scale.to_string());
             }
             applied.insert(tensor);
+        }
+        if applied.len() == by_tensor.len() {
+            break;
         }
     }
     if applied.len() != by_tensor.len() {
@@ -1380,8 +1383,13 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         .iter()
         .map(|block| block.tensor)
         .collect::<HashSet<_>>();
+    let allocation_base = schedule.allocations.len();
     append_child_schedule(schedule, &mut plan.schedule)?;
-    set_appended_gemm_left_start(schedule, &left_tensors, compute_phase);
+    set_appended_gemm_left_start(
+        &mut schedule.allocations[allocation_base..],
+        &left_tensors,
+        compute_phase,
+    );
     Ok(AppendedBlockedGemm {
         right: plan.right,
         output: plan.output,
@@ -1535,8 +1543,13 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
         .iter()
         .map(|block| block.tensor)
         .collect::<HashSet<_>>();
+    let allocation_base = schedule.allocations.len();
     append_child_schedule(schedule, &mut plan.schedule)?;
-    set_appended_gemm_left_start(schedule, &left_tensors, compute_phase);
+    set_appended_gemm_left_start(
+        &mut schedule.allocations[allocation_base..],
+        &left_tensors,
+        compute_phase,
+    );
     Ok(AppendedBlockedGemm {
         right: plan.right,
         output: plan.output,
@@ -1571,11 +1584,11 @@ fn prepare_appended_gemm_lifetimes(plan: &mut BlockedGemmPlan) {
 }
 
 fn set_appended_gemm_left_start(
-    schedule: &mut Schedule,
+    allocations: &mut [Allocation],
     left_tensors: &HashSet<TensorId>,
     live_from: usize,
 ) {
-    for allocation in &mut schedule.allocations {
+    for allocation in allocations {
         if allocation.kind == AllocationKind::Home && left_tensors.contains(&allocation.tensor) {
             allocation.live_from = live_from;
         }
