@@ -166,7 +166,9 @@ def f143_scales_by_row_block(values: torch.Tensor, block_size: int) -> torch.Ten
 
 
 def project_f143(values: torch.Tensor, scale: torch.Tensor | float) -> torch.Tensor:
-    factor = torch.exp2(torch.as_tensor(-scale, device=values.device, dtype=values.dtype))
+    output_dtype = values.dtype
+    values = values.float()
+    factor = torch.exp2(torch.as_tensor(-scale, device=values.device, dtype=torch.float32))
     magnitude = values.abs() * factor
     subnormal = torch.round(magnitude * 1024.0).clamp(max=8.0) * 2.0**-10
     exponent = torch.floor(torch.log2(magnitude.clamp_min(torch.finfo(torch.float32).tiny)))
@@ -177,7 +179,7 @@ def project_f143(values: torch.Tensor, scale: torch.Tensor | float) -> torch.Ten
     mantissa = torch.where(carry, torch.zeros_like(mantissa), mantissa)
     normal = (1.0 + mantissa / 8.0) * torch.exp2(exponent)
     projected = torch.where(magnitude < 2.0**-7, subnormal, normal).clamp(max=240.0)
-    return torch.copysign(projected / factor, values)
+    return torch.copysign(projected / factor, values).to(output_dtype)
 
 
 def inverse_hessian_factor(hessian: torch.Tensor, damp: float) -> torch.Tensor:
