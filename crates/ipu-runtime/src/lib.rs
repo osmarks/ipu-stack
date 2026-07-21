@@ -1958,11 +1958,20 @@ fn package_graph_impl(
     }
     #[derive(Clone, Copy)]
     enum TemplateDataObject {
-        RecordPrimary { template: usize },
-        RecordSecondary { template: usize },
-        PatchPrimary { template: usize, instance: usize },
-        PatchSecondary { template: usize, instance: usize },
-        Shared { template: usize },
+        RecordPrimary {
+            template: usize,
+        },
+        RecordSecondary {
+            template: usize,
+        },
+        Patch {
+            template: usize,
+            instance: usize,
+            part: usize,
+        },
+        Shared {
+            template: usize,
+        },
     }
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
@@ -1985,19 +1994,21 @@ fn package_graph_impl(
                 .into_iter()
                 .chain(plan.patches.iter().enumerate().skip(1).flat_map(
                     move |(instance, patch)| {
-                        [
-                            (
-                                TemplateDataObject::PatchPrimary { template, instance },
-                                static_codegen::template_patch_storage_words_range(0..split, patch),
-                            ),
-                            (
-                                TemplateDataObject::PatchSecondary { template, instance },
-                                static_codegen::template_patch_storage_words_range(
-                                    split..record_words,
-                                    patch,
-                                ),
-                            ),
-                        ]
+                        static_codegen::template_patch_ranges(record_words, split)
+                            .into_iter()
+                            .enumerate()
+                            .map(move |(part, slots)| {
+                                (
+                                    TemplateDataObject::Patch {
+                                        template,
+                                        instance,
+                                        part,
+                                    },
+                                    static_codegen::template_patch_storage_words_range(
+                                        slots, patch,
+                                    ),
+                                )
+                            })
                     },
                 ))
             })
@@ -2015,12 +2026,12 @@ fn package_graph_impl(
                     TemplateDataObject::RecordSecondary { template } => plans.templates[template]
                         .record_secondary_addresses
                         .fill(ipu_package::TILE_MEMORY_BASE),
-                    TemplateDataObject::PatchPrimary { template, instance } => {
-                        plans.templates[template].patch_primary_addresses[instance] =
-                            ipu_package::TILE_MEMORY_BASE
-                    }
-                    TemplateDataObject::PatchSecondary { template, instance } => {
-                        plans.templates[template].patch_secondary_addresses[instance] =
+                    TemplateDataObject::Patch {
+                        template,
+                        instance,
+                        part,
+                    } => {
+                        plans.templates[template].patch_addresses[instance][part] =
                             ipu_package::TILE_MEMORY_BASE
                     }
                     TemplateDataObject::Shared { template } => {
@@ -2053,12 +2064,11 @@ fn package_graph_impl(
                 TemplateDataObject::RecordSecondary { template } => plans.templates[template]
                     .record_secondary_addresses
                     .fill(address),
-                TemplateDataObject::PatchPrimary { template, instance } => {
-                    plans.templates[template].patch_primary_addresses[instance] = address
-                }
-                TemplateDataObject::PatchSecondary { template, instance } => {
-                    plans.templates[template].patch_secondary_addresses[instance] = address
-                }
+                TemplateDataObject::Patch {
+                    template,
+                    instance,
+                    part,
+                } => plans.templates[template].patch_addresses[instance][part] = address,
                 TemplateDataObject::Shared { template } => {
                     plans.templates[template].shared_address = address
                 }
@@ -2297,11 +2307,12 @@ fn package_graph_impl(
                         .skip(1)
                         .filter(|patch| !patch.is_empty())
                         .map(|patch| {
-                            static_codegen::template_patch_storage_words_range(0..split, patch)
-                                + static_codegen::template_patch_storage_words_range(
-                                    split..record_words,
-                                    patch,
-                                )
+                            static_codegen::template_patch_ranges(record_words, split)
+                                .into_iter()
+                                .map(|slots| {
+                                    static_codegen::template_patch_storage_words_range(slots, patch)
+                                })
+                                .sum::<usize>()
                         })
                         .sum::<usize>()
                         * 4;
@@ -2592,13 +2603,12 @@ fn package_graph_impl(
                 if patch.is_empty() {
                     continue;
                 }
-                for (slots, address) in [
-                    (0..split, template.patch_primary_addresses[instance]),
-                    (
-                        split..first_record.len(),
-                        template.patch_secondary_addresses[instance],
-                    ),
-                ] {
+                for (part, slots) in
+                    static_codegen::template_patch_ranges(first_record.len(), split)
+                        .into_iter()
+                        .enumerate()
+                {
+                    let address = template.patch_addresses[instance][part];
                     if static_codegen::template_patch_storage_words_range(slots.clone(), patch) == 0
                     {
                         continue;
@@ -2610,7 +2620,11 @@ fn package_graph_impl(
                     let span = static_codegen::template_patch_group_span(slots.clone(), patch)
                         .ok_or("nonempty static template patch has no group span")?;
                     let group_count = span.len().div_ceil(32);
-                    words.push(u32::try_from(span.start)? | (u32::try_from(group_count)? << 16));
+                    let segment_start = if slots.start < split { 0 } else { split };
+                    words.push(
+                        u32::try_from(slots.start - segment_start + span.start)?
+                            | (u32::try_from(group_count)? << 16),
+                    );
                     for local_base in span.step_by(32) {
                         let slot_base = slots.start + local_base;
                         let slot_limit = (slot_base + 32).min(slots.end);
