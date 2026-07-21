@@ -676,7 +676,7 @@ fn allocation_command_name(command: &ipu_compiler::KernelCommand) -> String {
         .metadata
         .get("label")
         .cloned()
-        .unwrap_or_else(|| command.specialization.operation.clone());
+        .unwrap_or_else(|| command.specialization.operation.to_string());
     if command.specialization.operation.starts_with("gemm_")
         && let (Some(row), Some(column)) = (
             command.metadata.get("output_block_row"),
@@ -712,7 +712,7 @@ fn allocation_profile_name(
             .metadata
             .get("label")
             .cloned()
-            .unwrap_or_else(|| command.specialization.operation.clone());
+            .unwrap_or_else(|| command.specialization.operation.to_string());
         return format!("input to {label}");
     }
     match allocation.kind {
@@ -759,7 +759,7 @@ fn compute_profile_step(
     let kernel = command.specialization.operation.clone();
     let operation = command.metadata.get("label").cloned().unwrap_or_else(|| {
         if command.specialization.role.is_empty() {
-            kernel.clone()
+            kernel.to_string()
         } else {
             format!("{} ({})", kernel, command.specialization.role)
         }
@@ -808,7 +808,7 @@ fn compute_profile_step(
         epoch: 0,
         operation,
         kind: ipu_package::ProfileStepKind::Compute,
-        kernel,
+        kernel: kernel.to_string(),
         metadata,
     }
 }
@@ -1029,7 +1029,7 @@ fn phase_compute_profile_step(
                 .metadata
                 .get("label")
                 .cloned()
-                .unwrap_or_else(|| kernel.clone());
+                .unwrap_or_else(|| kernel.to_string());
             let mut metadata = vec![
                 profile_metadata("role", &command.specialization.role),
                 profile_metadata(
@@ -1058,7 +1058,7 @@ fn phase_compute_profile_step(
                 epoch: 0,
                 operation,
                 kind: ipu_package::ProfileStepKind::Compute,
-                kernel,
+                kernel: kernel.to_string(),
                 metadata,
             }
         }

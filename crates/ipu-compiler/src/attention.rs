@@ -395,7 +395,7 @@ pub fn append_flash_attention_to_a16_row_shards(
                     operation: "attention_unpack_head_f16".into(),
                     shape: vec![usize::from(rows), usize::from(plan.head_dimension)],
                     worker_count: 6,
-                    role: format!("head-{}-rows-{row_start}", task.head),
+                    role: format!("head-{}-rows-{row_start}", task.head).into(),
                     alignment: 8,
                 },
                 metadata: BTreeMap::from([
@@ -437,7 +437,7 @@ fn append_attention_pack_phase(
                       head: u16,
                       destination_tile: u16,
                       output: TensorId,
-                      operation: &str|
+                      operation: &'static str|
      -> Result<(), CompileError> {
         let source_panel = head * plan.head_dimension / 16;
         let source_offset = head * plan.head_dimension % 16;
@@ -495,7 +495,7 @@ fn append_attention_pack_phase(
                 operation: operation.into(),
                 shape: vec![usize::from(shard.rows), usize::from(plan.head_dimension)],
                 worker_count: 6,
-                role: format!("head-{head}-rows-{}", shard.row_start),
+                role: format!("head-{head}-rows-{}", shard.row_start).into(),
                 alignment: 8,
             },
             metadata: BTreeMap::from([
@@ -921,7 +921,7 @@ pub fn plan_flash_attention(
                 inputs: vec![task.query, block.key_tensor],
                 arguments: Vec::new(),
                 specialization: SpecializationKey {
-                    operation: format!("attention_qk_init_{}_rows", query_size),
+                    operation: format!("attention_qk_init_{}_rows", query_size).into(),
                     shape: vec![
                         usize::from(task.query_rows),
                         usize::from(padded_head_dimension),
@@ -936,7 +936,8 @@ pub fn plan_flash_attention(
                         task.query_row_start + task.query_rows,
                         block.key_row_start,
                         block.key_row_start + block.key_rows
-                    ),
+                    )
+                    .into(),
                     alignment: 8,
                 },
                 metadata: BTreeMap::from([
@@ -953,7 +954,8 @@ pub fn plan_flash_attention(
                 inputs: vec![task.scores, task.scores],
                 arguments: Vec::new(),
                 specialization: SpecializationKey {
-                    operation: format!("attention_softmax_{query_size}_query_{key_size}_key_f16"),
+                    operation: format!("attention_softmax_{query_size}_query_{key_size}_key_f16")
+                        .into(),
                     shape: vec![usize::from(task.query_rows), usize::from(block.key_rows)],
                     worker_count: 6,
                     role: format!(
@@ -964,7 +966,8 @@ pub fn plan_flash_attention(
                         task.query_row_start + task.query_rows,
                         block.key_row_start,
                         block.key_row_start + block.key_rows
-                    ),
+                    )
+                    .into(),
                     alignment: 8,
                 },
                 metadata: task_metadata(
@@ -973,7 +976,8 @@ pub fn plan_flash_attention(
                     config,
                     head_dimension,
                     "FlashAttention block softmax",
-                ),
+                )
+                .into(),
             });
             pv_commands.push(KernelCommand {
                 tile: task.tile,
@@ -981,14 +985,14 @@ pub fn plan_flash_attention(
                 inputs: vec![task.weights, block.value_tensor],
                 arguments: Vec::new(),
                 specialization: SpecializationKey {
-                    operation: format!("attention_pv_init_{}_rows", query_size),
+                    operation: format!("attention_pv_init_{}_rows", query_size).into(),
                     shape: vec![
                         usize::from(task.query_rows),
                         usize::from(key_block_columns),
                         usize::from(padded_head_dimension),
                     ],
                     worker_count: 6,
-                    role: format!("attention-pv-batch-{}-head-{}", task.batch, task.head),
+                    role: format!("attention-pv-batch-{}-head-{}", task.batch, task.head).into(),
                     alignment: 8,
                 },
                 metadata: task_metadata(
@@ -1005,10 +1009,11 @@ pub fn plan_flash_attention(
                 inputs: vec![task.scores, task.weights],
                 arguments: Vec::new(),
                 specialization: SpecializationKey {
-                    operation: format!("attention_merge_{query_size}_query_{merge_role}_block_f16"),
+                    operation: format!("attention_merge_{query_size}_query_{merge_role}_block_f16")
+                        .into(),
                     shape: vec![usize::from(task.query_rows), usize::from(head_dimension)],
                     worker_count: 6,
-                    role: format!("attention-merge-batch-{}-head-{}", task.batch, task.head),
+                    role: format!("attention-merge-batch-{}-head-{}", task.batch, task.head).into(),
                     alignment: 8,
                 },
                 metadata: task_metadata(
@@ -1017,7 +1022,8 @@ pub fn plan_flash_attention(
                     config,
                     head_dimension,
                     "FlashAttention FP32 block merge",
-                ),
+                )
+                .into(),
             });
         }
         phases.push(Phase::Exchange { transfers });
@@ -1056,7 +1062,8 @@ pub fn plan_flash_attention(
                     task.head,
                     task.query_row_start,
                     task.query_row_start + task.query_rows
-                ),
+                )
+                .into(),
                 alignment: 8,
             },
             metadata: BTreeMap::from([

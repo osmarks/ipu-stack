@@ -581,7 +581,7 @@ fn plan_template_compute_step(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(StaticTemplateStep::Compute {
-        operation: first.specialization.operation.clone(),
+        operation: first.specialization.operation.to_string(),
         operands,
         kernel,
         condition,

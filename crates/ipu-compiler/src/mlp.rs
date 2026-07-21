@@ -387,7 +387,7 @@ fn append_activation_transition(
                 .into(),
                 shape: vec![usize::from(source.rows), usize::from(source.columns)],
                 worker_count: 6,
-                role: format!("layer-{layer}"),
+                role: format!("layer-{layer}").into(),
                 alignment: 8,
             },
             metadata: BTreeMap::from([

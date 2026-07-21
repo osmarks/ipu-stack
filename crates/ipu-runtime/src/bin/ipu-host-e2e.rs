@@ -372,7 +372,7 @@ fn home(tensor: TensorId, tile: u16, address: u32, size: u32) -> Allocation {
     }
 }
 
-fn add_u32(tile: u16, output: TensorId, input: TensorId, role: &str) -> KernelCommand {
+fn add_u32(tile: u16, output: TensorId, input: TensorId, role: &'static str) -> KernelCommand {
     KernelCommand {
         tile,
         output,

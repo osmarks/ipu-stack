@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
@@ -340,10 +341,10 @@ pub struct Layout {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SpecializationKey {
-    pub operation: String,
+    pub operation: Cow<'static, str>,
     pub shape: Vec<usize>,
     pub worker_count: u8,
-    pub role: String,
+    pub role: Cow<'static, str>,
     pub alignment: u32,
 }
 
@@ -887,10 +888,20 @@ impl GemmDataType {
         }
     }
 
-    const fn kernel_name(self) -> &'static str {
-        match self {
-            Self::F16 | Self::F16F8Weights { .. } => "gemm_f16",
-            Self::F32 => "gemm_f32",
+    const fn kernel_operation(self, initialize: bool, small_rows: bool) -> &'static str {
+        match (self, initialize, small_rows) {
+            (Self::F16 | Self::F16F8Weights { .. }, true, true) => "gemm_f16_init_small_rows",
+            (Self::F16 | Self::F16F8Weights { .. }, true, false) => "gemm_f16_init_large_rows",
+            (Self::F16 | Self::F16F8Weights { .. }, false, true) => {
+                "gemm_f16_accumulate_small_rows"
+            }
+            (Self::F16 | Self::F16F8Weights { .. }, false, false) => {
+                "gemm_f16_accumulate_large_rows"
+            }
+            (Self::F32, true, true) => "gemm_f32_init_small_rows",
+            (Self::F32, true, false) => "gemm_f32_init_large_rows",
+            (Self::F32, false, true) => "gemm_f32_accumulate_small_rows",
+            (Self::F32, false, false) => "gemm_f32_accumulate_large_rows",
         }
     }
 }
@@ -2207,7 +2218,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                                 usize::from(config.block_dimension),
                             ],
                             worker_count: 6,
-                            role: format!("inner-block-{inner_block}"),
+                            role: "weight-expansion".into(),
                             alignment: 4,
                         },
                         metadata: BTreeMap::from([
@@ -2248,27 +2259,17 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     inputs: vec![left_tensor, right_tensor],
                     arguments: Vec::new(),
                     specialization: SpecializationKey {
-                        operation: format!(
-                            "{}_{}_{}",
-                            config.data_type.kernel_name(),
-                            if inner_block == 0 {
-                                "init"
-                            } else {
-                                "accumulate"
-                            },
-                            if output_block.rows == base_rows {
-                                "small_rows"
-                            } else {
-                                "large_rows"
-                            }
-                        ),
+                        operation: config
+                            .data_type
+                            .kernel_operation(inner_block == 0, output_block.rows == base_rows)
+                            .into(),
                         shape: vec![
                             usize::from(output_block.rows),
                             usize::from(config.inner_block_dimension),
                             usize::from(config.block_dimension),
                         ],
                         worker_count: 6,
-                        role: format!("inner-block-{inner_block}"),
+                        role: "blocked-gemm".into(),
                         alignment: 32,
                     },
                     metadata: BTreeMap::from([
@@ -2389,7 +2390,8 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     role: format!(
                         "output-wave-{wave}-rows-{row_offset}..{}",
                         row_offset + rows
-                    ),
+                    )
+                    .into(),
                     alignment: 8,
                 },
                 metadata: BTreeMap::from([
@@ -2536,7 +2538,7 @@ impl Schedule {
             };
             for command in commands {
                 command.specialization.shape = Vec::new();
-                command.specialization.role = String::new();
+                command.specialization.role = Cow::Borrowed("");
                 command.metadata = BTreeMap::new();
             }
         }
@@ -4064,7 +4066,7 @@ mod tests {
                     .all(|transfer| transfer.bytes <= ipu_exchange::MAX_TRANSFER_WORDS * 4),
                 Phase::Compute { commands, .. } => commands.iter().all(|command| {
                     let units = u32::try_from(command.specialization.shape[0]).unwrap();
-                    let operation = command.specialization.operation.as_str();
+                    let operation = command.specialization.operation.as_ref();
                     let valid_arguments = if operation.starts_with("gemm_f32_") {
                         command.arguments.is_empty()
                     } else {
