@@ -1715,6 +1715,30 @@ fn package_graph_impl(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
+    // Support code is linked after static-data relocation, but it still needs at
+    // least one complete instruction element. Reserve that element before data
+    // packing so metadata cannot consume the final executable region.
+    let support_reservations = programs
+        .iter()
+        .zip(&tile_exchange_plans)
+        .zip(&program_reservations)
+        .map(
+            |((program, plans), &program_reservation)| -> Result<(u32, u32)> {
+                let base = executable_region_base_for_tile(
+                    &allocation_ranges_by_tile[usize::from(program.tile)],
+                    Some(program.tile),
+                    plans.end,
+                    ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+                    &[program_reservation],
+                )?;
+                Ok((
+                    base,
+                    base.checked_add(ipu_package::TILE_MEMORY_ELEMENT_SIZE)
+                        .ok_or("support image reservation overflow")?,
+                ))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
     let mut host_runtime_ranges = Vec::with_capacity(tile_host_plans.len());
     let mut worker_sync_addresses = Vec::with_capacity(tile_host_plans.len());
     let mut completion_addresses = Vec::with_capacity(tile_host_plans.len());
@@ -1731,7 +1755,10 @@ fn package_graph_impl(
             tile_exchange_plans[tile_index].end,
             &plans.ordinary_objects,
             false,
-            &[program_reservations[tile_index]],
+            &[
+                program_reservations[tile_index],
+                support_reservations[tile_index],
+            ],
         )?;
         let (data_relocations, data_ranges) = pack_data_objects_for_tile(
             &allocation_ranges_by_tile[usize::from(tile)],
@@ -1743,6 +1770,7 @@ fn package_graph_impl(
                 .iter()
                 .copied()
                 .chain(std::iter::once(program_reservations[tile_index]))
+                .chain(std::iter::once(support_reservations[tile_index]))
                 .collect::<Vec<_>>(),
         )?;
         relocations.extend(data_relocations);
@@ -1931,6 +1959,7 @@ fn package_graph_impl(
                     .copied()
                     .chain(template_record_ranges[tile_index].iter().copied())
                     .chain(std::iter::once(program_reservations[tile_index]))
+                    .chain(std::iter::once(support_reservations[tile_index]))
                     .collect::<Vec<_>>(),
             )?;
             let end = address
@@ -2015,6 +2044,17 @@ fn package_graph_impl(
                 .clone())
         })
         .collect::<Result<Vec<_>>>()?;
+    if let Some(image) = preliminary_images
+        .iter()
+        .find(|image| image.bytes.len() > ipu_package::TILE_MEMORY_ELEMENT_SIZE as usize)
+    {
+        return Err(format!(
+            "support image uses {} bytes and exceeds its {}-byte executable reservation",
+            image.bytes.len(),
+            ipu_package::TILE_MEMORY_ELEMENT_SIZE
+        )
+        .into());
+    }
     let emit_program =
         |program_index: usize, symbols: &BTreeMap<String, u32>, generated_base: u32| {
             let program = &programs[program_index];
