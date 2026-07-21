@@ -57,6 +57,7 @@ struct StaticHostTransfer {
 }
 
 struct StaticHostLayout {
+    weights: Vec<StaticHostTransfer>,
     inputs: Vec<StaticHostTransfer>,
     outputs: Vec<StaticHostTransfer>,
     staging_address: u32,
@@ -416,6 +417,7 @@ pub struct ExecutableGraph {
     pub schedule: Schedule,
     pub initial_buffers: Vec<InitialBuffer>,
     pub outputs: Vec<Binding>,
+    pub host_weights: Vec<Binding>,
     pub host_inputs: Vec<Binding>,
     pub host_outputs: Vec<Binding>,
 }
@@ -623,8 +625,9 @@ pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile
     let topology = Topology::c600();
     let mut binding_intervals = vec![Vec::<(u32, u32, &str)>::new(); topology.tile_count()];
     for binding in graph
-        .host_inputs
+        .host_weights
         .iter()
+        .chain(&graph.host_inputs)
         .chain(&graph.host_outputs)
         .chain(&graph.outputs)
     {
@@ -1608,8 +1611,9 @@ fn package_graph_impl(
     );
     let host = build_static_host_layout(graph)?;
     let host_transfers = host
-        .inputs
+        .weights
         .iter()
+        .chain(&host.inputs)
         .chain(&host.outputs)
         .copied()
         .collect::<Vec<_>>();
@@ -1700,9 +1704,12 @@ fn package_graph_impl(
                 }
             }
             let mut run_tables = vec![None; host_transfers.len()];
+            let weight_end = host.weights.len();
+            let input_end = weight_end + host.inputs.len();
             for range in [
-                0..host.inputs.len(),
-                host.inputs.len()..host_transfers.len(),
+                0..weight_end,
+                weight_end..input_end,
+                input_end..host_transfers.len(),
             ] {
                 let mut index = range.start;
                 while index < range.end {
@@ -1832,32 +1839,11 @@ fn package_graph_impl(
             }
             let plans = &tile_host_plans[program_index];
             let physical = topology.physical(program.tile)?;
-            let host_inputs = plans.addresses[..host.inputs.len()]
-                .iter()
-                .copied()
-                .zip(&plans.run_tables[..host.inputs.len()])
-                .zip(&host.inputs)
-                .map(
-                    |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
-                        address,
-                        active: host_phase_is_active(physical, transfer),
-                        run_table,
-                    },
-                )
-                .collect::<Vec<_>>();
-            let host_outputs = plans.addresses[host.inputs.len()..]
-                .iter()
-                .copied()
-                .zip(&plans.run_tables[host.inputs.len()..])
-                .zip(&host.outputs)
-                .map(
-                    |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
-                        address,
-                        active: host_phase_is_active(physical, transfer),
-                        run_table,
-                    },
-                )
-                .collect::<Vec<_>>();
+            let weight_end = host.weights.len();
+            let input_end = weight_end + host.inputs.len();
+            let host_weights = host_phase_calls(plans, physical, 0, &host.weights);
+            let host_inputs = host_phase_calls(plans, physical, weight_end, &host.inputs);
+            let host_outputs = host_phase_calls(plans, physical, input_end, &host.outputs);
             Ok(u32::try_from(
                 static_codegen::emit(
                     program,
@@ -1866,6 +1852,7 @@ fn package_graph_impl(
                     &tile_exchange_plans[program_index].compute_runs,
                     &tile_exchange_plans[program_index].templates,
                     static_codegen::HostCode {
+                        weights: &host_weights,
                         inputs: &host_inputs,
                         outputs: &host_outputs,
                     },
@@ -2217,32 +2204,11 @@ fn package_graph_impl(
             let program = &programs[program_index];
             let host_plans = &tile_host_plans[program_index];
             let physical = topology.physical(program.tile)?;
-            let host_inputs = host_plans.addresses[..host.inputs.len()]
-                .iter()
-                .copied()
-                .zip(&host_plans.run_tables[..host.inputs.len()])
-                .zip(&host.inputs)
-                .map(
-                    |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
-                        address,
-                        active: host_phase_is_active(physical, transfer),
-                        run_table,
-                    },
-                )
-                .collect::<Vec<_>>();
-            let host_outputs = host_plans.addresses[host.inputs.len()..]
-                .iter()
-                .copied()
-                .zip(&host_plans.run_tables[host.inputs.len()..])
-                .zip(&host.outputs)
-                .map(
-                    |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
-                        address,
-                        active: host_phase_is_active(physical, transfer),
-                        run_table,
-                    },
-                )
-                .collect::<Vec<_>>();
+            let weight_end = host.weights.len();
+            let input_end = weight_end + host.inputs.len();
+            let host_weights = host_phase_calls(host_plans, physical, 0, &host.weights);
+            let host_inputs = host_phase_calls(host_plans, physical, weight_end, &host.inputs);
+            let host_outputs = host_phase_calls(host_plans, physical, input_end, &host.outputs);
             static_codegen::emit(
                 program,
                 symbols,
@@ -2250,6 +2216,7 @@ fn package_graph_impl(
                 &tile_exchange_plans[program_index].compute_runs,
                 &tile_exchange_plans[program_index].templates,
                 static_codegen::HostCode {
+                    weights: &host_weights,
                     inputs: &host_inputs,
                     outputs: &host_outputs,
                 },
@@ -2758,6 +2725,7 @@ fn package_graph_impl(
     }
     app.tiles.sort_by_key(|tile| tile.physical_tile);
     app.inputs = graph.host_inputs.clone();
+    app.weights = graph.host_weights.clone();
     app.outputs = graph.outputs.clone();
     app.outputs.extend(graph.host_outputs.clone());
     app.outputs.push(Binding {
@@ -2813,8 +2781,12 @@ fn package_graph_impl(
 }
 
 fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout> {
-    if graph.host_inputs.is_empty() && graph.host_outputs.is_empty() {
+    if graph.host_weights.is_empty()
+        && graph.host_inputs.is_empty()
+        && graph.host_outputs.is_empty()
+    {
         return Ok(StaticHostLayout {
+            weights: Vec::new(),
             inputs: Vec::new(),
             outputs: Vec::new(),
             staging_address: 0,
@@ -2822,11 +2794,20 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
         });
     }
 
+    let mut weight_file_cursor = 0u64;
     let mut input_file_cursor = 0u64;
     let mut output_file_cursor = 0u64;
+    let mut weights = Vec::new();
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
     let mut calls = Vec::new();
+    append_host_bindings(
+        &graph.host_weights,
+        HostDirection::ToTile,
+        &mut weight_file_cursor,
+        &mut weights,
+        &mut calls,
+    )?;
     append_host_bindings(
         &graph.host_inputs,
         HostDirection::ToTile,
@@ -2843,8 +2824,9 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
     )?;
     let host_to_tile_limit =
         ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES;
-    let staging_bytes = inputs
+    let staging_bytes = weights
         .iter()
+        .chain(&inputs)
         .filter(|transfer| {
             transfer
                 .tile_address
@@ -2854,8 +2836,9 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
         .map(|transfer| transfer.bytes)
         .max()
         .unwrap_or(0);
-    let staging_tiles = inputs
+    let staging_tiles = weights
         .iter()
+        .chain(&inputs)
         .filter(|transfer| {
             transfer
                 .tile_address
@@ -2871,7 +2854,7 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
             allocate_low_runtime_range(&graph.schedule, staging_bytes, &staging_tiles, &[])?;
         Some((address, address + staging_bytes))
     };
-    for transfer in &mut inputs {
+    for transfer in weights.iter_mut().chain(&mut inputs) {
         if transfer
             .tile_address
             .checked_add(transfer.bytes)
@@ -2888,26 +2871,45 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
             transfer.bytes,
         )?;
     }
-    let call_inputs = calls
+    let weight_transfer_count = weights.len();
+    let input_transfer_count = inputs.len();
+    let weight_inputs = calls[..weight_transfer_count]
         .iter()
         .flat_map(|call| call.inputs.iter().cloned())
         .collect();
-    let call_outputs = calls
+    let call_inputs = calls[weight_transfer_count..weight_transfer_count + input_transfer_count]
+        .iter()
+        .flat_map(|call| call.inputs.iter().cloned())
+        .collect();
+    let call_outputs = calls[weight_transfer_count + input_transfer_count..]
         .iter()
         .flat_map(|call| call.outputs.iter().cloned())
         .collect();
-    let phases = host_transfer_phase_count(u32::try_from(inputs.len() + outputs.len())?)?;
-    calls = vec![HostCall {
+    let graph_phases = host_transfer_phase_count(u32::try_from(inputs.len() + outputs.len())?)?;
+    calls = Vec::new();
+    if !weights.is_empty() {
+        calls.push(HostCall {
+            name: "initialize".into(),
+            command: 0,
+            phases: u32::try_from(weights.len())?
+                .checked_mul(2)
+                .ok_or("host initialization phase count overflow")?,
+            inputs: weight_inputs,
+            outputs: Vec::new(),
+        });
+    }
+    calls.push(HostCall {
         name: "graph".into(),
         command: 0,
-        phases,
+        phases: graph_phases,
         inputs: call_inputs,
         outputs: call_outputs,
-    }];
+    });
 
     let command_page = 0;
     let data_page = 1;
     Ok(StaticHostLayout {
+        weights,
         inputs,
         outputs,
         staging_address: staging_range.map_or(0, |range| range.0),
@@ -3071,6 +3073,27 @@ fn host_phase_is_active(physical_tile: u16, transfer: &StaticHostTransfer) -> bo
     ipu_exchange::host_hierarchy(transfer.physical_tile).is_ok_and(|hierarchy| {
         physical_tile == transfer.physical_tile || physical_tile == hierarchy.xreq_physical_tile
     })
+}
+
+fn host_phase_calls(
+    plans: &TileHostPlans,
+    physical_tile: u16,
+    offset: usize,
+    transfers: &[StaticHostTransfer],
+) -> Vec<static_codegen::HostPhaseCall> {
+    plans.addresses[offset..offset + transfers.len()]
+        .iter()
+        .copied()
+        .zip(&plans.run_tables[offset..offset + transfers.len()])
+        .zip(transfers)
+        .map(
+            |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
+                address,
+                active: host_phase_is_active(physical_tile, transfer),
+                run_table,
+            },
+        )
+        .collect()
 }
 
 fn host_phase_instructions(
@@ -3394,12 +3417,41 @@ fn run_host_impl(
         .map(|slice| slice.file_offset + slice.size)
         .max()
         .unwrap_or(0);
-    if calls.len() != 1 {
-        return Err("the static host runtime requires exactly one generated call".into());
+    let invocation_input_bytes = bindings_size(&app.inputs)?;
+    let resident_input_bytes = bindings_size(&app.weights)?;
+    let expected_input_bytes = invocation_input_bytes
+        .checked_add(resident_input_bytes)
+        .ok_or("host input size overflow")?;
+    if input.len() != usize::try_from(expected_input_bytes)? {
+        return Err(format!(
+            "application expects {expected_input_bytes} input bytes ({} invocation, {} resident), got {}",
+            invocation_input_bytes,
+            resident_input_bytes,
+            input.len()
+        )
+        .into());
     }
-    let call = &calls[0];
+    let (invocation_input, resident_input) =
+        input.split_at(usize::try_from(invocation_input_bytes)?);
+    for call in &calls[..calls.len() - 1] {
+        let call_bytes = match call.name.as_str() {
+            "initialize" => resident_input,
+            "graph" => invocation_input,
+            name => return Err(format!("unsupported generated host call {name}").into()),
+        };
+        let completed = session
+            .invoke_streaming_deferred(&call.name, call_input(call, call_bytes)?)
+            .map_err(|error| generated_call_error(&device, app, call, error))?;
+        session.collect(&completed)?;
+    }
+    let call = calls.last().unwrap();
+    let final_input = match call.name.as_str() {
+        "initialize" => resident_input,
+        "graph" => invocation_input,
+        name => return Err(format!("unsupported generated host call {name}").into()),
+    };
     let deferred = session
-        .invoke_streaming_deferred(&call.name, call_input(call, input)?)
+        .invoke_streaming_deferred(&call.name, call_input(call, final_input)?)
         .map_err(|error| {
             format!(
                 "generated host call {}: {error}; supervisor states: {}; device outputs: {}",
@@ -3424,6 +3476,21 @@ fn run_host_impl(
         inspector(&device, &output)?;
     }
     Ok(output)
+}
+
+fn generated_call_error(
+    device: &Device,
+    app: &Application,
+    call: &HostCall,
+    error: DriverError,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    format!(
+        "generated host call {}: {error}; supervisor states: {}; device outputs: {}",
+        call.name,
+        supervisor_state_summary(device, app),
+        host_source_summary(device, app)
+    )
+    .into()
 }
 
 fn finish_host_graph(device: &Device, app: &Application) -> Result<()> {
@@ -3493,6 +3560,14 @@ fn call_input<'a>(call: &HostCall, input: &'a [u8]) -> Result<&'a [u8]> {
     Ok(input
         .get(..usize::try_from(size)?)
         .ok_or("host input is shorter than generated call range")?)
+}
+
+fn bindings_size(bindings: &[Binding]) -> Result<u64> {
+    bindings.iter().try_fold(0u64, |total, binding| {
+        total
+            .checked_add(binding_size(binding)?)
+            .ok_or_else(|| "binding set size overflow".into())
+    })
 }
 
 fn host_source_summary(device: &Device, app: &Application) -> String {
@@ -3765,6 +3840,7 @@ mod tests {
         let runtime_end = PLAN_BASE + element / 2;
         let allocation_address = align_up(runtime_end, element) + element;
         let graph = ExecutableGraph {
+            host_weights: Vec::new(),
             schedule: Schedule {
                 layouts: Vec::new(),
                 phases: Vec::new(),
@@ -4025,6 +4101,7 @@ mod tests {
     #[test]
     fn allocator_profile_covers_every_tile_and_labels_bindings() {
         let graph = ExecutableGraph {
+            host_weights: Vec::new(),
             schedule: ipu_compiler::Schedule {
                 layouts: Vec::new(),
                 phases: Vec::new(),

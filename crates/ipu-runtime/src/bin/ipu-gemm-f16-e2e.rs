@@ -109,6 +109,7 @@ fn main() {
         })
         .collect::<Vec<_>>();
     let graph = ExecutableGraph {
+        host_weights: Vec::new(),
         schedule: plan.schedule,
         initial_buffers: Vec::new(),
         outputs: Vec::new(),

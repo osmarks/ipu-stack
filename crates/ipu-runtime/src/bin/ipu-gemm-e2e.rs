@@ -255,6 +255,7 @@ fn gemm_graph_and_input(dimension: u16, plan: BlockedGemmPlan) -> (ExecutableGra
     ));
     (
         ExecutableGraph {
+            host_weights: Vec::new(),
             schedule: plan.schedule,
             initial_buffers: Vec::new(),
             outputs: Vec::new(),

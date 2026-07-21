@@ -103,6 +103,7 @@ fn run_case(case: Case<'_>) {
     let mut input = query_bytes;
     input.extend(key_value_bytes);
     let graph = ExecutableGraph {
+        host_weights: Vec::new(),
         schedule: plan.schedule.clone(),
         initial_buffers: Vec::new(),
         outputs: Vec::new(),

@@ -277,8 +277,11 @@ fn main() {
     let objects = compile_objects(&plan, &attentions, attention_variant).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
-        bytes: host_input,
+        bytes: mut host_input,
+        resident_bindings: host_weights,
+        resident_bytes: host_weight_bytes,
     } = host;
+    host_input.extend(host_weight_bytes);
     let mut host_outputs = Vec::new();
     if detailed_diagnostics {
         host_outputs.push(row_shard_binding("layer_norm2", rows, columns, &norm2));
@@ -308,6 +311,7 @@ fn main() {
         &output,
     ));
     let graph = ExecutableGraph {
+        host_weights,
         schedule: plan.schedule,
         initial_buffers: Vec::new(),
         outputs: Vec::new(),
@@ -554,9 +558,13 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
     let objects = compile_objects(&compilation_plan, &[attention], attention_variant).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
-        bytes: host_input,
+        bytes: mut host_input,
+        resident_bindings: host_weights,
+        resident_bytes: host_weight_bytes,
     } = host;
+    host_input.extend(host_weight_bytes);
     let graph = ExecutableGraph {
+        host_weights,
         schedule,
         initial_buffers: Vec::new(),
         outputs: Vec::new(),

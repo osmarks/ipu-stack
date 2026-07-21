@@ -216,6 +216,7 @@ fn randomized_case(seed: u64, case: usize) -> (ExecutableGraph, BTreeMap<String,
 
     (
         ExecutableGraph {
+            host_weights: Vec::new(),
             schedule: Schedule {
                 layouts: Vec::new(),
                 phases: vec![

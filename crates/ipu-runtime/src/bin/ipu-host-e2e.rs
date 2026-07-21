@@ -146,6 +146,9 @@ fn main() {
     if let Some(address) = host_test_address() {
         relocate_direct_host_graph(&mut graph, address);
     }
+    if std::env::var_os("IPU_HOST_TEST_RESIDENT_INPUT").is_some() {
+        graph.host_weights.append(&mut graph.host_inputs);
+    }
     if exchange
         && (std::env::var_os("IPU_STACK_TRAP_AFTER_RECEIVE").is_some()
             || std::env::var_os("IPU_STACK_TRACE_MILESTONES").is_some())
@@ -314,6 +317,7 @@ fn host_compute_relay_graph() -> Result<ExecutableGraph, ipu_compiler::CompileEr
     ));
 
     Ok(ExecutableGraph {
+        host_weights: Vec::new(),
         schedule: Schedule {
             layouts: Vec::new(),
             phases: vec![
@@ -449,6 +453,7 @@ fn d2h_only_graph(
         .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
         .collect::<Vec<_>>();
     Ok(ExecutableGraph {
+        host_weights: Vec::new(),
         schedule: Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
@@ -540,6 +545,7 @@ fn multi_tile_host_graph(
         slices,
     };
     Ok(ExecutableGraph {
+        host_weights: Vec::new(),
         schedule: Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
@@ -687,6 +693,7 @@ fn host_exchange_graph(
         source_tile
     };
     Ok(ExecutableGraph {
+        host_weights: Vec::new(),
         schedule: Schedule {
             layouts: Vec::new(),
             phases,

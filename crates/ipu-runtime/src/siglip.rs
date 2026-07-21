@@ -25,24 +25,44 @@ use tracing::{info, info_span};
 pub struct HostTensorSet {
     pub bindings: Vec<Binding>,
     pub bytes: Vec<u8>,
+    pub resident_bindings: Vec<Binding>,
+    pub resident_bytes: Vec<u8>,
 }
 
 impl HostTensorSet {
-    pub fn push(&mut self, binding: Binding, bytes: Vec<u8>) -> Result<()> {
-        let binding_bytes = binding.slices.iter().map(|slice| slice.size).sum::<u64>();
-        if binding_bytes != bytes.len() as u64 {
-            return Err(format!(
-                "host tensor {} has {} binding bytes but {} data bytes",
-                binding.name,
-                binding_bytes,
-                bytes.len()
-            )
-            .into());
-        }
-        self.bindings.push(binding);
-        self.bytes.extend(bytes);
-        Ok(())
+    pub fn push_input(&mut self, binding: Binding, bytes: Vec<u8>) -> Result<()> {
+        push_host_tensor(&mut self.bindings, &mut self.bytes, binding, bytes)
     }
+
+    pub fn push(&mut self, binding: Binding, bytes: Vec<u8>) -> Result<()> {
+        push_host_tensor(
+            &mut self.resident_bindings,
+            &mut self.resident_bytes,
+            binding,
+            bytes,
+        )
+    }
+}
+
+fn push_host_tensor(
+    bindings: &mut Vec<Binding>,
+    destination: &mut Vec<u8>,
+    binding: Binding,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    let binding_bytes = binding.slices.iter().map(|slice| slice.size).sum::<u64>();
+    if binding_bytes != bytes.len() as u64 {
+        return Err(format!(
+            "host tensor {} has {} binding bytes but {} data bytes",
+            binding.name,
+            binding_bytes,
+            bytes.len()
+        )
+        .into());
+    }
+    bindings.push(binding);
+    destination.extend(bytes);
+    Ok(())
 }
 
 pub struct SiglipEncoderLayer {
@@ -316,7 +336,7 @@ pub fn append_host_a16_matrix(
             }
         }
     }
-    host.push(row_shard_binding(name, rows, columns, &shards), bytes)?;
+    host.push_input(row_shard_binding(name, rows, columns, &shards), bytes)?;
     Ok(shards)
 }
 

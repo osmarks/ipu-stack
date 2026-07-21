@@ -26,6 +26,7 @@ pub(crate) struct HostPhaseCall {
 }
 
 pub(crate) struct HostCode<'a> {
+    pub weights: &'a [HostPhaseCall],
     pub inputs: &'a [HostPhaseCall],
     pub outputs: &'a [HostPhaseCall],
 }
@@ -852,6 +853,7 @@ pub(crate) fn emit(
     }
     let mut code = TileCode::new();
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
+    emit_host_phases(&mut code, symbols, host.weights)?;
     emit_host_phases(&mut code, symbols, host.inputs)?;
     if program.steps.iter().any(|step| {
         matches!(

@@ -26,6 +26,15 @@ fn local_h2d_and_d2h_round_trip_works() {
 }
 
 #[test]
+fn resident_h2d_then_d2h_works() {
+    let _device = device();
+    require_success(
+        "resident H2D initialization followed by D2H",
+        host_test(&[("IPU_HOST_TEST_RESIDENT_INPUT", "1")]),
+    );
+}
+
+#[test]
 fn initialized_d2d_relay_and_d2h_work() {
     let _device = device();
     require_success(
