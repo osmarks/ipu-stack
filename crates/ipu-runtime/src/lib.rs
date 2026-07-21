@@ -31,7 +31,7 @@ const HOST_DATA_START: u32 = 64;
 const HOST_CLOSE_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x160;
 const HOST_PACKET_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE;
 const HOST_STAGING_SEARCH_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x180;
-const HOST_RUN_DESCRIPTOR_WORDS: u32 = 5;
+const HOST_RUN_DESCRIPTOR_WORDS: u32 = 4;
 const WORKER_STACK_HEADROOM: u32 = 0xe0;
 const WORKER_SYNC_STRIDE: u32 = 0x100;
 const WORKER_SYNC_REGISTERS: u32 = 7;
@@ -55,6 +55,7 @@ struct StaticHostTransfer {
 struct StaticHostLayout {
     inputs: Vec<StaticHostTransfer>,
     outputs: Vec<StaticHostTransfer>,
+    staging_address: u32,
     protocol: HostExchange,
 }
 
@@ -2174,6 +2175,7 @@ fn package_graph_impl(
         let worker_context_offset = symbol_offset("ipu_stack_static_worker_sync_context_base")?;
         let worker_base_offset = symbol_offset("ipu_stack_static_worker_base")?;
         let prng_seed_base_offset = symbol_offset("ipu_stack_static_prng_seed_base")?;
+        let host_staging_offset = symbol_offset("ipu_stack_static_host_staging_address")?;
         let sample_worker_base_offset = (!profile_code.is_empty())
             .then(|| symbol_offset("ipu_stack_static_sample_worker_base"))
             .transpose()?;
@@ -2191,6 +2193,7 @@ fn package_graph_impl(
         patch_setzi_immediate(&mut support_code, worker_base_offset, worker_base)?;
         let prng_seed_base = (physical + 1) << 3;
         patch_setzi_immediate(&mut support_code, prng_seed_base_offset, prng_seed_base)?;
+        patch_setzi_immediate(&mut support_code, host_staging_offset, host.staging_address)?;
         if let Some(offset) = sample_worker_base_offset {
             patch_setzi_immediate(&mut support_code, offset, worker_base)?;
         }
@@ -2383,6 +2386,7 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
         return Ok(StaticHostLayout {
             inputs: Vec::new(),
             outputs: Vec::new(),
+            staging_address: 0,
             protocol: HostExchange::default(),
         });
     }
@@ -2481,6 +2485,7 @@ fn build_static_host_layout(graph: &ExecutableGraph) -> Result<StaticHostLayout>
     Ok(StaticHostLayout {
         inputs,
         outputs,
+        staging_address: staging_range.map_or(0, |range| range.0),
         protocol: HostExchange {
             startup_mark: ipu_driver::HOST_EXCHANGE_HANDOFF_MARK,
             command_page,
@@ -2764,7 +2769,6 @@ fn write_static_host_plans(
             descriptors.extend_from_slice(&[
                 plan_addresses[index],
                 copy.unwrap_or(0),
-                copy.map_or(0, |_| transfer.tile_address),
                 copy_words | packet_destination | (packet.words << 24),
                 packet.source,
             ]);
