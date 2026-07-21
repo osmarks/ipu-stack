@@ -16,6 +16,7 @@ const DEFAULT_INNER_BLOCK_DIMENSION: u16 = 64;
 const GEMM_DATA_BASE: u32 = 0xa0000;
 const DEFAULT_CLOCK_HZ: u64 = 1_500_000_000;
 const FP16_FLOPS_PER_TILE_CYCLE: f64 = 128.0;
+const FP8_FLOPS_PER_TILE_CYCLE: f64 = 256.0;
 
 fn main() {
     ipu_runtime::init_tracing();
@@ -286,8 +287,12 @@ fn main() {
         let graph_seconds = f64::from(graph_cycles) / clock_hz as f64;
         let flops = 2.0 * f64::from(dimension).powi(3);
         let tflops = flops / graph_seconds / 1.0e12;
-        let peak_tflops =
-            clock_hz as f64 * f64::from(TILE_COUNT) * FP16_FLOPS_PER_TILE_CYCLE / 1.0e12;
+        let flops_per_tile_cycle = if native_fp8 {
+            FP8_FLOPS_PER_TILE_CYCLE
+        } else {
+            FP16_FLOPS_PER_TILE_CYCLE
+        };
+        let peak_tflops = clock_hz as f64 * f64::from(TILE_COUNT) * flops_per_tile_cycle / 1.0e12;
         report.write(fs::File::create(path).unwrap()).unwrap();
         info!(
             path = %path.display(),

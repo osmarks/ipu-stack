@@ -16,6 +16,7 @@ use ipu_compiler::{
     append_c16_to_a16_row_shards, append_flash_attention_from_a16_qkv,
     append_flash_attention_to_a16_row_shards, end_tensor_lifetimes, make_tensors_resident,
     make_tensors_resident_since, occupied_intervals_by_tile, set_f8_weight_block_scales_in_phases,
+    set_native_f8_weight_block_scales_in_phases,
 };
 use ipu_models::SiglipWeights;
 use ipu_package::{Binding, RegionSlice};
@@ -221,13 +222,47 @@ pub enum SiglipWeightStorage {
     F143,
 }
 
-impl SiglipWeightStorage {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiglipLinearPrecision {
+    F16,
+    F143Expanded,
+    F143Native { activation_scale: i8 },
+}
+
+impl SiglipLinearPrecision {
     fn gemm_data_type(self, values: impl IntoIterator<Item = f32>) -> GemmDataType {
         match self {
             Self::F16 => GemmDataType::F16,
-            Self::F143 => GemmDataType::F16F8Weights {
+            Self::F143Expanded => GemmDataType::F16F8Weights {
                 scale: f143_scale(values),
             },
+            Self::F143Native { activation_scale } => GemmDataType::F8F143 {
+                input_scale: activation_scale,
+                weight_scale: f143_scale(values),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SiglipEncoderPrecision {
+    pub qkv: SiglipLinearPrecision,
+    pub attention_output: SiglipLinearPrecision,
+    pub mlp_up: SiglipLinearPrecision,
+    pub mlp_down: SiglipLinearPrecision,
+}
+
+impl SiglipEncoderPrecision {
+    pub fn uniform(storage: SiglipWeightStorage) -> Self {
+        let precision = match storage {
+            SiglipWeightStorage::F16 => SiglipLinearPrecision::F16,
+            SiglipWeightStorage::F143 => SiglipLinearPrecision::F143Expanded,
+        };
+        Self {
+            qkv: precision,
+            attention_output: precision,
+            mlp_up: precision,
+            mlp_down: precision,
         }
     }
 }
@@ -657,6 +692,39 @@ pub fn append_siglip_encoder_layer(
     retain_diagnostics: bool,
     host: &mut HostTensorSet,
 ) -> Result<SiglipEncoderLayer> {
+    append_siglip_encoder_layer_with_precision(
+        schedule,
+        input,
+        model,
+        layer,
+        rows,
+        columns,
+        row_block_dimension,
+        tile_count,
+        memory,
+        SiglipEncoderPrecision::uniform(weight_storage),
+        retain_profile_metadata,
+        retain_diagnostics,
+        host,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_siglip_encoder_layer_with_precision(
+    schedule: &mut Schedule,
+    input: &[RowShardPlacement],
+    model: &SiglipWeights,
+    layer: usize,
+    rows: u16,
+    columns: u16,
+    row_block_dimension: u16,
+    tile_count: u16,
+    memory: &MemoryPolicy,
+    precision: SiglipEncoderPrecision,
+    retain_profile_metadata: bool,
+    retain_diagnostics: bool,
+    host: &mut HostTensorSet,
+) -> Result<SiglipEncoderLayer> {
     memory.validate()?;
     // The standalone kernel planners use this ordinary-memory window before
     // policy-aware composition relocates movable operands into their arenas.
@@ -699,7 +767,7 @@ pub fn append_siglip_encoder_layer(
             )
             .unwrap()
     });
-    let qkv_data_type = weight_storage.gemm_data_type(
+    let qkv_data_type = precision.qkv.gemm_data_type(
         projection_weights
             .iter()
             .flat_map(|weights| weights.iter().copied()),
@@ -820,7 +888,9 @@ pub fn append_siglip_encoder_layer(
         append_flash_attention_to_a16_row_shards(schedule, &attention, data_base, data_limit)?;
     info!(stage = "attention_output", "planning SigLIP encoder stage");
     let output_weight = model.tensor_f32(&model.layer_name(layer, "self_attn.out_proj.weight")?)?;
-    let output_data_type = weight_storage.gemm_data_type(output_weight.iter().copied());
+    let output_data_type = precision
+        .attention_output
+        .gemm_data_type(output_weight.iter().copied());
     let output_projection_phase_start = schedule.phases.len();
     let output_projection_allocation_start = schedule.allocations.len();
     let output_projection = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
@@ -921,7 +991,9 @@ pub fn append_siglip_encoder_layer(
     )?;
     let intermediate_columns = u16::try_from(config.intermediate_size.div_ceil(64) * 64)?;
     let mlp_up_weight = model.tensor_f32(&model.layer_name(layer, "mlp.fc1.weight")?)?;
-    let mlp_up_data_type = weight_storage.gemm_data_type(mlp_up_weight.iter().copied());
+    let mlp_up_data_type = precision
+        .mlp_up
+        .gemm_data_type(mlp_up_weight.iter().copied());
     let mlp_up_phase_start = schedule.phases.len();
     let mlp_up_allocation_start = schedule.allocations.len();
     let mlp_up = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
@@ -993,7 +1065,9 @@ pub fn append_siglip_encoder_layer(
         append_c16_to_a16_blocks_gelu_f16(schedule, &mlp_up.output, data_base, data_limit)?;
     end_tensor_lifetimes(schedule, mlp_up.output.iter().map(|block| block.tensor))?;
     let mlp_down_weight = model.tensor_f32(&model.layer_name(layer, "mlp.fc2.weight")?)?;
-    let mlp_down_data_type = weight_storage.gemm_data_type(mlp_down_weight.iter().copied());
+    let mlp_down_data_type = precision
+        .mlp_down
+        .gemm_data_type(mlp_down_weight.iter().copied());
     let mlp_down_phase_start = schedule.phases.len();
     let mlp_down_allocation_start = schedule.allocations.len();
     let mlp_down = append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
@@ -1141,7 +1215,22 @@ fn push_gemm_weight(
                 blocked_matrix_f8_f143_by_block(placements, BlockLayout::AmpB16x16, &scales, value),
             )
         }
-        GemmDataType::F8F143 { .. } | GemmDataType::F32 => {
+        GemmDataType::F8F143 { input_scale, .. } => {
+            let scales = f143_block_scales(placements, &value);
+            let phase_end = schedule.phases.len();
+            set_native_f8_weight_block_scales_in_phases(
+                schedule,
+                phase_start..phase_end,
+                input_scale,
+                placements,
+                &scales,
+            )?;
+            (
+                "f8-f143-block-scaled",
+                blocked_matrix_f8_f143_by_block(placements, BlockLayout::AmpB32x16, &scales, value),
+            )
+        }
+        GemmDataType::F32 => {
             return Err("SigLIP weight serialization does not support this GEMM data type".into());
         }
     };

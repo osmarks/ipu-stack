@@ -1001,6 +1001,13 @@ impl GemmDataType {
         }
     }
 
+    const fn input_scale(self) -> Option<i8> {
+        match self {
+            Self::F8F143 { input_scale, .. } => Some(input_scale),
+            _ => None,
+        }
+    }
+
     const fn kernel_operation(self, initialize: bool, small_rows: bool) -> &'static str {
         match (self, initialize, small_rows) {
             (Self::F16 | Self::F16F8Weights { .. }, true, true) => "gemm_f16_init_small_rows",
@@ -1084,6 +1091,76 @@ pub fn set_f8_weight_block_scales_in_phases(
     if applied.len() != by_tensor.len() {
         return Err(CompileError::Graph(
             "some FP8 weight blocks have no expansion command".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn set_native_f8_weight_block_scales_in_phases(
+    schedule: &mut Schedule,
+    phases: std::ops::Range<usize>,
+    input_scale: i8,
+    blocks: &[BlockPlacement],
+    scales: &[i8],
+) -> Result<(), CompileError> {
+    if blocks.len() != scales.len() {
+        return Err(CompileError::Graph(
+            "native FP8 weight block and scale counts differ".into(),
+        ));
+    }
+    let by_tensor = blocks
+        .iter()
+        .zip(scales)
+        .map(|(block, &scale)| (block.tensor.0, scale))
+        .collect::<BTreeMap<_, _>>();
+    if by_tensor.len() != blocks.len() {
+        return Err(CompileError::Graph(
+            "native FP8 weight block tensors are not unique".into(),
+        ));
+    }
+    let mut applied = BTreeSet::new();
+    let selected = schedule.phases.get_mut(phases).ok_or_else(|| {
+        CompileError::Graph("native FP8 scale patch phase range is outside the schedule".into())
+    })?;
+    for phase in selected {
+        let Phase::Compute { commands, .. } = phase else {
+            continue;
+        };
+        for command in commands {
+            if !command.specialization.operation.starts_with("gemm_f8_") {
+                continue;
+            }
+            let Some((&tensor, &weight_scale)) = command
+                .inputs
+                .get(1)
+                .and_then(|tensor| by_tensor.get_key_value(&tensor.0))
+            else {
+                continue;
+            };
+            let product_scale = i16::from(input_scale) + i16::from(weight_scale);
+            if !(-32..=31).contains(&product_scale) {
+                return Err(CompileError::Graph(format!(
+                    "native FP8 product scale {product_scale} is outside the hardware range"
+                )));
+            }
+            let argument = command.arguments.first_mut().ok_or_else(|| {
+                CompileError::Graph("native FP8 GEMM command has no scale argument".into())
+            })?;
+            *argument = u32::from((product_scale as u8) & 0x3f);
+            if !command.metadata.is_empty() {
+                command
+                    .metadata
+                    .insert("f143_input_scale".into(), input_scale.to_string());
+                command
+                    .metadata
+                    .insert("f143_weight_scale".into(), weight_scale.to_string());
+            }
+            applied.insert(tensor);
+        }
+    }
+    if applied.len() != by_tensor.len() {
+        return Err(CompileError::Graph(
+            "some native FP8 weight blocks have no GEMM command".into(),
         ));
     }
     Ok(())
@@ -1301,7 +1378,7 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
 ) -> Result<AppendedBlockedGemm, CompileError> {
     if !matches!(
         config.data_type,
-        GemmDataType::F16 | GemmDataType::F16F8Weights { .. }
+        GemmDataType::F16 | GemmDataType::F16F8Weights { .. } | GemmDataType::F8F143 { .. }
     ) {
         return Err(CompileError::Graph(
             "A16 composition requires an FP16 GEMM".into(),
@@ -1397,20 +1474,41 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
             });
         }
         let units = bytes / 8;
+        let input_scale = config.data_type.input_scale();
         commands.push(KernelCommand {
             tile: block.tile,
             output: block.tensor,
             inputs: vec![alias, alias],
-            arguments: vec![units, units / 6, units % 6],
+            arguments: input_scale
+                .map(|scale| {
+                    vec![
+                        u32::from(block.rows),
+                        u32::from(block.columns),
+                        u32::from(scale as u8),
+                    ]
+                })
+                .unwrap_or_else(|| vec![units, units / 6, units % 6]),
             specialization: SpecializationKey {
-                operation: "copy_u64".into(),
-                shape: vec![
-                    usize::try_from(units)
-                        .map_err(|_| CompileError::Graph("A16 copy size overflow".into()))?,
-                ],
+                operation: input_scale
+                    .map(|_| "quantize_a16_to_a32_f143")
+                    .unwrap_or("copy_u64")
+                    .into(),
+                shape: if input_scale.is_some() {
+                    vec![usize::from(block.rows), usize::from(block.columns)]
+                } else {
+                    vec![
+                        usize::try_from(units)
+                            .map_err(|_| CompileError::Graph("A16 copy size overflow".into()))?,
+                    ]
+                },
                 worker_count: 6,
-                role: "A16 GEMM input placement".into(),
-                alignment: 8,
+                role: if input_scale.is_some() {
+                    "A16 to native FP8 GEMM input placement"
+                } else {
+                    "A16 GEMM input placement"
+                }
+                .into(),
+                alignment: if input_scale.is_some() { 16 } else { 8 },
             },
             metadata: BTreeMap::from([
                 ("label".into(), "place row-sharded GEMM input".into()),
@@ -1485,7 +1583,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
 ) -> Result<AppendedBlockedGemm, CompileError> {
     if !matches!(
         config.data_type,
-        GemmDataType::F16 | GemmDataType::F16F8Weights { .. }
+        GemmDataType::F16 | GemmDataType::F16F8Weights { .. } | GemmDataType::F8F143 { .. }
     ) {
         return Err(CompileError::Graph(
             "A16 block composition requires an FP16 GEMM".into(),
@@ -1557,20 +1655,44 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
             });
         }
         let units = bytes / 8;
+        let input_scale = config.data_type.input_scale();
         commands.push(KernelCommand {
             tile: destination.tile,
             output: destination.tensor,
             inputs: vec![source.tensor, source.tensor],
-            arguments: vec![units, units / 6, units % 6],
+            arguments: input_scale
+                .map(|scale| {
+                    vec![
+                        u32::from(destination.rows),
+                        u32::from(destination.columns),
+                        u32::from(scale as u8),
+                    ]
+                })
+                .unwrap_or_else(|| vec![units, units / 6, units % 6]),
             specialization: SpecializationKey {
-                operation: "copy_u64".into(),
-                shape: vec![
-                    usize::try_from(units)
-                        .map_err(|_| CompileError::Graph("A16 copy size overflow".into()))?,
-                ],
+                operation: input_scale
+                    .map(|_| "quantize_a16_to_a32_f143")
+                    .unwrap_or("copy_u64")
+                    .into(),
+                shape: if input_scale.is_some() {
+                    vec![
+                        usize::from(destination.rows),
+                        usize::from(destination.columns),
+                    ]
+                } else {
+                    vec![
+                        usize::try_from(units)
+                            .map_err(|_| CompileError::Graph("A16 copy size overflow".into()))?,
+                    ]
+                },
                 worker_count: 6,
-                role: "distributed A16 GEMM input placement".into(),
-                alignment: 8,
+                role: if input_scale.is_some() {
+                    "distributed A16 to native FP8 GEMM input placement"
+                } else {
+                    "distributed A16 GEMM input placement"
+                }
+                .into(),
+                alignment: if input_scale.is_some() { 16 } else { 8 },
             },
             metadata: BTreeMap::from([
                 ("label".into(), "place distributed GEMM input".into()),

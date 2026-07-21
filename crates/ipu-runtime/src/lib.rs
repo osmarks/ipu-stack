@@ -17,9 +17,11 @@ use tracing_subscriber::EnvFilter;
 mod siglip;
 mod static_codegen;
 pub use siglip::{
-    AttentionKernelVariant, HostTensorSet, SiglipEncoderLayer, SiglipMapHead, SiglipWeightStorage,
-    append_host_a16_matrix, append_siglip_encoder_layer, append_siglip_map_head,
-    append_siglip_post_layer_norm, attention_kernel_variant, consolidate_attention_kernel_variants,
+    AttentionKernelVariant, HostTensorSet, SiglipEncoderLayer, SiglipEncoderPrecision,
+    SiglipLinearPrecision, SiglipMapHead, SiglipWeightStorage, append_host_a16_matrix,
+    append_siglip_encoder_layer, append_siglip_encoder_layer_with_precision,
+    append_siglip_map_head, append_siglip_post_layer_norm, attention_kernel_variant,
+    consolidate_attention_kernel_variants,
 };
 
 mod blocked_data;

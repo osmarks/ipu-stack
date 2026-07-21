@@ -10,10 +10,10 @@ use ipu_elf::{KernelArtifact, Toolchain};
 use ipu_models::{SiglipWeights, TensorArchive};
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, SiglipWeightStorage,
-    StaticTemplateRegion, allocator_memory_profile, append_host_a16_matrix,
-    append_siglip_encoder_layer, append_siglip_map_head, append_siglip_post_layer_norm,
-    block_binding_typed, block_coordinates, blocked_matrix_f16,
+    BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, SiglipEncoderPrecision,
+    SiglipLinearPrecision, SiglipWeightStorage, StaticTemplateRegion, allocator_memory_profile,
+    append_host_a16_matrix, append_siglip_encoder_layer_with_precision, append_siglip_map_head,
+    append_siglip_post_layer_norm, block_binding_typed, block_coordinates, blocked_matrix_f16,
     consolidate_attention_kernel_variants, package_graph_repeated,
     package_graph_repeated_with_templates, run_host_with_options,
 };
@@ -171,10 +171,12 @@ fn main() {
         Ok("f143") | Err(_) => SiglipWeightStorage::F143,
         Ok(value) => panic!("unsupported SigLIP weight storage {value}"),
     };
+    let precision = siglip_encoder_precision(weight_storage);
     info!(
         transient = ?memory.transient,
         resident = ?memory.resident,
         ?weight_storage,
+        ?precision,
         "configured encoder tile-memory policy"
     );
     let detailed_diagnostics = layer_count == 1;
@@ -188,7 +190,7 @@ fn main() {
         let mut layer_memory = memory.clone();
         layer_memory.resident_tile_assignment =
             ipu_compiler::ResidentTileAssignment::WindowBalanced { allocation_start };
-        let appended = append_siglip_encoder_layer(
+        let appended = append_siglip_encoder_layer_with_precision(
             &mut plan.schedule,
             &current,
             &model,
@@ -198,7 +200,7 @@ fn main() {
             row_block_dimension,
             TILE_COUNT,
             &layer_memory,
-            weight_storage,
+            precision,
             retain_profile_metadata,
             detailed_diagnostics && layer + 1 == layer_count,
             &mut host,
@@ -892,6 +894,47 @@ fn compile_objects(
             ))
         })
         .transpose()?;
+    let uses_native_fp8 = plan.schedule.phases.iter().any(|phase| {
+        matches!(phase, Phase::Compute { commands, .. } if commands.iter().any(|command| {
+            command.specialization.operation.starts_with("gemm_f8_")
+        }))
+    });
+    let native_fp8 = uses_native_fp8
+        .then(|| {
+            Ok::<_, ipu_elf::ElfError>((
+                toolchain.compile(
+                    source("gemm_f16_64_amp.S"),
+                    &artifacts,
+                    "native-f8-gemm",
+                    &[
+                        format!("-DGEMM_INNER_BLOCK_DIMENSION={INNER_BLOCK_DIMENSION}"),
+                        format!("-DGEMM_OUTPUT_COLUMNS={BLOCK_DIMENSION}"),
+                        format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
+                        format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
+                        "-DGEMM_NATIVE_FP8=1".into(),
+                        "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_gemm_f8_init_small_rows".into(),
+                        "-DGEMM_INIT_LARGE_SYMBOL=ipu_stack_gemm_f8_init_large_rows".into(),
+                        "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_gemm_f8_accumulate_small_rows"
+                            .into(),
+                        "-DGEMM_ACCUMULATE_LARGE_SYMBOL=ipu_stack_gemm_f8_accumulate_large_rows"
+                            .into(),
+                    ],
+                )?,
+                toolchain.compile(
+                    source("quantize_a16_to_a32_f143.cpp"),
+                    &artifacts,
+                    "quantize-a16-to-a32-f143-codelet",
+                    &[],
+                )?,
+                toolchain.compile(
+                    source("quantize_a16_to_a32_f143.S"),
+                    &artifacts,
+                    "quantize-a16-to-a32-f143-wrapper",
+                    &[],
+                )?,
+            ))
+        })
+        .transpose()?;
     let add = toolchain.compile(source("add_f16.S"), &artifacts, "add-f16", &[])?;
     let add_bias = toolchain.compile(source("add_bias_f16.S"), &artifacts, "add-bias-f16", &[])?;
     let relayout = toolchain.compile(source("relayout_f16.S"), &artifacts, "relayout-f16", &[])?;
@@ -980,6 +1023,11 @@ fn compile_objects(
         objects.push(fs::read(object.object)?);
     }
     if let Some((codelet, wrapper)) = fp8_expander {
+        objects.push(fs::read(codelet.object)?);
+        objects.push(fs::read(wrapper.object)?);
+    }
+    if let Some((gemm, codelet, wrapper)) = native_fp8 {
+        objects.push(fs::read(gemm.object)?);
         objects.push(fs::read(codelet.object)?);
         objects.push(fs::read(wrapper.object)?);
     }
@@ -1251,6 +1299,37 @@ fn pad_columns(values: &[f32], rows: usize, columns: usize, padded_columns: usiz
 
 fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
+}
+
+fn siglip_encoder_precision(storage: SiglipWeightStorage) -> SiglipEncoderPrecision {
+    let fallback = match storage {
+        SiglipWeightStorage::F16 => SiglipLinearPrecision::F16,
+        SiglipWeightStorage::F143 => SiglipLinearPrecision::F143Expanded,
+    };
+    SiglipEncoderPrecision {
+        qkv: linear_precision("IPU_SIGLIP_QKV", fallback),
+        attention_output: linear_precision("IPU_SIGLIP_ATTENTION_OUTPUT", fallback),
+        mlp_up: linear_precision("IPU_SIGLIP_MLP_UP", fallback),
+        mlp_down: linear_precision("IPU_SIGLIP_MLP_DOWN", fallback),
+    }
+}
+
+fn linear_precision(prefix: &str, fallback: SiglipLinearPrecision) -> SiglipLinearPrecision {
+    let name = format!("{prefix}_PRECISION");
+    match std::env::var(&name).as_deref() {
+        Err(_) => fallback,
+        Ok("f16") => SiglipLinearPrecision::F16,
+        Ok("f143-expanded") => SiglipLinearPrecision::F143Expanded,
+        Ok("f143-native") => {
+            let scale_name = format!("{prefix}_ACTIVATION_SCALE");
+            let activation_scale = std::env::var(&scale_name)
+                .unwrap_or_else(|_| panic!("{scale_name} is required for native FP8"))
+                .parse()
+                .unwrap_or_else(|_| panic!("{scale_name} must be an i8"));
+            SiglipLinearPrecision::F143Native { activation_scale }
+        }
+        Ok(value) => panic!("unsupported precision {value:?} in {name}"),
+    }
 }
 
 fn env_f32(name: &str, default: f32) -> f32 {
