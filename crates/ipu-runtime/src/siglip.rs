@@ -15,7 +15,7 @@ use ipu_compiler::{
     append_blocked_gemm_f16_with_a16_input_with_memory_policy, append_c16_to_a16_blocks_gelu_f16,
     append_c16_to_a16_row_shards, append_flash_attention_from_a16_qkv,
     append_flash_attention_to_a16_row_shards, end_tensor_lifetimes, make_tensors_resident,
-    occupied_intervals_by_tile, set_f8_weight_block_scales,
+    occupied_intervals_by_tile, set_f8_weight_block_scales_in_phases,
 };
 use ipu_models::SiglipWeights;
 use ipu_package::{Binding, RegionSlice};
@@ -540,6 +540,7 @@ pub fn append_siglip_encoder_layer(
             .iter()
             .flat_map(|weights| weights.iter().copied()),
     );
+    let qkv_phase_start = schedule.phases.len();
     let qkv = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         &norm.output,
@@ -564,6 +565,7 @@ pub fn append_siglip_encoder_layer(
         columns * 3,
         &qkv.right,
         qkv_data_type,
+        qkv_phase_start,
         |row, column| {
             let projection = usize::from(column / columns);
             let output = usize::from(column % columns);
@@ -643,6 +645,7 @@ pub fn append_siglip_encoder_layer(
     info!(stage = "attention_output", "planning SigLIP encoder stage");
     let output_weight = model.tensor_f32(&model.layer_name(layer, "self_attn.out_proj.weight")?)?;
     let output_data_type = weight_storage.gemm_data_type(output_weight.iter().copied());
+    let output_projection_phase_start = schedule.phases.len();
     let output_projection = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         &attention_shards,
@@ -667,6 +670,7 @@ pub fn append_siglip_encoder_layer(
         columns,
         &output_projection.right,
         output_data_type,
+        output_projection_phase_start,
         |row, column| output_weight[usize::from(column) * usize::from(columns) + usize::from(row)],
     )?;
     make_tensors_resident(
@@ -733,6 +737,7 @@ pub fn append_siglip_encoder_layer(
     let intermediate_columns = u16::try_from(config.intermediate_size.div_ceil(64) * 64)?;
     let mlp_up_weight = model.tensor_f32(&model.layer_name(layer, "mlp.fc1.weight")?)?;
     let mlp_up_data_type = weight_storage.gemm_data_type(mlp_up_weight.iter().copied());
+    let mlp_up_phase_start = schedule.phases.len();
     let mlp_up = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         &norm2.output,
@@ -757,6 +762,7 @@ pub fn append_siglip_encoder_layer(
         intermediate_columns,
         &mlp_up.right,
         mlp_up_data_type,
+        mlp_up_phase_start,
         |row, column| {
             if usize::from(column) < config.intermediate_size {
                 mlp_up_weight[usize::from(column) * usize::from(columns) + usize::from(row)]
@@ -793,6 +799,7 @@ pub fn append_siglip_encoder_layer(
     end_tensor_lifetimes(schedule, mlp_up.output.iter().map(|block| block.tensor))?;
     let mlp_down_weight = model.tensor_f32(&model.layer_name(layer, "mlp.fc2.weight")?)?;
     let mlp_down_data_type = weight_storage.gemm_data_type(mlp_down_weight.iter().copied());
+    let mlp_down_phase_start = schedule.phases.len();
     let mlp_down = append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
         schedule,
         &mlp_gelu,
@@ -817,6 +824,7 @@ pub fn append_siglip_encoder_layer(
         columns,
         &mlp_down.right,
         mlp_down_data_type,
+        mlp_down_phase_start,
         |row, column| {
             if usize::from(row) < config.intermediate_size {
                 mlp_down_weight[usize::from(column) * config.intermediate_size + usize::from(row)]
@@ -909,6 +917,7 @@ fn push_gemm_weight(
     columns: u16,
     placements: &[BlockPlacement],
     data_type: GemmDataType,
+    phase_start: usize,
     value: impl Fn(u16, u16) -> f32,
 ) -> Result<()> {
     let (dtype, bytes) = match data_type {
@@ -918,7 +927,13 @@ fn push_gemm_weight(
         ),
         GemmDataType::F16F8Weights { .. } => {
             let scales = f143_block_scales(placements, &value);
-            set_f8_weight_block_scales(schedule, placements, &scales)?;
+            let phase_end = schedule.phases.len();
+            set_f8_weight_block_scales_in_phases(
+                schedule,
+                phase_start..phase_end,
+                placements,
+                &scales,
+            )?;
             (
                 "f8-f143-block-scaled",
                 blocked_matrix_f8_f143_by_block(placements, BlockLayout::AmpB16x16, &scales, value),

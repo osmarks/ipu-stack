@@ -685,6 +685,7 @@ pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile
                 names.sort_unstable();
                 let category = match allocation.kind {
                     ipu_compiler::AllocationKind::Home => "home",
+                    ipu_compiler::AllocationKind::HomeAlias { .. } => "home_alias",
                     ipu_compiler::AllocationKind::ExchangeStaging { .. } => "exchange_staging",
                 };
                 let name = allocation_profile_name(graph, allocation, &names, &output_names);
@@ -759,6 +760,9 @@ fn allocation_profile_name(
     }
     match allocation.kind {
         ipu_compiler::AllocationKind::Home => format!("tensor {} home", allocation.tensor.0),
+        ipu_compiler::AllocationKind::HomeAlias { source } => {
+            format!("tensor {} alias of {}", allocation.tensor.0, source.0)
+        }
         ipu_compiler::AllocationKind::ExchangeStaging { phase } => {
             format!("tensor {} staging for phase {phase}", allocation.tensor.0)
         }

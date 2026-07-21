@@ -485,9 +485,11 @@ fn append_attention_pack_phase(
             tile: shard.tile,
             address: source_address,
             size: bytes,
-            live_from: 0,
-            live_until: usize::MAX,
-            kind: AllocationKind::Home,
+            live_from: exchange_phase,
+            live_until: compute_phase + 1,
+            kind: AllocationKind::HomeAlias {
+                source: shard.tensor,
+            },
         });
         if shard.tile != destination_tile {
             transfers.push(Transfer {
@@ -604,6 +606,9 @@ fn remap_attention_tensors(plan: &mut FlashAttentionPlan, base: usize) -> Result
     }
     for allocation in &mut plan.schedule.allocations {
         remap(&mut allocation.tensor)?;
+        if let AllocationKind::HomeAlias { source } = &mut allocation.kind {
+            remap(source)?;
+        }
     }
     for phase in &mut plan.schedule.phases {
         match phase {

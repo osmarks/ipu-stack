@@ -391,7 +391,14 @@ pub struct Allocation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AllocationKind {
     Home,
+    HomeAlias { source: TensorId },
     ExchangeStaging { phase: usize },
+}
+
+impl AllocationKind {
+    fn has_home_address(&self) -> bool {
+        matches!(self, Self::Home | Self::HomeAlias { .. })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -992,6 +999,15 @@ pub fn set_f8_weight_block_scales(
     blocks: &[BlockPlacement],
     scales: &[i8],
 ) -> Result<(), CompileError> {
+    set_f8_weight_block_scales_in_phases(schedule, 0..schedule.phases.len(), blocks, scales)
+}
+
+pub fn set_f8_weight_block_scales_in_phases(
+    schedule: &mut Schedule,
+    phases: std::ops::Range<usize>,
+    blocks: &[BlockPlacement],
+    scales: &[i8],
+) -> Result<(), CompileError> {
     if blocks.len() != scales.len() {
         return Err(CompileError::Graph(
             "FP8 weight block and scale counts differ".into(),
@@ -1006,7 +1022,10 @@ pub fn set_f8_weight_block_scales(
         }
     }
     let mut applied = BTreeSet::new();
-    for phase in schedule.phases.iter_mut().rev() {
+    let selected = schedule.phases.get_mut(phases).ok_or_else(|| {
+        CompileError::Graph("FP8 scale patch phase range is outside the schedule".into())
+    })?;
+    for phase in selected {
         let Phase::Compute { commands, .. } = phase else {
             continue;
         };
@@ -1031,9 +1050,6 @@ pub fn set_f8_weight_block_scales(
                     .insert("f143_scale".into(), scale.to_string());
             }
             applied.insert(tensor);
-        }
-        if applied.len() == by_tensor.len() {
-            break;
         }
     }
     if applied.len() != by_tensor.len() {
@@ -1312,9 +1328,11 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
             tile: shard.tile,
             address,
             size: bytes,
-            live_from: 0,
+            live_from: exchange_phase,
             live_until: compute_phase + 1,
-            kind: AllocationKind::Home,
+            kind: AllocationKind::HomeAlias {
+                source: shard.tensor,
+            },
         });
         if shard.tile != block.tile {
             let cursor = &mut staging_cursors[usize::from(block.tile)];
@@ -1742,6 +1760,23 @@ fn plan_appended_blocked_gemm_with_memory_policy(
         placement.address = relocated[&placement.tensor];
     }
     for allocation in &mut plan.schedule.allocations {
+        if let AllocationKind::HomeAlias { source } = allocation.kind {
+            let owner = regions
+                .iter()
+                .find(|region| region.0 == source && region.1 == allocation.tile)
+                .ok_or_else(|| {
+                    CompileError::Memory(format!(
+                        "GEMM alias tensor {} has no movable source tensor {} on tile {}",
+                        allocation.tensor.0, source.0, allocation.tile
+                    ))
+                })?;
+            allocation.address = relocated[&source]
+                .checked_add(allocation.address.checked_sub(owner.2).ok_or_else(|| {
+                    CompileError::Memory("GEMM alias precedes its source allocation".into())
+                })?)
+                .ok_or_else(|| CompileError::Memory("GEMM alias relocation overflow".into()))?;
+            continue;
+        }
         if allocation.kind != AllocationKind::Home || allocation.address < config.data_base {
             continue;
         }
@@ -1881,6 +1916,9 @@ fn remap_gemm_tensors(plan: &mut BlockedGemmPlan, base: usize) -> Result<(), Com
     }
     for allocation in &mut plan.schedule.allocations {
         remap(&mut allocation.tensor)?;
+        if let AllocationKind::HomeAlias { source } = &mut allocation.kind {
+            remap(source)?;
+        }
     }
     for phase in &mut plan.schedule.phases {
         match phase {
@@ -2541,8 +2579,10 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     address: output_block.address + byte_offset,
                     size: bytes,
                     live_from: evacuation_phase + 1,
-                    live_until: usize::MAX,
-                    kind: AllocationKind::Home,
+                    live_until: evacuation_phase + 2,
+                    kind: AllocationKind::HomeAlias {
+                        source: output_block.tensor,
+                    },
                 });
                 transfers.push(Transfer {
                     source_tile,
@@ -2728,6 +2768,15 @@ impl Schedule {
     /// overlapping SRAM on the same tile.
     pub fn validate_allocations(&self) -> Result<(), CompileError> {
         let mut by_tile = vec![Vec::new(); usize::from(self.tile_count)];
+        let mut home_by_location = HashMap::<(TensorId, u16), Vec<usize>>::new();
+        for (index, allocation) in self.allocations.iter().enumerate() {
+            if allocation.kind.has_home_address() {
+                home_by_location
+                    .entry((allocation.tensor, allocation.tile))
+                    .or_default()
+                    .push(index);
+            }
+        }
         for (index, allocation) in self.allocations.iter().enumerate() {
             let allocations = by_tile
                 .get_mut(usize::from(allocation.tile))
@@ -2747,6 +2796,67 @@ impl Schedule {
                     ))
                 })?;
             if allocation.size != 0 && allocation.live_from < allocation.live_until {
+                if let AllocationKind::HomeAlias { source } = allocation.kind {
+                    let end = allocation.address + allocation.size;
+                    let backed = home_by_location
+                        .get(&(source, allocation.tile))
+                        .into_iter()
+                        .flatten()
+                        .map(|&index| &self.allocations[index])
+                        .any(|candidate| {
+                            candidate.address <= allocation.address
+                                && candidate.address.saturating_add(candidate.size) >= end
+                                && candidate.live_from <= allocation.live_from
+                                && candidate.live_until >= allocation.live_until
+                        });
+                    if !backed {
+                        let candidates = home_by_location
+                            .get(&(source, allocation.tile))
+                            .into_iter()
+                            .flatten()
+                            .map(|&index| {
+                                let candidate = &self.allocations[index];
+                                format!(
+                                    "0x{:x}..0x{:x}@{}..{} {:?}",
+                                    candidate.address,
+                                    candidate.address.saturating_add(candidate.size),
+                                    candidate.live_from,
+                                    candidate.live_until,
+                                    candidate.kind
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let global_candidates = self
+                            .allocations
+                            .iter()
+                            .filter(|candidate| candidate.tensor == source)
+                            .map(|candidate| {
+                                format!(
+                                    "tile{}:0x{:x}..0x{:x}@{}..{} {:?}",
+                                    candidate.tile,
+                                    candidate.address,
+                                    candidate.address.saturating_add(candidate.size),
+                                    candidate.live_from,
+                                    candidate.live_until,
+                                    candidate.kind
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(CompileError::Memory(format!(
+                            "tensor {} alias 0x{:x}..0x{:x}@{}..{} on tile {} is not backed by source tensor {} (local: {candidates}; global: {global_candidates})",
+                            allocation.tensor.0,
+                            allocation.address,
+                            end,
+                            allocation.live_from,
+                            allocation.live_until,
+                            allocation.tile,
+                            source.0
+                        )));
+                    }
+                    continue;
+                }
                 allocations.push(index);
             }
         }
@@ -2784,10 +2894,40 @@ impl Schedule {
                     .filter(|&index| self.allocations[index].address < end);
                 if let Some(other_index) = previous.or(next) {
                     let other = &self.allocations[other_index];
+                    let usage = |tensor| {
+                        self.phases
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(phase, entry)| match entry {
+                                Phase::Compute { commands, .. } => commands
+                                    .iter()
+                                    .filter(move |command| {
+                                        command.output == tensor || command.inputs.contains(&tensor)
+                                    })
+                                    .map(move |command| {
+                                        format!(
+                                            "{}:{}:{}",
+                                            phase,
+                                            command.specialization.operation,
+                                            command.specialization.role
+                                        )
+                                    })
+                                    .take(3)
+                                    .collect::<Vec<_>>(),
+                                Phase::Exchange { .. } => Vec::new(),
+                            })
+                            .take(3)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
                     return Err(CompileError::Memory(format!(
-                        "live tensors {} and {} overlap on tile {}: 0x{:x}..0x{:x} at phases {}..{} and 0x{:x}..0x{:x} at phases {}..{}",
+                        "live tensors {} ({:?}; {}) and {} ({:?}; {}) overlap on tile {}: 0x{:x}..0x{:x} at phases {}..{} and 0x{:x}..0x{:x} at phases {}..{}",
                         allocation.tensor.0,
+                        allocation.kind,
+                        usage(allocation.tensor),
                         other.tensor.0,
+                        other.kind,
+                        usage(other.tensor),
                         allocation.tile,
                         allocation.address,
                         end,
@@ -2965,7 +3105,7 @@ impl Schedule {
                 available.contains(&(tensor, tile))
                     || allocation_index
                         .at(tensor, tile)
-                        .any(|allocation| allocation.kind == AllocationKind::Home)
+                        .any(|allocation| allocation.kind.has_home_address())
             };
             let mut epoch_groups = Vec::with_capacity(colored_groups.len());
             while !colored_groups.is_empty() {
@@ -3047,7 +3187,7 @@ impl Schedule {
                     let home = || {
                         candidates
                             .clone()
-                            .find(|allocation| allocation.kind == AllocationKind::Home)
+                            .find(|allocation| allocation.kind.has_home_address())
                     };
                     let source_address =
                         if location_available(&available_before_phase, tensor, source) {
@@ -3308,7 +3448,7 @@ impl<'a> AllocationIndex<'a> {
 
     fn home_address(&self, tensor: TensorId, tile: u16) -> Result<u32, CompileError> {
         self.at(tensor, tile)
-            .find(|allocation| allocation.kind == AllocationKind::Home)
+            .find(|allocation| allocation.kind.has_home_address())
             .map(|allocation| allocation.address)
             .ok_or_else(|| {
                 CompileError::Memory(format!(
@@ -4344,7 +4484,9 @@ mod tests {
     #[test]
     fn fp8_weight_storage_expands_transiently_before_fp16_gemm() {
         let mut plan = plan_blocked_gemm(BlockedGemmConfig {
-            rows: 64,
+            // More output blocks than tiles force the same right-hand block to
+            // be expanded in multiple waves.
+            rows: 320,
             inner_dimension: 64,
             columns: 64,
             block_dimension: 64,
@@ -4376,24 +4518,21 @@ mod tests {
                 u32::from(block.rows) * u32::from(block.columns)
             );
         }
-        let rounds = &plan.schedule.phases[..plan.schedule.phases.len() - 2];
-        assert!(rounds.chunks_exact(3).all(|round| {
-            matches!(round[0], Phase::Exchange { .. })
-                && matches!(
-                    &round[1],
-                    Phase::Compute { commands, .. }
-                        if commands.iter().all(|command|
-                            command.specialization.operation == "expand_f8_f143_to_f16"
-                                && command.arguments.get(1) == Some(&u32::from((-7i8) as u8)))
-                )
-                && matches!(
-                    &round[2],
-                    Phase::Compute { commands, .. }
-                        if commands.iter().all(|command|
-                            command.specialization.operation.starts_with("gemm_f16_"))
-                )
-        }));
-        let expanded = rounds
+        let expansion_commands = plan.schedule.phases.iter().flat_map(|phase| match phase {
+            Phase::Compute { commands, .. } => commands
+                .iter()
+                .filter(|command| command.specialization.operation == "expand_f8_f143_to_f16")
+                .collect::<Vec<_>>(),
+            Phase::Exchange { .. } => Vec::new(),
+        });
+        assert!(
+            expansion_commands
+                .clone()
+                .all(|command| command.arguments.get(1) == Some(&u32::from((-7i8) as u8)))
+        );
+        let expanded = plan
+            .schedule
+            .phases
             .iter()
             .filter_map(|phase| match phase {
                 Phase::Compute { commands, .. }

@@ -468,7 +468,7 @@ mod tests {
             .schedule
             .allocations
             .iter()
-            .filter(|allocation| allocation.kind == AllocationKind::Home)
+            .filter(|allocation| allocation.kind.has_home_address())
             .map(|allocation| (allocation.tensor, allocation.tile))
             .collect::<HashSet<_>>();
         for (phase_index, phase) in plan.schedule.phases.iter().enumerate() {
