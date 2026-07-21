@@ -1613,6 +1613,99 @@ fn package_graph_impl(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    // Instruction fetch and data access cannot share a tile-memory element. Measure the
+    // address-invariant generated code before relocating host state so data packing can
+    // preserve enough complete elements for it.
+    let preliminary_program_sizes = programs
+        .iter()
+        .enumerate()
+        .map(|(program_index, program)| -> Result<u32> {
+            let mut symbols = BTreeMap::new();
+            for name in [
+                static_codegen::WORKER_BARRIER,
+                static_codegen::COMPLETE,
+                static_codegen::HOST_RUN,
+                static_codegen::REPEAT_CALL,
+                static_codegen::EXCHANGE_COMPUTE_RUN,
+                static_codegen::SAMPLE_CYCLE,
+                static_codegen::SAMPLE_CYCLE_NEXT,
+            ] {
+                symbols.insert(name.into(), ipu_driver::APPLICATION_LOAD_BASE);
+            }
+            for step in &program.steps {
+                if let ipu_compiler::LoweredTileStep::Compute(command) = step {
+                    symbols.insert(
+                        format!("ipu_stack_{}", command.specialization.operation),
+                        ipu_driver::APPLICATION_LOAD_BASE,
+                    );
+                }
+            }
+            let plans = &tile_host_plans[program_index];
+            let physical = topology.physical(program.tile)?;
+            let host_inputs = plans.addresses[..host.inputs.len()]
+                .iter()
+                .copied()
+                .zip(&plans.run_tables[..host.inputs.len()])
+                .zip(&host.inputs)
+                .map(
+                    |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
+                        address,
+                        active: host_phase_is_active(physical, transfer),
+                        run_table,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let host_outputs = plans.addresses[host.inputs.len()..]
+                .iter()
+                .copied()
+                .zip(&plans.run_tables[host.inputs.len()..])
+                .zip(&host.outputs)
+                .map(
+                    |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
+                        address,
+                        active: host_phase_is_active(physical, transfer),
+                        run_table,
+                    },
+                )
+                .collect::<Vec<_>>();
+            Ok(u32::try_from(
+                static_codegen::emit(
+                    program,
+                    &symbols,
+                    &tile_exchange_plans[program_index].addresses,
+                    &tile_exchange_plans[program_index].compute_runs,
+                    &tile_exchange_plans[program_index].templates,
+                    static_codegen::HostCode {
+                        inputs: &host_inputs,
+                        outputs: &host_outputs,
+                    },
+                    profile_code.get(program_index),
+                    0,
+                )?
+                .len(),
+            )?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let program_reservations = programs
+        .iter()
+        .zip(&tile_exchange_plans)
+        .zip(&preliminary_program_sizes)
+        .map(|((program, plans), &size)| -> Result<(u32, u32)> {
+            let base = executable_region_base_for_tile(
+                &allocation_ranges_by_tile[usize::from(program.tile)],
+                Some(program.tile),
+                plans.end,
+                size,
+                &[],
+            )?;
+            let reserved_size = align_up(size, ipu_package::TILE_MEMORY_ELEMENT_SIZE);
+            Ok((
+                base,
+                base.checked_add(reserved_size)
+                    .ok_or("generated program reservation overflow")?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut host_runtime_ranges = Vec::with_capacity(tile_host_plans.len());
     let mut worker_sync_addresses = Vec::with_capacity(tile_host_plans.len());
     let mut completion_addresses = Vec::with_capacity(tile_host_plans.len());
@@ -1629,7 +1722,7 @@ fn package_graph_impl(
             tile_exchange_plans[tile_index].end,
             &plans.ordinary_objects,
             false,
-            &[],
+            &[program_reservations[tile_index]],
         )?;
         let (data_relocations, data_ranges) = pack_data_objects_for_tile(
             &allocation_ranges_by_tile[usize::from(tile)],
@@ -1637,7 +1730,11 @@ fn package_graph_impl(
             tile_exchange_plans[tile_index].end,
             &plans.data_objects,
             true,
-            &ranges,
+            &ranges
+                .iter()
+                .copied()
+                .chain(std::iter::once(program_reservations[tile_index]))
+                .collect::<Vec<_>>(),
         )?;
         relocations.extend(data_relocations);
         ranges.extend(data_ranges);
@@ -1790,6 +1887,7 @@ fn package_graph_impl(
                     .iter()
                     .copied()
                     .chain(template_record_ranges[tile_index].iter().copied())
+                    .chain(std::iter::once(program_reservations[tile_index]))
                     .collect::<Vec<_>>(),
             )?;
             let end = address
@@ -1916,24 +2014,17 @@ fn package_graph_impl(
         .enumerate()
         .map(|(index, image)| emit_program(index, &image.symbols, 0))
         .collect::<Result<Vec<_>>>()?;
-    let program_bases = programs
+    if preliminary_generated
         .iter()
-        .zip(&preliminary_generated)
-        .zip(&template_record_ranges)
-        .map(|((program, generated), template_records)| {
-            executable_region_base_for_tile(
-                &allocation_ranges_by_tile[usize::from(program.tile)],
-                Some(program.tile),
-                tile_exchange_plans[usize::from(program.tile)].end,
-                u32::try_from(generated.len())?,
-                &host_runtime_ranges[usize::from(program.tile)]
-                    .iter()
-                    .copied()
-                    .chain(template_records.iter().copied())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .zip(&preliminary_program_sizes)
+        .any(|(generated, &size)| generated.len() != size as usize)
+    {
+        return Err("generated program size changed after static-data relocation".into());
+    }
+    let program_bases = program_reservations
+        .iter()
+        .map(|&(base, _)| base)
+        .collect::<Vec<_>>();
     let image_regions = programs
         .iter()
         .zip(&program_bases)
