@@ -112,6 +112,7 @@ enum StaticTemplateStep {
         sender_word_offset: Option<u16>,
         sender_address: Option<TemplateValue>,
         sender_instruction: Option<TemplateValue>,
+        plan_words: Vec<(u16, TemplateValue)>,
         plan_address: TemplateValue,
         active: TemplateValue,
     },
@@ -228,22 +229,29 @@ fn add_immediate_steps(offset: i32) -> usize {
 pub(crate) fn plan_static_templates(
     program: &LoweredTileProgram,
     plan_addresses: &[u32],
+    plan_rows: &[Vec<u32>],
     plan_patches: &[Option<StaticPlanPatch>],
     regions: &[crate::StaticTemplateRegion],
     mut cursor: u32,
 ) -> Result<(Vec<StaticTemplatePlan>, u32)> {
     let mut plan_by_step = vec![None; program.steps.len()];
+    let mut row_by_step = vec![None; program.steps.len()];
     let mut patch_by_step = vec![None; program.steps.len()];
     let mut plans = plan_addresses.iter().copied();
+    let mut rows = plan_rows.iter().map(Vec::as_slice);
     let mut patches = plan_patches.iter().copied();
     for (step_index, step) in program.steps.iter().enumerate() {
         if matches!(step, LoweredTileStep::Exchange { .. }) {
             plan_by_step[step_index] = plans.next();
+            row_by_step[step_index] = rows.next();
             patch_by_step[step_index] = patches.next().flatten();
         }
     }
     if plans.next().is_some() {
         return Err("unused exchange plan while planning static templates".into());
+    }
+    if rows.next().is_some() {
+        return Err("unused exchange plan row while planning static templates".into());
     }
     if patches.next().is_some() {
         return Err("unused exchange plan patch while planning static templates".into());
@@ -366,6 +374,24 @@ pub(crate) fn plan_static_templates(
                             )
                         })
                         .transpose()?;
+                    let instance_rows = phase_steps
+                        .iter()
+                        .map(|steps| {
+                            row_by_step[steps[epoch]]
+                                .ok_or_else(|| "template exchange has no normalized row".into())
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let mut plan_words = Vec::new();
+                    let plan_word_count = instance_rows.iter().map(|row| row.len()).max().unwrap();
+                    for word in 0..plan_word_count {
+                        let values = instance_rows
+                            .iter()
+                            .map(|row| row.get(word).copied().unwrap_or(0))
+                            .collect::<Vec<_>>();
+                        if values.windows(2).any(|pair| pair[0] != pair[1]) {
+                            plan_words.push((u16::try_from(word)?, records.values(values)?));
+                        }
+                    }
                     let plan_address = records.values(
                         phase_steps
                             .iter()
@@ -380,6 +406,7 @@ pub(crate) fn plan_static_templates(
                         sender_word_offset,
                         sender_address,
                         sender_instruction,
+                        plan_words,
                         plan_address,
                         active,
                     });
@@ -1052,9 +1079,29 @@ fn emit_static_template_body(
                 sender_word_offset,
                 sender_address,
                 sender_instruction,
+                plan_words,
                 plan_address,
                 active,
             } => {
+                if !plan_words.is_empty() {
+                    emit_template_value(
+                        code,
+                        *plan_address,
+                        8,
+                        template.shared_address,
+                        template.record_split,
+                    )?;
+                    for &(word, value) in plan_words {
+                        emit_template_value(
+                            code,
+                            value,
+                            3,
+                            template.shared_address,
+                            template.record_split,
+                        )?;
+                        code.st32(3, 8, 15, word)?;
+                    }
+                }
                 if let Some(instruction) = sender_instruction {
                     emit_template_value(
                         code,
@@ -1440,9 +1487,16 @@ mod tests {
             }),
             None,
         ];
-        let (templates, end) =
-            plan_static_templates(&program, &[0x52000, 0x52020], &patches, &regions, 0x53002)
-                .unwrap();
+        let plan_rows = vec![vec![1, 2, 3], vec![1, 2, 4]];
+        let (templates, end) = plan_static_templates(
+            &program,
+            &[0x52000, 0x52020],
+            &plan_rows,
+            &patches,
+            &regions,
+            0x53002,
+        )
+        .unwrap();
 
         assert_eq!(templates.len(), 1);
         let template = &templates[0];
@@ -1455,9 +1509,10 @@ mod tests {
                 sender_word_offset: Some(1),
                 sender_address: None,
                 sender_instruction: Some(_),
+                plan_words: ref words,
                 plan_address: TemplateValue::Record(_),
                 active: TemplateValue::Record(_),
-            }
+            } if words.len() == 1
         ));
         assert!(matches!(
             template.steps[1],

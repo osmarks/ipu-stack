@@ -1395,25 +1395,39 @@ fn package_graph_impl(
     let mut tile_exchange_plans = programs
         .par_iter()
         .map(|program| -> Result<TileExchangePlans> {
-            let mut cursor = PLAN_BASE;
-            let mut unique = HashMap::<Vec<u32>, u32>::new();
-            let mut addresses = Vec::with_capacity(exchange_count);
-            let mut rows = Vec::new();
-            let mut patches = Vec::with_capacity(exchange_count);
-            for (row, templated) in program.steps.iter().filter_map(|step| match step {
-                ipu_compiler::LoweredTileStep::Exchange { phase, row, .. } => Some((
-                    row,
-                    template_regions.iter().any(|region| {
-                        region
-                            .phase_instances
-                            .iter()
-                            .any(|phases| phases.contains(phase))
-                    }),
-                )),
-                _ => None,
-            }) {
+            #[derive(Clone)]
+            struct PreparedExchange {
+                row: Vec<u32>,
+                sender: Option<(usize, u32)>,
+                template_key: Option<(usize, usize, usize)>,
+            }
+
+            let mut phase_templates = HashMap::new();
+            for (region_index, region) in template_regions.iter().enumerate() {
+                for (instance, phases) in region.phase_instances.iter().enumerate() {
+                    for (relative_phase, phase) in phases.clone().enumerate() {
+                        phase_templates.insert(phase, (region_index, instance, relative_phase));
+                    }
+                }
+            }
+            let mut epochs_by_phase = HashMap::<usize, usize>::new();
+            let mut prepared = Vec::with_capacity(exchange_count);
+            let mut sequences = HashMap::<(usize, usize, usize), Vec<Option<Vec<u32>>>>::new();
+            for step in &program.steps {
+                let ipu_compiler::LoweredTileStep::Exchange { phase, row, .. } = step else {
+                    continue;
+                };
+                let epoch = epochs_by_phase.entry(*phase).or_default();
+                let template =
+                    phase_templates
+                        .get(phase)
+                        .map(|&(region, instance, relative_phase)| {
+                            (region, instance, relative_phase, *epoch)
+                        });
+                *epoch += 1;
                 let mut stored_row = row.to_vec();
-                let sender = templated
+                let sender = template
+                    .is_some()
                     .then(|| ipu_exchange::normalize_sender_instruction(&mut stored_row))
                     .flatten();
                 if let Some(return_word) = stored_row
@@ -1422,21 +1436,75 @@ fn package_graph_impl(
                 {
                     stored_row.truncate(return_word + 1);
                 }
-                let address = if let Some(&address) = unique.get(&stored_row) {
+                let template_key = template.map(|(region, instance, relative_phase, epoch)| {
+                    let key = (region, relative_phase, epoch);
+                    let rows = sequences.entry(key).or_insert_with(|| {
+                        vec![None; template_regions[region].phase_instances.len()]
+                    });
+                    rows[instance] = Some(stored_row.clone());
+                    key
+                });
+                prepared.push(PreparedExchange {
+                    row: stored_row,
+                    sender,
+                    template_key,
+                });
+            }
+            let mut dynamic_sequences = HashMap::new();
+            for (key, rows) in sequences {
+                let rows = rows
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or("template exchange sequence is incomplete")?;
+                if rows[1..].iter().any(|row| row != &rows[0]) {
+                    dynamic_sequences
+                        .insert(key, rows.iter().map(Vec::len).max().unwrap_or_default());
+                }
+            }
+
+            let mut cursor = PLAN_BASE;
+            let mut unique = HashMap::<Vec<u32>, u32>::new();
+            let mut template_addresses = HashMap::<(usize, usize, usize), u32>::new();
+            let mut addresses = Vec::with_capacity(exchange_count);
+            let mut rows = Vec::new();
+            let mut plan_rows = Vec::with_capacity(exchange_count);
+            let mut patches = Vec::with_capacity(exchange_count);
+            for exchange in prepared {
+                let dynamic_key = exchange
+                    .template_key
+                    .filter(|key| dynamic_sequences.contains_key(key));
+                let address = if let Some(key) = dynamic_key {
+                    if let Some(&address) = template_addresses.get(&key) {
+                        address
+                    } else {
+                        cursor = align_up(cursor, 8);
+                        let address = cursor;
+                        let mut canonical_row = exchange.row.clone();
+                        canonical_row.resize(dynamic_sequences[&key], 0);
+                        cursor = cursor
+                            .checked_add(u32::try_from(canonical_row.len() * 4)?)
+                            .ok_or("exchange plan address overflow")?;
+                        template_addresses.insert(key, address);
+                        rows.push((address, canonical_row));
+                        address
+                    }
+                } else if let Some(&address) = unique.get(&exchange.row) {
                     address
                 } else {
                     cursor = align_up(cursor, 8);
                     let address = cursor;
                     cursor = cursor
-                        .checked_add(u32::try_from(stored_row.len() * 4)?)
+                        .checked_add(u32::try_from(exchange.row.len() * 4)?)
                         .ok_or("exchange plan address overflow")?;
-                    unique.insert(stored_row.clone(), address);
-                    rows.push((address, stored_row));
+                    unique.insert(exchange.row.clone(), address);
+                    rows.push((address, exchange.row.clone()));
                     address
                 };
                 addresses.push(address);
+                plan_rows.push(exchange.row);
                 patches.push(
-                    sender
+                    exchange
+                        .sender
                         .map(|(word, instruction)| -> Result<_> {
                             Ok(static_codegen::StaticPlanPatch {
                                 word_address: address
@@ -1458,6 +1526,7 @@ fn package_graph_impl(
             let (templates, _) = static_codegen::plan_static_templates(
                 program,
                 &addresses,
+                &plan_rows,
                 &patches,
                 template_regions,
                 0,
