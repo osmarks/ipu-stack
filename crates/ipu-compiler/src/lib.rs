@@ -2715,7 +2715,7 @@ impl Schedule {
     /// overlapping SRAM on the same tile.
     pub fn validate_allocations(&self) -> Result<(), CompileError> {
         let mut by_tile = vec![Vec::new(); usize::from(self.tile_count)];
-        for allocation in &self.allocations {
+        for (index, allocation) in self.allocations.iter().enumerate() {
             let allocations = by_tile
                 .get_mut(usize::from(allocation.tile))
                 .ok_or_else(|| {
@@ -2733,38 +2733,60 @@ impl Schedule {
                         allocation.tensor.0, allocation.tile
                     ))
                 })?;
-            allocations.push(allocation);
+            if allocation.size != 0 && allocation.live_from < allocation.live_until {
+                allocations.push(index);
+            }
         }
-        for allocations in &mut by_tile {
-            allocations.sort_unstable_by_key(|allocation| allocation.address);
-            for (index, left) in allocations.iter().enumerate() {
-                let left_end = left.address + left.size;
-                for right in &allocations[index + 1..] {
-                    if right.address >= left_end {
-                        break;
-                    }
-                    if lifetimes_overlap(
-                        left.live_from,
-                        left.live_until,
-                        right.live_from,
-                        right.live_until,
-                    ) {
-                        return Err(CompileError::Memory(format!(
-                            "live tensors {} and {} overlap on tile {}: 0x{:x}..0x{:x} at phases {}..{} and 0x{:x}..0x{:x} at phases {}..{}",
-                            left.tensor.0,
-                            right.tensor.0,
-                            left.tile,
-                            left.address,
-                            left_end,
-                            left.live_from,
-                            left.live_until,
-                            right.address,
-                            right.address + right.size,
-                            right.live_from,
-                            right.live_until,
-                        )));
-                    }
+        for allocations in by_tile {
+            let mut events = Vec::with_capacity(allocations.len() * 2);
+            for index in allocations {
+                let allocation = &self.allocations[index];
+                events.push((allocation.live_from, true, index));
+                if allocation.live_until != usize::MAX {
+                    events.push((allocation.live_until, false, index));
                 }
+            }
+            events.sort_unstable_by_key(|&(phase, starts, _)| (phase, starts));
+            let mut active = BTreeMap::<(u32, usize), usize>::new();
+            for (_, starts, index) in events {
+                let allocation = &self.allocations[index];
+                let key = (allocation.address, index);
+                if !starts {
+                    active.remove(&key);
+                    continue;
+                }
+                let end = allocation.address + allocation.size;
+                let previous = active
+                    .range(..key)
+                    .next_back()
+                    .map(|(_, &index)| index)
+                    .filter(|&index| {
+                        let previous = &self.allocations[index];
+                        previous.address + previous.size > allocation.address
+                    });
+                let next = active
+                    .range(key..)
+                    .next()
+                    .map(|(_, &index)| index)
+                    .filter(|&index| self.allocations[index].address < end);
+                if let Some(other_index) = previous.or(next) {
+                    let other = &self.allocations[other_index];
+                    return Err(CompileError::Memory(format!(
+                        "live tensors {} and {} overlap on tile {}: 0x{:x}..0x{:x} at phases {}..{} and 0x{:x}..0x{:x} at phases {}..{}",
+                        allocation.tensor.0,
+                        other.tensor.0,
+                        allocation.tile,
+                        allocation.address,
+                        end,
+                        allocation.live_from,
+                        allocation.live_until,
+                        other.address,
+                        other.address + other.size,
+                        other.live_from,
+                        other.live_until,
+                    )));
+                }
+                active.insert(key, index);
             }
         }
         Ok(())
