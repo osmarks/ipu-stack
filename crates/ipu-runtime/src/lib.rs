@@ -18,8 +18,8 @@ mod siglip;
 mod static_codegen;
 pub use siglip::{
     AttentionKernelVariant, HostTensorSet, SiglipEncoderLayer, SiglipEncoderPrecision,
-    SiglipLinearPrecision, SiglipMapHead, SiglipProfileStage, SiglipWeightStorage,
-    append_host_a16_matrix, append_siglip_encoder_layer,
+    SiglipEncoderTuning, SiglipLinearPrecision, SiglipMapHead, SiglipProfileStage,
+    SiglipWeightStorage, append_host_a16_matrix, append_siglip_encoder_layer,
     append_siglip_encoder_layer_with_precision, append_siglip_map_head,
     append_siglip_post_layer_norm, attention_kernel_variant, consolidate_attention_kernel_variants,
 };
@@ -845,6 +845,25 @@ pub fn package_graph_repeated_with_templates_profiled_regions(
     )
 }
 
+pub fn package_graph_repeated_with_templates_profiled_with(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+    templates: &[StaticTemplateRegion],
+    granularity: ProfileGranularity,
+    invocations: u32,
+) -> Result<(Application, ProfileLayout)> {
+    if invocations == 0 {
+        return Err("profiled graph invocation count must be nonzero".into());
+    }
+    package_graph_with_profile_options(
+        graph,
+        objects,
+        ProfileSelection::Granularity(granularity),
+        templates,
+        invocations,
+    )
+}
+
 fn profile_metadata(name: impl Into<String>, value: impl ToString) -> ipu_package::ProfileMetadata {
     ipu_package::ProfileMetadata {
         name: name.into(),
@@ -1451,7 +1470,9 @@ fn package_graph_with_profile_options(
                 base: PLAN_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
                 limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
                 alignment: 8,
-                placement: ipu_compiler::MemoryPlacement::Low,
+                // Profile samples are ordinary host-visible data. Keep them away from
+                // the lower executable elements needed by fine-grained static code.
+                placement: ipu_compiler::MemoryPlacement::High,
             },
         )?;
         let physical = u32::from(topology.physical(program.tile)?);

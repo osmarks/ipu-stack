@@ -107,11 +107,16 @@ pub fn append_flash_attention_from_a16_qkv(
             ));
         }
     }
-    let query_block_rows = query.iter().map(|shard| shard.rows).max().unwrap();
-    let key_block_rows = key.iter().map(|shard| shard.rows).max().unwrap();
+    // Preserve the row-shard contract consumed by downstream composed operators.
+    // K/V packing below can independently assemble the larger blocks selected by
+    // the attention cost model from any number of input shards.
+    let query_block_rows = if config.query_block_rows == 0 {
+        query.iter().map(|shard| shard.rows).max().unwrap()
+    } else {
+        config.query_block_rows
+    };
     let mut plan = plan_flash_attention(FlashAttentionConfig {
         query_block_rows,
-        key_block_rows,
         ..config
     })?;
     relocate_appended_attention(schedule, &mut plan, config.data_base, config.data_limit)?;
@@ -459,12 +464,25 @@ fn append_attention_pack_phase(
     let compute_phase = exchange_phase + 1;
     let mut transfers = Vec::new();
     let mut commands = Vec::new();
+    let mut staging_cursors =
+        vec![ipu_exchange::EXCHANGE_WINDOW_BASE; usize::from(schedule.tile_count)];
     let mut append = |shard: &RowShardPlacement,
                       head: u16,
                       destination_tile: u16,
                       output: TensorId,
-                      operation: &'static str|
+                      operation: &'static str,
+                      source_row_start: u16,
+                      destination_row_start: u16,
+                      copy_rows: u16,
+                      destination_rows: u16|
      -> Result<(), CompileError> {
+        const ROW_OFFSET_BITS: u32 = 10;
+        const ROW_OFFSET_LIMIT: u16 = 1 << ROW_OFFSET_BITS;
+        if source_row_start >= ROW_OFFSET_LIMIT || destination_row_start >= ROW_OFFSET_LIMIT {
+            return Err(CompileError::Graph(
+                "attention pack block-local row offset exceeds 10-bit ABI".into(),
+            ));
+        }
         let source_panel = head * plan.head_dimension / 16;
         let source_offset = head * plan.head_dimension % 16;
         let source_columns = (source_offset + plan.head_dimension).div_ceil(16) * 16;
@@ -492,6 +510,19 @@ fn append_attention_pack_phase(
             },
         });
         if shard.tile != destination_tile {
+            let cursor = &mut staging_cursors[usize::from(destination_tile)];
+            let staging_address = *cursor;
+            *cursor = crate::align_u32(
+                cursor.checked_add(bytes).ok_or_else(|| {
+                    CompileError::Memory("attention staging address overflow".into())
+                })?,
+                32,
+            );
+            if *cursor > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES {
+                return Err(CompileError::Memory(format!(
+                    "attention packing exhausts tile {destination_tile} exchange window"
+                )));
+            }
             transfers.push(Transfer {
                 source_tile: shard.tile,
                 destination_tile,
@@ -501,7 +532,7 @@ fn append_attention_pack_phase(
             schedule.allocations.push(Allocation {
                 tensor: alias,
                 tile: destination_tile,
-                address: ipu_exchange::EXCHANGE_WINDOW_BASE,
+                address: staging_address,
                 size: bytes,
                 live_from: exchange_phase,
                 live_until: compute_phase,
@@ -516,37 +547,88 @@ fn append_attention_pack_phase(
             inputs: vec![alias, alias],
             arguments: vec![
                 u32::from(shard.rows),
-                u32::from(source_columns),
                 u32::from(source_offset),
+                u32::from(source_row_start) | (u32::from(destination_row_start) << ROW_OFFSET_BITS),
+                u32::from(copy_rows),
+                u32::from(destination_rows),
             ],
             specialization: SpecializationKey {
                 operation: operation.into(),
-                shape: vec![usize::from(shard.rows), usize::from(plan.head_dimension)],
+                shape: vec![
+                    usize::from(shard.rows),
+                    usize::from(source_row_start),
+                    usize::from(copy_rows),
+                    usize::from(destination_rows),
+                    usize::from(plan.head_dimension),
+                ],
                 worker_count: 6,
-                role: format!("head-{head}-rows-{}", shard.row_start).into(),
+                role: format!(
+                    "head-{head}-rows-{}..{}",
+                    shard.row_start + source_row_start,
+                    shard.row_start + source_row_start + copy_rows
+                )
+                .into(),
                 alignment: 8,
             },
             metadata: BTreeMap::from([
-                ("row_start".into(), shard.row_start.to_string()),
-                ("rows".into(), shard.rows.to_string()),
+                (
+                    "row_start".into(),
+                    (shard.row_start + source_row_start).to_string(),
+                ),
+                ("rows".into(), copy_rows.to_string()),
+                (
+                    "destination_row_start".into(),
+                    destination_row_start.to_string(),
+                ),
                 ("head".into(), head.to_string()),
             ]),
         });
         Ok(())
     };
+    let mut append_range = |row_start: u16,
+                            rows: u16,
+                            head: u16,
+                            destination_tile: u16,
+                            output: TensorId,
+                            operation: &'static str|
+     -> Result<(), CompileError> {
+        let row_end = row_start + rows;
+        let mut covered = 0u16;
+        for shard in source {
+            let overlap_start = row_start.max(shard.row_start);
+            let overlap_end = row_end.min(shard.row_start + shard.rows);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let copy_rows = overlap_end - overlap_start;
+            append(
+                shard,
+                head,
+                destination_tile,
+                output,
+                operation,
+                overlap_start - shard.row_start,
+                overlap_start - row_start,
+                copy_rows,
+                rows,
+            )?;
+            covered = covered.checked_add(copy_rows).ok_or_else(|| {
+                CompileError::Graph("attention packed row coverage overflow".into())
+            })?;
+        }
+        if covered != rows {
+            return Err(CompileError::Graph(format!(
+                "attention rows {row_start}..{row_end} have only {covered} source rows"
+            )));
+        }
+        Ok(())
+    };
     match kind {
         AttentionPackKind::Query => {
             for task in &plan.tasks {
-                let shard = source
-                    .iter()
-                    .find(|shard| {
-                        shard.row_start == task.query_row_start && shard.rows == task.query_rows
-                    })
-                    .ok_or_else(|| {
-                        CompileError::Graph("attention query shard is missing".into())
-                    })?;
-                append(
-                    shard,
+                append_range(
+                    task.query_row_start,
+                    task.query_rows,
                     task.head,
                     task.tile,
                     task.query,
@@ -556,20 +638,19 @@ fn append_attention_pack_phase(
         }
         AttentionPackKind::Key | AttentionPackKind::Value => {
             for block in &plan.key_values {
-                let shard = source
-                    .iter()
-                    .find(|shard| {
-                        shard.row_start == block.key_row_start && shard.rows == block.key_rows
-                    })
-                    .ok_or_else(|| {
-                        CompileError::Graph("attention key/value shard is missing".into())
-                    })?;
                 let (output, operation) = match kind {
                     AttentionPackKind::Key => (block.key_tensor, "attention_pack_key_f16"),
                     AttentionPackKind::Value => (block.value_tensor, "attention_pack_value_f16"),
                     AttentionPackKind::Query => unreachable!(),
                 };
-                append(shard, block.head, block.tile, output, operation)?;
+                append_range(
+                    block.key_row_start,
+                    block.key_rows,
+                    block.head,
+                    block.tile,
+                    output,
+                    operation,
+                )?;
             }
         }
     }
@@ -1162,14 +1243,20 @@ fn matrix_storage_bytes(storage_rows: u16, padded_dimension: u16) -> u32 {
 }
 
 fn select_key_block_rows(sequence_length: u16, maximum_rows: u16) -> u16 {
-    // Each additional block pays a sync and four kernel launches. Model that
-    // fixed work as one 16-row AMP micro-panel, then account for padded rows.
+    // The critical path trades fixed synchronization per block against packing
+    // and computing one padded block on a single owner tile. Two rows of block
+    // work per synchronization reflects the IPU21 launch/compute crossover;
+    // padding and the final tie-breakers keep the choice stable.
+    const SYNC_ROW_EQUIVALENT: u32 = 2;
     (1..=maximum_rows)
         .min_by_key(|&rows| {
             let blocks = u32::from(sequence_length.div_ceil(rows));
             let storage_rows = u32::from(rows.div_ceil(16) * 16);
-            let padded_rows = blocks * storage_rows;
-            (padded_rows + blocks * 16, padded_rows, maximum_rows - rows)
+            (
+                storage_rows + blocks * SYNC_ROW_EQUIVALENT,
+                blocks * storage_rows,
+                maximum_rows - rows,
+            )
         })
         .expect("maximum key rows is non-zero")
 }
@@ -1324,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn long_sequence_stripes_key_value_storage() {
+    fn long_sequence_splits_large_key_value_transfers() {
         let plan = plan_flash_attention(FlashAttentionConfig {
             batch_size: 1,
             query_sequence_length: 0,
@@ -1332,7 +1419,7 @@ mod tests {
             hidden_size: 1152,
             attention_heads: 16,
             query_block_rows: 0,
-            key_block_rows: 0,
+            key_block_rows: 92,
             tile_count: 1472,
             data_base: 0xa0000,
             data_limit: 0xe8000,
@@ -1460,6 +1547,10 @@ mod tests {
                 .unwrap();
 
         assert_eq!(plan.tasks.iter().map(|task| task.query_rows).max(), Some(6));
+        assert!(
+            plan.key_values.iter().any(|block| block.key_rows > 6),
+            "K/V blocks should be reassembled across source row shards"
+        );
         assert_eq!(
             output
                 .iter()

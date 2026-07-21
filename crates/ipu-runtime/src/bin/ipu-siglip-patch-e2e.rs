@@ -10,13 +10,14 @@ use ipu_elf::{KernelArtifact, Toolchain};
 use ipu_models::{SiglipWeights, TensorArchive};
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, SiglipEncoderPrecision,
-    SiglipLinearPrecision, SiglipWeightStorage, StaticProfileRegion, StaticTemplateRegion,
-    allocator_memory_profile, append_host_a16_matrix, append_siglip_encoder_layer_with_precision,
-    append_siglip_map_head, append_siglip_post_layer_norm, block_binding_typed, block_coordinates,
-    blocked_matrix_f16, consolidate_attention_kernel_variants, package_graph_repeated,
+    BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, ProfileGranularity,
+    SiglipEncoderPrecision, SiglipEncoderTuning, SiglipLinearPrecision, SiglipWeightStorage,
+    StaticProfileRegion, StaticTemplateRegion, allocator_memory_profile, append_host_a16_matrix,
+    append_siglip_encoder_layer_with_precision, append_siglip_map_head,
+    append_siglip_post_layer_norm, block_binding_typed, block_coordinates, blocked_matrix_f16,
+    consolidate_attention_kernel_variants, package_graph_repeated,
     package_graph_repeated_with_templates, package_graph_repeated_with_templates_profiled_regions,
-    run_host_with_options,
+    package_graph_repeated_with_templates_profiled_with, run_host_with_options,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -173,11 +174,16 @@ fn main() {
         Ok(value) => panic!("unsupported SigLIP weight storage {value}"),
     };
     let precision = siglip_encoder_precision(weight_storage);
+    let tuning = SiglipEncoderTuning {
+        attention_key_block_rows: u16::try_from(env_u32("IPU_SIGLIP_ATTENTION_KEY_BLOCK_ROWS", 0))
+            .expect("attention key block rows exceed u16"),
+    };
     info!(
         transient = ?memory.transient,
         resident = ?memory.resident,
         ?weight_storage,
         ?precision,
+        ?tuning,
         "configured encoder tile-memory policy"
     );
     let detailed_diagnostics = layer_count == 1;
@@ -206,6 +212,7 @@ fn main() {
             TILE_COUNT,
             &layer_memory,
             precision,
+            tuning,
             retain_profile_metadata,
             detailed_diagnostics && layer + 1 == layer_count,
             &mut host,
@@ -371,17 +378,29 @@ fn main() {
         "semantic profiling currently requires one invocation"
     );
     let (app, profile_layout) = if profile_output.is_some() {
-        let (app, layout) = package_graph_repeated_with_templates_profiled_regions(
-            &graph,
-            &objects,
-            &templates,
-            &profile_regions,
-            invocations,
-        )
+        let granularity = ProfileGranularity::from_environment().unwrap();
+        let (app, layout) = if granularity == ProfileGranularity::Graph {
+            package_graph_repeated_with_templates_profiled_regions(
+                &graph,
+                &objects,
+                &templates,
+                &profile_regions,
+                invocations,
+            )
+        } else {
+            package_graph_repeated_with_templates_profiled_with(
+                &graph,
+                &objects,
+                &templates,
+                granularity,
+                invocations,
+            )
+        }
         .unwrap();
         info!(
+            ?granularity,
             regions = profile_regions.len(),
-            "enabled semantic stage profiling"
+            "enabled SigLIP profiling"
         );
         (app, Some(layout))
     } else {
@@ -1046,6 +1065,10 @@ fn compile_objects(
             format!(
                 "-DATTENTION_PADDED_HEAD_DIMENSION={}",
                 attention.padded_head_dimension
+            ),
+            format!(
+                "-DATTENTION_KEY_BLOCK_COLUMNS={}",
+                attention.key_block_columns
             ),
         ],
     )?;

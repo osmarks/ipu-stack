@@ -85,6 +85,18 @@ pub struct SiglipMapHead {
     pub attention: FlashAttentionPlan,
 }
 
+fn log_attention_blocking(stage: &str, attention: &FlashAttentionPlan) {
+    info!(
+        stage,
+        query_block_rows = attention.query_block_rows,
+        key_block_rows = attention.key_block_rows,
+        key_block_columns = attention.key_block_columns,
+        tasks = attention.tasks.len(),
+        key_value_blocks = attention.key_values.len(),
+        "planned SigLIP attention blocking"
+    );
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AttentionKernelVariant {
     pub small_query_rows: u16,
@@ -257,6 +269,12 @@ pub struct SiglipEncoderPrecision {
     pub attention_output: SiglipLinearPrecision,
     pub mlp_up: SiglipLinearPrecision,
     pub mlp_down: SiglipLinearPrecision,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SiglipEncoderTuning {
+    /// Zero asks the attention planner to choose the K/V block size.
+    pub attention_key_block_rows: u16,
 }
 
 impl SiglipEncoderPrecision {
@@ -536,6 +554,7 @@ pub fn append_siglip_map_head(
             data_limit,
         },
     )?;
+    log_attention_blocking("map", &attention);
     specialize_attention_phases(schedule, attention_phase_start, &attention);
     end_tensor_lifetimes(
         schedule,
@@ -710,6 +729,7 @@ pub fn append_siglip_encoder_layer(
         tile_count,
         memory,
         SiglipEncoderPrecision::uniform(weight_storage),
+        SiglipEncoderTuning::default(),
         retain_profile_metadata,
         retain_diagnostics,
         host,
@@ -728,6 +748,7 @@ pub fn append_siglip_encoder_layer_with_precision(
     tile_count: u16,
     memory: &MemoryPolicy,
     precision: SiglipEncoderPrecision,
+    tuning: SiglipEncoderTuning,
     retain_profile_metadata: bool,
     retain_diagnostics: bool,
     host: &mut HostTensorSet,
@@ -879,12 +900,13 @@ pub fn append_siglip_encoder_layer_with_precision(
             hidden_size: columns,
             attention_heads: u16::try_from(config.num_attention_heads)?,
             query_block_rows: 0,
-            key_block_rows: 0,
+            key_block_rows: tuning.attention_key_block_rows,
             tile_count,
             data_base,
             data_limit,
         },
     )?;
+    log_attention_blocking("encoder", &attention);
     specialize_attention_phases(schedule, attention_phase_start, &attention);
     end_tensor_lifetimes(
         schedule,

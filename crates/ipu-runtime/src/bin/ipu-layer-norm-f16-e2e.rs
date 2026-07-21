@@ -45,9 +45,7 @@ fn main() {
         .flat_map(|value| value.to_bits().to_le_bytes())
         .collect::<Vec<_>>();
     let mut host_input = pack_rows(&input, columns, &plan.input);
-    for _ in &plan.affine {
-        host_input.extend_from_slice(&affine);
-    }
+    host_input.extend_from_slice(&affine);
 
     let graph = ExecutableGraph {
         host_weights: Vec::new(),
