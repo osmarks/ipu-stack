@@ -31,7 +31,7 @@ const HOST_DATA_START: u32 = 64;
 const HOST_CLOSE_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x160;
 const HOST_PACKET_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE;
 const HOST_STAGING_SEARCH_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x180;
-const HOST_RUN_DESCRIPTOR_WORDS: u32 = 7;
+const HOST_RUN_DESCRIPTOR_WORDS: u32 = 6;
 const WORKER_STACK_HEADROOM: u32 = 0xe0;
 const WORKER_SYNC_STRIDE: u32 = 0x100;
 const WORKER_SYNC_REGISTERS: u32 = 7;
@@ -2714,14 +2714,17 @@ fn write_static_host_plans(
                 .then_some(transfer.copy_destination)
                 .flatten();
             let packet = packet_copies[index].ok_or("active host run has no packet copy")?;
+            let copy_words = copy.map_or(0, |_| transfer.bytes / 4);
+            if copy_words >= 1 << 24 || packet.words >= 1 << 8 {
+                return Err("host descriptor copy count exceeds packed field".into());
+            }
             descriptors.extend_from_slice(&[
                 plan_addresses[index],
                 copy.unwrap_or(0),
                 copy.map_or(0, |_| transfer.tile_address),
-                copy.map_or(0, |_| transfer.bytes / 4),
+                copy_words | (packet.words << 24),
                 packet.destination,
                 packet.source,
-                packet.words,
             ]);
             index += 1;
         }
