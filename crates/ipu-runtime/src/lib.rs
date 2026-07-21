@@ -31,7 +31,7 @@ const HOST_DATA_START: u32 = 64;
 const HOST_CLOSE_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x160;
 const HOST_PACKET_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE;
 const HOST_STAGING_SEARCH_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x180;
-const HOST_RUN_DESCRIPTOR_WORDS: u32 = 4;
+const HOST_RUN_DESCRIPTOR_WORDS: u32 = 3;
 const WORKER_STACK_HEADROOM: u32 = 0xe0;
 const WORKER_SYNC_STRIDE: u32 = 0x100;
 const WORKER_CONTEXTS: u32 = 6;
@@ -1595,6 +1595,7 @@ fn package_graph_impl(
                     let start = index;
                     while index < range.end
                         && host_phase_is_active(physical, &host_transfers[index])
+                        && addresses[index] == addresses[start]
                     {
                         index += 1;
                     }
@@ -3007,7 +3008,6 @@ fn write_static_host_plans(
                 _ => return Err("host packet destination is not encodable".into()),
             };
             descriptors.extend_from_slice(&[
-                plan_addresses[index],
                 copy.unwrap_or(0),
                 copy_words | packet_destination | (packet.words << 24),
                 packet.source,

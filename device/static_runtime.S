@@ -7,7 +7,7 @@
 	.set TILE_MUX_EXCHANGE, 0x640
 	.set WORKER_BASE_PLACEHOLDER, 0
 	.set WORKER_BASE_STRIDE, 0x100
-	.set HOST_RUN_DESCRIPTOR_BYTES, 4 * 4
+	.set HOST_RUN_DESCRIPTOR_BYTES, 3 * 4
 	.set HOST_PACKET_ADDRESS, 0x50000
 	.set SYNC_ALL, 7
 	.set SYNC_COMPUTE_SET, 2
@@ -347,15 +347,16 @@ ipu_stack_static_template_patch:
 ipu_stack_static_host_run:
 	.supervisor
 	add $m11, $m11, -16
+	st32 $m4, $m11, $m15, 2
 .Lhost_run_next:
-	ld32 $m0, $m3, $m15, 2
+	ld32 $m0, $m3, $m15, 1
 	shr $m5, $m0, 24
 	brz $m5, .Lhost_run_call
 	shr $m6, $m0, 20
 	and $m6, $m6, 8
 	setzi $m1, HOST_PACKET_ADDRESS
 	add $m6, $m6, $m1
-	ld32 $m7, $m3, $m15, 3
+	ld32 $m7, $m3, $m15, 2
 .Lhost_run_packet_copy:
 	ld32 $m0, $m7, $m15, 0
 	st32 $m0, $m6, $m15, 0
@@ -366,17 +367,17 @@ ipu_stack_static_host_run:
 .Lhost_run_call:
 	st32 $m2, $m11, $m15, 0
 	st32 $m3, $m11, $m15, 1
-	ld32 $m0, $m3, $m15, 0
+	ld32 $m0, $m11, $m15, 2
 	setzi $m10, .Lhost_run_return
 	br $m0
 .Lhost_run_return:
 	ld32 $m2, $m11, $m15, 0
 	ld32 $m3, $m11, $m15, 1
-	ld32 $m5, $m3, $m15, 2
+	ld32 $m5, $m3, $m15, 1
 	shl $m5, $m5, 9
 	shr $m5, $m5, 9
 	brz $m5, .Lhost_run_advance
-	ld32 $m6, $m3, $m15, 1
+	ld32 $m6, $m3, $m15, 0
 	.globl ipu_stack_static_host_staging_address
 ipu_stack_static_host_staging_address:
 	setzi $m7, HOST_STAGING_ADDRESS_PLACEHOLDER

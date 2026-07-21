@@ -1167,7 +1167,10 @@ fn emit_host_phases(
     while index < phases.len() {
         if phases[index].active {
             let start = index;
-            while index < phases.len() && phases[index].active {
+            while index < phases.len()
+                && phases[index].active
+                && phases[index].address == phases[start].address
+            {
                 index += 1;
             }
             code.setzi(2, u32::try_from(index - start)?)?;
@@ -1177,6 +1180,7 @@ fn emit_host_phases(
                     .run_table
                     .ok_or("active host run has no descriptor table")?,
             )?;
+            code.setzi(4, phases[start].address)?;
             code.call(symbol(symbols, HOST_RUN)?, 9)?;
             continue;
         }
