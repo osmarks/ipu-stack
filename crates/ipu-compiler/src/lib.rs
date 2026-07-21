@@ -2546,12 +2546,20 @@ impl Schedule {
         &self,
         topology: &Topology,
     ) -> Result<Vec<LoweredExchangePhase>, CompileError> {
+        let allocation_index = AllocationIndex::new(&self.allocations);
+        self.lower_exchanges_with_index(topology, &allocation_index)
+    }
+
+    fn lower_exchanges_with_index(
+        &self,
+        topology: &Topology,
+        allocation_index: &AllocationIndex<'_>,
+    ) -> Result<Vec<LoweredExchangePhase>, CompileError> {
         if topology.tile_count() < usize::from(self.tile_count) {
             return Err(CompileError::Graph(
                 "exchange topology has too few tiles".into(),
             ));
         }
-        let allocation_index = AllocationIndex::new(&self.allocations);
         #[derive(Clone)]
         struct PendingGroup {
             source: u16,
@@ -2909,12 +2917,12 @@ impl Schedule {
         &self,
         topology: &Topology,
     ) -> Result<Vec<LoweredTileProgram>, CompileError> {
-        let exchanges = self.lower_exchanges(topology)?;
+        let allocation_index = AllocationIndex::new(&self.allocations);
+        let exchanges = self.lower_exchanges_with_index(topology, &allocation_index)?;
         let exchange_by_phase: HashMap<_, _> = exchanges
             .iter()
             .map(|exchange| (exchange.phase, exchange))
             .collect();
-        let allocation_index = AllocationIndex::new(&self.allocations);
         let mut inactive_row = vec![0; ipu_exchange::PLAN_WORDS];
         inactive_row[0] = SANS_INACTIVE_INSTRUCTION;
         inactive_row[1] = SYNC_ANS_INSTRUCTION;
