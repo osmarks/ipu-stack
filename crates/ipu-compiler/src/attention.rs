@@ -1,7 +1,7 @@
 use crate::{
-    Allocation, AllocationKind, CompileError, KernelCommand, MemoryConstraint, MemoryPlacement,
-    OpId, Phase, RowShardPlacement, Schedule, SpecializationKey, TensorId, Transfer,
-    allocate_from_occupied, occupied_intervals_by_tile,
+    Allocation, AllocationKind, CompileError, KernelCommand, MemoryArena, MemoryConstraint,
+    MemoryPlacement, OpId, Phase, RowShardPlacement, Schedule, SpecializationKey, TensorId,
+    Transfer, allocate_from_occupied, allocate_from_occupied_arenas, occupied_intervals_by_tile,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -174,9 +174,35 @@ fn relocate_appended_attention(
         parent.tile_count,
         live_from,
         usize::MAX,
-        data_base,
+        ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
         data_limit,
     );
+    let score_arenas = [
+        MemoryArena {
+            base: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+            limit: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+        },
+        MemoryArena {
+            base: data_base,
+            limit: data_limit,
+        },
+    ];
+    let mut relocated = BTreeMap::<usize, u32>::new();
+    for task in &plan.tasks {
+        let size = attention_scratch_bytes(
+            task.query_rows,
+            plan.key_block_columns,
+            plan.padded_head_dimension,
+        );
+        let address = allocate_from_occupied_arenas(
+            &mut occupied[usize::from(task.tile)],
+            size,
+            &score_arenas,
+            8,
+            MemoryPlacement::Low,
+        )?;
+        relocated.insert(task.scores.0, address);
+    }
     let mut regions = Vec::<(TensorId, u16, u32, u32)>::new();
     for task in &plan.tasks {
         regions.extend([
@@ -223,7 +249,6 @@ fn relocate_appended_attention(
         ]);
     }
     regions.sort_unstable_by_key(|&(_, _, _, size)| std::cmp::Reverse(size));
-    let mut relocated = BTreeMap::<usize, u32>::new();
     for &(tensor, tile, _address, size) in &regions {
         let address = allocate_from_occupied(
             &mut occupied[usize::from(tile)],
@@ -240,6 +265,7 @@ fn relocate_appended_attention(
     for task in &mut plan.tasks {
         task.query_address = relocated[&task.query.0];
         task.accumulator_address = relocated[&task.accumulator.0];
+        task.scores_address = relocated[&task.scores.0];
         task.weights_address = relocated[&task.weights.0];
         task.output_address = relocated[&task.output.0];
     }
@@ -678,8 +704,10 @@ pub fn plan_flash_attention(
                 let query_bytes = u32::from(query_rows) * u32::from(padded_head_dimension) * 2;
                 // The online state is [accumulator rows][maximum per row][denominator per row].
                 let accumulator_bytes = elements * 4 + u32::from(query_rows) * 8;
-                let scores_bytes = u32::from(query_rows) * u32::from(key_block_columns) * 2;
-                let weights_bytes = scores_bytes + u32::from(query_rows) * 8;
+                let qk_scores_bytes = u32::from(query_rows) * u32::from(key_block_columns) * 2;
+                let scores_bytes =
+                    attention_scratch_bytes(query_rows, key_block_columns, padded_head_dimension);
+                let weights_bytes = qk_scores_bytes + u32::from(query_rows) * 8;
                 let output_bytes = elements * 2;
                 let cursor = &mut cursors[usize::from(tile)];
                 let query_address = allocate(cursor, query_bytes, 8)?;
@@ -791,7 +819,7 @@ pub fn plan_flash_attention(
                 task.scores,
                 task.tile,
                 task.scores_address,
-                u32::from(task.query_rows) * u32::from(key_block_columns) * 2,
+                attention_scratch_bytes(task.query_rows, key_block_columns, padded_head_dimension),
                 0,
                 final_phase,
             ),
@@ -1104,6 +1132,14 @@ pub fn plan_flash_attention(
     })
 }
 
+fn attention_scratch_bytes(
+    query_rows: u16,
+    key_block_columns: u16,
+    padded_head_dimension: u16,
+) -> u32 {
+    u32::from(query_rows) * u32::from(key_block_columns.max(padded_head_dimension)) * 2
+}
+
 fn balanced_partition(total: u16, parts: u16, index: u16) -> (u16, u16) {
     let base = total / parts;
     let larger = total % parts;
@@ -1334,6 +1370,17 @@ mod tests {
 
         assert_eq!(plan.tasks.len(), 16);
         assert!(plan.tasks.iter().all(|task| task.query_rows == 12));
+        for task in &plan.tasks {
+            let scratch = plan
+                .schedule
+                .allocations
+                .iter()
+                .find(|allocation| allocation.tensor == task.scores && allocation.tile == task.tile)
+                .unwrap();
+            let qk_bytes = u32::from(task.query_rows) * u32::from(plan.key_block_columns) * 2;
+            let pv_bytes = u32::from(task.query_rows) * u32::from(plan.padded_head_dimension) * 2;
+            assert!(scratch.size >= qk_bytes.max(pv_bytes));
+        }
         for head in 0..16 {
             assert_eq!(
                 plan.key_values

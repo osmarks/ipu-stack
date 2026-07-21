@@ -1399,6 +1399,7 @@ fn package_graph_impl(
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
         return Err("the direct C600 runtime requires a schedule for every discovered tile".into());
     }
+    graph.schedule.validate_allocations()?;
     let programs = match lowered_programs {
         Some(programs) => programs,
         None => graph.schedule.lower_tile_programs(&topology)?,

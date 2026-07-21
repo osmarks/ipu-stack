@@ -2711,6 +2711,65 @@ impl LoweredExchangeEpoch {
 }
 
 impl Schedule {
+    /// Verifies that tensors which are live at the same time do not occupy
+    /// overlapping SRAM on the same tile.
+    pub fn validate_allocations(&self) -> Result<(), CompileError> {
+        let mut by_tile = vec![Vec::new(); usize::from(self.tile_count)];
+        for allocation in &self.allocations {
+            let allocations = by_tile
+                .get_mut(usize::from(allocation.tile))
+                .ok_or_else(|| {
+                    CompileError::Memory(format!(
+                        "tensor {} is allocated on tile {}, outside the {}-tile schedule",
+                        allocation.tensor.0, allocation.tile, self.tile_count
+                    ))
+                })?;
+            allocation
+                .address
+                .checked_add(allocation.size)
+                .ok_or_else(|| {
+                    CompileError::Memory(format!(
+                        "tensor {} allocation address overflows on tile {}",
+                        allocation.tensor.0, allocation.tile
+                    ))
+                })?;
+            allocations.push(allocation);
+        }
+        for allocations in &mut by_tile {
+            allocations.sort_unstable_by_key(|allocation| allocation.address);
+            for (index, left) in allocations.iter().enumerate() {
+                let left_end = left.address + left.size;
+                for right in &allocations[index + 1..] {
+                    if right.address >= left_end {
+                        break;
+                    }
+                    if lifetimes_overlap(
+                        left.live_from,
+                        left.live_until,
+                        right.live_from,
+                        right.live_until,
+                    ) {
+                        return Err(CompileError::Memory(format!(
+                            "live tensors {} and {} overlap on tile {}: 0x{:x}..0x{:x} at phases {}..{} and 0x{:x}..0x{:x} at phases {}..{}",
+                            left.tensor.0,
+                            right.tensor.0,
+                            left.tile,
+                            left.address,
+                            left_end,
+                            left.live_from,
+                            left.live_until,
+                            right.address,
+                            right.address + right.size,
+                            right.live_from,
+                            right.live_until,
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Releases command annotations used only to construct semantic profiles.
     /// Kernel operation identity and invocation operands remain intact.
     pub fn discard_profile_metadata(&mut self, phases: Range<usize>) {

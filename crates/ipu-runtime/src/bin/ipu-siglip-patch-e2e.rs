@@ -234,7 +234,7 @@ fn main() {
         !full_model || layer_count == config.num_hidden_layers,
         "full-model execution requires every encoder layer"
     );
-    let (output, output_rows, output_name, attentions) = if full_model {
+    let (output, output_rows, output_name, attentions, post_norm_output) = if full_model {
         let post_norm = append_siglip_post_layer_norm(
             &mut plan.schedule,
             &layer_output,
@@ -261,6 +261,7 @@ fn main() {
             12,
             "pooler_output".to_string(),
             vec![attention, map.attention],
+            Some(post_norm),
         )
     } else {
         (
@@ -268,6 +269,7 @@ fn main() {
             rows,
             format!("encoder_layer_{:02}", layer_count - 1),
             vec![attention],
+            None,
         )
     };
     let objects = compile_objects(&plan, &attentions).unwrap();
@@ -286,6 +288,16 @@ fn main() {
             "f16",
             2,
         ));
+    }
+    if std::env::var_os("IPU_SIGLIP_DIAGNOSTIC_BOUNDARIES").is_some() {
+        if let Some(post_norm) = &post_norm_output {
+            host_outputs.push(row_shard_binding(
+                "post_layernorm",
+                rows,
+                columns,
+                post_norm,
+            ));
+        }
     }
     host_outputs.push(row_shard_binding(
         &output_name,
