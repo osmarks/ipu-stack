@@ -413,6 +413,9 @@ pub struct MemoryPolicy {
     pub resident: Vec<MemoryArena>,
     /// Ordered arenas for short-lived activations and ordinary kernel scratch.
     pub transient: Vec<MemoryArena>,
+    /// Per-logical-tile capacity reserved for runtime data and generated code.
+    #[serde(default)]
+    pub resident_headroom: Vec<u32>,
 }
 
 /// Allocatable IPU21 SRAM regions, excluding executable and exchange storage.
@@ -448,6 +451,7 @@ impl MemoryPolicy {
         Self {
             resident: vec![arena],
             transient: vec![arena],
+            resident_headroom: Vec::new(),
         }
     }
 
@@ -482,6 +486,7 @@ impl MemoryPolicy {
         let policy = Self {
             resident: expand(resident_order),
             transient: expand(transient_order),
+            resident_headroom: Vec::new(),
         };
         policy.validate()?;
         Ok(policy)
@@ -1088,6 +1093,7 @@ pub fn append_blocked_gemm_f16_with_a16_input_in_arenas(
                 base: config.data_base,
                 limit: config.data_limit,
             }],
+            resident_headroom: Vec::new(),
         },
     )
 }
@@ -1263,6 +1269,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_in_arenas(
                 base: config.data_base,
                 limit: config.data_limit,
             }],
+            resident_headroom: Vec::new(),
         },
     )
 }
@@ -1438,6 +1445,7 @@ fn plan_appended_blocked_gemm_with_memory_policy(
         &plan.right,
         config.data_type.weight_element_bytes(),
         &memory.resident,
+        &memory.resident_headroom,
     );
     rotate_gemm_plan_tiles(&mut plan, tile_rotation)?;
     let mut regions = plan
@@ -1591,6 +1599,7 @@ fn choose_resident_tile_rotation_in_arenas(
     child_resident: &[BlockPlacement],
     element_bytes: u32,
     arenas: &[MemoryArena],
+    resident_headroom: &[u32],
 ) -> u16 {
     let tile_count = usize::from(parent.tile_count);
     if tile_count == 0 {
@@ -1627,7 +1636,9 @@ fn choose_resident_tile_rotation_in_arenas(
     (0..tile_count)
         .min_by_key(|&rotation| {
             let loads = (0..tile_count).map(|tile| {
-                parent_bytes[tile] + child_bytes[(tile + tile_count - rotation) % tile_count]
+                parent_bytes[tile]
+                    + u64::from(resident_headroom.get(tile).copied().unwrap_or(0))
+                    + child_bytes[(tile + tile_count - rotation) % tile_count]
             });
             let maximum = loads.clone().max().unwrap_or(0);
             let squared = loads
@@ -3922,10 +3933,46 @@ mod tests {
                 base: 0xa0000,
                 limit: 0xe8000,
             }],
+            &[],
         );
 
         assert_ne!(rotation, 0);
         assert_ne!(rotation, 3);
+    }
+
+    #[test]
+    fn appended_gemm_rotation_reserves_configured_tile_headroom() {
+        let parent = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: Vec::new(),
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+        let child = [BlockPlacement {
+            tensor: TensorId(1),
+            tile: 0,
+            address: 0xa0000,
+            block_row: 0,
+            block_column: 0,
+            row_start: 0,
+            rows: 1,
+            column_start: 0,
+            columns: 32,
+        }];
+        let arenas = [MemoryArena {
+            base: 0xa0000,
+            limit: 0xe8000,
+        }];
+
+        assert_eq!(
+            choose_resident_tile_rotation_in_arenas(&parent, &child, 2, &arenas, &[]),
+            0
+        );
+        assert_eq!(
+            choose_resident_tile_rotation_in_arenas(&parent, &child, 2, &arenas, &[128, 0, 0, 0],),
+            1
+        );
     }
 
     #[test]

@@ -153,7 +153,18 @@ fn main() {
         .unwrap_or(1);
     assert!((1..=config.num_hidden_layers).contains(&layer_count));
     let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
-    let memory = encoder_memory_policy(data_limit);
+    let mut memory = encoder_memory_policy(data_limit);
+    if let Ok(value) = std::env::var("IPU_SIGLIP_RESIDENT_HEADROOM") {
+        memory.resident_headroom = vec![0; usize::from(TILE_COUNT)];
+        for entry in value.split(',') {
+            let (tile, bytes) = entry
+                .split_once(':')
+                .unwrap_or_else(|| panic!("invalid resident headroom entry {entry}"));
+            let tile = tile.parse::<usize>().unwrap();
+            assert!(tile < usize::from(TILE_COUNT));
+            memory.resident_headroom[tile] = bytes.parse::<u32>().unwrap();
+        }
+    }
     let weight_storage = match std::env::var("IPU_SIGLIP_WEIGHT_STORAGE").as_deref() {
         Ok("f16") => SiglipWeightStorage::F16,
         Ok("f143") | Err(_) => SiglipWeightStorage::F143,
