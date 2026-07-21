@@ -1811,7 +1811,7 @@ fn package_graph_impl(
         "packed host exchange plans"
     );
     let mut template_record_ranges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); programs.len()];
-    if let Some((tile_index, template, words, changed_words)) = tile_exchange_plans
+    if let Some((tile_index, template, words, changed_words, narrow_deltas)) = tile_exchange_plans
         .iter()
         .enumerate()
         .flat_map(|(tile_index, plans)| {
@@ -1829,10 +1829,23 @@ fn package_graph_impl(
                             .count()
                     })
                     .sum::<usize>();
-                (tile_index, template, words, changed_words)
+                let narrow_deltas = template
+                    .records
+                    .windows(2)
+                    .flat_map(|records| records[0].iter().zip(&records[1]))
+                    .filter(|(left, right)| left != right)
+                    .filter(|(left, right)| match (left, right) {
+                        (
+                            static_codegen::StaticTemplateRecordWord::Value(left),
+                            static_codegen::StaticTemplateRecordWord::Value(right),
+                        ) => i16::try_from(i64::from(*right) - i64::from(*left)).is_ok(),
+                        _ => false,
+                    })
+                    .count();
+                (tile_index, template, words, changed_words, narrow_deltas)
             })
         })
-        .max_by_key(|(_, _, words, _)| *words)
+        .max_by_key(|(_, _, words, _, _)| *words)
     {
         info!(
             logical_tile = programs[tile_index].tile,
@@ -1840,6 +1853,7 @@ fn package_graph_impl(
             instances = template.records.len(),
             record_words = words,
             adjacent_changed_words = changed_words,
+            narrow_delta_words = narrow_deltas,
             "largest static template record set"
         );
     }
@@ -1877,8 +1891,7 @@ fn package_graph_impl(
                         .map(move |(instance, patch)| {
                             (
                                 TemplateDataObject::Patch { template, instance },
-                                patch.len()
-                                    + usize::from(!patch.is_empty()) * record_words.div_ceil(32),
+                                static_codegen::template_patch_storage_words(record_words, patch),
                             )
                         }),
                 )
@@ -2158,7 +2171,9 @@ fn package_graph_impl(
                         .iter()
                         .skip(1)
                         .filter(|patch| !patch.is_empty())
-                        .map(|patch| patch.len() + record_words.div_ceil(32))
+                        .map(|patch| {
+                            static_codegen::template_patch_storage_words(record_words, patch)
+                        })
                         .sum::<usize>()
                         * 4;
                     template.shared.len() * 4 + record + patches
@@ -2447,26 +2462,45 @@ fn package_graph_impl(
                 let mut words = Vec::new();
                 for slot_base in (0..first_record.len()).step_by(32) {
                     let slot_limit = (slot_base + 32).min(first_record.len());
-                    let mut mask = 0u32;
-                    let mut values = Vec::new();
-                    for (slot, word) in patch
+                    let mut changed_mask = 0u32;
+                    let mut narrow_mask = 0u32;
+                    let mut narrow = Vec::new();
+                    let mut wide = Vec::new();
+                    for (slot, value) in patch
                         .iter()
                         .filter(|(slot, _)| (slot_base..slot_limit).contains(&usize::from(*slot)))
                     {
-                        mask |= 1 << (usize::from(*slot) - slot_base);
-                        values.push(match word {
-                            static_codegen::StaticTemplateRecordWord::Value(value) => Ok(*value),
-                            static_codegen::StaticTemplateRecordWord::Symbol(name) => {
-                                image.symbols.get(name).copied().ok_or_else(|| {
-                                    format!("static template references missing {name}")
-                                })
+                        let bit = 1 << (usize::from(*slot) - slot_base);
+                        changed_mask |= bit;
+                        match value {
+                            static_codegen::StaticTemplatePatchValue::Delta(delta) => {
+                                narrow_mask |= bit;
+                                narrow.push(*delta as u16);
                             }
-                        });
+                            static_codegen::StaticTemplatePatchValue::Word(word) => {
+                                wide.push(match word {
+                                    static_codegen::StaticTemplateRecordWord::Value(value) => {
+                                        Ok(*value)
+                                    }
+                                    static_codegen::StaticTemplateRecordWord::Symbol(name) => {
+                                        image.symbols.get(name).copied().ok_or_else(|| {
+                                            format!("static template references missing {name}")
+                                        })
+                                    }
+                                });
+                            }
+                        }
                     }
-                    words.push(mask);
+                    words.extend_from_slice(&[
+                        changed_mask,
+                        narrow_mask,
+                        u32::try_from(narrow.len())?,
+                    ]);
+                    words.extend(narrow.chunks(2).map(|pair| {
+                        u32::from(pair[0]) | (u32::from(pair.get(1).copied().unwrap_or(0)) << 16)
+                    }));
                     words.extend(
-                        values
-                            .into_iter()
+                        wide.into_iter()
                             .collect::<std::result::Result<Vec<_>, String>>()?,
                     );
                 }

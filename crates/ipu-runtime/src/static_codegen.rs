@@ -65,7 +65,7 @@ pub(crate) struct StaticTemplatePlan {
     pub record_split: u16,
     pub records: Vec<Vec<StaticTemplateRecordWord>>,
     pub patch_addresses: Vec<u32>,
-    pub patches: Vec<Vec<(u16, StaticTemplateRecordWord)>>,
+    pub patches: Vec<Vec<(u16, StaticTemplatePatchValue)>>,
     pub shared_address: u32,
     pub shared: Vec<StaticTemplateRecordWord>,
     steps: Vec<StaticTemplateStep>,
@@ -82,6 +82,36 @@ pub(crate) struct StaticPlanPatch {
 pub(crate) enum StaticTemplateRecordWord {
     Value(u32),
     Symbol(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StaticTemplatePatchValue {
+    Delta(i16),
+    Word(StaticTemplateRecordWord),
+}
+
+pub(crate) fn template_patch_storage_words(
+    record_words: usize,
+    patch: &[(u16, StaticTemplatePatchValue)],
+) -> usize {
+    if patch.is_empty() {
+        return 0;
+    }
+    (0..record_words)
+        .step_by(32)
+        .map(|slot_base| {
+            let slot_limit = (slot_base + 32).min(record_words);
+            let group = patch
+                .iter()
+                .filter(|(slot, _)| (slot_base..slot_limit).contains(&usize::from(*slot)));
+            let (narrow, wide) =
+                group.fold((0usize, 0usize), |(narrow, wide), (_, value)| match value {
+                    StaticTemplatePatchValue::Delta(_) => (narrow + 1, wide),
+                    StaticTemplatePatchValue::Word(_) => (narrow, wide + 1),
+                });
+            3 + narrow.div_ceil(2) + wide
+        })
+        .sum()
 }
 
 #[derive(Clone, Debug)]
@@ -414,7 +444,20 @@ pub(crate) fn plan_static_templates(
                     .zip(&pair[1])
                     .enumerate()
                     .filter(|(_, (previous, next))| previous != next)
-                    .map(|(slot, (_, next))| Ok((u16::try_from(slot)?, next.clone())))
+                    .map(|(slot, (previous, next))| {
+                        let value = match (previous, next) {
+                            (
+                                StaticTemplateRecordWord::Value(previous),
+                                StaticTemplateRecordWord::Value(next),
+                            ) if i16::try_from(i64::from(*next) - i64::from(*previous)).is_ok() => {
+                                StaticTemplatePatchValue::Delta(
+                                    (i64::from(*next) - i64::from(*previous)) as i16,
+                                )
+                            }
+                            _ => StaticTemplatePatchValue::Word(next.clone()),
+                        };
+                        Ok((u16::try_from(slot)?, value))
+                    })
                     .collect::<Result<Vec<_>>>()
             }))
             .collect::<Result<Vec<_>>>()?;
@@ -435,11 +478,9 @@ pub(crate) fn plan_static_templates(
             patch_addresses.push(cursor);
             cursor = cursor
                 .checked_add(
-                    u32::try_from(
-                        patch.len() + usize::from(!patch.is_empty()) * record_words.div_ceil(32),
-                    )?
-                    .checked_mul(4)
-                    .ok_or("static template patch size overflow")?,
+                    u32::try_from(template_patch_storage_words(record_words, patch))?
+                        .checked_mul(4)
+                        .ok_or("static template patch size overflow")?,
                 )
                 .ok_or("static template patch address overflow")?;
         }
@@ -1404,14 +1445,29 @@ mod tests {
         assert_eq!(
             end - template.record_addresses[0],
             4 * (template.records[0].len()
-                + template.records[0].len().div_ceil(32)
-                + template.patches[1].len()) as u32
+                + template_patch_storage_words(template.records[0].len(), &template.patches[1],))
+                as u32
         );
         assert_eq!(template.patch_addresses.len(), 2);
         assert!(template.patches[0].is_empty());
         for &(slot, ref value) in &template.patches[1] {
-            assert_eq!(value, &template.records[1][usize::from(slot)]);
-            assert_ne!(value, &template.records[0][usize::from(slot)]);
+            let previous = &template.records[0][usize::from(slot)];
+            let expected = &template.records[1][usize::from(slot)];
+            match (value, previous, expected) {
+                (
+                    StaticTemplatePatchValue::Delta(delta),
+                    StaticTemplateRecordWord::Value(previous),
+                    StaticTemplateRecordWord::Value(expected),
+                ) => assert_eq!(
+                    i64::from(*previous) + i64::from(*delta),
+                    i64::from(*expected)
+                ),
+                (StaticTemplatePatchValue::Word(value), _, expected) => {
+                    assert_eq!(value, expected)
+                }
+                _ => panic!("invalid template patch encoding"),
+            }
+            assert_ne!(previous, expected);
         }
     }
 
