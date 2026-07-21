@@ -1,6 +1,6 @@
 use crate::Result;
 use ipu_compiler::{LoweredTileProgram, LoweredTileStep};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
 const INCOMING_DBASE: u8 = 0xa4;
@@ -72,7 +72,7 @@ pub(crate) struct StaticPlanPatch {
     pub instruction: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum StaticTemplateRecordWord {
     Value(u32),
     Symbol(String),
@@ -82,18 +82,62 @@ pub(crate) enum StaticTemplateRecordWord {
 enum StaticTemplateStep {
     Exchange {
         sender_word_offset: Option<u16>,
-        dynamic_sender_offset: bool,
-        active: bool,
-        dynamic_active: bool,
+        sender_address: Option<TemplateValue>,
+        sender_instruction: Option<TemplateValue>,
+        plan_address: TemplateValue,
+        active: TemplateValue,
     },
     Compute {
         operation: String,
-        operands: Vec<u32>,
-        dynamic_operands: Vec<bool>,
-        dynamic_kernel: bool,
-        conditional: bool,
+        operands: Vec<TemplateValue>,
+        kernel: Option<TemplateValue>,
+        condition: Option<TemplateValue>,
     },
     Idle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemplateValue {
+    Constant(u32),
+    Record(u16),
+}
+
+struct TemplateRecords {
+    rows: Vec<Vec<StaticTemplateRecordWord>>,
+    columns: HashMap<Vec<StaticTemplateRecordWord>, u16>,
+}
+
+impl TemplateRecords {
+    fn new(instances: usize) -> Self {
+        Self {
+            rows: vec![Vec::new(); instances],
+            columns: HashMap::new(),
+        }
+    }
+
+    fn values(&mut self, values: Vec<u32>) -> Result<TemplateValue> {
+        if values[0] < 1 << 20 && values.windows(2).all(|pair| pair[0] == pair[1]) {
+            return Ok(TemplateValue::Constant(values[0]));
+        }
+        self.words(
+            values
+                .into_iter()
+                .map(StaticTemplateRecordWord::Value)
+                .collect(),
+        )
+    }
+
+    fn words(&mut self, words: Vec<StaticTemplateRecordWord>) -> Result<TemplateValue> {
+        if let Some(&slot) = self.columns.get(&words) {
+            return Ok(TemplateValue::Record(slot));
+        }
+        let slot = u16::try_from(self.rows.first().map_or(0, Vec::len))?;
+        for (row, word) in self.rows.iter_mut().zip(&words) {
+            row.push(word.clone());
+        }
+        self.columns.insert(words, slot);
+        Ok(TemplateValue::Record(slot))
+    }
 }
 
 pub(crate) fn plan_static_templates(
@@ -155,7 +199,7 @@ pub(crate) fn plan_static_templates(
             )
             .into());
         }
-        let mut records = vec![Vec::new(); instance_steps.len()];
+        let mut records = TemplateRecords::new(instance_steps.len());
         let mut template_steps = Vec::new();
         for relative_phase in 0..phase_count {
             let phase_steps = instance_steps
@@ -204,45 +248,55 @@ pub(crate) fn plan_static_templates(
                             row.first() != Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION)
                         })
                         .collect::<Vec<_>>();
-                    let active = actives[0];
-                    let dynamic_active = actives[1..].iter().any(|&value| value != active);
-                    let sender_word_offsets = phase_steps
+                    let sender_patches = phase_steps
                         .iter()
-                        .filter_map(|steps| {
-                            patch_by_step[steps[epoch]].map(|patch| patch.word_offset)
-                        })
+                        .map(|steps| patch_by_step[steps[epoch]])
                         .collect::<Vec<_>>();
-                    let sender_word_offset = sender_word_offsets.first().copied();
-                    let dynamic_sender_offset = sender_word_offsets.first().is_some_and(|first| {
-                        sender_word_offsets.iter().any(|offset| offset != first)
-                    });
-                    for (instance, steps) in phase_steps.iter().enumerate() {
-                        let step_index = steps[epoch];
-                        let address = plan_by_step[step_index]
-                            .ok_or("template exchange has no plan address")?;
-                        if sender_word_offset.is_some() {
-                            let patch = patch_by_step[step_index];
-                            if dynamic_sender_offset {
-                                records[instance].push(StaticTemplateRecordWord::Value(
-                                    patch.map_or(0, |patch| patch.word_address),
-                                ));
-                            }
-                            records[instance].push(StaticTemplateRecordWord::Value(
-                                patch.map_or(0, |patch| patch.instruction),
-                            ));
-                        }
-                        records[instance].push(StaticTemplateRecordWord::Value(address));
-                        if dynamic_active {
-                            records[instance].push(StaticTemplateRecordWord::Value(u32::from(
-                                actives[instance],
-                            )));
-                        }
-                    }
+                    let sender_word_offset = sender_patches
+                        .iter()
+                        .flatten()
+                        .map(|patch| patch.word_offset)
+                        .next();
+                    let dynamic_sender_offset = sender_patches
+                        .iter()
+                        .flatten()
+                        .any(|patch| Some(patch.word_offset) != sender_word_offset);
+                    let sender_address = dynamic_sender_offset
+                        .then(|| {
+                            records.values(
+                                sender_patches
+                                    .iter()
+                                    .map(|patch| patch.map_or(0, |patch| patch.word_address))
+                                    .collect(),
+                            )
+                        })
+                        .transpose()?;
+                    let sender_instruction = sender_word_offset
+                        .map(|_| {
+                            records.values(
+                                sender_patches
+                                    .iter()
+                                    .map(|patch| patch.map_or(0, |patch| patch.instruction))
+                                    .collect(),
+                            )
+                        })
+                        .transpose()?;
+                    let plan_address = records.values(
+                        phase_steps
+                            .iter()
+                            .map(|steps| {
+                                plan_by_step[steps[epoch]]
+                                    .ok_or_else(|| "template exchange has no plan address".into())
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    )?;
+                    let active = records.values(actives.into_iter().map(u32::from).collect())?;
                     template_steps.push(StaticTemplateStep::Exchange {
                         sender_word_offset,
-                        dynamic_sender_offset,
+                        sender_address,
+                        sender_instruction,
+                        plan_address,
                         active,
-                        dynamic_active,
                     });
                 }
             } else if all_compute {
@@ -283,8 +337,8 @@ pub(crate) fn plan_static_templates(
                 .into());
             }
         }
-        let mut record_addresses = Vec::with_capacity(records.len());
-        for record in &records {
+        let mut record_addresses = Vec::with_capacity(records.rows.len());
+        for record in &records.rows {
             cursor = (cursor + 3) & !3;
             record_addresses.push(cursor);
             cursor = cursor
@@ -300,7 +354,7 @@ pub(crate) fn plan_static_templates(
             name: region.name.clone(),
             instance_steps,
             record_addresses,
-            records,
+            records: records.rows,
             steps: template_steps,
         });
     }
@@ -310,7 +364,7 @@ pub(crate) fn plan_static_templates(
 fn plan_template_compute_step(
     commands: &[Vec<&ipu_compiler::LoweredComputeCommand>],
     command_index: usize,
-    records: &mut [Vec<StaticTemplateRecordWord>],
+    records: &mut TemplateRecords,
     template_name: &str,
     relative_phase: usize,
 ) -> Result<StaticTemplateStep> {
@@ -343,56 +397,62 @@ fn plan_template_compute_step(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let dynamic_operands = (0..operands[0].len())
-        .map(|operand| {
-            operands[1..]
-                .iter()
-                .any(|values| values[operand] != operands[0][operand])
-        })
-        .collect::<Vec<_>>();
     let conditional = active.len() != commands.len();
     let dynamic_kernel = active
         .iter()
         .any(|command| command.specialization.operation != first.specialization.operation);
-    for (record, instance_commands) in records.iter_mut().zip(commands) {
-        let command = instance_commands.get(command_index).copied();
-        if conditional {
-            record.push(StaticTemplateRecordWord::Value(u32::from(
-                command.is_some(),
-            )));
-        }
-        if dynamic_kernel {
-            match command {
-                Some(command) => record.push(StaticTemplateRecordWord::Symbol(format!(
-                    "ipu_stack_{}",
-                    command.specialization.operation
-                ))),
-                None => record.push(StaticTemplateRecordWord::Value(0)),
-            }
-        }
-        let values = command
-            .map(|command| {
-                std::iter::once(command.output_address)
-                    .chain(command.input_addresses.iter().copied())
-                    .chain(command.arguments.iter().copied())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| operands[0].clone());
-        record.extend(
-            values
-                .iter()
-                .zip(&dynamic_operands)
-                .filter_map(|(&value, &dynamic)| {
-                    dynamic.then_some(StaticTemplateRecordWord::Value(value))
-                }),
-        );
-    }
+    let condition = conditional
+        .then(|| {
+            records.values(
+                commands
+                    .iter()
+                    .map(|commands| u32::from(commands.get(command_index).is_some()))
+                    .collect(),
+            )
+        })
+        .transpose()?;
+    let kernel = dynamic_kernel
+        .then(|| {
+            records.words(
+                commands
+                    .iter()
+                    .map(|commands| match commands.get(command_index) {
+                        Some(command) => StaticTemplateRecordWord::Symbol(format!(
+                            "ipu_stack_{}",
+                            command.specialization.operation
+                        )),
+                        None => StaticTemplateRecordWord::Value(0),
+                    })
+                    .collect(),
+            )
+        })
+        .transpose()?;
+    let operands = (0..operands[0].len())
+        .map(|operand| {
+            records.values(
+                commands
+                    .iter()
+                    .map(|commands| {
+                        commands
+                            .get(command_index)
+                            .map(|command| {
+                                std::iter::once(command.output_address)
+                                    .chain(command.input_addresses.iter().copied())
+                                    .chain(command.arguments.iter().copied())
+                                    .nth(operand)
+                                    .unwrap()
+                            })
+                            .unwrap_or(operands[0][operand])
+                    })
+                    .collect(),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(StaticTemplateStep::Compute {
         operation: first.specialization.operation.clone(),
-        operands: operands[0].clone(),
-        dynamic_operands,
-        dynamic_kernel,
-        conditional,
+        operands,
+        kernel,
+        condition,
     })
 }
 
@@ -710,12 +770,9 @@ pub(crate) fn emit(
     let template_exchanges = if templates.is_empty() {
         None
     } else {
-        let mut addresses = [0; 3];
-        for (index, active) in [Some(false), Some(true), None].into_iter().enumerate() {
-            addresses[index] = generated_address(generated_base, code.words.len())?;
-            emit_static_template_exchange(&mut code, worker_barrier, generated_base, active)?;
-        }
-        Some(addresses)
+        let address = generated_address(generated_base, code.words.len())?;
+        emit_static_template_exchange(&mut code, worker_barrier, generated_base)?;
+        Some(address)
     };
     let mut template_bodies = Vec::with_capacity(templates.len());
     for template in templates {
@@ -739,17 +796,7 @@ fn emit_static_template_exchange(
     code: &mut TileCode,
     worker_barrier: u32,
     generated_base: u32,
-    active: Option<bool>,
 ) -> Result<()> {
-    code.ld32(2, 11, 15, 0)?;
-    code.ld32(8, 2, 15, 0)?;
-    if active.is_none() {
-        code.ld32(0, 2, 15, 1)?;
-    } else {
-        code.setzi(0, u32::from(active == Some(true)))?;
-    }
-    code.add_immediate(2, 2, if active.is_none() { 8 } else { 4 })?;
-    code.st32(2, 11, 15, 0)?;
     code.instruction(ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
     let skip_barrier = code.words.len();
     code.brz(0, 0)?;
@@ -763,11 +810,21 @@ fn emit_static_template_exchange(
     Ok(())
 }
 
+fn emit_template_value(code: &mut TileCode, value: TemplateValue, register: u8) -> Result<()> {
+    match value {
+        TemplateValue::Constant(value) => code.setzi(register, value),
+        TemplateValue::Record(slot) => {
+            code.ld32(1, 11, 15, 0)?;
+            code.ld32(register, 1, 15, slot)
+        }
+    }
+}
+
 fn emit_static_template_body(
     code: &mut TileCode,
     template: &StaticTemplatePlan,
     symbols: &BTreeMap<String, u32>,
-    template_exchanges: [u32; 3],
+    template_exchange: u32,
     generated_base: u32,
 ) -> Result<()> {
     code.add_immediate(11, 11, -16)?;
@@ -777,83 +834,53 @@ fn emit_static_template_body(
         match planned {
             StaticTemplateStep::Exchange {
                 sender_word_offset,
-                dynamic_sender_offset,
+                sender_address,
+                sender_instruction,
+                plan_address,
                 active,
-                dynamic_active,
             } => {
-                if let Some(word_offset) = sender_word_offset {
-                    code.ld32(1, 11, 15, 0)?;
-                    if *dynamic_sender_offset {
-                        code.ld32(8, 1, 15, 0)?;
-                        code.ld32(3, 1, 15, 1)?;
-                        code.add_immediate(1, 1, 8)?;
-                    } else {
-                        code.ld32(3, 1, 15, 0)?;
-                        code.add_immediate(1, 1, 4)?;
-                    }
-                    code.st32(1, 11, 15, 0)?;
+                if let Some(instruction) = sender_instruction {
+                    emit_template_value(code, *instruction, 3)?;
                     let skip_patch = code.words.len();
                     code.brz(3, 0)?;
-                    if *dynamic_sender_offset {
+                    if let Some(address) = sender_address {
+                        emit_template_value(code, *address, 8)?;
                         code.st32(3, 8, 15, 0)?;
                     } else {
-                        code.ld32(8, 1, 15, 0)?;
-                        code.st32(3, 8, 15, *word_offset)?;
+                        emit_template_value(code, *plan_address, 8)?;
+                        code.st32(3, 8, 15, sender_word_offset.unwrap())?;
                     }
                     let after_patch = generated_address(generated_base, code.words.len())?;
                     code.words[skip_patch] = ipu_exchange::encode_brz_m_immediate(3, after_patch)?;
                 }
-                let helper = if *dynamic_active {
-                    2
-                } else {
-                    usize::from(*active)
-                };
-                code.call(template_exchanges[helper], 9)?;
+                emit_template_value(code, *plan_address, 8)?;
+                emit_template_value(code, *active, 0)?;
+                code.call(template_exchange, 9)?;
             }
             StaticTemplateStep::Compute {
                 operation,
                 operands,
-                dynamic_operands,
-                dynamic_kernel,
-                conditional,
+                kernel,
+                condition,
             } => {
-                let dynamic_count = dynamic_operands.iter().filter(|&&dynamic| dynamic).count();
-                let record_words =
-                    dynamic_count + usize::from(*conditional) + usize::from(*dynamic_kernel);
-                if record_words != 0 {
-                    code.ld32(1, 11, 15, 0)?;
+                if let Some(condition) = condition {
+                    emit_template_value(code, *condition, 0)?;
                 }
-                if *conditional {
-                    code.ld32(0, 1, 15, 0)?;
+                if let Some(kernel) = kernel {
+                    emit_template_value(code, *kernel, 8)?;
                 }
-                let kernel_offset = u16::from(*conditional);
-                if *dynamic_kernel {
-                    code.ld32(8, 1, 15, kernel_offset)?;
-                }
-                let mut dynamic_offset = kernel_offset + u16::from(*dynamic_kernel);
-                for (operand, (&value, &dynamic)) in
-                    operands.iter().zip(dynamic_operands).enumerate()
-                {
+                for (operand, &value) in operands.iter().enumerate() {
                     let register = u8::try_from(operand)? + 2;
-                    if dynamic {
-                        code.ld32(register, 1, 15, dynamic_offset)?;
-                        dynamic_offset += 1;
-                    } else {
-                        code.setzi(register, value)?;
-                    }
+                    emit_template_value(code, value, register)?;
                 }
-                if record_words != 0 {
-                    code.add_immediate(1, 1, i32::try_from(record_words * 4)?)?;
-                    code.st32(1, 11, 15, 0)?;
-                }
-                let skip_call = if *conditional {
+                let skip_call = if condition.is_some() {
                     let branch = code.words.len();
                     code.brz(0, 0)?;
                     Some(branch)
                 } else {
                     None
                 };
-                if *dynamic_kernel {
+                if kernel.is_some() {
                     let return_address = generated_address(generated_base, code.words.len() + 2)?;
                     code.setzi(10, return_address)?;
                     code.branch(8)?;
@@ -1075,6 +1102,41 @@ mod tests {
     }
 
     #[test]
+    fn template_records_intern_repeated_instance_columns() {
+        let mut records = TemplateRecords::new(3);
+
+        let first = records.values(vec![10, 20, 30]).unwrap();
+        let repeated = records.values(vec![10, 20, 30]).unwrap();
+        let second = records.values(vec![11, 21, 31]).unwrap();
+        let wide_constant = records.values(vec![0x3f80_0000; 3]).unwrap();
+
+        assert_eq!(first, TemplateValue::Record(0));
+        assert_eq!(repeated, first);
+        assert_eq!(second, TemplateValue::Record(1));
+        assert_eq!(wide_constant, TemplateValue::Record(2));
+        assert_eq!(
+            records.rows,
+            vec![
+                vec![
+                    StaticTemplateRecordWord::Value(10),
+                    StaticTemplateRecordWord::Value(11),
+                    StaticTemplateRecordWord::Value(0x3f80_0000),
+                ],
+                vec![
+                    StaticTemplateRecordWord::Value(20),
+                    StaticTemplateRecordWord::Value(21),
+                    StaticTemplateRecordWord::Value(0x3f80_0000),
+                ],
+                vec![
+                    StaticTemplateRecordWord::Value(30),
+                    StaticTemplateRecordWord::Value(31),
+                    StaticTemplateRecordWord::Value(0x3f80_0000),
+                ],
+            ]
+        );
+    }
+
+    #[test]
     fn templates_align_rotated_tile_work_by_global_phase() {
         let program = LoweredTileProgram {
             tile: 7,
@@ -1112,23 +1174,24 @@ mod tests {
             template.steps[0],
             StaticTemplateStep::Exchange {
                 sender_word_offset: Some(1),
-                dynamic_sender_offset: false,
-                active: true,
-                dynamic_active: true,
+                sender_address: None,
+                sender_instruction: Some(_),
+                plan_address: TemplateValue::Record(_),
+                active: TemplateValue::Record(_),
             }
         ));
         assert!(matches!(
             template.steps[1],
             StaticTemplateStep::Compute {
-                dynamic_kernel: true,
-                conditional: false,
+                kernel: Some(_),
+                condition: None,
                 ..
             }
         ));
         assert!(matches!(
             template.steps[2],
             StaticTemplateStep::Compute {
-                conditional: true,
+                condition: Some(_),
                 ..
             }
         ));
