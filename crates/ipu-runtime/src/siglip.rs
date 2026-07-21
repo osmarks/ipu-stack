@@ -1,6 +1,6 @@
 use crate::{
-    BlockLayout, Result, block_binding_typed, blocked_matrix_f8_f143, blocked_matrix_f16,
-    f143_scale,
+    BlockLayout, Result, block_binding_typed, blocked_matrix_f8_f143_by_block, blocked_matrix_f16,
+    f143_block_scales, f143_scale,
 };
 use half::f16;
 use ipu_compiler::{
@@ -15,7 +15,7 @@ use ipu_compiler::{
     append_blocked_gemm_f16_with_a16_input_with_memory_policy, append_c16_to_a16_blocks_gelu_f16,
     append_c16_to_a16_row_shards, append_flash_attention_from_a16_qkv,
     append_flash_attention_to_a16_row_shards, end_tensor_lifetimes, find_free_region,
-    make_tensors_resident,
+    make_tensors_resident, set_f8_weight_block_scales,
 };
 use ipu_models::SiglipWeights;
 use ipu_package::{Binding, RegionSlice};
@@ -553,6 +553,7 @@ pub fn append_siglip_encoder_layer(
         memory,
     )?;
     push_gemm_weight(
+        schedule,
         host,
         &format!("{prefix}.qkv.weight"),
         columns,
@@ -655,6 +656,7 @@ pub fn append_siglip_encoder_layer(
         memory,
     )?;
     push_gemm_weight(
+        schedule,
         host,
         &format!("{prefix}.attention_output.weight"),
         columns,
@@ -744,6 +746,7 @@ pub fn append_siglip_encoder_layer(
         memory,
     )?;
     push_gemm_weight(
+        schedule,
         host,
         &format!("{prefix}.mlp_up.weight"),
         columns,
@@ -803,6 +806,7 @@ pub fn append_siglip_encoder_layer(
         memory,
     )?;
     push_gemm_weight(
+        schedule,
         host,
         &format!("{prefix}.mlp_down.weight"),
         intermediate_columns,
@@ -894,6 +898,7 @@ fn gemm_config(
 }
 
 fn push_gemm_weight(
+    schedule: &mut Schedule,
     host: &mut HostTensorSet,
     name: &str,
     rows: u16,
@@ -907,10 +912,14 @@ fn push_gemm_weight(
             "f16",
             blocked_matrix_f16(placements, BlockLayout::AmpB16x16, value),
         ),
-        GemmDataType::F16F8Weights { scale } => (
-            "f8-f143",
-            blocked_matrix_f8_f143(placements, BlockLayout::AmpB16x16, scale, value),
-        ),
+        GemmDataType::F16F8Weights { .. } => {
+            let scales = f143_block_scales(placements, &value);
+            set_f8_weight_block_scales(schedule, placements, &scales)?;
+            (
+                "f8-f143-block-scaled",
+                blocked_matrix_f8_f143_by_block(placements, BlockLayout::AmpB16x16, &scales, value),
+            )
+        }
         GemmDataType::F32 => return Err("SigLIP weights require FP16 graph operands".into()),
     };
     host.push(

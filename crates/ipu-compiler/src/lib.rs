@@ -987,6 +987,60 @@ impl GemmDataType {
     }
 }
 
+pub fn set_f8_weight_block_scales(
+    schedule: &mut Schedule,
+    blocks: &[BlockPlacement],
+    scales: &[i8],
+) -> Result<(), CompileError> {
+    if blocks.len() != scales.len() {
+        return Err(CompileError::Graph(
+            "FP8 weight block and scale counts differ".into(),
+        ));
+    }
+    let mut by_tensor = BTreeMap::new();
+    for (block, &scale) in blocks.iter().zip(scales) {
+        if by_tensor.insert(block.tensor.0, scale).is_some() {
+            return Err(CompileError::Graph(
+                "FP8 weight block tensors are not unique".into(),
+            ));
+        }
+    }
+    let mut applied = BTreeSet::new();
+    for phase in &mut schedule.phases {
+        let Phase::Compute { commands, .. } = phase else {
+            continue;
+        };
+        for command in commands {
+            if command.specialization.operation != "expand_f8_f143_to_f16" {
+                continue;
+            }
+            let Some((&tensor, &scale)) = command
+                .inputs
+                .first()
+                .and_then(|tensor| by_tensor.get_key_value(&tensor.0))
+            else {
+                continue;
+            };
+            let argument = command.arguments.get_mut(1).ok_or_else(|| {
+                CompileError::Graph("FP8 expansion command has no scale argument".into())
+            })?;
+            *argument = u32::from(scale as u8);
+            if !command.metadata.is_empty() {
+                command
+                    .metadata
+                    .insert("f143_scale".into(), scale.to_string());
+            }
+            applied.insert(tensor);
+        }
+    }
+    if applied.len() != by_tensor.len() {
+        return Err(CompileError::Graph(
+            "some FP8 weight blocks have no expansion command".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockedGemmPlan {
     pub schedule: Schedule,
@@ -4141,7 +4195,6 @@ mod tests {
             retain_profile_metadata: true,
         })
         .unwrap();
-
         assert!(!plan.left.is_empty());
         assert!(!plan.right.is_empty());
         assert!(!plan.output.is_empty());
@@ -4196,7 +4249,7 @@ mod tests {
 
     #[test]
     fn fp8_weight_storage_expands_transiently_before_fp16_gemm() {
-        let plan = plan_blocked_gemm(BlockedGemmConfig {
+        let mut plan = plan_blocked_gemm(BlockedGemmConfig {
             rows: 64,
             inner_dimension: 64,
             columns: 64,
@@ -4210,6 +4263,8 @@ mod tests {
             retain_profile_metadata: true,
         })
         .unwrap();
+        let scales = vec![-7; plan.right.len()];
+        set_f8_weight_block_scales(&mut plan.schedule, &plan.right, &scales).unwrap();
 
         for block in &plan.right {
             let allocation = plan
@@ -4234,7 +4289,8 @@ mod tests {
                     &round[1],
                     Phase::Compute { commands, .. }
                         if commands.iter().all(|command|
-                            command.specialization.operation == "expand_f8_f143_to_f16")
+                            command.specialization.operation == "expand_f8_f143_to_f16"
+                                && command.arguments.get(1) == Some(&u32::from((-7i8) as u8)))
                 )
                 && matches!(
                     &round[2],

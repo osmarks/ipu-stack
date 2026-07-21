@@ -24,7 +24,8 @@ pub use siglip::{
 mod blocked_data;
 pub use blocked_data::{
     BlockLayout, block_binding, block_binding_typed, block_coordinates, blocked_matrix,
-    blocked_matrix_f8_f143, blocked_matrix_f16, f143_from_f32, f143_scale, f143_to_f32, normal_f16,
+    blocked_matrix_f8_f143, blocked_matrix_f8_f143_by_block, blocked_matrix_f16, f143_block_scales,
+    f143_from_f32, f143_scale, f143_to_f32, normal_f16,
 };
 
 const PLAN_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;

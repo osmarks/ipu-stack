@@ -236,6 +236,43 @@ pub fn blocked_matrix_f8_f143(
     bytes
 }
 
+pub fn f143_block_scales(
+    placements: &[BlockPlacement],
+    value: &impl Fn(u16, u16) -> f32,
+) -> Vec<i8> {
+    placements
+        .iter()
+        .map(|placement| {
+            f143_scale((0..placement.rows * placement.columns).map(|linear| {
+                let row = linear / placement.columns;
+                let column = linear % placement.columns;
+                value(placement.row_start + row, placement.column_start + column)
+            }))
+        })
+        .collect()
+}
+
+pub fn blocked_matrix_f8_f143_by_block(
+    placements: &[BlockPlacement],
+    layout: BlockLayout,
+    scales: &[i8],
+    value: impl Fn(u16, u16) -> f32,
+) -> Vec<u8> {
+    assert_eq!(placements.len(), scales.len());
+    let mut bytes = Vec::new();
+    for (placement, &scale) in placements.iter().zip(scales) {
+        for linear in 0..placement.rows * placement.columns {
+            let (row, column) =
+                block_coordinates(layout, placement.rows, placement.columns, linear);
+            bytes.push(f143_from_f32(
+                value(placement.row_start + row, placement.column_start + column),
+                scale,
+            ));
+        }
+    }
+    bytes
+}
+
 pub fn normal_f16(elements: usize, seed: u64, standard_deviation: f32) -> Vec<half::f16> {
     let mut rng = fastrand::Rng::with_seed(seed);
     let mut values = Vec::with_capacity(elements);
