@@ -96,6 +96,8 @@ enum Command {
     EncoderReference,
     PackageInspect {
         package: PathBuf,
+        #[arg(long)]
+        bindings: bool,
     },
     ProfileInspect {
         profile: PathBuf,
@@ -383,7 +385,7 @@ fn main() -> Result<()> {
                 output.iter().copied().fold(f32::NEG_INFINITY, f32::max)
             );
         }
-        Command::PackageInspect { package } => {
+        Command::PackageInspect { package, bindings } => {
             let app = Application::read(fs::File::open(&package)?)?;
             let stored: usize = app.blobs.iter().map(|blob| blob.bytes.len()).sum();
             println!(
@@ -398,6 +400,33 @@ fn main() -> Result<()> {
                 app.entry_points.len(),
                 app.device_config_writes.len()
             );
+            if bindings {
+                for (kind, group) in [
+                    ("input", &app.inputs),
+                    ("output", &app.outputs),
+                    ("weight", &app.weights),
+                ] {
+                    for binding in group {
+                        println!(
+                            "binding kind={kind} name={} dtype={} shape={:?} slices={}",
+                            binding.name,
+                            binding.dtype,
+                            binding.shape,
+                            binding.slices.len()
+                        );
+                        for (index, slice) in binding.slices.iter().enumerate() {
+                            println!(
+                                "slice binding={} index={index} tile={} address={:#x} offset={} size={}",
+                                binding.name,
+                                slice.tile,
+                                slice.tile_address,
+                                slice.file_offset,
+                                slice.size
+                            );
+                        }
+                    }
+                }
+            }
         }
         Command::ProfileInspect { profile } => {
             let report = ProfileReport::read(fs::File::open(profile)?)?;

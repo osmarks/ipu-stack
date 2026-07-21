@@ -10,7 +10,8 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
-from transformers import SiglipConfig, SiglipVisionModel
+from PIL import Image
+from transformers import AutoImageProcessor, SiglipConfig, SiglipVisionModel
 
 
 LINEAR_SUFFIXES = (
@@ -31,8 +32,15 @@ def parse_args() -> argparse.Namespace:
         "--calibration",
         type=Path,
         action="append",
-        required=True,
+        default=[],
         help="SafeTensors file containing pixel_values; may be repeated",
+    )
+    parser.add_argument(
+        "--image",
+        type=Path,
+        action="append",
+        default=[],
+        help="Image processed with the model's official processor; may be repeated",
     )
     parser.add_argument("--block-size", type=int, default=64)
     parser.add_argument("--damp", type=float, default=0.01)
@@ -41,6 +49,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threads", type=int)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cpu")
     parser.add_argument("--no-save", action="store_true")
+    parser.add_argument(
+        "--no-bias-correction", action="store_false", dest="bias_correction"
+    )
     return parser.parse_args()
 
 
@@ -60,11 +71,20 @@ def load_model(path: Path) -> tuple[SiglipVisionModel, SiglipConfig]:
     return model, config
 
 
-def calibration_pixels(paths: list[Path]) -> list[torch.Tensor]:
+def calibration_pixels(
+    paths: list[Path], image_paths: list[Path], model_path: Path
+) -> list[torch.Tensor]:
     batches = []
     for path in paths:
         with safe_open(path, framework="pt", device="cpu") as source:
             batches.append(source.get_tensor("pixel_values").float())
+    if image_paths:
+        processor = AutoImageProcessor.from_pretrained(model_path, local_files_only=True)
+        images = []
+        for path in image_paths:
+            with Image.open(path) as image:
+                images.append(image.convert("RGB"))
+        batches.append(processor(images=images, return_tensors="pt")["pixel_values"].float())
     return batches
 
 
@@ -84,7 +104,7 @@ def collect_block_hessians(
     modules: dict[str, torch.nn.Linear],
     batches: list[torch.Tensor],
     block_size: int,
-) -> dict[str, list[torch.Tensor]]:
+) -> tuple[dict[str, list[torch.Tensor]], dict[str, torch.Tensor], dict[str, int]]:
     hessians = {
         name: [
             torch.zeros(
@@ -95,10 +115,17 @@ def collect_block_hessians(
         ]
         for name, module in modules.items()
     }
+    sums = {
+        name: torch.zeros(module.in_features, device=module.weight.device)
+        for name, module in modules.items()
+    }
+    counts = dict.fromkeys(modules, 0)
     hooks = []
     for name, module in modules.items():
         def accumulate(_module, inputs, name=name):
             values = inputs[0].detach().float().reshape(-1, inputs[0].shape[-1])
+            sums[name].add_(values.sum(dim=0))
+            counts[name] += values.shape[0]
             for index, start in enumerate(range(0, values.shape[1], block_size)):
                 block = values[:, start : start + block_size]
                 hessians[name][index].addmm_(block.T, block)
@@ -109,7 +136,7 @@ def collect_block_hessians(
             model(pixel_values=pixels.to(next(model.parameters()).device), interpolate_pos_encoding=False)
     for hook in hooks:
         hook.remove()
-    return hessians
+    return hessians, sums, counts
 
 
 def f143_scales_by_row_block(values: torch.Tensor, block_size: int) -> torch.Tensor:
@@ -173,7 +200,8 @@ def reconstruct_linear(
     block_size: int,
     damp: float,
     algorithm: str,
-) -> tuple[float, float]:
+    input_mean: torch.Tensor | None,
+) -> tuple[float, float, float]:
     original = module.weight.detach()
     reconstructed = torch.empty_like(original)
     nearest_objective = 0.0
@@ -199,8 +227,12 @@ def reconstruct_linear(
         reconstructed_objective += torch.sum(
             (rebuilt_error @ hessian) * rebuilt_error
         ).item()
+    correction = torch.zeros(module.out_features, device=original.device)
+    if input_mean is not None and module.bias is not None:
+        correction = (original.float() - reconstructed.float()) @ input_mean
+        module.bias.add_(correction.to(module.bias.dtype))
     module.weight.copy_(reconstructed)
-    return nearest_objective, reconstructed_objective
+    return nearest_objective, reconstructed_objective, correction.square().mean().sqrt().item()
 
 
 def output_metrics(reference: torch.Tensor, actual: torch.Tensor) -> dict[str, float]:
@@ -233,7 +265,9 @@ def main() -> None:
     layer_count = args.layers or config.vision_config.num_hidden_layers
     if not 1 <= layer_count <= config.vision_config.num_hidden_layers:
         raise ValueError("layer count is outside the model")
-    batches = calibration_pixels(args.calibration)
+    if not args.calibration and not args.image:
+        raise ValueError("at least one --calibration or --image input is required")
+    batches = calibration_pixels(args.calibration, args.image, args.model)
     modules = encoder_linears(model, layer_count)
 
     with torch.inference_mode():
@@ -242,17 +276,30 @@ def main() -> None:
             .last_hidden_state.clone()
             for pixels in batches
         ]
-    hessians = collect_block_hessians(model, modules, batches, args.block_size)
+    hessians, input_sums, input_counts = collect_block_hessians(
+        model, modules, batches, args.block_size
+    )
     objectives = {}
     with torch.no_grad():
         for index, (name, module) in enumerate(modules.items(), 1):
-            nearest, reconstructed = reconstruct_linear(
-                module, hessians.pop(name), args.block_size, args.damp, args.algorithm
+            input_mean = (
+                input_sums.pop(name) / input_counts.pop(name)
+                if args.bias_correction
+                else None
+            )
+            nearest, reconstructed, correction_rms = reconstruct_linear(
+                module,
+                hessians.pop(name),
+                args.block_size,
+                args.damp,
+                args.algorithm,
+                input_mean,
             )
             objectives[name] = {
                 "nearest": nearest,
                 "reconstructed": reconstructed,
                 "ratio": reconstructed / nearest if nearest else 0.0,
+                "bias_correction_rms": correction_rms,
             }
             print(
                 f"[{index}/{len(modules)}] reconstructed {name} "
@@ -274,7 +321,9 @@ def main() -> None:
         "algorithm": f"block-diagonal-f143-{args.algorithm}",
         "block_size": args.block_size,
         "calibration": [str(path) for path in args.calibration],
+        "images": [str(path) for path in args.image],
         "damp": args.damp,
+        "bias_correction": args.bias_correction,
         "layers": layer_count,
         "metrics": metrics,
         "objectives": objectives,
