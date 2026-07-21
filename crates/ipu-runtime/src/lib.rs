@@ -34,7 +34,8 @@ const HOST_STAGING_SEARCH_BASE: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x180
 const HOST_RUN_DESCRIPTOR_WORDS: u32 = 4;
 const WORKER_STACK_HEADROOM: u32 = 0xe0;
 const WORKER_SYNC_STRIDE: u32 = 0x100;
-const WORKER_SYNC_REGISTERS: u32 = 7;
+const WORKER_CONTEXTS: u32 = 6;
+const TILE_CONTEXT_STACKS: u32 = WORKER_CONTEXTS + 1;
 
 #[derive(Clone, Copy, Debug)]
 enum HostDirection {
@@ -1719,7 +1720,7 @@ fn package_graph_impl(
     for (tile_index, plans) in tile_host_plans.iter_mut().enumerate() {
         let old_worker_sync = align_up(plans.end, 8);
         let old_end = old_worker_sync
-            .checked_add(WORKER_STACK_HEADROOM + WORKER_SYNC_REGISTERS * WORKER_SYNC_STRIDE)
+            .checked_add(WORKER_STACK_HEADROOM + (TILE_CONTEXT_STACKS - 1) * WORKER_SYNC_STRIDE)
             .ok_or("static host runtime address overflow")?;
         plans.ordinary_objects.push(old_worker_sync..old_end);
         let tile = programs[tile_index].tile;
