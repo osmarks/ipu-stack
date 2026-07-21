@@ -859,13 +859,11 @@ pub(crate) fn emit(
                 let patch = &template.patches[instance];
                 if template_patch_storage_words_range(0..record_split, patch) != 0 {
                     code.setzi(7, 0)?;
-                    code.setzi(2, u32::try_from(record_split)?)?;
                     code.setzi(3, template.patch_primary_addresses[instance])?;
                     code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
                 }
                 if template_patch_storage_words_range(record_split..record_words, patch) != 0 {
                     code.setzi(7, 1)?;
-                    code.setzi(2, u32::try_from(record_words - record_split)?)?;
                     code.setzi(3, template.patch_secondary_addresses[instance])?;
                     code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
                 }
