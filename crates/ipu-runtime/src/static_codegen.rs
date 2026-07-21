@@ -97,21 +97,13 @@ pub(crate) fn template_patch_storage_words(
     if patch.is_empty() {
         return 0;
     }
-    (0..record_words)
-        .step_by(32)
-        .map(|slot_base| {
-            let slot_limit = (slot_base + 32).min(record_words);
-            let group = patch
-                .iter()
-                .filter(|(slot, _)| (slot_base..slot_limit).contains(&usize::from(*slot)));
-            let (narrow, wide) =
-                group.fold((0usize, 0usize), |(narrow, wide), (_, value)| match value {
-                    StaticTemplatePatchValue::Delta(_) => (narrow + 1, wide),
-                    StaticTemplatePatchValue::Word(_) => (narrow, wide + 1),
-                });
-            2 + narrow.div_ceil(2) + wide
-        })
-        .sum()
+    let (narrow, wide) = patch
+        .iter()
+        .fold((0usize, 0usize), |(narrow, wide), (_, value)| match value {
+            StaticTemplatePatchValue::Delta(_) => (narrow + 1, wide),
+            StaticTemplatePatchValue::Word(_) => (narrow, wide + 1),
+        });
+    2 * record_words.div_ceil(32) + narrow.div_ceil(2) + wide
 }
 
 #[derive(Clone, Debug)]

@@ -2500,12 +2500,12 @@ fn package_graph_impl(
                     continue;
                 }
                 let mut words = Vec::new();
+                let mut narrow = Vec::new();
+                let mut wide = Vec::new();
                 for slot_base in (0..first_record.len()).step_by(32) {
                     let slot_limit = (slot_base + 32).min(first_record.len());
                     let mut changed_mask = 0u32;
                     let mut narrow_mask = 0u32;
-                    let mut narrow = Vec::new();
-                    let mut wide = Vec::new();
                     for (slot, value) in patch
                         .iter()
                         .filter(|(slot, _)| (slot_base..slot_limit).contains(&usize::from(*slot)))
@@ -2532,14 +2532,14 @@ fn package_graph_impl(
                         }
                     }
                     words.extend_from_slice(&[changed_mask, narrow_mask]);
-                    words.extend(narrow.chunks(2).map(|pair| {
-                        u32::from(pair[0]) | (u32::from(pair.get(1).copied().unwrap_or(0)) << 16)
-                    }));
-                    words.extend(
-                        wide.into_iter()
-                            .collect::<std::result::Result<Vec<_>, String>>()?,
-                    );
                 }
+                words.extend(narrow.chunks(2).map(|pair| {
+                    u32::from(pair[0]) | (u32::from(pair.get(1).copied().unwrap_or(0)) << 16)
+                }));
+                words.extend(
+                    wide.into_iter()
+                        .collect::<std::result::Result<Vec<_>, String>>()?,
+                );
                 template_segments
                     .push((template.patch_addresses[instance], words_to_bytes(&words)));
             }

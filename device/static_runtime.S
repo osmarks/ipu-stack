@@ -244,23 +244,39 @@ ipu_stack_static_template_patch:
 	st32 $m5, $m11, $m15, 1
 	st32 $m6, $m11, $m15, 2
 	st32 $m9, $m11, $m15, 3
-	zero $m7
-.Ltemplate_patch_mask:
-	ld32 $m8, $m3, $m15, 0
-	ld32 $m4, $m3, $m15, 1
-	add $m10, $m4, 0
+	st32 $m3, $m11, $m15, 5
+	add $m0, $m2, 31
+	shr $m0, $m0, 5
+	st32 $m0, $m11, $m15, 6
+	add $m10, $m3, 4
+	add $m6, $m0, 0
 	zero $m1
-.Ltemplate_patch_popcount:
-	and $m0, $m10, 1
+.Ltemplate_patch_popcount_group:
+	ld32 $m4, $m10, $m15, 0
+.Ltemplate_patch_popcount_bit:
+	and $m0, $m4, 1
 	add $m1, $m1, $m0
-	shr $m10, $m10, 1
-	brnz $m10, .Ltemplate_patch_popcount
-	add $m3, $m3, 8
+	shr $m4, $m4, 1
+	brnz $m4, .Ltemplate_patch_popcount_bit
+	add $m10, $m10, 8
+	sub $m6, $m6, 1
+	brnz $m6, .Ltemplate_patch_popcount_group
+	ld32 $m3, $m11, $m15, 5
+	ld32 $m0, $m11, $m15, 6
+	shl $m0, $m0, 3
+	add $m3, $m3, $m0
 	add $m5, $m1, 1
 	shr $m5, $m5, 1
 	shl $m5, $m5, 2
 	add $m5, $m3, $m5
 	zero $m9
+	zero $m7
+.Ltemplate_patch_mask:
+	ld32 $m10, $m11, $m15, 5
+	ld32 $m8, $m10, $m15, 0
+	ld32 $m4, $m10, $m15, 1
+	add $m10, $m10, 8
+	st32 $m10, $m11, $m15, 5
 	setzi $m1, 32
 .Ltemplate_patch_bit:
 	and $m0, $m8, 1
@@ -316,7 +332,6 @@ ipu_stack_static_template_patch:
 	brz $m2, .Ltemplate_patch_done
 	sub $m1, $m1, 1
 	brnz $m1, .Ltemplate_patch_bit
-	add $m3, $m5, 0
 	setzi $m0, .Ltemplate_patch_mask
 	br $m0
 .Ltemplate_patch_done:
