@@ -556,7 +556,10 @@ fn encoder_memory_policy(data_limit: u32) -> MemoryPolicy {
             Ipu21MemoryRegion::OrdinaryHigh,
         ],
     );
-    MemoryPolicy::ipu21(DEFAULT_RESIDENT_LOW_BASE, data_limit, &resident, &transient).unwrap()
+    let mut policy =
+        MemoryPolicy::ipu21(DEFAULT_RESIDENT_LOW_BASE, data_limit, &resident, &transient).unwrap();
+    policy.resident_tile_assignment = ipu_compiler::ResidentTileAssignment::Fixed;
+    policy
 }
 
 fn memory_region_order(name: &str, default: &[Ipu21MemoryRegion]) -> Vec<Ipu21MemoryRegion> {

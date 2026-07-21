@@ -655,6 +655,7 @@ pub fn append_affine_layer_norm_f16_in_arenas(
                 base: config.data_base,
                 limit: config.data_limit,
             }],
+            resident_tile_assignment: crate::ResidentTileAssignment::Balanced,
         },
     )
 }

@@ -414,6 +414,17 @@ pub struct MemoryPolicy {
     pub resident: Vec<MemoryArena>,
     /// Ordered arenas for short-lived activations and ordinary kernel scratch.
     pub transient: Vec<MemoryArena>,
+    /// Controls whether resident tensors are rotated to balance accumulated
+    /// per-tile pressure or retain the child planner's stable tile assignment.
+    #[serde(default)]
+    pub resident_tile_assignment: ResidentTileAssignment,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResidentTileAssignment {
+    #[default]
+    Balanced,
+    Fixed,
 }
 
 /// Allocatable IPU21 SRAM regions, excluding executable and exchange storage.
@@ -449,6 +460,7 @@ impl MemoryPolicy {
         Self {
             resident: vec![arena],
             transient: vec![arena],
+            resident_tile_assignment: ResidentTileAssignment::Balanced,
         }
     }
 
@@ -483,6 +495,7 @@ impl MemoryPolicy {
         let policy = Self {
             resident: expand(resident_order),
             transient: expand(transient_order),
+            resident_tile_assignment: ResidentTileAssignment::Balanced,
         };
         policy.validate()?;
         Ok(policy)
@@ -1105,6 +1118,7 @@ pub fn append_blocked_gemm_f16_with_a16_input_in_arenas(
                 base: config.data_base,
                 limit: config.data_limit,
             }],
+            resident_tile_assignment: ResidentTileAssignment::Balanced,
         },
     )
 }
@@ -1280,6 +1294,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_in_arenas(
                 base: config.data_base,
                 limit: config.data_limit,
             }],
+            resident_tile_assignment: ResidentTileAssignment::Balanced,
         },
     )
 }
@@ -1450,12 +1465,15 @@ fn plan_appended_blocked_gemm_with_memory_policy(
     memory: &MemoryPolicy,
 ) -> Result<BlockedGemmPlan, CompileError> {
     let mut plan = plan_blocked_gemm(config)?;
-    let tile_rotation = choose_resident_tile_rotation_in_arenas(
-        parent,
-        &plan.right,
-        config.data_type.weight_element_bytes(),
-        &memory.resident,
-    );
+    let tile_rotation = match memory.resident_tile_assignment {
+        ResidentTileAssignment::Balanced => choose_resident_tile_rotation_in_arenas(
+            parent,
+            &plan.right,
+            config.data_type.weight_element_bytes(),
+            &memory.resident,
+        ),
+        ResidentTileAssignment::Fixed => 0,
+    };
     rotate_gemm_plan_tiles(&mut plan, tile_rotation)?;
     let mut regions = plan
         .left
