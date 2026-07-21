@@ -1779,35 +1779,43 @@ fn package_graph_impl(
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
         let runtime_end = plans.end;
-        for template in &mut plans.templates {
-            for (record_address, record) in
-                template.record_addresses.iter_mut().zip(&template.records)
-            {
-                let size = u32::try_from(record.len())?
-                    .checked_mul(4)
-                    .ok_or("static template record size overflow")?;
-                if size == 0 {
-                    *record_address = ipu_package::TILE_MEMORY_BASE;
-                    continue;
-                }
-                let address = data_region_base_for_tile(
-                    &allocation_ranges_by_tile[usize::from(tile)],
-                    tile,
-                    runtime_end,
-                    size,
-                    4,
-                    &host_runtime_ranges[tile_index]
-                        .iter()
-                        .copied()
-                        .chain(template_record_ranges[tile_index].iter().copied())
-                        .collect::<Vec<_>>(),
-                )?;
-                let end = address
-                    .checked_add(size)
-                    .ok_or("static template record address overflow")?;
-                *record_address = address;
-                template_record_ranges[tile_index].push((address, end));
+        let mut records = plans
+            .templates
+            .iter()
+            .enumerate()
+            .flat_map(|(template, plan)| {
+                plan.records
+                    .iter()
+                    .enumerate()
+                    .map(move |(record, words)| (template, record, words.len()))
+            })
+            .collect::<Vec<_>>();
+        records.sort_unstable_by_key(|&(_, _, words)| std::cmp::Reverse(words));
+        for (template, record, words) in records {
+            let size = u32::try_from(words)?
+                .checked_mul(4)
+                .ok_or("static template record size overflow")?;
+            if size == 0 {
+                plans.templates[template].record_addresses[record] = ipu_package::TILE_MEMORY_BASE;
+                continue;
             }
+            let address = data_region_base_for_tile(
+                &allocation_ranges_by_tile[usize::from(tile)],
+                tile,
+                runtime_end,
+                size,
+                4,
+                &host_runtime_ranges[tile_index]
+                    .iter()
+                    .copied()
+                    .chain(template_record_ranges[tile_index].iter().copied())
+                    .collect::<Vec<_>>(),
+            )?;
+            let end = address
+                .checked_add(size)
+                .ok_or("static template record address overflow")?;
+            plans.templates[template].record_addresses[record] = address;
+            template_record_ranges[tile_index].push((address, end));
         }
     }
 
