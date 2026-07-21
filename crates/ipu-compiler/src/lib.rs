@@ -1732,7 +1732,11 @@ fn append_child_schedule(parent: &mut Schedule, child: &mut Schedule) -> Result<
     }
     let phase_base = parent.phases.len();
     for allocation in &mut child.allocations {
-        if allocation.live_from != 0 {
+        // A child allocation spanning its complete schedule is resident and was
+        // intentionally available before the composed program starts. Every
+        // finite lifetime, including one beginning at local phase zero, is
+        // relative to the child schedule.
+        if allocation.live_from != 0 || allocation.live_until != usize::MAX {
             allocation.live_from = allocation
                 .live_from
                 .checked_add(phase_base)
@@ -3644,6 +3648,53 @@ fn gelu(value: f32) -> f32 {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn composing_a_schedule_offsets_every_finite_lifetime() {
+        let allocation = |tensor, live_until, kind| Allocation {
+            tensor: TensorId(tensor),
+            tile: 0,
+            address: 0x60000 + tensor as u32 * 0x100,
+            size: 0x100,
+            live_from: 0,
+            live_until,
+            kind,
+        };
+        let mut parent = Schedule {
+            layouts: Vec::new(),
+            phases: vec![Phase::Exchange {
+                transfers: Vec::new(),
+            }],
+            allocations: Vec::new(),
+            tile_count: 1,
+            peak_sram: BTreeMap::new(),
+        };
+        let mut child = Schedule {
+            layouts: Vec::new(),
+            phases: vec![Phase::Exchange {
+                transfers: Vec::new(),
+            }],
+            allocations: vec![
+                allocation(0, usize::MAX, AllocationKind::Home),
+                allocation(1, 1, AllocationKind::Home),
+                allocation(2, 1, AllocationKind::ExchangeStaging { phase: 0 }),
+            ],
+            tile_count: 1,
+            peak_sram: BTreeMap::new(),
+        };
+
+        append_child_schedule(&mut parent, &mut child).unwrap();
+
+        assert_eq!(parent.allocations[0].live_from, 0);
+        assert_eq!(parent.allocations[0].live_until, usize::MAX);
+        for allocation in &parent.allocations[1..] {
+            assert_eq!((allocation.live_from, allocation.live_until), (1, 2));
+        }
+        assert_eq!(
+            parent.allocations[2].kind,
+            AllocationKind::ExchangeStaging { phase: 1 }
+        );
+    }
 
     #[test]
     fn distributed_a16_blocks_feed_gemm_without_a_full_row_shard() {
