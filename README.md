@@ -64,15 +64,19 @@ Logging uses `tracing`. Set `RUST_LOG`, for example
 ## F143 weight reconstruction
 
 `tools/quantize_siglip_f143.py` calibrates SigLIP encoder linears from one or
-more SafeTensors files containing `pixel_values`. It uses the runtime's 64x64
-F143 storage blocks, collects block-diagonal activation Hessians, and supports
-nearest rounding or GPTQ error compensation. The output is an ordinary model
-directory accepted by the Rust SigLIP runner.
+more SafeTensors files containing `pixel_values` and/or image files processed
+with the model's image processor. It uses the runtime's 64x64 F143 storage
+blocks, collects block-diagonal activation Hessians, and supports nearest
+rounding or GPTQ error compensation. Optional sequential-layer calibration and
+bounded LayerNorm channel equalization improve accumulated accuracy without
+adding device-side operations. The output is an ordinary model directory
+accepted by the Rust SigLIP runner.
 
 ```sh
 python tools/quantize_siglip_f143.py MODEL OUTPUT \
   --calibration profiles/siglip/reference-b1.safetensors \
-  --algorithm gptq --device cuda
+  --image sample.jpg --algorithm gptq --device cuda \
+  --sequential-layers --equalize-layernorm
 ```
 
 Use `--no-save` for error measurement without writing the reconstructed model.

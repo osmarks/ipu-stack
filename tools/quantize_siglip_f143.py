@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="recollect each layer after reconstructing its predecessors",
     )
+    parser.add_argument(
+        "--equalize-layernorm",
+        action="store_true",
+        help="fold activation-aware channel scales into LayerNorm and its consumers",
+    )
+    parser.add_argument("--equalization-scale-limit", type=float, default=16.0)
     return parser.parse_args()
 
 
@@ -200,6 +206,102 @@ def gptq_block(
     return output
 
 
+def nearest_f143_weight(weight: torch.Tensor, block_size: int) -> torch.Tensor:
+    output = torch.empty_like(weight)
+    for start in range(0, weight.shape[1], block_size):
+        block = weight[:, start : start + block_size]
+        scales = f143_scales_by_row_block(block, block_size)
+        output[:, start : start + block_size] = project_f143(block, scales[:, None])
+    return output
+
+
+def layernorm_consumer_groups(
+    model: SiglipVisionModel, layers: int
+) -> list[tuple[str, torch.nn.LayerNorm, list[torch.nn.Linear]]]:
+    groups = []
+    for index, layer in enumerate(model.vision_model.encoder.layers[:layers]):
+        groups.append(
+            (
+                f"encoder_layer_{index:02}.norm1_qkv",
+                layer.layer_norm1,
+                [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj],
+            )
+        )
+        groups.append(
+            (f"encoder_layer_{index:02}.norm2_fc1", layer.layer_norm2, [layer.mlp.fc1])
+        )
+    return groups
+
+
+def equalize_layernorm_consumers(
+    model: SiglipVisionModel,
+    batches: list[torch.Tensor],
+    layers: int,
+    block_size: int,
+    scale_limit: float,
+) -> dict[str, dict[str, float]]:
+    groups = layernorm_consumer_groups(model, layers)
+    second_moments = {
+        name: torch.zeros(consumers[0].in_features, device=consumers[0].weight.device)
+        for name, _norm, consumers in groups
+    }
+    counts = dict.fromkeys(second_moments, 0)
+    hooks = []
+    for name, _norm, consumers in groups:
+        def accumulate(_module, inputs, name=name):
+            values = inputs[0].detach().float().reshape(-1, inputs[0].shape[-1])
+            second_moments[name].add_(values.square().sum(dim=0))
+            counts[name] += values.shape[0]
+
+        hooks.append(consumers[0].register_forward_pre_hook(accumulate))
+    with torch.inference_mode():
+        for pixels in batches:
+            model(
+                pixel_values=pixels.to(next(model.parameters()).device),
+                interpolate_pos_encoding=False,
+            )
+    for hook in hooks:
+        hook.remove()
+
+    report = {}
+    with torch.no_grad():
+        for name, norm, consumers in groups:
+            moment = second_moments.pop(name) / counts.pop(name)
+            activation_rms = moment.sqrt().clamp_min(1e-8)
+            weight_rms = torch.cat([consumer.weight for consumer in consumers])
+            weight_rms = weight_rms.float().square().mean(dim=0).sqrt().clamp_min(1e-8)
+            baseline = 0.0
+            candidates = []
+            for alpha in (0.0, 0.25, 0.5, 0.75, 1.0):
+                scale = activation_rms.pow(alpha) / weight_rms.pow(1.0 - alpha)
+                scale /= (scale.min() * scale.max()).sqrt()
+                scale.clamp_(1.0 / scale_limit, scale_limit)
+                objective = 0.0
+                for consumer in consumers:
+                    transformed = consumer.weight.float() * scale
+                    quantized = nearest_f143_weight(transformed, block_size)
+                    error = transformed - quantized
+                    objective += torch.sum(error.square() * (moment / scale.square())).item()
+                    if alpha == 0.0:
+                        unscaled = nearest_f143_weight(consumer.weight.float(), block_size)
+                        baseline += torch.sum(
+                            (consumer.weight.float() - unscaled).square() * moment
+                        ).item()
+                candidates.append((objective, alpha, scale))
+            objective, alpha, scale = min(candidates, key=lambda candidate: candidate[0])
+            norm.weight.div_(scale.to(norm.weight.dtype))
+            norm.bias.div_(scale.to(norm.bias.dtype))
+            for consumer in consumers:
+                consumer.weight.mul_(scale.to(consumer.weight.dtype))
+            report[name] = {
+                "alpha": alpha,
+                "objective_ratio": objective / baseline if baseline else 0.0,
+                "scale_minimum": scale.min().item(),
+                "scale_maximum": scale.max().item(),
+            }
+    return report
+
+
 def reconstruct_linear(
     module: torch.nn.Linear,
     hessians: list[torch.Tensor],
@@ -297,8 +399,10 @@ def main() -> None:
     args = parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
-    if args.block_size <= 0 or args.damp < 0.0:
-        raise ValueError("block size must be positive and damping must be non-negative")
+    if args.block_size <= 0 or args.damp < 0.0 or args.equalization_scale_limit < 1.0:
+        raise ValueError(
+            "block size must be positive, damping non-negative, and scale limit at least one"
+        )
 
     device_name = (
         "cuda" if torch.cuda.is_available() else "cpu"
@@ -321,6 +425,26 @@ def main() -> None:
             model(pixel_values=pixels.to(device), interpolate_pos_encoding=False)
             .last_hidden_state.clone()
             for pixels in batches
+        ]
+    equalization = (
+        equalize_layernorm_consumers(
+            model,
+            batches,
+            layer_count,
+            args.block_size,
+            args.equalization_scale_limit,
+        )
+        if args.equalize_layernorm
+        else {}
+    )
+    with torch.inference_mode():
+        equalization_metrics = [
+            output_metrics(
+                reference,
+                model(pixel_values=pixels.to(device), interpolate_pos_encoding=False)
+                .last_hidden_state,
+            )
+            for pixels, reference in zip(batches, references)
         ]
     objectives = {}
     progress = [0, len(modules)]
@@ -352,6 +476,10 @@ def main() -> None:
         "damp": args.damp,
         "bias_correction": args.bias_correction,
         "sequential_layers": args.sequential_layers,
+        "equalize_layernorm": args.equalize_layernorm,
+        "equalization_scale_limit": args.equalization_scale_limit,
+        "equalization_metrics": equalization_metrics,
+        "equalization": equalization,
         "layers": layer_count,
         "metrics": metrics,
         "objectives": objectives,
