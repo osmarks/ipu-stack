@@ -2531,11 +2531,7 @@ fn package_graph_impl(
                             }
                         }
                     }
-                    words.extend_from_slice(&[
-                        changed_mask,
-                        narrow_mask,
-                        u32::try_from(narrow.len())?,
-                    ]);
+                    words.extend_from_slice(&[changed_mask, narrow_mask]);
                     words.extend(narrow.chunks(2).map(|pair| {
                         u32::from(pair[0]) | (u32::from(pair.get(1).copied().unwrap_or(0)) << 16)
                     }));

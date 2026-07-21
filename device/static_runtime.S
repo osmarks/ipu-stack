@@ -248,8 +248,14 @@ ipu_stack_static_template_patch:
 .Ltemplate_patch_mask:
 	ld32 $m8, $m3, $m15, 0
 	ld32 $m4, $m3, $m15, 1
-	ld32 $m1, $m3, $m15, 2
-	add $m3, $m3, 12
+	add $m10, $m4, 0
+	zero $m1
+.Ltemplate_patch_popcount:
+	and $m0, $m10, 1
+	add $m1, $m1, $m0
+	shr $m10, $m10, 1
+	brnz $m10, .Ltemplate_patch_popcount
+	add $m3, $m3, 8
 	add $m5, $m1, 1
 	shr $m5, $m5, 1
 	shl $m5, $m5, 2

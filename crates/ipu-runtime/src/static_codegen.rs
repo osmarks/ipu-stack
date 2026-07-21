@@ -109,7 +109,7 @@ pub(crate) fn template_patch_storage_words(
                     StaticTemplatePatchValue::Delta(_) => (narrow + 1, wide),
                     StaticTemplatePatchValue::Word(_) => (narrow, wide + 1),
                 });
-            3 + narrow.div_ceil(2) + wide
+            2 + narrow.div_ceil(2) + wide
         })
         .sum()
 }
