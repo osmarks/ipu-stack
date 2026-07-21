@@ -1010,14 +1010,14 @@ impl GemmDataType {
 
     const fn kernel_operation(self, initialize: bool, small_rows: bool) -> &'static str {
         match (self, initialize, small_rows) {
-            (Self::F16 | Self::F16F8Weights { .. }, true, true) => "gemm_f16_init_small_rows",
-            (Self::F16 | Self::F16F8Weights { .. }, true, false) => "gemm_f16_init_large_rows",
-            (Self::F16 | Self::F16F8Weights { .. }, false, true) => {
-                "gemm_f16_accumulate_small_rows"
-            }
-            (Self::F16 | Self::F16F8Weights { .. }, false, false) => {
-                "gemm_f16_accumulate_large_rows"
-            }
+            (Self::F16, true, true) => "gemm_f16_init_small_rows",
+            (Self::F16, true, false) => "gemm_f16_init_large_rows",
+            (Self::F16, false, true) => "gemm_f16_accumulate_small_rows",
+            (Self::F16, false, false) => "gemm_f16_accumulate_large_rows",
+            (Self::F16F8Weights { .. }, true, true) => "gemm_f16_f8w_init_small_rows",
+            (Self::F16F8Weights { .. }, true, false) => "gemm_f16_f8w_init_large_rows",
+            (Self::F16F8Weights { .. }, false, true) => "gemm_f16_f8w_accumulate_small_rows",
+            (Self::F16F8Weights { .. }, false, false) => "gemm_f16_f8w_accumulate_large_rows",
             (Self::F8F143 { .. }, true, true) => "gemm_f8_init_small_rows",
             (Self::F8F143 { .. }, true, false) => "gemm_f8_init_large_rows",
             (Self::F8F143 { .. }, false, true) => "gemm_f8_accumulate_small_rows",
@@ -4720,6 +4720,11 @@ mod tests {
                 && allocation.address >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
                 && allocation.address + allocation.size
                     <= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
+        }));
+        assert!(plan.schedule.phases.iter().any(|phase| {
+            matches!(phase, Phase::Compute { commands, .. } if commands.iter().any(|command| {
+                command.specialization.operation.starts_with("gemm_f16_f8w_")
+            }))
         }));
         plan.schedule
             .lower_tile_programs(&Topology::c600())

@@ -104,7 +104,11 @@ fn main() {
     if fp8_weights || native_fp8 {
         input.extend(blocked_matrix_f8_f143(
             &plan.right,
-            BlockLayout::AmpB32x16,
+            if native_fp8 {
+                BlockLayout::AmpB32x16
+            } else {
+                BlockLayout::AmpB16x16
+            },
             weight_scale,
             |row, column| right[matrix_index(dimension, row, column)].to_f32(),
         ));
@@ -199,12 +203,26 @@ fn main() {
             "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_gemm_f8_accumulate_small_rows".into(),
             "-DGEMM_ACCUMULATE_LARGE_SYMBOL=ipu_stack_gemm_f8_accumulate_large_rows".into(),
         ]);
+    } else if fp8_weights {
+        kernel_defines.extend([
+            "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_gemm_f16_f8w_init_small_rows".into(),
+            "-DGEMM_INIT_LARGE_SYMBOL=ipu_stack_gemm_f16_f8w_init_large_rows".into(),
+            "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_gemm_f16_f8w_accumulate_small_rows".into(),
+            "-DGEMM_ACCUMULATE_LARGE_SYMBOL=ipu_stack_gemm_f16_f8w_accumulate_large_rows".into(),
+        ]);
+        kernel_defines.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into());
     }
     let kernel = toolchain
         .compile(
             source("gemm_f16_64_amp.S"),
             &artifact_dir,
-            if native_fp8 { "gemm-f8" } else { "gemm-f16" },
+            if native_fp8 {
+                "gemm-f8"
+            } else if fp8_weights {
+                "gemm-f16-f8w"
+            } else {
+                "gemm-f16"
+            },
             &kernel_defines,
         )
         .unwrap();

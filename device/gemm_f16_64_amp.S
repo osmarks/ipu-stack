@@ -76,6 +76,40 @@
 	.endm
 
 	.macro LOAD_AMP16_WEIGHTS
+#ifdef GEMM_INTERLEAVED_WEIGHTS
+	ld128putcs 0
+	ld128putcs 2
+	ld128putcs 4
+	ld128putcs 6
+	ld128putcs 32
+	ld128putcs 34
+	ld128putcs 36
+	ld128putcs 38
+	ld128putcs 8
+	ld128putcs 10
+	ld128putcs 12
+	ld128putcs 14
+	ld128putcs 40
+	ld128putcs 42
+	ld128putcs 44
+	ld128putcs 46
+	ld128putcs 16
+	ld128putcs 18
+	ld128putcs 20
+	ld128putcs 22
+	ld128putcs 48
+	ld128putcs 50
+	ld128putcs 52
+	ld128putcs 54
+	ld128putcs 24
+	ld128putcs 26
+	ld128putcs 28
+	ld128putcs 30
+	ld128putcs 56
+	ld128putcs 58
+	ld128putcs 60
+	ld128putcs 62
+#else
 	ld64putcs 0
 	ld64putcs 1
 	ld64putcs 2
@@ -140,6 +174,7 @@
 	ld64putcs 61
 	ld64putcs 62
 	ld64putcs 63
+#endif
 	.endm
 
 	.macro GEMM_SUPERVISOR name, initial, rows, worker

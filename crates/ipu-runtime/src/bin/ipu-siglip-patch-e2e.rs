@@ -938,6 +938,22 @@ fn compile_objects(
         .then(|| {
             Ok::<_, ipu_elf::ElfError>((
                 toolchain.compile(
+                    source("gemm_f16_64_amp.S"),
+                    &artifacts,
+                    "expanded-f8-gemm",
+                    &[
+                        format!("-DGEMM_INNER_BLOCK_DIMENSION={INNER_BLOCK_DIMENSION}"),
+                        format!("-DGEMM_OUTPUT_COLUMNS={BLOCK_DIMENSION}"),
+                        format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
+                        format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
+                        "-DGEMM_INTERLEAVED_WEIGHTS=1".into(),
+                        "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_gemm_f16_f8w_init_small_rows".into(),
+                        "-DGEMM_INIT_LARGE_SYMBOL=ipu_stack_gemm_f16_f8w_init_large_rows".into(),
+                        "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_gemm_f16_f8w_accumulate_small_rows".into(),
+                        "-DGEMM_ACCUMULATE_LARGE_SYMBOL=ipu_stack_gemm_f16_f8w_accumulate_large_rows".into(),
+                    ],
+                )?,
+                toolchain.compile(
                     source("expand_f8_f143_to_f16.cpp"),
                     &artifacts,
                     "expand-f8-codelet",
@@ -1080,7 +1096,8 @@ fn compile_objects(
     for object in attention_objects {
         objects.push(fs::read(object.object)?);
     }
-    if let Some((codelet, wrapper)) = fp8_expander {
+    if let Some((gemm, codelet, wrapper)) = fp8_expander {
+        objects.push(fs::read(gemm.object)?);
         objects.push(fs::read(codelet.object)?);
         objects.push(fs::read(wrapper.object)?);
     }
