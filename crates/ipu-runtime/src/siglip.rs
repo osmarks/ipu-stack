@@ -71,6 +71,13 @@ pub struct SiglipEncoderLayer {
     pub norm2: Vec<RowShardPlacement>,
     pub mlp_gelu: Vec<BlockPlacement>,
     pub attention: FlashAttentionPlan,
+    pub profile_stages: Vec<SiglipProfileStage>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SiglipProfileStage {
+    pub name: String,
+    pub phases: std::ops::Range<usize>,
 }
 
 pub struct SiglipMapHead {
@@ -734,6 +741,7 @@ pub fn append_siglip_encoder_layer_with_precision(
     let _guard = span.enter();
     let config = &model.config;
     let prefix = format!("encoder_layer_{layer:02}");
+    let layer_phase_start = schedule.phases.len();
     info!(stage = "norm1_qkv", "planning SigLIP encoder stage");
     let norm_allocation_start = schedule.allocations.len();
     let norm = append_affine_layer_norm_f16_with_memory_policy(
@@ -968,6 +976,7 @@ pub fn append_siglip_encoder_layer_with_precision(
     end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
 
     info!(stage = "norm2_mlp", "planning SigLIP encoder stage");
+    let norm2_phase_start = schedule.phases.len();
     let norm2_allocation_start = schedule.allocations.len();
     let norm2 = append_affine_layer_norm_f16_with_memory_policy(
         schedule,
@@ -1151,11 +1160,34 @@ pub fn append_siglip_encoder_layer_with_precision(
         attention_residual.iter().map(|shard| shard.tensor),
     )?;
     info!(stage = "complete", "planned SigLIP encoder layer");
+    let layer_phase_end = schedule.phases.len();
     Ok(SiglipEncoderLayer {
         output,
         norm2: norm2.output,
         mlp_gelu,
         attention,
+        profile_stages: vec![
+            SiglipProfileStage {
+                name: format!("{prefix}.norm1_qkv"),
+                phases: layer_phase_start..attention_phase_start,
+            },
+            SiglipProfileStage {
+                name: format!("{prefix}.attention"),
+                phases: attention_phase_start..output_projection_phase_start,
+            },
+            SiglipProfileStage {
+                name: format!("{prefix}.attention_output"),
+                phases: output_projection_phase_start..norm2_phase_start,
+            },
+            SiglipProfileStage {
+                name: format!("{prefix}.norm2_mlp_up"),
+                phases: norm2_phase_start..mlp_down_phase_start,
+            },
+            SiglipProfileStage {
+                name: format!("{prefix}.mlp_down"),
+                phases: mlp_down_phase_start..layer_phase_end,
+            },
+        ],
     })
 }
 

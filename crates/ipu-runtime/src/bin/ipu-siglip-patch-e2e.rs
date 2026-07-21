@@ -11,11 +11,12 @@ use ipu_models::{SiglipWeights, TensorArchive};
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
     BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, SiglipEncoderPrecision,
-    SiglipLinearPrecision, SiglipWeightStorage, StaticTemplateRegion, allocator_memory_profile,
-    append_host_a16_matrix, append_siglip_encoder_layer_with_precision, append_siglip_map_head,
-    append_siglip_post_layer_norm, block_binding_typed, block_coordinates, blocked_matrix_f16,
-    consolidate_attention_kernel_variants, package_graph_repeated,
-    package_graph_repeated_with_templates, run_host_with_options,
+    SiglipLinearPrecision, SiglipWeightStorage, StaticProfileRegion, StaticTemplateRegion,
+    allocator_memory_profile, append_host_a16_matrix, append_siglip_encoder_layer_with_precision,
+    append_siglip_map_head, append_siglip_post_layer_norm, block_binding_typed, block_coordinates,
+    blocked_matrix_f16, consolidate_attention_kernel_variants, package_graph_repeated,
+    package_graph_repeated_with_templates, package_graph_repeated_with_templates_profiled_regions,
+    run_host_with_options,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -184,6 +185,10 @@ fn main() {
     let mut current = row_shards;
     let mut last_layer = None;
     let mut layer_phase_ranges = Vec::with_capacity(layer_count);
+    let mut profile_regions = vec![StaticProfileRegion {
+        name: "embedding".into(),
+        phases: 0..plan.schedule.phases.len(),
+    }];
     for layer in 0..layer_count {
         let phase_start = plan.schedule.phases.len();
         let allocation_start = plan.schedule.allocations.len();
@@ -206,6 +211,15 @@ fn main() {
             &mut host,
         )
         .unwrap();
+        profile_regions.extend(
+            appended
+                .profile_stages
+                .iter()
+                .map(|stage| StaticProfileRegion {
+                    name: stage.name.clone(),
+                    phases: stage.phases.clone(),
+                }),
+        );
         current = appended.output.clone();
         last_layer = Some(appended);
         let phase_range = phase_start..plan.schedule.phases.len();
@@ -286,6 +300,17 @@ fn main() {
         )
     };
     let attention_variant = consolidate_attention_kernel_variants(&mut plan.schedule, &attentions);
+    let profiled_end = profile_regions.last().unwrap().phases.end;
+    if profiled_end < plan.schedule.phases.len() {
+        profile_regions.push(StaticProfileRegion {
+            name: if full_model {
+                "post_norm_map_head".into()
+            } else {
+                "output".into()
+            },
+            phases: profiled_end..plan.schedule.phases.len(),
+        });
+    }
     let objects = compile_objects(&plan, &attentions, attention_variant).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
@@ -340,8 +365,32 @@ fn main() {
         })
         .into_iter()
         .collect::<Vec<_>>();
-    let app =
-        package_graph_repeated_with_templates(&graph, &objects, &templates, invocations).unwrap();
+    let profile_output = std::env::var_os("IPU_PROFILE_OUTPUT").map(PathBuf::from);
+    assert!(
+        profile_output.is_none() || invocations == 1,
+        "semantic profiling currently requires one invocation"
+    );
+    let (app, profile_layout) = if profile_output.is_some() {
+        let (app, layout) = package_graph_repeated_with_templates_profiled_regions(
+            &graph,
+            &objects,
+            &templates,
+            &profile_regions,
+            invocations,
+        )
+        .unwrap();
+        info!(
+            regions = profile_regions.len(),
+            "enabled semantic stage profiling"
+        );
+        (app, Some(layout))
+    } else {
+        (
+            package_graph_repeated_with_templates(&graph, &objects, &templates, invocations)
+                .unwrap(),
+            None,
+        )
+    };
     if let Some(path) = std::env::var_os("IPU_SIGLIP_PACKAGE_OUTPUT") {
         app.write(fs::File::create(path).unwrap()).unwrap();
     }
@@ -363,7 +412,7 @@ fn main() {
             .unwrap_or_else(|| sdk.join("bin/ipu/tile_bootloader_ipu2.elf")),
     )
     .unwrap();
-    let actual = run_host_with_options(
+    let mut actual = run_host_with_options(
         &app,
         &bootloader,
         &configuration,
@@ -372,6 +421,15 @@ fn main() {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
+    if let (Some(path), Some(layout)) = (&profile_output, &profile_layout) {
+        let clock_hz = std::env::var("IPU_CLOCK_HZ")
+            .map(|value| value.parse().expect("IPU_CLOCK_HZ must be an integer"))
+            .unwrap_or(1_500_000_000);
+        let report = layout.decode(&actual, clock_hz).unwrap();
+        report.write(fs::File::create(path).unwrap()).unwrap();
+        actual.truncate(layout.output_offset);
+        info!(path = %path.display(), clock_hz, "wrote semantic SigLIP cycle profile");
+    }
     let invocation_output_bytes = actual.len() / invocations as usize;
     assert_eq!(
         actual.len(),

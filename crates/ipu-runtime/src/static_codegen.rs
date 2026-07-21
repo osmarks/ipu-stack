@@ -865,8 +865,24 @@ pub(crate) fn emit(
     {
         return Err("profile boundary count differs from tile step count".into());
     }
-    if profile.is_some() && !templates.is_empty() {
-        return Err("profiled code cannot use static templates".into());
+    if let Some(profile) = profile {
+        for template in templates {
+            let first = &template.instance_steps[0];
+            let after_sync = &profile.after_sync[first.clone()];
+            let after_step = &profile.after_step[first.clone()];
+            if after_sync.iter().any(|&sample| sample) {
+                return Err("static templates cannot profile exchange sync boundaries".into());
+            }
+            for instance in &template.instance_steps[1..] {
+                if profile.after_sync[instance.clone()] != *after_sync
+                    || profile.after_step[instance.clone()] != *after_step
+                {
+                    return Err(
+                        "static template instances have different profile boundaries".into(),
+                    );
+                }
+            }
+        }
     }
     let mut code = TileCode::new();
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
@@ -1062,6 +1078,10 @@ pub(crate) fn emit(
     let mut template_bodies = Vec::with_capacity(templates.len());
     for template in templates {
         template_bodies.push(code.words.len());
+        let profile_after_step = profile.map(|profile| {
+            let first = &template.instance_steps[0];
+            &profile.after_step[first.clone()]
+        });
         emit_static_template_body(
             &mut code,
             template,
@@ -1076,6 +1096,7 @@ pub(crate) fn emit(
                     .record_secondary_addresses
                     .windows(2)
                     .all(|pair| pair[0] == pair[1]),
+            profile_after_step,
         )?;
     }
     for (call, template) in template_calls {
@@ -1151,6 +1172,7 @@ fn emit_static_template_body(
     template_exchange: u32,
     generated_base: u32,
     record_addresses_in_parent_frame: bool,
+    profile_after_step: Option<&[bool]>,
 ) -> Result<()> {
     code.add_immediate(11, 11, -16)?;
     if record_addresses_in_parent_frame {
@@ -1160,7 +1182,7 @@ fn emit_static_template_body(
     code.st32(2, 11, 15, 0)?;
     code.st32(3, 11, 15, 1)?;
     code.st32(9, 11, 15, 2)?;
-    for planned in &template.steps {
+    for (step_index, planned) in template.steps.iter().enumerate() {
         match planned {
             StaticTemplateStep::Exchange {
                 sender_word_offset,
@@ -1292,6 +1314,11 @@ fn emit_static_template_body(
             }
             StaticTemplateStep::Idle => {}
         }
+        emit_next_cycle_sample(
+            code,
+            symbols,
+            profile_after_step.and_then(|samples| samples.get(step_index).copied()),
+        )?;
     }
     code.ld32(9, 11, 15, 2)?;
     code.add_immediate(11, 11, 16)?;

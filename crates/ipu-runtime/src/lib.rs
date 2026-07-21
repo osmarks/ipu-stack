@@ -18,10 +18,10 @@ mod siglip;
 mod static_codegen;
 pub use siglip::{
     AttentionKernelVariant, HostTensorSet, SiglipEncoderLayer, SiglipEncoderPrecision,
-    SiglipLinearPrecision, SiglipMapHead, SiglipWeightStorage, append_host_a16_matrix,
-    append_siglip_encoder_layer, append_siglip_encoder_layer_with_precision,
-    append_siglip_map_head, append_siglip_post_layer_norm, attention_kernel_variant,
-    consolidate_attention_kernel_variants,
+    SiglipLinearPrecision, SiglipMapHead, SiglipProfileStage, SiglipWeightStorage,
+    append_host_a16_matrix, append_siglip_encoder_layer,
+    append_siglip_encoder_layer_with_precision, append_siglip_map_head,
+    append_siglip_post_layer_norm, attention_kernel_variant, consolidate_attention_kernel_variants,
 };
 
 mod blocked_data;
@@ -431,6 +431,12 @@ pub struct StaticTemplateRegion {
 }
 
 #[derive(Clone, Debug)]
+pub struct StaticProfileRegion {
+    pub name: String,
+    pub phases: Range<usize>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ProfileTileLayout {
     pub physical_tile: u32,
     pub file_offset: usize,
@@ -818,6 +824,25 @@ pub fn package_graph_profiled_with(
     granularity: ProfileGranularity,
 ) -> Result<(Application, ProfileLayout)> {
     package_graph_with_profile(graph, objects, granularity)
+}
+
+pub fn package_graph_repeated_with_templates_profiled_regions(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+    templates: &[StaticTemplateRegion],
+    regions: &[StaticProfileRegion],
+    invocations: u32,
+) -> Result<(Application, ProfileLayout)> {
+    if invocations == 0 {
+        return Err("profiled graph invocation count must be nonzero".into());
+    }
+    package_graph_with_profile_options(
+        graph,
+        objects,
+        ProfileSelection::Regions(regions),
+        templates,
+        invocations,
+    )
 }
 
 fn profile_metadata(name: impl Into<String>, value: impl ToString) -> ipu_package::ProfileMetadata {
@@ -1274,10 +1299,80 @@ fn profile_steps(
     (steps, boundaries)
 }
 
+fn region_profile_steps(
+    schedule: &ipu_compiler::Schedule,
+    program: &ipu_compiler::LoweredTileProgram,
+    regions: &[StaticProfileRegion],
+) -> Result<(Vec<ipu_package::ProfileStep>, Vec<ProfileBoundary>)> {
+    if regions.is_empty()
+        || regions[0].phases.start != 0
+        || regions.last().unwrap().phases.end != schedule.phases.len()
+        || regions.iter().any(|region| region.phases.is_empty())
+        || regions
+            .windows(2)
+            .any(|pair| pair[0].phases.end != pair[1].phases.start)
+    {
+        return Err(
+            "profile regions must be nonempty and exactly partition the graph phases".into(),
+        );
+    }
+    let mut boundaries = vec![ProfileBoundary::default(); program.steps.len()];
+    let mut steps = Vec::with_capacity(regions.len());
+    for (local_index, region) in regions.iter().enumerate() {
+        let boundary = program
+            .steps
+            .iter()
+            .rposition(|step| lowered_step_phase(step) < region.phases.end)
+            .ok_or("profile region has no lowered tile step")?;
+        if lowered_step_phase(&program.steps[boundary]) < region.phases.start {
+            return Err(format!("profile region {} has no lowered tile step", region.name).into());
+        }
+        if boundaries[boundary].after_step {
+            return Err("multiple profile regions end at the same tile step".into());
+        }
+        boundaries[boundary].after_step = true;
+        steps.push(ipu_package::ProfileStep {
+            local_index: u32::try_from(local_index)?,
+            phase: u32::try_from(region.phases.start)?,
+            epoch: 0,
+            operation: region.name.clone(),
+            kind: ipu_package::ProfileStepKind::Compute,
+            kernel: region.name.clone(),
+            metadata: vec![
+                profile_metadata("phase_start", region.phases.start),
+                profile_metadata("phase_end", region.phases.end),
+            ],
+        });
+    }
+    Ok((steps, boundaries))
+}
+
+#[derive(Clone, Copy)]
+enum ProfileSelection<'a> {
+    Granularity(ProfileGranularity),
+    Regions(&'a [StaticProfileRegion]),
+}
+
 fn package_graph_with_profile(
     graph: &ExecutableGraph,
     objects: &[Vec<u8>],
     granularity: ProfileGranularity,
+) -> Result<(Application, ProfileLayout)> {
+    package_graph_with_profile_options(
+        graph,
+        objects,
+        ProfileSelection::Granularity(granularity),
+        &[],
+        1,
+    )
+}
+
+fn package_graph_with_profile_options(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+    selection: ProfileSelection<'_>,
+    templates: &[StaticTemplateRegion],
+    invocations: u32,
 ) -> Result<(Application, ProfileLayout)> {
     let topology = Topology::c600();
     let programs = graph.schedule.lower_tile_programs(&topology)?;
@@ -1296,6 +1391,10 @@ fn package_graph_with_profile(
     let mut profile_tiles = Vec::with_capacity(programs.len());
     let mut slices = Vec::with_capacity(programs.len());
     let mut file_offset = 0usize;
+    let aggregate = matches!(
+        selection,
+        ProfileSelection::Granularity(ProfileGranularity::Graph)
+    );
     let profile_tensor_base = profile_graph
         .schedule
         .allocations
@@ -1306,8 +1405,15 @@ fn package_graph_with_profile(
         .checked_add(1)
         .ok_or("profile tensor id overflow")?;
     for program in &programs {
-        let (mut steps, boundaries) = profile_steps(&graph.schedule, program, granularity);
-        if granularity == ProfileGranularity::Graph {
+        let (mut steps, boundaries) = match selection {
+            ProfileSelection::Granularity(granularity) => {
+                profile_steps(&graph.schedule, program, granularity)
+            }
+            ProfileSelection::Regions(regions) => {
+                region_profile_steps(&graph.schedule, program, regions)?
+            }
+        };
+        if aggregate {
             steps.push(ipu_package::ProfileStep {
                 local_index: 0,
                 phase: 0,
@@ -1318,7 +1424,7 @@ fn package_graph_with_profile(
                 metadata: Vec::new(),
             });
         }
-        let sample_count = if granularity == ProfileGranularity::Graph {
+        let sample_count = if aggregate {
             1
         } else {
             steps
@@ -1326,11 +1432,7 @@ fn package_graph_with_profile(
                 .checked_add(1)
                 .ok_or("profile sample count overflow")?
         };
-        let sample_bytes = if granularity == ProfileGranularity::Graph {
-            8
-        } else {
-            4
-        };
+        let sample_bytes = if aggregate { 8 } else { 4 };
         let size = u32::try_from(
             sample_count
                 .checked_mul(sample_bytes)
@@ -1339,24 +1441,19 @@ fn package_graph_with_profile(
         if size == 0 {
             return Err("profile contains no sample storage".into());
         }
-        let address = align_up(
-            profile_graph
-                .schedule
-                .allocations
-                .iter()
-                .filter(|allocation| allocation.tile == program.tile)
-                .map(|allocation| allocation.address.saturating_add(allocation.size))
-                .max()
-                .unwrap_or(PLAN_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES)
-                .max(PLAN_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES),
-            8,
-        );
-        if address
-            .checked_add(size)
-            .is_none_or(|end| end > ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE)
-        {
-            return Err(format!("profile samples exhaust SRAM on tile {}", program.tile).into());
-        }
+        let address = ipu_compiler::find_free_region(
+            &profile_graph.schedule.allocations,
+            program.tile,
+            size,
+            0,
+            usize::MAX,
+            ipu_compiler::MemoryConstraint {
+                base: PLAN_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+                limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                alignment: 8,
+                placement: ipu_compiler::MemoryPlacement::Low,
+            },
+        )?;
         let physical = u32::from(topology.physical(program.tile)?);
         profile_graph
             .schedule
@@ -1378,7 +1475,7 @@ fn package_graph_with_profile(
             .iter()
             .map(|boundary| boundary.after_step)
             .collect::<Vec<_>>();
-        if granularity != ProfileGranularity::Graph {
+        if !aggregate {
             let boundary_count = boundaries
                 .iter()
                 .map(|boundary| usize::from(boundary.after_sync) + usize::from(boundary.after_step))
@@ -1389,7 +1486,7 @@ fn package_graph_with_profile(
             initial: address,
             after_sync,
             after_step,
-            aggregate_end: (granularity == ProfileGranularity::Graph).then_some(address + 4),
+            aggregate_end: aggregate.then_some(address + 4),
         });
         slices.push(RegionSlice {
             tile: physical,
@@ -1401,7 +1498,7 @@ fn package_graph_with_profile(
             physical_tile: physical,
             file_offset,
             steps,
-            boundary_samples: granularity != ProfileGranularity::Graph,
+            boundary_samples: !aggregate,
         });
         file_offset += size as usize;
     }
@@ -1416,8 +1513,8 @@ fn package_graph_with_profile(
         objects,
         &profile_code,
         Some(programs),
-        &[],
-        1,
+        templates,
+        invocations,
     )?;
     Ok((
         app,
