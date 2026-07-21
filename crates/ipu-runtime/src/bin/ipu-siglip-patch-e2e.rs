@@ -173,6 +173,11 @@ fn main() {
     let mut layer_phase_ranges = Vec::with_capacity(layer_count);
     for layer in 0..layer_count {
         let phase_start = plan.schedule.phases.len();
+        let mut layer_memory = memory.clone();
+        layer_memory.resident_tile_assignment =
+            ipu_compiler::ResidentTileAssignment::WindowBalanced {
+                allocation_start: plan.schedule.allocations.len(),
+            };
         let appended = append_siglip_encoder_layer(
             &mut plan.schedule,
             &current,
@@ -182,7 +187,7 @@ fn main() {
             columns,
             row_block_dimension,
             TILE_COUNT,
-            &memory,
+            &layer_memory,
             weight_storage,
             retain_profile_metadata,
             detailed_diagnostics && layer + 1 == layer_count,
@@ -556,10 +561,7 @@ fn encoder_memory_policy(data_limit: u32) -> MemoryPolicy {
             Ipu21MemoryRegion::OrdinaryHigh,
         ],
     );
-    let mut policy =
-        MemoryPolicy::ipu21(DEFAULT_RESIDENT_LOW_BASE, data_limit, &resident, &transient).unwrap();
-    policy.resident_tile_assignment = ipu_compiler::ResidentTileAssignment::Fixed;
-    policy
+    MemoryPolicy::ipu21(DEFAULT_RESIDENT_LOW_BASE, data_limit, &resident, &transient).unwrap()
 }
 
 fn memory_region_order(name: &str, default: &[Ipu21MemoryRegion]) -> Vec<Ipu21MemoryRegion> {

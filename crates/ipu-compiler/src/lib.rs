@@ -414,8 +414,8 @@ pub struct MemoryPolicy {
     pub resident: Vec<MemoryArena>,
     /// Ordered arenas for short-lived activations and ordinary kernel scratch.
     pub transient: Vec<MemoryArena>,
-    /// Controls whether resident tensors are rotated to balance accumulated
-    /// per-tile pressure or retain the child planner's stable tile assignment.
+    /// Controls the allocation window used to balance resident tensors across
+    /// tiles, or retains the child planner's tile assignment unchanged.
     #[serde(default)]
     pub resident_tile_assignment: ResidentTileAssignment,
 }
@@ -425,6 +425,9 @@ pub enum ResidentTileAssignment {
     #[default]
     Balanced,
     Fixed,
+    WindowBalanced {
+        allocation_start: usize,
+    },
 }
 
 /// Allocatable IPU21 SRAM regions, excluding executable and exchange storage.
@@ -1471,8 +1474,18 @@ fn plan_appended_blocked_gemm_with_memory_policy(
             &plan.right,
             config.data_type.weight_element_bytes(),
             &memory.resident,
+            0,
         ),
         ResidentTileAssignment::Fixed => 0,
+        ResidentTileAssignment::WindowBalanced { allocation_start } => {
+            choose_resident_tile_rotation_in_arenas(
+                parent,
+                &plan.right,
+                config.data_type.weight_element_bytes(),
+                &memory.resident,
+                allocation_start,
+            )
+        }
     };
     rotate_gemm_plan_tiles(&mut plan, tile_rotation)?;
     let mut regions = plan
@@ -1626,6 +1639,7 @@ fn choose_resident_tile_rotation_in_arenas(
     child_resident: &[BlockPlacement],
     element_bytes: u32,
     arenas: &[MemoryArena],
+    allocation_start: usize,
 ) -> u16 {
     let tile_count = usize::from(parent.tile_count);
     if tile_count == 0 {
@@ -1634,7 +1648,10 @@ fn choose_resident_tile_rotation_in_arenas(
     let arena_base = arenas.iter().map(|arena| arena.base).min().unwrap_or(0);
     let arena_limit = arenas.iter().map(|arena| arena.limit).max().unwrap_or(0);
     let occupied = occupied_intervals_by_tile(
-        &parent.allocations,
+        parent
+            .allocations
+            .get(allocation_start..)
+            .unwrap_or_default(),
         parent.tile_count,
         0,
         usize::MAX,
@@ -4042,6 +4059,7 @@ mod tests {
                 base: 0xa0000,
                 limit: 0xe8000,
             }],
+            0,
         );
 
         assert_ne!(rotation, 0);
