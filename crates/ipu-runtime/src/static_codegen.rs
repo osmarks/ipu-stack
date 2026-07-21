@@ -62,6 +62,8 @@ pub(crate) struct StaticTemplatePlan {
     pub instance_steps: Vec<Range<usize>>,
     pub record_addresses: Vec<u32>,
     pub records: Vec<Vec<StaticTemplateRecordWord>>,
+    pub shared_address: u32,
+    pub shared: Vec<StaticTemplateRecordWord>,
     steps: Vec<StaticTemplateStep>,
 }
 
@@ -101,12 +103,15 @@ enum TemplateValue {
     Constant(u32),
     Record(u16),
     RecordOffset { slot: u16, offset: i32 },
+    Shared(u16),
 }
 
 struct TemplateRecords {
     rows: Vec<Vec<StaticTemplateRecordWord>>,
     columns: HashMap<Vec<StaticTemplateRecordWord>, u16>,
     affine_columns: HashMap<Vec<i64>, (u16, u32)>,
+    shared: Vec<StaticTemplateRecordWord>,
+    shared_values: HashMap<StaticTemplateRecordWord, u16>,
 }
 
 impl TemplateRecords {
@@ -115,12 +120,18 @@ impl TemplateRecords {
             rows: vec![Vec::new(); instances],
             columns: HashMap::new(),
             affine_columns: HashMap::new(),
+            shared: Vec::new(),
+            shared_values: HashMap::new(),
         }
     }
 
     fn values(&mut self, values: Vec<u32>) -> Result<TemplateValue> {
-        if values[0] < 1 << 20 && values.windows(2).all(|pair| pair[0] == pair[1]) {
-            return Ok(TemplateValue::Constant(values[0]));
+        if values.windows(2).all(|pair| pair[0] == pair[1]) {
+            return if values[0] < 1 << 20 {
+                Ok(TemplateValue::Constant(values[0]))
+            } else {
+                self.shared(StaticTemplateRecordWord::Value(values[0]))
+            };
         }
         let words = values
             .iter()
@@ -148,12 +159,25 @@ impl TemplateRecords {
     }
 
     fn words(&mut self, words: Vec<StaticTemplateRecordWord>) -> Result<TemplateValue> {
+        if words.windows(2).all(|pair| pair[0] == pair[1]) {
+            return self.shared(words[0].clone());
+        }
         if let Some(&slot) = self.columns.get(&words) {
             return Ok(TemplateValue::Record(slot));
         }
         let slot = self.push_column(words.clone())?;
         self.columns.insert(words, slot);
         Ok(TemplateValue::Record(slot))
+    }
+
+    fn shared(&mut self, word: StaticTemplateRecordWord) -> Result<TemplateValue> {
+        if let Some(&slot) = self.shared_values.get(&word) {
+            return Ok(TemplateValue::Shared(slot));
+        }
+        let slot = u16::try_from(self.shared.len())?;
+        self.shared.push(word.clone());
+        self.shared_values.insert(word, slot);
+        Ok(TemplateValue::Shared(slot))
     }
 
     fn push_column(&mut self, words: Vec<StaticTemplateRecordWord>) -> Result<u16> {
@@ -390,6 +414,8 @@ pub(crate) fn plan_static_templates(
             instance_steps,
             record_addresses,
             records: records.rows,
+            shared_address: 0,
+            shared: records.shared,
             steps: template_steps,
         });
     }
@@ -845,7 +871,12 @@ fn emit_static_template_exchange(
     Ok(())
 }
 
-fn emit_template_value(code: &mut TileCode, value: TemplateValue, register: u8) -> Result<()> {
+fn emit_template_value(
+    code: &mut TileCode,
+    value: TemplateValue,
+    register: u8,
+    shared_address: u32,
+) -> Result<()> {
     match value {
         TemplateValue::Constant(value) => code.setzi(register, value),
         TemplateValue::Record(slot) => {
@@ -862,6 +893,10 @@ fn emit_template_value(code: &mut TileCode, value: TemplateValue, register: u8) 
                 remaining -= step;
             }
             Ok(())
+        }
+        TemplateValue::Shared(slot) => {
+            code.setzi(1, shared_address)?;
+            code.ld32(register, 1, 15, slot)
         }
     }
 }
@@ -886,21 +921,21 @@ fn emit_static_template_body(
                 active,
             } => {
                 if let Some(instruction) = sender_instruction {
-                    emit_template_value(code, *instruction, 3)?;
+                    emit_template_value(code, *instruction, 3, template.shared_address)?;
                     let skip_patch = code.words.len();
                     code.brz(3, 0)?;
                     if let Some(address) = sender_address {
-                        emit_template_value(code, *address, 8)?;
+                        emit_template_value(code, *address, 8, template.shared_address)?;
                         code.st32(3, 8, 15, 0)?;
                     } else {
-                        emit_template_value(code, *plan_address, 8)?;
+                        emit_template_value(code, *plan_address, 8, template.shared_address)?;
                         code.st32(3, 8, 15, sender_word_offset.unwrap())?;
                     }
                     let after_patch = generated_address(generated_base, code.words.len())?;
                     code.words[skip_patch] = ipu_exchange::encode_brz_m_immediate(3, after_patch)?;
                 }
-                emit_template_value(code, *plan_address, 8)?;
-                emit_template_value(code, *active, 0)?;
+                emit_template_value(code, *plan_address, 8, template.shared_address)?;
+                emit_template_value(code, *active, 0, template.shared_address)?;
                 code.call(template_exchange, 9)?;
             }
             StaticTemplateStep::Compute {
@@ -910,14 +945,14 @@ fn emit_static_template_body(
                 condition,
             } => {
                 if let Some(condition) = condition {
-                    emit_template_value(code, *condition, 0)?;
+                    emit_template_value(code, *condition, 0, template.shared_address)?;
                 }
                 if let Some(kernel) = kernel {
-                    emit_template_value(code, *kernel, 8)?;
+                    emit_template_value(code, *kernel, 8, template.shared_address)?;
                 }
                 for (operand, &value) in operands.iter().enumerate() {
                     let register = u8::try_from(operand)? + 2;
-                    emit_template_value(code, value, register)?;
+                    emit_template_value(code, value, register, template.shared_address)?;
                 }
                 let skip_call = if condition.is_some() {
                     let branch = code.words.len();
@@ -1159,23 +1194,18 @@ mod tests {
         assert_eq!(first, TemplateValue::Record(0));
         assert_eq!(repeated, first);
         assert_eq!(second, TemplateValue::RecordOffset { slot: 0, offset: 1 });
-        assert_eq!(wide_constant, TemplateValue::Record(1));
+        assert_eq!(wide_constant, TemplateValue::Shared(0));
         assert_eq!(
             records.rows,
             vec![
-                vec![
-                    StaticTemplateRecordWord::Value(10),
-                    StaticTemplateRecordWord::Value(0x3f80_0000),
-                ],
-                vec![
-                    StaticTemplateRecordWord::Value(20),
-                    StaticTemplateRecordWord::Value(0x3f80_0000),
-                ],
-                vec![
-                    StaticTemplateRecordWord::Value(30),
-                    StaticTemplateRecordWord::Value(0x3f80_0000),
-                ],
+                vec![StaticTemplateRecordWord::Value(10)],
+                vec![StaticTemplateRecordWord::Value(20)],
+                vec![StaticTemplateRecordWord::Value(30)],
             ]
+        );
+        assert_eq!(
+            records.shared,
+            vec![StaticTemplateRecordWord::Value(0x3f80_0000)]
         );
     }
 
