@@ -3524,6 +3524,7 @@ fn host_source_summary(device: &Device, app: &Application) -> String {
                 )
             })
         })
+        .take(16)
         .collect::<Vec<_>>()
         .join(", ")
 }

@@ -84,7 +84,7 @@ ipu_stack_static_prng_seed_base:
 	  fnop }
 	{ nop
 	  urand64 $azeros }
-	exitnz $m15
+	exitz $m15
 	.size ipu_stack_static_worker_init, .-ipu_stack_static_worker_init
 
 	.section .text.ipu_stack_static_worker_barrier,"ax",@progbits

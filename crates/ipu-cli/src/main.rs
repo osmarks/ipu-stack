@@ -1052,33 +1052,61 @@ fn main() -> Result<()> {
             let output: HashMap<_, _> = output.into_iter().collect();
             let bootloader = fs::read(bootloader)?;
             let configuration = fs::read(configuration)?;
-            block_device_interrupt_signals()?;
-            let device = Device::open(&device)?;
-            device.initialize()?;
-            device.replay_configuration(&configuration)?;
-            apply_device_config_writes(&device, &app)?;
-            Loader::new(&device, &bootloader)?.load(&app, protocol.startup_mark)?;
-            let mut session = HostSession::new(&device, protocol)?;
-            session.start()?;
-            for call in calls {
+            let generated_call =
+                calls.len() == 1 && protocol.calls.len() == 1 && calls[0] == protocol.calls[0].name;
+            if generated_call {
+                let call = &calls[0];
                 let bytes = input
-                    .get(&call)
+                    .get(call)
                     .map(fs::read)
                     .transpose()?
                     .unwrap_or_default();
-                let result = session.invoke(&call, &bytes).map_err(|error| {
-                    anyhow::anyhow!(
-                        "{error}; device state: {}",
-                        host_run_device_summary(&device, &app)
-                    )
-                })?;
-                if let Some(path) = output.get(&call) {
+                let result = ipu_runtime::run_host_with_options(
+                    &app,
+                    &bootloader,
+                    &configuration,
+                    &device,
+                    &bytes,
+                    ipu_runtime::HostRunOptions::default(),
+                )
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                if let Some(path) = output.get(call) {
                     fs::write(path, &result)?;
                 } else if !result.is_empty() {
                     bail!(
                         "call {call} produced {} bytes without --output",
                         result.len()
                     );
+                }
+            } else {
+                block_device_interrupt_signals()?;
+                let device = Device::open(&device)?;
+                device.initialize()?;
+                device.replay_configuration(&configuration)?;
+                apply_device_config_writes(&device, &app)?;
+                Loader::new(&device, &bootloader)?.load(&app, protocol.startup_mark)?;
+                let mut session = HostSession::new(&device, protocol)?;
+                session.start()?;
+                for call in calls {
+                    let bytes = input
+                        .get(&call)
+                        .map(fs::read)
+                        .transpose()?
+                        .unwrap_or_default();
+                    let result = session.invoke(&call, &bytes).map_err(|error| {
+                        anyhow::anyhow!(
+                            "{error}; device state: {}",
+                            host_run_device_summary(&device, &app)
+                        )
+                    })?;
+                    if let Some(path) = output.get(&call) {
+                        fs::write(path, &result)?;
+                    } else if !result.is_empty() {
+                        bail!(
+                            "call {call} produced {} bytes without --output",
+                            result.len()
+                        );
+                    }
                 }
             }
             println!("hostCalls={} directHostRun=PASS", app.entry_points.len());
