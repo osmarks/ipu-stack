@@ -797,17 +797,15 @@ pub(crate) fn emit(
         if let Some(template) = templates.get(template_index)
             && template.instance_steps[0].start == step_index
         {
-            let reusable_patch_destinations =
-                template.patches.iter().any(|patch| !patch.is_empty())
-                    && template
-                        .record_addresses
-                        .windows(2)
-                        .all(|pair| pair[0] == pair[1])
-                    && template
-                        .record_secondary_addresses
-                        .windows(2)
-                        .all(|pair| pair[0] == pair[1]);
-            if reusable_patch_destinations {
+            let reusable_record_frame = template
+                .record_addresses
+                .windows(2)
+                .all(|pair| pair[0] == pair[1])
+                && template
+                    .record_secondary_addresses
+                    .windows(2)
+                    .all(|pair| pair[0] == pair[1]);
+            if reusable_record_frame {
                 code.add_immediate(11, 11, -16)?;
                 code.setzi(4, template.record_addresses[0])?;
                 code.setzi(5, template.record_secondary_addresses[0])?;
@@ -826,20 +824,22 @@ pub(crate) fn emit(
                 if !patch.is_empty() {
                     code.setzi(2, u32::try_from(template.records[instance].len())?)?;
                     code.setzi(3, template.patch_addresses[instance])?;
-                    if !reusable_patch_destinations {
+                    if !reusable_record_frame {
                         code.setzi(4, record_address)?;
                         code.setzi(5, secondary_address)?;
                         code.setzi(6, u32::from(template.record_split))?;
                     }
                     code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
                 }
-                code.setzi(2, record_address)?;
-                code.setzi(3, secondary_address)?;
+                if !reusable_record_frame {
+                    code.setzi(2, record_address)?;
+                    code.setzi(3, secondary_address)?;
+                }
                 let call = code.words.len();
                 code.call(0, 9)?;
                 template_calls.push((call, template_index));
             }
-            if reusable_patch_destinations {
+            if reusable_record_frame {
                 code.add_immediate(11, 11, 16)?;
             }
             plan_index += template
@@ -954,6 +954,14 @@ pub(crate) fn emit(
             symbols,
             template_exchanges.unwrap(),
             generated_base,
+            template
+                .record_addresses
+                .windows(2)
+                .all(|pair| pair[0] == pair[1])
+                && template
+                    .record_secondary_addresses
+                    .windows(2)
+                    .all(|pair| pair[0] == pair[1]),
         )?;
     }
     for (call, template) in template_calls {
@@ -1028,8 +1036,13 @@ fn emit_static_template_body(
     symbols: &BTreeMap<String, u32>,
     template_exchange: u32,
     generated_base: u32,
+    record_addresses_in_parent_frame: bool,
 ) -> Result<()> {
     code.add_immediate(11, 11, -16)?;
+    if record_addresses_in_parent_frame {
+        code.ld32(2, 11, 15, 4)?;
+        code.ld32(3, 11, 15, 5)?;
+    }
     code.st32(2, 11, 15, 0)?;
     code.st32(3, 11, 15, 1)?;
     code.st32(9, 11, 15, 2)?;
