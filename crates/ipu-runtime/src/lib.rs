@@ -8,7 +8,7 @@ use ipu_package::{
     TileMemory,
 };
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
@@ -478,14 +478,6 @@ struct AllocationRelocation {
     live_until: usize,
 }
 
-#[derive(Clone, Copy)]
-struct LifetimeReservation {
-    start: u32,
-    end: u32,
-    live_from: usize,
-    live_until: usize,
-}
-
 fn is_movable_transient_home(allocation: &ipu_compiler::Allocation) -> bool {
     if !matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
         || allocation.live_until == usize::MAX
@@ -498,6 +490,68 @@ fn is_movable_transient_home(allocation: &ipu_compiler::Allocation) -> bool {
         ..ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
     (allocation.address >= ordinary_low.start && end <= ordinary_low.end)
         || (allocation.address >= ordinary_high.start && end <= ordinary_high.end)
+}
+
+fn merge_address_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    ranges.sort_unstable();
+    let mut merged = Vec::<(u32, u32)>::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if start >= end {
+            continue;
+        }
+        if let Some(previous) = merged.last_mut()
+            && start <= previous.1
+        {
+            previous.1 = previous.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn allocate_from_sorted_ranges(
+    permanent: &[(u32, u32)],
+    active: &BTreeMap<(u32, usize), u32>,
+    size: u32,
+    arenas: &[ipu_compiler::MemoryArena],
+    alignment: u32,
+) -> Option<u32> {
+    for arena in arenas {
+        let mut cursor = align_up(arena.base, alignment);
+        let mut permanent = permanent.iter().copied().peekable();
+        let mut active = active
+            .iter()
+            .map(|(&(start, _), &end)| (start, end))
+            .peekable();
+        loop {
+            let range = match (permanent.peek(), active.peek()) {
+                (Some(left), Some(right)) if left.0 <= right.0 => permanent.next(),
+                (Some(_), Some(_)) => active.next(),
+                (Some(_), None) => permanent.next(),
+                (None, Some(_)) => active.next(),
+                (None, None) => break,
+            };
+            let (start, end) = range.unwrap();
+            if end <= cursor || start >= arena.limit {
+                continue;
+            }
+            if cursor.checked_add(size).is_some_and(|end| end <= start) {
+                return Some(cursor);
+            }
+            cursor = align_up(cursor.max(end), alignment);
+            if cursor >= arena.limit {
+                break;
+            }
+        }
+        if cursor
+            .checked_add(size)
+            .is_some_and(|end| end <= arena.limit)
+        {
+            return Some(cursor);
+        }
+    }
+    None
 }
 
 fn fixed_allocation_ranges_by_tile(
@@ -537,12 +591,10 @@ fn repack_transient_allocations_around(
             && (allocation.address < ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
                 || allocation.address >= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT)
         {
-            fixed_by_tile[usize::from(allocation.tile)].push(LifetimeReservation {
-                start: allocation.address,
-                end: allocation.address.saturating_add(allocation.size),
-                live_from: allocation.live_from,
-                live_until: allocation.live_until,
-            });
+            fixed_by_tile[usize::from(allocation.tile)].push((
+                allocation.address,
+                allocation.address.saturating_add(allocation.size),
+            ));
         }
     }
     let ordinary_arenas = [
@@ -565,60 +617,47 @@ fn repack_transient_allocations_around(
                     allocation.tensor.0,
                 )
             });
-            let mut placed = Vec::<LifetimeReservation>::with_capacity(candidates.len());
-            let permanent = reservations[tile]
+            let permanent = merge_address_ranges(
+                reservations[tile]
                 .iter()
-                .map(|&(start, end)| LifetimeReservation {
-                    start,
-                    end,
-                    live_from: 0,
-                    live_until: usize::MAX,
-                })
+                .copied()
                 .chain(fixed_by_tile[tile].iter().copied())
-                .collect::<Vec<_>>();
+                .collect(),
+            );
+            let mut active = BTreeMap::<(u32, usize), u32>::new();
+            let mut expirations = BinaryHeap::<std::cmp::Reverse<(usize, u32, usize)>>::new();
             let mut result = Vec::with_capacity(candidates.len());
             for index in candidates {
                 let allocation = &graph.schedule.allocations[index];
-                placed.retain(|entry| entry.live_until > allocation.live_from);
-                let overlaps_lifetime = |entry: &LifetimeReservation| {
-                    allocation.live_from < entry.live_until
-                        && entry.live_from < allocation.live_until
-                };
-                let mut occupied = permanent
-                    .iter()
-                    .chain(&placed)
-                    .filter(|entry| overlaps_lifetime(entry))
-                    .map(|entry| (entry.start, entry.end))
-                    .collect::<Vec<_>>();
-                occupied.sort_unstable();
-                let mut merged = Vec::<(u32, u32)>::with_capacity(occupied.len());
-                for (start, end) in occupied {
-                    if let Some(previous) = merged.last_mut()
-                        && start <= previous.1
-                    {
-                        previous.1 = previous.1.max(end);
-                    } else {
-                        merged.push((start, end));
-                    }
+                while let Some(&std::cmp::Reverse((live_until, address, expired_index))) =
+                    expirations.peek()
+                    && live_until <= allocation.live_from
+                {
+                    expirations.pop();
+                    active.remove(&(address, expired_index));
                 }
-                let address = ipu_compiler::allocate_from_occupied_arenas(
-                    &mut merged,
+                let address = allocate_from_sorted_ranges(
+                    &permanent,
+                    &active,
                     allocation.size,
                     &ordinary_arenas,
                     32,
                 )
-                .map_err(|error| {
+                .ok_or_else(|| {
                     format!(
-                        "cannot repack transient tensor {} on tile {} for {reason}: {error}",
-                        allocation.tensor.0, allocation.tile,
+                        "cannot repack transient tensor {} on tile {} for {reason}: no arena can hold a {}-byte SRAM allocation",
+                        allocation.tensor.0, allocation.tile, allocation.size,
                     )
                 })?;
-                placed.push(LifetimeReservation {
-                    start: address,
-                    end: address.saturating_add(allocation.size),
-                    live_from: allocation.live_from,
-                    live_until: allocation.live_until,
-                });
+                if allocation.live_from < allocation.live_until {
+                    let end = address.saturating_add(allocation.size);
+                    active.insert((address, index), end);
+                    expirations.push(std::cmp::Reverse((
+                        allocation.live_until,
+                        address,
+                        index,
+                    )));
+                }
                 result.push((index, address));
             }
             Ok(result)
