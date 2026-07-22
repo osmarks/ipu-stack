@@ -4,7 +4,8 @@ use ipu_compiler::{
     FlashAttentionPlan, GemmDataType, Ipu21MemoryRegion, KernelCommand, MemoryConstraint,
     MemoryPlacement, MemoryPolicy, OpId, Phase, RowShardPlacement, RowShardTransitionConfig,
     SpecializationKey, TensorId, append_c16_to_a16_row_shards, choose_gemm_row_block_for_shape,
-    end_tensor_lifetimes, make_tensors_resident, plan_blocked_gemm, plan_flash_attention,
+    choose_gemm_row_block_for_shape_max_rows, end_tensor_lifetimes, make_tensors_resident,
+    plan_blocked_gemm, plan_flash_attention,
 };
 use ipu_elf::{KernelArtifact, Toolchain};
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -66,7 +67,14 @@ fn main() {
     let patch_elements = config.num_channels * config.patch_size.pow(2);
     let inner = u16::try_from(patch_elements.div_ceil(64) * 64).unwrap();
     let columns = u16::try_from(config.hidden_size).unwrap();
-    let automatic_row_block_dimension = choose_gemm_row_block_for_shape(
+    let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
+    let memory = encoder_memory_policy(data_limit);
+    let row_bytes = u32::from(columns) * 2;
+    let preferred_transient_capacity = memory.transient[0].limit - memory.transient[0].base;
+    let maximum_transient_rows = u16::try_from(preferred_transient_capacity / row_bytes)
+        .unwrap()
+        .max(1);
+    let automatic_row_block_dimension = choose_gemm_row_block_for_shape_max_rows(
         rows,
         inner,
         INNER_BLOCK_DIMENSION,
@@ -74,6 +82,7 @@ fn main() {
         BLOCK_DIMENSION,
         TILE_COUNT,
         GemmDataType::F16,
+        maximum_transient_rows,
     )
     .unwrap();
     let row_block_dimension = std::env::var("IPU_SIGLIP_ROW_BLOCK_ROWS")
@@ -181,8 +190,6 @@ fn main() {
         .map(|value| value.parse::<usize>().unwrap())
         .unwrap_or(1);
     assert!((1..=config.num_hidden_layers).contains(&layer_count));
-    let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
-    let memory = encoder_memory_policy(data_limit);
     let weight_storage = match std::env::var("IPU_SIGLIP_WEIGHT_STORAGE").as_deref() {
         Ok("f16") => SiglipWeightStorage::F16,
         Ok("f143") | Err(_) => SiglipWeightStorage::F143,

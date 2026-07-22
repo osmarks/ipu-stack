@@ -57,6 +57,63 @@ pub struct RowShardTransitionConfig {
     pub data_limit: u32,
 }
 
+pub fn choose_row_shard_rows_for_copies_in_arenas(
+    schedule: &Schedule,
+    rows: u16,
+    columns: u16,
+    maximum_rows: u16,
+    copies: usize,
+    arenas: &[MemoryArena],
+) -> Option<u16> {
+    if rows == 0 || columns == 0 || maximum_rows == 0 || copies == 0 || arenas.is_empty() {
+        return None;
+    }
+    let phase = schedule.phases.len() + 1;
+    let data_base = arenas.iter().map(|arena| arena.base).min()?;
+    let data_limit = arenas.iter().map(|arena| arena.limit).max()?;
+    let occupied = occupied_intervals_by_tile(
+        &schedule.allocations,
+        schedule.tile_count,
+        phase,
+        usize::MAX,
+        data_base,
+        data_limit,
+    );
+    let mut previous_grid = None;
+    for target_rows in (1..=maximum_rows.min(rows)).rev() {
+        let row_grid = rows.div_ceil(target_rows);
+        if row_grid > schedule.tile_count || previous_grid == Some(row_grid) {
+            continue;
+        }
+        previous_grid = Some(row_grid);
+        let base_rows = rows / row_grid;
+        let larger_shards = rows % row_grid;
+        let mut candidate = occupied.clone();
+        let fits = (0..row_grid).all(|index| {
+            let shard_rows = base_rows + u16::from(index < larger_shards);
+            u32::from(shard_rows)
+                .checked_mul(u32::from(columns))
+                .and_then(|elements| elements.checked_mul(2))
+                .is_some_and(|bytes| {
+                    (0..copies).all(|_| {
+                        allocate_from_occupied_arenas(
+                            &mut candidate[usize::from(index)],
+                            bytes,
+                            arenas,
+                            8,
+                            MemoryPlacement::Low,
+                        )
+                        .is_ok()
+                    })
+                })
+        });
+        if fits {
+            return Some(base_rows + u16::from(larger_shards != 0));
+        }
+    }
+    None
+}
+
 pub fn end_tensor_lifetimes(
     schedule: &mut Schedule,
     tensors: impl IntoIterator<Item = TensorId>,
@@ -678,12 +735,14 @@ pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
             .filter_map(|block| {
                 let overlap_start = row_start.max(block.row_start);
                 let overlap_end = row_end.min(block.row_start + block.rows);
-                (overlap_start < overlap_end).then_some((
-                    block,
-                    overlap_start - block.row_start,
-                    overlap_start - row_start,
-                    overlap_end - overlap_start,
-                ))
+                (overlap_start < overlap_end).then(|| {
+                    (
+                        block,
+                        overlap_start - block.row_start,
+                        overlap_start - row_start,
+                        overlap_end - overlap_start,
+                    )
+                })
             })
             .collect::<Vec<_>>();
         fragments.sort_unstable_by_key(|(block, source_row, _, _)| {
@@ -1499,6 +1558,30 @@ mod tests {
         schedule
             .lower_tile_programs(&ipu_exchange::Topology::c600())
             .unwrap();
+    }
+
+    #[test]
+    fn row_shard_choice_accounts_for_simultaneously_live_copies() {
+        let schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: Vec::new(),
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+        let arena = MemoryArena {
+            base: 0x1000,
+            limit: 0x1180,
+        };
+
+        assert_eq!(
+            choose_row_shard_rows_for_copies_in_arenas(&schedule, 12, 16, 12, 2, &[arena]),
+            Some(6)
+        );
+        assert_eq!(
+            choose_row_shard_rows_for_copies_in_arenas(&schedule, 12, 16, 12, 3, &[arena]),
+            None
+        );
     }
 
     #[test]

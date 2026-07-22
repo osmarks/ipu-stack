@@ -5,9 +5,9 @@ use crate::{
 use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
-    FlashAttentionConfig, FlashAttentionPlan, GemmDataType, MemoryArena, MemoryPlacement,
-    MemoryPolicy, Phase, RowShardPlacement, RowShardTransitionConfig, Schedule, TensorId,
-    allocate_from_occupied_arenas, append_add_affine_layer_norm_f16_with_memory_policy,
+    CompileError, FlashAttentionConfig, FlashAttentionPlan, GemmDataType, MemoryArena,
+    MemoryPlacement, MemoryPolicy, Phase, RowShardPlacement, RowShardTransitionConfig, Schedule,
+    TensorId, allocate_from_occupied_arenas, append_add_affine_layer_norm_f16_with_memory_policy,
     append_add_f16_row_shards_in_place, append_affine_layer_norm_f16_with_memory_policy,
     append_bias_f16_c16_in_arenas, append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
     append_blocked_gemm_f16_with_a16_input_with_memory_policy,
@@ -16,9 +16,10 @@ use ipu_compiler::{
     append_flash_attention_from_a16_qkv_in_arenas,
     append_flash_attention_to_a16_row_shards_in_arenas, choose_gemm_row_block_for,
     choose_gemm_row_block_for_shape, choose_gemm_row_block_for_shape_max_rows,
-    end_tensor_lifetimes, gemm_row_block_candidates_for, gemm_row_block_cost,
-    make_tensors_resident, make_tensors_resident_since, occupied_intervals_by_tile,
-    set_f8_weight_block_scales_in_phases, set_native_f8_weight_block_scales_in_phases,
+    choose_row_shard_rows_for_copies_in_arenas, end_tensor_lifetimes,
+    gemm_row_block_candidates_for, gemm_row_block_cost, make_tensors_resident,
+    make_tensors_resident_since, occupied_intervals_by_tile, set_f8_weight_block_scales_in_phases,
+    set_native_f8_weight_block_scales_in_phases,
 };
 use ipu_models::SiglipWeights;
 use ipu_package::{Binding, RegionSlice};
@@ -1353,10 +1354,31 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         qkv_bias_allocation_start,
         qkv_bias.iter().map(|block| block.tensor),
     )?;
+    let preferred_qkv_rows = if tuning.automatic_gemm_row_blocks {
+        qkv_row_block_dimension
+    } else {
+        row_block_dimension
+    };
+    let qkv_destination_rows = choose_row_shard_rows_for_copies_in_arenas(
+        schedule,
+        rows,
+        columns,
+        preferred_qkv_rows,
+        3,
+        &memory.transient,
+    )
+    .ok_or_else(|| {
+        CompileError::Memory("QKV has no feasible shared A16 row-shard placement".into())
+    })?;
+    info!(
+        source_row_block_rows = qkv_row_block_dimension,
+        destination_row_block_rows = qkv_destination_rows,
+        "selected shared QKV row-shard placement"
+    );
     let qkv_shards = (0..3)
         .map(|projection| {
             let blocks = projection_blocks(&qkv.output, projection, columns);
-            if qkv_row_block_dimension == row_block_dimension || tuning.automatic_gemm_row_blocks {
+            if qkv_destination_rows == qkv_row_block_dimension {
                 append_c16_to_a16_row_shards(
                     schedule,
                     &blocks,
@@ -1371,7 +1393,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
                     schedule,
                     &blocks,
                     columns,
-                    row_block_dimension,
+                    qkv_destination_rows,
                     &memory.transient,
                 )
             }
