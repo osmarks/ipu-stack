@@ -2543,30 +2543,6 @@ fn package_graph_impl_attempt(
             template: usize,
         },
     }
-    let transient_homes = graph
-        .schedule
-        .allocations
-        .iter()
-        .filter(|allocation| {
-            matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
-                && allocation.live_until != usize::MAX
-        })
-        .map(|allocation| (allocation.tile, allocation.tensor.0))
-        .collect::<BTreeSet<_>>();
-    let mut template_occupied_ranges_by_tile = vec![Vec::new(); programs.len()];
-    for allocation in &graph.schedule.allocations {
-        let relocatable = match allocation.kind {
-            ipu_compiler::AllocationKind::Home => allocation.live_until != usize::MAX,
-            ipu_compiler::AllocationKind::HomeAlias { source } => {
-                transient_homes.contains(&(allocation.tile, source.0))
-            }
-            _ => false,
-        };
-        if !relocatable {
-            template_occupied_ranges_by_tile[usize::from(allocation.tile)]
-                .push(allocation_range(allocation)?);
-        }
-    }
     let mut template_record_ranges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); programs.len()];
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
@@ -2646,24 +2622,67 @@ fn package_graph_impl_attempt(
                 .chain(host_executable_placements[tile_index].2.iter().copied())
                 .chain(std::iter::once(image_executable_elements[tile_index]))
                 .collect::<Vec<_>>();
-            let address = data_region_base_for_tile(
+            let existing_gap = data_region_base_for_tile(
                 &allocation_ranges_by_tile[usize::from(tile)],
                 tile,
                 runtime_end,
                 size,
                 4,
                 &additional_reserved,
-            )
-            .or_else(|_| {
-                data_region_base_for_tile(
-                    &template_occupied_ranges_by_tile[usize::from(tile)],
-                    tile,
-                    runtime_end,
-                    size,
-                    4,
-                    &additional_reserved,
-                )
-            })?;
+            );
+            let address = if let Ok(address) = existing_gap {
+                address
+            } else {
+                let mut movable = graph
+                    .schedule
+                    .allocations
+                    .iter()
+                    .filter(|allocation| {
+                        allocation.tile == tile
+                            && matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
+                            && allocation.live_until != usize::MAX
+                    })
+                    .map(|allocation| (allocation.size, allocation.tensor.0))
+                    .collect::<Vec<_>>();
+                movable.sort_unstable();
+                let mut admitted = BTreeSet::new();
+                let mut placement = None;
+                for (_, tensor) in movable {
+                    admitted.insert(tensor);
+                    let occupied = graph
+                        .schedule
+                        .allocations
+                        .iter()
+                        .filter(|allocation| allocation.tile == tile)
+                        .filter(|allocation| match allocation.kind {
+                            ipu_compiler::AllocationKind::Home => {
+                                !admitted.contains(&allocation.tensor.0)
+                            }
+                            ipu_compiler::AllocationKind::HomeAlias { source } => {
+                                !admitted.contains(&source.0)
+                            }
+                            _ => true,
+                        })
+                        .map(allocation_range)
+                        .collect::<Result<Vec<_>>>()?;
+                    if let Ok(address) = data_region_base_for_tile(
+                        &occupied,
+                        tile,
+                        runtime_end,
+                        size,
+                        4,
+                        &additional_reserved,
+                    ) {
+                        placement = Some(address);
+                        break;
+                    }
+                }
+                placement.ok_or_else(|| {
+                    format!(
+                        "cannot place {size} bytes of static template data on tile {tile} after admitting every transient home"
+                    )
+                })?
+            };
             let end = address
                 .checked_add(size)
                 .ok_or("static template record address overflow")?;
