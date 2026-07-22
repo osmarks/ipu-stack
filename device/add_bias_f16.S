@@ -30,6 +30,8 @@ ipu_stack_add_bias_f16_c16:
 	ld32 $m5, $mvertex_base, $m15, 3
 	ld32 $m6, $mvertex_base, $m15, 4
 	ld32 $m7, $mvertex_base, $m15, 5
+	setzi $m1, 0xffff
+	and $m6, $m6, $m1
 	get $m8, $WSR
 	and $m8, $m8, CSR_W_WSR__CTXTID_M1__MASK
 	mov $m9, $m6
@@ -66,7 +68,8 @@ ipu_stack_add_bias_f16_c16:
 	sub $m7, $m7, 1
 	brnz $m7, .Ladd_bias_word
 	add $m0, $m0, 1
-	setzi $m1, 4
+	ld32 $m1, $mvertex_base, $m15, 4
+	shr $m1, $m1, 16
 	cmpult $m1, $m0, $m1
 	brnz $m1, .Ladd_bias_panel
 	add $m10, $m10, 1

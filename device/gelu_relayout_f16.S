@@ -59,6 +59,8 @@ ipu_stack_gelu_f16_c16_to_a16:
 	ld32 $m7, $mvertex_base, $m15, 2
 	ld32 $m8, $mvertex_base, $m15, 3
 	ld32 $m9, $mvertex_base, $m15, 4
+	setzi $m0, 0xffff
+	and $m8, $m8, $m0
 	get $m4, $WSR
 	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
 	mov $m5, $m8
@@ -76,7 +78,8 @@ ipu_stack_gelu_f16_c16_to_a16:
 	mul $m4, $m6, 32
 	add $m0, $m0, $m4
 	add $m1, $m1, $m4
-	setzi $m4, 4
+	ld32 $m4, $mvertex_base, $m15, 3
+	shr $m4, $m4, 16
 .Lgelu_f16_column_group:
 	mov $m2, $m0
 	mov $m3, $m1

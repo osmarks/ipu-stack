@@ -284,10 +284,12 @@ pub fn append_c16_to_a16_blocks_gelu_f16_in_arenas(
         || arenas
             .iter()
             .any(|arena| arena.base & 7 != 0 || arena.base >= arena.limit)
-        || source.iter().any(|block| block.columns != 64)
+        || source
+            .iter()
+            .any(|block| block.columns == 0 || !block.columns.is_multiple_of(16))
     {
         return Err(CompileError::Graph(
-            "blocked C16-to-A16 GeLU requires 64-column blocks and aligned SRAM".into(),
+            "blocked C16-to-A16 GeLU requires 16-column-aligned blocks and aligned SRAM".into(),
         ));
     }
     let phase = schedule.phases.len();
@@ -341,7 +343,7 @@ pub fn append_c16_to_a16_blocks_gelu_f16_in_arenas(
             inputs: vec![block.tensor, block.tensor],
             arguments: vec![
                 u32::from(block.rows),
-                u32::from(block.rows / 6),
+                u32::from(block.rows / 6) | (u32::from(block.columns / 16) << 16),
                 u32::from(block.rows % 6),
             ],
             specialization: SpecializationKey {
@@ -414,7 +416,8 @@ fn append_c16_to_a16_row_shards_impl(
         for block in &blocks {
             if block.row_start != first.row_start
                 || block.rows != first.rows
-                || block.columns != 64
+                || block.columns == 0
+                || !block.columns.is_multiple_of(16)
                 || block.column_start != next_column
             {
                 return Err(CompileError::Graph(
@@ -469,7 +472,12 @@ fn append_c16_to_a16_row_shards_impl(
         .flat_map(|(_, _, blocks)| blocks.iter().map(|block| block.rows))
         .max()
         .unwrap();
-    let maximum_block_bytes = u32::from(maximum_rows) * 64 * 2;
+    let maximum_columns = destination_blocks
+        .iter()
+        .flat_map(|(_, _, blocks)| blocks.iter().map(|block| block.columns))
+        .max()
+        .unwrap();
+    let maximum_block_bytes = u32::from(maximum_rows) * u32::from(maximum_columns) * 2;
     let blocks_per_pass =
         usize::try_from(ipu_exchange::EXCHANGE_WINDOW_BYTES / maximum_block_bytes)
             .map_err(|_| CompileError::Graph("row-shard pass size overflow".into()))?;
@@ -528,9 +536,13 @@ fn append_c16_to_a16_row_shards_impl(
                     output: output_alias,
                     inputs: vec![block.tensor, block.tensor],
                     arguments: if gelu {
-                        vec![u32::from(block.rows), units_per_worker, extra_workers]
+                        vec![
+                            u32::from(block.rows),
+                            units_per_worker | (u32::from(block.columns / 16) << 16),
+                            extra_workers,
+                        ]
                     } else {
-                        vec![u32::from(block.rows)]
+                        vec![u32::from(block.rows), u32::from(block.columns / 16)]
                     },
                     specialization: SpecializationKey {
                         operation: if gelu {

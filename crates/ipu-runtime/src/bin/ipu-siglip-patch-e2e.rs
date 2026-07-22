@@ -198,6 +198,11 @@ fn main() {
             0,
         ))
         .expect("row-sharded GEMM inner block columns exceed u16"),
+        gemm_output_block_columns: u16::try_from(env_u32(
+            "IPU_SIGLIP_GEMM_OUTPUT_BLOCK_COLUMNS",
+            0,
+        ))
+        .expect("GEMM output block columns exceed u16"),
         attention_query_block_rows: u16::try_from(env_u32(
             "IPU_SIGLIP_ATTENTION_QUERY_BLOCK_ROWS",
             0,
@@ -1158,7 +1163,14 @@ fn specialize_gemm_row_operations(
                 .get(1)
                 .copied()
                 .expect("GEMM specialization requires its inner block shape");
-            command.specialization.operation = format!("{base}_rows_{rows}_inner_{inner}").into();
+            let output = command
+                .specialization
+                .shape
+                .get(2)
+                .copied()
+                .expect("GEMM specialization requires its output block shape");
+            command.specialization.operation =
+                format!("{base}_rows_{rows}_inner_{inner}_output_{output}").into();
         }
     }
 }
@@ -1168,14 +1180,17 @@ fn compile_gemm_row_variants(
     artifacts: &std::path::Path,
     schedule: &ipu_compiler::Schedule,
 ) -> Result<Vec<KernelArtifact>, ipu_elf::ElfError> {
-    let mut variants = BTreeSet::<(String, u16, u16)>::new();
+    let mut variants = BTreeSet::<(String, u16, u16, u16)>::new();
     for phase in &schedule.phases {
         let Phase::Compute { commands, .. } = phase else {
             continue;
         };
         for command in commands {
             let operation = command.specialization.operation.as_ref();
-            let Some((row_operation, inner)) = operation.rsplit_once("_inner_") else {
+            let Some((inner_operation, output)) = operation.rsplit_once("_output_") else {
+                continue;
+            };
+            let Some((row_operation, inner)) = inner_operation.rsplit_once("_inner_") else {
                 continue;
             };
             let Some((base, rows)) = row_operation.rsplit_once("_rows_") else {
@@ -1196,23 +1211,26 @@ fn compile_gemm_row_variants(
             let inner = inner.parse::<u16>().map_err(|_| {
                 ipu_elf::ElfError::Link(format!("invalid GEMM inner operation {operation}"))
             })?;
-            variants.insert((family.into(), rows, inner));
+            let output = output.parse::<u16>().map_err(|_| {
+                ipu_elf::ElfError::Link(format!("invalid GEMM output operation {operation}"))
+            })?;
+            variants.insert((family.into(), rows, inner, output));
         }
     }
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/gemm_f16_64_amp.S");
     variants
         .into_iter()
-        .map(|(family, rows, inner)| {
+        .map(|(family, rows, inner, output)| {
             let mut flags = vec![
                 format!("-DGEMM_INNER_BLOCK_DIMENSION={inner}"),
-                format!("-DGEMM_OUTPUT_COLUMNS={BLOCK_DIMENSION}"),
+                format!("-DGEMM_OUTPUT_COLUMNS={output}"),
                 format!("-DGEMM_SMALL_ROWS={rows}"),
                 "-DGEMM_SINGLE_ROWS=1".into(),
                 format!(
-                    "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_{family}_init_rows_{rows}_inner_{inner}"
+                    "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_{family}_init_rows_{rows}_inner_{inner}_output_{output}"
                 ),
                 format!(
-                    "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_{family}_accumulate_rows_{rows}_inner_{inner}"
+                    "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_{family}_accumulate_rows_{rows}_inner_{inner}_output_{output}"
                 ),
             ];
             match family.as_str() {
@@ -1224,7 +1242,7 @@ fn compile_gemm_row_variants(
             toolchain.compile(
                 &source,
                 artifacts,
-                &format!("{family}-rows-{rows}-inner-{inner}"),
+                &format!("{family}-rows-{rows}-inner-{inner}-output-{output}"),
                 &flags,
             )
         })

@@ -14,6 +14,7 @@ ipu_stack_relayout_f16_c16_to_a16:
 	st32 $m2, $m11, $m15, 0
 	st32 $m3, $m11, $m15, 1
 	st32 $m5, $m11, $m15, 2
+	st32 $m6, $m11, $m15, 3
 	setzi $m0, .Lrelayout_worker
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
@@ -36,7 +37,7 @@ ipu_stack_relayout_f16_c16_to_a16:
 	add $m2, $m0, $m6
 	add $m3, $m1, $m6
 	mul $m8, $m7, 32
-	setzi $m9, 4
+	ld32 $m9, $mvertex_base, $m15, 3
 .Lrelayout_column_group:
 	ld64 $a0:1, $m3, $m15, 0
 	st32 $a0, $m2, $m15, 0
