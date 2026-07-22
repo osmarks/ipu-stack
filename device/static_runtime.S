@@ -233,6 +233,134 @@ ipu_stack_static_exchange_compute_run:
 	br $m9
 	.size ipu_stack_static_exchange_compute_run, .-ipu_stack_static_exchange_compute_run
 
+	.section .text.ipu_stack_static_template_patch,"ax",@progbits
+	.globl ipu_stack_static_template_patch
+	.p2align 2
+	.type ipu_stack_static_template_patch,@function
+ipu_stack_static_template_patch:
+	.supervisor
+	add $m11, $m11, -32
+	brz $m7, .Ltemplate_patch_primary_segment
+	ld32 $m4, $m11, $m15, 9
+	setzi $m0, .Ltemplate_patch_segment_ready
+	br $m0
+.Ltemplate_patch_primary_segment:
+	ld32 $m4, $m11, $m15, 8
+.Ltemplate_patch_segment_ready:
+	ld32 $m0, $m3, $m15, 0
+	setzi $m10, 0xffff
+	and $m10, $m0, $m10
+	shl $m10, $m10, 2
+	add $m4, $m4, $m10
+	shr $m2, $m0, 16
+	add $m3, $m3, 4
+	st32 $m4, $m11, $m15, 0
+	st32 $m9, $m11, $m15, 3
+	st32 $m3, $m11, $m15, 5
+	add $m10, $m3, 0
+	add $m6, $m2, 0
+	zero $m1
+.Ltemplate_patch_changed_group:
+	ld32 $m4, $m10, $m15, 0
+.Ltemplate_patch_changed_bit:
+	and $m0, $m4, 1
+	add $m1, $m1, $m0
+	shr $m4, $m4, 1
+	brnz $m4, .Ltemplate_patch_changed_bit
+	add $m10, $m10, 4
+	sub $m6, $m6, 1
+	brnz $m6, .Ltemplate_patch_changed_group
+	st32 $m10, $m11, $m15, 1
+	add $m6, $m1, 31
+	shr $m6, $m6, 5
+	zero $m7
+.Ltemplate_patch_type_group:
+	ld32 $m4, $m10, $m15, 0
+.Ltemplate_patch_type_bit:
+	and $m0, $m4, 1
+	add $m7, $m7, $m0
+	shr $m4, $m4, 1
+	brnz $m4, .Ltemplate_patch_type_bit
+	add $m10, $m10, 4
+	sub $m6, $m6, 1
+	brnz $m6, .Ltemplate_patch_type_group
+	add $m3, $m10, 0
+	add $m5, $m7, 1
+	shr $m5, $m5, 1
+	shl $m5, $m5, 2
+	add $m5, $m3, $m5
+	shl $m2, $m2, 5
+	zero $m9
+	zero $m7
+	zero $m6
+.Ltemplate_patch_mask:
+	ld32 $m10, $m11, $m15, 5
+	ld32 $m8, $m10, $m15, 0
+	add $m10, $m10, 4
+	st32 $m10, $m11, $m15, 5
+	setzi $m1, 32
+.Ltemplate_patch_bit:
+	and $m0, $m8, 1
+	brz $m0, .Ltemplate_patch_advance
+	shl $m10, $m7, 2
+	ld32 $m0, $m11, $m15, 0
+	add $m10, $m0, $m10
+	st32 $m10, $m11, $m15, 4
+	brnz $m6, .Ltemplate_patch_have_type
+	ld32 $m10, $m11, $m15, 1
+	ld32 $m4, $m10, $m15, 0
+	add $m10, $m10, 4
+	st32 $m10, $m11, $m15, 1
+	setzi $m6, 32
+.Ltemplate_patch_have_type:
+	and $m0, $m4, 1
+	shr $m4, $m4, 1
+	sub $m6, $m6, 1
+	brz $m0, .Ltemplate_patch_wide
+	brnz $m9, .Ltemplate_patch_narrow_high
+	ld32 $m0, $m3, $m15, 0
+	st32 $m0, $m11, $m15, 7
+	shl $m0, $m0, 16
+	shr $m0, $m0, 16
+	setzi $m9, 1
+	setzi $m10, .Ltemplate_patch_narrow_value
+	br $m10
+.Ltemplate_patch_narrow_high:
+	ld32 $m0, $m11, $m15, 7
+	shr $m0, $m0, 16
+	zero $m9
+	add $m3, $m3, 4
+.Ltemplate_patch_narrow_value:
+	setzi $m10, 0x8000
+	xor $m0, $m0, $m10
+	sub $m0, $m0, $m10
+	ld32 $m10, $m11, $m15, 4
+	ld32 $m10, $m10, $m15, 0
+	add $m0, $m0, $m10
+	setzi $m10, .Ltemplate_patch_store
+	br $m10
+.Ltemplate_patch_wide:
+	ld32 $m0, $m5, $m15, 0
+	add $m5, $m5, 4
+.Ltemplate_patch_store:
+	ld32 $m10, $m11, $m15, 4
+	st32 $m0, $m10, $m15, 0
+.Ltemplate_patch_advance:
+	shr $m8, $m8, 1
+	add $m7, $m7, 1
+	sub $m2, $m2, 1
+	brz $m2, .Ltemplate_patch_done
+	sub $m1, $m1, 1
+	brnz $m1, .Ltemplate_patch_bit
+	setzi $m0, .Ltemplate_patch_mask
+	br $m0
+.Ltemplate_patch_done:
+	ld32 $m9, $m11, $m15, 3
+	add $m11, $m11, 32
+	br $m9
+	.size ipu_stack_static_template_patch, .-ipu_stack_static_template_patch
+
+
 	.section .text.ipu_stack_static_host_run,"ax",@progbits
 	.globl ipu_stack_static_host_run
 	.p2align 2
