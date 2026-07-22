@@ -87,6 +87,7 @@ struct TileExchangePlans {
     rows: Vec<(u32, Vec<u32>)>,
     compute_runs: Vec<static_codegen::ExchangeComputeRun>,
     templates: Vec<static_codegen::StaticTemplatePlan>,
+    kernel_symbols: Vec<String>,
     end: u32,
 }
 
@@ -450,6 +451,14 @@ fn summarize_executable_allocation_conflicts(
     )
 }
 
+#[derive(Clone, Debug)]
+struct AllocationRelocation {
+    tensor: ipu_compiler::TensorId,
+    tile: u16,
+    old: Range<u32>,
+    new_start: u32,
+}
+
 fn relocate_transient_allocations_for_executables(
     graph: &mut ExecutableGraph,
     topology: &Topology,
@@ -481,9 +490,10 @@ fn relocate_transient_allocations_for_executables(
         .map(|(index, allocation)| (index, allocation.size))
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|&(_, size)| std::cmp::Reverse(size));
-    let arena = [ipu_compiler::MemoryArena::low(
-        ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+    let arena = [ipu_compiler::Ipu21MemoryRegion::OrdinaryHigh.arena(
+        ipu_package::TILE_MEMORY_BASE,
         ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        ipu_compiler::MemoryPlacement::Low,
     )];
     let mut relocations = Vec::with_capacity(candidates.len());
     for (index, _) in candidates {
@@ -510,23 +520,24 @@ fn relocate_transient_allocations_for_executables(
         let tensor = allocation.tensor;
         let tile = allocation.tile;
         graph.schedule.allocations[index].address = new_address;
-        relocations.push((tensor, tile, old_address, old_end, new_address));
+        relocations.push(AllocationRelocation {
+            tensor,
+            tile,
+            old: old_address..old_end,
+            new_start: new_address,
+        });
     }
     for allocation in &mut graph.schedule.allocations {
         let ipu_compiler::AllocationKind::HomeAlias { source } = allocation.kind else {
             continue;
         };
-        if let Some(&(_, _, old_start, _old_end, new_start)) =
-            relocations
-                .iter()
-                .find(|&&(tensor, tile, old_start, old_end, _)| {
-                    tensor == source
-                        && tile == allocation.tile
-                        && allocation.address >= old_start
-                        && allocation.address.saturating_add(allocation.size) <= old_end
-                })
-        {
-            allocation.address = new_start + (allocation.address - old_start);
+        if let Some(relocation) = relocations.iter().find(|relocation| {
+            relocation.tensor == source
+                && relocation.tile == allocation.tile
+                && allocation.address >= relocation.old.start
+                && allocation.address.saturating_add(allocation.size) <= relocation.old.end
+        }) {
+            allocation.address = relocation.new_start + (allocation.address - relocation.old.start);
         }
     }
     for buffer in &mut graph.initial_buffers {
@@ -550,19 +561,12 @@ fn relocate_transient_allocations_for_executables(
     Ok(relocations.len())
 }
 
-fn relocate_literal_address(
-    tile: u16,
-    address: &mut u32,
-    relocations: &[(ipu_compiler::TensorId, u16, u32, u32, u32)],
-) {
-    if let Some(&(_, _, old_start, _old_end, new_start)) =
-        relocations
-            .iter()
-            .find(|&&(_, relocation_tile, old_start, old_end, _)| {
-                relocation_tile == tile && *address >= old_start && *address < old_end
-            })
+fn relocate_literal_address(tile: u16, address: &mut u32, relocations: &[AllocationRelocation]) {
+    if let Some(relocation) = relocations
+        .iter()
+        .find(|relocation| relocation.tile == tile && relocation.old.contains(address))
     {
-        *address = new_start + (*address - old_start);
+        *address = relocation.new_start + (*address - relocation.old.start);
     }
 }
 
@@ -1802,6 +1806,177 @@ fn package_graph_impl(
     )
 }
 
+fn plan_tile_exchange(
+    program: &ipu_compiler::LoweredTileProgram,
+    template_regions: &[StaticTemplateRegion],
+    enable_compute_runs: bool,
+    cyclic_templates: bool,
+) -> Result<TileExchangePlans> {
+    #[derive(Clone)]
+    struct PreparedExchange {
+        row: Vec<u32>,
+        sender: Option<(usize, u32)>,
+        template_key: Option<(usize, usize, usize)>,
+    }
+
+    let exchange_count = program
+        .steps
+        .iter()
+        .filter(|step| matches!(step, ipu_compiler::LoweredTileStep::Exchange { .. }))
+        .count();
+    let mut phase_templates = HashMap::new();
+    for (region_index, region) in template_regions.iter().enumerate() {
+        for (instance, phases) in region.phase_instances.iter().enumerate() {
+            for (relative_phase, phase) in phases.clone().enumerate() {
+                phase_templates.insert(phase, (region_index, instance, relative_phase));
+            }
+        }
+    }
+    let mut epochs_by_phase = HashMap::<usize, usize>::new();
+    let mut prepared = Vec::with_capacity(exchange_count);
+    let mut sequences = HashMap::<(usize, usize, usize), Vec<Option<Vec<u32>>>>::new();
+    for step in &program.steps {
+        let ipu_compiler::LoweredTileStep::Exchange { phase, row, .. } = step else {
+            continue;
+        };
+        let epoch = epochs_by_phase.entry(*phase).or_default();
+        let template = phase_templates
+            .get(phase)
+            .map(|&(region, instance, relative_phase)| (region, instance, relative_phase, *epoch));
+        *epoch += 1;
+        let mut stored_row = row.to_vec();
+        let sender = template
+            .is_some()
+            .then(|| ipu_exchange::normalize_sender_instruction(&mut stored_row))
+            .flatten();
+        if let Some(return_word) = stored_row
+            .iter()
+            .position(|&instruction| instruction == ipu_exchange::RETURN_M10_INSTRUCTION)
+        {
+            stored_row.truncate(return_word + 1);
+        }
+        let template_key = template.map(|(region, instance, relative_phase, epoch)| {
+            let key = (region, relative_phase, epoch);
+            let rows = sequences
+                .entry(key)
+                .or_insert_with(|| vec![None; template_regions[region].phase_instances.len()]);
+            rows[instance] = Some(stored_row.clone());
+            key
+        });
+        prepared.push(PreparedExchange {
+            row: stored_row,
+            sender,
+            template_key,
+        });
+    }
+    let mut dynamic_sequences = HashMap::new();
+    for (key, rows) in sequences {
+        let rows = rows
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or("template exchange sequence is incomplete")?;
+        if rows[1..].iter().any(|row| row != &rows[0]) {
+            dynamic_sequences.insert(key, rows.iter().map(Vec::len).max().unwrap_or_default());
+        }
+    }
+
+    let mut cursor = PLAN_BASE;
+    let mut unique = HashMap::<Vec<u32>, u32>::new();
+    let mut template_addresses = HashMap::<(usize, usize, usize), u32>::new();
+    let mut addresses = Vec::with_capacity(exchange_count);
+    let mut rows = Vec::new();
+    let mut plan_rows = Vec::with_capacity(exchange_count);
+    let mut patches = Vec::with_capacity(exchange_count);
+    for exchange in prepared {
+        let dynamic_key = exchange
+            .template_key
+            .filter(|key| dynamic_sequences.contains_key(key));
+        let address = if let Some(key) = dynamic_key {
+            if let Some(&address) = template_addresses.get(&key) {
+                address
+            } else {
+                cursor = align_up(cursor, 8);
+                let address = cursor;
+                let mut canonical_row = exchange.row.clone();
+                canonical_row.resize(dynamic_sequences[&key], 0);
+                cursor = cursor
+                    .checked_add(u32::try_from(canonical_row.len() * 4)?)
+                    .ok_or("exchange plan address overflow")?;
+                template_addresses.insert(key, address);
+                rows.push((address, canonical_row));
+                address
+            }
+        } else if let Some(&address) = unique.get(&exchange.row) {
+            address
+        } else {
+            cursor = align_up(cursor, 8);
+            let address = cursor;
+            cursor = cursor
+                .checked_add(u32::try_from(exchange.row.len() * 4)?)
+                .ok_or("exchange plan address overflow")?;
+            unique.insert(exchange.row.clone(), address);
+            rows.push((address, exchange.row.clone()));
+            address
+        };
+        addresses.push(address);
+        plan_rows.push(exchange.row);
+        patches.push(
+            exchange
+                .sender
+                .map(|(word, instruction)| -> Result<_> {
+                    Ok(static_codegen::StaticPlanPatch {
+                        word_address: address
+                            .checked_add(u32::try_from(word * 4)?)
+                            .ok_or("exchange plan patch address overflow")?,
+                        word_offset: u16::try_from(word)?,
+                        instruction,
+                    })
+                })
+                .transpose()?,
+        );
+    }
+    let (compute_runs, end) = static_codegen::plan_exchange_compute_runs(
+        program,
+        &addresses,
+        cursor,
+        enable_compute_runs,
+    )?;
+    let (templates, _) = static_codegen::plan_static_templates(
+        program,
+        &addresses,
+        &plan_rows,
+        &patches,
+        template_regions,
+        0,
+        cyclic_templates,
+    )?;
+    let mut kernel_symbols = program
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            ipu_compiler::LoweredTileStep::Compute(command) => {
+                Some(format!("ipu_stack_{}", command.specialization.operation))
+            }
+            _ => None,
+        })
+        .chain(
+            templates
+                .iter()
+                .flat_map(static_codegen::template_retained_symbols),
+        )
+        .collect::<Vec<_>>();
+    kernel_symbols.sort_unstable();
+    kernel_symbols.dedup();
+    Ok(TileExchangePlans {
+        addresses,
+        rows,
+        compute_runs,
+        templates,
+        kernel_symbols,
+        end,
+    })
+}
+
 fn package_graph_impl_attempt(
     graph: &ExecutableGraph,
     objects: &[Vec<u8>],
@@ -1817,9 +1992,38 @@ fn package_graph_impl_attempt(
     }
     validate_resident_host_bindings(graph, &topology)?;
     graph.schedule.validate_allocations()?;
-    let programs = match lowered_programs {
-        Some(programs) => programs,
-        None => graph.schedule.lower_tile_programs_for_codegen(&topology)?,
+    let stream_templates =
+        lowered_programs.is_none() && profile_code.is_empty() && !template_regions.is_empty();
+    let (mut programs, mut tile_exchange_plans) = if stream_templates {
+        let lowering = graph.schedule.prepare_tile_program_lowering(&topology)?;
+        let lowered = (0..graph.schedule.tile_count)
+            .into_par_iter()
+            .map(|tile| -> Result<_> {
+                let mut program = lowering.lower(tile, false)?;
+                let mut plans =
+                    plan_tile_exchange(&program, template_regions, false, invocations > 1)?;
+                static_codegen::compact_template_instances(&mut program, &mut plans.templates)?;
+                Ok((program, plans))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        lowered.into_iter().unzip()
+    } else {
+        let programs = match lowered_programs {
+            Some(programs) => programs,
+            None => graph.schedule.lower_tile_programs_for_codegen(&topology)?,
+        };
+        let plans = programs
+            .par_iter()
+            .map(|program| {
+                plan_tile_exchange(
+                    program,
+                    template_regions,
+                    profile_code.is_empty() && template_regions.is_empty(),
+                    invocations > 1,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        (programs, plans)
     };
     if !profile_code.is_empty() && profile_code.len() != programs.len() {
         return Err("profile layout tile count differs from schedule".into());
@@ -1831,175 +2035,16 @@ fn package_graph_impl_attempt(
             .ok_or("allocation tile exceeds schedule tile count")?;
         ranges.push(allocation_range(allocation)?);
     }
-    let exchange_count = programs
+    let exchange_count = tile_exchange_plans
         .first()
-        .map(|program| {
-            program
-                .steps
-                .iter()
-                .filter(|step| matches!(step, ipu_compiler::LoweredTileStep::Exchange { .. }))
-                .count()
-        })
+        .map(|plans| plans.addresses.len())
         .unwrap_or(0);
-    if programs.iter().any(|program| {
-        program
-            .steps
-            .iter()
-            .filter(|step| matches!(step, ipu_compiler::LoweredTileStep::Exchange { .. }))
-            .count()
-            != exchange_count
-    }) {
+    if tile_exchange_plans
+        .iter()
+        .any(|plans| plans.addresses.len() != exchange_count)
+    {
         return Err("per-tile programs disagree on exchange launch count".into());
     }
-    let mut tile_exchange_plans = programs
-        .par_iter()
-        .map(|program| -> Result<TileExchangePlans> {
-            #[derive(Clone)]
-            struct PreparedExchange {
-                row: Vec<u32>,
-                sender: Option<(usize, u32)>,
-                template_key: Option<(usize, usize, usize)>,
-            }
-
-            let mut phase_templates = HashMap::new();
-            for (region_index, region) in template_regions.iter().enumerate() {
-                for (instance, phases) in region.phase_instances.iter().enumerate() {
-                    for (relative_phase, phase) in phases.clone().enumerate() {
-                        phase_templates.insert(phase, (region_index, instance, relative_phase));
-                    }
-                }
-            }
-            let mut epochs_by_phase = HashMap::<usize, usize>::new();
-            let mut prepared = Vec::with_capacity(exchange_count);
-            let mut sequences = HashMap::<(usize, usize, usize), Vec<Option<Vec<u32>>>>::new();
-            for step in &program.steps {
-                let ipu_compiler::LoweredTileStep::Exchange { phase, row, .. } = step else {
-                    continue;
-                };
-                let epoch = epochs_by_phase.entry(*phase).or_default();
-                let template =
-                    phase_templates
-                        .get(phase)
-                        .map(|&(region, instance, relative_phase)| {
-                            (region, instance, relative_phase, *epoch)
-                        });
-                *epoch += 1;
-                let mut stored_row = row.to_vec();
-                let sender = template
-                    .is_some()
-                    .then(|| ipu_exchange::normalize_sender_instruction(&mut stored_row))
-                    .flatten();
-                if let Some(return_word) = stored_row
-                    .iter()
-                    .position(|&instruction| instruction == ipu_exchange::RETURN_M10_INSTRUCTION)
-                {
-                    stored_row.truncate(return_word + 1);
-                }
-                let template_key = template.map(|(region, instance, relative_phase, epoch)| {
-                    let key = (region, relative_phase, epoch);
-                    let rows = sequences.entry(key).or_insert_with(|| {
-                        vec![None; template_regions[region].phase_instances.len()]
-                    });
-                    rows[instance] = Some(stored_row.clone());
-                    key
-                });
-                prepared.push(PreparedExchange {
-                    row: stored_row,
-                    sender,
-                    template_key,
-                });
-            }
-            let mut dynamic_sequences = HashMap::new();
-            for (key, rows) in sequences {
-                let rows = rows
-                    .into_iter()
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or("template exchange sequence is incomplete")?;
-                if rows[1..].iter().any(|row| row != &rows[0]) {
-                    dynamic_sequences
-                        .insert(key, rows.iter().map(Vec::len).max().unwrap_or_default());
-                }
-            }
-
-            let mut cursor = PLAN_BASE;
-            let mut unique = HashMap::<Vec<u32>, u32>::new();
-            let mut template_addresses = HashMap::<(usize, usize, usize), u32>::new();
-            let mut addresses = Vec::with_capacity(exchange_count);
-            let mut rows = Vec::new();
-            let mut plan_rows = Vec::with_capacity(exchange_count);
-            let mut patches = Vec::with_capacity(exchange_count);
-            for exchange in prepared {
-                let dynamic_key = exchange
-                    .template_key
-                    .filter(|key| dynamic_sequences.contains_key(key));
-                let address = if let Some(key) = dynamic_key {
-                    if let Some(&address) = template_addresses.get(&key) {
-                        address
-                    } else {
-                        cursor = align_up(cursor, 8);
-                        let address = cursor;
-                        let mut canonical_row = exchange.row.clone();
-                        canonical_row.resize(dynamic_sequences[&key], 0);
-                        cursor = cursor
-                            .checked_add(u32::try_from(canonical_row.len() * 4)?)
-                            .ok_or("exchange plan address overflow")?;
-                        template_addresses.insert(key, address);
-                        rows.push((address, canonical_row));
-                        address
-                    }
-                } else if let Some(&address) = unique.get(&exchange.row) {
-                    address
-                } else {
-                    cursor = align_up(cursor, 8);
-                    let address = cursor;
-                    cursor = cursor
-                        .checked_add(u32::try_from(exchange.row.len() * 4)?)
-                        .ok_or("exchange plan address overflow")?;
-                    unique.insert(exchange.row.clone(), address);
-                    rows.push((address, exchange.row.clone()));
-                    address
-                };
-                addresses.push(address);
-                plan_rows.push(exchange.row);
-                patches.push(
-                    exchange
-                        .sender
-                        .map(|(word, instruction)| -> Result<_> {
-                            Ok(static_codegen::StaticPlanPatch {
-                                word_address: address
-                                    .checked_add(u32::try_from(word * 4)?)
-                                    .ok_or("exchange plan patch address overflow")?,
-                                word_offset: u16::try_from(word)?,
-                                instruction,
-                            })
-                        })
-                        .transpose()?,
-                );
-            }
-            let (compute_runs, end) = static_codegen::plan_exchange_compute_runs(
-                program,
-                &addresses,
-                cursor,
-                profile_code.is_empty() && template_regions.is_empty(),
-            )?;
-            let (templates, _) = static_codegen::plan_static_templates(
-                program,
-                &addresses,
-                &plan_rows,
-                &patches,
-                template_regions,
-                0,
-                invocations > 1,
-            )?;
-            Ok(TileExchangePlans {
-                addresses,
-                rows,
-                compute_runs,
-                templates,
-                end,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
     debug!(
         minimum_plan_end = format_args!(
             "0x{:x}",
@@ -2019,6 +2064,11 @@ fn package_graph_impl_attempt(
         ),
         "deduplicated device exchange plans"
     );
+    if !stream_templates && profile_code.is_empty() && !template_regions.is_empty() {
+        for (program, plans) in programs.iter_mut().zip(&mut tile_exchange_plans) {
+            static_codegen::compact_template_instances(program, &mut plans.templates)?;
+        }
+    }
     let host = build_static_host_layout(graph, invocations)?;
     let host_transfers = host
         .weights
@@ -2186,6 +2236,13 @@ fn package_graph_impl_attempt(
                 ipu_compiler::LoweredTileStep::IdleCompute { .. } => None,
                 _ => None,
             }));
+            symbols.extend(
+                exchange_plans
+                    .templates
+                    .iter()
+                    .flat_map(static_codegen::template_retained_symbols),
+            );
+            symbols.extend(exchange_plans.kernel_symbols.iter().cloned());
             symbols.sort();
             symbols.dedup();
             symbols
@@ -2246,6 +2303,9 @@ fn package_graph_impl_attempt(
                         ipu_driver::APPLICATION_LOAD_BASE,
                     );
                 }
+            }
+            for name in &tile_exchange_plans[program_index].kernel_symbols {
+                symbols.insert(name.clone(), ipu_driver::APPLICATION_LOAD_BASE);
             }
             let plans = &tile_host_plans[program_index];
             let physical = topology.physical(program.tile)?;

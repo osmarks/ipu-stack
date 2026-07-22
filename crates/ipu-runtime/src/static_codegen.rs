@@ -72,7 +72,65 @@ pub(crate) struct StaticTemplatePlan {
     pub patches: Vec<Vec<(u16, StaticTemplatePatchValue)>>,
     pub shared_address: u32,
     pub shared: Vec<StaticTemplateRecordWord>,
+    pub exchange_step_count: usize,
     steps: Vec<StaticTemplateStep>,
+}
+
+pub(crate) fn compact_template_instances(
+    program: &mut LoweredTileProgram,
+    templates: &mut [StaticTemplatePlan],
+) -> Result<()> {
+    let mut removed = 0usize;
+    for template in templates {
+        let original_start = template.instance_steps[0].start;
+        let original_end = template.instance_steps.last().unwrap().end;
+        let start = original_start - removed;
+        let end = original_end - removed;
+        template.exchange_step_count = program.steps[start..end]
+            .iter()
+            .filter(|step| matches!(step, LoweredTileStep::Exchange { .. }))
+            .count();
+        let phase = step_phase(
+            program
+                .steps
+                .get(start)
+                .ok_or("template compaction starts outside the tile program")?,
+        );
+        program.steps.splice(
+            start..end,
+            [LoweredTileStep::IdleCompute {
+                op: ipu_compiler::OpId(usize::MAX),
+                phase,
+            }],
+        );
+        removed += end - start - 1;
+        template.instance_steps.clear();
+        template.instance_steps.push(start..start + 1);
+    }
+    Ok(())
+}
+
+pub(crate) fn template_retained_symbols(template: &StaticTemplatePlan) -> Vec<String> {
+    let mut symbols = template
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            StaticTemplateStep::Compute { operation, .. } => Some(format!("ipu_stack_{operation}")),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    symbols.extend(
+        template
+            .records
+            .iter()
+            .flatten()
+            .chain(&template.shared)
+            .filter_map(|word| match word {
+                StaticTemplateRecordWord::Symbol(symbol) => Some(symbol.clone()),
+                StaticTemplateRecordWord::Value(_) => None,
+            }),
+    );
+    symbols
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -589,6 +647,7 @@ pub(crate) fn plan_static_templates(
             patches,
             shared_address: 0,
             shared: records.shared,
+            exchange_step_count: 0,
             steps: template_steps,
         });
     }
@@ -1009,12 +1068,16 @@ pub(crate) fn emit(
                 }
             }
             code.add_immediate(11, 11, 16)?;
-            plan_index += template
-                .instance_steps
-                .iter()
-                .flat_map(|range| &program.steps[range.clone()])
-                .filter(|step| matches!(step, LoweredTileStep::Exchange { .. }))
-                .count();
+            plan_index += if template.exchange_step_count == 0 {
+                template
+                    .instance_steps
+                    .iter()
+                    .flat_map(|range| &program.steps[range.clone()])
+                    .filter(|step| matches!(step, LoweredTileStep::Exchange { .. }))
+                    .count()
+            } else {
+                template.exchange_step_count
+            };
             step_index = template.instance_steps.last().unwrap().end;
             template_index += 1;
             continue;
@@ -1777,6 +1840,17 @@ mod tests {
                 assert_ne!(previous, expected);
             }
         }
+        let original_exchanges = program
+            .steps
+            .iter()
+            .filter(|step| matches!(step, LoweredTileStep::Exchange { .. }))
+            .count();
+        let mut compact_program = program.clone();
+        let mut compact_templates = templates.clone();
+        compact_template_instances(&mut compact_program, &mut compact_templates).unwrap();
+        assert!(compact_program.steps.len() < program.steps.len());
+        assert_eq!(compact_templates[0].exchange_step_count, original_exchanges);
+        assert_eq!(compact_templates[0].records, templates[0].records);
     }
 
     #[test]

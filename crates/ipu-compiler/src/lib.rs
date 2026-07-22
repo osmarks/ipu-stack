@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -509,7 +510,7 @@ pub enum Ipu21MemoryRegion {
 }
 
 impl Ipu21MemoryRegion {
-    fn arena(
+    pub fn arena(
         self,
         ordinary_low_base: u32,
         data_limit: u32,
@@ -3924,25 +3925,76 @@ impl Schedule {
         topology: &Topology,
         include_idle_compute: bool,
     ) -> Result<Vec<LoweredTileProgram>, CompileError> {
+        let lowering = self.prepare_tile_program_lowering(topology)?;
+        (0..self.tile_count)
+            .into_par_iter()
+            .map(|tile| lowering.lower(tile, include_idle_compute))
+            .collect()
+    }
+
+    pub fn prepare_tile_program_lowering(
+        &self,
+        topology: &Topology,
+    ) -> Result<TileProgramLowering<'_>, CompileError> {
         let allocation_index = AllocationIndex::new(&self.allocations);
         let exchanges = self.lower_exchanges_with_index(topology, &allocation_index)?;
-        let exchange_by_phase: HashMap<_, _> = exchanges
-            .iter()
-            .map(|exchange| (exchange.phase, exchange))
-            .collect();
+        let mut exchange_by_phase = vec![None; self.phases.len()];
+        for (index, exchange) in exchanges.iter().enumerate() {
+            exchange_by_phase[exchange.phase] = Some(index);
+        }
+        let mut commands_by_tile = vec![Vec::new(); usize::from(self.tile_count)];
+        for (phase, scheduled) in self.phases.iter().enumerate() {
+            let Phase::Compute { commands, .. } = scheduled else {
+                continue;
+            };
+            for command in commands {
+                commands_by_tile[usize::from(command.tile)].push((phase, command.clone()));
+            }
+        }
         let mut inactive_row = vec![0; ipu_exchange::PLAN_WORDS];
         inactive_row[0] = SANS_INACTIVE_INSTRUCTION;
         inactive_row[1] = SYNC_ANS_INSTRUCTION;
         inactive_row[2] = RETURN_M10_INSTRUCTION;
-        let inactive_row = Arc::<[u32]>::from(inactive_row);
-        let mut programs = (0..self.tile_count)
-            .map(|tile| LoweredTileProgram {
-                tile,
-                steps: Vec::new(),
-            })
-            .collect::<Vec<_>>();
+        Ok(TileProgramLowering {
+            schedule: self,
+            allocation_index,
+            exchanges,
+            exchange_by_phase,
+            commands_by_tile,
+            inactive_row: inactive_row.into(),
+        })
+    }
+}
+
+pub struct TileProgramLowering<'a> {
+    schedule: &'a Schedule,
+    allocation_index: AllocationIndex<'a>,
+    exchanges: Vec<LoweredExchangePhase>,
+    exchange_by_phase: Vec<Option<usize>>,
+    commands_by_tile: Vec<Vec<(usize, Arc<KernelCommand>)>>,
+    inactive_row: Arc<[u32]>,
+}
+
+impl TileProgramLowering<'_> {
+    pub fn lower(
+        &self,
+        tile: u16,
+        include_idle_compute: bool,
+    ) -> Result<LoweredTileProgram, CompileError> {
+        if tile >= self.schedule.tile_count {
+            return Err(CompileError::Graph(format!(
+                "tile {tile} exceeds tile count {}",
+                self.schedule.tile_count
+            )));
+        }
+        let mut program = LoweredTileProgram {
+            tile,
+            steps: Vec::new(),
+        };
+        let tile_commands = &self.commands_by_tile[usize::from(tile)];
+        let mut command_cursor = 0usize;
         let mut direct_staging = HashMap::<(TensorId, u16), u32>::default();
-        for (phase_index, phase) in self.phases.iter().enumerate() {
+        for (phase_index, phase) in self.schedule.phases.iter().enumerate() {
             match phase {
                 Phase::Exchange { transfers } => {
                     direct_staging.clear();
@@ -3951,36 +4003,37 @@ impl Schedule {
                             .staging_address
                             .map(|address| ((transfer.tensor, transfer.destination_tile), address))
                     }));
-                    let exchange = exchange_by_phase.get(&phase_index).ok_or_else(|| {
-                        CompileError::Graph(format!("missing lowered exchange phase {phase_index}"))
-                    })?;
-                    for (epoch, lowered) in exchange.epochs.iter().enumerate() {
-                        for program in &mut programs {
-                            program.steps.push(LoweredTileStep::Exchange {
-                                phase: phase_index,
-                                epoch,
-                                row: lowered
-                                    .tile_rows
-                                    .get(&program.tile)
-                                    .map(|row| Arc::<[u32]>::from(row.as_slice()))
-                                    .unwrap_or_else(|| inactive_row.clone()),
-                            });
-                        }
-                    }
-                }
-                Phase::Compute { op, commands } => {
-                    let mut active = vec![false; usize::from(self.tile_count)];
-                    for command in commands {
-                        let tile = command.tile;
-                        let tile_index = usize::from(tile);
-                        let program = programs.get_mut(tile_index).ok_or_else(|| {
+                    let exchange = self
+                        .exchange_by_phase
+                        .get(phase_index)
+                        .and_then(|index| index.map(|index| &self.exchanges[index]))
+                        .ok_or_else(|| {
                             CompileError::Graph(format!(
-                                "compute command tile {tile} exceeds tile count {}",
-                                self.tile_count
+                                "missing lowered exchange phase {phase_index}"
                             ))
                         })?;
-                        active[tile_index] = true;
-                        let output_address = allocation_index.home_address(command.output, tile)?;
+                    for (epoch, lowered) in exchange.epochs.iter().enumerate() {
+                        program.steps.push(LoweredTileStep::Exchange {
+                            phase: phase_index,
+                            epoch,
+                            row: lowered
+                                .tile_rows
+                                .get(&tile)
+                                .map(|row| Arc::<[u32]>::from(row.as_slice()))
+                                .unwrap_or_else(|| self.inactive_row.clone()),
+                        });
+                    }
+                }
+                Phase::Compute { op, .. } => {
+                    let mut active = false;
+                    while command_cursor < tile_commands.len()
+                        && tile_commands[command_cursor].0 == phase_index
+                    {
+                        let command = &tile_commands[command_cursor].1;
+                        command_cursor += 1;
+                        active = true;
+                        let output_address =
+                            self.allocation_index.home_address(command.output, tile)?;
                         let input_addresses = command
                             .inputs
                             .iter()
@@ -3990,7 +4043,7 @@ impl Schedule {
                                     .copied()
                                     .map(Ok)
                                     .unwrap_or_else(|| {
-                                        allocation_index.compute_input_address(
+                                        self.allocation_index.compute_input_address(
                                             *input,
                                             tile,
                                             phase_index,
@@ -4008,22 +4061,17 @@ impl Schedule {
                                 input_addresses,
                             }));
                     }
-                    if include_idle_compute {
-                        for (program, active) in programs.iter_mut().zip(active) {
-                            if !active {
-                                program.steps.push(LoweredTileStep::IdleCompute {
-                                    op: *op,
-                                    phase: phase_index,
-                                });
-                            }
-                        }
+                    if include_idle_compute && !active {
+                        program.steps.push(LoweredTileStep::IdleCompute {
+                            op: *op,
+                            phase: phase_index,
+                        });
                     }
                     direct_staging.clear();
                 }
             }
         }
-        info!(tiles = programs.len(), "lowered per-tile programs");
-        Ok(programs)
+        Ok(program)
     }
 }
 
