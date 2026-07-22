@@ -18,20 +18,21 @@ public:
       float squareSum = 0.0f;
       for (unsigned panel = 0; panel < columns / 16; ++panel) {
         const unsigned base = panel * rows * 16 + row * 16;
-        half2 panelSum = {0.0, 0.0};
-        half2 panelSquareSum = {0.0, 0.0};
-        for (unsigned column = 0; column < 16; column += 2) {
-          const half2 packed =
-              *reinterpret_cast<const half2 *>(&input[base + column]);
+        half4 panelSum = {0.0, 0.0, 0.0, 0.0};
+        half4 panelSquareSum = {0.0, 0.0, 0.0, 0.0};
+        for (unsigned column = 0; column < 16; column += 4) {
+          const half4 packed =
+              *reinterpret_cast<const half4 *>(&input[base + column]);
           panelSum += packed;
           panelSquareSum += packed * packed;
         }
-        const float2 panelSumF32 =
-            __builtin_convertvector(panelSum, float2);
-        const float2 panelSquareSumF32 =
-            __builtin_convertvector(panelSquareSum, float2);
-        sum += panelSumF32[0] + panelSumF32[1];
-        squareSum += panelSquareSumF32[0] + panelSquareSumF32[1];
+        const float4 panelSumF32 = __builtin_convertvector(panelSum, float4);
+        const float4 panelSquareSumF32 =
+            __builtin_convertvector(panelSquareSum, float4);
+        sum += panelSumF32[0] + panelSumF32[1] + panelSumF32[2] +
+               panelSumF32[3];
+        squareSum += panelSquareSumF32[0] + panelSquareSumF32[1] +
+                     panelSquareSumF32[2] + panelSquareSumF32[3];
       }
       const float reciprocalColumns = 1.0f / static_cast<float>(columns);
       const float mean = sum * reciprocalColumns;
@@ -39,21 +40,21 @@ public:
       const float variance = __builtin_fmaxf(0.0f, secondMoment - mean * mean);
       const float epsilon = static_cast<float>(epsilonQ30) * 0x1p-30f;
       const float scale = 1.0f / __builtin_sqrtf(variance + epsilon);
-      const half2 meanF16 =
-          __builtin_convertvector((float2){mean, mean}, half2);
-      const half2 scaleF16 =
-          __builtin_convertvector((float2){scale, scale}, half2);
+      const half4 meanF16 =
+          __builtin_convertvector((float4){mean, mean, mean, mean}, half4);
+      const half4 scaleF16 =
+          __builtin_convertvector((float4){scale, scale, scale, scale}, half4);
       for (unsigned panel = 0; panel < columns / 16; ++panel) {
         const unsigned base = panel * rows * 16 + row * 16;
-        for (unsigned inPanel = 0; inPanel < 16; inPanel += 2) {
+        for (unsigned inPanel = 0; inPanel < 16; inPanel += 4) {
           const unsigned column = panel * 16 + inPanel;
-          const half2 inputs =
-              *reinterpret_cast<const half2 *>(&input[base + inPanel]);
-          const half2 gammas =
-              *reinterpret_cast<const half2 *>(&affine[column]);
-          const half2 betas =
-              *reinterpret_cast<const half2 *>(&affine[columns + column]);
-          *reinterpret_cast<half2 *>(&output[base + inPanel]) =
+          const half4 inputs =
+              *reinterpret_cast<const half4 *>(&input[base + inPanel]);
+          const half4 gammas =
+              *reinterpret_cast<const half4 *>(&affine[column]);
+          const half4 betas =
+              *reinterpret_cast<const half4 *>(&affine[columns + column]);
+          *reinterpret_cast<half4 *>(&output[base + inPanel]) =
               (inputs - meanF16) * scaleF16 * gammas + betas;
         }
       }
