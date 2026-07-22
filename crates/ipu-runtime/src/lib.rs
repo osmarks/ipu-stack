@@ -2524,10 +2524,8 @@ fn package_graph_impl_attempt(
                 .into_iter()
                 .chain(plan.patches.iter().enumerate().skip(1).flat_map(
                     move |(instance, patch)| {
-                        static_codegen::template_patch_ranges(record_words, split)
-                            .into_iter()
-                            .enumerate()
-                            .map(move |(part, slots)| {
+                        plan.patch_ranges[instance].iter().cloned().enumerate().map(
+                            move |(part, slots)| {
                                 (
                                     TemplateDataObject::Patch {
                                         template,
@@ -2538,7 +2536,8 @@ fn package_graph_impl_attempt(
                                         slots, patch,
                                     ),
                                 )
-                            })
+                            },
+                        )
                     },
                 ))
             })
@@ -2919,16 +2918,16 @@ fn package_graph_impl_attempt(
                 .iter()
                 .map(|template| {
                     let record = template.records.first().map_or(0, Vec::len) * 4;
-                    let record_words = template.records.first().map_or(0, Vec::len);
-                    let split = usize::from(template.record_split);
                     let patches = template
                         .patches
                         .iter()
+                        .zip(&template.patch_ranges)
                         .skip(1)
-                        .filter(|patch| !patch.is_empty())
-                        .map(|patch| {
-                            static_codegen::template_patch_ranges(record_words, split)
-                                .into_iter()
+                        .filter(|(patch, _)| !patch.is_empty())
+                        .map(|(patch, ranges)| {
+                            ranges
+                                .iter()
+                                .cloned()
                                 .map(|slots| {
                                     static_codegen::template_patch_storage_words_range(slots, patch)
                                 })
@@ -3223,11 +3222,7 @@ fn package_graph_impl_attempt(
                 if patch.is_empty() {
                     continue;
                 }
-                for (part, slots) in
-                    static_codegen::template_patch_ranges(first_record.len(), split)
-                        .into_iter()
-                        .enumerate()
-                {
+                for (part, slots) in template.patch_ranges[instance].iter().cloned().enumerate() {
                     let address = template.patch_addresses[instance][part];
                     if static_codegen::template_patch_storage_words_range(slots.clone(), patch) == 0
                     {
