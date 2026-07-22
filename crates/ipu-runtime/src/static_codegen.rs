@@ -1,6 +1,8 @@
 use crate::Result;
 use ipu_compiler::{LoweredTileProgram, LoweredTileStep};
-use std::collections::{BTreeMap, HashMap};
+use rustc_hash::{FxHashMap as HashMap, FxHasher};
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 const INCOMING_DBASE: u8 = 0xa4;
@@ -172,7 +174,7 @@ enum TemplateValue {
 struct TemplateRecords {
     rows: Vec<Vec<StaticTemplateRecordWord>>,
     columns: HashMap<Vec<StaticTemplateRecordWord>, u16>,
-    affine_columns: HashMap<Vec<i64>, (u16, u32)>,
+    affine_columns: HashMap<u64, Vec<(Vec<i64>, u16, u32)>>,
     shared: Vec<StaticTemplateRecordWord>,
     shared_values: HashMap<StaticTemplateRecordWord, u16>,
 }
@@ -181,10 +183,10 @@ impl TemplateRecords {
     fn new(instances: usize) -> Self {
         Self {
             rows: vec![Vec::new(); instances],
-            columns: HashMap::new(),
-            affine_columns: HashMap::new(),
+            columns: HashMap::default(),
+            affine_columns: HashMap::default(),
             shared: Vec::new(),
-            shared_values: HashMap::new(),
+            shared_values: HashMap::default(),
         }
     }
 
@@ -205,19 +207,35 @@ impl TemplateRecords {
             return Ok(TemplateValue::Record(slot));
         }
         let first = values[0];
-        let affine_key = values
-            .iter()
-            .map(|&value| i64::from(value) - i64::from(first))
-            .collect::<Vec<_>>();
-        if let Some(&(slot, previous_first)) = self.affine_columns.get(&affine_key)
-            && let Ok(offset) = i32::try_from(i64::from(first) - i64::from(previous_first))
+        let normalized = || {
+            values
+                .iter()
+                .map(|&value| i64::from(value) - i64::from(first))
+        };
+        let mut hasher = FxHasher::default();
+        normalized().for_each(|value| value.hash(&mut hasher));
+        let affine_hash = hasher.finish();
+        if let Some((_, slot, previous_first)) =
+            self.affine_columns.get(&affine_hash).and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|(key, _, _)| key.iter().copied().eq(normalized()))
+            })
+            && let Ok(offset) = i32::try_from(i64::from(first) - i64::from(*previous_first))
             && add_immediate_steps(offset) < self.rows.len()
         {
-            return Ok(TemplateValue::RecordOffset { slot, offset });
+            return Ok(TemplateValue::RecordOffset {
+                slot: *slot,
+                offset,
+            });
         }
         let slot = self.push_column(words.clone())?;
         self.columns.insert(words, slot);
-        self.affine_columns.insert(affine_key, (slot, first));
+        self.affine_columns.entry(affine_hash).or_default().push((
+            normalized().collect(),
+            slot,
+            first,
+        ));
         Ok(TemplateValue::Record(slot))
     }
 
