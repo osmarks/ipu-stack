@@ -480,6 +480,7 @@ fn relocate_transient_allocations_around(
     topology: &Topology,
     reservations: &[Vec<(u32, u32)>],
     granularity: u32,
+    preserve_memory_region: bool,
     reason: &str,
 ) -> Result<usize> {
     if !granularity.is_power_of_two() || reservations.len() != topology.tile_count() {
@@ -517,11 +518,6 @@ fn relocate_transient_allocations_around(
     for (index, allocation) in graph.schedule.allocations.iter().enumerate() {
         allocations_by_tile[usize::from(allocation.tile)].push(index);
     }
-    let arena = [ipu_compiler::Ipu21MemoryRegion::OrdinaryHigh.arena(
-        ipu_package::TILE_MEMORY_BASE,
-        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-        ipu_compiler::MemoryPlacement::Low,
-    )];
     let mut relocations = Vec::with_capacity(candidates.len());
     for (index, _) in candidates {
         let allocation = &graph.schedule.allocations[index];
@@ -546,6 +542,20 @@ fn relocate_transient_allocations_around(
                 merged.push((start, end));
             }
         }
+        let region = if !preserve_memory_region {
+            ipu_compiler::Ipu21MemoryRegion::OrdinaryHigh
+        } else if allocation.address < ipu_package::IPU21_INTERLEAVED_MEMORY_BASE {
+            ipu_compiler::Ipu21MemoryRegion::OrdinaryLow
+        } else if allocation.address < ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT {
+            ipu_compiler::Ipu21MemoryRegion::Interleaved
+        } else {
+            ipu_compiler::Ipu21MemoryRegion::OrdinaryHigh
+        };
+        let arena = [region.arena(
+            ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+            ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            ipu_compiler::MemoryPlacement::Low,
+        )];
         let new_address =
             ipu_compiler::allocate_from_occupied_arenas(&mut merged, allocation.size, &arena, 32)
                 .map_err(|error| {
@@ -622,6 +632,7 @@ fn relocate_transient_allocations_for_executables(
         topology,
         &reservations,
         element,
+        false,
         "measured executable placement",
     )
 }
@@ -2710,6 +2721,7 @@ fn package_graph_impl_attempt(
                 &topology,
                 &reservations,
                 1,
+                true,
                 "static runtime placement",
             )?;
             if moved == 0 {
