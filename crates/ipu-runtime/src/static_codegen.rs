@@ -572,7 +572,6 @@ pub(crate) fn plan_static_templates(
             .checked_add(u32::try_from(record_words - usize::from(record_split))? * 4)
             .ok_or("static template record address overflow")?;
         let patch_ranges = template_patch_ranges(record_words, usize::from(record_split));
-        let patch_part_count = patch_ranges.len();
         let mut patch_addresses = Vec::with_capacity(patches.len());
         for patch in &patches {
             let mut addresses = Vec::with_capacity(patch_ranges.len());
@@ -594,7 +593,7 @@ pub(crate) fn plan_static_templates(
         cursor = cursor
             .checked_add(
                 u32::try_from(patches.len().saturating_sub(1))?
-                    .checked_mul(u32::try_from(patch_part_count)? * 4)
+                    .checked_mul(u32::from(!patch_ranges.is_empty()) * 4)
                     .ok_or("static template patch table size overflow")?,
             )
             .ok_or("static template patch table address overflow")?;
@@ -1098,7 +1097,6 @@ pub(crate) fn emit(
             emit_template_patches(
                 &mut code,
                 symbols,
-                generated_base,
                 template_patch_ranges(record_words, record_split),
                 record_split,
             )?;
@@ -1109,7 +1107,6 @@ pub(crate) fn emit(
                 emit_template_patches(
                     &mut code,
                     symbols,
-                    generated_base,
                     template_patch_ranges(record_words, record_split),
                     record_split,
                 )?;
@@ -1273,21 +1270,19 @@ pub(crate) fn emit(
 fn emit_template_patches(
     code: &mut TileCode,
     symbols: &BTreeMap<String, u32>,
-    generated_base: u32,
     ranges: Vec<Range<usize>>,
     record_split: usize,
 ) -> Result<()> {
+    if ranges.is_empty() {
+        return Ok(());
+    }
+    code.ld32(2, 11, 15, 5)?;
+    code.ld32(3, 2, 15, 0)?;
+    code.add_immediate(2, 2, 4)?;
+    code.st32(2, 11, 15, 5)?;
     for range in ranges {
-        code.ld32(2, 11, 15, 5)?;
-        code.ld32(3, 2, 15, 0)?;
-        code.add_immediate(2, 2, 4)?;
-        code.st32(2, 11, 15, 5)?;
         code.setzi(7, u32::from(range.start >= record_split))?;
-        let skip = code.words.len();
-        code.brz(3, 0)?;
         code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
-        let after = generated_address(generated_base, code.words.len())?;
-        code.words[skip] = ipu_exchange::encode_brz_m_immediate(3, after)?;
     }
     Ok(())
 }

@@ -248,6 +248,7 @@ ipu_stack_static_template_patch:
 	ld32 $m4, $m11, $m15, 8
 .Ltemplate_patch_segment_ready:
 	ld32 $m0, $m3, $m15, 0
+	brz $m0, .Ltemplate_patch_empty
 	setzi $m10, 0xffff
 	and $m10, $m0, $m10
 	shl $m10, $m10, 2
@@ -355,7 +356,12 @@ ipu_stack_static_template_patch:
 	setzi $m0, .Ltemplate_patch_mask
 	br $m0
 .Ltemplate_patch_done:
+	add $m3, $m5, 0
 	ld32 $m9, $m11, $m15, 3
+	add $m11, $m11, 32
+	br $m9
+.Ltemplate_patch_empty:
+	add $m3, $m3, 4
 	add $m11, $m11, 32
 	br $m9
 	.size ipu_stack_static_template_patch, .-ipu_stack_static_template_patch

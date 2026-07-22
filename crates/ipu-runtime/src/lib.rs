@@ -179,6 +179,7 @@ fn executable_regions_for_tile(
     Ok(space.free_regions(element_size))
 }
 
+#[cfg(test)]
 fn data_region_base_for_tile(
     allocation_ranges: &[(u32, u32)],
     tile: u16,
@@ -190,28 +191,7 @@ fn data_region_base_for_tile(
     if required_size == 0 || !alignment.is_power_of_two() {
         return Err("data region size must be nonzero and alignment must be a power of two".into());
     }
-    let memory_end = ipu_package::TILE_MEMORY_BASE
-        .checked_add(ipu_package::TILE_MEMORY_SIZE)
-        .ok_or("tile memory range overflow")?;
-    let reserved = vec![
-        (
-            ipu_package::TILE_MEMORY_BASE,
-            ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES,
-        ),
-        (
-            ipu_exchange::EXCHANGE_WINDOW_BASE,
-            ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
-        ),
-        (PLAN_BASE, runtime_end),
-    ];
-    let mut space = placement::AddressSpace::new(ipu_package::TILE_MEMORY_BASE..memory_end);
-    space.reserve_all(
-        reserved
-            .into_iter()
-            .chain(allocation_ranges.iter().copied())
-            .chain(additional_reserved.iter().copied()),
-    );
-    let gaps = space.free_regions(1);
+    let gaps = data_regions_for_tile(allocation_ranges, runtime_end, true, additional_reserved)?;
     if let Some(address) = gaps
         .iter()
         .filter_map(|&(start, end)| {
@@ -236,14 +216,12 @@ fn data_region_base_for_tile(
     .into())
 }
 
-fn pack_data_objects_for_tile(
+fn data_regions_for_tile(
     allocation_ranges: &[(u32, u32)],
-    tile: u16,
     runtime_end: u32,
-    objects: &[Range<u32>],
     allow_interleaved: bool,
     additional_reserved: &[(u32, u32)],
-) -> Result<(BTreeMap<u32, u32>, Vec<(u32, u32)>)> {
+) -> Result<Vec<(u32, u32)>> {
     let memory_end = ipu_package::TILE_MEMORY_BASE
         .checked_add(ipu_package::TILE_MEMORY_SIZE)
         .ok_or("tile memory range overflow")?;
@@ -268,7 +246,24 @@ fn pack_data_objects_for_tile(
     reserved.extend_from_slice(additional_reserved);
     let mut space = placement::AddressSpace::new(ipu_package::TILE_MEMORY_BASE..memory_end);
     space.reserve_all(reserved);
-    let gaps = space.free_regions(1);
+    Ok(space.free_regions(1))
+}
+
+#[cfg(test)]
+fn pack_data_objects_for_tile(
+    allocation_ranges: &[(u32, u32)],
+    tile: u16,
+    runtime_end: u32,
+    objects: &[Range<u32>],
+    allow_interleaved: bool,
+    additional_reserved: &[(u32, u32)],
+) -> Result<(BTreeMap<u32, u32>, Vec<(u32, u32)>)> {
+    let gaps = data_regions_for_tile(
+        allocation_ranges,
+        runtime_end,
+        allow_interleaved,
+        additional_reserved,
+    )?;
 
     pack_objects_in_gaps(tile, objects, gaps, "static data")
 }
@@ -2687,110 +2682,85 @@ fn package_graph_impl_attempt(
         .collect::<Result<Vec<_>>>()?;
     #[derive(Clone, Copy)]
     enum TemplateDataObject {
-        RecordPrimary {
-            template: usize,
-        },
-        RecordSecondary {
-            template: usize,
-        },
-        Patch {
-            template: usize,
-            instance: usize,
-            part: usize,
-        },
-        PatchTable {
-            template: usize,
-        },
-        Shared {
-            template: usize,
-        },
+        RecordPrimary { template: usize },
+        RecordSecondary { template: usize },
+        PatchPair { template: usize, instance: usize },
+        PatchTable { template: usize },
+        Shared { template: usize },
     }
     let mut template_record_ranges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); programs.len()];
+    let mut host_runtime_ranges = Vec::with_capacity(tile_host_plans.len());
+    let mut worker_sync_addresses = Vec::with_capacity(tile_host_plans.len());
+    let mut completion_addresses = Vec::with_capacity(tile_host_plans.len());
+    let mut static_relocation_reservations = Vec::with_capacity(programs.len());
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
         let runtime_end = plans.end;
-        let mut records = plans
-            .templates
-            .iter()
-            .enumerate()
-            .flat_map(|(template, plan)| {
-                let record_words = plan.records.first().map_or(0, Vec::len);
-                let split = usize::from(plan.record_split);
-                [
-                    (TemplateDataObject::RecordPrimary { template }, split),
-                    (
-                        TemplateDataObject::RecordSecondary { template },
-                        record_words - split,
-                    ),
-                    (
-                        TemplateDataObject::PatchTable { template },
-                        plan.patches.len().saturating_sub(1) * 2,
-                    ),
-                    (TemplateDataObject::Shared { template }, plan.shared.len()),
-                ]
-                .into_iter()
-                .chain(plan.patches.iter().enumerate().skip(1).flat_map(
-                    move |(instance, patch)| {
-                        static_codegen::template_patch_ranges(record_words, split)
-                            .into_iter()
-                            .enumerate()
-                            .map(move |(part, slots)| {
-                                (
-                                    TemplateDataObject::Patch {
-                                        template,
-                                        instance,
-                                        part,
-                                    },
-                                    static_codegen::template_patch_storage_words_range(
-                                        slots, patch,
-                                    ),
-                                )
-                            })
-                    },
-                ))
-            })
-            .collect::<Vec<_>>();
-        records.sort_unstable_by_key(|&(_, words)| std::cmp::Reverse(words));
-        let mut interned_patches = HashMap::<
+        let host_plans = &mut tile_host_plans[tile_index];
+        let old_worker_sync = align_up(host_plans.end, 8);
+        let old_worker_end = old_worker_sync
+            .checked_add(WORKER_STACK_HEADROOM + (TILE_CONTEXT_STACKS - 1) * WORKER_SYNC_STRIDE)
+            .ok_or("static host runtime address overflow")?;
+        host_plans
+            .ordinary_data_objects
+            .push(old_worker_sync..old_worker_end);
+        let (mut relocations, executable_ranges, executable_elements) =
+            std::mem::take(&mut host_executable_placements[tile_index]);
+        let mut objects = Vec::<(TemplateDataObject, usize)>::new();
+        let mut canonical_patches = HashMap::<
             (
                 usize,
                 usize,
                 Vec<(u16, static_codegen::StaticTemplatePatchValue)>,
             ),
-            u32,
+            (usize, usize),
         >::new();
-        for (object, words) in records {
-            let patch_key = if let TemplateDataObject::Patch {
-                template,
-                instance,
-                part,
-            } = object
-            {
-                let plan = &plans.templates[template];
-                let record_words = plan.records.first().map_or(0, Vec::len);
-                let slots = static_codegen::template_patch_ranges(
-                    record_words,
-                    usize::from(plan.record_split),
-                )[part]
-                    .clone();
-                let values = plan.patches[instance]
-                    .iter()
-                    .filter(|(slot, _)| slots.contains(&usize::from(*slot)))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let key = (slots.start, slots.end, values);
-                if let Some(&address) = interned_patches.get(&key) {
-                    plans.templates[template].patch_addresses[instance][part] = address;
+        let mut patch_aliases = Vec::<(usize, usize, usize, usize)>::new();
+        for (template, plan) in plans.templates.iter().enumerate() {
+            let record_words = plan.records.first().map_or(0, Vec::len);
+            let split = usize::from(plan.record_split);
+            objects.extend([
+                (TemplateDataObject::RecordPrimary { template }, split),
+                (
+                    TemplateDataObject::RecordSecondary { template },
+                    record_words - split,
+                ),
+                (
+                    TemplateDataObject::PatchTable { template },
+                    plan.patches.len().saturating_sub(1) * usize::from(record_words != 0),
+                ),
+                (TemplateDataObject::Shared { template }, plan.shared.len()),
+            ]);
+            for (instance, patch) in plan.patches.iter().enumerate().skip(1) {
+                if record_words == 0 {
                     continue;
                 }
-                Some(key)
-            } else {
-                None
-            };
-            let size = u32::try_from(words)?
-                .checked_mul(4)
-                .ok_or("static template record size overflow")?;
-            if size == 0 {
+                let key = (record_words, split, plan.patches[instance].clone());
+                if let Some(&(canonical_template, canonical_instance)) = canonical_patches.get(&key)
+                {
+                    patch_aliases.push((
+                        template,
+                        instance,
+                        canonical_template,
+                        canonical_instance,
+                    ));
+                    continue;
+                }
+                canonical_patches.insert(key, (template, instance));
+                let words = static_codegen::template_patch_ranges(record_words, split)
+                    .into_iter()
+                    .map(|slots| {
+                        static_codegen::template_patch_storage_words_range(slots, patch).max(1)
+                    })
+                    .sum();
+                objects.push((TemplateDataObject::PatchPair { template, instance }, words));
+            }
+        }
+
+        let mut placed_objects = Vec::new();
+        let mut sizes = Vec::new();
+        for (object, words) in objects {
+            if words == 0 {
                 match object {
                     TemplateDataObject::RecordPrimary { template } => plans.templates[template]
                         .record_addresses
@@ -2798,11 +2768,7 @@ fn package_graph_impl_attempt(
                     TemplateDataObject::RecordSecondary { template } => plans.templates[template]
                         .record_secondary_addresses
                         .fill(ipu_package::TILE_MEMORY_BASE),
-                    TemplateDataObject::Patch {
-                        template,
-                        instance,
-                        part,
-                    } => plans.templates[template].patch_addresses[instance][part] = 0,
+                    TemplateDataObject::PatchPair { .. } => unreachable!(),
                     TemplateDataObject::PatchTable { template } => {
                         plans.templates[template].patch_table_address =
                             ipu_package::TILE_MEMORY_BASE
@@ -2813,47 +2779,88 @@ fn package_graph_impl_attempt(
                 }
                 continue;
             }
-            let additional_reserved = template_record_ranges[tile_index]
+            sizes.push(
+                u32::try_from(words)?
+                    .checked_mul(4)
+                    .ok_or("static template record size overflow")?,
+            );
+            placed_objects.push(object);
+        }
+        let host_data_count = host_plans.data_objects.len();
+        let mut data_sizes = host_plans
+            .data_objects
+            .iter()
+            .map(|object| -> Result<u32> { Ok(u32::try_from(object.len())?) })
+            .collect::<Result<Vec<_>>>()?;
+        data_sizes.extend(sizes);
+        let executable_reserved = executable_elements
+            .iter()
+            .copied()
+            .chain(std::iter::once(image_executable_elements[tile_index]))
+            .collect::<Vec<_>>();
+        let place = |allocation_ranges: &[(u32, u32)]| -> Result<_> {
+            let ordinary_gaps =
+                data_regions_for_tile(allocation_ranges, runtime_end, false, &executable_reserved)?;
+            let (ordinary_relocations, ordinary_ranges) = pack_objects_in_gaps(
+                tile,
+                &host_plans.ordinary_data_objects,
+                ordinary_gaps,
+                "non-interleaved static data",
+            )?;
+            let data_reserved = executable_reserved
                 .iter()
                 .copied()
-                .chain(host_executable_placements[tile_index].2.iter().copied())
-                .chain(std::iter::once(image_executable_elements[tile_index]))
+                .chain(ordinary_ranges.iter().copied())
                 .collect::<Vec<_>>();
-            let existing_gap = data_region_base_for_tile(
-                &allocation_ranges_by_tile[usize::from(tile)],
-                tile,
-                runtime_end,
-                size,
-                4,
-                &additional_reserved,
-            );
-            let address = if let Ok(address) = existing_gap {
-                address
-            } else {
-                data_region_base_for_tile(
-                    &fixed_allocation_ranges[tile_index],
-                    tile,
-                    runtime_end,
-                    size,
-                    4,
-                    &additional_reserved,
-                )?
-            };
-            let end = address
-                .checked_add(size)
-                .ok_or("static template record address overflow")?;
-            match object {
+            let data_gaps =
+                data_regions_for_tile(allocation_ranges, runtime_end, true, &data_reserved)?;
+            let data_placements =
+                pack_sized_objects_in_gaps(tile, &data_sizes, data_gaps, 4, "static data")?;
+            Ok((ordinary_relocations, ordinary_ranges, data_placements))
+        };
+        let (ordinary_relocations, ordinary_ranges, data_placements) =
+            place(&allocation_ranges_by_tile[usize::from(tile)])
+                .or_else(|_| place(&fixed_allocation_ranges[usize::from(tile)]))?;
+        relocations.extend(ordinary_relocations);
+        let (host_data_placements, placements) = data_placements.split_at(host_data_count);
+        for (object, &(address, _)) in host_plans.data_objects.iter().zip(host_data_placements) {
+            relocations.insert(object.start, address);
+        }
+        for (object, &(address, end)) in placed_objects.iter().zip(placements) {
+            match *object {
                 TemplateDataObject::RecordPrimary { template } => {
                     plans.templates[template].record_addresses.fill(address)
                 }
                 TemplateDataObject::RecordSecondary { template } => plans.templates[template]
                     .record_secondary_addresses
                     .fill(address),
-                TemplateDataObject::Patch {
-                    template,
-                    instance,
-                    part,
-                } => plans.templates[template].patch_addresses[instance][part] = address,
+                TemplateDataObject::PatchPair { template, instance } => {
+                    let plan = &mut plans.templates[template];
+                    let record_words = plan.records.first().map_or(0, Vec::len);
+                    let mut cursor = address;
+                    let ranges = static_codegen::template_patch_ranges(
+                        record_words,
+                        usize::from(plan.record_split),
+                    );
+                    let mut addresses = Vec::with_capacity(ranges.len());
+                    for slots in ranges {
+                        addresses.push(cursor);
+                        let words = static_codegen::template_patch_storage_words_range(
+                            slots,
+                            &plan.patches[instance],
+                        )
+                        .max(1);
+                        cursor = cursor
+                            .checked_add(
+                                u32::try_from(words)?
+                                    .checked_mul(4)
+                                    .ok_or("static patch pair size overflow")?,
+                            )
+                            .ok_or("static patch pair address overflow")?;
+                    }
+                    debug_assert_eq!(cursor, end);
+                    plan.patch_addresses[instance] = addresses;
+                }
                 TemplateDataObject::PatchTable { template } => {
                     plans.templates[template].patch_table_address = address
                 }
@@ -2861,24 +2868,67 @@ fn package_graph_impl_attempt(
                     plans.templates[template].shared_address = address
                 }
             }
-            template_record_ranges[tile_index].push((address, end));
-            if let Some(key) = patch_key {
-                interned_patches.insert(key, address);
-            }
         }
-    }
-    let static_relocation_reservations = template_record_ranges
-        .iter()
-        .enumerate()
-        .map(|(tile_index, ranges)| {
-            ranges
+        for (template, instance, canonical_template, canonical_instance) in patch_aliases {
+            plans.templates[template].patch_addresses[instance] =
+                plans.templates[canonical_template].patch_addresses[canonical_instance].clone();
+        }
+        template_record_ranges[tile_index].extend_from_slice(placements);
+
+        let relocate = |address: u32| -> Result<u32> {
+            relocations
+                .get(&address)
+                .copied()
+                .ok_or_else(|| format!("missing relocation for static object 0x{address:x}").into())
+        };
+        for address in &mut host_plans.addresses {
+            *address = relocate(*address)?;
+        }
+        for copy in host_plans.packet_copies.iter_mut().flatten() {
+            copy.source = relocate(copy.source)?;
+        }
+        for address in host_plans.run_tables.iter_mut().flatten() {
+            *address = relocate(*address)?;
+        }
+        let worker_sync = relocate(old_worker_sync)?;
+        let completion = worker_sync;
+        let mut ranges = ordinary_ranges;
+        ranges.extend_from_slice(host_data_placements);
+        ranges.extend(executable_ranges);
+        ranges.sort_unstable();
+        host_plans.start = ranges.iter().map(|&(start, _)| start).min().unwrap_or(0);
+        host_plans.end = ranges.iter().map(|&(_, end)| end).max().unwrap_or(0);
+        host_runtime_ranges.push(ranges);
+        worker_sync_addresses.push(worker_sync);
+        completion_addresses.push(completion);
+        static_relocation_reservations.push(
+            data_placements
                 .iter()
                 .copied()
-                .chain(executable_reservations[tile_index])
-                .chain(host_executable_placements[tile_index].2.iter().copied())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+                .chain(executable_reserved)
+                .chain(host_runtime_ranges[tile_index].iter().copied())
+                .collect::<Vec<_>>(),
+        );
+        if tile == 0 {
+            info!(
+                ranges = ?host_runtime_ranges[tile_index],
+                first_plan = host_plans.addresses.first().map(|address| format!("0x{address:x}")),
+                first_packet = host_plans
+                    .packet_copies
+                    .first()
+                    .and_then(|copy| *copy)
+                    .map(|copy| format!("0x{:x}", copy.source)),
+                first_run_table = host_plans
+                    .run_tables
+                    .first()
+                    .and_then(|address| *address)
+                    .map(|address| format!("0x{address:x}")),
+                worker_sync = format_args!("0x{worker_sync:x}"),
+                completion = format_args!("0x{completion:x}"),
+                "packed unified static runtime"
+            );
+        }
+    }
     let needs_static_relocation = graph.schedule.allocations.iter().any(|allocation| {
         matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
             && allocation.live_until != usize::MAX
@@ -2917,96 +2967,6 @@ fn package_graph_impl_attempt(
             invocations,
             false,
         );
-    }
-    let mut host_runtime_ranges = Vec::with_capacity(tile_host_plans.len());
-    let mut worker_sync_addresses = Vec::with_capacity(tile_host_plans.len());
-    let mut completion_addresses = Vec::with_capacity(tile_host_plans.len());
-    for (tile_index, plans) in tile_host_plans.iter_mut().enumerate() {
-        let old_worker_sync = align_up(plans.end, 8);
-        let old_end = old_worker_sync
-            .checked_add(WORKER_STACK_HEADROOM + (TILE_CONTEXT_STACKS - 1) * WORKER_SYNC_STRIDE)
-            .ok_or("static host runtime address overflow")?;
-        plans.ordinary_data_objects.push(old_worker_sync..old_end);
-        let tile = programs[tile_index].tile;
-        let static_reservations = template_record_ranges[tile_index]
-            .iter()
-            .copied()
-            .chain(std::iter::once(image_executable_elements[tile_index]))
-            .collect::<Vec<_>>();
-        let (mut relocations, executable_ranges, executable_elements) =
-            std::mem::take(&mut host_executable_placements[tile_index]);
-        let (ordinary_relocations, mut ranges) = pack_data_objects_for_tile(
-            &allocation_ranges_by_tile[usize::from(tile)],
-            tile,
-            tile_exchange_plans[tile_index].end,
-            &plans.ordinary_data_objects,
-            false,
-            &executable_elements
-                .iter()
-                .copied()
-                .chain(static_reservations.iter().copied())
-                .collect::<Vec<_>>(),
-        )?;
-        relocations.extend(ordinary_relocations);
-        ranges.extend(executable_ranges);
-        let (data_relocations, data_ranges) = pack_data_objects_for_tile(
-            &allocation_ranges_by_tile[usize::from(tile)],
-            tile,
-            tile_exchange_plans[tile_index].end,
-            &plans.data_objects,
-            true,
-            &ranges
-                .iter()
-                .copied()
-                .chain(executable_elements.iter().copied())
-                .chain(static_reservations.iter().copied())
-                .collect::<Vec<_>>(),
-        )?;
-        relocations.extend(data_relocations);
-        ranges.extend(data_ranges);
-        ranges.sort_unstable();
-        let relocate = |address: u32| -> Result<u32> {
-            relocations
-                .get(&address)
-                .copied()
-                .ok_or_else(|| format!("missing relocation for static object 0x{address:x}").into())
-        };
-        for address in &mut plans.addresses {
-            *address = relocate(*address)?;
-        }
-        for copy in plans.packet_copies.iter_mut().flatten() {
-            copy.source = relocate(copy.source)?;
-        }
-        for address in plans.run_tables.iter_mut().flatten() {
-            *address = relocate(*address)?;
-        }
-        let worker_sync = relocate(old_worker_sync)?;
-        // Completion is written only after worker stacks are quiescent.
-        let completion = worker_sync;
-        plans.start = ranges.iter().map(|&(start, _)| start).min().unwrap_or(0);
-        plans.end = ranges.iter().map(|&(_, end)| end).max().unwrap_or(0);
-        host_runtime_ranges.push(ranges);
-        worker_sync_addresses.push(worker_sync);
-        completion_addresses.push(completion);
-        if tile == 0 {
-            info!(
-                ranges = ?host_runtime_ranges[tile_index],
-                first_plan = plans.addresses.first().map(|address| format!("0x{address:x}")),
-                first_packet = plans
-                    .packet_copies
-                    .first()
-                    .and_then(|copy| *copy)
-                    .map(|copy| format!("0x{:x}", copy.source)),
-                first_run_table = plans
-                    .run_tables
-                    .first()
-                    .and_then(|address| *address)
-                    .map(|address| format!("0x{address:x}")),
-                worker_sync = format_args!("0x{worker_sync:x}"),
-                completion = format_args!("0x{completion:x}"),
-                "packed segmented host runtime"
-            );
-        }
     }
     debug!(
         minimum_end = format_args!(
@@ -3579,28 +3539,25 @@ fn package_graph_impl_attempt(
                 .patch_addresses
                 .iter()
                 .skip(1)
-                .flatten()
-                .copied()
+                .filter_map(|addresses| addresses.first().copied())
                 .collect::<Vec<_>>();
             if !patch_table.is_empty() {
                 template_segments
                     .push((template.patch_table_address, words_to_bytes(&patch_table)));
             }
             for (instance, patch) in template.patches.iter().enumerate().skip(1) {
-                if patch.is_empty() {
-                    continue;
-                }
                 for (part, slots) in
                     static_codegen::template_patch_ranges(first_record.len(), split)
                         .into_iter()
                         .enumerate()
                 {
                     let address = template.patch_addresses[instance][part];
-                    if static_codegen::template_patch_storage_words_range(slots.clone(), patch) == 0
-                    {
+                    if !written_patch_addresses.insert(address) {
                         continue;
                     }
-                    if !written_patch_addresses.insert(address) {
+                    if static_codegen::template_patch_storage_words_range(slots.clone(), patch) == 0
+                    {
+                        template_segments.push((address, 0u32.to_le_bytes().to_vec()));
                         continue;
                     }
                     let mut words = Vec::new();
