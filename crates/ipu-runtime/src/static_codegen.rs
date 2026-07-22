@@ -186,29 +186,23 @@ pub(crate) fn template_patch_group_span(
     Some((first / 32 * 32)..((last + 1).div_ceil(32) * 32).min(slots.len()))
 }
 
-pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> [Range<usize>; 8] {
+pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> Vec<Range<usize>> {
     fn halves(range: Range<usize>) -> [Range<usize>; 2] {
         let local_midpoint = (range.len() / 2).div_ceil(32) * 32;
         let midpoint = range.start + local_midpoint.min(range.len());
         [range.start..midpoint, midpoint..range.end]
     }
 
-    let [primary_first, primary_second] = halves(0..split);
-    let [primary_0, primary_1] = halves(primary_first);
-    let [primary_2, primary_3] = halves(primary_second);
-    let [secondary_first, secondary_second] = halves(split..record_words);
-    let [secondary_0, secondary_1] = halves(secondary_first);
-    let [secondary_2, secondary_3] = halves(secondary_second);
-    [
-        primary_0,
-        primary_1,
-        primary_2,
-        primary_3,
-        secondary_0,
-        secondary_1,
-        secondary_2,
-        secondary_3,
-    ]
+    [0..split, split..record_words]
+        .into_iter()
+        .flat_map(|range| {
+            let mut ranges = vec![range];
+            for _ in 0..3 {
+                ranges = ranges.into_iter().flat_map(halves).collect();
+            }
+            ranges
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
