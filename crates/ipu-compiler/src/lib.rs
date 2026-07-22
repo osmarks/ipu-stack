@@ -17,7 +17,8 @@ mod mlp;
 mod rowwise;
 pub use attention::{
     AttentionKeyValuePlacement, AttentionTaskPlacement, FlashAttentionConfig, FlashAttentionPlan,
-    append_flash_attention_from_a16_qkv, append_flash_attention_to_a16_row_shards,
+    append_flash_attention_from_a16_qkv, append_flash_attention_from_a16_qkv_in_arenas,
+    append_flash_attention_to_a16_row_shards, append_flash_attention_to_a16_row_shards_in_arenas,
     plan_flash_attention,
 };
 pub use mlp::{BlockedMlpConfig, BlockedMlpPlan, plan_blocked_mlp};
@@ -26,9 +27,9 @@ pub use rowwise::{
     AppendedAffineLayerNorm, RowShardPlacement, RowShardTransitionConfig,
     append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
     append_affine_layer_norm_f16_in_arenas, append_affine_layer_norm_f16_with_memory_policy,
-    append_c16_to_a16_blocks_gelu_f16, append_c16_to_a16_row_shards,
-    append_c16_to_a16_row_shards_gelu_f16, end_tensor_lifetimes, make_tensors_resident,
-    make_tensors_resident_since, plan_affine_layer_norm_f16,
+    append_c16_to_a16_blocks_gelu_f16, append_c16_to_a16_blocks_gelu_f16_in_arenas,
+    append_c16_to_a16_row_shards, append_c16_to_a16_row_shards_gelu_f16, end_tensor_lifetimes,
+    make_tensors_resident, make_tensors_resident_since, plan_affine_layer_norm_f16,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -456,9 +457,6 @@ pub enum ResidentTileAssignment {
     #[default]
     Balanced,
     Fixed,
-    WindowBalanced {
-        allocation_start: usize,
-    },
 }
 
 /// Allocatable IPU21 SRAM regions, excluding executable and exchange storage.
@@ -802,7 +800,7 @@ pub fn allocate_from_occupied(
     Ok(address)
 }
 
-pub(crate) fn allocate_from_occupied_arenas(
+pub fn allocate_from_occupied_arenas(
     occupied: &mut Vec<(u32, u32)>,
     size: u32,
     arenas: &[MemoryArena],
@@ -1775,19 +1773,9 @@ fn plan_appended_blocked_gemm_with_memory_policy(
             parent,
             &plan.right,
             config.data_type.weight_element_bytes(),
-            &memory.resident,
-            0,
+            memory,
         ),
         ResidentTileAssignment::Fixed => 0,
-        ResidentTileAssignment::WindowBalanced { allocation_start } => {
-            choose_resident_tile_rotation_in_arenas(
-                parent,
-                &plan.right,
-                config.data_type.weight_element_bytes(),
-                &memory.resident,
-                allocation_start,
-            )
-        }
     };
     rotate_gemm_plan_tiles(&mut plan, tile_rotation)?;
     let mut regions = plan
@@ -1950,33 +1938,32 @@ fn choose_resident_tile_rotation_in_arenas(
     parent: &Schedule,
     child_resident: &[BlockPlacement],
     element_bytes: u32,
-    arenas: &[MemoryArena],
-    allocation_start: usize,
+    memory: &MemoryPolicy,
 ) -> u16 {
     let tile_count = usize::from(parent.tile_count);
     if tile_count == 0 {
         return 0;
     }
-    let arena_base = arenas.iter().map(|arena| arena.base).min().unwrap_or(0);
-    let arena_limit = arenas.iter().map(|arena| arena.limit).max().unwrap_or(0);
-    let occupied = occupied_intervals_by_tile(
-        parent
-            .allocations
-            .get(allocation_start..)
-            .unwrap_or_default(),
-        parent.tile_count,
-        0,
-        usize::MAX,
-        arena_base,
-        arena_limit,
-    );
+    let arena_base = memory
+        .resident
+        .iter()
+        .map(|arena| arena.base)
+        .min()
+        .unwrap_or(0);
+    let arena_limit = memory
+        .resident
+        .iter()
+        .map(|arena| arena.limit)
+        .max()
+        .unwrap_or(0);
+    let occupied = memory.occupied_all(parent, arena_base, arena_limit);
     let parent_bytes = occupied
         .iter()
         .map(|intervals| {
             intervals
                 .iter()
                 .flat_map(|&(start, end)| {
-                    arenas.iter().map(move |arena| {
+                    memory.resident.iter().map(move |arena| {
                         u64::from(end.min(arena.limit).saturating_sub(start.max(arena.base)))
                     })
                 })
@@ -4564,15 +4551,12 @@ mod tests {
             },
         ];
 
+        let memory = MemoryPolicy::contiguous(0xa0000, 0xe8000);
         let rotation = choose_resident_tile_rotation_in_arenas(
             &parent,
             &child,
             GemmDataType::F16.element_bytes(),
-            &[MemoryArena {
-                base: 0xa0000,
-                limit: 0xe8000,
-            }],
-            0,
+            &memory,
         );
 
         assert_ne!(rotation, 0);

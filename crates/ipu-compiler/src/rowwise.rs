@@ -264,9 +264,26 @@ pub fn append_c16_to_a16_blocks_gelu_f16(
     data_base: u32,
     data_limit: u32,
 ) -> Result<Vec<BlockPlacement>, CompileError> {
+    append_c16_to_a16_blocks_gelu_f16_in_arenas(
+        schedule,
+        source,
+        &[MemoryArena {
+            base: data_base,
+            limit: data_limit,
+        }],
+    )
+}
+
+pub fn append_c16_to_a16_blocks_gelu_f16_in_arenas(
+    schedule: &mut Schedule,
+    source: &[BlockPlacement],
+    arenas: &[MemoryArena],
+) -> Result<Vec<BlockPlacement>, CompileError> {
     if source.is_empty()
-        || data_base & 7 != 0
-        || data_base >= data_limit
+        || arenas.is_empty()
+        || arenas
+            .iter()
+            .any(|arena| arena.base & 7 != 0 || arena.base >= arena.limit)
         || source.iter().any(|block| block.columns != 64)
     {
         return Err(CompileError::Graph(
@@ -283,6 +300,8 @@ pub fn append_c16_to_a16_blocks_gelu_f16(
         + 1;
     let mut output = Vec::with_capacity(source.len());
     let mut commands = Vec::with_capacity(source.len());
+    let data_base = arenas.iter().map(|arena| arena.base).min().unwrap();
+    let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
     let mut occupied = occupied_intervals_by_tile(
         &schedule.allocations,
         schedule.tile_count,
@@ -293,15 +312,12 @@ pub fn append_c16_to_a16_blocks_gelu_f16(
     );
     for block in source {
         let bytes = u32::from(block.rows) * u32::from(block.columns) * 2;
-        let address = allocate_from_occupied(
+        let address = allocate_from_occupied_arenas(
             &mut occupied[usize::from(block.tile)],
             bytes,
-            MemoryConstraint {
-                base: data_base,
-                limit: data_limit,
-                alignment: 8,
-                placement: MemoryPlacement::Low,
-            },
+            arenas,
+            8,
+            MemoryPlacement::Low,
         )?;
         let tensor = TensorId(next_tensor);
         next_tensor += 1;

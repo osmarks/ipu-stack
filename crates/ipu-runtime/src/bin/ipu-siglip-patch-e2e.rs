@@ -14,8 +14,9 @@ use ipu_runtime::{
     SiglipEncoderPrecision, SiglipEncoderTuning, SiglipLinearPrecision, SiglipWeightStorage,
     StaticProfileRegion, StaticTemplateRegion, allocator_memory_profile, append_host_a16_matrix,
     append_siglip_encoder_layer_with_precision, append_siglip_map_head,
-    append_siglip_post_layer_norm, block_binding_typed, block_coordinates, blocked_matrix_f16,
-    consolidate_attention_kernel_variants, package_graph_repeated,
+    append_siglip_map_head_with_memory_policy, append_siglip_post_layer_norm,
+    append_siglip_post_layer_norm_with_memory_policy, block_binding_typed, block_coordinates,
+    blocked_matrix_f16, consolidate_attention_kernel_variants, package_graph_repeated,
     package_graph_repeated_with_templates, package_graph_repeated_with_templates_profiled_regions,
     package_graph_repeated_with_templates_profiled_with, run_host_with_options,
 };
@@ -28,8 +29,11 @@ const TILE_COUNT: u16 = 1472;
 const BLOCK_DIMENSION: u16 = 64;
 const INNER_BLOCK_DIMENSION: u16 = 64;
 const DATA_BASE: u32 = ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
-const DEFAULT_RESIDENT_LOW_BASE: u32 =
-    ipu_package::TILE_MEMORY_BASE + 7 * ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+// Full-model tiles can require four instruction elements each for the generated
+// program and linked support image. Data allocation starts after both budgets.
+const EXECUTABLE_RESERVE_ELEMENTS: u32 = 8;
+const DEFAULT_RESIDENT_LOW_BASE: u32 = ipu_package::TILE_MEMORY_BASE
+    + EXECUTABLE_RESERVE_ELEMENTS * ipu_package::TILE_MEMORY_ELEMENT_SIZE;
 
 fn main() {
     ipu_runtime::init_tracing();
@@ -174,6 +178,12 @@ fn main() {
         Ok(value) => panic!("unsupported SigLIP weight storage {value}"),
     };
     let precision = siglip_encoder_precision(weight_storage);
+    let resident_f16_layers = usize::try_from(env_u32(
+        "IPU_SIGLIP_RESIDENT_F16_PREFIX_LAYERS",
+        u32::try_from(layer_count).unwrap(),
+    ))
+    .unwrap();
+    assert!(resident_f16_layers <= layer_count);
     let tuning = SiglipEncoderTuning {
         attention_key_block_rows: u16::try_from(env_u32("IPU_SIGLIP_ATTENTION_KEY_BLOCK_ROWS", 0))
             .expect("attention key block rows exceed u16"),
@@ -183,6 +193,7 @@ fn main() {
         resident = ?memory.resident,
         ?weight_storage,
         ?precision,
+        resident_f16_layers,
         ?tuning,
         "configured encoder tile-memory policy"
     );
@@ -190,17 +201,19 @@ fn main() {
     let retain_profile_metadata = std::env::var_os("IPU_SIGLIP_RETAIN_PROFILE_METADATA").is_some();
     let mut current = row_shards;
     let mut last_layer = None;
-    let mut layer_phase_ranges = Vec::with_capacity(layer_count);
+    let mut layer_template_groups =
+        Vec::<(SiglipEncoderPrecision, Vec<std::ops::Range<usize>>)>::new();
     let mut profile_regions = vec![StaticProfileRegion {
         name: "embedding".into(),
         phases: 0..plan.schedule.phases.len(),
     }];
     for layer in 0..layer_count {
         let phase_start = plan.schedule.phases.len();
-        let allocation_start = plan.schedule.allocations.len();
-        let mut layer_memory = memory.clone();
-        layer_memory.resident_tile_assignment =
-            ipu_compiler::ResidentTileAssignment::WindowBalanced { allocation_start };
+        let layer_precision = if layer < resident_f16_layers {
+            precision
+        } else {
+            expanded_storage_fallback(precision)
+        };
         let appended = append_siglip_encoder_layer_with_precision(
             &mut plan.schedule,
             &current,
@@ -210,8 +223,8 @@ fn main() {
             columns,
             row_block_dimension,
             TILE_COUNT,
-            &layer_memory,
-            precision,
+            &memory,
+            layer_precision,
             tuning,
             retain_profile_metadata,
             detailed_diagnostics && layer + 1 == layer_count,
@@ -233,7 +246,13 @@ fn main() {
         if !retain_profile_metadata {
             plan.schedule.discard_profile_metadata(phase_range.clone());
         }
-        layer_phase_ranges.push(phase_range);
+        if let Some((group_precision, ranges)) = layer_template_groups.last_mut()
+            && *group_precision == layer_precision
+        {
+            ranges.push(phase_range);
+        } else {
+            layer_template_groups.push((layer_precision, vec![phase_range]));
+        }
         let (compute_commands, transfers) =
             plan.schedule
                 .phases
@@ -269,16 +288,15 @@ fn main() {
         "full-model execution requires every encoder layer"
     );
     let (output, output_rows, output_name, attentions, post_norm_output) = if full_model {
-        let post_norm = append_siglip_post_layer_norm(
+        let post_norm = append_siglip_post_layer_norm_with_memory_policy(
             &mut plan.schedule,
             &layer_output,
             &model,
-            DATA_BASE,
-            data_limit,
+            &memory,
             &mut host,
         )
         .unwrap();
-        let map = append_siglip_map_head(
+        let map = append_siglip_map_head_with_memory_policy(
             &mut plan.schedule,
             &post_norm,
             &model,
@@ -287,6 +305,7 @@ fn main() {
             TILE_COUNT,
             DATA_BASE,
             data_limit,
+            &memory,
             &mut host,
         )
         .unwrap();
@@ -365,12 +384,14 @@ fn main() {
         host_outputs,
     };
     write_memory_profile(&graph);
-    let templates = (layer_phase_ranges.len() >= 2)
-        .then(|| StaticTemplateRegion {
-            name: "siglip_encoder_layer".into(),
-            phase_instances: layer_phase_ranges,
-        })
+    let templates = layer_template_groups
         .into_iter()
+        .enumerate()
+        .filter(|(_, (_, ranges))| ranges.len() >= 2)
+        .map(|(index, (_, phase_instances))| StaticTemplateRegion {
+            name: format!("siglip_encoder_layer_{index}"),
+            phase_instances,
+        })
         .collect::<Vec<_>>();
     let profile_output = std::env::var_os("IPU_PROFILE_OUTPUT").map(PathBuf::from);
     assert!(
@@ -1409,6 +1430,19 @@ fn siglip_encoder_precision(storage: SiglipWeightStorage) -> SiglipEncoderPrecis
         attention_output: linear_precision("IPU_SIGLIP_ATTENTION_OUTPUT", fallback),
         mlp_up: linear_precision("IPU_SIGLIP_MLP_UP", fallback),
         mlp_down: linear_precision("IPU_SIGLIP_MLP_DOWN", fallback),
+    }
+}
+
+fn expanded_storage_fallback(precision: SiglipEncoderPrecision) -> SiglipEncoderPrecision {
+    let fallback = |linear| match linear {
+        SiglipLinearPrecision::F16 => SiglipLinearPrecision::F143Expanded,
+        other => other,
+    };
+    SiglipEncoderPrecision {
+        qkv: fallback(precision.qkv),
+        attention_output: fallback(precision.attention_output),
+        mlp_up: fallback(precision.mlp_up),
+        mlp_down: fallback(precision.mlp_down),
     }
 }
 

@@ -5,18 +5,17 @@ use crate::{
 use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
-    FlashAttentionConfig, FlashAttentionPlan, GemmDataType, MemoryConstraint, MemoryPlacement,
+    FlashAttentionConfig, FlashAttentionPlan, GemmDataType, MemoryArena, MemoryPlacement,
     MemoryPolicy, RowShardPlacement, RowShardTransitionConfig, Schedule, TensorId,
-    allocate_from_occupied, append_add_f16_row_shards_in_place, append_affine_layer_norm_f16,
-    append_affine_layer_norm_f16_with_memory_policy, append_bias_f16_c16,
-    append_bias_f16_c16_in_arenas, append_blocked_gemm_f16_with_a16_blocks,
+    allocate_from_occupied_arenas, append_add_f16_row_shards_in_place,
+    append_affine_layer_norm_f16_with_memory_policy, append_bias_f16_c16_in_arenas,
     append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
-    append_blocked_gemm_f16_with_a16_input,
-    append_blocked_gemm_f16_with_a16_input_with_memory_policy, append_c16_to_a16_blocks_gelu_f16,
-    append_c16_to_a16_row_shards, append_flash_attention_from_a16_qkv,
-    append_flash_attention_to_a16_row_shards, end_tensor_lifetimes, make_tensors_resident,
-    make_tensors_resident_since, occupied_intervals_by_tile, set_f8_weight_block_scales_in_phases,
-    set_native_f8_weight_block_scales_in_phases,
+    append_blocked_gemm_f16_with_a16_input_with_memory_policy,
+    append_c16_to_a16_blocks_gelu_f16_in_arenas, append_c16_to_a16_row_shards,
+    append_flash_attention_from_a16_qkv_in_arenas,
+    append_flash_attention_to_a16_row_shards_in_arenas, end_tensor_lifetimes,
+    make_tensors_resident, make_tensors_resident_since, occupied_intervals_by_tile,
+    set_f8_weight_block_scales_in_phases, set_native_f8_weight_block_scales_in_phases,
 };
 use ipu_models::SiglipWeights;
 use ipu_package::{Binding, RegionSlice};
@@ -304,10 +303,37 @@ pub fn append_host_a16_matrix(
     data_limit: u32,
     host: &mut HostTensorSet,
 ) -> Result<Vec<RowShardPlacement>> {
+    append_host_a16_matrix_in_arenas(
+        schedule,
+        name,
+        values,
+        rows,
+        columns,
+        row_block_dimension,
+        &[MemoryArena {
+            base: data_base,
+            limit: data_limit,
+        }],
+        host,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_host_a16_matrix_in_arenas(
+    schedule: &mut Schedule,
+    name: &str,
+    values: &[f32],
+    rows: u16,
+    columns: u16,
+    row_block_dimension: u16,
+    arenas: &[MemoryArena],
+    host: &mut HostTensorSet,
+) -> Result<Vec<RowShardPlacement>> {
     if rows == 0
         || columns == 0
         || !columns.is_multiple_of(16)
         || row_block_dimension == 0
+        || arenas.is_empty()
         || values.len() != usize::from(rows) * usize::from(columns)
     {
         return Err("host A16 matrix has incompatible dimensions or data".into());
@@ -337,15 +363,9 @@ pub fn append_host_a16_matrix(
         schedule.tile_count,
         0,
         usize::MAX,
-        data_base,
-        data_limit,
+        arenas.iter().map(|arena| arena.base).min().unwrap(),
+        arenas.iter().map(|arena| arena.limit).max().unwrap(),
     );
-    let constraint = MemoryConstraint {
-        base: data_base,
-        limit: data_limit,
-        alignment: 8,
-        placement: MemoryPlacement::High,
-    };
     let mut row_start = 0;
     for shard_index in 0..row_grid {
         let shard_rows = base_rows + u16::from(shard_index < larger_shards);
@@ -353,14 +373,26 @@ pub fn append_host_a16_matrix(
         let (tile, address) = (0..schedule.tile_count)
             .filter_map(|tile| {
                 let mut candidate = occupied[usize::from(tile)].clone();
-                let address = allocate_from_occupied(&mut candidate, bytes, constraint).ok()?;
+                let address = allocate_from_occupied_arenas(
+                    &mut candidate,
+                    bytes,
+                    arenas,
+                    8,
+                    MemoryPlacement::High,
+                )
+                .ok()?;
                 Some((resident_pressure[usize::from(tile)], tile, address))
             })
             .min()
             .map(|(_, tile, address)| (tile, address))
             .ok_or_else(|| format!("no tile can hold {bytes} bytes for host matrix {name}"))?;
-        let allocated =
-            allocate_from_occupied(&mut occupied[usize::from(tile)], bytes, constraint)?;
+        let allocated = allocate_from_occupied_arenas(
+            &mut occupied[usize::from(tile)],
+            bytes,
+            arenas,
+            8,
+            MemoryPlacement::High,
+        )?;
         debug_assert_eq!(allocated, address);
         resident_pressure[usize::from(tile)] += u64::from(bytes);
         let tensor = TensorId(next_tensor);
@@ -409,15 +441,38 @@ pub fn append_siglip_post_layer_norm(
     data_limit: u32,
     host: &mut HostTensorSet,
 ) -> Result<Vec<RowShardPlacement>> {
+    let memory = MemoryPolicy::contiguous(data_base, data_limit);
+    append_siglip_post_layer_norm_with_memory_policy(schedule, input, model, &memory, host)
+}
+
+pub fn append_siglip_post_layer_norm_with_memory_policy(
+    schedule: &mut Schedule,
+    input: &[RowShardPlacement],
+    model: &SiglipWeights,
+    memory: &MemoryPolicy,
+    host: &mut HostTensorSet,
+) -> Result<Vec<RowShardPlacement>> {
     let columns = u16::try_from(model.config.hidden_size)?;
-    let norm = append_affine_layer_norm_f16(
+    let allocation_start = schedule.allocations.len();
+    let norm = append_affine_layer_norm_f16_with_memory_policy(
         schedule,
         input,
         AppendAffineLayerNormConfig {
-            data_base,
-            data_limit,
+            data_base: memory
+                .transient
+                .iter()
+                .map(|arena| arena.base)
+                .min()
+                .unwrap(),
+            data_limit: memory
+                .transient
+                .iter()
+                .map(|arena| arena.limit)
+                .max()
+                .unwrap(),
             epsilon_bits: model.config.layer_norm_eps.to_bits(),
         },
+        memory,
     )?;
     push_named_layer_norm_affine(
         schedule,
@@ -427,7 +482,7 @@ pub fn append_siglip_post_layer_norm(
         &norm.affine,
         &model.tensor_f32("vision_model.post_layernorm.weight")?,
         &model.tensor_f32("vision_model.post_layernorm.bias")?,
-        0,
+        allocation_start,
     )?;
     end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
     Ok(norm.output)
@@ -445,6 +500,34 @@ pub fn append_siglip_map_head(
     data_limit: u32,
     host: &mut HostTensorSet,
 ) -> Result<SiglipMapHead> {
+    let memory = MemoryPolicy::contiguous(data_base, data_limit);
+    append_siglip_map_head_with_memory_policy(
+        schedule,
+        input,
+        model,
+        rows,
+        row_block_dimension,
+        tile_count,
+        data_base,
+        data_limit,
+        &memory,
+        host,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_siglip_map_head_with_memory_policy(
+    schedule: &mut Schedule,
+    input: &[RowShardPlacement],
+    model: &SiglipWeights,
+    rows: u16,
+    row_block_dimension: u16,
+    tile_count: u16,
+    data_base: u32,
+    data_limit: u32,
+    memory: &MemoryPolicy,
+    host: &mut HostTensorSet,
+) -> Result<SiglipMapHead> {
     const PROBE_ROWS: u16 = 12;
     let config = &model.config;
     let columns = u16::try_from(config.hidden_size)?;
@@ -454,20 +537,19 @@ pub fn append_siglip_map_head(
     for _ in 0..PROBE_ROWS {
         repeated_probe.extend_from_slice(&probe);
     }
-    let probe = append_host_a16_matrix(
+    let probe = append_host_a16_matrix_in_arenas(
         schedule,
         "map.probe",
         &repeated_probe,
         PROBE_ROWS,
         columns,
         PROBE_ROWS,
-        data_base,
-        data_limit,
+        &memory.resident,
         host,
     )?;
     let in_weight = model.tensor_f32("vision_model.head.attention.in_proj_weight")?;
     let in_bias = model.tensor_f32("vision_model.head.attention.in_proj_bias")?;
-    let query = append_a16_linear_c16(
+    let query = append_a16_linear_c16_with_memory_policy(
         schedule,
         &probe,
         PROBE_ROWS,
@@ -483,6 +565,7 @@ pub fn append_siglip_map_head(
         tile_count,
         data_base,
         data_limit,
+        memory,
         host,
     )?;
     end_tensor_lifetimes(schedule, probe.iter().map(|shard| shard.tensor))?;
@@ -496,7 +579,7 @@ pub fn append_siglip_map_head(
         },
     )?;
 
-    let key_value = append_a16_linear_c16(
+    let key_value = append_a16_linear_c16_with_memory_policy(
         schedule,
         input,
         rows,
@@ -512,6 +595,7 @@ pub fn append_siglip_map_head(
         tile_count,
         data_base,
         data_limit,
+        memory,
         host,
     )?;
     let key = append_c16_to_a16_row_shards(
@@ -536,7 +620,7 @@ pub fn append_siglip_map_head(
     end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
 
     let attention_phase_start = schedule.phases.len();
-    let attention = append_flash_attention_from_a16_qkv(
+    let attention = append_flash_attention_from_a16_qkv_in_arenas(
         schedule,
         &query,
         &key,
@@ -553,6 +637,7 @@ pub fn append_siglip_map_head(
             data_base,
             data_limit,
         },
+        &memory.transient,
     )?;
     log_attention_blocking("map", &attention);
     specialize_attention_phases(schedule, attention_phase_start, &attention);
@@ -564,9 +649,12 @@ pub fn append_siglip_map_head(
             .chain(&value)
             .map(|shard| shard.tensor),
     )?;
-    let attention_shards =
-        append_flash_attention_to_a16_row_shards(schedule, &attention, data_base, data_limit)?;
-    let projected = append_a16_linear_c16(
+    let attention_shards = append_flash_attention_to_a16_row_shards_in_arenas(
+        schedule,
+        &attention,
+        &memory.transient,
+    )?;
+    let projected = append_a16_linear_c16_with_memory_policy(
         schedule,
         &attention_shards,
         PROBE_ROWS,
@@ -582,6 +670,7 @@ pub fn append_siglip_map_head(
         tile_count,
         data_base,
         data_limit,
+        memory,
         host,
     )?;
     end_tensor_lifetimes(schedule, attention_shards.iter().map(|shard| shard.tensor))?;
@@ -596,7 +685,8 @@ pub fn append_siglip_map_head(
     )?;
     end_tensor_lifetimes(schedule, projected.iter().map(|block| block.tensor))?;
 
-    let norm = append_affine_layer_norm_f16(
+    let norm_allocation_start = schedule.allocations.len();
+    let norm = append_affine_layer_norm_f16_with_memory_policy(
         schedule,
         &residual,
         AppendAffineLayerNormConfig {
@@ -604,6 +694,7 @@ pub fn append_siglip_map_head(
             data_limit,
             epsilon_bits: config.layer_norm_eps.to_bits(),
         },
+        memory,
     )?;
     push_named_layer_norm_affine(
         schedule,
@@ -613,9 +704,9 @@ pub fn append_siglip_map_head(
         &norm.affine,
         &model.tensor_f32("vision_model.head.layernorm.weight")?,
         &model.tensor_f32("vision_model.head.layernorm.bias")?,
-        0,
+        norm_allocation_start,
     )?;
-    let up = append_a16_linear_c16(
+    let up = append_a16_linear_c16_with_memory_policy(
         schedule,
         &norm.output,
         PROBE_ROWS,
@@ -631,12 +722,13 @@ pub fn append_siglip_map_head(
         tile_count,
         data_base,
         data_limit,
+        memory,
         host,
     )?;
     end_tensor_lifetimes(schedule, norm.output.iter().map(|shard| shard.tensor))?;
-    let gelu = append_c16_to_a16_blocks_gelu_f16(schedule, &up, data_base, data_limit)?;
+    let gelu = append_c16_to_a16_blocks_gelu_f16_in_arenas(schedule, &up, &memory.transient)?;
     end_tensor_lifetimes(schedule, up.iter().map(|block| block.tensor))?;
-    let down = append_blocked_gemm_f16_with_a16_blocks(
+    let down = append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
         schedule,
         &gelu,
         gemm_config(
@@ -650,6 +742,7 @@ pub fn append_siglip_map_head(
             GemmDataType::F16,
             true,
         ),
+        memory,
     )?;
     let down_weight = model.tensor_f32("vision_model.head.mlp.fc2.weight")?;
     host.push(
@@ -671,7 +764,7 @@ pub fn append_siglip_map_head(
     )?;
     make_tensors_resident(schedule, down.right.iter().map(|block| block.tensor))?;
     end_tensor_lifetimes(schedule, gelu.iter().map(|block| block.tensor))?;
-    let down_bias = append_bias_f16_c16(schedule, &down.output, data_base, data_limit)?;
+    let down_bias = append_bias_f16_c16_in_arenas(schedule, &down.output, &memory.resident)?;
     let bias = model.tensor_f32("vision_model.head.mlp.fc2.bias")?;
     host.push(
         block_binding_typed(
@@ -888,7 +981,7 @@ pub fn append_siglip_encoder_layer_with_precision(
 
     info!(stage = "attention", "planning SigLIP encoder stage");
     let attention_phase_start = schedule.phases.len();
-    let attention = append_flash_attention_from_a16_qkv(
+    let attention = append_flash_attention_from_a16_qkv_in_arenas(
         schedule,
         &qkv_shards[0],
         &qkv_shards[1],
@@ -905,6 +998,7 @@ pub fn append_siglip_encoder_layer_with_precision(
             data_base,
             data_limit,
         },
+        &memory.transient,
     )?;
     log_attention_blocking("encoder", &attention);
     specialize_attention_phases(schedule, attention_phase_start, &attention);
@@ -914,8 +1008,11 @@ pub fn append_siglip_encoder_layer_with_precision(
             .iter()
             .flat_map(|shards| shards.iter().map(|shard| shard.tensor)),
     )?;
-    let attention_shards =
-        append_flash_attention_to_a16_row_shards(schedule, &attention, data_base, data_limit)?;
+    let attention_shards = append_flash_attention_to_a16_row_shards_in_arenas(
+        schedule,
+        &attention,
+        &memory.transient,
+    )?;
     info!(stage = "attention_output", "planning SigLIP encoder stage");
     let output_weight = model.tensor_f32(&model.layer_name(layer, "self_attn.out_proj.weight")?)?;
     let output_data_type = precision
@@ -1093,7 +1190,7 @@ pub fn append_siglip_encoder_layer_with_precision(
         mlp_up_adjustment.iter().map(|block| block.tensor),
     )?;
     let mlp_gelu =
-        append_c16_to_a16_blocks_gelu_f16(schedule, &mlp_up.output, data_base, data_limit)?;
+        append_c16_to_a16_blocks_gelu_f16_in_arenas(schedule, &mlp_up.output, &memory.transient)?;
     end_tensor_lifetimes(schedule, mlp_up.output.iter().map(|block| block.tensor))?;
     let mlp_down_weight = model.tensor_f32(&model.layer_name(layer, "mlp.fc2.weight")?)?;
     let mlp_down_data_type = precision
@@ -1302,7 +1399,7 @@ fn push_gemm_weight(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_a16_linear_c16(
+fn append_a16_linear_c16_with_memory_policy(
     schedule: &mut Schedule,
     input: &[RowShardPlacement],
     rows: u16,
@@ -1318,6 +1415,7 @@ fn append_a16_linear_c16(
     tile_count: u16,
     data_base: u32,
     data_limit: u32,
+    memory: &MemoryPolicy,
     host: &mut HostTensorSet,
 ) -> Result<Vec<BlockPlacement>> {
     if weight.len() < usize::from(output_offset + actual_output) * usize::from(actual_inner)
@@ -1325,7 +1423,7 @@ fn append_a16_linear_c16(
     {
         return Err(format!("{name} weight or bias is smaller than its declared slice").into());
     }
-    let gemm = append_blocked_gemm_f16_with_a16_input(
+    let gemm = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         input,
         gemm_config(
@@ -1339,6 +1437,7 @@ fn append_a16_linear_c16(
             GemmDataType::F16,
             true,
         ),
+        memory,
     )?;
     host.push(
         block_binding_typed(
@@ -1359,7 +1458,7 @@ fn append_a16_linear_c16(
         }),
     )?;
     make_tensors_resident(schedule, gemm.right.iter().map(|block| block.tensor))?;
-    let adjustment = append_bias_f16_c16(schedule, &gemm.output, data_base, data_limit)?;
+    let adjustment = append_bias_f16_c16_in_arenas(schedule, &gemm.output, &memory.resident)?;
     host.push(
         block_binding_typed(
             &format!("{name}.bias"),

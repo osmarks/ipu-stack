@@ -1,7 +1,7 @@
 use crate::{
-    Allocation, AllocationKind, CompileError, KernelCommand, MemoryArena, MemoryConstraint,
-    MemoryPlacement, OpId, Phase, RowShardPlacement, Schedule, SpecializationKey, TensorId,
-    Transfer, allocate_from_occupied, allocate_from_occupied_arenas, occupied_intervals_by_tile,
+    Allocation, AllocationKind, CompileError, KernelCommand, MemoryArena, MemoryPlacement, OpId,
+    Phase, RowShardPlacement, Schedule, SpecializationKey, TensorId, Transfer,
+    allocate_from_occupied_arenas, find_free_region_in_arenas, occupied_intervals_by_tile,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -75,6 +75,27 @@ pub fn append_flash_attention_from_a16_qkv(
     value: &[RowShardPlacement],
     config: FlashAttentionConfig,
 ) -> Result<FlashAttentionPlan, CompileError> {
+    append_flash_attention_from_a16_qkv_in_arenas(
+        schedule,
+        query,
+        key,
+        value,
+        config,
+        &[MemoryArena {
+            base: config.data_base,
+            limit: config.data_limit,
+        }],
+    )
+}
+
+pub fn append_flash_attention_from_a16_qkv_in_arenas(
+    schedule: &mut Schedule,
+    query: &[RowShardPlacement],
+    key: &[RowShardPlacement],
+    value: &[RowShardPlacement],
+    config: FlashAttentionConfig,
+    arenas: &[MemoryArena],
+) -> Result<FlashAttentionPlan, CompileError> {
     let query_sequence_length = if config.query_sequence_length == 0 {
         config.sequence_length
     } else {
@@ -119,7 +140,7 @@ pub fn append_flash_attention_from_a16_qkv(
         query_block_rows,
         ..config
     })?;
-    relocate_appended_attention(schedule, &mut plan, config.data_base, config.data_limit)?;
+    relocate_appended_attention(schedule, &mut plan, arenas)?;
     let tensor_base = schedule
         .allocations
         .iter()
@@ -170,9 +191,14 @@ pub fn append_flash_attention_from_a16_qkv(
 fn relocate_appended_attention(
     parent: &Schedule,
     plan: &mut FlashAttentionPlan,
-    data_base: u32,
-    data_limit: u32,
+    arenas: &[MemoryArena],
 ) -> Result<(), CompileError> {
+    if arenas.is_empty() {
+        return Err(CompileError::Memory(
+            "attention relocation requires an SRAM arena".into(),
+        ));
+    }
+    let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
     let live_from = parent.phases.len();
     let mut occupied = occupied_intervals_by_tile(
         &parent.allocations,
@@ -182,16 +208,15 @@ fn relocate_appended_attention(
         ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
         data_limit,
     );
-    let score_arenas = [
-        MemoryArena {
-            base: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
-            limit: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
-        },
-        MemoryArena {
-            base: data_base,
-            limit: data_limit,
-        },
-    ];
+    let mut score_arenas = vec![MemoryArena {
+        base: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+        limit: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+    }];
+    for arena in arenas {
+        if !score_arenas.contains(arena) {
+            score_arenas.push(*arena);
+        }
+    }
     let mut relocated = BTreeMap::<usize, u32>::new();
     for task in &plan.tasks {
         let size = attention_scratch_bytes(
@@ -255,15 +280,12 @@ fn relocate_appended_attention(
     }
     regions.sort_unstable_by_key(|&(_, _, _, size)| std::cmp::Reverse(size));
     for &(tensor, tile, _address, size) in &regions {
-        let address = allocate_from_occupied(
+        let address = allocate_from_occupied_arenas(
             &mut occupied[usize::from(tile)],
             size,
-            MemoryConstraint {
-                base: data_base,
-                limit: data_limit,
-                alignment: 8,
-                placement: MemoryPlacement::Low,
-            },
+            arenas,
+            8,
+            MemoryPlacement::Low,
         )?;
         relocated.insert(tensor.0, address);
     }
@@ -295,7 +317,27 @@ pub fn append_flash_attention_to_a16_row_shards(
     data_base: u32,
     data_limit: u32,
 ) -> Result<Vec<RowShardPlacement>, CompileError> {
-    if plan.tasks.is_empty() || data_base & 7 != 0 || data_base >= data_limit {
+    append_flash_attention_to_a16_row_shards_in_arenas(
+        schedule,
+        plan,
+        &[MemoryArena {
+            base: data_base,
+            limit: data_limit,
+        }],
+    )
+}
+
+pub fn append_flash_attention_to_a16_row_shards_in_arenas(
+    schedule: &mut Schedule,
+    plan: &FlashAttentionPlan,
+    arenas: &[MemoryArena],
+) -> Result<Vec<RowShardPlacement>, CompileError> {
+    if plan.tasks.is_empty()
+        || arenas.is_empty()
+        || arenas
+            .iter()
+            .any(|arena| arena.base & 7 != 0 || arena.base >= arena.limit)
+    {
         return Err(CompileError::Graph(
             "attention output gather requires tasks and an aligned SRAM arena".into(),
         ));
@@ -323,11 +365,9 @@ pub fn append_flash_attention_to_a16_row_shards(
         .max()
         .unwrap_or(0)
         + 1;
-    let exchange_phase = schedule.phases.len();
-    let compute_phase = exchange_phase + 1;
-    let mut transfers = Vec::new();
-    let mut commands = Vec::new();
+    let first_compute_phase = schedule.phases.len() + 1;
     let mut destinations = Vec::with_capacity(groups.len());
+    let mut output_groups = Vec::with_capacity(groups.len());
     for (destination_index, ((row_start, rows), mut tasks)) in groups.into_iter().enumerate() {
         tasks.sort_by_key(|task| task.head);
         if tasks.len() != usize::from(head_count)
@@ -348,23 +388,15 @@ pub fn append_flash_attention_to_a16_row_shards(
             ));
         }
         let activation_bytes = u32::from(rows) * u32::from(hidden_size) * 2;
-        if activation_bytes > ipu_exchange::EXCHANGE_WINDOW_BYTES {
-            return Err(CompileError::Graph(format!(
-                "attention row shard is {activation_bytes} bytes, larger than the exchange window"
-            )));
-        }
-        let address = crate::find_free_region(
+        let address = find_free_region_in_arenas(
             &schedule.allocations,
             destination_tile,
             activation_bytes,
-            compute_phase,
+            first_compute_phase,
             usize::MAX,
-            MemoryConstraint {
-                base: data_base,
-                limit: data_limit,
-                alignment: 8,
-                placement: MemoryPlacement::Low,
-            },
+            arenas,
+            8,
+            MemoryPlacement::Low,
         )?;
         let destination_tensor = fresh_tensor(&mut next_tensor);
         schedule.allocations.push(Allocation {
@@ -372,7 +404,7 @@ pub fn append_flash_attention_to_a16_row_shards(
             tile: destination_tile,
             address,
             size: activation_bytes,
-            live_from: compute_phase,
+            live_from: first_compute_phase,
             live_until: usize::MAX,
             kind: AllocationKind::Home,
         });
@@ -384,65 +416,89 @@ pub fn append_flash_attention_to_a16_row_shards(
             tensor: destination_tensor,
             address,
         });
+        output_groups.push((destination_tile, row_start, rows, address, tasks));
+    }
 
-        let head_bytes = u32::from(rows) * u32::from(plan.head_dimension) * 2;
-        for task in tasks {
-            let staging_offset = u32::from(task.head) * head_bytes;
-            if task.tile != destination_tile {
-                transfers.push(Transfer {
-                    source_tile: task.tile,
-                    destination_tile,
-                    tensor: task.output,
-                    bytes: head_bytes,
-                });
+    let maximum_head_bytes = output_groups
+        .iter()
+        .map(|(_, _, rows, _, _)| u32::from(*rows) * u32::from(plan.head_dimension) * 2)
+        .max()
+        .unwrap();
+    let heads_per_pass = u16::try_from(ipu_exchange::EXCHANGE_WINDOW_BYTES / maximum_head_bytes)
+        .unwrap_or(u16::MAX)
+        .min(head_count);
+    if heads_per_pass == 0 {
+        return Err(CompileError::Graph(format!(
+            "one attention head row shard is {maximum_head_bytes} bytes, larger than the exchange window"
+        )));
+    }
+    for first_head in (0..head_count).step_by(usize::from(heads_per_pass)) {
+        let exchange_phase = schedule.phases.len();
+        let compute_phase = exchange_phase + 1;
+        let pass_heads = (head_count - first_head).min(heads_per_pass);
+        let mut transfers = Vec::new();
+        let mut commands = Vec::new();
+        for &(destination_tile, row_start, rows, address, ref tasks) in &output_groups {
+            let activation_bytes = u32::from(rows) * u32::from(hidden_size) * 2;
+            let head_bytes = u32::from(rows) * u32::from(plan.head_dimension) * 2;
+            for task in &tasks[usize::from(first_head)..usize::from(first_head + pass_heads)] {
+                let staging_offset = u32::from(task.head - first_head) * head_bytes;
+                if task.tile != destination_tile {
+                    transfers.push(Transfer {
+                        source_tile: task.tile,
+                        destination_tile,
+                        tensor: task.output,
+                        bytes: head_bytes,
+                    });
+                    schedule.allocations.push(Allocation {
+                        tensor: task.output,
+                        tile: destination_tile,
+                        address: ipu_exchange::EXCHANGE_WINDOW_BASE + staging_offset,
+                        size: head_bytes,
+                        live_from: exchange_phase,
+                        live_until: compute_phase,
+                        kind: AllocationKind::ExchangeStaging {
+                            phase: exchange_phase,
+                        },
+                    });
+                }
+                let output_alias = fresh_tensor(&mut next_tensor);
                 schedule.allocations.push(Allocation {
-                    tensor: task.output,
+                    tensor: output_alias,
                     tile: destination_tile,
-                    address: ipu_exchange::EXCHANGE_WINDOW_BASE + staging_offset,
-                    size: head_bytes,
-                    live_from: exchange_phase,
+                    address,
+                    size: activation_bytes,
+                    live_from: compute_phase,
                     live_until: compute_phase,
-                    kind: AllocationKind::ExchangeStaging {
-                        phase: exchange_phase,
+                    kind: AllocationKind::Home,
+                });
+                commands.push(KernelCommand {
+                    tile: destination_tile,
+                    output: output_alias,
+                    inputs: vec![task.output, task.output],
+                    arguments: vec![u32::from(rows), u32::from(task.head * plan.head_dimension)],
+                    specialization: SpecializationKey {
+                        operation: "attention_unpack_head_f16".into(),
+                        shape: vec![usize::from(rows), usize::from(plan.head_dimension)],
+                        worker_count: 6,
+                        role: format!("head-{}-rows-{row_start}", task.head).into(),
+                        alignment: 8,
                     },
+                    metadata: BTreeMap::from([
+                        ("label".into(), "gather attention heads".into()),
+                        ("head".into(), task.head.to_string()),
+                        ("row_start".into(), row_start.to_string()),
+                        ("rows".into(), rows.to_string()),
+                    ]),
                 });
             }
-            let output_alias = fresh_tensor(&mut next_tensor);
-            schedule.allocations.push(Allocation {
-                tensor: output_alias,
-                tile: destination_tile,
-                address,
-                size: activation_bytes,
-                live_from: compute_phase,
-                live_until: compute_phase,
-                kind: AllocationKind::Home,
-            });
-            commands.push(KernelCommand {
-                tile: destination_tile,
-                output: output_alias,
-                inputs: vec![task.output, task.output],
-                arguments: vec![u32::from(rows), u32::from(task.head * plan.head_dimension)],
-                specialization: SpecializationKey {
-                    operation: "attention_unpack_head_f16".into(),
-                    shape: vec![usize::from(rows), usize::from(plan.head_dimension)],
-                    worker_count: 6,
-                    role: format!("head-{}-rows-{row_start}", task.head).into(),
-                    alignment: 8,
-                },
-                metadata: BTreeMap::from([
-                    ("label".into(), "gather attention heads".into()),
-                    ("head".into(), task.head.to_string()),
-                    ("row_start".into(), row_start.to_string()),
-                    ("rows".into(), rows.to_string()),
-                ]),
-            });
         }
+        schedule.phases.push(Phase::Exchange { transfers });
+        schedule.phases.push(Phase::Compute {
+            op: OpId(compute_phase),
+            commands,
+        });
     }
-    schedule.phases.push(Phase::Exchange { transfers });
-    schedule.phases.push(Phase::Compute {
-        op: OpId(compute_phase),
-        commands,
-    });
     Ok(destinations)
 }
 
@@ -1564,6 +1620,85 @@ mod tests {
             Phase::Compute { commands, .. }
                 if commands.iter().any(|command| command.specialization.operation == "attention_pack_query_f16")
         )));
+        schedule
+            .lower_tile_programs(&ipu_exchange::Topology::c600())
+            .unwrap();
+    }
+
+    #[test]
+    fn attention_output_gather_splits_shards_across_exchange_passes() {
+        let rows = 48u16;
+        let shard_rows = 24u16;
+        let hidden_size = 1152u16;
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: (0..rows / shard_rows)
+                .map(|index| Allocation {
+                    tensor: TensorId(usize::from(index)),
+                    tile: index,
+                    address: 0x90000,
+                    size: u32::from(shard_rows) * u32::from(hidden_size) * 2,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                })
+                .collect(),
+            tile_count: 1472,
+            peak_sram: BTreeMap::new(),
+        };
+        let shards = (0..rows / shard_rows)
+            .map(|index| RowShardPlacement {
+                tile: index,
+                row_start: index * shard_rows,
+                rows: shard_rows,
+                columns: hidden_size,
+                tensor: TensorId(usize::from(index)),
+                address: 0x90000,
+            })
+            .collect::<Vec<_>>();
+        let plan = append_flash_attention_from_a16_qkv(
+            &mut schedule,
+            &shards,
+            &shards,
+            &shards,
+            FlashAttentionConfig {
+                batch_size: 1,
+                query_sequence_length: 0,
+                sequence_length: rows,
+                hidden_size,
+                attention_heads: 16,
+                query_block_rows: shard_rows,
+                key_block_rows: 0,
+                tile_count: 1472,
+                data_base: 0xa0000,
+                data_limit: 0xe8000,
+            },
+        )
+        .unwrap();
+        let output =
+            append_flash_attention_to_a16_row_shards(&mut schedule, &plan, 0xc0000, 0xe8000)
+                .unwrap();
+
+        assert!(output.iter().all(|shard| {
+            u32::from(shard.rows) * u32::from(shard.columns) * 2
+                > ipu_exchange::EXCHANGE_WINDOW_BYTES
+        }));
+        let gather_phases = schedule
+            .phases
+            .iter()
+            .filter(|phase| matches!(
+                phase,
+                Phase::Compute { commands, .. }
+                    if commands.iter().any(|command| command.specialization.operation == "attention_unpack_head_f16")
+            ))
+            .count();
+        assert!(gather_phases > 1);
+        assert!(schedule.allocations.iter().all(|allocation| {
+            !matches!(allocation.kind, AllocationKind::ExchangeStaging { .. })
+                || allocation.address + allocation.size
+                    <= ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES
+        }));
         schedule
             .lower_tile_programs(&ipu_exchange::Topology::c600())
             .unwrap();
