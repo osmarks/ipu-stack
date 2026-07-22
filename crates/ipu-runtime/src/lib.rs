@@ -2645,10 +2645,13 @@ fn package_graph_impl_attempt(
                     .map(|allocation| (allocation.size, allocation.tensor.0))
                     .collect::<Vec<_>>();
                 movable.sort_unstable();
-                let mut admitted = BTreeSet::new();
-                let mut placement = None;
-                for (_, tensor) in movable {
-                    admitted.insert(tensor);
+                movable.dedup_by_key(|&mut (_, tensor)| tensor);
+                let try_prefix = |count: usize| -> Result<Option<u32>> {
+                    let admitted = movable
+                        .iter()
+                        .take(count)
+                        .map(|&(_, tensor)| tensor)
+                        .collect::<BTreeSet<_>>();
                     let occupied = graph
                         .schedule
                         .allocations
@@ -2665,16 +2668,26 @@ fn package_graph_impl_attempt(
                         })
                         .map(allocation_range)
                         .collect::<Result<Vec<_>>>()?;
-                    if let Ok(address) = data_region_base_for_tile(
+                    Ok(data_region_base_for_tile(
                         &occupied,
                         tile,
                         runtime_end,
                         size,
                         4,
                         &additional_reserved,
-                    ) {
+                    )
+                    .ok())
+                };
+                let mut low = 0usize;
+                let mut high = movable.len();
+                let mut placement = try_prefix(high)?;
+                while low < high {
+                    let middle = low + (high - low) / 2;
+                    if let Some(address) = try_prefix(middle)? {
                         placement = Some(address);
-                        break;
+                        high = middle;
+                    } else {
+                        low = middle + 1;
                     }
                 }
                 placement.ok_or_else(|| {
