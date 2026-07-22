@@ -21,20 +21,23 @@ const FP8_FLOPS_PER_TILE_CYCLE: f64 = 256.0;
 fn main() {
     ipu_runtime::init_tracing();
     let dimension = env_u16("IPU_GEMM_DIMENSION", 128);
+    let rows = env_u16("IPU_GEMM_ROWS", dimension);
+    let inner_dimension = env_u16("IPU_GEMM_INNER_DIMENSION", dimension);
+    let columns = env_u16("IPU_GEMM_COLUMNS", dimension);
     let block_dimension = env_u16("IPU_GEMM_BLOCK", DEFAULT_BLOCK_DIMENSION);
     let inner_block_dimension = env_u16("IPU_GEMM_INNER_BLOCK", DEFAULT_INNER_BLOCK_DIMENSION);
-    assert!(dimension.is_multiple_of(block_dimension));
+    assert!(columns.is_multiple_of(block_dimension));
+    assert!(inner_dimension.is_multiple_of(inner_block_dimension));
     let seed = env_u64("IPU_GEMM_SEED", 0x05ee_df16);
     let max_error_limit = env_f32("IPU_F16_MAX_ERROR", 0.005);
     let fp8_weights = env_bool("IPU_GEMM_FP8_WEIGHTS", false);
     let native_fp8 = env_bool("IPU_GEMM_NATIVE_FP8", false);
     assert!(!(fp8_weights && native_fp8));
-    let elements = usize::from(dimension).pow(2);
-    let left = normal_f16(elements, seed, 0.5);
+    let left = normal_f16(usize::from(rows) * usize::from(inner_dimension), seed, 0.5);
     let right = normal_f16(
-        elements,
+        usize::from(inner_dimension) * usize::from(columns),
         seed ^ 0x9e37_79b9_7f4a_7c15,
-        f32::from(dimension).sqrt().recip(),
+        f32::from(inner_dimension).sqrt().recip(),
     );
     let weight_scale = f143_scale(right.iter().map(|value| value.to_f32()));
     let input_scale = f143_scale(left.iter().map(|value| value.to_f32()));
@@ -54,9 +57,9 @@ fn main() {
         .map(|value| value.parse().expect("IPU_GEMM_ROW_BLOCK must be a u16"))
         .unwrap_or_else(|_| {
             choose_gemm_row_block_for(
-                dimension,
+                rows,
                 inner_block_dimension,
-                dimension,
+                columns,
                 block_dimension,
                 TILE_COUNT,
                 data_type,
@@ -64,9 +67,9 @@ fn main() {
             .expect("FP16 GEMM shape has no feasible row blocking")
         });
     let plan = plan_blocked_gemm(BlockedGemmConfig {
-        rows: dimension,
-        inner_dimension: dimension,
-        columns: dimension,
+        rows,
+        inner_dimension,
+        columns,
         block_dimension,
         inner_block_dimension,
         row_block_dimension,
@@ -94,11 +97,11 @@ fn main() {
             &plan.left,
             BlockLayout::AmpA32,
             input_scale,
-            |row, column| left[matrix_index(dimension, row, column)].to_f32(),
+            |row, column| left[matrix_index(inner_dimension, row, column)].to_f32(),
         )
     } else {
         blocked_matrix_f16(&plan.left, BlockLayout::AmpA16, |row, column| {
-            left[matrix_index(dimension, row, column)].to_f32()
+            left[matrix_index(inner_dimension, row, column)].to_f32()
         })
     };
     if fp8_weights || native_fp8 {
@@ -110,13 +113,13 @@ fn main() {
                 BlockLayout::AmpB16x16
             },
             weight_scale,
-            |row, column| right[matrix_index(dimension, row, column)].to_f32(),
+            |row, column| right[matrix_index(columns, row, column)].to_f32(),
         ));
     } else {
         input.extend(blocked_matrix_f16(
             &plan.right,
             BlockLayout::AmpB16x16,
-            |row, column| right[matrix_index(dimension, row, column)].to_f32(),
+            |row, column| right[matrix_index(columns, row, column)].to_f32(),
         ));
     }
     let reference_left = left
@@ -149,16 +152,16 @@ fn main() {
         host_inputs: vec![
             block_binding_typed(
                 "left",
-                dimension,
-                dimension,
+                rows,
+                inner_dimension,
                 &plan.left,
                 if native_fp8 { "f8-f143" } else { "f16" },
                 u64::from(data_type.input_element_bytes()),
             ),
             block_binding_typed(
                 "right",
-                dimension,
-                dimension,
+                inner_dimension,
+                columns,
                 &plan.right,
                 if fp8_weights || native_fp8 {
                     "f8-f143"
@@ -170,8 +173,8 @@ fn main() {
         ],
         host_outputs: vec![block_binding_typed(
             "output",
-            dimension,
-            dimension,
+            rows,
+            columns,
             &output_placements,
             "f16",
             2,
@@ -269,7 +272,9 @@ fn main() {
         (package_graph(&graph, &objects).unwrap(), None)
     };
     info!(
-        dimension,
+        rows,
+        inner_dimension,
+        columns,
         block_dimension,
         inner_block_dimension,
         fp8_weights,
@@ -303,7 +308,7 @@ fn main() {
         let report = layout.decode(&actual, clock_hz).unwrap();
         let graph_cycles = graph_cycles(&report);
         let graph_seconds = f64::from(graph_cycles) / clock_hz as f64;
-        let flops = 2.0 * f64::from(dimension).powi(3);
+        let flops = 2.0 * f64::from(rows) * f64::from(inner_dimension) * f64::from(columns);
         let tflops = flops / graph_seconds / 1.0e12;
         let flops_per_tile_cycle = if native_fp8 {
             FP8_FLOPS_PER_TILE_CYCLE
@@ -324,7 +329,9 @@ fn main() {
     }
     if env_bool("IPU_F16_VALIDATE", true) {
         let errors = verify_output(
-            dimension,
+            rows,
+            inner_dimension,
+            columns,
             &actual,
             &output_placements,
             &reference_left,
@@ -333,14 +340,19 @@ fn main() {
         )
         .unwrap();
         info!(
-            dimension,
+            rows,
+            inner_dimension,
+            columns,
             max_abs_error = errors.max_abs,
             rmse = errors.rmse,
             max_error_limit,
             "randomized FP16/16 GEMM passed"
         );
     } else {
-        info!(dimension, "skipped FP16 GEMM host reference");
+        info!(
+            rows,
+            inner_dimension, columns, "skipped FP16 GEMM host reference"
+        );
     }
     let _ = fs::remove_dir_all(artifact_dir);
 }
@@ -367,7 +379,9 @@ struct ErrorStatistics {
 }
 
 fn verify_output(
-    dimension: u16,
+    rows: u16,
+    inner_dimension: u16,
+    columns: u16,
     actual: &[u8],
     placements: &[ipu_compiler::BlockPlacement],
     left: &[f32],
@@ -375,7 +389,7 @@ fn verify_output(
     max_error_limit: f32,
 ) -> ipu_runtime::Result<ErrorStatistics> {
     let actual = actual
-        .get(..usize::from(dimension).pow(2) * 2)
+        .get(..usize::from(rows) * usize::from(columns) * 2)
         .ok_or("FP16 GEMM output is shorter than the matrix")?;
     let mut offset = 0usize;
     let mut max_abs = 0.0f32;
@@ -395,10 +409,10 @@ fn verify_output(
                 actual[offset..offset + 2].try_into().unwrap(),
             ))
             .to_f32();
-            let expected = (0..dimension)
+            let expected = (0..inner_dimension)
                 .map(|inner| {
-                    left[matrix_index(dimension, row, inner)]
-                        * right[matrix_index(dimension, inner, column)]
+                    left[matrix_index(inner_dimension, row, inner)]
+                        * right[matrix_index(columns, inner, column)]
                 })
                 .sum::<f32>();
             if !observed.is_finite() {
@@ -422,7 +436,7 @@ fn verify_output(
     }
     Ok(ErrorStatistics {
         max_abs,
-        rmse: (squared_error / (f64::from(dimension) * f64::from(dimension))).sqrt() as f32,
+        rmse: (squared_error / (f64::from(rows) * f64::from(columns))).sqrt() as f32,
     })
 }
 
