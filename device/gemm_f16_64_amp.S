@@ -177,7 +177,7 @@
 #endif
 	.endm
 
-	.macro GEMM_SUPERVISOR name, initial, rows, worker, retained_worker
+	.macro GEMM_SUPERVISOR name, initial, rows, worker, retained_output_worker, retained_inner_worker
 	.section .text.\name,"ax",@progbits
 	.globl \name
 	.p2align 2
@@ -232,7 +232,9 @@
 	setzi $m0, \worker
 	or $m8, $m6, $m7
 	brz $m8, .Lrun_workers_\@
-	setzi $m0, \retained_worker
+	setzi $m0, \retained_output_worker
+	brz $m7, .Lrun_workers_\@
+	setzi $m0, \retained_inner_worker
 .Lrun_workers_\@:
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
@@ -252,22 +254,22 @@
 	.endm
 
 #ifdef GEMM_SINGLE_ROWS
-	GEMM_SUPERVISOR GEMM_INIT_SMALL_SYMBOL, 1, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained
-	GEMM_SUPERVISOR GEMM_ACCUMULATE_SMALL_SYMBOL, 0, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained
+	GEMM_SUPERVISOR GEMM_INIT_SMALL_SYMBOL, 1, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained_output, .Lgemm_f16_amp_worker_small_retained_inner
+	GEMM_SUPERVISOR GEMM_ACCUMULATE_SMALL_SYMBOL, 0, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained_output, .Lgemm_f16_amp_worker_small_retained_inner
 #else
-	GEMM_SUPERVISOR GEMM_INIT_SMALL_SYMBOL, 1, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained
-	GEMM_SUPERVISOR GEMM_INIT_LARGE_SYMBOL, 1, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large, .Lgemm_f16_amp_worker_large_retained
-	GEMM_SUPERVISOR GEMM_ACCUMULATE_SMALL_SYMBOL, 0, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained
-	GEMM_SUPERVISOR GEMM_ACCUMULATE_LARGE_SYMBOL, 0, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large, .Lgemm_f16_amp_worker_large_retained
+	GEMM_SUPERVISOR GEMM_INIT_SMALL_SYMBOL, 1, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained_output, .Lgemm_f16_amp_worker_small_retained_inner
+	GEMM_SUPERVISOR GEMM_INIT_LARGE_SYMBOL, 1, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large, .Lgemm_f16_amp_worker_large_retained_output, .Lgemm_f16_amp_worker_large_retained_inner
+	GEMM_SUPERVISOR GEMM_ACCUMULATE_SMALL_SYMBOL, 0, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained_output, .Lgemm_f16_amp_worker_small_retained_inner
+	GEMM_SUPERVISOR GEMM_ACCUMULATE_LARGE_SYMBOL, 0, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large, .Lgemm_f16_amp_worker_large_retained_output, .Lgemm_f16_amp_worker_large_retained_inner
 #endif
 
 	.worker
-	.macro GEMM_WORKER name, retained_name, rows
+	.macro GEMM_WORKER name, retained_output_name, retained_inner_name, rows
 	.p2align 3
 \name:
 	PARTITION_ROWS \rows
 	shl $m6, $m6, 5
-\retained_name:
+\retained_output_name:
 	brz $m5, .Lgemm_f16_no_rows_\@
 	ld32 $m0, $mvertex_base, $m15, 0
 	ld32 $m1, $mvertex_base, $m15, 1
@@ -275,6 +277,12 @@
 	add $m2, $m1, $m6
 	add $m3, $m9, 32
 	add $m8, $m5, -1
+	bri .Lgemm_f16_load_mode_\@
+\retained_inner_name:
+	brz $m5, .Lgemm_f16_no_rows_\@
+	ld32 $m1, $mvertex_base, $m15, 1
+	add $m2, $m1, $m6
+.Lgemm_f16_load_mode_\@:
 	ld32 $m7, $mvertex_base, $m15, 5
 	brz $m7, .Lf16_accumulate_\@
 
@@ -413,7 +421,7 @@
 	exitz $mzero
 	.endm
 
-	GEMM_WORKER .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained, GEMM_SMALL_ROWS
+	GEMM_WORKER .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained_output, .Lgemm_f16_amp_worker_small_retained_inner, GEMM_SMALL_ROWS
 #ifndef GEMM_SINGLE_ROWS
-	GEMM_WORKER .Lgemm_f16_amp_worker_large, .Lgemm_f16_amp_worker_large_retained, GEMM_LARGE_ROWS
+	GEMM_WORKER .Lgemm_f16_amp_worker_large, .Lgemm_f16_amp_worker_large_retained_output, .Lgemm_f16_amp_worker_large_retained_inner, GEMM_LARGE_ROWS
 #endif
