@@ -2580,6 +2580,7 @@ fn package_graph_impl_attempt(
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
         let runtime_end = plans.end;
+        let fixed_allocations = fixed_allocation_ranges_for_tile(graph, tile)?;
         let mut records = plans
             .templates
             .iter()
@@ -2650,54 +2651,14 @@ fn package_graph_impl_attempt(
                 .chain(host_executable_placements[tile_index].2.iter().copied())
                 .chain(std::iter::once(image_executable_elements[tile_index]))
                 .collect::<Vec<_>>();
-            let address = match data_region_base_for_tile(
-                &allocation_ranges_by_tile[usize::from(tile)],
+            let address = data_region_base_for_tile(
+                &fixed_allocations,
                 tile,
                 runtime_end,
                 size,
                 4,
                 &reserved,
-            ) {
-                Ok(address) => address,
-                Err(error) if can_relower => {
-                    let fixed = fixed_allocation_ranges_for_tile(graph, tile)?;
-                    let desired =
-                        data_region_base_for_tile(&fixed, tile, runtime_end, size, 4, &reserved)?;
-                    let mut reservations = static_relocation_reservations.clone();
-                    reservations[usize::from(tile)].push((
-                        desired,
-                        desired
-                            .checked_add(size)
-                            .ok_or("static relocation reservation overflow")?,
-                    ));
-                    let mut relocated_graph = graph.clone();
-                    let moved = relocate_transient_allocations_around(
-                        &mut relocated_graph,
-                        &topology,
-                        &reservations,
-                        1,
-                        "static runtime placement",
-                    )?;
-                    if moved == 0 {
-                        return Err(error);
-                    }
-                    info!(
-                        tile,
-                        size, desired, moved, "reserved static runtime interval"
-                    );
-                    return package_graph_impl_attempt(
-                        &relocated_graph,
-                        objects,
-                        profile_code,
-                        None,
-                        template_regions,
-                        invocations,
-                        false,
-                        reservations,
-                    );
-                }
-                Err(error) => return Err(error),
-            };
+            )?;
             let end = address
                 .checked_add(size)
                 .ok_or("static template record address overflow")?;
@@ -2718,6 +2679,52 @@ fn package_graph_impl_attempt(
                 }
             }
             template_record_ranges[tile_index].push((address, end));
+        }
+    }
+    if can_relower {
+        let overlaps_transient_home = graph.schedule.allocations.iter().any(|allocation| {
+            matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
+                && allocation.live_until != usize::MAX
+                && template_record_ranges[usize::from(allocation.tile)]
+                    .iter()
+                    .any(|&(start, end)| {
+                        ranges_overlap(
+                            allocation.address,
+                            allocation.address.saturating_add(allocation.size),
+                            start,
+                            end,
+                        )
+                    })
+        });
+        if overlaps_transient_home {
+            let mut reservations = static_relocation_reservations;
+            for (reserved, templates) in reservations.iter_mut().zip(&template_record_ranges) {
+                reserved.extend_from_slice(templates);
+                reserved.sort_unstable();
+                reserved.dedup();
+            }
+            let mut relocated_graph = graph.clone();
+            let moved = relocate_transient_allocations_around(
+                &mut relocated_graph,
+                &topology,
+                &reservations,
+                1,
+                "static runtime placement",
+            )?;
+            if moved == 0 {
+                return Err("static runtime reservations overlap no relocatable homes".into());
+            }
+            info!(moved, "reserved complete static runtime layout");
+            return package_graph_impl_attempt(
+                &relocated_graph,
+                objects,
+                profile_code,
+                None,
+                template_regions,
+                invocations,
+                false,
+                reservations,
+            );
         }
     }
     let mut host_runtime_ranges = Vec::with_capacity(tile_host_plans.len());
