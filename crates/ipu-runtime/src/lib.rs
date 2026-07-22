@@ -851,22 +851,32 @@ fn repack_transient_allocations_around(
                     .map(|&(_, start, end)| (start, end))
                     .collect::<Vec<_>>();
                 occupied.sort_unstable();
-                let region = if allocation.address < ipu_package::IPU21_INTERLEAVED_MEMORY_BASE {
-                    ipu_compiler::Ipu21MemoryRegion::OrdinaryLow
-                } else if allocation.address < ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT {
-                    ipu_compiler::Ipu21MemoryRegion::Interleaved
+                let regions: &[_] = if (ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                    ..ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT)
+                    .contains(&allocation.address)
+                {
+                    &[ipu_compiler::Ipu21MemoryRegion::Interleaved]
                 } else {
-                    ipu_compiler::Ipu21MemoryRegion::OrdinaryHigh
+                    &[
+                        ipu_compiler::Ipu21MemoryRegion::OrdinaryLow,
+                        ipu_compiler::Ipu21MemoryRegion::OrdinaryHigh,
+                    ]
                 };
-                let arena = [region.arena(
-                    ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
-                    ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-                    ipu_compiler::MemoryPlacement::Low,
-                )];
+                let arenas = regions
+                    .iter()
+                    .map(|region| {
+                        region.arena(
+                            ipu_exchange::EXCHANGE_WINDOW_BASE
+                                + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+                            ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                            ipu_compiler::MemoryPlacement::Low,
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 let address = ipu_compiler::allocate_from_occupied_arenas(
                     &mut occupied,
                     allocation.size,
-                    &arena,
+                    &arenas,
                     32,
                 )
                 .map_err(|error| {
