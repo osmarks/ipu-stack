@@ -212,13 +212,16 @@ fn data_region_base_for_tile(
             .chain(additional_reserved.iter().copied()),
     );
     let gaps = space.free_regions(1);
-    if let Some(address) = gaps.iter().find_map(|&(start, end)| {
-        let address = align_up(start, alignment);
-        address
-            .checked_add(required_size)
-            .filter(|&candidate_end| candidate_end <= end)
-            .map(|_| address)
-    }) {
+    if let Some(address) = gaps
+        .iter()
+        .filter_map(|&(start, end)| {
+            let address = align_up(start, alignment);
+            let remaining = end.checked_sub(address.checked_add(required_size)?)?;
+            Some((address, remaining))
+        })
+        .min_by_key(|&(_, remaining)| remaining)
+        .map(|(address, _)| address)
+    {
         return Ok(address);
     }
     let free_bytes = gaps.iter().map(|(start, end)| end - start).sum::<u32>();
