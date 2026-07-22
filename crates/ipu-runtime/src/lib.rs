@@ -179,6 +179,7 @@ fn executable_regions_for_tile(
     Ok(space.free_regions(element_size))
 }
 
+#[cfg(test)]
 fn data_region_base_for_tile(
     allocation_ranges: &[(u32, u32)],
     tile: u16,
@@ -234,6 +235,82 @@ fn data_region_base_for_tile(
         "no tile-memory interval can hold {required_size} bytes of static data on tile {tile}: {free_bytes} free bytes, {largest_gap}-byte largest gap"
     )
     .into())
+}
+
+fn data_region_base_with_relocation_cost(
+    allocation_ranges: &[(u32, u32)],
+    tile: u16,
+    runtime_end: u32,
+    required_size: u32,
+    alignment: u32,
+    additional_reserved: &[(u32, u32)],
+    relocation_cost: &RelocationCostIndex,
+) -> Result<u32> {
+    if required_size == 0 || !alignment.is_power_of_two() {
+        return Err("data region size must be nonzero and alignment must be a power of two".into());
+    }
+    let memory_end = ipu_package::TILE_MEMORY_BASE
+        .checked_add(ipu_package::TILE_MEMORY_SIZE)
+        .ok_or("tile memory range overflow")?;
+    let mut space = placement::AddressSpace::new(ipu_package::TILE_MEMORY_BASE..memory_end);
+    space.reserve_all(
+        [
+            (
+                ipu_package::TILE_MEMORY_BASE,
+                ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES,
+            ),
+            (
+                ipu_exchange::EXCHANGE_WINDOW_BASE,
+                ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+            ),
+            (PLAN_BASE, runtime_end),
+        ]
+        .into_iter()
+        .chain(allocation_ranges.iter().copied())
+        .chain(additional_reserved.iter().copied()),
+    );
+    let gaps = space.free_regions(1);
+    let mut best = None::<(u64, u32, u32)>;
+    for &(gap_start, gap_end) in &gaps {
+        let mut candidates = vec![align_up(gap_start, alignment)];
+        for &boundary in &relocation_cost.boundaries {
+            candidates.push(align_up(boundary, alignment));
+            if let Some(start) = boundary.checked_sub(required_size) {
+                candidates.push(align_down(start, alignment));
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        for address in candidates {
+            let Some(end) = address.checked_add(required_size) else {
+                continue;
+            };
+            if address < gap_start || end > gap_end {
+                continue;
+            }
+            let candidate = (
+                relocation_cost.overlapping_bytes(address, end),
+                gap_end - end,
+                address,
+            );
+            if best.is_none_or(|current| candidate < current) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best.map(|(_, _, address)| address).ok_or_else(|| {
+        let free_bytes = gaps.iter().map(|(start, end)| end - start).sum::<u32>();
+        let largest_gap = gaps
+            .iter()
+            .map(|(start, end)| end - start)
+            .max()
+            .unwrap_or(0);
+        format!(
+            "no tile-memory interval can hold {required_size} bytes of static data on tile {tile}: \
+             {free_bytes} free bytes, {largest_gap}-byte largest gap"
+        )
+        .into()
+    })
 }
 
 fn pack_data_objects_for_tile(
@@ -440,7 +517,62 @@ fn allocation_range(allocation: &ipu_compiler::Allocation) -> Result<(u32, u32)>
     ))
 }
 
-fn fixed_allocation_ranges_by_tile(graph: &ExecutableGraph) -> Result<Vec<Vec<(u32, u32)>>> {
+#[derive(Default)]
+struct RelocationCostIndex {
+    starts: Vec<(u32, u64)>,
+    ends: Vec<(u32, u64)>,
+    boundaries: Vec<u32>,
+}
+
+impl RelocationCostIndex {
+    fn new(mut ranges: Vec<(u32, u32, u32)>) -> Self {
+        let mut boundaries = ranges
+            .iter()
+            .flat_map(|&(start, end, _)| [start, end])
+            .collect::<Vec<_>>();
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        ranges.sort_unstable_by_key(|&(start, _, _)| start);
+        let mut running = 0u64;
+        let starts = ranges
+            .iter()
+            .map(|&(start, _, size)| {
+                running += u64::from(size);
+                (start, running)
+            })
+            .collect();
+        ranges.sort_unstable_by_key(|&(_, end, _)| end);
+        running = 0;
+        let ends = ranges
+            .into_iter()
+            .map(|(_, end, size)| {
+                running += u64::from(size);
+                (end, running)
+            })
+            .collect();
+        Self {
+            starts,
+            ends,
+            boundaries,
+        }
+    }
+
+    fn overlapping_bytes(&self, start: u32, end: u32) -> u64 {
+        let started = self.starts.partition_point(|&(address, _)| address < end);
+        let ended = self.ends.partition_point(|&(address, _)| address <= start);
+        self.starts
+            .get(started.wrapping_sub(1))
+            .map_or(0, |&(_, sum)| sum)
+            - self
+                .ends
+                .get(ended.wrapping_sub(1))
+                .map_or(0, |&(_, sum)| sum)
+    }
+}
+
+fn allocation_placement_ranges_by_tile(
+    graph: &ExecutableGraph,
+) -> Result<(Vec<Vec<(u32, u32)>>, Vec<RelocationCostIndex>)> {
     let relocatable_homes = graph
         .schedule
         .allocations
@@ -452,6 +584,7 @@ fn fixed_allocation_ranges_by_tile(graph: &ExecutableGraph) -> Result<Vec<Vec<(u
         .map(|allocation| (allocation.tile, allocation.tensor))
         .collect::<HashSet<_>>();
     let mut ranges = vec![Vec::new(); usize::from(graph.schedule.tile_count)];
+    let mut relocation_ranges = vec![Vec::new(); usize::from(graph.schedule.tile_count)];
     for allocation in &graph.schedule.allocations {
         let relocatable = match allocation.kind {
             ipu_compiler::AllocationKind::Home => allocation.live_until != usize::MAX,
@@ -462,9 +595,18 @@ fn fixed_allocation_ranges_by_tile(graph: &ExecutableGraph) -> Result<Vec<Vec<(u
         };
         if !relocatable {
             ranges[usize::from(allocation.tile)].push(allocation_range(allocation)?);
+        } else if matches!(allocation.kind, ipu_compiler::AllocationKind::Home) {
+            let (start, end) = allocation_range(allocation)?;
+            relocation_ranges[usize::from(allocation.tile)].push((start, end, allocation.size));
         }
     }
-    Ok(ranges)
+    Ok((
+        ranges,
+        relocation_ranges
+            .into_iter()
+            .map(RelocationCostIndex::new)
+            .collect(),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -2597,7 +2739,7 @@ fn package_graph_impl_attempt(
         },
     }
     let mut template_record_ranges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); programs.len()];
-    let fixed_allocation_ranges = fixed_allocation_ranges_by_tile(graph)?;
+    let (fixed_allocation_ranges, relocation_costs) = allocation_placement_ranges_by_tile(graph)?;
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
         let runtime_end = plans.end;
@@ -2672,13 +2814,14 @@ fn package_graph_impl_attempt(
                 .chain(host_executable_placements[tile_index].2.iter().copied())
                 .chain(std::iter::once(image_executable_elements[tile_index]))
                 .collect::<Vec<_>>();
-            let address = data_region_base_for_tile(
+            let address = data_region_base_with_relocation_cost(
                 fixed_allocations,
                 tile,
                 runtime_end,
                 size,
                 4,
                 &reserved,
+                &relocation_costs[usize::from(tile)],
             )?;
             let end = address
                 .checked_add(size)
@@ -2703,6 +2846,7 @@ fn package_graph_impl_attempt(
         }
     }
     drop(fixed_allocation_ranges);
+    drop(relocation_costs);
     if can_relower {
         let overlaps_transient_home = graph.schedule.allocations.iter().any(|allocation| {
             matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
@@ -4630,6 +4774,17 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn relocation_cost_index_sums_overlapping_allocations() {
+        let index = RelocationCostIndex::new(vec![(10, 20, 100), (15, 25, 50)]);
+
+        assert_eq!(index.overlapping_bytes(0, 10), 0);
+        assert_eq!(index.overlapping_bytes(10, 15), 100);
+        assert_eq!(index.overlapping_bytes(14, 16), 150);
+        assert_eq!(index.overlapping_bytes(20, 21), 50);
+        assert_eq!(index.overlapping_bytes(25, 30), 0);
+    }
 
     #[test]
     fn measured_executable_relocation_updates_aliases_and_literal_addresses() {
