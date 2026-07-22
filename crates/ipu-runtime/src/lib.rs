@@ -8,7 +8,7 @@ use ipu_package::{
     TileMemory,
 };
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
@@ -2619,7 +2619,42 @@ fn package_graph_impl_attempt(
             })
             .map(allocation_range)
             .collect::<Result<Vec<_>>>()?;
+        let mut interned_patches = HashMap::<
+            (
+                usize,
+                usize,
+                Vec<(u16, static_codegen::StaticTemplatePatchValue)>,
+            ),
+            u32,
+        >::new();
         for (object, words) in records {
+            let patch_key = if let TemplateDataObject::Patch {
+                template,
+                instance,
+                part,
+            } = object
+            {
+                let plan = &plans.templates[template];
+                let record_words = plan.records.first().map_or(0, Vec::len);
+                let slots = static_codegen::template_patch_ranges(
+                    record_words,
+                    usize::from(plan.record_split),
+                )[part]
+                    .clone();
+                let values = plan.patches[instance]
+                    .iter()
+                    .filter(|(slot, _)| slots.contains(&usize::from(*slot)))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let key = (slots.start, slots.end, values);
+                if let Some(&address) = interned_patches.get(&key) {
+                    plans.templates[template].patch_addresses[instance][part] = address;
+                    continue;
+                }
+                Some(key)
+            } else {
+                None
+            };
             let size = u32::try_from(words)?
                 .checked_mul(4)
                 .ok_or("static template record size overflow")?;
@@ -2695,6 +2730,9 @@ fn package_graph_impl_attempt(
                 }
             }
             template_record_ranges[tile_index].push((address, end));
+            if let Some(key) = patch_key {
+                interned_patches.insert(key, address);
+            }
         }
     }
     let static_relocation_reservations = template_record_ranges
@@ -3371,6 +3409,7 @@ fn package_graph_impl_attempt(
             });
         }
         let mut template_segments = Vec::<(u32, Vec<u8>)>::new();
+        let mut written_patch_addresses = HashSet::new();
         for template in &tile_exchange_plans[tile_index].templates {
             let first_record = template.records.first().map(Vec::as_slice).unwrap_or(&[]);
             let split = usize::from(template.record_split);
@@ -3428,6 +3467,9 @@ fn package_graph_impl_attempt(
                     let address = template.patch_addresses[instance][part];
                     if static_codegen::template_patch_storage_words_range(slots.clone(), patch) == 0
                     {
+                        continue;
+                    }
+                    if !written_patch_addresses.insert(address) {
                         continue;
                     }
                     let mut words = Vec::new();

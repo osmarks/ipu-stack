@@ -147,7 +147,7 @@ pub(crate) enum StaticTemplateRecordWord {
     Symbol(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum StaticTemplatePatchValue {
     Delta(i16),
     Word(StaticTemplateRecordWord),
