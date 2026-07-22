@@ -186,7 +186,7 @@ pub(crate) fn template_patch_group_span(
     Some((first / 32 * 32)..((last + 1).div_ceil(32) * 32).min(slots.len()))
 }
 
-pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> [Range<usize>; 4] {
+pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> [Range<usize>; 8] {
     fn halves(range: Range<usize>) -> [Range<usize>; 2] {
         let local_midpoint = (range.len() / 2).div_ceil(32) * 32;
         let midpoint = range.start + local_midpoint.min(range.len());
@@ -194,12 +194,20 @@ pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> [Range
     }
 
     let [primary_first, primary_second] = halves(0..split);
+    let [primary_0, primary_1] = halves(primary_first);
+    let [primary_2, primary_3] = halves(primary_second);
     let [secondary_first, secondary_second] = halves(split..record_words);
+    let [secondary_0, secondary_1] = halves(secondary_first);
+    let [secondary_2, secondary_3] = halves(secondary_second);
     [
-        primary_first,
-        primary_second,
-        secondary_first,
-        secondary_second,
+        primary_0,
+        primary_1,
+        primary_2,
+        primary_3,
+        secondary_0,
+        secondary_1,
+        secondary_2,
+        secondary_3,
     ]
 }
 
@@ -1042,10 +1050,10 @@ pub(crate) fn emit(
                     .into_iter()
                     .enumerate()
                 {
-                    if template_patch_storage_words_range(slots, patch) == 0 {
+                    if template_patch_storage_words_range(slots.clone(), patch) == 0 {
                         continue;
                     }
-                    code.setzi(7, u32::from(part >= 2))?;
+                    code.setzi(7, u32::from(slots.start >= record_split))?;
                     code.setzi(3, template.patch_addresses[instance][part])?;
                     code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
                 }
@@ -1059,10 +1067,12 @@ pub(crate) fn emit(
                     .into_iter()
                     .enumerate()
                 {
-                    if template_patch_storage_words_range(slots, &template.patches[reset]) == 0 {
+                    if template_patch_storage_words_range(slots.clone(), &template.patches[reset])
+                        == 0
+                    {
                         continue;
                     }
-                    code.setzi(7, u32::from(part >= 2))?;
+                    code.setzi(7, u32::from(slots.start >= record_split))?;
                     code.setzi(3, template.patch_addresses[reset][part])?;
                     code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
                 }
@@ -1801,12 +1811,14 @@ mod tests {
         assert_eq!(template.records[0].len(), template.records[1].len());
         assert!(end > template.record_secondary_addresses[0]);
         assert_eq!(template.patch_addresses.len(), 3);
-        assert!(
-            template
-                .patch_addresses
-                .iter()
-                .all(|addresses| addresses.len() == 4)
-        );
+        assert!(template.patch_addresses.iter().all(|addresses| {
+            addresses.len()
+                == template_patch_ranges(
+                    template.records[0].len(),
+                    usize::from(template.record_split),
+                )
+                .len()
+        }));
         assert!(template.patches[0].is_empty());
         for (patch, previous_record, expected_record) in [
             (
