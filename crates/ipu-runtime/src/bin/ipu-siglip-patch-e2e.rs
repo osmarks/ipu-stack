@@ -187,7 +187,7 @@ fn main() {
     let tuning = SiglipEncoderTuning {
         gemm_row_block_rows: u16::try_from(env_u32("IPU_SIGLIP_GEMM_ROW_BLOCK_ROWS", 0))
             .expect("GEMM row block rows exceed u16"),
-        automatic_gemm_row_blocks: env_u32("IPU_SIGLIP_AUTOMATIC_GEMM_ROW_BLOCKS", 0) != 0,
+        automatic_gemm_row_blocks: env_u32("IPU_SIGLIP_AUTOMATIC_GEMM_ROW_BLOCKS", 1) != 0,
         row_gemm_inner_block_columns: u16::try_from(env_u32(
             "IPU_SIGLIP_ROW_GEMM_INNER_BLOCK_COLUMNS",
             0,

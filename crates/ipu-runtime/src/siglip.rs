@@ -274,7 +274,7 @@ pub struct SiglipEncoderPrecision {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SiglipEncoderTuning {
-    /// Zero keeps GEMM row blocks equal to the persistent activation layout.
+    /// Zero uses automatic or persistent row blocking according to the mode below.
     pub gemm_row_block_rows: u16,
     /// Choose row blocking independently for GEMMs whose inputs can be reblocked.
     pub automatic_gemm_row_blocks: bool,
@@ -1001,7 +1001,7 @@ pub fn append_siglip_encoder_layer_with_precision(
     let qkv_shards = (0..3)
         .map(|projection| {
             let blocks = projection_blocks(&qkv.output, projection, columns);
-            if qkv_row_block_dimension == row_block_dimension {
+            if qkv_row_block_dimension == row_block_dimension || tuning.automatic_gemm_row_blocks {
                 append_c16_to_a16_row_shards(
                     schedule,
                     &blocks,
@@ -1037,7 +1037,11 @@ pub fn append_siglip_encoder_layer_with_precision(
             sequence_length: rows,
             hidden_size: columns,
             attention_heads: u16::try_from(config.num_attention_heads)?,
-            query_block_rows: 0,
+            query_block_rows: if tuning.automatic_gemm_row_blocks {
+                row_block_dimension
+            } else {
+                0
+            },
             key_block_rows: tuning.attention_key_block_rows,
             tile_count,
             data_base,
