@@ -14,6 +14,7 @@ use ipu_exchange::{
 
 mod attention;
 mod mlp;
+mod placement;
 mod rowwise;
 pub use attention::{
     AttentionKeyValuePlacement, AttentionTaskPlacement, FlashAttentionConfig, FlashAttentionPlan,
@@ -22,6 +23,7 @@ pub use attention::{
     plan_flash_attention,
 };
 pub use mlp::{BlockedMlpConfig, BlockedMlpPlan, plan_blocked_mlp};
+use placement::{WindowRequirement, partition_address_window};
 pub use rowwise::{
     AffineLayerNormConfig, AffineLayerNormPlan, AppendAffineLayerNormConfig,
     AppendedAffineLayerNorm, RowShardPlacement, RowShardTransitionConfig,
@@ -1415,33 +1417,30 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
     }
     type InputFragment<'a> = (&'a RowShardPlacement, u16, u16, u16);
     let first_compute_phase = schedule.phases.len() + 1;
-    let mut pending = (0..plan.left.len()).collect::<Vec<_>>();
-    while !pending.is_empty() {
-        let exchange_phase = schedule.phases.len();
-        let compute_phase = exchange_phase + 1;
-        let mut selection_cursors =
-            vec![ipu_exchange::EXCHANGE_WINDOW_BASE; usize::from(config.tile_count)];
-        let mut selected = Vec::<(usize, Vec<InputFragment<'_>>, bool)>::new();
-        let mut deferred = Vec::new();
-        for block_index in pending {
-            let block = &plan.left[block_index];
+    let placements = plan
+        .left
+        .iter()
+        .map(|block| {
             let row_end = block.row_start + block.rows;
-            let mut fragments = Vec::new();
-            let mut covered = 0u16;
-            for shard in input {
-                let overlap_start = block.row_start.max(shard.row_start);
-                let overlap_end = row_end.min(shard.row_start + shard.rows);
-                if overlap_start < overlap_end {
-                    let copy_rows = overlap_end - overlap_start;
-                    fragments.push((
-                        shard,
-                        overlap_start - shard.row_start,
-                        overlap_start - block.row_start,
-                        copy_rows,
-                    ));
-                    covered += copy_rows;
-                }
-            }
+            let fragments = input
+                .iter()
+                .filter_map(|shard| {
+                    let overlap_start = block.row_start.max(shard.row_start);
+                    let overlap_end = row_end.min(shard.row_start + shard.rows);
+                    (overlap_start < overlap_end).then(|| {
+                        (
+                            shard,
+                            overlap_start - shard.row_start,
+                            overlap_start - block.row_start,
+                            overlap_end - overlap_start,
+                        )
+                    })
+                })
+                .collect::<Vec<InputFragment<'_>>>();
+            let covered = fragments
+                .iter()
+                .map(|(_, _, _, copy_rows)| *copy_rows)
+                .sum::<u16>();
             if covered != block.rows {
                 return Err(CompileError::Graph(format!(
                     "GEMM row block {}..{} has only {covered} A16 source rows",
@@ -1453,46 +1452,47 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
                 && fragments[0].2 == 0
                 && fragments[0].3 == block.rows
                 && fragments[0].0.rows == block.rows;
-            let cursor = &mut selection_cursors[usize::from(block.tile)];
-            let mut candidate_cursor = *cursor;
-            for (shard, _, _, copy_rows) in &fragments {
-                if shard.tile == block.tile {
-                    continue;
-                }
-                let panel_count = block.columns / 16;
-                let panel_stride = u32::from(shard.rows) * 32;
-                let source_bytes =
-                    u32::from(panel_count - 1) * panel_stride + u32::from(*copy_rows) * 32;
-                candidate_cursor = align_u32(
-                    candidate_cursor.checked_add(source_bytes).ok_or_else(|| {
-                        CompileError::Memory("A16 staging address overflow".into())
-                    })?,
-                    32,
-                );
-            }
-            if candidate_cursor
-                > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES
-            {
-                deferred.push(block_index);
-            } else {
-                *cursor = candidate_cursor;
-                selected.push((block_index, fragments, exact));
-            }
-        }
-        if selected.is_empty() {
-            let block = &plan.left[deferred[0]];
-            return Err(CompileError::Memory(format!(
-                "one A16 GEMM input block on tile {} exceeds the exchange window",
-                block.tile
-            )));
-        }
+            Ok((fragments, exact))
+        })
+        .collect::<Result<Vec<_>, CompileError>>()?;
+    let requirements = plan
+        .left
+        .iter()
+        .zip(&placements)
+        .map(|(block, (fragments, _))| WindowRequirement {
+            tile: block.tile,
+            regions: fragments
+                .iter()
+                .filter(|(shard, ..)| shard.tile != block.tile)
+                .map(|(shard, _, _, copy_rows)| {
+                    let panel_count = block.columns / 16;
+                    let panel_stride = u32::from(shard.rows) * 32;
+                    u32::from(panel_count - 1) * panel_stride + u32::from(*copy_rows) * 32
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let placement_passes = partition_address_window(
+        &requirements,
+        config.tile_count,
+        ipu_exchange::EXCHANGE_WINDOW_BASE,
+        ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+        32,
+    )?;
+    for selected in placement_passes {
+        let exchange_phase = schedule.phases.len();
+        let compute_phase = exchange_phase + 1;
         let mut transfers = Vec::with_capacity(selected.len());
         let mut commands = Vec::with_capacity(selected.len());
         let mut staging_cursors =
             vec![ipu_exchange::EXCHANGE_WINDOW_BASE; usize::from(config.tile_count)];
-        for (block_index, fragments, exact) in selected {
+        for block_index in selected {
             let block = &plan.left[block_index];
-            for (shard, source_row_start, destination_row_start, copy_rows) in fragments {
+            let (fragments, exact) = &placements[block_index];
+            let exact = *exact;
+            for (shard, source_row_start, destination_row_start, copy_rows) in
+                fragments.iter().copied()
+            {
                 let panel_count = block.columns / 16;
                 let panel_stride = u32::from(shard.rows) * 32;
                 let source_bytes =
@@ -1612,7 +1612,6 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
             op: OpId(compute_phase),
             commands,
         });
-        pending = deferred;
     }
     prepare_appended_gemm_lifetimes(&mut plan);
     let left_tensors = plan
@@ -1699,161 +1698,201 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
         .max()
         .unwrap_or(tensor_base)
         + 1;
-    let exchange_phase = schedule.phases.len();
-    let compute_phase = exchange_phase + 1;
-    let mut transfers = Vec::with_capacity(plan.left.len());
-    let mut commands = Vec::with_capacity(plan.left.len());
-    let mut staging_cursors =
-        vec![ipu_exchange::EXCHANGE_WINDOW_BASE; usize::from(config.tile_count)];
-    for destination in &plan.left {
-        let row_end = destination.row_start + destination.rows;
-        let mut fragments = input
-            .iter()
-            .filter_map(|source| {
-                if source.column_start != destination.column_start
-                    || source.columns != destination.columns
-                {
-                    return None;
-                }
-                let overlap_start = destination.row_start.max(source.row_start);
-                let overlap_end = row_end.min(source.row_start + source.rows);
-                (overlap_start < overlap_end).then(|| {
-                    (
-                        source,
-                        overlap_start - source.row_start,
-                        overlap_start - destination.row_start,
-                        overlap_end - overlap_start,
-                    )
+    type InputFragment<'a> = (&'a BlockPlacement, u16, u16, u16);
+    let first_compute_phase = schedule.phases.len() + 1;
+    let placements = plan
+        .left
+        .iter()
+        .map(|destination| {
+            let row_end = destination.row_start + destination.rows;
+            let mut fragments = input
+                .iter()
+                .filter_map(|source| {
+                    if source.column_start != destination.column_start
+                        || source.columns != destination.columns
+                    {
+                        return None;
+                    }
+                    let overlap_start = destination.row_start.max(source.row_start);
+                    let overlap_end = row_end.min(source.row_start + source.rows);
+                    (overlap_start < overlap_end).then(|| {
+                        (
+                            source,
+                            overlap_start - source.row_start,
+                            overlap_start - destination.row_start,
+                            overlap_end - overlap_start,
+                        )
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        fragments.sort_unstable_by_key(|(_, _, destination_row, _)| *destination_row);
-        let covered = fragments.iter().map(|(_, _, _, rows)| *rows).sum::<u16>();
-        if covered != destination.rows {
-            return Err(CompileError::Graph(format!(
-                "GEMM input block ({}, {}) has only {covered} source rows",
-                destination.block_row, destination.block_column
-            )));
-        }
-        let exact = fragments.len() == 1
-            && fragments[0].1 == 0
-            && fragments[0].2 == 0
-            && fragments[0].3 == destination.rows
-            && fragments[0].0.rows == destination.rows;
-        for (source, source_row_start, destination_row_start, copy_rows) in fragments {
-            let panel_count = source.columns / 16;
-            let panel_stride = u32::from(source.rows) * 32;
-            let source_bytes =
-                u32::from(panel_count - 1) * panel_stride + u32::from(copy_rows) * 32;
-            let source_alias = TensorId(next_tensor);
-            next_tensor += 1;
-            schedule.allocations.push(Allocation {
-                tensor: source_alias,
-                tile: source.tile,
-                address: source.address + u32::from(source_row_start) * 32,
-                size: source_bytes,
-                live_from: exchange_phase,
-                live_until: compute_phase + 1,
-                kind: AllocationKind::HomeAlias {
-                    source: source.tensor,
-                },
-            });
-            if source.tile != destination.tile {
-                let cursor = &mut staging_cursors[usize::from(destination.tile)];
-                let staging_address = *cursor;
-                *cursor = align_u32(
-                    cursor.checked_add(source_bytes).ok_or_else(|| {
-                        CompileError::Memory("A16 staging address overflow".into())
-                    })?,
-                    32,
-                );
-                if *cursor
-                    > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES
-                {
-                    return Err(CompileError::Memory(format!(
-                        "distributed A16 GEMM input staging exhausts tile {} exchange window",
-                        destination.tile
-                    )));
-                }
-                transfers.push(Transfer {
-                    source_tile: source.tile,
-                    destination_tile: destination.tile,
-                    tensor: source_alias,
-                    bytes: source_bytes,
-                });
+                .collect::<Vec<InputFragment<'_>>>();
+            fragments.sort_unstable_by_key(|(_, _, destination_row, _)| *destination_row);
+            let covered = fragments.iter().map(|(_, _, _, rows)| *rows).sum::<u16>();
+            if covered != destination.rows {
+                return Err(CompileError::Graph(format!(
+                    "GEMM input block ({}, {}) has only {covered} source rows",
+                    destination.block_row, destination.block_column
+                )));
+            }
+            let exact = fragments.len() == 1
+                && fragments[0].1 == 0
+                && fragments[0].2 == 0
+                && fragments[0].3 == destination.rows
+                && fragments[0].0.rows == destination.rows;
+            Ok((fragments, exact))
+        })
+        .collect::<Result<Vec<_>, CompileError>>()?;
+    let requirements = plan
+        .left
+        .iter()
+        .zip(&placements)
+        .map(|(destination, (fragments, _))| WindowRequirement {
+            tile: destination.tile,
+            regions: fragments
+                .iter()
+                .filter(|(source, ..)| source.tile != destination.tile)
+                .map(|(source, _, _, copy_rows)| {
+                    let panel_count = source.columns / 16;
+                    let panel_stride = u32::from(source.rows) * 32;
+                    u32::from(panel_count - 1) * panel_stride + u32::from(*copy_rows) * 32
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let placement_passes = partition_address_window(
+        &requirements,
+        config.tile_count,
+        ipu_exchange::EXCHANGE_WINDOW_BASE,
+        ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+        32,
+    )?;
+    for selected in placement_passes {
+        let exchange_phase = schedule.phases.len();
+        let compute_phase = exchange_phase + 1;
+        let mut transfers = Vec::with_capacity(selected.len());
+        let mut commands = Vec::with_capacity(selected.len());
+        let mut staging_cursors =
+            vec![ipu_exchange::EXCHANGE_WINDOW_BASE; usize::from(config.tile_count)];
+        for destination_index in selected {
+            let destination = &plan.left[destination_index];
+            let (fragments, exact) = &placements[destination_index];
+            let exact = *exact;
+            for (source, source_row_start, destination_row_start, copy_rows) in
+                fragments.iter().copied()
+            {
+                let panel_count = source.columns / 16;
+                let panel_stride = u32::from(source.rows) * 32;
+                let source_bytes =
+                    u32::from(panel_count - 1) * panel_stride + u32::from(copy_rows) * 32;
+                let source_alias = TensorId(next_tensor);
+                next_tensor += 1;
                 schedule.allocations.push(Allocation {
                     tensor: source_alias,
-                    tile: destination.tile,
-                    address: staging_address,
+                    tile: source.tile,
+                    address: source.address + u32::from(source_row_start) * 32,
                     size: source_bytes,
                     live_from: exchange_phase,
-                    live_until: compute_phase,
-                    kind: AllocationKind::ExchangeStaging {
-                        phase: exchange_phase,
+                    live_until: compute_phase + 1,
+                    kind: AllocationKind::HomeAlias {
+                        source: source.tensor,
                     },
                 });
+                if source.tile != destination.tile {
+                    let cursor = &mut staging_cursors[usize::from(destination.tile)];
+                    let staging_address = *cursor;
+                    *cursor = align_u32(
+                        cursor.checked_add(source_bytes).ok_or_else(|| {
+                            CompileError::Memory("A16 staging address overflow".into())
+                        })?,
+                        32,
+                    );
+                    if *cursor
+                        > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES
+                    {
+                        return Err(CompileError::Memory(format!(
+                            "distributed A16 GEMM input staging exhausts tile {} exchange window",
+                            destination.tile
+                        )));
+                    }
+                    transfers.push(Transfer {
+                        source_tile: source.tile,
+                        destination_tile: destination.tile,
+                        tensor: source_alias,
+                        bytes: source_bytes,
+                    });
+                    schedule.allocations.push(Allocation {
+                        tensor: source_alias,
+                        tile: destination.tile,
+                        address: staging_address,
+                        size: source_bytes,
+                        live_from: exchange_phase,
+                        live_until: compute_phase,
+                        kind: AllocationKind::ExchangeStaging {
+                            phase: exchange_phase,
+                        },
+                    });
+                }
+                let input_scale = config.data_type.input_scale();
+                let units = source_bytes / 8;
+                commands.push(KernelCommand {
+                    tile: destination.tile,
+                    output: destination.tensor,
+                    inputs: vec![source_alias, source_alias],
+                    arguments: match (exact, input_scale) {
+                        (true, Some(scale)) => vec![
+                            u32::from(destination.rows),
+                            u32::from(destination.columns),
+                            u32::from(scale as u8),
+                        ],
+                        (true, None) => vec![units, units / 6, units % 6],
+                        (false, Some(scale)) => vec![
+                            pack_reblock_row_pair(source.rows, destination.rows)?,
+                            pack_reblock_row_pair(0, destination_row_start)?,
+                            pack_a16_reblock_count(copy_rows, destination.columns, Some(scale))?,
+                        ],
+                        (false, None) => vec![
+                            pack_reblock_row_pair(source.rows, destination.rows)?,
+                            pack_reblock_row_pair(0, destination_row_start)?,
+                            pack_a16_reblock_count(copy_rows, destination.columns, None)?,
+                        ],
+                    },
+                    specialization: SpecializationKey {
+                        operation: match (exact, input_scale.is_some()) {
+                            (true, true) => "quantize_a16_to_a32_f143",
+                            (true, false) => "copy_u64",
+                            (false, true) => "quantize_reblock_a16_to_a32_f143",
+                            (false, false) => "reblock_f16_a16_to_a16",
+                        }
+                        .into(),
+                        shape: vec![
+                            usize::from(source.rows),
+                            usize::from(destination.rows),
+                            usize::from(copy_rows),
+                            usize::from(destination.columns),
+                        ],
+                        worker_count: 6,
+                        role: if input_scale.is_some() {
+                            "distributed A16 to native FP8 GEMM input placement"
+                        } else {
+                            "distributed A16 GEMM input placement"
+                        }
+                        .into(),
+                        alignment: if input_scale.is_some() { 16 } else { 8 },
+                    },
+                    metadata: BTreeMap::from([
+                        ("label".into(), "place distributed GEMM input".into()),
+                        ("row_start".into(), destination.row_start.to_string()),
+                        ("column_start".into(), destination.column_start.to_string()),
+                        ("copy_rows".into(), copy_rows.to_string()),
+                    ]),
+                });
             }
-            let input_scale = config.data_type.input_scale();
-            let units = source_bytes / 8;
-            commands.push(KernelCommand {
-                tile: destination.tile,
-                output: destination.tensor,
-                inputs: vec![source_alias, source_alias],
-                arguments: match (exact, input_scale) {
-                    (true, Some(scale)) => vec![
-                        u32::from(destination.rows),
-                        u32::from(destination.columns),
-                        u32::from(scale as u8),
-                    ],
-                    (true, None) => vec![units, units / 6, units % 6],
-                    (false, Some(scale)) => vec![
-                        pack_reblock_row_pair(source.rows, destination.rows)?,
-                        pack_reblock_row_pair(0, destination_row_start)?,
-                        pack_a16_reblock_count(copy_rows, destination.columns, Some(scale))?,
-                    ],
-                    (false, None) => vec![
-                        pack_reblock_row_pair(source.rows, destination.rows)?,
-                        pack_reblock_row_pair(0, destination_row_start)?,
-                        pack_a16_reblock_count(copy_rows, destination.columns, None)?,
-                    ],
-                },
-                specialization: SpecializationKey {
-                    operation: match (exact, input_scale.is_some()) {
-                        (true, true) => "quantize_a16_to_a32_f143",
-                        (true, false) => "copy_u64",
-                        (false, true) => "quantize_reblock_a16_to_a32_f143",
-                        (false, false) => "reblock_f16_a16_to_a16",
-                    }
-                    .into(),
-                    shape: vec![
-                        usize::from(source.rows),
-                        usize::from(destination.rows),
-                        usize::from(copy_rows),
-                        usize::from(destination.columns),
-                    ],
-                    worker_count: 6,
-                    role: if input_scale.is_some() {
-                        "distributed A16 to native FP8 GEMM input placement"
-                    } else {
-                        "distributed A16 GEMM input placement"
-                    }
-                    .into(),
-                    alignment: if input_scale.is_some() { 16 } else { 8 },
-                },
-                metadata: BTreeMap::from([
-                    ("label".into(), "place distributed GEMM input".into()),
-                    ("row_start".into(), destination.row_start.to_string()),
-                    ("column_start".into(), destination.column_start.to_string()),
-                    ("copy_rows".into(), copy_rows.to_string()),
-                ]),
-            });
         }
+        schedule.phases.push(Phase::Exchange { transfers });
+        schedule.phases.push(Phase::Compute {
+            op: OpId(compute_phase),
+            commands,
+        });
     }
-    schedule.phases.push(Phase::Exchange { transfers });
-    schedule.phases.push(Phase::Compute {
-        op: OpId(compute_phase),
-        commands,
-    });
     prepare_appended_gemm_lifetimes(&mut plan);
     let left_tensors = plan
         .left
@@ -1865,7 +1904,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
     set_appended_gemm_left_start(
         &mut schedule.allocations[allocation_base..],
         &left_tensors,
-        compute_phase,
+        first_compute_phase,
     );
     Ok(AppendedBlockedGemm {
         right: plan.right,
