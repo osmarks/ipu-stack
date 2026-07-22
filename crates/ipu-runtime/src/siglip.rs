@@ -280,6 +280,8 @@ pub struct SiglipEncoderTuning {
     pub automatic_gemm_row_blocks: bool,
     /// Zero uses 64-column K blocks for GEMMs with row-sharded inputs.
     pub row_gemm_inner_block_columns: u16,
+    /// Zero asks the attention planner to saturate the available tiles.
+    pub attention_query_block_rows: u16,
     /// Zero asks the attention planner to choose the K/V block size.
     pub attention_key_block_rows: u16,
 }
@@ -1037,11 +1039,7 @@ pub fn append_siglip_encoder_layer_with_precision(
             sequence_length: rows,
             hidden_size: columns,
             attention_heads: u16::try_from(config.num_attention_heads)?,
-            query_block_rows: if tuning.automatic_gemm_row_blocks {
-                row_block_dimension
-            } else {
-                0
-            },
+            query_block_rows: tuning.attention_query_block_rows,
             key_block_rows: tuning.attention_key_block_rows,
             tile_count,
             data_base,

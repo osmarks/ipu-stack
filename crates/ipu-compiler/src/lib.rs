@@ -1445,21 +1445,21 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
             && fragments[0].2 == 0
             && fragments[0].3 == block.rows
             && fragments[0].0.rows == block.rows;
-        if !exact && config.data_type.input_scale().is_some() {
-            return Err(CompileError::Graph(
-                "native FP8 GEMM input reblocking is not implemented".into(),
-            ));
-        }
         for (shard, source_row_start, destination_row_start, copy_rows) in fragments {
+            let panel_count = block.columns / 16;
+            let panel_stride = u32::from(shard.rows) * 32;
+            let source_bytes =
+                u32::from(panel_count - 1) * panel_stride + u32::from(copy_rows) * 32;
             let alias = TensorId(next_tensor);
             next_tensor += 1;
-            let address = shard.address + u32::from(block.column_start) * u32::from(shard.rows) * 2;
-            let bytes = u32::from(shard.rows) * u32::from(block.columns) * 2;
+            let address = shard.address
+                + u32::from(block.column_start) * u32::from(shard.rows) * 2
+                + u32::from(source_row_start) * 32;
             schedule.allocations.push(Allocation {
                 tensor: alias,
                 tile: shard.tile,
                 address,
-                size: bytes,
+                size: source_bytes,
                 live_from: exchange_phase,
                 live_until: compute_phase + 1,
                 kind: AllocationKind::HomeAlias {
@@ -1470,7 +1470,7 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
                 let cursor = &mut staging_cursors[usize::from(block.tile)];
                 let staging_address = *cursor;
                 *cursor = align_u32(
-                    cursor.checked_add(bytes).ok_or_else(|| {
+                    cursor.checked_add(source_bytes).ok_or_else(|| {
                         CompileError::Memory("A16 staging address overflow".into())
                     })?,
                     32,
@@ -1487,13 +1487,13 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
                     source_tile: shard.tile,
                     destination_tile: block.tile,
                     tensor: alias,
-                    bytes,
+                    bytes: source_bytes,
                 });
                 schedule.allocations.push(Allocation {
                     tensor: alias,
                     tile: block.tile,
                     address: staging_address,
-                    size: bytes,
+                    size: source_bytes,
                     live_from: exchange_phase,
                     live_until: compute_phase,
                     kind: AllocationKind::ExchangeStaging {
@@ -1501,36 +1501,36 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
                     },
                 });
             }
-            let units = bytes / 8;
+            let units = source_bytes / 8;
             let input_scale = config.data_type.input_scale();
             commands.push(KernelCommand {
                 tile: block.tile,
                 output: block.tensor,
                 inputs: vec![alias, alias],
-                arguments: if exact {
-                    input_scale
-                        .map(|scale| {
-                            vec![
-                                u32::from(block.rows),
-                                u32::from(block.columns),
-                                u32::from(scale as u8),
-                            ]
-                        })
-                        .unwrap_or_else(|| vec![units, units / 6, units % 6])
-                } else {
-                    vec![
+                arguments: match (exact, input_scale) {
+                    (true, Some(scale)) => vec![
+                        u32::from(block.rows),
+                        u32::from(block.columns),
+                        u32::from(scale as u8),
+                    ],
+                    (true, None) => vec![units, units / 6, units % 6],
+                    (false, Some(scale)) => vec![
                         pack_reblock_row_pair(shard.rows, block.rows)?,
-                        pack_reblock_row_pair(source_row_start, destination_row_start)?,
+                        pack_reblock_row_pair(0, destination_row_start)?,
+                        u32::from(copy_rows) | (u32::from((scale as u8) & 0x3f) << 10),
+                    ],
+                    (false, None) => vec![
+                        pack_reblock_row_pair(shard.rows, block.rows)?,
+                        pack_reblock_row_pair(0, destination_row_start)?,
                         u32::from(copy_rows),
-                    ]
+                    ],
                 },
                 specialization: SpecializationKey {
-                    operation: if exact {
-                        input_scale
-                            .map(|_| "quantize_a16_to_a32_f143")
-                            .unwrap_or("copy_u64")
-                    } else {
-                        "reblock_f16_a16_to_a16"
+                    operation: match (exact, input_scale.is_some()) {
+                        (true, true) => "quantize_a16_to_a32_f143",
+                        (true, false) => "copy_u64",
+                        (false, true) => "quantize_reblock_a16_to_a32_f143",
+                        (false, false) => "reblock_f16_a16_to_a16",
                     }
                     .into(),
                     shape: if exact {
@@ -1543,10 +1543,10 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
                         ]
                     },
                     worker_count: 6,
-                    role: if exact {
-                        "A16 GEMM input placement"
+                    role: if input_scale.is_some() {
+                        "row-sharded A16 to native FP8 GEMM input placement"
                     } else {
-                        "A16 GEMM input reblocking"
+                        "row-sharded A16 GEMM input placement"
                     }
                     .into(),
                     alignment: if input_scale.is_some() { 16 } else { 8 },
@@ -4608,64 +4608,82 @@ mod tests {
                 columns: 64,
             })
             .collect::<Vec<_>>();
-        let mut schedule = Schedule {
-            layouts: Vec::new(),
-            phases: Vec::new(),
-            allocations: input
-                .iter()
-                .map(|block| Allocation {
-                    tensor: block.tensor,
-                    tile: block.tile,
-                    address: block.address,
-                    size: u32::from(block.rows) * u32::from(block.columns) * 2,
-                    live_from: 0,
-                    live_until: usize::MAX,
-                    kind: AllocationKind::Home,
-                })
-                .collect(),
-            tile_count: 4,
-            peak_sram: BTreeMap::new(),
-        };
-
-        let appended = append_blocked_gemm_f16_with_a16_input(
-            &mut schedule,
-            &input,
-            BlockedGemmConfig {
-                rows: 30,
-                inner_dimension: 64,
-                columns: 64,
-                block_dimension: 64,
-                inner_block_dimension: 64,
-                row_block_dimension: 16,
+        for (data_type, expected_operation) in [
+            (GemmDataType::F16, "reblock_f16_a16_to_a16"),
+            (
+                GemmDataType::F8F143 {
+                    input_scale: -4,
+                    weight_scale: -7,
+                },
+                "quantize_reblock_a16_to_a32_f143",
+            ),
+        ] {
+            let mut schedule = Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: input
+                    .iter()
+                    .map(|block| Allocation {
+                        tensor: block.tensor,
+                        tile: block.tile,
+                        address: block.address,
+                        size: u32::from(block.rows) * u32::from(block.columns) * 2,
+                        live_from: 0,
+                        live_until: usize::MAX,
+                        kind: AllocationKind::Home,
+                    })
+                    .collect(),
                 tile_count: 4,
-                data_base: 0xb0000,
-                data_limit: 0xe8000,
-                data_type: GemmDataType::F16,
-                retain_profile_metadata: true,
-            },
-        )
-        .unwrap();
+                peak_sram: BTreeMap::new(),
+            };
 
-        assert_eq!(
-            appended.output.iter().map(|block| block.rows).sum::<u16>(),
-            30
-        );
-        let reblocks = schedule
-            .phases
-            .iter()
-            .filter_map(|phase| match phase {
-                Phase::Compute { commands, .. } => Some(commands),
-                Phase::Exchange { .. } => None,
-            })
-            .flatten()
-            .filter(|command| command.specialization.operation == "reblock_f16_a16_to_a16")
-            .collect::<Vec<_>>();
-        assert!(!reblocks.is_empty());
-        assert!(reblocks.iter().all(|command| command.arguments.len() == 3));
-        schedule.validate_allocations().unwrap();
-        schedule
-            .lower_tile_programs(&ipu_exchange::Topology::c600())
+            let appended = append_blocked_gemm_f16_with_a16_input(
+                &mut schedule,
+                &input,
+                BlockedGemmConfig {
+                    rows: 30,
+                    inner_dimension: 64,
+                    columns: 64,
+                    block_dimension: 64,
+                    inner_block_dimension: 64,
+                    row_block_dimension: 16,
+                    tile_count: 4,
+                    data_base: 0xb0000,
+                    data_limit: 0xe8000,
+                    data_type,
+                    retain_profile_metadata: true,
+                },
+            )
             .unwrap();
+
+            assert_eq!(
+                appended.output.iter().map(|block| block.rows).sum::<u16>(),
+                30
+            );
+            let reblocks = schedule
+                .phases
+                .iter()
+                .filter_map(|phase| match phase {
+                    Phase::Compute { commands, .. } => Some(commands),
+                    Phase::Exchange { .. } => None,
+                })
+                .flatten()
+                .filter(|command| command.specialization.operation == expected_operation)
+                .collect::<Vec<_>>();
+            assert!(!reblocks.is_empty());
+            assert!(reblocks.iter().all(|command| command.arguments.len() == 3));
+            assert_eq!(
+                reblocks
+                    .iter()
+                    .map(|command| command.metadata["copy_rows"].parse::<u16>().unwrap())
+                    .sum::<u16>(),
+                30
+            );
+            schedule.validate_allocations().unwrap();
+            schedule
+                .lower_tile_programs(&ipu_exchange::Topology::c600())
+                .unwrap();
+        }
     }
 
     #[test]

@@ -128,18 +128,10 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
             ));
         }
     }
-    // Preserve the row-shard contract consumed by downstream composed operators.
-    // K/V packing below can independently assemble the larger blocks selected by
-    // the attention cost model from any number of input shards.
-    let query_block_rows = if config.query_block_rows == 0 {
-        query.iter().map(|shard| shard.rows).max().unwrap()
-    } else {
-        config.query_block_rows
-    };
-    let mut plan = plan_flash_attention(FlashAttentionConfig {
-        query_block_rows,
-        ..config
-    })?;
+    // Query, key, and value packing can assemble attention blocks independently
+    // of the producer's row shards. Preserve zero so the attention planner can
+    // choose query blocking from the available tile count.
+    let mut plan = plan_flash_attention(config)?;
     relocate_appended_attention(schedule, &mut plan, arenas)?;
     let tensor_base = schedule
         .allocations
@@ -1613,7 +1605,14 @@ mod tests {
             append_flash_attention_to_a16_row_shards(&mut schedule, &plan, 0xc0000, 0xe8000)
                 .unwrap();
 
-        assert_eq!(plan.tasks.iter().map(|task| task.query_rows).max(), Some(6));
+        assert!(plan.tasks.len() <= usize::from(schedule.tile_count));
+        assert_eq!(
+            plan.tasks
+                .iter()
+                .map(|task| u32::from(task.query_rows))
+                .sum::<u32>(),
+            u32::from(row_start) * 4
+        );
         assert!(
             plan.key_values.iter().any(|block| block.key_rows > 6),
             "K/V blocks should be reassembled across source row shards"

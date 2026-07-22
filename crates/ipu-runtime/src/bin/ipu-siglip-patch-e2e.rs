@@ -193,6 +193,11 @@ fn main() {
             0,
         ))
         .expect("row-sharded GEMM inner block columns exceed u16"),
+        attention_query_block_rows: u16::try_from(env_u32(
+            "IPU_SIGLIP_ATTENTION_QUERY_BLOCK_ROWS",
+            0,
+        ))
+        .expect("attention query block rows exceed u16"),
         attention_key_block_rows: u16::try_from(env_u32("IPU_SIGLIP_ATTENTION_KEY_BLOCK_ROWS", 0))
             .expect("attention key block rows exceed u16"),
     };
