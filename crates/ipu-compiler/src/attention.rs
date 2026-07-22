@@ -779,16 +779,17 @@ pub fn plan_flash_attention(
     let head_count = usize::from(config.batch_size) * usize::from(config.attention_heads);
     const WORKER_COUNT: u16 = 6;
     let query_block_rows = if config.query_block_rows == 0 {
-        (WORKER_COUNT.min(query_sequence_length)..=query_sequence_length)
-            .find(|&rows| {
-                head_count * usize::from(query_sequence_length.div_ceil(rows))
-                    <= usize::from(config.tile_count)
-            })
-            .ok_or_else(|| {
-                CompileError::Graph(format!(
-                    "attention needs at least {head_count} tiles, one for each batch/head"
-                ))
-            })?
+        select_query_block_rows(
+            query_sequence_length,
+            head_count,
+            config.tile_count,
+            WORKER_COUNT,
+        )
+        .ok_or_else(|| {
+            CompileError::Graph(format!(
+                "attention needs at least {head_count} tiles, one for each batch/head"
+            ))
+        })?
     } else {
         config.query_block_rows
     }
@@ -811,7 +812,11 @@ pub fn plan_flash_attention(
             CompileError::Graph("one attention key row exceeds the exchange limit".into())
         })?;
     let key_block_rows = if config.key_block_rows == 0 {
-        select_key_block_rows(config.sequence_length, maximum_key_rows)
+        select_key_block_rows(
+            config.sequence_length,
+            maximum_key_rows,
+            padded_head_dimension,
+        )
     } else {
         config.key_block_rows
     }
@@ -1301,22 +1306,57 @@ fn matrix_storage_bytes(storage_rows: u16, padded_dimension: u16) -> u32 {
     u32::from(padded_dimension) * u32::from(storage_rows) * 2
 }
 
-fn select_key_block_rows(sequence_length: u16, maximum_rows: u16) -> u16 {
-    // The critical path trades fixed synchronization per block against packing
-    // and computing one padded block on a single owner tile. Two rows of block
-    // work per synchronization reflects the IPU21 launch/compute crossover;
-    // padding and the final tie-breakers keep the choice stable.
-    const SYNC_ROW_EQUIVALENT: u32 = 2;
-    (1..=maximum_rows)
-        .min_by_key(|&rows| {
-            let blocks = u32::from(sequence_length.div_ceil(rows));
-            let storage_rows = u32::from(rows.div_ceil(16) * 16);
-            (
-                storage_rows + blocks * SYNC_ROW_EQUIVALENT,
-                blocks * storage_rows,
-                maximum_rows - rows,
-            )
+fn select_query_block_rows(
+    sequence_length: u16,
+    head_count: usize,
+    tile_count: u16,
+    worker_count: u16,
+) -> Option<u16> {
+    (1..=sequence_length)
+        .filter_map(|requested_rows| {
+            let blocks = sequence_length.div_ceil(requested_rows);
+            (head_count * usize::from(blocks) <= usize::from(tile_count)).then(|| {
+                let maximum_rows = sequence_length.div_ceil(blocks);
+                (
+                    requested_rows,
+                    (
+                        maximum_rows.div_ceil(worker_count),
+                        sequence_length % blocks != 0,
+                        blocks,
+                    ),
+                )
+            })
         })
+        .min_by_key(|(_, cost)| *cost)
+        .map(|(_, (_, _, blocks))| sequence_length.div_ceil(blocks))
+}
+
+fn key_block_schedule_cost(
+    sequence_length: u16,
+    rows: u16,
+    padded_dimension: u16,
+) -> (u16, u32, u16, u16) {
+    let blocks = sequence_length.div_ceil(rows);
+    let storage_rows = rows.div_ceil(16) * 16;
+    let pair_bytes = matrix_storage_bytes(storage_rows, padded_dimension) * 2;
+    let blocks_per_exchange =
+        u16::try_from((ipu_exchange::EXCHANGE_WINDOW_BYTES / pair_bytes).min(u32::from(blocks)))
+            .expect("exchange-window block count fits in u16");
+    (
+        blocks.div_ceil(blocks_per_exchange),
+        u32::from(blocks) * u32::from(storage_rows),
+        blocks,
+        rows,
+    )
+}
+
+fn select_key_block_rows(sequence_length: u16, maximum_rows: u16, padded_dimension: u16) -> u16 {
+    (1..=maximum_rows)
+        .filter(|&rows| {
+            matrix_storage_bytes(rows.div_ceil(16) * 16, padded_dimension) * 2
+                <= ipu_exchange::EXCHANGE_WINDOW_BYTES
+        })
+        .min_by_key(|&rows| key_block_schedule_cost(sequence_length, rows, padded_dimension))
         .expect("maximum key rows is non-zero")
 }
 
