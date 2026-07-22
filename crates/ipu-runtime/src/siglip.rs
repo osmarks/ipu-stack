@@ -1187,8 +1187,18 @@ pub fn append_siglip_encoder_layer_with_precision(
     let mlp_up_data_type = precision
         .mlp_up
         .gemm_data_type(mlp_up_weight.iter().copied());
-    let mlp_row_block_dimension = if matches!(mlp_up_data_type, GemmDataType::F8F143 { .. }) {
+    let mlp_up_row_block_dimension = if matches!(mlp_up_data_type, GemmDataType::F8F143 { .. }) {
         row_block_dimension
+    } else if tuning.automatic_gemm_row_blocks && tuning.gemm_row_block_rows == 0 {
+        choose_gemm_row_block_for(
+            rows,
+            tuned_gemm_inner,
+            intermediate_columns,
+            64,
+            tile_count,
+            mlp_up_data_type,
+        )
+        .ok_or("MLP-up GEMM shape has no feasible row blocking")?
     } else {
         tuned_gemm_rows
     };
@@ -1202,7 +1212,7 @@ pub fn append_siglip_encoder_layer_with_precision(
             columns,
             intermediate_columns,
             tuned_gemm_inner,
-            mlp_row_block_dimension,
+            mlp_up_row_block_dimension,
             tile_count,
             data_base,
             data_limit,
@@ -1260,23 +1270,38 @@ pub fn append_siglip_encoder_layer_with_precision(
         mlp_up_adjustment_allocation_start,
         mlp_up_adjustment.iter().map(|block| block.tensor),
     )?;
-    let mlp_gelu =
-        append_c16_to_a16_blocks_gelu_f16_in_arenas(schedule, &mlp_up.output, &memory.transient)?;
-    end_tensor_lifetimes(schedule, mlp_up.output.iter().map(|block| block.tensor))?;
     let mlp_down_weight = model.tensor_f32(&model.layer_name(layer, "mlp.fc2.weight")?)?;
     let mlp_down_data_type = precision
         .mlp_down
         .gemm_data_type(mlp_down_weight.iter().copied());
+    let mlp_down_row_block_dimension =
+        if tuning.automatic_gemm_row_blocks && tuning.gemm_row_block_rows == 0 {
+            choose_gemm_row_block_for(
+                rows,
+                tuned_gemm_inner,
+                columns,
+                64,
+                tile_count,
+                mlp_down_data_type,
+            )
+            .ok_or("MLP-down GEMM shape has no feasible row blocking")?
+        } else {
+            tuned_gemm_rows
+        };
+    let mlp_gelu =
+        append_c16_to_a16_blocks_gelu_f16_in_arenas(schedule, &mlp_up.output, &memory.transient)?;
+    end_tensor_lifetimes(schedule, mlp_up.output.iter().map(|block| block.tensor))?;
     let mlp_down_phase_start = schedule.phases.len();
     let mlp_down_allocation_start = schedule.allocations.len();
     let mlp_down = append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
         schedule,
         &mlp_gelu,
-        gemm_config(
+        gemm_config_with_inner(
             rows,
             intermediate_columns,
             columns,
-            mlp_row_block_dimension,
+            tuned_gemm_inner,
+            mlp_down_row_block_dimension,
             tile_count,
             data_base,
             data_limit,
@@ -1334,7 +1359,7 @@ pub fn append_siglip_encoder_layer_with_precision(
         mlp_down_adjustment_allocation_start,
         mlp_down_adjustment.iter().map(|block| block.tensor),
     )?;
-    let output = if mlp_row_block_dimension == row_block_dimension {
+    let output = if mlp_down_row_block_dimension == row_block_dimension {
         append_c16_to_a16_row_shards(
             schedule,
             &mlp_down.output,
