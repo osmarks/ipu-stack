@@ -112,7 +112,7 @@ struct Accumulator {
     dimensions: BTreeMap<String, String>,
     durations: Vec<u32>,
     tiles: BTreeSet<u32>,
-    phases: BTreeMap<(u32, u32), u32>,
+    phases: BTreeMap<(u32, u32), Vec<(u64, u64)>>,
     work_cycles: u64,
     first_offset: u64,
     last_offset: u64,
@@ -165,8 +165,8 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
             accumulator
                 .phases
                 .entry((sample.step.phase, sample.step.epoch))
-                .and_modify(|maximum| *maximum = (*maximum).max(sample_duration))
-                .or_insert(sample_duration);
+                .or_default()
+                .push((offset, offset + u64::from(sample_duration)));
             accumulator.work_cycles += u64::from(sample_duration);
             accumulator.first_offset = accumulator.first_offset.min(offset);
             accumulator.last_offset = accumulator
@@ -190,7 +190,7 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
             let phase_cycles = accumulator
                 .phases
                 .values()
-                .map(|cycles| u64::from(*cycles))
+                .map(|intervals| union_length(intervals))
                 .sum::<u64>();
             let mean_cycles = if accumulator.durations.is_empty() {
                 0.0
@@ -352,6 +352,25 @@ fn percentile(sorted: &[u32], percentage: usize) -> u32 {
     sorted[(sorted.len() - 1) * percentage / 100]
 }
 
+fn union_length(intervals: &[(u64, u64)]) -> u64 {
+    let mut intervals = intervals.to_vec();
+    intervals.sort_unstable();
+    let Some(&(mut start, mut end)) = intervals.first() else {
+        return 0;
+    };
+    let mut total = 0;
+    for &(next_start, next_end) in &intervals[1..] {
+        if next_start <= end {
+            end = end.max(next_end);
+        } else {
+            total += end - start;
+            start = next_start;
+            end = next_end;
+        }
+    }
+    total + end - start
+}
+
 fn cycles_to_ms(cycles: u64, clock_hz: u64) -> f64 {
     if clock_hz == 0 {
         0.0
@@ -452,6 +471,34 @@ mod tests {
         assert_eq!(result.groups[0].work_cycles, 50);
         assert_eq!(result.groups[0].average_active_tiles, 50.0 / 30.0);
         assert_eq!(result.profile_span_cycles, 30);
+    }
+
+    #[test]
+    fn phase_cycles_include_sequential_repeated_operations() {
+        let report = ProfileReport {
+            clock_hz: 1_000_000_000,
+            tiles: vec![
+                TileProfile {
+                    physical_tile: 2,
+                    samples: vec![
+                        sample(0, ProfileStepKind::Compute, "gemm", 100, 110),
+                        sample(0, ProfileStepKind::Compute, "gemm", 110, 120),
+                    ],
+                },
+                TileProfile {
+                    physical_tile: 3,
+                    samples: vec![
+                        sample(0, ProfileStepKind::Compute, "gemm", 200, 208),
+                        sample(0, ProfileStepKind::Compute, "gemm", 208, 216),
+                    ],
+                },
+            ],
+        };
+        let result = query(&report, &Query::default());
+
+        assert_eq!(result.groups[0].phase_cycles, 20);
+        assert_eq!(result.groups[0].work_cycles, 36);
+        assert_eq!(result.groups[0].average_active_tiles, 1.8);
     }
 
     #[test]
