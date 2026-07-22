@@ -251,17 +251,7 @@ pub fn append_add_f16_row_shards_in_place(
                 destination_tile: destination.tile,
                 tensor: source.tensor,
                 bytes,
-            });
-            schedule.allocations.push(Allocation {
-                tensor: source.tensor,
-                tile: destination.tile,
-                address: ipu_exchange::EXCHANGE_WINDOW_BASE,
-                size: bytes,
-                live_from: exchange_phase,
-                live_until: compute_phase,
-                kind: AllocationKind::ExchangeStaging {
-                    phase: exchange_phase,
-                },
+                staging_address: Some(ipu_exchange::EXCHANGE_WINDOW_BASE),
             });
         }
         let units = bytes / 4;
@@ -560,17 +550,7 @@ fn append_c16_to_a16_row_shards_impl(
                         destination_tile,
                         tensor: block.tensor,
                         bytes: block_bytes,
-                    });
-                    schedule.allocations.push(Allocation {
-                        tensor: block.tensor,
-                        tile: destination_tile,
-                        address: staging_address,
-                        size: block_bytes,
-                        live_from: exchange_phase,
-                        live_until: compute_phase,
-                        kind: AllocationKind::ExchangeStaging {
-                            phase: exchange_phase,
-                        },
+                        staging_address: Some(staging_address),
                     });
                 }
                 let output_alias = TensorId(next_tensor);
@@ -820,17 +800,7 @@ pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
                         destination_tile: *tile,
                         tensor: source_alias,
                         bytes: source_bytes,
-                    });
-                    schedule.allocations.push(Allocation {
-                        tensor: source_alias,
-                        tile: *tile,
-                        address: staging_cursor,
-                        size: source_bytes,
-                        live_from: exchange_phase,
-                        live_until: compute_phase,
-                        kind: AllocationKind::ExchangeStaging {
-                            phase: exchange_phase,
-                        },
+                        staging_address: Some(staging_cursor),
                     });
                     staging_cursor = crate::align_u32(staging_cursor + source_bytes, 32);
                 }
@@ -1192,17 +1162,9 @@ fn append_affine_layer_norm_f16_impl(
                     destination_tile: shard.tile,
                     tensor,
                     bytes: affine_row_bytes,
-                });
-                schedule.allocations.push(Allocation {
-                    tensor,
-                    tile: shard.tile,
-                    address: ipu_exchange::EXCHANGE_WINDOW_BASE + row as u32 * affine_row_bytes,
-                    size: affine_row_bytes,
-                    live_from: exchange_phase,
-                    live_until: compute_phase,
-                    kind: AllocationKind::ExchangeStaging {
-                        phase: exchange_phase,
-                    },
+                    staging_address: Some(
+                        ipu_exchange::EXCHANGE_WINDOW_BASE + row as u32 * affine_row_bytes,
+                    ),
                 });
             }
         }

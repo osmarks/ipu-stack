@@ -359,6 +359,7 @@ fn append_activation_transition(
                 destination_tile: destination.tile,
                 tensor: source.tensor,
                 bytes,
+                staging_address: None,
             });
             allocations.push(Allocation {
                 tensor: source.tensor,

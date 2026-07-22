@@ -345,6 +345,7 @@ fn host_compute_relay_graph() -> Result<ExecutableGraph, ipu_compiler::CompileEr
                         destination_tile: DESTINATION_TILE,
                         tensor: first_result,
                         bytes: BYTES,
+                        staging_address: None,
                     }],
                 },
                 Phase::Compute {
@@ -667,6 +668,7 @@ fn host_exchange_graph(
             destination_tile: relay_tile,
             tensor,
             bytes: transfer_bytes,
+            staging_address: None,
         }];
         if remote_d2h {
             output_address = relay_address;
@@ -693,6 +695,7 @@ fn host_exchange_graph(
                 destination_tile: HOST_CONTROLLER_TILE,
                 tensor,
                 bytes: transfer_bytes,
+                staging_address: None,
             });
         }
         vec![Phase::Exchange { transfers }]

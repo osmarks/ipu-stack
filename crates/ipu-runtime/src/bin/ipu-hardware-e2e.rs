@@ -284,6 +284,7 @@ fn acceptance_graph() -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
                     destination_tile: receiver,
                     tensor: sender_tensor,
                     bytes: 4,
+                    staging_address: None,
                 });
                 allocations.push(Allocation {
                     tensor: sender_tensor,
@@ -347,6 +348,7 @@ fn acceptance_graph() -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
             destination_tile: destination,
             tensor,
             bytes: 4,
+            staging_address: None,
         });
         permutation_expected[usize::from(destination)] = value;
     }
@@ -390,18 +392,21 @@ fn acceptance_graph() -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
                 destination_tile: RELAY_TILE,
                 tensor: multicast_tensor,
                 bytes: (MULTICAST_WORDS * 4) as u32,
+                staging_address: None,
             },
             Transfer {
                 source_tile: 0,
                 destination_tile: MULTICAST_TAP_TILE,
                 tensor: multicast_tensor,
                 bytes: (MULTICAST_WORDS * 4) as u32,
+                staging_address: None,
             },
             Transfer {
                 source_tile: RELAY_TILE,
                 destination_tile: RELAY_DESTINATION_TILE,
                 tensor: multicast_tensor,
                 bytes: (MULTICAST_WORDS * 4) as u32,
+                staging_address: None,
             },
         ],
     });

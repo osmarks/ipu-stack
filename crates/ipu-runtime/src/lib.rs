@@ -701,6 +701,31 @@ pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile
                 }
             })
             .collect::<Vec<_>>();
+        regions.extend(
+            graph
+                .schedule
+                .phases
+                .iter()
+                .enumerate()
+                .flat_map(|(phase, entry)| match entry {
+                    ipu_compiler::Phase::Exchange { transfers } => transfers
+                        .iter()
+                        .filter(move |transfer| transfer.destination_tile == logical_tile)
+                        .filter_map(move |transfer| {
+                            transfer.staging_address.map(|address| MemoryRegion {
+                                address,
+                                size: transfer.bytes,
+                                category: "exchange_staging".into(),
+                                name: format!("exchange staging tensor {}", transfer.tensor.0),
+                                tensor: Some(transfer.tensor.0),
+                                live_from: phase,
+                                live_until: phase + 1,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                    ipu_compiler::Phase::Compute { .. } => Vec::new(),
+                }),
+        );
         regions.sort_by_key(|region| (region.address, region.live_from, region.live_until));
         tiles.push(TileMemory {
             logical_tile,

@@ -1,7 +1,7 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
@@ -370,6 +370,10 @@ pub struct Transfer {
     pub destination_tile: u16,
     pub tensor: TensorId,
     pub bytes: u32,
+    /// Resolved destination staging address. Legacy graph compilation may
+    /// leave this unset and provide an `ExchangeStaging` allocation instead.
+    #[serde(default)]
+    pub staging_address: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1296,17 +1300,7 @@ pub fn append_bias_f16_c16_in_arenas(
                 destination_tile: output.tile,
                 tensor: bias.tensor,
                 bytes,
-            });
-            schedule.allocations.push(Allocation {
-                tensor: bias.tensor,
-                tile: output.tile,
-                address: staging_address,
-                size: bytes,
-                live_from: exchange_phase,
-                live_until: compute_phase,
-                kind: AllocationKind::ExchangeStaging {
-                    phase: exchange_phase,
-                },
+                staging_address: Some(staging_address),
             });
         }
         commands.push(KernelCommand {
@@ -1535,17 +1529,7 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
                         destination_tile: block.tile,
                         tensor: alias,
                         bytes: source_bytes,
-                    });
-                    schedule.allocations.push(Allocation {
-                        tensor: alias,
-                        tile: block.tile,
-                        address: staging_address,
-                        size: source_bytes,
-                        live_from: exchange_phase,
-                        live_until: compute_phase,
-                        kind: AllocationKind::ExchangeStaging {
-                            phase: exchange_phase,
-                        },
+                        staging_address: Some(staging_address),
                     });
                 }
                 let units = source_bytes / 8;
@@ -1818,17 +1802,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
                         destination_tile: destination.tile,
                         tensor: source_alias,
                         bytes: source_bytes,
-                    });
-                    schedule.allocations.push(Allocation {
-                        tensor: source_alias,
-                        tile: destination.tile,
-                        address: staging_address,
-                        size: source_bytes,
-                        live_from: exchange_phase,
-                        live_until: compute_phase,
-                        kind: AllocationKind::ExchangeStaging {
-                            phase: exchange_phase,
-                        },
+                        staging_address: Some(staging_address),
                     });
                 }
                 let input_scale = config.data_type.input_scale();
@@ -2871,6 +2845,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                             bytes: u32::from(source.rows)
                                 * u32::from(config.inner_block_dimension)
                                 * input_element_bytes,
+                            staging_address: None,
                         });
                         allocations.push(Allocation {
                             tensor: source.tensor,
@@ -2895,6 +2870,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                             destination_tile,
                             tensor: source.tensor,
                             bytes: right_block_bytes,
+                            staging_address: None,
                         });
                         allocations.push(Allocation {
                             tensor: source.tensor,
@@ -3114,6 +3090,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     destination_tile: output_block.tile,
                     tensor,
                     bytes,
+                    staging_address: None,
                 });
                 evacuation_chunks.push((output_block, tensor, row_offset, rows, bytes));
                 row_offset += rows;
@@ -3508,7 +3485,7 @@ impl Schedule {
             source: u16,
             tensor: TensorId,
             bytes: u32,
-            destinations: Vec<u16>,
+            destinations: Vec<(u16, Option<u32>)>,
         }
 
         let mut staging_additions = vec![Vec::new(); self.phases.len() + 1];
@@ -3550,74 +3527,95 @@ impl Schedule {
                 continue;
             };
             validate_transfers(transfers)?;
+            let direct_staging = transfers
+                .iter()
+                .filter_map(|transfer| {
+                    transfer
+                        .staging_address
+                        .map(|address| ((transfer.tensor, transfer.destination_tile), address))
+                })
+                .collect::<HashMap<_, _>>();
             let mut groups: Vec<PendingGroup> = Vec::new();
             let mut group_indices = HashMap::<(u16, TensorId, u32), usize>::default();
             for transfer in transfers {
                 let key = (transfer.source_tile, transfer.tensor, transfer.bytes);
                 if let Some(&index) = group_indices.get(&key) {
-                    groups[index].destinations.push(transfer.destination_tile);
+                    groups[index]
+                        .destinations
+                        .push((transfer.destination_tile, transfer.staging_address));
                 } else {
                     group_indices.insert(key, groups.len());
                     groups.push(PendingGroup {
                         source: transfer.source_tile,
                         tensor: transfer.tensor,
                         bytes: transfer.bytes,
-                        destinations: vec![transfer.destination_tile],
+                        destinations: vec![(transfer.destination_tile, transfer.staging_address)],
                     });
                 }
             }
             for group in &mut groups {
-                group.destinations.sort_unstable();
-                group.destinations.dedup();
+                group.destinations.sort_unstable_by_key(|&(tile, _)| tile);
+                group.destinations.dedup_by(|right, left| {
+                    if right.0 != left.0 {
+                        return false;
+                    }
+                    debug_assert_eq!(right.1, left.1);
+                    true
+                });
             }
 
-            // A tile can execute one exchange role at a time. Order the
-            // multicast hyperedges by aggregate endpoint pressure, then place
-            // each in the first slot unused by any of its endpoints. This
-            // enforces the hardware constraint without materializing the
-            // quadratic pairwise conflict graph.
+            // A tile can execute one exchange role at a time. Incremental
+            // DSATUR preserves the compact static schedule without rescanning
+            // every uncolored group after each assignment.
             let mut groups_by_tile = vec![Vec::new(); topology.tile_count()];
             for (group_index, group) in groups.iter().enumerate() {
                 groups_by_tile[usize::from(group.source)].push(group_index);
-                for &destination in &group.destinations {
+                for &(destination, _) in &group.destinations {
                     groups_by_tile[usize::from(destination)].push(group_index);
                 }
             }
-            let pressure = groups_by_tile.iter().map(Vec::len).collect::<Vec<_>>();
-            let mut order = (0..groups.len()).collect::<Vec<_>>();
-            order.sort_unstable_by_key(|&index| {
-                let group = &groups[index];
-                let endpoint_pressure = pressure[usize::from(group.source)]
-                    + group
-                        .destinations
-                        .iter()
-                        .map(|&tile| pressure[usize::from(tile)])
-                        .sum::<usize>();
-                (
-                    std::cmp::Reverse(endpoint_pressure),
-                    std::cmp::Reverse(group.destinations.len()),
-                    group.source,
-                    group.tensor.0,
-                )
-            });
-            let mut used_colors = vec![HashSet::<usize>::default(); topology.tile_count()];
-            let mut colors = vec![None; groups.len()];
-            for index in order {
-                let group = &groups[index];
-                let color = (0..)
-                    .find(|color| {
-                        !used_colors[usize::from(group.source)].contains(color)
-                            && group
-                                .destinations
-                                .iter()
-                                .all(|&tile| !used_colors[usize::from(tile)].contains(color))
-                    })
-                    .ok_or_else(|| CompileError::Graph("exchange color overflow".into()))?;
-                used_colors[usize::from(group.source)].insert(color);
-                for &tile in &group.destinations {
-                    used_colors[usize::from(tile)].insert(color);
+            let mut adjacency = vec![HashSet::default(); groups.len()];
+            for tile_groups in groups_by_tile {
+                for (offset, &left) in tile_groups.iter().enumerate() {
+                    for &right in &tile_groups[offset + 1..] {
+                        adjacency[left].insert(right);
+                        adjacency[right].insert(left);
+                    }
                 }
+            }
+            let mut colors = vec![None; groups.len()];
+            let mut saturation = vec![HashSet::default(); groups.len()];
+            let key = |index: usize, saturation: &[HashSet<usize>]| {
+                (
+                    saturation[index].len(),
+                    adjacency[index].len(),
+                    std::cmp::Reverse(groups[index].source),
+                    std::cmp::Reverse(groups[index].tensor.0),
+                    index,
+                )
+            };
+            let mut queue = (0..groups.len())
+                .map(|index| key(index, &saturation))
+                .collect::<BinaryHeap<_>>();
+            for _ in 0..groups.len() {
+                let index = loop {
+                    let candidate = queue
+                        .pop()
+                        .ok_or_else(|| CompileError::Graph("exchange coloring failed".into()))?;
+                    let index = candidate.4;
+                    if colors[index].is_none() && candidate == key(index, &saturation) {
+                        break index;
+                    }
+                };
+                let color = (0..)
+                    .find(|color| !saturation[index].contains(color))
+                    .ok_or_else(|| CompileError::Graph("exchange color overflow".into()))?;
                 colors[index] = Some(color);
+                for &neighbor in &adjacency[index] {
+                    if colors[neighbor].is_none() && saturation[neighbor].insert(color) {
+                        queue.push(key(neighbor, &saturation));
+                    }
+                }
             }
             let color_count = colors
                 .iter()
@@ -3669,7 +3667,7 @@ impl Schedule {
                         group
                             .destinations
                             .iter()
-                            .map(|destination| (group.tensor, *destination)),
+                            .map(|&(destination, _)| (group.tensor, destination)),
                     );
                 }
                 epoch_groups.push(slot);
@@ -3688,9 +3686,13 @@ impl Schedule {
                     source,
                     tensor,
                     bytes,
-                    destinations,
+                    destinations: destination_entries,
                 } in pending
                 {
+                    let destinations = destination_entries
+                        .iter()
+                        .map(|&(tile, _)| tile)
+                        .collect::<Vec<_>>();
                     if bytes == 0 || bytes & 3 != 0 {
                         return Err(CompileError::Graph(format!(
                             "tensor {} exchange size is not whole words",
@@ -3720,32 +3722,46 @@ impl Schedule {
                             .clone()
                             .find(|allocation| allocation.kind.has_home_address())
                     };
+                    let direct_same_phase = direct_staging.get(&(tensor, source)).copied();
                     let source_address =
                         if location_available(&available_before_phase, tensor, source) {
-                            earlier_staging().or_else(home).or_else(same_phase_staging)
+                            earlier_staging()
+                                .or_else(home)
+                                .or_else(same_phase_staging)
+                                .map(|allocation| allocation.address)
+                                .or(direct_same_phase)
                         } else {
-                            same_phase_staging().or_else(earlier_staging).or_else(home)
+                            direct_same_phase.or_else(|| {
+                                same_phase_staging()
+                                    .or_else(earlier_staging)
+                                    .or_else(home)
+                                    .map(|allocation| allocation.address)
+                            })
                         }
                         .ok_or_else(|| {
                             CompileError::Memory(format!(
                                 "missing source allocation for tensor {} on tile {source}",
                                 tensor.0
                             ))
-                        })?
-                        .address;
-                    let destination_addresses = destinations
+                        })?;
+                    let destination_addresses = destination_entries
                         .iter()
-                        .map(|destination| {
-                            allocation_index
-                                .at(tensor, *destination)
-                                .find(|allocation| {
-                                    allocation.kind
-                                        == AllocationKind::ExchangeStaging { phase: phase_index }
+                        .map(|&(destination, direct_address)| {
+                            direct_address
+                                .or_else(|| {
+                                    allocation_index
+                                        .at(tensor, destination)
+                                        .find(|allocation| {
+                                            allocation.kind
+                                                == AllocationKind::ExchangeStaging {
+                                                    phase: phase_index,
+                                                }
+                                        })
+                                        .map(|allocation| allocation.address)
                                 })
-                                .map(|allocation| allocation.address)
                                 .ok_or_else(|| {
                                     CompileError::Memory(format!(
-                                        "missing staging allocation for tensor {} on tile {destination}",
+                                        "missing staging address for tensor {} on tile {destination}",
                                         tensor.0
                                     ))
                                 })
@@ -3871,9 +3887,16 @@ impl Schedule {
                 steps: Vec::new(),
             })
             .collect::<Vec<_>>();
+        let mut direct_staging = HashMap::<(TensorId, u16), u32>::default();
         for (phase_index, phase) in self.phases.iter().enumerate() {
             match phase {
-                Phase::Exchange { .. } => {
+                Phase::Exchange { transfers } => {
+                    direct_staging.clear();
+                    direct_staging.extend(transfers.iter().filter_map(|transfer| {
+                        transfer
+                            .staging_address
+                            .map(|address| ((transfer.tensor, transfer.destination_tile), address))
+                    }));
                     let exchange = exchange_by_phase.get(&phase_index).ok_or_else(|| {
                         CompileError::Graph(format!("missing lowered exchange phase {phase_index}"))
                     })?;
@@ -3908,7 +3931,17 @@ impl Schedule {
                             .inputs
                             .iter()
                             .map(|input| {
-                                allocation_index.compute_input_address(*input, tile, phase_index)
+                                direct_staging
+                                    .get(&(*input, tile))
+                                    .copied()
+                                    .map(Ok)
+                                    .unwrap_or_else(|| {
+                                        allocation_index.compute_input_address(
+                                            *input,
+                                            tile,
+                                            phase_index,
+                                        )
+                                    })
                             })
                             .collect::<Result<_, _>>()?;
                         program.steps.push(LoweredTileStep::Compute(Box::new(
@@ -3933,6 +3966,7 @@ impl Schedule {
                             });
                         }
                     }
+                    direct_staging.clear();
                 }
             }
         }
@@ -4104,6 +4138,7 @@ pub fn compile(graph: &Graph, options: &CompilerOptions) -> Result<Schedule, Com
                             destination_tile: *destination,
                             tensor: *input,
                             bytes: local_bytes(&graph.tensors[input.0], input_layout) as u32,
+                            staging_address: None,
                         });
                     }
                 }
@@ -4215,15 +4250,39 @@ fn worker_count(tensor: &Tensor) -> u8 {
 
 fn validate_transfers(transfers: &[Transfer]) -> Result<(), CompileError> {
     let mut destinations = HashSet::default();
+    let mut direct_ranges = Vec::new();
     for transfer in transfers {
         if transfer.source_tile == transfer.destination_tile || transfer.bytes == 0 {
             return Err(CompileError::Graph("invalid exchange transfer".into()));
+        }
+        if transfer
+            .staging_address
+            .is_some_and(|address| address & 3 != 0)
+        {
+            return Err(CompileError::Graph(
+                "exchange staging address is not word aligned".into(),
+            ));
+        }
+        if let Some(address) = transfer.staging_address {
+            let end = address
+                .checked_add(transfer.bytes)
+                .ok_or_else(|| CompileError::Memory("exchange staging address overflow".into()))?;
+            direct_ranges.push((transfer.destination_tile, address, end));
         }
         if !destinations.insert((transfer.destination_tile, transfer.tensor)) {
             return Err(CompileError::Graph(
                 "multiple sends target one tensor region in an epoch".into(),
             ));
         }
+    }
+    direct_ranges.sort_unstable();
+    if direct_ranges
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0 && pair[0].2 > pair[1].1)
+    {
+        return Err(CompileError::Memory(
+            "direct exchange staging regions overlap on one tile".into(),
+        ));
     }
     Ok(())
 }
@@ -5726,11 +5785,13 @@ mod tests {
                     kind: AllocationKind::Home,
                 });
             }
-            if !allocations.iter().any(|allocation| {
-                allocation.tensor == transfer.tensor
-                    && allocation.tile == transfer.destination_tile
-                    && allocation.kind == AllocationKind::ExchangeStaging { phase: 0 }
-            }) {
+            if transfer.staging_address.is_none()
+                && !allocations.iter().any(|allocation| {
+                    allocation.tensor == transfer.tensor
+                        && allocation.tile == transfer.destination_tile
+                        && allocation.kind == AllocationKind::ExchangeStaging { phase: 0 }
+                })
+            {
                 allocations.push(Allocation {
                     tensor: transfer.tensor,
                     tile: transfer.destination_tile,
@@ -5806,18 +5867,21 @@ mod tests {
                 destination_tile: 1,
                 tensor: TensorId(0),
                 bytes: 64,
+                staging_address: None,
             },
             Transfer {
                 source_tile: 0,
                 destination_tile: 2,
                 tensor: TensorId(0),
                 bytes: 64,
+                staging_address: None,
             },
             Transfer {
                 source_tile: 3,
                 destination_tile: 4,
                 tensor: TensorId(1),
                 bytes: 128,
+                staging_address: None,
             },
         ]);
         let lowered = schedule.lower_exchanges(&Topology::c600()).unwrap();
@@ -5836,6 +5900,23 @@ mod tests {
     }
 
     #[test]
+    fn lowering_uses_transfer_owned_staging_addresses() {
+        let schedule = exchange_schedule(vec![Transfer {
+            source_tile: 0,
+            destination_tile: 1,
+            tensor: TensorId(0),
+            bytes: 64,
+            staging_address: Some(0x53a40),
+        }]);
+
+        assert!(schedule.allocations.iter().all(|allocation| {
+            !matches!(allocation.kind, AllocationKind::ExchangeStaging { .. })
+        }));
+        schedule.lower_exchanges(&Topology::c600()).unwrap();
+        schedule.lower_tile_programs(&Topology::c600()).unwrap();
+    }
+
+    #[test]
     fn lowering_uses_point_schedule_for_an_independent_single_destination() {
         let topology = Topology::c600();
         let schedule = exchange_schedule(vec![Transfer {
@@ -5843,6 +5924,7 @@ mod tests {
             destination_tile: 1,
             tensor: TensorId(0),
             bytes: 64,
+            staging_address: None,
         }]);
         let lowered = schedule.lower_exchanges(&topology).unwrap();
         let group = &lowered[0].epochs[0].groups[0];
@@ -5866,18 +5948,21 @@ mod tests {
                 destination_tile: 1,
                 tensor: TensorId(0),
                 bytes: 64,
+                staging_address: None,
             },
             Transfer {
                 source_tile: 2,
                 destination_tile: 3,
                 tensor: TensorId(1),
                 bytes: 64,
+                staging_address: None,
             },
             Transfer {
                 source_tile: 1,
                 destination_tile: 2,
                 tensor: TensorId(2),
                 bytes: 64,
+                staging_address: None,
             },
         ]);
         let lowered = schedule.lower_exchanges(&Topology::c600()).unwrap();
@@ -5911,12 +5996,14 @@ mod tests {
                 destination_tile: 1,
                 tensor,
                 bytes: 256,
+                staging_address: None,
             },
             Transfer {
                 source_tile: 1,
                 destination_tile: 3,
                 tensor,
                 bytes: 256,
+                staging_address: None,
             },
         ]);
         schedule
@@ -5977,6 +6064,7 @@ mod tests {
                         destination_tile: 1,
                         tensor,
                         bytes: 64,
+                        staging_address: None,
                     }],
                 },
                 Phase::Exchange {
@@ -5985,6 +6073,7 @@ mod tests {
                         destination_tile: 2,
                         tensor,
                         bytes: 64,
+                        staging_address: None,
                     }],
                 },
             ],
@@ -6257,6 +6346,7 @@ mod tests {
                     destination_tile: destination,
                     tensor: TensorId(tensor),
                     bytes: 4 * rng.u32(1..=64),
+                    staging_address: None,
                 });
             }
             let schedule = exchange_schedule(transfers.clone());
@@ -6296,6 +6386,7 @@ mod tests {
                     destination_tile: destination,
                     tensor: TensorId(tensor),
                     bytes: words * 4,
+                    staging_address: None,
                 }));
             }
             let schedule = exchange_schedule(transfers.clone());
@@ -6356,6 +6447,7 @@ mod tests {
                 destination_tile: pair * 2 + 1,
                 tensor: TensorId(usize::from(pair)),
                 bytes: 4,
+                staging_address: None,
             })
             .collect();
         let mut schedule = exchange_schedule(transfers);
@@ -6374,6 +6466,7 @@ mod tests {
                 destination_tile: (source + 1) % 16,
                 tensor: TensorId(usize::from(source)),
                 bytes: 4,
+                staging_address: None,
             })
             .collect();
         let lowered = exchange_schedule(ring)
@@ -6391,6 +6484,7 @@ mod tests {
                         destination_tile: destination,
                         tensor: TensorId(usize::from(source)),
                         bytes: 4,
+                        staging_address: None,
                     })
             })
             .collect();

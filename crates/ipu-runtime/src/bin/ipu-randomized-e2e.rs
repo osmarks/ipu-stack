@@ -125,6 +125,7 @@ fn randomized_case(seed: u64, case: usize) -> (ExecutableGraph, BTreeMap<String,
                 destination_tile,
                 tensor: payload_tensor,
                 bytes: payload_bytes,
+                staging_address: None,
             })
             .collect(),
     };
@@ -191,6 +192,7 @@ fn randomized_case(seed: u64, case: usize) -> (ExecutableGraph, BTreeMap<String,
             destination_tile,
             tensor,
             bytes: 4,
+            staging_address: None,
         });
         output_slices.push((
             topology.physical(destination_tile).unwrap(),

@@ -451,6 +451,7 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
                         destination_tile,
                         tensor: task.output,
                         bytes: head_bytes,
+                        staging_address: None,
                     });
                     schedule.allocations.push(Allocation {
                         tensor: task.output,
@@ -586,17 +587,7 @@ fn append_attention_pack_phase(
                 destination_tile,
                 tensor: alias,
                 bytes,
-            });
-            schedule.allocations.push(Allocation {
-                tensor: alias,
-                tile: destination_tile,
-                address: staging_address,
-                size: bytes,
-                live_from: exchange_phase,
-                live_until: compute_phase,
-                kind: AllocationKind::ExchangeStaging {
-                    phase: exchange_phase,
-                },
+                staging_address: Some(staging_address),
             });
         }
         commands.push(KernelCommand {
@@ -1113,12 +1104,14 @@ pub fn plan_flash_attention(
                             destination_tile: task.tile,
                             tensor: block.key_tensor,
                             bytes: block.matrix_size,
+                            staging_address: None,
                         },
                         Transfer {
                             source_tile: block.tile,
                             destination_tile: task.tile,
                             tensor: block.value_tensor,
                             bytes: block.matrix_size,
+                            staging_address: None,
                         },
                     ]);
                     allocations.extend([
