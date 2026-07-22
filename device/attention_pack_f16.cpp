@@ -48,15 +48,15 @@ public:
            ++panel) {
         const unsigned outputBase =
             panel * destinationRows * 16 + destinationRow * 16;
-        for (unsigned column = 0; column < 16; column += 2) {
+        for (unsigned column = 0; column < 16; column += 4) {
           const unsigned logicalColumn = panel * 16 + column;
-          half2 packed = {};
-          if (logicalColumn < ATTENTION_HEAD_DIMENSION) {
+          half4 packed = {};
+          if (logicalColumn + 3 < ATTENTION_HEAD_DIMENSION) {
             const unsigned input =
                 sourceIndex(sourceRows, sourceRow, headStart + logicalColumn);
-            packed = *reinterpret_cast<const half2 *>(&source[input]);
+            packed = *reinterpret_cast<const half4 *>(&source[input]);
           }
-          *reinterpret_cast<half2 *>(&output[outputBase + column]) = packed;
+          *reinterpret_cast<half4 *>(&output[outputBase + column]) = packed;
         }
       }
     }
@@ -96,15 +96,15 @@ public:
              ++innerGroup) {
           const unsigned outputBase =
               (rowGroup * innerGroups + innerGroup) * 256 + loadChannel * 16;
-          for (unsigned inner = 0; inner < 16; inner += 2) {
+          for (unsigned inner = 0; inner < 16; inner += 4) {
             const unsigned logicalInner = innerGroup * 16 + inner;
-            half2 packed = {};
-            if (logicalInner < ATTENTION_HEAD_DIMENSION) {
+            half4 packed = {};
+            if (logicalInner + 3 < ATTENTION_HEAD_DIMENSION) {
               const unsigned input =
                   sourceIndex(sourceRows, sourceRow, headStart + logicalInner);
-              packed = *reinterpret_cast<const half2 *>(&source[input]);
+              packed = *reinterpret_cast<const half4 *>(&source[input]);
             }
-            *reinterpret_cast<half2 *>(&output[outputBase + inner]) = packed;
+            *reinterpret_cast<half4 *>(&output[outputBase + inner]) = packed;
           }
         }
       }
