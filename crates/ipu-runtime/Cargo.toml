@@ -15,6 +15,7 @@ ipu-models = { path = "../ipu-models" }
 ipu-package = { path = "../ipu-package" }
 rayon.workspace = true
 rustc-hash.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -478,6 +478,7 @@ dependencies = [
  "ipu-package",
  "rayon",
  "rustc-hash",
+ "smallvec",
  "thiserror",
  "tracing",
  "tracing-subscriber",

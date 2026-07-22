@@ -1,6 +1,7 @@
 use crate::Result;
 use ipu_compiler::{LoweredTileProgram, LoweredTileStep};
 use rustc_hash::{FxHashMap as HashMap, FxHasher};
+use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -173,7 +174,7 @@ enum TemplateValue {
 
 struct TemplateRecords {
     rows: Vec<Vec<StaticTemplateRecordWord>>,
-    columns: HashMap<Vec<StaticTemplateRecordWord>, u16>,
+    columns: HashMap<u64, Vec<(Vec<StaticTemplateRecordWord>, u16)>>,
     affine_columns: HashMap<u64, Vec<(Vec<i64>, u16, u32)>>,
     shared: Vec<StaticTemplateRecordWord>,
     shared_values: HashMap<StaticTemplateRecordWord, u16>,
@@ -190,7 +191,8 @@ impl TemplateRecords {
         }
     }
 
-    fn values(&mut self, values: Vec<u32>) -> Result<TemplateValue> {
+    fn values(&mut self, values: impl IntoIterator<Item = u32>) -> Result<TemplateValue> {
+        let values = values.into_iter().collect::<SmallVec<[u32; 32]>>();
         if values.windows(2).all(|pair| pair[0] == pair[1]) {
             return if values[0] < 1 << 20 {
                 Ok(TemplateValue::Constant(values[0]))
@@ -198,13 +200,17 @@ impl TemplateRecords {
                 self.shared(StaticTemplateRecordWord::Value(values[0]))
             };
         }
-        let words = values
-            .iter()
-            .copied()
-            .map(StaticTemplateRecordWord::Value)
-            .collect::<Vec<_>>();
-        if let Some(&slot) = self.columns.get(&words) {
-            return Ok(TemplateValue::Record(slot));
+        let exact_hash = hash_value_words(&values);
+        if let Some((_, slot)) = self.columns.get(&exact_hash).and_then(|entries| {
+            entries.iter().find(|(key, _)| {
+                key.len() == values.len()
+                    && key
+                        .iter()
+                        .zip(&values)
+                        .all(|(word, value)| word == &StaticTemplateRecordWord::Value(*value))
+            })
+        }) {
+            return Ok(TemplateValue::Record(*slot));
         }
         let first = values[0];
         let normalized = || {
@@ -229,8 +235,16 @@ impl TemplateRecords {
                 offset,
             });
         }
+        let words = values
+            .iter()
+            .copied()
+            .map(StaticTemplateRecordWord::Value)
+            .collect::<Vec<_>>();
         let slot = self.push_column(words.clone())?;
-        self.columns.insert(words, slot);
+        self.columns
+            .entry(exact_hash)
+            .or_default()
+            .push((words, slot));
         self.affine_columns.entry(affine_hash).or_default().push((
             normalized().collect(),
             slot,
@@ -243,11 +257,16 @@ impl TemplateRecords {
         if words.windows(2).all(|pair| pair[0] == pair[1]) {
             return self.shared(words[0].clone());
         }
-        if let Some(&slot) = self.columns.get(&words) {
-            return Ok(TemplateValue::Record(slot));
+        let hash = hash_record_words(&words);
+        if let Some((_, slot)) = self
+            .columns
+            .get(&hash)
+            .and_then(|entries| entries.iter().find(|(key, _)| key == &words))
+        {
+            return Ok(TemplateValue::Record(*slot));
         }
         let slot = self.push_column(words.clone())?;
-        self.columns.insert(words, slot);
+        self.columns.entry(hash).or_default().push((words, slot));
         Ok(TemplateValue::Record(slot))
     }
 
@@ -268,6 +287,21 @@ impl TemplateRecords {
         }
         Ok(slot)
     }
+}
+
+fn hash_value_words(values: &[u32]) -> u64 {
+    let mut hasher = FxHasher::default();
+    for value in values {
+        0u8.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn hash_record_words(words: &[StaticTemplateRecordWord]) -> u64 {
+    let mut hasher = FxHasher::default();
+    words.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn add_immediate_steps(offset: i32) -> usize {
@@ -412,8 +446,7 @@ pub(crate) fn plan_static_templates(
                             records.values(
                                 sender_patches
                                     .iter()
-                                    .map(|patch| patch.map_or(0, |patch| patch.word_address))
-                                    .collect(),
+                                    .map(|patch| patch.map_or(0, |patch| patch.word_address)),
                             )
                         })
                         .transpose()?;
@@ -422,8 +455,7 @@ pub(crate) fn plan_static_templates(
                             records.values(
                                 sender_patches
                                     .iter()
-                                    .map(|patch| patch.map_or(0, |patch| patch.instruction))
-                                    .collect(),
+                                    .map(|patch| patch.map_or(0, |patch| patch.instruction)),
                             )
                         })
                         .transpose()?;
@@ -440,7 +472,7 @@ pub(crate) fn plan_static_templates(
                         let values = instance_rows
                             .iter()
                             .map(|row| row.get(word).copied().unwrap_or(0))
-                            .collect::<Vec<_>>();
+                            .collect::<SmallVec<[u32; 32]>>();
                         if values.windows(2).any(|pair| pair[0] != pair[1]) {
                             plan_words.push((u16::try_from(word)?, records.values(values)?));
                         }
@@ -454,7 +486,7 @@ pub(crate) fn plan_static_templates(
                             })
                             .collect::<Result<Vec<_>>>()?,
                     )?;
-                    let active = records.values(actives.into_iter().map(u32::from).collect())?;
+                    let active = records.values(actives.into_iter().map(u32::from))?;
                     template_steps.push(StaticTemplateStep::Exchange {
                         sender_word_offset,
                         sender_address,
@@ -626,7 +658,7 @@ fn plan_template_compute_step(
             std::iter::once(command.output_address)
                 .chain(command.input_addresses.iter().copied())
                 .chain(command.arguments.iter().copied())
-                .collect::<Vec<_>>()
+                .collect::<SmallVec<[u32; 16]>>()
         })
         .collect::<Vec<_>>();
     let conditional = active.len() != commands.len();
@@ -638,8 +670,7 @@ fn plan_template_compute_step(
             records.values(
                 commands
                     .iter()
-                    .map(|commands| u32::from(commands.get(command_index).is_some()))
-                    .collect(),
+                    .map(|commands| u32::from(commands.get(command_index).is_some())),
             )
         })
         .transpose()?;
@@ -661,23 +692,18 @@ fn plan_template_compute_step(
         .transpose()?;
     let operands = (0..operands[0].len())
         .map(|operand| {
-            records.values(
+            records.values(commands.iter().map(|commands| {
                 commands
-                    .iter()
-                    .map(|commands| {
-                        commands
-                            .get(command_index)
-                            .map(|command| {
-                                std::iter::once(command.output_address)
-                                    .chain(command.input_addresses.iter().copied())
-                                    .chain(command.arguments.iter().copied())
-                                    .nth(operand)
-                                    .unwrap()
-                            })
-                            .unwrap_or(operands[0][operand])
+                    .get(command_index)
+                    .map(|command| {
+                        std::iter::once(command.output_address)
+                            .chain(command.input_addresses.iter().copied())
+                            .chain(command.arguments.iter().copied())
+                            .nth(operand)
+                            .unwrap()
                     })
-                    .collect(),
-            )
+                    .unwrap_or(operands[0][operand])
+            }))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(StaticTemplateStep::Compute {
@@ -1593,10 +1619,9 @@ mod tests {
         );
 
         let mut long = TemplateRecords::new(27);
-        long.values((1..=27).collect()).unwrap();
+        long.values(1..=27).unwrap();
         assert_eq!(
-            long.values((1..=27).map(|value| value + 0x20000).collect())
-                .unwrap(),
+            long.values((1..=27).map(|value| value + 0x20000)).unwrap(),
             TemplateValue::RecordOffset {
                 slot: 0,
                 offset: 0x20000,
