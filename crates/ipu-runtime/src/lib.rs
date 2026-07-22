@@ -440,32 +440,31 @@ fn allocation_range(allocation: &ipu_compiler::Allocation) -> Result<(u32, u32)>
     ))
 }
 
-fn fixed_allocation_ranges_for_tile(graph: &ExecutableGraph, tile: u16) -> Result<Vec<(u32, u32)>> {
+fn fixed_allocation_ranges_by_tile(graph: &ExecutableGraph) -> Result<Vec<Vec<(u32, u32)>>> {
     let relocatable_homes = graph
         .schedule
         .allocations
         .iter()
-        .filter(|allocation| allocation.tile == tile)
         .filter(|allocation| {
             matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
                 && allocation.live_until != usize::MAX
         })
-        .map(|allocation| allocation.tensor)
+        .map(|allocation| (allocation.tile, allocation.tensor))
         .collect::<HashSet<_>>();
-    graph
-        .schedule
-        .allocations
-        .iter()
-        .filter(|allocation| allocation.tile == tile)
-        .filter(|allocation| !match allocation.kind {
+    let mut ranges = vec![Vec::new(); usize::from(graph.schedule.tile_count)];
+    for allocation in &graph.schedule.allocations {
+        let relocatable = match allocation.kind {
             ipu_compiler::AllocationKind::Home => allocation.live_until != usize::MAX,
             ipu_compiler::AllocationKind::HomeAlias { source } => {
-                relocatable_homes.contains(&source)
+                relocatable_homes.contains(&(allocation.tile, source))
             }
             ipu_compiler::AllocationKind::ExchangeStaging { .. } => false,
-        })
-        .map(allocation_range)
-        .collect()
+        };
+        if !relocatable {
+            ranges[usize::from(allocation.tile)].push(allocation_range(allocation)?);
+        }
+    }
+    Ok(ranges)
 }
 
 #[derive(Clone, Debug)]
@@ -2577,10 +2576,11 @@ fn package_graph_impl_attempt(
         },
     }
     let mut template_record_ranges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); programs.len()];
+    let fixed_allocation_ranges = fixed_allocation_ranges_by_tile(graph)?;
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
         let runtime_end = plans.end;
-        let fixed_allocations = fixed_allocation_ranges_for_tile(graph, tile)?;
+        let fixed_allocations = &fixed_allocation_ranges[usize::from(tile)];
         let mut records = plans
             .templates
             .iter()
@@ -2652,7 +2652,7 @@ fn package_graph_impl_attempt(
                 .chain(std::iter::once(image_executable_elements[tile_index]))
                 .collect::<Vec<_>>();
             let address = data_region_base_for_tile(
-                &fixed_allocations,
+                fixed_allocations,
                 tile,
                 runtime_end,
                 size,
@@ -2681,6 +2681,7 @@ fn package_graph_impl_attempt(
             template_record_ranges[tile_index].push((address, end));
         }
     }
+    drop(fixed_allocation_ranges);
     if can_relower {
         let overlaps_transient_home = graph.schedule.allocations.iter().any(|allocation| {
             matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
