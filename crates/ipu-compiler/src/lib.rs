@@ -391,6 +391,122 @@ pub enum Phase {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepeatedRegion {
+    pub name: String,
+    pub phase_instances: Vec<Range<usize>>,
+    shape: Vec<RepeatedPhaseShape>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum RepeatedPhaseShape {
+    Exchange,
+    Compute(Vec<RepeatedTileComputeShape>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RepeatedTileComputeShape {
+    tile: u16,
+    commands: Vec<RepeatedCommandShape>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RepeatedCommandShape {
+    operation: Cow<'static, str>,
+    input_count: usize,
+    argument_count: usize,
+}
+
+impl RepeatedRegion {
+    pub fn new(
+        name: impl Into<String>,
+        schedule: &Schedule,
+        phases: Range<usize>,
+    ) -> Result<Self, CompileError> {
+        let shape = repeated_region_shape(schedule, phases.clone())?;
+        Ok(Self {
+            name: name.into(),
+            phase_instances: vec![phases],
+            shape,
+        })
+    }
+
+    pub fn push_instance(
+        &mut self,
+        schedule: &Schedule,
+        phases: Range<usize>,
+    ) -> Result<(), CompileError> {
+        let shape = repeated_region_shape(schedule, phases.clone())?;
+        if shape != self.shape {
+            return Err(CompileError::Graph(format!(
+                "instance {} of repeated region {} has a different phase or command structure",
+                self.phase_instances.len(),
+                self.name
+            )));
+        }
+        if self
+            .phase_instances
+            .last()
+            .is_some_and(|previous| previous.end > phases.start)
+        {
+            return Err(CompileError::Graph(format!(
+                "instances of repeated region {} overlap or are out of order",
+                self.name
+            )));
+        }
+        self.phase_instances.push(phases);
+        Ok(())
+    }
+
+    pub fn is_compatible(&self, schedule: &Schedule, phases: Range<usize>) -> bool {
+        repeated_region_shape(schedule, phases).is_ok_and(|shape| shape == self.shape)
+    }
+}
+
+fn repeated_region_shape(
+    schedule: &Schedule,
+    phases: Range<usize>,
+) -> Result<Vec<RepeatedPhaseShape>, CompileError> {
+    let selected = schedule.phases.get(phases.clone()).ok_or_else(|| {
+        CompileError::Graph(format!(
+            "repeated region phase range {}..{} exceeds {} phases",
+            phases.start,
+            phases.end,
+            schedule.phases.len()
+        ))
+    })?;
+    if selected.is_empty() {
+        return Err(CompileError::Graph(
+            "repeated region must contain at least one phase".into(),
+        ));
+    }
+    selected
+        .iter()
+        .map(|phase| match phase {
+            Phase::Exchange { .. } => Ok(RepeatedPhaseShape::Exchange),
+            Phase::Compute { commands, .. } => {
+                let mut by_tile = BTreeMap::<u16, Vec<RepeatedCommandShape>>::new();
+                for command in commands {
+                    by_tile
+                        .entry(command.tile)
+                        .or_default()
+                        .push(RepeatedCommandShape {
+                            operation: command.specialization.operation.clone(),
+                            input_count: command.inputs.len(),
+                            argument_count: command.arguments.len(),
+                        });
+                }
+                Ok(RepeatedPhaseShape::Compute(
+                    by_tile
+                        .into_iter()
+                        .map(|(tile, commands)| RepeatedTileComputeShape { tile, commands })
+                        .collect(),
+                ))
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Allocation {
     pub tensor: TensorId,
     pub tile: u16,
@@ -5906,6 +6022,52 @@ mod tests {
             tile_count: 16,
             peak_sram: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn repeated_region_accepts_matching_instances_and_rejects_changed_abi() {
+        let command = |phase, inputs: usize| Phase::Compute {
+            op: OpId(phase),
+            commands: vec![Arc::new(KernelCommand {
+                tile: 3,
+                output: TensorId(phase),
+                inputs: (0..inputs).map(TensorId).collect(),
+                arguments: vec![16],
+                specialization: SpecializationKey {
+                    operation: "test_kernel".into(),
+                    shape: vec![16],
+                    worker_count: 6,
+                    role: "compute".into(),
+                    alignment: 8,
+                },
+                metadata: BTreeMap::new(),
+            })],
+        };
+        let schedule = Schedule {
+            layouts: Vec::new(),
+            phases: vec![
+                Phase::Exchange {
+                    transfers: Vec::new(),
+                },
+                command(1, 2),
+                Phase::Exchange {
+                    transfers: Vec::new(),
+                },
+                command(3, 2),
+                Phase::Exchange {
+                    transfers: Vec::new(),
+                },
+                command(5, 1),
+            ],
+            allocations: Vec::new(),
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+        let mut repeated = RepeatedRegion::new("block", &schedule, 0..2).unwrap();
+        repeated.push_instance(&schedule, 2..4).unwrap();
+        assert_eq!(repeated.phase_instances, vec![0..2, 2..4]);
+        assert!(!repeated.is_compatible(&schedule, 4..6));
+        assert!(repeated.push_instance(&schedule, 4..6).is_err());
     }
 
     #[test]

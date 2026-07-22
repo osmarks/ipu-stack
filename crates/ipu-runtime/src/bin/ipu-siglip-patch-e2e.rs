@@ -2,9 +2,10 @@ use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, FlashAttentionConfig,
     FlashAttentionPlan, GemmDataType, Ipu21MemoryRegion, KernelCommand, MemoryConstraint,
-    MemoryPlacement, MemoryPolicy, OpId, Phase, RowShardPlacement, RowShardTransitionConfig,
-    SpecializationKey, TensorId, append_c16_to_a16_row_shards, choose_gemm_row_block_for_shape,
-    end_tensor_lifetimes, make_tensors_resident, plan_blocked_gemm, plan_flash_attention,
+    MemoryPlacement, MemoryPolicy, OpId, Phase, RepeatedRegion, RowShardPlacement,
+    RowShardTransitionConfig, SpecializationKey, TensorId, append_c16_to_a16_row_shards,
+    choose_gemm_row_block_for_shape, end_tensor_lifetimes, make_tensors_resident,
+    plan_blocked_gemm, plan_flash_attention,
 };
 use ipu_elf::{KernelArtifact, Toolchain};
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -23,7 +24,6 @@ use ipu_runtime::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -263,11 +263,7 @@ fn main() {
     let mut current = row_shards;
     let mut last_layer = None;
     let mut deferred_residual = None;
-    let mut layer_template_groups = Vec::<(
-        SiglipEncoderPrecision,
-        Vec<u64>,
-        Vec<std::ops::Range<usize>>,
-    )>::new();
+    let mut layer_template_groups = Vec::<(SiglipEncoderPrecision, RepeatedRegion)>::new();
     let mut profile_regions = vec![StaticProfileRegion {
         name: "embedding".into(),
         phases: 0..plan.schedule.phases.len(),
@@ -328,14 +324,17 @@ fn main() {
         if !retain_profile_metadata {
             plan.schedule.discard_profile_metadata(phase_range.clone());
         }
-        let template_signature = phase_template_signature(&plan.schedule, phase_range.clone());
-        if let Some((group_precision, group_signature, ranges)) = layer_template_groups.last_mut()
+        if let Some((group_precision, region)) = layer_template_groups.last_mut()
             && *group_precision == layer_precision
-            && *group_signature == template_signature
+            && region.is_compatible(&plan.schedule, phase_range.clone())
         {
-            ranges.push(phase_range);
+            region.push_instance(&plan.schedule, phase_range).unwrap();
         } else {
-            layer_template_groups.push((layer_precision, template_signature, vec![phase_range]));
+            let name = format!("siglip_encoder_layer_{}", layer_template_groups.len());
+            layer_template_groups.push((
+                layer_precision,
+                RepeatedRegion::new(name, &plan.schedule, phase_range).unwrap(),
+            ));
         }
         let (compute_commands, transfers) =
             plan.schedule
@@ -476,11 +475,7 @@ fn main() {
     write_memory_profile(&graph);
     let templates = layer_template_groups
         .into_iter()
-        .enumerate()
-        .map(|(index, (_, _, phase_instances))| StaticTemplateRegion {
-            name: format!("siglip_encoder_layer_{index}"),
-            phase_instances,
-        })
+        .map(|(_, region)| StaticTemplateRegion::from(region))
         .collect::<Vec<_>>();
     assert!(
         profile_output.is_none() || invocations == 1,
@@ -1569,35 +1564,6 @@ fn pad_columns(values: &[f32], rows: usize, columns: usize, padded_columns: usiz
             .copy_from_slice(&values[row * columns..(row + 1) * columns]);
     }
     padded
-}
-
-fn phase_template_signature(
-    schedule: &ipu_compiler::Schedule,
-    phases: std::ops::Range<usize>,
-) -> Vec<u64> {
-    phases
-        .map(|phase| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            match &schedule.phases[phase] {
-                ipu_compiler::Phase::Exchange { .. } => {
-                    0u8.hash(&mut hasher);
-                }
-                ipu_compiler::Phase::Compute { commands, .. } => {
-                    1u8.hash(&mut hasher);
-                    let mut register_abis = commands
-                        .iter()
-                        .map(|command| (command.inputs.len(), command.arguments.len()))
-                        .collect::<Vec<_>>();
-                    register_abis.sort_unstable();
-                    register_abis.dedup();
-                    for register_abi in register_abis {
-                        register_abi.hash(&mut hasher);
-                    }
-                }
-            }
-            hasher.finish()
-        })
-        .collect()
 }
 
 fn required_env(name: &str) -> String {

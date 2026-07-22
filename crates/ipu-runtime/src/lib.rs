@@ -643,6 +643,15 @@ pub struct StaticTemplateRegion {
     pub phase_instances: Vec<Range<usize>>,
 }
 
+impl From<ipu_compiler::RepeatedRegion> for StaticTemplateRegion {
+    fn from(region: ipu_compiler::RepeatedRegion) -> Self {
+        Self {
+            name: region.name,
+            phase_instances: region.phase_instances,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StaticProfileRegion {
     pub name: String,
