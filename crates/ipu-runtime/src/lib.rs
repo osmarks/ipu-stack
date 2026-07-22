@@ -2589,6 +2589,36 @@ fn package_graph_impl_attempt(
             })
             .collect::<Vec<_>>();
         records.sort_unstable_by_key(|&(_, words)| std::cmp::Reverse(words));
+        let largest_object_size = records.first().map_or(0, |&(_, words)| {
+            u32::try_from(words).unwrap_or(u32::MAX).saturating_mul(4)
+        });
+        let transient_home_sizes = graph
+            .schedule
+            .allocations
+            .iter()
+            .filter(|allocation| {
+                allocation.tile == tile
+                    && matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
+                    && allocation.live_until != usize::MAX
+            })
+            .map(|allocation| (allocation.tensor.0, allocation.size))
+            .collect::<HashMap<_, _>>();
+        let fallback_occupied = graph
+            .schedule
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.tile == tile)
+            .filter(|allocation| match allocation.kind {
+                ipu_compiler::AllocationKind::Home if allocation.live_until != usize::MAX => {
+                    allocation.size > largest_object_size
+                }
+                ipu_compiler::AllocationKind::HomeAlias { source } => transient_home_sizes
+                    .get(&source.0)
+                    .is_none_or(|&size| size > largest_object_size),
+                _ => true,
+            })
+            .map(allocation_range)
+            .collect::<Result<Vec<_>>>()?;
         for (object, words) in records {
             let size = u32::try_from(words)?
                 .checked_mul(4)
@@ -2633,68 +2663,14 @@ fn package_graph_impl_attempt(
             let address = if let Ok(address) = existing_gap {
                 address
             } else {
-                let mut movable = graph
-                    .schedule
-                    .allocations
-                    .iter()
-                    .filter(|allocation| {
-                        allocation.tile == tile
-                            && matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
-                            && allocation.live_until != usize::MAX
-                    })
-                    .map(|allocation| (allocation.size, allocation.tensor.0))
-                    .collect::<Vec<_>>();
-                movable.sort_unstable();
-                movable.dedup_by_key(|&mut (_, tensor)| tensor);
-                let try_prefix = |count: usize| -> Result<Option<u32>> {
-                    let admitted = movable
-                        .iter()
-                        .take(count)
-                        .map(|&(_, tensor)| tensor)
-                        .collect::<BTreeSet<_>>();
-                    let occupied = graph
-                        .schedule
-                        .allocations
-                        .iter()
-                        .filter(|allocation| allocation.tile == tile)
-                        .filter(|allocation| match allocation.kind {
-                            ipu_compiler::AllocationKind::Home => {
-                                !admitted.contains(&allocation.tensor.0)
-                            }
-                            ipu_compiler::AllocationKind::HomeAlias { source } => {
-                                !admitted.contains(&source.0)
-                            }
-                            _ => true,
-                        })
-                        .map(allocation_range)
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(data_region_base_for_tile(
-                        &occupied,
-                        tile,
-                        runtime_end,
-                        size,
-                        4,
-                        &additional_reserved,
-                    )
-                    .ok())
-                };
-                let mut low = 0usize;
-                let mut high = movable.len();
-                let mut placement = try_prefix(high)?;
-                while low < high {
-                    let middle = low + (high - low) / 2;
-                    if let Some(address) = try_prefix(middle)? {
-                        placement = Some(address);
-                        high = middle;
-                    } else {
-                        low = middle + 1;
-                    }
-                }
-                placement.ok_or_else(|| {
-                    format!(
-                        "cannot place {size} bytes of static template data on tile {tile} after admitting every transient home"
-                    )
-                })?
+                data_region_base_for_tile(
+                    &fallback_occupied,
+                    tile,
+                    runtime_end,
+                    size,
+                    4,
+                    &additional_reserved,
+                )?
             };
             let end = address
                 .checked_add(size)
