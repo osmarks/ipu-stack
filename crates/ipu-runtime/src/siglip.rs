@@ -7,9 +7,9 @@ use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
     FlashAttentionConfig, FlashAttentionPlan, GemmDataType, MemoryArena, MemoryPlacement,
     MemoryPolicy, RowShardPlacement, RowShardTransitionConfig, Schedule, TensorId,
-    allocate_from_occupied_arenas, append_add_f16_row_shards_in_place,
-    append_affine_layer_norm_f16_with_memory_policy, append_bias_f16_c16_in_arenas,
-    append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
+    allocate_from_occupied_arenas, append_add_affine_layer_norm_f16_with_memory_policy,
+    append_add_f16_row_shards_in_place, append_affine_layer_norm_f16_with_memory_policy,
+    append_bias_f16_c16_in_arenas, append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
     append_blocked_gemm_f16_with_a16_input_with_memory_policy,
     append_c16_to_a16_blocks_gelu_f16_in_arenas, append_c16_to_a16_row_shards,
     append_c16_to_a16_row_shards_reblocked_in_arenas,
@@ -1153,16 +1153,13 @@ pub fn append_siglip_encoder_layer_with_precision(
         schedule,
         output_projection.output.iter().map(|block| block.tensor),
     )?;
-    let attention_residual =
-        append_add_f16_row_shards_in_place(schedule, &projected_shards, input)?;
-    end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
-
     info!(stage = "norm2_mlp", "planning SigLIP encoder stage");
     let norm2_phase_start = schedule.phases.len();
     let norm2_allocation_start = schedule.allocations.len();
-    let norm2 = append_affine_layer_norm_f16_with_memory_policy(
+    let norm2 = append_add_affine_layer_norm_f16_with_memory_policy(
         schedule,
-        &attention_residual,
+        &projected_shards,
+        input,
         AppendAffineLayerNormConfig {
             data_base,
             data_limit,
@@ -1170,6 +1167,8 @@ pub fn append_siglip_encoder_layer_with_precision(
         },
         memory,
     )?;
+    let attention_residual = projected_shards;
+    end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
     push_layer_norm_affine(
         schedule,
         host,

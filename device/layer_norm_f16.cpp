@@ -3,16 +3,13 @@
 
 using namespace poplar;
 
-class LayerNormAffineF16 : public MultiVertex {
-public:
-  Input<Vector<half, VectorLayout::ONE_PTR>> input;
-  Input<Vector<half, VectorLayout::ONE_PTR>> affine;
-  Output<Vector<half, VectorLayout::ONE_PTR>> output;
-  unsigned rows;
-  unsigned columns;
-  unsigned epsilonQ30;
-
-  bool compute(unsigned worker) {
+template <bool AddResidual, typename InputVector, typename RightVector,
+          typename ResidualVector, typename AffineVector, typename OutputVector>
+static __attribute__((always_inline)) bool
+normalize(const InputVector &input, const RightVector &right,
+          ResidualVector &residual, const AffineVector &affine,
+          OutputVector &output, unsigned rows, unsigned columns,
+          unsigned epsilonQ30, unsigned worker) {
     for (unsigned row = worker; row < rows; row += 6) {
       float sum = 0.0f;
       float squareSum = 0.0f;
@@ -21,8 +18,13 @@ public:
         half4 panelSum = {0.0, 0.0, 0.0, 0.0};
         half4 panelSquareSum = {0.0, 0.0, 0.0, 0.0};
         for (unsigned column = 0; column < 16; column += 4) {
-          const half4 packed =
+          half4 packed =
               *reinterpret_cast<const half4 *>(&input[base + column]);
+          if (AddResidual) {
+            packed +=
+                *reinterpret_cast<const half4 *>(&right[base + column]);
+            *reinterpret_cast<half4 *>(&residual[base + column]) = packed;
+          }
           panelSum += packed;
           panelSquareSum += packed * packed;
         }
@@ -48,8 +50,9 @@ public:
         const unsigned base = panel * rows * 16 + row * 16;
         for (unsigned inPanel = 0; inPanel < 16; inPanel += 4) {
           const unsigned column = panel * 16 + inPanel;
-          const half4 inputs =
-              *reinterpret_cast<const half4 *>(&input[base + inPanel]);
+          const half4 inputs = *reinterpret_cast<const half4 *>(
+              AddResidual ? &residual[base + inPanel]
+                          : &input[base + inPanel]);
           const half4 gammas =
               *reinterpret_cast<const half4 *>(&affine[column]);
           const half4 betas =
@@ -60,5 +63,35 @@ public:
       }
     }
     return true;
+}
+
+class LayerNormAffineF16 : public MultiVertex {
+public:
+  Input<Vector<half, VectorLayout::ONE_PTR>> input;
+  Input<Vector<half, VectorLayout::ONE_PTR>> affine;
+  Output<Vector<half, VectorLayout::ONE_PTR>> output;
+  unsigned rows;
+  unsigned columns;
+  unsigned epsilonQ30;
+
+  bool compute(unsigned worker) {
+    return normalize<false>(input, input, output, affine, output, rows, columns,
+                            epsilonQ30, worker);
+  }
+};
+
+class AddLayerNormAffineF16 : public MultiVertex {
+public:
+  InOut<Vector<half, VectorLayout::ONE_PTR>> residual;
+  Input<Vector<half, VectorLayout::ONE_PTR>> right;
+  Input<Vector<half, VectorLayout::ONE_PTR>> affine;
+  Output<Vector<half, VectorLayout::ONE_PTR>> output;
+  unsigned rows;
+  unsigned columns;
+  unsigned epsilonQ30;
+
+  bool compute(unsigned worker) {
+    return normalize<true>(residual, right, residual, affine, output, rows,
+                           columns, epsilonQ30, worker);
   }
 };

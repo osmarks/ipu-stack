@@ -6,8 +6,8 @@ use std::ops::Range;
 const INCOMING_DBASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;
 const INCOMING_SBASE: u8 = 0xa7;
-const KERNEL_ARGUMENT_BASE: u8 = 5;
-const KERNEL_ARGUMENT_REGISTERS: usize = 5;
+const KERNEL_FIRST_INPUT_REGISTER: u8 = 3;
+const KERNEL_LAST_VALUE_REGISTER: u8 = 9;
 
 pub(crate) const WORKER_BARRIER: &str = "ipu_stack_static_worker_barrier";
 pub(crate) const COMPLETE: &str = "ipu_stack_static_complete";
@@ -592,7 +592,11 @@ fn plan_template_compute_step(
         )
         .into());
     }
-    if first.input_addresses.len() != 2 || first.arguments.len() > KERNEL_ARGUMENT_REGISTERS {
+    let value_registers = first.input_addresses.len() + first.arguments.len();
+    if first.input_addresses.is_empty()
+        || value_registers
+            > usize::from(KERNEL_LAST_VALUE_REGISTER - KERNEL_FIRST_INPUT_REGISTER + 1)
+    {
         return Err(format!(
             "template {template_name} has unsupported compute ABI in phase {relative_phase} call {command_index}"
         )
@@ -834,7 +838,7 @@ pub(crate) fn step_code_size(
                 size.exchange += (2 + usize::from(active)) * 4;
             }
             LoweredTileStep::Compute(command) => {
-                size.compute += (4 + command.arguments.len()) * 4;
+                size.compute += (2 + command.input_addresses.len() + command.arguments.len()) * 4;
                 size.compute_calls += 1;
                 size.compute_argument_words += command.arguments.len();
             }
@@ -1016,12 +1020,20 @@ pub(crate) fn emit(
                 code.call(target, 10)?;
             }
             LoweredTileStep::Compute(command) => {
-                if command.input_addresses.len() != 2 {
+                let argument_base = KERNEL_FIRST_INPUT_REGISTER
+                    .checked_add(u8::try_from(command.input_addresses.len())?)
+                    .ok_or("kernel input register overflow")?;
+                let value_registers = command.input_addresses.len() + command.arguments.len();
+                if command.input_addresses.is_empty()
+                    || value_registers
+                        > usize::from(KERNEL_LAST_VALUE_REGISTER - KERNEL_FIRST_INPUT_REGISTER + 1)
+                {
                     return Err(format!(
-                        "kernel {} on tile {} has {} inputs; the current ABI requires two",
+                        "kernel {} on tile {} needs {} input/argument registers; at most {} are available",
                         command.specialization.operation,
                         program.tile,
-                        command.input_addresses.len()
+                        value_registers,
+                        KERNEL_LAST_VALUE_REGISTER - KERNEL_FIRST_INPUT_REGISTER + 1,
                     )
                     .into());
                 }
@@ -1030,13 +1042,11 @@ pub(crate) fn emit(
                     &format!("ipu_stack_{}", command.specialization.operation),
                 )?;
                 code.setzi(2, command.output_address)?;
-                code.setzi(3, command.input_addresses[0])?;
-                code.setzi(4, command.input_addresses[1])?;
-                if command.arguments.len() > KERNEL_ARGUMENT_REGISTERS {
-                    return Err("kernel scalar arguments exceed the register ABI".into());
+                for (index, &address) in command.input_addresses.iter().enumerate() {
+                    code.setzi(KERNEL_FIRST_INPUT_REGISTER + u8::try_from(index)?, address)?;
                 }
                 for (index, &argument) in command.arguments.iter().enumerate() {
-                    code.setzi(u8::try_from(index)? + KERNEL_ARGUMENT_BASE, argument)?;
+                    code.setzi(argument_base + u8::try_from(index)?, argument)?;
                 }
                 code.call(kernel, 10)?;
             }
@@ -1574,6 +1584,26 @@ mod tests {
                 offset: 0x20000,
             }
         );
+    }
+
+    #[test]
+    fn template_compute_accepts_three_inputs_with_three_arguments() {
+        let LoweredTileStep::Compute(mut first) = compute(3, 0x54000, vec![8, 64, 1024]) else {
+            unreachable!()
+        };
+        first.inputs.push(TensorId(4));
+        first.input_addresses.push(0x58000);
+        let mut second = first.clone();
+        second.output_address += 0x1000;
+        let commands = vec![vec![first.as_ref()], vec![second.as_ref()]];
+        let mut records = TemplateRecords::new(commands.len());
+
+        let step = plan_template_compute_step(&commands, 0, &mut records, "test", 3).unwrap();
+
+        let StaticTemplateStep::Compute { operands, .. } = step else {
+            unreachable!()
+        };
+        assert_eq!(operands.len(), 7);
     }
 
     #[test]

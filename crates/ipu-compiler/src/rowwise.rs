@@ -940,6 +940,41 @@ pub fn append_affine_layer_norm_f16_with_memory_policy(
     config: AppendAffineLayerNormConfig,
     memory: &MemoryPolicy,
 ) -> Result<AppendedAffineLayerNorm, CompileError> {
+    append_affine_layer_norm_f16_impl(schedule, input, None, config, memory)
+}
+
+pub fn append_add_affine_layer_norm_f16_with_memory_policy(
+    schedule: &mut Schedule,
+    residual: &[RowShardPlacement],
+    right: &[RowShardPlacement],
+    config: AppendAffineLayerNormConfig,
+    memory: &MemoryPolicy,
+) -> Result<AppendedAffineLayerNorm, CompileError> {
+    if residual.is_empty()
+        || residual.len() != right.len()
+        || residual.iter().any(|destination| {
+            !right.iter().any(|source| {
+                source.tile == destination.tile
+                    && source.row_start == destination.row_start
+                    && source.rows == destination.rows
+                    && source.columns == destination.columns
+            })
+        })
+    {
+        return Err(CompileError::Graph(
+            "fused residual LayerNorm requires matching colocated row shards".into(),
+        ));
+    }
+    append_affine_layer_norm_f16_impl(schedule, residual, Some(right), config, memory)
+}
+
+fn append_affine_layer_norm_f16_impl(
+    schedule: &mut Schedule,
+    input: &[RowShardPlacement],
+    residual_right: Option<&[RowShardPlacement]>,
+    config: AppendAffineLayerNormConfig,
+    memory: &MemoryPolicy,
+) -> Result<AppendedAffineLayerNorm, CompileError> {
     memory.validate()?;
     let epsilon = f32::from_bits(config.epsilon_bits);
     let epsilon_q30 = (epsilon * (1u64 << 30) as f32).round() as u32;
@@ -1058,6 +1093,16 @@ pub fn append_affine_layer_norm_f16_with_memory_policy(
         transient_limit,
     );
     for shard in input {
+        let right = residual_right.map(|right| {
+            right
+                .iter()
+                .find(|source| {
+                    source.tile == shard.tile
+                        && source.row_start == shard.row_start
+                        && source.rows == shard.rows
+                })
+                .expect("fused residual shards were validated")
+        });
         let activation_bytes = u32::from(shard.rows) * u32::from(columns) * 2;
         let output_tensor = TensorId(next_tensor);
         next_tensor += 1;
@@ -1103,19 +1148,35 @@ pub fn append_affine_layer_norm_f16_with_memory_policy(
             live_until: usize::MAX,
             kind: AllocationKind::Home,
         });
+        let (inputs, operation, role, label) = if let Some(right) = right {
+            (
+                vec![shard.tensor, right.tensor, affine_tensors[0]],
+                "add_layer_norm_affine_f16",
+                "add-and-normalize",
+                "fused residual add and LayerNorm",
+            )
+        } else {
+            (
+                vec![shard.tensor, affine_tensors[0]],
+                "layer_norm_affine_f16",
+                "normalize",
+                "affine LayerNorm",
+            )
+        };
         commands.push(KernelCommand {
             tile: shard.tile,
             output: output_tensor,
-            inputs: vec![shard.tensor, affine_tensors[0]],
+            inputs,
             arguments: vec![u32::from(shard.rows), u32::from(columns), epsilon_q30],
             specialization: SpecializationKey {
-                operation: "layer_norm_affine_f16".into(),
+                operation: operation.into(),
                 shape: vec![usize::from(shard.rows), usize::from(columns)],
                 worker_count: 6,
-                role: "normalize".into(),
+                role: role.into(),
                 alignment: 8,
             },
             metadata: BTreeMap::from([
+                ("label".into(), label.into()),
                 ("row_start".into(), shard.row_start.to_string()),
                 ("rows".into(), shard.rows.to_string()),
                 ("columns".into(), columns.to_string()),
@@ -1160,6 +1221,83 @@ mod tests {
         let allocation = &schedule.allocations[0];
         assert_eq!(allocation.live_from, 0);
         assert_eq!(allocation.live_until, usize::MAX);
+    }
+
+    #[test]
+    fn colocated_residual_layer_norm_uses_one_fused_compute_phase() {
+        let residual = RowShardPlacement {
+            tile: 0,
+            row_start: 0,
+            rows: 8,
+            columns: 64,
+            tensor: TensorId(0),
+            address: 0xa0000,
+        };
+        let right = RowShardPlacement {
+            tensor: TensorId(1),
+            address: 0xa1000,
+            ..residual
+        };
+        let bytes = u32::from(residual.rows) * u32::from(residual.columns) * 2;
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: [residual, right]
+                .into_iter()
+                .map(|shard| Allocation {
+                    tensor: shard.tensor,
+                    tile: shard.tile,
+                    address: shard.address,
+                    size: bytes,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                })
+                .collect(),
+            tile_count: 1,
+            peak_sram: BTreeMap::new(),
+        };
+        let memory = MemoryPolicy {
+            resident: vec![MemoryArena {
+                base: 0xc0000,
+                limit: 0xe8000,
+            }],
+            transient: vec![MemoryArena {
+                base: 0xb0000,
+                limit: 0xc0000,
+            }],
+            resident_tile_assignment: crate::ResidentTileAssignment::Balanced,
+            allocation_occupancy: crate::AllocationOccupancyCache::default(),
+        };
+
+        let appended = append_add_affine_layer_norm_f16_with_memory_policy(
+            &mut schedule,
+            &[residual],
+            &[right],
+            AppendAffineLayerNormConfig {
+                data_base: 0xb0000,
+                data_limit: 0xe8000,
+                epsilon_bits: 1e-6f32.to_bits(),
+            },
+            &memory,
+        )
+        .unwrap();
+
+        assert_eq!(appended.output.len(), 1);
+        assert!(
+            matches!(&schedule.phases[0], Phase::Exchange { transfers } if transfers.is_empty())
+        );
+        let Phase::Compute { commands, .. } = &schedule.phases[1] else {
+            unreachable!()
+        };
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].specialization.operation,
+            "add_layer_norm_affine_f16"
+        );
+        assert_eq!(commands[0].inputs.len(), 3);
+        assert_eq!(commands[0].inputs[0], residual.tensor);
+        schedule.validate_allocations().unwrap();
     }
 
     #[test]
