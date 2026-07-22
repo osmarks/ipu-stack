@@ -332,6 +332,7 @@ fn host_compute_relay_graph() -> Result<ExecutableGraph, ipu_compiler::CompileEr
     ));
 
     Ok(ExecutableGraph {
+        memory_policy: None,
         host_weights: Vec::new(),
         schedule: Schedule {
             layouts: Vec::new(),
@@ -474,6 +475,7 @@ fn d2h_only_graph(
         .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
         .collect::<Vec<_>>();
     Ok(ExecutableGraph {
+        memory_policy: None,
         host_weights: Vec::new(),
         schedule: Schedule {
             layouts: Vec::new(),
@@ -566,6 +568,7 @@ fn multi_tile_host_graph(
         slices,
     };
     Ok(ExecutableGraph {
+        memory_policy: None,
         host_weights: Vec::new(),
         schedule: Schedule {
             layouts: Vec::new(),
@@ -716,6 +719,7 @@ fn host_exchange_graph(
         source_tile
     };
     Ok(ExecutableGraph {
+        memory_policy: None,
         host_weights: Vec::new(),
         schedule: Schedule {
             layouts: Vec::new(),

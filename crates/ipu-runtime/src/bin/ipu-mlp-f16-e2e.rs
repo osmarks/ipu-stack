@@ -104,6 +104,7 @@ fn main() {
         ));
     }
     let graph = ExecutableGraph {
+        memory_policy: None,
         host_weights: Vec::new(),
         schedule: plan.schedule,
         initial_buffers: Vec::new(),

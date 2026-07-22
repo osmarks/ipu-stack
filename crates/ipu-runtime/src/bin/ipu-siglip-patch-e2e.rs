@@ -469,6 +469,7 @@ fn main() {
         &output,
     ));
     let graph = ExecutableGraph {
+        memory_policy: Some(memory.clone()),
         host_weights,
         schedule: plan.schedule,
         initial_buffers: Vec::new(),
@@ -821,6 +822,7 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
     let mut host_input = host_input.repeat(invocations as usize);
     host_input.extend(host_weight_bytes);
     let graph = ExecutableGraph {
+        memory_policy: None,
         host_weights,
         schedule,
         initial_buffers: Vec::new(),

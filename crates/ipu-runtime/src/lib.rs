@@ -473,18 +473,44 @@ struct AllocationRelocation {
     live_until: usize,
 }
 
-fn is_movable_transient_home(allocation: &ipu_compiler::Allocation) -> bool {
+fn is_movable_transient_home(
+    allocation: &ipu_compiler::Allocation,
+    arenas: &[ipu_compiler::MemoryArena],
+) -> bool {
     if !matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
         || allocation.live_until == usize::MAX
     {
         return false;
     }
     let end = allocation.address.saturating_add(allocation.size);
-    let ordinary_low = PLAN_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE;
-    let ordinary_high = ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
-        ..ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
-    (allocation.address >= ordinary_low.start && end <= ordinary_low.end)
-        || (allocation.address >= ordinary_high.start && end <= ordinary_high.end)
+    arenas
+        .iter()
+        .any(|arena| allocation.address >= arena.base && end <= arena.limit)
+}
+
+fn is_movable_resident_home(
+    allocation: &ipu_compiler::Allocation,
+    arenas: &[ipu_compiler::MemoryArena],
+) -> bool {
+    if !matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
+        || allocation.live_until != usize::MAX
+    {
+        return false;
+    }
+    let end = allocation.address.saturating_add(allocation.size);
+    arenas
+        .iter()
+        .any(|arena| allocation.address >= arena.base && end <= arena.limit)
+}
+
+fn default_transient_arenas() -> Vec<ipu_compiler::MemoryArena> {
+    vec![
+        ipu_compiler::MemoryArena::low(PLAN_BASE, ipu_package::IPU21_INTERLEAVED_MEMORY_BASE),
+        ipu_compiler::MemoryArena::low(
+            ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+            ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        ),
+    ]
 }
 
 fn merge_address_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
@@ -513,37 +539,79 @@ fn allocate_from_sorted_ranges(
     alignment: u32,
 ) -> Option<u32> {
     for arena in arenas {
-        let mut cursor = align_up(arena.base, alignment);
-        let mut permanent = permanent.iter().copied().peekable();
-        let mut active = active
-            .iter()
-            .map(|(&(start, _), &end)| (start, end))
-            .peekable();
-        loop {
-            let range = match (permanent.peek(), active.peek()) {
-                (Some(left), Some(right)) if left.0 <= right.0 => permanent.next(),
-                (Some(_), Some(_)) => active.next(),
-                (Some(_), None) => permanent.next(),
-                (None, Some(_)) => active.next(),
-                (None, None) => break,
-            };
-            let (start, end) = range.unwrap();
-            if end <= cursor || start >= arena.limit {
-                continue;
+        match arena.placement {
+            ipu_compiler::MemoryPlacement::Low => {
+                let mut cursor = align_up(arena.base, alignment);
+                let mut permanent = permanent.iter().copied().peekable();
+                let mut active = active
+                    .iter()
+                    .map(|(&(start, _), &end)| (start, end))
+                    .peekable();
+                loop {
+                    let range = match (permanent.peek(), active.peek()) {
+                        (Some(left), Some(right)) if left.0 <= right.0 => permanent.next(),
+                        (Some(_), Some(_)) => active.next(),
+                        (Some(_), None) => permanent.next(),
+                        (None, Some(_)) => active.next(),
+                        (None, None) => break,
+                    };
+                    let (start, end) = range.unwrap();
+                    if end <= cursor || start >= arena.limit {
+                        continue;
+                    }
+                    if cursor.checked_add(size).is_some_and(|end| end <= start) {
+                        return Some(cursor);
+                    }
+                    cursor = align_up(cursor.max(end), alignment);
+                    if cursor >= arena.limit {
+                        break;
+                    }
+                }
+                if cursor
+                    .checked_add(size)
+                    .is_some_and(|end| end <= arena.limit)
+                {
+                    return Some(cursor);
+                }
             }
-            if cursor.checked_add(size).is_some_and(|end| end <= start) {
-                return Some(cursor);
+            ipu_compiler::MemoryPlacement::High => {
+                let mut cursor = arena.limit;
+                let mut permanent = permanent.iter().copied().rev().peekable();
+                let mut active = active
+                    .iter()
+                    .rev()
+                    .map(|(&(start, _), &end)| (start, end))
+                    .peekable();
+                loop {
+                    let range = match (permanent.peek(), active.peek()) {
+                        (Some(left), Some(right)) if left.0 >= right.0 => permanent.next(),
+                        (Some(_), Some(_)) => active.next(),
+                        (Some(_), None) => permanent.next(),
+                        (None, Some(_)) => active.next(),
+                        (None, None) => break,
+                    };
+                    let (start, end) = range.unwrap();
+                    if start >= cursor || end <= arena.base {
+                        continue;
+                    }
+                    let candidate = cursor
+                        .checked_sub(size)
+                        .map(|value| align_down(value, alignment));
+                    if candidate.is_some_and(|candidate| candidate >= end) {
+                        return candidate;
+                    }
+                    cursor = cursor.min(start);
+                    if cursor <= arena.base {
+                        break;
+                    }
+                }
+                let candidate = cursor
+                    .checked_sub(size)
+                    .map(|value| align_down(value, alignment));
+                if candidate.is_some_and(|candidate| candidate >= arena.base) {
+                    return candidate;
+                }
             }
-            cursor = align_up(cursor.max(end), alignment);
-            if cursor >= arena.limit {
-                break;
-            }
-        }
-        if cursor
-            .checked_add(size)
-            .is_some_and(|end| end <= arena.limit)
-        {
-            return Some(cursor);
         }
     }
     None
@@ -553,10 +621,45 @@ fn fixed_allocation_ranges_by_tile(
     graph: &ExecutableGraph,
     tile_count: usize,
 ) -> Result<Vec<Vec<(u32, u32)>>> {
+    let default_arenas = default_transient_arenas();
+    let transient_arenas = graph
+        .memory_policy
+        .as_ref()
+        .map_or(default_arenas.as_slice(), |policy| {
+            policy.transient.as_slice()
+        });
     let mut ranges = vec![Vec::new(); tile_count];
     for allocation in &graph.schedule.allocations {
         if !matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
-            || is_movable_transient_home(allocation)
+            || is_movable_transient_home(allocation, transient_arenas)
+        {
+            continue;
+        }
+        ranges[usize::from(allocation.tile)].push(allocation_range(allocation)?);
+    }
+    Ok(ranges)
+}
+
+fn immovable_allocation_ranges_by_tile(
+    graph: &ExecutableGraph,
+    tile_count: usize,
+) -> Result<Vec<Vec<(u32, u32)>>> {
+    let default_arenas = default_transient_arenas();
+    let transient_arenas = graph
+        .memory_policy
+        .as_ref()
+        .map_or(default_arenas.as_slice(), |policy| {
+            policy.transient.as_slice()
+        });
+    let resident_arenas = graph
+        .memory_policy
+        .as_ref()
+        .map_or(&[][..], |policy| policy.resident.as_slice());
+    let mut ranges = vec![Vec::new(); tile_count];
+    for allocation in &graph.schedule.allocations {
+        if !matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
+            || is_movable_transient_home(allocation, transient_arenas)
+            || is_movable_resident_home(allocation, resident_arenas)
         {
             continue;
         }
@@ -571,39 +674,77 @@ fn repack_transient_allocations_around(
     reservations: &[Vec<(u32, u32)>],
     reason: &str,
 ) -> Result<usize> {
+    repack_allocations_around(graph, topology, reservations, reason, false)
+}
+
+fn repack_all_allocations_around(
+    graph: &mut ExecutableGraph,
+    topology: &Topology,
+    reservations: &[Vec<(u32, u32)>],
+    reason: &str,
+) -> Result<usize> {
+    repack_allocations_around(graph, topology, reservations, reason, true)
+}
+
+fn repack_allocations_around(
+    graph: &mut ExecutableGraph,
+    topology: &Topology,
+    reservations: &[Vec<(u32, u32)>],
+    reason: &str,
+    move_resident: bool,
+) -> Result<usize> {
     if reservations.len() != topology.tile_count() {
         return Err("invalid transient repacking reservations".into());
     }
     let physical_to_logical = (0..u16::try_from(topology.tile_count())?)
         .map(|logical| Ok((u32::from(topology.physical(logical)?), logical)))
         .collect::<Result<HashMap<_, _>>>()?;
-    let mut candidates_by_tile = vec![Vec::new(); topology.tile_count()];
+    let ordinary_arenas = default_transient_arenas();
+    let transient_arenas = graph
+        .memory_policy
+        .as_ref()
+        .map_or(ordinary_arenas.as_slice(), |policy| {
+            policy.transient.as_slice()
+        })
+        .to_vec();
+    if transient_arenas.is_empty() {
+        return Err("transient allocation policy has no arenas".into());
+    }
+    let resident_arenas = graph
+        .memory_policy
+        .as_ref()
+        .filter(|_| move_resident)
+        .map_or(&[][..], |policy| policy.resident.as_slice())
+        .to_vec();
+    let mut transient_by_tile = vec![Vec::new(); topology.tile_count()];
+    let mut resident_by_tile = vec![Vec::new(); topology.tile_count()];
     let mut fixed_by_tile = vec![Vec::new(); topology.tile_count()];
     for (index, allocation) in graph.schedule.allocations.iter().enumerate() {
-        if is_movable_transient_home(allocation) {
-            candidates_by_tile[usize::from(allocation.tile)].push(index);
-        } else if matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
-            && (allocation.address < ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
-                || allocation.address >= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT)
-        {
+        if is_movable_transient_home(allocation, &transient_arenas) {
+            transient_by_tile[usize::from(allocation.tile)].push(index);
+        } else if is_movable_resident_home(allocation, &resident_arenas) {
+            resident_by_tile[usize::from(allocation.tile)].push(index);
+        } else if matches!(allocation.kind, ipu_compiler::AllocationKind::Home) {
             fixed_by_tile[usize::from(allocation.tile)].push((
                 allocation.address,
                 allocation.address.saturating_add(allocation.size),
             ));
         }
     }
-    let ordinary_arenas = [
-        ipu_compiler::MemoryArena::low(PLAN_BASE, ipu_package::IPU21_INTERLEAVED_MEMORY_BASE),
-        ipu_compiler::MemoryArena::low(
-            ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
-            ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-        ),
-    ];
-    let placements = candidates_by_tile
+    let placements = transient_by_tile
         .into_par_iter()
+        .zip(resident_by_tile)
         .enumerate()
-        .map(|(tile, mut candidates)| -> Result<Vec<(usize, u32)>> {
-            candidates.sort_unstable_by_key(|&index| {
+        .map(|(tile, (mut transients, mut residents))| -> Result<Vec<(usize, u32)>> {
+            residents.sort_unstable_by_key(|&index| {
+                let allocation = &graph.schedule.allocations[index];
+                (
+                    std::cmp::Reverse(allocation.size),
+                    allocation.tensor.0,
+                    allocation.address,
+                )
+            });
+            transients.sort_unstable_by_key(|&index| {
                 let allocation = &graph.schedule.allocations[index];
                 (
                     allocation.live_from,
@@ -612,17 +753,36 @@ fn repack_transient_allocations_around(
                     allocation.tensor.0,
                 )
             });
-            let permanent = merge_address_ranges(
+            let mut permanent = merge_address_ranges(
                 reservations[tile]
                 .iter()
                 .copied()
                 .chain(fixed_by_tile[tile].iter().copied())
                 .collect(),
             );
+            let mut result = Vec::with_capacity(residents.len() + transients.len());
+            for index in residents {
+                let allocation = &graph.schedule.allocations[index];
+                let address = allocate_from_sorted_ranges(
+                    &permanent,
+                    &BTreeMap::new(),
+                    allocation.size,
+                    &resident_arenas,
+                    32,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "cannot repack resident tensor {} on tile {} for {reason}: no arena can hold a {}-byte SRAM allocation",
+                        allocation.tensor.0, allocation.tile, allocation.size,
+                    )
+                })?;
+                permanent.push((address, address.saturating_add(allocation.size)));
+                permanent = merge_address_ranges(permanent);
+                result.push((index, address));
+            }
             let mut active = BTreeMap::<(u32, usize), u32>::new();
             let mut expirations = BinaryHeap::<std::cmp::Reverse<(usize, u32, usize)>>::new();
-            let mut result = Vec::with_capacity(candidates.len());
-            for index in candidates {
+            for index in transients {
                 let allocation = &graph.schedule.allocations[index];
                 while let Some(&std::cmp::Reverse((live_until, address, expired_index))) =
                     expirations.peek()
@@ -635,7 +795,7 @@ fn repack_transient_allocations_around(
                     &permanent,
                     &active,
                     allocation.size,
-                    &ordinary_arenas,
+                    &transient_arenas,
                     32,
                 )
                 .ok_or_else(|| {
@@ -706,6 +866,28 @@ fn repack_transient_allocations_around(
             allocation.address = relocation.new_start + (allocation.address - relocation.old.start);
         }
     }
+    for (phase, scheduled) in graph.schedule.phases.iter_mut().enumerate() {
+        let ipu_compiler::Phase::Exchange { transfers } = scheduled else {
+            continue;
+        };
+        for transfer in transfers {
+            let Some(address) = &mut transfer.staging_address else {
+                continue;
+            };
+            if let Some(relocation) = relocations_by_source
+                .get(&(transfer.tensor, transfer.destination_tile))
+                .into_iter()
+                .flatten()
+                .find(|relocation| {
+                    relocation.live_from <= phase
+                        && phase < relocation.live_until
+                        && relocation.old.contains(address)
+                })
+            {
+                *address = relocation.new_start + (*address - relocation.old.start);
+            }
+        }
+    }
     for buffer in &mut graph.initial_buffers {
         relocate_literal_address(
             &mut buffer.address,
@@ -733,6 +915,7 @@ fn repack_transient_allocations_around(
     Ok(relocations.len())
 }
 
+#[cfg(test)]
 fn relocate_transient_allocations_for_executables(
     graph: &mut ExecutableGraph,
     topology: &Topology,
@@ -787,6 +970,7 @@ pub struct InitialBuffer {
 #[derive(Clone, Debug)]
 pub struct ExecutableGraph {
     pub schedule: Schedule,
+    pub memory_policy: Option<ipu_compiler::MemoryPolicy>,
     pub initial_buffers: Vec<InitialBuffer>,
     pub outputs: Vec<Binding>,
     pub host_weights: Vec<Binding>,
@@ -2006,7 +2190,7 @@ fn package_graph_impl(
         lowered_programs,
         template_regions,
         invocations,
-        true,
+        Vec::new(),
     )
 }
 
@@ -2188,7 +2372,7 @@ fn package_graph_impl_attempt(
     lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
-    allow_executable_relocation: bool,
+    mut executable_placement_history: Vec<Vec<[(u32, u32); 2]>>,
 ) -> Result<Application> {
     let topology = Topology::c600();
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
@@ -2235,6 +2419,8 @@ fn package_graph_impl_attempt(
     let allocation_ranges_by_tile =
         allocation_footprints_by_tile(graph, usize::from(graph.schedule.tile_count))?;
     let fixed_allocation_ranges = fixed_allocation_ranges_by_tile(graph, topology.tile_count())?;
+    let immovable_allocation_ranges =
+        immovable_allocation_ranges_by_tile(graph, topology.tile_count())?;
     let exchange_count = tile_exchange_plans
         .first()
         .map(|plans| plans.addresses.len())
@@ -2583,41 +2769,75 @@ fn package_graph_impl_attempt(
         .collect::<Result<Vec<_>>>();
     let executable_reservations = match executable_reservations {
         Ok(reservations) => reservations,
-        Err(error) if allow_executable_relocation => {
-            let desired = programs
-                .par_iter()
-                .zip(&tile_exchange_plans)
-                .zip(&program_reservation_sizes)
-                .zip(&preliminary_images)
-                .map(
-                    |(((program, plans), &program_size), image)| -> Result<[(u32, u32); 2]> {
-                        let regions = executable_regions_for_tile(
-                            &fixed_allocation_ranges[usize::from(program.tile)],
-                            plans.end,
-                            &[],
-                        )?;
-                        let placed = pack_generated_and_support_images(
-                            program.tile,
-                            program_size,
-                            u32::try_from(image.bytes.len())?,
-                            regions,
-                        )?;
-                        Ok(placed)
-                    },
+        Err(error) => {
+            let place = |allocation_ranges: &[Vec<(u32, u32)>]| {
+                programs
+                    .par_iter()
+                    .zip(&tile_exchange_plans)
+                    .zip(&program_reservation_sizes)
+                    .zip(&preliminary_images)
+                    .map(
+                        |(((program, plans), &program_size), image)| -> Result<[(u32, u32); 2]> {
+                            let regions = executable_regions_for_tile(
+                                &allocation_ranges[usize::from(program.tile)],
+                                plans.end,
+                                &[],
+                            )?;
+                            let placed = pack_generated_and_support_images(
+                                program.tile,
+                                program_size,
+                                u32::try_from(image.bytes.len())?,
+                                regions,
+                            )?;
+                            Ok(placed)
+                        },
+                    )
+                    .collect::<Result<Vec<_>>>()
+            };
+            let (desired, move_resident) = match place(&fixed_allocation_ranges) {
+                Ok(desired) => (desired, false),
+                Err(_) => (place(&immovable_allocation_ranges)?, true),
+            };
+            if executable_placement_history.contains(&desired) {
+                return Err(format!(
+                    "executable and tensor placement did not converge after {} distinct layouts: {error}",
+                    executable_placement_history.len()
                 )
-                .collect::<Result<Vec<_>>>()?;
+                .into());
+            }
+            executable_placement_history.push(desired.clone());
             let mut relocated_graph = graph.clone();
-            let moved = relocate_transient_allocations_for_executables(
-                &mut relocated_graph,
-                &topology,
-                &desired,
-            )?;
+            let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+            let reservations = desired
+                .iter()
+                .map(|ranges| {
+                    ranges
+                        .iter()
+                        .map(|&(start, end)| (align_down(start, element), align_up(end, element)))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let moved = if move_resident {
+                repack_all_allocations_around(
+                    &mut relocated_graph,
+                    &topology,
+                    &reservations,
+                    "measured executable placement",
+                )?
+            } else {
+                repack_transient_allocations_around(
+                    &mut relocated_graph,
+                    &topology,
+                    &reservations,
+                    "measured executable placement",
+                )?
+            };
             if moved == 0 {
                 return Err(error);
             }
             info!(
                 moved,
-                "relocated transient tensors for measured executable images"
+                move_resident, "relocated transient tensors for measured executable images"
             );
             return package_graph_impl_attempt(
                 &relocated_graph,
@@ -2626,10 +2846,9 @@ fn package_graph_impl_attempt(
                 None,
                 template_regions,
                 invocations,
-                false,
+                executable_placement_history,
             );
         }
-        Err(error) => return Err(error),
     };
     info!(
         tiles = executable_reservations.len(),
@@ -2890,7 +3109,8 @@ fn package_graph_impl_attempt(
         };
         let (ordinary_relocations, ordinary_ranges, data_placements) =
             place(&allocation_ranges_by_tile[usize::from(tile)])
-                .or_else(|_| place(&fixed_allocation_ranges[usize::from(tile)]))?;
+                .or_else(|_| place(&fixed_allocation_ranges[usize::from(tile)]))
+                .or_else(|_| place(&immovable_allocation_ranges[usize::from(tile)]))?;
         relocations.extend(ordinary_relocations);
         let (host_data_placements, placements) = data_placements.split_at(host_data_count);
         for (object, &(address, _)) in host_plans.data_objects.iter().zip(host_data_placements) {
@@ -2999,9 +3219,8 @@ fn package_graph_impl_attempt(
             );
         }
     }
-    let needs_static_relocation = graph.schedule.allocations.iter().any(|allocation| {
+    let overlaps_static_reservation = |allocation: &ipu_compiler::Allocation| {
         matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
-            && allocation.live_until != usize::MAX
             && static_relocation_reservations[usize::from(allocation.tile)]
                 .iter()
                 .any(|&(start, end)| {
@@ -3012,21 +3231,45 @@ fn package_graph_impl_attempt(
                         end,
                     )
                 })
+    };
+    let needs_resident_relocation = graph.schedule.allocations.iter().any(|allocation| {
+        allocation.live_until == usize::MAX && overlaps_static_reservation(allocation)
     });
-    if needs_static_relocation {
+    let needs_transient_relocation = graph.schedule.allocations.iter().any(|allocation| {
+        allocation.live_until != usize::MAX && overlaps_static_reservation(allocation)
+    });
+    if needs_resident_relocation || needs_transient_relocation {
         let mut relocated_graph = graph.clone();
-        let moved = repack_transient_allocations_around(
-            &mut relocated_graph,
-            &topology,
-            &static_relocation_reservations,
-            "static template data placement",
-        )?;
+        let moved = if needs_resident_relocation {
+            repack_all_allocations_around(
+                &mut relocated_graph,
+                &topology,
+                &static_relocation_reservations,
+                "static runtime placement",
+            )?
+        } else {
+            match repack_transient_allocations_around(
+                &mut relocated_graph,
+                &topology,
+                &static_relocation_reservations,
+                "static runtime placement",
+            ) {
+                Ok(moved) => moved,
+                Err(_) if graph.memory_policy.is_some() => repack_all_allocations_around(
+                    &mut relocated_graph,
+                    &topology,
+                    &static_relocation_reservations,
+                    "static runtime placement",
+                )?,
+                Err(error) => return Err(error),
+            }
+        };
         if moved == 0 {
             return Err("static template data overlaps transients that cannot be relocated".into());
         }
         info!(
             moved,
-            "relocated transient tensors for static template data"
+            needs_resident_relocation, "relocated graph allocations for static runtime"
         );
         return package_graph_impl_attempt(
             &relocated_graph,
@@ -3035,7 +3278,7 @@ fn package_graph_impl_attempt(
             None,
             template_regions,
             invocations,
-            false,
+            executable_placement_history,
         );
     }
     debug!(
@@ -4903,6 +5146,7 @@ mod tests {
     #[test]
     fn allocation_footprints_merge_home_ranges_and_ignore_derived_storage() {
         let graph = ExecutableGraph {
+            memory_policy: None,
             schedule: Schedule {
                 layouts: Vec::new(),
                 phases: Vec::new(),
@@ -4969,6 +5213,7 @@ mod tests {
         let mut reservations = vec![[(0, 0); 2]; topology.tile_count()];
         reservations[0] = [(0x5c000, 0x64000), (0x64000, 0x68000)];
         let mut graph = ExecutableGraph {
+            memory_policy: None,
             schedule: Schedule {
                 layouts: Vec::new(),
                 phases: Vec::new(),
@@ -5076,6 +5321,7 @@ mod tests {
         let runtime_end = PLAN_BASE + element / 2;
         let allocation_address = align_up(runtime_end, element) + element;
         let graph = ExecutableGraph {
+            memory_policy: None,
             host_weights: Vec::new(),
             schedule: Schedule {
                 layouts: Vec::new(),
@@ -5382,6 +5628,7 @@ mod tests {
     #[test]
     fn allocator_profile_covers_every_tile_and_labels_bindings() {
         let graph = ExecutableGraph {
+            memory_policy: None,
             host_weights: Vec::new(),
             schedule: ipu_compiler::Schedule {
                 layouts: Vec::new(),

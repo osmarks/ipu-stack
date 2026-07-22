@@ -49,6 +49,7 @@ fn main() {
     host_input.extend_from_slice(&affine);
 
     let graph = ExecutableGraph {
+        memory_policy: None,
         host_weights: Vec::new(),
         schedule: plan.schedule,
         initial_buffers: Vec::new(),

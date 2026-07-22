@@ -124,6 +124,7 @@ fn main() {
     }
     let output_binding = block_binding("output", batch, width, &plan.output);
     let graph = ExecutableGraph {
+        memory_policy: None,
         host_weights: Vec::new(),
         schedule: plan.schedule,
         initial_buffers: Vec::new(),

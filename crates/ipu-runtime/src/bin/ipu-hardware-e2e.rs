@@ -135,6 +135,7 @@ fn run_compiler_segmented_add(
         }],
     };
     let executable = ExecutableGraph {
+        memory_policy: None,
         host_weights: Vec::new(),
         schedule,
         initial_buffers: Vec::new(),
@@ -448,6 +449,7 @@ fn acceptance_graph() -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
     let expected_sum = count * (count + 1) / 2;
     (
         ExecutableGraph {
+            memory_policy: None,
             host_weights: Vec::new(),
             schedule: Schedule {
                 layouts: Vec::new(),
