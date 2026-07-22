@@ -187,6 +187,11 @@ fn main() {
     let tuning = SiglipEncoderTuning {
         gemm_row_block_rows: u16::try_from(env_u32("IPU_SIGLIP_GEMM_ROW_BLOCK_ROWS", 0))
             .expect("GEMM row block rows exceed u16"),
+        row_gemm_inner_block_columns: u16::try_from(env_u32(
+            "IPU_SIGLIP_ROW_GEMM_INNER_BLOCK_COLUMNS",
+            0,
+        ))
+        .expect("row-sharded GEMM inner block columns exceed u16"),
         attention_key_block_rows: u16::try_from(env_u32("IPU_SIGLIP_ATTENTION_KEY_BLOCK_ROWS", 0))
             .expect("attention key block rows exceed u16"),
     };
@@ -1127,7 +1132,13 @@ fn specialize_gemm_row_operations(
                 .first()
                 .copied()
                 .expect("GEMM row specialization requires its block shape");
-            command.specialization.operation = format!("{base}_rows_{rows}").into();
+            let inner = command
+                .specialization
+                .shape
+                .get(1)
+                .copied()
+                .expect("GEMM specialization requires its inner block shape");
+            command.specialization.operation = format!("{base}_rows_{rows}_inner_{inner}").into();
         }
     }
 }
@@ -1137,14 +1148,17 @@ fn compile_gemm_row_variants(
     artifacts: &std::path::Path,
     schedule: &ipu_compiler::Schedule,
 ) -> Result<Vec<KernelArtifact>, ipu_elf::ElfError> {
-    let mut variants = BTreeSet::<(String, u16)>::new();
+    let mut variants = BTreeSet::<(String, u16, u16)>::new();
     for phase in &schedule.phases {
         let Phase::Compute { commands, .. } = phase else {
             continue;
         };
         for command in commands {
             let operation = command.specialization.operation.as_ref();
-            let Some((base, rows)) = operation.rsplit_once("_rows_") else {
+            let Some((row_operation, inner)) = operation.rsplit_once("_inner_") else {
+                continue;
+            };
+            let Some((base, rows)) = row_operation.rsplit_once("_rows_") else {
                 continue;
             };
             let family = if base.starts_with("gemm_f16_f8w_") {
@@ -1159,20 +1173,27 @@ fn compile_gemm_row_variants(
             let rows = rows.parse::<u16>().map_err(|_| {
                 ipu_elf::ElfError::Link(format!("invalid GEMM row operation {operation}"))
             })?;
-            variants.insert((family.into(), rows));
+            let inner = inner.parse::<u16>().map_err(|_| {
+                ipu_elf::ElfError::Link(format!("invalid GEMM inner operation {operation}"))
+            })?;
+            variants.insert((family.into(), rows, inner));
         }
     }
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/gemm_f16_64_amp.S");
     variants
         .into_iter()
-        .map(|(family, rows)| {
+        .map(|(family, rows, inner)| {
             let mut flags = vec![
-                format!("-DGEMM_INNER_BLOCK_DIMENSION={INNER_BLOCK_DIMENSION}"),
+                format!("-DGEMM_INNER_BLOCK_DIMENSION={inner}"),
                 format!("-DGEMM_OUTPUT_COLUMNS={BLOCK_DIMENSION}"),
                 format!("-DGEMM_SMALL_ROWS={rows}"),
                 "-DGEMM_SINGLE_ROWS=1".into(),
-                format!("-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_{family}_init_rows_{rows}"),
-                format!("-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_{family}_accumulate_rows_{rows}"),
+                format!(
+                    "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_{family}_init_rows_{rows}_inner_{inner}"
+                ),
+                format!(
+                    "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_{family}_accumulate_rows_{rows}_inner_{inner}"
+                ),
             ];
             match family.as_str() {
                 "gemm_f16" => {}
@@ -1180,7 +1201,12 @@ fn compile_gemm_row_variants(
                 "gemm_f8" => flags.push("-DGEMM_NATIVE_FP8=1".into()),
                 _ => unreachable!(),
             }
-            toolchain.compile(&source, artifacts, &format!("{family}-rows-{rows}"), &flags)
+            toolchain.compile(
+                &source,
+                artifacts,
+                &format!("{family}-rows-{rows}-inner-{inner}"),
+                &flags,
+            )
         })
         .collect()
 }

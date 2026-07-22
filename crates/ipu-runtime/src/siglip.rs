@@ -275,6 +275,8 @@ pub struct SiglipEncoderPrecision {
 pub struct SiglipEncoderTuning {
     /// Zero keeps GEMM row blocks equal to the persistent activation layout.
     pub gemm_row_block_rows: u16,
+    /// Zero uses 64-column K blocks for GEMMs with row-sharded inputs.
+    pub row_gemm_inner_block_columns: u16,
     /// Zero asks the attention planner to choose the K/V block size.
     pub attention_key_block_rows: u16,
 }
@@ -862,6 +864,11 @@ pub fn append_siglip_encoder_layer_with_precision(
     } else {
         tuning.gemm_row_block_rows
     };
+    let tuned_gemm_inner = if tuning.row_gemm_inner_block_columns == 0 {
+        64
+    } else {
+        tuning.row_gemm_inner_block_columns
+    };
     let prefix = format!("encoder_layer_{layer:02}");
     let layer_phase_start = schedule.phases.len();
     info!(stage = "norm1_qkv", "planning SigLIP encoder stage");
@@ -912,10 +919,11 @@ pub fn append_siglip_encoder_layer_with_precision(
     let qkv = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         &norm.output,
-        gemm_config(
+        gemm_config_with_inner(
             rows,
             columns,
             columns * 3,
+            tuned_gemm_inner,
             qkv_row_block_dimension,
             tile_count,
             data_base,
@@ -1052,10 +1060,11 @@ pub fn append_siglip_encoder_layer_with_precision(
     let output_projection = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         &attention_shards,
-        gemm_config(
+        gemm_config_with_inner(
             rows,
             columns,
             columns,
+            tuned_gemm_inner,
             output_row_block_dimension,
             tile_count,
             data_base,
@@ -1171,10 +1180,11 @@ pub fn append_siglip_encoder_layer_with_precision(
     let mlp_up = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
         &norm2.output,
-        gemm_config(
+        gemm_config_with_inner(
             rows,
             columns,
             intermediate_columns,
+            tuned_gemm_inner,
             mlp_row_block_dimension,
             tile_count,
             data_base,
@@ -1375,12 +1385,38 @@ fn gemm_config(
     data_type: GemmDataType,
     retain_profile_metadata: bool,
 ) -> BlockedGemmConfig {
+    gemm_config_with_inner(
+        rows,
+        inner_dimension,
+        columns,
+        64,
+        row_block_dimension,
+        tile_count,
+        data_base,
+        data_limit,
+        data_type,
+        retain_profile_metadata,
+    )
+}
+
+fn gemm_config_with_inner(
+    rows: u16,
+    inner_dimension: u16,
+    columns: u16,
+    inner_block_dimension: u16,
+    row_block_dimension: u16,
+    tile_count: u16,
+    data_base: u32,
+    data_limit: u32,
+    data_type: GemmDataType,
+    retain_profile_metadata: bool,
+) -> BlockedGemmConfig {
     BlockedGemmConfig {
         rows,
         inner_dimension,
         columns,
         block_dimension: 64,
-        inner_block_dimension: 64,
+        inner_block_dimension,
         row_block_dimension,
         tile_count,
         data_base,
