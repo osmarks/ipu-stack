@@ -2543,6 +2543,30 @@ fn package_graph_impl_attempt(
             template: usize,
         },
     }
+    let transient_homes = graph
+        .schedule
+        .allocations
+        .iter()
+        .filter(|allocation| {
+            matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
+                && allocation.live_until != usize::MAX
+        })
+        .map(|allocation| (allocation.tile, allocation.tensor.0))
+        .collect::<BTreeSet<_>>();
+    let mut template_occupied_ranges_by_tile = vec![Vec::new(); programs.len()];
+    for allocation in &graph.schedule.allocations {
+        let relocatable = match allocation.kind {
+            ipu_compiler::AllocationKind::Home => allocation.live_until != usize::MAX,
+            ipu_compiler::AllocationKind::HomeAlias { source } => {
+                transient_homes.contains(&(allocation.tile, source.0))
+            }
+            _ => false,
+        };
+        if !relocatable {
+            template_occupied_ranges_by_tile[usize::from(allocation.tile)]
+                .push(allocation_range(allocation)?);
+        }
+    }
     let mut template_record_ranges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); programs.len()];
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
@@ -2616,19 +2640,30 @@ fn package_graph_impl_attempt(
                 }
                 continue;
             }
+            let additional_reserved = template_record_ranges[tile_index]
+                .iter()
+                .copied()
+                .chain(host_executable_placements[tile_index].2.iter().copied())
+                .chain(std::iter::once(image_executable_elements[tile_index]))
+                .collect::<Vec<_>>();
             let address = data_region_base_for_tile(
                 &allocation_ranges_by_tile[usize::from(tile)],
                 tile,
                 runtime_end,
                 size,
                 4,
-                &template_record_ranges[tile_index]
-                    .iter()
-                    .copied()
-                    .chain(host_executable_placements[tile_index].2.iter().copied())
-                    .chain(std::iter::once(image_executable_elements[tile_index]))
-                    .collect::<Vec<_>>(),
-            )?;
+                &additional_reserved,
+            )
+            .or_else(|_| {
+                data_region_base_for_tile(
+                    &template_occupied_ranges_by_tile[usize::from(tile)],
+                    tile,
+                    runtime_end,
+                    size,
+                    4,
+                    &additional_reserved,
+                )
+            })?;
             let end = address
                 .checked_add(size)
                 .ok_or("static template record address overflow")?;
@@ -2653,6 +2688,58 @@ fn package_graph_impl_attempt(
             }
             template_record_ranges[tile_index].push((address, end));
         }
+    }
+    let static_relocation_reservations = template_record_ranges
+        .iter()
+        .enumerate()
+        .map(|(tile_index, ranges)| {
+            ranges
+                .iter()
+                .copied()
+                .chain(executable_reservations[tile_index])
+                .chain(host_executable_placements[tile_index].2.iter().copied())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let needs_static_relocation = graph.schedule.allocations.iter().any(|allocation| {
+        matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
+            && allocation.live_until != usize::MAX
+            && static_relocation_reservations[usize::from(allocation.tile)]
+                .iter()
+                .any(|&(start, end)| {
+                    ranges_overlap(
+                        allocation.address,
+                        allocation.address.saturating_add(allocation.size),
+                        start,
+                        end,
+                    )
+                })
+    });
+    if needs_static_relocation {
+        let mut relocated_graph = graph.clone();
+        let moved = relocate_transient_allocations_around(
+            &mut relocated_graph,
+            &topology,
+            &static_relocation_reservations,
+            4,
+            "static template data placement",
+        )?;
+        if moved == 0 {
+            return Err("static template data overlaps transients that cannot be relocated".into());
+        }
+        info!(
+            moved,
+            "relocated transient tensors for static template data"
+        );
+        return package_graph_impl_attempt(
+            &relocated_graph,
+            objects,
+            profile_code,
+            None,
+            template_regions,
+            invocations,
+            false,
+        );
     }
     let mut host_runtime_ranges = Vec::with_capacity(tile_host_plans.len());
     let mut worker_sync_addresses = Vec::with_capacity(tile_host_plans.len());
