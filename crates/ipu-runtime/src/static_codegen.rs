@@ -69,7 +69,6 @@ pub(crate) struct StaticTemplatePlan {
     pub record_split: u16,
     pub records: Vec<Vec<StaticTemplateRecordWord>>,
     pub patch_addresses: Vec<Vec<u32>>,
-    pub patch_ranges: Vec<Vec<Range<usize>>>,
     pub patches: Vec<Vec<(u16, StaticTemplatePatchValue)>>,
     pub shared_address: u32,
     pub shared: Vec<StaticTemplateRecordWord>,
@@ -188,7 +187,7 @@ pub(crate) fn template_patch_group_span(
 }
 
 pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> Vec<Range<usize>> {
-    const SUBDIVISIONS_PER_RECORD_PART: usize = 3;
+    const SUBDIVISIONS_PER_RECORD_PART: usize = 4;
 
     fn halves(range: Range<usize>) -> [Range<usize>; 2] {
         let local_midpoint = (range.len() / 2).div_ceil(32) * 32;
@@ -206,29 +205,6 @@ pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> Vec<Ra
             ranges
         })
         .collect()
-}
-
-const TEMPLATE_PATCH_SEGMENT_BYTES: usize = 192;
-
-pub(crate) fn template_patch_ranges_for_patch(
-    record_words: usize,
-    split: usize,
-    patch: &[(u16, StaticTemplatePatchValue)],
-) -> Vec<Range<usize>> {
-    let mut ranges = template_patch_ranges(record_words, split);
-    loop {
-        let Some(index) = ranges.iter().position(|range| {
-            range.len() > 32
-                && template_patch_storage_words_range(range.clone(), patch) * 4
-                    > TEMPLATE_PATCH_SEGMENT_BYTES
-        }) else {
-            break;
-        };
-        let range = ranges.remove(index);
-        let midpoint = range.start + (range.len() / 2).div_ceil(32) * 32;
-        ranges.splice(index..index, [range.start..midpoint, midpoint..range.end]);
-    }
-    ranges
 }
 
 #[derive(Clone, Debug)]
@@ -647,16 +623,11 @@ pub(crate) fn plan_static_templates(
         cursor = cursor
             .checked_add(u32::try_from(record_words - usize::from(record_split))? * 4)
             .ok_or("static template record address overflow")?;
-        let patch_ranges = patches
-            .iter()
-            .map(|patch| {
-                template_patch_ranges_for_patch(record_words, usize::from(record_split), patch)
-            })
-            .collect::<Vec<_>>();
+        let patch_ranges = template_patch_ranges(record_words, usize::from(record_split));
         let mut patch_addresses = Vec::with_capacity(patches.len());
-        for (patch, ranges) in patches.iter().zip(&patch_ranges) {
-            let mut addresses = Vec::with_capacity(ranges.len());
-            for slots in ranges {
+        for patch in &patches {
+            let mut addresses = Vec::with_capacity(patch_ranges.len());
+            for slots in &patch_ranges {
                 cursor = (cursor + 3) & !3;
                 addresses.push(cursor);
                 cursor = cursor
@@ -677,7 +648,6 @@ pub(crate) fn plan_static_templates(
             record_split,
             records: records.rows,
             patch_addresses,
-            patch_ranges,
             patches,
             shared_address: 0,
             shared: records.shared,
@@ -1072,7 +1042,10 @@ pub(crate) fn emit(
             code.st32(7, 11, 15, 3)?;
             for instance in 0..template.records.len() {
                 let patch = &template.patches[instance];
-                for (part, slots) in template.patch_ranges[instance].iter().cloned().enumerate() {
+                for (part, slots) in template_patch_ranges(record_words, record_split)
+                    .into_iter()
+                    .enumerate()
+                {
                     if template_patch_storage_words_range(slots.clone(), patch) == 0 {
                         continue;
                     }
@@ -1086,7 +1059,10 @@ pub(crate) fn emit(
             }
             if template.patches.len() > template.records.len() {
                 let reset = template.patches.len() - 1;
-                for (part, slots) in template.patch_ranges[reset].iter().cloned().enumerate() {
+                for (part, slots) in template_patch_ranges(record_words, record_split)
+                    .into_iter()
+                    .enumerate()
+                {
                     if template_patch_storage_words_range(slots.clone(), &template.patches[reset])
                         == 0
                     {
@@ -1761,29 +1737,6 @@ mod tests {
     }
 
     #[test]
-    fn dense_template_patches_are_split_without_gaps() {
-        let record_words = 4096;
-        let split = record_words / 2;
-        let patch = (0..record_words)
-            .map(|slot| {
-                (
-                    u16::try_from(slot).unwrap(),
-                    StaticTemplatePatchValue::Delta(1),
-                )
-            })
-            .collect::<Vec<_>>();
-        let ranges = template_patch_ranges_for_patch(record_words, split, &patch);
-
-        assert_eq!(ranges.first().unwrap().start, 0);
-        assert_eq!(ranges.last().unwrap().end, record_words);
-        assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
-        assert!(ranges.iter().all(|range| {
-            template_patch_storage_words_range(range.clone(), &patch) * 4
-                <= TEMPLATE_PATCH_SEGMENT_BYTES
-        }));
-    }
-
-    #[test]
     fn templates_align_rotated_tile_work_by_global_phase() {
         let program = LoweredTileProgram {
             tile: 7,
@@ -1854,13 +1807,14 @@ mod tests {
         assert_eq!(template.records[0].len(), template.records[1].len());
         assert!(end > template.record_secondary_addresses[0]);
         assert_eq!(template.patch_addresses.len(), 3);
-        assert!(
-            template
-                .patch_addresses
-                .iter()
-                .zip(&template.patch_ranges)
-                .all(|(addresses, ranges)| addresses.len() == ranges.len())
-        );
+        assert!(template.patch_addresses.iter().all(|addresses| {
+            addresses.len()
+                == template_patch_ranges(
+                    template.records[0].len(),
+                    usize::from(template.record_split),
+                )
+                .len()
+        }));
         assert!(template.patches[0].is_empty());
         for (patch, previous_record, expected_record) in [
             (
