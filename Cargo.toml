@@ -34,7 +34,7 @@ serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"
 safetensors = "0.8.0"
 sha2 = "0.11.0"
-smallvec = "1.15.1"
+smallvec = { version = "1.15.1", features = ["serde"] }
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }

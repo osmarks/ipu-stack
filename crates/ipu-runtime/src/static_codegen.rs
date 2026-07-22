@@ -506,7 +506,7 @@ pub(crate) fn plan_static_templates(
                                 let LoweredTileStep::Compute(command) = step else {
                                     return None;
                                 };
-                                Some(command.as_ref())
+                                Some(command)
                             })
                             .collect::<Vec<_>>()
                     })
@@ -1564,7 +1564,7 @@ mod tests {
         arguments: Vec<u32>,
         operation: &'static str,
     ) -> LoweredTileStep {
-        LoweredTileStep::Compute(Box::new(LoweredComputeCommand {
+        LoweredTileStep::Compute(LoweredComputeCommand {
             op: OpId(phase),
             phase,
             command: Arc::new(ipu_compiler::KernelCommand {
@@ -1582,8 +1582,8 @@ mod tests {
                 metadata: BTreeMap::new(),
             }),
             output_address: 0x80000,
-            input_addresses: vec![0x50000, input_address],
-        }))
+            input_addresses: smallvec::smallvec![0x50000, input_address],
+        })
     }
 
     #[test]
@@ -1642,7 +1642,7 @@ mod tests {
         first.input_addresses.push(0x58000);
         let mut second = first.clone();
         second.output_address += 0x1000;
-        let commands = vec![vec![first.as_ref()], vec![second.as_ref()]];
+        let commands = vec![vec![&first], vec![&second]];
         let mut records = TemplateRecords::new(commands.len());
 
         let step = plan_template_compute_step(&commands, 0, &mut records, "test", 3).unwrap();

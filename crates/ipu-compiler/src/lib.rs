@@ -1,5 +1,6 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ops::Range;
@@ -3254,7 +3255,7 @@ pub struct LoweredComputeCommand {
     pub phase: usize,
     pub command: Arc<KernelCommand>,
     pub output_address: u32,
-    pub input_addresses: Vec<u32>,
+    pub input_addresses: SmallVec<[u32; 4]>,
 }
 
 impl std::ops::Deref for LoweredComputeCommand {
@@ -3272,7 +3273,7 @@ pub enum LoweredTileStep {
         epoch: usize,
         row: Arc<[u32]>,
     },
-    Compute(Box<LoweredComputeCommand>),
+    Compute(LoweredComputeCommand),
     IdleCompute {
         op: OpId,
         phase: usize,
@@ -3905,6 +3906,24 @@ impl Schedule {
         &self,
         topology: &Topology,
     ) -> Result<Vec<LoweredTileProgram>, CompileError> {
+        self.lower_tile_programs_impl(topology, true)
+    }
+
+    /// Lowers executable tile programs without materializing inactive compute
+    /// phases. Those phases emit no device instructions and are only needed by
+    /// the profiling representation.
+    pub fn lower_tile_programs_for_codegen(
+        &self,
+        topology: &Topology,
+    ) -> Result<Vec<LoweredTileProgram>, CompileError> {
+        self.lower_tile_programs_impl(topology, false)
+    }
+
+    fn lower_tile_programs_impl(
+        &self,
+        topology: &Topology,
+        include_idle_compute: bool,
+    ) -> Result<Vec<LoweredTileProgram>, CompileError> {
         let allocation_index = AllocationIndex::new(&self.allocations);
         let exchanges = self.lower_exchanges_with_index(topology, &allocation_index)?;
         let exchange_by_phase: HashMap<_, _> = exchanges
@@ -3979,22 +3998,24 @@ impl Schedule {
                                     })
                             })
                             .collect::<Result<_, _>>()?;
-                        program.steps.push(LoweredTileStep::Compute(Box::new(
-                            LoweredComputeCommand {
+                        program
+                            .steps
+                            .push(LoweredTileStep::Compute(LoweredComputeCommand {
                                 op: *op,
                                 phase: phase_index,
                                 command: command.clone(),
                                 output_address,
                                 input_addresses,
-                            },
-                        )));
+                            }));
                     }
-                    for (program, active) in programs.iter_mut().zip(active) {
-                        if !active {
-                            program.steps.push(LoweredTileStep::IdleCompute {
-                                op: *op,
-                                phase: phase_index,
-                            });
+                    if include_idle_compute {
+                        for (program, active) in programs.iter_mut().zip(active) {
+                            if !active {
+                                program.steps.push(LoweredTileStep::IdleCompute {
+                                    op: *op,
+                                    phase: phase_index,
+                                });
+                            }
                         }
                     }
                     direct_staging.clear();

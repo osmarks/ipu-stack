@@ -1819,7 +1819,7 @@ fn package_graph_impl_attempt(
     graph.schedule.validate_allocations()?;
     let programs = match lowered_programs {
         Some(programs) => programs,
-        None => graph.schedule.lower_tile_programs(&topology)?,
+        None => graph.schedule.lower_tile_programs_for_codegen(&topology)?,
     };
     if !profile_code.is_empty() && profile_code.len() != programs.len() {
         return Err("profile layout tile count differs from schedule".into());
@@ -4632,7 +4632,7 @@ mod tests {
                 ]),
             }),
             output_address: 0x80000,
-            input_addresses: vec![0x50000, 0x54000],
+            input_addresses: smallvec::smallvec![0x50000, 0x54000],
         };
         let step = compute_profile_step(8, &command);
 
