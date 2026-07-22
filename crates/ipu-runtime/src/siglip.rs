@@ -390,14 +390,25 @@ pub struct SiglipEncoderTuning {
 fn choose_gemm_output_block_columns(
     rows: u16,
     row_block_rows: u16,
+    inner_block_columns: u16,
     columns: u16,
     tile_count: u16,
+    data_type: GemmDataType,
     requested: u16,
 ) -> Result<u16> {
+    let fits_transfer = |output_columns: u16| {
+        u32::from(inner_block_columns)
+            .checked_mul(u32::from(output_columns))
+            .and_then(|elements| elements.checked_mul(data_type.weight_element_bytes()))
+            .is_some_and(|bytes| bytes <= ipu_exchange::MAX_TRANSFER_WORDS * 4)
+    };
     if requested != 0 {
-        if !matches!(requested, 32 | 64 | 128) || !columns.is_multiple_of(requested) {
+        if !matches!(requested, 32 | 64 | 128)
+            || !columns.is_multiple_of(requested)
+            || !fits_transfer(requested)
+        {
             return Err(format!(
-                "GEMM output block width {requested} must be 32, 64, or 128 and divide {columns}"
+                "GEMM output block width {requested} must be supported, divide {columns}, and fit one weight transfer"
             )
             .into());
         }
@@ -415,7 +426,7 @@ fn choose_gemm_output_block_columns(
     let baseline_waves = best_waves;
     let mut best_is_saturated = best_blocks * 4 >= best_waves * tile_count * 3;
     for candidate in [32, 64, 128] {
-        if !columns.is_multiple_of(candidate) {
+        if !columns.is_multiple_of(candidate) || !fits_transfer(candidate) {
             continue;
         }
         let blocks = u32::from(row_shards) * u32::from(columns / candidate);
@@ -1243,8 +1254,10 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let qkv_output_block_columns = choose_gemm_output_block_columns(
         rows,
         qkv_row_block_dimension,
+        qkv_inner,
         columns * 3,
         tile_count,
+        qkv_data_type,
         projection_output(tuning.qkv_output_block_columns),
     )?;
     if tuning.automatic_gemm_row_blocks
@@ -1415,8 +1428,10 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let output_projection_block_columns = choose_gemm_output_block_columns(
         rows,
         output_row_block_dimension,
+        attention_output_inner,
         columns,
         tile_count,
+        output_data_type,
         projection_output(tuning.attention_output_block_columns),
     )?;
     let output_projection_allocation_start = schedule.allocations.len();
@@ -1558,8 +1573,10 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let mlp_up_output_block_columns = choose_gemm_output_block_columns(
         rows,
         mlp_up_row_block_dimension,
+        mlp_up_inner,
         intermediate_columns,
         tile_count,
+        mlp_up_data_type,
         projection_output(tuning.mlp_up_output_block_columns),
     )?;
     let mut planned_mlp_down_row_block_dimension = None;
@@ -1731,8 +1748,10 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let mlp_down_output_block_columns = choose_gemm_output_block_columns(
         rows,
         mlp_down_row_block_dimension,
+        mlp_down_inner_block_dimension,
         columns,
         tile_count,
+        mlp_down_data_type,
         projection_output(tuning.mlp_down_output_block_columns),
     )?;
     let mlp_down_allocation_start = schedule.allocations.len();
@@ -2186,6 +2205,19 @@ mod tests {
             },
             metadata: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn automatic_output_blocks_respect_weight_transfer_capacity() {
+        let output =
+            choose_gemm_output_block_columns(4096, 18, 128, 1152, 1472, GemmDataType::F16, 0)
+                .unwrap();
+        let bytes = u32::from(output) * 128 * GemmDataType::F16.weight_element_bytes();
+        assert!(bytes <= ipu_exchange::MAX_TRANSFER_WORDS * 4);
+        assert!(
+            choose_gemm_output_block_columns(4096, 18, 128, 1152, 1472, GemmDataType::F16, 128,)
+                .is_err()
+        );
     }
 
     #[test]
