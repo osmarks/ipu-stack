@@ -505,7 +505,10 @@ fn repack_transient_allocations_around(
     for (index, allocation) in graph.schedule.allocations.iter().enumerate() {
         if is_movable_transient_home(allocation) {
             candidates_by_tile[usize::from(allocation.tile)].push(index);
-        } else if matches!(allocation.kind, ipu_compiler::AllocationKind::Home) {
+        } else if matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
+            && (allocation.address < ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                || allocation.address >= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT)
+        {
             fixed_by_tile[usize::from(allocation.tile)].push(LifetimeReservation {
                 start: allocation.address,
                 end: allocation.address.saturating_add(allocation.size),
@@ -548,6 +551,7 @@ fn repack_transient_allocations_around(
             let mut result = Vec::with_capacity(candidates.len());
             for index in candidates {
                 let allocation = &graph.schedule.allocations[index];
+                placed.retain(|entry| entry.live_until > allocation.live_from);
                 let overlaps_lifetime = |entry: &LifetimeReservation| {
                     allocation.live_from < entry.live_until
                         && entry.live_from < allocation.live_until
