@@ -399,6 +399,34 @@ fn pack_sized_objects_in_gaps(
     Ok(placed)
 }
 
+fn pack_generated_and_support_images(
+    tile: u16,
+    generated_size: u32,
+    support_size: u32,
+    occupied: Vec<(u32, u32)>,
+) -> Result<[(u32, u32); 2]> {
+    let support_offset = align_up(generated_size, 8);
+    let combined_size = support_offset
+        .checked_add(support_size)
+        .ok_or("combined executable image size overflow")?;
+    let combined = pack_sized_objects_in_gaps(
+        tile,
+        &[combined_size],
+        occupied,
+        ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+        "executable images",
+    )?[0];
+    let support_start = combined
+        .0
+        .checked_add(support_offset)
+        .ok_or("support image address overflow")?;
+    let generated_end = combined
+        .0
+        .checked_add(generated_size)
+        .ok_or("generated image address overflow")?;
+    Ok([(combined.0, generated_end), (support_start, combined.1)])
+}
+
 fn allocation_range(allocation: &ipu_compiler::Allocation) -> Result<(u32, u32)> {
     Ok((
         allocation.address,
@@ -2349,14 +2377,13 @@ fn package_graph_impl_attempt(
                     plans.end,
                     &[],
                 )?;
-                let placed = pack_sized_objects_in_gaps(
+                let placed = pack_generated_and_support_images(
                     program.tile,
-                    &[program_size, u32::try_from(image.bytes.len())?],
+                    program_size,
+                    u32::try_from(image.bytes.len())?,
                     regions,
-                    ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                    "executable",
                 )?;
-                Ok([placed[0], placed[1]])
+                Ok(placed)
             },
         )
         .collect::<Result<Vec<_>>>();
@@ -2371,14 +2398,13 @@ fn package_graph_impl_attempt(
                 .map(
                     |(((program, plans), &program_size), image)| -> Result<[(u32, u32); 2]> {
                         let regions = executable_regions_for_tile(&[], plans.end, &[])?;
-                        let placed = pack_sized_objects_in_gaps(
+                        let placed = pack_generated_and_support_images(
                             program.tile,
-                            &[program_size, u32::try_from(image.bytes.len())?],
+                            program_size,
+                            u32::try_from(image.bytes.len())?,
                             regions,
-                            ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                            "measured executable",
                         )?;
-                        Ok([placed[0], placed[1]])
+                        Ok(placed)
                     },
                 )
                 .collect::<Result<Vec<_>>>()?;
