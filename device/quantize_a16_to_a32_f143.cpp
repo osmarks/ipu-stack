@@ -63,7 +63,8 @@ public:
     const unsigned sourceRowStart = offsets & 0x3ff;
     const unsigned destinationRowStart = offsets >> 10;
     const unsigned copyRows = countAndScale & 0x3ff;
-    const unsigned scaleBits = countAndScale >> 10;
+    const unsigned scaleBits = (countAndScale >> 10) & 0x3f;
+    const unsigned groupCount = countAndScale >> 16;
     const auto outputScale =
         static_cast<signed char>((scaleBits ^ 0x20) - 0x20);
     const quarter_metadata metadata = {
@@ -75,7 +76,7 @@ public:
     for (unsigned copiedRow = worker; copiedRow < copyRows; copiedRow += 6) {
       const unsigned sourceRow = sourceRowStart + copiedRow;
       const unsigned destinationRow = destinationRowStart + copiedRow;
-      for (unsigned group = 0; group < 2; ++group) {
+      for (unsigned group = 0; group < groupCount; ++group) {
         const unsigned outputBase = (group * destinationRows + destinationRow) * 32;
         for (unsigned panel = 0; panel < 2; ++panel) {
           const unsigned inputBase =

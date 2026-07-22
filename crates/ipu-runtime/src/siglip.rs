@@ -1331,11 +1331,23 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let mlp_down_data_type = precision
         .mlp_down
         .gemm_data_type(mlp_down_weight.iter().copied());
+    let mlp_gelu =
+        append_c16_to_a16_blocks_gelu_f16_in_arenas(schedule, &mlp_up.output, &memory.transient)?;
+    let mlp_down_inner_block_dimension = mlp_gelu
+        .first()
+        .map(|block| block.columns)
+        .ok_or("MLP GeLU produced no input blocks")?;
+    if mlp_gelu
+        .iter()
+        .any(|block| block.columns != mlp_down_inner_block_dimension)
+    {
+        return Err("MLP GeLU blocks have inconsistent column widths".into());
+    }
     let mlp_down_row_block_dimension =
         if tuning.automatic_gemm_row_blocks && tuning.gemm_row_block_rows == 0 {
             choose_gemm_row_block_for(
                 rows,
-                tuned_gemm_inner,
+                mlp_down_inner_block_dimension,
                 columns,
                 64,
                 tile_count,
@@ -1345,11 +1357,10 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         } else {
             tuned_gemm_rows
         };
-    let mlp_gelu =
-        append_c16_to_a16_blocks_gelu_f16_in_arenas(schedule, &mlp_up.output, &memory.transient)?;
     info!(
         operation = "mlp_down",
         row_block_rows = mlp_down_row_block_dimension,
+        inner_block_columns = mlp_down_inner_block_dimension,
         "selected SigLIP GEMM blocking"
     );
     end_tensor_lifetimes(schedule, mlp_up.output.iter().map(|block| block.tensor))?;
@@ -1362,7 +1373,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
             rows,
             intermediate_columns,
             columns,
-            tuned_gemm_inner,
+            mlp_down_inner_block_dimension,
             mlp_down_row_block_dimension,
             tile_count,
             data_base,

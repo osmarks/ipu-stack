@@ -1518,12 +1518,12 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
                     (false, Some(scale)) => vec![
                         pack_reblock_row_pair(shard.rows, block.rows)?,
                         pack_reblock_row_pair(0, destination_row_start)?,
-                        u32::from(copy_rows) | (u32::from((scale as u8) & 0x3f) << 10),
+                        pack_a16_reblock_count(copy_rows, block.columns, Some(scale))?,
                     ],
                     (false, None) => vec![
                         pack_reblock_row_pair(shard.rows, block.rows)?,
                         pack_reblock_row_pair(0, destination_row_start)?,
-                        u32::from(copy_rows),
+                        pack_a16_reblock_count(copy_rows, block.columns, None)?,
                     ],
                 },
                 specialization: SpecializationKey {
@@ -1761,12 +1761,12 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
                     (false, Some(scale)) => vec![
                         pack_reblock_row_pair(source.rows, destination.rows)?,
                         pack_reblock_row_pair(0, destination_row_start)?,
-                        u32::from(copy_rows) | (u32::from((scale as u8) & 0x3f) << 10),
+                        pack_a16_reblock_count(copy_rows, destination.columns, Some(scale))?,
                     ],
                     (false, None) => vec![
                         pack_reblock_row_pair(source.rows, destination.rows)?,
                         pack_reblock_row_pair(0, destination_row_start)?,
-                        u32::from(copy_rows),
+                        pack_a16_reblock_count(copy_rows, destination.columns, None)?,
                     ],
                 },
                 specialization: SpecializationKey {
@@ -4165,6 +4165,28 @@ pub(crate) fn pack_reblock_row_pair(first: u16, second: u16) -> Result<u32, Comp
     Ok(u32::from(first) | (u32::from(second) << REBLOCK_ROW_BITS))
 }
 
+fn pack_a16_reblock_count(
+    copy_rows: u16,
+    columns: u16,
+    input_scale: Option<i8>,
+) -> Result<u32, CompileError> {
+    if copy_rows >= REBLOCK_ROW_LIMIT {
+        return Err(CompileError::Graph(format!(
+            "row reblocking supports copy counts below {REBLOCK_ROW_LIMIT}"
+        )));
+    }
+    let column_group = if input_scale.is_some() { 32 } else { 16 };
+    if columns == 0 || !columns.is_multiple_of(column_group) {
+        return Err(CompileError::Graph(format!(
+            "A16 reblocking requires columns divisible by {column_group}"
+        )));
+    }
+    let groups = columns / column_group;
+    Ok(u32::from(copy_rows)
+        | (u32::from(input_scale.map_or(0, |scale| (scale as u8) & 0x3f)) << 10)
+        | (u32::from(groups) << 16))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EncoderConfig {
     pub sequence: usize,
@@ -5274,6 +5296,16 @@ mod tests {
             gemm_row_block_candidates_for(1458, 64, 3456, 64, 1472, GemmDataType::F16)
                 .contains(&constrained)
         );
+    }
+
+    #[test]
+    fn a16_reblock_count_encodes_full_column_span() {
+        assert_eq!(pack_a16_reblock_count(17, 128, None).unwrap(), 8 << 16 | 17);
+        assert_eq!(
+            pack_a16_reblock_count(17, 128, Some(-4)).unwrap(),
+            4 << 16 | 0x3c << 10 | 17
+        );
+        assert!(pack_a16_reblock_count(17, 80, Some(-4)).is_err());
     }
 
     fn exchange_schedule(transfers: Vec<Transfer>) -> Schedule {

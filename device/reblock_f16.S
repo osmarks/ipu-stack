@@ -19,7 +19,9 @@
 	.endm
 
 	.macro REBLOCK_ROW_POINTERS done
-	cmpult $m6, $m4, $m7
+	setzi $m6, REBLOCK_ROW_MASK
+	and $m6, $m7, $m6
+	cmpult $m6, $m4, $m6
 	brz $m6, \done
 	setzi $m9, REBLOCK_ROW_MASK
 	add $m6, $m8, 0
@@ -78,16 +80,25 @@
 	.type ipu_stack_reblock_f16_a16_to_a16,@function
 ipu_stack_reblock_f16_a16_to_a16:
 	.supervisor
+	add $m11, $m11, -8
 	REBLOCK_SETUP
 .La16_row:
 	REBLOCK_ROW_POINTERS .La16_done
+	st32 $m4, $m11, $m15, 0
+	zero $m4
+.La16_panel:
+	shr $m6, $m7, 16
+	cmpult $m6, $m4, $m6
+	brz $m6, .La16_row_done
 	COPY_A16_PANEL
-	COPY_A16_PANEL
-	COPY_A16_PANEL
-	COPY_A16_PANEL
+	add $m4, $m4, 1
+	bri .La16_panel
+.La16_row_done:
+	ld32 $m4, $m11, $m15, 0
 	add $m4, $m4, 1
 	bri .La16_row
 .La16_done:
+	add $m11, $m11, 8
 	br $m10
 	.size ipu_stack_reblock_f16_a16_to_a16, .-ipu_stack_reblock_f16_a16_to_a16
 
