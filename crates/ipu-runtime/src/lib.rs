@@ -524,7 +524,17 @@ fn relocate_transient_allocations_around(
         let mut occupied = allocations_by_tile[usize::from(allocation.tile)]
             .iter()
             .filter_map(|&other_index| {
+                if other_index == index {
+                    return None;
+                }
                 let other = &graph.schedule.allocations[other_index];
+                if matches!(
+                    other.kind,
+                    ipu_compiler::AllocationKind::HomeAlias { source }
+                        if source == allocation.tensor
+                ) {
+                    return None;
+                }
                 (allocation.live_from < other.live_until && other.live_from < allocation.live_until)
                     .then_some((other.address, other.address.saturating_add(other.size)))
             })
