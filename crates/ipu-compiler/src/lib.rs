@@ -3666,13 +3666,14 @@ impl Schedule {
         topology: &Topology,
     ) -> Result<Vec<LoweredExchangePhase>, CompileError> {
         let allocation_index = AllocationIndex::new(&self.allocations);
-        self.lower_exchanges_with_index(topology, &allocation_index)
+        self.lower_exchanges_with_index(topology, &allocation_index, true)
     }
 
     fn lower_exchanges_with_index(
         &self,
         topology: &Topology,
         allocation_index: &AllocationIndex<'_>,
+        retain_groups: bool,
     ) -> Result<Vec<LoweredExchangePhase>, CompileError> {
         if topology.tile_count() < usize::from(self.tile_count) {
             return Err(CompileError::Graph(
@@ -4023,15 +4024,17 @@ impl Schedule {
                         .unwrap_or(0);
                     slot_horizon = slot_horizon.max(group_cycles);
                     cost.payload_words += u64::from(words);
-                    lowered_groups.push(LoweredExchangeGroup {
-                        source_tile: source,
-                        destination_tiles: destinations,
-                        tensor,
-                        bytes,
-                        addressing: ExchangeAddressing::Absolute,
-                        sender,
-                        receivers,
-                    });
+                    if retain_groups {
+                        lowered_groups.push(LoweredExchangeGroup {
+                            source_tile: source,
+                            destination_tiles: destinations,
+                            tensor,
+                            bytes,
+                            addressing: ExchangeAddressing::Absolute,
+                            sender,
+                            receivers,
+                        });
+                    }
                 }
                 horizon = slot_horizon;
             }
@@ -4041,7 +4044,7 @@ impl Schedule {
                 .map(|(tile, builder)| Ok((tile, builder.finish(horizon)?)))
                 .collect::<Result<BTreeMap<_, _>, CompileError>>()?;
             debug!(horizon, tile_rows = ?tile_rows, "composed exchange programs");
-            let epochs = if lowered_groups.is_empty() {
+            let epochs = if cost.launches == 0 {
                 Vec::new()
             } else {
                 vec![LoweredExchangeEpoch {
@@ -4099,7 +4102,7 @@ impl Schedule {
         topology: &Topology,
     ) -> Result<TileProgramLowering<'_>, CompileError> {
         let allocation_index = AllocationIndex::new(&self.allocations);
-        let exchanges = self.lower_exchanges_with_index(topology, &allocation_index)?;
+        let exchanges = self.lower_exchanges_with_index(topology, &allocation_index, false)?;
         let mut exchange_by_phase = vec![None; self.phases.len()];
         for (index, exchange) in exchanges.iter().enumerate() {
             exchange_by_phase[exchange.phase] = Some(index);
