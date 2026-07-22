@@ -187,6 +187,8 @@ pub(crate) fn template_patch_group_span(
 }
 
 pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> Vec<Range<usize>> {
+    const SUBDIVISIONS_PER_RECORD_PART: usize = 4;
+
     fn halves(range: Range<usize>) -> [Range<usize>; 2] {
         let local_midpoint = (range.len() / 2).div_ceil(32) * 32;
         let midpoint = range.start + local_midpoint.min(range.len());
@@ -197,7 +199,7 @@ pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> Vec<Ra
         .into_iter()
         .flat_map(|range| {
             let mut ranges = vec![range];
-            for _ in 0..3 {
+            for _ in 0..SUBDIVISIONS_PER_RECORD_PART {
                 ranges = ranges.into_iter().flat_map(halves).collect();
             }
             ranges
