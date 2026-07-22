@@ -14,9 +14,10 @@ use ipu_compiler::{
     append_c16_to_a16_blocks_gelu_f16_in_arenas, append_c16_to_a16_row_shards,
     append_c16_to_a16_row_shards_reblocked_in_arenas,
     append_flash_attention_from_a16_qkv_in_arenas,
-    append_flash_attention_to_a16_row_shards_in_arenas, end_tensor_lifetimes,
-    make_tensors_resident, make_tensors_resident_since, occupied_intervals_by_tile,
-    set_f8_weight_block_scales_in_phases, set_native_f8_weight_block_scales_in_phases,
+    append_flash_attention_to_a16_row_shards_in_arenas, choose_gemm_row_block_for,
+    end_tensor_lifetimes, make_tensors_resident, make_tensors_resident_since,
+    occupied_intervals_by_tile, set_f8_weight_block_scales_in_phases,
+    set_native_f8_weight_block_scales_in_phases,
 };
 use ipu_models::SiglipWeights;
 use ipu_package::{Binding, RegionSlice};
@@ -275,6 +276,8 @@ pub struct SiglipEncoderPrecision {
 pub struct SiglipEncoderTuning {
     /// Zero keeps GEMM row blocks equal to the persistent activation layout.
     pub gemm_row_block_rows: u16,
+    /// Choose row blocking independently for GEMMs whose inputs can be reblocked.
+    pub automatic_gemm_row_blocks: bool,
     /// Zero uses 64-column K blocks for GEMMs with row-sharded inputs.
     pub row_gemm_inner_block_columns: u16,
     /// Zero asks the attention planner to choose the K/V block size.
@@ -911,6 +914,16 @@ pub fn append_siglip_encoder_layer_with_precision(
     );
     let qkv_row_block_dimension = if matches!(qkv_data_type, GemmDataType::F8F143 { .. }) {
         row_block_dimension
+    } else if tuning.automatic_gemm_row_blocks && tuning.gemm_row_block_rows == 0 {
+        choose_gemm_row_block_for(
+            rows,
+            tuned_gemm_inner,
+            columns * 3,
+            64,
+            tile_count,
+            qkv_data_type,
+        )
+        .ok_or("QKV GEMM shape has no feasible row blocking")?
     } else {
         tuned_gemm_rows
     };
