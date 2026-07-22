@@ -448,6 +448,10 @@ fn relocate_transient_allocations_for_executables(
         .map(|(index, allocation)| (index, allocation.size))
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|&(_, size)| std::cmp::Reverse(size));
+    let mut allocations_by_tile = vec![Vec::new(); topology.tile_count()];
+    for (index, allocation) in graph.schedule.allocations.iter().enumerate() {
+        allocations_by_tile[usize::from(allocation.tile)].push(index);
+    }
     let arena = [ipu_compiler::Ipu21MemoryRegion::OrdinaryHigh.arena(
         ipu_package::TILE_MEMORY_BASE,
         ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
@@ -456,12 +460,28 @@ fn relocate_transient_allocations_for_executables(
     let mut relocations = Vec::with_capacity(candidates.len());
     for (index, _) in candidates {
         let allocation = &graph.schedule.allocations[index];
-        let new_address = ipu_compiler::find_free_region_in_arenas(
-            &graph.schedule.allocations,
-            allocation.tile,
+        let mut occupied = allocations_by_tile[usize::from(allocation.tile)]
+            .iter()
+            .filter_map(|&other_index| {
+                let other = &graph.schedule.allocations[other_index];
+                (allocation.live_from < other.live_until && other.live_from < allocation.live_until)
+                    .then_some((other.address, other.address.saturating_add(other.size)))
+            })
+            .collect::<Vec<_>>();
+        occupied.sort_unstable();
+        let mut merged = Vec::<(u32, u32)>::with_capacity(occupied.len());
+        for (start, end) in occupied {
+            if let Some(previous) = merged.last_mut()
+                && start <= previous.1
+            {
+                previous.1 = previous.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        let new_address = ipu_compiler::allocate_from_occupied_arenas(
+            &mut merged,
             allocation.size,
-            allocation.live_from,
-            allocation.live_until,
             &arena,
             32,
         )
@@ -2234,6 +2254,10 @@ fn package_graph_impl_attempt(
                 .clone())
         })
         .collect::<Result<Vec<_>>>()?;
+    info!(
+        tiles = preliminary_images.len(),
+        "linked preliminary tile support images"
+    );
     // Instruction fetch and data access cannot share a tile-memory element. Measure the
     // address-invariant generated code before relocating host state so data packing can
     // preserve enough complete elements for it.
@@ -2292,6 +2316,10 @@ fn package_graph_impl_attempt(
             )?)
         })
         .collect::<Result<Vec<_>>>()?;
+    info!(
+        tiles = preliminary_program_sizes.len(),
+        "measured generated tile programs"
+    );
     let program_reservation_sizes = preliminary_program_sizes
         .iter()
         .zip(&tile_host_plans)
@@ -2379,6 +2407,10 @@ fn package_graph_impl_attempt(
         }
         Err(error) => return Err(error),
     };
+    info!(
+        tiles = executable_reservations.len(),
+        "placed measured tile executables"
+    );
     let program_reservations = executable_reservations
         .iter()
         .map(|reservations| reservations[0])
