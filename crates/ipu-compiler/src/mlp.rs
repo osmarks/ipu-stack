@@ -370,7 +370,7 @@ fn append_activation_transition(
                 u32::from(source.rows / 6),
                 u32::from(source.rows % 6),
             ],
-            specialization: SpecializationKey {
+            specialization: Arc::new(SpecializationKey {
                 operation: match data_type {
                     GemmDataType::F16
                     | GemmDataType::F16F8Weights { .. }
@@ -382,7 +382,7 @@ fn append_activation_transition(
                 worker_count: 6,
                 role: format!("layer-{layer}").into(),
                 alignment: 8,
-            },
+            }),
             metadata: BTreeMap::from([
                 ("label".into(), format!("MLP layer {layer} GeLU")),
                 ("layer".into(), layer.to_string()),

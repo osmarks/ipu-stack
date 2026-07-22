@@ -137,13 +137,13 @@ fn randomized_case(seed: u64, case: usize) -> (ExecutableGraph, BTreeMap<String,
             output: accumulator_tensor,
             inputs: vec![accumulator_tensor, payload_tensor],
             arguments: Vec::new(),
-            specialization: SpecializationKey {
+            specialization: Arc::new(SpecializationKey {
                 operation: "add_u32".into(),
                 shape: vec![1],
                 worker_count: 1,
                 role: "randomized-sparse-compute".into(),
                 alignment: 4,
-            },
+            }),
             metadata: Default::default(),
         })],
     };

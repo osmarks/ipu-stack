@@ -1689,13 +1689,13 @@ mod tests {
                 output: TensorId(3),
                 inputs: vec![TensorId(1), TensorId(2)],
                 arguments,
-                specialization: SpecializationKey {
+                specialization: Arc::new(SpecializationKey {
                     operation: operation.into(),
                     shape: vec![12, 64, 64],
                     worker_count: 6,
                     role: "inner-block".into(),
                     alignment: 32,
-                },
+                }),
                 metadata: BTreeMap::new(),
             }),
             output_address: 0x80000,

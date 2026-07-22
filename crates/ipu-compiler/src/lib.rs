@@ -363,7 +363,7 @@ pub struct KernelCommand {
     pub output: TensorId,
     pub inputs: Vec<TensorId>,
     pub arguments: Vec<u32>,
-    pub specialization: SpecializationKey,
+    pub specialization: Arc<SpecializationKey>,
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -1540,13 +1540,13 @@ pub fn append_bias_f16_c16_in_arenas(
                 u32::from(output.rows / 6) | (u32::from(output.columns / 16) << 16),
                 u32::from(output.rows % 6),
             ],
-            specialization: SpecializationKey {
+            specialization: Arc::new(SpecializationKey {
                 operation: "add_bias_f16_c16".into(),
                 shape: vec![usize::from(output.rows), usize::from(output.columns)],
                 worker_count: 6,
                 role: "blocked-bias".into(),
                 alignment: 8,
-            },
+            }),
             metadata: BTreeMap::from([
                 ("label".into(), "blocked bias add".into()),
                 ("row_start".into(), output.row_start.to_string()),
@@ -1781,7 +1781,7 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
                             pack_a16_reblock_count(copy_rows, block.columns, None)?,
                         ],
                     },
-                    specialization: SpecializationKey {
+                    specialization: Arc::new(SpecializationKey {
                         operation: match (exact, input_scale.is_some()) {
                             (true, true) => "quantize_a16_to_a32_f143",
                             (true, false) => "copy_u64",
@@ -1806,7 +1806,7 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
                         }
                         .into(),
                         alignment: if input_scale.is_some() { 16 } else { 8 },
-                    },
+                    }),
                     metadata: BTreeMap::from([
                         ("label".into(), "place row-sharded GEMM input".into()),
                         ("row_start".into(), block.row_start.to_string()),
@@ -2051,7 +2051,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
                             pack_a16_reblock_count(copy_rows, destination.columns, None)?,
                         ],
                     },
-                    specialization: SpecializationKey {
+                    specialization: Arc::new(SpecializationKey {
                         operation: match (exact, input_scale.is_some()) {
                             (true, true) => "quantize_a16_to_a32_f143",
                             (true, false) => "copy_u64",
@@ -2073,7 +2073,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
                         }
                         .into(),
                         alignment: if input_scale.is_some() { 16 } else { 8 },
-                    },
+                    }),
                     metadata: BTreeMap::from([
                         ("label".into(), "place distributed GEMM input".into()),
                         ("row_start".into(), destination.row_start.to_string()),
@@ -3130,7 +3130,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                                     * u32::from(config.block_dimension),
                                 u32::from(config.data_type.weight_scale() as u8),
                             ],
-                            specialization: SpecializationKey {
+                            specialization: Arc::new(SpecializationKey {
                                 operation: "expand_f8_f143_to_f16".into(),
                                 shape: if config.retain_profile_metadata {
                                     vec![
@@ -3143,7 +3143,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                                 worker_count: 6,
                                 role: "weight-expansion".into(),
                                 alignment: 4,
-                            },
+                            }),
                             metadata: if config.retain_profile_metadata {
                                 BTreeMap::from([
                                     ("label".into(), "expand FP8 weights to FP16".into()),
@@ -3168,7 +3168,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                             .product_scale()
                             .map(|scale| vec![u32::from((scale as u8) & 0x3f)])
                             .unwrap_or_default(),
-                        specialization: SpecializationKey {
+                        specialization: Arc::new(SpecializationKey {
                             operation: config
                                 .data_type
                                 .kernel_operation(inner_block == 0, output_block.rows == base_rows)
@@ -3181,7 +3181,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                             worker_count: 6,
                             role: "blocked-gemm".into(),
                             alignment: 32,
-                        },
+                        }),
                         metadata: if config.retain_profile_metadata {
                             BTreeMap::from([
                                 (
@@ -3292,7 +3292,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                 output: tensor,
                 inputs: vec![tensor, tensor],
                 arguments: vec![units, units / 6, units % 6],
-                specialization: SpecializationKey {
+                specialization: Arc::new(SpecializationKey {
                     operation: "copy_u64".into(),
                     shape: if config.retain_profile_metadata {
                         vec![usize::try_from(units).map_err(|_| {
@@ -3312,7 +3312,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                         "gemm-output".into()
                     },
                     alignment: 8,
-                },
+                }),
                 metadata: if config.retain_profile_metadata {
                     BTreeMap::from([
                         (
@@ -3641,15 +3641,22 @@ impl Schedule {
     /// Releases command annotations used only to construct semantic profiles.
     /// Kernel operation identity and invocation operands remain intact.
     pub fn discard_profile_metadata(&mut self, phases: Range<usize>) {
+        let mut specializations = HashMap::<SpecializationKey, Arc<SpecializationKey>>::default();
         for phase in &mut self.phases[phases] {
             let Phase::Compute { commands, .. } = phase else {
                 continue;
             };
             for command in commands {
                 let command = Arc::make_mut(command);
-                command.specialization.shape = Vec::new();
-                command.specialization.role = Cow::Borrowed("");
+                let specialization = Arc::make_mut(&mut command.specialization);
+                specialization.shape = Vec::new();
+                specialization.role = Cow::Borrowed("");
                 command.metadata = BTreeMap::new();
+                if let Some(shared) = specializations.get(specialization) {
+                    command.specialization = shared.clone();
+                } else {
+                    specializations.insert(specialization.clone(), command.specialization.clone());
+                }
             }
         }
     }
@@ -4417,7 +4424,7 @@ pub fn compile(graph: &Graph, options: &CompilerOptions) -> Result<Schedule, Com
                     output: op.output,
                     inputs: op.inputs.clone(),
                     arguments: Vec::new(),
-                    specialization: SpecializationKey {
+                    specialization: Arc::new(SpecializationKey {
                         operation: operation.into(),
                         shape: graph.tensors[op.output.0].shape.clone(),
                         worker_count: worker_count(&graph.tensors[op.output.0]),
@@ -4427,7 +4434,7 @@ pub fn compile(graph: &Graph, options: &CompilerOptions) -> Result<Schedule, Com
                             "body".into()
                         },
                         alignment: output_layout.alignment,
-                    },
+                    }),
                     metadata: BTreeMap::new(),
                 })
             })
@@ -6086,13 +6093,13 @@ mod tests {
                 output: TensorId(phase),
                 inputs: (0..inputs).map(TensorId).collect(),
                 arguments: vec![16],
-                specialization: SpecializationKey {
+                specialization: Arc::new(SpecializationKey {
                     operation: "test_kernel".into(),
                     shape: vec![16],
                     worker_count: 6,
                     role: "compute".into(),
                     alignment: 8,
-                },
+                }),
                 metadata: BTreeMap::new(),
             })],
         };
@@ -6122,6 +6129,47 @@ mod tests {
         assert!(repeated.is_compatible(&schedule, 4..6));
         repeated.push_instance(&schedule, 4..6).unwrap();
         assert_eq!(repeated.phase_instances, vec![0..2, 2..4, 4..6]);
+    }
+
+    #[test]
+    fn discarding_profile_metadata_interns_kernel_specializations() {
+        let command = |shape, role: &'static str| {
+            Arc::new(KernelCommand {
+                tile: 0,
+                output: TensorId(0),
+                inputs: vec![TensorId(1), TensorId(2)],
+                arguments: Vec::new(),
+                specialization: Arc::new(SpecializationKey {
+                    operation: "add_u32".into(),
+                    shape,
+                    worker_count: 6,
+                    role: role.into(),
+                    alignment: 4,
+                }),
+                metadata: BTreeMap::from([("label".into(), role.into())]),
+            })
+        };
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: vec![Phase::Compute {
+                op: OpId(0),
+                commands: vec![command(vec![64], "left"), command(vec![128], "right")],
+            }],
+            allocations: Vec::new(),
+            tile_count: 1,
+            peak_sram: BTreeMap::new(),
+        };
+
+        schedule.discard_profile_metadata(0..1);
+
+        let Phase::Compute { commands, .. } = &schedule.phases[0] else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(
+            &commands[0].specialization,
+            &commands[1].specialization
+        ));
+        assert!(commands.iter().all(|command| command.metadata.is_empty()));
     }
 
     #[test]

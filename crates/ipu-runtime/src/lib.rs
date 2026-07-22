@@ -685,11 +685,13 @@ fn repack_transient_allocations_around(
     }
     let mut relocations_by_source =
         HashMap::<(ipu_compiler::TensorId, u16), Vec<&AllocationRelocation>>::default();
+    let mut relocations_by_tile = vec![Vec::new(); topology.tile_count()];
     for relocation in &relocations {
         relocations_by_source
             .entry((relocation.tensor, relocation.tile))
             .or_default()
             .push(relocation);
+        relocations_by_tile[usize::from(relocation.tile)].push(relocation);
     }
     for allocation in &mut graph.schedule.allocations {
         let ipu_compiler::AllocationKind::HomeAlias { source } = allocation.kind else {
@@ -710,7 +712,10 @@ fn repack_transient_allocations_around(
         }
     }
     for buffer in &mut graph.initial_buffers {
-        relocate_literal_address(buffer.tile, &mut buffer.address, &relocations);
+        relocate_literal_address(
+            &mut buffer.address,
+            &relocations_by_tile[usize::from(buffer.tile)],
+        );
     }
     for binding in graph
         .outputs
@@ -723,7 +728,10 @@ fn repack_transient_allocations_around(
             let logical = *physical_to_logical
                 .get(&slice.tile)
                 .ok_or("host binding references a physical tile outside the topology")?;
-            relocate_literal_address(logical, &mut slice.tile_address, &relocations);
+            relocate_literal_address(
+                &mut slice.tile_address,
+                &relocations_by_tile[usize::from(logical)],
+            );
         }
     }
     graph.schedule.validate_allocations()?;
@@ -753,10 +761,10 @@ fn relocate_transient_allocations_for_executables(
     )
 }
 
-fn relocate_literal_address(tile: u16, address: &mut u32, relocations: &[AllocationRelocation]) {
+fn relocate_literal_address(address: &mut u32, relocations: &[&AllocationRelocation]) {
     if let Some(relocation) = relocations
         .iter()
-        .find(|relocation| relocation.tile == tile && relocation.old.contains(address))
+        .find(|relocation| relocation.old.contains(address))
     {
         *address = relocation.new_start + (*address - relocation.old.start);
     }
@@ -5179,13 +5187,13 @@ mod tests {
                 output: ipu_compiler::TensorId(11),
                 inputs: vec![ipu_compiler::TensorId(9), ipu_compiler::TensorId(10)],
                 arguments: vec![64],
-                specialization: ipu_compiler::SpecializationKey {
+                specialization: Arc::new(ipu_compiler::SpecializationKey {
                     operation: "gemm_f32_accumulate".into(),
                     shape: vec![64, 64, 64],
                     worker_count: 6,
                     role: "inner-block-3".into(),
                     alignment: 32,
-                },
+                }),
                 metadata: BTreeMap::from([
                     ("label".into(), "GEMM block (2, 5) inner block 3".into()),
                     ("output_block_row".into(), "2".into()),
@@ -5217,13 +5225,13 @@ mod tests {
             output: ipu_compiler::TensorId(3),
             inputs: vec![ipu_compiler::TensorId(1), ipu_compiler::TensorId(2)],
             arguments: vec![64],
-            specialization: ipu_compiler::SpecializationKey {
+            specialization: Arc::new(ipu_compiler::SpecializationKey {
                 operation: "gelu_c16_to_a8".into(),
                 shape: vec![64, 64],
                 worker_count: 6,
                 role: "activation".into(),
                 alignment: 32,
-            },
+            }),
             metadata: BTreeMap::from([
                 ("label".into(), label.into()),
                 ("layer".into(), "3".into()),
@@ -5267,13 +5275,13 @@ mod tests {
             output: ipu_compiler::TensorId(3),
             inputs: vec![ipu_compiler::TensorId(1), ipu_compiler::TensorId(2)],
             arguments: Vec::new(),
-            specialization: ipu_compiler::SpecializationKey {
+            specialization: Arc::new(ipu_compiler::SpecializationKey {
                 operation: "add_u32".into(),
                 shape: vec![64],
                 worker_count: 6,
                 role: "elementwise".into(),
                 alignment: 8,
-            },
+            }),
             metadata: BTreeMap::new(),
         };
         let schedule = ipu_compiler::Schedule {

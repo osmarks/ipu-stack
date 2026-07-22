@@ -275,7 +275,7 @@ pub fn append_add_f16_row_shards_in_place(
             output: destination.tensor,
             inputs: vec![destination.tensor, source.tensor],
             arguments: vec![units, units / 6, units % 6],
-            specialization: SpecializationKey {
+            specialization: Arc::new(SpecializationKey {
                 operation: "add_f16".into(),
                 shape: vec![
                     usize::from(destination.rows),
@@ -284,7 +284,7 @@ pub fn append_add_f16_row_shards_in_place(
                 worker_count: 6,
                 role: "row-sharded-residual".into(),
                 alignment: 4,
-            },
+            }),
             metadata: BTreeMap::from([
                 ("label".into(), "row-sharded residual add".into()),
                 ("row_start".into(), destination.row_start.to_string()),
@@ -408,13 +408,13 @@ pub fn append_c16_to_a16_blocks_gelu_f16_in_arenas(
                 u32::from(block.rows / 6) | (u32::from(block.columns / 16) << 16),
                 u32::from(block.rows % 6),
             ],
-            specialization: SpecializationKey {
+            specialization: Arc::new(SpecializationKey {
                 operation: "gelu_f16_c16_to_a16".into(),
                 shape: vec![usize::from(block.rows), usize::from(block.columns)],
                 worker_count: 6,
                 role: "blocked-gelu".into(),
                 alignment: 8,
-            },
+            }),
             metadata: BTreeMap::from([
                 ("label".into(), "blocked GeLU".into()),
                 ("row_start".into(), block.row_start.to_string()),
@@ -596,7 +596,7 @@ fn append_c16_to_a16_row_shards_impl(
                     } else {
                         vec![u32::from(block.rows), u32::from(block.columns / 16)]
                     },
-                    specialization: SpecializationKey {
+                    specialization: Arc::new(SpecializationKey {
                         operation: if gelu {
                             "gelu_f16_c16_to_a16"
                         } else {
@@ -612,7 +612,7 @@ fn append_c16_to_a16_row_shards_impl(
                         }
                         .into(),
                         alignment: 8,
-                    },
+                    }),
                     metadata: BTreeMap::from([
                         (
                             "label".into(),
@@ -957,7 +957,7 @@ fn append_to_a16_row_shards_reblocked_in_arenas(
                         crate::pack_reblock_row_pair(0, destination_row_start)?,
                         u32::from(copy_rows) | (u32::from(panel_count) << 16),
                     ],
-                    specialization: SpecializationKey {
+                    specialization: Arc::new(SpecializationKey {
                         operation: match block.layout {
                             ReblockSourceLayout::A16 => "reblock_f16_a16_to_a16",
                             ReblockSourceLayout::C16 => "reblock_f16_c16_to_a16",
@@ -975,7 +975,7 @@ fn append_to_a16_row_shards_reblocked_in_arenas(
                         }
                         .into(),
                         alignment: 8,
-                    },
+                    }),
                     metadata: BTreeMap::from([
                         ("label".into(), "reblock GEMM output rows".into()),
                         ("row_start".into(), block.row_start.to_string()),
@@ -1339,13 +1339,13 @@ fn append_affine_layer_norm_f16_impl(
             output: output_tensor,
             inputs,
             arguments: vec![u32::from(shard.rows), u32::from(columns), epsilon_q30],
-            specialization: SpecializationKey {
+            specialization: Arc::new(SpecializationKey {
                 operation: operation.into(),
                 shape: vec![usize::from(shard.rows), usize::from(columns)],
                 worker_count: 6,
                 role: role.into(),
                 alignment: 8,
-            },
+            }),
             metadata: BTreeMap::from([
                 ("label".into(), label.into()),
                 ("row_start".into(), shard.row_start.to_string()),

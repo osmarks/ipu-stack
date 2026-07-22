@@ -1010,13 +1010,13 @@ fn append_adjustment_phase(
             output: output.tensor,
             inputs: vec![output.tensor, tensor],
             arguments: vec![units, units / 6, units % 6],
-            specialization: SpecializationKey {
+            specialization: Arc::new(SpecializationKey {
                 operation: "add_f16".into(),
                 shape: vec![usize::from(output.rows), usize::from(output.columns)],
                 worker_count: 6,
                 role: "patch-position-bias".into(),
                 alignment: 4,
-            },
+            }),
             metadata: BTreeMap::from([
                 ("label".into(), "patch bias and learned position".into()),
                 ("row_start".into(), output.row_start.to_string()),
@@ -1236,8 +1236,8 @@ fn specialize_gemm_row_operations(
                 .get(2)
                 .copied()
                 .expect("GEMM specialization requires its output block shape");
-            command.specialization.operation =
-                format!("{base}_rows_{rows}_inner_{inner}_output_{output}").into();
+            let specialized = format!("{base}_rows_{rows}_inner_{inner}_output_{output}");
+            Arc::make_mut(&mut command.specialization).operation = specialized.into();
         }
     }
 }

@@ -490,13 +490,13 @@ fn add_u32(
         output: accumulator,
         inputs: vec![accumulator, received],
         arguments: Vec::new(),
-        specialization: SpecializationKey {
+        specialization: Arc::new(SpecializationKey {
             operation: "add_u32".into(),
             shape: vec![1],
             worker_count: 1,
             role: format!("reduction-{operation}").into(),
             alignment: 4,
-        },
+        }),
         metadata: Default::default(),
     }
 }

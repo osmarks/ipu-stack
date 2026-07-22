@@ -192,8 +192,9 @@ pub fn fuse_deferred_residual_into_layer_norm(
             return Err("deferred residual source is not colocated with LayerNorm".into());
         }
         command.inputs.insert(1, source);
-        command.specialization.operation = "add_layer_norm_affine_f16".into();
-        command.specialization.role = "add-and-normalize".into();
+        let specialization = Arc::make_mut(&mut command.specialization);
+        specialization.operation = "add_layer_norm_affine_f16".into();
+        specialization.role = "add-and-normalize".into();
         command
             .metadata
             .insert("label".into(), "fused residual add and LayerNorm".into());
@@ -329,7 +330,8 @@ pub fn consolidate_attention_kernel_variants(
                 .replace("@KEY_LARGE@", &format!("{key_large}_key"))
                 .replace("@QUERY_SMALL_ROWS@", &format!("{query_small}_rows"))
                 .replace("@QUERY_LARGE_ROWS@", &format!("{query_large}_rows"));
-            command.specialization.operation = format!("{base}_{}", domain.suffix()).into();
+            Arc::make_mut(&mut command.specialization).operation =
+                format!("{base}_{}", domain.suffix()).into();
         }
     }
     domain
@@ -352,13 +354,18 @@ fn specialize_attention_phases(
         for command in commands {
             let command = Arc::make_mut(command);
             let operation = command.specialization.operation.as_ref();
-            if operation.starts_with("attention_qk_")
+            let specialized = if operation.starts_with("attention_qk_")
                 || operation.starts_with("attention_pv_")
                 || operation.starts_with("attention_softmax_")
                 || operation.starts_with("attention_merge_")
                 || operation == "attention_f32_to_f16"
             {
-                command.specialization.operation = format!("{operation}_{suffix}").into();
+                Some(format!("{operation}_{suffix}"))
+            } else {
+                None
+            };
+            if let Some(specialized) = specialized {
+                Arc::make_mut(&mut command.specialization).operation = specialized.into();
             }
         }
     }
@@ -2278,13 +2285,13 @@ mod tests {
             output: TensorId(output),
             inputs: inputs.iter().copied().map(TensorId).collect(),
             arguments: vec![1, 16, 1],
-            specialization: SpecializationKey {
+            specialization: Arc::new(SpecializationKey {
                 operation: operation.into(),
                 shape: vec![1, 16],
                 worker_count: 6,
                 role: String::new().into(),
                 alignment: 8,
-            },
+            }),
             metadata: BTreeMap::new(),
         }
     }

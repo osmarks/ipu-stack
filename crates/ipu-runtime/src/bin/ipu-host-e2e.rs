@@ -10,6 +10,7 @@ use ipu_runtime::{
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const TILE_COUNT: u16 = 1472;
 const HOST_CONTROLLER_TILE: u16 = 0;
@@ -402,13 +403,13 @@ fn add_u32(tile: u16, output: TensorId, input: TensorId, role: &'static str) -> 
         output,
         inputs: vec![input, input],
         arguments: Vec::new(),
-        specialization: SpecializationKey {
+        specialization: Arc::new(SpecializationKey {
             operation: "add_u32".into(),
             shape: vec![1],
             worker_count: 1,
             role: role.into(),
             alignment: 4,
-        },
+        }),
         metadata: Default::default(),
     }
 }
