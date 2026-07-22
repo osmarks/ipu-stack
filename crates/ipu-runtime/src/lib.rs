@@ -789,6 +789,156 @@ fn relocate_transient_allocations_for_executables(
     )
 }
 
+fn repack_transient_allocations_around(
+    graph: &mut ExecutableGraph,
+    topology: &Topology,
+    reservations: &[Vec<(u32, u32)>],
+) -> Result<usize> {
+    if reservations.len() != topology.tile_count() {
+        return Err("invalid transient repack reservations".into());
+    }
+    let physical_to_logical = (0..u16::try_from(topology.tile_count())?)
+        .map(|logical| Ok((u32::from(topology.physical(logical)?), logical)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let allocations = &graph.schedule.allocations;
+    let relocations = (0..topology.tile_count())
+        .into_par_iter()
+        .map(|tile_index| -> Result<Vec<(usize, AllocationRelocation)>> {
+            let tile = u16::try_from(tile_index)?;
+            let mut entries = allocations
+                .iter()
+                .enumerate()
+                .filter(|(_, allocation)| allocation.tile == tile)
+                .filter(|(_, allocation)| {
+                    !matches!(
+                        allocation.kind,
+                        ipu_compiler::AllocationKind::HomeAlias { .. }
+                    )
+                })
+                .map(|(index, allocation)| {
+                    let fixed = !matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
+                        || allocation.live_until == usize::MAX;
+                    (index, fixed)
+                })
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|&(index, fixed)| {
+                let allocation = &allocations[index];
+                (
+                    allocation.live_from,
+                    !fixed,
+                    std::cmp::Reverse(allocation.size),
+                    index,
+                )
+            });
+            let mut active = reservations[tile_index]
+                .iter()
+                .map(|&(start, end)| (usize::MAX, start, end))
+                .collect::<Vec<_>>();
+            let mut moved = Vec::new();
+            for (index, fixed) in entries {
+                let allocation = &allocations[index];
+                active.retain(|&(live_until, _, _)| live_until > allocation.live_from);
+                if fixed {
+                    active.push((
+                        allocation.live_until,
+                        allocation.address,
+                        allocation.address.saturating_add(allocation.size),
+                    ));
+                    continue;
+                }
+                let mut occupied = active
+                    .iter()
+                    .map(|&(_, start, end)| (start, end))
+                    .collect::<Vec<_>>();
+                occupied.sort_unstable();
+                let region = if allocation.address < ipu_package::IPU21_INTERLEAVED_MEMORY_BASE {
+                    ipu_compiler::Ipu21MemoryRegion::OrdinaryLow
+                } else if allocation.address < ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT {
+                    ipu_compiler::Ipu21MemoryRegion::Interleaved
+                } else {
+                    ipu_compiler::Ipu21MemoryRegion::OrdinaryHigh
+                };
+                let arena = [region.arena(
+                    ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+                    ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                    ipu_compiler::MemoryPlacement::Low,
+                )];
+                let address = ipu_compiler::allocate_from_occupied_arenas(
+                    &mut occupied,
+                    allocation.size,
+                    &arena,
+                    32,
+                )
+                .map_err(|error| {
+                    format!(
+                        "cannot repack transient tensor {} on tile {} around static runtime: {error}",
+                        allocation.tensor.0, tile,
+                    )
+                })?;
+                active.push((
+                    allocation.live_until,
+                    address,
+                    address.saturating_add(allocation.size),
+                ));
+                if address != allocation.address {
+                    moved.push((
+                        index,
+                        AllocationRelocation {
+                            tensor: allocation.tensor,
+                            tile,
+                            old: allocation.address
+                                ..allocation.address.saturating_add(allocation.size),
+                            new_start: address,
+                        },
+                    ));
+                }
+            }
+            Ok(moved)
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    for &(index, ref relocation) in &relocations {
+        graph.schedule.allocations[index].address = relocation.new_start;
+    }
+    let relocation_map = relocations
+        .iter()
+        .map(|(_, relocation)| ((relocation.tile, relocation.tensor), relocation))
+        .collect::<HashMap<_, _>>();
+    for allocation in &mut graph.schedule.allocations {
+        let ipu_compiler::AllocationKind::HomeAlias { source } = allocation.kind else {
+            continue;
+        };
+        if let Some(relocation) = relocation_map.get(&(allocation.tile, source)) {
+            allocation.address = relocation.new_start + (allocation.address - relocation.old.start);
+        }
+    }
+    let relocations = relocations
+        .into_iter()
+        .map(|(_, relocation)| relocation)
+        .collect::<Vec<_>>();
+    for buffer in &mut graph.initial_buffers {
+        relocate_literal_address(buffer.tile, &mut buffer.address, &relocations);
+    }
+    for binding in graph
+        .outputs
+        .iter_mut()
+        .chain(&mut graph.host_weights)
+        .chain(&mut graph.host_inputs)
+        .chain(&mut graph.host_outputs)
+    {
+        for slice in &mut binding.slices {
+            let logical = *physical_to_logical
+                .get(&slice.tile)
+                .ok_or("host binding references a physical tile outside the topology")?;
+            relocate_literal_address(logical, &mut slice.tile_address, &relocations);
+        }
+    }
+    graph.schedule.validate_allocations()?;
+    Ok(relocations.len())
+}
+
 fn relocate_literal_address(tile: u16, address: &mut u32, relocations: &[AllocationRelocation]) {
     if let Some(relocation) = relocations
         .iter()
@@ -2863,20 +3013,25 @@ fn package_graph_impl_attempt(
                     })
         });
         if overlaps_transient_home {
-            let mut reservations = static_relocation_reservations;
-            for (reserved, templates) in reservations.iter_mut().zip(&template_record_ranges) {
+            let mut static_reservations = static_relocation_reservations;
+            for (reserved, templates) in static_reservations.iter_mut().zip(&template_record_ranges)
+            {
                 reserved.extend_from_slice(templates);
                 reserved.sort_unstable();
                 reserved.dedup();
             }
+            let mut repack_reservations = static_reservations.clone();
+            for (tile_index, reserved) in repack_reservations.iter_mut().enumerate() {
+                reserved.push(image_executable_elements[tile_index]);
+                reserved.extend_from_slice(&host_executable_placements[tile_index].2);
+                reserved.sort_unstable();
+                reserved.dedup();
+            }
             let mut relocated_graph = graph.clone();
-            let moved = relocate_transient_allocations_around(
+            let moved = repack_transient_allocations_around(
                 &mut relocated_graph,
                 &topology,
-                &reservations,
-                1,
-                true,
-                "static runtime placement",
+                &repack_reservations,
             )?;
             if moved == 0 {
                 return Err("static runtime reservations overlap no relocatable homes".into());
@@ -2890,7 +3045,7 @@ fn package_graph_impl_attempt(
                 template_regions,
                 invocations,
                 false,
-                reservations,
+                static_reservations,
             );
         }
     }
