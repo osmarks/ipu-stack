@@ -2,10 +2,10 @@ use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, FlashAttentionConfig,
     FlashAttentionPlan, GemmDataType, Ipu21MemoryRegion, KernelCommand, MemoryConstraint,
-    MemoryPlacement, MemoryPolicy, OpId, Phase, RepeatedRegion, RowShardPlacement,
-    RowShardTransitionConfig, SpecializationKey, TensorId, append_c16_to_a16_row_shards,
-    choose_gemm_row_block_for_shape, end_tensor_lifetimes, make_tensors_resident,
-    plan_blocked_gemm, plan_flash_attention,
+    MemoryPlacement, MemoryPolicy, OpId, Phase, RepeatedRegion, ResidentPlacementTemplate,
+    RowShardPlacement, RowShardTransitionConfig, SpecializationKey, TensorId,
+    append_c16_to_a16_row_shards, choose_gemm_row_block_for_shape, end_tensor_lifetimes,
+    make_tensors_resident, plan_blocked_gemm, plan_flash_attention,
 };
 use ipu_elf::{KernelArtifact, Toolchain};
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -265,17 +265,40 @@ fn main() {
     let mut last_layer = None;
     let mut deferred_residual = None;
     let mut layer_template_groups = Vec::<(SiglipEncoderPrecision, RepeatedRegion)>::new();
+    let mut resident_placement_groups =
+        Vec::<(SiglipEncoderPrecision, ResidentPlacementTemplate)>::new();
     let mut profile_regions = vec![StaticProfileRegion {
         name: "embedding".into(),
         phases: 0..plan.schedule.phases.len(),
     }];
-    let (mut compute_command_count, mut transfer_count) = phase_entry_counts(&plan.schedule.phases);
-    for layer in 0..layer_count {
-        let phase_start = plan.schedule.phases.len();
-        let layer_precision = if layer < resident_f16_layers {
+    let precision_for_layer = |layer: usize| {
+        if layer < resident_f16_layers {
             precision
         } else {
             expanded_storage_fallback(precision)
+        }
+    };
+    let (mut compute_command_count, mut transfer_count) = phase_entry_counts(&plan.schedule.phases);
+    for layer in 0..layer_count {
+        let phase_start = plan.schedule.phases.len();
+        let layer_precision = precision_for_layer(layer);
+        let layer_memory = if let Some((group_precision, template)) =
+            resident_placement_groups.last()
+            && *group_precision == layer_precision
+        {
+            memory.replay_resident_placement(template).unwrap()
+        } else {
+            resident_placement_groups.push((layer_precision, ResidentPlacementTemplate::default()));
+            let repetitions = (layer..layer_count)
+                .take_while(|&instance| precision_for_layer(instance) == layer_precision)
+                .count();
+            memory
+                .record_resident_placement(
+                    &resident_placement_groups.last().unwrap().1,
+                    &plan.schedule,
+                    repetitions,
+                )
+                .unwrap()
         };
         let mut appended = append_siglip_encoder_layer_batched_with_precision(
             &mut plan.schedule,
@@ -287,7 +310,7 @@ fn main() {
             columns,
             row_block_dimension,
             TILE_COUNT,
-            &memory,
+            &layer_memory,
             layer_precision,
             tuning,
             retain_profile_metadata,
@@ -295,6 +318,7 @@ fn main() {
             &mut host,
         )
         .unwrap();
+        layer_memory.finish_resident_placement().unwrap();
         if let Some(deferred) = deferred_residual.take() {
             fuse_deferred_residual_into_layer_norm(&mut plan.schedule, phase_start, deferred)
                 .unwrap();

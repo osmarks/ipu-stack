@@ -1111,6 +1111,7 @@ pub fn append_affine_layer_norm_f16_in_arenas(
             }],
             resident_tile_assignment: crate::ResidentTileAssignment::Balanced,
             allocation_occupancy: crate::AllocationOccupancyCache::default(),
+            resident_placement_session: None,
         },
     )
 }
@@ -1433,6 +1434,7 @@ mod tests {
             transient: vec![MemoryArena::low(0xb0000, 0xc0000)],
             resident_tile_assignment: crate::ResidentTileAssignment::Balanced,
             allocation_occupancy: crate::AllocationOccupancyCache::default(),
+            resident_placement_session: None,
         };
 
         let appended = append_add_affine_layer_norm_f16_with_memory_policy(

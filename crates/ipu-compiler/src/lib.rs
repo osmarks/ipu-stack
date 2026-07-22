@@ -5,6 +5,7 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
@@ -660,6 +661,8 @@ pub struct MemoryPolicy {
     pub resident_tile_assignment: ResidentTileAssignment,
     #[serde(skip)]
     allocation_occupancy: AllocationOccupancyCache,
+    #[serde(skip)]
+    resident_placement_session: Option<ResidentPlacementSession>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -672,6 +675,90 @@ impl PartialEq for AllocationOccupancyCache {
 }
 
 impl Eq for AllocationOccupancyCache {}
+
+/// A reusable sequence of balanced resident-placement decisions.
+///
+/// Recording the first instance of a repeated program block and replaying the
+/// template for later instances keeps their tile roles identical without
+/// giving up load balancing across the operations within the block.
+#[derive(Clone, Debug, Default)]
+pub struct ResidentPlacementTemplate {
+    decisions: Arc<Mutex<Vec<ResidentPlacementDecision>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResidentPlacementDecision {
+    key: ResidentPlacementKey,
+    rotation: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResidentPlacementKey {
+    rows: u16,
+    inner_dimension: u16,
+    columns: u16,
+    block_dimension: u16,
+    inner_block_dimension: u16,
+    row_block_dimension: u16,
+    tile_count: u16,
+    data_base: u32,
+    data_limit: u32,
+    data_type: GemmPlacementType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GemmPlacementType {
+    F16,
+    F16F8Weights,
+    F8F143,
+    F32,
+}
+
+impl From<BlockedGemmConfig> for ResidentPlacementKey {
+    fn from(config: BlockedGemmConfig) -> Self {
+        let data_type = match config.data_type {
+            GemmDataType::F16 => GemmPlacementType::F16,
+            GemmDataType::F16F8Weights { .. } => GemmPlacementType::F16F8Weights,
+            GemmDataType::F8F143 { .. } => GemmPlacementType::F8F143,
+            GemmDataType::F32 => GemmPlacementType::F32,
+        };
+        Self {
+            rows: config.rows,
+            inner_dimension: config.inner_dimension,
+            columns: config.columns,
+            block_dimension: config.block_dimension,
+            inner_block_dimension: config.inner_block_dimension,
+            row_block_dimension: config.row_block_dimension,
+            tile_count: config.tile_count,
+            data_base: config.data_base,
+            data_limit: config.data_limit,
+            data_type,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResidentPlacementMode {
+    Record,
+    Replay,
+}
+
+#[derive(Clone, Debug)]
+struct ResidentPlacementSession {
+    template: ResidentPlacementTemplate,
+    mode: ResidentPlacementMode,
+    cursor: Arc<AtomicUsize>,
+    allocation_start: usize,
+    repetitions: usize,
+}
+
+impl PartialEq for ResidentPlacementSession {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ResidentPlacementSession {}
 
 #[derive(Debug)]
 struct CachedAllocationOccupancy {
@@ -742,6 +829,7 @@ impl MemoryPolicy {
             transient: vec![transient],
             resident_tile_assignment: ResidentTileAssignment::Balanced,
             allocation_occupancy: AllocationOccupancyCache::default(),
+            resident_placement_session: None,
         }
     }
 
@@ -778,6 +866,7 @@ impl MemoryPolicy {
             transient: expand(transient_order, MemoryPlacement::Low),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
             allocation_occupancy: AllocationOccupancyCache::default(),
+            resident_placement_session: None,
         };
         policy.validate()?;
         Ok(policy)
@@ -793,6 +882,69 @@ impl MemoryPolicy {
                 .any(|arena| arena.base >= arena.limit)
         {
             return Err(CompileError::Memory("invalid tile-memory policy".into()));
+        }
+        Ok(())
+    }
+
+    /// Returns a policy which records the balanced resident tile rotations
+    /// selected while constructing one repeated-block instance.
+    pub fn record_resident_placement(
+        &self,
+        template: &ResidentPlacementTemplate,
+        schedule: &Schedule,
+        repetitions: usize,
+    ) -> Result<Self, CompileError> {
+        if repetitions == 0 {
+            return Err(CompileError::Memory(
+                "resident placement template requires at least one instance".into(),
+            ));
+        }
+        template.decisions.lock().unwrap().clear();
+        let mut policy = self.clone();
+        policy.resident_placement_session = Some(ResidentPlacementSession {
+            template: template.clone(),
+            mode: ResidentPlacementMode::Record,
+            cursor: Arc::new(AtomicUsize::new(0)),
+            allocation_start: schedule.allocations.len(),
+            repetitions,
+        });
+        Ok(policy)
+    }
+
+    /// Returns a policy which replays a previously recorded resident tile
+    /// placement sequence for another instance of the same program block.
+    pub fn replay_resident_placement(
+        &self,
+        template: &ResidentPlacementTemplate,
+    ) -> Result<Self, CompileError> {
+        if template.decisions.lock().unwrap().is_empty() {
+            return Err(CompileError::Memory(
+                "cannot replay an empty resident placement template".into(),
+            ));
+        }
+        let mut policy = self.clone();
+        policy.resident_placement_session = Some(ResidentPlacementSession {
+            template: template.clone(),
+            mode: ResidentPlacementMode::Replay,
+            cursor: Arc::new(AtomicUsize::new(0)),
+            allocation_start: 0,
+            repetitions: 1,
+        });
+        Ok(policy)
+    }
+
+    /// Verifies that a recorded or replayed instance consumed exactly the
+    /// operation sequence represented by its placement template.
+    pub fn finish_resident_placement(&self) -> Result<(), CompileError> {
+        let Some(session) = &self.resident_placement_session else {
+            return Ok(());
+        };
+        let consumed = session.cursor.load(Ordering::Relaxed);
+        let expected = session.template.decisions.lock().unwrap().len();
+        if consumed != expected {
+            return Err(CompileError::Memory(format!(
+                "resident placement instance consumed {consumed} decisions, expected {expected}"
+            )));
         }
         Ok(())
     }
@@ -819,9 +971,6 @@ impl MemoryPolicy {
         }
         let cache = cache.as_mut().unwrap();
         for allocation in &schedule.allocations[cache.allocation_count..] {
-            if allocation.live_until == 0 || allocation.live_from == usize::MAX {
-                continue;
-            }
             let start = allocation.address.max(base);
             let end = allocation
                 .address
@@ -991,6 +1140,7 @@ pub fn allocate_from_occupied(
     size: u32,
     constraint: MemoryConstraint,
 ) -> Result<u32, CompileError> {
+    normalize_occupied_intervals(occupied);
     let alignment = constraint.alignment;
     let address = match constraint.placement {
         MemoryPlacement::Low => {
@@ -1042,8 +1192,7 @@ pub fn allocate_from_occupied(
     }
     .ok_or_else(|| CompileError::Memory(format!("no {size}-byte region in SRAM arena")))?;
     let end = address + size;
-    let insertion = occupied.partition_point(|&(start, _)| start < address);
-    occupied.insert(insertion, (address, end));
+    insert_occupied_interval(occupied, (address, end));
     Ok(address)
 }
 
@@ -1060,6 +1209,7 @@ pub fn allocate_from_occupied_arenas(
     {
         return Err(CompileError::Memory("invalid SRAM arena allocation".into()));
     }
+    normalize_occupied_intervals(occupied);
     for arena in arenas {
         let mut arena_occupied = occupied
             .iter()
@@ -1085,13 +1235,43 @@ pub fn allocate_from_occupied_arenas(
         let end = address
             .checked_add(size)
             .ok_or_else(|| CompileError::Memory("SRAM arena allocation overflow".into()))?;
-        let insertion = occupied.partition_point(|&(start, _)| start < address);
-        occupied.insert(insertion, (address, end));
+        if let Some(&(start, occupied_end)) = occupied
+            .iter()
+            .find(|&&(start, occupied_end)| address < occupied_end && start < end)
+        {
+            return Err(CompileError::Memory(format!(
+                "SRAM arena allocator selected occupied range 0x{address:x}..0x{end:x} overlapping 0x{start:x}..0x{occupied_end:x}"
+            )));
+        }
+        insert_occupied_interval(occupied, (address, end));
         return Ok(address);
     }
     Err(CompileError::Memory(format!(
         "no arena can hold a {size}-byte SRAM allocation"
     )))
+}
+
+fn normalize_occupied_intervals(occupied: &mut Vec<(u32, u32)>) {
+    if !occupied.windows(2).all(|pair| pair[0].0 <= pair[1].0) {
+        occupied.sort_unstable();
+    }
+    let mut write = 0;
+    for read in 0..occupied.len() {
+        let (start, end) = occupied[read];
+        if write != 0 && start <= occupied[write - 1].1 {
+            occupied[write - 1].1 = occupied[write - 1].1.max(end);
+        } else {
+            occupied[write] = (start, end);
+            write += 1;
+        }
+    }
+    occupied.truncate(write);
+}
+
+fn insert_occupied_interval(occupied: &mut Vec<(u32, u32)>, interval: (u32, u32)) {
+    let insertion = occupied.partition_point(|&(start, _)| start < interval.0);
+    occupied.insert(insertion, interval);
+    normalize_occupied_intervals(occupied);
 }
 
 pub fn occupied_intervals_by_tile(
@@ -1135,18 +1315,7 @@ pub fn occupied_intervals_by_tile(
 
 fn merge_occupied_intervals(occupied: &mut [Vec<(u32, u32)>]) {
     for intervals in occupied {
-        intervals.sort_unstable();
-        let mut merged = Vec::<(u32, u32)>::with_capacity(intervals.len());
-        for &(start, end) in intervals.iter() {
-            if let Some(previous) = merged.last_mut()
-                && start <= previous.1
-            {
-                previous.1 = previous.1.max(end);
-            } else {
-                merged.push((start, end));
-            }
-        }
-        *intervals = merged;
+        normalize_occupied_intervals(intervals);
     }
 }
 
@@ -1589,6 +1758,7 @@ pub fn append_blocked_gemm_f16_with_a16_input_in_arenas(
             transient: arenas.to_vec(),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
             allocation_occupancy: AllocationOccupancyCache::default(),
+            resident_placement_session: None,
         },
     )
 }
@@ -1868,6 +2038,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_in_arenas(
             transient: arenas.to_vec(),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
             allocation_occupancy: AllocationOccupancyCache::default(),
+            resident_placement_session: None,
         },
     )
 }
@@ -2153,15 +2324,7 @@ fn plan_appended_blocked_gemm_with_memory_policy(
     memory: &MemoryPolicy,
 ) -> Result<BlockedGemmPlan, CompileError> {
     let mut plan = plan_blocked_gemm(config)?;
-    let tile_rotation = match memory.resident_tile_assignment {
-        ResidentTileAssignment::Balanced => choose_resident_tile_rotation_in_arenas(
-            parent,
-            &plan.right,
-            config.data_type.weight_element_bytes(),
-            memory,
-        ),
-        ResidentTileAssignment::Fixed => 0,
-    };
+    let tile_rotation = resident_tile_rotation(parent, config, &plan.right, memory)?;
     rotate_gemm_plan_tiles(&mut plan, tile_rotation)?;
     let mut regions = plan
         .left
@@ -2214,6 +2377,10 @@ fn plan_appended_blocked_gemm_with_memory_policy(
         arena_limit,
     );
     let mut occupied_all = memory.occupied_all(parent, arena_base, arena_limit);
+    for (all, current) in occupied_all.iter_mut().zip(&occupied_current) {
+        all.extend_from_slice(current);
+    }
+    merge_occupied_intervals(&mut occupied_all);
     let movable = regions
         .iter()
         .map(|&(tensor, ..)| tensor)
@@ -2267,9 +2434,7 @@ fn plan_appended_blocked_gemm_with_memory_policy(
         } else {
             &mut occupied_all
         };
-        let intervals = &mut other[usize::from(tile)];
-        let insertion = intervals.partition_point(|&(start, _)| start < address);
-        intervals.insert(insertion, (address, end));
+        insert_occupied_interval(&mut other[usize::from(tile)], (address, end));
         relocated.insert(tensor, address);
     }
     for placement in plan
@@ -2316,14 +2481,114 @@ fn plan_appended_blocked_gemm_with_memory_policy(
     Ok(plan)
 }
 
+fn resident_tile_rotation(
+    parent: &Schedule,
+    config: BlockedGemmConfig,
+    child_resident: &[BlockPlacement],
+    memory: &MemoryPolicy,
+) -> Result<u16, CompileError> {
+    let choose = || match memory.resident_tile_assignment {
+        ResidentTileAssignment::Balanced => choose_resident_tile_rotation_in_arenas(
+            parent,
+            child_resident,
+            config.data_type.weight_element_bytes(),
+            memory,
+        ),
+        ResidentTileAssignment::Fixed => 0,
+    };
+    let Some(session) = &memory.resident_placement_session else {
+        return Ok(choose());
+    };
+    let key = ResidentPlacementKey::from(config);
+    let index = session.cursor.fetch_add(1, Ordering::Relaxed);
+    match session.mode {
+        ResidentPlacementMode::Record => {
+            let rotation = match memory.resident_tile_assignment {
+                ResidentTileAssignment::Balanced => {
+                    let mut projected_extra = vec![0u64; usize::from(parent.tile_count)];
+                    let additional_instances = session.repetitions - 1;
+                    if additional_instances != 0 {
+                        for allocation in &parent.allocations[session.allocation_start..] {
+                            if allocation.kind == AllocationKind::Home
+                                && allocation.live_from == 0
+                                && allocation.live_until == usize::MAX
+                            {
+                                projected_extra[usize::from(allocation.tile)] +=
+                                    u64::from(allocation.size)
+                                        * u64::try_from(additional_instances).unwrap();
+                            }
+                        }
+                    }
+                    choose_resident_tile_rotation_with_projection(
+                        parent,
+                        child_resident,
+                        config.data_type.weight_element_bytes(),
+                        memory,
+                        &projected_extra,
+                        session.repetitions,
+                    )
+                }
+                ResidentTileAssignment::Fixed => 0,
+            };
+            let mut decisions = session.template.decisions.lock().unwrap();
+            if index != decisions.len() {
+                return Err(CompileError::Memory(
+                    "resident placement template was recorded out of order".into(),
+                ));
+            }
+            decisions.push(ResidentPlacementDecision { key, rotation });
+            Ok(rotation)
+        }
+        ResidentPlacementMode::Replay => {
+            let decision = session
+                .template
+                .decisions
+                .lock()
+                .unwrap()
+                .get(index)
+                .copied()
+                .ok_or_else(|| {
+                    CompileError::Memory(format!(
+                        "resident placement instance has an unexpected operation at index {index}"
+                    ))
+                })?;
+            if decision.key != key {
+                return Err(CompileError::Memory(format!(
+                    "resident placement operation {index} changed from {:?} to {:?}",
+                    decision.key, key
+                )));
+            }
+            Ok(decision.rotation)
+        }
+    }
+}
+
 fn choose_resident_tile_rotation_in_arenas(
     parent: &Schedule,
     child_resident: &[BlockPlacement],
     element_bytes: u32,
     memory: &MemoryPolicy,
 ) -> u16 {
+    choose_resident_tile_rotation_with_projection(
+        parent,
+        child_resident,
+        element_bytes,
+        memory,
+        &vec![0; usize::from(parent.tile_count)],
+        1,
+    )
+}
+
+fn choose_resident_tile_rotation_with_projection(
+    parent: &Schedule,
+    child_resident: &[BlockPlacement],
+    element_bytes: u32,
+    memory: &MemoryPolicy,
+    projected_extra: &[u64],
+    child_instances: usize,
+) -> u16 {
     let tile_count = usize::from(parent.tile_count);
-    if tile_count == 0 {
+    if tile_count == 0 || projected_extra.len() != tile_count || child_instances == 0 {
         return 0;
     }
     let arena_base = memory
@@ -2360,7 +2625,10 @@ fn choose_resident_tile_rotation_in_arenas(
     (0..tile_count)
         .min_by_key(|&rotation| {
             let loads = (0..tile_count).map(|tile| {
-                parent_bytes[tile] + child_bytes[(tile + tile_count - rotation) % tile_count]
+                parent_bytes[tile]
+                    + projected_extra[tile]
+                    + child_bytes[(tile + tile_count - rotation) % tile_count]
+                        * u64::try_from(child_instances).unwrap()
             });
             let maximum = loads.clone().max().unwrap_or(0);
             let squared = loads
@@ -3101,7 +3369,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                         address: expanded_right_address,
                         size: expanded_right_block_bytes,
                         live_from: gemm_phase,
-                        live_until: gemm_phase,
+                        live_until: gemm_phase + 1,
                         kind: AllocationKind::Home,
                     });
                 }
@@ -5569,6 +5837,63 @@ mod tests {
     }
 
     #[test]
+    fn repeated_resident_placement_replays_balanced_operation_sequence() {
+        let allocation = |tensor, tile| Allocation {
+            tensor: TensorId(tensor),
+            tile,
+            address: 0xa0000,
+            size: 4096,
+            live_from: 0,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        };
+        let parent = |tile| Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![allocation(0, tile)],
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+        let child = [BlockPlacement {
+            tensor: TensorId(1),
+            tile: 0,
+            address: 0xa0000,
+            block_row: 0,
+            block_column: 0,
+            row_start: 0,
+            rows: 64,
+            column_start: 0,
+            columns: 64,
+        }];
+        let config = BlockedGemmConfig {
+            rows: 64,
+            inner_dimension: 64,
+            columns: 64,
+            block_dimension: 64,
+            inner_block_dimension: 64,
+            row_block_dimension: 64,
+            tile_count: 4,
+            data_base: 0xa0000,
+            data_limit: 0xe8000,
+            data_type: GemmDataType::F16,
+            retain_profile_metadata: false,
+        };
+        let memory = MemoryPolicy::contiguous(0xa0000, 0xe8000);
+        let template = ResidentPlacementTemplate::default();
+        let recording = memory
+            .record_resident_placement(&template, &parent(0), 3)
+            .unwrap();
+        let expected = resident_tile_rotation(&parent(0), config, &child, &recording).unwrap();
+        recording.finish_resident_placement().unwrap();
+
+        let replaying = memory.replay_resident_placement(&template).unwrap();
+        let actual = resident_tile_rotation(&parent(2), config, &child, &replaying).unwrap();
+        replaying.finish_resident_placement().unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn blocked_gemm_plan_preserves_block_ownership_and_phase_dependencies() {
         let plan = plan_blocked_gemm(BlockedGemmConfig {
             rows: 128,
@@ -5710,6 +6035,10 @@ mod tests {
                 && allocation.address >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
                 && allocation.address + allocation.size
                     <= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
+        }));
+        assert!(plan.schedule.allocations.iter().all(|allocation| {
+            !expanded.contains(&allocation.tensor)
+                || allocation.live_until == allocation.live_from + 1
         }));
         assert!(plan.schedule.phases.iter().any(|phase| {
             matches!(phase, Phase::Compute { commands, .. } if commands.iter().any(|command| {
@@ -6554,6 +6883,20 @@ mod tests {
     }
 
     #[test]
+    fn occupied_allocator_clips_ranges_crossing_arena_boundaries() {
+        let arenas = [
+            MemoryArena::high(0x88000, 0xe8000),
+            MemoryArena::high(0x58000, 0x80000),
+            MemoryArena::high(0x80000, 0x88000),
+        ];
+        let mut occupied = vec![(0x7ab00, 0x85100), (0x7c000, 0x7d000), (0x88000, 0xe8000)];
+
+        let address = allocate_from_occupied_arenas(&mut occupied, 4096, &arenas, 32).unwrap();
+
+        assert_eq!(address, 0x79b00);
+    }
+
+    #[test]
     fn ipu21_policy_maps_named_regions_without_overlap() {
         let ordinary_low_base =
             ipu_package::TILE_MEMORY_BASE + 7 * ipu_package::TILE_MEMORY_ELEMENT_SIZE;
@@ -6605,6 +6948,30 @@ mod tests {
 
         assert_eq!(transient, arena.base);
         assert_ne!(resident, transient);
+    }
+
+    #[test]
+    fn resident_occupancy_includes_physical_allocations_with_empty_lifetimes() {
+        let memory = MemoryPolicy::contiguous(0xa0000, 0xe8000);
+        let schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![Allocation {
+                tensor: TensorId(1),
+                tile: 2,
+                address: 0xb0000,
+                size: 4096,
+                live_from: 7,
+                live_until: 7,
+                kind: AllocationKind::Home,
+            }],
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let occupied = memory.occupied_all(&schedule, 0xa0000, 0xe8000);
+
+        assert_eq!(occupied[2], vec![(0xb0000, 0xb1000)]);
     }
 
     #[test]
