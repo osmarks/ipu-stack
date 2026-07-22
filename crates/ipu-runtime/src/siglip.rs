@@ -15,8 +15,8 @@ use ipu_compiler::{
     append_c16_to_a16_row_shards_reblocked_in_arenas,
     append_flash_attention_from_a16_qkv_in_arenas,
     append_flash_attention_to_a16_row_shards_in_arenas, choose_gemm_row_block_for,
-    end_tensor_lifetimes, make_tensors_resident, make_tensors_resident_since,
-    occupied_intervals_by_tile, set_f8_weight_block_scales_in_phases,
+    choose_gemm_row_block_for_max_rows, end_tensor_lifetimes, make_tensors_resident,
+    make_tensors_resident_since, occupied_intervals_by_tile, set_f8_weight_block_scales_in_phases,
     set_native_f8_weight_block_scales_in_phases,
 };
 use ipu_models::SiglipWeights;
@@ -856,6 +856,43 @@ pub fn append_siglip_encoder_layer_with_precision(
     retain_diagnostics: bool,
     host: &mut HostTensorSet,
 ) -> Result<SiglipEncoderLayer> {
+    append_siglip_encoder_layer_batched_with_precision(
+        schedule,
+        input,
+        model,
+        layer,
+        1,
+        rows,
+        columns,
+        row_block_dimension,
+        tile_count,
+        memory,
+        precision,
+        tuning,
+        retain_profile_metadata,
+        retain_diagnostics,
+        host,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_siglip_encoder_layer_batched_with_precision(
+    schedule: &mut Schedule,
+    input: &[RowShardPlacement],
+    model: &SiglipWeights,
+    layer: usize,
+    batch_size: u16,
+    rows: u16,
+    columns: u16,
+    row_block_dimension: u16,
+    tile_count: u16,
+    memory: &MemoryPolicy,
+    precision: SiglipEncoderPrecision,
+    tuning: SiglipEncoderTuning,
+    retain_profile_metadata: bool,
+    retain_diagnostics: bool,
+    host: &mut HostTensorSet,
+) -> Result<SiglipEncoderLayer> {
     memory.validate()?;
     // The standalone kernel planners use this ordinary-memory window before
     // policy-aware composition relocates movable operands into their arenas.
@@ -864,6 +901,10 @@ pub fn append_siglip_encoder_layer_with_precision(
     let span = info_span!("siglip_encoder_layer", layer);
     let _guard = span.enter();
     let config = &model.config;
+    let sequence_length = u16::try_from(model.sequence_length())?;
+    if batch_size == 0 || u32::from(rows) != u32::from(batch_size) * u32::from(sequence_length) {
+        return Err("SigLIP encoder rows must equal batch size times sequence length".into());
+    }
     let tuned_gemm_rows = if tuning.gemm_row_block_rows == 0 {
         row_block_dimension
     } else {
@@ -917,19 +958,33 @@ pub fn append_siglip_encoder_layer_with_precision(
     let qkv_row_block_dimension = if matches!(qkv_data_type, GemmDataType::F8F143 { .. }) {
         row_block_dimension
     } else if tuning.automatic_gemm_row_blocks && tuning.gemm_row_block_rows == 0 {
-        choose_gemm_row_block_for(
+        let preferred_arena = memory
+            .transient
+            .first()
+            .ok_or("SigLIP encoder requires a transient memory arena")?;
+        let maximum_materialized_rows = (preferred_arena.limit - preferred_arena.base)
+            .checked_div(u32::from(columns) * 2)
+            .and_then(|rows| u16::try_from(rows).ok())
+            .ok_or("preferred transient arena cannot hold one QKV row")?;
+        choose_gemm_row_block_for_max_rows(
             rows,
             tuned_gemm_inner,
             columns * 3,
             64,
             tile_count,
             qkv_data_type,
+            maximum_materialized_rows,
         )
-        .ok_or("QKV GEMM shape has no feasible row blocking")?
+        .ok_or("QKV GEMM has no row blocking whose output fits the preferred transient arena")?
     } else {
         tuned_gemm_rows
     };
     let qkv_phase_start = schedule.phases.len();
+    info!(
+        operation = "qkv",
+        row_block_rows = qkv_row_block_dimension,
+        "selected SigLIP GEMM blocking"
+    );
     let qkv_allocation_start = schedule.allocations.len();
     let qkv = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
@@ -1034,9 +1089,9 @@ pub fn append_siglip_encoder_layer_with_precision(
         &qkv_shards[1],
         &qkv_shards[2],
         FlashAttentionConfig {
-            batch_size: 1,
+            batch_size,
             query_sequence_length: 0,
-            sequence_length: rows,
+            sequence_length,
             hidden_size: columns,
             attention_heads: u16::try_from(config.num_attention_heads)?,
             query_block_rows: tuning.attention_query_block_rows,
@@ -1200,6 +1255,11 @@ pub fn append_siglip_encoder_layer_with_precision(
         tuned_gemm_rows
     };
     let mlp_up_phase_start = schedule.phases.len();
+    info!(
+        operation = "mlp_up",
+        row_block_rows = mlp_up_row_block_dimension,
+        "selected SigLIP GEMM blocking"
+    );
     let mlp_up_allocation_start = schedule.allocations.len();
     let mlp_up = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule,
@@ -1287,6 +1347,11 @@ pub fn append_siglip_encoder_layer_with_precision(
         };
     let mlp_gelu =
         append_c16_to_a16_blocks_gelu_f16_in_arenas(schedule, &mlp_up.output, &memory.transient)?;
+    info!(
+        operation = "mlp_down",
+        row_block_rows = mlp_down_row_block_dimension,
+        "selected SigLIP GEMM blocking"
+    );
     end_tensor_lifetimes(schedule, mlp_up.output.iter().map(|block| block.tensor))?;
     let mlp_down_phase_start = schedule.phases.len();
     let mlp_down_allocation_start = schedule.allocations.len();

@@ -2254,6 +2254,26 @@ pub fn choose_gemm_row_block_for(
     tile_count: u16,
     data_type: GemmDataType,
 ) -> Option<u16> {
+    choose_gemm_row_block_for_max_rows(
+        rows,
+        inner_block_dimension,
+        columns,
+        block_dimension,
+        tile_count,
+        data_type,
+        u16::MAX,
+    )
+}
+
+pub fn choose_gemm_row_block_for_max_rows(
+    rows: u16,
+    inner_block_dimension: u16,
+    columns: u16,
+    block_dimension: u16,
+    tile_count: u16,
+    data_type: GemmDataType,
+    maximum_rows: u16,
+) -> Option<u16> {
     let candidates = gemm_row_block_candidates_for(
         rows,
         inner_block_dimension,
@@ -2261,9 +2281,11 @@ pub fn choose_gemm_row_block_for(
         block_dimension,
         tile_count,
         data_type,
-    );
+    )
+    .into_iter()
+    .filter(|&candidate| candidate <= maximum_rows);
     let column_blocks = columns.checked_div(block_dimension)?;
-    candidates.into_iter().min_by_key(|&target| {
+    candidates.min_by_key(|&target| {
         let row_shards = rows.div_ceil(target);
         let maximum_rows = rows.div_ceil(row_shards);
         let output_blocks = usize::from(row_shards) * usize::from(column_blocks);
@@ -5236,6 +5258,22 @@ mod tests {
             );
         }
         assert!(choose_gemm_row_block(65, 32, 65, 64, 1472).is_none());
+    }
+
+    #[test]
+    fn gemm_row_block_choice_respects_materialized_row_limit() {
+        let unrestricted =
+            choose_gemm_row_block_for(1458, 64, 3456, 64, 1472, GemmDataType::F16).unwrap();
+        let constrained =
+            choose_gemm_row_block_for_max_rows(1458, 64, 3456, 64, 1472, GemmDataType::F16, 35)
+                .unwrap();
+
+        assert!(unrestricted > 35);
+        assert!(constrained <= 35);
+        assert!(
+            gemm_row_block_candidates_for(1458, 64, 3456, 64, 1472, GemmDataType::F16)
+                .contains(&constrained)
+        );
     }
 
     fn exchange_schedule(transfers: Vec<Transfer>) -> Schedule {

@@ -101,14 +101,16 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
     } else {
         config.query_sequence_length
     };
-    if config.batch_size != 1 || query.is_empty() || key.is_empty() || key.len() != value.len() {
+    if query.is_empty() || key.is_empty() || key.len() != value.len() {
         return Err(CompileError::Graph(
-            "row-sharded FlashAttention composition currently requires one batch and matching K/V shards"
+            "row-sharded FlashAttention composition requires matching non-empty Q/K/V shards"
                 .into(),
         ));
     }
-    if query.iter().map(|shard| shard.rows).sum::<u16>() != query_sequence_length
-        || key.iter().map(|shard| shard.rows).sum::<u16>() != config.sequence_length
+    let query_total_rows = u32::from(config.batch_size) * u32::from(query_sequence_length);
+    let key_value_total_rows = u32::from(config.batch_size) * u32::from(config.sequence_length);
+    if query.iter().map(|shard| u32::from(shard.rows)).sum::<u32>() != query_total_rows
+        || key.iter().map(|shard| u32::from(shard.rows)).sum::<u32>() != key_value_total_rows
         || query
             .iter()
             .any(|shard| shard.columns != config.hidden_size)
@@ -335,19 +337,20 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
             "attention output gather requires tasks and an aligned SRAM arena".into(),
         ));
     }
-    if plan.tasks.iter().any(|task| task.batch != 0) {
-        return Err(CompileError::Graph(
-            "row-sharded attention output currently requires one batch".into(),
-        ));
-    }
     let head_count = plan.tasks.iter().map(|task| task.head).max().unwrap() + 1;
     let hidden_size = head_count
         .checked_mul(plan.head_dimension)
         .ok_or_else(|| CompileError::Graph("attention hidden size overflow".into()))?;
-    let mut groups = BTreeMap::<(u16, u16), Vec<&AttentionTaskPlacement>>::new();
+    let query_sequence_length = plan
+        .tasks
+        .iter()
+        .map(|task| task.query_row_start + task.query_rows)
+        .max()
+        .unwrap();
+    let mut groups = BTreeMap::<(u16, u16, u16), Vec<&AttentionTaskPlacement>>::new();
     for task in &plan.tasks {
         groups
-            .entry((task.query_row_start, task.query_rows))
+            .entry((task.batch, task.query_row_start, task.query_rows))
             .or_default()
             .push(task);
     }
@@ -361,7 +364,13 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
     let first_compute_phase = schedule.phases.len() + 1;
     let mut destinations = Vec::with_capacity(groups.len());
     let mut output_groups = Vec::with_capacity(groups.len());
-    for (destination_index, ((row_start, rows), mut tasks)) in groups.into_iter().enumerate() {
+    for (destination_index, ((batch, batch_row_start, rows), mut tasks)) in
+        groups.into_iter().enumerate()
+    {
+        let row_start = batch
+            .checked_mul(query_sequence_length)
+            .and_then(|offset| offset.checked_add(batch_row_start))
+            .ok_or_else(|| CompileError::Graph("attention output row index overflow".into()))?;
         tasks.sort_by_key(|task| task.head);
         if tasks.len() != usize::from(head_count)
             || tasks
@@ -672,11 +681,30 @@ fn append_attention_pack_phase(
         }
         Ok(())
     };
+    let query_sequence_length = plan
+        .tasks
+        .iter()
+        .map(|task| task.query_row_start + task.query_rows)
+        .max()
+        .unwrap_or(0);
+    let key_sequence_length = plan
+        .key_values
+        .iter()
+        .map(|block| block.key_row_start + block.key_rows)
+        .max()
+        .unwrap_or(0);
     match kind {
         AttentionPackKind::Query => {
             for task in &plan.tasks {
+                let source_row_start = task
+                    .batch
+                    .checked_mul(query_sequence_length)
+                    .and_then(|offset| offset.checked_add(task.query_row_start))
+                    .ok_or_else(|| {
+                        CompileError::Graph("attention query row index overflow".into())
+                    })?;
                 append_range(
-                    task.query_row_start,
+                    source_row_start,
                     task.query_rows,
                     task.head,
                     task.tile,
@@ -692,8 +720,15 @@ fn append_attention_pack_phase(
                     AttentionPackKind::Value => (block.value_tensor, "attention_pack_value_f16"),
                     AttentionPackKind::Query => unreachable!(),
                 };
+                let source_row_start = block
+                    .batch
+                    .checked_mul(key_sequence_length)
+                    .and_then(|offset| offset.checked_add(block.key_row_start))
+                    .ok_or_else(|| {
+                        CompileError::Graph("attention key row index overflow".into())
+                    })?;
                 append_range(
-                    block.key_row_start,
+                    source_row_start,
                     block.key_rows,
                     block.head,
                     block.tile,
@@ -1733,6 +1768,82 @@ mod tests {
         .unwrap();
 
         schedule.validate_allocations().unwrap();
+    }
+
+    #[test]
+    fn composed_attention_preserves_flattened_batch_row_order() {
+        let batch_size = 2u16;
+        let sequence_length = 24u16;
+        let columns = 64u16;
+        let shards = (0..6u16)
+            .map(|index| RowShardPlacement {
+                tile: index,
+                row_start: index * 8,
+                rows: 8,
+                columns,
+                tensor: TensorId(usize::from(index)),
+                address: 0x90000,
+            })
+            .collect::<Vec<_>>();
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: shards
+                .iter()
+                .map(|shard| Allocation {
+                    tensor: shard.tensor,
+                    tile: shard.tile,
+                    address: shard.address,
+                    size: u32::from(shard.rows) * u32::from(shard.columns) * 2,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                })
+                .collect(),
+            tile_count: 64,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let plan = append_flash_attention_from_a16_qkv(
+            &mut schedule,
+            &shards,
+            &shards,
+            &shards,
+            FlashAttentionConfig {
+                batch_size,
+                query_sequence_length: 0,
+                sequence_length,
+                hidden_size: columns,
+                attention_heads: 4,
+                query_block_rows: 8,
+                key_block_rows: 8,
+                tile_count: 64,
+                data_base: 0xa0000,
+                data_limit: 0xe8000,
+            },
+        )
+        .unwrap();
+        let output =
+            append_flash_attention_to_a16_row_shards(&mut schedule, &plan, 0xc0000, 0xe8000)
+                .unwrap();
+
+        assert!(plan.tasks.iter().any(|task| task.batch == 0));
+        assert!(plan.tasks.iter().any(|task| task.batch == 1));
+        let mut output = output
+            .iter()
+            .map(|shard| (shard.row_start, shard.rows))
+            .collect::<Vec<_>>();
+        output.sort_unstable();
+        let mut expected_start = 0;
+        for (row_start, rows) in output {
+            assert_eq!(row_start, expected_start);
+            expected_start += rows;
+        }
+        assert_eq!(expected_start, batch_size * sequence_length);
+        schedule.validate_allocations().unwrap();
+        schedule
+            .lower_tile_programs(&ipu_exchange::Topology::c600())
+            .unwrap();
     }
 
     #[test]

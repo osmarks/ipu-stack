@@ -13,7 +13,7 @@ use ipu_runtime::{
     BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, ProfileGranularity,
     SiglipEncoderPrecision, SiglipEncoderTuning, SiglipLinearPrecision, SiglipWeightStorage,
     StaticProfileRegion, StaticTemplateRegion, allocator_memory_profile, append_host_a16_matrix,
-    append_siglip_encoder_layer_with_precision, append_siglip_map_head,
+    append_siglip_encoder_layer_batched_with_precision, append_siglip_map_head,
     append_siglip_map_head_with_memory_policy, append_siglip_post_layer_norm,
     append_siglip_post_layer_norm_with_memory_policy, block_binding_typed, block_coordinates,
     blocked_matrix_f16, consolidate_attention_kernel_variants, package_graph_repeated,
@@ -52,7 +52,12 @@ fn main() {
         return;
     }
     let config = &model.config;
-    let rows = u16::try_from(model.sequence_length()).unwrap();
+    let sequence_length = u16::try_from(model.sequence_length()).unwrap();
+    let batch_size =
+        u16::try_from(env_u32("IPU_SIGLIP_BATCH_SIZE", 1)).expect("SigLIP batch size exceeds u16");
+    let rows = sequence_length
+        .checked_mul(batch_size)
+        .expect("SigLIP flattened row count exceeds u16");
     let patch_elements = config.num_channels * config.patch_size.pow(2);
     let inner = u16::try_from(patch_elements.div_ceil(64) * 64).unwrap();
     let columns = u16::try_from(config.hidden_size).unwrap();
@@ -95,7 +100,7 @@ fn main() {
         .unwrap();
     let mut host = HostTensorSet::default();
     let patch_bytes = blocked_matrix_f16(&plan.left, BlockLayout::AmpA16, |row, column| {
-        patch_value(&pixels, config, row, column)
+        patch_value(&pixels, config, row % sequence_length, column)
     });
     host.push_input(
         block_binding_typed("patches", rows, inner, &plan.left, "f16", 2),
@@ -124,7 +129,7 @@ fn main() {
     let adjustment = append_adjustment_phase(&mut plan.schedule, &plan.output).unwrap();
     let adjustment_bytes =
         blocked_matrix_f16(&adjustment, BlockLayout::AmpC16F16, |row, column| {
-            position[usize::from(row) * config.hidden_size + usize::from(column)]
+            position[usize::from(row % sequence_length) * config.hidden_size + usize::from(column)]
                 + bias[usize::from(column)]
         });
     host.push(
@@ -210,7 +215,7 @@ fn main() {
         ?tuning,
         "configured encoder tile-memory policy"
     );
-    let detailed_diagnostics = layer_count == 1;
+    let detailed_diagnostics = layer_count == 1 && batch_size == 1;
     let retain_profile_metadata = std::env::var_os("IPU_SIGLIP_RETAIN_PROFILE_METADATA").is_some();
     let mut current = row_shards;
     let mut last_layer = None;
@@ -227,11 +232,12 @@ fn main() {
         } else {
             expanded_storage_fallback(precision)
         };
-        let appended = append_siglip_encoder_layer_with_precision(
+        let appended = append_siglip_encoder_layer_batched_with_precision(
             &mut plan.schedule,
             &current,
             &model,
             layer,
+            batch_size,
             rows,
             columns,
             row_block_dimension,
@@ -300,6 +306,10 @@ fn main() {
     assert!(
         !full_model || layer_count == config.num_hidden_layers,
         "full-model execution requires every encoder layer"
+    );
+    assert!(
+        !full_model || batch_size == 1,
+        "batched MAP-head execution is not implemented"
     );
     let (output, output_rows, output_name, attentions, post_norm_output) = if full_model {
         let post_norm = append_siglip_post_layer_norm_with_memory_policy(
@@ -559,11 +569,12 @@ fn main() {
         let expected = reference.tensor_f32("pooler_output").unwrap();
         (0..usize::from(output_rows))
             .flat_map(|_| expected.iter().copied())
-            .collect()
+            .collect::<Vec<_>>()
     } else {
-        reference
+        let expected = reference
             .tensor_f32(&format!("encoder_layer_{:02}", layer_count - 1))
-            .unwrap()
+            .unwrap();
+        expected.repeat(usize::from(batch_size))
     };
     let expected_layer = serialize_a16_row_shards(
         &expected_layer,
@@ -623,6 +634,8 @@ fn main() {
         patch_size = config.patch_size,
         patch_grid = model.patch_grid(),
         discarded_pixels = config.image_size % config.patch_size,
+        batch_size,
+        sequence_length,
         rows,
         inner,
         columns,
