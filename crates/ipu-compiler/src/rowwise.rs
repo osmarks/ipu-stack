@@ -4,6 +4,7 @@ use crate::{
     TensorId, Transfer, allocate_from_occupied, allocate_from_occupied_arenas,
     find_free_region_in_arenas, occupied_intervals_by_tile,
 };
+use rayon::prelude::*;
 use rustc_hash::FxHashSet as HashSet;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -113,17 +114,28 @@ pub fn end_tensor_lifetimes(
 ) -> Result<(), CompileError> {
     let phase = schedule.phases.len();
     let tensors = tensors.into_iter().collect::<HashSet<_>>();
-    let mut found = HashSet::default();
     let mut regions = vec![Vec::<(u32, u32)>::new(); usize::from(schedule.tile_count)];
-    for allocation in &schedule.allocations {
-        if tensors.contains(&allocation.tensor) {
-            found.insert(allocation.tensor);
-            if allocation.kind == AllocationKind::Home {
-                regions[usize::from(allocation.tile)].push((
-                    allocation.address,
-                    allocation.address.saturating_add(allocation.size),
-                ));
-            }
+    let targets = schedule
+        .allocations
+        .par_iter()
+        .filter(|allocation| tensors.contains(&allocation.tensor))
+        .map(|allocation| {
+            (
+                allocation.tensor,
+                allocation.tile,
+                allocation.address,
+                allocation.address.saturating_add(allocation.size),
+                allocation.kind == AllocationKind::Home,
+            )
+        })
+        .collect::<Vec<_>>();
+    let found = targets
+        .iter()
+        .map(|&(tensor, _, _, _, _)| tensor)
+        .collect::<HashSet<_>>();
+    for &(_, tile, start, end, home) in &targets {
+        if home {
+            regions[usize::from(tile)].push((start, end));
         }
     }
     if let Some(tensor) = tensors.difference(&found).next() {
@@ -146,22 +158,31 @@ pub fn end_tensor_lifetimes(
         }
         *tile_regions = merged;
     }
-    for allocation in &mut schedule.allocations {
-        if allocation.kind != AllocationKind::Home || allocation.live_until != usize::MAX {
-            continue;
-        }
-        let allocation_end = allocation.address.saturating_add(allocation.size);
-        let aliases_target = regions[usize::from(allocation.tile)]
-            .iter()
-            .any(|&(start, end)| allocation.address >= start && allocation_end <= end);
-        if aliases_target {
-            if allocation.live_from >= phase {
-                return Err(CompileError::Graph(
-                    "tensor cannot end before an alias becomes live".into(),
-                ));
+    let ending = schedule
+        .allocations
+        .par_iter()
+        .enumerate()
+        .filter_map(|(index, allocation)| {
+            if allocation.kind != AllocationKind::Home || allocation.live_until != usize::MAX {
+                return None;
             }
-            allocation.live_until = phase;
-        }
+            let allocation_end = allocation.address.saturating_add(allocation.size);
+            regions[usize::from(allocation.tile)]
+                .iter()
+                .any(|&(start, end)| allocation.address >= start && allocation_end <= end)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if ending
+        .iter()
+        .any(|&index| schedule.allocations[index].live_from >= phase)
+    {
+        return Err(CompileError::Graph(
+            "tensor cannot end before an alias becomes live".into(),
+        ));
+    }
+    for index in ending {
+        schedule.allocations[index].live_until = phase;
     }
     Ok(())
 }

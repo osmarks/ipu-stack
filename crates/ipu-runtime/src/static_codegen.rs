@@ -297,8 +297,8 @@ pub(crate) fn plan_static_templates(
     let mut templates = Vec::with_capacity(regions.len());
     let mut previous_end = 0;
     for region in regions {
-        if region.phase_instances.len() < 2 {
-            return Err(format!("template {} requires at least two instances", region.name).into());
+        if region.phase_instances.is_empty() {
+            return Err(format!("template {} has no instances", region.name).into());
         }
         let instance_steps = region
             .phase_instances

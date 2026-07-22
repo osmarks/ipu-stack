@@ -23,6 +23,7 @@ use ipu_runtime::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -261,8 +262,11 @@ fn main() {
     let mut current = row_shards;
     let mut last_layer = None;
     let mut deferred_residual = None;
-    let mut layer_template_groups =
-        Vec::<(SiglipEncoderPrecision, Vec<std::ops::Range<usize>>)>::new();
+    let mut layer_template_groups = Vec::<(
+        SiglipEncoderPrecision,
+        Vec<u64>,
+        Vec<std::ops::Range<usize>>,
+    )>::new();
     let mut profile_regions = vec![StaticProfileRegion {
         name: "embedding".into(),
         phases: 0..plan.schedule.phases.len(),
@@ -323,15 +327,14 @@ fn main() {
         if !retain_profile_metadata {
             plan.schedule.discard_profile_metadata(phase_range.clone());
         }
-        if let Some((group_precision, ranges)) = layer_template_groups.last_mut()
+        let template_signature = phase_template_signature(&plan.schedule, phase_range.clone());
+        if let Some((group_precision, group_signature, ranges)) = layer_template_groups.last_mut()
             && *group_precision == layer_precision
-            && ranges
-                .first()
-                .is_some_and(|existing| existing.len() == phase_range.len())
+            && *group_signature == template_signature
         {
             ranges.push(phase_range);
         } else {
-            layer_template_groups.push((layer_precision, vec![phase_range]));
+            layer_template_groups.push((layer_precision, template_signature, vec![phase_range]));
         }
         let (compute_commands, transfers) =
             plan.schedule
@@ -473,8 +476,7 @@ fn main() {
     let templates = layer_template_groups
         .into_iter()
         .enumerate()
-        .filter(|(_, (_, ranges))| ranges.len() >= 2)
-        .map(|(index, (_, phase_instances))| StaticTemplateRegion {
+        .map(|(index, (_, _, phase_instances))| StaticTemplateRegion {
             name: format!("siglip_encoder_layer_{index}"),
             phase_instances,
         })
@@ -1565,6 +1567,35 @@ fn pad_columns(values: &[f32], rows: usize, columns: usize, padded_columns: usiz
             .copy_from_slice(&values[row * columns..(row + 1) * columns]);
     }
     padded
+}
+
+fn phase_template_signature(
+    schedule: &ipu_compiler::Schedule,
+    phases: std::ops::Range<usize>,
+) -> Vec<u64> {
+    phases
+        .map(|phase| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            match &schedule.phases[phase] {
+                ipu_compiler::Phase::Exchange { .. } => {
+                    0u8.hash(&mut hasher);
+                }
+                ipu_compiler::Phase::Compute { commands, .. } => {
+                    1u8.hash(&mut hasher);
+                    let mut register_abis = commands
+                        .iter()
+                        .map(|command| (command.inputs.len(), command.arguments.len()))
+                        .collect::<Vec<_>>();
+                    register_abis.sort_unstable();
+                    register_abis.dedup();
+                    for register_abi in register_abis {
+                        register_abi.hash(&mut hasher);
+                    }
+                }
+            }
+            hasher.finish()
+        })
+        .collect()
 }
 
 fn required_env(name: &str) -> String {

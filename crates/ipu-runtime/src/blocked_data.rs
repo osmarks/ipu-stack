@@ -174,8 +174,13 @@ pub fn f143_scale(values: impl IntoIterator<Item = f32>) -> i8 {
 }
 
 pub fn f143_from_f32(value: f32, scale: i8) -> u8 {
+    let scale_multiplier = f32::from_bits(((127 - i32::from(scale)) as u32) << 23);
+    f143_from_scaled_f32(value * scale_multiplier)
+}
+
+fn f143_from_scaled_f32(value: f32) -> u8 {
     let sign = u8::from(value.is_sign_negative()) << 7;
-    let magnitude = value.abs() * 2.0f32.powi(-i32::from(scale));
+    let magnitude = value.abs();
     if magnitude.is_nan() {
         return 0x80;
     }
@@ -185,15 +190,15 @@ pub fn f143_from_f32(value: f32, scale: i8) -> u8 {
     if !magnitude.is_finite() || magnitude >= 240.0 {
         return sign | 0x7f;
     }
-    if magnitude < 2.0f32.powi(-7) {
+    if magnitude < 1.0 / 128.0 {
         let mantissa = (magnitude * 1024.0).round_ties_even() as u8;
         let mantissa = mantissa.min(8);
         return if mantissa == 0 { 0 } else { sign | mantissa };
     }
 
-    let exponent = magnitude.log2().floor() as i32;
+    let exponent = i32::try_from((magnitude.to_bits() >> 23) & 0xff).unwrap() - 127;
     let mut encoded_exponent = exponent + 8;
-    let unit = 2.0f32.powi(exponent);
+    let unit = f32::from_bits(((exponent + 127) as u32) << 23);
     let mut mantissa = ((magnitude / unit - 1.0) * 8.0).round_ties_even() as i32;
     if mantissa == 8 {
         mantissa = 0;
@@ -263,14 +268,20 @@ pub fn blocked_matrix_f8_f143_by_block(
     value: impl Fn(u16, u16) -> f32,
 ) -> Vec<u8> {
     assert_eq!(placements.len(), scales.len());
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(
+        placements
+            .iter()
+            .map(|placement| usize::from(placement.rows) * usize::from(placement.columns))
+            .sum(),
+    );
     for (placement, &scale) in placements.iter().zip(scales) {
+        let scale_multiplier = f32::from_bits(((127 - i32::from(scale)) as u32) << 23);
         for linear in 0..placement.rows * placement.columns {
             let (row, column) =
                 block_coordinates(layout, placement.rows, placement.columns, linear);
-            bytes.push(f143_from_f32(
-                value(placement.row_start + row, placement.column_start + column),
-                scale,
+            bytes.push(f143_from_scaled_f32(
+                value(placement.row_start + row, placement.column_start + column)
+                    * scale_multiplier,
             ));
         }
     }

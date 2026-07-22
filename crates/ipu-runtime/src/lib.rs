@@ -2274,12 +2274,27 @@ fn package_graph_impl_attempt(
             )?)
         })
         .collect::<Result<Vec<_>>>()?;
+    let program_reservation_sizes = preliminary_program_sizes
+        .iter()
+        .zip(&tile_host_plans)
+        .map(|(&program_size, plans)| -> Result<u32> {
+            plans
+                .executable_objects
+                .iter()
+                .try_fold(program_size, |size, object| {
+                    let object_size = u32::try_from(object.len())?;
+                    align_up(size, 8)
+                        .checked_add(object_size)
+                        .ok_or_else(|| "generated program and host plan size overflow".into())
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
     // Place the measured support and generated images together. Placing the smaller
     // generated image first can fragment otherwise sufficient instruction elements.
     let executable_reservations = programs
         .par_iter()
         .zip(&tile_exchange_plans)
-        .zip(&preliminary_program_sizes)
+        .zip(&program_reservation_sizes)
         .zip(&preliminary_images)
         .map(
             |(((program, plans), &program_size), image)| -> Result<[(u32, u32); 2]> {
@@ -2315,7 +2330,7 @@ fn package_graph_impl_attempt(
             let desired = programs
                 .par_iter()
                 .zip(&tile_exchange_plans)
-                .zip(&preliminary_program_sizes)
+                .zip(&program_reservation_sizes)
                 .zip(&preliminary_images)
                 .map(
                     |(((program, plans), &program_size), image)| -> Result<[(u32, u32); 2]> {

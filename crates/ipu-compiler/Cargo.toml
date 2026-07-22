@@ -7,10 +7,11 @@ license.workspace = true
 [dependencies]
 ipu-exchange = { path = "../ipu-exchange" }
 ipu-package = { path = "../ipu-package" }
+rayon.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-rustc-hash = "2"
+rustc-hash.workspace = true
 
 [dev-dependencies]
 fastrand.workspace = true

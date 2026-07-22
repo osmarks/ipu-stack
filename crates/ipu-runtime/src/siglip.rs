@@ -24,6 +24,7 @@ use ipu_compiler::{
 };
 use ipu_models::SiglipWeights;
 use ipu_package::{Binding, RegionSlice};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use tracing::{info, info_span};
 
 #[derive(Default)]
@@ -140,23 +141,36 @@ pub fn fuse_deferred_residual_into_layer_norm(
     if commands.len() != deferred.sources.len() {
         return Err("deferred residual add and LayerNorm shard counts differ".into());
     }
+    let sources = deferred.sources.into_iter().collect::<HashMap<_, _>>();
+    if sources.len() != commands.len() {
+        return Err("deferred residual add has duplicate destination shards".into());
+    }
+    let required = commands
+        .iter()
+        .filter_map(|command| {
+            sources
+                .get(&command.inputs[0])
+                .map(|&source| (source, command.tile))
+        })
+        .collect::<HashSet<_>>();
+    let live = schedule
+        .allocations
+        .iter()
+        .filter(|allocation| {
+            allocation.live_from <= compute_phase
+                && allocation.live_until > compute_phase
+                && required.contains(&(allocation.tensor, allocation.tile))
+        })
+        .map(|allocation| (allocation.tensor, allocation.tile))
+        .collect::<HashSet<_>>();
     for command in commands {
-        let source = deferred
-            .sources
-            .iter()
-            .find(|(output, _)| *output == command.inputs[0])
-            .map(|(_, source)| *source)
+        let source = sources
+            .get(&command.inputs[0])
+            .copied()
             .ok_or("deferred residual add has no source for a LayerNorm shard")?;
-        schedule
-            .allocations
-            .iter()
-            .find(|allocation| {
-                allocation.tensor == source
-                    && allocation.tile == command.tile
-                    && allocation.live_from <= compute_phase
-                    && allocation.live_until > compute_phase
-            })
-            .ok_or("deferred residual source is not colocated with LayerNorm")?;
+        if !live.contains(&(source, command.tile)) {
+            return Err("deferred residual source is not colocated with LayerNorm".into());
+        }
         command.inputs.insert(1, source);
         command.specialization.operation = "add_layer_norm_affine_f16".into();
         command.specialization.role = "add-and-normalize".into();
