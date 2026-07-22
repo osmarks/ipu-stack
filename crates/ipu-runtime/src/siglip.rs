@@ -15,7 +15,8 @@ use ipu_compiler::{
     append_c16_to_a16_row_shards_reblocked_in_arenas,
     append_flash_attention_from_a16_qkv_in_arenas,
     append_flash_attention_to_a16_row_shards_in_arenas, choose_gemm_row_block_for,
-    choose_gemm_row_block_for_max_rows, end_tensor_lifetimes, gemm_row_block_candidates_for,
+    choose_gemm_row_block_for_shape, choose_gemm_row_block_for_shape_max_rows,
+    end_tensor_lifetimes, gemm_row_block_candidates_for, gemm_row_block_cost,
     make_tensors_resident, make_tensors_resident_since, occupied_intervals_by_tile,
     set_f8_weight_block_scales_in_phases, set_native_f8_weight_block_scales_in_phases,
 };
@@ -417,10 +418,12 @@ fn choose_gemm_output_block_columns(
 fn choose_shared_gemm_row_block(
     rows: u16,
     tile_count: u16,
+    first_inner_dimension: u16,
     first_inner_block: u16,
     first_columns: u16,
     first_output_block: u16,
     first_type: GemmDataType,
+    second_inner_dimension: u16,
     second_inner_block: u16,
     second_columns: u16,
     second_output_block: u16,
@@ -452,21 +455,25 @@ fn choose_shared_gemm_row_block(
     .filter(|target| second_row_shards.contains(&rows.div_ceil(*target)))
     .filter(|target| rows.div_ceil(rows.div_ceil(*target)) <= maximum_second_source_rows)
     .min_by_key(|target| {
-        let row_shards = rows.div_ceil(*target);
-        let maximum_rows = rows.div_ceil(row_shards);
-        let first_blocks =
-            usize::from(row_shards) * usize::from(first_columns / first_output_block);
-        let second_blocks =
-            usize::from(row_shards) * usize::from(second_columns / second_output_block);
-        let first_waves = first_blocks.div_ceil(usize::from(tile_count));
-        let second_waves = second_blocks.div_ceil(usize::from(tile_count));
-        (
-            first_waves + second_waves,
-            (first_waves + second_waves) * usize::from(maximum_rows),
-            first_waves * usize::from(tile_count) - first_blocks
-                + second_waves * usize::from(tile_count)
-                - second_blocks,
+        let first = gemm_row_block_cost(
+            rows,
+            *target,
+            first_inner_dimension,
+            first_columns,
+            first_output_block,
+            tile_count,
         )
+        .expect("shared GEMM row candidate has valid first dimensions");
+        let second = gemm_row_block_cost(
+            rows,
+            *target,
+            second_inner_dimension,
+            second_columns,
+            second_output_block,
+            tile_count,
+        )
+        .expect("shared GEMM row candidate has valid second dimensions");
+        (first.0 + second.0, first.1 + second.1, first.2 + second.2)
     })
 }
 
@@ -1182,8 +1189,9 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let mut qkv_row_block_dimension = if matches!(qkv_data_type, GemmDataType::F8F143 { .. }) {
         row_block_dimension
     } else if tuning.automatic_gemm_row_blocks && tuning.gemm_row_block_rows == 0 {
-        choose_gemm_row_block_for_max_rows(
+        choose_gemm_row_block_for_shape_max_rows(
             rows,
+            columns,
             tuned_gemm_inner,
             columns * 3,
             64,
@@ -1207,8 +1215,9 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         && tuning.gemm_row_block_rows == 0
         && !matches!(qkv_data_type, GemmDataType::F8F143 { .. })
     {
-        qkv_row_block_dimension = choose_gemm_row_block_for_max_rows(
+        qkv_row_block_dimension = choose_gemm_row_block_for_shape_max_rows(
             rows,
+            columns,
             tuned_gemm_inner,
             columns * 3,
             qkv_output_block_columns,
@@ -1520,8 +1529,9 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         && tuning.gemm_row_block_rows == 0
         && !matches!(mlp_up_data_type, GemmDataType::F8F143 { .. })
     {
-        let independent_up = choose_gemm_row_block_for(
+        let independent_up = choose_gemm_row_block_for_shape(
             rows,
+            columns,
             tuned_gemm_inner,
             intermediate_columns,
             mlp_up_output_block_columns,
@@ -1529,8 +1539,9 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
             mlp_up_data_type,
         )
         .ok_or("MLP-up GEMM has no row blocking for its selected output blocks")?;
-        let independent_down = choose_gemm_row_block_for(
+        let independent_down = choose_gemm_row_block_for_shape(
             rows,
+            intermediate_columns,
             mlp_up_output_block_columns,
             columns,
             64,
@@ -1553,10 +1564,12 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
             let shared = choose_shared_gemm_row_block(
                 rows,
                 tile_count,
+                columns,
                 tuned_gemm_inner,
                 intermediate_columns,
                 mlp_up_output_block_columns,
                 mlp_up_data_type,
+                intermediate_columns,
                 mlp_up_output_block_columns,
                 columns,
                 64,
@@ -1656,8 +1669,9 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let mlp_down_row_block_dimension = if let Some(planned) = planned_mlp_down_row_block_dimension {
         planned
     } else if tuning.automatic_gemm_row_blocks && tuning.gemm_row_block_rows == 0 {
-        choose_gemm_row_block_for(
+        choose_gemm_row_block_for_shape(
             rows,
+            intermediate_columns,
             mlp_down_inner_block_dimension,
             columns,
             64,

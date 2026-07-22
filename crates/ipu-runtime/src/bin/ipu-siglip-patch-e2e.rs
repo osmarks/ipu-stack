@@ -3,7 +3,7 @@ use ipu_compiler::{
     Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, FlashAttentionConfig,
     FlashAttentionPlan, GemmDataType, Ipu21MemoryRegion, KernelCommand, MemoryConstraint,
     MemoryPlacement, MemoryPolicy, OpId, Phase, RowShardPlacement, RowShardTransitionConfig,
-    SpecializationKey, TensorId, append_c16_to_a16_row_shards, choose_gemm_row_block_for,
+    SpecializationKey, TensorId, append_c16_to_a16_row_shards, choose_gemm_row_block_for_shape,
     end_tensor_lifetimes, make_tensors_resident, plan_blocked_gemm, plan_flash_attention,
 };
 use ipu_elf::{KernelArtifact, Toolchain};
@@ -66,8 +66,9 @@ fn main() {
     let patch_elements = config.num_channels * config.patch_size.pow(2);
     let inner = u16::try_from(patch_elements.div_ceil(64) * 64).unwrap();
     let columns = u16::try_from(config.hidden_size).unwrap();
-    let automatic_row_block_dimension = choose_gemm_row_block_for(
+    let automatic_row_block_dimension = choose_gemm_row_block_for_shape(
         rows,
+        inner,
         INNER_BLOCK_DIMENSION,
         columns,
         BLOCK_DIMENSION,
@@ -688,8 +689,9 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
     let config = &model.config;
     let rows = u16::try_from(model.sequence_length()).unwrap();
     let columns = u16::try_from(config.hidden_size).unwrap();
-    let row_block_dimension = choose_gemm_row_block_for(
+    let row_block_dimension = choose_gemm_row_block_for_shape(
         rows,
+        columns,
         INNER_BLOCK_DIMENSION,
         columns,
         BLOCK_DIMENSION,

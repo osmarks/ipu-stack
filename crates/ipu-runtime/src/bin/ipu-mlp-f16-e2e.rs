@@ -1,5 +1,7 @@
 use half::f16;
-use ipu_compiler::{BlockedMlpConfig, GemmDataType, choose_gemm_row_block_for, plan_blocked_mlp};
+use ipu_compiler::{
+    BlockedMlpConfig, GemmDataType, choose_gemm_row_block_for_shape, plan_blocked_mlp,
+};
 use ipu_elf::Toolchain;
 use ipu_runtime::{
     BlockLayout, ExecutableGraph, HostRunOptions, ProfileGranularity, block_binding_typed,
@@ -29,8 +31,9 @@ fn main() {
     let row_block_dimension = std::env::var("IPU_MLP_ROW_BLOCK")
         .map(|value| value.parse().expect("IPU_MLP_ROW_BLOCK must be a u16"))
         .unwrap_or_else(|_| {
-            choose_gemm_row_block_for(
+            choose_gemm_row_block_for_shape(
                 batch,
+                width,
                 inner_block_dimension,
                 width,
                 BLOCK_DIMENSION,

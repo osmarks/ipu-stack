@@ -1,5 +1,7 @@
 use half::f16;
-use ipu_compiler::{BlockedGemmConfig, GemmDataType, choose_gemm_row_block_for, plan_blocked_gemm};
+use ipu_compiler::{
+    BlockedGemmConfig, GemmDataType, choose_gemm_row_block_for_shape, plan_blocked_gemm,
+};
 use ipu_elf::Toolchain;
 use ipu_runtime::{
     BlockLayout, ExecutableGraph, HostRunOptions, ProfileGranularity, block_binding_typed,
@@ -56,8 +58,9 @@ fn main() {
     let row_block_dimension = std::env::var("IPU_GEMM_ROW_BLOCK")
         .map(|value| value.parse().expect("IPU_GEMM_ROW_BLOCK must be a u16"))
         .unwrap_or_else(|_| {
-            choose_gemm_row_block_for(
+            choose_gemm_row_block_for_shape(
                 rows,
+                inner_dimension,
                 inner_block_dimension,
                 columns,
                 block_dimension,

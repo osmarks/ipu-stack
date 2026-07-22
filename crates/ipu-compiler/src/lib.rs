@@ -2267,6 +2267,27 @@ pub fn choose_gemm_row_block_for(
     )
 }
 
+pub fn choose_gemm_row_block_for_shape(
+    rows: u16,
+    inner_dimension: u16,
+    inner_block_dimension: u16,
+    columns: u16,
+    block_dimension: u16,
+    tile_count: u16,
+    data_type: GemmDataType,
+) -> Option<u16> {
+    choose_gemm_row_block_for_shape_max_rows(
+        rows,
+        inner_dimension,
+        inner_block_dimension,
+        columns,
+        block_dimension,
+        tile_count,
+        data_type,
+        u16::MAX,
+    )
+}
+
 pub fn choose_gemm_row_block_for_max_rows(
     rows: u16,
     inner_block_dimension: u16,
@@ -2274,6 +2295,56 @@ pub fn choose_gemm_row_block_for_max_rows(
     block_dimension: u16,
     tile_count: u16,
     data_type: GemmDataType,
+    maximum_rows: u16,
+) -> Option<u16> {
+    choose_gemm_row_block_with_inner_jobs(
+        rows,
+        inner_block_dimension,
+        columns,
+        block_dimension,
+        tile_count,
+        data_type,
+        0,
+        maximum_rows,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn choose_gemm_row_block_for_shape_max_rows(
+    rows: u16,
+    inner_dimension: u16,
+    inner_block_dimension: u16,
+    columns: u16,
+    block_dimension: u16,
+    tile_count: u16,
+    data_type: GemmDataType,
+    maximum_rows: u16,
+) -> Option<u16> {
+    if !inner_dimension.is_multiple_of(inner_block_dimension) {
+        return None;
+    }
+    let inner_work_units = inner_dimension.div_ceil(GEMM_COST_INNER_MICRO_COLUMNS);
+    choose_gemm_row_block_with_inner_jobs(
+        rows,
+        inner_block_dimension,
+        columns,
+        block_dimension,
+        tile_count,
+        data_type,
+        inner_work_units,
+        maximum_rows,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn choose_gemm_row_block_with_inner_jobs(
+    rows: u16,
+    inner_block_dimension: u16,
+    columns: u16,
+    block_dimension: u16,
+    tile_count: u16,
+    data_type: GemmDataType,
+    inner_work_units: u16,
     maximum_rows: u16,
 ) -> Option<u16> {
     let candidates = gemm_row_block_candidates_for(
@@ -2286,18 +2357,67 @@ pub fn choose_gemm_row_block_for_max_rows(
     )
     .into_iter()
     .filter(|&candidate| candidate <= maximum_rows);
-    let column_blocks = columns.checked_div(block_dimension)?;
     candidates.min_by_key(|&target| {
-        let row_shards = rows.div_ceil(target);
-        let maximum_rows = rows.div_ceil(row_shards);
-        let output_blocks = usize::from(row_shards) * usize::from(column_blocks);
-        let waves = output_blocks.div_ceil(usize::from(tile_count));
-        let unused_tiles = waves * usize::from(tile_count) - output_blocks;
-
-        // Each wave runs at the pace of its largest row shard. Prefer the
-        // shortest aggregate critical path, then fewer barriers and fuller waves.
-        (waves * usize::from(maximum_rows), waves, unused_tiles)
+        gemm_row_block_cost_components(
+            rows,
+            target,
+            inner_work_units,
+            columns,
+            block_dimension,
+            tile_count,
+        )
+        .expect("GEMM row-block candidates have valid dimensions")
     })
+}
+
+const GEMM_COST_INNER_MICRO_COLUMNS: u16 = 64;
+const GEMM_COST_SETUP_WEIGHT_NUMERATOR: usize = 4;
+const GEMM_COST_SETUP_WEIGHT_DENOMINATOR: usize = 5;
+
+pub fn gemm_row_block_cost(
+    rows: u16,
+    target_rows: u16,
+    inner_dimension: u16,
+    columns: u16,
+    block_dimension: u16,
+    tile_count: u16,
+) -> Option<(usize, usize, usize)> {
+    gemm_row_block_cost_components(
+        rows,
+        target_rows,
+        inner_dimension.div_ceil(GEMM_COST_INNER_MICRO_COLUMNS),
+        columns,
+        block_dimension,
+        tile_count,
+    )
+}
+
+fn gemm_row_block_cost_components(
+    rows: u16,
+    target_rows: u16,
+    inner_work_units: u16,
+    columns: u16,
+    block_dimension: u16,
+    tile_count: u16,
+) -> Option<(usize, usize, usize)> {
+    let row_shards = rows.div_ceil(target_rows);
+    let maximum_rows = rows.div_ceil(row_shards);
+    let column_blocks = columns.checked_div(block_dimension)?;
+    let output_blocks = usize::from(row_shards) * usize::from(column_blocks);
+    let waves = output_blocks.div_ceil(usize::from(tile_count));
+    let unused_tiles = waves * usize::from(tile_count) - output_blocks;
+    // Row work determines the critical path while each output block repeats
+    // coefficient setup for every 64-column K microblock. The setup weight is
+    // calibrated from cycle profiles of rectangular FP16 GEMMs.
+    let weighted_inner_jobs =
+        output_blocks * usize::from(inner_work_units) * GEMM_COST_SETUP_WEIGHT_NUMERATOR;
+    let average_inner_work =
+        weighted_inner_jobs.div_ceil(usize::from(tile_count) * GEMM_COST_SETUP_WEIGHT_DENOMINATOR);
+    Some((
+        waves * usize::from(maximum_rows) + average_inner_work,
+        waves,
+        unused_tiles,
+    ))
 }
 
 pub fn gemm_row_block_candidates(
@@ -5361,6 +5481,32 @@ mod tests {
             gemm_row_block_candidates_for(1458, 64, 3456, 64, 1472, GemmDataType::F16)
                 .contains(&constrained)
         );
+    }
+
+    #[test]
+    fn shape_aware_gemm_blocking_amortizes_deeper_inner_dimensions() {
+        let shallow = choose_gemm_row_block_for_shape(
+            729,
+            1152,
+            64,
+            1152,
+            64,
+            1472,
+            GemmDataType::F16F8Weights { scale: 0 },
+        )
+        .unwrap();
+        let deep = choose_gemm_row_block_for_shape(
+            729,
+            4352,
+            128,
+            1152,
+            64,
+            1472,
+            GemmDataType::F16F8Weights { scale: 0 },
+        )
+        .unwrap();
+
+        assert!(deep >= shallow);
     }
 
     #[test]
