@@ -26,7 +26,7 @@ pub use siglip::{
     append_siglip_map_head, append_siglip_map_head_with_memory_policy,
     append_siglip_post_layer_norm, append_siglip_post_layer_norm_with_memory_policy,
     attention_kernel_variant, consolidate_attention_kernel_variants, defer_terminal_residual_add,
-    fuse_deferred_residual_into_layer_norm,
+    fuse_deferred_residual_into_layer_norm, materialize_deferred_residual_add,
 };
 
 mod blocked_data;

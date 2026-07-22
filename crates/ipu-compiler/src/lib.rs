@@ -411,7 +411,6 @@ struct RepeatedTileComputeShape {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct RepeatedCommandShape {
-    operation: Cow<'static, str>,
     input_count: usize,
     argument_count: usize,
 }
@@ -436,7 +435,7 @@ impl RepeatedRegion {
         phases: Range<usize>,
     ) -> Result<(), CompileError> {
         let shape = repeated_region_shape(schedule, phases.clone())?;
-        if shape != self.shape {
+        if !repeated_shapes_compatible(&self.shape, &shape) {
             return Err(CompileError::Graph(format!(
                 "instance {} of repeated region {} has a different phase or command structure",
                 self.phase_instances.len(),
@@ -453,12 +452,14 @@ impl RepeatedRegion {
                 self.name
             )));
         }
+        merge_repeated_shapes(&mut self.shape, shape);
         self.phase_instances.push(phases);
         Ok(())
     }
 
     pub fn is_compatible(&self, schedule: &Schedule, phases: Range<usize>) -> bool {
-        repeated_region_shape(schedule, phases).is_ok_and(|shape| shape == self.shape)
+        repeated_region_shape(schedule, phases)
+            .is_ok_and(|shape| repeated_shapes_compatible(&self.shape, &shape))
     }
 }
 
@@ -490,7 +491,6 @@ fn repeated_region_shape(
                         .entry(command.tile)
                         .or_default()
                         .push(RepeatedCommandShape {
-                            operation: command.specialization.operation.clone(),
                             input_count: command.inputs.len(),
                             argument_count: command.arguments.len(),
                         });
@@ -504,6 +504,52 @@ fn repeated_region_shape(
             }
         })
         .collect()
+}
+
+fn repeated_shapes_compatible(left: &[RepeatedPhaseShape], right: &[RepeatedPhaseShape]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| match (left, right) {
+                (RepeatedPhaseShape::Exchange, RepeatedPhaseShape::Exchange) => true,
+                (RepeatedPhaseShape::Compute(left), RepeatedPhaseShape::Compute(right)) => {
+                    let right = right
+                        .iter()
+                        .map(|tile| (tile.tile, tile))
+                        .collect::<BTreeMap<_, _>>();
+                    left.iter().all(|left_tile| {
+                        right.get(&left_tile.tile).is_none_or(|right_tile| {
+                            left_tile
+                                .commands
+                                .iter()
+                                .zip(&right_tile.commands)
+                                .all(|(left, right)| left == right)
+                        })
+                    })
+                }
+                _ => false,
+            })
+}
+
+fn merge_repeated_shapes(target: &mut [RepeatedPhaseShape], instance: Vec<RepeatedPhaseShape>) {
+    for (target, instance) in target.iter_mut().zip(instance) {
+        let (RepeatedPhaseShape::Compute(target), RepeatedPhaseShape::Compute(instance)) =
+            (target, instance)
+        else {
+            continue;
+        };
+        for instance_tile in instance {
+            match target.binary_search_by_key(&instance_tile.tile, |tile| tile.tile) {
+                Ok(index) => {
+                    if instance_tile.commands.len() > target[index].commands.len() {
+                        target[index].commands = instance_tile.commands;
+                    }
+                }
+                Err(index) => target.insert(index, instance_tile),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -83,6 +83,7 @@ pub struct SiglipEncoderLayer {
 #[derive(Clone, Debug)]
 pub struct DeferredResidualAdd {
     sources: Vec<(TensorId, TensorId)>,
+    phases: [Phase; 2],
 }
 
 pub fn defer_terminal_residual_add(schedule: &mut Schedule) -> Result<Option<DeferredResidualAdd>> {
@@ -113,8 +114,24 @@ pub fn defer_terminal_residual_add(schedule: &mut Schedule) -> Result<Option<Def
             Ok((command.output, command.inputs[1]))
         })
         .collect::<Result<Vec<_>>>()?;
-    schedule.phases.truncate(schedule.phases.len() - 2);
-    Ok(Some(DeferredResidualAdd { sources }))
+    let deferred = schedule.phases.split_off(schedule.phases.len() - 2);
+    let phases: [Phase; 2] = deferred
+        .try_into()
+        .map_err(|_| "terminal residual add did not contain two phases")?;
+    Ok(Some(DeferredResidualAdd { sources, phases }))
+}
+
+pub fn materialize_deferred_residual_add(
+    schedule: &mut Schedule,
+    mut deferred: DeferredResidualAdd,
+) -> Result<()> {
+    let phase = schedule.phases.len();
+    let Phase::Compute { op, .. } = &mut deferred.phases[1] else {
+        return Err("deferred residual tail has no compute phase".into());
+    };
+    op.0 = phase + 1;
+    schedule.phases.extend(deferred.phases);
+    Ok(())
 }
 
 pub fn fuse_deferred_residual_into_layer_norm(
@@ -122,6 +139,7 @@ pub fn fuse_deferred_residual_into_layer_norm(
     phase_start: usize,
     deferred: DeferredResidualAdd,
 ) -> Result<()> {
+    let DeferredResidualAdd { sources, .. } = deferred;
     let (compute_phase, commands) = schedule
         .phases
         .iter_mut()
@@ -139,10 +157,10 @@ pub fn fuse_deferred_residual_into_layer_norm(
             _ => None,
         })
         .ok_or("deferred residual add has no following affine LayerNorm")?;
-    if commands.len() != deferred.sources.len() {
+    if commands.len() != sources.len() {
         return Err("deferred residual add and LayerNorm shard counts differ".into());
     }
-    let sources = deferred.sources.into_iter().collect::<HashMap<_, _>>();
+    let sources = sources.into_iter().collect::<HashMap<_, _>>();
     if sources.len() != commands.len() {
         return Err("deferred residual add has duplicate destination shards".into());
     }

@@ -18,8 +18,9 @@ use ipu_runtime::{
     append_siglip_map_head_with_memory_policy, append_siglip_post_layer_norm,
     append_siglip_post_layer_norm_with_memory_policy, block_binding_typed, block_coordinates,
     blocked_matrix_f16, consolidate_attention_kernel_variants, defer_terminal_residual_add,
-    fuse_deferred_residual_into_layer_norm, package_graph_repeated,
-    package_graph_repeated_with_templates, package_graph_repeated_with_templates_profiled_regions,
+    fuse_deferred_residual_into_layer_norm, materialize_deferred_residual_add,
+    package_graph_repeated, package_graph_repeated_with_templates,
+    package_graph_repeated_with_templates_profiled_regions,
     package_graph_repeated_with_templates_profiled_with_regions, run_host_with_options,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -297,9 +298,7 @@ fn main() {
             fuse_deferred_residual_into_layer_norm(&mut plan.schedule, phase_start, deferred)
                 .unwrap();
         }
-        if layer + 1 < layer_count
-            && let Some(deferred) = defer_terminal_residual_add(&mut plan.schedule).unwrap()
-        {
+        if let Some(deferred) = defer_terminal_residual_add(&mut plan.schedule).unwrap() {
             appended
                 .profile_stages
                 .last_mut()
@@ -359,6 +358,18 @@ fn main() {
             "accumulated SigLIP compiler state"
         );
     }
+    materialize_deferred_residual_add(
+        &mut plan.schedule,
+        deferred_residual
+            .take()
+            .expect("encoder layer has a terminal residual add"),
+    )
+    .unwrap();
+    profile_regions
+        .last_mut()
+        .expect("encoder layer has a profile region")
+        .phases
+        .end = plan.schedule.phases.len();
     let last_layer = last_layer.unwrap();
     let norm2 = last_layer.norm2;
     let mlp_gelu = last_layer.mlp_gelu;
