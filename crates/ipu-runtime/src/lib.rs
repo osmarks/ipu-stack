@@ -8,7 +8,7 @@ use ipu_package::{
     TileMemory,
 };
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
@@ -438,6 +438,34 @@ fn allocation_range(allocation: &ipu_compiler::Allocation) -> Result<(u32, u32)>
             .checked_add(allocation.size)
             .ok_or("allocation address overflow")?,
     ))
+}
+
+fn fixed_allocation_ranges_for_tile(graph: &ExecutableGraph, tile: u16) -> Result<Vec<(u32, u32)>> {
+    let relocatable_homes = graph
+        .schedule
+        .allocations
+        .iter()
+        .filter(|allocation| allocation.tile == tile)
+        .filter(|allocation| {
+            matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
+                && allocation.live_until != usize::MAX
+        })
+        .map(|allocation| allocation.tensor)
+        .collect::<HashSet<_>>();
+    graph
+        .schedule
+        .allocations
+        .iter()
+        .filter(|allocation| allocation.tile == tile)
+        .filter(|allocation| !match allocation.kind {
+            ipu_compiler::AllocationKind::Home => allocation.live_until != usize::MAX,
+            ipu_compiler::AllocationKind::HomeAlias { source } => {
+                relocatable_homes.contains(&source)
+            }
+            ipu_compiler::AllocationKind::ExchangeStaging { .. } => false,
+        })
+        .map(allocation_range)
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -1833,6 +1861,7 @@ fn package_graph_impl(
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
 ) -> Result<Application> {
+    let topology = Topology::c600();
     package_graph_impl_attempt(
         graph,
         objects,
@@ -1841,6 +1870,7 @@ fn package_graph_impl(
         template_regions,
         invocations,
         true,
+        vec![Vec::new(); topology.tile_count()],
     )
 }
 
@@ -2023,13 +2053,18 @@ fn package_graph_impl_attempt(
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
     allow_executable_relocation: bool,
+    static_relocation_reservations: Vec<Vec<(u32, u32)>>,
 ) -> Result<Application> {
     let topology = Topology::c600();
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
         return Err("the direct C600 runtime requires a schedule for every discovered tile".into());
     }
+    if static_relocation_reservations.len() != topology.tile_count() {
+        return Err("static relocation reservation count does not match topology".into());
+    }
     validate_resident_host_bindings(graph, &topology)?;
     graph.schedule.validate_allocations()?;
+    let can_relower = lowered_programs.is_none();
     let stream_templates =
         lowered_programs.is_none() && profile_code.is_empty() && !template_regions.is_empty();
     let (mut programs, mut tile_exchange_plans) = if stream_templates {
@@ -2407,7 +2442,7 @@ fn package_graph_impl_attempt(
                 let regions = executable_regions_for_tile(
                     &allocation_ranges_by_tile[usize::from(program.tile)],
                     plans.end,
-                    &[],
+                    &static_relocation_reservations[usize::from(program.tile)],
                 )?;
                 let placed = pack_generated_and_support_images(
                     program.tile,
@@ -2429,7 +2464,11 @@ fn package_graph_impl_attempt(
                 .zip(&preliminary_images)
                 .map(
                     |(((program, plans), &program_size), image)| -> Result<[(u32, u32); 2]> {
-                        let regions = executable_regions_for_tile(&[], plans.end, &[])?;
+                        let regions = executable_regions_for_tile(
+                            &[],
+                            plans.end,
+                            &static_relocation_reservations[usize::from(program.tile)],
+                        )?;
                         let placed = pack_generated_and_support_images(
                             program.tile,
                             program_size,
@@ -2461,6 +2500,7 @@ fn package_graph_impl_attempt(
                 template_regions,
                 invocations,
                 false,
+                static_relocation_reservations,
             );
         }
         Err(error) => return Err(error),
@@ -2501,15 +2541,20 @@ fn package_graph_impl_attempt(
                 .0
                 .checked_add(preliminary_program_sizes[tile_index])
                 .ok_or("generated program tail overflow")?;
+            let reserved = static_relocation_reservations[tile_index]
+                .iter()
+                .copied()
+                .chain([
+                    program_reservations[tile_index],
+                    support_reservations[tile_index],
+                ])
+                .collect::<Vec<_>>();
             pack_executable_objects_for_tile(
                 &allocation_ranges_by_tile[usize::from(tile)],
                 tile,
                 tile_exchange_plans[tile_index].end,
                 &plans.executable_objects,
-                &[
-                    program_reservations[tile_index],
-                    support_reservations[tile_index],
-                ],
+                &reserved,
                 &[(program_tail_start, program_reservations[tile_index].1)],
             )
         })
@@ -2599,19 +2644,60 @@ fn package_graph_impl_attempt(
                 }
                 continue;
             }
-            let address = data_region_base_for_tile(
+            let reserved = template_record_ranges[tile_index]
+                .iter()
+                .copied()
+                .chain(host_executable_placements[tile_index].2.iter().copied())
+                .chain(std::iter::once(image_executable_elements[tile_index]))
+                .collect::<Vec<_>>();
+            let address = match data_region_base_for_tile(
                 &allocation_ranges_by_tile[usize::from(tile)],
                 tile,
                 runtime_end,
                 size,
                 4,
-                &template_record_ranges[tile_index]
-                    .iter()
-                    .copied()
-                    .chain(host_executable_placements[tile_index].2.iter().copied())
-                    .chain(std::iter::once(image_executable_elements[tile_index]))
-                    .collect::<Vec<_>>(),
-            )?;
+                &reserved,
+            ) {
+                Ok(address) => address,
+                Err(error) if can_relower => {
+                    let fixed = fixed_allocation_ranges_for_tile(graph, tile)?;
+                    let desired =
+                        data_region_base_for_tile(&fixed, tile, runtime_end, size, 4, &reserved)?;
+                    let mut reservations = static_relocation_reservations.clone();
+                    reservations[usize::from(tile)].push((
+                        desired,
+                        desired
+                            .checked_add(size)
+                            .ok_or("static relocation reservation overflow")?,
+                    ));
+                    let mut relocated_graph = graph.clone();
+                    let moved = relocate_transient_allocations_around(
+                        &mut relocated_graph,
+                        &topology,
+                        &reservations,
+                        1,
+                        "static runtime placement",
+                    )?;
+                    if moved == 0 {
+                        return Err(error);
+                    }
+                    info!(
+                        tile,
+                        size, desired, moved, "reserved static runtime interval"
+                    );
+                    return package_graph_impl_attempt(
+                        &relocated_graph,
+                        objects,
+                        profile_code,
+                        None,
+                        template_regions,
+                        invocations,
+                        false,
+                        reservations,
+                    );
+                }
+                Err(error) => return Err(error),
+            };
             let end = address
                 .checked_add(size)
                 .ok_or("static template record address overflow")?;
