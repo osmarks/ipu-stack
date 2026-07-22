@@ -939,7 +939,21 @@ pub fn plan_flash_attention(
         }
     }
 
-    let final_phase = usize::from(key_blocks) * 5 + 1;
+    let key_value_pair_bytes = key_values
+        .first()
+        .and_then(|block| block.matrix_size.checked_mul(2))
+        .ok_or_else(|| CompileError::Memory("attention K/V pair size overflow".into()))?;
+    let key_blocks_per_exchange = u16::try_from(
+        (ipu_exchange::EXCHANGE_WINDOW_BYTES / key_value_pair_bytes).min(u32::from(key_blocks)),
+    )
+    .map_err(|_| CompileError::Graph("attention key batch size overflow".into()))?;
+    if key_blocks_per_exchange == 0 {
+        return Err(CompileError::Memory(
+            "one attention K/V pair exceeds the exchange window".into(),
+        ));
+    }
+    let key_batches = key_blocks.div_ceil(key_blocks_per_exchange);
+    let final_phase = usize::from(key_batches) * 2 + 1;
     for task in &tasks {
         allocations.extend([
             home(
@@ -1006,213 +1020,209 @@ pub fn plan_flash_attention(
     }
 
     let mut phases = Vec::with_capacity(final_phase);
-    for key_block in 0..key_blocks {
+    for key_batch_start in (0..key_blocks).step_by(usize::from(key_blocks_per_exchange)) {
+        let key_batch_end = (key_batch_start + key_blocks_per_exchange).min(key_blocks);
         let exchange_phase = phases.len();
-        let qk_phase = exchange_phase + 1;
-        let softmax_phase = exchange_phase + 2;
-        let pv_phase = exchange_phase + 3;
-        let merge_phase = exchange_phase + 4;
-        let initial = u32::from(key_block == 0);
-        let final_block = u32::from(key_block + 1 == key_blocks);
-        let merge_role = match (initial != 0, final_block != 0) {
-            (true, true) => "single",
-            (true, false) => "initial",
-            (false, true) => "final",
-            (false, false) => "middle",
-        };
+        let compute_phase = exchange_phase + 1;
         let mut transfers = Vec::new();
-        let mut qk_commands = Vec::with_capacity(tasks.len());
-        let mut softmax_commands = Vec::with_capacity(tasks.len());
-        let mut pv_commands = Vec::with_capacity(tasks.len());
-        let mut merge_commands = Vec::with_capacity(tasks.len());
-        for task in &tasks {
-            let (key_row_start, _) =
-                balanced_partition(config.sequence_length, key_blocks, key_block);
-            let block = key_values
-                .iter()
-                .find(|block| {
-                    block.batch == task.batch
-                        && block.head == task.head
-                        && block.key_row_start == key_row_start
-                })
-                .expect("each head has every key block");
-            let query_size = if task.query_rows == query_block_rows {
-                "large"
-            } else {
-                "small"
+        let mut commands =
+            Vec::with_capacity(tasks.len() * usize::from(key_batch_end - key_batch_start) * 4);
+        for key_block in key_batch_start..key_batch_end {
+            let initial = u32::from(key_block == 0);
+            let final_block = u32::from(key_block + 1 == key_blocks);
+            let merge_role = match (initial != 0, final_block != 0) {
+                (true, true) => "single",
+                (true, false) => "initial",
+                (false, true) => "final",
+                (false, false) => "middle",
             };
-            let key_size = if block.key_rows == key_block_rows {
-                "large"
-            } else {
-                "small"
-            };
-            if task.tile != block.tile {
-                transfers.extend([
-                    Transfer {
-                        source_tile: block.tile,
-                        destination_tile: task.tile,
-                        tensor: block.key_tensor,
-                        bytes: block.matrix_size,
-                    },
-                    Transfer {
-                        source_tile: block.tile,
-                        destination_tile: task.tile,
-                        tensor: block.value_tensor,
-                        bytes: block.matrix_size,
-                    },
-                ]);
-                allocations.extend([
-                    Allocation {
-                        tensor: block.key_tensor,
-                        tile: task.tile,
-                        address: ipu_exchange::EXCHANGE_WINDOW_BASE,
-                        size: block.matrix_size,
-                        live_from: exchange_phase,
-                        live_until: qk_phase,
-                        kind: AllocationKind::ExchangeStaging {
-                            phase: exchange_phase,
+            for task in &tasks {
+                let (key_row_start, _) =
+                    balanced_partition(config.sequence_length, key_blocks, key_block);
+                let block = key_values
+                    .iter()
+                    .find(|block| {
+                        block.batch == task.batch
+                            && block.head == task.head
+                            && block.key_row_start == key_row_start
+                    })
+                    .expect("each head has every key block");
+                let query_size = if task.query_rows == query_block_rows {
+                    "large"
+                } else {
+                    "small"
+                };
+                let key_size = if block.key_rows == key_block_rows {
+                    "large"
+                } else {
+                    "small"
+                };
+                if task.tile != block.tile {
+                    let staging_offset =
+                        u32::from(key_block - key_batch_start) * key_value_pair_bytes;
+                    transfers.extend([
+                        Transfer {
+                            source_tile: block.tile,
+                            destination_tile: task.tile,
+                            tensor: block.key_tensor,
+                            bytes: block.matrix_size,
                         },
-                    },
-                    Allocation {
-                        tensor: block.value_tensor,
-                        tile: task.tile,
-                        address: ipu_exchange::EXCHANGE_WINDOW_BASE + block.matrix_size,
-                        size: block.matrix_size,
-                        live_from: exchange_phase,
-                        live_until: pv_phase,
-                        kind: AllocationKind::ExchangeStaging {
-                            phase: exchange_phase,
+                        Transfer {
+                            source_tile: block.tile,
+                            destination_tile: task.tile,
+                            tensor: block.value_tensor,
+                            bytes: block.matrix_size,
                         },
+                    ]);
+                    allocations.extend([
+                        Allocation {
+                            tensor: block.key_tensor,
+                            tile: task.tile,
+                            address: ipu_exchange::EXCHANGE_WINDOW_BASE + staging_offset,
+                            size: block.matrix_size,
+                            live_from: exchange_phase,
+                            live_until: compute_phase,
+                            kind: AllocationKind::ExchangeStaging {
+                                phase: exchange_phase,
+                            },
+                        },
+                        Allocation {
+                            tensor: block.value_tensor,
+                            tile: task.tile,
+                            address: ipu_exchange::EXCHANGE_WINDOW_BASE
+                                + staging_offset
+                                + block.matrix_size,
+                            size: block.matrix_size,
+                            live_from: exchange_phase,
+                            live_until: compute_phase,
+                            kind: AllocationKind::ExchangeStaging {
+                                phase: exchange_phase,
+                            },
+                        },
+                    ]);
+                }
+                commands.push(KernelCommand {
+                    tile: task.tile,
+                    output: task.scores,
+                    inputs: vec![task.query, block.key_tensor],
+                    arguments: Vec::new(),
+                    specialization: SpecializationKey {
+                        operation: format!("attention_qk_init_{}_rows", query_size).into(),
+                        shape: vec![
+                            usize::from(task.query_rows),
+                            usize::from(padded_head_dimension),
+                            usize::from(key_block_columns),
+                        ],
+                        worker_count: 6,
+                        role: format!(
+                            "attention-qk-batch-{}-head-{}-queries-{}-{}-keys-{}-{}",
+                            task.batch,
+                            task.head,
+                            task.query_row_start,
+                            task.query_row_start + task.query_rows,
+                            block.key_row_start,
+                            block.key_row_start + block.key_rows
+                        )
+                        .into(),
+                        alignment: 8,
                     },
-                ]);
+                    metadata: BTreeMap::from([
+                        ("label".into(), "FlashAttention QK AMP".into()),
+                        ("batch".into(), task.batch.to_string()),
+                        ("head".into(), task.head.to_string()),
+                        ("query_rows".into(), task.query_rows.to_string()),
+                        ("key_rows".into(), block.key_rows.to_string()),
+                    ]),
+                });
+                commands.push(KernelCommand {
+                    tile: task.tile,
+                    output: task.weights,
+                    inputs: vec![task.scores, task.scores],
+                    arguments: Vec::new(),
+                    specialization: SpecializationKey {
+                        operation: format!(
+                            "attention_softmax_{query_size}_query_{key_size}_key_f16"
+                        )
+                        .into(),
+                        shape: vec![usize::from(task.query_rows), usize::from(block.key_rows)],
+                        worker_count: 6,
+                        role: format!(
+                            "attention-softmax-batch-{}-head-{}-queries-{}-{}-keys-{}-{}",
+                            task.batch,
+                            task.head,
+                            task.query_row_start,
+                            task.query_row_start + task.query_rows,
+                            block.key_row_start,
+                            block.key_row_start + block.key_rows
+                        )
+                        .into(),
+                        alignment: 8,
+                    },
+                    metadata: task_metadata(
+                        task,
+                        block,
+                        config,
+                        head_dimension,
+                        "FlashAttention block softmax",
+                    )
+                    .into(),
+                });
+                commands.push(KernelCommand {
+                    tile: task.tile,
+                    output: task.scores,
+                    inputs: vec![task.weights, block.value_tensor],
+                    arguments: Vec::new(),
+                    specialization: SpecializationKey {
+                        operation: format!("attention_pv_init_{}_rows", query_size).into(),
+                        shape: vec![
+                            usize::from(task.query_rows),
+                            usize::from(key_block_columns),
+                            usize::from(padded_head_dimension),
+                        ],
+                        worker_count: 6,
+                        role: format!("attention-pv-batch-{}-head-{}", task.batch, task.head)
+                            .into(),
+                        alignment: 8,
+                    },
+                    metadata: task_metadata(
+                        task,
+                        block,
+                        config,
+                        head_dimension,
+                        "FlashAttention PV AMP",
+                    ),
+                });
+                commands.push(KernelCommand {
+                    tile: task.tile,
+                    output: task.accumulator,
+                    inputs: vec![task.scores, task.weights],
+                    arguments: Vec::new(),
+                    specialization: SpecializationKey {
+                        operation: format!(
+                            "attention_merge_{query_size}_query_{merge_role}_block_f16"
+                        )
+                        .into(),
+                        shape: vec![usize::from(task.query_rows), usize::from(head_dimension)],
+                        worker_count: 6,
+                        role: format!("attention-merge-batch-{}-head-{}", task.batch, task.head)
+                            .into(),
+                        alignment: 8,
+                    },
+                    metadata: task_metadata(
+                        task,
+                        block,
+                        config,
+                        head_dimension,
+                        "FlashAttention FP32 block merge",
+                    )
+                    .into(),
+                });
             }
-            qk_commands.push(KernelCommand {
-                tile: task.tile,
-                output: task.scores,
-                inputs: vec![task.query, block.key_tensor],
-                arguments: Vec::new(),
-                specialization: SpecializationKey {
-                    operation: format!("attention_qk_init_{}_rows", query_size).into(),
-                    shape: vec![
-                        usize::from(task.query_rows),
-                        usize::from(padded_head_dimension),
-                        usize::from(key_block_columns),
-                    ],
-                    worker_count: 6,
-                    role: format!(
-                        "attention-qk-batch-{}-head-{}-queries-{}-{}-keys-{}-{}",
-                        task.batch,
-                        task.head,
-                        task.query_row_start,
-                        task.query_row_start + task.query_rows,
-                        block.key_row_start,
-                        block.key_row_start + block.key_rows
-                    )
-                    .into(),
-                    alignment: 8,
-                },
-                metadata: BTreeMap::from([
-                    ("label".into(), "FlashAttention QK AMP".into()),
-                    ("batch".into(), task.batch.to_string()),
-                    ("head".into(), task.head.to_string()),
-                    ("query_rows".into(), task.query_rows.to_string()),
-                    ("key_rows".into(), block.key_rows.to_string()),
-                ]),
-            });
-            softmax_commands.push(KernelCommand {
-                tile: task.tile,
-                output: task.weights,
-                inputs: vec![task.scores, task.scores],
-                arguments: Vec::new(),
-                specialization: SpecializationKey {
-                    operation: format!("attention_softmax_{query_size}_query_{key_size}_key_f16")
-                        .into(),
-                    shape: vec![usize::from(task.query_rows), usize::from(block.key_rows)],
-                    worker_count: 6,
-                    role: format!(
-                        "attention-softmax-batch-{}-head-{}-queries-{}-{}-keys-{}-{}",
-                        task.batch,
-                        task.head,
-                        task.query_row_start,
-                        task.query_row_start + task.query_rows,
-                        block.key_row_start,
-                        block.key_row_start + block.key_rows
-                    )
-                    .into(),
-                    alignment: 8,
-                },
-                metadata: task_metadata(
-                    task,
-                    block,
-                    config,
-                    head_dimension,
-                    "FlashAttention block softmax",
-                )
-                .into(),
-            });
-            pv_commands.push(KernelCommand {
-                tile: task.tile,
-                output: task.scores,
-                inputs: vec![task.weights, block.value_tensor],
-                arguments: Vec::new(),
-                specialization: SpecializationKey {
-                    operation: format!("attention_pv_init_{}_rows", query_size).into(),
-                    shape: vec![
-                        usize::from(task.query_rows),
-                        usize::from(key_block_columns),
-                        usize::from(padded_head_dimension),
-                    ],
-                    worker_count: 6,
-                    role: format!("attention-pv-batch-{}-head-{}", task.batch, task.head).into(),
-                    alignment: 8,
-                },
-                metadata: task_metadata(
-                    task,
-                    block,
-                    config,
-                    head_dimension,
-                    "FlashAttention PV AMP",
-                ),
-            });
-            merge_commands.push(KernelCommand {
-                tile: task.tile,
-                output: task.accumulator,
-                inputs: vec![task.scores, task.weights],
-                arguments: Vec::new(),
-                specialization: SpecializationKey {
-                    operation: format!("attention_merge_{query_size}_query_{merge_role}_block_f16")
-                        .into(),
-                    shape: vec![usize::from(task.query_rows), usize::from(head_dimension)],
-                    worker_count: 6,
-                    role: format!("attention-merge-batch-{}-head-{}", task.batch, task.head).into(),
-                    alignment: 8,
-                },
-                metadata: task_metadata(
-                    task,
-                    block,
-                    config,
-                    head_dimension,
-                    "FlashAttention FP32 block merge",
-                )
-                .into(),
-            });
         }
         phases.push(Phase::Exchange { transfers });
         phases.push(Phase::Compute {
-            op: OpId(qk_phase),
-            commands: qk_commands,
-        });
-        phases.push(Phase::Compute {
-            op: OpId(softmax_phase),
-            commands: softmax_commands,
-        });
-        phases.push(Phase::Compute {
-            op: OpId(pv_phase),
-            commands: pv_commands,
-        });
-        phases.push(Phase::Compute {
-            op: OpId(merge_phase),
-            commands: merge_commands,
+            op: OpId(compute_phase),
+            commands,
         });
     }
 
