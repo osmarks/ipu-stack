@@ -96,14 +96,8 @@ fn run_compiler_segmented_add(
         &CompilerOptions {
             tile_count: TILE_COUNT,
             data_arenas: vec![
-                MemoryArena {
-                    base: first_arena_base,
-                    limit: first_arena_base + 32,
-                },
-                MemoryArena {
-                    base: second_arena_base,
-                    limit: second_arena_base + 256,
-                },
+                MemoryArena::low(first_arena_base, first_arena_base + 32),
+                MemoryArena::low(second_arena_base, second_arena_base + 256),
             ],
             ..CompilerOptions::default()
         },

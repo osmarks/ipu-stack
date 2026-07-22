@@ -84,6 +84,7 @@ pub fn append_flash_attention_from_a16_qkv(
         &[MemoryArena {
             base: config.data_base,
             limit: config.data_limit,
+            placement: MemoryPlacement::Low,
         }],
     )
 }
@@ -206,6 +207,7 @@ fn relocate_appended_attention(
     let mut score_arenas = vec![MemoryArena {
         base: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
         limit: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+        placement: MemoryPlacement::Low,
     }];
     for arena in arenas {
         if !score_arenas.contains(arena) {
@@ -224,7 +226,6 @@ fn relocate_appended_attention(
             size,
             &score_arenas,
             8,
-            MemoryPlacement::Low,
         )?;
         relocated.insert(task.scores.0, address);
     }
@@ -275,13 +276,8 @@ fn relocate_appended_attention(
     }
     regions.sort_unstable_by_key(|&(_, _, _, size)| std::cmp::Reverse(size));
     for &(tensor, tile, _address, size) in &regions {
-        let address = allocate_from_occupied_arenas(
-            &mut occupied[usize::from(tile)],
-            size,
-            arenas,
-            8,
-            MemoryPlacement::Low,
-        )?;
+        let address =
+            allocate_from_occupied_arenas(&mut occupied[usize::from(tile)], size, arenas, 8)?;
         relocated.insert(tensor.0, address);
     }
     for task in &mut plan.tasks {
@@ -318,6 +314,7 @@ pub fn append_flash_attention_to_a16_row_shards(
         &[MemoryArena {
             base: data_base,
             limit: data_limit,
+            placement: MemoryPlacement::Low,
         }],
     )
 }
@@ -398,7 +395,6 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
             usize::MAX,
             arenas,
             8,
-            MemoryPlacement::Low,
         )?;
         let destination_tensor = fresh_tensor(&mut next_tensor);
         schedule.allocations.push(Allocation {
@@ -1794,14 +1790,11 @@ mod tests {
             peak_sram: BTreeMap::new(),
         };
         let arenas = [
-            MemoryArena {
-                base: 0x6c000,
-                limit: 0x80000,
-            },
-            MemoryArena {
-                base: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
-                limit: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
-            },
+            MemoryArena::low(0x6c000, 0x80000),
+            MemoryArena::low(
+                ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+                ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+            ),
         ];
 
         append_flash_attention_from_a16_qkv_in_arenas(

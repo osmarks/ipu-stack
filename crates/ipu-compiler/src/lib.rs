@@ -412,10 +412,16 @@ impl AllocationKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryPlacement {
     Low,
     High,
+}
+
+impl Default for MemoryPlacement {
+    fn default() -> Self {
+        Self::Low
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -424,6 +430,31 @@ pub struct MemoryArena {
     pub base: u32,
     /// Exclusive end address. Allocations never span arena boundaries.
     pub limit: u32,
+    /// Direction in which objects are packed within this arena.
+    #[serde(default)]
+    pub placement: MemoryPlacement,
+}
+
+impl MemoryArena {
+    pub const fn low(base: u32, limit: u32) -> Self {
+        Self {
+            base,
+            limit,
+            placement: MemoryPlacement::Low,
+        }
+    }
+
+    pub const fn high(base: u32, limit: u32) -> Self {
+        Self {
+            base,
+            limit,
+            placement: MemoryPlacement::High,
+        }
+    }
+
+    pub const fn with_placement(self, placement: MemoryPlacement) -> Self {
+        Self { placement, ..self }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,19 +508,27 @@ pub enum Ipu21MemoryRegion {
 }
 
 impl Ipu21MemoryRegion {
-    fn arena(self, ordinary_low_base: u32, data_limit: u32) -> MemoryArena {
+    fn arena(
+        self,
+        ordinary_low_base: u32,
+        data_limit: u32,
+        placement: MemoryPlacement,
+    ) -> MemoryArena {
         match self {
             Self::OrdinaryLow => MemoryArena {
                 base: ordinary_low_base,
                 limit: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+                placement: MemoryPlacement::High,
             },
             Self::Interleaved => MemoryArena {
                 base: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
                 limit: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+                placement,
             },
             Self::OrdinaryHigh => MemoryArena {
                 base: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
                 limit: data_limit,
+                placement,
             },
         }
     }
@@ -497,10 +536,19 @@ impl Ipu21MemoryRegion {
 
 impl MemoryPolicy {
     pub fn contiguous(base: u32, limit: u32) -> Self {
-        let arena = MemoryArena { base, limit };
+        let resident = MemoryArena {
+            base,
+            limit,
+            placement: MemoryPlacement::High,
+        };
+        let transient = MemoryArena {
+            base,
+            limit,
+            placement: MemoryPlacement::Low,
+        };
         Self {
-            resident: vec![arena],
-            transient: vec![arena],
+            resident: vec![resident],
+            transient: vec![transient],
             resident_tile_assignment: ResidentTileAssignment::Balanced,
             allocation_occupancy: AllocationOccupancyCache::default(),
         }
@@ -527,16 +575,16 @@ impl MemoryPolicy {
                 "invalid allocatable IPU21 SRAM bounds".into(),
             ));
         }
-        let expand = |order: &[Ipu21MemoryRegion]| {
+        let expand = |order: &[Ipu21MemoryRegion], placement| {
             order
                 .iter()
                 .copied()
-                .map(|region| region.arena(ordinary_low_base, data_limit))
+                .map(|region| region.arena(ordinary_low_base, data_limit, placement))
                 .collect::<Vec<_>>()
         };
         let policy = Self {
-            resident: expand(resident_order),
-            transient: expand(transient_order),
+            resident: expand(resident_order, MemoryPlacement::High),
+            transient: expand(transient_order, MemoryPlacement::Low),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
             allocation_occupancy: AllocationOccupancyCache::default(),
         };
@@ -710,7 +758,6 @@ pub fn find_free_region_in_arenas(
     live_until: usize,
     arenas: &[MemoryArena],
     alignment: u32,
-    placement: MemoryPlacement,
 ) -> Result<u32, CompileError> {
     let base = arenas
         .iter()
@@ -745,7 +792,7 @@ pub fn find_free_region_in_arenas(
             occupied.push((start, end));
         }
     }
-    allocate_from_occupied_arenas(&mut occupied, size, arenas, alignment, placement)
+    allocate_from_occupied_arenas(&mut occupied, size, arenas, alignment)
 }
 
 pub fn allocate_from_occupied(
@@ -814,7 +861,6 @@ pub fn allocate_from_occupied_arenas(
     size: u32,
     arenas: &[MemoryArena],
     alignment: u32,
-    placement: MemoryPlacement,
 ) -> Result<u32, CompileError> {
     if size == 0
         || arenas.is_empty()
@@ -839,7 +885,7 @@ pub fn allocate_from_occupied_arenas(
                 base: arena.base,
                 limit: arena.limit,
                 alignment,
-                placement,
+                placement: arena.placement,
             },
         );
         let Ok(address) = address else {
@@ -1193,14 +1239,7 @@ pub fn append_bias_f16_c16(
     data_base: u32,
     data_limit: u32,
 ) -> Result<Vec<BlockPlacement>, CompileError> {
-    append_bias_f16_c16_in_arenas(
-        schedule,
-        output,
-        &[MemoryArena {
-            base: data_base,
-            limit: data_limit,
-        }],
-    )
+    append_bias_f16_c16_in_arenas(schedule, output, &[MemoryArena::low(data_base, data_limit)])
 }
 
 pub fn append_bias_f16_c16_in_arenas(
@@ -1245,13 +1284,8 @@ pub fn append_bias_f16_c16_in_arenas(
             .find(|block| block.block_column == block_column)
             .ok_or_else(|| CompileError::Graph("C16 output has a missing column block".into()))?;
         let size = u32::from(owner.columns) * 2;
-        let address = allocate_from_occupied_arenas(
-            &mut occupied[usize::from(owner.tile)],
-            size,
-            arenas,
-            8,
-            MemoryPlacement::Low,
-        )?;
+        let address =
+            allocate_from_occupied_arenas(&mut occupied[usize::from(owner.tile)], size, arenas, 8)?;
         let bias = BlockPlacement {
             tensor: TensorId(next_tensor),
             address,
@@ -1340,10 +1374,7 @@ pub fn append_blocked_gemm_f16_with_a16_input(
     input: &[RowShardPlacement],
     config: BlockedGemmConfig,
 ) -> Result<AppendedBlockedGemm, CompileError> {
-    let arenas = [MemoryArena {
-        base: config.data_base,
-        limit: config.data_limit,
-    }];
+    let arenas = [MemoryArena::low(config.data_base, config.data_limit)];
     append_blocked_gemm_f16_with_a16_input_in_arenas(schedule, input, config, &arenas)
 }
 
@@ -1358,11 +1389,11 @@ pub fn append_blocked_gemm_f16_with_a16_input_in_arenas(
         input,
         config,
         &MemoryPolicy {
-            resident: arenas.to_vec(),
-            transient: vec![MemoryArena {
-                base: config.data_base,
-                limit: config.data_limit,
-            }],
+            resident: arenas
+                .iter()
+                .map(|arena| arena.with_placement(MemoryPlacement::High))
+                .collect(),
+            transient: arenas.to_vec(),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
             allocation_occupancy: AllocationOccupancyCache::default(),
         },
@@ -1622,10 +1653,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks(
     input: &[BlockPlacement],
     config: BlockedGemmConfig,
 ) -> Result<AppendedBlockedGemm, CompileError> {
-    let arenas = [MemoryArena {
-        base: config.data_base,
-        limit: config.data_limit,
-    }];
+    let arenas = [MemoryArena::low(config.data_base, config.data_limit)];
     append_blocked_gemm_f16_with_a16_blocks_in_arenas(schedule, input, config, &arenas)
 }
 
@@ -1640,11 +1668,11 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_in_arenas(
         input,
         config,
         &MemoryPolicy {
-            resident: arenas.to_vec(),
-            transient: vec![MemoryArena {
-                base: config.data_base,
-                limit: config.data_limit,
-            }],
+            resident: arenas
+                .iter()
+                .map(|arena| arena.with_placement(MemoryPlacement::High))
+                .collect(),
+            transient: arenas.to_vec(),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
             allocation_occupancy: AllocationOccupancyCache::default(),
         },
@@ -1952,7 +1980,6 @@ fn plan_appended_blocked_gemm_with_memory_policy(
                 placement.tile,
                 placement.address,
                 u32::from(placement.rows) * u32::from(placement.columns) * 2,
-                MemoryPlacement::Low,
                 false,
             )
         })
@@ -1965,11 +1992,10 @@ fn plan_appended_blocked_gemm_with_memory_policy(
             u32::from(placement.rows)
                 * u32::from(placement.columns)
                 * config.data_type.weight_element_bytes(),
-            MemoryPlacement::High,
             true,
         )
     }));
-    regions.sort_unstable_by_key(|&(_, _, _, size, _, _)| std::cmp::Reverse(size));
+    regions.sort_unstable_by_key(|&(_, _, _, size, _)| std::cmp::Reverse(size));
     let arena_base = memory
         .resident
         .iter()
@@ -2016,7 +2042,7 @@ fn plan_appended_blocked_gemm_with_memory_policy(
     merge_occupied_intervals(&mut occupied_current);
     merge_occupied_intervals(&mut occupied_all);
     let mut relocated = HashMap::<TensorId, u32>::default();
-    for &(tensor, tile, _old_address, size, placement, resident) in &regions {
+    for &(tensor, tile, _old_address, size, resident) in &regions {
         let allocation_arenas = if resident {
             &memory.resident
         } else {
@@ -2032,7 +2058,6 @@ fn plan_appended_blocked_gemm_with_memory_policy(
             size,
             allocation_arenas,
             32,
-            placement,
         )
         .map_err(|error| {
             let lifetime = if resident { "resident" } else { "transient" };
@@ -4076,14 +4101,8 @@ impl Default for CompilerOptions {
             exchange_base: 0x50000,
             exchange_limit: 0x58000,
             data_arenas: vec![
-                MemoryArena {
-                    base: 0x58000,
-                    limit: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
-                },
-                MemoryArena {
-                    base: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
-                    limit: 0xe0000,
-                },
+                MemoryArena::high(0x58000, ipu_package::IPU21_INTERLEAVED_MEMORY_BASE),
+                MemoryArena::low(ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT, 0xe0000),
             ],
         }
     }
@@ -4359,10 +4378,10 @@ fn plan_memory(
                 phase_index + 1,
                 16,
                 AllocationKind::ExchangeStaging { phase: phase_index },
-                &[MemoryArena {
-                    base: options.exchange_base,
-                    limit: options.exchange_limit,
-                }],
+                &[MemoryArena::low(
+                    options.exchange_base,
+                    options.exchange_limit,
+                )],
                 &format!("tensor {} exchange staging", transfer.tensor.0),
             )?;
         }
@@ -6175,20 +6194,12 @@ mod tests {
     #[test]
     fn occupied_allocator_spills_without_crossing_arena_boundaries() {
         let arenas = [
-            MemoryArena {
-                base: 0x1000,
-                limit: 0x1040,
-            },
-            MemoryArena {
-                base: 0x2000,
-                limit: 0x2080,
-            },
+            MemoryArena::low(0x1000, 0x1040),
+            MemoryArena::low(0x2000, 0x2080),
         ];
         let mut occupied = vec![(arenas[0].base, arenas[0].limit)];
         let size = 32;
-        let address =
-            allocate_from_occupied_arenas(&mut occupied, size, &arenas, 16, MemoryPlacement::Low)
-                .unwrap();
+        let address = allocate_from_occupied_arenas(&mut occupied, size, &arenas, 16).unwrap();
 
         assert_eq!(address % 16, 0);
         assert!(
@@ -6232,10 +6243,7 @@ mod tests {
 
     #[test]
     fn resident_allocation_does_not_reuse_expired_transient_storage() {
-        let arena = MemoryArena {
-            base: 0x1000,
-            limit: 0x1100,
-        };
+        let arena = MemoryArena::low(0x1000, 0x1100);
         let expired = Allocation {
             tensor: TensorId(1),
             tile: 0,
@@ -6246,28 +6254,11 @@ mod tests {
             kind: AllocationKind::Home,
         };
 
-        let transient = find_free_region_in_arenas(
-            std::slice::from_ref(&expired),
-            0,
-            64,
-            1,
-            2,
-            &[arena],
-            16,
-            MemoryPlacement::Low,
-        )
-        .unwrap();
-        let resident = find_free_region_in_arenas(
-            &[expired],
-            0,
-            64,
-            0,
-            usize::MAX,
-            &[arena],
-            16,
-            MemoryPlacement::Low,
-        )
-        .unwrap();
+        let transient =
+            find_free_region_in_arenas(std::slice::from_ref(&expired), 0, 64, 1, 2, &[arena], 16)
+                .unwrap();
+        let resident =
+            find_free_region_in_arenas(&[expired], 0, 64, 0, usize::MAX, &[arena], 16).unwrap();
 
         assert_eq!(transient, arena.base);
         assert_ne!(resident, transient);
@@ -6276,14 +6267,8 @@ mod tests {
     #[test]
     fn segmented_allocator_never_spans_holes_and_reuses_lifetimes() {
         let arenas = [
-            MemoryArena {
-                base: 0x58000,
-                limit: 0x58100,
-            },
-            MemoryArena {
-                base: 0x60000,
-                limit: 0x60400,
-            },
+            MemoryArena::low(0x58000, 0x58100),
+            MemoryArena::low(0x60000, 0x60400),
         ];
         let mut allocations = Vec::new();
         let mut by_tile = HashMap::default();

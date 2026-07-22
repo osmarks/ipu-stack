@@ -30,11 +30,8 @@ const TILE_COUNT: u16 = 1472;
 const BLOCK_DIMENSION: u16 = 64;
 const INNER_BLOCK_DIMENSION: u16 = 64;
 const DATA_BASE: u32 = ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
-// Full-model tiles can require four instruction elements each for the generated
-// program and linked support image. Data allocation starts after both budgets.
-const EXECUTABLE_RESERVE_ELEMENTS: u32 = 8;
-const DEFAULT_RESIDENT_LOW_BASE: u32 = ipu_package::TILE_MEMORY_BASE
-    + EXECUTABLE_RESERVE_ELEMENTS * ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+const ORDINARY_LOW_BASE: u32 =
+    ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
 
 fn main() {
     ipu_runtime::init_tracing();
@@ -912,7 +909,7 @@ fn encoder_memory_policy(data_limit: u32) -> MemoryPolicy {
             Ipu21MemoryRegion::OrdinaryHigh,
         ],
     );
-    MemoryPolicy::ipu21(DEFAULT_RESIDENT_LOW_BASE, data_limit, &resident, &transient).unwrap()
+    MemoryPolicy::ipu21(ORDINARY_LOW_BASE, data_limit, &resident, &transient).unwrap()
 }
 
 fn memory_region_order(name: &str, default: &[Ipu21MemoryRegion]) -> Vec<Ipu21MemoryRegion> {

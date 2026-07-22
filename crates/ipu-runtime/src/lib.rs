@@ -114,6 +114,7 @@ fn executable_region_base(
     executable_region_base_for_tile(&allocations, None, runtime_end, required_size, &[])
 }
 
+#[cfg(test)]
 fn executable_region_base_for_tile(
     allocation_ranges: &[(u32, u32)],
     tile: Option<u16>,
@@ -352,6 +353,51 @@ fn pack_objects_in_gaps(
     Ok((relocations, merged))
 }
 
+fn pack_sized_objects_in_gaps(
+    tile: u16,
+    sizes: &[u32],
+    mut gaps: Vec<(u32, u32)>,
+    alignment: u32,
+    description: &str,
+) -> Result<Vec<(u32, u32)>> {
+    if !alignment.is_power_of_two() || sizes.contains(&0) {
+        return Err(format!("invalid {description} placement request").into());
+    }
+    let mut order = (0..sizes.len()).collect::<Vec<_>>();
+    order.sort_unstable_by_key(|&index| std::cmp::Reverse(sizes[index]));
+    let mut placed = vec![(0, 0); sizes.len()];
+    for index in order {
+        let size = align_up(sizes[index], alignment);
+        let (gap_index, address) = gaps
+            .iter()
+            .enumerate()
+            .filter_map(|(gap_index, &(start, end))| {
+                let address = align_up(start, alignment);
+                let remaining = end.checked_sub(address.checked_add(size)?)?;
+                Some((gap_index, address, remaining))
+            })
+            .min_by_key(|&(_, _, remaining)| remaining)
+            .map(|(gap_index, address, _)| (gap_index, address))
+            .ok_or_else(|| {
+                let free = gaps.iter().map(|(start, end)| end - start).sum::<u32>();
+                let largest = gaps
+                    .iter()
+                    .map(|(start, end)| end - start)
+                    .max()
+                    .unwrap_or(0);
+                format!(
+                    "no tile-memory gap can hold a {size}-byte {description} object on tile {tile}: {free} free bytes, {largest}-byte largest gap"
+                )
+            })?;
+        let end = address
+            .checked_add(size)
+            .ok_or_else(|| format!("{description} placement overflow"))?;
+        gaps[gap_index].0 = end;
+        placed[index] = (address, end);
+    }
+    Ok(placed)
+}
+
 fn allocation_range(allocation: &ipu_compiler::Allocation) -> Result<(u32, u32)> {
     Ok((
         allocation.address,
@@ -361,6 +407,165 @@ fn allocation_range(allocation: &ipu_compiler::Allocation) -> Result<(u32, u32)>
             .ok_or("allocation address overflow")?,
     ))
 }
+
+fn summarize_executable_allocation_conflicts(
+    schedule: &Schedule,
+    tile: u16,
+    runtime_end: u32,
+) -> String {
+    const MAX_OBJECTS: usize = 24;
+    let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+    let executable_start = align_up(runtime_end, element);
+    let executable_end = ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT;
+    let mut objects = schedule
+        .allocations
+        .iter()
+        .filter(|allocation| allocation.tile == tile)
+        .filter_map(|allocation| {
+            let end = allocation.address.checked_add(allocation.size)?;
+            ranges_overlap(
+                align_down(allocation.address, element),
+                align_up(end, element),
+                executable_start,
+                executable_end,
+            )
+            .then_some((allocation.address, end, allocation))
+        })
+        .collect::<Vec<_>>();
+    objects.sort_unstable_by_key(|&(start, end, allocation)| (start, end, allocation.tensor.0));
+    let total = objects.len();
+    let details = objects
+        .into_iter()
+        .take(MAX_OBJECTS)
+        .map(|(start, end, allocation)| {
+            format!(
+                "tensor {} {:?} 0x{start:x}..0x{end:x} live {}..{}",
+                allocation.tensor.0, allocation.kind, allocation.live_from, allocation.live_until
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{total} allocation records touch complete executable elements on tile {tile}; first {MAX_OBJECTS}: {details}"
+    )
+}
+
+fn relocate_transient_allocations_for_executables(
+    graph: &mut ExecutableGraph,
+    topology: &Topology,
+    reservations: &[[(u32, u32); 2]],
+) -> Result<usize> {
+    let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+    let physical_to_logical = (0..u16::try_from(topology.tile_count())?)
+        .map(|logical| Ok((u32::from(topology.physical(logical)?), logical)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let mut candidates = graph
+        .schedule
+        .allocations
+        .iter()
+        .enumerate()
+        .filter(|(_, allocation)| {
+            matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
+                && allocation.live_until != usize::MAX
+                && reservations[usize::from(allocation.tile)]
+                    .iter()
+                    .any(|&(start, end)| {
+                        ranges_overlap(
+                            align_down(allocation.address, element),
+                            align_up(allocation.address.saturating_add(allocation.size), element),
+                            start,
+                            end,
+                        )
+                    })
+        })
+        .map(|(index, allocation)| (index, allocation.size))
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|&(_, size)| std::cmp::Reverse(size));
+    let arena = [ipu_compiler::MemoryArena::low(
+        ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+    )];
+    let mut relocations = Vec::with_capacity(candidates.len());
+    for (index, _) in candidates {
+        let allocation = &graph.schedule.allocations[index];
+        let new_address = ipu_compiler::find_free_region_in_arenas(
+            &graph.schedule.allocations,
+            allocation.tile,
+            allocation.size,
+            allocation.live_from,
+            allocation.live_until,
+            &arena,
+            32,
+        )
+        .map_err(|error| {
+            format!(
+                "cannot relocate transient tensor {} on tile {} for measured executable placement: {error}",
+                allocation.tensor.0, allocation.tile
+            )
+        })?;
+        let old_address = allocation.address;
+        let old_end = old_address
+            .checked_add(allocation.size)
+            .ok_or("allocation relocation range overflow")?;
+        let tensor = allocation.tensor;
+        let tile = allocation.tile;
+        graph.schedule.allocations[index].address = new_address;
+        relocations.push((tensor, tile, old_address, old_end, new_address));
+    }
+    for allocation in &mut graph.schedule.allocations {
+        let ipu_compiler::AllocationKind::HomeAlias { source } = allocation.kind else {
+            continue;
+        };
+        if let Some(&(_, _, old_start, _old_end, new_start)) =
+            relocations
+                .iter()
+                .find(|&&(tensor, tile, old_start, old_end, _)| {
+                    tensor == source
+                        && tile == allocation.tile
+                        && allocation.address >= old_start
+                        && allocation.address.saturating_add(allocation.size) <= old_end
+                })
+        {
+            allocation.address = new_start + (allocation.address - old_start);
+        }
+    }
+    for buffer in &mut graph.initial_buffers {
+        relocate_literal_address(buffer.tile, &mut buffer.address, &relocations);
+    }
+    for binding in graph
+        .outputs
+        .iter_mut()
+        .chain(&mut graph.host_weights)
+        .chain(&mut graph.host_inputs)
+        .chain(&mut graph.host_outputs)
+    {
+        for slice in &mut binding.slices {
+            let logical = *physical_to_logical
+                .get(&slice.tile)
+                .ok_or("host binding references a physical tile outside the topology")?;
+            relocate_literal_address(logical, &mut slice.tile_address, &relocations);
+        }
+    }
+    graph.schedule.validate_allocations()?;
+    Ok(relocations.len())
+}
+
+fn relocate_literal_address(
+    tile: u16,
+    address: &mut u32,
+    relocations: &[(ipu_compiler::TensorId, u16, u32, u32, u32)],
+) {
+    if let Some(&(_, _, old_start, _old_end, new_start)) =
+        relocations
+            .iter()
+            .find(|&&(_, relocation_tile, old_start, old_end, _)| {
+                relocation_tile == tile && *address >= old_start && *address < old_end
+            })
+    {
+        *address = new_start + (*address - old_start);
+    }
+}
+
 pub fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let builder = tracing_subscriber::fmt()
@@ -1586,6 +1791,26 @@ fn package_graph_impl(
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
 ) -> Result<Application> {
+    package_graph_impl_attempt(
+        graph,
+        objects,
+        profile_code,
+        lowered_programs,
+        template_regions,
+        invocations,
+        true,
+    )
+}
+
+fn package_graph_impl_attempt(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+    profile_code: &[static_codegen::ProfileCode],
+    lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
+    template_regions: &[StaticTemplateRegion],
+    invocations: u32,
+    allow_executable_relocation: bool,
+) -> Result<Application> {
     let topology = Topology::c600();
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
         return Err("the direct C600 runtime requires a schedule for every discovered tile".into());
@@ -2049,54 +2274,96 @@ fn package_graph_impl(
             )?)
         })
         .collect::<Result<Vec<_>>>()?;
-    let program_reservations = programs
+    // Place the measured support and generated images together. Placing the smaller
+    // generated image first can fragment otherwise sufficient instruction elements.
+    let executable_reservations = programs
         .par_iter()
         .zip(&tile_exchange_plans)
         .zip(&preliminary_program_sizes)
-        .map(|((program, plans), &size)| -> Result<(u32, u32)> {
-            let base = executable_region_base_for_tile(
-                &allocation_ranges_by_tile[usize::from(program.tile)],
-                Some(program.tile),
-                plans.end,
-                size,
-                &[],
-            )?;
-            let reserved_size = align_up(size, ipu_package::TILE_MEMORY_ELEMENT_SIZE);
-            Ok((
-                base,
-                base.checked_add(reserved_size)
-                    .ok_or("generated program reservation overflow")?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // Reserve complete instruction elements for each tile's measured support image
-    // before data packing so metadata cannot consume its executable region.
-    let support_reservations = programs
-        .par_iter()
-        .zip(&tile_exchange_plans)
-        .zip(&program_reservations)
         .zip(&preliminary_images)
         .map(
-            |(((program, plans), &program_reservation), image)| -> Result<(u32, u32)> {
-                let reserved_size = align_up(
-                    u32::try_from(image.bytes.len())?,
-                    ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                );
-                let base = executable_region_base_for_tile(
+            |(((program, plans), &program_size), image)| -> Result<[(u32, u32); 2]> {
+                let regions = executable_regions_for_tile(
                     &allocation_ranges_by_tile[usize::from(program.tile)],
-                    Some(program.tile),
                     plans.end,
-                    reserved_size,
-                    &[program_reservation],
+                    &[],
                 )?;
-                Ok((
-                    base,
-                    base.checked_add(reserved_size)
-                        .ok_or("support image reservation overflow")?,
-                ))
+                let placed = pack_sized_objects_in_gaps(
+                    program.tile,
+                    &[program_size, u32::try_from(image.bytes.len())?],
+                    regions,
+                    ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+                    "executable",
+                )
+                .map_err(|error| {
+                    format!(
+                        "{error}; {}",
+                        summarize_executable_allocation_conflicts(
+                            &graph.schedule,
+                            program.tile,
+                            plans.end
+                        )
+                    )
+                })?;
+                Ok([placed[0], placed[1]])
             },
         )
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>();
+    let executable_reservations = match executable_reservations {
+        Ok(reservations) => reservations,
+        Err(error) if allow_executable_relocation => {
+            let desired = programs
+                .par_iter()
+                .zip(&tile_exchange_plans)
+                .zip(&preliminary_program_sizes)
+                .zip(&preliminary_images)
+                .map(
+                    |(((program, plans), &program_size), image)| -> Result<[(u32, u32); 2]> {
+                        let regions = executable_regions_for_tile(&[], plans.end, &[])?;
+                        let placed = pack_sized_objects_in_gaps(
+                            program.tile,
+                            &[program_size, u32::try_from(image.bytes.len())?],
+                            regions,
+                            ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+                            "measured executable",
+                        )?;
+                        Ok([placed[0], placed[1]])
+                    },
+                )
+                .collect::<Result<Vec<_>>>()?;
+            let mut relocated_graph = graph.clone();
+            let moved = relocate_transient_allocations_for_executables(
+                &mut relocated_graph,
+                &topology,
+                &desired,
+            )?;
+            if moved == 0 {
+                return Err(error);
+            }
+            info!(
+                moved,
+                "relocated transient tensors for measured executable images"
+            );
+            return package_graph_impl_attempt(
+                &relocated_graph,
+                objects,
+                profile_code,
+                None,
+                template_regions,
+                invocations,
+                false,
+            );
+        }
+        Err(error) => return Err(error),
+    };
+    let program_reservations = executable_reservations
+        .iter()
+        .map(|reservations| reservations[0])
+        .collect::<Vec<_>>();
+    let support_reservations = executable_reservations
+        .iter()
+        .map(|reservations| reservations[1])
+        .collect::<Vec<_>>();
     let mut host_runtime_ranges = Vec::with_capacity(tile_host_plans.len());
     let mut worker_sync_addresses = Vec::with_capacity(tile_host_plans.len());
     let mut completion_addresses = Vec::with_capacity(tile_host_plans.len());
@@ -4081,6 +4348,100 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measured_executable_relocation_updates_aliases_and_literal_addresses() {
+        let topology = Topology::c600();
+        let old_address = 0x60000;
+        let mut reservations = vec![[(0, 0); 2]; topology.tile_count()];
+        reservations[0] = [(0x5c000, 0x64000), (0x64000, 0x68000)];
+        let mut graph = ExecutableGraph {
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: vec![
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(1),
+                        tile: 0,
+                        address: old_address,
+                        size: 64,
+                        live_from: 1,
+                        live_until: 2,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(2),
+                        tile: 0,
+                        address: old_address + 16,
+                        size: 16,
+                        live_from: 1,
+                        live_until: 2,
+                        kind: ipu_compiler::AllocationKind::HomeAlias {
+                            source: ipu_compiler::TensorId(1),
+                        },
+                    },
+                ],
+                tile_count: u16::try_from(topology.tile_count()).unwrap(),
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: vec![InitialBuffer {
+                tile: 0,
+                address: old_address + 4,
+                words: vec![1],
+            }],
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: vec![Binding {
+                name: "input".into(),
+                dtype: "u32".into(),
+                shape: vec![1],
+                slices: vec![RegionSlice {
+                    tile: u32::from(topology.physical(0).unwrap()),
+                    tile_address: old_address + 8,
+                    file_offset: 0,
+                    size: 4,
+                }],
+            }],
+            host_outputs: Vec::new(),
+        };
+
+        assert_eq!(
+            relocate_transient_allocations_for_executables(&mut graph, &topology, &reservations)
+                .unwrap(),
+            1
+        );
+        let relocated = graph.schedule.allocations[0].address;
+        assert!(relocated >= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT);
+        assert_eq!(graph.schedule.allocations[1].address, relocated + 16);
+        assert_eq!(graph.initial_buffers[0].address, relocated + 4);
+        assert_eq!(graph.host_inputs[0].slices[0].tile_address, relocated + 8);
+    }
+
+    #[test]
+    fn executable_objects_are_packed_without_order_induced_fragmentation() {
+        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        let gaps = vec![
+            (0x10000, 0x10000 + 2 * element),
+            (0x20000, 0x20000 + element),
+        ];
+        let placed = pack_sized_objects_in_gaps(
+            0,
+            &[element, 2 * element],
+            gaps,
+            element,
+            "test executable",
+        )
+        .unwrap();
+
+        assert_eq!(placed[0].1 - placed[0].0, element);
+        assert_eq!(placed[1].1 - placed[1].0, 2 * element);
+        assert!(!ranges_overlap(
+            placed[0].0,
+            placed[0].1,
+            placed[1].0,
+            placed[1].1,
+        ));
+    }
 
     #[test]
     fn executable_placement_reserves_complete_memory_elements() {

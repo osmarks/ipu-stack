@@ -6,8 +6,8 @@ use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
     CompileError, FlashAttentionConfig, FlashAttentionPlan, GemmDataType, MemoryArena,
-    MemoryPlacement, MemoryPolicy, Phase, RowShardPlacement, RowShardTransitionConfig, Schedule,
-    TensorId, allocate_from_occupied_arenas, append_a16_to_a16_row_shards_reblocked_in_arenas,
+    MemoryPolicy, Phase, RowShardPlacement, RowShardTransitionConfig, Schedule, TensorId,
+    allocate_from_occupied_arenas, append_a16_to_a16_row_shards_reblocked_in_arenas,
     append_add_affine_layer_norm_f16_with_memory_policy, append_add_f16_row_shards_in_place,
     append_affine_layer_norm_f16_with_memory_policy, append_bias_f16_c16_in_arenas,
     append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
@@ -571,10 +571,7 @@ pub fn append_host_a16_matrix(
         rows,
         columns,
         row_block_dimension,
-        &[MemoryArena {
-            base: data_base,
-            limit: data_limit,
-        }],
+        &[MemoryArena::high(data_base, data_limit)],
         host,
     )
 }
@@ -634,26 +631,15 @@ pub fn append_host_a16_matrix_in_arenas(
         let (tile, address) = (0..schedule.tile_count)
             .filter_map(|tile| {
                 let mut candidate = occupied[usize::from(tile)].clone();
-                let address = allocate_from_occupied_arenas(
-                    &mut candidate,
-                    bytes,
-                    arenas,
-                    8,
-                    MemoryPlacement::High,
-                )
-                .ok()?;
+                let address =
+                    allocate_from_occupied_arenas(&mut candidate, bytes, arenas, 8).ok()?;
                 Some((resident_pressure[usize::from(tile)], tile, address))
             })
             .min()
             .map(|(_, tile, address)| (tile, address))
             .ok_or_else(|| format!("no tile can hold {bytes} bytes for host matrix {name}"))?;
-        let allocated = allocate_from_occupied_arenas(
-            &mut occupied[usize::from(tile)],
-            bytes,
-            arenas,
-            8,
-            MemoryPlacement::High,
-        )?;
+        let allocated =
+            allocate_from_occupied_arenas(&mut occupied[usize::from(tile)], bytes, arenas, 8)?;
         debug_assert_eq!(allocated, address);
         resident_pressure[usize::from(tile)] += u64::from(bytes);
         let tensor = TensorId(next_tensor);

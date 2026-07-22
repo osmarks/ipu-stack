@@ -96,14 +96,7 @@ pub fn choose_row_shard_rows_for_copies_in_arenas(
                 .and_then(|elements| elements.checked_mul(2))
                 .is_some_and(|bytes| {
                     (0..copies).all(|_| {
-                        allocate_from_occupied_arenas(
-                            &mut tile_occupied,
-                            bytes,
-                            arenas,
-                            8,
-                            MemoryPlacement::Low,
-                        )
-                        .is_ok()
+                        allocate_from_occupied_arenas(&mut tile_occupied, bytes, arenas, 8).is_ok()
                     })
                 })
         });
@@ -317,6 +310,7 @@ pub fn append_c16_to_a16_blocks_gelu_f16(
         &[MemoryArena {
             base: data_base,
             limit: data_limit,
+            placement: MemoryPlacement::Low,
         }],
     )
 }
@@ -366,7 +360,6 @@ pub fn append_c16_to_a16_blocks_gelu_f16_in_arenas(
             bytes,
             arenas,
             8,
-            MemoryPlacement::Low,
         )?;
         let tensor = TensorId(next_tensor);
         next_tensor += 1;
@@ -796,7 +789,6 @@ fn append_to_a16_row_shards_reblocked_in_arenas(
             bytes,
             arenas,
             8,
-            MemoryPlacement::Low,
         )?;
         let tensor = TensorId(next_tensor);
         next_tensor += 1;
@@ -1073,6 +1065,7 @@ pub fn append_affine_layer_norm_f16(
         &[MemoryArena {
             base: config.data_base,
             limit: config.data_limit,
+            placement: MemoryPlacement::Low,
         }],
     )
 }
@@ -1092,6 +1085,7 @@ pub fn append_affine_layer_norm_f16_in_arenas(
             transient: vec![MemoryArena {
                 base: config.data_base,
                 limit: config.data_limit,
+                placement: MemoryPlacement::Low,
             }],
             resident_tile_assignment: crate::ResidentTileAssignment::Balanced,
             allocation_occupancy: crate::AllocationOccupancyCache::default(),
@@ -1206,7 +1200,6 @@ fn append_affine_layer_norm_f16_impl(
         usize::MAX,
         &memory.resident,
         8,
-        MemoryPlacement::High,
     )?;
     let affine_tensors = [TensorId(next_tensor), TensorId(next_tensor + 1)];
     next_tensor += 2;
@@ -1276,7 +1269,6 @@ fn append_affine_layer_norm_f16_impl(
             activation_bytes,
             &memory.transient,
             constraint.alignment,
-            MemoryPlacement::Low,
         )?;
         if shard.tile != owner.tile {
             for (row, &tensor) in affine_tensors.iter().enumerate() {
@@ -1415,14 +1407,8 @@ mod tests {
             peak_sram: BTreeMap::new(),
         };
         let memory = MemoryPolicy {
-            resident: vec![MemoryArena {
-                base: 0xc0000,
-                limit: 0xe8000,
-            }],
-            transient: vec![MemoryArena {
-                base: 0xb0000,
-                limit: 0xc0000,
-            }],
+            resident: vec![MemoryArena::high(0xc0000, 0xe8000)],
+            transient: vec![MemoryArena::low(0xb0000, 0xc0000)],
             resident_tile_assignment: crate::ResidentTileAssignment::Balanced,
             allocation_occupancy: crate::AllocationOccupancyCache::default(),
         };
@@ -1614,10 +1600,7 @@ mod tests {
             &source,
             128,
             20,
-            &[MemoryArena {
-                base: 0xb0000,
-                limit: 0xe8000,
-            }],
+            &[MemoryArena::low(0xb0000, 0xe8000)],
         )
         .unwrap();
 
@@ -1680,10 +1663,7 @@ mod tests {
             &mut schedule,
             &source,
             20,
-            &[MemoryArena {
-                base: 0xb0000,
-                limit: 0xe8000,
-            }],
+            &[MemoryArena::low(0xb0000, 0xe8000)],
         )
         .unwrap();
 
@@ -1719,10 +1699,7 @@ mod tests {
             tile_count: 2,
             peak_sram: BTreeMap::new(),
         };
-        let arena = MemoryArena {
-            base: 0x1000,
-            limit: 0x1180,
-        };
+        let arena = MemoryArena::low(0x1000, 0x1180);
 
         assert_eq!(
             choose_row_shard_rows_for_copies_in_arenas(&schedule, 12, 16, 12, 2, &[arena]),

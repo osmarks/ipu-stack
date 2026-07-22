@@ -38,9 +38,11 @@ These limits belong in target properties and kernel operand constraints:
 
 ## Incidental limits and coupling
 
-- The SigLIP runner reserves eight instruction elements on every tile before
-  generated and support code have been measured. This is a provisional budget,
-  not a target property.
+- Ordinary-low tensor arenas grow downward from the interleaved boundary while
+  exchange plans and executable objects grow upward. Packaging measures support
+  and generated images together, then relocates conflicting transient homes to
+  ordinary-high SRAM and relowers once. This replaces the former fixed
+  eight-element reservation with exact instruction-element demand.
 - Exchange rows and compute-run tables occupy one contiguous `PLAN_BASE..end`
   interval. Rows are independently addressed and can instead be placed as
   relocatable executable objects; run tables are ordinary data objects.
@@ -79,9 +81,8 @@ while individual kernel operands declare any contiguous panel they require.
 
 The runtime now uses one `AddressSpace` implementation to normalize
 reservations and calculate gaps for all static object classes. The remaining
-work is to carry allowed arenas and relocations from compiler allocations into
-that pass, then remove the fixed eight-element budget and contiguous plan
-region.
+work is to carry explicit allowed memory classes from compiler allocations into
+that pass, then remove the contiguous plan region.
 
 ## Compile-time priorities
 
