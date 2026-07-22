@@ -409,48 +409,6 @@ fn allocation_range(allocation: &ipu_compiler::Allocation) -> Result<(u32, u32)>
     ))
 }
 
-fn summarize_executable_allocation_conflicts(
-    schedule: &Schedule,
-    tile: u16,
-    runtime_end: u32,
-) -> String {
-    const MAX_OBJECTS: usize = 24;
-    let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
-    let executable_start = align_up(runtime_end, element);
-    let executable_end = ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT;
-    let mut objects = schedule
-        .allocations
-        .iter()
-        .filter(|allocation| allocation.tile == tile)
-        .filter_map(|allocation| {
-            let end = allocation.address.checked_add(allocation.size)?;
-            ranges_overlap(
-                align_down(allocation.address, element),
-                align_up(end, element),
-                executable_start,
-                executable_end,
-            )
-            .then_some((allocation.address, end, allocation))
-        })
-        .collect::<Vec<_>>();
-    objects.sort_unstable_by_key(|&(start, end, allocation)| (start, end, allocation.tensor.0));
-    let total = objects.len();
-    let details = objects
-        .into_iter()
-        .take(MAX_OBJECTS)
-        .map(|(start, end, allocation)| {
-            format!(
-                "tensor {} {:?} 0x{start:x}..0x{end:x} live {}..{}",
-                allocation.tensor.0, allocation.kind, allocation.live_from, allocation.live_until
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "{total} allocation records touch complete executable elements on tile {tile}; first {MAX_OBJECTS}: {details}"
-    )
-}
-
 #[derive(Clone, Debug)]
 struct AllocationRelocation {
     tensor: ipu_compiler::TensorId,
@@ -2369,17 +2327,7 @@ fn package_graph_impl_attempt(
                     regions,
                     ipu_package::TILE_MEMORY_ELEMENT_SIZE,
                     "executable",
-                )
-                .map_err(|error| {
-                    format!(
-                        "{error}; {}",
-                        summarize_executable_allocation_conflicts(
-                            &graph.schedule,
-                            program.tile,
-                            plans.end
-                        )
-                    )
-                })?;
+                )?;
                 Ok([placed[0], placed[1]])
             },
         )
