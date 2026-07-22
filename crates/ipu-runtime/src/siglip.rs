@@ -412,6 +412,7 @@ fn choose_gemm_output_block_columns(
     let mut best = BASELINE;
     let mut best_blocks = u32::from(row_shards) * u32::from(columns / BASELINE);
     let mut best_waves = best_blocks.div_ceil(tile_count);
+    let baseline_waves = best_waves;
     let mut best_is_saturated = best_blocks * 4 >= best_waves * tile_count * 3;
     for candidate in [32, 64, 128] {
         if !columns.is_multiple_of(candidate) {
@@ -420,7 +421,7 @@ fn choose_gemm_output_block_columns(
         let blocks = u32::from(row_shards) * u32::from(columns / candidate);
         let waves = blocks.div_ceil(tile_count);
         let is_saturated = blocks * 4 >= waves * tile_count * 3;
-        if !is_saturated {
+        if !is_saturated || waves > baseline_waves {
             continue;
         }
         if !best_is_saturated || waves < best_waves || (waves == best_waves && blocks > best_blocks)
