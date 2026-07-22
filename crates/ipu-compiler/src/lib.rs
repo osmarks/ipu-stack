@@ -2432,16 +2432,6 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         (ipu_exchange::EXCHANGE_WINDOW_BYTES / exchange_slot_bytes).min(u32::from(inner_grid)),
     )
     .map_err(|_| CompileError::Graph("GEMM inner batch size overflow".into()))?;
-    let inner_batch_size = if config.data_type.expands_weights() {
-        1
-    } else {
-        direct_inner_batch_size
-    };
-    if inner_batch_size == 0 {
-        return Err(CompileError::Memory(
-            "one GEMM operand pair exceeds the exchange window".into(),
-        ));
-    }
     let tile_data_end = config
         .data_base
         .checked_add(max_left_bytes)
@@ -2452,6 +2442,12 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         .checked_add(max_output_bytes)
         .ok_or_else(|| CompileError::Memory("GEMM output address overflow".into()))?;
     let expanded_right_address = align_u32(output_end, 32);
+    let inner_batch_size = direct_inner_batch_size;
+    if inner_batch_size == 0 {
+        return Err(CompileError::Memory(
+            "one GEMM operand pair and its scratch do not fit on a tile".into(),
+        ));
+    }
     let interleaved_scratch_end = if config.data_type.expands_weights() {
         expanded_right_address
             .checked_add(expanded_right_block_bytes)
@@ -2629,7 +2625,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
 
     let output_waves = output.len().div_ceil(usize::from(config.tile_count));
     let inner_batches = inner_grid.div_ceil(inner_batch_size);
-    let phases_per_batch = 2 + usize::from(config.data_type.expands_weights());
+    let phases_per_batch = 2;
     let mut phases =
         Vec::with_capacity(output_waves * (usize::from(inner_batches) * phases_per_batch + 2));
     for (wave, wave_outputs) in output.chunks(usize::from(config.tile_count)).enumerate() {
@@ -2679,9 +2675,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                                 * u32::from(config.inner_block_dimension)
                                 * input_element_bytes,
                             live_from: exchange_phase,
-                            live_until: exchange_phase
-                                + 1
-                                + usize::from(config.data_type.expands_weights()),
+                            live_until: exchange_phase + 1,
                             kind: AllocationKind::ExchangeStaging {
                                 phase: exchange_phase,
                             },
@@ -2713,92 +2707,82 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
             }
             phases.push(Phase::Exchange { transfers });
 
-            let mut expanded_right_tensors = Vec::new();
-            if config.data_type.expands_weights() {
-                let inner_block = inner_batch_start;
-                let expansion_phase = phases.len();
-                let mut commands = Vec::with_capacity(wave_outputs.len());
-                for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
-                    let output_index = wave * usize::from(config.tile_count) + wave_tile;
-                    let right_tensor = right[usize::from(inner_block) * usize::from(column_grid)
-                        + usize::from(output_block.block_column)]
-                    .tensor;
-                    let expanded_tensor = TensorId(expanded_right_tensor_base + output_index);
-                    let tile = u16::try_from(wave_tile)
-                        .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?;
-                    allocations.push(Allocation {
-                        tensor: expanded_tensor,
-                        tile,
-                        address: expanded_right_address,
-                        size: expanded_right_block_bytes,
-                        live_from: expansion_phase,
-                        live_until: expansion_phase + 1,
-                        kind: AllocationKind::Home,
-                    });
-                    commands.push(KernelCommand {
-                        tile,
-                        output: expanded_tensor,
-                        inputs: vec![right_tensor, right_tensor],
-                        arguments: vec![
-                            u32::from(config.inner_block_dimension)
-                                * u32::from(config.block_dimension),
-                            u32::from(config.data_type.weight_scale() as u8),
-                        ],
-                        specialization: SpecializationKey {
-                            operation: "expand_f8_f143_to_f16".into(),
-                            shape: if config.retain_profile_metadata {
-                                vec![
-                                    usize::from(config.inner_block_dimension),
-                                    usize::from(config.block_dimension),
-                                ]
-                            } else {
-                                Vec::new()
-                            },
-                            worker_count: 6,
-                            role: "weight-expansion".into(),
-                            alignment: 4,
-                        },
-                        metadata: if config.retain_profile_metadata {
-                            BTreeMap::from([
-                                ("label".into(), "expand FP8 weights to FP16".into()),
-                                ("wave".into(), wave.to_string()),
-                                ("inner_block".into(), inner_block.to_string()),
-                                ("bytes".into(), expanded_right_block_bytes.to_string()),
-                            ])
-                        } else {
-                            BTreeMap::new()
-                        },
-                    });
-                    expanded_right_tensors.push(expanded_tensor);
-                }
-                phases.push(Phase::Compute {
-                    op: OpId(expansion_phase),
-                    commands,
-                });
-            }
-
             let gemm_phase = phases.len();
             let mut gemm_commands = Vec::with_capacity(
-                wave_outputs.len() * usize::from(inner_batch_end - inner_batch_start),
+                wave_outputs.len()
+                    * usize::from(inner_batch_end - inner_batch_start)
+                    * (1 + usize::from(config.data_type.expands_weights())),
             );
+            if config.data_type.expands_weights() {
+                for (wave_tile, _) in wave_outputs.iter().enumerate() {
+                    let output_index = wave * usize::from(config.tile_count) + wave_tile;
+                    allocations.push(Allocation {
+                        tensor: TensorId(expanded_right_tensor_base + output_index),
+                        tile: u16::try_from(wave_tile)
+                            .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?,
+                        address: expanded_right_address,
+                        size: expanded_right_block_bytes,
+                        live_from: gemm_phase,
+                        live_until: gemm_phase,
+                        kind: AllocationKind::Home,
+                    });
+                }
+            }
             for inner_block in inner_batch_start..inner_batch_end {
                 for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
                     let output_index = wave * usize::from(config.tile_count) + wave_tile;
+                    let tile = u16::try_from(wave_tile)
+                        .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?;
                     let left_tensor = left[usize::from(output_block.block_row)
                         * usize::from(inner_grid)
                         + usize::from(inner_block)]
                     .tensor;
-                    let right_tensor = expanded_right_tensors
-                        .get(wave_tile)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            right[usize::from(inner_block) * usize::from(column_grid)
-                                + usize::from(output_block.block_column)]
-                            .tensor
+                    let source_right_tensor = right[usize::from(inner_block)
+                        * usize::from(column_grid)
+                        + usize::from(output_block.block_column)]
+                    .tensor;
+                    let right_tensor = if config.data_type.expands_weights() {
+                        let expanded_tensor = TensorId(expanded_right_tensor_base + output_index);
+                        gemm_commands.push(KernelCommand {
+                            tile,
+                            output: expanded_tensor,
+                            inputs: vec![source_right_tensor, source_right_tensor],
+                            arguments: vec![
+                                u32::from(config.inner_block_dimension)
+                                    * u32::from(config.block_dimension),
+                                u32::from(config.data_type.weight_scale() as u8),
+                            ],
+                            specialization: SpecializationKey {
+                                operation: "expand_f8_f143_to_f16".into(),
+                                shape: if config.retain_profile_metadata {
+                                    vec![
+                                        usize::from(config.inner_block_dimension),
+                                        usize::from(config.block_dimension),
+                                    ]
+                                } else {
+                                    Vec::new()
+                                },
+                                worker_count: 6,
+                                role: "weight-expansion".into(),
+                                alignment: 4,
+                            },
+                            metadata: if config.retain_profile_metadata {
+                                BTreeMap::from([
+                                    ("label".into(), "expand FP8 weights to FP16".into()),
+                                    ("wave".into(), wave.to_string()),
+                                    ("inner_block".into(), inner_block.to_string()),
+                                    ("bytes".into(), expanded_right_block_bytes.to_string()),
+                                ])
+                            } else {
+                                BTreeMap::new()
+                            },
                         });
+                        expanded_tensor
+                    } else {
+                        source_right_tensor
+                    };
                     gemm_commands.push(KernelCommand {
-                        tile: u16::try_from(wave_tile)
-                            .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?,
+                        tile,
                         output: TensorId(scratch_tensor_base + output_index),
                         inputs: vec![left_tensor, right_tensor],
                         arguments: config
@@ -5066,17 +5050,14 @@ mod tests {
             .schedule
             .phases
             .iter()
-            .filter_map(|phase| match phase {
-                Phase::Compute { commands, .. }
-                    if commands.iter().all(|command| {
-                        command.specialization.operation == "expand_f8_f143_to_f16"
-                    }) =>
-                {
-                    Some(commands.iter().map(|command| command.output))
-                }
-                _ => None,
+            .flat_map(|phase| match phase {
+                Phase::Compute { commands, .. } => commands
+                    .iter()
+                    .filter(|command| command.specialization.operation == "expand_f8_f143_to_f16")
+                    .map(|command| command.output)
+                    .collect::<Vec<_>>(),
+                Phase::Exchange { .. } => Vec::new(),
             })
-            .flatten()
             .collect::<HashSet<_>>();
         assert!(!expanded.is_empty());
         assert!(plan.schedule.allocations.iter().any(|allocation| {
@@ -5092,6 +5073,64 @@ mod tests {
                 command.specialization.operation.starts_with("gemm_f16_f8w_")
             }))
         }));
+        plan.schedule
+            .lower_tile_programs(&Topology::c600())
+            .unwrap();
+    }
+
+    #[test]
+    fn fp8_weight_expansion_batches_independent_inner_blocks() {
+        let plan = plan_blocked_gemm(BlockedGemmConfig {
+            rows: 64,
+            inner_dimension: 256,
+            columns: 128,
+            block_dimension: 128,
+            inner_block_dimension: 64,
+            row_block_dimension: 64,
+            tile_count: 64,
+            data_base: 0xa0000,
+            data_limit: 0xe8000,
+            data_type: GemmDataType::F16F8Weights { scale: 0 },
+            retain_profile_metadata: true,
+        })
+        .unwrap();
+
+        let expansion_batches = plan
+            .schedule
+            .phases
+            .iter()
+            .filter_map(|phase| match phase {
+                Phase::Compute { commands, .. } => {
+                    let count = commands
+                        .iter()
+                        .filter(|command| {
+                            command.specialization.operation == "expand_f8_f143_to_f16"
+                        })
+                        .count();
+                    (count != 0).then_some(count)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expansion_batches.iter().sum::<usize>(), plan.right.len());
+        assert!(expansion_batches.len() < plan.right.len());
+        assert!(expansion_batches.iter().any(|&commands| commands > 1));
+        assert!(plan.schedule.phases.iter().all(|phase| match phase {
+            Phase::Compute { commands, .. }
+                if commands.iter().any(|command| {
+                    command.specialization.operation == "expand_f8_f143_to_f16"
+                }) =>
+                commands.chunks_exact(2).all(|pair| {
+                    pair[0].specialization.operation == "expand_f8_f143_to_f16"
+                        && pair[1]
+                            .specialization
+                            .operation
+                            .starts_with("gemm_f16_f8w_")
+                        && pair[0].tile == pair[1].tile
+                }),
+            _ => true,
+        }));
+
         plan.schedule
             .lower_tile_programs(&Topology::c600())
             .unwrap();
