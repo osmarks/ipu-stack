@@ -448,18 +448,7 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
                         destination_tile,
                         tensor: task.output,
                         bytes: head_bytes,
-                        staging_address: None,
-                    });
-                    schedule.allocations.push(Allocation {
-                        tensor: task.output,
-                        tile: destination_tile,
-                        address: ipu_exchange::EXCHANGE_WINDOW_BASE + staging_offset,
-                        size: head_bytes,
-                        live_from: exchange_phase,
-                        live_until: compute_phase,
-                        kind: AllocationKind::ExchangeStaging {
-                            phase: exchange_phase,
-                        },
+                        staging_address: Some(ipu_exchange::EXCHANGE_WINDOW_BASE + staging_offset),
                     });
                 }
                 let output_alias = fresh_tensor(&mut next_tensor);
@@ -1102,40 +1091,20 @@ pub fn plan_flash_attention(
                             destination_tile: task.tile,
                             tensor: block.key_tensor,
                             bytes: block.matrix_size,
-                            staging_address: None,
+                            staging_address: Some(
+                                ipu_exchange::EXCHANGE_WINDOW_BASE + staging_offset,
+                            ),
                         },
                         Transfer {
                             source_tile: block.tile,
                             destination_tile: task.tile,
                             tensor: block.value_tensor,
                             bytes: block.matrix_size,
-                            staging_address: None,
-                        },
-                    ]);
-                    allocations.extend([
-                        Allocation {
-                            tensor: block.key_tensor,
-                            tile: task.tile,
-                            address: ipu_exchange::EXCHANGE_WINDOW_BASE + staging_offset,
-                            size: block.matrix_size,
-                            live_from: exchange_phase,
-                            live_until: compute_phase,
-                            kind: AllocationKind::ExchangeStaging {
-                                phase: exchange_phase,
-                            },
-                        },
-                        Allocation {
-                            tensor: block.value_tensor,
-                            tile: task.tile,
-                            address: ipu_exchange::EXCHANGE_WINDOW_BASE
-                                + staging_offset
-                                + block.matrix_size,
-                            size: block.matrix_size,
-                            live_from: exchange_phase,
-                            live_until: compute_phase,
-                            kind: AllocationKind::ExchangeStaging {
-                                phase: exchange_phase,
-                            },
+                            staging_address: Some(
+                                ipu_exchange::EXCHANGE_WINDOW_BASE
+                                    + staging_offset
+                                    + block.matrix_size,
+                            ),
                         },
                     ]);
                 }
@@ -1974,8 +1943,14 @@ mod tests {
         assert!(gather_phases > 1);
         assert!(schedule.allocations.iter().all(|allocation| {
             !matches!(allocation.kind, AllocationKind::ExchangeStaging { .. })
-                || allocation.address + allocation.size
-                    <= ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES
+        }));
+        assert!(schedule.phases.iter().all(|phase| {
+            match phase {
+                Phase::Exchange { transfers } => transfers
+                    .iter()
+                    .all(|transfer| transfer.staging_address.is_some()),
+                Phase::Compute { .. } => true,
+            }
         }));
         schedule
             .lower_tile_programs(&ipu_exchange::Topology::c600())

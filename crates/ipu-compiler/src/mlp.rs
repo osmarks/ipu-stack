@@ -113,7 +113,6 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
         if let Some(source) = previous_output.as_ref() {
             append_activation_transition(
                 &mut phases,
-                &mut allocations,
                 source,
                 &plan.left,
                 layer - 1,
@@ -136,7 +135,6 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
     }
     append_activation_transition(
         &mut phases,
-        &mut allocations,
         previous_output.as_ref().unwrap(),
         &output,
         usize::from(config.layers) - 1,
@@ -324,7 +322,6 @@ fn append_schedule(
 
 fn append_activation_transition(
     phases: &mut Vec<Phase>,
-    allocations: &mut Vec<Allocation>,
     source: &[BlockPlacement],
     destination: &[BlockPlacement],
     layer: usize,
@@ -335,8 +332,7 @@ fn append_activation_transition(
             "MLP activation block counts differ between layers".into(),
         ));
     }
-    let exchange_phase = phases.len();
-    let compute_phase = exchange_phase + 1;
+    let compute_phase = phases.len() + 1;
     let mut transfers = Vec::with_capacity(source.len());
     let mut commands = Vec::with_capacity(source.len());
     let mut occupied_destinations = HashSet::default();
@@ -362,18 +358,7 @@ fn append_activation_transition(
                 destination_tile: destination.tile,
                 tensor: source.tensor,
                 bytes,
-                staging_address: None,
-            });
-            allocations.push(Allocation {
-                tensor: source.tensor,
-                tile: destination.tile,
-                address: ipu_exchange::EXCHANGE_WINDOW_BASE,
-                size: bytes,
-                live_from: exchange_phase,
-                live_until: compute_phase,
-                kind: AllocationKind::ExchangeStaging {
-                    phase: exchange_phase,
-                },
+                staging_address: Some(ipu_exchange::EXCHANGE_WINDOW_BASE),
             });
         }
         commands.push(KernelCommand {

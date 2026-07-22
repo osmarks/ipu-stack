@@ -3047,7 +3047,6 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         }
         for inner_batch_start in (0..inner_grid).step_by(usize::from(inner_batch_size)) {
             let inner_batch_end = (inner_batch_start + inner_batch_size).min(inner_grid);
-            let exchange_phase = phases.len();
             let mut transfers = Vec::new();
             for inner_block in inner_batch_start..inner_batch_end {
                 let slot_offset = u32::from(inner_block - inner_batch_start) * exchange_slot_bytes;
@@ -3059,27 +3058,15 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                         + usize::from(inner_block);
                     let source = left[source_index];
                     if source.tile != destination_tile {
+                        let bytes = u32::from(source.rows)
+                            * u32::from(config.inner_block_dimension)
+                            * input_element_bytes;
                         transfers.push(Transfer {
                             source_tile: source.tile,
                             destination_tile,
                             tensor: source.tensor,
-                            bytes: u32::from(source.rows)
-                                * u32::from(config.inner_block_dimension)
-                                * input_element_bytes,
-                            staging_address: None,
-                        });
-                        allocations.push(Allocation {
-                            tensor: source.tensor,
-                            tile: destination_tile,
-                            address: left_exchange_address + slot_offset,
-                            size: u32::from(source.rows)
-                                * u32::from(config.inner_block_dimension)
-                                * input_element_bytes,
-                            live_from: exchange_phase,
-                            live_until: exchange_phase + 1,
-                            kind: AllocationKind::ExchangeStaging {
-                                phase: exchange_phase,
-                            },
+                            bytes,
+                            staging_address: Some(left_exchange_address + slot_offset),
                         });
                     }
                     let source_index = usize::from(inner_block) * usize::from(column_grid)
@@ -3091,18 +3078,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                             destination_tile,
                             tensor: source.tensor,
                             bytes: right_block_bytes,
-                            staging_address: None,
-                        });
-                        allocations.push(Allocation {
-                            tensor: source.tensor,
-                            tile: destination_tile,
-                            address: right_exchange_address + slot_offset,
-                            size: right_block_bytes,
-                            live_from: exchange_phase,
-                            live_until: exchange_phase + 1,
-                            kind: AllocationKind::ExchangeStaging {
-                                phase: exchange_phase,
-                            },
+                            staging_address: Some(right_exchange_address + slot_offset),
                         });
                     }
                 }
@@ -3287,17 +3263,6 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                 allocations.push(Allocation {
                     tensor,
                     tile: output_block.tile,
-                    address: left_exchange_address + byte_offset,
-                    size: bytes,
-                    live_from: evacuation_phase,
-                    live_until: evacuation_phase + 1,
-                    kind: AllocationKind::ExchangeStaging {
-                        phase: evacuation_phase,
-                    },
-                });
-                allocations.push(Allocation {
-                    tensor,
-                    tile: output_block.tile,
                     address: output_block.address + byte_offset,
                     size: bytes,
                     live_from: evacuation_phase + 1,
@@ -3311,7 +3276,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     destination_tile: output_block.tile,
                     tensor,
                     bytes,
-                    staging_address: None,
+                    staging_address: Some(left_exchange_address + byte_offset),
                 });
                 evacuation_chunks.push((output_block, tensor, row_offset, rows, bytes));
                 row_offset += rows;
@@ -5638,9 +5603,10 @@ mod tests {
         }));
         assert!(plan.schedule.phases.iter().all(|phase| {
             match phase {
-                Phase::Exchange { transfers } => transfers
-                    .iter()
-                    .all(|transfer| transfer.bytes <= ipu_exchange::MAX_TRANSFER_WORDS * 4),
+                Phase::Exchange { transfers } => transfers.iter().all(|transfer| {
+                    transfer.bytes <= ipu_exchange::MAX_TRANSFER_WORDS * 4
+                        && transfer.staging_address.is_some()
+                }),
                 Phase::Compute { commands, .. } => commands.iter().all(|command| {
                     let units = u32::try_from(command.specialization.shape[0]).unwrap();
                     let operation = command.specialization.operation.as_ref();
@@ -5658,6 +5624,9 @@ mod tests {
                         && command.metadata.contains_key("output_block_column")
                 }),
             }
+        }));
+        assert!(plan.schedule.allocations.iter().all(|allocation| {
+            !matches!(allocation.kind, AllocationKind::ExchangeStaging { .. })
         }));
     }
 
