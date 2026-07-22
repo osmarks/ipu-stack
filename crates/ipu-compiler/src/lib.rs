@@ -3571,8 +3571,11 @@ impl Schedule {
                 group.destinations.dedup();
             }
 
-            // A tile can execute one exchange role at a time. Color the
-            // multicast-hyperedge conflict graph into timed slots with deterministic DSATUR.
+            // A tile can execute one exchange role at a time. Order the
+            // multicast hyperedges by aggregate endpoint pressure, then place
+            // each in the first slot unused by any of its endpoints. This
+            // enforces the hardware constraint without materializing the
+            // quadratic pairwise conflict graph.
             let mut groups_by_tile = vec![Vec::new(); topology.tile_count()];
             for (group_index, group) in groups.iter().enumerate() {
                 groups_by_tile[usize::from(group.source)].push(group_index);
@@ -3580,38 +3583,41 @@ impl Schedule {
                     groups_by_tile[usize::from(destination)].push(group_index);
                 }
             }
-            let mut adjacency = vec![HashSet::default(); groups.len()];
-            for tile_groups in groups_by_tile {
-                for (offset, &left) in tile_groups.iter().enumerate() {
-                    for &right in &tile_groups[offset + 1..] {
-                        adjacency[left].insert(right);
-                        adjacency[right].insert(left);
-                    }
-                }
-            }
+            let pressure = groups_by_tile.iter().map(Vec::len).collect::<Vec<_>>();
+            let mut order = (0..groups.len()).collect::<Vec<_>>();
+            order.sort_unstable_by_key(|&index| {
+                let group = &groups[index];
+                let endpoint_pressure = pressure[usize::from(group.source)]
+                    + group
+                        .destinations
+                        .iter()
+                        .map(|&tile| pressure[usize::from(tile)])
+                        .sum::<usize>();
+                (
+                    std::cmp::Reverse(endpoint_pressure),
+                    std::cmp::Reverse(group.destinations.len()),
+                    group.source,
+                    group.tensor.0,
+                )
+            });
+            let mut used_colors = vec![HashSet::<usize>::default(); topology.tile_count()];
             let mut colors = vec![None; groups.len()];
-            let mut saturation = vec![HashSet::default(); groups.len()];
-            for _ in 0..groups.len() {
-                let index = (0..groups.len())
-                    .filter(|index| colors[*index].is_none())
-                    .max_by_key(|index| {
-                        (
-                            saturation[*index].len(),
-                            adjacency[*index].len(),
-                            std::cmp::Reverse(groups[*index].source),
-                            std::cmp::Reverse(groups[*index].tensor.0),
-                        )
-                    })
-                    .ok_or_else(|| CompileError::Graph("exchange coloring failed".into()))?;
+            for index in order {
+                let group = &groups[index];
                 let color = (0..)
-                    .find(|color| !saturation[index].contains(color))
+                    .find(|color| {
+                        !used_colors[usize::from(group.source)].contains(color)
+                            && group
+                                .destinations
+                                .iter()
+                                .all(|&tile| !used_colors[usize::from(tile)].contains(color))
+                    })
                     .ok_or_else(|| CompileError::Graph("exchange color overflow".into()))?;
-                colors[index] = Some(color);
-                for &neighbor in &adjacency[index] {
-                    if colors[neighbor].is_none() {
-                        saturation[neighbor].insert(color);
-                    }
+                used_colors[usize::from(group.source)].insert(color);
+                for &tile in &group.destinations {
+                    used_colors[usize::from(tile)].insert(color);
                 }
+                colors[index] = Some(color);
             }
             let color_count = colors
                 .iter()
