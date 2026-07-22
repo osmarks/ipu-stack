@@ -2341,6 +2341,26 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         .checked_mul(u32::from(config.block_dimension))
         .and_then(|elements| elements.checked_mul(output_element_bytes))
         .ok_or_else(|| CompileError::Memory("GEMM output block size overflow".into()))?;
+    let exchange_slot_bytes = align_u32(
+        max_left_bytes
+            .checked_add(right_block_bytes)
+            .ok_or_else(|| CompileError::Memory("GEMM exchange slot overflow".into()))?,
+        32,
+    );
+    let direct_inner_batch_size = u16::try_from(
+        (ipu_exchange::EXCHANGE_WINDOW_BYTES / exchange_slot_bytes).min(u32::from(inner_grid)),
+    )
+    .map_err(|_| CompileError::Graph("GEMM inner batch size overflow".into()))?;
+    let inner_batch_size = if config.data_type.expands_weights() {
+        1
+    } else {
+        direct_inner_batch_size
+    };
+    if inner_batch_size == 0 {
+        return Err(CompileError::Memory(
+            "one GEMM operand pair exceeds the exchange window".into(),
+        ));
+    }
     let tile_data_end = config
         .data_base
         .checked_add(max_left_bytes)
@@ -2499,9 +2519,10 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
     }
 
     let output_waves = output.len().div_ceil(usize::from(config.tile_count));
-    let phases_per_inner = 2 + usize::from(config.data_type.expands_weights());
+    let inner_batches = inner_grid.div_ceil(inner_batch_size);
+    let phases_per_batch = 2 + usize::from(config.data_type.expands_weights());
     let mut phases =
-        Vec::with_capacity(output_waves * (usize::from(inner_grid) * phases_per_inner + 2));
+        Vec::with_capacity(output_waves * (usize::from(inner_batches) * phases_per_batch + 2));
     for (wave, wave_outputs) in output.chunks(usize::from(config.tile_count)).enumerate() {
         let wave_start = phases.len();
         for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
@@ -2515,71 +2536,77 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     * u32::from(config.block_dimension)
                     * output_element_bytes,
                 live_from: wave_start,
-                live_until: wave_start + usize::from(inner_grid) * phases_per_inner + 1,
+                live_until: wave_start + usize::from(inner_batches) * phases_per_batch + 1,
                 kind: AllocationKind::Home,
             });
         }
-        for inner_block in 0..inner_grid {
+        for inner_batch_start in (0..inner_grid).step_by(usize::from(inner_batch_size)) {
+            let inner_batch_end = (inner_batch_start + inner_batch_size).min(inner_grid);
             let exchange_phase = phases.len();
             let mut transfers = Vec::new();
-            for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
-                let destination_tile = u16::try_from(wave_tile)
-                    .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?;
-                let source_index = usize::from(output_block.block_row) * usize::from(inner_grid)
-                    + usize::from(inner_block);
-                let source = left[source_index];
-                if source.tile != destination_tile {
-                    transfers.push(Transfer {
-                        source_tile: source.tile,
-                        destination_tile,
-                        tensor: source.tensor,
-                        bytes: u32::from(source.rows)
-                            * u32::from(config.inner_block_dimension)
-                            * input_element_bytes,
-                    });
-                    allocations.push(Allocation {
-                        tensor: source.tensor,
-                        tile: destination_tile,
-                        address: left_exchange_address,
-                        size: u32::from(source.rows)
-                            * u32::from(config.inner_block_dimension)
-                            * input_element_bytes,
-                        live_from: exchange_phase,
-                        live_until: exchange_phase
-                            + 1
-                            + usize::from(config.data_type.expands_weights()),
-                        kind: AllocationKind::ExchangeStaging {
-                            phase: exchange_phase,
-                        },
-                    });
-                }
-                let source_index = usize::from(inner_block) * usize::from(column_grid)
-                    + usize::from(output_block.block_column);
-                let source = right[source_index];
-                if source.tile != destination_tile {
-                    transfers.push(Transfer {
-                        source_tile: source.tile,
-                        destination_tile,
-                        tensor: source.tensor,
-                        bytes: right_block_bytes,
-                    });
-                    allocations.push(Allocation {
-                        tensor: source.tensor,
-                        tile: destination_tile,
-                        address: right_exchange_address,
-                        size: right_block_bytes,
-                        live_from: exchange_phase,
-                        live_until: exchange_phase + 1,
-                        kind: AllocationKind::ExchangeStaging {
-                            phase: exchange_phase,
-                        },
-                    });
+            for inner_block in inner_batch_start..inner_batch_end {
+                let slot_offset = u32::from(inner_block - inner_batch_start) * exchange_slot_bytes;
+                for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
+                    let destination_tile = u16::try_from(wave_tile)
+                        .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?;
+                    let source_index = usize::from(output_block.block_row)
+                        * usize::from(inner_grid)
+                        + usize::from(inner_block);
+                    let source = left[source_index];
+                    if source.tile != destination_tile {
+                        transfers.push(Transfer {
+                            source_tile: source.tile,
+                            destination_tile,
+                            tensor: source.tensor,
+                            bytes: u32::from(source.rows)
+                                * u32::from(config.inner_block_dimension)
+                                * input_element_bytes,
+                        });
+                        allocations.push(Allocation {
+                            tensor: source.tensor,
+                            tile: destination_tile,
+                            address: left_exchange_address + slot_offset,
+                            size: u32::from(source.rows)
+                                * u32::from(config.inner_block_dimension)
+                                * input_element_bytes,
+                            live_from: exchange_phase,
+                            live_until: exchange_phase
+                                + 1
+                                + usize::from(config.data_type.expands_weights()),
+                            kind: AllocationKind::ExchangeStaging {
+                                phase: exchange_phase,
+                            },
+                        });
+                    }
+                    let source_index = usize::from(inner_block) * usize::from(column_grid)
+                        + usize::from(output_block.block_column);
+                    let source = right[source_index];
+                    if source.tile != destination_tile {
+                        transfers.push(Transfer {
+                            source_tile: source.tile,
+                            destination_tile,
+                            tensor: source.tensor,
+                            bytes: right_block_bytes,
+                        });
+                        allocations.push(Allocation {
+                            tensor: source.tensor,
+                            tile: destination_tile,
+                            address: right_exchange_address + slot_offset,
+                            size: right_block_bytes,
+                            live_from: exchange_phase,
+                            live_until: exchange_phase + 1,
+                            kind: AllocationKind::ExchangeStaging {
+                                phase: exchange_phase,
+                            },
+                        });
+                    }
                 }
             }
             phases.push(Phase::Exchange { transfers });
 
             let mut expanded_right_tensors = Vec::new();
             if config.data_type.expands_weights() {
+                let inner_block = inner_batch_start;
                 let expansion_phase = phases.len();
                 let mut commands = Vec::with_capacity(wave_outputs.len());
                 for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
@@ -2642,83 +2669,89 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
             }
 
             let gemm_phase = phases.len();
-            let mut gemm_commands = Vec::with_capacity(wave_outputs.len());
-            for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
-                let output_index = wave * usize::from(config.tile_count) + wave_tile;
-                let left_tensor = left[usize::from(output_block.block_row)
-                    * usize::from(inner_grid)
-                    + usize::from(inner_block)]
-                .tensor;
-                let right_tensor = expanded_right_tensors
-                    .get(wave_tile)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        right[usize::from(inner_block) * usize::from(column_grid)
-                            + usize::from(output_block.block_column)]
-                        .tensor
-                    });
-                gemm_commands.push(KernelCommand {
-                    tile: u16::try_from(wave_tile)
-                        .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?,
-                    output: TensorId(scratch_tensor_base + output_index),
-                    inputs: vec![left_tensor, right_tensor],
-                    arguments: config
-                        .data_type
-                        .product_scale()
-                        .map(|scale| vec![u32::from((scale as u8) & 0x3f)])
-                        .unwrap_or_default(),
-                    specialization: SpecializationKey {
-                        operation: config
+            let mut gemm_commands = Vec::with_capacity(
+                wave_outputs.len() * usize::from(inner_batch_end - inner_batch_start),
+            );
+            for inner_block in inner_batch_start..inner_batch_end {
+                for (wave_tile, output_block) in wave_outputs.iter().enumerate() {
+                    let output_index = wave * usize::from(config.tile_count) + wave_tile;
+                    let left_tensor = left[usize::from(output_block.block_row)
+                        * usize::from(inner_grid)
+                        + usize::from(inner_block)]
+                    .tensor;
+                    let right_tensor = expanded_right_tensors
+                        .get(wave_tile)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            right[usize::from(inner_block) * usize::from(column_grid)
+                                + usize::from(output_block.block_column)]
+                            .tensor
+                        });
+                    gemm_commands.push(KernelCommand {
+                        tile: u16::try_from(wave_tile)
+                            .map_err(|_| CompileError::Graph("GEMM wave tile overflow".into()))?,
+                        output: TensorId(scratch_tensor_base + output_index),
+                        inputs: vec![left_tensor, right_tensor],
+                        arguments: config
                             .data_type
-                            .kernel_operation(inner_block == 0, output_block.rows == base_rows)
-                            .into(),
-                        shape: vec![
-                            usize::from(output_block.rows),
-                            usize::from(config.inner_block_dimension),
-                            usize::from(config.block_dimension),
-                        ],
-                        worker_count: 6,
-                        role: "blocked-gemm".into(),
-                        alignment: 32,
-                    },
-                    metadata: if config.retain_profile_metadata {
-                        BTreeMap::from([
-                            (
-                                "label".into(),
-                                format!(
-                                    "GEMM block ({}, {}) inner block {}",
-                                    output_block.block_row, output_block.block_column, inner_block
+                            .product_scale()
+                            .map(|scale| vec![u32::from((scale as u8) & 0x3f)])
+                            .unwrap_or_default(),
+                        specialization: SpecializationKey {
+                            operation: config
+                                .data_type
+                                .kernel_operation(inner_block == 0, output_block.rows == base_rows)
+                                .into(),
+                            shape: vec![
+                                usize::from(output_block.rows),
+                                usize::from(config.inner_block_dimension),
+                                usize::from(config.block_dimension),
+                            ],
+                            worker_count: 6,
+                            role: "blocked-gemm".into(),
+                            alignment: 32,
+                        },
+                        metadata: if config.retain_profile_metadata {
+                            BTreeMap::from([
+                                (
+                                    "label".into(),
+                                    format!(
+                                        "GEMM block ({}, {}) inner block {}",
+                                        output_block.block_row,
+                                        output_block.block_column,
+                                        inner_block
+                                    ),
                                 ),
-                            ),
-                            ("wave".into(), wave.to_string()),
-                            (
-                                "output_block_row".into(),
-                                output_block.block_row.to_string(),
-                            ),
-                            (
-                                "output_block_column".into(),
-                                output_block.block_column.to_string(),
-                            ),
-                            ("inner_block".into(), inner_block.to_string()),
-                            ("row_start".into(), output_block.row_start.to_string()),
-                            ("rows".into(), output_block.rows.to_string()),
-                            (
-                                "output_bytes".into(),
-                                (u32::from(output_block.rows)
-                                    * u32::from(config.block_dimension)
-                                    * output_element_bytes)
-                                    .to_string(),
-                            ),
-                            ("block_dimension".into(), config.block_dimension.to_string()),
-                            (
-                                "inner_block_dimension".into(),
-                                config.inner_block_dimension.to_string(),
-                            ),
-                        ])
-                    } else {
-                        BTreeMap::new()
-                    },
-                });
+                                ("wave".into(), wave.to_string()),
+                                (
+                                    "output_block_row".into(),
+                                    output_block.block_row.to_string(),
+                                ),
+                                (
+                                    "output_block_column".into(),
+                                    output_block.block_column.to_string(),
+                                ),
+                                ("inner_block".into(), inner_block.to_string()),
+                                ("row_start".into(), output_block.row_start.to_string()),
+                                ("rows".into(), output_block.rows.to_string()),
+                                (
+                                    "output_bytes".into(),
+                                    (u32::from(output_block.rows)
+                                        * u32::from(config.block_dimension)
+                                        * output_element_bytes)
+                                        .to_string(),
+                                ),
+                                ("block_dimension".into(), config.block_dimension.to_string()),
+                                (
+                                    "inner_block_dimension".into(),
+                                    config.inner_block_dimension.to_string(),
+                                ),
+                            ])
+                        } else {
+                            BTreeMap::new()
+                        },
+                    });
+                }
             }
             phases.push(Phase::Compute {
                 op: OpId(gemm_phase),
@@ -4979,13 +5012,20 @@ mod tests {
             let minimum = first_column.iter().map(|block| block.rows).min().unwrap();
             let maximum = first_column.iter().map(|block| block.rows).max().unwrap();
             assert!(maximum - minimum <= 1);
+            let exchange_slot_bytes =
+                align_u32(u32::from(maximum) * 32 * 4 + u32::from(32u16) * 64 * 4, 32);
+            let batch_capacity =
+                usize::try_from(ipu_exchange::EXCHANGE_WINDOW_BYTES / exchange_slot_bytes).unwrap();
             assert!(plan.schedule.phases.iter().all(|phase| match phase {
                 Phase::Compute { commands, .. } => {
                     let mut per_tile = BTreeMap::<u16, usize>::new();
-                    for command in commands {
+                    for command in commands
+                        .iter()
+                        .filter(|command| command.specialization.operation.starts_with("gemm_f32_"))
+                    {
                         *per_tile.entry(command.tile).or_default() += 1;
                     }
-                    per_tile.values().all(|&count| count <= 2)
+                    per_tile.values().all(|&count| count <= batch_capacity)
                 }
                 Phase::Exchange { .. } => true,
             }));
