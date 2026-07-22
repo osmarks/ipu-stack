@@ -3,7 +3,8 @@ use ipu_compiler::{AffineLayerNormConfig, RowShardPlacement, plan_affine_layer_n
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
-    ExecutableGraph, HostRunOptions, normal_f16, package_graph, run_host_with_options,
+    ExecutableGraph, HostRunOptions, ProfileGranularity, normal_f16, package_graph,
+    package_graph_profiled_with, run_host_with_options,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -95,16 +96,21 @@ fn main() {
             &[],
         )
         .unwrap();
-    let app = package_graph(
-        &graph,
-        &[
-            fs::read(runtime.object).unwrap(),
-            fs::read(codelet.object).unwrap(),
-            fs::read(wrapper.object).unwrap(),
-            fs::read(worker_support.object).unwrap(),
-        ],
-    )
-    .unwrap();
+    let objects = [
+        fs::read(runtime.object).unwrap(),
+        fs::read(codelet.object).unwrap(),
+        fs::read(wrapper.object).unwrap(),
+        fs::read(worker_support.object).unwrap(),
+    ];
+    let profile_output = std::env::var_os("IPU_PROFILE_OUTPUT").map(PathBuf::from);
+    let (app, profile_layout) = if profile_output.is_some() {
+        let granularity = ProfileGranularity::from_environment().unwrap();
+        let (app, layout) = package_graph_profiled_with(&graph, &objects, granularity).unwrap();
+        info!(?granularity, "enabled FP16 LayerNorm cycle profiling");
+        (app, Some(layout))
+    } else {
+        (package_graph(&graph, &objects).unwrap(), None)
+    };
     let configuration = fs::read(required_env("IPU_CONFIG")).unwrap();
     let bootloader = fs::read(
         std::env::var_os("IPU_BOOTLOADER")
@@ -112,7 +118,7 @@ fn main() {
             .unwrap_or_else(|| sdk.join("bin/ipu/tile_bootloader_ipu2.elf")),
     )
     .unwrap();
-    let actual = run_host_with_options(
+    let mut actual = run_host_with_options(
         &app,
         &bootloader,
         &configuration,
@@ -121,6 +127,13 @@ fn main() {
         HostRunOptions::from_environment().unwrap(),
     )
     .unwrap();
+    if let (Some(path), Some(layout)) = (&profile_output, &profile_layout) {
+        let clock_hz = env_u64("IPU_CLOCK_HZ", 1_500_000_000);
+        let report = layout.decode(&actual, clock_hz).unwrap();
+        report.write(fs::File::create(path).unwrap()).unwrap();
+        actual.truncate(layout.output_offset);
+        info!(path = %path.display(), clock_hz, "wrote FP16 LayerNorm cycle profile");
+    }
     let max_error = verify(
         rows,
         columns,
