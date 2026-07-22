@@ -370,8 +370,17 @@ pub struct SiglipEncoderTuning {
     pub automatic_gemm_row_blocks: bool,
     /// Zero uses 64-column K blocks for GEMMs with row-sharded inputs.
     pub row_gemm_inner_block_columns: u16,
+    /// Per-projection K-block overrides; zero inherits `row_gemm_inner_block_columns`.
+    pub qkv_inner_block_columns: u16,
+    pub attention_output_inner_block_columns: u16,
+    pub mlp_up_inner_block_columns: u16,
     /// Zero selects an output block width from the GEMM shape and device occupancy.
     pub gemm_output_block_columns: u16,
+    /// Per-projection output-block overrides; zero inherits `gemm_output_block_columns`.
+    pub qkv_output_block_columns: u16,
+    pub attention_output_block_columns: u16,
+    pub mlp_up_output_block_columns: u16,
+    pub mlp_down_output_block_columns: u16,
     /// Zero asks the attention planner to saturate the available tiles.
     pub attention_query_block_rows: u16,
     /// Zero asks the attention planner to choose the K/V block size.
@@ -394,24 +403,35 @@ fn choose_gemm_output_block_columns(
         }
         return Ok(requested);
     }
-    let baseline = 64;
-    if !columns.is_multiple_of(baseline) {
+    const BASELINE: u16 = 64;
+    if !columns.is_multiple_of(BASELINE) {
         return Err(format!("GEMM output columns {columns} are not divisible by 64").into());
     }
     let row_shards = rows.div_ceil(row_block_rows);
-    let baseline_blocks = u32::from(row_shards) * u32::from(columns / baseline);
-    let baseline_waves = baseline_blocks.div_ceil(u32::from(tile_count));
-    for candidate in [128] {
+    let tile_count = u32::from(tile_count);
+    let mut best = BASELINE;
+    let mut best_blocks = u32::from(row_shards) * u32::from(columns / BASELINE);
+    let mut best_waves = best_blocks.div_ceil(tile_count);
+    let mut best_is_saturated = best_blocks * 4 >= best_waves * tile_count * 3;
+    for candidate in [32, 64, 128] {
         if !columns.is_multiple_of(candidate) {
             continue;
         }
         let blocks = u32::from(row_shards) * u32::from(columns / candidate);
-        let waves = blocks.div_ceil(u32::from(tile_count));
-        if waves < baseline_waves && blocks * 4 >= u32::from(tile_count) * 3 {
-            return Ok(candidate);
+        let waves = blocks.div_ceil(tile_count);
+        let is_saturated = blocks * 4 >= waves * tile_count * 3;
+        if !is_saturated {
+            continue;
+        }
+        if !best_is_saturated || waves < best_waves || (waves == best_waves && blocks > best_blocks)
+        {
+            best = candidate;
+            best_blocks = blocks;
+            best_waves = waves;
+            best_is_saturated = true;
         }
     }
-    Ok(baseline)
+    Ok(best)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1132,6 +1152,21 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     } else {
         tuning.row_gemm_inner_block_columns
     };
+    let projection_inner = |requested: u16| {
+        if requested == 0 {
+            tuned_gemm_inner
+        } else {
+            requested
+        }
+    };
+    let projection_output = |requested: u16| {
+        if requested == 0 {
+            tuning.gemm_output_block_columns
+        } else {
+            requested
+        }
+    };
+    let qkv_inner = projection_inner(tuning.qkv_inner_block_columns);
     let prefix = format!("encoder_layer_{layer:02}");
     let layer_phase_start = schedule.phases.len();
     info!(stage = "norm1_qkv", "planning SigLIP encoder stage");
@@ -1192,7 +1227,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         choose_gemm_row_block_for_shape_max_rows(
             rows,
             columns,
-            tuned_gemm_inner,
+            qkv_inner,
             columns * 3,
             64,
             tile_count,
@@ -1209,7 +1244,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         qkv_row_block_dimension,
         columns * 3,
         tile_count,
-        tuning.gemm_output_block_columns,
+        projection_output(tuning.qkv_output_block_columns),
     )?;
     if tuning.automatic_gemm_row_blocks
         && tuning.gemm_row_block_rows == 0
@@ -1218,7 +1253,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         qkv_row_block_dimension = choose_gemm_row_block_for_shape_max_rows(
             rows,
             columns,
-            tuned_gemm_inner,
+            qkv_inner,
             columns * 3,
             qkv_output_block_columns,
             tile_count,
@@ -1242,7 +1277,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
             columns,
             columns * 3,
             qkv_output_block_columns,
-            tuned_gemm_inner,
+            qkv_inner,
             qkv_row_block_dimension,
             tile_count,
             data_base,
@@ -1369,6 +1404,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let output_data_type = precision
         .attention_output
         .gemm_data_type(output_weight.iter().copied());
+    let attention_output_inner = projection_inner(tuning.attention_output_inner_block_columns);
     let output_row_block_dimension = if matches!(output_data_type, GemmDataType::F8F143 { .. }) {
         row_block_dimension
     } else {
@@ -1380,7 +1416,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         output_row_block_dimension,
         columns,
         tile_count,
-        tuning.gemm_output_block_columns,
+        projection_output(tuning.attention_output_block_columns),
     )?;
     let output_projection_allocation_start = schedule.allocations.len();
     let output_projection = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
@@ -1391,7 +1427,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
             columns,
             columns,
             output_projection_block_columns,
-            tuned_gemm_inner,
+            attention_output_inner,
             output_row_block_dimension,
             tile_count,
             data_base,
@@ -1500,13 +1536,14 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let mlp_down_data_type = precision
         .mlp_down
         .gemm_data_type(mlp_down_weight.iter().copied());
+    let mlp_up_inner = projection_inner(tuning.mlp_up_inner_block_columns);
     let mut mlp_up_row_block_dimension = if matches!(mlp_up_data_type, GemmDataType::F8F143 { .. })
     {
         row_block_dimension
     } else if tuning.automatic_gemm_row_blocks && tuning.gemm_row_block_rows == 0 {
         choose_gemm_row_block_for(
             rows,
-            tuned_gemm_inner,
+            mlp_up_inner,
             intermediate_columns,
             64,
             tile_count,
@@ -1522,7 +1559,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         mlp_up_row_block_dimension,
         intermediate_columns,
         tile_count,
-        tuning.gemm_output_block_columns,
+        projection_output(tuning.mlp_up_output_block_columns),
     )?;
     let mut planned_mlp_down_row_block_dimension = None;
     if tuning.automatic_gemm_row_blocks
@@ -1532,7 +1569,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         let independent_up = choose_gemm_row_block_for_shape(
             rows,
             columns,
-            tuned_gemm_inner,
+            mlp_up_inner,
             intermediate_columns,
             mlp_up_output_block_columns,
             tile_count,
@@ -1565,7 +1602,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
                 rows,
                 tile_count,
                 columns,
-                tuned_gemm_inner,
+                mlp_up_inner,
                 intermediate_columns,
                 mlp_up_output_block_columns,
                 mlp_up_data_type,
@@ -1595,7 +1632,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
             columns,
             intermediate_columns,
             mlp_up_output_block_columns,
-            tuned_gemm_inner,
+            mlp_up_inner,
             mlp_up_row_block_dimension,
             tile_count,
             data_base,
@@ -1695,7 +1732,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         mlp_down_row_block_dimension,
         columns,
         tile_count,
-        tuning.gemm_output_block_columns,
+        projection_output(tuning.mlp_down_output_block_columns),
     )?;
     let mlp_down_allocation_start = schedule.allocations.len();
     let mlp_down = append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(

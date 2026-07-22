@@ -108,15 +108,24 @@ ipu_stack_reblock_f16_a16_to_a16:
 	.type ipu_stack_reblock_f16_c16_to_a16,@function
 ipu_stack_reblock_f16_c16_to_a16:
 	.supervisor
+	add $m11, $m11, -8
 	REBLOCK_SETUP
 .Lc16_row:
 	REBLOCK_ROW_POINTERS .Lc16_done
+	st32 $m4, $m11, $m15, 0
+	zero $m4
+.Lc16_panel:
+	shr $m6, $m7, 16
+	cmpult $m6, $m4, $m6
+	brz $m6, .Lc16_row_done
 	COPY_C16_PANEL
-	COPY_C16_PANEL
-	COPY_C16_PANEL
-	COPY_C16_PANEL
+	add $m4, $m4, 1
+	bri .Lc16_panel
+.Lc16_row_done:
+	ld32 $m4, $m11, $m15, 0
 	add $m4, $m4, 1
 	bri .Lc16_row
 .Lc16_done:
+	add $m11, $m11, 8
 	br $m10
 	.size ipu_stack_reblock_f16_c16_to_a16, .-ipu_stack_reblock_f16_c16_to_a16

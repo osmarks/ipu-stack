@@ -204,11 +204,40 @@ fn main() {
             0,
         ))
         .expect("row-sharded GEMM inner block columns exceed u16"),
+        qkv_inner_block_columns: u16::try_from(env_u32("IPU_SIGLIP_QKV_INNER_BLOCK_COLUMNS", 0))
+            .expect("QKV inner block columns exceed u16"),
+        attention_output_inner_block_columns: u16::try_from(env_u32(
+            "IPU_SIGLIP_ATTENTION_OUTPUT_INNER_BLOCK_COLUMNS",
+            0,
+        ))
+        .expect("attention-output inner block columns exceed u16"),
+        mlp_up_inner_block_columns: u16::try_from(env_u32(
+            "IPU_SIGLIP_MLP_UP_INNER_BLOCK_COLUMNS",
+            0,
+        ))
+        .expect("MLP-up inner block columns exceed u16"),
         gemm_output_block_columns: u16::try_from(env_u32(
             "IPU_SIGLIP_GEMM_OUTPUT_BLOCK_COLUMNS",
             0,
         ))
         .expect("GEMM output block columns exceed u16"),
+        qkv_output_block_columns: u16::try_from(env_u32("IPU_SIGLIP_QKV_OUTPUT_BLOCK_COLUMNS", 0))
+            .expect("QKV output block columns exceed u16"),
+        attention_output_block_columns: u16::try_from(env_u32(
+            "IPU_SIGLIP_ATTENTION_OUTPUT_BLOCK_COLUMNS",
+            0,
+        ))
+        .expect("attention-output block columns exceed u16"),
+        mlp_up_output_block_columns: u16::try_from(env_u32(
+            "IPU_SIGLIP_MLP_UP_OUTPUT_BLOCK_COLUMNS",
+            0,
+        ))
+        .expect("MLP-up output block columns exceed u16"),
+        mlp_down_output_block_columns: u16::try_from(env_u32(
+            "IPU_SIGLIP_MLP_DOWN_OUTPUT_BLOCK_COLUMNS",
+            0,
+        ))
+        .expect("MLP-down output block columns exceed u16"),
         attention_query_block_rows: u16::try_from(env_u32(
             "IPU_SIGLIP_ATTENTION_QUERY_BLOCK_ROWS",
             0,

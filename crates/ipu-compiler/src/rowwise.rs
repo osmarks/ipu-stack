@@ -725,12 +725,13 @@ pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
             while let Some(&(block, source_row_start, destination_row_start, copy_rows)) =
                 fragments.get(cursors[group_index])
             {
-                let panel_count = block.columns / 16;
-                if panel_count != 4 {
+                if block.columns == 0 || !block.columns.is_multiple_of(16) {
                     return Err(CompileError::Graph(
-                        "C16 reblocking requires four 16-column panels per block".into(),
+                        "C16 reblocking requires source blocks divisible into 16-column panels"
+                            .into(),
                     ));
                 }
+                let panel_count = block.columns / 16;
                 let panel_stride = u32::from(block.rows) * 32;
                 let source_bytes =
                     u32::from(panel_count - 1) * panel_stride + u32::from(copy_rows) * 32;
@@ -796,7 +797,7 @@ pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
                     arguments: vec![
                         crate::pack_reblock_row_pair(block.rows, *destination_rows)?,
                         crate::pack_reblock_row_pair(0, destination_row_start)?,
-                        u32::from(copy_rows),
+                        u32::from(copy_rows) | (u32::from(panel_count) << 16),
                     ],
                     specialization: SpecializationKey {
                         operation: "reblock_f16_c16_to_a16".into(),
