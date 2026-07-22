@@ -574,6 +574,226 @@ fn append_c16_to_a16_row_shards_impl(
     Ok(destinations)
 }
 
+pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
+    schedule: &mut Schedule,
+    source: &[BlockPlacement],
+    columns: u16,
+    row_block_dimension: u16,
+    arenas: &[MemoryArena],
+) -> Result<Vec<RowShardPlacement>, CompileError> {
+    if source.is_empty()
+        || columns == 0
+        || !columns.is_multiple_of(64)
+        || row_block_dimension == 0
+        || arenas.is_empty()
+        || arenas
+            .iter()
+            .any(|arena| arena.base & 7 != 0 || arena.base >= arena.limit)
+    {
+        return Err(CompileError::Graph(
+            "C16 row reblocking requires 64-column blocks, a row block size, and aligned SRAM"
+                .into(),
+        ));
+    }
+    let rows = source
+        .iter()
+        .map(|block| block.row_start + block.rows)
+        .max()
+        .unwrap();
+    let row_grid = rows.div_ceil(row_block_dimension);
+    let base_rows = rows / row_grid;
+    let larger_shards = rows % row_grid;
+    let phase = schedule.phases.len();
+    let first_compute_phase = phase + 1;
+    let data_base = arenas.iter().map(|arena| arena.base).min().unwrap();
+    let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
+    let mut occupied = occupied_intervals_by_tile(
+        &schedule.allocations,
+        schedule.tile_count,
+        first_compute_phase,
+        usize::MAX,
+        data_base,
+        data_limit,
+    );
+    let mut next_tensor = schedule
+        .allocations
+        .iter()
+        .map(|allocation| allocation.tensor.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let mut destinations = Vec::with_capacity(usize::from(row_grid));
+    let mut groups = Vec::with_capacity(usize::from(row_grid));
+    let mut row_start = 0u16;
+    for index in 0..row_grid {
+        let destination_rows = base_rows + u16::from(index < larger_shards);
+        let destination_tile = index;
+        if destination_tile >= schedule.tile_count {
+            return Err(CompileError::Graph(
+                "C16 row reblocking needs more destination tiles".into(),
+            ));
+        }
+        let bytes = u32::from(destination_rows) * u32::from(columns) * 2;
+        let address = allocate_from_occupied_arenas(
+            &mut occupied[usize::from(destination_tile)],
+            bytes,
+            arenas,
+            8,
+            MemoryPlacement::Low,
+        )?;
+        let tensor = TensorId(next_tensor);
+        next_tensor += 1;
+        schedule.allocations.push(Allocation {
+            tensor,
+            tile: destination_tile,
+            address,
+            size: bytes,
+            live_from: first_compute_phase,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        });
+        destinations.push(RowShardPlacement {
+            tile: destination_tile,
+            row_start,
+            rows: destination_rows,
+            columns,
+            tensor,
+            address,
+        });
+        let row_end = row_start + destination_rows;
+        let mut fragments = source
+            .iter()
+            .filter_map(|block| {
+                let overlap_start = row_start.max(block.row_start);
+                let overlap_end = row_end.min(block.row_start + block.rows);
+                (overlap_start < overlap_end).then_some((
+                    block,
+                    overlap_start - block.row_start,
+                    overlap_start - row_start,
+                    overlap_end - overlap_start,
+                ))
+            })
+            .collect::<Vec<_>>();
+        fragments.sort_unstable_by_key(|(block, source_row, _, _)| {
+            (block.column_start, block.row_start + *source_row)
+        });
+        let covered = fragments
+            .iter()
+            .map(|(block, _, _, copy_rows)| u32::from(*copy_rows) * u32::from(block.columns))
+            .sum::<u32>();
+        if covered != u32::from(destination_rows) * u32::from(columns) {
+            return Err(CompileError::Graph(format!(
+                "C16 row shard {row_start}..{row_end} has incomplete source coverage"
+            )));
+        }
+        groups.push((destination_tile, address, destination_rows, fragments));
+        row_start = row_end;
+    }
+
+    let mut cursors = vec![0usize; groups.len()];
+    while cursors
+        .iter()
+        .zip(&groups)
+        .any(|(&cursor, group)| cursor < group.3.len())
+    {
+        let exchange_phase = schedule.phases.len();
+        let compute_phase = exchange_phase + 1;
+        let mut transfers = Vec::new();
+        let mut commands = Vec::new();
+        for (group_index, (tile, address, destination_rows, fragments)) in groups.iter().enumerate()
+        {
+            let mut staging_cursor = ipu_exchange::EXCHANGE_WINDOW_BASE;
+            while let Some(&(block, source_row_start, destination_row_start, copy_rows)) =
+                fragments.get(cursors[group_index])
+            {
+                let source_bytes = u32::from(block.rows) * u32::from(block.columns) * 2;
+                if block.tile != *tile && source_bytes > ipu_exchange::EXCHANGE_WINDOW_BYTES {
+                    return Err(CompileError::Graph(format!(
+                        "C16 reblocking source block at row {}, column {} needs {} exchange bytes, exceeding the {}-byte window",
+                        block.row_start,
+                        block.column_start,
+                        source_bytes,
+                        ipu_exchange::EXCHANGE_WINDOW_BYTES,
+                    )));
+                }
+                if block.tile != *tile
+                    && staging_cursor + source_bytes
+                        > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES
+                {
+                    break;
+                }
+                if block.tile != *tile {
+                    transfers.push(Transfer {
+                        source_tile: block.tile,
+                        destination_tile: *tile,
+                        tensor: block.tensor,
+                        bytes: source_bytes,
+                    });
+                    schedule.allocations.push(Allocation {
+                        tensor: block.tensor,
+                        tile: *tile,
+                        address: staging_cursor,
+                        size: source_bytes,
+                        live_from: exchange_phase,
+                        live_until: compute_phase,
+                        kind: AllocationKind::ExchangeStaging {
+                            phase: exchange_phase,
+                        },
+                    });
+                    staging_cursor = crate::align_u32(staging_cursor + source_bytes, 32);
+                }
+                let output_alias = TensorId(next_tensor);
+                next_tensor += 1;
+                let output_address =
+                    *address + u32::from(block.column_start) * u32::from(*destination_rows) * 2;
+                schedule.allocations.push(Allocation {
+                    tensor: output_alias,
+                    tile: *tile,
+                    address: output_address,
+                    size: u32::from(*destination_rows) * u32::from(block.columns) * 2,
+                    live_from: compute_phase,
+                    live_until: compute_phase,
+                    kind: AllocationKind::Home,
+                });
+                commands.push(KernelCommand {
+                    tile: *tile,
+                    output: output_alias,
+                    inputs: vec![block.tensor, block.tensor],
+                    arguments: vec![
+                        crate::pack_reblock_row_pair(block.rows, *destination_rows)?,
+                        crate::pack_reblock_row_pair(source_row_start, destination_row_start)?,
+                        u32::from(copy_rows),
+                    ],
+                    specialization: SpecializationKey {
+                        operation: "reblock_f16_c16_to_a16".into(),
+                        shape: vec![
+                            usize::from(block.rows),
+                            usize::from(*destination_rows),
+                            usize::from(copy_rows),
+                        ],
+                        worker_count: 6,
+                        role: "C16 to A16 row reblocking".into(),
+                        alignment: 8,
+                    },
+                    metadata: BTreeMap::from([
+                        ("label".into(), "reblock GEMM output rows".into()),
+                        ("row_start".into(), block.row_start.to_string()),
+                        ("column_start".into(), block.column_start.to_string()),
+                        ("copy_rows".into(), copy_rows.to_string()),
+                    ]),
+                });
+                cursors[group_index] += 1;
+            }
+        }
+        schedule.phases.push(Phase::Exchange { transfers });
+        schedule.phases.push(Phase::Compute {
+            op: OpId(compute_phase),
+            commands,
+        });
+    }
+    Ok(destinations)
+}
+
 pub fn plan_affine_layer_norm_f16(
     config: AffineLayerNormConfig,
 ) -> Result<AffineLayerNormPlan, CompileError> {
@@ -1032,6 +1252,72 @@ mod tests {
             &schedule.phases[0],
             Phase::Compute { commands, .. } if commands.len() == source.len()
         ));
+    }
+
+    #[test]
+    fn c16_outputs_reblock_to_complete_balanced_row_shards() {
+        let mut source = Vec::new();
+        let mut allocations = Vec::new();
+        for block_row in 0..2u16 {
+            for block_column in 0..2u16 {
+                let tensor = TensorId(usize::from(block_row * 2 + block_column));
+                let block = BlockPlacement {
+                    tensor,
+                    tile: block_row * 2 + block_column,
+                    address: 0xa0000,
+                    block_row,
+                    block_column,
+                    row_start: block_row * 13,
+                    rows: 13,
+                    column_start: block_column * 64,
+                    columns: 64,
+                };
+                allocations.push(Allocation {
+                    tensor,
+                    tile: block.tile,
+                    address: block.address,
+                    size: u32::from(block.rows) * u32::from(block.columns) * 2,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                });
+                source.push(block);
+            }
+        }
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations,
+            tile_count: 8,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let output = append_c16_to_a16_row_shards_reblocked_in_arenas(
+            &mut schedule,
+            &source,
+            128,
+            20,
+            &[MemoryArena {
+                base: 0xb0000,
+                limit: 0xe8000,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(output.iter().map(|shard| shard.rows).sum::<u16>(), 26);
+        assert!(output.iter().all(|shard| shard.columns == 128));
+        assert!(schedule.phases.iter().any(|phase| matches!(
+            phase,
+            Phase::Compute { commands, .. }
+                if commands.iter().any(|command| {
+                    command.specialization.operation == "reblock_f16_c16_to_a16"
+                        && command.arguments.len() == 3
+                })
+        )));
+        schedule.validate_allocations().unwrap();
+        schedule
+            .lower_tile_programs(&ipu_exchange::Topology::c600())
+            .unwrap();
     }
 
     #[test]

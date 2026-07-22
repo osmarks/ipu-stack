@@ -198,6 +198,7 @@ fn relocate_appended_attention(
             "attention relocation requires an SRAM arena".into(),
         ));
     }
+    let data_base = arenas.iter().map(|arena| arena.base).min().unwrap();
     let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
     let live_from = parent.phases.len();
     let mut occupied = occupied_intervals_by_tile(
@@ -205,7 +206,7 @@ fn relocate_appended_attention(
         parent.tile_count,
         live_from,
         usize::MAX,
-        ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+        data_base,
         data_limit,
     );
     let mut score_arenas = vec![MemoryArena {
@@ -1623,6 +1624,66 @@ mod tests {
         schedule
             .lower_tile_programs(&ipu_exchange::Topology::c600())
             .unwrap();
+    }
+
+    #[test]
+    fn attention_relocation_respects_live_allocations_in_every_arena() {
+        let shard = RowShardPlacement {
+            tile: 0,
+            row_start: 0,
+            rows: 8,
+            columns: 64,
+            tensor: TensorId(0),
+            address: 0x6c000,
+        };
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![Allocation {
+                tensor: shard.tensor,
+                tile: shard.tile,
+                address: shard.address,
+                size: u32::from(shard.rows) * u32::from(shard.columns) * 2,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            }],
+            tile_count: 16,
+            peak_sram: BTreeMap::new(),
+        };
+        let arenas = [
+            MemoryArena {
+                base: 0x6c000,
+                limit: 0x80000,
+            },
+            MemoryArena {
+                base: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+                limit: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+            },
+        ];
+
+        append_flash_attention_from_a16_qkv_in_arenas(
+            &mut schedule,
+            &[shard],
+            &[shard],
+            &[shard],
+            FlashAttentionConfig {
+                batch_size: 1,
+                query_sequence_length: 0,
+                sequence_length: shard.rows,
+                hidden_size: shard.columns,
+                attention_heads: 1,
+                query_block_rows: shard.rows,
+                key_block_rows: shard.rows,
+                tile_count: 16,
+                data_base: arenas[0].base,
+                data_limit: arenas[1].limit,
+            },
+            &arenas,
+        )
+        .unwrap();
+
+        schedule.validate_allocations().unwrap();
     }
 
     #[test]

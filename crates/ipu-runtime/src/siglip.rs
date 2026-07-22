@@ -12,6 +12,7 @@ use ipu_compiler::{
     append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
     append_blocked_gemm_f16_with_a16_input_with_memory_policy,
     append_c16_to_a16_blocks_gelu_f16_in_arenas, append_c16_to_a16_row_shards,
+    append_c16_to_a16_row_shards_reblocked_in_arenas,
     append_flash_attention_from_a16_qkv_in_arenas,
     append_flash_attention_to_a16_row_shards_in_arenas, end_tensor_lifetimes,
     make_tensors_resident, make_tensors_resident_since, occupied_intervals_by_tile,
@@ -272,6 +273,8 @@ pub struct SiglipEncoderPrecision {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SiglipEncoderTuning {
+    /// Zero keeps GEMM row blocks equal to the persistent activation layout.
+    pub gemm_row_block_rows: u16,
     /// Zero asks the attention planner to choose the K/V block size.
     pub attention_key_block_rows: u16,
 }
@@ -854,6 +857,11 @@ pub fn append_siglip_encoder_layer_with_precision(
     let span = info_span!("siglip_encoder_layer", layer);
     let _guard = span.enter();
     let config = &model.config;
+    let tuned_gemm_rows = if tuning.gemm_row_block_rows == 0 {
+        row_block_dimension
+    } else {
+        tuning.gemm_row_block_rows
+    };
     let prefix = format!("encoder_layer_{layer:02}");
     let layer_phase_start = schedule.phases.len();
     info!(stage = "norm1_qkv", "planning SigLIP encoder stage");
@@ -894,6 +902,11 @@ pub fn append_siglip_encoder_layer_with_precision(
             .iter()
             .flat_map(|weights| weights.iter().copied()),
     );
+    let qkv_row_block_dimension = if matches!(qkv_data_type, GemmDataType::F8F143 { .. }) {
+        row_block_dimension
+    } else {
+        tuned_gemm_rows
+    };
     let qkv_phase_start = schedule.phases.len();
     let qkv_allocation_start = schedule.allocations.len();
     let qkv = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
@@ -903,7 +916,7 @@ pub fn append_siglip_encoder_layer_with_precision(
             rows,
             columns,
             columns * 3,
-            row_block_dimension,
+            qkv_row_block_dimension,
             tile_count,
             data_base,
             data_limit,
@@ -966,15 +979,26 @@ pub fn append_siglip_encoder_layer_with_precision(
     )?;
     let qkv_shards = (0..3)
         .map(|projection| {
-            append_c16_to_a16_row_shards(
-                schedule,
-                &projection_blocks(&qkv.output, projection, columns),
-                RowShardTransitionConfig {
+            let blocks = projection_blocks(&qkv.output, projection, columns);
+            if qkv_row_block_dimension == row_block_dimension {
+                append_c16_to_a16_row_shards(
+                    schedule,
+                    &blocks,
+                    RowShardTransitionConfig {
+                        columns,
+                        data_base,
+                        data_limit,
+                    },
+                )
+            } else {
+                append_c16_to_a16_row_shards_reblocked_in_arenas(
+                    schedule,
+                    &blocks,
                     columns,
-                    data_base,
-                    data_limit,
-                },
-            )
+                    row_block_dimension,
+                    &memory.transient,
+                )
+            }
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     end_tensor_lifetimes(schedule, qkv.output.iter().map(|block| block.tensor))?;
@@ -1018,6 +1042,11 @@ pub fn append_siglip_encoder_layer_with_precision(
     let output_data_type = precision
         .attention_output
         .gemm_data_type(output_weight.iter().copied());
+    let output_row_block_dimension = if matches!(output_data_type, GemmDataType::F8F143 { .. }) {
+        row_block_dimension
+    } else {
+        tuned_gemm_rows
+    };
     let output_projection_phase_start = schedule.phases.len();
     let output_projection_allocation_start = schedule.allocations.len();
     let output_projection = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
@@ -1027,7 +1056,7 @@ pub fn append_siglip_encoder_layer_with_precision(
             rows,
             columns,
             columns,
-            row_block_dimension,
+            output_row_block_dimension,
             tile_count,
             data_base,
             data_limit,
@@ -1077,15 +1106,25 @@ pub fn append_siglip_encoder_layer_with_precision(
         output_adjustment_allocation_start,
         output_adjustment.iter().map(|block| block.tensor),
     )?;
-    let projected_shards = append_c16_to_a16_row_shards(
-        schedule,
-        &output_projection.output,
-        RowShardTransitionConfig {
+    let projected_shards = if output_row_block_dimension == row_block_dimension {
+        append_c16_to_a16_row_shards(
+            schedule,
+            &output_projection.output,
+            RowShardTransitionConfig {
+                columns,
+                data_base,
+                data_limit,
+            },
+        )?
+    } else {
+        append_c16_to_a16_row_shards_reblocked_in_arenas(
+            schedule,
+            &output_projection.output,
             columns,
-            data_base,
-            data_limit,
-        },
-    )?;
+            row_block_dimension,
+            &memory.transient,
+        )?
+    };
     end_tensor_lifetimes(
         schedule,
         output_projection.output.iter().map(|block| block.tensor),
@@ -1122,6 +1161,11 @@ pub fn append_siglip_encoder_layer_with_precision(
     let mlp_up_data_type = precision
         .mlp_up
         .gemm_data_type(mlp_up_weight.iter().copied());
+    let mlp_row_block_dimension = if matches!(mlp_up_data_type, GemmDataType::F8F143 { .. }) {
+        row_block_dimension
+    } else {
+        tuned_gemm_rows
+    };
     let mlp_up_phase_start = schedule.phases.len();
     let mlp_up_allocation_start = schedule.allocations.len();
     let mlp_up = append_blocked_gemm_f16_with_a16_input_with_memory_policy(
@@ -1131,7 +1175,7 @@ pub fn append_siglip_encoder_layer_with_precision(
             rows,
             columns,
             intermediate_columns,
-            row_block_dimension,
+            mlp_row_block_dimension,
             tile_count,
             data_base,
             data_limit,
@@ -1205,7 +1249,7 @@ pub fn append_siglip_encoder_layer_with_precision(
             rows,
             intermediate_columns,
             columns,
-            row_block_dimension,
+            mlp_row_block_dimension,
             tile_count,
             data_base,
             data_limit,
@@ -1263,15 +1307,25 @@ pub fn append_siglip_encoder_layer_with_precision(
         mlp_down_adjustment_allocation_start,
         mlp_down_adjustment.iter().map(|block| block.tensor),
     )?;
-    let output = append_c16_to_a16_row_shards(
-        schedule,
-        &mlp_down.output,
-        RowShardTransitionConfig {
+    let output = if mlp_row_block_dimension == row_block_dimension {
+        append_c16_to_a16_row_shards(
+            schedule,
+            &mlp_down.output,
+            RowShardTransitionConfig {
+                columns,
+                data_base,
+                data_limit,
+            },
+        )?
+    } else {
+        append_c16_to_a16_row_shards_reblocked_in_arenas(
+            schedule,
+            &mlp_down.output,
             columns,
-            data_base,
-            data_limit,
-        },
-    )?;
+            row_block_dimension,
+            &memory.transient,
+        )?
+    };
     end_tensor_lifetimes(schedule, mlp_down.output.iter().map(|block| block.tensor))?;
     let output = append_add_f16_row_shards_in_place(schedule, &output, &attention_residual)?;
     end_tensor_lifetimes(

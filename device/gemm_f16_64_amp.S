@@ -247,10 +247,15 @@
 	.size \name, .-\name
 	.endm
 
+#ifdef GEMM_SINGLE_ROWS
+	GEMM_SUPERVISOR GEMM_INIT_SMALL_SYMBOL, 1, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small
+	GEMM_SUPERVISOR GEMM_ACCUMULATE_SMALL_SYMBOL, 0, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small
+#else
 	GEMM_SUPERVISOR GEMM_INIT_SMALL_SYMBOL, 1, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small
 	GEMM_SUPERVISOR GEMM_INIT_LARGE_SYMBOL, 1, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large
 	GEMM_SUPERVISOR GEMM_ACCUMULATE_SMALL_SYMBOL, 0, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small
 	GEMM_SUPERVISOR GEMM_ACCUMULATE_LARGE_SYMBOL, 0, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large
+#endif
 
 	.worker
 	.macro GEMM_WORKER name, rows
@@ -404,4 +409,6 @@
 	.endm
 
 	GEMM_WORKER .Lgemm_f16_amp_worker_small, GEMM_SMALL_ROWS
+#ifndef GEMM_SINGLE_ROWS
 	GEMM_WORKER .Lgemm_f16_amp_worker_large, GEMM_LARGE_ROWS
+#endif

@@ -20,7 +20,7 @@ use ipu_runtime::{
     package_graph_repeated_with_templates, package_graph_repeated_with_templates_profiled_regions,
     package_graph_repeated_with_templates_profiled_with, run_host_with_options,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use tracing::info;
@@ -185,6 +185,8 @@ fn main() {
     .unwrap();
     assert!(resident_f16_layers <= layer_count);
     let tuning = SiglipEncoderTuning {
+        gemm_row_block_rows: u16::try_from(env_u32("IPU_SIGLIP_GEMM_ROW_BLOCK_ROWS", 0))
+            .expect("GEMM row block rows exceed u16"),
         attention_key_block_rows: u16::try_from(env_u32("IPU_SIGLIP_ATTENTION_KEY_BLOCK_ROWS", 0))
             .expect("attention key block rows exceed u16"),
     };
@@ -243,6 +245,7 @@ fn main() {
         current = appended.output.clone();
         last_layer = Some(appended);
         let phase_range = phase_start..plan.schedule.phases.len();
+        specialize_gemm_row_operations(&mut plan.schedule, phase_range.clone());
         if !retain_profile_metadata {
             plan.schedule.discard_profile_metadata(phase_range.clone());
         }
@@ -337,7 +340,9 @@ fn main() {
             phases: profiled_end..plan.schedule.phases.len(),
         });
     }
-    let objects = compile_objects(&plan, &attentions, attention_variant).unwrap();
+    let phase_count = plan.schedule.phases.len();
+    specialize_gemm_row_operations(&mut plan.schedule, 0..phase_count);
+    let objects = compile_objects(&plan.schedule, &attentions, attention_variant).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
         bytes: host_input,
@@ -635,20 +640,6 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         GemmDataType::F16,
     )
     .unwrap();
-    let compilation_plan = plan_blocked_gemm(BlockedGemmConfig {
-        rows,
-        inner_dimension: columns,
-        columns,
-        block_dimension: BLOCK_DIMENSION,
-        inner_block_dimension: INNER_BLOCK_DIMENSION,
-        row_block_dimension,
-        tile_count: TILE_COUNT,
-        data_base: DATA_BASE,
-        data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-        data_type: GemmDataType::F16,
-        retain_profile_metadata: true,
-    })
-    .unwrap();
     let mut schedule = ipu_compiler::Schedule {
         layouts: Vec::new(),
         phases: Vec::new(),
@@ -721,7 +712,9 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
     };
     let attention_variant =
         consolidate_attention_kernel_variants(&mut schedule, std::slice::from_ref(&attention));
-    let objects = compile_objects(&compilation_plan, &[attention], attention_variant).unwrap();
+    let phase_count = schedule.phases.len();
+    specialize_gemm_row_operations(&mut schedule, 0..phase_count);
+    let objects = compile_objects(&schedule, &[attention], attention_variant).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
         bytes: host_input,
@@ -943,7 +936,7 @@ fn append_adjustment_phase(
 }
 
 fn compile_objects(
-    plan: &ipu_compiler::BlockedGemmPlan,
+    schedule: &ipu_compiler::Schedule,
     attentions: &[FlashAttentionPlan],
     attention_variant: ipu_runtime::AttentionKernelVariant,
 ) -> ipu_runtime::Result<Vec<Vec<u8>>> {
@@ -954,22 +947,10 @@ fn compile_objects(
             .join("../../device")
             .join(name)
     };
-    let minimum_rows = plan.left.iter().map(|block| block.rows).min().unwrap();
-    let maximum_rows = plan.left.iter().map(|block| block.rows).max().unwrap();
     let toolchain = Toolchain::from_sdk(sdk);
     let runtime = toolchain.compile(source("static_runtime.S"), &artifacts, "runtime", &[])?;
-    let gemm = toolchain.compile(
-        source("gemm_f16_64_amp.S"),
-        &artifacts,
-        "patch-gemm",
-        &[
-            format!("-DGEMM_INNER_BLOCK_DIMENSION={INNER_BLOCK_DIMENSION}"),
-            format!("-DGEMM_OUTPUT_COLUMNS={BLOCK_DIMENSION}"),
-            format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
-            format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
-        ],
-    )?;
-    let uses_fp8_weights = plan.schedule.phases.iter().any(|phase| {
+    let gemm_variants = compile_gemm_row_variants(&toolchain, &artifacts, schedule)?;
+    let uses_fp8_weights = schedule.phases.iter().any(|phase| {
         matches!(phase, Phase::Compute { commands, .. } if commands.iter().any(|command| {
             command.specialization.operation == "expand_f8_f143_to_f16"
         }))
@@ -977,22 +958,6 @@ fn compile_objects(
     let fp8_expander = uses_fp8_weights
         .then(|| {
             Ok::<_, ipu_elf::ElfError>((
-                toolchain.compile(
-                    source("gemm_f16_64_amp.S"),
-                    &artifacts,
-                    "expanded-f8-gemm",
-                    &[
-                        format!("-DGEMM_INNER_BLOCK_DIMENSION={INNER_BLOCK_DIMENSION}"),
-                        format!("-DGEMM_OUTPUT_COLUMNS={BLOCK_DIMENSION}"),
-                        format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
-                        format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
-                        "-DGEMM_INTERLEAVED_WEIGHTS=1".into(),
-                        "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_gemm_f16_f8w_init_small_rows".into(),
-                        "-DGEMM_INIT_LARGE_SYMBOL=ipu_stack_gemm_f16_f8w_init_large_rows".into(),
-                        "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_gemm_f16_f8w_accumulate_small_rows".into(),
-                        "-DGEMM_ACCUMULATE_LARGE_SYMBOL=ipu_stack_gemm_f16_f8w_accumulate_large_rows".into(),
-                    ],
-                )?,
                 toolchain.compile(
                     source("expand_f8_f143_to_f16.cpp"),
                     &artifacts,
@@ -1008,7 +973,7 @@ fn compile_objects(
             ))
         })
         .transpose()?;
-    let uses_native_fp8 = plan.schedule.phases.iter().any(|phase| {
+    let uses_native_fp8 = schedule.phases.iter().any(|phase| {
         matches!(phase, Phase::Compute { commands, .. } if commands.iter().any(|command| {
             command.specialization.operation.starts_with("gemm_f8_")
         }))
@@ -1016,24 +981,6 @@ fn compile_objects(
     let native_fp8 = uses_native_fp8
         .then(|| {
             Ok::<_, ipu_elf::ElfError>((
-                toolchain.compile(
-                    source("gemm_f16_64_amp.S"),
-                    &artifacts,
-                    "native-f8-gemm",
-                    &[
-                        format!("-DGEMM_INNER_BLOCK_DIMENSION={INNER_BLOCK_DIMENSION}"),
-                        format!("-DGEMM_OUTPUT_COLUMNS={BLOCK_DIMENSION}"),
-                        format!("-DGEMM_SMALL_ROWS={minimum_rows}"),
-                        format!("-DGEMM_LARGE_ROWS={maximum_rows}"),
-                        "-DGEMM_NATIVE_FP8=1".into(),
-                        "-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_gemm_f8_init_small_rows".into(),
-                        "-DGEMM_INIT_LARGE_SYMBOL=ipu_stack_gemm_f8_init_large_rows".into(),
-                        "-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_gemm_f8_accumulate_small_rows"
-                            .into(),
-                        "-DGEMM_ACCUMULATE_LARGE_SYMBOL=ipu_stack_gemm_f8_accumulate_large_rows"
-                            .into(),
-                    ],
-                )?,
                 toolchain.compile(
                     source("quantize_a16_to_a32_f143.cpp"),
                     &artifacts,
@@ -1052,6 +999,7 @@ fn compile_objects(
     let add = toolchain.compile(source("add_f16.S"), &artifacts, "add-f16", &[])?;
     let add_bias = toolchain.compile(source("add_bias_f16.S"), &artifacts, "add-bias-f16", &[])?;
     let relayout = toolchain.compile(source("relayout_f16.S"), &artifacts, "relayout-f16", &[])?;
+    let reblock = toolchain.compile(source("reblock_f16.S"), &artifacts, "reblock-f16", &[])?;
     let gelu_relayout = toolchain.compile(
         source("gelu_relayout_f16.S"),
         &artifacts,
@@ -1124,10 +1072,10 @@ fn compile_objects(
     )?;
     let mut objects = vec![
         fs::read(runtime.object)?,
-        fs::read(gemm.object)?,
         fs::read(add.object)?,
         fs::read(add_bias.object)?,
         fs::read(relayout.object)?,
+        fs::read(reblock.object)?,
         fs::read(gelu_relayout.object)?,
         fs::read(norm_codelet.object)?,
         fs::read(norm_wrapper.object)?,
@@ -1137,20 +1085,104 @@ fn compile_objects(
         fs::read(unpack_wrapper.object)?,
         fs::read(worker_support.object)?,
     ];
+    for object in gemm_variants {
+        objects.push(fs::read(object.object)?);
+    }
     for object in attention_objects {
         objects.push(fs::read(object.object)?);
     }
-    if let Some((gemm, codelet, wrapper)) = fp8_expander {
-        objects.push(fs::read(gemm.object)?);
+    if let Some((codelet, wrapper)) = fp8_expander {
         objects.push(fs::read(codelet.object)?);
         objects.push(fs::read(wrapper.object)?);
     }
-    if let Some((gemm, codelet, wrapper)) = native_fp8 {
-        objects.push(fs::read(gemm.object)?);
+    if let Some((codelet, wrapper)) = native_fp8 {
         objects.push(fs::read(codelet.object)?);
         objects.push(fs::read(wrapper.object)?);
     }
     Ok(objects)
+}
+
+fn specialize_gemm_row_operations(
+    schedule: &mut ipu_compiler::Schedule,
+    phases: std::ops::Range<usize>,
+) {
+    for phase in &mut schedule.phases[phases] {
+        let Phase::Compute { commands, .. } = phase else {
+            continue;
+        };
+        for command in commands {
+            let operation = command.specialization.operation.as_ref();
+            let Some(base) = operation
+                .strip_suffix("_small_rows")
+                .or_else(|| operation.strip_suffix("_large_rows"))
+            else {
+                continue;
+            };
+            if !base.starts_with("gemm_") {
+                continue;
+            }
+            let rows = command
+                .specialization
+                .shape
+                .first()
+                .copied()
+                .expect("GEMM row specialization requires its block shape");
+            command.specialization.operation = format!("{base}_rows_{rows}").into();
+        }
+    }
+}
+
+fn compile_gemm_row_variants(
+    toolchain: &Toolchain,
+    artifacts: &std::path::Path,
+    schedule: &ipu_compiler::Schedule,
+) -> Result<Vec<KernelArtifact>, ipu_elf::ElfError> {
+    let mut variants = BTreeSet::<(String, u16)>::new();
+    for phase in &schedule.phases {
+        let Phase::Compute { commands, .. } = phase else {
+            continue;
+        };
+        for command in commands {
+            let operation = command.specialization.operation.as_ref();
+            let Some((base, rows)) = operation.rsplit_once("_rows_") else {
+                continue;
+            };
+            let family = if base.starts_with("gemm_f16_f8w_") {
+                "gemm_f16_f8w"
+            } else if base.starts_with("gemm_f16_") {
+                "gemm_f16"
+            } else if base.starts_with("gemm_f8_") {
+                "gemm_f8"
+            } else {
+                continue;
+            };
+            let rows = rows.parse::<u16>().map_err(|_| {
+                ipu_elf::ElfError::Link(format!("invalid GEMM row operation {operation}"))
+            })?;
+            variants.insert((family.into(), rows));
+        }
+    }
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/gemm_f16_64_amp.S");
+    variants
+        .into_iter()
+        .map(|(family, rows)| {
+            let mut flags = vec![
+                format!("-DGEMM_INNER_BLOCK_DIMENSION={INNER_BLOCK_DIMENSION}"),
+                format!("-DGEMM_OUTPUT_COLUMNS={BLOCK_DIMENSION}"),
+                format!("-DGEMM_SMALL_ROWS={rows}"),
+                "-DGEMM_SINGLE_ROWS=1".into(),
+                format!("-DGEMM_INIT_SMALL_SYMBOL=ipu_stack_{family}_init_rows_{rows}"),
+                format!("-DGEMM_ACCUMULATE_SMALL_SYMBOL=ipu_stack_{family}_accumulate_rows_{rows}"),
+            ];
+            match family.as_str() {
+                "gemm_f16" => {}
+                "gemm_f16_f8w" => flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into()),
+                "gemm_f8" => flags.push("-DGEMM_NATIVE_FP8=1".into()),
+                _ => unreachable!(),
+            }
+            toolchain.compile(&source, artifacts, &format!("{family}-rows-{rows}"), &flags)
+        })
+        .collect()
 }
 
 fn compile_attention_variant(
