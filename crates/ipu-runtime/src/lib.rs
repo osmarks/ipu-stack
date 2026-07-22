@@ -2810,10 +2810,12 @@ fn package_graph_impl_attempt(
             let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
             let reservations = desired
                 .iter()
-                .map(|ranges| {
+                .enumerate()
+                .map(|(tile, ranges)| {
                     ranges
                         .iter()
                         .map(|&(start, end)| (align_down(start, element), align_up(end, element)))
+                        .chain(std::iter::once((PLAN_BASE, tile_exchange_plans[tile].end)))
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
@@ -3197,6 +3199,7 @@ fn package_graph_impl_attempt(
                 .copied()
                 .chain(executable_reserved)
                 .chain(host_runtime_ranges[tile_index].iter().copied())
+                .chain(std::iter::once((PLAN_BASE, runtime_end)))
                 .collect::<Vec<_>>(),
         );
         if tile == 0 {
@@ -5287,6 +5290,91 @@ mod tests {
         assert_eq!(graph.schedule.allocations[1].address, relocated + 16);
         assert_eq!(graph.initial_buffers[0].address, relocated + 4);
         assert_eq!(graph.host_inputs[0].slices[0].tile_address, relocated + 8);
+    }
+
+    #[test]
+    fn global_repacking_places_residents_before_lifetime_overlapped_transients() {
+        let topology = Topology::c600();
+        let arena = 0x88000..0xe8000;
+        let resident_address = 0x90000;
+        let transient_address = 0x92000;
+        let mut reservations = vec![Vec::new(); topology.tile_count()];
+        reservations[0].push((0x90000, 0xa0000));
+        let mut graph = ExecutableGraph {
+            memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(
+                arena.start,
+                arena.end,
+            )),
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: vec![
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(1),
+                        tile: 0,
+                        address: resident_address,
+                        size: 4096,
+                        live_from: 0,
+                        live_until: usize::MAX,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(2),
+                        tile: 0,
+                        address: transient_address,
+                        size: 4096,
+                        live_from: 0,
+                        live_until: 1,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                ],
+                tile_count: u16::try_from(topology.tile_count()).unwrap(),
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: vec![Binding {
+                name: "weight".into(),
+                dtype: "u32".into(),
+                shape: vec![1],
+                slices: vec![RegionSlice {
+                    tile: u32::from(topology.physical(0).unwrap()),
+                    tile_address: resident_address + 8,
+                    file_offset: 0,
+                    size: 4,
+                }],
+            }],
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+
+        assert_eq!(
+            repack_all_allocations_around(&mut graph, &topology, &reservations, "unit test",)
+                .unwrap(),
+            2
+        );
+        let resident = &graph.schedule.allocations[0];
+        let transient = &graph.schedule.allocations[1];
+        for allocation in [resident, transient] {
+            assert!(allocation.address >= arena.start);
+            assert!(allocation.address + allocation.size <= arena.end);
+            assert!(!ranges_overlap(
+                allocation.address,
+                allocation.address + allocation.size,
+                reservations[0][0].0,
+                reservations[0][0].1,
+            ));
+        }
+        assert!(!ranges_overlap(
+            resident.address,
+            resident.address + resident.size,
+            transient.address,
+            transient.address + transient.size,
+        ));
+        assert_eq!(
+            graph.host_weights[0].slices[0].tile_address,
+            resident.address + 8
+        );
     }
 
     #[test]
