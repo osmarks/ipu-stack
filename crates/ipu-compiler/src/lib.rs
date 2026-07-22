@@ -2281,7 +2281,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
             (config.data_type, config.block_dimension),
             (
                 GemmDataType::F16 | GemmDataType::F16F8Weights { .. } | GemmDataType::F8F143 { .. },
-                64 | 128
+                32 | 64 | 128
             ) | (GemmDataType::F32, 64)
         )
         || !config
@@ -4972,6 +4972,39 @@ mod tests {
                     || command.specialization.operation == "copy_u64"
             }),
             Phase::Exchange { .. } => true,
+        }));
+    }
+
+    #[test]
+    fn blocked_f16_gemm_supports_rectangular_output_blocks() {
+        let plan = plan_blocked_gemm(BlockedGemmConfig {
+            rows: 96,
+            inner_dimension: 128,
+            columns: 128,
+            block_dimension: 32,
+            inner_block_dimension: 64,
+            row_block_dimension: 24,
+            tile_count: 1472,
+            data_base: 0xa0000,
+            data_limit: 0xe8000,
+            data_type: GemmDataType::F16,
+            retain_profile_metadata: true,
+        })
+        .unwrap();
+
+        assert_eq!(plan.output.len(), 16);
+        assert!(
+            plan.output
+                .iter()
+                .all(|block| block.rows == 24 && block.columns == 32)
+        );
+        assert!(plan.schedule.phases.iter().all(|phase| match phase {
+            Phase::Exchange { .. } => true,
+            Phase::Compute { commands, .. } => commands.iter().all(|command| {
+                command.specialization.operation == "copy_u64"
+                    || (command.specialization.operation.starts_with("gemm_f16_")
+                        && command.specialization.shape == [24, 64, 32])
+            }),
         }));
     }
 
