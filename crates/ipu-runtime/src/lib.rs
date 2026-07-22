@@ -448,12 +448,16 @@ struct AllocationRelocation {
     new_start: u32,
 }
 
-fn relocate_transient_allocations_for_executables(
+fn relocate_transient_allocations_around(
     graph: &mut ExecutableGraph,
     topology: &Topology,
-    reservations: &[[(u32, u32); 2]],
+    reservations: &[Vec<(u32, u32)>],
+    granularity: u32,
+    reason: &str,
 ) -> Result<usize> {
-    let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+    if !granularity.is_power_of_two() || reservations.len() != topology.tile_count() {
+        return Err("invalid transient relocation reservations".into());
+    }
     let physical_to_logical = (0..u16::try_from(topology.tile_count())?)
         .map(|logical| Ok((u32::from(topology.physical(logical)?), logical)))
         .collect::<Result<HashMap<_, _>>>()?;
@@ -469,8 +473,11 @@ fn relocate_transient_allocations_for_executables(
                     .iter()
                     .any(|&(start, end)| {
                         ranges_overlap(
-                            align_down(allocation.address, element),
-                            align_up(allocation.address.saturating_add(allocation.size), element),
+                            align_down(allocation.address, granularity),
+                            align_up(
+                                allocation.address.saturating_add(allocation.size),
+                                granularity,
+                            ),
                             start,
                             end,
                         )
@@ -500,6 +507,8 @@ fn relocate_transient_allocations_for_executables(
             })
             .collect::<Vec<_>>();
         occupied.sort_unstable();
+        occupied.extend_from_slice(&reservations[usize::from(allocation.tile)]);
+        occupied.sort_unstable();
         let mut merged = Vec::<(u32, u32)>::with_capacity(occupied.len());
         for (start, end) in occupied {
             if let Some(previous) = merged.last_mut()
@@ -510,18 +519,14 @@ fn relocate_transient_allocations_for_executables(
                 merged.push((start, end));
             }
         }
-        let new_address = ipu_compiler::allocate_from_occupied_arenas(
-            &mut merged,
-            allocation.size,
-            &arena,
-            32,
-        )
-        .map_err(|error| {
-            format!(
-                "cannot relocate transient tensor {} on tile {} for measured executable placement: {error}",
-                allocation.tensor.0, allocation.tile
-            )
-        })?;
+        let new_address =
+            ipu_compiler::allocate_from_occupied_arenas(&mut merged, allocation.size, &arena, 32)
+                .map_err(|error| {
+                format!(
+                    "cannot relocate transient tensor {} on tile {} for {reason}: {error}",
+                    allocation.tensor.0, allocation.tile,
+                )
+            })?;
         let old_address = allocation.address;
         let old_end = old_address
             .checked_add(allocation.size)
@@ -568,6 +573,30 @@ fn relocate_transient_allocations_for_executables(
     }
     graph.schedule.validate_allocations()?;
     Ok(relocations.len())
+}
+
+fn relocate_transient_allocations_for_executables(
+    graph: &mut ExecutableGraph,
+    topology: &Topology,
+    reservations: &[[(u32, u32); 2]],
+) -> Result<usize> {
+    let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+    let reservations = reservations
+        .iter()
+        .map(|ranges| {
+            ranges
+                .iter()
+                .map(|&(start, end)| (align_down(start, element), align_up(end, element)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    relocate_transient_allocations_around(
+        graph,
+        topology,
+        &reservations,
+        element,
+        "measured executable placement",
+    )
 }
 
 fn relocate_literal_address(tile: u16, address: &mut u32, relocations: &[AllocationRelocation]) {
@@ -4549,6 +4578,15 @@ mod tests {
         );
         let relocated = graph.schedule.allocations[0].address;
         assert!(relocated >= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT);
+        assert!(reservations[0].iter().all(|&(start, end)| !ranges_overlap(
+            align_down(relocated, ipu_package::TILE_MEMORY_ELEMENT_SIZE),
+            align_up(
+                relocated + graph.schedule.allocations[0].size,
+                ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+            ),
+            start,
+            end,
+        )));
         assert_eq!(graph.schedule.allocations[1].address, relocated + 16);
         assert_eq!(graph.initial_buffers[0].address, relocated + 4);
         assert_eq!(graph.host_inputs[0].slices[0].tile_address, relocated + 8);
