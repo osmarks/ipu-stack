@@ -495,6 +495,9 @@ fn repeated_region_shape(
                             argument_count: command.arguments.len(),
                         });
                 }
+                for commands in by_tile.values_mut() {
+                    commands.sort_by_key(|command| (command.input_count, command.argument_count));
+                }
                 Ok(RepeatedPhaseShape::Compute(
                     by_tile
                         .into_iter()

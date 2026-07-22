@@ -2536,6 +2536,9 @@ fn package_graph_impl_attempt(
             instance: usize,
             part: usize,
         },
+        PatchTable {
+            template: usize,
+        },
         Shared {
             template: usize,
         },
@@ -2556,6 +2559,10 @@ fn package_graph_impl_attempt(
                     (
                         TemplateDataObject::RecordSecondary { template },
                         record_words - split,
+                    ),
+                    (
+                        TemplateDataObject::PatchTable { template },
+                        plan.patches.len().saturating_sub(1) * 2,
                     ),
                     (TemplateDataObject::Shared { template }, plan.shared.len()),
                 ]
@@ -2598,8 +2605,9 @@ fn package_graph_impl_attempt(
                         template,
                         instance,
                         part,
-                    } => {
-                        plans.templates[template].patch_addresses[instance][part] =
+                    } => plans.templates[template].patch_addresses[instance][part] = 0,
+                    TemplateDataObject::PatchTable { template } => {
+                        plans.templates[template].patch_table_address =
                             ipu_package::TILE_MEMORY_BASE
                     }
                     TemplateDataObject::Shared { template } => {
@@ -2636,6 +2644,9 @@ fn package_graph_impl_attempt(
                     instance,
                     part,
                 } => plans.templates[template].patch_addresses[instance][part] = address,
+                TemplateDataObject::PatchTable { template } => {
+                    plans.templates[template].patch_table_address = address
+                }
                 TemplateDataObject::Shared { template } => {
                     plans.templates[template].shared_address = address
                 }
@@ -2788,13 +2799,54 @@ fn package_graph_impl_attempt(
         })
         .max_by_key(|(_, _, words, _, _)| *words)
     {
+        let tile = programs[tile_index].tile;
+        let allocations = graph
+            .schedule
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.tile == tile)
+            .collect::<Vec<_>>();
+        let address_kind = |word: &static_codegen::StaticTemplateRecordWord| {
+            let static_codegen::StaticTemplateRecordWord::Value(address) = word else {
+                return 0;
+            };
+            allocations
+                .iter()
+                .find(|allocation| {
+                    *address >= allocation.address
+                        && *address < allocation.address.saturating_add(allocation.size)
+                })
+                .map_or(0, |allocation| {
+                    if allocation.live_until == usize::MAX {
+                        1
+                    } else {
+                        2
+                    }
+                })
+        };
+        let changed_address_kinds = template
+            .records
+            .windows(2)
+            .flat_map(|records| records[0].iter().zip(&records[1]))
+            .filter(|(left, right)| left != right)
+            .fold([0usize; 4], |mut counts, (left, right)| {
+                let left = address_kind(left);
+                let right = address_kind(right);
+                let kind = if left == right { left } else { 3 };
+                counts[kind] += 1;
+                counts
+            });
         info!(
-            logical_tile = programs[tile_index].tile,
+            logical_tile = tile,
             template = template.name,
             instances = template.records.len(),
             record_words = words,
             adjacent_changed_words = changed_words,
             narrow_delta_words = narrow_deltas,
+            changed_non_allocation_words = changed_address_kinds[0],
+            changed_resident_addresses = changed_address_kinds[1],
+            changed_transient_addresses = changed_address_kinds[2],
+            changed_mixed_addresses = changed_address_kinds[3],
             "largest static template record set"
         );
     }
@@ -2974,7 +3026,8 @@ fn package_graph_impl_attempt(
                         })
                         .sum::<usize>()
                         * 4;
-                    template.shared.len() * 4 + record + patches
+                    let patch_table = template.patches.len().saturating_sub(1) * 8;
+                    template.shared.len() * 4 + record + patches + patch_table
                 })
                 .sum::<usize>();
             let template_instances = templates
@@ -3256,6 +3309,17 @@ fn package_graph_impl_attempt(
                     }
                 }
                 template_segments.push((address, bytes));
+            }
+            let patch_table = template
+                .patch_addresses
+                .iter()
+                .skip(1)
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+            if !patch_table.is_empty() {
+                template_segments
+                    .push((template.patch_table_address, words_to_bytes(&patch_table)));
             }
             for (instance, patch) in template.patches.iter().enumerate().skip(1) {
                 if patch.is_empty() {

@@ -68,6 +68,7 @@ pub(crate) struct StaticTemplatePlan {
     pub record_secondary_addresses: Vec<u32>,
     pub record_split: u16,
     pub records: Vec<Vec<StaticTemplateRecordWord>>,
+    pub patch_table_address: u32,
     pub patch_addresses: Vec<Vec<u32>>,
     pub patches: Vec<Vec<(u16, StaticTemplatePatchValue)>>,
     pub shared_address: u32,
@@ -187,24 +188,7 @@ pub(crate) fn template_patch_group_span(
 }
 
 pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> Vec<Range<usize>> {
-    const SUBDIVISIONS_PER_RECORD_PART: usize = 3;
-
-    fn halves(range: Range<usize>) -> [Range<usize>; 2] {
-        let local_midpoint = (range.len() / 2).div_ceil(32) * 32;
-        let midpoint = range.start + local_midpoint.min(range.len());
-        [range.start..midpoint, midpoint..range.end]
-    }
-
-    [0..split, split..record_words]
-        .into_iter()
-        .flat_map(|range| {
-            let mut ranges = vec![range];
-            for _ in 0..SUBDIVISIONS_PER_RECORD_PART {
-                ranges = ranges.into_iter().flat_map(halves).collect();
-            }
-            ranges
-        })
-        .collect()
+    vec![0..split, split..record_words]
 }
 
 #[derive(Clone, Debug)]
@@ -559,7 +543,7 @@ pub(crate) fn plan_static_templates(
                     });
                 }
             } else if all_compute {
-                let commands = phase_steps
+                let mut commands = phase_steps
                     .iter()
                     .map(|steps| {
                         program.steps[steps.clone()]
@@ -573,6 +557,11 @@ pub(crate) fn plan_static_templates(
                             .collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>();
+                for commands in &mut commands {
+                    commands.sort_by_key(|command| {
+                        (command.input_addresses.len(), command.arguments.len())
+                    });
+                }
                 let command_count = commands.iter().map(Vec::len).max().unwrap_or(0);
                 if command_count == 0 {
                     template_steps.push(StaticTemplateStep::Idle);
@@ -640,6 +629,15 @@ pub(crate) fn plan_static_templates(
             }
             patch_addresses.push(addresses);
         }
+        cursor = (cursor + 3) & !3;
+        let patch_table_address = cursor;
+        cursor = cursor
+            .checked_add(
+                u32::try_from(patches.len().saturating_sub(1))?
+                    .checked_mul(8)
+                    .ok_or("static template patch table size overflow")?,
+            )
+            .ok_or("static template patch table address overflow")?;
         templates.push(StaticTemplatePlan {
             name: region.name.clone(),
             instance_steps,
@@ -647,6 +645,7 @@ pub(crate) fn plan_static_templates(
             record_secondary_addresses: vec![secondary_address; records.rows.len()],
             record_split,
             records: records.rows,
+            patch_table_address,
             patch_addresses,
             patches,
             shared_address: 0,
@@ -1031,7 +1030,7 @@ pub(crate) fn emit(
         {
             let record_words = template.records[0].len();
             let record_split = usize::from(template.record_split);
-            code.add_immediate(11, 11, -16)?;
+            code.add_immediate(11, 11, -32)?;
             code.setzi(4, template.record_addresses[0])?;
             code.setzi(5, template.record_secondary_addresses[0])?;
             code.setzi(6, u32::from(template.record_split))?;
@@ -1040,40 +1039,27 @@ pub(crate) fn emit(
             code.st32(5, 11, 15, 1)?;
             code.st32(6, 11, 15, 2)?;
             code.st32(7, 11, 15, 3)?;
-            for instance in 0..template.records.len() {
-                let patch = &template.patches[instance];
-                for (part, slots) in template_patch_ranges(record_words, record_split)
-                    .into_iter()
-                    .enumerate()
-                {
-                    if template_patch_storage_words_range(slots.clone(), patch) == 0 {
-                        continue;
-                    }
-                    code.setzi(7, u32::from(slots.start >= record_split))?;
-                    code.setzi(3, template.patch_addresses[instance][part])?;
-                    code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
-                }
-                let call = code.words.len();
-                code.call(0, 9)?;
-                template_calls.push((call, template_index));
-            }
+            code.setzi(2, u32::try_from(template.records.len())?)?;
+            code.st32(2, 11, 15, 4)?;
+            code.setzi(2, template.patch_table_address)?;
+            code.st32(2, 11, 15, 5)?;
+            let loop_start = generated_address(generated_base, code.words.len())?;
+            let call = code.words.len();
+            code.call(0, 9)?;
+            template_calls.push((call, template_index));
+            code.ld32(2, 11, 15, 4)?;
+            code.add_immediate(2, 2, -1)?;
+            code.st32(2, 11, 15, 4)?;
+            let loop_done = code.words.len();
+            code.brz(2, 0)?;
+            emit_template_patch_pair(&mut code, symbols, generated_base)?;
+            code.jump(loop_start)?;
+            let after_loop = generated_address(generated_base, code.words.len())?;
+            code.words[loop_done] = ipu_exchange::encode_brz_m_immediate(2, after_loop)?;
             if template.patches.len() > template.records.len() {
-                let reset = template.patches.len() - 1;
-                for (part, slots) in template_patch_ranges(record_words, record_split)
-                    .into_iter()
-                    .enumerate()
-                {
-                    if template_patch_storage_words_range(slots.clone(), &template.patches[reset])
-                        == 0
-                    {
-                        continue;
-                    }
-                    code.setzi(7, u32::from(slots.start >= record_split))?;
-                    code.setzi(3, template.patch_addresses[reset][part])?;
-                    code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
-                }
+                emit_template_patch_pair(&mut code, symbols, generated_base)?;
             }
-            code.add_immediate(11, 11, 16)?;
+            code.add_immediate(11, 11, 32)?;
             plan_index += if template.exchange_step_count == 0 {
                 template
                     .instance_steps
@@ -1227,6 +1213,35 @@ pub(crate) fn emit(
         code.words[call] = ipu_exchange::encode_call_m_immediate(9, target)?;
     }
     Ok(code.words.into_iter().flat_map(u32::to_le_bytes).collect())
+}
+
+fn emit_template_patch_pair(
+    code: &mut TileCode,
+    symbols: &BTreeMap<String, u32>,
+    generated_base: u32,
+) -> Result<()> {
+    code.ld32(2, 11, 15, 5)?;
+    code.ld32(3, 2, 15, 0)?;
+    code.ld32(4, 2, 15, 1)?;
+    code.st32(4, 11, 15, 6)?;
+    code.add_immediate(2, 2, 8)?;
+    code.st32(2, 11, 15, 5)?;
+
+    code.setzi(7, 0)?;
+    let skip_primary = code.words.len();
+    code.brz(3, 0)?;
+    code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
+    let after_primary = generated_address(generated_base, code.words.len())?;
+    code.words[skip_primary] = ipu_exchange::encode_brz_m_immediate(3, after_primary)?;
+
+    code.ld32(3, 11, 15, 6)?;
+    code.setzi(7, 1)?;
+    let skip_secondary = code.words.len();
+    code.brz(3, 0)?;
+    code.call(symbol(symbols, TEMPLATE_PATCH)?, 9)?;
+    let after_secondary = generated_address(generated_base, code.words.len())?;
+    code.words[skip_secondary] = ipu_exchange::encode_brz_m_immediate(3, after_secondary)?;
+    Ok(())
 }
 
 fn emit_static_template_exchange(
@@ -1934,5 +1949,70 @@ mod tests {
 
         assert!(runs.is_empty());
         assert_eq!(end, 0x53000);
+    }
+
+    #[test]
+    fn repeated_template_executable_size_is_independent_of_instance_count() {
+        fn emitted_size(instance_count: usize) -> usize {
+            let mut steps = Vec::new();
+            let mut phase_instances = Vec::new();
+            let mut plan_addresses = Vec::new();
+            let mut plan_rows = Vec::new();
+            for instance in 0..instance_count {
+                let phase = instance * 2;
+                steps.push(exchange(phase, true));
+                steps.push(compute(
+                    phase + 1,
+                    0x54000 + instance as u32 * 0x20,
+                    Vec::new(),
+                ));
+                phase_instances.push(phase..phase + 2);
+                plan_addresses.push(0x52000 + instance as u32 * 0x20);
+                plan_rows.push(vec![1, 2, 3 + instance as u32]);
+            }
+            let mut program = LoweredTileProgram { tile: 7, steps };
+            let regions = [crate::StaticTemplateRegion {
+                name: "encoder_layer".into(),
+                phase_instances,
+            }];
+            let (mut templates, _) = plan_static_templates(
+                &program,
+                &plan_addresses,
+                &plan_rows,
+                &vec![None; instance_count],
+                &regions,
+                0x60000,
+                true,
+            )
+            .unwrap();
+            compact_template_instances(&mut program, &mut templates).unwrap();
+            let symbols = BTreeMap::from([
+                (WORKER_BARRIER.into(), 0x50000),
+                (COMPLETE.into(), 0x50020),
+                (HOST_RUN.into(), 0x50040),
+                (REPEAT_CALL.into(), 0x50060),
+                (TEMPLATE_PATCH.into(), 0x50080),
+                ("ipu_stack_gemm_f16_accumulate".into(), 0x500a0),
+            ]);
+            emit(
+                &program,
+                &symbols,
+                &plan_addresses,
+                &[],
+                &templates,
+                HostCode {
+                    weights: &[],
+                    inputs: &[],
+                    outputs: &[],
+                },
+                None,
+                0x70000,
+                2,
+            )
+            .unwrap()
+            .len()
+        }
+
+        assert_eq!(emitted_size(2), emitted_size(27));
     }
 }
