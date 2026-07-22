@@ -971,6 +971,21 @@ pub fn plan_flash_attention(
         }
     }
 
+    // Balanced partitions are bounded by the requested block size, but need not
+    // contain a block of exactly that size. Specialize against the shapes that
+    // were actually planned so the larger of two uneven partitions is not run
+    // through the smaller-row kernel.
+    let maximum_query_rows = tasks
+        .iter()
+        .map(|task| task.query_rows)
+        .max()
+        .expect("attention has at least one query task");
+    let maximum_planned_key_rows = key_values
+        .iter()
+        .map(|block| block.key_rows)
+        .max()
+        .expect("attention has at least one key block");
+
     let key_value_pair_bytes = key_values
         .first()
         .and_then(|block| block.matrix_size.checked_mul(2))
@@ -1079,12 +1094,12 @@ pub fn plan_flash_attention(
                             && block.key_row_start == key_row_start
                     })
                     .expect("each head has every key block");
-                let query_size = if task.query_rows == query_block_rows {
+                let query_size = if task.query_rows == maximum_query_rows {
                     "large"
                 } else {
                     "small"
                 };
-                let key_size = if block.key_rows == key_block_rows {
+                let key_size = if block.key_rows == maximum_planned_key_rows {
                     "large"
                 } else {
                     "small"
@@ -1616,6 +1631,54 @@ mod tests {
                     .sum::<u16>(),
                 729
             );
+        }
+    }
+
+    #[test]
+    fn uneven_partitions_select_specializations_from_planned_shapes() {
+        let plan = plan_flash_attention(FlashAttentionConfig {
+            batch_size: 1,
+            query_sequence_length: 729,
+            sequence_length: 729,
+            hidden_size: 1152,
+            attention_heads: 16,
+            query_block_rows: 48,
+            key_block_rows: 48,
+            tile_count: 1472,
+            data_base: 0xa0000,
+            data_limit: 0xe8000,
+        })
+        .unwrap();
+
+        let query_rows = plan
+            .tasks
+            .iter()
+            .map(|task| task.query_rows)
+            .collect::<BTreeSet<_>>();
+        let key_rows = plan
+            .key_values
+            .iter()
+            .map(|block| block.key_rows)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(query_rows, BTreeSet::from([45, 46]));
+        assert_eq!(key_rows, BTreeSet::from([45, 46]));
+
+        for phase in &plan.schedule.phases {
+            let Phase::Compute { commands, .. } = phase else {
+                continue;
+            };
+            for command in commands.iter().filter(|command| {
+                command
+                    .specialization
+                    .operation
+                    .starts_with("attention_softmax_")
+            }) {
+                let query_rows = command.metadata["query_rows"].parse::<u16>().unwrap();
+                let key_rows = command.metadata["key_rows"].parse::<u16>().unwrap();
+                let operation = command.specialization.operation.as_ref();
+                assert_eq!(operation.contains("large_query"), query_rows == 46);
+                assert_eq!(operation.contains("large_key"), key_rows == 46);
+            }
         }
     }
 
