@@ -187,7 +187,7 @@ pub(crate) fn template_patch_group_span(
 }
 
 pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> Vec<Range<usize>> {
-    const SUBDIVISIONS_PER_RECORD_PART: usize = 4;
+    const SUBDIVISIONS_PER_RECORD_PART: usize = 3;
 
     fn halves(range: Range<usize>) -> [Range<usize>; 2] {
         let local_midpoint = (range.len() / 2).div_ceil(32) * 32;

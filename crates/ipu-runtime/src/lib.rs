@@ -2448,21 +2448,30 @@ fn package_graph_impl_attempt(
         .iter()
         .map(|reservations| reservations[1])
         .collect::<Vec<_>>();
-    let mut host_runtime_ranges = Vec::with_capacity(tile_host_plans.len());
-    let mut worker_sync_addresses = Vec::with_capacity(tile_host_plans.len());
-    let mut completion_addresses = Vec::with_capacity(tile_host_plans.len());
-    for (tile_index, plans) in tile_host_plans.iter_mut().enumerate() {
-        let old_worker_sync = align_up(plans.end, 8);
-        let old_end = old_worker_sync
-            .checked_add(WORKER_STACK_HEADROOM + (TILE_CONTEXT_STACKS - 1) * WORKER_SYNC_STRIDE)
-            .ok_or("static host runtime address overflow")?;
-        plans.ordinary_data_objects.push(old_worker_sync..old_end);
-        let tile = programs[tile_index].tile;
-        let program_tail_start = program_reservations[tile_index]
-            .0
-            .checked_add(preliminary_program_sizes[tile_index])
-            .ok_or("generated program tail overflow")?;
-        let (mut relocations, executable_ranges, executable_elements) =
+    let image_executable_elements = executable_reservations
+        .iter()
+        .map(|reservations| {
+            (
+                align_down(
+                    reservations[0].0.min(reservations[1].0),
+                    ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+                ),
+                align_up(
+                    reservations[0].1.max(reservations[1].1),
+                    ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut host_executable_placements = tile_host_plans
+        .iter()
+        .enumerate()
+        .map(|(tile_index, plans)| {
+            let tile = programs[tile_index].tile;
+            let program_tail_start = program_reservations[tile_index]
+                .0
+                .checked_add(preliminary_program_sizes[tile_index])
+                .ok_or("generated program tail overflow")?;
             pack_executable_objects_for_tile(
                 &allocation_ranges_by_tile[usize::from(tile)],
                 tile,
@@ -2473,148 +2482,9 @@ fn package_graph_impl_attempt(
                     support_reservations[tile_index],
                 ],
                 &[(program_tail_start, program_reservations[tile_index].1)],
-            )?;
-        let (ordinary_relocations, mut ranges) = pack_data_objects_for_tile(
-            &allocation_ranges_by_tile[usize::from(tile)],
-            tile,
-            tile_exchange_plans[tile_index].end,
-            &plans.ordinary_data_objects,
-            false,
-            &executable_elements
-                .iter()
-                .copied()
-                .chain(std::iter::once(program_reservations[tile_index]))
-                .chain(std::iter::once(support_reservations[tile_index]))
-                .collect::<Vec<_>>(),
-        )?;
-        relocations.extend(ordinary_relocations);
-        ranges.extend(executable_ranges);
-        let (data_relocations, data_ranges) = pack_data_objects_for_tile(
-            &allocation_ranges_by_tile[usize::from(tile)],
-            tile,
-            tile_exchange_plans[tile_index].end,
-            &plans.data_objects,
-            true,
-            &ranges
-                .iter()
-                .copied()
-                .chain(executable_elements.iter().copied())
-                .chain(std::iter::once(program_reservations[tile_index]))
-                .chain(std::iter::once(support_reservations[tile_index]))
-                .collect::<Vec<_>>(),
-        )?;
-        relocations.extend(data_relocations);
-        ranges.extend(data_ranges);
-        ranges.sort_unstable();
-        let relocate = |address: u32| -> Result<u32> {
-            relocations
-                .get(&address)
-                .copied()
-                .ok_or_else(|| format!("missing relocation for static object 0x{address:x}").into())
-        };
-        for address in &mut plans.addresses {
-            *address = relocate(*address)?;
-        }
-        for copy in plans.packet_copies.iter_mut().flatten() {
-            copy.source = relocate(copy.source)?;
-        }
-        for address in plans.run_tables.iter_mut().flatten() {
-            *address = relocate(*address)?;
-        }
-        let worker_sync = relocate(old_worker_sync)?;
-        // Completion is written only after worker stacks are quiescent.
-        let completion = worker_sync;
-        plans.start = ranges.iter().map(|&(start, _)| start).min().unwrap_or(0);
-        plans.end = ranges.iter().map(|&(_, end)| end).max().unwrap_or(0);
-        host_runtime_ranges.push(ranges);
-        worker_sync_addresses.push(worker_sync);
-        completion_addresses.push(completion);
-        if tile == 0 {
-            info!(
-                ranges = ?host_runtime_ranges[tile_index],
-                first_plan = plans.addresses.first().map(|address| format!("0x{address:x}")),
-                first_packet = plans
-                    .packet_copies
-                    .first()
-                    .and_then(|copy| *copy)
-                    .map(|copy| format!("0x{:x}", copy.source)),
-                first_run_table = plans
-                    .run_tables
-                    .first()
-                    .and_then(|address| *address)
-                    .map(|address| format!("0x{address:x}")),
-                worker_sync = format_args!("0x{worker_sync:x}"),
-                completion = format_args!("0x{completion:x}"),
-                "packed segmented host runtime"
-            );
-        }
-    }
-    debug!(
-        minimum_end = format_args!(
-            "0x{:x}",
-            tile_host_plans
-                .iter()
-                .map(|plans| plans.end)
-                .min()
-                .unwrap_or(PLAN_BASE)
-        ),
-        maximum_end = format_args!(
-            "0x{:x}",
-            tile_host_plans
-                .iter()
-                .map(|plans| plans.end)
-                .max()
-                .unwrap_or(PLAN_BASE)
-        ),
-        "packed host exchange plans"
-    );
-    let mut template_record_ranges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); programs.len()];
-    if let Some((tile_index, template, words, changed_words, narrow_deltas)) = tile_exchange_plans
-        .iter()
-        .enumerate()
-        .flat_map(|(tile_index, plans)| {
-            plans.templates.iter().map(move |template| {
-                let words =
-                    template.shared.len() + template.records.iter().map(Vec::len).sum::<usize>();
-                let changed_words = template
-                    .records
-                    .windows(2)
-                    .map(|records| {
-                        records[0]
-                            .iter()
-                            .zip(&records[1])
-                            .filter(|(left, right)| left != right)
-                            .count()
-                    })
-                    .sum::<usize>();
-                let narrow_deltas = template
-                    .records
-                    .windows(2)
-                    .flat_map(|records| records[0].iter().zip(&records[1]))
-                    .filter(|(left, right)| left != right)
-                    .filter(|(left, right)| match (left, right) {
-                        (
-                            static_codegen::StaticTemplateRecordWord::Value(left),
-                            static_codegen::StaticTemplateRecordWord::Value(right),
-                        ) => i16::try_from(i64::from(*right) - i64::from(*left)).is_ok(),
-                        _ => false,
-                    })
-                    .count();
-                (tile_index, template, words, changed_words, narrow_deltas)
-            })
+            )
         })
-        .max_by_key(|(_, _, words, _, _)| *words)
-    {
-        info!(
-            logical_tile = programs[tile_index].tile,
-            template = template.name,
-            instances = template.records.len(),
-            record_words = words,
-            adjacent_changed_words = changed_words,
-            narrow_delta_words = narrow_deltas,
-            "largest static template record set"
-        );
-    }
+        .collect::<Result<Vec<_>>>()?;
     #[derive(Clone, Copy)]
     enum TemplateDataObject {
         RecordPrimary {
@@ -2632,6 +2502,7 @@ fn package_graph_impl_attempt(
             template: usize,
         },
     }
+    let mut template_record_ranges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); programs.len()];
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
         let runtime_end = plans.end;
@@ -2705,12 +2576,11 @@ fn package_graph_impl_attempt(
                 runtime_end,
                 size,
                 4,
-                &host_runtime_ranges[tile_index]
+                &template_record_ranges[tile_index]
                     .iter()
                     .copied()
-                    .chain(template_record_ranges[tile_index].iter().copied())
-                    .chain(std::iter::once(program_reservations[tile_index]))
-                    .chain(std::iter::once(support_reservations[tile_index]))
+                    .chain(host_executable_placements[tile_index].2.iter().copied())
+                    .chain(std::iter::once(image_executable_elements[tile_index]))
                     .collect::<Vec<_>>(),
             )?;
             let end = address
@@ -2735,7 +2605,161 @@ fn package_graph_impl_attempt(
             template_record_ranges[tile_index].push((address, end));
         }
     }
-
+    let mut host_runtime_ranges = Vec::with_capacity(tile_host_plans.len());
+    let mut worker_sync_addresses = Vec::with_capacity(tile_host_plans.len());
+    let mut completion_addresses = Vec::with_capacity(tile_host_plans.len());
+    for (tile_index, plans) in tile_host_plans.iter_mut().enumerate() {
+        let old_worker_sync = align_up(plans.end, 8);
+        let old_end = old_worker_sync
+            .checked_add(WORKER_STACK_HEADROOM + (TILE_CONTEXT_STACKS - 1) * WORKER_SYNC_STRIDE)
+            .ok_or("static host runtime address overflow")?;
+        plans.ordinary_data_objects.push(old_worker_sync..old_end);
+        let tile = programs[tile_index].tile;
+        let static_reservations = template_record_ranges[tile_index]
+            .iter()
+            .copied()
+            .chain(std::iter::once(image_executable_elements[tile_index]))
+            .collect::<Vec<_>>();
+        let (mut relocations, executable_ranges, executable_elements) =
+            std::mem::take(&mut host_executable_placements[tile_index]);
+        let (ordinary_relocations, mut ranges) = pack_data_objects_for_tile(
+            &allocation_ranges_by_tile[usize::from(tile)],
+            tile,
+            tile_exchange_plans[tile_index].end,
+            &plans.ordinary_data_objects,
+            false,
+            &executable_elements
+                .iter()
+                .copied()
+                .chain(static_reservations.iter().copied())
+                .collect::<Vec<_>>(),
+        )?;
+        relocations.extend(ordinary_relocations);
+        ranges.extend(executable_ranges);
+        let (data_relocations, data_ranges) = pack_data_objects_for_tile(
+            &allocation_ranges_by_tile[usize::from(tile)],
+            tile,
+            tile_exchange_plans[tile_index].end,
+            &plans.data_objects,
+            true,
+            &ranges
+                .iter()
+                .copied()
+                .chain(executable_elements.iter().copied())
+                .chain(static_reservations.iter().copied())
+                .collect::<Vec<_>>(),
+        )?;
+        relocations.extend(data_relocations);
+        ranges.extend(data_ranges);
+        ranges.sort_unstable();
+        let relocate = |address: u32| -> Result<u32> {
+            relocations
+                .get(&address)
+                .copied()
+                .ok_or_else(|| format!("missing relocation for static object 0x{address:x}").into())
+        };
+        for address in &mut plans.addresses {
+            *address = relocate(*address)?;
+        }
+        for copy in plans.packet_copies.iter_mut().flatten() {
+            copy.source = relocate(copy.source)?;
+        }
+        for address in plans.run_tables.iter_mut().flatten() {
+            *address = relocate(*address)?;
+        }
+        let worker_sync = relocate(old_worker_sync)?;
+        // Completion is written only after worker stacks are quiescent.
+        let completion = worker_sync;
+        plans.start = ranges.iter().map(|&(start, _)| start).min().unwrap_or(0);
+        plans.end = ranges.iter().map(|&(_, end)| end).max().unwrap_or(0);
+        host_runtime_ranges.push(ranges);
+        worker_sync_addresses.push(worker_sync);
+        completion_addresses.push(completion);
+        if tile == 0 {
+            info!(
+                ranges = ?host_runtime_ranges[tile_index],
+                first_plan = plans.addresses.first().map(|address| format!("0x{address:x}")),
+                first_packet = plans
+                    .packet_copies
+                    .first()
+                    .and_then(|copy| *copy)
+                    .map(|copy| format!("0x{:x}", copy.source)),
+                first_run_table = plans
+                    .run_tables
+                    .first()
+                    .and_then(|address| *address)
+                    .map(|address| format!("0x{address:x}")),
+                worker_sync = format_args!("0x{worker_sync:x}"),
+                completion = format_args!("0x{completion:x}"),
+                "packed segmented host runtime"
+            );
+        }
+    }
+    debug!(
+        minimum_end = format_args!(
+            "0x{:x}",
+            tile_host_plans
+                .iter()
+                .map(|plans| plans.end)
+                .min()
+                .unwrap_or(PLAN_BASE)
+        ),
+        maximum_end = format_args!(
+            "0x{:x}",
+            tile_host_plans
+                .iter()
+                .map(|plans| plans.end)
+                .max()
+                .unwrap_or(PLAN_BASE)
+        ),
+        "packed host exchange plans"
+    );
+    if let Some((tile_index, template, words, changed_words, narrow_deltas)) = tile_exchange_plans
+        .iter()
+        .enumerate()
+        .flat_map(|(tile_index, plans)| {
+            plans.templates.iter().map(move |template| {
+                let words =
+                    template.shared.len() + template.records.iter().map(Vec::len).sum::<usize>();
+                let changed_words = template
+                    .records
+                    .windows(2)
+                    .map(|records| {
+                        records[0]
+                            .iter()
+                            .zip(&records[1])
+                            .filter(|(left, right)| left != right)
+                            .count()
+                    })
+                    .sum::<usize>();
+                let narrow_deltas = template
+                    .records
+                    .windows(2)
+                    .flat_map(|records| records[0].iter().zip(&records[1]))
+                    .filter(|(left, right)| left != right)
+                    .filter(|(left, right)| match (left, right) {
+                        (
+                            static_codegen::StaticTemplateRecordWord::Value(left),
+                            static_codegen::StaticTemplateRecordWord::Value(right),
+                        ) => i16::try_from(i64::from(*right) - i64::from(*left)).is_ok(),
+                        _ => false,
+                    })
+                    .count();
+                (tile_index, template, words, changed_words, narrow_deltas)
+            })
+        })
+        .max_by_key(|(_, _, words, _, _)| *words)
+    {
+        info!(
+            logical_tile = programs[tile_index].tile,
+            template = template.name,
+            instances = template.records.len(),
+            record_words = words,
+            adjacent_changed_words = changed_words,
+            narrow_delta_words = narrow_deltas,
+            "largest static template record set"
+        );
+    }
     let emit_program =
         |program_index: usize, symbols: &BTreeMap<String, u32>, generated_base: u32| {
             let program = &programs[program_index];
@@ -2788,7 +2812,7 @@ fn package_graph_impl_attempt(
                 let program_end = program_base
                     .checked_add(u32::try_from(generated.len())?)
                     .ok_or("generated program address overflow")?;
-                executable_regions_for_tile(
+                let mut regions = executable_regions_for_tile(
                     &allocation_ranges_by_tile[usize::from(program.tile)],
                     tile_exchange_plans[usize::from(program.tile)].end,
                     &host_runtime_ranges[usize::from(program.tile)]
@@ -2797,12 +2821,30 @@ fn package_graph_impl_attempt(
                         .chain(template_records.iter().copied())
                         .chain(std::iter::once((program_base, program_end)))
                         .collect::<Vec<_>>(),
-                )
+                )?;
+                // Generated and support code deliberately share executable memory
+                // elements. Re-add the measured support interval after excluding the
+                // generated bytes from generally available executable regions.
+                regions.push(support_reservations[usize::from(program.tile)]);
+                regions.sort_unstable();
+                let mut merged = Vec::<(u32, u32)>::new();
+                for (start, end) in regions {
+                    if let Some(previous) = merged.last_mut()
+                        && start <= previous.1
+                    {
+                        previous.1 = previous.1.max(end);
+                    } else {
+                        merged.push((start, end));
+                    }
+                }
+                Ok(merged)
             },
         )
         .collect::<Result<Vec<_>>>()?;
     let mut image_cache = HashMap::<(Vec<(u32, u32)>, Vec<String>), ipu_elf::LinkedImage>::new();
-    for (regions, symbols) in image_regions.iter().zip(&tile_retained_symbols) {
+    for (tile_index, (regions, symbols)) in
+        image_regions.iter().zip(&tile_retained_symbols).enumerate()
+    {
         let key = (regions.clone(), symbols.clone());
         if image_cache.contains_key(&key) {
             continue;
@@ -2816,7 +2858,17 @@ fn package_graph_impl_attempt(
                 retained_symbols: symbols.clone(),
                 externals: HashMap::new(),
             },
-        )?;
+        )
+        .map_err(|error| {
+            format!(
+                "failed to link support image for logical tile {} ({} bytes preliminary, \
+                 reservation {:?}, executable regions {:?}): {error}",
+                programs[tile_index].tile,
+                preliminary_images[tile_index].bytes.len(),
+                support_reservations[tile_index],
+                regions,
+            )
+        })?;
         image_cache.insert(key, image);
     }
     let images = image_regions
