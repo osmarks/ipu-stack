@@ -16,7 +16,8 @@ use ipu_runtime::{
     append_siglip_encoder_layer_batched_with_precision, append_siglip_map_head,
     append_siglip_map_head_with_memory_policy, append_siglip_post_layer_norm,
     append_siglip_post_layer_norm_with_memory_policy, block_binding_typed, block_coordinates,
-    blocked_matrix_f16, consolidate_attention_kernel_variants, package_graph_repeated,
+    blocked_matrix_f16, consolidate_attention_kernel_variants, defer_terminal_residual_add,
+    fuse_deferred_residual_into_layer_norm, package_graph_repeated,
     package_graph_repeated_with_templates, package_graph_repeated_with_templates_profiled_regions,
     package_graph_repeated_with_templates_profiled_with_regions, run_host_with_options,
 };
@@ -37,6 +38,10 @@ const DEFAULT_RESIDENT_LOW_BASE: u32 = ipu_package::TILE_MEMORY_BASE
 
 fn main() {
     ipu_runtime::init_tracing();
+    let profile_output = std::env::var_os("IPU_PROFILE_OUTPUT").map(PathBuf::from);
+    let profile_granularity = profile_output
+        .as_ref()
+        .map(|_| ProfileGranularity::from_environment().unwrap());
     let model_directory = PathBuf::from(
         std::env::var_os("IPU_SIGLIP_MODEL")
             .unwrap_or_else(|| "/srv/home/gc-sdk/siglip-so400m-patch14-384".into()),
@@ -221,9 +226,14 @@ fn main() {
         "configured encoder tile-memory policy"
     );
     let detailed_diagnostics = layer_count == 1 && batch_size == 1;
-    let retain_profile_metadata = std::env::var_os("IPU_SIGLIP_RETAIN_PROFILE_METADATA").is_some();
+    let retain_profile_metadata = std::env::var_os("IPU_SIGLIP_RETAIN_PROFILE_METADATA").is_some()
+        || matches!(
+            profile_granularity,
+            Some(ProfileGranularity::Phase | ProfileGranularity::Step)
+        );
     let mut current = row_shards;
     let mut last_layer = None;
+    let mut deferred_residual = None;
     let mut layer_template_groups =
         Vec::<(SiglipEncoderPrecision, Vec<std::ops::Range<usize>>)>::new();
     let mut profile_regions = vec![StaticProfileRegion {
@@ -237,7 +247,7 @@ fn main() {
         } else {
             expanded_storage_fallback(precision)
         };
-        let appended = append_siglip_encoder_layer_batched_with_precision(
+        let mut appended = append_siglip_encoder_layer_batched_with_precision(
             &mut plan.schedule,
             &current,
             &model,
@@ -255,6 +265,21 @@ fn main() {
             &mut host,
         )
         .unwrap();
+        if let Some(deferred) = deferred_residual.take() {
+            fuse_deferred_residual_into_layer_norm(&mut plan.schedule, phase_start, deferred)
+                .unwrap();
+        }
+        if layer + 1 < layer_count
+            && let Some(deferred) = defer_terminal_residual_add(&mut plan.schedule).unwrap()
+        {
+            appended
+                .profile_stages
+                .last_mut()
+                .expect("encoder layer has profile stages")
+                .phases
+                .end -= 2;
+            deferred_residual = Some(deferred);
+        }
         profile_regions.extend(
             appended
                 .profile_stages
@@ -273,6 +298,9 @@ fn main() {
         }
         if let Some((group_precision, ranges)) = layer_template_groups.last_mut()
             && *group_precision == layer_precision
+            && ranges
+                .first()
+                .is_some_and(|existing| existing.len() == phase_range.len())
         {
             ranges.push(phase_range);
         } else {
@@ -424,13 +452,12 @@ fn main() {
             phase_instances,
         })
         .collect::<Vec<_>>();
-    let profile_output = std::env::var_os("IPU_PROFILE_OUTPUT").map(PathBuf::from);
     assert!(
         profile_output.is_none() || invocations == 1,
         "semantic profiling currently requires one invocation"
     );
     let (app, profile_layout) = if profile_output.is_some() {
-        let granularity = ProfileGranularity::from_environment().unwrap();
+        let granularity = profile_granularity.expect("profile output has a granularity");
         let (app, layout) = if granularity == ProfileGranularity::Graph {
             package_graph_repeated_with_templates_profiled_regions(
                 &graph,

@@ -17,14 +17,15 @@ use tracing_subscriber::EnvFilter;
 mod siglip;
 mod static_codegen;
 pub use siglip::{
-    AttentionKernelVariant, HostTensorSet, SiglipEncoderLayer, SiglipEncoderPrecision,
-    SiglipEncoderTuning, SiglipLinearPrecision, SiglipMapHead, SiglipProfileStage,
-    SiglipWeightStorage, append_host_a16_matrix, append_host_a16_matrix_in_arenas,
-    append_siglip_encoder_layer, append_siglip_encoder_layer_batched_with_precision,
-    append_siglip_encoder_layer_with_precision, append_siglip_map_head,
-    append_siglip_map_head_with_memory_policy, append_siglip_post_layer_norm,
-    append_siglip_post_layer_norm_with_memory_policy, attention_kernel_variant,
-    consolidate_attention_kernel_variants,
+    AttentionKernelVariant, DeferredResidualAdd, HostTensorSet, SiglipEncoderLayer,
+    SiglipEncoderPrecision, SiglipEncoderTuning, SiglipLinearPrecision, SiglipMapHead,
+    SiglipProfileStage, SiglipWeightStorage, append_host_a16_matrix,
+    append_host_a16_matrix_in_arenas, append_siglip_encoder_layer,
+    append_siglip_encoder_layer_batched_with_precision, append_siglip_encoder_layer_with_precision,
+    append_siglip_map_head, append_siglip_map_head_with_memory_policy,
+    append_siglip_post_layer_norm, append_siglip_post_layer_norm_with_memory_policy,
+    attention_kernel_variant, consolidate_attention_kernel_variants, defer_terminal_residual_add,
+    fuse_deferred_residual_into_layer_norm,
 };
 
 mod blocked_data;

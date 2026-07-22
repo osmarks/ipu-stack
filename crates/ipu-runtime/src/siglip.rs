@@ -6,7 +6,7 @@ use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
     FlashAttentionConfig, FlashAttentionPlan, GemmDataType, MemoryArena, MemoryPlacement,
-    MemoryPolicy, RowShardPlacement, RowShardTransitionConfig, Schedule, TensorId,
+    MemoryPolicy, Phase, RowShardPlacement, RowShardTransitionConfig, Schedule, TensorId,
     allocate_from_occupied_arenas, append_add_affine_layer_norm_f16_with_memory_policy,
     append_add_f16_row_shards_in_place, append_affine_layer_norm_f16_with_memory_policy,
     append_bias_f16_c16_in_arenas, append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
@@ -73,6 +73,95 @@ pub struct SiglipEncoderLayer {
     pub mlp_gelu: Vec<BlockPlacement>,
     pub attention: FlashAttentionPlan,
     pub profile_stages: Vec<SiglipProfileStage>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeferredResidualAdd {
+    sources: Vec<(TensorId, TensorId)>,
+}
+
+pub fn defer_terminal_residual_add(schedule: &mut Schedule) -> Result<Option<DeferredResidualAdd>> {
+    let Some(Phase::Compute { commands, .. }) = schedule.phases.last() else {
+        return Ok(None);
+    };
+    if commands.is_empty()
+        || commands
+            .iter()
+            .any(|command| command.specialization.operation != "add_f16")
+    {
+        return Ok(None);
+    }
+    let Some(Phase::Exchange { transfers }) =
+        schedule.phases.get(schedule.phases.len().saturating_sub(2))
+    else {
+        return Ok(None);
+    };
+    if !transfers.is_empty() {
+        return Ok(None);
+    }
+    let sources = commands
+        .iter()
+        .map(|command| {
+            if command.inputs.len() != 2 || command.output != command.inputs[0] {
+                return Err("terminal residual add has an incompatible command ABI".into());
+            }
+            Ok((command.output, command.inputs[1]))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    schedule.phases.truncate(schedule.phases.len() - 2);
+    Ok(Some(DeferredResidualAdd { sources }))
+}
+
+pub fn fuse_deferred_residual_into_layer_norm(
+    schedule: &mut Schedule,
+    phase_start: usize,
+    deferred: DeferredResidualAdd,
+) -> Result<()> {
+    let (compute_phase, commands) = schedule
+        .phases
+        .iter_mut()
+        .enumerate()
+        .skip(phase_start)
+        .find_map(|(phase, candidate)| match candidate {
+            Phase::Compute { commands, .. }
+                if !commands.is_empty()
+                    && commands.iter().all(|command| {
+                        command.specialization.operation == "layer_norm_affine_f16"
+                    }) =>
+            {
+                Some((phase, commands))
+            }
+            _ => None,
+        })
+        .ok_or("deferred residual add has no following affine LayerNorm")?;
+    if commands.len() != deferred.sources.len() {
+        return Err("deferred residual add and LayerNorm shard counts differ".into());
+    }
+    for command in commands {
+        let source = deferred
+            .sources
+            .iter()
+            .find(|(output, _)| *output == command.inputs[0])
+            .map(|(_, source)| *source)
+            .ok_or("deferred residual add has no source for a LayerNorm shard")?;
+        schedule
+            .allocations
+            .iter()
+            .find(|allocation| {
+                allocation.tensor == source
+                    && allocation.tile == command.tile
+                    && allocation.live_from <= compute_phase
+                    && allocation.live_until > compute_phase
+            })
+            .ok_or("deferred residual source is not colocated with LayerNorm")?;
+        command.inputs.insert(1, source);
+        command.specialization.operation = "add_layer_norm_affine_f16".into();
+        command.specialization.role = "add-and-normalize".into();
+        command
+            .metadata
+            .insert("label".into(), "fused residual add and LayerNorm".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -2022,4 +2111,77 @@ fn projection_blocks(
             ..*block
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ipu_compiler::{KernelCommand, OpId, SpecializationKey};
+    use std::collections::BTreeMap;
+
+    fn command(operation: &'static str, output: usize, inputs: &[usize]) -> KernelCommand {
+        KernelCommand {
+            tile: 0,
+            output: TensorId(output),
+            inputs: inputs.iter().copied().map(TensorId).collect(),
+            arguments: vec![1, 16, 1],
+            specialization: SpecializationKey {
+                operation: operation.into(),
+                shape: vec![1, 16],
+                worker_count: 6,
+                role: String::new().into(),
+                alignment: 8,
+            },
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn terminal_residual_add_fuses_into_following_layer_norm() {
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: Vec::new(),
+            tile_count: 1,
+            peak_sram: BTreeMap::new(),
+        };
+        for tensor in 1..=4 {
+            schedule.allocations.push(Allocation {
+                tensor: TensorId(tensor),
+                tile: 0,
+                address: 0x60000 + tensor as u32 * 0x100,
+                size: 32,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            });
+        }
+        schedule.phases.push(Phase::Exchange {
+            transfers: Vec::new(),
+        });
+        schedule.phases.push(Phase::Compute {
+            op: OpId(1),
+            commands: vec![command("add_f16", 1, &[1, 2])],
+        });
+        let deferred = defer_terminal_residual_add(&mut schedule).unwrap().unwrap();
+        assert!(schedule.phases.is_empty());
+
+        schedule.phases.push(Phase::Exchange {
+            transfers: Vec::new(),
+        });
+        schedule.phases.push(Phase::Compute {
+            op: OpId(1),
+            commands: vec![command("layer_norm_affine_f16", 4, &[1, 3])],
+        });
+        fuse_deferred_residual_into_layer_norm(&mut schedule, 0, deferred).unwrap();
+
+        let Phase::Compute { commands, .. } = &schedule.phases[1] else {
+            panic!("expected fused compute phase");
+        };
+        assert_eq!(
+            commands[0].specialization.operation,
+            "add_layer_norm_affine_f16"
+        );
+        assert_eq!(commands[0].inputs, [TensorId(1), TensorId(2), TensorId(3)]);
+    }
 }
