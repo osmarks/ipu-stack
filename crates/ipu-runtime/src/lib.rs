@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
+mod placement;
 mod siglip;
 mod static_codegen;
 pub use siglip::{
@@ -149,7 +150,7 @@ fn executable_regions_for_tile(
 ) -> Result<Vec<(u32, u32)>> {
     let element_size = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
     let memory_end = ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT;
-    let mut reserved = vec![
+    let reserved = vec![
         (
             ipu_package::TILE_MEMORY_BASE,
             ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES,
@@ -164,32 +165,16 @@ fn executable_regions_for_tile(
         ),
         (PLAN_BASE, runtime_end),
     ];
-    reserved.extend_from_slice(allocation_ranges);
-    reserved.extend_from_slice(additional_reserved);
-    let mut reserved = reserved
-        .into_iter()
-        .map(|(start, end)| (align_down(start, element_size), align_up(end, element_size)))
-        .collect::<Vec<_>>();
-    reserved.sort_unstable();
-
-    let mut cursor = align_up(
-        ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES,
-        element_size,
+    let mut space = placement::AddressSpace::new(
+        ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES..memory_end,
     );
-    let mut regions = Vec::new();
-    for (start, end) in reserved {
-        if end <= cursor || start >= memory_end {
-            continue;
-        }
-        if cursor < start {
-            regions.push((cursor, start.min(memory_end)));
-        }
-        cursor = align_up(cursor.max(end), element_size);
-    }
-    if cursor < memory_end {
-        regions.push((cursor, memory_end));
-    }
-    Ok(regions)
+    space.reserve_all(
+        reserved
+            .into_iter()
+            .chain(allocation_ranges.iter().copied())
+            .chain(additional_reserved.iter().copied()),
+    );
+    Ok(space.free_regions(element_size))
 }
 
 fn data_region_base_for_tile(
@@ -206,7 +191,7 @@ fn data_region_base_for_tile(
     let memory_end = ipu_package::TILE_MEMORY_BASE
         .checked_add(ipu_package::TILE_MEMORY_SIZE)
         .ok_or("tile memory range overflow")?;
-    let mut reserved = vec![
+    let reserved = vec![
         (
             ipu_package::TILE_MEMORY_BASE,
             ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES,
@@ -217,42 +202,33 @@ fn data_region_base_for_tile(
         ),
         (PLAN_BASE, runtime_end),
     ];
-    reserved.extend_from_slice(allocation_ranges);
-    reserved.extend_from_slice(additional_reserved);
-    reserved.sort_unstable();
-
-    let mut cursor = align_up(ipu_package::TILE_MEMORY_BASE, alignment);
-    let mut free_bytes = 0u32;
-    let mut largest_gap = 0u32;
-    for (start, end) in reserved {
-        if end <= cursor || start >= memory_end {
-            continue;
-        }
-        let gap = start.saturating_sub(cursor);
-        free_bytes = free_bytes.saturating_add(gap);
-        largest_gap = largest_gap.max(gap);
-        let candidate_end = cursor
+    let mut space = placement::AddressSpace::new(ipu_package::TILE_MEMORY_BASE..memory_end);
+    space.reserve_all(
+        reserved
+            .into_iter()
+            .chain(allocation_ranges.iter().copied())
+            .chain(additional_reserved.iter().copied()),
+    );
+    let gaps = space.free_regions(1);
+    if let Some(address) = gaps.iter().find_map(|&(start, end)| {
+        let address = align_up(start, alignment);
+        address
             .checked_add(required_size)
-            .ok_or("data region address overflow")?;
-        if candidate_end <= start {
-            return Ok(cursor);
-        }
-        cursor = align_up(cursor.max(end), alignment);
+            .filter(|&candidate_end| candidate_end <= end)
+            .map(|_| address)
+    }) {
+        return Ok(address);
     }
-    let final_gap = memory_end.saturating_sub(cursor);
-    free_bytes = free_bytes.saturating_add(final_gap);
-    largest_gap = largest_gap.max(final_gap);
-    if cursor
-        .checked_add(required_size)
-        .is_some_and(|end| end <= memory_end)
-    {
-        Ok(cursor)
-    } else {
-        Err(format!(
-            "no tile-memory interval can hold {required_size} bytes of static data on tile {tile}: {free_bytes} free bytes, {largest_gap}-byte largest gap"
-        )
-        .into())
-    }
+    let free_bytes = gaps.iter().map(|(start, end)| end - start).sum::<u32>();
+    let largest_gap = gaps
+        .iter()
+        .map(|(start, end)| end - start)
+        .max()
+        .unwrap_or(0);
+    Err(format!(
+        "no tile-memory interval can hold {required_size} bytes of static data on tile {tile}: {free_bytes} free bytes, {largest_gap}-byte largest gap"
+    )
+    .into())
 }
 
 fn pack_data_objects_for_tile(
@@ -285,23 +261,9 @@ fn pack_data_objects_for_tile(
     }
     reserved.extend_from_slice(allocation_ranges);
     reserved.extend_from_slice(additional_reserved);
-    reserved.sort_unstable();
-    let mut gaps = Vec::new();
-    let mut cursor = ipu_package::TILE_MEMORY_BASE;
-    for (start, end) in reserved {
-        if end <= cursor || start >= memory_end {
-            continue;
-        }
-        let gap_start = align_up(cursor, 8);
-        if gap_start < start {
-            gaps.push((gap_start, start));
-        }
-        cursor = cursor.max(end);
-    }
-    let gap_start = align_up(cursor, 8);
-    if gap_start < memory_end {
-        gaps.push((gap_start, memory_end));
-    }
+    let mut space = placement::AddressSpace::new(ipu_package::TILE_MEMORY_BASE..memory_end);
+    space.reserve_all(reserved);
+    let gaps = space.free_regions(1);
 
     pack_objects_in_gaps(tile, objects, gaps, "static data")
 }
