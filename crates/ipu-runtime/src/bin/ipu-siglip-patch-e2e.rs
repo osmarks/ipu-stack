@@ -18,7 +18,7 @@ use ipu_runtime::{
     append_siglip_post_layer_norm_with_memory_policy, block_binding_typed, block_coordinates,
     blocked_matrix_f16, consolidate_attention_kernel_variants, package_graph_repeated,
     package_graph_repeated_with_templates, package_graph_repeated_with_templates_profiled_regions,
-    package_graph_repeated_with_templates_profiled_with, run_host_with_options,
+    package_graph_repeated_with_templates_profiled_with_regions, run_host_with_options,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -420,10 +420,11 @@ fn main() {
                 invocations,
             )
         } else {
-            package_graph_repeated_with_templates_profiled_with(
+            package_graph_repeated_with_templates_profiled_with_regions(
                 &graph,
                 &objects,
                 &templates,
+                &profile_regions,
                 granularity,
                 invocations,
             )

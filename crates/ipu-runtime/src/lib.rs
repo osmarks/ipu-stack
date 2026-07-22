@@ -860,7 +860,27 @@ pub fn package_graph_repeated_with_templates_profiled_with(
     package_graph_with_profile_options(
         graph,
         objects,
-        ProfileSelection::Granularity(granularity),
+        ProfileSelection::Granularity(granularity, None),
+        templates,
+        invocations,
+    )
+}
+
+pub fn package_graph_repeated_with_templates_profiled_with_regions(
+    graph: &ExecutableGraph,
+    objects: &[Vec<u8>],
+    templates: &[StaticTemplateRegion],
+    regions: &[StaticProfileRegion],
+    granularity: ProfileGranularity,
+    invocations: u32,
+) -> Result<(Application, ProfileLayout)> {
+    if invocations == 0 {
+        return Err("profiled graph invocation count must be nonzero".into());
+    }
+    package_graph_with_profile_options(
+        graph,
+        objects,
+        ProfileSelection::Granularity(granularity, Some(regions)),
         templates,
         invocations,
     )
@@ -1370,8 +1390,25 @@ fn region_profile_steps(
 
 #[derive(Clone, Copy)]
 enum ProfileSelection<'a> {
-    Granularity(ProfileGranularity),
+    Granularity(ProfileGranularity, Option<&'a [StaticProfileRegion]>),
     Regions(&'a [StaticProfileRegion]),
+}
+
+fn annotate_semantic_regions(
+    steps: &mut [ipu_package::ProfileStep],
+    regions: &[StaticProfileRegion],
+) -> Result<()> {
+    for step in steps {
+        let phase = usize::try_from(step.phase)?;
+        let index = regions.partition_point(|region| region.phases.end <= phase);
+        let region = regions
+            .get(index)
+            .filter(|region| region.phases.contains(&phase))
+            .ok_or_else(|| format!("profile phase {phase} is outside the semantic regions"))?;
+        step.metadata
+            .push(profile_metadata("semantic_region", &region.name));
+    }
+    Ok(())
 }
 
 fn package_graph_with_profile(
@@ -1382,7 +1419,7 @@ fn package_graph_with_profile(
     package_graph_with_profile_options(
         graph,
         objects,
-        ProfileSelection::Granularity(granularity),
+        ProfileSelection::Granularity(granularity, None),
         &[],
         1,
     )
@@ -1414,7 +1451,7 @@ fn package_graph_with_profile_options(
     let mut file_offset = 0usize;
     let aggregate = matches!(
         selection,
-        ProfileSelection::Granularity(ProfileGranularity::Graph)
+        ProfileSelection::Granularity(ProfileGranularity::Graph, _)
     );
     let profile_tensor_base = profile_graph
         .schedule
@@ -1427,8 +1464,12 @@ fn package_graph_with_profile_options(
         .ok_or("profile tensor id overflow")?;
     for program in &programs {
         let (mut steps, boundaries) = match selection {
-            ProfileSelection::Granularity(granularity) => {
-                profile_steps(&graph.schedule, program, granularity)
+            ProfileSelection::Granularity(granularity, regions) => {
+                let (mut steps, boundaries) = profile_steps(&graph.schedule, program, granularity);
+                if let Some(regions) = regions {
+                    annotate_semantic_regions(&mut steps, regions)?;
+                }
+                (steps, boundaries)
             }
             ProfileSelection::Regions(regions) => {
                 region_profile_steps(&graph.schedule, program, regions)?
@@ -4162,6 +4203,44 @@ mod tests {
         assert_eq!(report.tiles[0].samples[0].end_cycle, 23);
         assert_eq!(report.tiles[0].samples[1].start_cycle, 23);
         assert_eq!(report.tiles[0].samples[1].end_cycle, 47);
+    }
+
+    #[test]
+    fn fine_profile_steps_include_their_semantic_region() {
+        let mut steps = [0, 2, 5].map(|phase| ipu_package::ProfileStep {
+            local_index: phase,
+            phase,
+            epoch: 0,
+            operation: format!("phase-{phase}"),
+            kind: ipu_package::ProfileStepKind::Compute,
+            kernel: "test".into(),
+            metadata: Vec::new(),
+        });
+        let regions = [
+            StaticProfileRegion {
+                name: "embedding".into(),
+                phases: 0..2,
+            },
+            StaticProfileRegion {
+                name: "encoder".into(),
+                phases: 2..6,
+            },
+        ];
+
+        annotate_semantic_regions(&mut steps, &regions).unwrap();
+
+        let names = steps
+            .iter()
+            .map(|step| {
+                step.metadata
+                    .iter()
+                    .find(|entry| entry.name == "semantic_region")
+                    .unwrap()
+                    .value
+                    .as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["embedding", "encoder", "encoder"]);
     }
 
     #[test]
