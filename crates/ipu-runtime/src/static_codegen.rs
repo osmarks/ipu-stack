@@ -188,7 +188,7 @@ pub(crate) fn template_patch_group_span(
 }
 
 pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> Vec<Range<usize>> {
-    const MASK_BYTES_PER_STREAM: usize = 32;
+    const MASK_BYTES_PER_STREAM: usize = 16;
     const SLOTS_PER_MASK: usize = 32;
     const MASK_GROUPS_PER_STREAM: usize = MASK_BYTES_PER_STREAM / size_of::<u32>();
     let maximum_slots = MASK_GROUPS_PER_STREAM * SLOTS_PER_MASK;
