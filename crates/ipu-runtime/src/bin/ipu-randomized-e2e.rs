@@ -8,6 +8,7 @@ use ipu_runtime::{ExecutableGraph, InitialBuffer, package_graph, run_diagnostic}
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const TILE_COUNT: u16 = 1472;
 const DEFAULT_SEED: u64 = 0x4950_552d_5354_4143;
@@ -131,7 +132,7 @@ fn randomized_case(seed: u64, case: usize) -> (ExecutableGraph, BTreeMap<String,
     };
     let sparse_compute = Phase::Compute {
         op: OpId(0),
-        commands: vec![KernelCommand {
+        commands: vec![Arc::new(KernelCommand {
             tile: compute_tile,
             output: accumulator_tensor,
             inputs: vec![accumulator_tensor, payload_tensor],
@@ -144,7 +145,7 @@ fn randomized_case(seed: u64, case: usize) -> (ExecutableGraph, BTreeMap<String,
                 alignment: 4,
             },
             metadata: Default::default(),
-        }],
+        })],
     };
 
     let matching_width = rng.usize(8..=64);

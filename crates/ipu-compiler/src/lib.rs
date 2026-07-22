@@ -384,7 +384,7 @@ pub enum Phase {
     },
     Compute {
         op: OpId,
-        commands: Vec<KernelCommand>,
+        commands: Vec<Arc<KernelCommand>>,
     },
 }
 
@@ -1119,6 +1119,7 @@ pub fn set_f8_weight_block_scales_in_phases(
             continue;
         };
         for command in commands {
+            let command = Arc::make_mut(command);
             if command.specialization.operation != "expand_f8_f143_to_f16" {
                 continue;
             }
@@ -1180,6 +1181,7 @@ pub fn set_native_f8_weight_block_scales_in_phases(
             continue;
         };
         for command in commands {
+            let command = Arc::make_mut(command);
             if !command.specialization.operation.starts_with("gemm_f8_") {
                 continue;
             }
@@ -1364,7 +1366,7 @@ pub fn append_bias_f16_c16_in_arenas(
     schedule.phases.push(Phase::Exchange { transfers });
     schedule.phases.push(Phase::Compute {
         op: OpId(compute_phase),
-        commands,
+        commands: commands.into_iter().map(Arc::new).collect(),
     });
     Ok(biases)
 }
@@ -1626,7 +1628,7 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
         schedule.phases.push(Phase::Exchange { transfers });
         schedule.phases.push(Phase::Compute {
             op: OpId(compute_phase),
-            commands,
+            commands: commands.into_iter().map(Arc::new).collect(),
         });
     }
     prepare_appended_gemm_lifetimes(&mut plan);
@@ -1893,7 +1895,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
         schedule.phases.push(Phase::Exchange { transfers });
         schedule.phases.push(Phase::Compute {
             op: OpId(compute_phase),
-            commands,
+            commands: commands.into_iter().map(Arc::new).collect(),
         });
     }
     prepare_appended_gemm_lifetimes(&mut plan);
@@ -2207,6 +2209,7 @@ fn rotate_gemm_plan_tiles(plan: &mut BlockedGemmPlan, rotation: u16) -> Result<(
             }
             Phase::Compute { commands, .. } => {
                 for command in commands {
+                    let command = Arc::make_mut(command);
                     rotate(&mut command.tile);
                 }
             }
@@ -2256,6 +2259,7 @@ fn remap_gemm_tensors(plan: &mut BlockedGemmPlan, base: usize) -> Result<(), Com
             }
             Phase::Compute { commands, .. } => {
                 for command in commands {
+                    let command = Arc::make_mut(command);
                     remap(&mut command.output)?;
                     for input in &mut command.inputs {
                         remap(input)?;
@@ -3055,7 +3059,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
             }
             phases.push(Phase::Compute {
                 op: OpId(gemm_phase),
-                commands: gemm_commands,
+                commands: gemm_commands.into_iter().map(Arc::new).collect(),
             });
         }
         let evacuation_phase = phases.len();
@@ -3188,7 +3192,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         }
         phases.push(Phase::Compute {
             op: OpId(copy_phase),
-            commands: copy_commands,
+            commands: copy_commands.into_iter().map(Arc::new).collect(),
         });
     }
 
@@ -3248,13 +3252,17 @@ pub struct LoweredExchangePhase {
 pub struct LoweredComputeCommand {
     pub op: OpId,
     pub phase: usize,
-    pub output: TensorId,
-    pub inputs: Vec<TensorId>,
+    pub command: Arc<KernelCommand>,
     pub output_address: u32,
     pub input_addresses: Vec<u32>,
-    pub arguments: Vec<u32>,
-    pub specialization: SpecializationKey,
-    pub metadata: BTreeMap<String, String>,
+}
+
+impl std::ops::Deref for LoweredComputeCommand {
+    type Target = KernelCommand;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3481,6 +3489,7 @@ impl Schedule {
                 continue;
             };
             for command in commands {
+                let command = Arc::make_mut(command);
                 command.specialization.shape = Vec::new();
                 command.specialization.role = Cow::Borrowed("");
                 command.metadata = BTreeMap::new();
@@ -3974,13 +3983,9 @@ impl Schedule {
                             LoweredComputeCommand {
                                 op: *op,
                                 phase: phase_index,
-                                output: command.output,
-                                inputs: command.inputs.clone(),
+                                command: command.clone(),
                                 output_address,
                                 input_addresses,
-                                arguments: command.arguments.clone(),
-                                specialization: command.specialization.clone(),
-                                metadata: command.metadata.clone(),
                             },
                         )));
                     }
@@ -4172,23 +4177,25 @@ pub fn compile(graph: &Graph, options: &CompilerOptions) -> Result<Schedule, Com
         let commands = output_layout
             .tiles
             .iter()
-            .map(|tile| KernelCommand {
-                tile: *tile,
-                output: op.output,
-                inputs: op.inputs.clone(),
-                arguments: Vec::new(),
-                specialization: SpecializationKey {
-                    operation: operation.into(),
-                    shape: graph.tensors[op.output.0].shape.clone(),
-                    worker_count: worker_count(&graph.tensors[op.output.0]),
-                    role: if output_layout.tiles.last() == Some(tile) {
-                        "tail".into()
-                    } else {
-                        "body".into()
+            .map(|tile| {
+                Arc::new(KernelCommand {
+                    tile: *tile,
+                    output: op.output,
+                    inputs: op.inputs.clone(),
+                    arguments: Vec::new(),
+                    specialization: SpecializationKey {
+                        operation: operation.into(),
+                        shape: graph.tensors[op.output.0].shape.clone(),
+                        worker_count: worker_count(&graph.tensors[op.output.0]),
+                        role: if output_layout.tiles.last() == Some(tile) {
+                            "tail".into()
+                        } else {
+                            "body".into()
+                        },
+                        alignment: output_layout.alignment,
                     },
-                    alignment: output_layout.alignment,
-                },
-                metadata: BTreeMap::new(),
+                    metadata: BTreeMap::new(),
+                })
             })
             .collect();
         phases.push(Phase::Compute {

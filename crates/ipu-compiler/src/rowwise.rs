@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashSet as HashSet;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AffineLayerNormConfig {
@@ -295,7 +296,7 @@ pub fn append_add_f16_row_shards_in_place(
     schedule.phases.push(Phase::Exchange { transfers });
     schedule.phases.push(Phase::Compute {
         op: OpId(compute_phase),
-        commands,
+        commands: commands.into_iter().map(Arc::new).collect(),
     });
     Ok(destination.to_vec())
 }
@@ -424,7 +425,7 @@ pub fn append_c16_to_a16_blocks_gelu_f16_in_arenas(
     }
     schedule.phases.push(Phase::Compute {
         op: OpId(phase),
-        commands,
+        commands: commands.into_iter().map(Arc::new).collect(),
     });
     Ok(output)
 }
@@ -631,7 +632,7 @@ fn append_c16_to_a16_row_shards_impl(
         schedule.phases.push(Phase::Exchange { transfers });
         schedule.phases.push(Phase::Compute {
             op: OpId(compute_phase),
-            commands,
+            commands: commands.into_iter().map(Arc::new).collect(),
         });
     }
     Ok(destinations)
@@ -988,7 +989,7 @@ fn append_to_a16_row_shards_reblocked_in_arenas(
         schedule.phases.push(Phase::Exchange { transfers });
         schedule.phases.push(Phase::Compute {
             op: OpId(compute_phase),
-            commands,
+            commands: commands.into_iter().map(Arc::new).collect(),
         });
     }
     Ok(destinations)
@@ -1356,7 +1357,7 @@ fn append_affine_layer_norm_f16_impl(
     schedule.phases.push(Phase::Exchange { transfers });
     schedule.phases.push(Phase::Compute {
         op: OpId(compute_phase),
-        commands,
+        commands: commands.into_iter().map(Arc::new).collect(),
     });
     Ok(AppendedAffineLayerNorm { affine, output })
 }

@@ -337,7 +337,9 @@ fn host_compute_relay_graph() -> Result<ExecutableGraph, ipu_compiler::CompileEr
             phases: vec![
                 Phase::Compute {
                     op: OpId(0),
-                    commands: vec![add_u32(SOURCE_TILE, first_result, input, "before-exchange")],
+                    commands: vec![
+                        add_u32(SOURCE_TILE, first_result, input, "before-exchange").into(),
+                    ],
                 },
                 Phase::Exchange {
                     transfers: vec![Transfer {
@@ -350,12 +352,15 @@ fn host_compute_relay_graph() -> Result<ExecutableGraph, ipu_compiler::CompileEr
                 },
                 Phase::Compute {
                     op: OpId(1),
-                    commands: vec![add_u32(
-                        DESTINATION_TILE,
-                        final_result,
-                        first_result,
-                        "after-exchange",
-                    )],
+                    commands: vec![
+                        add_u32(
+                            DESTINATION_TILE,
+                            final_result,
+                            first_result,
+                            "after-exchange",
+                        )
+                        .into(),
+                    ],
                 },
             ],
             allocations,

@@ -4,6 +4,7 @@ use crate::{
 };
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockedMlpConfig {
@@ -215,6 +216,7 @@ fn annotate_layer(schedule: &mut Schedule, layer: usize) {
             continue;
         };
         for command in commands {
+            let command = Arc::make_mut(command);
             command.metadata.insert("layer".into(), layer.to_string());
             if let Some(label) = command.metadata.get_mut("label") {
                 *label = format!("MLP layer {layer}: {label}");
@@ -272,6 +274,7 @@ fn remap_tensors(plan: &mut crate::BlockedGemmPlan, base: usize) {
             }
             Phase::Compute { commands, .. } => {
                 for command in commands {
+                    let command = Arc::make_mut(command);
                     command.output.0 += base;
                     for input in &mut command.inputs {
                         input.0 += base;
@@ -411,7 +414,7 @@ fn append_activation_transition(
     phases.push(Phase::Exchange { transfers });
     phases.push(Phase::Compute {
         op: OpId(compute_phase),
-        commands,
+        commands: commands.into_iter().map(Arc::new).collect(),
     });
     Ok(())
 }

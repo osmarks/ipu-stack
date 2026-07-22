@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
 
 const TILE_COUNT: u16 = 1472;
@@ -1017,7 +1018,7 @@ fn append_adjustment_phase(
     }
     schedule.phases.push(Phase::Compute {
         op: OpId(phase),
-        commands,
+        commands: commands.into_iter().map(Arc::new).collect(),
     });
     Ok(placements)
 }
@@ -1198,6 +1199,7 @@ fn specialize_gemm_row_operations(
             continue;
         };
         for command in commands {
+            let command = Arc::make_mut(command);
             let operation = command.specialization.operation.as_ref();
             let Some(base) = operation
                 .strip_suffix("_small_rows")

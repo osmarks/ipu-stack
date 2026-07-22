@@ -8,6 +8,7 @@ use ipu_runtime::{ExecutableGraph, InitialBuffer, package_graph, run_diagnostic,
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const TILE_COUNT: u16 = 1472;
 const ACCUMULATOR_ADDRESS: u32 = 0x60000;
@@ -303,7 +304,7 @@ fn acceptance_graph() -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
         phases.push(Phase::Exchange { transfers });
         phases.push(Phase::Compute {
             op: OpId(operation),
-            commands: compute,
+            commands: compute.into_iter().map(Arc::new).collect(),
         });
         active = next;
     }

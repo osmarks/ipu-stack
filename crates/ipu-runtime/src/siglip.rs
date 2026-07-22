@@ -25,6 +25,7 @@ use ipu_compiler::{
 use ipu_models::SiglipWeights;
 use ipu_package::{Binding, RegionSlice};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::sync::Arc;
 use tracing::{info, info_span};
 
 #[derive(Default)]
@@ -164,6 +165,7 @@ pub fn fuse_deferred_residual_into_layer_norm(
         .map(|allocation| (allocation.tensor, allocation.tile))
         .collect::<HashSet<_>>();
     for command in commands {
+        let command = Arc::make_mut(command);
         let source = sources
             .get(&command.inputs[0])
             .copied()
@@ -280,6 +282,7 @@ pub fn consolidate_attention_kernel_variants(
             continue;
         };
         for command in commands {
+            let command = Arc::make_mut(command);
             let operation = command.specialization.operation.as_ref();
             if !operation.starts_with("attention_") {
                 continue;
@@ -329,6 +332,7 @@ fn specialize_attention_phases(
             continue;
         };
         for command in commands {
+            let command = Arc::make_mut(command);
             let operation = command.specialization.operation.as_ref();
             if operation.starts_with("attention_qk_")
                 || operation.starts_with("attention_pv_")
@@ -2305,7 +2309,7 @@ mod tests {
         });
         schedule.phases.push(Phase::Compute {
             op: OpId(1),
-            commands: vec![command("add_f16", 1, &[1, 2])],
+            commands: vec![command("add_f16", 1, &[1, 2]).into()],
         });
         let deferred = defer_terminal_residual_add(&mut schedule).unwrap().unwrap();
         assert!(schedule.phases.is_empty());
@@ -2315,7 +2319,7 @@ mod tests {
         });
         schedule.phases.push(Phase::Compute {
             op: OpId(1),
-            commands: vec![command("layer_norm_affine_f16", 4, &[1, 3])],
+            commands: vec![command("layer_norm_affine_f16", 4, &[1, 3]).into()],
         });
         fuse_deferred_residual_into_layer_norm(&mut schedule, 0, deferred).unwrap();
 

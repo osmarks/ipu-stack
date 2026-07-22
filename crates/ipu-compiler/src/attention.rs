@@ -5,6 +5,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlashAttentionConfig {
@@ -495,7 +496,7 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
         schedule.phases.push(Phase::Exchange { transfers });
         schedule.phases.push(Phase::Compute {
             op: OpId(compute_phase),
-            commands,
+            commands: commands.into_iter().map(Arc::new).collect(),
         });
     }
     Ok(destinations)
@@ -728,7 +729,7 @@ fn append_attention_pack_phase(
     schedule.phases.push(Phase::Exchange { transfers });
     schedule.phases.push(Phase::Compute {
         op: OpId(compute_phase),
-        commands,
+        commands: commands.into_iter().map(Arc::new).collect(),
     });
     Ok(())
 }
@@ -771,6 +772,7 @@ fn remap_attention_tensors(plan: &mut FlashAttentionPlan, base: usize) -> Result
             }
             Phase::Compute { commands, .. } => {
                 for command in commands {
+                    let command = Arc::make_mut(command);
                     remap(&mut command.output)?;
                     for input in &mut command.inputs {
                         remap(input)?;
@@ -1258,38 +1260,42 @@ pub fn plan_flash_attention(
         phases.push(Phase::Exchange { transfers });
         phases.push(Phase::Compute {
             op: OpId(compute_phase),
-            commands,
+            commands: commands.into_iter().map(Arc::new).collect(),
         });
     }
 
     let finalize_commands = tasks
         .iter()
-        .map(|task| KernelCommand {
-            tile: task.tile,
-            output: task.output,
-            inputs: vec![task.accumulator, task.query],
-            arguments: vec![(u32::from(task.query_rows) * u32::from(head_dimension)).div_ceil(2)],
-            specialization: SpecializationKey {
-                operation: "attention_f32_to_f16".into(),
-                shape: vec![usize::from(task.query_rows), usize::from(head_dimension)],
-                worker_count: 6,
-                role: format!(
-                    "batch-{}-head-{}-queries-{}-{}",
-                    task.batch,
-                    task.head,
-                    task.query_row_start,
-                    task.query_row_start + task.query_rows
-                )
-                .into(),
-                alignment: 8,
-            },
-            metadata: BTreeMap::from([
-                ("label".into(), "Attention FP16 output".into()),
-                ("batch".into(), task.batch.to_string()),
-                ("head".into(), task.head.to_string()),
-                ("query_row_start".into(), task.query_row_start.to_string()),
-                ("query_rows".into(), task.query_rows.to_string()),
-            ]),
+        .map(|task| {
+            Arc::new(KernelCommand {
+                tile: task.tile,
+                output: task.output,
+                inputs: vec![task.accumulator, task.query],
+                arguments: vec![
+                    (u32::from(task.query_rows) * u32::from(head_dimension)).div_ceil(2),
+                ],
+                specialization: SpecializationKey {
+                    operation: "attention_f32_to_f16".into(),
+                    shape: vec![usize::from(task.query_rows), usize::from(head_dimension)],
+                    worker_count: 6,
+                    role: format!(
+                        "batch-{}-head-{}-queries-{}-{}",
+                        task.batch,
+                        task.head,
+                        task.query_row_start,
+                        task.query_row_start + task.query_rows
+                    )
+                    .into(),
+                    alignment: 8,
+                },
+                metadata: BTreeMap::from([
+                    ("label".into(), "Attention FP16 output".into()),
+                    ("batch".into(), task.batch.to_string()),
+                    ("head".into(), task.head.to_string()),
+                    ("query_row_start".into(), task.query_row_start.to_string()),
+                    ("query_rows".into(), task.query_rows.to_string()),
+                ]),
+            })
         })
         .collect();
     phases.push(Phase::Compute {

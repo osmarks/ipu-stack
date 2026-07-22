@@ -1539,6 +1539,7 @@ mod tests {
         TensorId,
     };
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn exchange(phase: usize, active: bool) -> LoweredTileStep {
         LoweredTileStep::Exchange {
@@ -1566,19 +1567,22 @@ mod tests {
         LoweredTileStep::Compute(Box::new(LoweredComputeCommand {
             op: OpId(phase),
             phase,
-            output: TensorId(3),
-            inputs: vec![TensorId(1), TensorId(2)],
+            command: Arc::new(ipu_compiler::KernelCommand {
+                tile: 0,
+                output: TensorId(3),
+                inputs: vec![TensorId(1), TensorId(2)],
+                arguments,
+                specialization: SpecializationKey {
+                    operation: operation.into(),
+                    shape: vec![12, 64, 64],
+                    worker_count: 6,
+                    role: "inner-block".into(),
+                    alignment: 32,
+                },
+                metadata: BTreeMap::new(),
+            }),
             output_address: 0x80000,
             input_addresses: vec![0x50000, input_address],
-            arguments,
-            specialization: SpecializationKey {
-                operation: operation.into(),
-                shape: vec![12, 64, 64],
-                worker_count: 6,
-                role: "inner-block".into(),
-                alignment: 32,
-            },
-            metadata: BTreeMap::new(),
         }))
     }
 
@@ -1634,7 +1638,7 @@ mod tests {
         let LoweredTileStep::Compute(mut first) = compute(3, 0x54000, vec![8, 64, 1024]) else {
             unreachable!()
         };
-        first.inputs.push(TensorId(4));
+        Arc::make_mut(&mut first.command).inputs.push(TensorId(4));
         first.input_addresses.push(0x58000);
         let mut second = first.clone();
         second.output_address += 0x1000;

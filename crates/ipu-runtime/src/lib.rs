@@ -4363,6 +4363,7 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn measured_executable_relocation_updates_aliases_and_literal_addresses() {
@@ -4613,22 +4614,25 @@ mod tests {
         let command = ipu_compiler::LoweredComputeCommand {
             op: ipu_compiler::OpId(4),
             phase: 7,
-            output: ipu_compiler::TensorId(11),
-            inputs: vec![ipu_compiler::TensorId(9), ipu_compiler::TensorId(10)],
+            command: Arc::new(ipu_compiler::KernelCommand {
+                tile: 7,
+                output: ipu_compiler::TensorId(11),
+                inputs: vec![ipu_compiler::TensorId(9), ipu_compiler::TensorId(10)],
+                arguments: vec![64],
+                specialization: ipu_compiler::SpecializationKey {
+                    operation: "gemm_f32_accumulate".into(),
+                    shape: vec![64, 64, 64],
+                    worker_count: 6,
+                    role: "inner-block-3".into(),
+                    alignment: 32,
+                },
+                metadata: BTreeMap::from([
+                    ("label".into(), "GEMM block (2, 5) inner block 3".into()),
+                    ("output_block_row".into(), "2".into()),
+                ]),
+            }),
             output_address: 0x80000,
             input_addresses: vec![0x50000, 0x54000],
-            arguments: vec![64],
-            specialization: ipu_compiler::SpecializationKey {
-                operation: "gemm_f32_accumulate".into(),
-                shape: vec![64, 64, 64],
-                worker_count: 6,
-                role: "inner-block-3".into(),
-                alignment: 32,
-            },
-            metadata: BTreeMap::from([
-                ("label".into(), "GEMM block (2, 5) inner block 3".into()),
-                ("output_block_row".into(), "2".into()),
-            ]),
         };
         let step = compute_profile_step(8, &command);
 
@@ -4669,7 +4673,10 @@ mod tests {
             layouts: Vec::new(),
             phases: vec![ipu_compiler::Phase::Compute {
                 op: ipu_compiler::OpId(9),
-                commands: vec![command(7, "layer 3 GeLU"), command(7, "second command")],
+                commands: vec![
+                    command(7, "layer 3 GeLU").into(),
+                    command(7, "second command").into(),
+                ],
             }],
             allocations: Vec::new(),
             tile_count: 8,
@@ -4717,7 +4724,7 @@ mod tests {
                 },
                 ipu_compiler::Phase::Compute {
                     op: ipu_compiler::OpId(2),
-                    commands: vec![scheduled_command],
+                    commands: vec![scheduled_command.into()],
                 },
             ],
             allocations: Vec::new(),
