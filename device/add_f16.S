@@ -42,6 +42,7 @@ ipu_stack_add_f16:
 	add $m3, $m3, $m9
 	add $m4, $m4, $m9
 	add $m5, $m5, $m8
+	brz $m5, .Ladd_f16_worker_done
 .Ladd_f16_worker_loop:
 	ld32 $a0, $m3, $m15, 0
 	ld32 $a1, $m4, $m15, 0
@@ -52,4 +53,5 @@ ipu_stack_add_f16:
 	add $m4, $m4, 4
 	sub $m5, $m5, 1
 	brnz $m5, .Ladd_f16_worker_loop
+.Ladd_f16_worker_done:
 	exitz $m15

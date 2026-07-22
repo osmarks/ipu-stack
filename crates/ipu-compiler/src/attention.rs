@@ -1385,19 +1385,21 @@ fn key_block_schedule_cost(
     sequence_length: u16,
     rows: u16,
     padded_dimension: u16,
-) -> (u16, u32, u16, u16) {
+) -> (u32, u16, u16) {
     let blocks = sequence_length.div_ceil(rows);
     let storage_rows = rows.div_ceil(16) * 16;
     let pair_bytes = matrix_storage_bytes(storage_rows, padded_dimension) * 2;
     let blocks_per_exchange =
         u16::try_from((ipu_exchange::EXCHANGE_WINDOW_BYTES / pair_bytes).min(u32::from(blocks)))
             .expect("exchange-window block count fits in u16");
-    (
-        blocks.div_ceil(blocks_per_exchange),
-        u32::from(blocks) * u32::from(storage_rows),
-        blocks,
-        rows,
-    )
+    let exchange_batches = blocks.div_ceil(blocks_per_exchange);
+    let padded_work_rows = u32::from(blocks) * u32::from(storage_rows);
+    // QK, softmax, and PV scale with padded rows. Each online-softmax merge
+    // and each exchange batch also has fixed control/synchronization work;
+    // express that overhead as one 16-row panel so it participates in the
+    // same cost units without embedding device cycle measurements.
+    let control_rows = u32::from(blocks + exchange_batches) * 16;
+    (padded_work_rows + control_rows, blocks, rows)
 }
 
 fn select_key_block_rows(sequence_length: u16, maximum_rows: u16, padded_dimension: u16) -> u16 {
