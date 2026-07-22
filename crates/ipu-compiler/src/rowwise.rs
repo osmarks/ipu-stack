@@ -686,7 +686,13 @@ pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
                 "C16 row shard {row_start}..{row_end} has incomplete source coverage"
             )));
         }
-        groups.push((destination_tile, address, destination_rows, fragments));
+        groups.push((
+            destination_tile,
+            address,
+            destination_rows,
+            tensor,
+            fragments,
+        ));
         row_start = row_end;
     }
 
@@ -694,43 +700,57 @@ pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
     while cursors
         .iter()
         .zip(&groups)
-        .any(|(&cursor, group)| cursor < group.3.len())
+        .any(|(&fragment, group)| fragment < group.4.len())
     {
         let exchange_phase = schedule.phases.len();
         let compute_phase = exchange_phase + 1;
         let mut transfers = Vec::new();
         let mut commands = Vec::new();
-        for (group_index, (tile, address, destination_rows, fragments)) in groups.iter().enumerate()
+        for (group_index, (tile, address, destination_rows, destination_tensor, fragments)) in
+            groups.iter().enumerate()
         {
             let mut staging_cursor = ipu_exchange::EXCHANGE_WINDOW_BASE;
             while let Some(&(block, source_row_start, destination_row_start, copy_rows)) =
                 fragments.get(cursors[group_index])
             {
-                let source_bytes = u32::from(block.rows) * u32::from(block.columns) * 2;
-                if block.tile != *tile && source_bytes > ipu_exchange::EXCHANGE_WINDOW_BYTES {
-                    return Err(CompileError::Graph(format!(
-                        "C16 reblocking source block at row {}, column {} needs {} exchange bytes, exceeding the {}-byte window",
-                        block.row_start,
-                        block.column_start,
-                        source_bytes,
-                        ipu_exchange::EXCHANGE_WINDOW_BYTES,
-                    )));
+                let panel_count = block.columns / 16;
+                if panel_count != 4 {
+                    return Err(CompileError::Graph(
+                        "C16 reblocking requires four 16-column panels per block".into(),
+                    ));
                 }
+                let panel_stride = u32::from(block.rows) * 32;
+                let source_bytes =
+                    u32::from(panel_count - 1) * panel_stride + u32::from(copy_rows) * 32;
                 if block.tile != *tile
                     && staging_cursor + source_bytes
                         > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES
                 {
                     break;
                 }
+                let source_alias = TensorId(next_tensor);
+                next_tensor += 1;
+                let source_address = block.address + u32::from(source_row_start) * 32;
+                schedule.allocations.push(Allocation {
+                    tensor: source_alias,
+                    tile: block.tile,
+                    address: source_address,
+                    size: source_bytes,
+                    live_from: exchange_phase,
+                    live_until: compute_phase + 1,
+                    kind: AllocationKind::HomeAlias {
+                        source: block.tensor,
+                    },
+                });
                 if block.tile != *tile {
                     transfers.push(Transfer {
                         source_tile: block.tile,
                         destination_tile: *tile,
-                        tensor: block.tensor,
+                        tensor: source_alias,
                         bytes: source_bytes,
                     });
                     schedule.allocations.push(Allocation {
-                        tensor: block.tensor,
+                        tensor: source_alias,
                         tile: *tile,
                         address: staging_cursor,
                         size: source_bytes,
@@ -752,16 +772,18 @@ pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
                     address: output_address,
                     size: u32::from(*destination_rows) * u32::from(block.columns) * 2,
                     live_from: compute_phase,
-                    live_until: compute_phase,
-                    kind: AllocationKind::Home,
+                    live_until: compute_phase + 1,
+                    kind: AllocationKind::HomeAlias {
+                        source: *destination_tensor,
+                    },
                 });
                 commands.push(KernelCommand {
                     tile: *tile,
                     output: output_alias,
-                    inputs: vec![block.tensor, block.tensor],
+                    inputs: vec![source_alias, source_alias],
                     arguments: vec![
                         crate::pack_reblock_row_pair(block.rows, *destination_rows)?,
-                        crate::pack_reblock_row_pair(source_row_start, destination_row_start)?,
+                        crate::pack_reblock_row_pair(0, destination_row_start)?,
                         u32::from(copy_rows),
                     ],
                     specialization: SpecializationKey {
@@ -771,7 +793,7 @@ pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
                             usize::from(*destination_rows),
                             usize::from(copy_rows),
                         ],
-                        worker_count: 6,
+                        worker_count: 1,
                         role: "C16 to A16 row reblocking".into(),
                         alignment: 8,
                     },
@@ -1314,6 +1336,14 @@ mod tests {
                         && command.arguments.len() == 3
                 })
         )));
+        assert!(schedule.phases.iter().all(|phase| {
+            match phase {
+                Phase::Exchange { transfers } => transfers
+                    .iter()
+                    .all(|transfer| transfer.bytes <= 13 * 64 * 2),
+                Phase::Compute { .. } => true,
+            }
+        }));
         schedule.validate_allocations().unwrap();
         schedule
             .lower_tile_programs(&ipu_exchange::Topology::c600())
