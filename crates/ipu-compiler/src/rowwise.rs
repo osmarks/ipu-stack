@@ -88,16 +88,16 @@ pub fn choose_row_shard_rows_for_copies_in_arenas(
         previous_grid = Some(row_grid);
         let base_rows = rows / row_grid;
         let larger_shards = rows % row_grid;
-        let mut candidate = occupied.clone();
         let fits = (0..row_grid).all(|index| {
             let shard_rows = base_rows + u16::from(index < larger_shards);
+            let mut tile_occupied = occupied[usize::from(index)].clone();
             u32::from(shard_rows)
                 .checked_mul(u32::from(columns))
                 .and_then(|elements| elements.checked_mul(2))
                 .is_some_and(|bytes| {
                     (0..copies).all(|_| {
                         allocate_from_occupied_arenas(
-                            &mut candidate[usize::from(index)],
+                            &mut tile_occupied,
                             bytes,
                             arenas,
                             8,
@@ -644,6 +644,114 @@ pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
                 .into(),
         ));
     }
+    let source = source
+        .iter()
+        .map(|block| ReblockSource {
+            tensor: block.tensor,
+            tile: block.tile,
+            address: block.address,
+            row_start: block.row_start,
+            rows: block.rows,
+            column_start: block.column_start,
+            columns: block.columns,
+            layout: ReblockSourceLayout::C16,
+        })
+        .collect::<Vec<_>>();
+    append_to_a16_row_shards_reblocked_in_arenas(
+        schedule,
+        &source,
+        columns,
+        row_block_dimension,
+        arenas,
+    )
+}
+
+pub fn append_a16_to_a16_row_shards_reblocked_in_arenas(
+    schedule: &mut Schedule,
+    source: &[RowShardPlacement],
+    row_block_dimension: u16,
+    arenas: &[MemoryArena],
+) -> Result<Vec<RowShardPlacement>, CompileError> {
+    let columns = source.first().map(|shard| shard.columns).unwrap_or(0);
+    if source.is_empty()
+        || columns == 0
+        || !columns.is_multiple_of(16)
+        || source
+            .iter()
+            .any(|shard| shard.rows == 0 || shard.columns != columns)
+        || row_block_dimension == 0
+        || arenas.is_empty()
+        || arenas
+            .iter()
+            .any(|arena| arena.base & 7 != 0 || arena.base >= arena.limit)
+    {
+        return Err(CompileError::Graph(
+            "A16 row reblocking requires consistent 16-column panels, a row block size, and aligned SRAM"
+                .into(),
+        ));
+    }
+    let source = source
+        .iter()
+        .flat_map(|shard| {
+            let panel_stride = u32::from(shard.rows) * 32;
+            let transfer_limit =
+                ipu_exchange::EXCHANGE_WINDOW_BYTES.min(ipu_exchange::MAX_TRANSFER_WORDS * 4);
+            let panels_per_fragment = (transfer_limit / panel_stride)
+                .max(1)
+                .min(u32::from(shard.columns / 16)) as u16;
+            let columns_per_fragment = panels_per_fragment * 16;
+            (0..shard.columns)
+                .step_by(usize::from(columns_per_fragment))
+                .map(move |column_start| {
+                    let columns = columns_per_fragment.min(shard.columns - column_start);
+                    ReblockSource {
+                        tensor: shard.tensor,
+                        tile: shard.tile,
+                        address: shard.address
+                            + u32::from(column_start) * u32::from(shard.rows) * 2,
+                        row_start: shard.row_start,
+                        rows: shard.rows,
+                        column_start,
+                        columns,
+                        layout: ReblockSourceLayout::A16,
+                    }
+                })
+        })
+        .collect::<Vec<_>>();
+    append_to_a16_row_shards_reblocked_in_arenas(
+        schedule,
+        &source,
+        columns,
+        row_block_dimension,
+        arenas,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ReblockSourceLayout {
+    A16,
+    C16,
+}
+
+#[derive(Clone, Copy)]
+struct ReblockSource {
+    tensor: TensorId,
+    tile: u16,
+    address: u32,
+    row_start: u16,
+    rows: u16,
+    column_start: u16,
+    columns: u16,
+    layout: ReblockSourceLayout,
+}
+
+fn append_to_a16_row_shards_reblocked_in_arenas(
+    schedule: &mut Schedule,
+    source: &[ReblockSource],
+    columns: u16,
+    row_block_dimension: u16,
+    arenas: &[MemoryArena],
+) -> Result<Vec<RowShardPlacement>, CompileError> {
     let rows = source
         .iter()
         .map(|block| block.row_start + block.rows)
@@ -774,6 +882,13 @@ pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
                 let panel_stride = u32::from(block.rows) * 32;
                 let source_bytes =
                     u32::from(panel_count - 1) * panel_stride + u32::from(copy_rows) * 32;
+                let transfer_limit =
+                    ipu_exchange::EXCHANGE_WINDOW_BYTES.min(ipu_exchange::MAX_TRANSFER_WORDS * 4);
+                if block.tile != *tile && source_bytes > transfer_limit {
+                    return Err(CompileError::Memory(format!(
+                        "row-shard fragment requires {source_bytes} exchange bytes"
+                    )));
+                }
                 if block.tile != *tile
                     && staging_cursor + source_bytes
                         > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES
@@ -829,14 +944,22 @@ pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
                         u32::from(copy_rows) | (u32::from(panel_count) << 16),
                     ],
                     specialization: SpecializationKey {
-                        operation: "reblock_f16_c16_to_a16".into(),
+                        operation: match block.layout {
+                            ReblockSourceLayout::A16 => "reblock_f16_a16_to_a16",
+                            ReblockSourceLayout::C16 => "reblock_f16_c16_to_a16",
+                        }
+                        .into(),
                         shape: vec![
                             usize::from(block.rows),
                             usize::from(*destination_rows),
                             usize::from(copy_rows),
                         ],
                         worker_count: 1,
-                        role: "C16 to A16 row reblocking".into(),
+                        role: match block.layout {
+                            ReblockSourceLayout::A16 => "A16 row-shard transition",
+                            ReblockSourceLayout::C16 => "C16 to A16 row reblocking",
+                        }
+                        .into(),
                         alignment: 8,
                     },
                     metadata: BTreeMap::from([
@@ -1513,6 +1636,71 @@ mod tests {
                 Phase::Exchange { transfers } => transfers
                     .iter()
                     .all(|transfer| transfer.bytes <= 13 * 64 * 2),
+                Phase::Compute { .. } => true,
+            }
+        }));
+        schedule.validate_allocations().unwrap();
+        schedule
+            .lower_tile_programs(&ipu_exchange::Topology::c600())
+            .unwrap();
+    }
+
+    #[test]
+    fn a16_row_shards_transition_to_a_balanced_grid() {
+        let source = (0..2u16)
+            .map(|index| RowShardPlacement {
+                tensor: TensorId(usize::from(index)),
+                tile: index,
+                address: 0xa0000,
+                row_start: index * 40,
+                rows: 40,
+                columns: 1024,
+            })
+            .collect::<Vec<_>>();
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: source
+                .iter()
+                .map(|shard| Allocation {
+                    tensor: shard.tensor,
+                    tile: shard.tile,
+                    address: shard.address,
+                    size: u32::from(shard.rows) * u32::from(shard.columns) * 2,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                })
+                .collect(),
+            tile_count: 8,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let output = append_a16_to_a16_row_shards_reblocked_in_arenas(
+            &mut schedule,
+            &source,
+            20,
+            &[MemoryArena {
+                base: 0xb0000,
+                limit: 0xe8000,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(output.iter().map(|shard| shard.rows).sum::<u16>(), 80);
+        assert_eq!(output.len(), 4);
+        assert!(schedule.phases.iter().any(|phase| matches!(
+            phase,
+            Phase::Compute { commands, .. }
+                if commands.iter().any(|command| {
+                    command.specialization.operation == "reblock_f16_a16_to_a16"
+                })
+        )));
+        assert!(schedule.phases.iter().all(|phase| {
+            match phase {
+                Phase::Exchange { transfers } => transfers
+                    .iter()
+                    .all(|transfer| transfer.bytes <= ipu_exchange::MAX_TRANSFER_WORDS * 4),
                 Phase::Compute { .. } => true,
             }
         }));

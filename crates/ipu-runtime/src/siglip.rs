@@ -7,9 +7,10 @@ use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
     CompileError, FlashAttentionConfig, FlashAttentionPlan, GemmDataType, MemoryArena,
     MemoryPlacement, MemoryPolicy, Phase, RowShardPlacement, RowShardTransitionConfig, Schedule,
-    TensorId, allocate_from_occupied_arenas, append_add_affine_layer_norm_f16_with_memory_policy,
-    append_add_f16_row_shards_in_place, append_affine_layer_norm_f16_with_memory_policy,
-    append_bias_f16_c16_in_arenas, append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
+    TensorId, allocate_from_occupied_arenas, append_a16_to_a16_row_shards_reblocked_in_arenas,
+    append_add_affine_layer_norm_f16_with_memory_policy, append_add_f16_row_shards_in_place,
+    append_affine_layer_norm_f16_with_memory_policy, append_bias_f16_c16_in_arenas,
+    append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
     append_blocked_gemm_f16_with_a16_input_with_memory_policy,
     append_c16_to_a16_blocks_gelu_f16_in_arenas, append_c16_to_a16_row_shards,
     append_c16_to_a16_row_shards_reblocked_in_arenas,
@@ -1516,7 +1517,39 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         output_adjustment_allocation_start,
         output_adjustment.iter().map(|block| block.tensor),
     )?;
-    let projected_shards = if output_row_block_dimension == row_block_dimension {
+    // Residual edges keep their preferred layout until the current placement
+    // can no longer hold the residual, projection, and normalized output
+    // together. Only that edge is then transitioned to a smaller shard grid.
+    let residual_source_rows = input.iter().map(|shard| shard.rows).max().unwrap_or(1);
+    let residual_rows = choose_row_shard_rows_for_copies_in_arenas(
+        schedule,
+        rows,
+        columns,
+        residual_source_rows,
+        2,
+        &memory.transient,
+    )
+    .ok_or_else(|| {
+        CompileError::Memory("attention residual has no feasible row-shard placement".into())
+    })?;
+    let residual_input = if residual_rows == residual_source_rows {
+        input.to_vec()
+    } else {
+        let transitioned = append_a16_to_a16_row_shards_reblocked_in_arenas(
+            schedule,
+            input,
+            residual_rows,
+            &memory.transient,
+        )?;
+        end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
+        transitioned
+    };
+    info!(
+        source_row_block_rows = residual_source_rows,
+        destination_row_block_rows = residual_rows,
+        "selected attention residual row-shard placement"
+    );
+    let projected_shards = if output_row_block_dimension == residual_rows {
         append_c16_to_a16_row_shards(
             schedule,
             &output_projection.output,
@@ -1531,7 +1564,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
             schedule,
             &output_projection.output,
             columns,
-            row_block_dimension,
+            residual_rows,
             &memory.transient,
         )?
     };
@@ -1545,7 +1578,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let norm2 = append_add_affine_layer_norm_f16_with_memory_policy(
         schedule,
         &projected_shards,
-        input,
+        &residual_input,
         AppendAffineLayerNormConfig {
             data_base,
             data_limit,
@@ -1554,7 +1587,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         memory,
     )?;
     let attention_residual = projected_shards;
-    end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
+    end_tensor_lifetimes(schedule, residual_input.iter().map(|shard| shard.tensor))?;
     push_layer_norm_affine(
         schedule,
         host,
@@ -1844,7 +1877,12 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         mlp_down_adjustment_allocation_start,
         mlp_down_adjustment.iter().map(|block| block.tensor),
     )?;
-    let output = if mlp_down_row_block_dimension == row_block_dimension {
+    let output_row_block_dimension = attention_residual
+        .iter()
+        .map(|shard| shard.rows)
+        .max()
+        .ok_or("attention residual has no row shards")?;
+    let output = if mlp_down_row_block_dimension == output_row_block_dimension {
         append_c16_to_a16_row_shards(
             schedule,
             &mlp_down.output,
@@ -1859,7 +1897,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
             schedule,
             &mlp_down.output,
             columns,
-            row_block_dimension,
+            output_row_block_dimension,
             &memory.transient,
         )?
     };

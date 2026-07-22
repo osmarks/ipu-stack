@@ -27,6 +27,7 @@ use placement::{WindowRequirement, partition_address_window};
 pub use rowwise::{
     AffineLayerNormConfig, AffineLayerNormPlan, AppendAffineLayerNormConfig,
     AppendedAffineLayerNorm, RowShardPlacement, RowShardTransitionConfig,
+    append_a16_to_a16_row_shards_reblocked_in_arenas,
     append_add_affine_layer_norm_f16_with_memory_policy, append_add_f16_row_shards_in_place,
     append_affine_layer_norm_f16, append_affine_layer_norm_f16_in_arenas,
     append_affine_layer_norm_f16_with_memory_policy, append_c16_to_a16_blocks_gelu_f16,

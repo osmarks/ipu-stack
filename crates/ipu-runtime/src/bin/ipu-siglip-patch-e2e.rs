@@ -4,8 +4,7 @@ use ipu_compiler::{
     FlashAttentionPlan, GemmDataType, Ipu21MemoryRegion, KernelCommand, MemoryConstraint,
     MemoryPlacement, MemoryPolicy, OpId, Phase, RowShardPlacement, RowShardTransitionConfig,
     SpecializationKey, TensorId, append_c16_to_a16_row_shards, choose_gemm_row_block_for_shape,
-    choose_gemm_row_block_for_shape_max_rows, end_tensor_lifetimes, make_tensors_resident,
-    plan_blocked_gemm, plan_flash_attention,
+    end_tensor_lifetimes, make_tensors_resident, plan_blocked_gemm, plan_flash_attention,
 };
 use ipu_elf::{KernelArtifact, Toolchain};
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -69,12 +68,7 @@ fn main() {
     let columns = u16::try_from(config.hidden_size).unwrap();
     let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
     let memory = encoder_memory_policy(data_limit);
-    let row_bytes = u32::from(columns) * 2;
-    let preferred_transient_capacity = memory.transient[0].limit - memory.transient[0].base;
-    let maximum_transient_rows = u16::try_from(preferred_transient_capacity / row_bytes)
-        .unwrap()
-        .max(1);
-    let automatic_row_block_dimension = choose_gemm_row_block_for_shape_max_rows(
+    let automatic_row_block_dimension = choose_gemm_row_block_for_shape(
         rows,
         inner,
         INNER_BLOCK_DIMENSION,
@@ -82,7 +76,6 @@ fn main() {
         BLOCK_DIMENSION,
         TILE_COUNT,
         GemmDataType::F16,
-        maximum_transient_rows,
     )
     .unwrap();
     let row_block_dimension = std::env::var("IPU_SIGLIP_ROW_BLOCK_ROWS")
