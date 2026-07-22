@@ -440,6 +440,34 @@ fn allocation_range(allocation: &ipu_compiler::Allocation) -> Result<(u32, u32)>
     ))
 }
 
+fn allocation_footprints_by_tile(
+    graph: &ExecutableGraph,
+    tile_count: usize,
+) -> Result<Vec<Vec<(u32, u32)>>> {
+    let mut footprints = vec![Vec::new(); tile_count];
+    for allocation in &graph.schedule.allocations {
+        if !matches!(allocation.kind, ipu_compiler::AllocationKind::Home) {
+            continue;
+        }
+        footprints[usize::from(allocation.tile)].push(allocation_range(allocation)?);
+    }
+    for tile in &mut footprints {
+        tile.sort_unstable();
+        let mut merged = Vec::<(u32, u32)>::with_capacity(tile.len());
+        for &(start, end) in tile.iter() {
+            if let Some(previous) = merged.last_mut()
+                && start <= previous.1
+            {
+                previous.1 = previous.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        *tile = merged;
+    }
+    Ok(footprints)
+}
+
 #[derive(Clone, Debug)]
 struct AllocationRelocation {
     tensor: ipu_compiler::TensorId,
@@ -616,18 +644,29 @@ fn repack_transient_allocations_around(
         });
         graph.schedule.allocations[index].address = new_address;
     }
+    let mut relocations_by_source =
+        HashMap::<(ipu_compiler::TensorId, u16), Vec<&AllocationRelocation>>::default();
+    for relocation in &relocations {
+        relocations_by_source
+            .entry((relocation.tensor, relocation.tile))
+            .or_default()
+            .push(relocation);
+    }
     for allocation in &mut graph.schedule.allocations {
         let ipu_compiler::AllocationKind::HomeAlias { source } = allocation.kind else {
             continue;
         };
-        if let Some(relocation) = relocations.iter().find(|relocation| {
-            relocation.tensor == source
-                && relocation.tile == allocation.tile
-                && allocation.address >= relocation.old.start
-                && allocation.address.saturating_add(allocation.size) <= relocation.old.end
-                && relocation.live_from <= allocation.live_from
-                && relocation.live_until >= allocation.live_until
-        }) {
+        if let Some(relocation) = relocations_by_source
+            .get(&(source, allocation.tile))
+            .into_iter()
+            .flatten()
+            .find(|relocation| {
+                allocation.address >= relocation.old.start
+                    && allocation.address.saturating_add(allocation.size) <= relocation.old.end
+                    && relocation.live_from <= allocation.live_from
+                    && relocation.live_until >= allocation.live_until
+            })
+        {
             allocation.address = relocation.new_start + (allocation.address - relocation.old.start);
         }
     }
@@ -2151,13 +2190,8 @@ fn package_graph_impl_attempt(
     if !profile_code.is_empty() && profile_code.len() != programs.len() {
         return Err("profile layout tile count differs from schedule".into());
     }
-    let mut allocation_ranges_by_tile = vec![Vec::new(); usize::from(graph.schedule.tile_count)];
-    for allocation in &graph.schedule.allocations {
-        let ranges = allocation_ranges_by_tile
-            .get_mut(usize::from(allocation.tile))
-            .ok_or("allocation tile exceeds schedule tile count")?;
-        ranges.push(allocation_range(allocation)?);
-    }
+    let allocation_ranges_by_tile =
+        allocation_footprints_by_tile(graph, usize::from(graph.schedule.tile_count))?;
     let fixed_allocation_ranges = fixed_allocation_ranges_by_tile(graph, topology.tile_count())?;
     let exchange_count = tile_exchange_plans
         .first()
@@ -4774,6 +4808,68 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn allocation_footprints_merge_home_ranges_and_ignore_derived_storage() {
+        let graph = ExecutableGraph {
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: vec![
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(1),
+                        tile: 0,
+                        address: 0x60000,
+                        size: 64,
+                        live_from: 0,
+                        live_until: 1,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(2),
+                        tile: 0,
+                        address: 0x60040,
+                        size: 32,
+                        live_from: 1,
+                        live_until: 2,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(3),
+                        tile: 0,
+                        address: 0x60010,
+                        size: 16,
+                        live_from: 0,
+                        live_until: 1,
+                        kind: ipu_compiler::AllocationKind::HomeAlias {
+                            source: ipu_compiler::TensorId(1),
+                        },
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(4),
+                        tile: 0,
+                        address: ipu_exchange::EXCHANGE_WINDOW_BASE,
+                        size: 16,
+                        live_from: 0,
+                        live_until: 1,
+                        kind: ipu_compiler::AllocationKind::ExchangeStaging { phase: 0 },
+                    },
+                ],
+                tile_count: 1,
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+
+        assert_eq!(
+            allocation_footprints_by_tile(&graph, 1).unwrap(),
+            vec![vec![(0x60000, 0x60060)]]
+        );
+    }
 
     #[test]
     fn measured_executable_relocation_updates_aliases_and_literal_addresses() {

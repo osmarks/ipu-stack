@@ -269,6 +269,7 @@ fn main() {
         name: "embedding".into(),
         phases: 0..plan.schedule.phases.len(),
     }];
+    let (mut compute_command_count, mut transfer_count) = phase_entry_counts(&plan.schedule.phases);
     for layer in 0..layer_count {
         let phase_start = plan.schedule.phases.len();
         let layer_precision = if layer < resident_f16_layers {
@@ -335,23 +336,15 @@ fn main() {
                 RepeatedRegion::new(name, &plan.schedule, phase_range).unwrap(),
             ));
         }
-        let (compute_commands, transfers) =
-            plan.schedule
-                .phases
-                .iter()
-                .fold((0usize, 0usize), |(compute, exchange), phase| match phase {
-                    ipu_compiler::Phase::Compute { commands, .. } => {
-                        (compute + commands.len(), exchange)
-                    }
-                    ipu_compiler::Phase::Exchange { transfers } => {
-                        (compute, exchange + transfers.len())
-                    }
-                });
+        let (new_compute_commands, new_transfers) =
+            phase_entry_counts(&plan.schedule.phases[phase_start..]);
+        compute_command_count += new_compute_commands;
+        transfer_count += new_transfers;
         info!(
             layer,
             phases = plan.schedule.phases.len(),
-            compute_commands,
-            transfers,
+            compute_commands = compute_command_count,
+            transfers = transfer_count,
             allocations = plan.schedule.allocations.len(),
             host_bindings = host.bindings.len(),
             host_bytes = host.bytes.len(),
@@ -718,6 +711,15 @@ fn main() {
         full_model,
         "SigLIP encoder prefix passed against Hugging Face"
     );
+}
+
+fn phase_entry_counts(phases: &[Phase]) -> (usize, usize) {
+    phases
+        .iter()
+        .fold((0usize, 0usize), |(compute, exchange), phase| match phase {
+            Phase::Compute { commands, .. } => (compute + commands.len(), exchange),
+            Phase::Exchange { transfers } => (compute, exchange + transfers.len()),
+        })
 }
 
 fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
