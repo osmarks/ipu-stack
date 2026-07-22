@@ -150,7 +150,11 @@ pub(crate) enum StaticTemplateRecordWord {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum StaticTemplatePatchValue {
     Delta(i16),
-    Word(StaticTemplateRecordWord),
+    Delta32(u32),
+    Difference {
+        previous: StaticTemplateRecordWord,
+        next: StaticTemplateRecordWord,
+    },
 }
 
 pub(crate) fn template_patch_storage_words_range(
@@ -162,7 +166,9 @@ pub(crate) fn template_patch_storage_words_range(
         .filter(|(slot, _)| slots.contains(&usize::from(*slot)))
         .fold((0usize, 0usize), |(narrow, wide), (_, value)| match value {
             StaticTemplatePatchValue::Delta(_) => (narrow + 1, wide),
-            StaticTemplatePatchValue::Word(_) => (narrow, wide + 1),
+            StaticTemplatePatchValue::Delta32(_) | StaticTemplatePatchValue::Difference { .. } => {
+                (narrow, wide + 1)
+            }
         });
     let Some(span) = template_patch_group_span(slots, patch) else {
         return 0;
@@ -719,7 +725,14 @@ fn template_record_patch(
                         (i64::from(*next) - i64::from(*previous)) as i16,
                     )
                 }
-                _ => StaticTemplatePatchValue::Word(next.clone()),
+                (
+                    StaticTemplateRecordWord::Value(previous),
+                    StaticTemplateRecordWord::Value(next),
+                ) => StaticTemplatePatchValue::Delta32(next.wrapping_sub(*previous)),
+                _ => StaticTemplatePatchValue::Difference {
+                    previous: previous.clone(),
+                    next: next.clone(),
+                },
             };
             Ok((u16::try_from(slot)?, value))
         })
@@ -1771,10 +1784,7 @@ mod tests {
     fn template_patch_span_omits_empty_segment_groups() {
         let patch = vec![
             (131, StaticTemplatePatchValue::Delta(4)),
-            (
-                134,
-                StaticTemplatePatchValue::Word(StaticTemplateRecordWord::Value(9)),
-            ),
+            (134, StaticTemplatePatchValue::Delta32(9)),
         ];
 
         assert_eq!(template_patch_group_span(64..256, &patch), Some(64..96));
@@ -1886,8 +1896,21 @@ mod tests {
                         i64::from(*previous) + i64::from(*delta),
                         i64::from(*expected)
                     ),
-                    (StaticTemplatePatchValue::Word(value), _, expected) => {
-                        assert_eq!(value, expected)
+                    (
+                        StaticTemplatePatchValue::Delta32(delta),
+                        StaticTemplateRecordWord::Value(previous),
+                        StaticTemplateRecordWord::Value(expected),
+                    ) => assert_eq!(previous.wrapping_add(*delta), *expected),
+                    (
+                        StaticTemplatePatchValue::Difference {
+                            previous: encoded_previous,
+                            next,
+                        },
+                        previous,
+                        expected,
+                    ) => {
+                        assert_eq!(encoded_previous, previous);
+                        assert_eq!(next, expected);
                     }
                     _ => panic!("invalid template patch encoding"),
                 }

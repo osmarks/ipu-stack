@@ -343,6 +343,9 @@ ipu_stack_static_template_patch:
 .Ltemplate_patch_wide:
 	ld32 $m0, $m5, $m15, 0
 	add $m5, $m5, 4
+	ld32 $m10, $m11, $m15, 4
+	ld32 $m10, $m10, $m15, 0
+	add $m0, $m0, $m10
 .Ltemplate_patch_store:
 	ld32 $m10, $m11, $m15, 4
 	st32 $m0, $m10, $m15, 0

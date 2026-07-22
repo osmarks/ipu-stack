@@ -2706,6 +2706,61 @@ fn package_graph_impl_attempt(
             .push(old_worker_sync..old_worker_end);
         let (mut relocations, executable_ranges, executable_elements) =
             std::mem::take(&mut host_executable_placements[tile_index]);
+        if tile == 0
+            && let Some((template, instance, patch_words)) = plans
+                .templates
+                .iter()
+                .enumerate()
+                .flat_map(|(template, plan)| {
+                    let record_words = plan.records.first().map_or(0, Vec::len);
+                    let split = usize::from(plan.record_split);
+                    plan.patches
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .map(move |(instance, patch)| {
+                            let words = static_codegen::template_patch_ranges(record_words, split)
+                                .into_iter()
+                                .map(|slots| {
+                                    static_codegen::template_patch_storage_words_range(slots, patch)
+                                        .max(1)
+                                })
+                                .sum::<usize>();
+                            (template, instance, words)
+                        })
+                })
+                .max_by_key(|&(_, _, words)| words)
+        {
+            let patch = &plans.templates[template].patches[instance];
+            let mut delta_counts = BTreeMap::<i16, usize>::new();
+            let mut wide_values = 0usize;
+            for (_, value) in patch {
+                match value {
+                    static_codegen::StaticTemplatePatchValue::Delta(delta) => {
+                        *delta_counts.entry(*delta).or_default() += 1;
+                    }
+                    static_codegen::StaticTemplatePatchValue::Delta32(_)
+                    | static_codegen::StaticTemplatePatchValue::Difference { .. } => {
+                        wide_values += 1
+                    }
+                }
+            }
+            let common_delta = delta_counts
+                .iter()
+                .max_by_key(|(_, count)| **count)
+                .map(|(&delta, &count)| (delta, count));
+            info!(
+                template = plans.templates[template].name,
+                instance,
+                patch_words,
+                changed_words = patch.len(),
+                narrow_deltas = patch.len() - wide_values,
+                wide_values,
+                distinct_deltas = delta_counts.len(),
+                ?common_delta,
+                "largest static template transition patch"
+            );
+        }
         let mut objects = Vec::<(TemplateDataObject, usize)>::new();
         let mut canonical_patches = HashMap::<
             (
@@ -2755,6 +2810,21 @@ fn package_graph_impl_attempt(
                     .sum();
                 objects.push((TemplateDataObject::PatchPair { template, instance }, words));
             }
+        }
+        if tile == 0 {
+            let patch_words = objects
+                .iter()
+                .filter_map(|(object, words)| {
+                    matches!(object, TemplateDataObject::PatchPair { .. }).then_some(*words)
+                })
+                .sum::<usize>();
+            info!(
+                transition_patches = canonical_patches.len() + patch_aliases.len(),
+                unique_transition_patches = canonical_patches.len(),
+                interned_transition_patches = patch_aliases.len(),
+                patch_bytes = patch_words * 4,
+                "compacted static template transition patches"
+            );
         }
 
         let mut placed_objects = Vec::new();
@@ -3586,18 +3656,35 @@ fn package_graph_impl_attempt(
                                     narrow_bits.push(true);
                                     narrow.push(*delta as u16);
                                 }
-                                static_codegen::StaticTemplatePatchValue::Word(word) => {
+                                static_codegen::StaticTemplatePatchValue::Delta32(delta) => {
                                     narrow_bits.push(false);
-                                    wide.push(match word {
-                                        static_codegen::StaticTemplateRecordWord::Value(value) => {
-                                            Ok(*value)
-                                        }
-                                        static_codegen::StaticTemplateRecordWord::Symbol(name) => {
-                                            image.symbols.get(name).copied().ok_or_else(|| {
-                                                format!("static template references missing {name}")
-                                            })
-                                        }
-                                    });
+                                    wide.push(Ok(*delta));
+                                }
+                                static_codegen::StaticTemplatePatchValue::Difference {
+                                    previous,
+                                    next,
+                                } => {
+                                    narrow_bits.push(false);
+                                    let resolve =
+                                        |word: &static_codegen::StaticTemplateRecordWord| match word
+                                        {
+                                            static_codegen::StaticTemplateRecordWord::Value(
+                                                value,
+                                            ) => Ok(*value),
+                                            static_codegen::StaticTemplateRecordWord::Symbol(
+                                                name,
+                                            ) => {
+                                                image.symbols.get(name).copied().ok_or_else(|| {
+                                                    format!(
+                                                        "static template references missing {name}"
+                                                    )
+                                                })
+                                            }
+                                        };
+                                    wide.push(resolve(next).and_then(|next| {
+                                        resolve(previous)
+                                            .map(|previous| next.wrapping_sub(previous))
+                                    }));
                                 }
                             }
                         }
