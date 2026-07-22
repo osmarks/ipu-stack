@@ -136,7 +136,43 @@ public:
       for (unsigned panel = 0;
            panel < ATTENTION_PADDED_HEAD_DIMENSION / 16; ++panel) {
         const unsigned logicalColumn = panel * 16 + logicalColumnInPanel;
-        for (unsigned localRow = 0; localRow < copyRows; ++localRow) {
+        unsigned localRow = 0;
+        if ((destinationRowStart & 1u) != 0 && localRow < copyRows) {
+          const unsigned destinationRow = destinationRowStart + localRow;
+          const unsigned keyGroup = destinationRow / 16;
+          const unsigned row = destinationRow % 16;
+          const unsigned outputBase =
+              (panel * keyGroups + keyGroup) * 256 + loadChannel * 16;
+          const unsigned pairRow = row & ~1u;
+          half2 values =
+              *reinterpret_cast<const half2 *>(&output[outputBase + pairRow]);
+          const unsigned lane = row & 1u;
+          values[lane] = 0.0;
+          if (logicalColumn < ATTENTION_HEAD_DIMENSION) {
+            const unsigned sourceRow = sourceRowStart + localRow;
+            values[lane] = source[sourceIndex(
+                sourceRows, sourceRow, headStart + logicalColumn)];
+          }
+          *reinterpret_cast<half2 *>(&output[outputBase + pairRow]) = values;
+          ++localRow;
+        }
+        for (; localRow + 1 < copyRows; localRow += 2) {
+          const unsigned destinationRow = destinationRowStart + localRow;
+          const unsigned keyGroup = destinationRow / 16;
+          const unsigned row = destinationRow % 16;
+          const unsigned outputBase =
+              (panel * keyGroups + keyGroup) * 256 + loadChannel * 16;
+          half2 values = {};
+          if (logicalColumn < ATTENTION_HEAD_DIMENSION) {
+            const unsigned sourceRow = sourceRowStart + localRow;
+            values[0] = source[sourceIndex(sourceRows, sourceRow,
+                                           headStart + logicalColumn)];
+            values[1] = source[sourceIndex(sourceRows, sourceRow + 1,
+                                           headStart + logicalColumn)];
+          }
+          *reinterpret_cast<half2 *>(&output[outputBase + row]) = values;
+        }
+        if (localRow < copyRows) {
           const unsigned destinationRow = destinationRowStart + localRow;
           const unsigned keyGroup = destinationRow / 16;
           const unsigned row = destinationRow % 16;
