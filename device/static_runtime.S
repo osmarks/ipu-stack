@@ -27,6 +27,8 @@
 ipu_stack_static_start:
 	.supervisor
 	.long OPCODE_SYNC | SYNC_SUPERVISOR
+	// The bootloader may reach application entry before every worker retires.
+	.long OPCODE_SYNC | SYNC_COMPUTE_SET
 	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
 	put 0xa7, $m15

@@ -198,6 +198,12 @@ enum Command {
         #[arg(long, default_value = "/dev/ipu0")]
         device: String,
     },
+    DeviceReadMemory {
+        #[arg(value_parser = parse_memory_read, required = true)]
+        reads: Vec<MemoryRead>,
+        #[arg(long, default_value = "/dev/ipu0")]
+        device: String,
+    },
     Load {
         package: PathBuf,
         bootloader: PathBuf,
@@ -830,6 +836,11 @@ fn main() -> Result<()> {
                 registers.join(" ")
             );
         }
+        Command::DeviceReadMemory { reads, device } => {
+            let device = Device::open(&device)?;
+            write_memory_reads(&device, &reads)?;
+            println!("memoryReads={} deviceRead=PASS", reads.len());
+        }
         Command::Load {
             package,
             bootloader,
@@ -1226,6 +1237,7 @@ impl Command {
             Self::PackageElfDirectory { .. } => "package-elf-directory",
             Self::DeviceProbe { .. } => "device-probe",
             Self::DeviceContext { .. } => "device-context",
+            Self::DeviceReadMemory { .. } => "device-read-memory",
             Self::Load { .. } => "load",
             Self::RunDiagnostic { .. } => "run-diagnostic",
             Self::RunOutput { .. } => "run-output",
@@ -1447,9 +1459,21 @@ fn parse_memory_read(value: &str) -> Result<MemoryRead, String> {
 
 fn write_memory_reads(device: &Device, reads: &[MemoryRead]) -> Result<()> {
     for read in reads {
+        let context = (1..=6)
+            .find(|&context| {
+                device
+                    .tile_context_state(read.physical_tile, context)
+                    .is_ok_and(|state| state == 0)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "tile {} has no inactive worker context for an SRAM read",
+                    read.physical_tile
+                )
+            })?;
         let words = device.read_tile_words_from_inactive_context(
             read.physical_tile,
-            1,
+            context,
             read.address,
             read.words,
         )?;
@@ -1460,6 +1484,7 @@ fn write_memory_reads(device: &Device, reads: &[MemoryRead]) -> Result<()> {
         fs::write(&read.output, bytes)?;
         info!(
             physical_tile = read.physical_tile,
+            context,
             address = format_args!("0x{:x}", read.address),
             words = read.words,
             output = %read.output.display(),
