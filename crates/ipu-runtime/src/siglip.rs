@@ -77,7 +77,17 @@ pub struct SiglipEncoderLayer {
     pub norm2: Vec<RowShardPlacement>,
     pub mlp_gelu: Vec<BlockPlacement>,
     pub attention: FlashAttentionPlan,
+    pub diagnostics: Option<SiglipEncoderDiagnostics>,
     pub profile_stages: Vec<SiglipProfileStage>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SiglipEncoderDiagnostics {
+    pub input: Vec<RowShardPlacement>,
+    pub norm1: Vec<RowShardPlacement>,
+    pub qkv: [Vec<RowShardPlacement>; 3],
+    pub attention_hidden: Vec<RowShardPlacement>,
+    pub attention_residual: Vec<RowShardPlacement>,
 }
 
 #[derive(Clone, Debug)]
@@ -1358,7 +1368,9 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         qkv_allocation_start,
         qkv.right.iter().map(|block| block.tensor),
     )?;
-    end_tensor_lifetimes(schedule, norm.output.iter().map(|shard| shard.tensor))?;
+    if !retain_diagnostics {
+        end_tensor_lifetimes(schedule, norm.output.iter().map(|shard| shard.tensor))?;
+    }
 
     let projection_biases = projection_names.map(|projection| {
         model
@@ -1460,12 +1472,14 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     )?;
     log_attention_blocking("encoder", &attention);
     specialize_attention_phases(schedule, attention_phase_start, &attention);
-    end_tensor_lifetimes(
-        schedule,
-        qkv_shards
-            .iter()
-            .flat_map(|shards| shards.iter().map(|shard| shard.tensor)),
-    )?;
+    if !retain_diagnostics {
+        end_tensor_lifetimes(
+            schedule,
+            qkv_shards
+                .iter()
+                .flat_map(|shards| shards.iter().map(|shard| shard.tensor)),
+        )?;
+    }
     let attention_shards = append_flash_attention_to_a16_row_shards_in_arenas(
         schedule,
         &attention,
@@ -1527,7 +1541,9 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         output_projection_allocation_start,
         output_projection.right.iter().map(|block| block.tensor),
     )?;
-    end_tensor_lifetimes(schedule, attention_shards.iter().map(|shard| shard.tensor))?;
+    if !retain_diagnostics {
+        end_tensor_lifetimes(schedule, attention_shards.iter().map(|shard| shard.tensor))?;
+    }
     let output_bias = model.tensor_f32(&model.layer_name(layer, "self_attn.out_proj.bias")?)?;
     let output_adjustment_allocation_start = schedule.allocations.len();
     let output_adjustment =
@@ -1576,7 +1592,9 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
             residual_rows,
             &memory.transient,
         )?;
-        end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
+        if !retain_diagnostics {
+            end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
+        }
         transitioned
     };
     info!(
@@ -1622,7 +1640,9 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         memory,
     )?;
     let attention_residual = projected_shards;
-    end_tensor_lifetimes(schedule, residual_input.iter().map(|shard| shard.tensor))?;
+    if !retain_diagnostics {
+        end_tensor_lifetimes(schedule, residual_input.iter().map(|shard| shard.tensor))?;
+    }
     push_layer_norm_affine(
         schedule,
         host,
@@ -1938,10 +1958,12 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     };
     end_tensor_lifetimes(schedule, mlp_down.output.iter().map(|block| block.tensor))?;
     let output = append_add_f16_row_shards_in_place(schedule, &output, &attention_residual)?;
-    end_tensor_lifetimes(
-        schedule,
-        attention_residual.iter().map(|shard| shard.tensor),
-    )?;
+    if !retain_diagnostics {
+        end_tensor_lifetimes(
+            schedule,
+            attention_residual.iter().map(|shard| shard.tensor),
+        )?;
+    }
     info!(stage = "complete", "planned SigLIP encoder layer");
     let layer_phase_end = schedule.phases.len();
     Ok(SiglipEncoderLayer {
@@ -1949,6 +1971,13 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         norm2: norm2.output,
         mlp_gelu,
         attention,
+        diagnostics: retain_diagnostics.then(|| SiglipEncoderDiagnostics {
+            input: input.to_vec(),
+            norm1: norm.output,
+            qkv: qkv_shards.try_into().expect("QKV has three projections"),
+            attention_hidden: attention_shards,
+            attention_residual,
+        }),
         profile_stages: vec![
             SiglipProfileStage {
                 name: format!("{prefix}.norm1_qkv"),

@@ -389,6 +389,7 @@ fn main() {
     let mlp_gelu = last_layer.mlp_gelu;
     let layer_output = last_layer.output;
     let attention = last_layer.attention;
+    let diagnostics = last_layer.diagnostics;
     let intermediate_columns = u16::try_from(config.intermediate_size.div_ceil(64) * 64).unwrap();
     let full_model = std::env::var_os("IPU_SIGLIP_FULL_MODEL").is_some();
     assert!(
@@ -463,6 +464,36 @@ fn main() {
     host_input.extend(host_weight_bytes);
     let mut host_outputs = Vec::new();
     if detailed_diagnostics {
+        let diagnostics = diagnostics
+            .as_ref()
+            .expect("detailed diagnostics retain encoder intermediates");
+        host_outputs.push(row_shard_binding(
+            "encoder_input",
+            rows,
+            columns,
+            &diagnostics.input,
+        ));
+        host_outputs.push(row_shard_binding(
+            "layer_norm1",
+            rows,
+            columns,
+            &diagnostics.norm1,
+        ));
+        for (name, shards) in ["query", "key", "value"].into_iter().zip(&diagnostics.qkv) {
+            host_outputs.push(row_shard_binding(name, rows, columns, shards));
+        }
+        host_outputs.push(row_shard_binding(
+            "attention_hidden",
+            rows,
+            columns,
+            &diagnostics.attention_hidden,
+        ));
+        host_outputs.push(row_shard_binding(
+            "attention_residual",
+            rows,
+            columns,
+            &diagnostics.attention_residual,
+        ));
         host_outputs.push(row_shard_binding("layer_norm2", rows, columns, &norm2));
         host_outputs.push(block_binding_typed(
             "mlp_gelu",
@@ -601,29 +632,86 @@ fn main() {
     let invocation_outputs = actual
         .chunks_exact(invocation_output_bytes)
         .collect::<Vec<_>>();
-    let (diagnostic_bytes, norm2_error, mlp_gelu_error) = if detailed_diagnostics {
-        let norm2_bytes = usize::from(rows) * usize::from(columns) * 2;
-        let expected_norm2 = reference.tensor_f32("encoder_layer_00_norm2").unwrap();
-        let expected_norm2 = serialize_a16_row_shards(
-            &expected_norm2,
-            usize::from(rows),
-            usize::from(columns),
-            &norm2,
+    let (diagnostic_bytes, boundary_errors, norm2_error, mlp_gelu_error) = if detailed_diagnostics {
+        let diagnostics = diagnostics.as_ref().unwrap();
+        let row_tensor_bytes = usize::from(rows) * usize::from(columns) * 2;
+        let mut diagnostic_offset = 0;
+        let mut boundary_errors = Vec::new();
+        let mut verify_rows = |stage: &str, expected: Vec<f32>, shards: &[RowShardPlacement]| {
+            let expected = serialize_a16_row_shards(
+                &expected,
+                usize::from(rows),
+                usize::from(columns),
+                shards,
+            );
+            let start = diagnostic_offset;
+            let end = start + row_tensor_bytes;
+            let error = invocation_outputs
+                .iter()
+                .enumerate()
+                .map(|(invocation, actual)| {
+                    let error = verify_linear_f16(&actual[start..end], &expected);
+                    info!(invocation, error, stage, "SigLIP invocation error");
+                    error
+                })
+                .fold(0.0, f32::max);
+            diagnostic_offset = end;
+            boundary_errors.push((stage.to_string(), error));
+            error
+        };
+        verify_rows(
+            "encoder_input",
+            reference.tensor_f32("patch_and_position").unwrap(),
+            &diagnostics.input,
         );
-        let norm2_error = invocation_outputs
-            .iter()
-            .enumerate()
-            .map(|(invocation, actual)| {
-                let error = verify_linear_f16(&actual[..norm2_bytes], &expected_norm2);
-                info!(
-                    invocation,
-                    error,
-                    stage = "norm2",
-                    "SigLIP invocation error"
-                );
-                error
-            })
-            .fold(0.0, f32::max);
+        verify_rows(
+            "norm1",
+            reference.tensor_f32("encoder_layer_00_norm1").unwrap(),
+            &diagnostics.norm1,
+        );
+        for (stage, key, shards) in [
+            ("query", "encoder_layer_00_query", &diagnostics.qkv[0]),
+            ("key", "encoder_layer_00_key", &diagnostics.qkv[1]),
+            ("value", "encoder_layer_00_value", &diagnostics.qkv[2]),
+        ] {
+            verify_rows(stage, reference.tensor_f32(key).unwrap(), shards);
+        }
+        let attention_heads = reference
+            .tensor_f32("encoder_layer_00_attention_heads")
+            .unwrap();
+        let heads = config.num_attention_heads;
+        let sequence = model.sequence_length();
+        let head_columns = config.hidden_size / heads;
+        let mut attention_hidden = vec![0.0; usize::from(rows) * usize::from(columns)];
+        for batch in 0..usize::from(batch_size) {
+            for row in 0..sequence {
+                for head in 0..heads {
+                    for column in 0..head_columns {
+                        let source =
+                            ((batch * heads + head) * sequence + row) * head_columns + column;
+                        let destination = (batch * sequence + row) * config.hidden_size
+                            + head * head_columns
+                            + column;
+                        attention_hidden[destination] = attention_heads[source];
+                    }
+                }
+            }
+        }
+        verify_rows(
+            "attention_hidden",
+            attention_hidden,
+            &diagnostics.attention_hidden,
+        );
+        verify_rows(
+            "attention_residual",
+            reference
+                .tensor_f32("encoder_layer_00_attention_residual")
+                .unwrap(),
+            &diagnostics.attention_residual,
+        );
+        let expected_norm2 = reference.tensor_f32("encoder_layer_00_norm2").unwrap();
+        let norm2_error = verify_rows("norm2", expected_norm2, &norm2);
+        drop(verify_rows);
         let expected = reference.tensor_f32("encoder_layer_00_mlp_gelu").unwrap();
         let expected = pad_columns(
             &expected,
@@ -641,7 +729,10 @@ fn main() {
             .iter()
             .enumerate()
             .map(|(invocation, actual)| {
-                let error = verify_linear_f16(&actual[norm2_bytes..], &expected);
+                let error = verify_linear_f16(
+                    &actual[diagnostic_offset..diagnostic_offset + expected.len() * 2],
+                    &expected,
+                );
                 info!(
                     invocation,
                     error,
@@ -653,12 +744,13 @@ fn main() {
             .fold(0.0, f32::max);
         let gelu_bytes = usize::from(rows) * usize::from(intermediate_columns) * 2;
         (
-            norm2_bytes + gelu_bytes,
+            diagnostic_offset + gelu_bytes,
+            boundary_errors,
             Some(norm2_error),
             Some(mlp_gelu_error),
         )
     } else {
-        (0, None, None)
+        (0, Vec::new(), None, None)
     };
     let expected_layer = if full_model {
         let expected = reference.tensor_f32("pooler_output").unwrap();
@@ -701,6 +793,7 @@ fn main() {
     info!(
         ?norm2_error,
         ?mlp_gelu_error,
+        ?boundary_errors,
         layer_error,
         ?cosine_similarity,
         limit,
