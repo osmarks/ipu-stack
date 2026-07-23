@@ -455,12 +455,11 @@ fn place_generated_with_segmented_support(
     retained_symbols: &[String],
     free_regions: &[(u32, u32)],
 ) -> Result<ExecutablePlacement> {
-    let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
-    let generated_size = align_up(generated_size, element);
+    let generated_size = align_up(generated_size, 8);
     let mut candidates = free_regions
         .iter()
         .filter_map(|&(start, end)| {
-            let start = align_up(start, element);
+            let start = align_up(start, 8);
             let generated_end = start.checked_add(generated_size)?;
             (generated_end <= end).then_some(((start, generated_end), end - generated_end))
         })
@@ -497,7 +496,7 @@ fn place_generated_with_segmented_support(
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let support = effective_element_reservations(support_ranges)?;
+                let support = merge_address_ranges(support_ranges);
                 if support.is_empty() {
                     return Err(format!("support image for tile {tile} has no segments").into());
                 }
@@ -4018,7 +4017,7 @@ fn package_graph_impl_attempt(
             .zip(&preliminary_images)
             .zip(&tile_retained_symbols)
             .map(
-                |((((program, plans), &program_size), _image), symbols)| -> Result<_> {
+                |((((program, plans), &program_size), image), symbols)| -> Result<_> {
                     let regions = executable_regions_for_tile(
                         &allocation_ranges_by_tile[usize::from(program.tile)],
                         plans.end,
@@ -4031,12 +4030,22 @@ fn package_graph_impl_attempt(
                         symbols,
                         &regions,
                     )
+                    .map_err(|error| {
+                        format!(
+                            "tile {} needs {} bytes for generated code and host executable objects plus {} bytes of preliminary support image: {error}",
+                            program.tile,
+                            program_size,
+                            image.bytes.len(),
+                        )
+                        .into()
+                    })
                 },
             )
             .collect::<Result<Vec<_>>>();
         match attempted {
             Ok(reservations) => reservations,
             Err(error) => {
+                info!(error = %error, "segmented executable placement requires tensor relayout");
                 let place = |allocation_ranges: &[Vec<(u32, u32)>]| {
                     programs
                         .par_iter()

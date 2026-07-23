@@ -359,9 +359,15 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
                 }
                 region_index += 1;
                 if region_index == regions.len() {
+                    let free_bytes = regions.iter().map(|&(start, end)| end - start).sum::<u32>();
                     return Err(ElfError::Link(format!(
-                        "retained section {} cannot fit executable regions",
-                        section.name().unwrap_or("?")
+                        "retained section {} ({} bytes, alignment {}) cannot fit executable regions {:?} ({} bytes total, {} image bytes already placed)",
+                        section.name().unwrap_or("?"),
+                        size,
+                        alignment,
+                        regions,
+                        free_bytes,
+                        cursor,
                     )));
                 }
                 address = regions[region_index].0;
