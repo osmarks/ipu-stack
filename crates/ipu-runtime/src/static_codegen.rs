@@ -36,6 +36,7 @@ pub(crate) struct HostCode<'a> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProfileCode {
+    pub allocation: Option<ipu_compiler::TensorId>,
     pub initial: u32,
     pub after_sync: Vec<bool>,
     pub after_step: Vec<bool>,
@@ -2075,6 +2076,7 @@ mod tests {
             &templates,
             host(),
             Some(&ProfileCode {
+                allocation: None,
                 initial: 0x68000,
                 after_sync: vec![true, false, true, false],
                 after_step: vec![true; 4],
