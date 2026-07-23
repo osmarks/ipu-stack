@@ -435,6 +435,10 @@ pub enum SiglipLinearPrecision {
 }
 
 impl SiglipLinearPrecision {
+    pub fn is_quantized(self) -> bool {
+        !matches!(self, Self::F16)
+    }
+
     fn gemm_data_type(self, values: impl IntoIterator<Item = f32>) -> GemmDataType {
         match self {
             Self::F16 => GemmDataType::F16,
@@ -455,6 +459,15 @@ pub struct SiglipEncoderPrecision {
     pub attention_output: SiglipLinearPrecision,
     pub mlp_up: SiglipLinearPrecision,
     pub mlp_down: SiglipLinearPrecision,
+}
+
+impl SiglipEncoderPrecision {
+    pub fn is_quantized(self) -> bool {
+        self.qkv.is_quantized()
+            || self.attention_output.is_quantized()
+            || self.mlp_up.is_quantized()
+            || self.mlp_down.is_quantized()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

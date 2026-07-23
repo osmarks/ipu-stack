@@ -1197,39 +1197,37 @@ fn main() {
             error
         })
         .fold(0.0, f32::max);
-    let cosine_similarity = pooler_model.then(|| {
-        invocation_outputs
-            .iter()
-            .map(|actual| cosine_similarity_f16(&actual[diagnostic_bytes..], &expected_layer))
-            .fold(f64::INFINITY, f64::min)
-    });
+    let cosine_similarity = invocation_outputs
+        .iter()
+        .map(|actual| cosine_similarity_f16(&actual[diagnostic_bytes..], &expected_layer))
+        .fold(f64::INFINITY, f64::min);
+    let quantized_encoder = precision.iter().any(|precision| precision.is_quantized());
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
     info!(
         ?norm2_error,
         ?mlp_gelu_error,
         ?boundary_errors,
         layer_error,
-        ?cosine_similarity,
+        cosine_similarity,
+        quantized_encoder,
         limit,
         "SigLIP verification results"
     );
-    match cosine_similarity {
-        Some(cosine) => println!(
-            "siglip_verification max_error={layer_error:.8} cosine_similarity={cosine:.10}"
-        ),
-        None => println!("siglip_verification max_error={layer_error:.8}"),
-    }
+    println!(
+        "siglip_verification max_error={layer_error:.8} \
+         cosine_similarity={cosine_similarity:.10}"
+    );
     if let Some(error) = norm2_error {
         assert!(error <= limit, "norm2 max error {error} exceeds {limit}");
     }
     if let Some(error) = mlp_gelu_error {
         assert!(error <= limit, "MLP GeLU max error {error} exceeds {limit}");
     }
-    if let Some(cosine_similarity) = cosine_similarity {
+    if pooler_model || quantized_encoder {
         let minimum = env_f32("IPU_SIGLIP_MIN_COSINE", 0.995);
         assert!(
             cosine_similarity >= f64::from(minimum),
-            "pooler output cosine {cosine_similarity} is below {minimum}"
+            "output cosine {cosine_similarity} is below {minimum}"
         );
     } else {
         assert!(
@@ -1254,7 +1252,7 @@ fn main() {
         ?norm2_error,
         ?mlp_gelu_error,
         layer_error,
-        ?cosine_similarity,
+        cosine_similarity,
         full_model,
         "SigLIP encoder prefix passed against Hugging Face"
     );
