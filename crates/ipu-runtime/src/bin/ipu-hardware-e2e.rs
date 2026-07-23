@@ -94,7 +94,8 @@ fn main() {
 
 fn run_template_patch(objects: &[Vec<u8>], bootloader: &[u8], configuration: &[u8], device: &str) {
     const TILE: u16 = 17;
-    const BASES: [u32; 2] = [0x60000, 0xe0000];
+    const CALLS: usize = 24;
+    const INSTANCES: usize = 27;
     let topology = ipu_exchange::Topology::c600();
     let mut rng = fastrand::Rng::with_seed(0x7465_6d70_6c61_7465);
     let mut phases = Vec::new();
@@ -102,59 +103,69 @@ fn run_template_patch(objects: &[Vec<u8>], bootloader: &[u8], configuration: &[u
     let mut initial_buffers = Vec::new();
     let mut outputs = Vec::new();
     let mut expected = Vec::new();
-    for (instance, base) in BASES.into_iter().enumerate() {
-        let output = TensorId(instance * 3);
-        let left = TensorId(instance * 3 + 1);
-        let right = TensorId(instance * 3 + 2);
-        let mut commands = Vec::with_capacity(usize::from(TILE_COUNT));
+    for instance in 0..INSTANCES {
+        let mut commands = Vec::with_capacity(usize::from(TILE_COUNT) * CALLS);
         for tile in 0..TILE_COUNT {
-            let left_value = rng.u32(..);
-            let right_value = rng.u32(..);
-            if tile == TILE {
-                expected.push(left_value.wrapping_add(right_value));
+            for call in 0..CALLS {
+                let call_offset = u32::try_from(call).unwrap() * 0x40;
+                let base = if call.is_multiple_of(2) {
+                    0x60000 + u32::try_from(instance).unwrap() * 0x800 + call_offset
+                } else {
+                    let slot = (instance * 11) % INSTANCES;
+                    0x90000 + u32::try_from(slot).unwrap() * 0x1800 + call_offset
+                };
+                let tensor = (instance * CALLS + call) * 3;
+                let output = TensorId(tensor);
+                let left = TensorId(tensor + 1);
+                let right = TensorId(tensor + 2);
+                allocations.extend([
+                    home(output, tile, base, 4),
+                    home(left, tile, base + 0x10, 4),
+                    home(right, tile, base + 0x20, 4),
+                ]);
+                if tile == TILE {
+                    let left_value = rng.u32(..);
+                    let right_value = rng.u32(..);
+                    expected.push(left_value.wrapping_add(right_value));
+                    initial_buffers.extend([
+                        InitialBuffer {
+                            tile,
+                            address: base + 0x10,
+                            words: vec![left_value],
+                        },
+                        InitialBuffer {
+                            tile,
+                            address: base + 0x20,
+                            words: vec![right_value],
+                        },
+                    ]);
+                    outputs.push(RegionSlice {
+                        tile: u32::from(topology.physical(TILE).unwrap()),
+                        tile_address: base,
+                        file_offset: u64::try_from(expected.len() * 4 - 4).unwrap(),
+                        size: 4,
+                    });
+                }
+                commands.push(Arc::new(KernelCommand {
+                    tile,
+                    output,
+                    inputs: vec![left, right],
+                    arguments: Vec::new(),
+                    specialization: Arc::new(SpecializationKey {
+                        operation: "add_u32".into(),
+                        shape: vec![1],
+                        worker_count: 1,
+                        role: "template-patch-e2e".into(),
+                        alignment: 4,
+                        abi: ipu_compiler::KernelAbi::Generic,
+                    }),
+                    metadata: BTreeMap::new(),
+                }));
             }
-            allocations.extend([
-                home(output, tile, base, 4),
-                home(left, tile, base + 0x10, 4),
-                home(right, tile, base + 0x20, 4),
-            ]);
-            initial_buffers.extend([
-                InitialBuffer {
-                    tile,
-                    address: base + 0x10,
-                    words: vec![left_value],
-                },
-                InitialBuffer {
-                    tile,
-                    address: base + 0x20,
-                    words: vec![right_value],
-                },
-            ]);
-            commands.push(Arc::new(KernelCommand {
-                tile,
-                output,
-                inputs: vec![left, right],
-                arguments: Vec::new(),
-                specialization: Arc::new(SpecializationKey {
-                    operation: "add_u32".into(),
-                    shape: vec![1],
-                    worker_count: 1,
-                    role: "template-patch-e2e".into(),
-                    alignment: 4,
-                    abi: ipu_compiler::KernelAbi::Generic,
-                }),
-                metadata: BTreeMap::new(),
-            }));
         }
         phases.push(Phase::Compute {
             op: OpId(instance),
             commands,
-        });
-        outputs.push(RegionSlice {
-            tile: u32::from(topology.physical(TILE).unwrap()),
-            tile_address: base,
-            file_offset: u64::try_from(instance * 4).unwrap(),
-            size: 4,
         });
     }
     let schedule = Schedule {
@@ -165,7 +176,11 @@ fn run_template_patch(objects: &[Vec<u8>], bootloader: &[u8], configuration: &[u
         peak_sram: BTreeMap::new(),
     };
     let mut repeated = RepeatedRegion::new("wide-template-patch", &schedule, 0..1).unwrap();
-    repeated.push_instance(&schedule, 1..2).unwrap();
+    for instance in 1..INSTANCES {
+        repeated
+            .push_instance(&schedule, instance..instance + 1)
+            .unwrap();
+    }
     let graph = ExecutableGraph {
         memory_policy: None,
         host_weights: Vec::new(),
@@ -174,7 +189,7 @@ fn run_template_patch(objects: &[Vec<u8>], bootloader: &[u8], configuration: &[u
         outputs: vec![Binding {
             name: "template-results".into(),
             dtype: "u32".into(),
-            shape: vec![2],
+            shape: vec![u32::try_from(expected.len()).unwrap()],
             slices: outputs,
         }],
         host_inputs: Vec::new(),
