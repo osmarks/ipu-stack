@@ -259,6 +259,8 @@ pub fn inspect_object(bytes: &[u8]) -> Result<ObjectSummary, ElfError> {
 
 #[derive(Clone, Debug)]
 pub struct LinkOptions {
+    /// Architectural base used by image-relative relocations. For IPU21 this
+    /// is `TMEM_REGION0_BASE_ADDR` (0x4c000), regardless of section placement.
     pub image_base: u32,
     /// Optional executable intervals used for non-contiguous section placement.
     pub regions: Vec<(u32, u32)>,
@@ -320,9 +322,13 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
     if regions.iter().any(|&(start, end)| start >= end) {
         return Err(ElfError::Link("invalid executable region".into()));
     }
-    let image_base = regions[0].0;
+    // Colossus image-relative relocations are relative to the architectural
+    // TMEM region-0 base, even when the linked sections start in a later
+    // placement interval.  `image_base` therefore must not be inferred from
+    // `regions[0]`.
+    let image_base = options.image_base;
     let mut region_index = 0usize;
-    let mut address = image_base;
+    let mut address = regions[0].0;
     for (object_index, file) in parsed.iter().enumerate() {
         for section in file.sections() {
             if !kept.contains(&(object_index, section.index())) {

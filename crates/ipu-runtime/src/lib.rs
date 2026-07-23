@@ -474,7 +474,7 @@ fn place_generated_with_segmented_support(
         match link(
             objects,
             &LinkOptions {
-                image_base: support_regions[0].0,
+                image_base: ipu_package::TILE_MEMORY_BASE,
                 regions: support_regions,
                 entry_symbol: "ipu_stack_static_start".into(),
                 retained_symbols: retained_symbols.to_vec(),
@@ -4747,7 +4747,7 @@ fn package_graph_impl_attempt(
         let image = link(
             objects,
             &LinkOptions {
-                image_base: regions.first().ok_or("tile has no executable region")?.0,
+                image_base: ipu_package::TILE_MEMORY_BASE,
                 regions: regions.clone(),
                 entry_symbol: "ipu_stack_static_start".into(),
                 retained_symbols: symbols.clone(),
