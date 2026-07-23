@@ -371,6 +371,11 @@ pub enum KernelAbi {
     /// PACE matrix multiply operands in output, left, right order.
     Pace {
         operand_bytes: [u32; 3],
+        /// Bytes touched after the logical end of each operand by the selected
+        /// instruction schedule. Pipelined loads may intentionally read ahead
+        /// without making those bytes part of the tensor payload.
+        #[serde(default)]
+        access_tail_bytes: [u32; 3],
         interleaved_right: bool,
     },
 }
@@ -384,10 +389,33 @@ impl KernelAbi {
     ) -> Self {
         Self::Pace {
             operand_bytes: [output_bytes, left_bytes, right_bytes],
+            access_tail_bytes: [0; 3],
+            interleaved_right,
+        }
+    }
+
+    pub const fn pace_with_left_access_tail(
+        output_bytes: u32,
+        left_bytes: u32,
+        right_bytes: u32,
+        left_access_tail_bytes: u32,
+        interleaved_right: bool,
+    ) -> Self {
+        Self::Pace {
+            operand_bytes: [output_bytes, left_bytes, right_bytes],
+            access_tail_bytes: [0, left_access_tail_bytes, 0],
             interleaved_right,
         }
     }
 }
+
+/// The FP16/FP8 PACE worker primes six 64-bit loads for each 32-byte
+/// left-operand micro-row before entering its steady-state pipeline.
+pub const PACE_F16_LEFT_ACCESS_TAIL_BYTES: u32 = 16;
+
+/// The FP32 PACE worker primes four 128-bit loads for each 32-byte
+/// left-operand micro-row before entering its steady-state pipeline.
+pub const PACE_F32_LEFT_ACCESS_TAIL_BYTES: u32 = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelOperand {
@@ -467,11 +495,32 @@ impl SpecializationKey {
     }
 
     pub fn operand_access_bytes(&self, operand: KernelOperand) -> Result<u32, CompileError> {
-        let bytes = match (self.abi, operand) {
-            (KernelAbi::Generic, _) | (KernelAbi::Pace { .. }, KernelOperand::Input(2..)) => 1,
-            (KernelAbi::Pace { operand_bytes, .. }, KernelOperand::Output) => operand_bytes[0],
-            (KernelAbi::Pace { operand_bytes, .. }, KernelOperand::Input(0)) => operand_bytes[1],
-            (KernelAbi::Pace { operand_bytes, .. }, KernelOperand::Input(1)) => operand_bytes[2],
+        let (bytes, tail) = match (self.abi, operand) {
+            (KernelAbi::Generic, _) | (KernelAbi::Pace { .. }, KernelOperand::Input(2..)) => (1, 0),
+            (
+                KernelAbi::Pace {
+                    operand_bytes,
+                    access_tail_bytes,
+                    ..
+                },
+                KernelOperand::Output,
+            ) => (operand_bytes[0], access_tail_bytes[0]),
+            (
+                KernelAbi::Pace {
+                    operand_bytes,
+                    access_tail_bytes,
+                    ..
+                },
+                KernelOperand::Input(0),
+            ) => (operand_bytes[1], access_tail_bytes[1]),
+            (
+                KernelAbi::Pace {
+                    operand_bytes,
+                    access_tail_bytes,
+                    ..
+                },
+                KernelOperand::Input(1),
+            ) => (operand_bytes[2], access_tail_bytes[2]),
         };
         if bytes == 0 {
             return Err(CompileError::Graph(format!(
@@ -479,7 +528,12 @@ impl SpecializationKey {
                 self.operation
             )));
         }
-        Ok(bytes)
+        bytes.checked_add(tail).ok_or_else(|| {
+            CompileError::Graph(format!(
+                "kernel {} memory ABI operand access overflows",
+                self.operation
+            ))
+        })
     }
 }
 
@@ -1887,6 +1941,15 @@ impl GemmDataType {
             Self::F16F8Weights { .. } | Self::F8F143 { .. } => 1,
             Self::F16 => 2,
             Self::F32 => 4,
+        }
+    }
+
+    const fn left_access_tail_bytes(self) -> u32 {
+        match self {
+            Self::F16 | Self::F16F8Weights { .. } | Self::F8F143 { .. } => {
+                PACE_F16_LEFT_ACCESS_TAIL_BYTES
+            }
+            Self::F32 => PACE_F32_LEFT_ACCESS_TAIL_BYTES,
         }
     }
 
@@ -3925,7 +3988,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                             worker_count: 6,
                             role: "blocked-gemm".into(),
                             alignment: 32,
-                            abi: KernelAbi::pace(
+                            abi: KernelAbi::pace_with_left_access_tail(
                                 u32::from(output_block.rows)
                                     * u32::from(config.block_dimension)
                                     * output_element_bytes,
@@ -3937,6 +4000,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                                 } else {
                                     right_block_bytes
                                 },
+                                config.data_type.left_access_tail_bytes(),
                                 config.data_type.expands_weights(),
                             ),
                         }),
@@ -4444,7 +4508,7 @@ impl Schedule {
                     tensor.0
                 )));
             }
-            let candidates = index
+            let address_candidates = index
                 .by_tensor
                 .get(&tensor)
                 .into_iter()
@@ -4456,18 +4520,21 @@ impl Schedule {
                         && allocation.live_from <= phase
                         && phase < allocation.live_until
                         && allocation.address <= address
-                        && address.checked_add(bytes).is_some_and(|end| {
-                            address < end
-                                && end <= allocation.address.saturating_add(allocation.size)
-                        })
+                        && address < allocation.address.saturating_add(allocation.size)
                 })
                 .collect::<SmallVec<[usize; 2]>>();
-            let mut owners = candidates.iter().copied().filter(|&allocation_index| {
-                !matches!(
-                    allocations[allocation_index].kind,
-                    AllocationKind::HomeAlias { .. }
-                )
-            });
+            // Ownership follows the operand's base pointer. Its machine access
+            // span may extend beyond the logical payload and is reserved later
+            // by the relocation allocator.
+            let mut owners = address_candidates
+                .iter()
+                .copied()
+                .filter(|&allocation_index| {
+                    !matches!(
+                        allocations[allocation_index].kind,
+                        AllocationKind::HomeAlias { .. }
+                    )
+                });
             if let Some(allocation) = owners.next() {
                 if owners.next().is_some() {
                     return Err(CompileError::Graph(format!(
@@ -4482,7 +4549,7 @@ impl Schedule {
                     bytes,
                 });
             }
-            let mut aliases = candidates.iter().filter_map(|&allocation_index| {
+            let mut aliases = address_candidates.iter().filter_map(|&allocation_index| {
                 let AllocationKind::HomeAlias { source } = allocations[allocation_index].kind
                 else {
                     return None;
@@ -6764,10 +6831,11 @@ mod tests {
             };
             assert_eq!(
                 command.specialization.abi,
-                KernelAbi::pace(
+                KernelAbi::pace_with_left_access_tail(
                     u32::try_from(rows * columns * 4).unwrap(),
                     u32::try_from(rows * inner * 4).unwrap(),
                     u32::try_from(inner * columns * 4).unwrap(),
+                    PACE_F32_LEFT_ACCESS_TAIL_BYTES,
                     false,
                 )
             );
@@ -6786,12 +6854,22 @@ mod tests {
         };
         let pace = SpecializationKey {
             operation: "attention_qk_custom_name".into(),
-            abi: KernelAbi::pace(12 * 64 * 2, 12 * 64 * 2, 64 * 64 * 2, false),
+            abi: KernelAbi::pace_with_left_access_tail(
+                12 * 64 * 2,
+                12 * 64 * 2,
+                64 * 64 * 2,
+                PACE_F16_LEFT_ACCESS_TAIL_BYTES,
+                false,
+            ),
             ..generic.clone()
         };
 
         assert!(generic.memory_constraints().is_empty());
         assert!(!pace.memory_constraints().is_empty());
+        assert_eq!(
+            pace.operand_access_bytes(KernelOperand::Input(0)).unwrap(),
+            12 * 64 * 2 + PACE_F16_LEFT_ACCESS_TAIL_BYTES
+        );
         assert_eq!(
             pace.operand_access_bytes(KernelOperand::Input(1)).unwrap(),
             64 * 64 * 2

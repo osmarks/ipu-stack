@@ -1,7 +1,7 @@
 use crate::{
     Allocation, AllocationKind, CompileError, KernelAbi, KernelCommand, MemoryArena,
-    MemoryPlacement, OpId, Phase, RowShardPlacement, Schedule, SpecializationKey, TensorId,
-    Transfer, allocate_from_occupied_arenas,
+    MemoryPlacement, OpId, PACE_F16_LEFT_ACCESS_TAIL_BYTES, Phase, RowShardPlacement, Schedule,
+    SpecializationKey, TensorId, Transfer, allocate_from_occupied_arenas,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1120,10 +1120,11 @@ pub fn plan_flash_attention(
                         )
                         .into(),
                         alignment: 8,
-                        abi: KernelAbi::pace(
+                        abi: KernelAbi::pace_with_left_access_tail(
                             u32::from(task.query_rows) * u32::from(key_block_columns) * 2,
                             u32::from(task.query_rows) * u32::from(padded_head_dimension) * 2,
                             block.matrix_size,
+                            PACE_F16_LEFT_ACCESS_TAIL_BYTES,
                             false,
                         ),
                     }),
@@ -1185,10 +1186,11 @@ pub fn plan_flash_attention(
                         role: format!("attention-pv-batch-{}-head-{}", task.batch, task.head)
                             .into(),
                         alignment: 8,
-                        abi: KernelAbi::pace(
+                        abi: KernelAbi::pace_with_left_access_tail(
                             u32::from(task.query_rows) * u32::from(padded_head_dimension) * 2,
                             u32::from(task.query_rows) * u32::from(key_block_columns) * 2,
                             block.matrix_size,
+                            PACE_F16_LEFT_ACCESS_TAIL_BYTES,
                             false,
                         ),
                     }),
@@ -1633,10 +1635,11 @@ mod tests {
             };
             assert_eq!(
                 command.specialization.abi,
-                KernelAbi::pace(
+                KernelAbi::pace_with_left_access_tail(
                     u32::try_from(rows * columns * 2).unwrap(),
                     u32::try_from(rows * inner * 2).unwrap(),
                     u32::try_from(inner * columns * 2).unwrap(),
+                    PACE_F16_LEFT_ACCESS_TAIL_BYTES,
                     false,
                 )
             );
