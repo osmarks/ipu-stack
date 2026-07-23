@@ -1380,6 +1380,13 @@ pub(crate) fn emit(
             let first = &template.instance_steps[0];
             let after_sync = &profile.after_sync[first.clone()];
             let after_step = &profile.after_step[first.clone()];
+            if !after_sync
+                .iter()
+                .chain(after_step)
+                .any(|boundary| *boundary)
+            {
+                continue;
+            }
             for instance in &template.instance_steps[1..] {
                 if profile.after_sync[instance.clone()] != *after_sync
                     || profile.after_step[instance.clone()] != *after_step
@@ -2484,6 +2491,57 @@ mod tests {
         .unwrap();
 
         assert!(profiled.len() > unprofiled.len());
+    }
+
+    #[test]
+    fn aggregate_profile_allows_different_template_instance_step_counts() {
+        let program = LoweredTileProgram {
+            tile: 7,
+            steps: vec![
+                compute(0, 0x54000, Vec::new()),
+                compute(1, 0x54020, Vec::new()),
+                compute(1, 0x54040, Vec::new()),
+            ],
+        };
+        let regions = [crate::StaticTemplateRegion {
+            name: "encoder_layer".into(),
+            phase_instances: vec![0..1, 1..2],
+        }];
+        let (templates, _) =
+            plan_static_templates(&program, &[], &[], &[], &regions, 0x60000, false).unwrap();
+        let symbols = BTreeMap::from([
+            (WORKER_BARRIER.into(), 0x50000),
+            (COMPLETE.into(), 0x50020),
+            (HOST_RUN.into(), 0x50040),
+            (REPEAT_CALL.into(), 0x50060),
+            (TEMPLATE_PATCH.into(), 0x50080),
+            (SAMPLE_CYCLE.into(), 0x500a0),
+            (SAMPLE_CYCLE_NEXT.into(), 0x500c0),
+            ("ipu_stack_gemm_f16_accumulate".into(), 0x500e0),
+        ]);
+
+        emit(
+            &program,
+            &symbols,
+            &[],
+            &[],
+            &templates,
+            HostCode {
+                weights: &[],
+                inputs: &[],
+                outputs: &[],
+            },
+            Some(&ProfileCode {
+                allocation: None,
+                initial: 0x68000,
+                after_sync: vec![false; 3],
+                after_step: vec![false; 3],
+                aggregate_end: Some(0x68004),
+            }),
+            0x70000,
+            1,
+        )
+        .unwrap();
     }
 
     #[test]
