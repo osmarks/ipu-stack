@@ -609,6 +609,7 @@ impl AllocationKind {
 struct AllocationStoreIndex {
     by_tensor: HashMap<TensorId, Vec<usize>>,
     homes_by_tile: Vec<Vec<usize>>,
+    all_by_tile: Vec<Vec<(u32, u32)>>,
     finite_by_live_until: HashMap<usize, Vec<usize>>,
     live_forever: Vec<usize>,
     live_forever_count: usize,
@@ -627,6 +628,14 @@ impl AllocationStoreIndex {
                 self.homes_by_tile.resize_with(tile + 1, Vec::new);
             }
             self.homes_by_tile[tile].push(index);
+        }
+        let tile = usize::from(allocation.tile);
+        if self.all_by_tile.len() <= tile {
+            self.all_by_tile.resize_with(tile + 1, Vec::new);
+        }
+        let end = allocation.address.saturating_add(allocation.size);
+        if allocation.address < end {
+            self.all_by_tile[tile].push((allocation.address, end));
         }
         if allocation.live_until == usize::MAX {
             self.live_forever.push(index);
@@ -882,6 +891,32 @@ impl AllocationStore {
         occupied
     }
 
+    /// Returns every address range ever assigned on each tile, irrespective of
+    /// lifetime. Resident objects use this view because they must not reuse an
+    /// address occupied by any transient program state.
+    pub fn all_occupied_intervals_by_tile(
+        &self,
+        tile_count: u16,
+        base: u32,
+        limit: u32,
+    ) -> Vec<Vec<(u32, u32)>> {
+        self.with_index(|index| {
+            let mut occupied = vec![Vec::new(); usize::from(tile_count)];
+            for (destination, source) in occupied.iter_mut().zip(&mut index.all_by_tile) {
+                // Keep the owned union compact between append batches. Most
+                // short-lived tensors reuse a small number of physical ranges.
+                normalize_occupied_intervals(source);
+                destination.extend(source.iter().filter_map(|&(start, end)| {
+                    let start = start.max(base);
+                    let end = end.min(limit);
+                    (start < end).then_some((start, end))
+                }));
+            }
+            merge_occupied_intervals(&mut occupied);
+            occupied
+        })
+    }
+
     pub fn find_free_region_in_arenas(
         &self,
         tile: u16,
@@ -1054,21 +1089,8 @@ pub struct MemoryPolicy {
     #[serde(default)]
     pub resident_tile_assignment: ResidentTileAssignment,
     #[serde(skip)]
-    allocation_occupancy: AllocationOccupancyCache,
-    #[serde(skip)]
     resident_placement_session: Option<ResidentPlacementSession>,
 }
-
-#[derive(Clone, Debug, Default)]
-struct AllocationOccupancyCache(Arc<Mutex<Option<CachedAllocationOccupancy>>>);
-
-impl PartialEq for AllocationOccupancyCache {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for AllocationOccupancyCache {}
 
 /// A reusable sequence of balanced resident-placement decisions.
 ///
@@ -1154,16 +1176,6 @@ impl PartialEq for ResidentPlacementSession {
 
 impl Eq for ResidentPlacementSession {}
 
-#[derive(Debug)]
-struct CachedAllocationOccupancy {
-    schedule: usize,
-    allocation_count: usize,
-    tile_count: u16,
-    base: u32,
-    limit: u32,
-    occupied: Vec<Vec<(u32, u32)>>,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResidentTileAssignment {
     #[default]
@@ -1222,7 +1234,6 @@ impl MemoryPolicy {
             resident: vec![resident],
             transient: vec![transient],
             resident_tile_assignment: ResidentTileAssignment::Balanced,
-            allocation_occupancy: AllocationOccupancyCache::default(),
             resident_placement_session: None,
         }
     }
@@ -1259,7 +1270,6 @@ impl MemoryPolicy {
             resident: expand(resident_order, MemoryPlacement::High),
             transient: expand(transient_order, MemoryPlacement::Low),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
-            allocation_occupancy: AllocationOccupancyCache::default(),
             resident_placement_session: None,
         };
         policy.validate()?;
@@ -1344,39 +1354,9 @@ impl MemoryPolicy {
     }
 
     fn occupied_all(&self, schedule: &Schedule, base: u32, limit: u32) -> Vec<Vec<(u32, u32)>> {
-        let schedule_id = schedule as *const Schedule as usize;
-        let mut cache = self.allocation_occupancy.0.lock().unwrap();
-        let reset = cache.as_ref().is_none_or(|cache| {
-            cache.schedule != schedule_id
-                || cache.tile_count != schedule.tile_count
-                || cache.base != base
-                || cache.limit != limit
-                || cache.allocation_count > schedule.allocations.len()
-        });
-        if reset {
-            *cache = Some(CachedAllocationOccupancy {
-                schedule: schedule_id,
-                allocation_count: 0,
-                tile_count: schedule.tile_count,
-                base,
-                limit,
-                occupied: vec![Vec::new(); usize::from(schedule.tile_count)],
-            });
-        }
-        let cache = cache.as_mut().unwrap();
-        for allocation in &schedule.allocations[cache.allocation_count..] {
-            let start = allocation.address.max(base);
-            let end = allocation
-                .address
-                .saturating_add(allocation.size)
-                .min(limit);
-            if start < end {
-                cache.occupied[usize::from(allocation.tile)].push((start, end));
-            }
-        }
-        cache.allocation_count = schedule.allocations.len();
-        merge_occupied_intervals(&mut cache.occupied);
-        cache.occupied.clone()
+        schedule
+            .allocations
+            .all_occupied_intervals_by_tile(schedule.tile_count, base, limit)
     }
 }
 
@@ -2144,7 +2124,6 @@ pub fn append_blocked_gemm_f16_with_a16_input_in_arenas(
                 .collect(),
             transient: arenas.to_vec(),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
-            allocation_occupancy: AllocationOccupancyCache::default(),
             resident_placement_session: None,
         },
     )
@@ -2417,7 +2396,6 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_in_arenas(
                 .collect(),
             transient: arenas.to_vec(),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
-            allocation_occupancy: AllocationOccupancyCache::default(),
             resident_placement_session: None,
         },
     )
