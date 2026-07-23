@@ -3,6 +3,7 @@ use crate::{
     MemoryPlacement, OpId, PACE_F16_LEFT_ACCESS_TAIL_BYTES, Phase, RowShardPlacement, Schedule,
     SpecializationKey, TensorId, Transfer, allocate_from_occupied_arenas,
 };
+use rustc_hash::FxHashSet as HashSet;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -148,6 +149,7 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
         .unwrap_or(0)
         + 1;
 
+    let query_live_from = schedule.phases.len() + 1;
     append_attention_pack_phase(
         schedule,
         &mut next_tensor,
@@ -155,6 +157,7 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
         &plan,
         AttentionPackKind::Query,
     )?;
+    let key_live_from = schedule.phases.len() + 1;
     append_attention_pack_phase(
         schedule,
         &mut next_tensor,
@@ -162,6 +165,7 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
         &plan,
         AttentionPackKind::Key,
     )?;
+    let value_live_from = schedule.phases.len() + 1;
     append_attention_pack_phase(
         schedule,
         &mut next_tensor,
@@ -169,12 +173,51 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
         &plan,
         AttentionPackKind::Value,
     )?;
-    for allocation in &mut plan.schedule.allocations {
-        if allocation.kind == AllocationKind::Home && allocation.live_from == 0 {
-            allocation.live_from = 1;
-        }
-    }
+    let output_tensors = plan
+        .tasks
+        .iter()
+        .map(|task| task.output)
+        .collect::<HashSet<_>>();
+    let output_allocations = plan
+        .schedule
+        .allocations
+        .indices_for_tensors(&output_tensors)
+        .into_iter()
+        .filter(|&index| plan.schedule.allocations[index].kind == AllocationKind::Home)
+        .collect::<Vec<_>>();
+    plan.schedule
+        .allocations
+        .set_live_until(&output_allocations, usize::MAX);
+    let allocation_base = schedule.allocations.len();
     crate::append_child_schedule(schedule, &mut plan.schedule)?;
+    for (tensors, live_from) in [
+        (
+            plan.tasks
+                .iter()
+                .map(|task| task.query)
+                .collect::<HashSet<_>>(),
+            query_live_from,
+        ),
+        (
+            plan.key_values
+                .iter()
+                .map(|block| block.key_tensor)
+                .collect::<HashSet<_>>(),
+            key_live_from,
+        ),
+        (
+            plan.key_values
+                .iter()
+                .map(|block| block.value_tensor)
+                .collect::<HashSet<_>>(),
+            value_live_from,
+        ),
+    ] {
+        let indices = schedule
+            .allocations
+            .home_indices_for_tensors_since(&tensors, allocation_base);
+        schedule.allocations.set_live_from(&indices, live_from);
+    }
     Ok(plan)
 }
 
@@ -401,12 +444,19 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
             tensor: destination_tensor,
             address,
         });
-        output_groups.push((destination_tile, row_start, rows, address, tasks));
+        output_groups.push((
+            destination_tile,
+            row_start,
+            rows,
+            destination_tensor,
+            address,
+            tasks,
+        ));
     }
 
     let maximum_head_bytes = output_groups
         .iter()
-        .map(|(_, _, rows, _, _)| u32::from(*rows) * u32::from(plan.head_dimension) * 2)
+        .map(|(_, _, rows, _, _, _)| u32::from(*rows) * u32::from(plan.head_dimension) * 2)
         .max()
         .unwrap();
     let heads_per_pass = u16::try_from(ipu_exchange::EXCHANGE_WINDOW_BYTES / maximum_head_bytes)
@@ -423,8 +473,9 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
         let pass_heads = (head_count - first_head).min(heads_per_pass);
         let mut transfers = Vec::new();
         let mut commands = Vec::new();
-        for &(destination_tile, row_start, rows, address, ref tasks) in &output_groups {
-            let activation_bytes = u32::from(rows) * u32::from(hidden_size) * 2;
+        for &(destination_tile, row_start, rows, destination_tensor, _address, ref tasks) in
+            &output_groups
+        {
             let head_bytes = u32::from(rows) * u32::from(plan.head_dimension) * 2;
             for task in &tasks[usize::from(first_head)..usize::from(first_head + pass_heads)] {
                 let staging_offset = u32::from(task.head - first_head) * head_bytes;
@@ -437,19 +488,9 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
                         staging_address: Some(ipu_exchange::EXCHANGE_WINDOW_BASE + staging_offset),
                     });
                 }
-                let output_alias = fresh_tensor(&mut next_tensor);
-                schedule.allocations.push(Allocation {
-                    tensor: output_alias,
-                    tile: destination_tile,
-                    address,
-                    size: activation_bytes,
-                    live_from: compute_phase,
-                    live_until: compute_phase,
-                    kind: AllocationKind::Home,
-                });
                 commands.push(KernelCommand {
                     tile: destination_tile,
-                    output: output_alias,
+                    output: destination_tensor,
                     inputs: vec![task.output, task.output],
                     arguments: vec![u32::from(rows), u32::from(task.head * plan.head_dimension)],
                     specialization: Arc::new(SpecializationKey {
@@ -475,6 +516,7 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
             commands: commands.into_iter().map(Arc::new).collect(),
         });
     }
+    crate::end_tensor_lifetimes(schedule, plan.tasks.iter().map(|task| task.output))?;
     Ok(destinations)
 }
 

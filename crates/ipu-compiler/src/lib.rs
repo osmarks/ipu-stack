@@ -2988,18 +2988,19 @@ fn plan_appended_blocked_gemm_with_memory_policy(
         if let AllocationKind::HomeAlias { source } = allocation.kind {
             let owner = regions
                 .iter()
-                .find(|region| region.0 == source && region.1 == allocation.tile)
-                .ok_or_else(|| {
-                    CompileError::Memory(format!(
-                        "GEMM alias tensor {} has no movable source tensor {} on tile {}",
-                        allocation.tensor.0, source.0, allocation.tile
-                    ))
-                })?;
-            allocation.address = relocated[&source]
-                .checked_add(allocation.address.checked_sub(owner.2).ok_or_else(|| {
-                    CompileError::Memory("GEMM alias precedes its source allocation".into())
-                })?)
-                .ok_or_else(|| CompileError::Memory("GEMM alias relocation overflow".into()))?;
+                .find(|region| region.0 == source && region.1 == allocation.tile);
+            if let Some(owner) = owner {
+                allocation.address = relocated[&source]
+                    .checked_add(allocation.address.checked_sub(owner.2).ok_or_else(|| {
+                        CompileError::Memory("GEMM alias precedes its source allocation".into())
+                    })?)
+                    .ok_or_else(|| CompileError::Memory("GEMM alias relocation overflow".into()))?;
+            } else if relocated.contains_key(&source) {
+                return Err(CompileError::Memory(format!(
+                    "GEMM alias tensor {} references relocated source tensor {} on another tile",
+                    allocation.tensor.0, source.0
+                )));
+            }
             continue;
         }
         if allocation.kind != AllocationKind::Home || allocation.address < config.data_base {
@@ -4080,8 +4081,10 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                     address: output_address + byte_offset,
                     size: bytes,
                     live_from: evacuation_phase,
-                    live_until: evacuation_phase,
-                    kind: AllocationKind::Home,
+                    live_until: evacuation_phase + 1,
+                    kind: AllocationKind::HomeAlias {
+                        source: TensorId(scratch_tensor_base + output_index),
+                    },
                 });
                 allocations.push(Allocation {
                     tensor,
@@ -4765,11 +4768,11 @@ impl Schedule {
                         .map(|address| ((transfer.tensor, transfer.destination_tile), address))
                 })
                 .collect::<HashMap<_, _>>();
-            let location_available = |tensor, tile| {
-                available_staging.contains(&(tensor, tile))
+            let location_available = |tensor, tile| -> Result<bool, CompileError> {
+                Ok(available_staging.contains(&(tensor, tile))
                     || allocation_index
-                        .at(tensor, tile)
-                        .any(|allocation| allocation.kind.has_home_address())
+                        .live_home(tensor, tile, phase_index)?
+                        .is_some())
             };
             let resolved_transfers = transfers
                 .iter()
@@ -4791,18 +4794,18 @@ impl Schedule {
                                 && allocation.live_until > phase_index
                         })
                     };
-                    let home = || {
-                        candidates
-                            .clone()
-                            .find(|allocation| allocation.kind.has_home_address())
-                    };
+                    let home = allocation_index.live_home(
+                        transfer.tensor,
+                        transfer.source_tile,
+                        phase_index,
+                    )?;
                     let direct_same_phase = direct_staging
                         .get(&(transfer.tensor, transfer.source_tile))
                         .copied();
                     let source_address =
-                        if location_available(transfer.tensor, transfer.source_tile) {
+                        if location_available(transfer.tensor, transfer.source_tile)? {
                             earlier_staging()
-                                .or_else(home)
+                                .or(home)
                                 .or_else(same_phase_staging)
                                 .map(|allocation| allocation.address)
                                 .or(direct_same_phase)
@@ -4810,14 +4813,18 @@ impl Schedule {
                             direct_same_phase.or_else(|| {
                                 same_phase_staging()
                                     .or_else(earlier_staging)
-                                    .or_else(home)
+                                    .or(home)
                                     .map(|allocation| allocation.address)
                             })
                         }
                         .ok_or_else(|| {
+                            let homes = allocation_index.home_lifetimes(
+                                transfer.tensor,
+                                transfer.source_tile,
+                            );
                             CompileError::Memory(format!(
-                                "missing source allocation for tensor {} on tile {}",
-                                transfer.tensor.0, transfer.source_tile
+                                "missing source allocation for tensor {} on tile {} at phase {phase_index}; homes: {homes}",
+                                transfer.tensor.0, transfer.source_tile,
                             ))
                         })?;
                     let destination_address = transfer
@@ -5305,8 +5312,11 @@ impl TileProgramLowering<'_> {
                         let command = &tile_commands[command_cursor].2;
                         command_cursor += 1;
                         active = true;
-                        let output_address =
-                            self.allocation_index.home_address(command.output, tile)?;
+                        let output_address = self.allocation_index.home_address_at(
+                            command.output,
+                            tile,
+                            phase_index,
+                        )?;
                         let input_addresses =
                             command
                                 .inputs
@@ -5405,16 +5415,62 @@ impl<'a> AllocationIndex<'a> {
         }
     }
 
-    fn home_address(&self, tensor: TensorId, tile: u16) -> Result<u32, CompileError> {
-        self.at(tensor, tile)
-            .find(|allocation| allocation.kind.has_home_address())
+    fn live_home(
+        &self,
+        tensor: TensorId,
+        tile: u16,
+        phase: usize,
+    ) -> Result<Option<&Allocation>, CompileError> {
+        let mut candidates = self.at(tensor, tile).filter(|allocation| {
+            allocation.kind.has_home_address()
+                && allocation.live_from <= phase
+                && phase < allocation.live_until
+        });
+        let Some(first) = candidates.next() else {
+            return Ok(None);
+        };
+        if let Some(other) = candidates.find(|candidate| candidate.address != first.address) {
+            return Err(CompileError::Memory(format!(
+                "tensor {} has ambiguous live home addresses on tile {tile} at phase {phase}: 0x{:x} and 0x{:x}",
+                tensor.0, first.address, other.address,
+            )));
+        }
+        Ok(Some(first))
+    }
+
+    fn home_address_at(
+        &self,
+        tensor: TensorId,
+        tile: u16,
+        phase: usize,
+    ) -> Result<u32, CompileError> {
+        self.live_home(tensor, tile, phase)?
             .map(|allocation| allocation.address)
             .ok_or_else(|| {
                 CompileError::Memory(format!(
-                    "missing home allocation for tensor {} on tile {tile}",
-                    tensor.0
+                    "missing live home allocation for tensor {} on tile {tile} at phase {phase}; homes: {}",
+                    tensor.0,
+                    self.home_lifetimes(tensor, tile),
                 ))
             })
+    }
+
+    fn home_lifetimes(&self, tensor: TensorId, tile: u16) -> String {
+        let homes = self
+            .at(tensor, tile)
+            .filter(|allocation| allocation.kind.has_home_address())
+            .map(|allocation| {
+                format!(
+                    "0x{:x}/{}..{}",
+                    allocation.address, allocation.live_from, allocation.live_until
+                )
+            })
+            .collect::<Vec<_>>();
+        if homes.is_empty() {
+            "none".into()
+        } else {
+            homes.join(",")
+        }
     }
 
     fn compute_input_address(
@@ -5430,7 +5486,7 @@ impl<'a> AllocationIndex<'a> {
         }) {
             return Ok(staging.address);
         }
-        self.home_address(tensor, tile)
+        self.home_address_at(tensor, tile, compute_phase)
     }
 }
 
@@ -7326,6 +7382,101 @@ mod tests {
             tile_count: 16,
             peak_sram: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn tile_program_lowering_resolves_home_addresses_by_phase() {
+        let tensor = TensorId(0);
+        let command = |phase: usize| {
+            Arc::new(KernelCommand {
+                tile: 0,
+                output: tensor,
+                inputs: vec![tensor],
+                arguments: Vec::new(),
+                specialization: Arc::new(SpecializationKey {
+                    operation: "copy_u32".into(),
+                    shape: vec![1],
+                    worker_count: 6,
+                    role: "test".into(),
+                    alignment: 4,
+                    abi: KernelAbi::Generic,
+                }),
+                metadata: BTreeMap::from([("phase".into(), phase.to_string())]),
+            })
+        };
+        let schedule = Schedule {
+            layouts: Vec::new(),
+            phases: vec![
+                Phase::Compute {
+                    op: OpId(0),
+                    commands: vec![command(0)],
+                },
+                Phase::Compute {
+                    op: OpId(1),
+                    commands: Vec::new(),
+                },
+                Phase::Compute {
+                    op: OpId(2),
+                    commands: vec![command(2)],
+                },
+            ],
+            allocations: vec![
+                Allocation {
+                    tensor,
+                    tile: 0,
+                    address: 0x60000,
+                    size: 4,
+                    live_from: 0,
+                    live_until: 1,
+                    kind: AllocationKind::Home,
+                },
+                Allocation {
+                    tensor,
+                    tile: 0,
+                    address: 0x68000,
+                    size: 4,
+                    live_from: 2,
+                    live_until: 3,
+                    kind: AllocationKind::Home,
+                },
+            ]
+            .into(),
+            tile_count: 1,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let program = schedule.lower_tile_programs(&Topology::c600()).unwrap();
+        let addresses = program[0]
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                LoweredTileStep::Compute(command) => {
+                    Some((command.output_address, command.input_addresses[0]))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(addresses, vec![(0x60000, 0x60000), (0x68000, 0x68000)]);
+    }
+
+    #[test]
+    fn phase_address_resolution_rejects_ambiguous_live_homes() {
+        let tensor = TensorId(0);
+        let allocations = [0x60000, 0x68000]
+            .into_iter()
+            .map(|address| Allocation {
+                tensor,
+                tile: 0,
+                address,
+                size: 4,
+                live_from: 0,
+                live_until: 1,
+                kind: AllocationKind::Home,
+            })
+            .collect::<Vec<_>>();
+        let index = AllocationIndex::new(&allocations);
+
+        assert!(index.home_address_at(tensor, 0, 0).is_err());
     }
 
     #[test]
