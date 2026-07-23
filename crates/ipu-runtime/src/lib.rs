@@ -653,15 +653,447 @@ fn allocation_footprints_by_tile(
     Ok(footprints)
 }
 
-#[derive(Clone, Debug)]
-struct AllocationRelocation {
-    tensor: ipu_compiler::TensorId,
-    tile: u16,
-    old: Range<u32>,
-    new_start: u32,
-    live_from: usize,
-    live_until: usize,
-    home: bool,
+#[derive(Clone, Copy, Debug)]
+struct AllocationAddressRef {
+    allocation: usize,
+    offset: u32,
+}
+
+#[derive(Clone, Copy)]
+enum GraphBoundary {
+    Input,
+    Output,
+}
+
+struct AllocationReferenceIndex<'a> {
+    allocations: &'a [ipu_compiler::Allocation],
+    by_tensor_tile: HashMap<(ipu_compiler::TensorId, u16), Vec<usize>>,
+    homes_by_tile: Vec<Vec<usize>>,
+    home_prefix_ends: Vec<Vec<u32>>,
+}
+
+impl<'a> AllocationReferenceIndex<'a> {
+    fn new(allocations: &'a [ipu_compiler::Allocation], tile_count: usize) -> Self {
+        let mut by_tensor_tile = HashMap::<_, Vec<_>>::default();
+        let mut homes_by_tile = vec![Vec::new(); tile_count];
+        for (index, allocation) in allocations.iter().enumerate() {
+            by_tensor_tile
+                .entry((allocation.tensor, allocation.tile))
+                .or_default()
+                .push(index);
+            if matches!(allocation.kind, ipu_compiler::AllocationKind::Home) {
+                homes_by_tile[usize::from(allocation.tile)].push(index);
+            }
+        }
+        for homes in &mut homes_by_tile {
+            homes.sort_unstable_by_key(|&index| {
+                let allocation = &allocations[index];
+                (allocation.address, allocation.size, allocation.live_from)
+            });
+        }
+        let home_prefix_ends = homes_by_tile
+            .iter()
+            .map(|homes| {
+                let mut maximum = 0;
+                homes
+                    .iter()
+                    .map(|&index| {
+                        let allocation = &allocations[index];
+                        maximum = maximum.max(allocation.address.saturating_add(allocation.size));
+                        maximum
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            allocations,
+            by_tensor_tile,
+            homes_by_tile,
+            home_prefix_ends,
+        }
+    }
+
+    fn tensor_span(
+        &self,
+        tensor: ipu_compiler::TensorId,
+        tile: u16,
+        address: u32,
+        bytes: u32,
+        live_from: usize,
+        live_until: usize,
+    ) -> Result<Option<AllocationAddressRef>> {
+        let end = address
+            .checked_add(bytes)
+            .ok_or("allocation reference span overflow")?;
+        let candidates = self
+            .by_tensor_tile
+            .get(&(tensor, tile))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&index| {
+                let allocation = &self.allocations[index];
+                allocation.address <= address
+                    && allocation.address.saturating_add(allocation.size) >= end
+                    && allocation.live_from <= live_from
+                    && allocation.live_until >= live_until
+            })
+            .collect::<Vec<_>>();
+        self.select_owner(candidates, address)
+    }
+
+    fn transfer_destination(
+        &self,
+        transfer: &ipu_compiler::Transfer,
+        phase: usize,
+        address: u32,
+    ) -> Result<Option<AllocationAddressRef>> {
+        let end = address
+            .checked_add(transfer.bytes)
+            .ok_or("transfer destination span overflow")?;
+        let candidates = self
+            .by_tensor_tile
+            .get(&(transfer.tensor, transfer.destination_tile))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&index| {
+                let allocation = &self.allocations[index];
+                let used_during_exchange =
+                    allocation.live_from <= phase && phase < allocation.live_until;
+                let used_by_following_compute = allocation.live_from <= phase.saturating_add(1)
+                    && phase.saturating_add(1) < allocation.live_until;
+                allocation.address <= address
+                    && allocation.address.saturating_add(allocation.size) >= end
+                    && (used_during_exchange || used_by_following_compute)
+            })
+            .collect::<Vec<_>>();
+        self.select_owner(candidates, address)
+    }
+
+    fn boundary(
+        &self,
+        tile: u16,
+        address: u32,
+        bytes: u32,
+        boundary: GraphBoundary,
+    ) -> Result<Option<AllocationAddressRef>> {
+        let end = address
+            .checked_add(bytes)
+            .ok_or("graph boundary span overflow")?;
+        let homes = self
+            .homes_by_tile
+            .get(usize::from(tile))
+            .ok_or("graph boundary tile is outside the allocation index")?;
+        let prefix_ends = &self.home_prefix_ends[usize::from(tile)];
+        let mut position =
+            homes.partition_point(|&index| self.allocations[index].address <= address);
+        let mut candidates = Vec::new();
+        while position != 0 && prefix_ends[position - 1] >= end {
+            position -= 1;
+            let allocation = &self.allocations[homes[position]];
+            if allocation.address <= address
+                && allocation.address.saturating_add(allocation.size) >= end
+            {
+                candidates.push(homes[position]);
+            }
+        }
+        let lifetime = match boundary {
+            GraphBoundary::Input => candidates
+                .iter()
+                .map(|&index| self.allocations[index].live_from)
+                .min(),
+            GraphBoundary::Output => candidates
+                .iter()
+                .map(|&index| self.allocations[index].live_until)
+                .max(),
+        };
+        let Some(lifetime) = lifetime else {
+            return Ok(None);
+        };
+        candidates.retain(|&index| match boundary {
+            GraphBoundary::Input => self.allocations[index].live_from == lifetime,
+            GraphBoundary::Output => self.allocations[index].live_until == lifetime,
+        });
+        self.select_owner(candidates, address)
+    }
+
+    fn select_owner(
+        &self,
+        mut candidates: Vec<usize>,
+        address: u32,
+    ) -> Result<Option<AllocationAddressRef>> {
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        candidates.sort_unstable_by_key(|&index| {
+            let allocation = &self.allocations[index];
+            (
+                allocation.size,
+                std::cmp::Reverse(allocation.live_from),
+                index,
+            )
+        });
+        let selected = candidates[0];
+        let selected_allocation = &self.allocations[selected];
+        let selected_offset = address - selected_allocation.address;
+        if candidates.iter().skip(1).any(|&index| {
+            let allocation = &self.allocations[index];
+            allocation.size == selected_allocation.size
+                && allocation.live_from == selected_allocation.live_from
+                && allocation.live_until == selected_allocation.live_until
+                && address - allocation.address != selected_offset
+        }) {
+            return Err(format!("address 0x{address:x} has ambiguous allocation ownership").into());
+        }
+        Ok(Some(AllocationAddressRef {
+            allocation: selected,
+            offset: selected_offset,
+        }))
+    }
+}
+
+struct AllocationAddressPlan {
+    addresses: Vec<u32>,
+}
+
+impl AllocationAddressPlan {
+    fn new(
+        graph: &ExecutableGraph,
+        placements: impl IntoIterator<Item = (usize, u32)>,
+        index: &AllocationReferenceIndex<'_>,
+    ) -> Result<Self> {
+        let allocations = &graph.schedule.allocations;
+        let mut placed = allocations
+            .iter()
+            .map(|allocation| allocation.address)
+            .collect::<Vec<_>>();
+        for (allocation, address) in placements {
+            placed[allocation] = address;
+        }
+        let alias_sources = allocations
+            .iter()
+            .map(|allocation| {
+                let ipu_compiler::AllocationKind::HomeAlias { source } = allocation.kind else {
+                    return Ok(None);
+                };
+                index.tensor_span(
+                    source,
+                    allocation.tile,
+                    allocation.address,
+                    allocation.size,
+                    allocation.live_from,
+                    allocation.live_until,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut addresses = vec![None; allocations.len()];
+        let mut visiting = vec![false; allocations.len()];
+        fn resolve(
+            allocation: usize,
+            allocations: &[ipu_compiler::Allocation],
+            placed: &[u32],
+            alias_sources: &[Option<AllocationAddressRef>],
+            addresses: &mut [Option<u32>],
+            visiting: &mut [bool],
+        ) -> Result<u32> {
+            if let Some(address) = addresses[allocation] {
+                return Ok(address);
+            }
+            if visiting[allocation] {
+                return Err("allocation alias ownership contains a cycle".into());
+            }
+            visiting[allocation] = true;
+            let address = if let Some(source) = alias_sources[allocation] {
+                resolve(
+                    source.allocation,
+                    allocations,
+                    placed,
+                    alias_sources,
+                    addresses,
+                    visiting,
+                )?
+                .checked_add(source.offset)
+                .ok_or("allocation alias address overflow")?
+            } else {
+                placed[allocation]
+            };
+            visiting[allocation] = false;
+            addresses[allocation] = Some(address);
+            Ok(address)
+        }
+        for allocation in 0..allocations.len() {
+            resolve(
+                allocation,
+                allocations,
+                &placed,
+                &alias_sources,
+                &mut addresses,
+                &mut visiting,
+            )?;
+        }
+        Ok(Self {
+            addresses: addresses.into_iter().map(Option::unwrap).collect(),
+        })
+    }
+
+    fn resolve(&self, reference: AllocationAddressRef) -> Result<u32> {
+        self.addresses[reference.allocation]
+            .checked_add(reference.offset)
+            .ok_or_else(|| "relocated allocation reference overflows".into())
+    }
+
+    fn changed(
+        &self,
+        allocations: &[ipu_compiler::Allocation],
+        reference: AllocationAddressRef,
+    ) -> bool {
+        self.addresses[reference.allocation] != allocations[reference.allocation].address
+    }
+}
+
+#[derive(Default)]
+struct GraphAddressReferences {
+    transfers: Vec<(usize, usize, AllocationAddressRef)>,
+    initial_buffers: Vec<(usize, AllocationAddressRef)>,
+    host_weights: Vec<(usize, usize, AllocationAddressRef)>,
+    host_inputs: Vec<(usize, usize, AllocationAddressRef)>,
+    outputs: Vec<(usize, usize, AllocationAddressRef)>,
+    host_outputs: Vec<(usize, usize, AllocationAddressRef)>,
+}
+
+impl GraphAddressReferences {
+    fn capture(
+        graph: &ExecutableGraph,
+        index: &AllocationReferenceIndex<'_>,
+        plan: &AllocationAddressPlan,
+        physical_to_logical: &HashMap<u32, u16>,
+    ) -> Result<Self> {
+        let allocations = &graph.schedule.allocations;
+        let mut references = Self::default();
+        for (phase, scheduled) in graph.schedule.phases.iter().enumerate() {
+            let ipu_compiler::Phase::Exchange { transfers } = scheduled else {
+                continue;
+            };
+            for (transfer_index, transfer) in transfers.iter().enumerate() {
+                let Some(address) = transfer.staging_address else {
+                    continue;
+                };
+                let Some(reference) = index.transfer_destination(transfer, phase, address)? else {
+                    continue;
+                };
+                if plan.changed(allocations, reference) {
+                    references
+                        .transfers
+                        .push((phase, transfer_index, reference));
+                }
+            }
+        }
+        for (buffer_index, buffer) in graph.initial_buffers.iter().enumerate() {
+            let bytes = u32::try_from(buffer.words.len())?
+                .checked_mul(4)
+                .ok_or("initial buffer size overflow")?;
+            if bytes == 0 {
+                continue;
+            }
+            let Some(reference) =
+                index.boundary(buffer.tile, buffer.address, bytes, GraphBoundary::Input)?
+            else {
+                continue;
+            };
+            if plan.changed(allocations, reference) {
+                references.initial_buffers.push((buffer_index, reference));
+            }
+        }
+        references.host_weights = Self::capture_bindings(
+            &graph.host_weights,
+            GraphBoundary::Input,
+            index,
+            plan,
+            physical_to_logical,
+        )?;
+        references.host_inputs = Self::capture_bindings(
+            &graph.host_inputs,
+            GraphBoundary::Input,
+            index,
+            plan,
+            physical_to_logical,
+        )?;
+        references.outputs = Self::capture_bindings(
+            &graph.outputs,
+            GraphBoundary::Output,
+            index,
+            plan,
+            physical_to_logical,
+        )?;
+        references.host_outputs = Self::capture_bindings(
+            &graph.host_outputs,
+            GraphBoundary::Output,
+            index,
+            plan,
+            physical_to_logical,
+        )?;
+        Ok(references)
+    }
+
+    fn capture_bindings(
+        bindings: &[Binding],
+        boundary: GraphBoundary,
+        index: &AllocationReferenceIndex<'_>,
+        plan: &AllocationAddressPlan,
+        physical_to_logical: &HashMap<u32, u16>,
+    ) -> Result<Vec<(usize, usize, AllocationAddressRef)>> {
+        let mut references = Vec::new();
+        for (binding_index, binding) in bindings.iter().enumerate() {
+            for (slice_index, slice) in binding.slices.iter().enumerate() {
+                let logical = *physical_to_logical
+                    .get(&slice.tile)
+                    .ok_or("host binding references a physical tile outside the topology")?;
+                let bytes = u32::try_from(slice.size)?;
+                let Some(reference) =
+                    index.boundary(logical, slice.tile_address, bytes, boundary)?
+                else {
+                    continue;
+                };
+                if plan.changed(index.allocations, reference) {
+                    references.push((binding_index, slice_index, reference));
+                }
+            }
+        }
+        Ok(references)
+    }
+
+    fn apply(self, graph: &mut ExecutableGraph, plan: &AllocationAddressPlan) -> Result<()> {
+        for (phase, transfer, reference) in self.transfers {
+            let ipu_compiler::Phase::Exchange { transfers } = &mut graph.schedule.phases[phase]
+            else {
+                return Err("relocated transfer phase changed kind".into());
+            };
+            transfers[transfer].staging_address = Some(plan.resolve(reference)?);
+        }
+        for (buffer, reference) in self.initial_buffers {
+            graph.initial_buffers[buffer].address = plan.resolve(reference)?;
+        }
+        Self::apply_bindings(&mut graph.host_weights, self.host_weights, plan)?;
+        Self::apply_bindings(&mut graph.host_inputs, self.host_inputs, plan)?;
+        Self::apply_bindings(&mut graph.outputs, self.outputs, plan)?;
+        Self::apply_bindings(&mut graph.host_outputs, self.host_outputs, plan)?;
+        for (allocation, &address) in graph.schedule.allocations.iter_mut().zip(&plan.addresses) {
+            allocation.address = address;
+        }
+        Ok(())
+    }
+
+    fn apply_bindings(
+        bindings: &mut [Binding],
+        references: Vec<(usize, usize, AllocationAddressRef)>,
+        plan: &AllocationAddressPlan,
+    ) -> Result<()> {
+        for (binding, slice, reference) in references {
+            bindings[binding].slices[slice].tile_address = plan.resolve(reference)?;
+        }
+        Ok(())
+    }
 }
 
 fn is_movable_transient_storage(
@@ -1798,203 +2230,21 @@ fn compact_allocations_around(
             Ok(result)
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut relocations = Vec::new();
-    for (index, new_address) in placements.into_iter().flatten() {
-        let allocation = &graph.schedule.allocations[index];
-        if allocation.address == new_address {
-            continue;
-        }
-        let old_end = allocation
-            .address
-            .checked_add(allocation.size)
-            .ok_or("allocation relocation range overflow")?;
-        relocations.push(AllocationRelocation {
-            tensor: allocation.tensor,
-            tile: allocation.tile,
-            old: allocation.address..old_end,
-            new_start: new_address,
-            live_from: allocation.live_from,
-            live_until: allocation.live_until,
-            home: matches!(allocation.kind, ipu_compiler::AllocationKind::Home),
-        });
-        graph.schedule.allocations[index].address = new_address;
-    }
-    let moved_storage = relocations.len();
-    let mut relocation_indices_by_location =
-        HashMap::<(ipu_compiler::TensorId, u16), Vec<usize>>::default();
-    for (index, relocation) in relocations.iter().enumerate() {
-        relocation_indices_by_location
-            .entry((relocation.tensor, relocation.tile))
-            .or_default()
-            .push(index);
-    }
-    let mut pending_aliases = graph
-        .schedule
-        .allocations
+    let placements = placements.into_iter().flatten().collect::<Vec<_>>();
+    let moved_storage = placements
         .iter()
-        .enumerate()
-        .filter_map(|(index, allocation)| {
-            matches!(
-                allocation.kind,
-                ipu_compiler::AllocationKind::HomeAlias { .. }
-            )
-            .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    loop {
-        let mut propagated = 0usize;
-        pending_aliases.retain(|&allocation_index| {
-            let (tensor, tile, old_start, size, live_from, live_until, source) = {
-                let allocation = &graph.schedule.allocations[allocation_index];
-                let ipu_compiler::AllocationKind::HomeAlias { source } = allocation.kind else {
-                    unreachable!();
-                };
-                (
-                    allocation.tensor,
-                    allocation.tile,
-                    allocation.address,
-                    allocation.size,
-                    allocation.live_from,
-                    allocation.live_until,
-                    source,
-                )
-            };
-            let old_end = old_start.saturating_add(size);
-            let relocated = relocation_indices_by_location
-                .get(&(source, tile))
-                .into_iter()
-                .flatten()
-                .map(|&index| &relocations[index])
-                .filter(|relocation| {
-                    old_start >= relocation.old.start
-                        && old_end <= relocation.old.end
-                        && relocation.live_from <= live_from
-                        && relocation.live_until >= live_until
-                })
-                .map(|relocation| relocation.new_start + (old_start - relocation.old.start))
-                .collect::<BTreeSet<_>>();
-            if relocated.len() > 1 {
-                return true;
-            }
-            let Some(&new_start) = relocated.first() else {
-                return true;
-            };
-            graph.schedule.allocations[allocation_index].address = new_start;
-            let relocation_index = relocations.len();
-            relocations.push(AllocationRelocation {
-                tensor,
-                tile,
-                old: old_start..old_end,
-                new_start,
-                live_from,
-                live_until,
-                home: false,
-            });
-            relocation_indices_by_location
-                .entry((tensor, tile))
-                .or_default()
-                .push(relocation_index);
-            propagated += 1;
-            false
-        });
-        if propagated == 0 {
-            break;
-        }
-    }
-    for &allocation_index in &pending_aliases {
-        let allocation = &graph.schedule.allocations[allocation_index];
-        let ipu_compiler::AllocationKind::HomeAlias { source } = allocation.kind else {
-            unreachable!();
-        };
-        let old_end = allocation.address.saturating_add(allocation.size);
-        let candidates = relocation_indices_by_location
-            .get(&(source, allocation.tile))
-            .into_iter()
-            .flatten()
-            .map(|&index| &relocations[index])
-            .filter(|relocation| {
-                allocation.address >= relocation.old.start
-                    && old_end <= relocation.old.end
-                    && relocation.live_from <= allocation.live_from
-                    && relocation.live_until >= allocation.live_until
-            })
-            .count();
-        if candidates > 1 {
-            return Err(format!(
-                "alias tensor {} on tile {} at 0x{:x} has ambiguous relocation ownership from source tensor {}",
-                allocation.tensor.0, allocation.tile, allocation.address, source.0,
-            )
-            .into());
-        }
-    }
-    let mut relocations_by_location =
-        HashMap::<(ipu_compiler::TensorId, u16), Vec<&AllocationRelocation>>::default();
-    let mut home_relocations_by_tile = vec![Vec::new(); topology.tile_count()];
-    for relocation in &relocations {
-        relocations_by_location
-            .entry((relocation.tensor, relocation.tile))
-            .or_default()
-            .push(relocation);
-        if relocation.home {
-            home_relocations_by_tile[usize::from(relocation.tile)].push(relocation);
-        }
-    }
-    for (phase, scheduled) in graph.schedule.phases.iter_mut().enumerate() {
-        let ipu_compiler::Phase::Exchange { transfers } = scheduled else {
-            continue;
-        };
-        for transfer in transfers {
-            let Some(address) = &mut transfer.staging_address else {
-                continue;
-            };
-            let candidates = relocations_by_location
-                .get(&(transfer.tensor, transfer.destination_tile))
-                .into_iter()
-                .flatten()
-                .filter(|relocation| {
-                    relocation.live_from <= phase
-                        && phase < relocation.live_until
-                        && relocation.old.contains(address)
-                })
-                .collect::<Vec<_>>();
-            if candidates.len() > 1 {
-                return Err(format!(
-                    "transfer of tensor {} to tile {} at phase {phase} has ambiguous relocation ownership for 0x{address:x}",
-                    transfer.tensor.0, transfer.destination_tile,
-                )
-                .into());
-            }
-            if let Some(relocation) = candidates.first() {
-                *address = relocation.new_start + (*address - relocation.old.start);
-            }
-        }
-    }
-    for buffer in &mut graph.initial_buffers {
-        relocate_boundary_address(
-            &mut buffer.address,
-            &home_relocations_by_tile[usize::from(buffer.tile)],
-            GraphBoundary::Input,
-        )?;
-    }
-    for (bindings, boundary) in [
-        (&mut graph.host_weights, GraphBoundary::Input),
-        (&mut graph.host_inputs, GraphBoundary::Input),
-        (&mut graph.outputs, GraphBoundary::Output),
-        (&mut graph.host_outputs, GraphBoundary::Output),
-    ] {
-        for binding in bindings {
-            for slice in &mut binding.slices {
-                let logical = *physical_to_logical
-                    .get(&slice.tile)
-                    .ok_or("host binding references a physical tile outside the topology")?;
-                relocate_boundary_address(
-                    &mut slice.tile_address,
-                    &home_relocations_by_tile[usize::from(logical)],
-                    boundary,
-                )?;
-            }
-        }
-    }
+        .filter(|&&(index, address)| graph.schedule.allocations[index].address != address)
+        .count();
+    let reference_index =
+        AllocationReferenceIndex::new(&graph.schedule.allocations, topology.tile_count());
+    let address_plan = AllocationAddressPlan::new(graph, placements, &reference_index)?;
+    let references = GraphAddressReferences::capture(
+        graph,
+        &reference_index,
+        &address_plan,
+        &physical_to_logical,
+    )?;
+    references.apply(graph, &address_plan)?;
     graph.schedule.validate_allocations()?;
     Ok(moved_storage)
 }
@@ -2022,50 +2272,6 @@ fn relocate_transient_allocations_for_executables(
         None,
         "measured executable placement",
     )
-}
-
-#[derive(Clone, Copy)]
-enum GraphBoundary {
-    Input,
-    Output,
-}
-
-fn relocate_boundary_address(
-    address: &mut u32,
-    relocations: &[&AllocationRelocation],
-    boundary: GraphBoundary,
-) -> Result<()> {
-    let candidates = relocations
-        .iter()
-        .filter(|relocation| relocation.old.contains(address))
-        .collect::<Vec<_>>();
-    let selected_lifetime = match boundary {
-        GraphBoundary::Input => candidates.iter().map(|entry| entry.live_from).min(),
-        GraphBoundary::Output => candidates.iter().map(|entry| entry.live_until).max(),
-    };
-    let Some(selected_lifetime) = selected_lifetime else {
-        return Ok(());
-    };
-    let relocated = candidates
-        .into_iter()
-        .filter(|relocation| match boundary {
-            GraphBoundary::Input => relocation.live_from == selected_lifetime,
-            GraphBoundary::Output => relocation.live_until == selected_lifetime,
-        })
-        .map(|relocation| relocation.new_start + (*address - relocation.old.start))
-        .collect::<BTreeSet<_>>();
-    if relocated.len() != 1 {
-        let boundary = match boundary {
-            GraphBoundary::Input => "input",
-            GraphBoundary::Output => "output",
-        };
-        return Err(format!(
-            "address 0x{address:x} has ambiguous allocation ownership at the graph {boundary} boundary"
-        )
-        .into());
-    }
-    *address = *relocated.first().unwrap();
-    Ok(())
 }
 
 pub fn init_tracing() {
@@ -7028,34 +7234,69 @@ mod tests {
     }
 
     #[test]
-    fn literal_relocation_resolves_reused_addresses_by_lifetime() {
-        let first = AllocationRelocation {
-            tensor: ipu_compiler::TensorId(1),
-            tile: 0,
-            old: 0x60000..0x61000,
-            new_start: 0x70000,
-            live_from: 0,
-            live_until: 5,
-            home: true,
+    fn boundary_references_distinguish_reused_storage_by_lifetime() {
+        let reused = 0x60000;
+        let allocations = vec![
+            ipu_compiler::Allocation {
+                tensor: ipu_compiler::TensorId(1),
+                tile: 0,
+                address: reused,
+                size: 4096,
+                live_from: 0,
+                live_until: 5,
+                kind: ipu_compiler::AllocationKind::Home,
+            },
+            ipu_compiler::Allocation {
+                tensor: ipu_compiler::TensorId(2),
+                tile: 0,
+                address: reused,
+                size: 4096,
+                live_from: 5,
+                live_until: usize::MAX,
+                kind: ipu_compiler::AllocationKind::Home,
+            },
+        ];
+        let graph = ExecutableGraph {
+            schedule: ipu_compiler::Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: allocations.into(),
+                tile_count: 1,
+                peak_sram: BTreeMap::new(),
+            },
+            memory_policy: None,
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
         };
-        let second = AllocationRelocation {
-            tensor: ipu_compiler::TensorId(2),
-            tile: 0,
-            old: first.old.clone(),
-            new_start: 0x80000,
-            live_from: 5,
-            live_until: usize::MAX,
-            home: true,
-        };
-        let relocations = [&first, &second];
-        let mut early = 0x60040;
-        let mut late = early;
+        let index = AllocationReferenceIndex::new(&graph.schedule.allocations, 1);
+        let offset = 64;
+        let input = index
+            .boundary(0, reused + offset, 8, GraphBoundary::Input)
+            .unwrap()
+            .unwrap();
+        let output = index
+            .boundary(0, reused + offset, 8, GraphBoundary::Output)
+            .unwrap()
+            .unwrap();
+        let plan = AllocationAddressPlan::new(
+            &graph,
+            [(input.allocation, 0x70000), (output.allocation, 0x80000)],
+            &index,
+        )
+        .unwrap();
 
-        relocate_boundary_address(&mut early, &relocations, GraphBoundary::Input).unwrap();
-        relocate_boundary_address(&mut late, &relocations, GraphBoundary::Output).unwrap();
-
-        assert_eq!(early, 0x70040);
-        assert_eq!(late, 0x80040);
+        assert_ne!(input.allocation, output.allocation);
+        assert_eq!(
+            plan.resolve(input).unwrap() - plan.addresses[input.allocation],
+            offset
+        );
+        assert_eq!(
+            plan.resolve(output).unwrap() - plan.addresses[output.allocation],
+            offset
+        );
     }
 
     #[test]
