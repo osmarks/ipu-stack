@@ -179,8 +179,11 @@ fn executable_regions_for_tile(
     Ok(space
         .free_regions(element_size)
         .into_iter()
-        .filter_map(|(start, end)| {
-            let end = end.checked_sub(ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD)?;
+        .flat_map(|(start, end)| (start..end).step_by(element_size as usize))
+        .filter_map(|start| {
+            let end = start
+                .checked_add(element_size)?
+                .checked_sub(ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD)?;
             (start < end).then_some((start, end))
         })
         .collect())
@@ -402,22 +405,6 @@ fn pack_sized_objects_in_gaps(
     Ok(placed)
 }
 
-fn pack_generated_and_support_images(
-    tile: u16,
-    generated_size: u32,
-    support_size: u32,
-    occupied: Vec<(u32, u32)>,
-) -> Result<[(u32, u32); 2]> {
-    let placed = pack_sized_objects_in_gaps(
-        tile,
-        &[generated_size, support_size],
-        occupied,
-        8,
-        "executable images",
-    )?;
-    Ok([placed[0], placed[1]])
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExecutablePlacement {
     generated: (u32, u32),
@@ -425,13 +412,6 @@ struct ExecutablePlacement {
 }
 
 impl ExecutablePlacement {
-    fn contiguous(ranges: [(u32, u32); 2]) -> Self {
-        Self {
-            generated: ranges[0],
-            support: vec![ranges[1]],
-        }
-    }
-
     fn ranges(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         std::iter::once(self.generated).chain(self.support.iter().copied())
     }
@@ -567,43 +547,6 @@ fn validate_pinned_executable_placement(
         }
     }
     Ok(pinned.clone())
-}
-
-#[cfg(test)]
-fn validate_pinned_executable_images(
-    tile: u16,
-    generated_size: u32,
-    support_size: u32,
-    pinned: [(u32, u32); 2],
-    free_regions: &[(u32, u32)],
-) -> Result<[(u32, u32); 2]> {
-    for ((name, required), (start, end)) in [
-        ("generated program", generated_size),
-        ("support image", support_size),
-    ]
-    .into_iter()
-    .zip(pinned)
-    {
-        if end.checked_sub(start).is_none_or(|bytes| bytes < required) {
-            return Err(format!(
-                "pinned {name} interval 0x{start:x}..0x{end:x} on tile {tile} is shorter than {required} bytes"
-            )
-            .into());
-        }
-        if !free_regions
-            .iter()
-            .any(|&(free_start, free_end)| start >= free_start && end <= free_end)
-        {
-            return Err(format!(
-                "tensor relocation did not preserve pinned {name} interval 0x{start:x}..0x{end:x} on tile {tile}"
-            )
-            .into());
-        }
-    }
-    if ranges_overlap(pinned[0].0, pinned[0].1, pinned[1].0, pinned[1].1) {
-        return Err(format!("pinned executable images overlap on tile {tile}").into());
-    }
-    Ok(pinned)
 }
 
 #[cfg(test)]
@@ -4576,7 +4519,7 @@ fn package_graph_impl_attempt(
     // Generated and support code are independently relocatable. Reserving them
     // separately avoids requiring one artificial contiguous executable extent.
     let executable_placements = if let Some(pinned) = executable_placement_history.last() {
-        programs
+        let validated = programs
             .par_iter()
             .zip(&tile_exchange_plans)
             .zip(&program_reservation_sizes)
@@ -4598,7 +4541,18 @@ fn package_graph_impl_attempt(
                     )
                 },
             )
-            .collect::<Result<Vec<_>>>()?
+            .collect::<Result<Vec<_>>>();
+        match validated {
+            Ok(placements) => placements,
+            Err(error) => {
+                info!(
+                    error = %error,
+                    "recomputing executable placement after graph relayout changed its requirements"
+                );
+                executable_placement_history.pop();
+                return Err(Box::new(PackageRelayout { graph }));
+            }
+        }
     } else {
         let attempted = programs
             .par_iter()
@@ -4641,21 +4595,23 @@ fn package_graph_impl_attempt(
                         .par_iter()
                         .zip(&tile_exchange_plans)
                         .zip(&program_reservation_sizes)
-                        .zip(&preliminary_images)
-                        .map(|(((program, plans), &program_size), image)| -> Result<_> {
-                            let regions = executable_regions_for_tile(
-                                &allocation_ranges[usize::from(program.tile)],
-                                plans.end,
-                                &[],
-                            )?;
-                            let placed = pack_generated_and_support_images(
-                                program.tile,
-                                program_size,
-                                u32::try_from(image.bytes.len())?,
-                                regions,
-                            )?;
-                            Ok(ExecutablePlacement::contiguous(placed))
-                        })
+                        .zip(&tile_retained_symbols)
+                        .map(
+                            |(((program, plans), &program_size), symbols)| -> Result<_> {
+                                let regions = executable_regions_for_tile(
+                                    &allocation_ranges[usize::from(program.tile)],
+                                    plans.end,
+                                    &[],
+                                )?;
+                                place_generated_with_segmented_support(
+                                    program.tile,
+                                    program_size,
+                                    objects,
+                                    symbols,
+                                    &regions,
+                                )
+                            },
+                        )
                         .collect::<Result<Vec<_>>>()
                 };
                 let (desired, move_resident) = match place(&fixed_allocation_ranges) {
@@ -8139,48 +8095,9 @@ mod tests {
         assert!(!regions.is_empty());
         assert!(regions.iter().all(|&(start, end)| {
             start % element == 0
+                && end - start == element - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD
                 && end % element == element - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD
         }));
-    }
-
-    #[test]
-    fn generated_and_support_images_use_independent_executable_gaps() {
-        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
-        let gaps = vec![(0x10000, 0x10000 + element), (0x20000, 0x20000 + element)];
-
-        let [generated, support] =
-            pack_generated_and_support_images(0, element, element, gaps).unwrap();
-
-        assert_eq!(generated.1 - generated.0, element);
-        assert_eq!(support.1 - support.0, element);
-        assert!(!ranges_overlap(
-            generated.0,
-            generated.1,
-            support.0,
-            support.1,
-        ));
-    }
-
-    #[test]
-    fn pinned_executable_images_survive_tensor_relayout() {
-        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
-        let pinned = [(0x50000, 0x50000 + element), (0x58000, 0x58000 + element)];
-        let free = vec![(0x4c000, 0x54000), (0x58000, 0x58000 + 2 * element)];
-
-        assert_eq!(
-            validate_pinned_executable_images(17, element / 2, element, pinned, &free).unwrap(),
-            pinned
-        );
-        assert!(
-            validate_pinned_executable_images(
-                17,
-                element / 2,
-                element,
-                pinned,
-                &[(0x4c000, 0x50000), (0x58000, 0x58000 + 2 * element)],
-            )
-            .is_err()
-        );
     }
 
     #[test]
@@ -8220,7 +8137,7 @@ mod tests {
     }
 
     #[test]
-    fn executable_placement_reserves_complete_memory_elements() {
+    fn executable_placement_stays_within_one_unreserved_memory_element() {
         let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
         let runtime_end = PLAN_BASE + element / 2;
         let allocation_address = align_up(runtime_end, element) + element;
@@ -8248,9 +8165,9 @@ mod tests {
             host_inputs: Vec::new(),
             host_outputs: Vec::new(),
         };
-        let required = element + 1;
+        let required = element / 2;
         let base = executable_region_base(&graph, runtime_end, required).unwrap();
-        let end = base + align_up(required, element);
+        let end = base + align_up(required, 8);
 
         assert_eq!(base % element, 0);
         assert!(base >= align_up(runtime_end, element));
@@ -8260,6 +8177,15 @@ mod tests {
             align_down(allocation_address, element),
             align_up(allocation_address + 4, element),
         ));
+        assert_eq!(base / element, (end - 1) / element);
+        assert!(
+            executable_region_base(
+                &graph,
+                runtime_end,
+                element - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD + 1,
+            )
+            .is_err()
+        );
     }
 
     #[test]

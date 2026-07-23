@@ -10,7 +10,7 @@
 	.set HOST_RUN_DESCRIPTOR_BYTES, 3 * 4
 	.set HOST_PACKET_ADDRESS, 0x50000
 	.set SYNC_ALL, 7
-	.set SYNC_COMPUTE_SET, 2
+	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
 	.set SYNC_SUPERVISOR, 3
 	.set OPCODE_SYNC, 0x41800000
 	.set PROGRAM_ADDRESS_PLACEHOLDER, 0
@@ -47,6 +47,7 @@ ipu_stack_static_worker_base:
 	add $m11, $m11, WORKER_BASE_STRIDE
 	setzi $m0, ipu_stack_static_worker_init
 	runall $m0, $m15, 0
+	.long OPCODE_SYNC | SYNC_COMPUTE_SET
 	setzi $m0, TILE_MUX_HOST
 	put 0xa0, $m0
 	.long OPCODE_SYNC | SYNC_ALL
