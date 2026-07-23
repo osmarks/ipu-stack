@@ -1200,17 +1200,26 @@ fn append_affine_layer_norm_f16_impl(
             address: affine_address + row as u32 * affine_row_bytes,
         })
         .collect::<Vec<_>>();
-    for placement in &affine {
-        schedule.allocations.push(Allocation {
-            tensor: placement.tensor,
-            tile: placement.tile,
-            address: placement.address,
-            size: affine_row_bytes,
-            live_from: 0,
-            live_until: usize::MAX,
-            kind: AllocationKind::Home,
-        });
-    }
+    schedule.allocations.push(Allocation {
+        tensor: affine_tensors[0],
+        tile: owner.tile,
+        address: affine_address,
+        size: affine_bytes,
+        live_from: 0,
+        live_until: usize::MAX,
+        kind: AllocationKind::Home,
+    });
+    schedule.allocations.push(Allocation {
+        tensor: affine_tensors[1],
+        tile: owner.tile,
+        address: affine_address + affine_row_bytes,
+        size: affine_row_bytes,
+        live_from: 0,
+        live_until: usize::MAX,
+        kind: AllocationKind::HomeAlias {
+            source: affine_tensors[0],
+        },
+    });
 
     let mut transfers = Vec::with_capacity(input.len().saturating_sub(1) * 2);
     let mut output = Vec::with_capacity(input.len());
@@ -1519,6 +1528,27 @@ mod tests {
         );
         assert_eq!(commands[0].inputs.len(), 3);
         assert_eq!(commands[0].inputs[0], residual.tensor);
+        let affine_owner = schedule
+            .allocations
+            .iter()
+            .find(|allocation| allocation.tensor == appended.affine[0].tensor)
+            .unwrap();
+        let affine_beta = schedule
+            .allocations
+            .iter()
+            .find(|allocation| allocation.tensor == appended.affine[1].tensor)
+            .unwrap();
+        assert_eq!(affine_owner.size, u32::from(residual.columns) * 4);
+        assert_eq!(
+            affine_beta.address,
+            affine_owner.address + affine_owner.size / 2
+        );
+        assert_eq!(
+            affine_beta.kind,
+            AllocationKind::HomeAlias {
+                source: affine_owner.tensor
+            }
+        );
         schedule.validate_allocations().unwrap();
     }
 

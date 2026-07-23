@@ -1111,7 +1111,7 @@ impl AllocationStore {
     ) -> Vec<usize> {
         self.indices_for_tensors(tensors)
             .into_iter()
-            .filter(|&index| index >= start && self.values[index].kind == AllocationKind::Home)
+            .filter(|&index| index >= start && self.values[index].kind.has_home_address())
             .collect()
     }
 
