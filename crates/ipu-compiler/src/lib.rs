@@ -791,6 +791,11 @@ struct AllocationStoreIndex {
     finite_by_live_until: HashMap<usize, Vec<usize>>,
     live_forever: Vec<usize>,
     live_forever_count: usize,
+    /// Merged address occupancy for allocations whose lifetime reaches the end
+    /// of the program. Long-lived model parameters heavily reuse a small set of
+    /// ranges, so retaining the union avoids revisiting every parameter while
+    /// planning each subsequent operation.
+    live_forever_by_tile: Option<Vec<Vec<(u32, u32)>>>,
     maximum_tensor: Option<usize>,
 }
 
@@ -819,6 +824,16 @@ impl AllocationStoreIndex {
         if allocation.live_until == usize::MAX {
             self.live_forever.push(index);
             self.live_forever_count += 1;
+            if let Some(by_tile) = &mut self.live_forever_by_tile {
+                let tile = usize::from(allocation.tile);
+                if by_tile.len() <= tile {
+                    by_tile.resize_with(tile + 1, Vec::new);
+                }
+                let end = allocation.address.saturating_add(allocation.size);
+                if allocation.address < end {
+                    by_tile[tile].push((allocation.address, end));
+                }
+            }
         } else {
             self.finite_by_live_until
                 .entry(allocation.live_until)
@@ -1054,6 +1069,63 @@ impl AllocationStore {
         base: u32,
         limit: u32,
     ) -> Vec<Vec<(u32, u32)>> {
+        if live_until == usize::MAX {
+            return self.with_index(|index| {
+                if index.live_forever.len() > index.live_forever_count.saturating_mul(2).max(1024) {
+                    index.live_forever.retain(|&allocation_index| {
+                        self.values[allocation_index].live_until == usize::MAX
+                    });
+                }
+                let resident = index.live_forever_by_tile.get_or_insert_with(|| {
+                    let mut occupied = Vec::<Vec<(u32, u32)>>::new();
+                    for &allocation_index in &index.live_forever {
+                        let allocation = &self.values[allocation_index];
+                        if allocation.live_until != usize::MAX {
+                            continue;
+                        }
+                        let tile = usize::from(allocation.tile);
+                        if occupied.len() <= tile {
+                            occupied.resize_with(tile + 1, Vec::new);
+                        }
+                        let end = allocation.address.saturating_add(allocation.size);
+                        if allocation.address < end {
+                            occupied[tile].push((allocation.address, end));
+                        }
+                    }
+                    merge_occupied_intervals(&mut occupied);
+                    occupied
+                });
+                let mut occupied = vec![Vec::<(u32, u32)>::new(); usize::from(tile_count)];
+                for (destination, source) in occupied.iter_mut().zip(resident) {
+                    destination.extend(source.iter().filter_map(|&(start, end)| {
+                        let start = start.max(base);
+                        let end = end.min(limit);
+                        (start < end).then_some((start, end))
+                    }));
+                }
+                for (&end, indices) in &index.finite_by_live_until {
+                    if end <= live_from {
+                        continue;
+                    }
+                    for &allocation_index in indices {
+                        let allocation = &self.values[allocation_index];
+                        if allocation.live_until != end {
+                            continue;
+                        }
+                        let start = allocation.address.max(base);
+                        let end = allocation
+                            .address
+                            .saturating_add(allocation.size)
+                            .min(limit);
+                        if start < end {
+                            occupied[usize::from(allocation.tile)].push((start, end));
+                        }
+                    }
+                }
+                merge_occupied_intervals(&mut occupied);
+                occupied
+            });
+        }
         let mut occupied = vec![Vec::<(u32, u32)>::new(); usize::from(tile_count)];
         for allocation_index in self.overlapping_indices(live_from, live_until) {
             let allocation = &self.values[allocation_index];
@@ -1175,8 +1247,10 @@ impl AllocationStore {
                 let previous = self.values[index].live_until;
                 if previous == usize::MAX && phase != usize::MAX {
                     allocation_index.live_forever_count -= 1;
+                    allocation_index.live_forever_by_tile = None;
                 } else if previous != usize::MAX && phase == usize::MAX {
                     allocation_index.live_forever_count += 1;
+                    allocation_index.live_forever_by_tile = None;
                 }
                 if phase == usize::MAX {
                     allocation_index.live_forever.push(index);
@@ -1204,6 +1278,7 @@ impl AllocationStore {
                 if self.values[index].live_until != usize::MAX {
                     allocation_index.live_forever_count += 1;
                     allocation_index.live_forever.push(index);
+                    allocation_index.live_forever_by_tile = None;
                 }
             }
             self.values[index].live_from = 0;
@@ -8083,10 +8158,18 @@ mod tests {
             let live_until = store[index].live_from + 1;
             store.set_live_until(&[index], live_until);
         }
+        let promoted = (1..store.len()).step_by(23).collect::<Vec<_>>();
+        store.set_resident(&promoted);
         store.extend((0..512).map(|_| random_allocation(&mut rng, 1024)));
 
         let scanned_maximum = store.iter().map(|allocation| allocation.tensor.0).max();
         assert_eq!(store.maximum_tensor_id(), scanned_maximum);
+        for live_from in [0, 31, 63, 95] {
+            assert_eq!(
+                store.occupied_intervals_by_tile(16, live_from, usize::MAX, 0x50000, 0x98000,),
+                occupied_intervals_by_tile(&store, 16, live_from, usize::MAX, 0x50000, 0x98000,)
+            );
+        }
         for _ in 0..128 {
             let live_from = rng.usize(0..80);
             let live_until = rng.usize(live_from + 1..=usize::MAX);
