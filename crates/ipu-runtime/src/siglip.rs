@@ -2314,7 +2314,7 @@ mod tests {
         let mut schedule = Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
-            allocations: Vec::new(),
+            allocations: Vec::new().into(),
             tile_count: 1,
             peak_sram: BTreeMap::new(),
         };

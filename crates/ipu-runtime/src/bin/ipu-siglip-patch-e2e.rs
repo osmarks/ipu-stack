@@ -774,7 +774,7 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
     let mut schedule = ipu_compiler::Schedule {
         layouts: Vec::new(),
         phases: Vec::new(),
-        allocations: Vec::new(),
+        allocations: Vec::new().into(),
         tile_count: TILE_COUNT,
         peak_sram: BTreeMap::new(),
     };

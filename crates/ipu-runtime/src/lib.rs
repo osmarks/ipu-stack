@@ -5454,7 +5454,8 @@ mod tests {
                         live_until: 1,
                         kind: ipu_compiler::AllocationKind::ExchangeStaging { phase: 0 },
                     },
-                ],
+                ]
+                .into(),
                 tile_count: 1,
                 peak_sram: BTreeMap::new(),
             },
@@ -5503,7 +5504,8 @@ mod tests {
                             source: ipu_compiler::TensorId(1),
                         },
                     },
-                ],
+                ]
+                .into(),
                 tile_count: u16::try_from(topology.tile_count()).unwrap(),
                 peak_sram: BTreeMap::new(),
             },
@@ -5727,7 +5729,8 @@ mod tests {
                         live_until: 1,
                         kind: ipu_compiler::AllocationKind::Home,
                     },
-                ],
+                ]
+                .into(),
                 tile_count: u16::try_from(topology.tile_count()).unwrap(),
                 peak_sram: BTreeMap::new(),
             },
@@ -5822,7 +5825,8 @@ mod tests {
                     live_from: 0,
                     live_until: 1,
                     kind: ipu_compiler::AllocationKind::Home,
-                }],
+                }]
+                .into(),
                 tile_count: 1,
                 peak_sram: BTreeMap::new(),
             },
@@ -6024,7 +6028,7 @@ mod tests {
                     command(7, "second command").into(),
                 ],
             }],
-            allocations: Vec::new(),
+            allocations: Vec::new().into(),
             tile_count: 8,
             peak_sram: BTreeMap::new(),
         };
@@ -6073,7 +6077,7 @@ mod tests {
                     commands: vec![scheduled_command.into()],
                 },
             ],
-            allocations: Vec::new(),
+            allocations: Vec::new().into(),
             tile_count: 2,
             peak_sram: BTreeMap::new(),
         };
@@ -6129,7 +6133,8 @@ mod tests {
                     live_from: 0,
                     live_until: usize::MAX,
                     kind: ipu_compiler::AllocationKind::Home,
-                }],
+                }]
+                .into(),
                 tile_count: 1472,
                 peak_sram: BTreeMap::new(),
             },

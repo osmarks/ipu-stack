@@ -4,7 +4,6 @@ use crate::{
     TensorId, Transfer, allocate_from_occupied, allocate_from_occupied_arenas,
     find_free_region_in_arenas, occupied_intervals_by_tile,
 };
-use rayon::prelude::*;
 use rustc_hash::FxHashSet as HashSet;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -116,10 +115,10 @@ pub fn end_tensor_lifetimes(
     let phase = schedule.phases.len();
     let tensors = tensors.into_iter().collect::<HashSet<_>>();
     let mut regions = vec![Vec::<(u32, u32)>::new(); usize::from(schedule.tile_count)];
-    let targets = schedule
-        .allocations
-        .par_iter()
-        .filter(|allocation| tensors.contains(&allocation.tensor))
+    let target_indices = schedule.allocations.indices_for_tensors(&tensors);
+    let targets = target_indices
+        .iter()
+        .map(|&index| &schedule.allocations[index])
         .map(|allocation| {
             (
                 allocation.tensor,
@@ -159,21 +158,7 @@ pub fn end_tensor_lifetimes(
         }
         *tile_regions = merged;
     }
-    let ending = schedule
-        .allocations
-        .par_iter()
-        .enumerate()
-        .filter_map(|(index, allocation)| {
-            if allocation.kind != AllocationKind::Home || allocation.live_until != usize::MAX {
-                return None;
-            }
-            let allocation_end = allocation.address.saturating_add(allocation.size);
-            regions[usize::from(allocation.tile)]
-                .iter()
-                .any(|&(start, end)| allocation.address >= start && allocation_end <= end)
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
+    let ending = schedule.allocations.live_home_indices_in_regions(&regions);
     if ending
         .iter()
         .any(|&index| schedule.allocations[index].live_from >= phase)
@@ -182,9 +167,7 @@ pub fn end_tensor_lifetimes(
             "tensor cannot end before an alias becomes live".into(),
         ));
     }
-    for index in ending {
-        schedule.allocations[index].live_until = phase;
-    }
+    schedule.allocations.set_live_until(&ending, phase);
     Ok(())
 }
 
@@ -207,24 +190,25 @@ pub fn make_tensors_resident_since(
             .all(|allocation| !tensors.contains(&allocation.tensor)),
         "newly appended tensors must not have allocations before allocation_start"
     );
-    let mut found = HashSet::default();
-    let allocations = schedule
-        .allocations
-        .get_mut(allocation_start..)
-        .ok_or_else(|| CompileError::Graph("resident allocation start is out of range".into()))?;
-    for allocation in allocations {
-        if allocation.kind == AllocationKind::Home && tensors.contains(&allocation.tensor) {
-            found.insert(allocation.tensor);
-            allocation.live_from = 0;
-            allocation.live_until = usize::MAX;
-        }
+    if allocation_start > schedule.allocations.len() {
+        return Err(CompileError::Graph(
+            "resident allocation start is out of range".into(),
+        ));
     }
+    let indices = schedule
+        .allocations
+        .home_indices_for_tensors_since(&tensors, allocation_start);
+    let found = indices
+        .iter()
+        .map(|&index| schedule.allocations[index].tensor)
+        .collect::<HashSet<_>>();
     if let Some(tensor) = tensors.difference(&found).next() {
         return Err(CompileError::Graph(format!(
             "cannot retain unknown tensor {}",
             tensor.0
         )));
     }
+    schedule.allocations.set_resident(&indices);
     Ok(())
 }
 
@@ -1054,7 +1038,7 @@ pub fn plan_affine_layer_norm_f16(
     let mut schedule = Schedule {
         layouts: Vec::new(),
         tile_count: config.tile_count,
-        allocations,
+        allocations: allocations.into(),
         phases: Vec::new(),
         peak_sram: BTreeMap::new(),
     };
@@ -1383,7 +1367,8 @@ mod tests {
                 live_from: 1,
                 live_until: 2,
                 kind: AllocationKind::Home,
-            }],
+            }]
+            .into(),
             tile_count: 1,
             peak_sram: BTreeMap::new(),
         };
@@ -1393,6 +1378,99 @@ mod tests {
         let allocation = &schedule.allocations[0];
         assert_eq!(allocation.live_from, 0);
         assert_eq!(allocation.live_until, usize::MAX);
+    }
+
+    #[test]
+    fn lifetime_index_tracks_appends_and_only_ends_contained_home_storage() {
+        let owner = TensorId(10);
+        let owner_start = 0x80000;
+        let owner_end = owner_start + 0x100;
+        let allocation = |tensor, tile, address, size, live_until, kind| Allocation {
+            tensor: TensorId(tensor),
+            tile,
+            address,
+            size,
+            live_from: 0,
+            live_until,
+            kind,
+        };
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: vec![
+                Phase::Exchange {
+                    transfers: Vec::new(),
+                },
+                Phase::Compute {
+                    op: OpId(1),
+                    commands: Vec::new(),
+                },
+            ],
+            allocations: vec![
+                allocation(owner.0, 0, owner_start, 0x100, 1, AllocationKind::Home),
+                allocation(
+                    11,
+                    0,
+                    owner_start + 0xf0,
+                    0x20,
+                    usize::MAX,
+                    AllocationKind::Home,
+                ),
+                allocation(
+                    12,
+                    1,
+                    owner_start + 0x20,
+                    0x20,
+                    usize::MAX,
+                    AllocationKind::Home,
+                ),
+                allocation(13, 0, owner_start + 0x20, 0x20, 1, AllocationKind::Home),
+            ]
+            .into(),
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+
+        // Builds the index, then changes only lifetimes. The subsequent append must update the
+        // existing index instead of requiring a different code path.
+        make_tensors_resident(&mut schedule, [owner]).unwrap();
+        schedule.allocations.extend([
+            allocation(
+                14,
+                0,
+                owner_start + 0x40,
+                0x20,
+                usize::MAX,
+                AllocationKind::Home,
+            ),
+            allocation(
+                15,
+                0,
+                owner_start + 0x60,
+                0x20,
+                usize::MAX,
+                AllocationKind::ExchangeStaging { phase: 0 },
+            ),
+        ]);
+        let before = schedule.allocations.clone();
+
+        end_tensor_lifetimes(&mut schedule, [owner]).unwrap();
+
+        let end_phase = schedule.phases.len();
+        for (before, after) in before.iter().zip(schedule.allocations.iter()) {
+            let contained_live_home = before.tile == 0
+                && before.kind == AllocationKind::Home
+                && before.live_until == usize::MAX
+                && before.address >= owner_start
+                && before.address.saturating_add(before.size) <= owner_end;
+            assert_eq!(
+                after.live_until,
+                if contained_live_home {
+                    end_phase
+                } else {
+                    before.live_until
+                }
+            );
+        }
     }
 
     #[test]
@@ -1500,7 +1578,7 @@ mod tests {
         let mut schedule = Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
-            allocations: Vec::new(),
+            allocations: Vec::new().into(),
             tile_count: 3,
             peak_sram: BTreeMap::new(),
         };
@@ -1614,7 +1692,7 @@ mod tests {
         let mut schedule = Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
-            allocations,
+            allocations: allocations.into(),
             tile_count: 8,
             peak_sram: BTreeMap::new(),
         };
@@ -1719,7 +1797,7 @@ mod tests {
         let schedule = Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
-            allocations: Vec::new(),
+            allocations: Vec::new().into(),
             tile_count: 2,
             peak_sram: BTreeMap::new(),
         };
@@ -1771,7 +1849,8 @@ mod tests {
                     live_until: usize::MAX,
                     kind: AllocationKind::Home,
                 },
-            ],
+            ]
+            .into(),
             tile_count: 1,
             peak_sram: BTreeMap::new(),
         };

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
-use std::ops::Range;
+use std::ops::{Deref, DerefMut, Range};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
@@ -601,6 +601,235 @@ pub enum AllocationKind {
 impl AllocationKind {
     fn has_home_address(&self) -> bool {
         matches!(self, Self::Home | Self::HomeAlias { .. })
+    }
+}
+
+#[derive(Debug, Default)]
+struct AllocationStoreIndex {
+    by_tensor: HashMap<TensorId, Vec<usize>>,
+    homes_by_tile: Vec<Vec<usize>>,
+}
+
+impl AllocationStoreIndex {
+    fn add(&mut self, index: usize, allocation: &Allocation) {
+        self.by_tensor
+            .entry(allocation.tensor)
+            .or_default()
+            .push(index);
+        if allocation.kind == AllocationKind::Home {
+            let tile = usize::from(allocation.tile);
+            if self.homes_by_tile.len() <= tile {
+                self.homes_by_tile.resize_with(tile + 1, Vec::new);
+            }
+            self.homes_by_tile[tile].push(index);
+        }
+    }
+
+    fn build(allocations: &[Allocation]) -> Self {
+        let mut index = Self::default();
+        for (allocation_index, allocation) in allocations.iter().enumerate() {
+            index.add(allocation_index, allocation);
+        }
+        index
+    }
+}
+
+/// Append-oriented allocation storage with indexes used by lifetime and placement queries.
+///
+/// Planning creates many more allocation records than phases. Keeping the indexes beside the
+/// records avoids repeated whole-graph scans while preserving the ordinary slice-like API.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AllocationStore {
+    values: Vec<Allocation>,
+    #[serde(skip)]
+    index: Mutex<Option<AllocationStoreIndex>>,
+}
+
+impl Default for AllocationStore {
+    fn default() -> Self {
+        Self {
+            values: Vec::new(),
+            index: Mutex::new(Some(AllocationStoreIndex::default())),
+        }
+    }
+}
+
+impl Clone for AllocationStore {
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            index: Mutex::new(None),
+        }
+    }
+}
+
+impl PartialEq for AllocationStore {
+    fn eq(&self, other: &Self) -> bool {
+        self.values == other.values
+    }
+}
+
+impl Eq for AllocationStore {}
+
+impl From<Vec<Allocation>> for AllocationStore {
+    fn from(values: Vec<Allocation>) -> Self {
+        Self {
+            values,
+            index: Mutex::new(None),
+        }
+    }
+}
+
+impl FromIterator<Allocation> for AllocationStore {
+    fn from_iter<T: IntoIterator<Item = Allocation>>(iter: T) -> Self {
+        iter.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
+impl Deref for AllocationStore {
+    type Target = Vec<Allocation>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl DerefMut for AllocationStore {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        *self.index.get_mut().unwrap() = None;
+        &mut self.values
+    }
+}
+
+impl<'a> IntoIterator for &'a AllocationStore {
+    type Item = &'a Allocation;
+    type IntoIter = std::slice::Iter<'a, Allocation>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut AllocationStore {
+    type Item = &'a mut Allocation;
+    type IntoIter = std::slice::IterMut<'a, Allocation>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        *self.index.get_mut().unwrap() = None;
+        self.values.iter_mut()
+    }
+}
+
+impl AllocationStore {
+    pub fn push(&mut self, allocation: Allocation) {
+        let allocation_index = self.values.len();
+        if let Some(index) = self.index.get_mut().unwrap() {
+            index.add(allocation_index, &allocation);
+        }
+        self.values.push(allocation);
+    }
+
+    pub fn append(&mut self, other: &mut Self) {
+        let start = self.values.len();
+        self.values.append(&mut other.values);
+        *other.index.get_mut().unwrap() = Some(AllocationStoreIndex::default());
+        if let Some(index) = self.index.get_mut().unwrap() {
+            for (offset, allocation) in self.values[start..].iter().enumerate() {
+                index.add(start + offset, allocation);
+            }
+        }
+    }
+
+    pub fn extend(&mut self, allocations: impl IntoIterator<Item = Allocation>) {
+        let start = self.values.len();
+        self.values.extend(allocations);
+        if let Some(index) = self.index.get_mut().unwrap() {
+            for (offset, allocation) in self.values[start..].iter().enumerate() {
+                index.add(start + offset, allocation);
+            }
+        }
+    }
+
+    pub fn retain(&mut self, keep: impl FnMut(&Allocation) -> bool) {
+        self.values.retain(keep);
+        *self.index.get_mut().unwrap() = None;
+    }
+
+    pub fn retain_mut(&mut self, keep: impl FnMut(&mut Allocation) -> bool) {
+        self.values.retain_mut(keep);
+        *self.index.get_mut().unwrap() = None;
+    }
+
+    fn with_index<T>(&self, query: impl FnOnce(&AllocationStoreIndex) -> T) -> T {
+        let mut index = self.index.lock().unwrap();
+        query(index.get_or_insert_with(|| AllocationStoreIndex::build(&self.values)))
+    }
+
+    pub(crate) fn indices_for_tensors(&self, tensors: &HashSet<TensorId>) -> Vec<usize> {
+        self.with_index(|index| {
+            tensors
+                .iter()
+                .flat_map(|tensor| index.by_tensor.get(tensor).into_iter().flatten().copied())
+                .collect()
+        })
+    }
+
+    pub(crate) fn home_indices_for_tensors_since(
+        &self,
+        tensors: &HashSet<TensorId>,
+        start: usize,
+    ) -> Vec<usize> {
+        self.indices_for_tensors(tensors)
+            .into_iter()
+            .filter(|&index| index >= start && self.values[index].kind == AllocationKind::Home)
+            .collect()
+    }
+
+    pub(crate) fn live_home_indices_in_regions(&self, regions: &[Vec<(u32, u32)>]) -> Vec<usize> {
+        self.with_index(|index| {
+            regions
+                .iter()
+                .enumerate()
+                .flat_map(|(tile, regions)| {
+                    index
+                        .homes_by_tile
+                        .get(tile)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(move |&allocation_index| {
+                            let allocation = &self.values[allocation_index];
+                            if allocation.live_until != usize::MAX {
+                                return false;
+                            }
+                            let end = allocation.address.saturating_add(allocation.size);
+                            regions.iter().any(|&(start, region_end)| {
+                                allocation.address >= start && end <= region_end
+                            })
+                        })
+                })
+                .collect()
+        })
+    }
+
+    pub(crate) fn set_live_until(&mut self, indices: &[usize], phase: usize) {
+        for &index in indices {
+            self.values[index].live_until = phase;
+        }
+    }
+
+    pub(crate) fn set_live_from(&mut self, indices: &[usize], phase: usize) {
+        for &index in indices {
+            self.values[index].live_from = phase;
+        }
+    }
+
+    pub(crate) fn set_resident(&mut self, indices: &[usize]) {
+        for &index in indices {
+            self.values[index].live_from = 0;
+            self.values[index].live_until = usize::MAX;
+        }
     }
 }
 
@@ -1323,7 +1552,7 @@ fn merge_occupied_intervals(occupied: &mut [Vec<(u32, u32)>]) {
 pub struct Schedule {
     pub layouts: Vec<Layout>,
     pub phases: Vec<Phase>,
-    pub allocations: Vec<Allocation>,
+    pub allocations: AllocationStore,
     pub tile_count: u16,
     pub peak_sram: BTreeMap<u16, u32>,
 }
@@ -2001,7 +2230,8 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
     let allocation_base = schedule.allocations.len();
     append_child_schedule(schedule, &mut plan.schedule)?;
     set_appended_gemm_left_start(
-        &mut schedule.allocations[allocation_base..],
+        &mut schedule.allocations,
+        allocation_base,
         &left_tensors,
         first_compute_phase,
     );
@@ -2269,7 +2499,8 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
     let allocation_base = schedule.allocations.len();
     append_child_schedule(schedule, &mut plan.schedule)?;
     set_appended_gemm_left_start(
-        &mut schedule.allocations[allocation_base..],
+        &mut schedule.allocations,
+        allocation_base,
         &left_tensors,
         first_compute_phase,
     );
@@ -2307,15 +2538,13 @@ fn prepare_appended_gemm_lifetimes(plan: &mut BlockedGemmPlan) {
 }
 
 fn set_appended_gemm_left_start(
-    allocations: &mut [Allocation],
+    allocations: &mut AllocationStore,
+    allocation_start: usize,
     left_tensors: &HashSet<TensorId>,
     live_from: usize,
 ) {
-    for allocation in allocations {
-        if allocation.kind == AllocationKind::Home && left_tensors.contains(&allocation.tensor) {
-            allocation.live_from = live_from;
-        }
-    }
+    let indices = allocations.home_indices_for_tensors_since(left_tensors, allocation_start);
+    allocations.set_live_from(&indices, live_from);
 }
 
 fn plan_appended_blocked_gemm_with_memory_policy(
@@ -3624,7 +3853,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
         schedule: Schedule {
             layouts: Vec::new(),
             phases,
-            allocations,
+            allocations: allocations.into(),
             tile_count: config.tile_count,
             peak_sram: BTreeMap::new(),
         },
@@ -4782,7 +5011,7 @@ pub fn compile(graph: &Graph, options: &CompilerOptions) -> Result<Schedule, Com
     let schedule = Schedule {
         layouts,
         phases,
-        allocations,
+        allocations: allocations.into(),
         tile_count: options.tile_count,
         peak_sram,
     };
@@ -5308,7 +5537,7 @@ mod tests {
             phases: vec![Phase::Exchange {
                 transfers: Vec::new(),
             }],
-            allocations: Vec::new(),
+            allocations: Vec::new().into(),
             tile_count: 1,
             peak_sram: BTreeMap::new(),
         };
@@ -5321,7 +5550,8 @@ mod tests {
                 allocation(0, usize::MAX, AllocationKind::Home),
                 allocation(1, 1, AllocationKind::Home),
                 allocation(2, 1, AllocationKind::ExchangeStaging { phase: 0 }),
-            ],
+            ]
+            .into(),
             tile_count: 1,
             peak_sram: BTreeMap::new(),
         };
@@ -5363,7 +5593,8 @@ mod tests {
                 live_from: 0,
                 live_until: usize::MAX,
                 kind: AllocationKind::Home,
-            }],
+            }]
+            .into(),
             tile_count: 2,
             peak_sram: BTreeMap::new(),
         };
@@ -5463,7 +5694,7 @@ mod tests {
         let mut schedule = Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
-            allocations,
+            allocations: allocations.into(),
             tile_count: 8,
             peak_sram: BTreeMap::new(),
         };
@@ -5736,7 +5967,7 @@ mod tests {
         let mut schedule = Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
-            allocations,
+            allocations: allocations.into(),
             tile_count: 2,
             peak_sram: BTreeMap::new(),
         };
@@ -5811,7 +6042,7 @@ mod tests {
         let mut schedule = Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
-            allocations,
+            allocations: allocations.into(),
             tile_count: 4,
             peak_sram: BTreeMap::new(),
         };
@@ -5847,7 +6078,7 @@ mod tests {
             tile_count: 4,
             peak_sram: BTreeMap::new(),
         };
-        let parent = schedule(vec![allocation(0, 0, 128)]);
+        let parent = schedule(vec![allocation(0, 0, 128)].into());
         let child = vec![
             BlockPlacement {
                 tensor: TensorId(1),
@@ -5899,7 +6130,7 @@ mod tests {
         let parent = |tile| Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
-            allocations: vec![allocation(0, tile)],
+            allocations: vec![allocation(0, tile)].into(),
             tile_count: 4,
             peak_sram: BTreeMap::new(),
         };
@@ -6459,7 +6690,7 @@ mod tests {
         Schedule {
             layouts: Vec::new(),
             phases: vec![Phase::Exchange { transfers }],
-            allocations,
+            allocations: allocations.into(),
             tile_count: 16,
             peak_sram: BTreeMap::new(),
         }
@@ -6500,7 +6731,7 @@ mod tests {
                 },
                 command(5, 1),
             ],
-            allocations: Vec::new(),
+            allocations: Vec::new().into(),
             tile_count: 4,
             peak_sram: BTreeMap::new(),
         };
@@ -6536,7 +6767,7 @@ mod tests {
                 op: OpId(0),
                 commands: vec![command(vec![64], "left"), command(vec![128], "right")],
             }],
-            allocations: Vec::new(),
+            allocations: Vec::new().into(),
             tile_count: 1,
             peak_sram: BTreeMap::new(),
         };
@@ -6846,7 +7077,8 @@ mod tests {
                     live_until: 2,
                     kind: AllocationKind::ExchangeStaging { phase: 1 },
                 },
-            ],
+            ]
+            .into(),
             tile_count: 16,
             peak_sram: BTreeMap::new(),
         };
@@ -7013,7 +7245,8 @@ mod tests {
                 live_from: 7,
                 live_until: 7,
                 kind: AllocationKind::Home,
-            }],
+            }]
+            .into(),
             tile_count: 4,
             peak_sram: BTreeMap::new(),
         };

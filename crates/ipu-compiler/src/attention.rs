@@ -1282,7 +1282,7 @@ pub fn plan_flash_attention(
         schedule: Schedule {
             layouts: Vec::new(),
             phases,
-            allocations,
+            allocations: allocations.into(),
             tile_count: config.tile_count,
             peak_sram,
         },
@@ -1681,7 +1681,7 @@ mod tests {
         let mut schedule = Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
-            allocations,
+            allocations: allocations.into(),
             tile_count: 32,
             peak_sram: BTreeMap::new(),
         };
@@ -1760,7 +1760,8 @@ mod tests {
                 live_from: 0,
                 live_until: usize::MAX,
                 kind: AllocationKind::Home,
-            }],
+            }]
+            .into(),
             tile_count: 16,
             peak_sram: BTreeMap::new(),
         };

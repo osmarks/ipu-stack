@@ -145,7 +145,7 @@ pub fn plan_blocked_mlp(config: BlockedMlpConfig) -> Result<BlockedMlpPlan, Comp
         schedule: Schedule {
             layouts: Vec::new(),
             phases,
-            allocations,
+            allocations: allocations.into(),
             tile_count: config.tile_count,
             peak_sram: BTreeMap::new(),
         },

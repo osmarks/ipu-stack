@@ -454,7 +454,7 @@ fn acceptance_graph() -> (ExecutableGraph, u32, Vec<u32>, Vec<u32>) {
             schedule: Schedule {
                 layouts: Vec::new(),
                 phases,
-                allocations,
+                allocations: allocations.into(),
                 tile_count: TILE_COUNT,
                 peak_sram: BTreeMap::new(),
             },

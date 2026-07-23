@@ -365,7 +365,7 @@ fn host_compute_relay_graph() -> Result<ExecutableGraph, ipu_compiler::CompileEr
                     ],
                 },
             ],
-            allocations,
+            allocations: allocations.into(),
             tile_count: TILE_COUNT,
             peak_sram: BTreeMap::new(),
         },
@@ -488,7 +488,8 @@ fn d2h_only_graph(
                 live_from: 0,
                 live_until: usize::MAX,
                 kind: AllocationKind::Home,
-            }],
+            }]
+            .into(),
             tile_count: TILE_COUNT,
             peak_sram: BTreeMap::new(),
         },
@@ -573,7 +574,7 @@ fn multi_tile_host_graph(
         schedule: Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
-            allocations,
+            allocations: allocations.into(),
             tile_count: TILE_COUNT,
             peak_sram: BTreeMap::new(),
         },
@@ -724,7 +725,7 @@ fn host_exchange_graph(
         schedule: Schedule {
             layouts: Vec::new(),
             phases,
-            allocations,
+            allocations: allocations.into(),
             tile_count: TILE_COUNT,
             peak_sram: BTreeMap::new(),
         },
