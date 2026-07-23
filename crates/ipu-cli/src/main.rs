@@ -182,6 +182,12 @@ enum Command {
         #[arg(long, default_value = "/dev/ipu0")]
         device: String,
     },
+    DeviceContext {
+        tile: u16,
+        context: u32,
+        #[arg(long, default_value = "/dev/ipu0")]
+        device: String,
+    },
     Load {
         package: PathBuf,
         bootloader: PathBuf,
@@ -780,6 +786,36 @@ fn main() -> Result<()> {
                 device.read_config(ipu_driver::pci::HSP_GS2_CONTROL)? & ipu_driver::HSP_MARK_MASK,
             );
         }
+        Command::DeviceContext {
+            tile,
+            context,
+            device,
+        } => {
+            if context > 6 {
+                bail!("tile context must be in 0..=6");
+            }
+            let device = Device::open(&device)?;
+            let state = device.tile_context_state(tile, context)?;
+            let status = if context == 0 {
+                device.read_tile_context_status(tile, context)?
+            } else {
+                device.read_tile_worker_status(tile, context)?
+            };
+            let exception = ipu_driver::TileException::from_status(status);
+            let pc = device.read_tile_program_counter(tile, context)?;
+            let registers = (0..16)
+                .map(|register| {
+                    device
+                        .read_tile_m_register(tile, context, register)
+                        .map(|value| format!("m{register}=0x{value:x}"))
+                        .unwrap_or_else(|error| format!("m{register}=error({error})"))
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "tile={tile} context={context} state={state} status=0x{status:x} exception={exception} pc=0x{pc:x} {}",
+                registers.join(" ")
+            );
+        }
         Command::Load {
             package,
             bootloader,
@@ -1161,6 +1197,7 @@ impl Command {
             Self::PackageImportIpuimg { .. } => "package-import-ipuimg",
             Self::PackageElfDirectory { .. } => "package-elf-directory",
             Self::DeviceProbe { .. } => "device-probe",
+            Self::DeviceContext { .. } => "device-context",
             Self::Load { .. } => "load",
             Self::RunDiagnostic { .. } => "run-diagnostic",
             Self::RunOutput { .. } => "run-output",
