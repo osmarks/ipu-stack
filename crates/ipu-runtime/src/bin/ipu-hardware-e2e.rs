@@ -1,10 +1,13 @@
 use ipu_compiler::{
     Allocation, AllocationKind, CompilerOptions, Graph, KernelCommand, MemoryArena, OpId, Phase,
-    Schedule, SpecializationKey, TensorId, Transfer, compile,
+    RepeatedRegion, Schedule, SpecializationKey, TensorId, Transfer, compile,
 };
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
-use ipu_runtime::{ExecutableGraph, InitialBuffer, package_graph, run_diagnostic, run_host};
+use ipu_runtime::{
+    ExecutableGraph, InitialBuffer, StaticTemplateRegion, package_graph,
+    package_graph_with_templates, run_diagnostic, run_host,
+};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -60,6 +63,16 @@ fn main() {
         let _ = fs::remove_dir_all(output);
         return;
     }
+    if mode == "template-patch" {
+        run_template_patch(
+            &[runtime_object, kernel_object],
+            &bootloader,
+            &configuration,
+            &device,
+        );
+        let _ = fs::remove_dir_all(output);
+        return;
+    }
     let (graph, expected_sum, expected_permutation, expected_multicast) = acceptance_case(&mode);
     let app = package_graph(&graph, &[runtime_object, kernel_object]).unwrap();
     let results = run_diagnostic(&app, &bootloader, &configuration, &device).unwrap();
@@ -77,6 +90,102 @@ fn main() {
     }
     assert_eq!(results.bindings["runtime-completion"], [1]);
     let _ = fs::remove_dir_all(output);
+}
+
+fn run_template_patch(objects: &[Vec<u8>], bootloader: &[u8], configuration: &[u8], device: &str) {
+    const TILE: u16 = 17;
+    const BASES: [u32; 2] = [0x60000, 0xe0000];
+    let topology = ipu_exchange::Topology::c600();
+    let mut rng = fastrand::Rng::with_seed(0x7465_6d70_6c61_7465);
+    let mut phases = Vec::new();
+    let mut allocations = Vec::new();
+    let mut initial_buffers = Vec::new();
+    let mut outputs = Vec::new();
+    let mut expected = Vec::new();
+    for (instance, base) in BASES.into_iter().enumerate() {
+        let output = TensorId(instance * 3);
+        let left = TensorId(instance * 3 + 1);
+        let right = TensorId(instance * 3 + 2);
+        let mut commands = Vec::with_capacity(usize::from(TILE_COUNT));
+        for tile in 0..TILE_COUNT {
+            let left_value = rng.u32(..);
+            let right_value = rng.u32(..);
+            if tile == TILE {
+                expected.push(left_value.wrapping_add(right_value));
+            }
+            allocations.extend([
+                home(output, tile, base, 4),
+                home(left, tile, base + 0x10, 4),
+                home(right, tile, base + 0x20, 4),
+            ]);
+            initial_buffers.extend([
+                InitialBuffer {
+                    tile,
+                    address: base + 0x10,
+                    words: vec![left_value],
+                },
+                InitialBuffer {
+                    tile,
+                    address: base + 0x20,
+                    words: vec![right_value],
+                },
+            ]);
+            commands.push(Arc::new(KernelCommand {
+                tile,
+                output,
+                inputs: vec![left, right],
+                arguments: Vec::new(),
+                specialization: Arc::new(SpecializationKey {
+                    operation: "add_u32".into(),
+                    shape: vec![1],
+                    worker_count: 1,
+                    role: "template-patch-e2e".into(),
+                    alignment: 4,
+                    abi: ipu_compiler::KernelAbi::Generic,
+                }),
+                metadata: BTreeMap::new(),
+            }));
+        }
+        phases.push(Phase::Compute {
+            op: OpId(instance),
+            commands,
+        });
+        outputs.push(RegionSlice {
+            tile: u32::from(topology.physical(TILE).unwrap()),
+            tile_address: base,
+            file_offset: u64::try_from(instance * 4).unwrap(),
+            size: 4,
+        });
+    }
+    let schedule = Schedule {
+        layouts: Vec::new(),
+        phases,
+        allocations: allocations.into(),
+        tile_count: TILE_COUNT,
+        peak_sram: BTreeMap::new(),
+    };
+    let mut repeated = RepeatedRegion::new("wide-template-patch", &schedule, 0..1).unwrap();
+    repeated.push_instance(&schedule, 1..2).unwrap();
+    let graph = ExecutableGraph {
+        memory_policy: None,
+        host_weights: Vec::new(),
+        schedule,
+        initial_buffers,
+        outputs: vec![Binding {
+            name: "template-results".into(),
+            dtype: "u32".into(),
+            shape: vec![2],
+            slices: outputs,
+        }],
+        host_inputs: Vec::new(),
+        host_outputs: Vec::new(),
+    };
+    let app =
+        package_graph_with_templates(&graph, objects, &[StaticTemplateRegion::from(repeated)])
+            .unwrap();
+    let actual = run_diagnostic(&app, bootloader, configuration, device).unwrap();
+    assert_eq!(actual.bindings["template-results"], expected);
+    assert_eq!(actual.bindings["runtime-completion"], [1]);
 }
 
 fn run_compiler_segmented_add(
