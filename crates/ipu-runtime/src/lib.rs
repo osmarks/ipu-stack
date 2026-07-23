@@ -2194,7 +2194,9 @@ fn package_graph_with_profile_options(
     invocations: u32,
 ) -> Result<(Application, ProfileLayout)> {
     let topology = Topology::c600();
+    let profile_started = Instant::now();
     let programs = graph.schedule.lower_tile_programs(&topology)?;
+    let lowering_elapsed = profile_started.elapsed();
     let output_offset = graph
         .host_outputs
         .iter()
@@ -2205,125 +2207,154 @@ fn package_graph_with_profile_options(
                     .ok_or_else(|| "profile output offset overflow".into())
             })
         })?;
-    let mut profile_graph = graph.clone();
-    let mut profile_code = Vec::with_capacity(programs.len());
-    let mut profile_tiles = Vec::with_capacity(programs.len());
-    let mut slices = Vec::with_capacity(programs.len());
-    let mut file_offset = 0usize;
     let aggregate = matches!(
         selection,
         ProfileSelection::Granularity(ProfileGranularity::Graph, _)
     );
-    let profile_tensor_base = profile_graph
+    let profile_tensor_base = graph
         .schedule
         .allocations
         .maximum_tensor_id()
         .unwrap_or(0)
         .checked_add(1)
         .ok_or("profile tensor id overflow")?;
-    for program in &programs {
-        let (mut steps, boundaries) = match selection {
-            ProfileSelection::Granularity(granularity, regions) => {
-                let (mut steps, boundaries) = profile_steps(&graph.schedule, program, granularity);
-                if let Some(regions) = regions {
-                    annotate_semantic_regions(&mut steps, regions)?;
+    struct PreparedProfileTile {
+        steps: Vec<ipu_package::ProfileStep>,
+        boundaries: Vec<ProfileBoundary>,
+        size: u32,
+        address: u32,
+        physical_tile: u32,
+    }
+    let profile_arena = ipu_compiler::MemoryArena::high(
+        PLAN_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+    );
+    let profile_occupied = graph.schedule.allocations.all_occupied_intervals_by_tile(
+        graph.schedule.tile_count,
+        profile_arena.base,
+        profile_arena.limit,
+    );
+    let prepared = programs
+        .par_iter()
+        .map(|program| -> Result<PreparedProfileTile> {
+            let (mut steps, boundaries) = match selection {
+                ProfileSelection::Granularity(granularity, regions) => {
+                    let (mut steps, boundaries) =
+                        profile_steps(&graph.schedule, program, granularity);
+                    if let Some(regions) = regions {
+                        annotate_semantic_regions(&mut steps, regions)?;
+                    }
+                    (steps, boundaries)
                 }
-                (steps, boundaries)
+                ProfileSelection::Regions(regions) => {
+                    region_profile_steps(&graph.schedule, program, regions)?
+                }
+            };
+            if aggregate {
+                steps.push(ipu_package::ProfileStep {
+                    local_index: 0,
+                    phase: 0,
+                    epoch: 0,
+                    operation: "graph".into(),
+                    kind: ipu_package::ProfileStepKind::Compute,
+                    kernel: String::new(),
+                    metadata: Vec::new(),
+                });
             }
-            ProfileSelection::Regions(regions) => {
-                region_profile_steps(&graph.schedule, program, regions)?
+            let sample_count = if aggregate {
+                1
+            } else {
+                steps
+                    .len()
+                    .checked_add(1)
+                    .ok_or("profile sample count overflow")?
+            };
+            let sample_bytes = if aggregate { 8 } else { 4 };
+            let size = u32::try_from(
+                sample_count
+                    .checked_mul(sample_bytes)
+                    .ok_or("profile size overflow")?,
+            )?;
+            if size == 0 {
+                return Err("profile contains no sample storage".into());
             }
-        };
-        if aggregate {
-            steps.push(ipu_package::ProfileStep {
-                local_index: 0,
-                phase: 0,
-                epoch: 0,
-                operation: "graph".into(),
-                kind: ipu_package::ProfileStepKind::Compute,
-                kernel: String::new(),
-                metadata: Vec::new(),
-            });
-        }
-        let sample_count = if aggregate {
-            1
-        } else {
-            steps
-                .len()
-                .checked_add(1)
-                .ok_or("profile sample count overflow")?
-        };
-        let sample_bytes = if aggregate { 8 } else { 4 };
-        let size = u32::try_from(
-            sample_count
-                .checked_mul(sample_bytes)
-                .ok_or("profile size overflow")?,
-        )?;
-        if size == 0 {
-            return Err("profile contains no sample storage".into());
-        }
-        let address = ipu_compiler::find_free_region(
-            &profile_graph.schedule.allocations,
-            program.tile,
-            size,
-            0,
-            usize::MAX,
-            ipu_compiler::MemoryConstraint {
-                base: PLAN_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
-                limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-                alignment: 8,
-                // Profile samples are ordinary host-visible data. Keep them away from
-                // the lower executable elements needed by fine-grained static code.
-                placement: ipu_compiler::MemoryPlacement::High,
-            },
-        )?;
-        let physical = u32::from(topology.physical(program.tile)?);
+            let mut occupied = profile_occupied[usize::from(program.tile)].clone();
+            let address = ipu_compiler::allocate_from_occupied_arenas(
+                &mut occupied,
+                size,
+                std::slice::from_ref(&profile_arena),
+                8,
+            )?;
+            Ok(PreparedProfileTile {
+                steps,
+                boundaries,
+                size,
+                address,
+                physical_tile: u32::from(topology.physical(program.tile)?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    info!(
+        tile_lowering_ms = lowering_elapsed.as_millis(),
+        profile_layout_ms = (profile_started.elapsed() - lowering_elapsed).as_millis(),
+        tiles = prepared.len(),
+        "prepared all-tile profile layout"
+    );
+    let mut profile_graph = graph.clone();
+    let mut profile_code = Vec::with_capacity(programs.len());
+    let mut profile_tiles = Vec::with_capacity(programs.len());
+    let mut slices = Vec::with_capacity(programs.len());
+    let mut file_offset = 0usize;
+    for (program, prepared) in programs.iter().zip(prepared) {
         profile_graph
             .schedule
             .allocations
             .push(ipu_compiler::Allocation {
                 tensor: ipu_compiler::TensorId(profile_tensor_base + usize::from(program.tile)),
                 tile: program.tile,
-                address,
-                size,
+                address: prepared.address,
+                size: prepared.size,
                 live_from: 0,
                 live_until: usize::MAX,
                 kind: ipu_compiler::AllocationKind::Home,
             });
-        let after_sync = boundaries
+        let after_sync = prepared
+            .boundaries
             .iter()
             .map(|boundary| boundary.after_sync)
             .collect::<Vec<_>>();
-        let after_step = boundaries
+        let after_step = prepared
+            .boundaries
             .iter()
             .map(|boundary| boundary.after_step)
             .collect::<Vec<_>>();
         if !aggregate {
-            let boundary_count = boundaries
+            let boundary_count = prepared
+                .boundaries
                 .iter()
                 .map(|boundary| usize::from(boundary.after_sync) + usize::from(boundary.after_step))
                 .sum::<usize>();
-            debug_assert_eq!(boundary_count, steps.len());
+            debug_assert_eq!(boundary_count, prepared.steps.len());
         }
         profile_code.push(static_codegen::ProfileCode {
-            initial: address,
+            initial: prepared.address,
             after_sync,
             after_step,
-            aggregate_end: aggregate.then_some(address + 4),
+            aggregate_end: aggregate.then_some(prepared.address + 4),
         });
         slices.push(RegionSlice {
-            tile: physical,
-            tile_address: address,
+            tile: prepared.physical_tile,
+            tile_address: prepared.address,
             file_offset: file_offset as u64,
-            size: u64::from(size),
+            size: u64::from(prepared.size),
         });
         profile_tiles.push(ProfileTileLayout {
-            physical_tile: physical,
+            physical_tile: prepared.physical_tile,
             file_offset,
-            steps,
+            steps: prepared.steps,
             boundary_samples: !aggregate,
         });
-        file_offset += size as usize;
+        file_offset += prepared.size as usize;
     }
     profile_graph.host_outputs.push(Binding {
         name: "runtime-profile".into(),
@@ -2937,8 +2968,7 @@ fn package_graph_impl_attempt(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
-    // Place the measured support and generated images together. Placing the smaller
-    // generated image first can fragment otherwise sufficient instruction elements.
+    // Reserve the generated and support code together during preliminary sizing.
     let executable_reservations = programs
         .par_iter()
         .zip(&tile_exchange_plans)
@@ -3058,21 +3088,7 @@ fn package_graph_impl_attempt(
         .iter()
         .map(|reservations| reservations[1])
         .collect::<Vec<_>>();
-    let image_executable_elements = executable_reservations
-        .iter()
-        .map(|reservations| {
-            (
-                align_down(
-                    reservations[0].0.min(reservations[1].0),
-                    ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                ),
-                align_up(
-                    reservations[0].1.max(reservations[1].1),
-                    ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
+    let image_executable_elements = executable_reservations.iter().copied().collect::<Vec<_>>();
     let mut host_executable_placements = tile_host_plans
         .iter()
         .enumerate()
@@ -3281,7 +3297,7 @@ fn package_graph_impl_attempt(
         let executable_reserved = executable_elements
             .iter()
             .copied()
-            .chain(std::iter::once(image_executable_elements[tile_index]))
+            .chain(image_executable_elements[tile_index])
             .collect::<Vec<_>>();
         let place = |allocation_ranges: &[(u32, u32)]| -> Result<_> {
             // Linker/runtime data can displace ordinary graph allocations, which

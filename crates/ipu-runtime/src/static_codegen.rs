@@ -1035,9 +1035,6 @@ pub(crate) fn emit(
             let first = &template.instance_steps[0];
             let after_sync = &profile.after_sync[first.clone()];
             let after_step = &profile.after_step[first.clone()];
-            if after_sync.iter().any(|&sample| sample) {
-                return Err("static templates cannot profile exchange sync boundaries".into());
-            }
             for instance in &template.instance_steps[1..] {
                 if profile.after_sync[instance.clone()] != *after_sync
                     || profile.after_step[instance.clone()] != *after_step
@@ -1252,6 +1249,10 @@ pub(crate) fn emit(
     let mut template_bodies = Vec::with_capacity(templates.len());
     for template in templates {
         template_bodies.push(code.words.len());
+        let profile_after_sync = profile.map(|profile| {
+            let first = &template.instance_steps[0];
+            &profile.after_sync[first.clone()]
+        });
         let profile_after_step = profile.map(|profile| {
             let first = &template.instance_steps[0];
             &profile.after_step[first.clone()]
@@ -1270,6 +1271,7 @@ pub(crate) fn emit(
                     .record_secondary_addresses
                     .windows(2)
                     .all(|pair| pair[0] == pair[1]),
+            profile_after_sync,
             profile_after_step,
         )?;
     }
@@ -1305,7 +1307,6 @@ fn emit_static_template_exchange(
     worker_barrier: u32,
     generated_base: u32,
 ) -> Result<()> {
-    code.instruction(ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
     let skip_barrier = code.words.len();
     code.brz(0, 0)?;
     code.call(worker_barrier, 7)?;
@@ -1350,6 +1351,7 @@ fn emit_static_template_body(
     template_exchange: u32,
     generated_base: u32,
     record_addresses_in_parent_frame: bool,
+    profile_after_sync: Option<&[bool]>,
     profile_after_step: Option<&[bool]>,
 ) -> Result<()> {
     code.add_immediate(11, 11, -16)?;
@@ -1370,6 +1372,12 @@ fn emit_static_template_body(
                 plan_address,
                 active,
             } => {
+                code.instruction(ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
+                emit_next_cycle_sample(
+                    code,
+                    symbols,
+                    profile_after_sync.and_then(|samples| samples.get(step_index).copied()),
+                )?;
                 if !plan_words.is_empty() {
                     emit_template_value(
                         code,
@@ -2003,6 +2011,81 @@ mod tests {
 
         assert!(runs.is_empty());
         assert_eq!(end, 0x53000);
+    }
+
+    #[test]
+    fn repeated_templates_profile_sync_and_exchange_boundaries() {
+        let program = LoweredTileProgram {
+            tile: 7,
+            steps: vec![
+                exchange(0, true),
+                compute(1, 0x54000, Vec::new()),
+                exchange(2, true),
+                compute(3, 0x54020, Vec::new()),
+            ],
+        };
+        let regions = [crate::StaticTemplateRegion {
+            name: "encoder_layer".into(),
+            phase_instances: vec![0..2, 2..4],
+        }];
+        let plans = [0x52000, 0x52020];
+        let rows = [vec![1, 2, 3], vec![1, 2, 4]];
+        let (templates, _) = plan_static_templates(
+            &program,
+            &plans,
+            &rows,
+            &[None, None],
+            &regions,
+            0x60000,
+            false,
+        )
+        .unwrap();
+        let symbols = BTreeMap::from([
+            (WORKER_BARRIER.into(), 0x50000),
+            (COMPLETE.into(), 0x50020),
+            (HOST_RUN.into(), 0x50040),
+            (REPEAT_CALL.into(), 0x50060),
+            (TEMPLATE_PATCH.into(), 0x50080),
+            (SAMPLE_CYCLE.into(), 0x500a0),
+            (SAMPLE_CYCLE_NEXT.into(), 0x500c0),
+            ("ipu_stack_gemm_f16_accumulate".into(), 0x500e0),
+        ]);
+        let host = || HostCode {
+            weights: &[],
+            inputs: &[],
+            outputs: &[],
+        };
+        let unprofiled = emit(
+            &program,
+            &symbols,
+            &plans,
+            &[],
+            &templates,
+            host(),
+            None,
+            0x70000,
+            1,
+        )
+        .unwrap();
+        let profiled = emit(
+            &program,
+            &symbols,
+            &plans,
+            &[],
+            &templates,
+            host(),
+            Some(&ProfileCode {
+                initial: 0x68000,
+                after_sync: vec![true, false, true, false],
+                after_step: vec![true; 4],
+                aggregate_end: None,
+            }),
+            0x70000,
+            1,
+        )
+        .unwrap();
+
+        assert!(profiled.len() > unprofiled.len());
     }
 
     #[test]
