@@ -429,7 +429,10 @@ fn allocation_footprints_by_tile(
 ) -> Result<Vec<Vec<(u32, u32)>>> {
     let mut footprints = vec![Vec::new(); tile_count];
     for allocation in &graph.schedule.allocations {
-        if !matches!(allocation.kind, ipu_compiler::AllocationKind::Home) {
+        if matches!(
+            allocation.kind,
+            ipu_compiler::AllocationKind::HomeAlias { .. }
+        ) {
             continue;
         }
         footprints[usize::from(allocation.tile)].push(allocation_range(allocation)?);
@@ -459,14 +462,17 @@ struct AllocationRelocation {
     new_start: u32,
     live_from: usize,
     live_until: usize,
+    home: bool,
 }
 
-fn is_movable_transient_home(
+fn is_movable_transient_storage(
     allocation: &ipu_compiler::Allocation,
     arenas: &[ipu_compiler::MemoryArena],
 ) -> bool {
-    if !matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
-        || allocation.live_until == usize::MAX
+    if matches!(
+        allocation.kind,
+        ipu_compiler::AllocationKind::HomeAlias { .. }
+    ) || allocation.live_until == usize::MAX
     {
         return false;
     }
@@ -751,8 +757,10 @@ fn fixed_allocation_ranges_by_tile(
         });
     let mut ranges = vec![Vec::new(); tile_count];
     for allocation in &graph.schedule.allocations {
-        if !matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
-            || is_movable_transient_home(allocation, transient_arenas)
+        if matches!(
+            allocation.kind,
+            ipu_compiler::AllocationKind::HomeAlias { .. }
+        ) || is_movable_transient_storage(allocation, transient_arenas)
         {
             continue;
         }
@@ -778,8 +786,10 @@ fn immovable_allocation_ranges_by_tile(
         .map_or(&[][..], |policy| policy.resident.as_slice());
     let mut ranges = vec![Vec::new(); tile_count];
     for allocation in &graph.schedule.allocations {
-        if !matches!(allocation.kind, ipu_compiler::AllocationKind::Home)
-            || is_movable_transient_home(allocation, transient_arenas)
+        if matches!(
+            allocation.kind,
+            ipu_compiler::AllocationKind::HomeAlias { .. }
+        ) || is_movable_transient_storage(allocation, transient_arenas)
             || is_movable_resident_home(allocation, resident_arenas)
         {
             continue;
@@ -841,11 +851,14 @@ fn compact_allocations_around(
     let mut resident_by_tile = vec![Vec::new(); topology.tile_count()];
     let mut fixed_by_tile = vec![Vec::new(); topology.tile_count()];
     for (index, allocation) in graph.schedule.allocations.iter().enumerate() {
-        if is_movable_transient_home(allocation, &transient_arenas) {
+        if is_movable_transient_storage(allocation, &transient_arenas) {
             transient_by_tile[usize::from(allocation.tile)].push(index);
         } else if is_movable_resident_home(allocation, &resident_arenas) {
             resident_by_tile[usize::from(allocation.tile)].push(index);
-        } else if matches!(allocation.kind, ipu_compiler::AllocationKind::Home) {
+        } else if !matches!(
+            allocation.kind,
+            ipu_compiler::AllocationKind::HomeAlias { .. }
+        ) {
             fixed_by_tile[usize::from(allocation.tile)].push((
                 allocation.address,
                 allocation.address.saturating_add(allocation.size),
@@ -976,24 +989,33 @@ fn compact_allocations_around(
             new_start: new_address,
             live_from: allocation.live_from,
             live_until: allocation.live_until,
+            home: matches!(allocation.kind, ipu_compiler::AllocationKind::Home),
         });
         graph.schedule.allocations[index].address = new_address;
     }
-    let mut relocations_by_source =
+    let mut relocations_by_location =
         HashMap::<(ipu_compiler::TensorId, u16), Vec<&AllocationRelocation>>::default();
-    let mut relocations_by_tile = vec![Vec::new(); topology.tile_count()];
+    let mut home_relocations_by_source =
+        HashMap::<(ipu_compiler::TensorId, u16), Vec<&AllocationRelocation>>::default();
+    let mut home_relocations_by_tile = vec![Vec::new(); topology.tile_count()];
     for relocation in &relocations {
-        relocations_by_source
+        relocations_by_location
             .entry((relocation.tensor, relocation.tile))
             .or_default()
             .push(relocation);
-        relocations_by_tile[usize::from(relocation.tile)].push(relocation);
+        if relocation.home {
+            home_relocations_by_source
+                .entry((relocation.tensor, relocation.tile))
+                .or_default()
+                .push(relocation);
+            home_relocations_by_tile[usize::from(relocation.tile)].push(relocation);
+        }
     }
     for allocation in &mut graph.schedule.allocations {
         let ipu_compiler::AllocationKind::HomeAlias { source } = allocation.kind else {
             continue;
         };
-        if let Some(relocation) = relocations_by_source
+        if let Some(relocation) = home_relocations_by_source
             .get(&(source, allocation.tile))
             .into_iter()
             .flatten()
@@ -1015,16 +1037,24 @@ fn compact_allocations_around(
             let Some(address) = &mut transfer.staging_address else {
                 continue;
             };
-            if let Some(relocation) = relocations_by_source
+            let candidates = relocations_by_location
                 .get(&(transfer.tensor, transfer.destination_tile))
                 .into_iter()
                 .flatten()
-                .find(|relocation| {
+                .filter(|relocation| {
                     relocation.live_from <= phase
                         && phase < relocation.live_until
                         && relocation.old.contains(address)
                 })
-            {
+                .collect::<Vec<_>>();
+            if candidates.len() > 1 {
+                return Err(format!(
+                    "transfer of tensor {} to tile {} at phase {phase} has ambiguous relocation ownership for 0x{address:x}",
+                    transfer.tensor.0, transfer.destination_tile,
+                )
+                .into());
+            }
+            if let Some(relocation) = candidates.first() {
                 *address = relocation.new_start + (*address - relocation.old.start);
             }
         }
@@ -1032,7 +1062,7 @@ fn compact_allocations_around(
     for buffer in &mut graph.initial_buffers {
         relocate_boundary_address(
             &mut buffer.address,
-            &relocations_by_tile[usize::from(buffer.tile)],
+            &home_relocations_by_tile[usize::from(buffer.tile)],
             GraphBoundary::Input,
         )?;
     }
@@ -1049,7 +1079,7 @@ fn compact_allocations_around(
                     .ok_or("host binding references a physical tile outside the topology")?;
                 relocate_boundary_address(
                     &mut slice.tile_address,
-                    &relocations_by_tile[usize::from(logical)],
+                    &home_relocations_by_tile[usize::from(logical)],
                     boundary,
                 )?;
             }
@@ -3219,6 +3249,7 @@ fn package_graph_impl_attempt(
     let mut worker_sync_addresses = Vec::with_capacity(tile_host_plans.len());
     let mut completion_addresses = Vec::with_capacity(tile_host_plans.len());
     let mut static_relocation_reservations = Vec::with_capacity(programs.len());
+    let mut executable_element_reservations = Vec::with_capacity(programs.len());
     for (tile_index, plans) in tile_exchange_plans.iter_mut().enumerate() {
         let tile = programs[tile_index].tile;
         let runtime_end = plans.end;
@@ -3394,6 +3425,7 @@ fn package_graph_impl_attempt(
             .copied()
             .chain(image_executable_elements[tile_index])
             .collect::<Vec<_>>();
+        executable_element_reservations.push(executable_reserved.clone());
         let place = |allocation_ranges: &[(u32, u32)]| -> Result<_> {
             // Linker/runtime data can displace ordinary graph allocations, which
             // are subsequently relocated. Interleaved footprints are hardware
@@ -3941,7 +3973,12 @@ fn package_graph_impl_attempt(
                 .checked_add(u32::try_from(generated[tile].len())?)
                 .ok_or("generated tile program address overflow")?;
             let image = &images[tile];
-            if image.segments.iter().any(|segment| {
+            if executable_element_reservations[tile]
+                .iter()
+                .any(|&(start, stop)| {
+                    ranges_overlap(start, stop, allocation.address, end)
+                })
+                || image.segments.iter().any(|segment| {
                 ranges_overlap(
                     segment.address,
                     segment.address + segment.size as u32,
@@ -3958,8 +3995,8 @@ fn package_graph_impl_attempt(
                     .any(|&(start, stop)| ranges_overlap(start, stop, allocation.address, end))
             {
                 return Err(format!(
-                    "static runtime 0x{PLAN_BASE:x}..0x{runtime_end:x} overlaps tensor {} on tile {} at 0x{:x}..0x{end:x}",
-                    allocation.tensor.0, allocation.tile, allocation.address
+                    "static runtime or executable memory element overlaps tensor {} ({:?}) on tile {} at 0x{:x}..0x{end:x}",
+                    allocation.tensor.0, allocation.kind, allocation.tile, allocation.address
                 )
                 .into());
             }
@@ -5531,7 +5568,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn allocation_footprints_merge_home_ranges_and_ignore_derived_storage() {
+    fn allocation_footprints_merge_owned_storage_and_ignore_aliases() {
         let graph = ExecutableGraph {
             memory_policy: None,
             schedule: Schedule {
@@ -5590,7 +5627,13 @@ mod tests {
 
         assert_eq!(
             allocation_footprints_by_tile(&graph, 1).unwrap(),
-            vec![vec![(0x60000, 0x60060)]]
+            vec![vec![
+                (
+                    ipu_exchange::EXCHANGE_WINDOW_BASE,
+                    ipu_exchange::EXCHANGE_WINDOW_BASE + 16,
+                ),
+                (0x60000, 0x60060),
+            ]]
         );
     }
 
@@ -5679,6 +5722,76 @@ mod tests {
     }
 
     #[test]
+    fn measured_executable_relocation_moves_owned_exchange_staging() {
+        let topology = Topology::c600();
+        let old_address = 0x60000;
+        let mut reservations = vec![[(0, 0); 2]; topology.tile_count()];
+        reservations[0] = [(0x5c000, 0x64000), (0x64000, 0x68000)];
+        let tensor = ipu_compiler::TensorId(1);
+        let mut graph = ExecutableGraph {
+            memory_policy: None,
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: vec![ipu_compiler::Phase::Exchange {
+                    transfers: vec![ipu_compiler::Transfer {
+                        source_tile: 1,
+                        destination_tile: 0,
+                        tensor,
+                        bytes: 64,
+                        staging_address: Some(old_address),
+                    }],
+                }],
+                allocations: vec![
+                    ipu_compiler::Allocation {
+                        tensor,
+                        tile: 1,
+                        address: 0x90000,
+                        size: 64,
+                        live_from: 0,
+                        live_until: usize::MAX,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor,
+                        tile: 0,
+                        address: old_address,
+                        size: 64,
+                        live_from: 0,
+                        live_until: 2,
+                        kind: ipu_compiler::AllocationKind::ExchangeStaging { phase: 0 },
+                    },
+                ]
+                .into(),
+                tile_count: u16::try_from(topology.tile_count()).unwrap(),
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+
+        assert_eq!(
+            relocate_transient_allocations_for_executables(&mut graph, &topology, &reservations)
+                .unwrap(),
+            1
+        );
+        let relocated = graph.schedule.allocations[1].address;
+        assert_ne!(relocated, old_address);
+        assert!(reservations[0].iter().all(|&(start, end)| !ranges_overlap(
+            relocated,
+            relocated + 64,
+            start,
+            end,
+        )));
+        let ipu_compiler::Phase::Exchange { transfers } = &graph.schedule.phases[0] else {
+            unreachable!()
+        };
+        assert_eq!(transfers[0].staging_address, Some(relocated));
+    }
+
+    #[test]
     fn literal_relocation_resolves_reused_addresses_by_lifetime() {
         let first = AllocationRelocation {
             tensor: ipu_compiler::TensorId(1),
@@ -5687,6 +5800,7 @@ mod tests {
             new_start: 0x70000,
             live_from: 0,
             live_until: 5,
+            home: true,
         };
         let second = AllocationRelocation {
             tensor: ipu_compiler::TensorId(2),
@@ -5695,6 +5809,7 @@ mod tests {
             new_start: 0x80000,
             live_from: 5,
             live_until: usize::MAX,
+            home: true,
         };
         let relocations = [&first, &second];
         let mut early = 0x60040;
