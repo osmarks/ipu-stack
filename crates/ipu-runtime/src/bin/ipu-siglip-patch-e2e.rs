@@ -20,7 +20,7 @@ use ipu_runtime::{
     blocked_matrix_f16, consolidate_attention_kernel_variants, defer_terminal_residual_add,
     fuse_deferred_residual_into_layer_norm, materialize_deferred_residual_add,
     package_graph_repeated, package_graph_repeated_with_templates_owned,
-    package_graph_repeated_with_templates_profiled_regions,
+    package_graph_repeated_with_templates_profiled_with,
     package_graph_repeated_with_templates_profiled_with_regions, run_host_with_options,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -521,11 +521,11 @@ fn main() {
     } else if profile_output.is_some() {
         let granularity = profile_granularity.expect("profile output has a granularity");
         let (app, layout) = if granularity == ProfileGranularity::Graph {
-            package_graph_repeated_with_templates_profiled_regions(
+            package_graph_repeated_with_templates_profiled_with(
                 &graph,
                 &objects,
                 &templates,
-                &profile_regions,
+                granularity,
                 invocations,
             )
         } else {
