@@ -2279,6 +2279,7 @@ mod tests {
                 worker_count: 6,
                 role: String::new().into(),
                 alignment: 8,
+                abi: ipu_compiler::KernelAbi::Generic,
             }),
             metadata: BTreeMap::new(),
         }

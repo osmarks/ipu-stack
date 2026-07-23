@@ -498,6 +498,7 @@ fn add_u32(
             worker_count: 1,
             role: format!("reduction-{operation}").into(),
             alignment: 4,
+            abi: ipu_compiler::KernelAbi::Generic,
         }),
         metadata: Default::default(),
     }

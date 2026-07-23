@@ -4723,6 +4723,7 @@ fn package_graph_impl_attempt(
                     }
                 };
             static_codegen::validate_template_transitions(template, &mut resolve_word)?;
+            static_codegen::validate_template_kernel_operands(template)?;
             let first_record = template.records.first().map(Vec::as_slice).unwrap_or(&[]);
             let split = usize::from(template.record_split);
             for (address, record) in [
@@ -5746,19 +5747,6 @@ fn bindings_size(bindings: &[Binding]) -> Result<u64> {
     })
 }
 
-fn diagnostic_tile_word(device: &Device, physical_tile: u16, address: u32) -> Result<u32> {
-    for context in 1..7 {
-        if device.tile_context_state(physical_tile, context).ok() == Some(0) {
-            return Ok(device.read_tile_word_from_inactive_context(
-                physical_tile,
-                context,
-                address,
-            )?);
-        }
-    }
-    Ok(device.read_tile_word(physical_tile, address)?)
-}
-
 fn host_source_summary(device: &Device, app: &Application) -> String {
     app.inputs
         .iter()
@@ -5767,7 +5755,19 @@ fn host_source_summary(device: &Device, app: &Application) -> String {
         .flat_map(|binding| {
             binding.slices.iter().map(|slice| {
                 let physical_tile = slice.tile as u16;
-                let value = diagnostic_tile_word(device, physical_tile, slice.tile_address)
+                let value = device
+                    .tile_context_state(physical_tile, 0)
+                    .and_then(|state| {
+                        if state == 0 {
+                            device.read_tile_word_from_inactive_context(
+                                physical_tile,
+                                1,
+                                slice.tile_address,
+                            )
+                        } else {
+                            device.read_tile_word(physical_tile, slice.tile_address)
+                        }
+                    })
                     .map(|word| format!("0x{word:08x}"))
                     .unwrap_or_else(|error| format!("error({error})"));
                 format!(
@@ -5846,7 +5846,15 @@ fn supervisor_state_summary(device: &Device, app: &Application) -> String {
         .map(|tile| {
             let physical_tile = tile.physical_tile as u16;
             let address = tile.diagnostic_address + 4;
-            let value = diagnostic_tile_word(device, physical_tile, address)
+            let value = device
+                .tile_context_state(physical_tile, 0)
+                .and_then(|state| {
+                    if state == 0 {
+                        device.read_tile_word_from_inactive_context(physical_tile, 1, address)
+                    } else {
+                        device.read_tile_word(physical_tile, address)
+                    }
+                })
                 .map(|value| format!("0x{value:x}"))
                 .unwrap_or_else(|error| format!("error({error})"));
             format!("{}:{value}", tile.physical_tile)
@@ -5896,49 +5904,10 @@ fn supervisor_state_summary(device: &Device, app: &Application) -> String {
                                             .collect::<Vec<_>>()
                                             .join(",")
                                     });
-                                    let frame = (context == 1
-                                        && exception == ipu_driver::TileException::MemoryConflict)
-                                        .then(|| {
-                                            let vertex = device.read_tile_m_register(
-                                                tile.physical_tile as u16,
-                                                context,
-                                                12,
-                                            )?;
-                                            let words = [
-                                                ("output", 0),
-                                                ("input0", 4),
-                                                ("record0", 32),
-                                                ("record1", 36),
-                                                ("remaining", 64),
-                                                ("patches", 68),
-                                            ]
-                                            .into_iter()
-                                            .map(|(name, offset)| {
-                                                diagnostic_tile_word(
-                                                    device,
-                                                    tile.physical_tile as u16,
-                                                    vertex + offset,
-                                                )
-                                                .map(|value| format!("{name}=0x{value:x}"))
-                                            })
-                                            .collect::<Result<Vec<_>>>()?;
-                                            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
-                                                words.join(","),
-                                            )
-                                        })
-                                        .transpose();
                                     match registers {
-                                        Some(registers) => match frame {
-                                            Ok(Some(frame)) => format!(
-                                                "c{context}:{exception}@0x{pc:x}[{registers};{frame}]"
-                                            ),
-                                            Ok(None) => format!(
-                                                "c{context}:{exception}@0x{pc:x}[{registers}]"
-                                            ),
-                                            Err(error) => format!(
-                                                "c{context}:{exception}@0x{pc:x}[{registers};frame=error({error})]"
-                                            ),
-                                        },
+                                        Some(registers) => {
+                                            format!("c{context}:{exception}@0x{pc:x}[{registers}]")
+                                        }
                                         None => format!("c{context}:{exception}@0x{pc:x}"),
                                     }
                                 }
@@ -6428,6 +6397,7 @@ mod tests {
                 worker_count: 6,
                 role: "test".into(),
                 alignment: 8,
+                abi: ipu_compiler::KernelAbi::pace(8 * 16 * 2, 8 * 16 * 2, 1, false),
             }),
             metadata: BTreeMap::new(),
         });
@@ -6876,6 +6846,12 @@ mod tests {
                     worker_count: 6,
                     role: "inner-block-3".into(),
                     alignment: 32,
+                    abi: ipu_compiler::KernelAbi::pace(
+                        64 * 64 * 4,
+                        64 * 64 * 4,
+                        64 * 64 * 4,
+                        false,
+                    ),
                 }),
                 metadata: BTreeMap::from([
                     ("label".into(), "GEMM block (2, 5) inner block 3".into()),
@@ -6914,6 +6890,7 @@ mod tests {
                 worker_count: 6,
                 role: "activation".into(),
                 alignment: 32,
+                abi: ipu_compiler::KernelAbi::Generic,
             }),
             metadata: BTreeMap::from([
                 ("label".into(), label.into()),
@@ -6964,6 +6941,7 @@ mod tests {
                 worker_count: 6,
                 role: "elementwise".into(),
                 alignment: 8,
+                abi: ipu_compiler::KernelAbi::Generic,
             }),
             metadata: BTreeMap::new(),
         };

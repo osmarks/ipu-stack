@@ -377,6 +377,7 @@ fn append_activation_transition(
                 worker_count: 6,
                 role: format!("layer-{layer}").into(),
                 alignment: 8,
+                abi: crate::KernelAbi::Generic,
             }),
             metadata: BTreeMap::from([
                 ("label".into(), format!("MLP layer {layer} GeLU")),

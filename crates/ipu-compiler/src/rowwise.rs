@@ -266,6 +266,7 @@ pub fn append_add_f16_row_shards_in_place(
                 worker_count: 6,
                 role: "row-sharded-residual".into(),
                 alignment: 4,
+                abi: crate::KernelAbi::Generic,
             }),
             metadata: BTreeMap::from([
                 ("label".into(), "row-sharded residual add".into()),
@@ -389,6 +390,7 @@ pub fn append_c16_to_a16_blocks_gelu_f16_in_arenas(
                 worker_count: 6,
                 role: "blocked-gelu".into(),
                 alignment: 8,
+                abi: crate::KernelAbi::Generic,
             }),
             metadata: BTreeMap::from([
                 ("label".into(), "blocked GeLU".into()),
@@ -580,6 +582,7 @@ fn append_c16_to_a16_row_shards_impl(
                         }
                         .into(),
                         alignment: 8,
+                        abi: crate::KernelAbi::Generic,
                     }),
                     metadata: BTreeMap::from([
                         (
@@ -936,6 +939,7 @@ fn append_to_a16_row_shards_reblocked_in_arenas(
                         }
                         .into(),
                         alignment: 8,
+                        abi: crate::KernelAbi::Generic,
                     }),
                     metadata: BTreeMap::from([
                         ("label".into(), "reblock GEMM output rows".into()),
@@ -1301,6 +1305,7 @@ fn append_affine_layer_norm_f16_impl(
                 worker_count: 6,
                 role: role.into(),
                 alignment: 8,
+                abi: crate::KernelAbi::Generic,
             }),
             metadata: BTreeMap::from([
                 ("label".into(), label.into()),

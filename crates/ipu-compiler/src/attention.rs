@@ -1,7 +1,7 @@
 use crate::{
-    Allocation, AllocationKind, CompileError, KernelCommand, MemoryArena, MemoryPlacement, OpId,
-    Phase, RowShardPlacement, Schedule, SpecializationKey, TensorId, Transfer,
-    allocate_from_occupied_arenas,
+    Allocation, AllocationKind, CompileError, KernelAbi, KernelCommand, MemoryArena,
+    MemoryPlacement, OpId, Phase, RowShardPlacement, Schedule, SpecializationKey, TensorId,
+    Transfer, allocate_from_occupied_arenas,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -458,6 +458,7 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
                         worker_count: 6,
                         role: format!("head-{}-rows-{row_start}", task.head).into(),
                         alignment: 8,
+                        abi: KernelAbi::Generic,
                     }),
                     metadata: BTreeMap::from([
                         ("label".into(), "gather attention heads".into()),
@@ -590,6 +591,7 @@ fn append_attention_pack_phase(
                 )
                 .into(),
                 alignment: 8,
+                abi: KernelAbi::Generic,
             }),
             metadata: BTreeMap::from([
                 (
@@ -1118,6 +1120,12 @@ pub fn plan_flash_attention(
                         )
                         .into(),
                         alignment: 8,
+                        abi: KernelAbi::pace(
+                            u32::from(task.query_rows) * u32::from(key_block_columns) * 2,
+                            u32::from(task.query_rows) * u32::from(padded_head_dimension) * 2,
+                            block.matrix_size,
+                            false,
+                        ),
                     }),
                     metadata: BTreeMap::from([
                         ("label".into(), "FlashAttention QK AMP".into()),
@@ -1150,6 +1158,7 @@ pub fn plan_flash_attention(
                         )
                         .into(),
                         alignment: 8,
+                        abi: KernelAbi::Generic,
                     }),
                     metadata: task_metadata(
                         task,
@@ -1176,6 +1185,12 @@ pub fn plan_flash_attention(
                         role: format!("attention-pv-batch-{}-head-{}", task.batch, task.head)
                             .into(),
                         alignment: 8,
+                        abi: KernelAbi::pace(
+                            u32::from(task.query_rows) * u32::from(padded_head_dimension) * 2,
+                            u32::from(task.query_rows) * u32::from(key_block_columns) * 2,
+                            block.matrix_size,
+                            false,
+                        ),
                     }),
                     metadata: task_metadata(
                         task,
@@ -1200,6 +1215,7 @@ pub fn plan_flash_attention(
                         role: format!("attention-merge-batch-{}-head-{}", task.batch, task.head)
                             .into(),
                         alignment: 8,
+                        abi: KernelAbi::Generic,
                     }),
                     metadata: task_metadata(
                         task,
@@ -1242,6 +1258,7 @@ pub fn plan_flash_attention(
                     )
                     .into(),
                     alignment: 8,
+                    abi: KernelAbi::Generic,
                 }),
                 metadata: BTreeMap::from([
                     ("label".into(), "Attention FP16 output".into()),
@@ -1584,6 +1601,48 @@ mod tests {
                 729
             );
         }
+    }
+
+    #[test]
+    fn attention_matrix_kernels_declare_their_pace_memory_abi() {
+        let plan = plan_flash_attention(FlashAttentionConfig {
+            batch_size: 2,
+            query_sequence_length: 48,
+            sequence_length: 96,
+            hidden_size: 1152,
+            attention_heads: 16,
+            query_block_rows: 24,
+            key_block_rows: 32,
+            tile_count: 1472,
+            data_base: 0xa0000,
+            data_limit: 0xe8000,
+        })
+        .unwrap();
+
+        let mut pace_commands = 0;
+        for command in plan.schedule.phases.iter().flat_map(|phase| match phase {
+            Phase::Compute { commands, .. } => commands.as_slice(),
+            Phase::Exchange { .. } => &[],
+        }) {
+            let operation = command.specialization.operation.as_ref();
+            if !operation.starts_with("attention_qk_") && !operation.starts_with("attention_pv_") {
+                continue;
+            }
+            let [rows, inner, columns] = command.specialization.shape.as_slice() else {
+                panic!("attention matrix kernel has no matrix shape");
+            };
+            assert_eq!(
+                command.specialization.abi,
+                KernelAbi::pace(
+                    u32::try_from(rows * columns * 2).unwrap(),
+                    u32::try_from(rows * inner * 2).unwrap(),
+                    u32::try_from(inner * columns * 2).unwrap(),
+                    false,
+                )
+            );
+            pace_commands += 1;
+        }
+        assert!(pace_commands > 0);
     }
 
     #[test]

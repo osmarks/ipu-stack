@@ -376,6 +376,161 @@ pub(crate) fn validate_template_transitions(
     Ok(())
 }
 
+fn template_instance_word(
+    template: &StaticTemplatePlan,
+    instance: usize,
+    value: TemplateValue,
+) -> Result<StaticTemplateRecordWord> {
+    match value {
+        TemplateValue::Constant(value) => Ok(StaticTemplateRecordWord::Value(value)),
+        TemplateValue::Record(slot) => template
+            .records
+            .get(instance)
+            .and_then(|record| record.get(usize::from(slot)))
+            .cloned()
+            .ok_or_else(|| "static template value references a missing record slot".into()),
+        TemplateValue::Shared(slot) => template
+            .shared
+            .get(usize::from(slot))
+            .cloned()
+            .ok_or_else(|| "static template value references a missing shared slot".into()),
+    }
+}
+
+fn template_instance_value(
+    template: &StaticTemplatePlan,
+    instance: usize,
+    value: TemplateValue,
+) -> Result<u32> {
+    let StaticTemplateRecordWord::Value(value) = template_instance_word(template, instance, value)?
+    else {
+        return Err("static template address resolves to a symbol".into());
+    };
+    Ok(value)
+}
+
+/// Validates the operands that the compact body will actually load. This is
+/// intentionally separate from lowered-program validation: template command
+/// alignment and record-column interning are part of code generation and can
+/// otherwise change which values reach a kernel after the lowered body has
+/// been discarded.
+pub(crate) fn validate_template_kernel_operands(template: &StaticTemplatePlan) -> Result<()> {
+    for (step_index, step) in template.steps.iter().enumerate() {
+        let StaticTemplateStep::Compute {
+            operation,
+            abi,
+            input_count,
+            operands,
+            kernel,
+            condition,
+        } = step
+        else {
+            continue;
+        };
+        for instance in 0..template.records.len() {
+            if let Some(condition) = condition {
+                if template_instance_value(template, instance, *condition)? == 0 {
+                    continue;
+                }
+            }
+            let operation = if let Some(kernel) = kernel {
+                let StaticTemplateRecordWord::Symbol(symbol) =
+                    template_instance_word(template, instance, *kernel)?
+                else {
+                    return Err(format!(
+                        "static template {} instance {instance} step {step_index} has a nonsymbolic dynamic kernel",
+                        template.name
+                    )
+                    .into());
+                };
+                symbol
+                    .strip_prefix("ipu_stack_")
+                    .ok_or("static template kernel symbol has no runtime prefix")?
+                    .to_string()
+            } else {
+                operation.clone()
+            };
+            let specialization = ipu_compiler::SpecializationKey {
+                operation: operation.clone().into(),
+                shape: Vec::new(),
+                worker_count: 0,
+                role: "".into(),
+                alignment: 1,
+                abi: *abi,
+            };
+            let addresses = operands
+                .iter()
+                .take(input_count + 1)
+                .map(|&value| template_instance_value(template, instance, value))
+                .collect::<Result<Vec<_>>>()?;
+            let address = |operand: ipu_compiler::KernelOperand| -> Result<u32> {
+                match operand {
+                    ipu_compiler::KernelOperand::Output => Ok(addresses[0]),
+                    ipu_compiler::KernelOperand::Input(input) => addresses
+                        .get(input + 1)
+                        .copied()
+                        .ok_or_else(|| "static template kernel constraint has no operand".into()),
+                }
+            };
+            let span = |operand: ipu_compiler::KernelOperand| -> Result<(u32, u32)> {
+                Ok((
+                    address(operand)?,
+                    specialization.operand_access_bytes(operand)?,
+                ))
+            };
+            for constraint in specialization.memory_constraints() {
+                match constraint {
+                    ipu_compiler::KernelMemoryConstraint::InClass(operand, class) => {
+                        let (value, bytes) = span(*operand)?;
+                        let end = value
+                            .checked_add(bytes)
+                            .ok_or("static template kernel operand span overflows")?;
+                        match class {
+                            ipu_compiler::KernelMemoryClass::Ipu21Interleaved
+                                if value < ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                                    || end > ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT =>
+                            {
+                                return Err(format!(
+                                    "static template {} instance {instance} step {step_index} kernel {operation} resolves {operand:?} outside interleaved memory at 0x{value:x}..0x{end:x}",
+                                    template.name
+                                )
+                                .into());
+                            }
+                            _ => {}
+                        }
+                    }
+                    ipu_compiler::KernelMemoryConstraint::DistinctEffectiveElements(operands) => {
+                        let mut elements =
+                            BTreeMap::<u8, (ipu_compiler::KernelOperand, u32)>::new();
+                        for &operand in *operands {
+                            let (value, bytes) = span(operand)?;
+                            let touched = ipu_package::ipu21_effective_memory_elements(value, bytes)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "static template {} instance {instance} step {step_index} kernel {operation} resolves {operand:?} outside tile SRAM at 0x{value:x} for {bytes} bytes",
+                                        template.name
+                                    )
+                                })?;
+                            for (element, _, _) in touched {
+                                if let Some((other_operand, other_value)) =
+                                    elements.insert(element, (operand, value))
+                                {
+                                    return Err(format!(
+                                        "static template {} instance {instance} step {step_index} kernel {operation} maps {other_operand:?} at 0x{other_value:x} and {operand:?} at 0x{value:x} to memory element {element}",
+                                        template.name
+                                    )
+                                    .into());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> Vec<Range<usize>> {
     [0..split, split..record_words]
         .into_iter()
@@ -395,6 +550,8 @@ enum StaticTemplateStep {
     },
     Compute {
         operation: String,
+        abi: ipu_compiler::KernelAbi,
+        input_count: usize,
         operands: Vec<TemplateValue>,
         kernel: Option<TemplateValue>,
         condition: Option<TemplateValue>,
@@ -809,6 +966,7 @@ pub(crate) fn plan_static_templates(
 struct ComputeShape<'a> {
     phase_tile_command_index: usize,
     operation: &'a str,
+    abi: ipu_compiler::KernelAbi,
     input_count: usize,
     argument_count: usize,
 }
@@ -817,6 +975,7 @@ fn compute_shape(command: &ipu_compiler::LoweredComputeCommand) -> ComputeShape<
     ComputeShape {
         phase_tile_command_index: command.phase_tile_command_index,
         operation: &command.specialization.operation,
+        abi: command.specialization.abi,
         input_count: command.input_addresses.len(),
         argument_count: command.arguments.len(),
     }
@@ -937,6 +1096,7 @@ fn plan_template_compute_step(
     if active.iter().any(|command| {
         command.input_addresses.len() != first.input_addresses.len()
             || command.arguments.len() != first.arguments.len()
+            || command.specialization.abi != first.specialization.abi
     }) {
         return Err(format!(
             "template {template_name} changes compute ABI in phase {relative_phase} call {command_index}"
@@ -1008,6 +1168,8 @@ fn plan_template_compute_step(
         .collect::<Result<Vec<_>>>()?;
     Ok(StaticTemplateStep::Compute {
         operation: first.specialization.operation.to_string(),
+        abi: first.specialization.abi,
+        input_count: first.input_addresses.len(),
         operands,
         kernel,
         condition,
@@ -1630,6 +1792,8 @@ fn emit_static_template_body(
             }
             StaticTemplateStep::Compute {
                 operation,
+                abi: _,
+                input_count: _,
                 operands,
                 kernel,
                 condition,
@@ -1894,6 +2058,12 @@ mod tests {
                     worker_count: 6,
                     role: "inner-block".into(),
                     alignment: 32,
+                    abi: ipu_compiler::KernelAbi::pace(
+                        12 * 64 * 2,
+                        12 * 64 * 2,
+                        64 * 64 * 2,
+                        false,
+                    ),
                 }),
                 metadata: BTreeMap::new(),
             }),

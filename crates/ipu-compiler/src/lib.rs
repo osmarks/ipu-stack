@@ -357,6 +357,36 @@ pub struct SpecializationKey {
     pub worker_count: u8,
     pub role: Cow<'static, str>,
     pub alignment: u32,
+    /// Device-kernel memory ABI. This remains present when diagnostic shape
+    /// and role metadata are discarded, so relocation never has to infer
+    /// correctness constraints from a linker symbol's spelling.
+    #[serde(default)]
+    pub abi: KernelAbi,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum KernelAbi {
+    #[default]
+    Generic,
+    /// PACE matrix multiply operands in output, left, right order.
+    Pace {
+        operand_bytes: [u32; 3],
+        interleaved_right: bool,
+    },
+}
+
+impl KernelAbi {
+    pub const fn pace(
+        output_bytes: u32,
+        left_bytes: u32,
+        right_bytes: u32,
+        interleaved_right: bool,
+    ) -> Self {
+        Self::Pace {
+            operand_bytes: [output_bytes, left_bytes, right_bytes],
+            interleaved_right,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -422,79 +452,34 @@ const PACE_EXPANDED_WEIGHT_CONSTRAINTS: [KernelMemoryConstraint; 3] = [
 
 impl SpecializationKey {
     /// Memory-access constraints imposed by the selected device kernel ABI.
-    ///
-    /// Operation names are the link-time ABI keys used to select support-image
-    /// symbols, so keeping the constraint registry on the same keys prevents
-    /// planner-only placement assumptions from being lost during final packing.
     pub fn memory_constraints(&self) -> &'static [KernelMemoryConstraint] {
-        if self.operation.starts_with("gemm_f16_f8w_") {
-            &PACE_EXPANDED_WEIGHT_CONSTRAINTS
-        } else if self.operation.starts_with("gemm_f16_")
-            || self.operation.starts_with("gemm_f8_")
-            || self.operation.starts_with("gemm_f32_")
-        {
-            &PACE_ACCUMULATOR_STREAM_CONSTRAINTS
-        } else {
-            &[]
+        match self.abi {
+            KernelAbi::Generic => &[],
+            KernelAbi::Pace {
+                interleaved_right: true,
+                ..
+            } => &PACE_EXPANDED_WEIGHT_CONSTRAINTS,
+            KernelAbi::Pace {
+                interleaved_right: false,
+                ..
+            } => &PACE_ACCUMULATOR_STREAM_CONSTRAINTS,
         }
     }
 
-    fn operand_access_bytes(&self, operand: KernelOperand) -> Result<u32, CompileError> {
-        if !(self.operation.starts_with("gemm_f16_")
-            || self.operation.starts_with("gemm_f8_")
-            || self.operation.starts_with("gemm_f32_"))
-        {
-            return Ok(1);
-        }
-        let dimensions = self
-            .shape
-            .get(..3)
-            .map(|shape| (shape[0], shape[1], shape[2]));
-        let (rows, inner, columns) = dimensions
-            .or_else(|| {
-                let (row_inner, columns) = self.operation.rsplit_once("_output_")?;
-                let (rows, inner) = row_inner.rsplit_once("_inner_")?;
-                let (_, rows) = rows.rsplit_once("_rows_")?;
-                Some((
-                    rows.parse().ok()?,
-                    inner.parse().ok()?,
-                    columns.parse().ok()?,
-                ))
-            })
-            .ok_or_else(|| {
-                CompileError::Graph(format!(
-                    "kernel {} has no encoded GEMM dimensions",
-                    self.operation
-                ))
-            })?;
-        let (output_bytes, input_bytes, weight_bytes) = if self.operation.starts_with("gemm_f32_") {
-            (4usize, 4usize, 4usize)
-        } else if self.operation.starts_with("gemm_f8_") {
-            (2, 1, 1)
-        } else if self.operation.starts_with("gemm_f16_f8w_") {
-            (2, 2, 2)
-        } else {
-            (2, 2, 2)
+    pub fn operand_access_bytes(&self, operand: KernelOperand) -> Result<u32, CompileError> {
+        let bytes = match (self.abi, operand) {
+            (KernelAbi::Generic, _) | (KernelAbi::Pace { .. }, KernelOperand::Input(2..)) => 1,
+            (KernelAbi::Pace { operand_bytes, .. }, KernelOperand::Output) => operand_bytes[0],
+            (KernelAbi::Pace { operand_bytes, .. }, KernelOperand::Input(0)) => operand_bytes[1],
+            (KernelAbi::Pace { operand_bytes, .. }, KernelOperand::Input(1)) => operand_bytes[2],
         };
-        let elements = match operand {
-            KernelOperand::Output => rows.checked_mul(columns),
-            KernelOperand::Input(0) => rows.checked_mul(inner),
-            KernelOperand::Input(1) => inner.checked_mul(columns),
-            KernelOperand::Input(_) => Some(1),
+        if bytes == 0 {
+            return Err(CompileError::Graph(format!(
+                "kernel {} has a zero-sized memory ABI operand",
+                self.operation
+            )));
         }
-        .ok_or_else(|| CompileError::Memory("kernel operand span overflow".into()))?;
-        let element_bytes = match operand {
-            KernelOperand::Output => output_bytes,
-            KernelOperand::Input(0) => input_bytes,
-            KernelOperand::Input(1) => weight_bytes,
-            KernelOperand::Input(_) => 1,
-        };
-        u32::try_from(
-            elements
-                .checked_mul(element_bytes)
-                .ok_or_else(|| CompileError::Memory("kernel operand byte span overflow".into()))?,
-        )
-        .map_err(|_| CompileError::Memory("kernel operand byte span exceeds u32".into()))
+        Ok(bytes)
     }
 }
 
@@ -2221,6 +2206,7 @@ pub fn append_bias_f16_c16_in_arenas(
                 worker_count: 6,
                 role: "blocked-bias".into(),
                 alignment: 8,
+                abi: KernelAbi::Generic,
             }),
             metadata: BTreeMap::from([
                 ("label".into(), "blocked bias add".into()),
@@ -2473,6 +2459,7 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
                         }
                         .into(),
                         alignment: if input_scale.is_some() { 16 } else { 8 },
+                        abi: KernelAbi::Generic,
                     }),
                     metadata: BTreeMap::from([
                         ("label".into(), "place row-sharded GEMM input".into()),
@@ -2733,6 +2720,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
                         }
                         .into(),
                         alignment: if input_scale.is_some() { 16 } else { 8 },
+                        abi: KernelAbi::Generic,
                     }),
                     metadata: BTreeMap::from([
                         ("label".into(), "place distributed GEMM input".into()),
@@ -3898,6 +3886,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                                 worker_count: 6,
                                 role: "weight-expansion".into(),
                                 alignment: 4,
+                                abi: KernelAbi::Generic,
                             }),
                             metadata: if config.retain_profile_metadata {
                                 BTreeMap::from([
@@ -3936,6 +3925,20 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                             worker_count: 6,
                             role: "blocked-gemm".into(),
                             alignment: 32,
+                            abi: KernelAbi::pace(
+                                u32::from(output_block.rows)
+                                    * u32::from(config.block_dimension)
+                                    * output_element_bytes,
+                                u32::from(output_block.rows)
+                                    * u32::from(config.inner_block_dimension)
+                                    * input_element_bytes,
+                                if config.data_type.expands_weights() {
+                                    expanded_right_block_bytes
+                                } else {
+                                    right_block_bytes
+                                },
+                                config.data_type.expands_weights(),
+                            ),
                         }),
                         metadata: if config.retain_profile_metadata {
                             BTreeMap::from([
@@ -4067,6 +4070,7 @@ pub fn plan_blocked_gemm(config: BlockedGemmConfig) -> Result<BlockedGemmPlan, C
                         "gemm-output".into()
                     },
                     alignment: 8,
+                    abi: KernelAbi::Generic,
                 }),
                 metadata: if config.retain_profile_metadata {
                     BTreeMap::from([
@@ -5487,6 +5491,7 @@ pub fn compile(graph: &Graph, options: &CompilerOptions) -> Result<Schedule, Com
                             "body".into()
                         },
                         alignment: output_layout.alignment,
+                        abi: KernelAbi::Generic,
                     }),
                     metadata: BTreeMap::new(),
                 })
@@ -6747,6 +6752,50 @@ mod tests {
         assert!(plan.schedule.allocations.iter().all(|allocation| {
             !matches!(allocation.kind, AllocationKind::ExchangeStaging { .. })
         }));
+        for command in plan.schedule.phases.iter().flat_map(|phase| match phase {
+            Phase::Compute { commands, .. } => commands.as_slice(),
+            Phase::Exchange { .. } => &[],
+        }) {
+            if !command.specialization.operation.starts_with("gemm_f32_") {
+                continue;
+            }
+            let [rows, inner, columns] = command.specialization.shape.as_slice() else {
+                panic!("blocked GEMM kernel has no matrix shape");
+            };
+            assert_eq!(
+                command.specialization.abi,
+                KernelAbi::pace(
+                    u32::try_from(rows * columns * 4).unwrap(),
+                    u32::try_from(rows * inner * 4).unwrap(),
+                    u32::try_from(inner * columns * 4).unwrap(),
+                    false,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_memory_abi_is_independent_of_symbol_names() {
+        let generic = SpecializationKey {
+            operation: "gemm_f16_misleading_name".into(),
+            shape: vec![12, 64, 64],
+            worker_count: 6,
+            role: "test".into(),
+            alignment: 32,
+            abi: KernelAbi::Generic,
+        };
+        let pace = SpecializationKey {
+            operation: "attention_qk_custom_name".into(),
+            abi: KernelAbi::pace(12 * 64 * 2, 12 * 64 * 2, 64 * 64 * 2, false),
+            ..generic.clone()
+        };
+
+        assert!(generic.memory_constraints().is_empty());
+        assert!(!pace.memory_constraints().is_empty());
+        assert_eq!(
+            pace.operand_access_bytes(KernelOperand::Input(1)).unwrap(),
+            64 * 64 * 2
+        );
     }
 
     #[test]
@@ -7215,6 +7264,7 @@ mod tests {
                     worker_count: 6,
                     role: "compute".into(),
                     alignment: 8,
+                    abi: KernelAbi::Generic,
                 }),
                 metadata: BTreeMap::new(),
             })],
@@ -7261,6 +7311,7 @@ mod tests {
                     worker_count: 6,
                     role: role.into(),
                     alignment: 4,
+                    abi: KernelAbi::Generic,
                 }),
                 metadata: BTreeMap::from([("label".into(), role.into())]),
             })

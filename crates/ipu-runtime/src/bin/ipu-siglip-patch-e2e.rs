@@ -1052,6 +1052,7 @@ fn append_adjustment_phase(
                 worker_count: 6,
                 role: "patch-position-bias".into(),
                 alignment: 4,
+                abi: ipu_compiler::KernelAbi::Generic,
             }),
             metadata: BTreeMap::from([
                 ("label".into(), "patch bias and learned position".into()),

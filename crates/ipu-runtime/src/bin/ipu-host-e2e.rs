@@ -410,6 +410,7 @@ fn add_u32(tile: u16, output: TensorId, input: TensorId, role: &'static str) -> 
             worker_count: 1,
             role: role.into(),
             alignment: 4,
+            abi: ipu_compiler::KernelAbi::Generic,
         }),
         metadata: Default::default(),
     }
