@@ -1265,19 +1265,55 @@ fn compact_allocations_around(
             movable.append(&mut transients);
             let mut compact = Vec::with_capacity(movable.len());
             for index in movable {
-                    let allocation = &graph.schedule.allocations[index];
-                    if memory_constraints.pinned.contains(&index) {
-                        let range = (
-                            allocation.address,
-                            allocation.address.saturating_add(allocation.size),
-                        );
-                        for occupied in &mut occupied_by_phase[lifetime(allocation)] {
-                            occupied.push(range);
-                        }
-                        result.push((index, allocation.address));
-                    } else {
-                        compact.push(index);
+                let allocation = &graph.schedule.allocations[index];
+                let arenas = if allocation.live_until == usize::MAX {
+                    &resident_arenas
+                } else {
+                    &transient_arenas
+                };
+                let requires_interleaved = (resolved_memory_constraints.is_none()
+                    && allocation_requires_interleaved(allocation))
+                    || memory_constraints.required_interleaved.contains(&index);
+                let compatible_arenas = relocation_arenas_for_allocation(
+                    allocation,
+                    arenas,
+                    requires_interleaved,
+                )?;
+                let storage_end = allocation
+                    .address
+                    .checked_add(allocation.size)
+                    .ok_or("allocation address overflow during stable placement")?;
+                let access_end = allocation
+                    .address
+                    .checked_add(memory_constraints.access_extent(index, allocation.size))
+                    .ok_or("allocation access span overflow during stable placement")?;
+                let fits_arena = compatible_arenas.iter().any(|arena| {
+                    allocation.address >= arena.base && storage_end <= arena.limit
+                });
+                let storage_conflicts_with_permanent = permanent.iter().any(|&(start, end)| {
+                    ranges_overlap(allocation.address, storage_end, start, end)
+                });
+                let access_conflicts_with_reservation = reservations[tile]
+                    .iter()
+                    .any(|&(start, end)| ranges_overlap(allocation.address, access_end, start, end));
+                if fits_arena
+                    && !storage_conflicts_with_permanent
+                    && !access_conflicts_with_reservation
+                {
+                    let range = (allocation.address, storage_end);
+                    for occupied in &mut occupied_by_phase[lifetime(allocation)] {
+                        occupied.push(range);
                     }
+                    result.push((index, allocation.address));
+                } else if memory_constraints.pinned.contains(&index) {
+                    return Err(format!(
+                        "pinned tensor {} on tile {} at 0x{:x}..0x{storage_end:x} conflicts with {reason}",
+                        allocation.tensor.0, allocation.tile, allocation.address,
+                    )
+                    .into());
+                } else {
+                    compact.push(index);
+                }
             }
             let compact_set = compact.iter().copied().collect::<HashSet<_>>();
             let mut placed_addresses = result.iter().copied().collect::<HashMap<_, _>>();
@@ -6907,7 +6943,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_repacking_reuses_addresses_across_disjoint_lifetimes() {
+    fn relocation_preserves_valid_addresses_across_disjoint_lifetimes() {
         let topology = Topology::c600();
         let arena = 0x88000..0xe8000;
         let mut graph = ExecutableGraph {
@@ -6944,7 +6980,7 @@ mod tests {
         };
         let reservations = vec![Vec::new(); topology.tile_count()];
 
-        compact_transient_allocations_around(
+        let moved = compact_transient_allocations_around(
             &mut graph,
             &topology,
             &reservations,
@@ -6953,10 +6989,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            graph.schedule.allocations[0].address, graph.schedule.allocations[1].address,
-            "equal-shaped values with disjoint lifetimes should share storage"
-        );
+        assert_eq!(moved, 0);
+        assert_eq!(graph.schedule.allocations[0].address, 0x90000);
+        assert_eq!(graph.schedule.allocations[1].address, 0xd0000);
     }
 
     #[test]
