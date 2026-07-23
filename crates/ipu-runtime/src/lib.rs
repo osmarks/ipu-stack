@@ -1975,23 +1975,30 @@ fn compact_allocations_around(
                 let access_conflicts_with_reservation = reservations[tile]
                     .iter()
                     .any(|&(start, end)| ranges_overlap(allocation.address, access_end, start, end));
-                if fits_arena
+                let stable = fits_arena
                     && !storage_conflicts_with_permanent
-                    && !access_conflicts_with_reservation
-                {
+                    && !access_conflicts_with_reservation;
+                if memory_constraints.pinned.contains(&index) {
+                    if !stable {
+                        return Err(format!(
+                            "pinned tensor {} on tile {} at 0x{:x}..0x{storage_end:x} conflicts with {reason}",
+                            allocation.tensor.0, allocation.tile, allocation.address,
+                        )
+                        .into());
+                    }
                     let range = (allocation.address, storage_end);
                     for occupied in &mut occupied_by_phase[lifetime(allocation)] {
                         occupied.push(range);
                     }
                     result.push((index, allocation.address));
-                } else if memory_constraints.pinned.contains(&index) {
-                    return Err(format!(
-                        "pinned tensor {} on tile {} at 0x{:x}..0x{storage_end:x} conflicts with {reason}",
-                        allocation.tensor.0, allocation.tile, allocation.address,
-                    )
-                    .into());
-                } else {
+                } else if move_resident || !stable {
                     compact.push(index);
+                } else {
+                    let range = (allocation.address, storage_end);
+                    for occupied in &mut occupied_by_phase[lifetime(allocation)] {
+                        occupied.push(range);
+                    }
+                    result.push((index, allocation.address));
                 }
             }
             let mut compact_set = compact.iter().copied().collect::<HashSet<_>>();
@@ -2009,13 +2016,11 @@ fn compact_allocations_around(
                 )
             });
             let mut compact = VecDeque::from(compact);
-            let protected = memory_constraints
-                .pinned
-                .iter()
-                .chain(&memory_constraints.required_interleaved)
-                .chain(memory_constraints.relations.keys())
-                .copied()
-                .collect::<HashSet<_>>();
+            // Relation-constrained objects remain movable: every relation is
+            // stored in both directions, so re-placing an evicted object checks
+            // it against the neighbor's current address. Only an allocation
+            // whose correctness depends on its exact base is immovable.
+            let protected = memory_constraints.pinned.clone();
             let mut eviction_counts = HashMap::<usize, usize>::new();
             while let Some(index) = compact.pop_front() {
                     let allocation = &graph.schedule.allocations[index];
@@ -7838,6 +7843,80 @@ mod tests {
             right.address,
             right.address + right.size,
         ));
+    }
+
+    #[test]
+    fn global_repacking_reconsiders_valid_unpinned_placements() {
+        let topology = Topology::c600();
+        let arena = 0x88000..0x98000;
+        let original_addresses = [arena.start, arena.start + 0x2000];
+        let mut graph = ExecutableGraph {
+            memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(
+                arena.start,
+                arena.end,
+            )),
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: vec![
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(1),
+                        tile: 0,
+                        address: original_addresses[0],
+                        size: 0x2000,
+                        live_from: 0,
+                        live_until: usize::MAX,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(2),
+                        tile: 0,
+                        address: original_addresses[1],
+                        size: 0x6000,
+                        live_from: 0,
+                        live_until: usize::MAX,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                ]
+                .into(),
+                tile_count: u16::try_from(topology.tile_count()).unwrap(),
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+
+        assert_eq!(
+            compact_all_allocations_around(
+                &mut graph,
+                &topology,
+                &vec![Vec::new(); topology.tile_count()],
+                None,
+                "global placement test",
+            )
+            .unwrap(),
+            2
+        );
+        let small = &graph.schedule.allocations[0];
+        let large = &graph.schedule.allocations[1];
+        for (allocation, original) in graph.schedule.allocations.iter().zip(original_addresses) {
+            assert_ne!(allocation.address, original);
+            assert!(allocation.address >= arena.start);
+            assert!(allocation.address + allocation.size <= arena.end);
+        }
+        assert!(!ranges_overlap(
+            small.address,
+            small.address + small.size,
+            large.address,
+            large.address + large.size,
+        ));
+        assert_eq!(
+            small.size + large.size,
+            arena.end - small.address.min(large.address)
+        );
     }
 
     #[test]
