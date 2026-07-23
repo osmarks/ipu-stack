@@ -255,7 +255,10 @@ fn main() {
         ?tuning,
         "configured encoder tile-memory policy"
     );
-    let detailed_diagnostics = layer_count == 1 && batch_size == 1;
+    let detailed_diagnostics = env_u32(
+        "IPU_SIGLIP_DETAILED_DIAGNOSTICS",
+        u32::from(layer_count == 1 && batch_size == 1),
+    ) != 0;
     let retain_profile_metadata = std::env::var_os("IPU_SIGLIP_RETAIN_PROFILE_METADATA").is_some()
         || matches!(
             profile_granularity,
@@ -504,6 +507,7 @@ fn main() {
     write_memory_profile(&graph);
     let templates = layer_template_groups
         .into_iter()
+        .filter(|(_, region)| region.phase_instances.len() > 1)
         .map(|(_, region)| StaticTemplateRegion::from(region))
         .collect::<Vec<_>>();
     assert!(
