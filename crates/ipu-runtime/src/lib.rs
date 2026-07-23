@@ -666,22 +666,8 @@ fn relocation_arenas_for_allocation(
     arenas: &[ipu_compiler::MemoryArena],
     requires_interleaved: bool,
 ) -> Result<Vec<ipu_compiler::MemoryArena>> {
-    let allocation_end = allocation
-        .address
-        .checked_add(allocation.size)
-        .ok_or("allocation address overflow while preserving its memory class")?;
     let interleaved =
         ipu_package::IPU21_INTERLEAVED_MEMORY_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
-    if !requires_interleaved
-        && allocation.address < interleaved.end
-        && allocation_end > interleaved.start
-    {
-        return Err(format!(
-            "tensor {} allocation 0x{:x}..0x{allocation_end:x} crosses IPU21 memory classes",
-            allocation.tensor.0, allocation.address,
-        )
-        .into());
-    }
 
     let mut compatible = Vec::new();
     for arena in arenas {
@@ -883,6 +869,16 @@ fn relocation_memory_constraints(
         let endpoint = allocation_endpoint(graph, class.operand)?;
         match (class.class, endpoint) {
             (ipu_compiler::KernelMemoryClass::Ipu21Interleaved, (Some(index), 0)) => {
+                let allocation = &graph.schedule.allocations[index];
+                let end = allocation
+                    .address
+                    .checked_add(allocation.size)
+                    .ok_or("interleaved kernel allocation address overflow")?;
+                if allocation.address < ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                    || end > ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
+                {
+                    return Err("kernel allocation is outside required interleaved memory".into());
+                }
                 constraints.required_interleaved.insert(index);
             }
             (ipu_compiler::KernelMemoryClass::Ipu21Interleaved, (Some(_), _)) => {
