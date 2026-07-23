@@ -194,6 +194,188 @@ pub(crate) fn template_patch_group_span(
     Some((first / 32 * 32)..((last + 1).div_ceil(32) * 32).min(slots.len()))
 }
 
+pub(crate) fn serialize_template_patch_range(
+    slots: Range<usize>,
+    patch: &[(u16, StaticTemplatePatchValue)],
+    mut resolve: impl FnMut(&StaticTemplateRecordWord) -> Result<u32>,
+) -> Result<Vec<u32>> {
+    let Some(span) = template_patch_group_span(slots.clone(), patch) else {
+        return Ok(vec![0]);
+    };
+    let group_count = span.len().div_ceil(32);
+    let mut words = Vec::new();
+    let mut narrow_bits = Vec::new();
+    let mut narrow = Vec::new();
+    let mut wide = Vec::new();
+    words.push(u32::try_from(span.start)? | (u32::try_from(group_count)? << 16));
+    for local_base in span.step_by(32) {
+        let slot_base = slots.start + local_base;
+        let slot_limit = (slot_base + 32).min(slots.end);
+        let mut changed_mask = 0u32;
+        for (slot, value) in patch
+            .iter()
+            .filter(|(slot, _)| (slot_base..slot_limit).contains(&usize::from(*slot)))
+        {
+            changed_mask |= 1 << (usize::from(*slot) - slot_base);
+            match value {
+                StaticTemplatePatchValue::Delta(delta) => {
+                    narrow_bits.push(true);
+                    narrow.push(*delta as u16);
+                }
+                StaticTemplatePatchValue::Delta32(delta) => {
+                    narrow_bits.push(false);
+                    wide.push(*delta);
+                }
+                StaticTemplatePatchValue::Difference { previous, next } => {
+                    narrow_bits.push(false);
+                    wide.push(resolve(next)?.wrapping_sub(resolve(previous)?));
+                }
+            }
+        }
+        words.push(changed_mask);
+    }
+    words.extend(narrow_bits.chunks(32).map(|bits| {
+        bits.iter().enumerate().fold(0u32, |mask, (bit, narrow)| {
+            mask | (u32::from(*narrow) << bit)
+        })
+    }));
+    words.extend(
+        narrow
+            .chunks(2)
+            .map(|pair| u32::from(pair[0]) | (u32::from(pair.get(1).copied().unwrap_or(0)) << 16)),
+    );
+    words.extend(wide);
+    Ok(words)
+}
+
+/// Applies the packed transition format consumed by
+/// `ipu_stack_static_template_patch` to one record segment.
+pub(crate) fn apply_serialized_template_patch(record: &mut [u32], words: &[u32]) -> Result<usize> {
+    let &header = words.first().ok_or("static template patch is empty")?;
+    if header == 0 {
+        return Ok(1);
+    }
+    let first = usize::try_from(header & 0xffff)?;
+    let groups = usize::try_from(header >> 16)?;
+    if groups == 0 || first.checked_add(groups * 32).is_none() {
+        return Err("static template patch has an invalid span".into());
+    }
+    let changed_end = 1usize
+        .checked_add(groups)
+        .ok_or("static template patch mask size overflow")?;
+    let changed_masks = words
+        .get(1..changed_end)
+        .ok_or("static template patch truncates changed masks")?;
+    let changed = changed_masks
+        .iter()
+        .map(|mask| mask.count_ones() as usize)
+        .sum::<usize>();
+    let type_words = changed.div_ceil(32);
+    let type_end = changed_end
+        .checked_add(type_words)
+        .ok_or("static template patch type size overflow")?;
+    let types = words
+        .get(changed_end..type_end)
+        .ok_or("static template patch truncates type masks")?;
+    let narrow = types
+        .iter()
+        .map(|mask| mask.count_ones() as usize)
+        .sum::<usize>();
+    let narrow_words = narrow.div_ceil(2);
+    let narrow_end = type_end
+        .checked_add(narrow_words)
+        .ok_or("static template patch narrow size overflow")?;
+    let narrow_values = words
+        .get(type_end..narrow_end)
+        .ok_or("static template patch truncates narrow values")?;
+    let wide = changed - narrow;
+    let end = narrow_end
+        .checked_add(wide)
+        .ok_or("static template patch wide size overflow")?;
+    let wide_values = words
+        .get(narrow_end..end)
+        .ok_or("static template patch truncates wide values")?;
+
+    let mut changed_index = 0usize;
+    let mut narrow_index = 0usize;
+    let mut wide_index = 0usize;
+    for (group, &changed_mask) in changed_masks.iter().enumerate() {
+        for bit in 0..32 {
+            if changed_mask & (1 << bit) == 0 {
+                continue;
+            }
+            let slot = first + group * 32 + bit;
+            let value = record
+                .get_mut(slot)
+                .ok_or("static template patch writes beyond its record segment")?;
+            let is_narrow = types[changed_index / 32] & (1 << (changed_index % 32)) != 0;
+            if is_narrow {
+                let packed = narrow_values[narrow_index / 2];
+                let delta = if narrow_index % 2 == 0 {
+                    packed as u16
+                } else {
+                    (packed >> 16) as u16
+                } as i16;
+                *value = value.wrapping_add_signed(i32::from(delta));
+                narrow_index += 1;
+            } else {
+                *value = value.wrapping_add(wide_values[wide_index]);
+                wide_index += 1;
+            }
+            changed_index += 1;
+        }
+    }
+    debug_assert_eq!(changed_index, changed);
+    debug_assert_eq!(narrow_index, narrow);
+    debug_assert_eq!(wide_index, wide);
+    Ok(end)
+}
+
+pub(crate) fn validate_template_transitions(
+    template: &StaticTemplatePlan,
+    mut resolve: impl FnMut(&StaticTemplateRecordWord) -> Result<u32>,
+) -> Result<()> {
+    let Some(first) = template.records.first() else {
+        return Ok(());
+    };
+    let mut current = first.iter().map(&mut resolve).collect::<Result<Vec<_>>>()?;
+    let split = usize::from(template.record_split);
+    for instance in 1..template.records.len() {
+        for slots in template_patch_ranges(current.len(), split) {
+            let words = serialize_template_patch_range(
+                slots.clone(),
+                &template.patches[instance],
+                &mut resolve,
+            )?;
+            let consumed = apply_serialized_template_patch(&mut current[slots], &words)?;
+            if consumed != words.len() {
+                return Err(format!(
+                    "static template {} transition {instance} leaves {} trailing patch words",
+                    template.name,
+                    words.len() - consumed
+                )
+                .into());
+            }
+        }
+        let expected = template.records[instance]
+            .iter()
+            .map(&mut resolve)
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(slot) = current
+            .iter()
+            .zip(&expected)
+            .position(|(actual, expected)| actual != expected)
+        {
+            return Err(format!(
+                "static template {} transition {instance} reconstructs slot {slot} as 0x{:x}, expected 0x{:x}",
+                template.name, current[slot], expected[slot]
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> Vec<Range<usize>> {
     [0..split, split..record_words]
         .into_iter()
@@ -1798,6 +1980,50 @@ mod tests {
 
         assert_eq!(template_patch_group_span(64..256, &patch), Some(64..96));
         assert_eq!(template_patch_storage_words_range(64..256, &patch), 5);
+    }
+
+    #[test]
+    fn serialized_template_patches_reconstruct_random_records() {
+        let mut rng = fastrand::Rng::with_seed(0x7465_6d70_6c61_7465);
+        for _ in 0..500 {
+            let len = rng.usize(1..600);
+            let previous = (0..len).map(|_| rng.u32(..)).collect::<Vec<_>>();
+            let mut expected = previous.clone();
+            for value in &mut expected {
+                if rng.usize(..5) == 0 {
+                    *value = match rng.usize(..3) {
+                        0 => value.wrapping_add_signed(rng.i32(-32768..32768)),
+                        1 => value.wrapping_add(rng.u32(..)),
+                        _ => rng.u32(..),
+                    };
+                }
+            }
+            let previous_words = previous
+                .iter()
+                .copied()
+                .map(StaticTemplateRecordWord::Value)
+                .collect::<Vec<_>>();
+            let expected_words = expected
+                .iter()
+                .copied()
+                .map(StaticTemplateRecordWord::Value)
+                .collect::<Vec<_>>();
+            let patch = template_record_patch(&previous_words, &expected_words).unwrap();
+            let split = len.div_ceil(2);
+            let mut actual = previous;
+            for slots in template_patch_ranges(len, split) {
+                let words = serialize_template_patch_range(slots.clone(), &patch, |word| {
+                    let StaticTemplateRecordWord::Value(value) = word else {
+                        unreachable!()
+                    };
+                    Ok(*value)
+                })
+                .unwrap();
+                let consumed = apply_serialized_template_patch(&mut actual[slots], &words).unwrap();
+                assert_eq!(consumed, words.len());
+            }
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

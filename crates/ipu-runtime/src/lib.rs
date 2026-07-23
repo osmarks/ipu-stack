@@ -3110,6 +3110,11 @@ fn package_graph_impl_attempt(
         let memory_constraints = graph.schedule.resolve_memory_constraints(&programs)?;
         (programs, plans, memory_constraints)
     };
+    info!(
+        memory_classes = resolved_memory_constraints.classes.len(),
+        memory_separations = resolved_memory_constraints.separations.len(),
+        "resolved kernel memory constraints"
+    );
     if !profile_code.is_empty() && profile_code.len() != programs.len() {
         return Err("profile layout tile count differs from schedule".into());
     }
@@ -4706,6 +4711,18 @@ fn package_graph_impl_attempt(
         let mut template_segments = Vec::<(u32, Vec<u8>)>::new();
         let mut written_patch_addresses = HashSet::new();
         for template in &tile_exchange_plans[tile_index].templates {
+            let mut resolve_word =
+                |word: &static_codegen::StaticTemplateRecordWord| -> Result<u32> {
+                    match word {
+                        static_codegen::StaticTemplateRecordWord::Value(value) => Ok(*value),
+                        static_codegen::StaticTemplateRecordWord::Symbol(name) => {
+                            image.symbols.get(name).copied().ok_or_else(|| {
+                                format!("static template references missing {name}").into()
+                            })
+                        }
+                    }
+                };
+            static_codegen::validate_template_transitions(template, &mut resolve_word)?;
             let first_record = template.records.first().map(Vec::as_slice).unwrap_or(&[]);
             let split = usize::from(template.record_split);
             for (address, record) in [
@@ -4721,15 +4738,8 @@ fn package_graph_impl_attempt(
                 }
                 let words = record
                     .iter()
-                    .map(|word| match word {
-                        static_codegen::StaticTemplateRecordWord::Value(value) => Ok(*value),
-                        static_codegen::StaticTemplateRecordWord::Symbol(name) => image
-                            .symbols
-                            .get(name)
-                            .copied()
-                            .ok_or_else(|| format!("static template references missing {name}")),
-                    })
-                    .collect::<std::result::Result<Vec<_>, String>>()?;
+                    .map(&mut resolve_word)
+                    .collect::<Result<Vec<_>>>()?;
                 let bytes = words_to_bytes(&words);
                 if let Some((start, contents)) = template_segments.last_mut() {
                     if start.checked_add(u32::try_from(contents.len())?) == Some(address) {
@@ -4764,78 +4774,11 @@ fn package_graph_impl_attempt(
                         template_segments.push((address, 0u32.to_le_bytes().to_vec()));
                         continue;
                     }
-                    let mut words = Vec::new();
-                    let mut narrow_bits = Vec::new();
-                    let mut narrow = Vec::new();
-                    let mut wide = Vec::new();
-                    let span = static_codegen::template_patch_group_span(slots.clone(), patch)
-                        .ok_or("nonempty static template patch has no group span")?;
-                    let group_count = span.len().div_ceil(32);
-                    let segment_start = if slots.start < split { 0 } else { split };
-                    words.push(
-                        u32::try_from(slots.start - segment_start + span.start)?
-                            | (u32::try_from(group_count)? << 16),
-                    );
-                    for local_base in span.step_by(32) {
-                        let slot_base = slots.start + local_base;
-                        let slot_limit = (slot_base + 32).min(slots.end);
-                        let mut changed_mask = 0u32;
-                        for (slot, value) in patch.iter().filter(|(slot, _)| {
-                            (slot_base..slot_limit).contains(&usize::from(*slot))
-                        }) {
-                            let bit = 1 << (usize::from(*slot) - slot_base);
-                            changed_mask |= bit;
-                            match value {
-                                static_codegen::StaticTemplatePatchValue::Delta(delta) => {
-                                    narrow_bits.push(true);
-                                    narrow.push(*delta as u16);
-                                }
-                                static_codegen::StaticTemplatePatchValue::Delta32(delta) => {
-                                    narrow_bits.push(false);
-                                    wide.push(Ok(*delta));
-                                }
-                                static_codegen::StaticTemplatePatchValue::Difference {
-                                    previous,
-                                    next,
-                                } => {
-                                    narrow_bits.push(false);
-                                    let resolve =
-                                        |word: &static_codegen::StaticTemplateRecordWord| match word
-                                        {
-                                            static_codegen::StaticTemplateRecordWord::Value(
-                                                value,
-                                            ) => Ok(*value),
-                                            static_codegen::StaticTemplateRecordWord::Symbol(
-                                                name,
-                                            ) => {
-                                                image.symbols.get(name).copied().ok_or_else(|| {
-                                                    format!(
-                                                        "static template references missing {name}"
-                                                    )
-                                                })
-                                            }
-                                        };
-                                    wide.push(resolve(next).and_then(|next| {
-                                        resolve(previous)
-                                            .map(|previous| next.wrapping_sub(previous))
-                                    }));
-                                }
-                            }
-                        }
-                        words.push(changed_mask);
-                    }
-                    words.extend(narrow_bits.chunks(32).map(|bits| {
-                        bits.iter().enumerate().fold(0u32, |mask, (bit, narrow)| {
-                            mask | (u32::from(*narrow) << bit)
-                        })
-                    }));
-                    words.extend(narrow.chunks(2).map(|pair| {
-                        u32::from(pair[0]) | (u32::from(pair.get(1).copied().unwrap_or(0)) << 16)
-                    }));
-                    words.extend(
-                        wide.into_iter()
-                            .collect::<std::result::Result<Vec<_>, String>>()?,
-                    );
+                    let words = static_codegen::serialize_template_patch_range(
+                        slots.clone(),
+                        patch,
+                        &mut resolve_word,
+                    )?;
                     template_segments.push((address, words_to_bytes(&words)));
                 }
             }
@@ -5803,6 +5746,19 @@ fn bindings_size(bindings: &[Binding]) -> Result<u64> {
     })
 }
 
+fn diagnostic_tile_word(device: &Device, physical_tile: u16, address: u32) -> Result<u32> {
+    for context in 1..7 {
+        if device.tile_context_state(physical_tile, context).ok() == Some(0) {
+            return Ok(device.read_tile_word_from_inactive_context(
+                physical_tile,
+                context,
+                address,
+            )?);
+        }
+    }
+    Ok(device.read_tile_word(physical_tile, address)?)
+}
+
 fn host_source_summary(device: &Device, app: &Application) -> String {
     app.inputs
         .iter()
@@ -5811,19 +5767,7 @@ fn host_source_summary(device: &Device, app: &Application) -> String {
         .flat_map(|binding| {
             binding.slices.iter().map(|slice| {
                 let physical_tile = slice.tile as u16;
-                let value = device
-                    .tile_context_state(physical_tile, 0)
-                    .and_then(|state| {
-                        if state == 0 {
-                            device.read_tile_word_from_inactive_context(
-                                physical_tile,
-                                1,
-                                slice.tile_address,
-                            )
-                        } else {
-                            device.read_tile_word(physical_tile, slice.tile_address)
-                        }
-                    })
+                let value = diagnostic_tile_word(device, physical_tile, slice.tile_address)
                     .map(|word| format!("0x{word:08x}"))
                     .unwrap_or_else(|error| format!("error({error})"));
                 format!(
@@ -5902,15 +5846,7 @@ fn supervisor_state_summary(device: &Device, app: &Application) -> String {
         .map(|tile| {
             let physical_tile = tile.physical_tile as u16;
             let address = tile.diagnostic_address + 4;
-            let value = device
-                .tile_context_state(physical_tile, 0)
-                .and_then(|state| {
-                    if state == 0 {
-                        device.read_tile_word_from_inactive_context(physical_tile, 1, address)
-                    } else {
-                        device.read_tile_word(physical_tile, address)
-                    }
-                })
+            let value = diagnostic_tile_word(device, physical_tile, address)
                 .map(|value| format!("0x{value:x}"))
                 .unwrap_or_else(|error| format!("error({error})"));
             format!("{}:{value}", tile.physical_tile)
@@ -5937,32 +5873,72 @@ fn supervisor_state_summary(device: &Device, app: &Application) -> String {
                                 (Ok(status), Ok(pc)) => {
                                     let exception = ipu_driver::TileException::from_status(status);
                                     let registers = (context == 1
-                                        && exception
-                                            == ipu_driver::TileException::InvalidMemoryAddress)
+                                        && matches!(
+                                            exception,
+                                            ipu_driver::TileException::InvalidMemoryAddress
+                                                | ipu_driver::TileException::MemoryConflict
+                                        ))
+                                    .then(|| {
+                                        [0, 1, 2, 3, 9, 12]
+                                            .into_iter()
+                                            .map(|register| {
+                                                device
+                                                    .read_tile_m_register(
+                                                        tile.physical_tile as u16,
+                                                        context,
+                                                        register,
+                                                    )
+                                                    .map(|value| format!("m{register}=0x{value:x}"))
+                                                    .unwrap_or_else(|error| {
+                                                        format!("m{register}=error({error})")
+                                                    })
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    });
+                                    let frame = (context == 1
+                                        && exception == ipu_driver::TileException::MemoryConflict)
                                         .then(|| {
-                                            [0, 1, 2, 3, 9, 12]
-                                                .into_iter()
-                                                .map(|register| {
-                                                    device
-                                                        .read_tile_m_register(
-                                                            tile.physical_tile as u16,
-                                                            context,
-                                                            register,
-                                                        )
-                                                        .map(|value| {
-                                                            format!("m{register}=0x{value:x}")
-                                                        })
-                                                        .unwrap_or_else(|error| {
-                                                            format!("m{register}=error({error})")
-                                                        })
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join(",")
-                                        });
+                                            let vertex = device.read_tile_m_register(
+                                                tile.physical_tile as u16,
+                                                context,
+                                                12,
+                                            )?;
+                                            let words = [
+                                                ("output", 0),
+                                                ("input0", 4),
+                                                ("record0", 32),
+                                                ("record1", 36),
+                                                ("remaining", 64),
+                                                ("patches", 68),
+                                            ]
+                                            .into_iter()
+                                            .map(|(name, offset)| {
+                                                diagnostic_tile_word(
+                                                    device,
+                                                    tile.physical_tile as u16,
+                                                    vertex + offset,
+                                                )
+                                                .map(|value| format!("{name}=0x{value:x}"))
+                                            })
+                                            .collect::<Result<Vec<_>>>()?;
+                                            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
+                                                words.join(","),
+                                            )
+                                        })
+                                        .transpose();
                                     match registers {
-                                        Some(registers) => {
-                                            format!("c{context}:{exception}@0x{pc:x}[{registers}]")
-                                        }
+                                        Some(registers) => match frame {
+                                            Ok(Some(frame)) => format!(
+                                                "c{context}:{exception}@0x{pc:x}[{registers};{frame}]"
+                                            ),
+                                            Ok(None) => format!(
+                                                "c{context}:{exception}@0x{pc:x}[{registers}]"
+                                            ),
+                                            Err(error) => format!(
+                                                "c{context}:{exception}@0x{pc:x}[{registers};frame=error({error})]"
+                                            ),
+                                        },
                                         None => format!("c{context}:{exception}@0x{pc:x}"),
                                     }
                                 }
