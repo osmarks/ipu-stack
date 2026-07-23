@@ -19,7 +19,7 @@ use ipu_compiler::{
     choose_gemm_row_block_for_shape, choose_gemm_row_block_for_shape_max_rows,
     choose_row_shard_rows_for_copies_in_arenas, end_tensor_lifetimes,
     gemm_row_block_candidates_for, gemm_row_block_cost, make_tensors_resident,
-    make_tensors_resident_since, set_f8_weight_block_scales_in_phases,
+    make_tensors_resident_since, retain_tensor_lifetimes, set_f8_weight_block_scales_in_phases,
     set_native_f8_weight_block_scales_in_phases,
 };
 use ipu_models::SiglipWeights;
@@ -136,6 +136,17 @@ pub fn materialize_deferred_residual_add(
     mut deferred: DeferredResidualAdd,
 ) -> Result<()> {
     let phase = schedule.phases.len();
+    let live_until = phase + deferred.phases.len();
+    let sources = deferred
+        .sources
+        .iter()
+        .flat_map(|&(left, right)| [left, right])
+        .collect::<HashSet<_>>();
+    for allocation in schedule.allocations.iter_mut() {
+        if sources.contains(&allocation.tensor) && allocation.live_until != usize::MAX {
+            allocation.live_until = allocation.live_until.max(live_until);
+        }
+    }
     let Phase::Compute { op, .. } = &mut deferred.phases[1] else {
         return Err("deferred residual tail has no compute phase".into());
     };
@@ -216,6 +227,14 @@ pub struct SiglipProfileStage {
 pub struct SiglipMapHead {
     pub output: Vec<RowShardPlacement>,
     pub attention: FlashAttentionPlan,
+    pub diagnostics: Option<SiglipMapDiagnostics>,
+}
+
+pub struct SiglipMapDiagnostics {
+    pub attention_hidden: Vec<RowShardPlacement>,
+    pub attention_residual: Vec<RowShardPlacement>,
+    pub norm: Vec<RowShardPlacement>,
+    pub mlp_gelu: Vec<BlockPlacement>,
 }
 
 fn log_attention_blocking(stage: &str, attention: &FlashAttentionPlan) {
@@ -442,6 +461,11 @@ pub struct SiglipEncoderPrecision {
 pub struct SiglipEncoderTuning {
     /// Zero uses automatic or persistent row blocking according to the mode below.
     pub gemm_row_block_rows: u16,
+    /// Per-projection row-block overrides; zero inherits `gemm_row_block_rows`.
+    pub qkv_row_block_rows: u16,
+    pub attention_output_row_block_rows: u16,
+    pub mlp_up_row_block_rows: u16,
+    pub mlp_down_row_block_rows: u16,
     /// Choose row blocking independently for GEMMs whose inputs can be reblocked.
     pub automatic_gemm_row_blocks: bool,
     /// Zero uses 64-column K blocks for GEMMs with row-sharded inputs.
@@ -461,6 +485,21 @@ pub struct SiglipEncoderTuning {
     pub attention_query_block_rows: u16,
     /// Zero asks the attention planner to choose the K/V block size.
     pub attention_key_block_rows: u16,
+}
+
+fn fixed_input_gemm_row_block(
+    requested_rows: u16,
+    automatic_row_blocks: bool,
+    input_row_block_rows: u16,
+    data_type: GemmDataType,
+) -> Option<u16> {
+    if requested_rows != 0 {
+        Some(requested_rows)
+    } else if matches!(data_type, GemmDataType::F8F143 { .. }) || !automatic_row_blocks {
+        Some(input_row_block_rows)
+    } else {
+        None
+    }
 }
 
 fn choose_gemm_output_block_columns(
@@ -871,6 +910,7 @@ pub fn append_siglip_map_head_with_memory_policy(
         data_base,
         data_limit,
         memory,
+        false,
         host,
     )
 }
@@ -887,6 +927,7 @@ pub fn append_siglip_map_head_batched_with_memory_policy(
     data_base: u32,
     data_limit: u32,
     memory: &MemoryPolicy,
+    retain_diagnostics: bool,
     host: &mut HostTensorSet,
 ) -> Result<SiglipMapHead> {
     const PROBE_ROWS: u16 = 12;
@@ -990,7 +1031,9 @@ pub fn append_siglip_map_head_batched_with_memory_policy(
         },
     )?;
     end_tensor_lifetimes(schedule, key_value.iter().map(|block| block.tensor))?;
-    end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
+    if !retain_diagnostics {
+        end_tensor_lifetimes(schedule, input.iter().map(|shard| shard.tensor))?;
+    }
 
     let attention_phase_start = schedule.phases.len();
     let attention = append_flash_attention_from_a16_qkv_in_arenas(
@@ -1022,6 +1065,29 @@ pub fn append_siglip_map_head_batched_with_memory_policy(
             .chain(&value)
             .map(|shard| shard.tensor),
     )?;
+    if retain_diagnostics {
+        retain_tensor_lifetimes(
+            schedule,
+            attention
+                .tasks
+                .iter()
+                .flat_map(|task| {
+                    [
+                        task.query,
+                        task.accumulator,
+                        task.scores,
+                        task.weights,
+                        task.output,
+                    ]
+                })
+                .chain(
+                    attention
+                        .key_values
+                        .iter()
+                        .flat_map(|block| [block.key_tensor, block.value_tensor]),
+                ),
+        )?;
+    }
     let attention_shards = append_flash_attention_to_a16_row_shards_in_arenas(
         schedule,
         &attention,
@@ -1046,7 +1112,9 @@ pub fn append_siglip_map_head_batched_with_memory_policy(
         memory,
         host,
     )?;
-    end_tensor_lifetimes(schedule, attention_shards.iter().map(|shard| shard.tensor))?;
+    if !retain_diagnostics {
+        end_tensor_lifetimes(schedule, attention_shards.iter().map(|shard| shard.tensor))?;
+    }
     let residual = append_c16_to_a16_row_shards(
         schedule,
         &projected,
@@ -1098,7 +1166,9 @@ pub fn append_siglip_map_head_batched_with_memory_policy(
         memory,
         host,
     )?;
-    end_tensor_lifetimes(schedule, norm.output.iter().map(|shard| shard.tensor))?;
+    if !retain_diagnostics {
+        end_tensor_lifetimes(schedule, norm.output.iter().map(|shard| shard.tensor))?;
+    }
     let gelu = append_c16_to_a16_blocks_gelu_f16_in_arenas(schedule, &up, &memory.transient)?;
     end_tensor_lifetimes(schedule, up.iter().map(|block| block.tensor))?;
     let down = append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
@@ -1136,7 +1206,9 @@ pub fn append_siglip_map_head_batched_with_memory_policy(
         }),
     )?;
     make_tensors_resident(schedule, down.right.iter().map(|block| block.tensor))?;
-    end_tensor_lifetimes(schedule, gelu.iter().map(|block| block.tensor))?;
+    if !retain_diagnostics {
+        end_tensor_lifetimes(schedule, gelu.iter().map(|block| block.tensor))?;
+    }
     let down_bias = append_bias_f16_c16_in_arenas(schedule, &down.output, &memory.resident)?;
     let bias = model.tensor_f32("vision_model.head.mlp.fc2.bias")?;
     host.push(
@@ -1164,8 +1236,20 @@ pub fn append_siglip_map_head_batched_with_memory_policy(
     )?;
     end_tensor_lifetimes(schedule, down.output.iter().map(|block| block.tensor))?;
     let output = append_add_f16_row_shards_in_place(schedule, &output, &residual)?;
-    end_tensor_lifetimes(schedule, residual.iter().map(|shard| shard.tensor))?;
-    Ok(SiglipMapHead { output, attention })
+    if !retain_diagnostics {
+        end_tensor_lifetimes(schedule, residual.iter().map(|shard| shard.tensor))?;
+    }
+    let diagnostics = retain_diagnostics.then(|| SiglipMapDiagnostics {
+        attention_hidden: attention_shards,
+        attention_residual: residual,
+        norm: norm.output,
+        mlp_gelu: gelu,
+    });
+    Ok(SiglipMapHead {
+        output,
+        attention,
+        diagnostics,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1268,10 +1352,12 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     if batch_size == 0 || u32::from(rows) != u32::from(batch_size) * u32::from(sequence_length) {
         return Err("SigLIP encoder rows must equal batch size times sequence length".into());
     }
-    let tuned_gemm_rows = if tuning.gemm_row_block_rows == 0 {
-        row_block_dimension
-    } else {
-        tuning.gemm_row_block_rows
+    let projection_rows = |requested: u16| {
+        if requested == 0 {
+            tuning.gemm_row_block_rows
+        } else {
+            requested
+        }
     };
     let tuned_gemm_inner = if tuning.row_gemm_inner_block_columns == 0 {
         64
@@ -1333,6 +1419,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
             .iter()
             .flat_map(|weights| weights.iter().copied()),
     );
+    let qkv_requested_rows = projection_rows(tuning.qkv_row_block_rows);
     let qkv_maximum_materialized_rows = if matches!(qkv_data_type, GemmDataType::F8F143 { .. }) {
         None
     } else {
@@ -1347,9 +1434,14 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
                 .ok_or("preferred transient arena cannot hold one QKV row")?,
         )
     };
-    let mut qkv_row_block_dimension = if matches!(qkv_data_type, GemmDataType::F8F143 { .. }) {
-        row_block_dimension
-    } else if tuning.automatic_gemm_row_blocks && tuning.gemm_row_block_rows == 0 {
+    let mut qkv_row_block_dimension = if let Some(rows) = fixed_input_gemm_row_block(
+        qkv_requested_rows,
+        tuning.automatic_gemm_row_blocks,
+        row_block_dimension,
+        qkv_data_type,
+    ) {
+        rows
+    } else {
         choose_gemm_row_block_for_shape_max_rows(
             rows,
             columns,
@@ -1361,8 +1453,6 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
             qkv_maximum_materialized_rows.unwrap(),
         )
         .ok_or("QKV GEMM has no row blocking whose output fits the preferred transient arena")?
-    } else {
-        tuned_gemm_rows
     };
     let qkv_phase_start = schedule.phases.len();
     let qkv_output_block_columns = choose_gemm_output_block_columns(
@@ -1375,7 +1465,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         projection_output(tuning.qkv_output_block_columns),
     )?;
     if tuning.automatic_gemm_row_blocks
-        && tuning.gemm_row_block_rows == 0
+        && qkv_requested_rows == 0
         && !matches!(qkv_data_type, GemmDataType::F8F143 { .. })
     {
         qkv_row_block_dimension = choose_gemm_row_block_for_shape_max_rows(
@@ -1469,7 +1559,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         qkv_bias_allocation_start,
         qkv_bias.iter().map(|block| block.tensor),
     )?;
-    let preferred_qkv_rows = if tuning.automatic_gemm_row_blocks {
+    let preferred_qkv_rows = if tuning.automatic_gemm_row_blocks && qkv_requested_rows == 0 {
         qkv_row_block_dimension
     } else {
         row_block_dimension
@@ -1557,12 +1647,15 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let output_data_type = precision
         .attention_output
         .gemm_data_type(output_weight.iter().copied());
+    let attention_output_requested_rows = projection_rows(tuning.attention_output_row_block_rows);
     let attention_output_inner = projection_inner(tuning.attention_output_inner_block_columns);
-    let output_row_block_dimension = if matches!(output_data_type, GemmDataType::F8F143 { .. }) {
-        row_block_dimension
-    } else {
-        tuned_gemm_rows
-    };
+    let output_row_block_dimension = fixed_input_gemm_row_block(
+        attention_output_requested_rows,
+        tuning.automatic_gemm_row_blocks,
+        row_block_dimension,
+        output_data_type,
+    )
+    .unwrap_or(row_block_dimension);
     let output_projection_phase_start = schedule.phases.len();
     let output_projection_block_columns = choose_gemm_output_block_columns(
         rows,
@@ -1729,11 +1822,17 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let mlp_down_data_type = precision
         .mlp_down
         .gemm_data_type(mlp_down_weight.iter().copied());
+    let mlp_up_requested_rows = projection_rows(tuning.mlp_up_row_block_rows);
+    let mlp_down_requested_rows = projection_rows(tuning.mlp_down_row_block_rows);
     let mlp_up_inner = projection_inner(tuning.mlp_up_inner_block_columns);
-    let mut mlp_up_row_block_dimension = if matches!(mlp_up_data_type, GemmDataType::F8F143 { .. })
-    {
-        row_block_dimension
-    } else if tuning.automatic_gemm_row_blocks && tuning.gemm_row_block_rows == 0 {
+    let mut mlp_up_row_block_dimension = if let Some(rows) = fixed_input_gemm_row_block(
+        mlp_up_requested_rows,
+        tuning.automatic_gemm_row_blocks,
+        row_block_dimension,
+        mlp_up_data_type,
+    ) {
+        rows
+    } else {
         choose_gemm_row_block_for(
             rows,
             mlp_up_inner,
@@ -1743,8 +1842,6 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
             mlp_up_data_type,
         )
         .ok_or("MLP-up GEMM shape has no feasible row blocking")?
-    } else {
-        tuned_gemm_rows
     };
     let mlp_up_phase_start = schedule.phases.len();
     let mlp_up_output_block_columns = choose_gemm_output_block_columns(
@@ -1758,7 +1855,8 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     )?;
     let mut planned_mlp_down_row_block_dimension = None;
     if tuning.automatic_gemm_row_blocks
-        && tuning.gemm_row_block_rows == 0
+        && mlp_up_requested_rows == 0
+        && mlp_down_requested_rows == 0
         && !matches!(mlp_up_data_type, GemmDataType::F8F143 { .. })
     {
         let independent_up = choose_gemm_row_block_for_shape(
@@ -1900,7 +1998,9 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     }
     let mlp_down_row_block_dimension = if let Some(planned) = planned_mlp_down_row_block_dimension {
         planned
-    } else if tuning.automatic_gemm_row_blocks && tuning.gemm_row_block_rows == 0 {
+    } else if mlp_down_requested_rows != 0 {
+        mlp_down_requested_rows
+    } else if tuning.automatic_gemm_row_blocks {
         choose_gemm_row_block_for_shape(
             rows,
             intermediate_columns,
@@ -1912,7 +2012,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         )
         .ok_or("MLP-down GEMM shape has no feasible row blocking")?
     } else {
-        tuned_gemm_rows
+        row_block_dimension
     };
     info!(
         operation = "mlp_down",
@@ -2413,6 +2513,46 @@ mod tests {
     }
 
     #[test]
+    fn explicit_row_blocking_overrides_input_layout_for_every_precision() {
+        assert_eq!(
+            fixed_input_gemm_row_block(54, true, 18, GemmDataType::F16),
+            Some(54)
+        );
+        assert_eq!(
+            fixed_input_gemm_row_block(
+                54,
+                true,
+                18,
+                GemmDataType::F8F143 {
+                    input_scale: -3,
+                    weight_scale: 2,
+                },
+            ),
+            Some(54)
+        );
+    }
+
+    #[test]
+    fn native_fp8_defaults_to_input_layout_until_independent_blocking_is_requested() {
+        assert_eq!(
+            fixed_input_gemm_row_block(
+                0,
+                true,
+                18,
+                GemmDataType::F8F143 {
+                    input_scale: 0,
+                    weight_scale: 0,
+                },
+            ),
+            Some(18)
+        );
+        assert_eq!(
+            fixed_input_gemm_row_block(0, true, 18, GemmDataType::F16),
+            None
+        );
+    }
+
+    #[test]
     fn native_fp8_scales_are_instance_data_not_execution_shape() {
         let precision = |scale| SiglipEncoderPrecision {
             qkv: SiglipLinearPrecision::F143Native {
@@ -2499,5 +2639,55 @@ mod tests {
             "add_layer_norm_affine_f16"
         );
         assert_eq!(commands[0].inputs, [TensorId(1), TensorId(2), TensorId(3)]);
+    }
+
+    #[test]
+    fn deferred_residual_materialization_extends_finite_source_lifetimes() {
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: vec![
+                Phase::Exchange {
+                    transfers: Vec::new(),
+                },
+                Phase::Compute {
+                    op: OpId(1),
+                    commands: vec![command("add_f16", 1, &[1, 2]).into()],
+                },
+            ],
+            allocations: (1..=2)
+                .map(|tensor| Allocation {
+                    tensor: TensorId(tensor),
+                    tile: 0,
+                    address: 0x60000 + tensor as u32 * 0x100,
+                    size: 32,
+                    live_from: 0,
+                    live_until: 2,
+                    kind: AllocationKind::Home,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            tile_count: 1,
+            peak_sram: BTreeMap::new(),
+        };
+        let deferred = defer_terminal_residual_add(&mut schedule).unwrap().unwrap();
+        schedule.phases.extend([
+            Phase::Exchange {
+                transfers: Vec::new(),
+            },
+            Phase::Compute {
+                op: OpId(1),
+                commands: Vec::new(),
+            },
+        ]);
+
+        materialize_deferred_residual_add(&mut schedule, deferred).unwrap();
+
+        assert_eq!(schedule.phases.len(), 4);
+        assert!(
+            schedule
+                .allocations
+                .iter()
+                .all(|allocation| allocation.live_until == 4)
+        );
     }
 }

@@ -38,7 +38,7 @@ pub use rowwise::{
     append_c16_to_a16_blocks_gelu_f16_in_arenas, append_c16_to_a16_row_shards,
     append_c16_to_a16_row_shards_gelu_f16, append_c16_to_a16_row_shards_reblocked_in_arenas,
     choose_row_shard_rows_for_copies_in_arenas, end_tensor_lifetimes, make_tensors_resident,
-    make_tensors_resident_since, plan_affine_layer_norm_f16,
+    make_tensors_resident_since, plan_affine_layer_norm_f16, retain_tensor_lifetimes,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

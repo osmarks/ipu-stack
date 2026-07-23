@@ -26,6 +26,14 @@ struct Arguments {
     command: Command,
 }
 
+#[derive(Clone, Debug)]
+struct MemoryRead {
+    physical_tile: u16,
+    address: u32,
+    words: u32,
+    output: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ProfileGroupArgument {
     Kind,
@@ -100,8 +108,10 @@ enum Command {
         bindings: bool,
         #[arg(long)]
         tile: Option<u32>,
-        #[arg(long, requires = "tile")]
+        #[arg(long, requires = "tile", value_parser = parse_u32)]
         address: Option<u32>,
+        #[arg(long, requires = "address", default_value_t = 16)]
+        words: usize,
     },
     ProfileInspect {
         profile: PathBuf,
@@ -240,6 +250,9 @@ enum Command {
         input: Vec<(String, PathBuf)>,
         #[arg(long, value_parser = parse_named_path)]
         output: Vec<(String, PathBuf)>,
+        /// Read quiescent tile SRAM after the generated graph completes.
+        #[arg(long, value_parser = parse_memory_read)]
+        read_memory: Vec<MemoryRead>,
         #[arg(required = true)]
         calls: Vec<String>,
     },
@@ -400,6 +413,7 @@ fn main() -> Result<()> {
             bindings,
             tile,
             address,
+            words,
         } => {
             let app = Application::read(fs::File::open(&package)?)?;
             let stored: usize = app.blobs.iter().map(|blob| blob.bytes.len()).sum();
@@ -486,7 +500,7 @@ fn main() -> Result<()> {
                         segment.blob_offset + u64::from(address - segment.address),
                     )?;
                     let bytes = &app.blobs[segment.blob].bytes;
-                    for (index, word) in bytes[offset..].chunks_exact(4).take(16).enumerate() {
+                    for (index, word) in bytes[offset..].chunks_exact(4).take(words).enumerate() {
                         println!(
                             "word address={:#x} value={:#010x}",
                             address + u32::try_from(index * 4)?,
@@ -1080,6 +1094,7 @@ fn main() -> Result<()> {
             device,
             input,
             output,
+            read_memory,
             calls,
         } => {
             let app = Application::read(fs::File::open(package)?)?;
@@ -1101,14 +1116,26 @@ fn main() -> Result<()> {
                     .map(fs::read)
                     .transpose()?
                     .unwrap_or_default();
-                let result = ipu_runtime::run_host_with_options(
-                    &app,
-                    &bootloader,
-                    &configuration,
-                    &device,
-                    &bytes,
-                    ipu_runtime::HostRunOptions::default(),
-                )
+                let result = if read_memory.is_empty() {
+                    ipu_runtime::run_host_with_options(
+                        &app,
+                        &bootloader,
+                        &configuration,
+                        &device,
+                        &bytes,
+                        ipu_runtime::HostRunOptions::default(),
+                    )
+                } else {
+                    ipu_runtime::run_host_with_inspector(
+                        &app,
+                        &bootloader,
+                        &configuration,
+                        &device,
+                        &bytes,
+                        ipu_runtime::HostRunOptions::default(),
+                        |device, _| Ok(write_memory_reads(device, &read_memory)?),
+                    )
+                }
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                 if let Some(path) = output.get(call) {
                     fs::write(path, &result)?;
@@ -1148,6 +1175,7 @@ fn main() -> Result<()> {
                         );
                     }
                 }
+                write_memory_reads(&device, &read_memory)?;
             }
             println!("hostCalls={} directHostRun=PASS", app.entry_points.len());
         }
@@ -1392,6 +1420,53 @@ fn parse_named_path(value: &str) -> Result<(String, PathBuf), String> {
         return Err("expected non-empty NAME=PATH".into());
     }
     Ok((name.into(), path.into()))
+}
+
+fn parse_memory_read(value: &str) -> Result<MemoryRead, String> {
+    let Some((range, output)) = value.split_once('=') else {
+        return Err("expected PHYSICAL_TILE:ADDRESS:WORDS=PATH".into());
+    };
+    let mut fields = range.split(':');
+    let physical_tile = fields
+        .next()
+        .ok_or("missing physical tile")?
+        .parse::<u16>()
+        .map_err(|error| error.to_string())?;
+    let address = parse_u32(fields.next().ok_or("missing tile address")?)?;
+    let words = parse_u32(fields.next().ok_or("missing word count")?)?;
+    if fields.next().is_some() || words == 0 || output.is_empty() {
+        return Err("expected PHYSICAL_TILE:ADDRESS:WORDS=PATH".into());
+    }
+    Ok(MemoryRead {
+        physical_tile,
+        address,
+        words,
+        output: output.into(),
+    })
+}
+
+fn write_memory_reads(device: &Device, reads: &[MemoryRead]) -> Result<()> {
+    for read in reads {
+        let words = device.read_tile_words_from_inactive_context(
+            read.physical_tile,
+            1,
+            read.address,
+            read.words,
+        )?;
+        let bytes = words
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        fs::write(&read.output, bytes)?;
+        info!(
+            physical_tile = read.physical_tile,
+            address = format_args!("0x{:x}", read.address),
+            words = read.words,
+            output = %read.output.display(),
+            "read quiescent tile memory"
+        );
+    }
+    Ok(())
 }
 
 fn parse_metadata_filter(value: &str) -> Result<MetadataFilter, String> {

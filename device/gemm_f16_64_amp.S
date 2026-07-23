@@ -15,6 +15,9 @@
 #ifndef GEMM_RIGHT_BYTE_OFFSET
 #define GEMM_RIGHT_BYTE_OFFSET 0
 #endif
+#ifndef GEMM_STOCHASTIC_ROUNDING
+#define GEMM_STOCHASTIC_ROUNDING 1
+#endif
 #ifdef GEMM_NATIVE_FP8
 #define GEMM_AMP f8v8hihov4amp
 #define GEMM_TAMP_P0 TAMP_F8V8_E4_P0
@@ -192,9 +195,11 @@
 	st32 $m8, $m11, $m15, 7
 	get $m8, $FP_ICTL
 	st32 $m8, $m11, $m15, 6
+#if GEMM_STOCHASTIC_ROUNDING
 	setzi $m0, ENABLE_STOCHASTIC_ROUNDING
 	or $m8, $m8, $m0
 	put $FP_ICTL, $m8
+#endif
 	setzi $m0, GEMM_INPUT_FORMAT
 	put CSR_S_FP_INFMT__INDEX, $m0
 #ifdef GEMM_NATIVE_FP8

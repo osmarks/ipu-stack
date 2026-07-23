@@ -94,7 +94,7 @@ fn main() {
 
 fn run_template_patch(objects: &[Vec<u8>], bootloader: &[u8], configuration: &[u8], device: &str) {
     const TILE: u16 = 17;
-    const CALLS: usize = 24;
+    const CALLS: usize = 130;
     const INSTANCES: usize = 27;
     let topology = ipu_exchange::Topology::c600();
     let mut rng = fastrand::Rng::with_seed(0x7465_6d70_6c61_7465);
@@ -103,65 +103,93 @@ fn run_template_patch(objects: &[Vec<u8>], bootloader: &[u8], configuration: &[u
     let mut initial_buffers = Vec::new();
     let mut outputs = Vec::new();
     let mut expected = Vec::new();
+    let idle_tensor_base = INSTANCES * CALLS * 3;
+    for tile in 0..TILE_COUNT {
+        if tile != TILE {
+            allocations.push(home(
+                TensorId(idle_tensor_base + usize::from(tile)),
+                tile,
+                0xd0000,
+                4,
+            ));
+        }
+    }
     for instance in 0..INSTANCES {
-        let mut commands = Vec::with_capacity(usize::from(TILE_COUNT) * CALLS);
+        let mut commands = Vec::with_capacity(CALLS + usize::from(TILE_COUNT) - 1);
+        for call in 0..CALLS {
+            let call_offset = u32::try_from(call).unwrap() * 0x30;
+            let base = if call.is_multiple_of(2) {
+                0x60000 + u32::try_from(instance).unwrap() * 0x2000 + call_offset
+            } else {
+                let slot = (instance * 11) % INSTANCES;
+                0xa0000 + u32::try_from(slot).unwrap() * 0x2000 + call_offset
+            };
+            let tensor = (instance * CALLS + call) * 3;
+            let output = TensorId(tensor);
+            let left = TensorId(tensor + 1);
+            let right = TensorId(tensor + 2);
+            allocations.extend([
+                home(output, TILE, base, 4),
+                home(left, TILE, base + 0x10, 4),
+                home(right, TILE, base + 0x20, 4),
+            ]);
+            let left_value = rng.u32(..);
+            let right_value = rng.u32(..);
+            expected.push(left_value.wrapping_add(right_value));
+            initial_buffers.extend([
+                InitialBuffer {
+                    tile: TILE,
+                    address: base + 0x10,
+                    words: vec![left_value],
+                },
+                InitialBuffer {
+                    tile: TILE,
+                    address: base + 0x20,
+                    words: vec![right_value],
+                },
+            ]);
+            outputs.push(RegionSlice {
+                tile: u32::from(topology.physical(TILE).unwrap()),
+                tile_address: base,
+                file_offset: u64::try_from(expected.len() * 4 - 4).unwrap(),
+                size: 4,
+            });
+            commands.push(Arc::new(KernelCommand {
+                tile: TILE,
+                output,
+                inputs: vec![left, right],
+                arguments: Vec::new(),
+                specialization: Arc::new(SpecializationKey {
+                    operation: "add_u32".into(),
+                    shape: vec![1],
+                    worker_count: 1,
+                    role: "template-patch-e2e".into(),
+                    alignment: 4,
+                    abi: ipu_compiler::KernelAbi::Generic,
+                }),
+                metadata: BTreeMap::new(),
+            }));
+        }
         for tile in 0..TILE_COUNT {
-            for call in 0..CALLS {
-                let call_offset = u32::try_from(call).unwrap() * 0x40;
-                let base = if call.is_multiple_of(2) {
-                    0x60000 + u32::try_from(instance).unwrap() * 0x800 + call_offset
-                } else {
-                    let slot = (instance * 11) % INSTANCES;
-                    0x90000 + u32::try_from(slot).unwrap() * 0x1800 + call_offset
-                };
-                let tensor = (instance * CALLS + call) * 3;
-                let output = TensorId(tensor);
-                let left = TensorId(tensor + 1);
-                let right = TensorId(tensor + 2);
-                allocations.extend([
-                    home(output, tile, base, 4),
-                    home(left, tile, base + 0x10, 4),
-                    home(right, tile, base + 0x20, 4),
-                ]);
-                if tile == TILE {
-                    let left_value = rng.u32(..);
-                    let right_value = rng.u32(..);
-                    expected.push(left_value.wrapping_add(right_value));
-                    initial_buffers.extend([
-                        InitialBuffer {
-                            tile,
-                            address: base + 0x10,
-                            words: vec![left_value],
-                        },
-                        InitialBuffer {
-                            tile,
-                            address: base + 0x20,
-                            words: vec![right_value],
-                        },
-                    ]);
-                    outputs.push(RegionSlice {
-                        tile: u32::from(topology.physical(TILE).unwrap()),
-                        tile_address: base,
-                        file_offset: u64::try_from(expected.len() * 4 - 4).unwrap(),
-                        size: 4,
-                    });
-                }
-                commands.push(Arc::new(KernelCommand {
-                    tile,
-                    output,
-                    inputs: vec![left, right],
-                    arguments: Vec::new(),
-                    specialization: Arc::new(SpecializationKey {
-                        operation: "add_u32".into(),
-                        shape: vec![1],
-                        worker_count: 1,
-                        role: "template-patch-e2e".into(),
-                        alignment: 4,
-                        abi: ipu_compiler::KernelAbi::Generic,
-                    }),
-                    metadata: BTreeMap::new(),
-                }));
+            if tile == TILE {
+                continue;
             }
+            let tensor = TensorId(idle_tensor_base + usize::from(tile));
+            commands.push(Arc::new(KernelCommand {
+                tile,
+                output: tensor,
+                inputs: vec![tensor, tensor],
+                arguments: Vec::new(),
+                specialization: Arc::new(SpecializationKey {
+                    operation: "add_u32".into(),
+                    shape: vec![1],
+                    worker_count: 1,
+                    role: "template-patch-idle".into(),
+                    alignment: 4,
+                    abi: ipu_compiler::KernelAbi::Generic,
+                }),
+                metadata: BTreeMap::new(),
+            }));
         }
         phases.push(Phase::Compute {
             op: OpId(instance),

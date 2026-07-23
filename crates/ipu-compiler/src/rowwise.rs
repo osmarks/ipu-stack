@@ -169,6 +169,26 @@ pub fn end_tensor_lifetimes(
     Ok(())
 }
 
+pub fn retain_tensor_lifetimes(
+    schedule: &mut Schedule,
+    tensors: impl IntoIterator<Item = TensorId>,
+) -> Result<(), CompileError> {
+    let tensors = tensors.into_iter().collect::<HashSet<_>>();
+    let indices = schedule.allocations.indices_for_tensors(&tensors);
+    let found = indices
+        .iter()
+        .map(|&index| schedule.allocations[index].tensor)
+        .collect::<HashSet<_>>();
+    if let Some(tensor) = tensors.difference(&found).next() {
+        return Err(CompileError::Graph(format!(
+            "cannot retain unknown tensor {}",
+            tensor.0
+        )));
+    }
+    schedule.allocations.set_live_until(&indices, usize::MAX);
+    Ok(())
+}
+
 pub fn make_tensors_resident(
     schedule: &mut Schedule,
     tensors: impl IntoIterator<Item = TensorId>,

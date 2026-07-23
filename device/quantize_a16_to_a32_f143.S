@@ -1,5 +1,9 @@
 #include "arch/gc_tile_defines.h"
 
+#ifndef QUANTIZE_STOCHASTIC_ROUNDING
+#define QUANTIZE_STOCHASTIC_ROUNDING 1
+#endif
+
 	.text
 	.allow_optimizations
 
@@ -20,9 +24,11 @@ ipu_stack_quantize_a16_to_a32_f143:
 	st32 $m7, $m11, $m15, 5
 	get $m8, $FP_ICTL
 	st32 $m8, $m11, $m15, 6
+#if QUANTIZE_STOCHASTIC_ROUNDING
 	setzi $m0, ENABLE_STOCHASTIC_ROUNDING
 	or $m8, $m8, $m0
 	put $FP_ICTL, $m8
+#endif
 	setzi $m0, __runCodelet_QuantizeA16ToA32F143
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
@@ -47,9 +53,11 @@ ipu_stack_quantize_reblock_a16_to_a32_f143:
 	st32 $m7, $m11, $m15, 5
 	get $m8, $FP_ICTL
 	st32 $m8, $m11, $m15, 6
+#if QUANTIZE_STOCHASTIC_ROUNDING
 	setzi $m0, ENABLE_STOCHASTIC_ROUNDING
 	or $m8, $m8, $m0
 	put $FP_ICTL, $m8
+#endif
 	setzi $m0, __runCodelet_QuantizeReblockA16ToA32F143
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET

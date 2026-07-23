@@ -11,12 +11,10 @@ normalize(const InputVector &input, const RightVector &right,
           OutputVector &output, unsigned rows, unsigned columns,
           unsigned epsilonQ30, unsigned worker) {
     for (unsigned row = worker; row < rows; row += 6) {
-      float sum = 0.0f;
-      float squareSum = 0.0f;
+      float4 sums = {0.0f, 0.0f, 0.0f, 0.0f};
+      float4 squareSums = {0.0f, 0.0f, 0.0f, 0.0f};
       for (unsigned panel = 0; panel < columns / 16; ++panel) {
         const unsigned base = panel * rows * 16 + row * 16;
-        half4 panelSum = {0.0, 0.0, 0.0, 0.0};
-        half4 panelSquareSum = {0.0, 0.0, 0.0, 0.0};
         for (unsigned column = 0; column < 16; column += 4) {
           half4 packed =
               *reinterpret_cast<const half4 *>(&input[base + column]);
@@ -25,17 +23,14 @@ normalize(const InputVector &input, const RightVector &right,
                 *reinterpret_cast<const half4 *>(&right[base + column]);
             *reinterpret_cast<half4 *>(&residual[base + column]) = packed;
           }
-          panelSum += packed;
-          panelSquareSum += packed * packed;
+          const float4 values = __builtin_convertvector(packed, float4);
+          sums += values;
+          squareSums += values * values;
         }
-        const float4 panelSumF32 = __builtin_convertvector(panelSum, float4);
-        const float4 panelSquareSumF32 =
-            __builtin_convertvector(panelSquareSum, float4);
-        sum += panelSumF32[0] + panelSumF32[1] + panelSumF32[2] +
-               panelSumF32[3];
-        squareSum += panelSquareSumF32[0] + panelSquareSumF32[1] +
-                     panelSquareSumF32[2] + panelSquareSumF32[3];
       }
+      const float sum = sums[0] + sums[1] + sums[2] + sums[3];
+      const float squareSum =
+          squareSums[0] + squareSums[1] + squareSums[2] + squareSums[3];
       const float reciprocalColumns = 1.0f / static_cast<float>(columns);
       const float mean = sum * reciprocalColumns;
       const float secondMoment = squareSum * reciprocalColumns;

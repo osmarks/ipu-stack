@@ -34,8 +34,8 @@ pub const SECONDARY_LOADER_MIN_PAYLOAD_SIZE: usize = 0x4134;
 pub const SECONDARY_LOADER_MAX_FRAMES: usize = 0x283;
 /// Exclusive upper address that can be represented by that bootloader when
 /// loading an application from [`APPLICATION_LOAD_BASE`].
-pub const APPLICATION_LOAD_LIMIT: u32 = APPLICATION_LOAD_BASE
-    + (SECONDARY_LOADER_MAX_FRAMES * FRAME_PAYLOAD_SIZE) as u32;
+pub const APPLICATION_LOAD_LIMIT: u32 =
+    APPLICATION_LOAD_BASE + (SECONDARY_LOADER_MAX_FRAMES * FRAME_PAYLOAD_SIZE) as u32;
 const TILE_DEBUG_BASE: u32 = 0x30000;
 const TILE_DEBUG_TILE_STRIDE: u32 = 0x40;
 const TILE_DEBUG_EXCEPTION_STATE: u32 = 5;

@@ -19,8 +19,8 @@ mod siglip;
 mod static_codegen;
 pub use siglip::{
     AttentionKernelVariant, DeferredResidualAdd, HostTensorSet, SiglipEncoderLayer,
-    SiglipEncoderPrecision, SiglipEncoderTuning, SiglipLinearPrecision, SiglipMapHead,
-    SiglipProfileStage, SiglipWeightStorage, append_host_a16_matrix,
+    SiglipEncoderPrecision, SiglipEncoderTuning, SiglipLinearPrecision, SiglipMapDiagnostics,
+    SiglipMapHead, SiglipProfileStage, SiglipWeightStorage, append_host_a16_matrix,
     append_host_a16_matrix_in_arenas, append_siglip_encoder_layer,
     append_siglip_encoder_layer_batched_with_precision, append_siglip_encoder_layer_with_precision,
     append_siglip_map_head, append_siglip_map_head_batched_with_memory_policy,
@@ -125,8 +125,7 @@ fn executable_region_base_for_tile(
     additional_reserved: &[(u32, u32)],
 ) -> Result<u32> {
     let regions = executable_regions_for_tile(allocation_ranges, runtime_end, additional_reserved)?;
-    let element_size = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
-    let required_size = align_up(required_size, element_size);
+    let required_size = align_up(required_size, 8);
     if let Some(base) = regions
         .iter()
         .find_map(|&(start, end)| (end - start >= required_size).then_some(start))
@@ -177,7 +176,14 @@ fn executable_regions_for_tile(
             .chain(allocation_ranges.iter().copied())
             .chain(additional_reserved.iter().copied()),
     );
-    Ok(space.free_regions(element_size))
+    Ok(space
+        .free_regions(element_size)
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let end = end.checked_sub(ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD)?;
+            (start < end).then_some((start, end))
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -223,9 +229,7 @@ fn data_regions_for_tile(
     allow_interleaved: bool,
     additional_reserved: &[(u32, u32)],
 ) -> Result<Vec<(u32, u32)>> {
-    let memory_end = ipu_package::TILE_MEMORY_BASE
-        .checked_add(ipu_package::TILE_MEMORY_SIZE)
-        .ok_or("tile memory range overflow")?;
+    let memory_end = ipu_driver::APPLICATION_LOAD_LIMIT;
     let mut reserved = vec![
         (
             ipu_package::TILE_MEMORY_BASE,
@@ -408,7 +412,7 @@ fn pack_generated_and_support_images(
         tile,
         &[generated_size, support_size],
         occupied,
-        ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+        8,
         "executable images",
     )?;
     Ok([placed[0], placed[1]])
@@ -1217,7 +1221,7 @@ fn default_transient_arenas() -> Vec<ipu_compiler::MemoryArena> {
         ipu_compiler::MemoryArena::low(PLAN_BASE, ipu_package::IPU21_INTERLEAVED_MEMORY_BASE),
         ipu_compiler::MemoryArena::low(
             ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
-            ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            ipu_driver::APPLICATION_LOAD_LIMIT,
         ),
     ]
 }
@@ -1452,7 +1456,7 @@ fn relocation_arenas_for_allocation(
             append(
                 &mut compatible,
                 interleaved.end,
-                ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                ipu_driver::APPLICATION_LOAD_LIMIT,
             );
         }
     }
@@ -1519,15 +1523,18 @@ fn placement_diagnostics(
 }
 
 fn select_eviction_window(
+    allocation_index: usize,
     allocation: &ipu_compiler::Allocation,
     placed: &[(usize, u32)],
     allocations: &[ipu_compiler::Allocation],
+    memory_constraints: &RelocationMemoryConstraints,
     permanent: &[(u32, u32)],
     forbidden_starts: &[(u32, u32)],
     arenas: &[ipu_compiler::MemoryArena],
     protected: &HashSet<usize>,
     alignment: u32,
 ) -> Option<(u32, Vec<usize>)> {
+    let allocation_extent = memory_constraints.access_extent(allocation_index, allocation.size);
     let lifetime_overlaps = |other: &ipu_compiler::Allocation| {
         allocation.live_from < other.live_until && other.live_from < allocation.live_until
     };
@@ -1537,7 +1544,9 @@ fn select_eviction_window(
             (
                 index,
                 address,
-                address.saturating_add(allocations[index].size),
+                address.saturating_add(
+                    memory_constraints.access_extent(index, allocations[index].size),
+                ),
             )
         })
         .collect::<Vec<_>>();
@@ -1547,7 +1556,7 @@ fn select_eviction_window(
         candidates.insert(align_up(arena.base, alignment));
         if let Some(address) = arena
             .limit
-            .checked_sub(allocation.size)
+            .checked_sub(allocation_extent)
             .map(|address| align_down(address, alignment))
         {
             candidates.insert(address);
@@ -1555,7 +1564,7 @@ fn select_eviction_window(
         for &(start, end) in permanent {
             candidates.insert(align_up(end, alignment));
             if let Some(address) = start
-                .checked_sub(allocation.size)
+                .checked_sub(allocation_extent)
                 .map(|address| align_down(address, alignment))
             {
                 candidates.insert(address);
@@ -1564,14 +1573,14 @@ fn select_eviction_window(
         for &(_, start, end) in &placed_ranges {
             candidates.insert(align_up(end, alignment));
             if let Some(address) = start
-                .checked_sub(allocation.size)
+                .checked_sub(allocation_extent)
                 .map(|address| align_down(address, alignment))
             {
                 candidates.insert(address);
             }
         }
         for address in candidates {
-            let Some(end) = address.checked_add(allocation.size) else {
+            let Some(end) = address.checked_add(allocation_extent) else {
                 continue;
             };
             if address < arena.base
@@ -1709,9 +1718,9 @@ struct RelocationMemoryConstraints {
     relations: HashMap<usize, Vec<MemoryElementRelation>>,
     pinned: HashSet<usize>,
     required_interleaved: HashSet<usize>,
-    /// Maximum base-relative address touched by a kernel. This reserves
-    /// pipelined read-ahead against code/static objects without changing data
-    /// allocation ownership or lifetime coloring.
+    /// Maximum base-relative address touched by a kernel. The logical
+    /// allocation size remains unchanged, but placement reserves this full
+    /// physical footprint for every phase in the allocation's lifetime.
     access_extents: HashMap<usize, u32>,
 }
 
@@ -1985,9 +1994,10 @@ fn compact_allocations_around(
             allocation.kind,
             ipu_compiler::AllocationKind::HomeAlias { .. }
         ) {
+            let extent = memory_constraints.access_extent(index, allocation.size);
             fixed_by_tile[usize::from(allocation.tile)].push((
                 allocation.address,
-                allocation.address.saturating_add(allocation.size),
+                allocation.address.saturating_add(extent),
             ));
         }
     }
@@ -2046,21 +2056,22 @@ fn compact_allocations_around(
                     .address
                     .checked_add(allocation.size)
                     .ok_or("allocation address overflow during stable placement")?;
+                let access_extent = memory_constraints.access_extent(index, allocation.size);
                 let access_end = allocation
                     .address
-                    .checked_add(memory_constraints.access_extent(index, allocation.size))
+                    .checked_add(access_extent)
                     .ok_or("allocation access span overflow during stable placement")?;
                 let fits_arena = compatible_arenas.iter().any(|arena| {
-                    allocation.address >= arena.base && storage_end <= arena.limit
+                    allocation.address >= arena.base && access_end <= arena.limit
                 });
-                let storage_conflicts_with_permanent = permanent.iter().any(|&(start, end)| {
-                    ranges_overlap(allocation.address, storage_end, start, end)
+                let access_conflicts_with_permanent = permanent.iter().any(|&(start, end)| {
+                    ranges_overlap(allocation.address, access_end, start, end)
                 });
                 let access_conflicts_with_reservation = reservations[tile]
                     .iter()
                     .any(|&(start, end)| ranges_overlap(allocation.address, access_end, start, end));
                 let stable = fits_arena
-                    && !storage_conflicts_with_permanent
+                    && !access_conflicts_with_permanent
                     && !access_conflicts_with_reservation;
                 if memory_constraints.pinned.contains(&index) {
                     if !stable {
@@ -2070,7 +2081,7 @@ fn compact_allocations_around(
                         )
                         .into());
                     }
-                    let range = (allocation.address, storage_end);
+                    let range = (allocation.address, access_end);
                     for occupied in &mut occupied_by_phase[lifetime(allocation)] {
                         occupied.push(range);
                     }
@@ -2078,7 +2089,7 @@ fn compact_allocations_around(
                 } else if move_resident || !stable {
                     compact.push(index);
                 } else {
-                    let range = (allocation.address, storage_end);
+                    let range = (allocation.address, access_end);
                     for occupied in &mut occupied_by_phase[lifetime(allocation)] {
                         occupied.push(range);
                     }
@@ -2190,7 +2201,7 @@ fn compact_allocations_around(
                         .contains_key(&index)
                         .then_some(allocation.address)
                         .filter(|&address| {
-                            let end = address.saturating_add(allocation.size);
+                            let end = address.saturating_add(access_extent);
                             compatible_arenas
                                 .iter()
                                 .any(|arena| address >= arena.base && end <= arena.limit)
@@ -2206,7 +2217,7 @@ fn compact_allocations_around(
                             &occupied,
                             &BTreeMap::new(),
                             &forbidden_starts,
-                            allocation.size,
+                            access_extent,
                             &compatible_arenas,
                             32,
                         )
@@ -2214,9 +2225,11 @@ fn compact_allocations_around(
                     if address.is_none()
                         && move_resident
                         && let Some((candidate, blockers)) = select_eviction_window(
+                            index,
                             allocation,
                             &result,
                             &graph.schedule.allocations,
+                            &memory_constraints,
                             &permanent,
                             &forbidden_starts,
                             &compatible_arenas,
@@ -2243,7 +2256,10 @@ fn compact_allocations_around(
                                 let placed_allocation = &graph.schedule.allocations[placed];
                                 let range = (
                                     placed_address,
-                                    placed_address.saturating_add(placed_allocation.size),
+                                    placed_address.saturating_add(memory_constraints.access_extent(
+                                        placed,
+                                        placed_allocation.size,
+                                    )),
                                 );
                                 for occupied in
                                     &mut occupied_by_phase[lifetime(placed_allocation)]
@@ -2309,7 +2325,7 @@ fn compact_allocations_around(
                             capacity, free, largest,
                         )
                     })?;
-                let range = (address, address.saturating_add(allocation.size));
+                let range = (address, address.saturating_add(access_extent));
                 for phase in &mut occupied_by_phase[allocation_lifetime] {
                     phase.push(range);
                 }
@@ -2665,8 +2681,43 @@ pub fn package_graph_repeated_with_templates_owned(
     package_graph_impl_owned(graph, objects, &[], None, templates, invocations)
 }
 
+pub fn package_graph_repeated_with_templates_owned_and_memory_profile(
+    graph: ExecutableGraph,
+    objects: &[Vec<u8>],
+    templates: &[StaticTemplateRegion],
+    invocations: u32,
+) -> Result<(Application, MemoryProfile)> {
+    if invocations == 0 {
+        return Err("graph invocation count must be nonzero".into());
+    }
+    let (application, graph) = package_graph_impl_owned_with_final_graph(
+        graph,
+        objects,
+        &[],
+        None,
+        templates,
+        invocations,
+    )?;
+    let profile = allocator_memory_profile(&graph)?;
+    Ok((application, profile))
+}
+
 pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile> {
     let topology = Topology::c600();
+    let mut staging_allocations =
+        HashMap::<(usize, u16, ipu_compiler::TensorId), Vec<(u32, u32)>>::new();
+    for allocation in &graph.schedule.allocations {
+        let ipu_compiler::AllocationKind::ExchangeStaging { phase } = allocation.kind else {
+            continue;
+        };
+        staging_allocations
+            .entry((phase, allocation.tile, allocation.tensor))
+            .or_default()
+            .push((
+                allocation.address,
+                allocation.address.saturating_add(allocation.size),
+            ));
+    }
     let mut binding_intervals = vec![Vec::<(u32, u32, &str)>::new(); topology.tile_count()];
     for binding in graph
         .host_weights
@@ -2748,6 +2799,7 @@ pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile
                 }
             })
             .collect::<Vec<_>>();
+        let staging_allocations = &staging_allocations;
         regions.extend(
             graph
                 .schedule
@@ -2759,7 +2811,16 @@ pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile
                         .iter()
                         .filter(move |transfer| transfer.destination_tile == logical_tile)
                         .filter_map(move |transfer| {
-                            transfer.staging_address.map(|address| MemoryRegion {
+                            let address = transfer.staging_address?;
+                            let end = address.saturating_add(transfer.bytes);
+                            let represented = staging_allocations
+                                .get(&(phase, transfer.destination_tile, transfer.tensor))
+                                .is_some_and(|ranges| {
+                                    ranges
+                                        .iter()
+                                        .any(|&(start, stop)| start <= address && stop >= end)
+                                });
+                            (!represented).then(|| MemoryRegion {
                                 address,
                                 size: transfer.bytes,
                                 category: "exchange_staging".into(),
@@ -3538,7 +3599,7 @@ fn package_graph_with_profile_options(
     }
     let profile_arena = ipu_compiler::MemoryArena::high(
         PLAN_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
-        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        ipu_driver::APPLICATION_LOAD_LIMIT,
     );
     let profile_occupied = graph.schedule.allocations.all_occupied_intervals_by_tile(
         graph.schedule.tile_count,
@@ -3739,13 +3800,32 @@ fn package_graph_impl(
 }
 
 fn package_graph_impl_owned(
+    graph: ExecutableGraph,
+    objects: &[Vec<u8>],
+    profile_code: &[static_codegen::ProfileCode],
+    lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
+    template_regions: &[StaticTemplateRegion],
+    invocations: u32,
+) -> Result<Application> {
+    package_graph_impl_owned_with_final_graph(
+        graph,
+        objects,
+        profile_code,
+        lowered_programs,
+        template_regions,
+        invocations,
+    )
+    .map(|(application, _)| application)
+}
+
+fn package_graph_impl_owned_with_final_graph(
     mut graph: ExecutableGraph,
     objects: &[Vec<u8>],
     profile_code: &[static_codegen::ProfileCode],
     mut lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
-) -> Result<Application> {
+) -> Result<(Application, ExecutableGraph)> {
     let mut executable_placement_history = Vec::new();
     loop {
         match package_graph_impl_attempt(
@@ -3757,7 +3837,7 @@ fn package_graph_impl_owned(
             invocations,
             &mut executable_placement_history,
         ) {
-            Ok(app) => return Ok(app),
+            Ok(result) => return Ok(result),
             Err(error) => match error.downcast::<PackageRelayout>() {
                 Ok(relayout) => graph = relayout.graph,
                 Err(error) => return Err(error),
@@ -4032,7 +4112,7 @@ fn package_graph_impl_attempt(
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
     executable_placement_history: &mut Vec<Vec<ExecutablePlacement>>,
-) -> Result<Application> {
+) -> Result<(Application, ExecutableGraph)> {
     let topology = Topology::c600();
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
         return Err("the direct C600 runtime requires a schedule for every discovered tile".into());
@@ -4997,6 +5077,10 @@ fn package_graph_impl_attempt(
                 .chain(executable_reserved)
                 .chain(host_runtime_ranges[tile_index].iter().copied())
                 .chain(std::iter::once((PLAN_BASE, runtime_end)))
+                .chain(std::iter::once((
+                    ipu_driver::APPLICATION_LOAD_LIMIT,
+                    ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                )))
                 .collect::<Vec<_>>(),
         );
         if tile == 0 {
@@ -5893,7 +5977,7 @@ fn package_graph_impl_attempt(
             format_args!("0x{:x}", program_bases.iter().max().copied().unwrap_or(0)),
         "packaged static executable graph"
     );
-    Ok(app)
+    Ok((app, graph))
 }
 
 fn validate_resident_host_bindings(graph: &ExecutableGraph, topology: &Topology) -> Result<()> {
@@ -6844,25 +6928,23 @@ fn supervisor_state_summary(device: &Device, app: &Application) -> String {
             match status {
                 Ok(status) => {
                     let exception = ipu_driver::TileException::from_status(status);
-                    let registers = (exception == ipu_driver::TileException::InvalidMemoryAddress)
-                        .then(|| {
-                            [2, 3, 4, 5, 10, 11, 15]
-                                .into_iter()
-                                .map(|register| {
-                                    device
-                                        .read_tile_m_register(
-                                            tile.physical_tile as u16,
-                                            0,
-                                            register,
-                                        )
-                                        .map(|value| format!("m{register}=0x{value:x}"))
-                                        .unwrap_or_else(|error| {
-                                            format!("m{register}=error({error})")
-                                        })
-                                })
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        });
+                    let registers = matches!(
+                        exception,
+                        ipu_driver::TileException::InvalidMemoryAddress
+                            | ipu_driver::TileException::MemoryConflict
+                    )
+                    .then(|| {
+                        [2, 3, 4, 5, 10, 11, 15]
+                            .into_iter()
+                            .map(|register| {
+                                device
+                                    .read_tile_m_register(tile.physical_tile as u16, 0, register)
+                                    .map(|value| format!("m{register}=0x{value:x}"))
+                                    .unwrap_or_else(|error| format!("m{register}=error({error})"))
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    });
                     if let Some(registers) = registers {
                         format!("{}:{exception}@{pc}[{registers}]", tile.physical_tile)
                     } else {
@@ -7450,13 +7532,13 @@ mod tests {
     }
 
     #[test]
-    fn kernel_access_spans_do_not_expand_storage_ownership() {
+    fn kernel_access_spans_reserve_footprints_without_expanding_storage_ownership() {
         let topology = Topology::c600();
         let first = ipu_compiler::TensorId(1);
         let second = ipu_compiler::TensorId(2);
         let logical_bytes = 32;
         let access_bytes = 48;
-        let graph = ExecutableGraph {
+        let mut graph = ExecutableGraph {
             memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(0x80000, 0x90000)),
             schedule: Schedule {
                 layouts: Vec::new(),
@@ -7511,6 +7593,26 @@ mod tests {
         assert_eq!(constraints.access_extent(0, logical_bytes), access_bytes);
         assert_eq!(graph.schedule.allocations[0].size, logical_bytes);
         assert_eq!(graph.schedule.allocations[1].address, 0x80020);
+
+        compact_all_allocations_around(
+            &mut graph,
+            &topology,
+            &vec![Vec::new(); topology.tile_count()],
+            Some(&resolved),
+            "unit test",
+        )
+        .unwrap();
+
+        let first = &graph.schedule.allocations[0];
+        let second = &graph.schedule.allocations[1];
+        assert_eq!(first.size, logical_bytes);
+        assert_eq!(second.size, logical_bytes);
+        assert!(!ranges_overlap(
+            first.address,
+            first.address + access_bytes,
+            second.address,
+            second.address + second.size,
+        ));
         graph.schedule.validate_allocations().unwrap();
     }
 
@@ -8030,6 +8132,18 @@ mod tests {
     }
 
     #[test]
+    fn executable_regions_leave_the_supervisor_fetch_lookahead_unused() {
+        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        let regions = executable_regions_for_tile(&[], PLAN_BASE, &[]).unwrap();
+
+        assert!(!regions.is_empty());
+        assert!(regions.iter().all(|&(start, end)| {
+            start % element == 0
+                && end % element == element - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD
+        }));
+    }
+
+    #[test]
     fn generated_and_support_images_use_independent_executable_gaps() {
         let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
         let gaps = vec![(0x10000, 0x10000 + element), (0x20000, 0x20000 + element)];
@@ -8471,6 +8585,62 @@ mod tests {
                 .iter()
                 .skip(1)
                 .all(|tile| tile.regions.is_empty())
+        );
+    }
+
+    #[test]
+    fn allocator_profile_does_not_duplicate_allocated_exchange_staging() {
+        let graph = ExecutableGraph {
+            memory_policy: None,
+            host_weights: Vec::new(),
+            schedule: ipu_compiler::Schedule {
+                layouts: Vec::new(),
+                phases: vec![ipu_compiler::Phase::Exchange {
+                    transfers: vec![
+                        ipu_compiler::Transfer {
+                            source_tile: 0,
+                            destination_tile: 1,
+                            tensor: ipu_compiler::TensorId(4),
+                            bytes: 64,
+                            staging_address: Some(0x60000),
+                        },
+                        ipu_compiler::Transfer {
+                            source_tile: 0,
+                            destination_tile: 1,
+                            tensor: ipu_compiler::TensorId(5),
+                            bytes: 64,
+                            staging_address: Some(0x61000),
+                        },
+                    ],
+                }],
+                allocations: vec![ipu_compiler::Allocation {
+                    tensor: ipu_compiler::TensorId(4),
+                    tile: 1,
+                    address: 0x60000,
+                    size: 128,
+                    live_from: 0,
+                    live_until: 1,
+                    kind: ipu_compiler::AllocationKind::ExchangeStaging { phase: 0 },
+                }]
+                .into(),
+                tile_count: 1472,
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+
+        let profile = allocator_memory_profile(&graph).unwrap();
+        let regions = &profile.tiles[1].regions;
+        assert_eq!(regions.len(), 2);
+        assert_eq!(
+            regions
+                .iter()
+                .filter_map(|region| region.tensor)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([4, 5])
         );
     }
 

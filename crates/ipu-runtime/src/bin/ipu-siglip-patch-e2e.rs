@@ -13,13 +13,14 @@ use ipu_package::{Binding, RegionSlice};
 use ipu_runtime::{
     BlockLayout, ExecutableGraph, HostRunOptions, HostTensorSet, ProfileGranularity,
     SiglipEncoderPrecision, SiglipEncoderTuning, SiglipLinearPrecision, SiglipWeightStorage,
-    StaticProfileRegion, StaticTemplateRegion, allocator_memory_profile, append_host_a16_matrix,
-    append_siglip_encoder_layer_batched_with_precision, append_siglip_map_head,
+    StaticProfileRegion, StaticTemplateRegion, append_host_a16_matrix,
+    append_siglip_encoder_layer_batched_with_precision,
     append_siglip_map_head_batched_with_memory_policy, append_siglip_post_layer_norm,
     append_siglip_post_layer_norm_with_memory_policy, block_binding_typed, block_coordinates,
     blocked_matrix_f16, consolidate_attention_kernel_variants, defer_terminal_residual_add,
     fuse_deferred_residual_into_layer_norm, materialize_deferred_residual_add,
-    package_graph_repeated, package_graph_repeated_with_templates_owned,
+    package_graph_repeated_with_templates_owned,
+    package_graph_repeated_with_templates_owned_and_memory_profile,
     package_graph_repeated_with_templates_profiled_with,
     package_graph_repeated_with_templates_profiled_with_regions, run_host_with_options,
 };
@@ -35,6 +36,14 @@ const INNER_BLOCK_DIMENSION: u16 = 64;
 const DATA_BASE: u32 = ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
 const ORDINARY_LOW_BASE: u32 =
     ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
+
+#[derive(Clone, Copy)]
+struct FiniteCheckPlacement {
+    tile: u16,
+    address: u32,
+    phase: usize,
+    command: usize,
+}
 
 fn main() {
     ipu_runtime::init_tracing();
@@ -198,6 +207,17 @@ fn main() {
     let tuning = SiglipEncoderTuning {
         gemm_row_block_rows: u16::try_from(env_u32("IPU_SIGLIP_GEMM_ROW_BLOCK_ROWS", 0))
             .expect("GEMM row block rows exceed u16"),
+        qkv_row_block_rows: u16::try_from(env_u32("IPU_SIGLIP_QKV_ROW_BLOCK_ROWS", 0))
+            .expect("QKV row block rows exceed u16"),
+        attention_output_row_block_rows: u16::try_from(env_u32(
+            "IPU_SIGLIP_ATTENTION_OUTPUT_ROW_BLOCK_ROWS",
+            0,
+        ))
+        .expect("attention-output row block rows exceed u16"),
+        mlp_up_row_block_rows: u16::try_from(env_u32("IPU_SIGLIP_MLP_UP_ROW_BLOCK_ROWS", 0))
+            .expect("MLP-up row block rows exceed u16"),
+        mlp_down_row_block_rows: u16::try_from(env_u32("IPU_SIGLIP_MLP_DOWN_ROW_BLOCK_ROWS", 0))
+            .expect("MLP-down row block rows exceed u16"),
         automatic_gemm_row_blocks: env_u32("IPU_SIGLIP_AUTOMATIC_GEMM_ROW_BLOCKS", 1) != 0,
         row_gemm_inner_block_columns: u16::try_from(env_u32(
             "IPU_SIGLIP_ROW_GEMM_INNER_BLOCK_COLUMNS",
@@ -259,6 +279,7 @@ fn main() {
         "IPU_SIGLIP_DETAILED_DIAGNOSTICS",
         u32::from(layer_count == 1 && batch_size == 1),
     ) != 0;
+    let diagnostic_boundaries = std::env::var_os("IPU_SIGLIP_DIAGNOSTIC_BOUNDARIES").is_some();
     let retain_profile_metadata = std::env::var_os("IPU_SIGLIP_RETAIN_PROFILE_METADATA").is_some()
         || matches!(
             profile_granularity,
@@ -267,7 +288,21 @@ fn main() {
     let mut current = row_shards;
     let mut last_layer = None;
     let mut deferred_residual = None;
-    let mut layer_template_groups = Vec::<(SiglipEncoderPrecision, RepeatedRegion)>::new();
+    let retain_map_diagnostics = std::env::var_os("IPU_SIGLIP_MAP_DIAGNOSTICS").is_some();
+    let diagnostic_layers = std::env::var("IPU_SIGLIP_DIAGNOSTIC_LAYERS")
+        .map(|value| {
+            value
+                .split(',')
+                .map(|layer| layer.parse::<usize>().expect("invalid diagnostic layer"))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    assert!(
+        diagnostic_layers.iter().all(|&layer| layer < layer_count),
+        "diagnostic layer is outside the compiled encoder"
+    );
+    let mut diagnostic_finite_checks = Vec::new();
+    let mut layer_template_groups = Vec::<(SiglipEncoderPrecision, bool, RepeatedRegion)>::new();
     let mut resident_placement_groups =
         Vec::<(SiglipEncoderPrecision, ResidentPlacementTemplate)>::new();
     let mut profile_regions = vec![StaticProfileRegion {
@@ -346,12 +381,25 @@ fn main() {
         );
         current = appended.output.clone();
         last_layer = Some(appended);
+        let layer_instrumented = diagnostic_layers.contains(&layer);
+        if layer_instrumented {
+            let phase = (phase_start..plan.schedule.phases.len())
+                .rev()
+                .find(|&phase| matches!(plan.schedule.phases[phase], Phase::Compute { .. }))
+                .expect("encoder layer has a compute phase");
+            diagnostic_finite_checks.push((
+                format!("encoder_layer_{layer:02}_pre_residual"),
+                append_finite_checks_at_phase(&mut plan.schedule, &current, phase),
+            ));
+        }
         let phase_range = phase_start..plan.schedule.phases.len();
         specialize_gemm_row_operations(&mut plan.schedule, phase_range.clone());
         if !retain_profile_metadata {
             plan.schedule.discard_profile_metadata(phase_range.clone());
         }
-        if let Some((group_precision, region)) = layer_template_groups.last_mut()
+        if let Some((group_precision, group_instrumented, region)) =
+            layer_template_groups.last_mut()
+            && *group_instrumented == layer_instrumented
             && group_precision.has_same_execution_shape(layer_precision)
             && region.is_compatible(&plan.schedule, phase_range.clone())
         {
@@ -360,6 +408,7 @@ fn main() {
             let name = format!("siglip_encoder_layer_{}", layer_template_groups.len());
             layer_template_groups.push((
                 layer_precision,
+                layer_instrumented,
                 RepeatedRegion::new(name, &plan.schedule, phase_range).unwrap(),
             ));
         }
@@ -379,6 +428,13 @@ fn main() {
             .expect("encoder layer has a terminal residual add"),
     )
     .unwrap();
+    if !diagnostic_layers.is_empty() {
+        let phase = plan.schedule.phases.len() - 1;
+        diagnostic_finite_checks.push((
+            "encoder_final_post_residual".into(),
+            append_finite_checks_at_phase(&mut plan.schedule, &current, phase),
+        ));
+    }
     profile_regions
         .last_mut()
         .expect("encoder layer has a profile region")
@@ -392,11 +448,21 @@ fn main() {
     let diagnostics = last_layer.diagnostics;
     let intermediate_columns = u16::try_from(config.intermediate_size.div_ceil(64) * 64).unwrap();
     let full_model = std::env::var_os("IPU_SIGLIP_FULL_MODEL").is_some();
+    let post_norm_only = std::env::var_os("IPU_SIGLIP_POST_NORM_ONLY").is_some();
     assert!(
         !full_model || layer_count == config.num_hidden_layers,
         "full-model execution requires every encoder layer"
     );
-    let (output, output_rows, output_name, attentions, post_norm_output) = if full_model {
+    let (
+        output,
+        output_rows,
+        output_name,
+        attentions,
+        post_norm_output,
+        map_diagnostics,
+        mut finite_checks,
+    ) = if full_model {
+        let mut finite_checks = diagnostic_finite_checks;
         let post_norm = append_siglip_post_layer_norm_with_memory_policy(
             &mut plan.schedule,
             &layer_output,
@@ -405,27 +471,50 @@ fn main() {
             &mut host,
         )
         .unwrap();
-        let map = append_siglip_map_head_batched_with_memory_policy(
-            &mut plan.schedule,
-            &post_norm,
-            &model,
-            batch_size,
-            sequence_length,
-            row_block_dimension,
-            TILE_COUNT,
-            DATA_BASE,
-            data_limit,
-            &memory,
-            &mut host,
-        )
-        .unwrap();
-        (
-            map.output,
-            batch_size.checked_mul(12).unwrap(),
-            "pooler_output".to_string(),
-            vec![attention, map.attention],
-            Some(post_norm),
-        )
+        if !diagnostic_layers.is_empty() {
+            let phase = plan.schedule.phases.len() - 1;
+            finite_checks.push((
+                "post_norm_pre_map".into(),
+                append_finite_checks_at_phase(&mut plan.schedule, &post_norm, phase),
+            ));
+        }
+        if post_norm_only {
+            (
+                post_norm,
+                rows,
+                "post_layernorm".to_string(),
+                vec![attention],
+                None,
+                None,
+                finite_checks,
+            )
+        } else {
+            let map = append_siglip_map_head_batched_with_memory_policy(
+                &mut plan.schedule,
+                &post_norm,
+                &model,
+                batch_size,
+                sequence_length,
+                row_block_dimension,
+                TILE_COUNT,
+                DATA_BASE,
+                data_limit,
+                &memory,
+                retain_map_diagnostics,
+                &mut host,
+            )
+            .unwrap();
+            dump_map_attention_placement(&map.attention);
+            (
+                map.output,
+                batch_size.checked_mul(12).unwrap(),
+                "pooler_output".to_string(),
+                vec![attention, map.attention],
+                Some(post_norm),
+                map.diagnostics,
+                finite_checks,
+            )
+        }
     } else {
         (
             layer_output,
@@ -433,8 +522,11 @@ fn main() {
             format!("encoder_layer_{:02}", layer_count - 1),
             vec![attention],
             None,
+            None,
+            diagnostic_finite_checks,
         )
     };
+    materialize_finite_checks(&mut plan.schedule, &mut finite_checks, &memory).unwrap();
     let attention_variants = consolidate_attention_kernel_variants(&mut plan.schedule, &attentions);
     let profiled_end = profile_regions.last().unwrap().phases.end;
     if profiled_end < plan.schedule.phases.len() {
@@ -456,6 +548,40 @@ fn main() {
         resident_bindings: host_weights,
         resident_bytes: host_weight_bytes,
     } = host;
+    let verify_weight_prefixes = std::env::var("IPU_SIGLIP_VERIFY_WEIGHT_PREFIXES")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter(|prefix| !prefix.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut weight_readback_bindings = Vec::new();
+    let mut expected_weight_readback = Vec::new();
+    if !verify_weight_prefixes.is_empty() {
+        let mut offset = 0usize;
+        for binding in &host_weights {
+            let bytes = binding
+                .slices
+                .iter()
+                .map(|slice| usize::try_from(slice.size).unwrap())
+                .sum::<usize>();
+            if verify_weight_prefixes
+                .iter()
+                .any(|prefix| binding.name.starts_with(prefix))
+            {
+                let mut readback = binding.clone();
+                readback.name = format!("verify.{}", binding.name);
+                weight_readback_bindings.push(readback);
+                expected_weight_readback
+                    .extend_from_slice(&host_weight_bytes[offset..offset + bytes]);
+            }
+            offset += bytes;
+        }
+        assert_eq!(offset, host_weight_bytes.len());
+    }
     let invocations = env_u32("IPU_SIGLIP_INVOCATIONS", 1);
     let mut host_input = host_input.repeat(invocations as usize);
     host_input.extend(host_weight_bytes);
@@ -501,7 +627,10 @@ fn main() {
             2,
         ));
     }
-    if std::env::var_os("IPU_SIGLIP_DIAGNOSTIC_BOUNDARIES").is_some() {
+    for (stage, checks) in &finite_checks {
+        host_outputs.push(finite_check_binding(&format!("{stage}_finite"), checks));
+    }
+    if diagnostic_boundaries {
         if let Some(post_norm) = &post_norm_output {
             host_outputs.push(row_shard_binding(
                 "post_layernorm",
@@ -511,12 +640,98 @@ fn main() {
             ));
         }
     }
+    if let Some(diagnostics) = &map_diagnostics {
+        let map_rows = batch_size.checked_mul(12).unwrap();
+        let attention = attentions
+            .get(1)
+            .expect("MAP diagnostics require MAP attention");
+        host_outputs.push(attention_task_binding(
+            "map_attention_query",
+            "f16",
+            &attention.tasks,
+            |task| task.query_address,
+            |task| u64::from(task.query_rows) * u64::from(attention.padded_head_dimension) * 2,
+        ));
+        host_outputs.push(attention_key_value_binding(
+            "map_attention_key",
+            &attention.key_values,
+            |block| block.key_address,
+        ));
+        host_outputs.push(attention_key_value_binding(
+            "map_attention_value",
+            &attention.key_values,
+            |block| block.value_address,
+        ));
+        host_outputs.push(attention_task_binding(
+            "map_attention_accumulator",
+            "f32",
+            &attention.tasks,
+            |task| task.accumulator_address,
+            |task| u64::from(task.query_rows) * (u64::from(attention.head_dimension) * 4 + 8),
+        ));
+        host_outputs.push(attention_task_binding(
+            "map_attention_scores",
+            "f16",
+            &attention.tasks,
+            |task| task.scores_address,
+            |task| {
+                u64::from(task.query_rows)
+                    * u64::from(
+                        attention
+                            .key_block_columns
+                            .max(attention.padded_head_dimension),
+                    )
+                    * 2
+            },
+        ));
+        host_outputs.push(attention_task_binding(
+            "map_attention_weights",
+            "f16",
+            &attention.tasks,
+            |task| task.weights_address,
+            |task| u64::from(task.query_rows) * u64::from(attention.key_block_columns) * 2,
+        ));
+        host_outputs.push(attention_task_binding(
+            "map_attention_task_output",
+            "f16",
+            &attention.tasks,
+            |task| task.output_address,
+            |task| u64::from(task.query_rows) * u64::from(attention.head_dimension) * 2,
+        ));
+        host_outputs.push(row_shard_binding(
+            "map_attention_hidden",
+            map_rows,
+            columns,
+            &diagnostics.attention_hidden,
+        ));
+        host_outputs.push(row_shard_binding(
+            "map_attention_residual",
+            map_rows,
+            columns,
+            &diagnostics.attention_residual,
+        ));
+        host_outputs.push(row_shard_binding(
+            "map_norm",
+            map_rows,
+            columns,
+            &diagnostics.norm,
+        ));
+        host_outputs.push(block_binding_typed(
+            "map_mlp_gelu",
+            map_rows,
+            intermediate_columns,
+            &diagnostics.mlp_gelu,
+            "f16",
+            2,
+        ));
+    }
     host_outputs.push(row_shard_binding(
         &output_name,
         output_rows,
         columns,
         &output,
     ));
+    host_outputs.extend(weight_readback_bindings);
     let graph = ExecutableGraph {
         memory_policy: Some(memory.clone()),
         host_weights,
@@ -526,12 +741,11 @@ fn main() {
         host_inputs,
         host_outputs,
     };
-    write_memory_profile(&graph);
     let enable_templates = env_u32("IPU_SIGLIP_ENABLE_TEMPLATES", 1) != 0;
     let templates = layer_template_groups
         .into_iter()
-        .filter(|(_, region)| enable_templates && region.phase_instances.len() > 1)
-        .map(|(_, region)| StaticTemplateRegion::from(region))
+        .filter(|(_, _, region)| enable_templates && region.phase_instances.len() > 1)
+        .map(|(_, _, region)| StaticTemplateRegion::from(region))
         .collect::<Vec<_>>();
     assert!(
         profile_output.is_none() || invocations == 1,
@@ -541,6 +755,10 @@ fn main() {
     assert!(
         profile_output.is_none() || load_package.is_none(),
         "a cached package does not carry this run's profile layout"
+    );
+    assert!(
+        std::env::var_os("IPU_MEMORY_PROFILE_OUTPUT").is_none() || load_package.is_none(),
+        "a cached package does not carry its finalized allocator layout"
     );
     let (app, profile_layout) = if let Some(path) = load_package {
         (
@@ -574,12 +792,21 @@ fn main() {
             "enabled SigLIP profiling"
         );
         (app, Some(layout))
-    } else {
-        (
-            package_graph_repeated_with_templates_owned(graph, &objects, &templates, invocations)
-                .unwrap(),
-            None,
+    } else if std::env::var_os("IPU_MEMORY_PROFILE_OUTPUT").is_some() {
+        let (app, memory_profile) = package_graph_repeated_with_templates_owned_and_memory_profile(
+            graph,
+            &objects,
+            &templates,
+            invocations,
         )
+        .unwrap();
+        write_memory_profile(&memory_profile);
+        (app, None)
+    } else {
+        let app =
+            package_graph_repeated_with_templates_owned(graph, &objects, &templates, invocations)
+                .unwrap();
+        (app, None)
     };
     if let Some(path) = std::env::var_os("IPU_SIGLIP_PACKAGE_OUTPUT") {
         app.write(fs::File::create(path).unwrap()).unwrap();
@@ -629,131 +856,296 @@ fn main() {
     let invocation_outputs = actual
         .chunks_exact(invocation_output_bytes)
         .collect::<Vec<_>>();
-    let (diagnostic_bytes, boundary_errors, norm2_error, mlp_gelu_error) = if detailed_diagnostics {
-        let diagnostics = diagnostics.as_ref().unwrap();
-        let row_tensor_bytes = usize::from(rows) * usize::from(columns) * 2;
-        let mut diagnostic_offset = 0;
-        let mut boundary_errors = Vec::new();
-        let mut verify_rows = |stage: &str, expected: Vec<f32>, shards: &[RowShardPlacement]| {
-            let expected = serialize_a16_row_shards(
-                &expected,
-                usize::from(rows),
-                usize::from(columns),
-                shards,
-            );
-            let start = diagnostic_offset;
-            let end = start + row_tensor_bytes;
-            let error = invocation_outputs
-                .iter()
-                .enumerate()
-                .map(|(invocation, actual)| {
-                    let error = verify_linear_f16(&actual[start..end], &expected);
-                    info!(invocation, error, stage, "SigLIP invocation error");
+    let (mut diagnostic_bytes, mut boundary_errors, norm2_error, mlp_gelu_error) =
+        if detailed_diagnostics {
+            let diagnostics = diagnostics.as_ref().unwrap();
+            let row_tensor_bytes = usize::from(rows) * usize::from(columns) * 2;
+            let mut diagnostic_offset = 0;
+            let mut boundary_errors = Vec::new();
+            let mut verify_rows =
+                |stage: &str, expected: Vec<f32>, shards: &[RowShardPlacement]| {
+                    let expected = serialize_a16_row_shards(
+                        &expected,
+                        usize::from(rows),
+                        usize::from(columns),
+                        shards,
+                    );
+                    let start = diagnostic_offset;
+                    let end = start + row_tensor_bytes;
+                    let error = invocation_outputs
+                        .iter()
+                        .enumerate()
+                        .map(|(invocation, actual)| {
+                            let error = verify_linear_f16(&actual[start..end], &expected);
+                            info!(invocation, error, stage, "SigLIP invocation error");
+                            error
+                        })
+                        .fold(0.0, f32::max);
+                    diagnostic_offset = end;
+                    boundary_errors.push((stage.to_string(), error));
                     error
-                })
-                .fold(0.0, f32::max);
-            diagnostic_offset = end;
-            boundary_errors.push((stage.to_string(), error));
-            error
-        };
-        verify_rows(
-            "encoder_input",
-            reference.tensor_f32("patch_and_position").unwrap(),
-            &diagnostics.input,
-        );
-        verify_rows(
-            "norm1",
-            reference.tensor_f32("encoder_layer_00_norm1").unwrap(),
-            &diagnostics.norm1,
-        );
-        for (stage, key, shards) in [
-            ("query", "encoder_layer_00_query", &diagnostics.qkv[0]),
-            ("key", "encoder_layer_00_key", &diagnostics.qkv[1]),
-            ("value", "encoder_layer_00_value", &diagnostics.qkv[2]),
-        ] {
-            verify_rows(stage, reference.tensor_f32(key).unwrap(), shards);
-        }
-        let attention_heads = reference
-            .tensor_f32("encoder_layer_00_attention_heads")
-            .unwrap();
-        let heads = config.num_attention_heads;
-        let sequence = model.sequence_length();
-        let head_columns = config.hidden_size / heads;
-        let mut attention_hidden = vec![0.0; usize::from(rows) * usize::from(columns)];
-        for batch in 0..usize::from(batch_size) {
-            for row in 0..sequence {
-                for head in 0..heads {
-                    for column in 0..head_columns {
-                        let source =
-                            ((batch * heads + head) * sequence + row) * head_columns + column;
-                        let destination = (batch * sequence + row) * config.hidden_size
-                            + head * head_columns
-                            + column;
-                        attention_hidden[destination] = attention_heads[source];
+                };
+            verify_rows(
+                "encoder_input",
+                reference.tensor_f32("patch_and_position").unwrap(),
+                &diagnostics.input,
+            );
+            verify_rows(
+                "norm1",
+                reference.tensor_f32("encoder_layer_00_norm1").unwrap(),
+                &diagnostics.norm1,
+            );
+            for (stage, key, shards) in [
+                ("query", "encoder_layer_00_query", &diagnostics.qkv[0]),
+                ("key", "encoder_layer_00_key", &diagnostics.qkv[1]),
+                ("value", "encoder_layer_00_value", &diagnostics.qkv[2]),
+            ] {
+                verify_rows(stage, reference.tensor_f32(key).unwrap(), shards);
+            }
+            let attention_heads = reference
+                .tensor_f32("encoder_layer_00_attention_heads")
+                .unwrap();
+            let heads = config.num_attention_heads;
+            let sequence = model.sequence_length();
+            let head_columns = config.hidden_size / heads;
+            let mut attention_hidden = vec![0.0; usize::from(rows) * usize::from(columns)];
+            for batch in 0..usize::from(batch_size) {
+                for row in 0..sequence {
+                    for head in 0..heads {
+                        for column in 0..head_columns {
+                            let source =
+                                ((batch * heads + head) * sequence + row) * head_columns + column;
+                            let destination = (batch * sequence + row) * config.hidden_size
+                                + head * head_columns
+                                + column;
+                            attention_hidden[destination] = attention_heads[source];
+                        }
                     }
                 }
             }
+            verify_rows(
+                "attention_hidden",
+                attention_hidden,
+                &diagnostics.attention_hidden,
+            );
+            verify_rows(
+                "attention_residual",
+                reference
+                    .tensor_f32("encoder_layer_00_attention_residual")
+                    .unwrap(),
+                &diagnostics.attention_residual,
+            );
+            let expected_norm2 = reference.tensor_f32("encoder_layer_00_norm2").unwrap();
+            let norm2_error = verify_rows("norm2", expected_norm2, &norm2);
+            drop(verify_rows);
+            let expected = reference.tensor_f32("encoder_layer_00_mlp_gelu").unwrap();
+            let expected = pad_columns(
+                &expected,
+                usize::from(rows),
+                config.intermediate_size,
+                usize::from(intermediate_columns),
+            );
+            let expected = serialize_a16_blocks(
+                &expected,
+                usize::from(rows),
+                usize::from(intermediate_columns),
+                &mlp_gelu,
+            );
+            let mlp_gelu_error = invocation_outputs
+                .iter()
+                .enumerate()
+                .map(|(invocation, actual)| {
+                    let error = verify_linear_f16(
+                        &actual[diagnostic_offset..diagnostic_offset + expected.len() * 2],
+                        &expected,
+                    );
+                    info!(
+                        invocation,
+                        error,
+                        stage = "mlp_gelu",
+                        "SigLIP invocation error"
+                    );
+                    error
+                })
+                .fold(0.0, f32::max);
+            let gelu_bytes = usize::from(rows) * usize::from(intermediate_columns) * 2;
+            (
+                diagnostic_offset + gelu_bytes,
+                boundary_errors,
+                Some(norm2_error),
+                Some(mlp_gelu_error),
+            )
+        } else {
+            (0, Vec::new(), None, None)
+        };
+    for (stage, checks) in &finite_checks {
+        let bytes = checks.len() * 6 * 4;
+        for (invocation, actual) in invocation_outputs.iter().enumerate() {
+            let flags = &actual[diagnostic_bytes..diagnostic_bytes + bytes];
+            let nonfinite = flags
+                .chunks_exact(4)
+                .enumerate()
+                .filter_map(|(index, bytes)| {
+                    let value = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    (value != 0).then_some((index / 6, index % 6, value - 1))
+                })
+                .collect::<Vec<_>>();
+            if let Some(&(shard, worker, element)) = nonfinite.first() {
+                println!(
+                    "siglip_finite_check stage={stage} status=nonfinite invocation={invocation} affected_workers={} first_shard={shard} first_worker={worker} first_element={element}",
+                    nonfinite.len()
+                );
+            } else {
+                println!("siglip_finite_check stage={stage} status=finite invocation={invocation}");
+            }
         }
-        verify_rows(
-            "attention_hidden",
-            attention_hidden,
-            &diagnostics.attention_hidden,
-        );
-        verify_rows(
-            "attention_residual",
-            reference
-                .tensor_f32("encoder_layer_00_attention_residual")
-                .unwrap(),
-            &diagnostics.attention_residual,
-        );
-        let expected_norm2 = reference.tensor_f32("encoder_layer_00_norm2").unwrap();
-        let norm2_error = verify_rows("norm2", expected_norm2, &norm2);
-        drop(verify_rows);
-        let expected = reference.tensor_f32("encoder_layer_00_mlp_gelu").unwrap();
-        let expected = pad_columns(
+        diagnostic_bytes += bytes;
+    }
+    if diagnostic_boundaries && let Some(post_norm) = &post_norm_output {
+        let expected = reference.tensor_f32("post_layernorm").unwrap();
+        let expected = expected.repeat(usize::from(batch_size));
+        let expected = serialize_a16_row_shards(
             &expected,
             usize::from(rows),
-            config.intermediate_size,
-            usize::from(intermediate_columns),
+            usize::from(columns),
+            post_norm,
         );
-        let expected = serialize_a16_blocks(
-            &expected,
-            usize::from(rows),
-            usize::from(intermediate_columns),
-            &mlp_gelu,
-        );
-        let mlp_gelu_error = invocation_outputs
+        let boundary_bytes = expected.len() * 2;
+        let error = invocation_outputs
             .iter()
             .enumerate()
             .map(|(invocation, actual)| {
-                let error = verify_linear_f16(
-                    &actual[diagnostic_offset..diagnostic_offset + expected.len() * 2],
-                    &expected,
-                );
+                let end = diagnostic_bytes + boundary_bytes;
+                let error = verify_linear_f16(&actual[diagnostic_bytes..end], &expected);
                 info!(
                     invocation,
                     error,
-                    stage = "mlp_gelu",
+                    stage = "post_layernorm",
                     "SigLIP invocation error"
                 );
                 error
             })
             .fold(0.0, f32::max);
-        let gelu_bytes = usize::from(rows) * usize::from(intermediate_columns) * 2;
-        (
-            diagnostic_offset + gelu_bytes,
-            boundary_errors,
-            Some(norm2_error),
-            Some(mlp_gelu_error),
-        )
-    } else {
-        (0, Vec::new(), None, None)
-    };
-    let expected_layer = if full_model {
+        diagnostic_bytes += boundary_bytes;
+        boundary_errors.push(("post_layernorm".into(), error));
+    }
+    if map_diagnostics.is_some() {
+        let attention = attentions
+            .get(1)
+            .expect("MAP diagnostics require MAP attention");
+        let query_bytes = attention
+            .tasks
+            .iter()
+            .map(|task| {
+                usize::from(task.query_rows) * usize::from(attention.padded_head_dimension) * 2
+            })
+            .sum::<usize>();
+        let key_value_bytes = attention
+            .key_values
+            .iter()
+            .map(|block| usize::try_from(block.matrix_size).unwrap())
+            .sum::<usize>();
+        let accumulator_bytes = attention
+            .tasks
+            .iter()
+            .map(|task| {
+                usize::from(task.query_rows) * (usize::from(attention.head_dimension) * 4 + 8)
+            })
+            .sum::<usize>();
+        let scores_bytes = attention
+            .tasks
+            .iter()
+            .map(|task| {
+                usize::from(task.query_rows)
+                    * usize::from(
+                        attention
+                            .key_block_columns
+                            .max(attention.padded_head_dimension),
+                    )
+                    * 2
+            })
+            .sum::<usize>();
+        let weights_bytes = attention
+            .tasks
+            .iter()
+            .map(|task| usize::from(task.query_rows) * usize::from(attention.key_block_columns) * 2)
+            .sum::<usize>();
+        let output_bytes = attention
+            .tasks
+            .iter()
+            .map(|task| usize::from(task.query_rows) * usize::from(attention.head_dimension) * 2)
+            .sum::<usize>();
+        for (stage, bytes) in [
+            ("map_attention_query", query_bytes),
+            ("map_attention_key", key_value_bytes),
+            ("map_attention_value", key_value_bytes),
+        ] {
+            let mut finite = true;
+            for (invocation, actual) in invocation_outputs.iter().enumerate() {
+                finite &=
+                    verify_finite_f16(&actual[diagnostic_bytes..diagnostic_bytes + bytes], stage);
+                info!(invocation, stage, "SigLIP MAP diagnostic is finite");
+            }
+            println!(
+                "siglip_map_diagnostic stage={stage} status={}",
+                if finite { "finite" } else { "nonfinite" }
+            );
+            diagnostic_bytes += bytes;
+        }
+        for (stage, bytes, f32_values) in [
+            ("map_attention_accumulator", accumulator_bytes, true),
+            ("map_attention_scores", scores_bytes, false),
+            ("map_attention_weights", weights_bytes, false),
+            ("map_attention_task_output", output_bytes, false),
+        ] {
+            let mut finite = true;
+            for (invocation, actual) in invocation_outputs.iter().enumerate() {
+                let values = &actual[diagnostic_bytes..diagnostic_bytes + bytes];
+                finite &= if f32_values {
+                    verify_finite_f32(values, stage)
+                } else {
+                    verify_finite_f16(values, stage)
+                };
+                info!(invocation, stage, "SigLIP MAP diagnostic is finite");
+            }
+            println!(
+                "siglip_map_diagnostic stage={stage} status={}",
+                if finite { "finite" } else { "nonfinite" }
+            );
+            diagnostic_bytes += bytes;
+        }
+        let map_rows = usize::from(batch_size) * 12;
+        for (stage, elements) in [
+            ("map_attention_hidden", map_rows * usize::from(columns)),
+            ("map_attention_residual", map_rows * usize::from(columns)),
+            ("map_norm", map_rows * usize::from(columns)),
+            ("map_mlp_gelu", map_rows * usize::from(intermediate_columns)),
+        ] {
+            let bytes = elements * 2;
+            let mut finite = true;
+            for (invocation, actual) in invocation_outputs.iter().enumerate() {
+                finite &=
+                    verify_finite_f16(&actual[diagnostic_bytes..diagnostic_bytes + bytes], stage);
+                info!(invocation, stage, "SigLIP MAP diagnostic is finite");
+            }
+            println!(
+                "siglip_map_diagnostic stage={stage} status={}",
+                if finite { "finite" } else { "nonfinite" }
+            );
+            diagnostic_bytes += bytes;
+        }
+    }
+    let pooler_model = full_model && !post_norm_only;
+    let expected_layer = if pooler_model {
         let expected = reference.tensor_f32("pooler_output").unwrap();
         (0..usize::from(output_rows))
             .flat_map(|_| expected.iter().copied())
             .collect::<Vec<_>>()
+    } else if full_model {
+        reference
+            .tensor_f32("post_layernorm")
+            .unwrap()
+            .repeat(usize::from(batch_size))
     } else {
         let expected = reference
             .tensor_f32(&format!("encoder_layer_{:02}", layer_count - 1))
@@ -766,6 +1158,31 @@ fn main() {
         usize::from(columns),
         &output,
     );
+    if let Some(path) = std::env::var_os("IPU_SIGLIP_LOGICAL_OUTPUT") {
+        let output_bytes = expected_layer.len() * 2;
+        let logical = deserialize_a16_row_shards(
+            &invocation_outputs[0][diagnostic_bytes..diagnostic_bytes + output_bytes],
+            usize::from(output_rows),
+            usize::from(columns),
+            &output,
+        );
+        fs::write(path, logical).unwrap();
+    }
+    if !verify_weight_prefixes.is_empty() {
+        let weight_offset = diagnostic_bytes + expected_layer.len() * 2;
+        for (invocation, actual) in invocation_outputs.iter().enumerate() {
+            assert_eq!(
+                &actual[weight_offset..],
+                expected_weight_readback.as_slice(),
+                "resident-weight readback differs for invocation {invocation}"
+            );
+        }
+        println!(
+            "siglip_weight_verification prefixes={} bytes={} status=match",
+            verify_weight_prefixes.join(","),
+            expected_weight_readback.len()
+        );
+    }
     let layer_error = invocation_outputs
         .iter()
         .enumerate()
@@ -780,7 +1197,7 @@ fn main() {
             error
         })
         .fold(0.0, f32::max);
-    let cosine_similarity = full_model.then(|| {
+    let cosine_similarity = pooler_model.then(|| {
         invocation_outputs
             .iter()
             .map(|actual| cosine_similarity_f16(&actual[diagnostic_bytes..], &expected_layer))
@@ -845,7 +1262,12 @@ fn main() {
 
 fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
     let config = &model.config;
-    let rows = u16::try_from(model.sequence_length()).unwrap();
+    let sequence_length = u16::try_from(model.sequence_length()).unwrap();
+    let batch_size =
+        u16::try_from(env_u32("IPU_SIGLIP_BATCH_SIZE", 1)).expect("SigLIP batch size exceeds u16");
+    let rows = sequence_length
+        .checked_mul(batch_size)
+        .expect("SigLIP flattened row count exceeds u16");
     let columns = u16::try_from(config.hidden_size).unwrap();
     let row_block_dimension = choose_gemm_row_block_for_shape(
         rows,
@@ -865,7 +1287,19 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         peak_sram: BTreeMap::new(),
     };
     let mut host = HostTensorSet::default();
-    let input_values = reference.tensor_f32("encoder_layer_26").unwrap();
+    let input_values = if let Some(path) = std::env::var_os("IPU_SIGLIP_MAP_INPUT") {
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(bytes.len(), usize::from(rows) * usize::from(columns) * 2);
+        bytes
+            .chunks_exact(2)
+            .map(|bytes| f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32())
+            .collect()
+    } else {
+        reference
+            .tensor_f32("encoder_layer_26")
+            .unwrap()
+            .repeat(usize::from(batch_size))
+    };
     let input = append_host_a16_matrix(
         &mut schedule,
         "map.input",
@@ -890,9 +1324,9 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
     let post_norm_only = std::env::var_os("IPU_SIGLIP_POST_NORM_ONLY").is_some();
     let (output, output_rows, attention, expected) = if post_norm_only {
         let attention = plan_flash_attention(FlashAttentionConfig {
-            batch_size: 1,
+            batch_size,
             query_sequence_length: 12,
-            sequence_length: rows,
+            sequence_length,
             hidden_size: columns,
             attention_heads: u16::try_from(config.num_attention_heads).unwrap(),
             query_block_rows: 12,
@@ -906,26 +1340,40 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
             input,
             rows,
             attention,
-            reference.tensor_f32("post_layernorm").unwrap(),
+            reference
+                .tensor_f32("post_layernorm")
+                .unwrap()
+                .repeat(usize::from(batch_size)),
         )
     } else {
-        let map = append_siglip_map_head(
+        let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
+        let memory = if std::env::var_os("IPU_SIGLIP_MAP_USE_ENCODER_MEMORY_POLICY").is_some() {
+            encoder_memory_policy(data_limit)
+        } else {
+            MemoryPolicy::contiguous(DATA_BASE, data_limit)
+        };
+        let map = append_siglip_map_head_batched_with_memory_policy(
             &mut schedule,
             &input,
             model,
-            rows,
+            batch_size,
+            sequence_length,
             row_block_dimension,
             TILE_COUNT,
             DATA_BASE,
-            ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            data_limit,
+            &memory,
+            false,
             &mut host,
         )
         .unwrap();
+        dump_map_attention_placement(&map.attention);
         let expected = reference.tensor_f32("pooler_output").unwrap();
-        let expected = (0..12)
+        let output_rows = batch_size.checked_mul(12).unwrap();
+        let expected = (0..output_rows)
             .flat_map(|_| expected.iter().copied())
             .collect::<Vec<_>>();
-        (map.output, 12, map.attention, expected)
+        (map.output, output_rows, map.attention, expected)
     };
     let attention_variants =
         consolidate_attention_kernel_variants(&mut schedule, std::slice::from_ref(&attention));
@@ -959,8 +1407,19 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
             &output,
         )],
     };
-    write_memory_profile(&graph);
-    let app = package_graph_repeated(&graph, &objects, invocations).unwrap();
+    let app = if std::env::var_os("IPU_MEMORY_PROFILE_OUTPUT").is_some() {
+        let (app, memory_profile) = package_graph_repeated_with_templates_owned_and_memory_profile(
+            graph,
+            &objects,
+            &[],
+            invocations,
+        )
+        .unwrap();
+        write_memory_profile(&memory_profile);
+        app
+    } else {
+        package_graph_repeated_with_templates_owned(graph, &objects, &[], invocations).unwrap()
+    };
     if let Some(path) = std::env::var_os("IPU_SIGLIP_PACKAGE_OUTPUT") {
         app.write(fs::File::create(path).unwrap()).unwrap();
     }
@@ -1009,20 +1468,62 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         .fold(0.0, f32::max);
     let limit = env_f32("IPU_F16_MAX_ERROR", 0.2);
     info!(error, limit, "SigLIP MAP verification result");
+    println!("siglip_map_verification max_error={error:.8}");
     assert!(error <= limit, "MAP max error {error} exceeds {limit}");
 }
 
-fn write_memory_profile(graph: &ExecutableGraph) {
+fn write_memory_profile(profile: &ipu_package::MemoryProfile) {
     let Some(path) = std::env::var_os("IPU_MEMORY_PROFILE_OUTPUT") else {
         return;
     };
-    let profile = allocator_memory_profile(graph).unwrap();
     profile.write(fs::File::create(&path).unwrap()).unwrap();
     info!(
         path = %PathBuf::from(path).display(),
         tiles = profile.tiles.len(),
         "wrote SigLIP allocator memory profile"
     );
+}
+
+fn dump_map_attention_placement(attention: &FlashAttentionPlan) {
+    if std::env::var_os("IPU_SIGLIP_DUMP_MAP_ATTENTION").is_none() {
+        return;
+    }
+    for task in attention
+        .tasks
+        .iter()
+        .filter(|task| task.batch == 0 && task.head == 5)
+    {
+        println!(
+            "map_attention_task batch={} head={} rows={}..{} tile={} query=0x{:x} accumulator=0x{:x} scores=0x{:x} weights=0x{:x} output=0x{:x}",
+            task.batch,
+            task.head,
+            task.query_row_start,
+            task.query_row_start + task.query_rows,
+            task.tile,
+            task.query_address,
+            task.accumulator_address,
+            task.scores_address,
+            task.weights_address,
+            task.output_address,
+        );
+    }
+    for block in attention
+        .key_values
+        .iter()
+        .filter(|block| block.batch == 0 && block.head == 5)
+    {
+        println!(
+            "map_attention_kv batch={} head={} rows={}..{} tile={} key=0x{:x} value=0x{:x} bytes={}",
+            block.batch,
+            block.head,
+            block.key_row_start,
+            block.key_row_start + block.key_rows,
+            block.tile,
+            block.key_address,
+            block.value_address,
+            block.matrix_size,
+        );
+    }
 }
 
 fn encoder_memory_policy(data_limit: u32) -> MemoryPolicy {
@@ -1168,7 +1669,26 @@ fn compile_objects(
     };
     let toolchain = Toolchain::from_sdk(sdk);
     let runtime = toolchain.compile(source("static_runtime.S"), &artifacts, "runtime", &[])?;
-    let gemm_variants = compile_gemm_row_variants(&toolchain, &artifacts, schedule)?;
+    let finite_check_codelet = toolchain.compile(
+        source("check_finite_f16.cpp"),
+        &artifacts,
+        "check-finite-f16-codelet",
+        &["-O1".into()],
+    )?;
+    let finite_check_wrapper = toolchain.compile(
+        source("check_finite_f16.S"),
+        &artifacts,
+        "check-finite-f16-wrapper",
+        &[],
+    )?;
+    let native_fp8_stochastic_rounding =
+        env_u32("IPU_SIGLIP_NATIVE_FP8_STOCHASTIC_ROUNDING", 1) != 0;
+    let gemm_variants = compile_gemm_row_variants(
+        &toolchain,
+        &artifacts,
+        schedule,
+        native_fp8_stochastic_rounding,
+    )?;
     let uses_fp8_weights = schedule.phases.iter().any(|phase| {
         matches!(phase, Phase::Compute { commands, .. } if commands.iter().any(|command| {
             command.specialization.operation == "expand_f8_f143_to_f16"
@@ -1210,7 +1730,11 @@ fn compile_objects(
                     source("quantize_a16_to_a32_f143.S"),
                     &artifacts,
                     "quantize-a16-to-a32-f143-wrapper",
-                    &[],
+                    &if native_fp8_stochastic_rounding {
+                        Vec::new()
+                    } else {
+                        vec!["-DQUANTIZE_STOCHASTIC_ROUNDING=0".into()]
+                    },
                 )?,
             ))
         })
@@ -1295,6 +1819,8 @@ fn compile_objects(
     )?;
     let mut objects = vec![
         fs::read(runtime.object)?,
+        fs::read(finite_check_codelet.object)?,
+        fs::read(finite_check_wrapper.object)?,
         fs::read(add.object)?,
         fs::read(add_bias.object)?,
         fs::read(relayout.object)?,
@@ -1373,6 +1899,7 @@ fn compile_gemm_row_variants(
     toolchain: &Toolchain,
     artifacts: &std::path::Path,
     schedule: &ipu_compiler::Schedule,
+    native_fp8_stochastic_rounding: bool,
 ) -> Result<Vec<KernelArtifact>, ipu_elf::ElfError> {
     let mut variants = BTreeSet::<(String, u16, u16, u16)>::new();
     for phase in &schedule.phases {
@@ -1430,7 +1957,12 @@ fn compile_gemm_row_variants(
             match family.as_str() {
                 "gemm_f16" => {}
                 "gemm_f16_f8w" => flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into()),
-                "gemm_f8" => flags.push("-DGEMM_NATIVE_FP8=1".into()),
+                "gemm_f8" => {
+                    flags.push("-DGEMM_NATIVE_FP8=1".into());
+                    if !native_fp8_stochastic_rounding {
+                        flags.push("-DGEMM_STOCHASTIC_ROUNDING=0".into());
+                    }
+                }
                 _ => unreachable!(),
             }
             toolchain.compile(
@@ -1574,6 +2106,103 @@ fn compile_attention_variant(
     Ok(objects)
 }
 
+fn append_finite_checks_at_phase(
+    schedule: &mut ipu_compiler::Schedule,
+    input: &[RowShardPlacement],
+    phase: usize,
+) -> Vec<FiniteCheckPlacement> {
+    const WORKERS: u32 = 6;
+    let Phase::Compute { commands, .. } = &mut schedule.phases[phase] else {
+        panic!("finite checks require a compute phase")
+    };
+    let command_base = commands.len();
+    let mut checks = Vec::with_capacity(input.len());
+    for (command, shard) in input.iter().enumerate() {
+        checks.push(FiniteCheckPlacement {
+            tile: shard.tile,
+            address: 0,
+            phase,
+            command: command_base + command,
+        });
+        commands.push(Arc::new(KernelCommand {
+            tile: shard.tile,
+            output: TensorId(usize::MAX),
+            inputs: vec![shard.tensor],
+            arguments: vec![u32::from(shard.rows) * u32::from(shard.columns)],
+            specialization: Arc::new(SpecializationKey {
+                operation: "check_finite_f16".into(),
+                shape: vec![usize::from(shard.rows), usize::from(shard.columns)],
+                worker_count: WORKERS as u8,
+                role: "finite-check".into(),
+                alignment: 8,
+                abi: ipu_compiler::KernelAbi::Generic,
+            }),
+            metadata: BTreeMap::from([
+                ("label".into(), "check FP16 finiteness".into()),
+                ("row_start".into(), shard.row_start.to_string()),
+                ("rows".into(), shard.rows.to_string()),
+            ]),
+        }));
+    }
+    checks
+}
+
+fn materialize_finite_checks(
+    schedule: &mut ipu_compiler::Schedule,
+    stages: &mut [(String, Vec<FiniteCheckPlacement>)],
+    memory: &MemoryPolicy,
+) -> Result<(), ipu_compiler::CompileError> {
+    const BYTES: u32 = 6 * 4;
+    let mut next_tensor = schedule.allocations.next_tensor_id();
+    for (_, checks) in stages {
+        for check in checks {
+            let tensor = TensorId(next_tensor);
+            next_tensor += 1;
+            check.address = schedule.allocations.find_free_region_in_arenas(
+                check.tile,
+                BYTES,
+                check.phase,
+                usize::MAX,
+                &memory.transient,
+                8,
+            )?;
+            schedule.allocations.push(Allocation {
+                tensor,
+                tile: check.tile,
+                address: check.address,
+                size: BYTES,
+                live_from: check.phase,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            });
+            let Phase::Compute { commands, .. } = &mut schedule.phases[check.phase] else {
+                unreachable!("finite-check phase changed kind")
+            };
+            Arc::make_mut(&mut commands[check.command]).output = tensor;
+        }
+    }
+    Ok(())
+}
+
+fn finite_check_binding(name: &str, checks: &[FiniteCheckPlacement]) -> Binding {
+    let topology = ipu_exchange::Topology::c600();
+    Binding {
+        name: name.into(),
+        dtype: "u32".into(),
+        shape: vec![u32::try_from(checks.len()).unwrap(), 6],
+        slices: checks
+            .iter()
+            .enumerate()
+            .map(|(index, check)| RegionSlice {
+                tile: u32::from(topology.physical(check.tile).unwrap()),
+                tile_address: check.address,
+                file_offset: u64::try_from(index * 24).unwrap(),
+                size: 24,
+            })
+            .collect(),
+    }
+}
+
 fn row_shard_binding(name: &str, rows: u16, columns: u16, shards: &[RowShardPlacement]) -> Binding {
     let topology = ipu_exchange::Topology::c600();
     let mut file_offset = 0u64;
@@ -1599,6 +2228,76 @@ fn row_shard_binding(name: &str, rows: u16, columns: u16, shards: &[RowShardPlac
     }
 }
 
+fn attention_task_binding(
+    name: &str,
+    dtype: &str,
+    tasks: &[ipu_compiler::AttentionTaskPlacement],
+    address: impl Fn(&ipu_compiler::AttentionTaskPlacement) -> u32,
+    size: impl Fn(&ipu_compiler::AttentionTaskPlacement) -> u64,
+) -> Binding {
+    let topology = ipu_exchange::Topology::c600();
+    let mut file_offset = 0u64;
+    let slices = tasks
+        .iter()
+        .map(|task| {
+            let size = size(task);
+            let slice = RegionSlice {
+                tile: u32::from(topology.physical(task.tile).unwrap()),
+                tile_address: address(task),
+                file_offset,
+                size,
+            };
+            file_offset += size;
+            slice
+        })
+        .collect();
+    Binding {
+        name: name.into(),
+        dtype: dtype.into(),
+        shape: vec![
+            u32::try_from(
+                file_offset
+                    / match dtype {
+                        "f16" => 2,
+                        "f32" => 4,
+                        _ => 1,
+                    },
+            )
+            .unwrap(),
+        ],
+        slices,
+    }
+}
+
+fn attention_key_value_binding(
+    name: &str,
+    blocks: &[ipu_compiler::AttentionKeyValuePlacement],
+    address: impl Fn(&ipu_compiler::AttentionKeyValuePlacement) -> u32,
+) -> Binding {
+    let topology = ipu_exchange::Topology::c600();
+    let mut file_offset = 0u64;
+    let slices = blocks
+        .iter()
+        .map(|block| {
+            let size = u64::from(block.matrix_size);
+            let slice = RegionSlice {
+                tile: u32::from(topology.physical(block.tile).unwrap()),
+                tile_address: address(block),
+                file_offset,
+                size,
+            };
+            file_offset += size;
+            slice
+        })
+        .collect();
+    Binding {
+        name: name.into(),
+        dtype: "f16".into(),
+        shape: vec![u32::try_from(file_offset / 2).unwrap()],
+        slices,
+    }
+}
+
 fn verify_linear_f16(actual: &[u8], expected: &[f32]) -> f32 {
     assert!(actual.len() >= expected.len() * 2);
     let mut max_error = 0.0f32;
@@ -1606,11 +2305,12 @@ fn verify_linear_f16(actual: &[u8], expected: &[f32]) -> f32 {
     let mut observed_min = f32::INFINITY;
     let mut observed_max = f32::NEG_INFINITY;
     for (index, &expected) in expected.iter().enumerate() {
-        let observed = f16::from_bits(u16::from_le_bytes(
-            actual[index * 2..index * 2 + 2].try_into().unwrap(),
-        ))
-        .to_f32();
-        assert!(observed.is_finite());
+        let bits = u16::from_le_bytes(actual[index * 2..index * 2 + 2].try_into().unwrap());
+        let observed = f16::from_bits(bits).to_f32();
+        assert!(
+            observed.is_finite(),
+            "non-finite FP16 result at element {index}: bits=0x{bits:04x}, expected={expected}"
+        );
         observed_min = observed_min.min(observed);
         observed_max = observed_max.max(observed);
         let error = (observed - expected).abs();
@@ -1630,17 +2330,42 @@ fn verify_linear_f16(actual: &[u8], expected: &[f32]) -> f32 {
     max_error
 }
 
+fn verify_finite_f16(actual: &[u8], stage: &str) -> bool {
+    assert!(actual.len().is_multiple_of(2));
+    for (index, bytes) in actual.chunks_exact(2).enumerate() {
+        let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        if !f16::from_bits(bits).is_finite() {
+            println!("siglip_map_nonfinite stage={stage} element={index} bits=0x{bits:04x}");
+            return false;
+        }
+    }
+    true
+}
+
+fn verify_finite_f32(actual: &[u8], stage: &str) -> bool {
+    assert!(actual.len().is_multiple_of(4));
+    for (index, bytes) in actual.chunks_exact(4).enumerate() {
+        let bits = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if !f32::from_bits(bits).is_finite() {
+            println!("siglip_map_nonfinite stage={stage} element={index} bits=0x{bits:08x}");
+            return false;
+        }
+    }
+    true
+}
+
 fn cosine_similarity_f16(actual: &[u8], expected: &[f32]) -> f64 {
     assert!(actual.len() >= expected.len() * 2);
     let mut dot = 0.0f64;
     let mut actual_norm = 0.0f64;
     let mut expected_norm = 0.0f64;
     for (index, &expected) in expected.iter().enumerate() {
-        let actual = f16::from_bits(u16::from_le_bytes(
-            actual[index * 2..index * 2 + 2].try_into().unwrap(),
-        ))
-        .to_f32();
-        assert!(actual.is_finite());
+        let bits = u16::from_le_bytes(actual[index * 2..index * 2 + 2].try_into().unwrap());
+        let actual = f16::from_bits(bits).to_f32();
+        assert!(
+            actual.is_finite(),
+            "non-finite FP16 result at element {index}: bits=0x{bits:04x}, expected={expected}"
+        );
         let actual = f64::from(actual);
         let expected = f64::from(expected);
         dot += actual * expected;
@@ -1672,6 +2397,32 @@ fn serialize_a16_row_shards(
         }
     }
     serialized
+}
+
+fn deserialize_a16_row_shards(
+    serialized: &[u8],
+    rows: usize,
+    columns: usize,
+    shards: &[RowShardPlacement],
+) -> Vec<u8> {
+    assert_eq!(serialized.len(), rows * columns * 2);
+    let mut values = vec![0u8; serialized.len()];
+    let mut source = 0;
+    for shard in shards {
+        for panel in 0..usize::from(shard.columns) / 16 {
+            for row in 0..usize::from(shard.rows) {
+                for column in 0..16 {
+                    let destination =
+                        ((usize::from(shard.row_start) + row) * columns + panel * 16 + column) * 2;
+                    values[destination..destination + 2]
+                        .copy_from_slice(&serialized[source..source + 2]);
+                    source += 2;
+                }
+            }
+        }
+    }
+    assert_eq!(source, serialized.len());
+    values
 }
 
 fn serialize_a16_blocks(
