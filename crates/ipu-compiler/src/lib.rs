@@ -785,7 +785,7 @@ impl AllocationKind {
 
 #[derive(Debug, Default)]
 struct AllocationStoreIndex {
-    by_tensor: HashMap<TensorId, Vec<usize>>,
+    by_tensor: Vec<Vec<usize>>,
     homes_by_tile: Vec<Vec<usize>>,
     all_by_tile: Vec<Vec<(u32, u32)>>,
     finite_by_live_until: HashMap<usize, Vec<usize>>,
@@ -796,10 +796,11 @@ struct AllocationStoreIndex {
 
 impl AllocationStoreIndex {
     fn add(&mut self, index: usize, allocation: &Allocation) {
-        self.by_tensor
-            .entry(allocation.tensor)
-            .or_default()
-            .push(index);
+        if self.by_tensor.len() <= allocation.tensor.0 {
+            self.by_tensor
+                .resize_with(allocation.tensor.0 + 1, Vec::new);
+        }
+        self.by_tensor[allocation.tensor.0].push(index);
         if allocation.kind == AllocationKind::Home {
             let tile = usize::from(allocation.tile);
             if self.homes_by_tile.len() <= tile {
@@ -974,7 +975,7 @@ impl AllocationStore {
         self.with_index(|index| {
             tensors
                 .iter()
-                .flat_map(|tensor| index.by_tensor.get(tensor).into_iter().flatten().copied())
+                .flat_map(|tensor| index.by_tensor.get(tensor.0).into_iter().flatten().copied())
                 .collect()
         })
     }
@@ -1033,7 +1034,7 @@ impl AllocationStore {
         self.with_index(|index| {
             index
                 .by_tensor
-                .get(&tensor)
+                .get(tensor.0)
                 .into_iter()
                 .flatten()
                 .any(|&allocation_index| {
@@ -4510,7 +4511,7 @@ impl Schedule {
             }
             let address_candidates = index
                 .by_tensor
-                .get(&tensor)
+                .get(tensor.0)
                 .into_iter()
                 .flatten()
                 .copied()
