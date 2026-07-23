@@ -359,6 +359,40 @@ pub struct SpecializationKey {
     pub alignment: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelOperand {
+    Output,
+    Input(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelMemoryConstraint {
+    /// Every listed pointer must reside in a different effective memory element.
+    DistinctEffectiveElements(&'static [KernelOperand]),
+}
+
+const PACE_ACCUMULATOR_STREAM_OPERANDS: [KernelOperand; 2] =
+    [KernelOperand::Output, KernelOperand::Input(0)];
+const PACE_ACCUMULATOR_STREAM_CONSTRAINTS: [KernelMemoryConstraint; 1] =
+    [KernelMemoryConstraint::DistinctEffectiveElements(
+        &PACE_ACCUMULATOR_STREAM_OPERANDS,
+    )];
+
+impl SpecializationKey {
+    /// Memory-access constraints imposed by the selected device kernel ABI.
+    ///
+    /// Operation names are the link-time ABI keys used to select support-image
+    /// symbols, so keeping the constraint registry on the same keys prevents
+    /// planner-only placement assumptions from being lost during final packing.
+    pub fn memory_constraints(&self) -> &'static [KernelMemoryConstraint] {
+        if self.operation.starts_with("gemm_f16_") || self.operation.starts_with("gemm_f32_") {
+            &PACE_ACCUMULATOR_STREAM_CONSTRAINTS
+        } else {
+            &[]
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KernelCommand {
     pub tile: u16,

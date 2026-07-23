@@ -182,10 +182,48 @@ pub const TILE_MEMORY_SIZE: u32 = 624 * 1024;
 pub const TILE_MEMORY_ELEMENT_SIZE: u32 = 0x4000;
 /// End of IPU21 region 0, the only tile-memory region supporting instruction fetch.
 pub const IPU21_EXECUTABLE_MEMORY_LIMIT: u32 = 0x80000;
-// From Target::getMemoryElementOffsets() for IPU21. PACE kernels use this
-// element for operands declared with an interleaved-memory constraint.
+// The first effective element of IPU21's two-way-interleaved region is kept
+// separate for operands carrying Poplar's interleaved-memory constraint. PACE
+// kernels use it for accumulator output while streaming inputs from another
+// element. These are placement bounds, not the extent of architectural region 1.
 pub const IPU21_INTERLEAVED_MEMORY_BASE: u32 = TILE_MEMORY_BASE + 0x34000;
 pub const IPU21_INTERLEAVED_MEMORY_LIMIT: u32 = TILE_MEMORY_BASE + 0x3c000;
+/// End of architectural region 1, whose interleave factor is two on IPU21.
+pub const IPU21_INTERLEAVED_REGION_LIMIT: u32 = TILE_MEMORY_BASE + TILE_MEMORY_SIZE;
+/// Logical bytes covered by a pair of physical elements in interleaved region 1.
+pub const IPU21_INTERLEAVED_ELEMENT_SIZE: u32 = 2 * TILE_MEMORY_ELEMENT_SIZE;
+
+/// Returns the effective memory-element number and its logical address bounds.
+///
+/// Region 0 maps each 16 KiB logical interval to one physical element. Region 1
+/// stripes 64-bit words over pairs of physical elements, so a 32 KiB logical
+/// interval is the unit that must be kept distinct for packed multi-accesses
+/// whose pointers have the same 64-bit lane parity.
+pub fn ipu21_effective_memory_element(address: u32) -> Option<(u8, u32, u32)> {
+    if !(TILE_MEMORY_BASE..IPU21_INTERLEAVED_REGION_LIMIT).contains(&address) {
+        return None;
+    }
+    if address < IPU21_EXECUTABLE_MEMORY_LIMIT {
+        let index = (address - TILE_MEMORY_BASE) / TILE_MEMORY_ELEMENT_SIZE;
+        let base = TILE_MEMORY_BASE + index * TILE_MEMORY_ELEMENT_SIZE;
+        Some((
+            u8::try_from(index).ok()?,
+            base,
+            base + TILE_MEMORY_ELEMENT_SIZE,
+        ))
+    } else {
+        let region_index =
+            (address - IPU21_EXECUTABLE_MEMORY_LIMIT) / IPU21_INTERLEAVED_ELEMENT_SIZE;
+        let region0_elements =
+            (IPU21_EXECUTABLE_MEMORY_LIMIT - TILE_MEMORY_BASE) / TILE_MEMORY_ELEMENT_SIZE;
+        let base = IPU21_EXECUTABLE_MEMORY_LIMIT + region_index * IPU21_INTERLEAVED_ELEMENT_SIZE;
+        Some((
+            u8::try_from(region0_elements + region_index).ok()?,
+            base,
+            base + IPU21_INTERLEAVED_ELEMENT_SIZE,
+        ))
+    }
+}
 pub const SEGMENT_READ: u32 = 1;
 pub const SEGMENT_WRITE: u32 = 2;
 pub const SEGMENT_EXECUTE: u32 = 4;
@@ -1146,6 +1184,25 @@ mod tests {
             },
         ];
         assert!(app.validate().is_err());
+    }
+
+    #[test]
+    fn ipu21_effective_elements_follow_region_interleaving() {
+        let low = ipu21_effective_memory_element(TILE_MEMORY_BASE).unwrap();
+        let low_tail = ipu21_effective_memory_element(IPU21_EXECUTABLE_MEMORY_LIMIT - 1).unwrap();
+        let high = ipu21_effective_memory_element(IPU21_EXECUTABLE_MEMORY_LIMIT).unwrap();
+        let high_same =
+            ipu21_effective_memory_element(IPU21_EXECUTABLE_MEMORY_LIMIT + 0x7fff).unwrap();
+        let high_next =
+            ipu21_effective_memory_element(IPU21_EXECUTABLE_MEMORY_LIMIT + 0x8000).unwrap();
+
+        assert_eq!(low, (0, TILE_MEMORY_BASE, TILE_MEMORY_BASE + 0x4000));
+        assert_eq!(low_tail.0 + 1, high.0);
+        assert_eq!(high, high_same);
+        assert_eq!(high_next.0, high.0 + 1);
+        assert_eq!(high_next.1, high.2);
+        assert!(ipu21_effective_memory_element(TILE_MEMORY_BASE - 1).is_none());
+        assert!(ipu21_effective_memory_element(IPU21_INTERLEAVED_REGION_LIMIT).is_none());
     }
 
     #[test]

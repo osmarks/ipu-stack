@@ -674,7 +674,6 @@ fn relocation_arenas_for_allocation(
                 ipu_package::TILE_MEMORY_BASE,
                 interleaved.start,
             );
-            append(&mut compatible, interleaved.start, interleaved.end);
             append(
                 &mut compatible,
                 interleaved.end,
@@ -3957,6 +3956,97 @@ fn package_graph_impl_attempt(
     {
         return Err("generated program size changed after executable placement".into());
     }
+    programs
+        .par_iter()
+        .try_for_each(|program| -> Result<()> {
+            let tile = usize::from(program.tile);
+            let executable_elements = &executable_element_reservations[tile];
+            for step in &program.steps {
+                let ipu_compiler::LoweredTileStep::Compute(command) = step else {
+                    continue;
+                };
+                for (tensor, address, operand) in std::iter::once((
+                    command.output,
+                    command.output_address,
+                    "output",
+                ))
+                .chain(
+                    command
+                        .inputs
+                        .iter()
+                        .copied()
+                        .zip(command.input_addresses.iter().copied())
+                        .map(|(tensor, address)| (tensor, address, "input")),
+                ) {
+                    if let Some(&(start, end)) = executable_elements
+                        .iter()
+                        .find(|&&(start, end)| start <= address && address < end)
+                    {
+                        return Err(format!(
+                            "kernel {} phase {} tile {} resolves {operand} tensor {} to 0x{address:x} in executable element 0x{start:x}..0x{end:x}",
+                            command.specialization.operation,
+                            command.phase,
+                            command.tile,
+                            tensor.0,
+                        )
+                        .into());
+                    }
+                }
+                for constraint in command.specialization.memory_constraints() {
+                    let ipu_compiler::KernelMemoryConstraint::DistinctEffectiveElements(
+                        operands,
+                    ) = constraint;
+                    let mut elements = BTreeMap::<u8, (&str, u32, u32, u32)>::new();
+                    for operand in *operands {
+                        let (name, tensor, address) = match *operand {
+                            ipu_compiler::KernelOperand::Output => {
+                                ("output", command.output, command.output_address)
+                            }
+                            ipu_compiler::KernelOperand::Input(index) => (
+                                "input",
+                                *command.inputs.get(index).ok_or_else(|| {
+                                    format!(
+                                        "kernel {} memory ABI refers to missing input {index}",
+                                        command.specialization.operation
+                                    )
+                                })?,
+                                *command.input_addresses.get(index).ok_or_else(|| {
+                                    format!(
+                                        "lowered kernel {} has no address for input {index}",
+                                        command.specialization.operation
+                                    )
+                                })?,
+                            ),
+                        };
+                        let (element, start, end) =
+                            ipu_package::ipu21_effective_memory_element(address).ok_or_else(
+                                || {
+                                    format!(
+                                        "kernel {} phase {} tile {} resolves {name} tensor {} outside tile SRAM at 0x{address:x}",
+                                        command.specialization.operation,
+                                        command.phase,
+                                        command.tile,
+                                        tensor.0,
+                                    )
+                                },
+                            )?;
+                        if let Some((other_name, other_tensor, other_address, _)) =
+                            elements.insert(element, (name, tensor.0 as u32, address, end))
+                        {
+                            return Err(format!(
+                                "kernel {} phase {} tile {} maps {other_name} tensor {other_tensor} at 0x{other_address:x} and {name} tensor {} at 0x{address:x} to effective memory element {element} (0x{start:x}..0x{end:x})",
+                                command.specialization.operation,
+                                command.phase,
+                                command.tile,
+                                tensor.0,
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
     graph
         .schedule
         .allocations
@@ -5823,7 +5913,7 @@ mod tests {
     }
 
     #[test]
-    fn relocation_preserves_required_interleaving_and_allows_ordinary_spill() {
+    fn relocation_preserves_the_dedicated_pace_element() {
         let interleaved = ipu_compiler::Allocation {
             tensor: ipu_compiler::TensorId(1),
             tile: 0,
@@ -5863,18 +5953,13 @@ mod tests {
             arena.base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
                 && arena.limit <= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
         }));
-        assert!(ordinary_arenas.iter().any(|arena| {
-            arena.base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
-                && arena.limit <= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
-        }));
         assert!(ordinary_arenas.iter().all(|arena| {
             !ranges_overlap(
                 arena.base,
                 arena.limit,
                 ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
                 ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
-            ) || (arena.base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
-                && arena.limit <= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT)
+            )
         }));
 
         let ordinary_reservation = (PLAN_BASE, PLAN_BASE + 0x100);
