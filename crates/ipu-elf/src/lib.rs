@@ -296,9 +296,10 @@ struct PlacedSection {
 }
 
 pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, ElfError> {
-    info!(
+    debug!(
         objects = objects.len(),
-        base = format_args!("0x{:x}", options.image_base),
+        relocation_base = format_args!("0x{:x}", options.image_base),
+        regions = ?options.regions,
         entry = %options.entry_symbol,
         "linking tile image"
     );
@@ -532,7 +533,7 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
         segments,
         symbols,
     };
-    info!(
+    debug!(
         bytes = linked.bytes.len(),
         symbols = linked.symbols.len(),
         entry = format_args!("0x{:x}", linked.entry),

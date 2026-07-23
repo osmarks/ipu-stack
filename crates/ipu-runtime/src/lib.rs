@@ -3884,8 +3884,11 @@ fn package_graph_impl_attempt(
             link(
                 objects,
                 &LinkOptions {
-                    image_base: ipu_driver::APPLICATION_LOAD_BASE,
-                    regions: Vec::new(),
+                    image_base: ipu_package::TILE_MEMORY_BASE,
+                    regions: vec![(
+                        ipu_driver::APPLICATION_LOAD_BASE,
+                        ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                    )],
                     entry_symbol: "ipu_stack_static_start".into(),
                     retained_symbols: symbols.clone(),
                     externals: HashMap::new(),
