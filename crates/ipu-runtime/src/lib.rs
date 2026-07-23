@@ -413,6 +413,42 @@ fn pack_generated_and_support_images(
     Ok([placed[0], placed[1]])
 }
 
+fn validate_pinned_executable_images(
+    tile: u16,
+    generated_size: u32,
+    support_size: u32,
+    pinned: [(u32, u32); 2],
+    free_regions: &[(u32, u32)],
+) -> Result<[(u32, u32); 2]> {
+    for ((name, required), (start, end)) in [
+        ("generated program", generated_size),
+        ("support image", support_size),
+    ]
+    .into_iter()
+    .zip(pinned)
+    {
+        if end.checked_sub(start).is_none_or(|bytes| bytes < required) {
+            return Err(format!(
+                "pinned {name} interval 0x{start:x}..0x{end:x} on tile {tile} is shorter than {required} bytes"
+            )
+            .into());
+        }
+        if !free_regions
+            .iter()
+            .any(|&(free_start, free_end)| start >= free_start && end <= free_end)
+        {
+            return Err(format!(
+                "tensor relocation did not preserve pinned {name} interval 0x{start:x}..0x{end:x} on tile {tile}"
+            )
+            .into());
+        }
+    }
+    if ranges_overlap(pinned[0].0, pinned[0].1, pinned[1].0, pinned[1].1) {
+        return Err(format!("pinned executable images overlap on tile {tile}").into());
+    }
+    Ok(pinned)
+}
+
 #[cfg(test)]
 fn allocation_range(allocation: &ipu_compiler::Allocation) -> Result<(u32, u32)> {
     Ok((
@@ -3559,33 +3595,57 @@ fn package_graph_impl_attempt(
         .collect::<Result<Vec<_>>>()?;
     // Generated and support code are independently relocatable. Reserving them
     // separately avoids requiring one artificial contiguous executable extent.
-    let executable_reservations = programs
-        .par_iter()
-        .zip(&tile_exchange_plans)
-        .zip(&program_reservation_sizes)
-        .zip(&preliminary_images)
-        .map(
-            |(((program, plans), &program_size), image)| -> Result<[(u32, u32); 2]> {
-                let regions = executable_regions_for_tile(
-                    &allocation_ranges_by_tile[usize::from(program.tile)],
-                    plans.end,
-                    &[],
-                )?;
-                let placed = pack_generated_and_support_images(
-                    program.tile,
-                    program_size,
-                    u32::try_from(image.bytes.len())?,
-                    regions,
-                )?;
-                Ok(placed)
-            },
-        )
-        .collect::<Result<Vec<_>>>();
-    let executable_reservations = match executable_reservations {
-        Ok(reservations) => reservations,
-        Err(error) => {
-            let place = |allocation_ranges: &[Vec<(u32, u32)>]| {
-                programs
+    let executable_reservations = if let Some(pinned) = executable_placement_history.last() {
+        programs
+            .par_iter()
+            .zip(&tile_exchange_plans)
+            .zip(&program_reservation_sizes)
+            .zip(&preliminary_images)
+            .zip(pinned)
+            .map(
+                |((((program, plans), &program_size), image), &pinned)| -> Result<_> {
+                    let regions = executable_regions_for_tile(
+                        &allocation_ranges_by_tile[usize::from(program.tile)],
+                        plans.end,
+                        &[],
+                    )?;
+                    validate_pinned_executable_images(
+                        program.tile,
+                        program_size,
+                        u32::try_from(image.bytes.len())?,
+                        pinned,
+                        &regions,
+                    )
+                },
+            )
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        let attempted = programs
+            .par_iter()
+            .zip(&tile_exchange_plans)
+            .zip(&program_reservation_sizes)
+            .zip(&preliminary_images)
+            .map(
+                |(((program, plans), &program_size), image)| -> Result<[(u32, u32); 2]> {
+                    let regions = executable_regions_for_tile(
+                        &allocation_ranges_by_tile[usize::from(program.tile)],
+                        plans.end,
+                        &[],
+                    )?;
+                    pack_generated_and_support_images(
+                        program.tile,
+                        program_size,
+                        u32::try_from(image.bytes.len())?,
+                        regions,
+                    )
+                },
+            )
+            .collect::<Result<Vec<_>>>();
+        match attempted {
+            Ok(reservations) => reservations,
+            Err(error) => {
+                let place = |allocation_ranges: &[Vec<(u32, u32)>]| {
+                    programs
                     .par_iter()
                     .zip(&tile_exchange_plans)
                     .zip(&program_reservation_sizes)
@@ -3607,70 +3667,66 @@ fn package_graph_impl_attempt(
                         },
                     )
                     .collect::<Result<Vec<_>>>()
-            };
-            let (desired, move_resident) = match place(&fixed_allocation_ranges) {
-                Ok(desired) => (desired, false),
-                Err(_) => (place(&immovable_allocation_ranges)?, true),
-            };
-            if executable_placement_history.contains(&desired) {
-                return Err(format!(
-                    "executable and tensor placement did not converge after {} distinct layouts: {error}",
-                    executable_placement_history.len()
-                )
-                .into());
+                };
+                let (desired, move_resident) = match place(&fixed_allocation_ranges) {
+                    Ok(desired) => (desired, false),
+                    Err(_) => (place(&immovable_allocation_ranges)?, true),
+                };
+                executable_placement_history.push(desired.clone());
+                let mut relocated_graph = graph.clone();
+                let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+                let reservations = desired
+                    .iter()
+                    .enumerate()
+                    .map(|(tile, ranges)| {
+                        ranges
+                            .iter()
+                            .map(|&(start, end)| {
+                                (align_down(start, element), align_up(end, element))
+                            })
+                            .chain(std::iter::once((PLAN_BASE, tile_exchange_plans[tile].end)))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let moved = if move_resident {
+                    compact_all_allocations_around(
+                        &mut relocated_graph,
+                        &topology,
+                        &reservations,
+                        Some(&resolved_memory_constraints),
+                        "measured executable placement",
+                    )?
+                } else {
+                    compact_transient_allocations_around(
+                        &mut relocated_graph,
+                        &topology,
+                        &reservations,
+                        Some(&resolved_memory_constraints),
+                        "measured executable placement",
+                    )?
+                };
+                if moved == 0 {
+                    return Err(error);
+                }
+                info!(
+                    moved,
+                    move_resident, "relocated transient tensors for measured executable images"
+                );
+                if !profile_code.is_empty() {
+                    return Err(Box::new(ProfileRelayout {
+                        graph: relocated_graph,
+                    }));
+                }
+                return package_graph_impl_attempt(
+                    &relocated_graph,
+                    objects,
+                    &profile_code,
+                    None,
+                    template_regions,
+                    invocations,
+                    executable_placement_history,
+                );
             }
-            executable_placement_history.push(desired.clone());
-            let mut relocated_graph = graph.clone();
-            let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
-            let reservations = desired
-                .iter()
-                .enumerate()
-                .map(|(tile, ranges)| {
-                    ranges
-                        .iter()
-                        .map(|&(start, end)| (align_down(start, element), align_up(end, element)))
-                        .chain(std::iter::once((PLAN_BASE, tile_exchange_plans[tile].end)))
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-            let moved = if move_resident {
-                compact_all_allocations_around(
-                    &mut relocated_graph,
-                    &topology,
-                    &reservations,
-                    Some(&resolved_memory_constraints),
-                    "measured executable placement",
-                )?
-            } else {
-                compact_transient_allocations_around(
-                    &mut relocated_graph,
-                    &topology,
-                    &reservations,
-                    Some(&resolved_memory_constraints),
-                    "measured executable placement",
-                )?
-            };
-            if moved == 0 {
-                return Err(error);
-            }
-            info!(
-                moved,
-                move_resident, "relocated transient tensors for measured executable images"
-            );
-            if !profile_code.is_empty() {
-                return Err(Box::new(ProfileRelayout {
-                    graph: relocated_graph,
-                }));
-            }
-            return package_graph_impl_attempt(
-                &relocated_graph,
-                objects,
-                &profile_code,
-                None,
-                template_regions,
-                invocations,
-                executable_placement_history,
-            );
         }
     };
     info!(
@@ -6830,6 +6886,28 @@ mod tests {
             support.0,
             support.1,
         ));
+    }
+
+    #[test]
+    fn pinned_executable_images_survive_tensor_relayout() {
+        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        let pinned = [(0x50000, 0x50000 + element), (0x58000, 0x58000 + element)];
+        let free = vec![(0x4c000, 0x54000), (0x58000, 0x58000 + 2 * element)];
+
+        assert_eq!(
+            validate_pinned_executable_images(17, element / 2, element, pinned, &free).unwrap(),
+            pinned
+        );
+        assert!(
+            validate_pinned_executable_images(
+                17,
+                element / 2,
+                element,
+                pinned,
+                &[(0x4c000, 0x50000), (0x58000, 0x58000 + 2 * element)],
+            )
+            .is_err()
+        );
     }
 
     #[test]
