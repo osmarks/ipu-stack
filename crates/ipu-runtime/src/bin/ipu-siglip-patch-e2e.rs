@@ -1751,50 +1751,64 @@ fn linear_precision_schedule(
     fallback: SiglipLinearPrecision,
     layers: usize,
 ) -> Vec<SiglipLinearPrecision> {
-    let name = format!("{prefix}_PRECISION");
-    match std::env::var(&name).as_deref() {
-        Err(_) => vec![fallback; layers],
-        Ok("f16") => vec![SiglipLinearPrecision::F16; layers],
-        Ok("f143-expanded") => vec![SiglipLinearPrecision::F143Expanded; layers],
-        Ok("f143-native") => {
-            let plural_name = format!("{prefix}_ACTIVATION_SCALES");
-            let singular_name = format!("{prefix}_ACTIVATION_SCALE");
-            let values = std::env::var(&plural_name)
-                .map(|value| {
-                    value
-                        .split(',')
-                        .map(|value| {
-                            value.parse::<i8>().unwrap_or_else(|_| {
-                                panic!("{plural_name} must be a comma-separated list of i8 values")
-                            })
+    let singular_name = format!("{prefix}_PRECISION");
+    let plural_name = format!("{prefix}_PRECISIONS");
+    let Ok(specification) = std::env::var(&plural_name).or_else(|_| std::env::var(&singular_name))
+    else {
+        return vec![fallback; layers];
+    };
+    let specifications =
+        expand_schedule_values(specification.split(',').collect(), layers, &plural_name);
+    let needs_activation_scales = specifications.contains(&"f143-native");
+    let activation_scales = if needs_activation_scales {
+        let plural_scale_name = format!("{prefix}_ACTIVATION_SCALES");
+        let singular_scale_name = format!("{prefix}_ACTIVATION_SCALE");
+        let values = std::env::var(&plural_scale_name)
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|value| {
+                        value.parse::<i8>().unwrap_or_else(|_| {
+                            panic!(
+                                "{plural_scale_name} must be a comma-separated list of i8 values"
+                            )
                         })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|_| {
-                    vec![
-                        std::env::var(&singular_name)
-                            .unwrap_or_else(|_| {
-                                panic!(
-                                    "{singular_name} or {plural_name} is required for native FP8"
-                                )
-                            })
-                            .parse()
-                            .unwrap_or_else(|_| panic!("{singular_name} must be an i8")),
-                    ]
-                });
-            let values = match values.as_slice() {
-                [value] => vec![*value; layers],
-                values if values.len() == layers => values.to_vec(),
-                _ => {
-                    panic!("{plural_name} must contain one value or exactly {layers} layer values")
-                }
-            };
-            values
-                .into_iter()
-                .map(|activation_scale| SiglipLinearPrecision::F143Native { activation_scale })
-                .collect()
-        }
-        Ok(value) => panic!("unsupported precision {value:?} in {name}"),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|_| {
+                vec![
+                    std::env::var(&singular_scale_name)
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "{singular_scale_name} or {plural_scale_name} is required for native FP8"
+                            )
+                        })
+                        .parse()
+                        .unwrap_or_else(|_| panic!("{singular_scale_name} must be an i8")),
+                ]
+            });
+        expand_schedule_values(values, layers, &plural_scale_name)
+    } else {
+        vec![0; layers]
+    };
+    specifications
+        .into_iter()
+        .zip(activation_scales)
+        .map(|(precision, activation_scale)| match precision {
+            "f16" => SiglipLinearPrecision::F16,
+            "f143-expanded" => SiglipLinearPrecision::F143Expanded,
+            "f143-native" => SiglipLinearPrecision::F143Native { activation_scale },
+            value => panic!("unsupported precision {value:?} in {plural_name}"),
+        })
+        .collect()
+}
+
+fn expand_schedule_values<T: Clone>(values: Vec<T>, layers: usize, name: &str) -> Vec<T> {
+    match values.as_slice() {
+        [value] => vec![value.clone(); layers],
+        values if values.len() == layers => values.to_vec(),
+        _ => panic!("{name} must contain one value or exactly {layers} layer values"),
     }
 }
 
