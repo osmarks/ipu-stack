@@ -1419,9 +1419,115 @@ fn compact_allocations_around(
         });
         graph.schedule.allocations[index].address = new_address;
     }
+    let moved_storage = relocations.len();
+    let mut relocation_indices_by_location =
+        HashMap::<(ipu_compiler::TensorId, u16), Vec<usize>>::default();
+    for (index, relocation) in relocations.iter().enumerate() {
+        relocation_indices_by_location
+            .entry((relocation.tensor, relocation.tile))
+            .or_default()
+            .push(index);
+    }
+    let mut pending_aliases = graph
+        .schedule
+        .allocations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, allocation)| {
+            matches!(
+                allocation.kind,
+                ipu_compiler::AllocationKind::HomeAlias { .. }
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    loop {
+        let mut propagated = 0usize;
+        pending_aliases.retain(|&allocation_index| {
+            let (tensor, tile, old_start, size, live_from, live_until, source) = {
+                let allocation = &graph.schedule.allocations[allocation_index];
+                let ipu_compiler::AllocationKind::HomeAlias { source } = allocation.kind else {
+                    unreachable!();
+                };
+                (
+                    allocation.tensor,
+                    allocation.tile,
+                    allocation.address,
+                    allocation.size,
+                    allocation.live_from,
+                    allocation.live_until,
+                    source,
+                )
+            };
+            let old_end = old_start.saturating_add(size);
+            let relocated = relocation_indices_by_location
+                .get(&(source, tile))
+                .into_iter()
+                .flatten()
+                .map(|&index| &relocations[index])
+                .filter(|relocation| {
+                    old_start >= relocation.old.start
+                        && old_end <= relocation.old.end
+                        && relocation.live_from <= live_from
+                        && relocation.live_until >= live_until
+                })
+                .map(|relocation| relocation.new_start + (old_start - relocation.old.start))
+                .collect::<BTreeSet<_>>();
+            if relocated.len() > 1 {
+                return true;
+            }
+            let Some(&new_start) = relocated.first() else {
+                return true;
+            };
+            graph.schedule.allocations[allocation_index].address = new_start;
+            let relocation_index = relocations.len();
+            relocations.push(AllocationRelocation {
+                tensor,
+                tile,
+                old: old_start..old_end,
+                new_start,
+                live_from,
+                live_until,
+                home: false,
+            });
+            relocation_indices_by_location
+                .entry((tensor, tile))
+                .or_default()
+                .push(relocation_index);
+            propagated += 1;
+            false
+        });
+        if propagated == 0 {
+            break;
+        }
+    }
+    for &allocation_index in &pending_aliases {
+        let allocation = &graph.schedule.allocations[allocation_index];
+        let ipu_compiler::AllocationKind::HomeAlias { source } = allocation.kind else {
+            unreachable!();
+        };
+        let old_end = allocation.address.saturating_add(allocation.size);
+        let candidates = relocation_indices_by_location
+            .get(&(source, allocation.tile))
+            .into_iter()
+            .flatten()
+            .map(|&index| &relocations[index])
+            .filter(|relocation| {
+                allocation.address >= relocation.old.start
+                    && old_end <= relocation.old.end
+                    && relocation.live_from <= allocation.live_from
+                    && relocation.live_until >= allocation.live_until
+            })
+            .count();
+        if candidates > 1 {
+            return Err(format!(
+                "alias tensor {} on tile {} at 0x{:x} has ambiguous relocation ownership from source tensor {}",
+                allocation.tensor.0, allocation.tile, allocation.address, source.0,
+            )
+            .into());
+        }
+    }
     let mut relocations_by_location =
-        HashMap::<(ipu_compiler::TensorId, u16), Vec<&AllocationRelocation>>::default();
-    let mut home_relocations_by_source =
         HashMap::<(ipu_compiler::TensorId, u16), Vec<&AllocationRelocation>>::default();
     let mut home_relocations_by_tile = vec![Vec::new(); topology.tile_count()];
     for relocation in &relocations {
@@ -1430,38 +1536,7 @@ fn compact_allocations_around(
             .or_default()
             .push(relocation);
         if relocation.home {
-            home_relocations_by_source
-                .entry((relocation.tensor, relocation.tile))
-                .or_default()
-                .push(relocation);
             home_relocations_by_tile[usize::from(relocation.tile)].push(relocation);
-        }
-    }
-    for allocation in &mut graph.schedule.allocations {
-        let ipu_compiler::AllocationKind::HomeAlias { source } = allocation.kind else {
-            continue;
-        };
-        let relocated = home_relocations_by_source
-            .get(&(source, allocation.tile))
-            .into_iter()
-            .flatten()
-            .filter(|relocation| {
-                allocation.address >= relocation.old.start
-                    && allocation.address.saturating_add(allocation.size) <= relocation.old.end
-                    && relocation.live_from <= allocation.live_from
-                    && relocation.live_until >= allocation.live_until
-            })
-            .map(|relocation| relocation.new_start + (allocation.address - relocation.old.start))
-            .collect::<BTreeSet<_>>();
-        if relocated.len() > 1 {
-            return Err(format!(
-                "alias tensor {} on tile {} at 0x{:x} has ambiguous relocation ownership from source tensor {}",
-                allocation.tensor.0, allocation.tile, allocation.address, source.0,
-            )
-            .into());
-        }
-        if let Some(&address) = relocated.first() {
-            allocation.address = address;
         }
     }
     for (phase, scheduled) in graph.schedule.phases.iter_mut().enumerate() {
@@ -1521,7 +1596,7 @@ fn compact_allocations_around(
         }
     }
     graph.schedule.validate_allocations()?;
-    Ok(relocations.len())
+    Ok(moved_storage)
 }
 
 #[cfg(test)]
@@ -6882,6 +6957,78 @@ mod tests {
             graph.schedule.allocations[0].address, graph.schedule.allocations[1].address,
             "equal-shaped values with disjoint lifetimes should share storage"
         );
+    }
+
+    #[test]
+    fn compaction_propagates_relocation_through_nested_aliases() {
+        let topology = Topology::c600();
+        let owner = ipu_compiler::TensorId(0);
+        let first_alias = ipu_compiler::TensorId(1);
+        let second_alias = ipu_compiler::TensorId(2);
+        let old_owner = 0x90000;
+        let mut graph = ExecutableGraph {
+            memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(0x88000, 0xe8000)),
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: vec![
+                    ipu_compiler::Allocation {
+                        tensor: owner,
+                        tile: 0,
+                        address: old_owner,
+                        size: 0x1000,
+                        live_from: 0,
+                        live_until: 2,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: first_alias,
+                        tile: 0,
+                        address: old_owner + 0x100,
+                        size: 0x400,
+                        live_from: 0,
+                        live_until: 2,
+                        kind: ipu_compiler::AllocationKind::HomeAlias { source: owner },
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: second_alias,
+                        tile: 0,
+                        address: old_owner + 0x200,
+                        size: 0x100,
+                        live_from: 0,
+                        live_until: 1,
+                        kind: ipu_compiler::AllocationKind::HomeAlias {
+                            source: first_alias,
+                        },
+                    },
+                ]
+                .into(),
+                tile_count: u16::try_from(topology.tile_count()).unwrap(),
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+        let mut reservations = vec![Vec::new(); topology.tile_count()];
+        reservations[0].push((old_owner, old_owner + 0x1000));
+
+        compact_transient_allocations_around(
+            &mut graph,
+            &topology,
+            &reservations,
+            None,
+            "unit test",
+        )
+        .unwrap();
+
+        let new_owner = graph.schedule.allocations[0].address;
+        assert_ne!(new_owner, old_owner);
+        assert_eq!(graph.schedule.allocations[1].address, new_owner + 0x100);
+        assert_eq!(graph.schedule.allocations[2].address, new_owner + 0x200);
+        graph.schedule.validate_allocations().unwrap();
     }
 
     #[test]
