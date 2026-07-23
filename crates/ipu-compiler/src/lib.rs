@@ -386,6 +386,7 @@ pub struct ResolvedMemoryOperand {
     pub allocation: Option<usize>,
     pub tile: u16,
     pub address: u32,
+    pub bytes: u32,
 }
 
 /// A pair of operands that cannot occupy the same effective memory element.
@@ -436,6 +437,64 @@ impl SpecializationKey {
         } else {
             &[]
         }
+    }
+
+    fn operand_access_bytes(&self, operand: KernelOperand) -> Result<u32, CompileError> {
+        if !(self.operation.starts_with("gemm_f16_")
+            || self.operation.starts_with("gemm_f8_")
+            || self.operation.starts_with("gemm_f32_"))
+        {
+            return Ok(1);
+        }
+        let dimensions = self
+            .shape
+            .get(..3)
+            .map(|shape| (shape[0], shape[1], shape[2]));
+        let (rows, inner, columns) = dimensions
+            .or_else(|| {
+                let (row_inner, columns) = self.operation.rsplit_once("_output_")?;
+                let (rows, inner) = row_inner.rsplit_once("_inner_")?;
+                let (_, rows) = rows.rsplit_once("_rows_")?;
+                Some((
+                    rows.parse().ok()?,
+                    inner.parse().ok()?,
+                    columns.parse().ok()?,
+                ))
+            })
+            .ok_or_else(|| {
+                CompileError::Graph(format!(
+                    "kernel {} has no encoded GEMM dimensions",
+                    self.operation
+                ))
+            })?;
+        let (output_bytes, input_bytes, weight_bytes) = if self.operation.starts_with("gemm_f32_") {
+            (4usize, 4usize, 4usize)
+        } else if self.operation.starts_with("gemm_f8_") {
+            (2, 1, 1)
+        } else if self.operation.starts_with("gemm_f16_f8w_") {
+            (2, 2, 2)
+        } else {
+            (2, 2, 2)
+        };
+        let elements = match operand {
+            KernelOperand::Output => rows.checked_mul(columns),
+            KernelOperand::Input(0) => rows.checked_mul(inner),
+            KernelOperand::Input(1) => inner.checked_mul(columns),
+            KernelOperand::Input(_) => Some(1),
+        }
+        .ok_or_else(|| CompileError::Memory("kernel operand span overflow".into()))?;
+        let element_bytes = match operand {
+            KernelOperand::Output => output_bytes,
+            KernelOperand::Input(0) => input_bytes,
+            KernelOperand::Input(1) => weight_bytes,
+            KernelOperand::Input(_) => 1,
+        };
+        u32::try_from(
+            elements
+                .checked_mul(element_bytes)
+                .ok_or_else(|| CompileError::Memory("kernel operand byte span overflow".into()))?,
+        )
+        .map_err(|_| CompileError::Memory("kernel operand byte span exceeds u32".into()))
     }
 }
 
@@ -4372,6 +4431,7 @@ impl Schedule {
             tile: u16,
             phase: usize,
             address: u32,
+            bytes: u32,
             alias_depth: usize,
         ) -> Result<ResolvedMemoryOperand, CompileError> {
             if alias_depth > 16 {
@@ -4392,7 +4452,10 @@ impl Schedule {
                         && allocation.live_from <= phase
                         && phase < allocation.live_until
                         && allocation.address <= address
-                        && address < allocation.address.saturating_add(allocation.size)
+                        && address.checked_add(bytes).is_some_and(|end| {
+                            address < end
+                                && end <= allocation.address.saturating_add(allocation.size)
+                        })
                 })
                 .collect::<SmallVec<[usize; 2]>>();
             let mut owners = candidates.iter().copied().filter(|&allocation_index| {
@@ -4412,6 +4475,7 @@ impl Schedule {
                     allocation: Some(allocation),
                     tile,
                     address,
+                    bytes,
                 });
             }
             let mut aliases = candidates.iter().filter_map(|&allocation_index| {
@@ -4435,6 +4499,7 @@ impl Schedule {
                     tile,
                     phase,
                     address,
+                    bytes,
                     alias_depth + 1,
                 );
             }
@@ -4442,6 +4507,7 @@ impl Schedule {
                 allocation: None,
                 tile,
                 address,
+                bytes,
             })
         }
 
@@ -4475,6 +4541,7 @@ impl Schedule {
                 command.tile,
                 command.phase,
                 address,
+                command.specialization.operand_access_bytes(operand)?,
                 0,
             )
         }

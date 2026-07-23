@@ -224,6 +224,22 @@ pub fn ipu21_effective_memory_element(address: u32) -> Option<(u8, u32, u32)> {
         ))
     }
 }
+
+/// Returns every effective memory element touched by a non-empty byte span.
+pub fn ipu21_effective_memory_elements(address: u32, bytes: u32) -> Option<Vec<(u8, u32, u32)>> {
+    let end = address.checked_add(bytes)?;
+    if bytes == 0 || end > IPU21_INTERLEAVED_REGION_LIMIT {
+        return None;
+    }
+    let mut elements = Vec::new();
+    let mut cursor = address;
+    while cursor < end {
+        let element = ipu21_effective_memory_element(cursor)?;
+        cursor = end.min(element.2);
+        elements.push(element);
+    }
+    Some(elements)
+}
 pub const SEGMENT_READ: u32 = 1;
 pub const SEGMENT_WRITE: u32 = 2;
 pub const SEGMENT_EXECUTE: u32 = 4;
@@ -1201,6 +1217,14 @@ mod tests {
         assert_eq!(high, high_same);
         assert_eq!(high_next.0, high.0 + 1);
         assert_eq!(high_next.1, high.2);
+        assert_eq!(
+            ipu21_effective_memory_elements(IPU21_EXECUTABLE_MEMORY_LIMIT - 16, 32)
+                .unwrap()
+                .iter()
+                .map(|element| element.0)
+                .collect::<Vec<_>>(),
+            vec![low_tail.0, high.0]
+        );
         assert!(ipu21_effective_memory_element(TILE_MEMORY_BASE - 1).is_none());
         assert!(ipu21_effective_memory_element(IPU21_INTERLEAVED_REGION_LIMIT).is_none());
     }

@@ -817,13 +817,21 @@ fn immovable_allocation_ranges_by_tile(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum MemoryElementNeighbor {
-    Allocation { index: usize, offset: u32 },
-    Fixed { address: u32 },
+    Allocation {
+        index: usize,
+        offset: u32,
+        bytes: u32,
+    },
+    Fixed {
+        address: u32,
+        bytes: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct MemoryElementRelation {
     own_offset: u32,
+    own_bytes: u32,
     neighbor: MemoryElementNeighbor,
 }
 
@@ -832,6 +840,21 @@ struct RelocationMemoryConstraints {
     relations: HashMap<usize, Vec<MemoryElementRelation>>,
     pinned: HashSet<usize>,
     required_interleaved: HashSet<usize>,
+}
+
+fn memory_spans_share_effective_element(
+    first_address: u32,
+    first_bytes: u32,
+    second_address: u32,
+    second_bytes: u32,
+) -> Result<bool> {
+    let first = ipu_package::ipu21_effective_memory_elements(first_address, first_bytes)
+        .ok_or("first kernel operand span is outside tile SRAM")?;
+    let second = ipu_package::ipu21_effective_memory_elements(second_address, second_bytes)
+        .ok_or("second kernel operand span is outside tile SRAM")?;
+    Ok(first
+        .iter()
+        .any(|first| second.iter().any(|second| first.0 == second.0)))
 }
 
 fn relocation_memory_constraints(
@@ -857,7 +880,10 @@ fn relocation_memory_constraints(
             .address
             .checked_sub(allocation.address)
             .ok_or("resolved kernel operand precedes its owning allocation")?;
-        if offset >= allocation.size {
+        if offset
+            .checked_add(endpoint.bytes)
+            .is_none_or(|end| endpoint.bytes == 0 || end > allocation.size)
+        {
             return Err("resolved kernel operand lies outside its owning allocation".into());
         }
         Ok((Some(index), offset))
@@ -884,9 +910,13 @@ fn relocation_memory_constraints(
                 return Err("interleaved kernel operand is not allocation-aligned".into());
             }
             (ipu_compiler::KernelMemoryClass::Ipu21Interleaved, (None, address)) => {
+                let end = address
+                    .checked_add(class.operand.bytes)
+                    .ok_or("fixed interleaved operand span overflow")?;
                 if !(ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
                     ..ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT)
                     .contains(&address)
+                    || end > ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
                 {
                     return Err("fixed kernel operand is outside interleaved memory".into());
                 }
@@ -901,34 +931,45 @@ fn relocation_memory_constraints(
         let second = allocation_endpoint(graph, separation.second)?;
         match (first, second) {
             ((None, first), (None, second)) => {
-                let first = ipu_package::ipu21_effective_memory_element(first)
-                    .ok_or("fixed kernel operand is outside tile SRAM")?;
-                let second = ipu_package::ipu21_effective_memory_element(second)
-                    .ok_or("fixed kernel operand is outside tile SRAM")?;
-                if first.0 == second.0 {
+                if memory_spans_share_effective_element(
+                    first,
+                    separation.first.bytes,
+                    second,
+                    separation.second.bytes,
+                )? {
                     return Err("fixed kernel operands require distinct memory elements".into());
                 }
             }
             ((Some(index), own_offset), (None, address))
             | ((None, address), (Some(index), own_offset)) => {
+                let (own_bytes, neighbor_bytes) = if separation.first.allocation.is_some() {
+                    (separation.first.bytes, separation.second.bytes)
+                } else {
+                    (separation.second.bytes, separation.first.bytes)
+                };
                 constraints
                     .relations
                     .entry(index)
                     .or_default()
                     .push(MemoryElementRelation {
                         own_offset,
-                        neighbor: MemoryElementNeighbor::Fixed { address },
+                        own_bytes,
+                        neighbor: MemoryElementNeighbor::Fixed {
+                            address,
+                            bytes: neighbor_bytes,
+                        },
                     });
             }
             ((Some(first), first_offset), (Some(second), second_offset)) if first == second => {
                 let allocation = &graph.schedule.allocations[first];
                 let first_address = allocation.address.saturating_add(first_offset);
                 let second_address = allocation.address.saturating_add(second_offset);
-                let first_element = ipu_package::ipu21_effective_memory_element(first_address)
-                    .ok_or("kernel operand is outside tile SRAM")?;
-                let second_element = ipu_package::ipu21_effective_memory_element(second_address)
-                    .ok_or("kernel operand is outside tile SRAM")?;
-                if first_element.0 == second_element.0 {
+                if memory_spans_share_effective_element(
+                    first_address,
+                    separation.first.bytes,
+                    second_address,
+                    separation.second.bytes,
+                )? {
                     return Err(
                         "two operands in one allocation require distinct memory elements".into(),
                     );
@@ -944,9 +985,11 @@ fn relocation_memory_constraints(
                     .or_default()
                     .push(MemoryElementRelation {
                         own_offset: first_offset,
+                        own_bytes: separation.first.bytes,
                         neighbor: MemoryElementNeighbor::Allocation {
                             index: second,
                             offset: second_offset,
+                            bytes: separation.second.bytes,
                         },
                     });
                 constraints
@@ -955,9 +998,11 @@ fn relocation_memory_constraints(
                     .or_default()
                     .push(MemoryElementRelation {
                         own_offset: second_offset,
+                        own_bytes: separation.second.bytes,
                         neighbor: MemoryElementNeighbor::Allocation {
                             index: first,
                             offset: first_offset,
+                            bytes: separation.first.bytes,
                         },
                     });
             }
@@ -1154,26 +1199,44 @@ fn compact_allocations_around(
                         .get(&index)
                         .into_iter()
                         .flatten()
-                        .filter_map(|relation| {
-                            let neighbor_address = match relation.neighbor {
-                                MemoryElementNeighbor::Fixed { address } => address,
+                        .flat_map(|relation| {
+                            let (neighbor_address, neighbor_bytes) = match relation.neighbor {
+                                MemoryElementNeighbor::Fixed { address, bytes } => (address, bytes),
                                 MemoryElementNeighbor::Allocation {
                                     index: neighbor,
                                     offset,
+                                    bytes,
                                 } => {
                                     let base = placed_addresses.get(&neighbor).copied().or_else(|| {
                                         (!compact_set.contains(&neighbor)).then_some(
                                             graph.schedule.allocations[neighbor].address,
                                         )
-                                    })?;
-                                    base.checked_add(offset)?
+                                    });
+                                    let Some(address) =
+                                        base.and_then(|base| base.checked_add(offset))
+                                    else {
+                                        return Vec::new();
+                                    };
+                                    (address, bytes)
                                 }
                             };
-                            let (_, start, end) =
-                                ipu_package::ipu21_effective_memory_element(neighbor_address)?;
-                            let end = end.checked_sub(relation.own_offset)?;
-                            let start = start.saturating_sub(relation.own_offset);
-                            (start < end).then_some((start, end))
+                            ipu_package::ipu21_effective_memory_elements(
+                                neighbor_address,
+                                neighbor_bytes,
+                            )
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|(_, start, end)| {
+                                let start = i64::from(start)
+                                    - i64::from(relation.own_offset)
+                                    - i64::from(relation.own_bytes)
+                                    + 1;
+                                let end = i64::from(end) - i64::from(relation.own_offset);
+                                let start = u32::try_from(start.max(0)).ok()?;
+                                let end = u32::try_from(end.max(0)).ok()?;
+                                (start < end).then_some((start, end))
+                            })
+                            .collect::<Vec<_>>()
                         })
                         .collect::<Vec<_>>();
                     let forbidden_starts = merge_address_ranges(forbidden_starts);
@@ -2911,51 +2974,63 @@ fn validate_kernel_memory_constraints(
         let ranges = executable_elements
             .get(usize::from(operand.tile))
             .ok_or("kernel memory constraint references a tile outside the executable")?;
-        if let Some(&(start, end)) = ranges
-            .iter()
-            .find(|&&(start, end)| start <= operand.address && operand.address < end)
-        {
-            return Err(format!(
-                "kernel operand on tile {} at 0x{:x} occupies executable element 0x{start:x}..0x{end:x}",
-                operand.tile, operand.address,
-            )
-            .into());
+        let elements = ipu_package::ipu21_effective_memory_elements(operand.address, operand.bytes)
+            .ok_or("kernel operand span is outside tile SRAM")?;
+        for (_, element_start, element_end) in elements {
+            if let Some(&(start, end)) = ranges
+                .iter()
+                .find(|&&(start, end)| ranges_overlap(element_start, element_end, start, end))
+            {
+                return Err(format!(
+                    "kernel operand on tile {} at 0x{:x}..0x{:x} touches executable element 0x{start:x}..0x{end:x}",
+                    operand.tile,
+                    operand.address,
+                    operand.address.saturating_add(operand.bytes),
+                )
+                .into());
+            }
         }
         Ok(())
     };
     for class in &constraints.classes {
         validate_address(class.operand)?;
         match class.class {
-            ipu_compiler::KernelMemoryClass::Ipu21Interleaved
-                if !(ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
-                    ..ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT)
-                    .contains(&class.operand.address) =>
-            {
-                return Err(format!(
-                    "kernel operand on tile {} at 0x{:x} is outside required interleaved memory",
-                    class.operand.tile, class.operand.address,
-                )
-                .into());
+            ipu_compiler::KernelMemoryClass::Ipu21Interleaved => {
+                let end = class
+                    .operand
+                    .address
+                    .checked_add(class.operand.bytes)
+                    .ok_or("interleaved kernel operand span overflow")?;
+                if class.operand.address < ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                    || end > ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
+                {
+                    return Err(format!(
+                        "kernel operand on tile {} at 0x{:x}..0x{end:x} is outside required interleaved memory",
+                        class.operand.tile, class.operand.address,
+                    )
+                    .into());
+                }
             }
-            _ => {}
         }
     }
     for separation in &constraints.separations {
         validate_address(separation.first)?;
         validate_address(separation.second)?;
-        let first = ipu_package::ipu21_effective_memory_element(separation.first.address)
-            .ok_or("kernel operand is outside tile SRAM")?;
-        let second = ipu_package::ipu21_effective_memory_element(separation.second.address)
-            .ok_or("kernel operand is outside tile SRAM")?;
-        if separation.first.tile == separation.second.tile && first.0 == second.0 {
+        if separation.first.tile == separation.second.tile
+            && memory_spans_share_effective_element(
+                separation.first.address,
+                separation.first.bytes,
+                separation.second.address,
+                separation.second.bytes,
+            )?
+        {
             return Err(format!(
-                "kernel operands on tile {} at 0x{:x} and 0x{:x} share effective memory element {} (0x{:x}..0x{:x})",
+                "kernel operand spans on tile {} at 0x{:x}..0x{:x} and 0x{:x}..0x{:x} share an effective memory element",
                 separation.first.tile,
                 separation.first.address,
+                separation.first.address.saturating_add(separation.first.bytes),
                 separation.second.address,
-                first.0,
-                first.1,
-                first.2,
+                separation.second.address.saturating_add(separation.second.bytes),
             )
             .into());
         }
@@ -6373,7 +6448,7 @@ mod tests {
             arguments: Vec::new(),
             specialization: Arc::new(ipu_compiler::SpecializationKey {
                 operation: "gemm_f16_accumulate_small_rows".into(),
-                shape: Vec::new(),
+                shape: vec![8, 16, 16],
                 worker_count: 6,
                 role: "test".into(),
                 alignment: 8,
