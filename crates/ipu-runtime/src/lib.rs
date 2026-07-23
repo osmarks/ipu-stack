@@ -548,10 +548,49 @@ fn static_placement_ranges(
 fn allocate_from_sorted_ranges(
     permanent: &[(u32, u32)],
     active: &BTreeMap<(u32, usize), u32>,
+    forbidden_starts: &[(u32, u32)],
     size: u32,
     arenas: &[ipu_compiler::MemoryArena],
     alignment: u32,
 ) -> Option<u32> {
+    let allowed_start =
+        |gap_start: u32, gap_end: u32, placement: ipu_compiler::MemoryPlacement| match placement {
+            ipu_compiler::MemoryPlacement::Low => {
+                let mut candidate = align_up(gap_start, alignment);
+                loop {
+                    if candidate.checked_add(size).is_none_or(|end| end > gap_end) {
+                        return None;
+                    }
+                    let Some(&(_, end)) = forbidden_starts
+                        .iter()
+                        .find(|&&(start, end)| start <= candidate && candidate < end)
+                    else {
+                        return Some(candidate);
+                    };
+                    candidate = align_up(end, alignment);
+                }
+            }
+            ipu_compiler::MemoryPlacement::High => {
+                let mut candidate = gap_end
+                    .checked_sub(size)
+                    .map(|candidate| align_down(candidate, alignment))?;
+                loop {
+                    if candidate < gap_start {
+                        return None;
+                    }
+                    let Some(&(start, _)) = forbidden_starts
+                        .iter()
+                        .rev()
+                        .find(|&&(start, end)| start <= candidate && candidate < end)
+                    else {
+                        return Some(candidate);
+                    };
+                    candidate = start
+                        .checked_sub(1)
+                        .map(|candidate| align_down(candidate, alignment))?;
+                }
+            }
+        };
     for arena in arenas {
         match arena.placement {
             ipu_compiler::MemoryPlacement::Low => {
@@ -573,19 +612,16 @@ fn allocate_from_sorted_ranges(
                     if end <= cursor || start >= arena.limit {
                         continue;
                     }
-                    if cursor.checked_add(size).is_some_and(|end| end <= start) {
-                        return Some(cursor);
+                    if let Some(candidate) = allowed_start(cursor, start, arena.placement) {
+                        return Some(candidate);
                     }
                     cursor = align_up(cursor.max(end), alignment);
                     if cursor >= arena.limit {
                         break;
                     }
                 }
-                if cursor
-                    .checked_add(size)
-                    .is_some_and(|end| end <= arena.limit)
-                {
-                    return Some(cursor);
+                if let Some(candidate) = allowed_start(cursor, arena.limit, arena.placement) {
+                    return Some(candidate);
                 }
             }
             ipu_compiler::MemoryPlacement::High => {
@@ -608,22 +644,16 @@ fn allocate_from_sorted_ranges(
                     if start >= cursor || end <= arena.base {
                         continue;
                     }
-                    let candidate = cursor
-                        .checked_sub(size)
-                        .map(|value| align_down(value, alignment));
-                    if candidate.is_some_and(|candidate| candidate >= end) {
-                        return candidate;
+                    if let Some(candidate) = allowed_start(end, cursor, arena.placement) {
+                        return Some(candidate);
                     }
                     cursor = cursor.min(start);
                     if cursor <= arena.base {
                         break;
                     }
                 }
-                let candidate = cursor
-                    .checked_sub(size)
-                    .map(|value| align_down(value, alignment));
-                if candidate.is_some_and(|candidate| candidate >= arena.base) {
-                    return candidate;
+                if let Some(candidate) = allowed_start(arena.base, cursor, arena.placement) {
+                    return Some(candidate);
                 }
             }
         }
@@ -634,6 +664,7 @@ fn allocate_from_sorted_ranges(
 fn relocation_arenas_for_allocation(
     allocation: &ipu_compiler::Allocation,
     arenas: &[ipu_compiler::MemoryArena],
+    requires_interleaved: bool,
 ) -> Result<Vec<ipu_compiler::MemoryArena>> {
     let allocation_end = allocation
         .address
@@ -641,7 +672,6 @@ fn relocation_arenas_for_allocation(
         .ok_or("allocation address overflow while preserving its memory class")?;
     let interleaved =
         ipu_package::IPU21_INTERLEAVED_MEMORY_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
-    let requires_interleaved = allocation_requires_interleaved(allocation);
     if !requires_interleaved
         && allocation.address < interleaved.end
         && allocation_end > interleaved.start
@@ -674,6 +704,7 @@ fn relocation_arenas_for_allocation(
                 ipu_package::TILE_MEMORY_BASE,
                 interleaved.start,
             );
+            append(&mut compatible, interleaved.start, interleaved.end);
             append(
                 &mut compatible,
                 interleaved.end,
@@ -798,34 +829,187 @@ fn immovable_allocation_ranges_by_tile(
     Ok(ranges)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum MemoryElementNeighbor {
+    Allocation { index: usize, offset: u32 },
+    Fixed { address: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct MemoryElementRelation {
+    own_offset: u32,
+    neighbor: MemoryElementNeighbor,
+}
+
+#[derive(Default)]
+struct RelocationMemoryConstraints {
+    relations: HashMap<usize, Vec<MemoryElementRelation>>,
+    pinned: HashSet<usize>,
+    required_interleaved: HashSet<usize>,
+}
+
+fn relocation_memory_constraints(
+    graph: &ExecutableGraph,
+    programs: &[ipu_compiler::LoweredTileProgram],
+) -> Result<RelocationMemoryConstraints> {
+    fn allocation_endpoint(
+        graph: &ExecutableGraph,
+        endpoint: ipu_compiler::ResolvedMemoryOperand,
+    ) -> Result<(Option<usize>, u32)> {
+        let Some(index) = endpoint.allocation else {
+            return Ok((None, endpoint.address));
+        };
+        let allocation = graph
+            .schedule
+            .allocations
+            .get(index)
+            .ok_or("resolved kernel memory constraint has an invalid allocation index")?;
+        if allocation.tile != endpoint.tile {
+            return Err("resolved kernel memory constraint changes tiles".into());
+        }
+        let offset = endpoint
+            .address
+            .checked_sub(allocation.address)
+            .ok_or("resolved kernel operand precedes its owning allocation")?;
+        if offset >= allocation.size {
+            return Err("resolved kernel operand lies outside its owning allocation".into());
+        }
+        Ok((Some(index), offset))
+    }
+
+    let mut constraints = RelocationMemoryConstraints::default();
+    let resolved = graph.schedule.resolve_memory_constraints(programs)?;
+    for class in resolved.classes {
+        let endpoint = allocation_endpoint(graph, class.operand)?;
+        match (class.class, endpoint) {
+            (ipu_compiler::KernelMemoryClass::Ipu21Interleaved, (Some(index), 0)) => {
+                constraints.required_interleaved.insert(index);
+            }
+            (ipu_compiler::KernelMemoryClass::Ipu21Interleaved, (Some(_), _)) => {
+                return Err("interleaved kernel operand is not allocation-aligned".into());
+            }
+            (ipu_compiler::KernelMemoryClass::Ipu21Interleaved, (None, address)) => {
+                if !(ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                    ..ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT)
+                    .contains(&address)
+                {
+                    return Err("fixed kernel operand is outside interleaved memory".into());
+                }
+            }
+        }
+    }
+    for separation in resolved.separations {
+        if separation.first.tile != separation.second.tile {
+            return Err("one kernel memory-element constraint spans multiple tiles".into());
+        }
+        let first = allocation_endpoint(graph, separation.first)?;
+        let second = allocation_endpoint(graph, separation.second)?;
+        match (first, second) {
+            ((None, first), (None, second)) => {
+                let first = ipu_package::ipu21_effective_memory_element(first)
+                    .ok_or("fixed kernel operand is outside tile SRAM")?;
+                let second = ipu_package::ipu21_effective_memory_element(second)
+                    .ok_or("fixed kernel operand is outside tile SRAM")?;
+                if first.0 == second.0 {
+                    return Err("fixed kernel operands require distinct memory elements".into());
+                }
+            }
+            ((Some(index), own_offset), (None, address))
+            | ((None, address), (Some(index), own_offset)) => {
+                constraints
+                    .relations
+                    .entry(index)
+                    .or_default()
+                    .push(MemoryElementRelation {
+                        own_offset,
+                        neighbor: MemoryElementNeighbor::Fixed { address },
+                    });
+            }
+            ((Some(first), first_offset), (Some(second), second_offset)) if first == second => {
+                let allocation = &graph.schedule.allocations[first];
+                let first_address = allocation.address.saturating_add(first_offset);
+                let second_address = allocation.address.saturating_add(second_offset);
+                let first_element = ipu_package::ipu21_effective_memory_element(first_address)
+                    .ok_or("kernel operand is outside tile SRAM")?;
+                let second_element = ipu_package::ipu21_effective_memory_element(second_address)
+                    .ok_or("kernel operand is outside tile SRAM")?;
+                if first_element.0 == second_element.0 {
+                    return Err(
+                        "two operands in one allocation require distinct memory elements".into(),
+                    );
+                }
+                // Their relative offsets are fixed, but crossing an element boundary can
+                // depend on the allocation base. Preserve a known-valid base.
+                constraints.pinned.insert(first);
+            }
+            ((Some(first), first_offset), (Some(second), second_offset)) => {
+                constraints
+                    .relations
+                    .entry(first)
+                    .or_default()
+                    .push(MemoryElementRelation {
+                        own_offset: first_offset,
+                        neighbor: MemoryElementNeighbor::Allocation {
+                            index: second,
+                            offset: second_offset,
+                        },
+                    });
+                constraints
+                    .relations
+                    .entry(second)
+                    .or_default()
+                    .push(MemoryElementRelation {
+                        own_offset: second_offset,
+                        neighbor: MemoryElementNeighbor::Allocation {
+                            index: first,
+                            offset: first_offset,
+                        },
+                    });
+            }
+        }
+    }
+    for relations in constraints.relations.values_mut() {
+        relations.sort_unstable();
+        relations.dedup();
+    }
+    Ok(constraints)
+}
+
 fn compact_transient_allocations_around(
     graph: &mut ExecutableGraph,
     topology: &Topology,
     reservations: &[Vec<(u32, u32)>],
+    programs: Option<&[ipu_compiler::LoweredTileProgram]>,
     reason: &str,
 ) -> Result<usize> {
-    compact_allocations_around(graph, topology, reservations, reason, false)
+    compact_allocations_around(graph, topology, reservations, programs, reason, false)
 }
 
 fn compact_all_allocations_around(
     graph: &mut ExecutableGraph,
     topology: &Topology,
     reservations: &[Vec<(u32, u32)>],
+    programs: Option<&[ipu_compiler::LoweredTileProgram]>,
     reason: &str,
 ) -> Result<usize> {
-    compact_allocations_around(graph, topology, reservations, reason, true)
+    compact_allocations_around(graph, topology, reservations, programs, reason, true)
 }
 
 fn compact_allocations_around(
     graph: &mut ExecutableGraph,
     topology: &Topology,
     reservations: &[Vec<(u32, u32)>],
+    programs: Option<&[ipu_compiler::LoweredTileProgram]>,
     reason: &str,
     move_resident: bool,
 ) -> Result<usize> {
     if reservations.len() != topology.tile_count() {
         return Err("invalid transient repacking reservations".into());
     }
+    let memory_constraints = programs
+        .map(|programs| relocation_memory_constraints(graph, programs))
+        .transpose()?
+        .unwrap_or_default();
     let physical_to_logical = (0..u16::try_from(topology.tile_count())?)
         .map(|logical| Ok((u32::from(topology.physical(logical)?), logical)))
         .collect::<Result<HashMap<_, _>>>()?;
@@ -902,7 +1086,12 @@ fn compact_allocations_around(
             let mut compact = Vec::with_capacity(movable.len());
             for index in movable {
                     let allocation = &graph.schedule.allocations[index];
-                    if allocation_requires_interleaved(allocation) {
+                    let requires_interleaved = (programs.is_none()
+                        && allocation_requires_interleaved(allocation))
+                        || memory_constraints.required_interleaved.contains(&index);
+                    if requires_interleaved
+                        || memory_constraints.pinned.contains(&index)
+                    {
                         let range = (
                             allocation.address,
                             allocation.address.saturating_add(allocation.size),
@@ -915,6 +1104,8 @@ fn compact_allocations_around(
                         compact.push(index);
                     }
             }
+            let compact_set = compact.iter().copied().collect::<HashSet<_>>();
+            let mut placed_addresses = result.iter().copied().collect::<HashMap<_, _>>();
             compact.sort_unstable_by_key(|&index| {
                     let allocation = &graph.schedule.allocations[index];
                     (
@@ -932,7 +1123,14 @@ fn compact_allocations_around(
                     } else {
                         &transient_arenas
                     };
-                    let compatible_arenas = relocation_arenas_for_allocation(allocation, arenas)?;
+                    let requires_interleaved = (programs.is_none()
+                        && allocation_requires_interleaved(allocation))
+                        || memory_constraints.required_interleaved.contains(&index);
+                    let compatible_arenas = relocation_arenas_for_allocation(
+                        allocation,
+                        arenas,
+                        requires_interleaved,
+                    )?;
                     let allocation_lifetime = lifetime(allocation);
                     let mut occupied = permanent.clone();
                     occupied.extend(
@@ -942,9 +1140,38 @@ fn compact_allocations_around(
                             .copied(),
                     );
                     let occupied = merge_address_ranges(occupied);
+                    let forbidden_starts = memory_constraints
+                        .relations
+                        .get(&index)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|relation| {
+                            let neighbor_address = match relation.neighbor {
+                                MemoryElementNeighbor::Fixed { address } => address,
+                                MemoryElementNeighbor::Allocation {
+                                    index: neighbor,
+                                    offset,
+                                } => {
+                                    let base = placed_addresses.get(&neighbor).copied().or_else(|| {
+                                        (!compact_set.contains(&neighbor)).then_some(
+                                            graph.schedule.allocations[neighbor].address,
+                                        )
+                                    })?;
+                                    base.checked_add(offset)?
+                                }
+                            };
+                            let (_, start, end) =
+                                ipu_package::ipu21_effective_memory_element(neighbor_address)?;
+                            let end = end.checked_sub(relation.own_offset)?;
+                            let start = start.saturating_sub(relation.own_offset);
+                            (start < end).then_some((start, end))
+                        })
+                        .collect::<Vec<_>>();
+                    let forbidden_starts = merge_address_ranges(forbidden_starts);
                     let address = allocate_from_sorted_ranges(
                         &occupied,
                         &BTreeMap::new(),
+                        &forbidden_starts,
                         allocation.size,
                         &compatible_arenas,
                         32,
@@ -966,6 +1193,7 @@ fn compact_allocations_around(
                     for phase in &mut occupied_by_phase[allocation_lifetime] {
                         phase.push(range);
                     }
+                placed_addresses.insert(index, address);
                 result.push((index, address));
             }
             Ok(result)
@@ -1108,6 +1336,7 @@ fn relocate_transient_allocations_for_executables(
         graph,
         topology,
         &reservations,
+        None,
         "measured executable placement",
     )
 }
@@ -3167,6 +3396,7 @@ fn package_graph_impl_attempt(
                     &mut relocated_graph,
                     &topology,
                     &reservations,
+                    Some(&programs),
                     "measured executable placement",
                 )?
             } else {
@@ -3174,6 +3404,7 @@ fn package_graph_impl_attempt(
                     &mut relocated_graph,
                     &topology,
                     &reservations,
+                    Some(&programs),
                     "measured executable placement",
                 )?
             };
@@ -3595,6 +3826,7 @@ fn package_graph_impl_attempt(
                 &mut relocated_graph,
                 &topology,
                 &static_relocation_reservations,
+                Some(&programs),
                 "static runtime placement",
             )?
         } else {
@@ -3602,6 +3834,7 @@ fn package_graph_impl_attempt(
                 &mut relocated_graph,
                 &topology,
                 &static_relocation_reservations,
+                Some(&programs),
                 "static runtime placement",
             ) {
                 Ok(moved) => moved,
@@ -3609,6 +3842,7 @@ fn package_graph_impl_attempt(
                     &mut relocated_graph,
                     &topology,
                     &static_relocation_reservations,
+                    Some(&programs),
                     "static runtime placement",
                 )?,
                 Err(error) => return Err(error),
@@ -3992,32 +4226,59 @@ fn package_graph_impl_attempt(
                         .into());
                     }
                 }
+                let resolve_operand = |operand: ipu_compiler::KernelOperand| -> Result<_> {
+                    Ok(match operand {
+                        ipu_compiler::KernelOperand::Output => {
+                            ("output", command.output, command.output_address)
+                        }
+                        ipu_compiler::KernelOperand::Input(index) => (
+                            "input",
+                            *command.inputs.get(index).ok_or_else(|| {
+                                format!(
+                                    "kernel {} memory ABI refers to missing input {index}",
+                                    command.specialization.operation
+                                )
+                            })?,
+                            *command.input_addresses.get(index).ok_or_else(|| {
+                                format!(
+                                    "lowered kernel {} has no address for input {index}",
+                                    command.specialization.operation
+                                )
+                            })?,
+                        ),
+                    })
+                };
                 for constraint in command.specialization.memory_constraints() {
-                    let ipu_compiler::KernelMemoryConstraint::DistinctEffectiveElements(
-                        operands,
-                    ) = constraint;
+                    let ipu_compiler::KernelMemoryConstraint::DistinctEffectiveElements(operands) =
+                        constraint
+                    else {
+                        let ipu_compiler::KernelMemoryConstraint::InClass(operand, class) = constraint
+                        else {
+                            unreachable!()
+                        };
+                        let (name, tensor, address) = resolve_operand(*operand)?;
+                        match class {
+                            ipu_compiler::KernelMemoryClass::Ipu21Interleaved
+                                if !(ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                                    ..ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT)
+                                    .contains(&address) =>
+                            {
+                                return Err(format!(
+                                    "kernel {} phase {} tile {} resolves {name} tensor {} outside required interleaved memory at 0x{address:x}",
+                                    command.specialization.operation,
+                                    command.phase,
+                                    command.tile,
+                                    tensor.0,
+                                )
+                                .into());
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    };
                     let mut elements = BTreeMap::<u8, (&str, u32, u32, u32)>::new();
                     for operand in *operands {
-                        let (name, tensor, address) = match *operand {
-                            ipu_compiler::KernelOperand::Output => {
-                                ("output", command.output, command.output_address)
-                            }
-                            ipu_compiler::KernelOperand::Input(index) => (
-                                "input",
-                                *command.inputs.get(index).ok_or_else(|| {
-                                    format!(
-                                        "kernel {} memory ABI refers to missing input {index}",
-                                        command.specialization.operation
-                                    )
-                                })?,
-                                *command.input_addresses.get(index).ok_or_else(|| {
-                                    format!(
-                                        "lowered kernel {} has no address for input {index}",
-                                        command.specialization.operation
-                                    )
-                                })?,
-                            ),
-                        };
+                        let (name, tensor, address) = resolve_operand(*operand)?;
                         let (element, start, end) =
                             ipu_package::ipu21_effective_memory_element(address).ok_or_else(
                                 || {
@@ -5913,7 +6174,7 @@ mod tests {
     }
 
     #[test]
-    fn relocation_preserves_the_dedicated_pace_element() {
+    fn relocation_preserves_required_interleaving_and_allows_ordinary_spill() {
         let interleaved = ipu_compiler::Allocation {
             tensor: ipu_compiler::TensorId(1),
             tile: 0,
@@ -5945,21 +6206,17 @@ mod tests {
         .unwrap();
 
         let interleaved_arenas =
-            relocation_arenas_for_allocation(&interleaved, &policy.transient).unwrap();
+            relocation_arenas_for_allocation(&interleaved, &policy.transient, true).unwrap();
         let ordinary_arenas =
-            relocation_arenas_for_allocation(&ordinary, &policy.transient).unwrap();
+            relocation_arenas_for_allocation(&ordinary, &policy.transient, false).unwrap();
 
         assert!(interleaved_arenas.iter().all(|arena| {
             arena.base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
                 && arena.limit <= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
         }));
-        assert!(ordinary_arenas.iter().all(|arena| {
-            !ranges_overlap(
-                arena.base,
-                arena.limit,
-                ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
-                ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
-            )
+        assert!(ordinary_arenas.iter().any(|arena| {
+            arena.base <= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                && arena.limit >= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
         }));
 
         let ordinary_reservation = (PLAN_BASE, PLAN_BASE + 0x100);
@@ -5975,6 +6232,109 @@ mod tests {
         assert!(static_ranges.contains(&ordinary_reservation));
         assert!(static_ranges.contains(&interleaved_footprint));
         assert!(!static_ranges.contains(&ordinary_movable));
+    }
+
+    #[test]
+    fn compaction_enforces_kernel_memory_relations_without_reserving_the_element() {
+        let topology = Topology::c600();
+        let output = ipu_compiler::TensorId(1);
+        let input = ipu_compiler::TensorId(2);
+        let unrelated = ipu_compiler::TensorId(3);
+        let command = Arc::new(ipu_compiler::KernelCommand {
+            tile: 0,
+            output,
+            inputs: vec![input],
+            arguments: Vec::new(),
+            specialization: Arc::new(ipu_compiler::SpecializationKey {
+                operation: "gemm_f16_accumulate_small_rows".into(),
+                shape: Vec::new(),
+                worker_count: 6,
+                role: "test".into(),
+                alignment: 8,
+            }),
+            metadata: BTreeMap::new(),
+        });
+        let mut graph = ExecutableGraph {
+            memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(0x80000, 0x90000)),
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: vec![ipu_compiler::Phase::Compute {
+                    op: ipu_compiler::OpId(0),
+                    commands: vec![command.clone()],
+                }],
+                allocations: vec![
+                    ipu_compiler::Allocation {
+                        tensor: output,
+                        tile: 0,
+                        address: 0x80000,
+                        size: 0x1000,
+                        live_from: 0,
+                        live_until: 2,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: input,
+                        tile: 0,
+                        address: 0x88000,
+                        size: 0x4000,
+                        live_from: 0,
+                        live_until: 2,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: unrelated,
+                        tile: 0,
+                        address: 0x8c000,
+                        size: 0x6000,
+                        live_from: 0,
+                        live_until: 2,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                ]
+                .into(),
+                tile_count: u16::try_from(topology.tile_count()).unwrap(),
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+        let programs = vec![ipu_compiler::LoweredTileProgram {
+            tile: 0,
+            steps: vec![ipu_compiler::LoweredTileStep::Compute(
+                ipu_compiler::LoweredComputeCommand {
+                    op: ipu_compiler::OpId(0),
+                    phase: 0,
+                    phase_tile_command_index: 0,
+                    command,
+                    output_address: 0x80000,
+                    input_addresses: smallvec::smallvec![0x88000],
+                },
+            )],
+        }];
+        let reservations = vec![Vec::new(); topology.tile_count()];
+
+        compact_transient_allocations_around(
+            &mut graph,
+            &topology,
+            &reservations,
+            Some(&programs),
+            "unit test",
+        )
+        .unwrap();
+
+        let output_element =
+            ipu_package::ipu21_effective_memory_element(graph.schedule.allocations[0].address)
+                .unwrap()
+                .0;
+        let input_element =
+            ipu_package::ipu21_effective_memory_element(graph.schedule.allocations[1].address)
+                .unwrap()
+                .0;
+        assert_ne!(output_element, input_element);
+        graph.schedule.validate_allocations().unwrap();
     }
 
     #[test]
@@ -6015,8 +6375,14 @@ mod tests {
         };
         let reservations = vec![Vec::new(); topology.tile_count()];
 
-        compact_transient_allocations_around(&mut graph, &topology, &reservations, "unit test")
-            .unwrap();
+        compact_transient_allocations_around(
+            &mut graph,
+            &topology,
+            &reservations,
+            None,
+            "unit test",
+        )
+        .unwrap();
 
         assert_eq!(
             graph.schedule.allocations[0].address, graph.schedule.allocations[1].address,
@@ -6082,7 +6448,13 @@ mod tests {
         };
 
         assert_eq!(
-            compact_all_allocations_around(&mut graph, &topology, &reservations, "unit test",)
+            compact_all_allocations_around(
+                &mut graph,
+                &topology,
+                &reservations,
+                None,
+                "unit test",
+            )
                 .unwrap(),
             2
         );

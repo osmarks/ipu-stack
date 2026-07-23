@@ -365,18 +365,59 @@ pub enum KernelOperand {
     Input(usize),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum KernelMemoryClass {
+    Ipu21Interleaved,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelMemoryConstraint {
+    /// The operand must be placed in a hardware-specific memory class.
+    InClass(KernelOperand, KernelMemoryClass),
     /// Every listed pointer must reside in a different effective memory element.
     DistinctEffectiveElements(&'static [KernelOperand]),
 }
 
+/// One endpoint of a memory-element separation constraint after tile-program
+/// lowering has resolved aliases and exchange staging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ResolvedMemoryOperand {
+    /// The allocation owning this address, or `None` for a fixed runtime address.
+    pub allocation: Option<usize>,
+    pub tile: u16,
+    pub address: u32,
+}
+
+/// A pair of operands that cannot occupy the same effective memory element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ResolvedMemorySeparation {
+    pub first: ResolvedMemoryOperand,
+    pub second: ResolvedMemoryOperand,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ResolvedMemoryClassConstraint {
+    pub operand: ResolvedMemoryOperand,
+    pub class: KernelMemoryClass,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResolvedKernelMemoryConstraints {
+    pub classes: Vec<ResolvedMemoryClassConstraint>,
+    pub separations: Vec<ResolvedMemorySeparation>,
+}
+
 const PACE_ACCUMULATOR_STREAM_OPERANDS: [KernelOperand; 2] =
     [KernelOperand::Output, KernelOperand::Input(0)];
-const PACE_ACCUMULATOR_STREAM_CONSTRAINTS: [KernelMemoryConstraint; 1] =
-    [KernelMemoryConstraint::DistinctEffectiveElements(
-        &PACE_ACCUMULATOR_STREAM_OPERANDS,
-    )];
+const PACE_ACCUMULATOR_STREAM_CONSTRAINTS: [KernelMemoryConstraint; 2] = [
+    KernelMemoryConstraint::InClass(KernelOperand::Output, KernelMemoryClass::Ipu21Interleaved),
+    KernelMemoryConstraint::DistinctEffectiveElements(&PACE_ACCUMULATOR_STREAM_OPERANDS),
+];
+const PACE_EXPANDED_WEIGHT_CONSTRAINTS: [KernelMemoryConstraint; 3] = [
+    KernelMemoryConstraint::InClass(KernelOperand::Output, KernelMemoryClass::Ipu21Interleaved),
+    KernelMemoryConstraint::InClass(KernelOperand::Input(1), KernelMemoryClass::Ipu21Interleaved),
+    KernelMemoryConstraint::DistinctEffectiveElements(&PACE_ACCUMULATOR_STREAM_OPERANDS),
+];
 
 impl SpecializationKey {
     /// Memory-access constraints imposed by the selected device kernel ABI.
@@ -385,7 +426,12 @@ impl SpecializationKey {
     /// symbols, so keeping the constraint registry on the same keys prevents
     /// planner-only placement assumptions from being lost during final packing.
     pub fn memory_constraints(&self) -> &'static [KernelMemoryConstraint] {
-        if self.operation.starts_with("gemm_f16_") || self.operation.starts_with("gemm_f32_") {
+        if self.operation.starts_with("gemm_f16_f8w_") {
+            &PACE_EXPANDED_WEIGHT_CONSTRAINTS
+        } else if self.operation.starts_with("gemm_f16_")
+            || self.operation.starts_with("gemm_f8_")
+            || self.operation.starts_with("gemm_f32_")
+        {
             &PACE_ACCUMULATOR_STREAM_CONSTRAINTS
         } else {
             &[]
@@ -4309,6 +4355,187 @@ impl Schedule {
                 }
             }
         }
+    }
+
+    /// Resolves kernel ABI memory constraints to allocation ownership.
+    ///
+    /// Doing this while holding the allocation index avoids rebuilding a
+    /// multi-million-entry location map during final executable placement.
+    pub fn resolve_memory_constraints(
+        &self,
+        programs: &[LoweredTileProgram],
+    ) -> Result<ResolvedKernelMemoryConstraints, CompileError> {
+        fn resolve_operand(
+            allocations: &[Allocation],
+            index: &AllocationStoreIndex,
+            tensor: TensorId,
+            tile: u16,
+            phase: usize,
+            address: u32,
+            alias_depth: usize,
+        ) -> Result<ResolvedMemoryOperand, CompileError> {
+            if alias_depth > 16 {
+                return Err(CompileError::Graph(format!(
+                    "allocation alias chain for tensor {} is cyclic or unreasonably deep",
+                    tensor.0
+                )));
+            }
+            let candidates = index
+                .by_tensor
+                .get(&tensor)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&allocation_index| {
+                    let allocation = &allocations[allocation_index];
+                    allocation.tile == tile
+                        && allocation.live_from <= phase
+                        && phase < allocation.live_until
+                        && allocation.address <= address
+                        && address < allocation.address.saturating_add(allocation.size)
+                })
+                .collect::<SmallVec<[usize; 2]>>();
+            let mut owners = candidates.iter().copied().filter(|&allocation_index| {
+                !matches!(
+                    allocations[allocation_index].kind,
+                    AllocationKind::HomeAlias { .. }
+                )
+            });
+            if let Some(allocation) = owners.next() {
+                if owners.next().is_some() {
+                    return Err(CompileError::Graph(format!(
+                        "kernel operand tensor {} on tile {tile} at phase {phase} and 0x{address:x} has multiple owning allocations",
+                        tensor.0
+                    )));
+                }
+                return Ok(ResolvedMemoryOperand {
+                    allocation: Some(allocation),
+                    tile,
+                    address,
+                });
+            }
+            let mut aliases = candidates.iter().filter_map(|&allocation_index| {
+                let AllocationKind::HomeAlias { source } = allocations[allocation_index].kind
+                else {
+                    return None;
+                };
+                Some(source)
+            });
+            if let Some(source) = aliases.next() {
+                if aliases.any(|candidate| candidate != source) {
+                    return Err(CompileError::Graph(format!(
+                        "kernel operand tensor {} on tile {tile} at phase {phase} has ambiguous aliases",
+                        tensor.0
+                    )));
+                }
+                return resolve_operand(
+                    allocations,
+                    index,
+                    source,
+                    tile,
+                    phase,
+                    address,
+                    alias_depth + 1,
+                );
+            }
+            Ok(ResolvedMemoryOperand {
+                allocation: None,
+                tile,
+                address,
+            })
+        }
+
+        fn resolve_command_operand(
+            allocations: &[Allocation],
+            index: &AllocationStoreIndex,
+            command: &LoweredComputeCommand,
+            operand: KernelOperand,
+        ) -> Result<ResolvedMemoryOperand, CompileError> {
+            let (tensor, address) = match operand {
+                KernelOperand::Output => (command.output, command.output_address),
+                KernelOperand::Input(input) => (
+                    *command.inputs.get(input).ok_or_else(|| {
+                        CompileError::Graph(format!(
+                            "kernel {} memory ABI refers to missing input {input}",
+                            command.specialization.operation
+                        ))
+                    })?,
+                    *command.input_addresses.get(input).ok_or_else(|| {
+                        CompileError::Graph(format!(
+                            "lowered kernel {} has no address for input {input}",
+                            command.specialization.operation
+                        ))
+                    })?,
+                ),
+            };
+            resolve_operand(
+                allocations,
+                index,
+                tensor,
+                command.tile,
+                command.phase,
+                address,
+                0,
+            )
+        }
+
+        self.allocations.with_index(|index| {
+            let mut separations = HashSet::default();
+            let mut classes = HashSet::default();
+            for program in programs {
+                for step in &program.steps {
+                    let LoweredTileStep::Compute(command) = step else {
+                        continue;
+                    };
+                    for constraint in command.specialization.memory_constraints() {
+                        match constraint {
+                            KernelMemoryConstraint::InClass(operand, class) => {
+                                classes.insert(ResolvedMemoryClassConstraint {
+                                    operand: resolve_command_operand(
+                                        &self.allocations,
+                                        index,
+                                        command,
+                                        *operand,
+                                    )?,
+                                    class: *class,
+                                });
+                            }
+                            KernelMemoryConstraint::DistinctEffectiveElements(operands) => {
+                                let mut resolved = SmallVec::<[ResolvedMemoryOperand; 4]>::new();
+                                for operand in *operands {
+                                    resolved.push(resolve_command_operand(
+                                        &self.allocations,
+                                        index,
+                                        command,
+                                        *operand,
+                                    )?);
+                                }
+                                for first in 0..resolved.len() {
+                                    for second in first + 1..resolved.len() {
+                                        let (first, second) = if resolved[first] <= resolved[second]
+                                        {
+                                            (resolved[first], resolved[second])
+                                        } else {
+                                            (resolved[second], resolved[first])
+                                        };
+                                        separations
+                                            .insert(ResolvedMemorySeparation { first, second });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let mut separations = separations.into_iter().collect::<Vec<_>>();
+            separations.sort_unstable();
+            let mut classes = classes.into_iter().collect::<Vec<_>>();
+            classes.sort_unstable();
+            Ok(ResolvedKernelMemoryConstraints {
+                classes,
+                separations,
+            })
+        })
     }
 
     pub fn lower_exchanges(
