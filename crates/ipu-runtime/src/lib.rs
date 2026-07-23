@@ -1448,7 +1448,13 @@ fn compact_allocations_around(
                 let access_conflicts_with_reservation = reservations[tile]
                     .iter()
                     .any(|&(start, end)| ranges_overlap(allocation.address, access_end, start, end));
-                if fits_arena
+                // A resident-aware compaction is the fallback after stable
+                // transient placement proved insufficient. Repack every
+                // movable object on that tile so large constrained objects are
+                // ordered before smaller allocations instead of inheriting
+                // fragmentation from the incremental graph builder.
+                if !move_resident
+                    && fits_arena
                     && !storage_conflicts_with_permanent
                     && !access_conflicts_with_reservation
                 {
@@ -7309,6 +7315,82 @@ mod tests {
             graph.host_weights[0].slices[0].tile_address,
             resident.address + 8
         );
+    }
+
+    #[test]
+    fn global_repacking_removes_incremental_resident_fragmentation() {
+        let topology = Topology::c600();
+        let arena = 0x88000..0xa8000;
+        let mut reservations = vec![Vec::new(); topology.tile_count()];
+        reservations[0].push((0x90000, 0x98000));
+        let mut graph = ExecutableGraph {
+            memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(
+                arena.start,
+                arena.end,
+            )),
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: vec![
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(1),
+                        tile: 0,
+                        address: 0x9c000,
+                        size: 0x6000,
+                        live_from: 0,
+                        live_until: usize::MAX,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(2),
+                        tile: 0,
+                        address: 0x8c000,
+                        size: 0x8000,
+                        live_from: 0,
+                        live_until: usize::MAX,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                ]
+                .into(),
+                tile_count: u16::try_from(topology.tile_count()).unwrap(),
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+
+        assert_eq!(
+            compact_all_allocations_around(
+                &mut graph,
+                &topology,
+                &reservations,
+                None,
+                "fragmentation test",
+            )
+            .unwrap(),
+            2
+        );
+        for allocation in &graph.schedule.allocations {
+            let end = allocation.address + allocation.size;
+            assert!(allocation.address >= arena.start && end <= arena.end);
+            assert!(!ranges_overlap(
+                allocation.address,
+                end,
+                reservations[0][0].0,
+                reservations[0][0].1,
+            ));
+        }
+        let left = &graph.schedule.allocations[0];
+        let right = &graph.schedule.allocations[1];
+        assert!(!ranges_overlap(
+            left.address,
+            left.address + left.size,
+            right.address,
+            right.address + right.size,
+        ));
     }
 
     #[test]
