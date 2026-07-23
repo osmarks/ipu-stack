@@ -580,21 +580,7 @@ pub struct RepeatedRegion {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum RepeatedPhaseShape {
     Exchange,
-    Compute(Vec<RepeatedTileComputeShape>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct RepeatedTileComputeShape {
-    tile: u16,
-    commands: Vec<RepeatedCommandShape>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct RepeatedCommandShape {
-    phase_tile_command_index: usize,
-    operation: String,
-    input_count: usize,
-    argument_count: usize,
+    Compute,
 }
 
 impl RepeatedRegion {
@@ -619,7 +605,7 @@ impl RepeatedRegion {
         let shape = repeated_region_shape(schedule, phases.clone())?;
         if !repeated_shapes_compatible(&self.shape, &shape) {
             return Err(CompileError::Graph(format!(
-                "instance {} of repeated region {} has a different phase or command structure",
+                "instance {} of repeated region {} has a different phase structure",
                 self.phase_instances.len(),
                 self.name
             )));
@@ -634,7 +620,6 @@ impl RepeatedRegion {
                 self.name
             )));
         }
-        merge_repeated_shapes(&mut self.shape, shape);
         self.phase_instances.push(phases);
         Ok(())
     }
@@ -666,97 +651,13 @@ fn repeated_region_shape(
         .iter()
         .map(|phase| match phase {
             Phase::Exchange { .. } => Ok(RepeatedPhaseShape::Exchange),
-            Phase::Compute { commands, .. } => {
-                let mut by_tile = BTreeMap::<u16, Vec<RepeatedCommandShape>>::new();
-                for command in commands {
-                    let tile_commands = by_tile.entry(command.tile).or_default();
-                    tile_commands.push(RepeatedCommandShape {
-                        phase_tile_command_index: tile_commands.len(),
-                        operation: command.specialization.operation.to_string(),
-                        input_count: command.inputs.len(),
-                        argument_count: command.arguments.len(),
-                    });
-                }
-                Ok(RepeatedPhaseShape::Compute(
-                    by_tile
-                        .into_iter()
-                        .map(|(tile, commands)| RepeatedTileComputeShape { tile, commands })
-                        .collect(),
-                ))
-            }
+            Phase::Compute { .. } => Ok(RepeatedPhaseShape::Compute),
         })
         .collect()
 }
 
 fn repeated_shapes_compatible(left: &[RepeatedPhaseShape], right: &[RepeatedPhaseShape]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| match (left, right) {
-                (RepeatedPhaseShape::Exchange, RepeatedPhaseShape::Exchange) => true,
-                (RepeatedPhaseShape::Compute(_), RepeatedPhaseShape::Compute(_)) => true,
-                _ => false,
-            })
-}
-
-fn merge_repeated_command_shapes(
-    left: &[RepeatedCommandShape],
-    right: &[RepeatedCommandShape],
-) -> Vec<RepeatedCommandShape> {
-    let columns = right.len() + 1;
-    let mut common = vec![0usize; (left.len() + 1) * columns];
-    for left_index in (0..left.len()).rev() {
-        for right_index in (0..right.len()).rev() {
-            common[left_index * columns + right_index] = if left[left_index] == right[right_index] {
-                1 + common[(left_index + 1) * columns + right_index + 1]
-            } else {
-                common[(left_index + 1) * columns + right_index]
-                    .max(common[left_index * columns + right_index + 1])
-            };
-        }
-    }
-    let mut merged = Vec::with_capacity(left.len() + right.len());
-    let (mut left_index, mut right_index) = (0, 0);
-    while left_index < left.len() && right_index < right.len() {
-        if left[left_index] == right[right_index] {
-            merged.push(left[left_index].clone());
-            left_index += 1;
-            right_index += 1;
-        } else if common[(left_index + 1) * columns + right_index]
-            >= common[left_index * columns + right_index + 1]
-        {
-            merged.push(left[left_index].clone());
-            left_index += 1;
-        } else {
-            merged.push(right[right_index].clone());
-            right_index += 1;
-        }
-    }
-    merged.extend_from_slice(&left[left_index..]);
-    merged.extend_from_slice(&right[right_index..]);
-    merged
-}
-
-fn merge_repeated_shapes(target: &mut [RepeatedPhaseShape], instance: Vec<RepeatedPhaseShape>) {
-    for (target, instance) in target.iter_mut().zip(instance) {
-        let (RepeatedPhaseShape::Compute(target), RepeatedPhaseShape::Compute(instance)) =
-            (target, instance)
-        else {
-            continue;
-        };
-        for instance_tile in instance {
-            match target.binary_search_by_key(&instance_tile.tile, |tile| tile.tile) {
-                Ok(index) => {
-                    target[index].commands = merge_repeated_command_shapes(
-                        &target[index].commands,
-                        &instance_tile.commands,
-                    );
-                }
-                Err(index) => target.insert(index, instance_tile),
-            }
-        }
-    }
+    left == right
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
