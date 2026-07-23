@@ -836,7 +836,7 @@ struct RelocationMemoryConstraints {
 
 fn relocation_memory_constraints(
     graph: &ExecutableGraph,
-    programs: &[ipu_compiler::LoweredTileProgram],
+    resolved: &ipu_compiler::ResolvedKernelMemoryConstraints,
 ) -> Result<RelocationMemoryConstraints> {
     fn allocation_endpoint(
         graph: &ExecutableGraph,
@@ -864,8 +864,7 @@ fn relocation_memory_constraints(
     }
 
     let mut constraints = RelocationMemoryConstraints::default();
-    let resolved = graph.schedule.resolve_memory_constraints(programs)?;
-    for class in resolved.classes {
+    for &class in &resolved.classes {
         let endpoint = allocation_endpoint(graph, class.operand)?;
         match (class.class, endpoint) {
             (ipu_compiler::KernelMemoryClass::Ipu21Interleaved, (Some(index), 0)) => {
@@ -894,7 +893,7 @@ fn relocation_memory_constraints(
             }
         }
     }
-    for separation in resolved.separations {
+    for &separation in &resolved.separations {
         if separation.first.tile != separation.second.tile {
             return Err("one kernel memory-element constraint spans multiple tiles".into());
         }
@@ -975,35 +974,49 @@ fn compact_transient_allocations_around(
     graph: &mut ExecutableGraph,
     topology: &Topology,
     reservations: &[Vec<(u32, u32)>],
-    programs: Option<&[ipu_compiler::LoweredTileProgram]>,
+    memory_constraints: Option<&ipu_compiler::ResolvedKernelMemoryConstraints>,
     reason: &str,
 ) -> Result<usize> {
-    compact_allocations_around(graph, topology, reservations, programs, reason, false)
+    compact_allocations_around(
+        graph,
+        topology,
+        reservations,
+        memory_constraints,
+        reason,
+        false,
+    )
 }
 
 fn compact_all_allocations_around(
     graph: &mut ExecutableGraph,
     topology: &Topology,
     reservations: &[Vec<(u32, u32)>],
-    programs: Option<&[ipu_compiler::LoweredTileProgram]>,
+    memory_constraints: Option<&ipu_compiler::ResolvedKernelMemoryConstraints>,
     reason: &str,
 ) -> Result<usize> {
-    compact_allocations_around(graph, topology, reservations, programs, reason, true)
+    compact_allocations_around(
+        graph,
+        topology,
+        reservations,
+        memory_constraints,
+        reason,
+        true,
+    )
 }
 
 fn compact_allocations_around(
     graph: &mut ExecutableGraph,
     topology: &Topology,
     reservations: &[Vec<(u32, u32)>],
-    programs: Option<&[ipu_compiler::LoweredTileProgram]>,
+    resolved_memory_constraints: Option<&ipu_compiler::ResolvedKernelMemoryConstraints>,
     reason: &str,
     move_resident: bool,
 ) -> Result<usize> {
     if reservations.len() != topology.tile_count() {
         return Err("invalid transient repacking reservations".into());
     }
-    let memory_constraints = programs
-        .map(|programs| relocation_memory_constraints(graph, programs))
+    let memory_constraints = resolved_memory_constraints
+        .map(|constraints| relocation_memory_constraints(graph, constraints))
         .transpose()?
         .unwrap_or_default();
     let physical_to_logical = (0..u16::try_from(topology.tile_count())?)
@@ -1082,7 +1095,7 @@ fn compact_allocations_around(
             let mut compact = Vec::with_capacity(movable.len());
             for index in movable {
                     let allocation = &graph.schedule.allocations[index];
-                    let requires_interleaved = (programs.is_none()
+                    let requires_interleaved = (resolved_memory_constraints.is_none()
                         && allocation_requires_interleaved(allocation))
                         || memory_constraints.required_interleaved.contains(&index);
                     if requires_interleaved
@@ -1119,7 +1132,7 @@ fn compact_allocations_around(
                     } else {
                         &transient_arenas
                     };
-                    let requires_interleaved = (programs.is_none()
+                    let requires_interleaved = (resolved_memory_constraints.is_none()
                         && allocation_requires_interleaved(allocation))
                         || memory_constraints.required_interleaved.contains(&index);
                     let compatible_arenas = relocation_arenas_for_allocation(
@@ -2875,6 +2888,81 @@ fn plan_tile_exchange(
     })
 }
 
+fn merge_kernel_memory_constraints(
+    constraints: impl IntoIterator<Item = ipu_compiler::ResolvedKernelMemoryConstraints>,
+) -> ipu_compiler::ResolvedKernelMemoryConstraints {
+    let mut merged = ipu_compiler::ResolvedKernelMemoryConstraints::default();
+    for mut constraints in constraints {
+        merged.classes.append(&mut constraints.classes);
+        merged.separations.append(&mut constraints.separations);
+    }
+    merged.classes.sort_unstable();
+    merged.classes.dedup();
+    merged.separations.sort_unstable();
+    merged.separations.dedup();
+    merged
+}
+
+fn validate_kernel_memory_constraints(
+    constraints: &ipu_compiler::ResolvedKernelMemoryConstraints,
+    executable_elements: &[Vec<(u32, u32)>],
+) -> Result<()> {
+    let validate_address = |operand: ipu_compiler::ResolvedMemoryOperand| -> Result<()> {
+        let ranges = executable_elements
+            .get(usize::from(operand.tile))
+            .ok_or("kernel memory constraint references a tile outside the executable")?;
+        if let Some(&(start, end)) = ranges
+            .iter()
+            .find(|&&(start, end)| start <= operand.address && operand.address < end)
+        {
+            return Err(format!(
+                "kernel operand on tile {} at 0x{:x} occupies executable element 0x{start:x}..0x{end:x}",
+                operand.tile, operand.address,
+            )
+            .into());
+        }
+        Ok(())
+    };
+    for class in &constraints.classes {
+        validate_address(class.operand)?;
+        match class.class {
+            ipu_compiler::KernelMemoryClass::Ipu21Interleaved
+                if !(ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                    ..ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT)
+                    .contains(&class.operand.address) =>
+            {
+                return Err(format!(
+                    "kernel operand on tile {} at 0x{:x} is outside required interleaved memory",
+                    class.operand.tile, class.operand.address,
+                )
+                .into());
+            }
+            _ => {}
+        }
+    }
+    for separation in &constraints.separations {
+        validate_address(separation.first)?;
+        validate_address(separation.second)?;
+        let first = ipu_package::ipu21_effective_memory_element(separation.first.address)
+            .ok_or("kernel operand is outside tile SRAM")?;
+        let second = ipu_package::ipu21_effective_memory_element(separation.second.address)
+            .ok_or("kernel operand is outside tile SRAM")?;
+        if separation.first.tile == separation.second.tile && first.0 == second.0 {
+            return Err(format!(
+                "kernel operands on tile {} at 0x{:x} and 0x{:x} share effective memory element {} (0x{:x}..0x{:x})",
+                separation.first.tile,
+                separation.first.address,
+                separation.second.address,
+                first.0,
+                first.1,
+                first.2,
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn package_graph_impl_attempt(
     graph: &ExecutableGraph,
     objects: &[Vec<u8>],
@@ -2892,7 +2980,7 @@ fn package_graph_impl_attempt(
     graph.schedule.validate_allocations()?;
     let stream_templates =
         lowered_programs.is_none() && profile_code.is_empty() && !template_regions.is_empty();
-    let (mut programs, mut tile_exchange_plans) = if stream_templates {
+    let (mut programs, mut tile_exchange_plans, resolved_memory_constraints) = if stream_templates {
         let prepare_started = Instant::now();
         let lowering = graph.schedule.prepare_tile_program_lowering(&topology)?;
         let prepare_elapsed = prepare_started.elapsed();
@@ -2900,10 +2988,13 @@ fn package_graph_impl_attempt(
             .into_par_iter()
             .map(|tile| -> Result<_> {
                 let mut program = lowering.lower(tile, false)?;
+                let memory_constraints = graph
+                    .schedule
+                    .resolve_memory_constraints(std::slice::from_ref(&program))?;
                 let mut plans =
                     plan_tile_exchange(&program, template_regions, false, invocations > 1)?;
                 static_codegen::compact_template_instances(&mut program, &mut plans.templates)?;
-                Ok((program, plans))
+                Ok((program, plans, memory_constraints))
             })
             .collect::<Result<Vec<_>>>()?;
         info!(
@@ -2912,7 +3003,19 @@ fn package_graph_impl_attempt(
             total_ms = prepare_started.elapsed().as_millis(),
             "lowered and compacted tile programs"
         );
-        lowered.into_iter().unzip()
+        let mut programs = Vec::with_capacity(lowered.len());
+        let mut plans = Vec::with_capacity(lowered.len());
+        let mut constraints = Vec::with_capacity(lowered.len());
+        for (program, plan, memory_constraints) in lowered {
+            programs.push(program);
+            plans.push(plan);
+            constraints.push(memory_constraints);
+        }
+        (
+            programs,
+            plans,
+            merge_kernel_memory_constraints(constraints),
+        )
     } else {
         let programs = match lowered_programs {
             Some(programs) => programs,
@@ -2929,7 +3032,8 @@ fn package_graph_impl_attempt(
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        (programs, plans)
+        let memory_constraints = graph.schedule.resolve_memory_constraints(&programs)?;
+        (programs, plans, memory_constraints)
     };
     if !profile_code.is_empty() && profile_code.len() != programs.len() {
         return Err("profile layout tile count differs from schedule".into());
@@ -3392,7 +3496,7 @@ fn package_graph_impl_attempt(
                     &mut relocated_graph,
                     &topology,
                     &reservations,
-                    Some(&programs),
+                    Some(&resolved_memory_constraints),
                     "measured executable placement",
                 )?
             } else {
@@ -3400,7 +3504,7 @@ fn package_graph_impl_attempt(
                     &mut relocated_graph,
                     &topology,
                     &reservations,
-                    Some(&programs),
+                    Some(&resolved_memory_constraints),
                     "measured executable placement",
                 )?
             };
@@ -3822,7 +3926,7 @@ fn package_graph_impl_attempt(
                 &mut relocated_graph,
                 &topology,
                 &static_relocation_reservations,
-                Some(&programs),
+                Some(&resolved_memory_constraints),
                 "static runtime placement",
             )?
         } else {
@@ -3830,7 +3934,7 @@ fn package_graph_impl_attempt(
                 &mut relocated_graph,
                 &topology,
                 &static_relocation_reservations,
-                Some(&programs),
+                Some(&resolved_memory_constraints),
                 "static runtime placement",
             ) {
                 Ok(moved) => moved,
@@ -3838,7 +3942,7 @@ fn package_graph_impl_attempt(
                     &mut relocated_graph,
                     &topology,
                     &static_relocation_reservations,
-                    Some(&programs),
+                    Some(&resolved_memory_constraints),
                     "static runtime placement",
                 )?,
                 Err(error) => return Err(error),
@@ -4186,6 +4290,10 @@ fn package_graph_impl_attempt(
     {
         return Err("generated program size changed after executable placement".into());
     }
+    validate_kernel_memory_constraints(
+        &resolved_memory_constraints,
+        &executable_element_reservations,
+    )?;
     programs
         .par_iter()
         .try_for_each(|program| -> Result<()> {
@@ -5681,11 +5789,33 @@ fn supervisor_state_summary(device: &Device, app: &Application) -> String {
                 .map(|pc| format!("0x{pc:x}"))
                 .unwrap_or_else(|error| format!("error({error})"));
             match status {
-                Ok(status) => format!(
-                    "{}:{}@{pc}",
-                    tile.physical_tile,
-                    ipu_driver::TileException::from_status(status)
-                ),
+                Ok(status) => {
+                    let exception = ipu_driver::TileException::from_status(status);
+                    let registers = (exception == ipu_driver::TileException::InvalidMemoryAddress)
+                        .then(|| {
+                            [2, 3, 4, 5, 10, 11, 15]
+                                .into_iter()
+                                .map(|register| {
+                                    device
+                                        .read_tile_m_register(
+                                            tile.physical_tile as u16,
+                                            0,
+                                            register,
+                                        )
+                                        .map(|value| format!("m{register}=0x{value:x}"))
+                                        .unwrap_or_else(|error| {
+                                            format!("m{register}=error({error})")
+                                        })
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        });
+                    if let Some(registers) = registers {
+                        format!("{}:{exception}@{pc}[{registers}]", tile.physical_tile)
+                    } else {
+                        format!("{}:{exception}@{pc}", tile.physical_tile)
+                    }
+                }
                 Err(error) => format!("{}:status=error({error}),pc={pc}", tile.physical_tile),
             }
         })
@@ -6310,13 +6440,17 @@ mod tests {
                 },
             )],
         }];
+        let memory_constraints = graph
+            .schedule
+            .resolve_memory_constraints(&programs)
+            .unwrap();
         let reservations = vec![Vec::new(); topology.tile_count()];
 
         compact_transient_allocations_around(
             &mut graph,
             &topology,
             &reservations,
-            Some(&programs),
+            Some(&memory_constraints),
             "unit test",
         )
         .unwrap();
