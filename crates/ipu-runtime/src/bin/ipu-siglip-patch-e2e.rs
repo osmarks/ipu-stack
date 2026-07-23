@@ -510,7 +510,17 @@ fn main() {
         profile_output.is_none() || invocations == 1,
         "semantic profiling currently requires one invocation"
     );
-    let (app, profile_layout) = if profile_output.is_some() {
+    let load_package = std::env::var_os("IPU_SIGLIP_LOAD_PACKAGE").map(PathBuf::from);
+    assert!(
+        profile_output.is_none() || load_package.is_none(),
+        "a cached package does not carry this run's profile layout"
+    );
+    let (app, profile_layout) = if let Some(path) = load_package {
+        (
+            ipu_package::Application::read(fs::File::open(path).unwrap()).unwrap(),
+            None,
+        )
+    } else if profile_output.is_some() {
         let granularity = profile_granularity.expect("profile output has a granularity");
         let (app, layout) = if granularity == ProfileGranularity::Graph {
             package_graph_repeated_with_templates_profiled_regions(

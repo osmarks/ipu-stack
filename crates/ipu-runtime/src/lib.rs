@@ -531,6 +531,26 @@ fn merge_address_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     merged
 }
 
+fn static_placement_ranges(
+    reserved: &[(u32, u32)],
+    graph_allocations: &[(u32, u32)],
+) -> Vec<(u32, u32)> {
+    let interleaved =
+        ipu_package::IPU21_INTERLEAVED_MEMORY_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
+    merge_address_ranges(
+        reserved
+            .iter()
+            .copied()
+            .chain(
+                graph_allocations
+                    .iter()
+                    .copied()
+                    .filter(|&(start, end)| start < interleaved.end && end > interleaved.start),
+            )
+            .collect(),
+    )
+}
+
 fn allocate_from_sorted_ranges(
     permanent: &[(u32, u32)],
     active: &BTreeMap<(u32, usize), u32>,
@@ -615,6 +635,101 @@ fn allocate_from_sorted_ranges(
         }
     }
     None
+}
+
+fn relocation_arenas_for_allocation(
+    allocation: &ipu_compiler::Allocation,
+    arenas: &[ipu_compiler::MemoryArena],
+) -> Result<Vec<ipu_compiler::MemoryArena>> {
+    let allocation_end = allocation
+        .address
+        .checked_add(allocation.size)
+        .ok_or("allocation address overflow while preserving its memory class")?;
+    let interleaved =
+        ipu_package::IPU21_INTERLEAVED_MEMORY_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
+    let requires_interleaved =
+        allocation.address >= interleaved.start && allocation_end <= interleaved.end;
+    if !requires_interleaved
+        && allocation.address < interleaved.end
+        && allocation_end > interleaved.start
+    {
+        return Err(format!(
+            "tensor {} allocation 0x{:x}..0x{allocation_end:x} crosses IPU21 memory classes",
+            allocation.tensor.0, allocation.address,
+        )
+        .into());
+    }
+
+    let mut compatible = Vec::new();
+    for arena in arenas {
+        let append = |compatible: &mut Vec<ipu_compiler::MemoryArena>, base, limit| {
+            let base = arena.base.max(base);
+            let limit = arena.limit.min(limit);
+            if base < limit {
+                compatible.push(ipu_compiler::MemoryArena {
+                    base,
+                    limit,
+                    placement: arena.placement,
+                });
+            }
+        };
+        if requires_interleaved {
+            append(&mut compatible, interleaved.start, interleaved.end);
+        } else {
+            append(
+                &mut compatible,
+                ipu_package::TILE_MEMORY_BASE,
+                interleaved.start,
+            );
+            append(
+                &mut compatible,
+                interleaved.end,
+                ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            );
+        }
+    }
+    if compatible.is_empty() {
+        let class = if requires_interleaved {
+            "interleaved"
+        } else {
+            "data"
+        };
+        return Err(format!(
+            "memory policy has no {class} relocation arena for tensor {} on tile {}",
+            allocation.tensor.0, allocation.tile,
+        )
+        .into());
+    }
+    Ok(compatible)
+}
+
+fn allocation_address_is_available(
+    allocation: &ipu_compiler::Allocation,
+    arenas: &[ipu_compiler::MemoryArena],
+    permanent: &[(u32, u32)],
+    active: &BTreeMap<(u32, usize), u32>,
+) -> bool {
+    let Some(end) = allocation.address.checked_add(allocation.size) else {
+        return false;
+    };
+    if !arenas
+        .iter()
+        .any(|arena| allocation.address >= arena.base && end <= arena.limit)
+    {
+        return false;
+    }
+    let permanent_index =
+        permanent.partition_point(|&(_, occupied_end)| occupied_end <= allocation.address);
+    if permanent
+        .get(permanent_index)
+        .is_some_and(|&(start, _)| start < end)
+    {
+        return false;
+    }
+    !active
+        .range(..(end, 0))
+        .next_back()
+        .is_some_and(|(&(_, _), &occupied_end)| occupied_end > allocation.address)
 }
 
 fn fixed_allocation_ranges_by_tile(
@@ -763,19 +878,30 @@ fn repack_allocations_around(
             let mut result = Vec::with_capacity(residents.len() + transients.len());
             for index in residents {
                 let allocation = &graph.schedule.allocations[index];
-                let address = allocate_from_sorted_ranges(
+                let compatible_arenas =
+                    relocation_arenas_for_allocation(allocation, &resident_arenas)?;
+                let address = if allocation_address_is_available(
+                    allocation,
+                    &compatible_arenas,
                     &permanent,
                     &BTreeMap::new(),
-                    allocation.size,
-                    &resident_arenas,
-                    32,
-                )
-                .ok_or_else(|| {
-                    format!(
-                        "cannot repack resident tensor {} on tile {} for {reason}: no arena can hold a {}-byte SRAM allocation",
-                        allocation.tensor.0, allocation.tile, allocation.size,
+                ) {
+                    allocation.address
+                } else {
+                    allocate_from_sorted_ranges(
+                        &permanent,
+                        &BTreeMap::new(),
+                        allocation.size,
+                        &compatible_arenas,
+                        32,
                     )
-                })?;
+                    .ok_or_else(|| {
+                        format!(
+                            "cannot repack resident tensor {} on tile {} for {reason}: no arena can hold a {}-byte SRAM allocation",
+                            allocation.tensor.0, allocation.tile, allocation.size,
+                        )
+                    })?
+                };
                 permanent.push((address, address.saturating_add(allocation.size)));
                 permanent = merge_address_ranges(permanent);
                 result.push((index, address));
@@ -791,19 +917,30 @@ fn repack_allocations_around(
                     expirations.pop();
                     active.remove(&(address, expired_index));
                 }
-                let address = allocate_from_sorted_ranges(
+                let compatible_arenas =
+                    relocation_arenas_for_allocation(allocation, &transient_arenas)?;
+                let address = if allocation_address_is_available(
+                    allocation,
+                    &compatible_arenas,
                     &permanent,
                     &active,
-                    allocation.size,
-                    &transient_arenas,
-                    32,
-                )
-                .ok_or_else(|| {
-                    format!(
-                        "cannot repack transient tensor {} on tile {} for {reason}: no arena can hold a {}-byte SRAM allocation",
-                        allocation.tensor.0, allocation.tile, allocation.size,
+                ) {
+                    allocation.address
+                } else {
+                    allocate_from_sorted_ranges(
+                        &permanent,
+                        &active,
+                        allocation.size,
+                        &compatible_arenas,
+                        32,
                     )
-                })?;
+                    .ok_or_else(|| {
+                        format!(
+                            "cannot repack transient tensor {} on tile {} for {reason}: no arena can hold a {}-byte SRAM allocation",
+                            allocation.tensor.0, allocation.tile, allocation.size,
+                        )
+                    })?
+                };
                 if allocation.live_from < allocation.live_until {
                     let end = address.saturating_add(allocation.size);
                     active.insert((address, index), end);
@@ -889,26 +1026,29 @@ fn repack_allocations_around(
         }
     }
     for buffer in &mut graph.initial_buffers {
-        relocate_literal_address(
+        relocate_boundary_address(
             &mut buffer.address,
             &relocations_by_tile[usize::from(buffer.tile)],
-        );
+            GraphBoundary::Input,
+        )?;
     }
-    for binding in graph
-        .outputs
-        .iter_mut()
-        .chain(&mut graph.host_weights)
-        .chain(&mut graph.host_inputs)
-        .chain(&mut graph.host_outputs)
-    {
-        for slice in &mut binding.slices {
-            let logical = *physical_to_logical
-                .get(&slice.tile)
-                .ok_or("host binding references a physical tile outside the topology")?;
-            relocate_literal_address(
-                &mut slice.tile_address,
-                &relocations_by_tile[usize::from(logical)],
-            );
+    for (bindings, boundary) in [
+        (&mut graph.host_weights, GraphBoundary::Input),
+        (&mut graph.host_inputs, GraphBoundary::Input),
+        (&mut graph.outputs, GraphBoundary::Output),
+        (&mut graph.host_outputs, GraphBoundary::Output),
+    ] {
+        for binding in bindings {
+            for slice in &mut binding.slices {
+                let logical = *physical_to_logical
+                    .get(&slice.tile)
+                    .ok_or("host binding references a physical tile outside the topology")?;
+                relocate_boundary_address(
+                    &mut slice.tile_address,
+                    &relocations_by_tile[usize::from(logical)],
+                    boundary,
+                )?;
+            }
         }
     }
     graph.schedule.validate_allocations()?;
@@ -939,13 +1079,48 @@ fn relocate_transient_allocations_for_executables(
     )
 }
 
-fn relocate_literal_address(address: &mut u32, relocations: &[&AllocationRelocation]) {
-    if let Some(relocation) = relocations
+#[derive(Clone, Copy)]
+enum GraphBoundary {
+    Input,
+    Output,
+}
+
+fn relocate_boundary_address(
+    address: &mut u32,
+    relocations: &[&AllocationRelocation],
+    boundary: GraphBoundary,
+) -> Result<()> {
+    let candidates = relocations
         .iter()
-        .find(|relocation| relocation.old.contains(address))
-    {
-        *address = relocation.new_start + (*address - relocation.old.start);
+        .filter(|relocation| relocation.old.contains(address))
+        .collect::<Vec<_>>();
+    let selected_lifetime = match boundary {
+        GraphBoundary::Input => candidates.iter().map(|entry| entry.live_from).min(),
+        GraphBoundary::Output => candidates.iter().map(|entry| entry.live_until).max(),
+    };
+    let Some(selected_lifetime) = selected_lifetime else {
+        return Ok(());
+    };
+    let relocated = candidates
+        .into_iter()
+        .filter(|relocation| match boundary {
+            GraphBoundary::Input => relocation.live_from == selected_lifetime,
+            GraphBoundary::Output => relocation.live_until == selected_lifetime,
+        })
+        .map(|relocation| relocation.new_start + (*address - relocation.old.start))
+        .collect::<BTreeSet<_>>();
+    if relocated.len() != 1 {
+        let boundary = match boundary {
+            GraphBoundary::Input => "input",
+            GraphBoundary::Output => "output",
+        };
+        return Err(format!(
+            "address 0x{address:x} has ambiguous allocation ownership at the graph {boundary} boundary"
+        )
+        .into());
     }
+    *address = *relocated.first().unwrap();
+    Ok(())
 }
 
 pub fn init_tracing() {
@@ -2550,6 +2725,7 @@ fn package_graph_impl_attempt(
                 }
             }
             let mut run_tables = vec![None; host_transfers.len()];
+            let mut run_table_addresses = HashMap::<Vec<u32>, u32>::new();
             let weight_end = host.weights.len();
             let input_end = weight_end + host.inputs.len();
             for range in [
@@ -2570,16 +2746,28 @@ fn package_graph_impl_attempt(
                     {
                         index += 1;
                     }
-                    cursor = align_up(cursor, 4);
-                    run_tables[start] = Some(cursor);
-                    cursor = cursor
-                        .checked_add(
-                            u32::try_from(index - start)?
-                                .checked_mul(HOST_RUN_DESCRIPTOR_WORDS * 4)
-                                .ok_or("static host run descriptor size overflow")?,
-                        )
-                        .ok_or("static host run descriptor address overflow")?;
-                    data_objects.push(run_tables[start].unwrap()..cursor);
+                    let descriptors = host_run_descriptor_words(
+                        physical,
+                        &host_transfers[start..index],
+                        &packet_copies[start..index],
+                    )?;
+                    let address = if let Some(&address) = run_table_addresses.get(&descriptors) {
+                        address
+                    } else {
+                        cursor = align_up(cursor, 4);
+                        let address = cursor;
+                        cursor = cursor
+                            .checked_add(
+                                u32::try_from(descriptors.len())?
+                                    .checked_mul(4)
+                                    .ok_or("static host run descriptor size overflow")?,
+                            )
+                            .ok_or("static host run descriptor address overflow")?;
+                        data_objects.push(address..cursor);
+                        run_table_addresses.insert(descriptors, address);
+                        address
+                    };
+                    run_tables[start] = Some(address);
                 }
             }
             Ok(TileHostPlans {
@@ -3090,8 +3278,19 @@ fn package_graph_impl_attempt(
             .chain(std::iter::once(image_executable_elements[tile_index]))
             .collect::<Vec<_>>();
         let place = |allocation_ranges: &[(u32, u32)]| -> Result<_> {
-            let ordinary_gaps =
-                data_regions_for_tile(allocation_ranges, runtime_end, false, &executable_reserved)?;
+            // Linker/runtime data can displace ordinary graph allocations, which
+            // are subsequently relocated. Interleaved footprints are hardware
+            // placement requirements for AMP/PACE kernels and remain reserved.
+            let allocation_ranges = static_placement_ranges(
+                allocation_ranges,
+                &allocation_ranges_by_tile[usize::from(tile)],
+            );
+            let ordinary_gaps = data_regions_for_tile(
+                &allocation_ranges,
+                runtime_end,
+                false,
+                &executable_reserved,
+            )?;
             let (ordinary_relocations, ordinary_ranges) = pack_objects_in_gaps(
                 tile,
                 &host_plans.ordinary_data_objects,
@@ -3104,7 +3303,7 @@ fn package_graph_impl_attempt(
                 .chain(ordinary_ranges.iter().copied())
                 .collect::<Vec<_>>();
             let data_gaps =
-                data_regions_for_tile(allocation_ranges, runtime_end, true, &data_reserved)?;
+                data_regions_for_tile(&allocation_ranges, runtime_end, true, &data_reserved)?;
             let data_placements =
                 pack_sized_objects_in_gaps(tile, &data_sizes, data_gaps, 4, "static data")?;
             Ok((ordinary_relocations, ordinary_ranges, data_placements))
@@ -4190,6 +4389,13 @@ fn build_static_host_layout(graph: &ExecutableGraph, invocations: u32) -> Result
         .flat_map(|call| call.outputs.iter().cloned())
         .collect();
     let graph_transfers = u32::try_from(inputs.len() + outputs.len())?;
+    info!(
+        weight_transfers = weights.len(),
+        input_transfers = inputs.len(),
+        output_transfers = outputs.len(),
+        staging_bytes,
+        "planned static host-transfer layout"
+    );
     let graph_phases = if invocations == 1 {
         host_transfer_phase_count(graph_transfers)?
     } else {
@@ -4461,6 +4667,41 @@ struct StaticHostPacketLayout<'a> {
     run_tables: &'a [Option<u32>],
 }
 
+fn host_run_descriptor_words(
+    physical_tile: u16,
+    transfers: &[StaticHostTransfer],
+    packet_copies: &[Option<HostPacketCopy>],
+) -> Result<Vec<u32>> {
+    if transfers.len() != packet_copies.len() {
+        return Err("host run transfer and packet counts differ".into());
+    }
+    let mut descriptors = Vec::with_capacity(transfers.len() * HOST_RUN_DESCRIPTOR_WORDS as usize);
+    for (&transfer, &packet) in transfers.iter().zip(packet_copies) {
+        if !host_phase_is_active(physical_tile, &transfer) {
+            return Err("inactive transfer included in a static host run".into());
+        }
+        let copy = (transfer.physical_tile == physical_tile)
+            .then_some(transfer.copy_destination)
+            .flatten();
+        let packet = packet.ok_or("active host run has no packet copy")?;
+        let copy_words = copy.map_or(0, |_| transfer.bytes / 4);
+        if copy_words >= 1 << 23 || packet.words >= 1 << 8 {
+            return Err("host descriptor copy count exceeds packed field".into());
+        }
+        let packet_destination = match packet.destination {
+            HOST_PACKET_ADDRESS => 0,
+            address if address == HOST_PACKET_ADDRESS + 8 => 1 << 23,
+            _ => return Err("host packet destination is not encodable".into()),
+        };
+        descriptors.extend_from_slice(&[
+            copy.unwrap_or(0),
+            copy_words | packet_destination | (packet.words << 24),
+            packet.source,
+        ]);
+    }
+    Ok(descriptors)
+}
+
 fn write_static_host_plans(
     physical_tile: u16,
     layout: StaticHostPacketLayout<'_>,
@@ -4493,36 +4734,28 @@ fn write_static_host_plans(
         }
         follower_written |= !active;
     }
+    let mut written_tables = HashMap::<u32, Vec<u32>>::new();
     for (start, &table_address) in run_tables.iter().enumerate() {
         let Some(table_address) = table_address else {
             continue;
         };
-        let mut descriptors = Vec::new();
         let mut index = start;
         while index < transfers.len()
             && (index == start || run_tables[index].is_none())
             && host_phase_is_active(physical_tile, &transfers[index])
         {
-            let transfer = transfers[index];
-            let copy = (transfer.physical_tile == physical_tile)
-                .then_some(transfer.copy_destination)
-                .flatten();
-            let packet = packet_copies[index].ok_or("active host run has no packet copy")?;
-            let copy_words = copy.map_or(0, |_| transfer.bytes / 4);
-            if copy_words >= 1 << 23 || packet.words >= 1 << 8 {
-                return Err("host descriptor copy count exceeds packed field".into());
-            }
-            let packet_destination = match packet.destination {
-                HOST_PACKET_ADDRESS => 0,
-                address if address == HOST_PACKET_ADDRESS + 8 => 1 << 23,
-                _ => return Err("host packet destination is not encodable".into()),
-            };
-            descriptors.extend_from_slice(&[
-                copy.unwrap_or(0),
-                copy_words | packet_destination | (packet.words << 24),
-                packet.source,
-            ]);
             index += 1;
+        }
+        let descriptors = host_run_descriptor_words(
+            physical_tile,
+            &transfers[start..index],
+            &packet_copies[start..index],
+        )?;
+        if let Some(previous) = written_tables.insert(table_address, descriptors.clone()) {
+            if previous != descriptors {
+                return Err("aliased static host run tables have different contents".into());
+            }
+            continue;
         }
         write_sparse_region_bytes(regions, table_address, &words_to_bytes(&descriptors))?;
     }
@@ -4976,6 +5209,7 @@ fn supervisor_state_summary(device: &Device, app: &Application) -> String {
         .tiles
         .iter()
         .filter(|tile| device.tile_context_state(tile.physical_tile as u16, 0).ok() == Some(1))
+        .take(16)
         .map(|tile| {
             let states = (0..7)
                 .map(|context| device.tile_context_state(tile.physical_tile as u16, context))
@@ -4989,10 +5223,38 @@ fn supervisor_state_summary(device: &Device, app: &Application) -> String {
                             let pc = device
                                 .read_tile_program_counter(tile.physical_tile as u16, context);
                             match (status, pc) {
-                                (Ok(status), Ok(pc)) => format!(
-                                    "c{context}:{}@0x{pc:x}",
-                                    ipu_driver::TileException::from_status(status)
-                                ),
+                                (Ok(status), Ok(pc)) => {
+                                    let exception = ipu_driver::TileException::from_status(status);
+                                    let registers = (context == 1
+                                        && exception
+                                            == ipu_driver::TileException::InvalidMemoryAddress)
+                                        .then(|| {
+                                            [0, 1, 2, 3, 9, 12]
+                                                .into_iter()
+                                                .map(|register| {
+                                                    device
+                                                        .read_tile_m_register(
+                                                            tile.physical_tile as u16,
+                                                            context,
+                                                            register,
+                                                        )
+                                                        .map(|value| {
+                                                            format!("m{register}=0x{value:x}")
+                                                        })
+                                                        .unwrap_or_else(|error| {
+                                                            format!("m{register}=error({error})")
+                                                        })
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join(",")
+                                        });
+                                    match registers {
+                                        Some(registers) => {
+                                            format!("c{context}:{exception}@0x{pc:x}[{registers}]")
+                                        }
+                                        None => format!("c{context}:{exception}@0x{pc:x}"),
+                                    }
+                                }
                                 (status, pc) => format!("c{context}:status={status:?},pc={pc:?}"),
                             }
                         })
@@ -5290,6 +5552,144 @@ mod tests {
         assert_eq!(graph.schedule.allocations[1].address, relocated + 16);
         assert_eq!(graph.initial_buffers[0].address, relocated + 4);
         assert_eq!(graph.host_inputs[0].slices[0].tile_address, relocated + 8);
+    }
+
+    #[test]
+    fn literal_relocation_resolves_reused_addresses_by_lifetime() {
+        let first = AllocationRelocation {
+            tensor: ipu_compiler::TensorId(1),
+            tile: 0,
+            old: 0x60000..0x61000,
+            new_start: 0x70000,
+            live_from: 0,
+            live_until: 5,
+        };
+        let second = AllocationRelocation {
+            tensor: ipu_compiler::TensorId(2),
+            tile: 0,
+            old: first.old.clone(),
+            new_start: 0x80000,
+            live_from: 5,
+            live_until: usize::MAX,
+        };
+        let relocations = [&first, &second];
+        let mut early = 0x60040;
+        let mut late = early;
+
+        relocate_boundary_address(&mut early, &relocations, GraphBoundary::Input).unwrap();
+        relocate_boundary_address(&mut late, &relocations, GraphBoundary::Output).unwrap();
+
+        assert_eq!(early, 0x70040);
+        assert_eq!(late, 0x80040);
+    }
+
+    #[test]
+    fn executable_relocation_preserves_ipu21_data_memory_class() {
+        let interleaved = ipu_compiler::Allocation {
+            tensor: ipu_compiler::TensorId(1),
+            tile: 0,
+            address: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+            size: 1024,
+            live_from: 0,
+            live_until: 1,
+            kind: ipu_compiler::AllocationKind::Home,
+        };
+        let ordinary = ipu_compiler::Allocation {
+            address: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+            tensor: ipu_compiler::TensorId(2),
+            ..interleaved.clone()
+        };
+        let policy = ipu_compiler::MemoryPolicy::ipu21(
+            PLAN_BASE,
+            ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            &[
+                ipu_compiler::Ipu21MemoryRegion::OrdinaryHigh,
+                ipu_compiler::Ipu21MemoryRegion::Interleaved,
+                ipu_compiler::Ipu21MemoryRegion::OrdinaryLow,
+            ],
+            &[
+                ipu_compiler::Ipu21MemoryRegion::OrdinaryLow,
+                ipu_compiler::Ipu21MemoryRegion::Interleaved,
+                ipu_compiler::Ipu21MemoryRegion::OrdinaryHigh,
+            ],
+        )
+        .unwrap();
+
+        let interleaved_arenas =
+            relocation_arenas_for_allocation(&interleaved, &policy.transient).unwrap();
+        let ordinary_arenas =
+            relocation_arenas_for_allocation(&ordinary, &policy.transient).unwrap();
+
+        assert!(interleaved_arenas.iter().all(|arena| {
+            arena.base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                && arena.limit <= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
+        }));
+        assert!(ordinary_arenas.iter().all(|arena| {
+            arena.limit <= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                || arena.base >= ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT
+        }));
+
+        let ordinary_reservation = (PLAN_BASE, PLAN_BASE + 0x100);
+        let ordinary_movable = (PLAN_BASE + 0x200, PLAN_BASE + 0x300);
+        let interleaved_footprint = (
+            ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+            ipu_package::IPU21_INTERLEAVED_MEMORY_BASE + 0x400,
+        );
+        let static_ranges = static_placement_ranges(
+            &[ordinary_reservation],
+            &[ordinary_movable, interleaved_footprint],
+        );
+        assert!(static_ranges.contains(&ordinary_reservation));
+        assert!(static_ranges.contains(&interleaved_footprint));
+        assert!(!static_ranges.contains(&ordinary_movable));
+    }
+
+    #[test]
+    fn graph_repacking_moves_only_allocations_in_conflict() {
+        let topology = Topology::c600();
+        let arena = 0x88000..0xe8000;
+        let conflicting_address = 0x90000;
+        let stable_address = 0xb0000;
+        let mut reservations = vec![Vec::new(); topology.tile_count()];
+        reservations[0].push((conflicting_address, conflicting_address + 0x1000));
+        let mut graph = ExecutableGraph {
+            memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(
+                arena.start,
+                arena.end,
+            )),
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: [conflicting_address, stable_address]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(tensor, address)| ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(tensor),
+                        tile: 0,
+                        address,
+                        size: 0x1000,
+                        live_from: 0,
+                        live_until: usize::MAX,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    })
+                    .collect(),
+                tile_count: u16::try_from(topology.tile_count()).unwrap(),
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+
+        let moved =
+            repack_all_allocations_around(&mut graph, &topology, &reservations, "unit test")
+                .unwrap();
+
+        assert_eq!(moved, 1);
+        assert_ne!(graph.schedule.allocations[0].address, conflicting_address);
+        assert_eq!(graph.schedule.allocations[1].address, stable_address);
     }
 
     #[test]
