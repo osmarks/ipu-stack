@@ -413,6 +413,159 @@ fn pack_generated_and_support_images(
     Ok([placed[0], placed[1]])
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExecutablePlacement {
+    generated: (u32, u32),
+    support: Vec<(u32, u32)>,
+}
+
+impl ExecutablePlacement {
+    fn contiguous(ranges: [(u32, u32); 2]) -> Self {
+        Self {
+            generated: ranges[0],
+            support: vec![ranges[1]],
+        }
+    }
+
+    fn ranges(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        std::iter::once(self.generated).chain(self.support.iter().copied())
+    }
+}
+
+fn subtract_address_range(regions: &[(u32, u32)], reserved: (u32, u32)) -> Vec<(u32, u32)> {
+    regions
+        .iter()
+        .flat_map(|&(start, end)| {
+            if !ranges_overlap(start, end, reserved.0, reserved.1) {
+                return [Some((start, end)), None];
+            }
+            [
+                (start < reserved.0).then_some((start, reserved.0.min(end))),
+                (reserved.1 < end).then_some((reserved.1.max(start), end)),
+            ]
+        })
+        .flatten()
+        .collect()
+}
+
+fn place_generated_with_segmented_support(
+    tile: u16,
+    generated_size: u32,
+    objects: &[Vec<u8>],
+    retained_symbols: &[String],
+    free_regions: &[(u32, u32)],
+) -> Result<ExecutablePlacement> {
+    let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+    let generated_size = align_up(generated_size, element);
+    let mut candidates = free_regions
+        .iter()
+        .filter_map(|&(start, end)| {
+            let start = align_up(start, element);
+            let generated_end = start.checked_add(generated_size)?;
+            (generated_end <= end).then_some(((start, generated_end), end - generated_end))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|&(_, remaining)| remaining);
+    let mut last_error = None;
+    for (generated, _) in candidates {
+        let support_regions = subtract_address_range(free_regions, generated);
+        if support_regions.is_empty() {
+            continue;
+        }
+        match link(
+            objects,
+            &LinkOptions {
+                image_base: support_regions[0].0,
+                regions: support_regions,
+                entry_symbol: "ipu_stack_static_start".into(),
+                retained_symbols: retained_symbols.to_vec(),
+                externals: HashMap::new(),
+            },
+        ) {
+            Ok(image) => {
+                let support_ranges = image
+                    .segments
+                    .iter()
+                    .map(|segment| -> Result<_> {
+                        let size = u32::try_from(segment.size)?;
+                        Ok((
+                            segment.address,
+                            segment
+                                .address
+                                .checked_add(size)
+                                .ok_or("support segment address overflow")?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let support = effective_element_reservations(support_ranges)?;
+                if support.is_empty() {
+                    return Err(format!("support image for tile {tile} has no segments").into());
+                }
+                return Ok(ExecutablePlacement { generated, support });
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let free = free_regions
+        .iter()
+        .map(|&(start, end)| end - start)
+        .sum::<u32>();
+    let largest = free_regions
+        .iter()
+        .map(|&(start, end)| end - start)
+        .max()
+        .unwrap_or(0);
+    Err(format!(
+        "cannot place generated program and segmented support image on tile {tile}: {free} executable bytes free, {largest}-byte largest gap{}",
+        last_error.map_or_else(String::new, |error| format!(": {error}")),
+    )
+    .into())
+}
+
+fn validate_pinned_executable_placement(
+    tile: u16,
+    generated_size: u32,
+    support_size: u32,
+    pinned: &ExecutablePlacement,
+    free_regions: &[(u32, u32)],
+) -> Result<ExecutablePlacement> {
+    let generated_bytes = pinned.generated.1.saturating_sub(pinned.generated.0);
+    let support_bytes = pinned
+        .support
+        .iter()
+        .map(|&(start, end)| end.saturating_sub(start))
+        .sum::<u32>();
+    if generated_bytes < generated_size || support_bytes < support_size {
+        return Err(format!(
+            "pinned executable placement on tile {tile} is too small: generated {generated_bytes}/{generated_size} bytes, support {support_bytes}/{support_size} bytes"
+        )
+        .into());
+    }
+    let ranges = pinned.ranges().collect::<Vec<_>>();
+    for &(start, end) in &ranges {
+        if start >= end
+            || !free_regions
+                .iter()
+                .any(|&(free_start, free_end)| start >= free_start && end <= free_end)
+        {
+            return Err(format!(
+                "tensor relocation did not preserve pinned executable interval 0x{start:x}..0x{end:x} on tile {tile}"
+            )
+            .into());
+        }
+    }
+    for (index, &(start, end)) in ranges.iter().enumerate() {
+        if ranges[index + 1..]
+            .iter()
+            .any(|&(other_start, other_end)| ranges_overlap(start, end, other_start, other_end))
+        {
+            return Err(format!("pinned executable intervals overlap on tile {tile}").into());
+        }
+    }
+    Ok(pinned.clone())
+}
+
+#[cfg(test)]
 fn validate_pinned_executable_images(
     tile: u16,
     generated_size: u32,
@@ -3372,7 +3525,7 @@ fn package_graph_impl_attempt(
     lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
-    executable_placement_history: &mut Vec<Vec<[(u32, u32); 2]>>,
+    executable_placement_history: &mut Vec<Vec<ExecutablePlacement>>,
 ) -> Result<Application> {
     let topology = Topology::c600();
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
@@ -3833,7 +3986,7 @@ fn package_graph_impl_attempt(
         .collect::<Result<Vec<_>>>()?;
     // Generated and support code are independently relocatable. Reserving them
     // separately avoids requiring one artificial contiguous executable extent.
-    let executable_reservations = if let Some(pinned) = executable_placement_history.last() {
+    let executable_placements = if let Some(pinned) = executable_placement_history.last() {
         programs
             .par_iter()
             .zip(&tile_exchange_plans)
@@ -3841,13 +3994,13 @@ fn package_graph_impl_attempt(
             .zip(&preliminary_images)
             .zip(pinned)
             .map(
-                |((((program, plans), &program_size), image), &pinned)| -> Result<_> {
+                |((((program, plans), &program_size), image), pinned)| -> Result<_> {
                     let regions = executable_regions_for_tile(
                         &allocation_ranges_by_tile[usize::from(program.tile)],
                         plans.end,
                         &[],
                     )?;
-                    validate_pinned_executable_images(
+                    validate_pinned_executable_placement(
                         program.tile,
                         program_size,
                         u32::try_from(image.bytes.len())?,
@@ -3863,18 +4016,20 @@ fn package_graph_impl_attempt(
             .zip(&tile_exchange_plans)
             .zip(&program_reservation_sizes)
             .zip(&preliminary_images)
+            .zip(&tile_retained_symbols)
             .map(
-                |(((program, plans), &program_size), image)| -> Result<[(u32, u32); 2]> {
+                |((((program, plans), &program_size), _image), symbols)| -> Result<_> {
                     let regions = executable_regions_for_tile(
                         &allocation_ranges_by_tile[usize::from(program.tile)],
                         plans.end,
                         &[],
                     )?;
-                    pack_generated_and_support_images(
+                    place_generated_with_segmented_support(
                         program.tile,
                         program_size,
-                        u32::try_from(image.bytes.len())?,
-                        regions,
+                        objects,
+                        symbols,
+                        &regions,
                     )
                 },
             )
@@ -3884,12 +4039,11 @@ fn package_graph_impl_attempt(
             Err(error) => {
                 let place = |allocation_ranges: &[Vec<(u32, u32)>]| {
                     programs
-                    .par_iter()
-                    .zip(&tile_exchange_plans)
-                    .zip(&program_reservation_sizes)
-                    .zip(&preliminary_images)
-                    .map(
-                        |(((program, plans), &program_size), image)| -> Result<[(u32, u32); 2]> {
+                        .par_iter()
+                        .zip(&tile_exchange_plans)
+                        .zip(&program_reservation_sizes)
+                        .zip(&preliminary_images)
+                        .map(|(((program, plans), &program_size), image)| -> Result<_> {
                             let regions = executable_regions_for_tile(
                                 &allocation_ranges[usize::from(program.tile)],
                                 plans.end,
@@ -3901,10 +4055,9 @@ fn package_graph_impl_attempt(
                                 u32::try_from(image.bytes.len())?,
                                 regions,
                             )?;
-                            Ok(placed)
-                        },
-                    )
-                    .collect::<Result<Vec<_>>>()
+                            Ok(ExecutablePlacement::contiguous(placed))
+                        })
+                        .collect::<Result<Vec<_>>>()
                 };
                 let (desired, move_resident) = match place(&fixed_allocation_ranges) {
                     Ok(desired) => (desired, false),
@@ -3917,8 +4070,8 @@ fn package_graph_impl_attempt(
                     .enumerate()
                     .map(|(tile, ranges)| {
                         ranges
-                            .iter()
-                            .map(|&(start, end)| {
+                            .ranges()
+                            .map(|(start, end)| {
                                 (align_down(start, element), align_up(end, element))
                             })
                             .chain(std::iter::once((PLAN_BASE, tile_exchange_plans[tile].end)))
@@ -3957,39 +4110,43 @@ fn package_graph_impl_attempt(
         }
     };
     info!(
-        tiles = executable_reservations.len(),
+        tiles = executable_placements.len(),
+        support_segments = executable_placements
+            .iter()
+            .map(|placement| placement.support.len())
+            .sum::<usize>(),
         "placed measured tile executables"
     );
-    let program_reservations = executable_reservations
+    let program_reservations = executable_placements
         .iter()
-        .map(|reservations| reservations[0])
+        .map(|placement| placement.generated)
         .collect::<Vec<_>>();
-    let support_reservations = executable_reservations
+    let support_reservations = executable_placements
         .iter()
-        .map(|reservations| reservations[1])
+        .map(|placement| placement.support.clone())
         .collect::<Vec<_>>();
-    let image_executable_elements = executable_reservations
+    let image_executable_elements = executable_placements
         .iter()
-        .map(|reservations| effective_element_reservations(reservations.iter().copied()))
+        .map(|placement| effective_element_reservations(placement.ranges()))
         .collect::<Result<Vec<_>>>()?;
     let mut host_executable_placements = tile_host_plans
         .iter()
         .enumerate()
-        .map(|(tile_index, plans)| {
+        .map(|(tile_index, plans)| -> Result<_> {
             let tile = programs[tile_index].tile;
             let program_tail_start = program_reservations[tile_index]
                 .0
                 .checked_add(preliminary_program_sizes[tile_index])
                 .ok_or("generated program tail overflow")?;
+            let executable_reserved = std::iter::once(program_reservations[tile_index])
+                .chain(support_reservations[tile_index].iter().copied())
+                .collect::<Vec<_>>();
             pack_executable_objects_for_tile(
                 &allocation_ranges_by_tile[usize::from(tile)],
                 tile,
                 tile_exchange_plans[tile_index].end,
                 &plans.executable_objects,
-                &[
-                    program_reservations[tile_index],
-                    support_reservations[tile_index],
-                ],
+                &executable_reserved,
                 &[(program_tail_start, program_reservations[tile_index].1)],
             )
         })
@@ -4565,45 +4722,11 @@ fn package_graph_impl_attempt(
         .iter()
         .map(|&(base, _)| base)
         .collect::<Vec<_>>();
-    let image_regions = programs
-        .par_iter()
-        .zip(&program_bases)
-        .zip(&preliminary_generated)
-        .zip(&template_record_ranges)
-        .map(
-            |(((program, &program_base), generated), template_records)| {
-                let program_end = program_base
-                    .checked_add(u32::try_from(generated.len())?)
-                    .ok_or("generated program address overflow")?;
-                let mut regions = executable_regions_for_tile(
-                    &allocation_ranges_by_tile[usize::from(program.tile)],
-                    tile_exchange_plans[usize::from(program.tile)].end,
-                    &host_runtime_ranges[usize::from(program.tile)]
-                        .iter()
-                        .copied()
-                        .chain(template_records.iter().copied())
-                        .chain(std::iter::once((program_base, program_end)))
-                        .collect::<Vec<_>>(),
-                )?;
-                // Generated and support code deliberately share executable memory
-                // elements. Re-add the measured support interval after excluding the
-                // generated bytes from generally available executable regions.
-                regions.push(support_reservations[usize::from(program.tile)]);
-                regions.sort_unstable();
-                let mut merged = Vec::<(u32, u32)>::new();
-                for (start, end) in regions {
-                    if let Some(previous) = merged.last_mut()
-                        && start <= previous.1
-                    {
-                        previous.1 = previous.1.max(end);
-                    } else {
-                        merged.push((start, end));
-                    }
-                }
-                Ok(merged)
-            },
-        )
-        .collect::<Result<Vec<_>>>()?;
+    // Relink into the exact element reservations established by preliminary
+    // section placement. Keeping the support image inside those intervals makes
+    // the later static-data placement and kernel access validation independent
+    // of linker traversal order.
+    let image_regions = support_reservations.clone();
     let mut image_cache = HashMap::<(Vec<(u32, u32)>, Vec<String>), ipu_elf::LinkedImage>::new();
     for (tile_index, (regions, symbols)) in
         image_regions.iter().zip(&tile_retained_symbols).enumerate()
@@ -4644,6 +4767,24 @@ fn package_graph_impl_attempt(
                 .clone())
         })
         .collect::<Result<Vec<_>>>()?;
+    for (tile, (image, regions)) in images.iter().zip(&image_regions).enumerate() {
+        for segment in &image.segments {
+            let end = segment
+                .address
+                .checked_add(u32::try_from(segment.size)?)
+                .ok_or("final support segment address overflow")?;
+            if !regions
+                .iter()
+                .any(|&(start, stop)| segment.address >= start && end <= stop)
+            {
+                return Err(format!(
+                    "final support segment 0x{:x}..0x{end:x} escaped its reservation on tile {tile}",
+                    segment.address,
+                )
+                .into());
+            }
+        }
+    }
     if let Some((index, generated_code)) = preliminary_generated
         .iter()
         .enumerate()
@@ -7222,6 +7363,42 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn segmented_executable_placement_preserves_each_reserved_interval() {
+        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        let pinned = ExecutablePlacement {
+            generated: (0x50000, 0x50000 + element),
+            support: vec![(0x58000, 0x58000 + element), (0x68000, 0x68000 + element)],
+        };
+        let free = vec![
+            (0x4c000, 0x54000),
+            (0x58000, 0x58000 + element),
+            (0x68000, 0x68000 + 2 * element),
+        ];
+
+        assert_eq!(
+            validate_pinned_executable_placement(17, element / 2, element + 1, &pinned, &free,)
+                .unwrap(),
+            pinned
+        );
+
+        let remaining = subtract_address_range(&free, pinned.generated);
+        assert!(!remaining.iter().any(|&(start, end)| ranges_overlap(
+            start,
+            end,
+            pinned.generated.0,
+            pinned.generated.1,
+        )));
+        assert!(validate_pinned_executable_placement(
+            17,
+            element / 2,
+            element + 1,
+            &pinned,
+            &free[..2],
+        )
+        .is_err());
     }
 
     #[test]
