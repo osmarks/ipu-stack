@@ -821,11 +821,11 @@ fn fixed_allocation_ranges_by_tile(
         });
     let mut ranges = vec![Vec::new(); tile_count];
     for (index, allocation) in graph.schedule.allocations.iter().enumerate() {
-        if matches!(
+        let movable = matches!(
             allocation.kind,
             ipu_compiler::AllocationKind::HomeAlias { .. }
-        ) || is_movable_transient_storage(allocation, transient_arenas)
-        {
+        ) || is_movable_transient_storage(allocation, transient_arenas);
+        if movable && !memory_constraints.pinned.contains(&index) {
             continue;
         }
         let bytes = memory_constraints.access_extent(index, allocation.size);
@@ -858,12 +858,12 @@ fn immovable_allocation_ranges_by_tile(
         .map_or(&[][..], |policy| policy.resident.as_slice());
     let mut ranges = vec![Vec::new(); tile_count];
     for (index, allocation) in graph.schedule.allocations.iter().enumerate() {
-        if matches!(
+        let movable = matches!(
             allocation.kind,
             ipu_compiler::AllocationKind::HomeAlias { .. }
         ) || is_movable_transient_storage(allocation, transient_arenas)
-            || is_movable_resident_home(allocation, resident_arenas)
-        {
+            || is_movable_resident_home(allocation, resident_arenas);
+        if movable && !memory_constraints.pinned.contains(&index) {
             continue;
         }
         let bytes = memory_constraints.access_extent(index, allocation.size);
@@ -1223,12 +1223,7 @@ fn compact_allocations_around(
             let mut compact = Vec::with_capacity(movable.len());
             for index in movable {
                     let allocation = &graph.schedule.allocations[index];
-                    let requires_interleaved = (resolved_memory_constraints.is_none()
-                        && allocation_requires_interleaved(allocation))
-                        || memory_constraints.required_interleaved.contains(&index);
-                    if requires_interleaved
-                        || memory_constraints.pinned.contains(&index)
-                    {
+                    if memory_constraints.pinned.contains(&index) {
                         let range = (
                             allocation.address,
                             allocation.address.saturating_add(allocation.size),
@@ -1246,6 +1241,7 @@ fn compact_allocations_around(
             compact.sort_unstable_by_key(|&index| {
                     let allocation = &graph.schedule.allocations[index];
                     (
+                        !memory_constraints.required_interleaved.contains(&index),
                         allocation.live_until != usize::MAX,
                         std::cmp::Reverse(allocation.size),
                         allocation.live_from,
@@ -1277,6 +1273,7 @@ fn compact_allocations_around(
                             .copied(),
                     );
                     let occupied = merge_address_ranges(occupied);
+                    let access_extent = memory_constraints.access_extent(index, allocation.size);
                     let forbidden_starts = memory_constraints
                         .relations
                         .get(&index)
@@ -1321,6 +1318,10 @@ fn compact_allocations_around(
                             })
                             .collect::<Vec<_>>()
                         })
+                        .chain(reservations[tile].iter().filter_map(|&(start, end)| {
+                            let forbidden_start = start.saturating_sub(access_extent.saturating_sub(1));
+                            (forbidden_start < end).then_some((forbidden_start, end))
+                        }))
                         .collect::<Vec<_>>();
                     let forbidden_starts = merge_address_ranges(forbidden_starts);
                     let address = allocate_from_sorted_ranges(
@@ -1339,8 +1340,8 @@ fn compact_allocations_around(
                             32,
                         );
                         format!(
-                            "cannot compact tensor {} on tile {} for {reason}: no arena can hold a {}-byte SRAM allocation at lifetime {}..{} ({} bytes capacity, {} bytes free, {}-byte largest aligned gap)",
-                            allocation.tensor.0, allocation.tile, allocation.size,
+                            "cannot compact tensor {} on tile {} for {reason}: no arena can hold a {}-byte SRAM allocation with a {}-byte static access span at lifetime {}..{} ({} bytes capacity, {} bytes free, {}-byte largest aligned gap)",
+                            allocation.tensor.0, allocation.tile, allocation.size, access_extent,
                             allocation.live_from, allocation.live_until, capacity, free, largest,
                         )
                     })?;
@@ -6586,7 +6587,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_enforces_kernel_memory_relations_without_reserving_the_element() {
+    fn compaction_preserves_kernel_memory_constraints_and_static_access_spans() {
         let topology = Topology::c600();
         let output = ipu_compiler::TensorId(1);
         let input = ipu_compiler::TensorId(2);
@@ -6634,7 +6635,7 @@ mod tests {
                         tensor: input,
                         tile: 0,
                         address: 0x88000,
-                        size: 0x4000,
+                        size: 8 * 16 * 2,
                         live_from: 0,
                         live_until: 2,
                         kind: ipu_compiler::AllocationKind::Home,
@@ -6676,7 +6677,9 @@ mod tests {
             .schedule
             .resolve_memory_constraints(&programs)
             .unwrap();
-        let reservations = vec![Vec::new(); topology.tile_count()];
+        let static_reservation = (0x88100, 0x88200);
+        let mut reservations = vec![Vec::new(); topology.tile_count()];
+        reservations[0].push(static_reservation);
 
         compact_transient_allocations_around(
             &mut graph,
@@ -6696,6 +6699,13 @@ mod tests {
             )
             .unwrap()
         );
+        let input_address = graph.schedule.allocations[1].address;
+        assert!(!ranges_overlap(
+            input_address,
+            input_address + 8 * 16 * 2 + ipu_compiler::PACE_F16_LEFT_ACCESS_TAIL_BYTES,
+            static_reservation.0,
+            static_reservation.1,
+        ));
         graph.schedule.validate_allocations().unwrap();
     }
 
