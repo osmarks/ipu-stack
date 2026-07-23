@@ -1475,10 +1475,11 @@ fn compact_allocations_around(
             }
             let compact_set = compact.iter().copied().collect::<HashSet<_>>();
             let mut placed_addresses = result.iter().copied().collect::<HashMap<_, _>>();
-            compact.sort_unstable_by_key(|&index| {
+                compact.sort_unstable_by_key(|&index| {
                     let allocation = &graph.schedule.allocations[index];
                     (
                         !memory_constraints.required_interleaved.contains(&index),
+                        !memory_constraints.relations.contains_key(&index),
                         allocation.live_until != usize::MAX,
                         std::cmp::Reverse(allocation.size),
                         allocation.live_from,
@@ -1569,7 +1570,6 @@ fn compact_allocations_around(
                         .relations
                         .contains_key(&index)
                         .then_some(allocation.address)
-                        .filter(|address| address & 31 == 0)
                         .filter(|&address| {
                             let end = address.saturating_add(allocation.size);
                             compatible_arenas
@@ -1600,10 +1600,41 @@ fn compact_allocations_around(
                             &compatible_arenas,
                             32,
                         );
+                        let old_end = allocation.address.saturating_add(allocation.size);
+                        let old_fits_arena = compatible_arenas.iter().any(|arena| {
+                            allocation.address >= arena.base && old_end <= arena.limit
+                        });
+                        let old_storage_conflict = occupied.iter().find(|&&(start, end)| {
+                            ranges_overlap(allocation.address, old_end, start, end)
+                        });
+                        let old_forbidden = forbidden_starts.iter().find(|&&(start, end)| {
+                            start <= allocation.address && allocation.address < end
+                        });
+                        let allowed_start_ranges = merge_address_ranges(
+                            compatible_arenas
+                                .iter()
+                                .map(|arena| (arena.base, arena.limit))
+                                .collect(),
+                        );
+                        let forbidden_start_bytes = forbidden_starts
+                            .iter()
+                            .flat_map(|&(forbidden_start, forbidden_end)| {
+                                allowed_start_ranges.iter().filter_map(move |&(start, end)| {
+                                    let start = start.max(forbidden_start);
+                                    let end = end.min(forbidden_end);
+                                    (start < end).then_some(end - start)
+                                })
+                            })
+                            .sum::<u32>();
                         format!(
-                            "cannot compact tensor {} on tile {} for {reason}: no arena can hold a {}-byte SRAM allocation with a {}-byte static access span at lifetime {}..{} ({} bytes capacity, {} bytes free, {}-byte largest aligned gap)",
+                            "cannot compact tensor {} on tile {} for {reason}: no arena can hold a {}-byte SRAM allocation with a {}-byte static access span at lifetime {}..{} (old=0x{:x}..0x{:x}, old_fits_arena={}, old_storage_conflict={:?}, old_forbidden={:?}, relations={}, forbidden_start_ranges={}, forbidden_start_bytes={}, {} bytes capacity, {} bytes free, {}-byte largest aligned gap)",
                             allocation.tensor.0, allocation.tile, allocation.size, access_extent,
-                            allocation.live_from, allocation.live_until, capacity, free, largest,
+                            allocation.live_from, allocation.live_until,
+                            allocation.address, old_end, old_fits_arena, old_storage_conflict,
+                            old_forbidden,
+                            memory_constraints.relations.get(&index).map_or(0, Vec::len),
+                            forbidden_starts.len(), forbidden_start_bytes,
+                            capacity, free, largest,
                         )
                     })?;
                     let range = (address, address.saturating_add(allocation.size));
@@ -7097,7 +7128,7 @@ mod tests {
         let mut reservations = vec![Vec::new(); topology.tile_count()];
         reservations[0].push(static_reservation);
 
-        compact_transient_allocations_around(
+        compact_all_allocations_around(
             &mut graph,
             &topology,
             &reservations,
