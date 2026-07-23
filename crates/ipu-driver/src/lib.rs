@@ -30,6 +30,12 @@ pub const TRANSPORT_SIZE: usize = 0x2842000;
 // The Graphcore secondary loader does not acknowledge a one-frame application.
 // Pad transport payloads to the smallest established working envelope.
 pub const SECONDARY_LOADER_MIN_PAYLOAD_SIZE: usize = 0x4134;
+/// Maximum frame count accepted by the IPU21 SDK secondary bootloader.
+pub const SECONDARY_LOADER_MAX_FRAMES: usize = 0x283;
+/// Exclusive upper address that can be represented by that bootloader when
+/// loading an application from [`APPLICATION_LOAD_BASE`].
+pub const APPLICATION_LOAD_LIMIT: u32 = APPLICATION_LOAD_BASE
+    + (SECONDARY_LOADER_MAX_FRAMES * FRAME_PAYLOAD_SIZE) as u32;
 const TILE_DEBUG_BASE: u32 = 0x30000;
 const TILE_DEBUG_TILE_STRIDE: u32 = 0x40;
 const TILE_DEBUG_EXCEPTION_STATE: u32 = 5;
@@ -983,6 +989,12 @@ impl<'a> Loader<'a> {
                 }
                 let mut image = app.tile_image(physical)?;
                 image.resize(image.len().max(SECONDARY_LOADER_MIN_PAYLOAD_SIZE), 0);
+                let frames = image.len().div_ceil(FRAME_PAYLOAD_SIZE);
+                if frames > SECONDARY_LOADER_MAX_FRAMES {
+                    return Err(DriverError::Invalid(format!(
+                        "tile {physical} application image needs {frames} frames, but the secondary loader accepts at most {SECONDARY_LOADER_MAX_FRAMES}; image ends beyond 0x{APPLICATION_LOAD_LIMIT:x}"
+                    )));
+                }
                 let framed = frame_tile(physical, &image)?;
                 if cursor + framed.len() > bytes.len() {
                     return Err(DriverError::Invalid("tile batch exceeds transport".into()));
