@@ -2556,7 +2556,9 @@ fn package_graph_impl_attempt(
     let stream_templates =
         lowered_programs.is_none() && profile_code.is_empty() && !template_regions.is_empty();
     let (mut programs, mut tile_exchange_plans) = if stream_templates {
+        let prepare_started = Instant::now();
         let lowering = graph.schedule.prepare_tile_program_lowering(&topology)?;
+        let prepare_elapsed = prepare_started.elapsed();
         let lowered = (0..graph.schedule.tile_count)
             .into_par_iter()
             .map(|tile| -> Result<_> {
@@ -2567,6 +2569,12 @@ fn package_graph_impl_attempt(
                 Ok((program, plans))
             })
             .collect::<Result<Vec<_>>>()?;
+        info!(
+            prepare_ms = prepare_elapsed.as_millis(),
+            lower_and_compact_ms = (prepare_started.elapsed() - prepare_elapsed).as_millis(),
+            total_ms = prepare_started.elapsed().as_millis(),
+            "lowered and compacted tile programs"
+        );
         lowered.into_iter().unzip()
     } else {
         let programs = match lowered_programs {

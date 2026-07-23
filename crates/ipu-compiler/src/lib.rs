@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ops::{Deref, DerefMut, Range};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::{debug, info};
 
 use ipu_exchange::{
@@ -4787,39 +4788,68 @@ impl Schedule {
         &self,
         topology: &Topology,
     ) -> Result<TileProgramLowering<'_>, CompileError> {
+        let started = Instant::now();
         let allocation_index = AllocationIndex::new(&self.allocations);
+        let allocation_index_elapsed = started.elapsed();
         let exchanges = self.lower_exchanges_with_index(topology, &allocation_index, false)?;
+        let exchange_elapsed = started.elapsed() - allocation_index_elapsed;
         let mut exchange_by_phase = vec![None; self.phases.len()];
         for (index, exchange) in exchanges.iter().enumerate() {
             exchange_by_phase[exchange.phase] = Some(index);
         }
         let mut commands_by_tile = vec![Vec::new(); usize::from(self.tile_count)];
+        let mut direct_staging_by_tile = vec![Vec::new(); usize::from(self.tile_count)];
         for (phase, scheduled) in self.phases.iter().enumerate() {
-            let Phase::Compute { commands, .. } = scheduled else {
-                continue;
-            };
-            let mut tile_command_counts = vec![0usize; usize::from(self.tile_count)];
-            for command in commands {
-                let tile = usize::from(command.tile);
-                let phase_tile_command_index = tile_command_counts[tile];
-                tile_command_counts[tile] += 1;
-                commands_by_tile[usize::from(command.tile)].push((
-                    phase,
-                    phase_tile_command_index,
-                    command.clone(),
-                ));
+            match scheduled {
+                Phase::Exchange { transfers } => {
+                    for transfer in transfers {
+                        if let Some(address) = transfer.staging_address {
+                            direct_staging_by_tile[usize::from(transfer.destination_tile)].push((
+                                phase,
+                                transfer.tensor,
+                                address,
+                            ));
+                        }
+                    }
+                }
+                Phase::Compute { commands, .. } => {
+                    let mut tile_command_counts = vec![0usize; usize::from(self.tile_count)];
+                    for command in commands {
+                        let tile = usize::from(command.tile);
+                        let phase_tile_command_index = tile_command_counts[tile];
+                        tile_command_counts[tile] += 1;
+                        commands_by_tile[tile].push((
+                            phase,
+                            phase_tile_command_index,
+                            command.clone(),
+                        ));
+                    }
+                }
             }
         }
         let mut inactive_row = vec![0; ipu_exchange::PLAN_WORDS];
         inactive_row[0] = SANS_INACTIVE_INSTRUCTION;
         inactive_row[1] = SYNC_ANS_INSTRUCTION;
         inactive_row[2] = RETURN_M10_INSTRUCTION;
+        info!(
+            allocations = self.allocations.len(),
+            phases = self.phases.len(),
+            commands = commands_by_tile.iter().map(Vec::len).sum::<usize>(),
+            direct_staging = direct_staging_by_tile.iter().map(Vec::len).sum::<usize>(),
+            allocation_index_ms = allocation_index_elapsed.as_millis(),
+            exchange_ms = exchange_elapsed.as_millis(),
+            tile_index_ms =
+                (started.elapsed() - allocation_index_elapsed - exchange_elapsed).as_millis(),
+            total_ms = started.elapsed().as_millis(),
+            "prepared tile program lowering"
+        );
         Ok(TileProgramLowering {
             schedule: self,
             allocation_index,
             exchanges,
             exchange_by_phase,
             commands_by_tile,
+            direct_staging_by_tile,
             inactive_row: inactive_row.into(),
         })
     }
@@ -4831,6 +4861,7 @@ pub struct TileProgramLowering<'a> {
     exchanges: Vec<LoweredExchangePhase>,
     exchange_by_phase: Vec<Option<usize>>,
     commands_by_tile: Vec<Vec<(usize, usize, Arc<KernelCommand>)>>,
+    direct_staging_by_tile: Vec<Vec<(usize, TensorId, u32)>>,
     inactive_row: Arc<[u32]>,
 }
 
@@ -4851,17 +4882,21 @@ impl TileProgramLowering<'_> {
             steps: Vec::new(),
         };
         let tile_commands = &self.commands_by_tile[usize::from(tile)];
+        let tile_staging = &self.direct_staging_by_tile[usize::from(tile)];
         let mut command_cursor = 0usize;
-        let mut direct_staging = HashMap::<(TensorId, u16), u32>::default();
+        let mut staging_cursor = 0usize;
+        let mut direct_staging = HashMap::<TensorId, u32>::default();
         for (phase_index, phase) in self.schedule.phases.iter().enumerate() {
             match phase {
-                Phase::Exchange { transfers } => {
+                Phase::Exchange { .. } => {
                     direct_staging.clear();
-                    direct_staging.extend(transfers.iter().filter_map(|transfer| {
-                        transfer
-                            .staging_address
-                            .map(|address| ((transfer.tensor, transfer.destination_tile), address))
-                    }));
+                    while staging_cursor < tile_staging.len()
+                        && tile_staging[staging_cursor].0 == phase_index
+                    {
+                        let (_, tensor, address) = tile_staging[staging_cursor];
+                        direct_staging.insert(tensor, address);
+                        staging_cursor += 1;
+                    }
                     let exchange = self
                         .exchange_by_phase
                         .get(phase_index)
@@ -4894,23 +4929,22 @@ impl TileProgramLowering<'_> {
                         active = true;
                         let output_address =
                             self.allocation_index.home_address(command.output, tile)?;
-                        let input_addresses = command
-                            .inputs
-                            .iter()
-                            .map(|input| {
-                                direct_staging
-                                    .get(&(*input, tile))
-                                    .copied()
-                                    .map(Ok)
-                                    .unwrap_or_else(|| {
-                                        self.allocation_index.compute_input_address(
-                                            *input,
-                                            tile,
-                                            phase_index,
-                                        )
-                                    })
-                            })
-                            .collect::<Result<_, _>>()?;
+                        let input_addresses =
+                            command
+                                .inputs
+                                .iter()
+                                .map(|input| {
+                                    direct_staging.get(input).copied().map(Ok).unwrap_or_else(
+                                        || {
+                                            self.allocation_index.compute_input_address(
+                                                *input,
+                                                tile,
+                                                phase_index,
+                                            )
+                                        },
+                                    )
+                                })
+                                .collect::<Result<_, _>>()?;
                         program
                             .steps
                             .push(LoweredTileStep::Compute(LoweredComputeCommand {
@@ -4938,37 +4972,58 @@ impl TileProgramLowering<'_> {
 
 struct AllocationIndex<'a> {
     allocations: &'a [Allocation],
-    by_location: HashMap<(TensorId, u16), usize>,
+    heads: AllocationHeads,
     next: Vec<usize>,
+}
+
+enum AllocationHeads {
+    Dense(Vec<usize>),
+    Sparse(HashMap<TensorId, usize>),
 }
 
 impl<'a> AllocationIndex<'a> {
     fn new(allocations: &'a [Allocation]) -> Self {
-        let mut by_location = HashMap::default();
         let mut next = vec![usize::MAX; allocations.len()];
-        // Build backwards so iteration retains the original allocation order.
-        for (index, allocation) in allocations.iter().enumerate().rev() {
-            if let Some(successor) = by_location.insert((allocation.tensor, allocation.tile), index)
-            {
-                next[index] = successor;
+        let maximum_tensor = allocations
+            .iter()
+            .map(|allocation| allocation.tensor.0)
+            .max();
+        let heads = if maximum_tensor
+            .is_some_and(|maximum| maximum <= allocations.len().saturating_mul(4).max(4096))
+        {
+            let mut heads = vec![usize::MAX; maximum_tensor.map_or(0, |maximum| maximum + 1)];
+            // Build backwards so iteration retains the original allocation order.
+            for (index, allocation) in allocations.iter().enumerate().rev() {
+                next[index] = heads[allocation.tensor.0];
+                heads[allocation.tensor.0] = index;
             }
-        }
+            AllocationHeads::Dense(heads)
+        } else {
+            let mut heads = HashMap::default();
+            for (index, allocation) in allocations.iter().enumerate().rev() {
+                if let Some(successor) = heads.insert(allocation.tensor, index) {
+                    next[index] = successor;
+                }
+            }
+            AllocationHeads::Sparse(heads)
+        };
         Self {
             allocations,
-            by_location,
+            heads,
             next,
         }
     }
 
     fn at(&self, tensor: TensorId, tile: u16) -> AllocationCandidates<'_> {
+        let current = match &self.heads {
+            AllocationHeads::Dense(heads) => heads.get(tensor.0).copied().unwrap_or(usize::MAX),
+            AllocationHeads::Sparse(heads) => heads.get(&tensor).copied().unwrap_or(usize::MAX),
+        };
         AllocationCandidates {
             allocations: self.allocations,
             next: &self.next,
-            current: self
-                .by_location
-                .get(&(tensor, tile))
-                .copied()
-                .unwrap_or(usize::MAX),
+            current,
+            tile,
         }
     }
 
@@ -5006,18 +5061,21 @@ struct AllocationCandidates<'a> {
     allocations: &'a [Allocation],
     next: &'a [usize],
     current: usize,
+    tile: u16,
 }
 
 impl<'a> Iterator for AllocationCandidates<'a> {
     type Item = &'a Allocation;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current == usize::MAX {
-            return None;
+        while self.current != usize::MAX {
+            let index = self.current;
+            self.current = self.next[index];
+            if self.allocations[index].tile == self.tile {
+                return Some(&self.allocations[index]);
+            }
         }
-        let index = self.current;
-        self.current = self.next[index];
-        Some(&self.allocations[index])
+        None
     }
 }
 
