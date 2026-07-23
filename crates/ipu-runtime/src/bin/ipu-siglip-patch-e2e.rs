@@ -505,9 +505,10 @@ fn main() {
         host_outputs,
     };
     write_memory_profile(&graph);
+    let enable_templates = env_u32("IPU_SIGLIP_ENABLE_TEMPLATES", 1) != 0;
     let templates = layer_template_groups
         .into_iter()
-        .filter(|(_, region)| region.phase_instances.len() > 1)
+        .filter(|(_, region)| enable_templates && region.phase_instances.len() > 1)
         .map(|(_, region)| StaticTemplateRegion::from(region))
         .collect::<Vec<_>>();
     assert!(
