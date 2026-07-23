@@ -1561,14 +1561,38 @@ fn compact_allocations_around(
                         }))
                         .collect::<Vec<_>>();
                     let forbidden_starts = merge_address_ranges(forbidden_starts);
-                    let address = allocate_from_sorted_ranges(
-                        &occupied,
-                        &BTreeMap::new(),
-                        &forbidden_starts,
-                        allocation.size,
-                        &compatible_arenas,
-                        32,
-                    )
+                    // Cross-allocation effective-element constraints are
+                    // non-convex. Prefer the builder's known-valid base when
+                    // it remains available; unconstrained allocations are
+                    // still fully repacked around these anchors.
+                    let preferred = memory_constraints
+                        .relations
+                        .contains_key(&index)
+                        .then_some(allocation.address)
+                        .filter(|address| address & 31 == 0)
+                        .filter(|&address| {
+                            let end = address.saturating_add(allocation.size);
+                            compatible_arenas
+                                .iter()
+                                .any(|arena| address >= arena.base && end <= arena.limit)
+                                && !occupied.iter().any(|&(start, occupied_end)| {
+                                    ranges_overlap(address, end, start, occupied_end)
+                                })
+                                && !forbidden_starts
+                                    .iter()
+                                    .any(|&(start, end)| start <= address && address < end)
+                        });
+                    let address = preferred
+                        .or_else(|| {
+                            allocate_from_sorted_ranges(
+                                &occupied,
+                                &BTreeMap::new(),
+                                &forbidden_starts,
+                                allocation.size,
+                                &compatible_arenas,
+                                32,
+                            )
+                        })
                     .ok_or_else(|| {
                         let (capacity, free, largest) = placement_diagnostics(
                             &occupied,
