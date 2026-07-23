@@ -19,7 +19,7 @@ use ipu_compiler::{
     choose_gemm_row_block_for_shape, choose_gemm_row_block_for_shape_max_rows,
     choose_row_shard_rows_for_copies_in_arenas, end_tensor_lifetimes,
     gemm_row_block_candidates_for, gemm_row_block_cost, make_tensors_resident,
-    make_tensors_resident_since, occupied_intervals_by_tile, set_f8_weight_block_scales_in_phases,
+    make_tensors_resident_since, set_f8_weight_block_scales_in_phases,
     set_native_f8_weight_block_scales_in_phases,
 };
 use ipu_models::SiglipWeights;
@@ -172,15 +172,10 @@ pub fn fuse_deferred_residual_into_layer_norm(
                 .map(|&source| (source, command.tile))
         })
         .collect::<HashSet<_>>();
-    let live = schedule
-        .allocations
+    let live = required
         .iter()
-        .filter(|allocation| {
-            allocation.live_from <= compute_phase
-                && allocation.live_until > compute_phase
-                && required.contains(&(allocation.tensor, allocation.tile))
-        })
-        .map(|allocation| (allocation.tensor, allocation.tile))
+        .copied()
+        .filter(|&(tensor, tile)| schedule.allocations.is_live_at(tensor, tile, compute_phase))
         .collect::<HashSet<_>>();
     for command in commands {
         let command = Arc::make_mut(command);
@@ -639,13 +634,7 @@ pub fn append_host_a16_matrix_in_arenas(
     {
         return Err("host A16 matrix has incompatible dimensions or data".into());
     }
-    let mut next_tensor = schedule
-        .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let mut next_tensor = schedule.allocations.next_tensor_id();
     let row_grid = rows.div_ceil(row_block_dimension);
     let base_rows = rows / row_grid;
     let larger_shards = rows % row_grid;
@@ -659,8 +648,7 @@ pub fn append_host_a16_matrix_in_arenas(
             resident_pressure[usize::from(allocation.tile)] += u64::from(allocation.size);
         }
     }
-    let mut occupied = occupied_intervals_by_tile(
-        &schedule.allocations,
+    let mut occupied = schedule.allocations.occupied_intervals_by_tile(
         schedule.tile_count,
         0,
         usize::MAX,

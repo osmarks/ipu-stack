@@ -243,12 +243,7 @@ fn resident_end(plan: &crate::BlockedGemmPlan, element_bytes: u32) -> Result<u32
 }
 
 fn maximum_tensor(plan: &crate::BlockedGemmPlan) -> usize {
-    plan.schedule
-        .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
-        .unwrap_or(0)
+    plan.schedule.allocations.maximum_tensor_id().unwrap_or(0)
 }
 
 fn remap_tensors(plan: &mut crate::BlockedGemmPlan, base: usize) {

@@ -2,7 +2,6 @@ use crate::{
     Allocation, AllocationKind, BlockPlacement, CompileError, KernelCommand, MemoryArena,
     MemoryConstraint, MemoryPlacement, MemoryPolicy, OpId, Phase, Schedule, SpecializationKey,
     TensorId, Transfer, allocate_from_occupied, allocate_from_occupied_arenas,
-    find_free_region_in_arenas, occupied_intervals_by_tile,
 };
 use rustc_hash::FxHashSet as HashSet;
 use serde::{Deserialize, Serialize};
@@ -72,8 +71,7 @@ pub fn choose_row_shard_rows_for_copies_in_arenas(
     let phase = schedule.phases.len() + 1;
     let data_base = arenas.iter().map(|arena| arena.base).min()?;
     let data_limit = arenas.iter().map(|arena| arena.limit).max()?;
-    let occupied = occupied_intervals_by_tile(
-        &schedule.allocations,
+    let occupied = schedule.allocations.occupied_intervals_by_tile(
         schedule.tile_count,
         phase,
         usize::MAX,
@@ -340,19 +338,12 @@ pub fn append_c16_to_a16_blocks_gelu_f16_in_arenas(
         ));
     }
     let phase = schedule.phases.len();
-    let mut next_tensor = schedule
-        .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let mut next_tensor = schedule.allocations.next_tensor_id();
     let mut output = Vec::with_capacity(source.len());
     let mut commands = Vec::with_capacity(source.len());
     let data_base = arenas.iter().map(|arena| arena.base).min().unwrap();
     let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
-    let mut occupied = occupied_intervals_by_tile(
-        &schedule.allocations,
+    let mut occupied = schedule.allocations.occupied_intervals_by_tile(
         schedule.tile_count,
         phase,
         usize::MAX,
@@ -435,18 +426,11 @@ fn append_c16_to_a16_row_shards_impl(
     for block in source {
         rows.entry(block.block_row).or_default().push(block);
     }
-    let mut next_tensor = schedule
-        .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let mut next_tensor = schedule.allocations.next_tensor_id();
     let first_compute_phase = schedule.phases.len() + 1;
     let mut destinations = Vec::with_capacity(rows.len());
     let mut destination_blocks = Vec::with_capacity(rows.len());
-    let mut occupied = occupied_intervals_by_tile(
-        &schedule.allocations,
+    let mut occupied = schedule.allocations.occupied_intervals_by_tile(
         schedule.tile_count,
         first_compute_phase,
         usize::MAX,
@@ -763,21 +747,14 @@ fn append_to_a16_row_shards_reblocked_in_arenas(
     let first_compute_phase = phase + 1;
     let data_base = arenas.iter().map(|arena| arena.base).min().unwrap();
     let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
-    let mut occupied = occupied_intervals_by_tile(
-        &schedule.allocations,
+    let mut occupied = schedule.allocations.occupied_intervals_by_tile(
         schedule.tile_count,
         first_compute_phase,
         usize::MAX,
         data_base,
         data_limit,
     );
-    let mut next_tensor = schedule
-        .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let mut next_tensor = schedule.allocations.next_tensor_id();
     let mut destinations = Vec::with_capacity(usize::from(row_grid));
     let mut groups = Vec::with_capacity(usize::from(row_grid));
     let mut row_start = 0u16;
@@ -1161,19 +1138,16 @@ fn append_affine_layer_norm_f16_impl(
             "appended FP16 affine layer norm has incompatible row shards, SRAM, or epsilon".into(),
         ));
     }
-    let mut next_tensor = schedule
-        .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let mut next_tensor = schedule.allocations.next_tensor_id();
     let exchange_phase = schedule.phases.len();
     let compute_phase = exchange_phase + 1;
     let affine_row_bytes = u32::from(columns) * 2;
     let affine_bytes = affine_row_bytes * 2;
     let mut resident_pressure = vec![0u64; usize::from(schedule.tile_count)];
-    for allocation in &schedule.allocations {
+    for allocation in schedule
+        .allocations
+        .overlapping_allocations(0, compute_phase)
+    {
         if allocation.live_from < compute_phase
             && allocation.live_until > 0
             && memory
@@ -1199,8 +1173,7 @@ fn append_affine_layer_norm_f16_impl(
         alignment: 8,
         placement: MemoryPlacement::High,
     };
-    let affine_address = find_free_region_in_arenas(
-        &schedule.allocations,
+    let affine_address = schedule.allocations.find_free_region_in_arenas(
         owner.tile,
         affine_bytes,
         0,
@@ -1249,8 +1222,7 @@ fn append_affine_layer_norm_f16_impl(
         .map(|arena| arena.limit)
         .max()
         .unwrap();
-    let mut output_occupied = occupied_intervals_by_tile(
-        &schedule.allocations,
+    let mut output_occupied = schedule.allocations.occupied_intervals_by_tile(
         schedule.tile_count,
         compute_phase,
         usize::MAX,

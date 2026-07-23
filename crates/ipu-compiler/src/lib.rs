@@ -608,6 +608,10 @@ impl AllocationKind {
 struct AllocationStoreIndex {
     by_tensor: HashMap<TensorId, Vec<usize>>,
     homes_by_tile: Vec<Vec<usize>>,
+    finite_by_live_until: HashMap<usize, Vec<usize>>,
+    live_forever: Vec<usize>,
+    live_forever_count: usize,
+    maximum_tensor: Option<usize>,
 }
 
 impl AllocationStoreIndex {
@@ -623,6 +627,18 @@ impl AllocationStoreIndex {
             }
             self.homes_by_tile[tile].push(index);
         }
+        if allocation.live_until == usize::MAX {
+            self.live_forever.push(index);
+            self.live_forever_count += 1;
+        } else {
+            self.finite_by_live_until
+                .entry(allocation.live_until)
+                .or_default()
+                .push(index);
+        }
+        self.maximum_tensor = Some(self.maximum_tensor.map_or(allocation.tensor.0, |current| {
+            current.max(allocation.tensor.0)
+        }));
     }
 
     fn build(allocations: &[Allocation]) -> Self {
@@ -761,7 +777,7 @@ impl AllocationStore {
         *self.index.get_mut().unwrap() = None;
     }
 
-    fn with_index<T>(&self, query: impl FnOnce(&AllocationStoreIndex) -> T) -> T {
+    fn with_index<T>(&self, query: impl FnOnce(&mut AllocationStoreIndex) -> T) -> T {
         let mut index = self.index.lock().unwrap();
         query(index.get_or_insert_with(|| AllocationStoreIndex::build(&self.values)))
     }
@@ -773,6 +789,131 @@ impl AllocationStore {
                 .flat_map(|tensor| index.by_tensor.get(tensor).into_iter().flatten().copied())
                 .collect()
         })
+    }
+
+    pub fn maximum_tensor_id(&self) -> Option<usize> {
+        self.with_index(|index| index.maximum_tensor)
+    }
+
+    pub fn next_tensor_id(&self) -> usize {
+        self.maximum_tensor_id().unwrap_or(0) + 1
+    }
+
+    fn overlapping_indices(&self, live_from: usize, live_until: usize) -> Vec<usize> {
+        if live_from >= live_until {
+            return Vec::new();
+        }
+        self.with_index(|index| {
+            if index.live_forever.len() > index.live_forever_count.saturating_mul(2).max(1024) {
+                index.live_forever.retain(|&allocation_index| {
+                    self.values[allocation_index].live_until == usize::MAX
+                });
+            }
+            let mut overlapping = index
+                .live_forever
+                .iter()
+                .copied()
+                .filter(|&allocation_index| {
+                    let allocation = &self.values[allocation_index];
+                    allocation.live_until == usize::MAX && allocation.live_from < live_until
+                })
+                .collect::<Vec<_>>();
+            overlapping.extend(
+                index
+                    .finite_by_live_until
+                    .iter()
+                    .filter(|&(&end, _)| end > live_from)
+                    .flat_map(|(&end, indices)| {
+                        indices.iter().copied().filter(move |&allocation_index| {
+                            let allocation = &self.values[allocation_index];
+                            allocation.live_until == end && allocation.live_from < live_until
+                        })
+                    }),
+            );
+            overlapping
+        })
+    }
+
+    pub fn overlapping_allocations(&self, live_from: usize, live_until: usize) -> Vec<&Allocation> {
+        self.overlapping_indices(live_from, live_until)
+            .into_iter()
+            .map(|index| &self.values[index])
+            .collect()
+    }
+
+    pub fn is_live_at(&self, tensor: TensorId, tile: u16, phase: usize) -> bool {
+        self.with_index(|index| {
+            index
+                .by_tensor
+                .get(&tensor)
+                .into_iter()
+                .flatten()
+                .any(|&allocation_index| {
+                    let allocation = &self.values[allocation_index];
+                    allocation.tile == tile
+                        && allocation.live_from <= phase
+                        && allocation.live_until > phase
+                })
+        })
+    }
+
+    pub fn occupied_intervals_by_tile(
+        &self,
+        tile_count: u16,
+        live_from: usize,
+        live_until: usize,
+        base: u32,
+        limit: u32,
+    ) -> Vec<Vec<(u32, u32)>> {
+        let mut occupied = vec![Vec::<(u32, u32)>::new(); usize::from(tile_count)];
+        for allocation_index in self.overlapping_indices(live_from, live_until) {
+            let allocation = &self.values[allocation_index];
+            let start = allocation.address.max(base);
+            let end = allocation
+                .address
+                .saturating_add(allocation.size)
+                .min(limit);
+            if start < end {
+                occupied[usize::from(allocation.tile)].push((start, end));
+            }
+        }
+        merge_occupied_intervals(&mut occupied);
+        occupied
+    }
+
+    pub fn find_free_region_in_arenas(
+        &self,
+        tile: u16,
+        size: u32,
+        live_from: usize,
+        live_until: usize,
+        arenas: &[MemoryArena],
+        alignment: u32,
+    ) -> Result<u32, CompileError> {
+        let base = arenas
+            .iter()
+            .map(|arena| arena.base)
+            .min()
+            .ok_or_else(|| CompileError::Memory("allocation requires an SRAM arena".into()))?;
+        let limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
+        let mut occupied = self
+            .overlapping_indices(live_from, live_until)
+            .into_iter()
+            .filter_map(|allocation_index| {
+                let allocation = &self.values[allocation_index];
+                if allocation.tile != tile {
+                    return None;
+                }
+                let start = allocation.address.max(base);
+                let end = allocation
+                    .address
+                    .saturating_add(allocation.size)
+                    .min(limit);
+                (start < end).then_some((start, end))
+            })
+            .collect::<Vec<_>>();
+        normalize_occupied_intervals(&mut occupied);
+        allocate_from_occupied_arenas(&mut occupied, size, arenas, alignment)
     }
 
     pub(crate) fn home_indices_for_tensors_since(
@@ -815,6 +956,23 @@ impl AllocationStore {
 
     pub(crate) fn set_live_until(&mut self, indices: &[usize], phase: usize) {
         for &index in indices {
+            if let Some(allocation_index) = self.index.get_mut().unwrap() {
+                let previous = self.values[index].live_until;
+                if previous == usize::MAX && phase != usize::MAX {
+                    allocation_index.live_forever_count -= 1;
+                } else if previous != usize::MAX && phase == usize::MAX {
+                    allocation_index.live_forever_count += 1;
+                }
+                if phase == usize::MAX {
+                    allocation_index.live_forever.push(index);
+                } else {
+                    allocation_index
+                        .finite_by_live_until
+                        .entry(phase)
+                        .or_default()
+                        .push(index);
+                }
+            }
             self.values[index].live_until = phase;
         }
     }
@@ -827,6 +985,12 @@ impl AllocationStore {
 
     pub(crate) fn set_resident(&mut self, indices: &[usize]) {
         for &index in indices {
+            if let Some(allocation_index) = self.index.get_mut().unwrap() {
+                if self.values[index].live_until != usize::MAX {
+                    allocation_index.live_forever_count += 1;
+                    allocation_index.live_forever.push(index);
+                }
+            }
             self.values[index].live_from = 0;
             self.values[index].live_until = usize::MAX;
         }
@@ -1853,15 +2017,8 @@ pub fn append_bias_f16_c16_in_arenas(
     }
     let exchange_phase = schedule.phases.len();
     let compute_phase = exchange_phase + 1;
-    let mut next_tensor = schedule
-        .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
-        .unwrap_or(0)
-        + 1;
-    let mut occupied = occupied_intervals_by_tile(
-        &schedule.allocations,
+    let mut next_tensor = schedule.allocations.next_tensor_id();
+    let mut occupied = schedule.allocations.occupied_intervals_by_tile(
         schedule.tile_count,
         0,
         usize::MAX,
@@ -2008,20 +2165,12 @@ pub fn append_blocked_gemm_f16_with_a16_input_with_memory_policy(
     }
     memory.validate()?;
     let mut plan = plan_appended_blocked_gemm_with_memory_policy(schedule, config, memory)?;
-    let tensor_base = schedule
-        .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let tensor_base = schedule.allocations.next_tensor_id();
     remap_gemm_tensors(&mut plan, tensor_base)?;
     let mut next_tensor = plan
         .schedule
         .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
+        .maximum_tensor_id()
         .unwrap_or(tensor_base)
         + 1;
     if input
@@ -2289,20 +2438,12 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_with_memory_policy(
     }
     memory.validate()?;
     let mut plan = plan_appended_blocked_gemm_with_memory_policy(schedule, config, memory)?;
-    let tensor_base = schedule
-        .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let tensor_base = schedule.allocations.next_tensor_id();
     remap_gemm_tensors(&mut plan, tensor_base)?;
     let mut next_tensor = plan
         .schedule
         .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
+        .maximum_tensor_id()
         .unwrap_or(tensor_base)
         + 1;
     type InputFragment<'a> = (&'a BlockPlacement, u16, u16, u16);
@@ -2597,8 +2738,7 @@ fn plan_appended_blocked_gemm_with_memory_policy(
         .map(|arena| arena.limit)
         .max()
         .unwrap();
-    let mut occupied_current = occupied_intervals_by_tile(
-        &parent.allocations,
+    let mut occupied_current = parent.allocations.occupied_intervals_by_tile(
         parent.tile_count,
         parent.phases.len(),
         usize::MAX,
@@ -7254,6 +7394,63 @@ mod tests {
         let occupied = memory.occupied_all(&schedule, 0xa0000, 0xe8000);
 
         assert_eq!(occupied[2], vec![(0xb0000, 0xb1000)]);
+    }
+
+    #[test]
+    fn allocation_indexes_match_full_scans_after_lifetime_and_append_updates() {
+        let mut rng = fastrand::Rng::with_seed(0xb7e1_5162_8aed_2a6b);
+        let random_allocation = |rng: &mut fastrand::Rng, tensor_offset: usize| {
+            let live_from = rng.usize(0..64);
+            Allocation {
+                tensor: TensorId(tensor_offset + rng.usize(0..256)),
+                tile: rng.u16(0..16),
+                address: 0x50000 + rng.u32(0..0x48000),
+                size: rng.u32(1..4096),
+                live_from,
+                live_until: if rng.bool() {
+                    usize::MAX
+                } else {
+                    rng.usize(live_from + 1..96)
+                },
+                kind: AllocationKind::Home,
+            }
+        };
+        let mut store = (0..4096)
+            .map(|_| random_allocation(&mut rng, 0))
+            .collect::<AllocationStore>();
+
+        // Build every index before mutating it, then exercise both maintained update paths.
+        let _ = store.maximum_tensor_id();
+        let changed = (0..store.len()).step_by(19).collect::<Vec<_>>();
+        for &index in &changed {
+            let live_until = store[index].live_from + 1;
+            store.set_live_until(&[index], live_until);
+        }
+        store.extend((0..512).map(|_| random_allocation(&mut rng, 1024)));
+
+        let scanned_maximum = store.iter().map(|allocation| allocation.tensor.0).max();
+        assert_eq!(store.maximum_tensor_id(), scanned_maximum);
+        for _ in 0..128 {
+            let live_from = rng.usize(0..80);
+            let live_until = rng.usize(live_from + 1..=usize::MAX);
+            let base = 0x50000 + rng.u32(0..0x20000);
+            let limit = base + rng.u32(0x1000..0x28000);
+            assert_eq!(
+                store.occupied_intervals_by_tile(16, live_from, live_until, base, limit),
+                occupied_intervals_by_tile(&store, 16, live_from, live_until, base, limit)
+            );
+
+            let allocation = &store[rng.usize(0..store.len())];
+            assert_eq!(
+                store.is_live_at(allocation.tensor, allocation.tile, live_from),
+                store.iter().any(|candidate| {
+                    candidate.tensor == allocation.tensor
+                        && candidate.tile == allocation.tile
+                        && candidate.live_from <= live_from
+                        && candidate.live_until > live_from
+                })
+            );
+        }
     }
 
     #[test]

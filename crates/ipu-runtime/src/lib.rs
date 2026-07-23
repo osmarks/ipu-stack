@@ -2217,9 +2217,7 @@ fn package_graph_with_profile_options(
     let profile_tensor_base = profile_graph
         .schedule
         .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
+        .maximum_tensor_id()
         .unwrap_or(0)
         .checked_add(1)
         .ok_or("profile tensor id overflow")?;

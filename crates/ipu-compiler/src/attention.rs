@@ -1,7 +1,7 @@
 use crate::{
     Allocation, AllocationKind, CompileError, KernelCommand, MemoryArena, MemoryPlacement, OpId,
     Phase, RowShardPlacement, Schedule, SpecializationKey, TensorId, Transfer,
-    allocate_from_occupied_arenas, find_free_region_in_arenas, occupied_intervals_by_tile,
+    allocate_from_occupied_arenas,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -137,19 +137,13 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
     // choose query blocking from the available tile count.
     let mut plan = plan_flash_attention(config)?;
     relocate_appended_attention(schedule, &mut plan, arenas)?;
-    let tensor_base = schedule
-        .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let tensor_base = schedule.allocations.next_tensor_id();
     remap_attention_tensors(&mut plan, tensor_base)?;
     let mut next_tensor = schedule
         .allocations
-        .iter()
-        .chain(&plan.schedule.allocations)
-        .map(|allocation| allocation.tensor.0)
+        .maximum_tensor_id()
+        .into_iter()
+        .chain(plan.schedule.allocations.maximum_tensor_id())
         .max()
         .unwrap_or(0)
         + 1;
@@ -197,8 +191,7 @@ fn relocate_appended_attention(
     let data_base = arenas.iter().map(|arena| arena.base).min().unwrap();
     let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
     let live_from = parent.phases.len();
-    let mut occupied = occupied_intervals_by_tile(
-        &parent.allocations,
+    let mut occupied = parent.allocations.occupied_intervals_by_tile(
         parent.tile_count,
         live_from,
         usize::MAX,
@@ -352,13 +345,7 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
             .or_default()
             .push(task);
     }
-    let mut next_tensor = schedule
-        .allocations
-        .iter()
-        .map(|allocation| allocation.tensor.0)
-        .max()
-        .unwrap_or(0)
-        + 1;
+    let mut next_tensor = schedule.allocations.next_tensor_id();
     let first_compute_phase = schedule.phases.len() + 1;
     let mut destinations = Vec::with_capacity(groups.len());
     let mut output_groups = Vec::with_capacity(groups.len());
@@ -388,8 +375,7 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
             ));
         }
         let activation_bytes = u32::from(rows) * u32::from(hidden_size) * 2;
-        let address = find_free_region_in_arenas(
-            &schedule.allocations,
+        let address = schedule.allocations.find_free_region_in_arenas(
             destination_tile,
             activation_bytes,
             first_compute_phase,
