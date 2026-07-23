@@ -496,17 +496,17 @@ fn append_c16_to_a16_row_shards_impl(
             tensor: destination_tensor,
             address,
         });
-        destination_blocks.push((destination_tile, address, blocks));
+        destination_blocks.push((destination_tile, address, destination_tensor, blocks));
     }
 
     let maximum_rows = destination_blocks
         .iter()
-        .flat_map(|(_, _, blocks)| blocks.iter().map(|block| block.rows))
+        .flat_map(|(_, _, _, blocks)| blocks.iter().map(|block| block.rows))
         .max()
         .unwrap();
     let maximum_columns = destination_blocks
         .iter()
-        .flat_map(|(_, _, blocks)| blocks.iter().map(|block| block.columns))
+        .flat_map(|(_, _, _, blocks)| blocks.iter().map(|block| block.columns))
         .max()
         .unwrap();
     let maximum_block_bytes = u32::from(maximum_rows) * u32::from(maximum_columns) * 2;
@@ -518,13 +518,13 @@ fn append_c16_to_a16_row_shards_impl(
             "one row-shard block exceeds the exchange window".into(),
         ));
     }
-    let block_count = destination_blocks[0].2.len();
+    let block_count = destination_blocks[0].3.len();
     for first_block in (0..block_count).step_by(blocks_per_pass) {
         let exchange_phase = schedule.phases.len();
         let compute_phase = exchange_phase + 1;
         let mut transfers = Vec::new();
         let mut commands = Vec::new();
-        for &(destination_tile, address, ref blocks) in &destination_blocks {
+        for &(destination_tile, address, destination_tensor, ref blocks) in &destination_blocks {
             for block in blocks.iter().skip(first_block).take(blocks_per_pass) {
                 let block_bytes = u32::from(block.rows) * u32::from(block.columns) * 2;
                 if block.tile != destination_tile {
@@ -548,8 +548,10 @@ fn append_c16_to_a16_row_shards_impl(
                     address: output_address,
                     size: block_bytes,
                     live_from: compute_phase,
-                    live_until: compute_phase,
-                    kind: AllocationKind::Home,
+                    live_until: compute_phase + 1,
+                    kind: AllocationKind::HomeAlias {
+                        source: destination_tensor,
+                    },
                 });
                 let units_per_worker = u32::from(block.rows / 6);
                 let extra_workers = u32::from(block.rows % 6);

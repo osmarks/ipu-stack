@@ -5316,12 +5316,19 @@ impl TileProgramLowering<'_> {
                             command.output,
                             tile,
                             phase_index,
-                        )?;
+                        )
+                        .map_err(|error| {
+                            CompileError::Memory(format!(
+                                "kernel {} output tensor {} on tile {tile} at phase {phase_index} cannot be resolved: {error}",
+                                command.specialization.operation, command.output.0
+                            ))
+                        })?;
                         let input_addresses =
                             command
                                 .inputs
                                 .iter()
-                                .map(|input| {
+                                .enumerate()
+                                .map(|(input_index, input)| {
                                     direct_staging.get(input).copied().map(Ok).unwrap_or_else(
                                         || {
                                             self.allocation_index.compute_input_address(
@@ -5330,7 +5337,12 @@ impl TileProgramLowering<'_> {
                                                 phase_index,
                                             )
                                         },
-                                    )
+                                    ).map_err(|error| {
+                                        CompileError::Memory(format!(
+                                            "kernel {} input {input_index} tensor {} on tile {tile} at phase {phase_index} cannot be resolved: {error}",
+                                            command.specialization.operation, input.0
+                                        ))
+                                    })
                                 })
                                 .collect::<Result<_, _>>()?;
                         program

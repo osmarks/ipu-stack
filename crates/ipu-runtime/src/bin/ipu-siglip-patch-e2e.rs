@@ -1022,7 +1022,7 @@ fn append_adjustment_phase(
             output.tile,
             bytes,
             0,
-            phase,
+            phase + 1,
             MemoryConstraint {
                 base: DATA_BASE,
                 limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
@@ -1042,7 +1042,7 @@ fn append_adjustment_phase(
             address,
             size: bytes,
             live_from: 0,
-            live_until: phase,
+            live_until: phase + 1,
             kind: AllocationKind::Home,
         });
         let units = bytes / 4;
