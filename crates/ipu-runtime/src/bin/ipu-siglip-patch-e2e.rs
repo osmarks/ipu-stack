@@ -15,7 +15,7 @@ use ipu_runtime::{
     SiglipEncoderPrecision, SiglipEncoderTuning, SiglipLinearPrecision, SiglipWeightStorage,
     StaticProfileRegion, StaticTemplateRegion, allocator_memory_profile, append_host_a16_matrix,
     append_siglip_encoder_layer_batched_with_precision, append_siglip_map_head,
-    append_siglip_map_head_with_memory_policy, append_siglip_post_layer_norm,
+    append_siglip_map_head_batched_with_memory_policy, append_siglip_post_layer_norm,
     append_siglip_post_layer_norm_with_memory_policy, block_binding_typed, block_coordinates,
     blocked_matrix_f16, consolidate_attention_kernel_variants, defer_terminal_residual_add,
     fuse_deferred_residual_into_layer_norm, materialize_deferred_residual_add,
@@ -396,10 +396,6 @@ fn main() {
         !full_model || layer_count == config.num_hidden_layers,
         "full-model execution requires every encoder layer"
     );
-    assert!(
-        !full_model || batch_size == 1,
-        "batched MAP-head execution is not implemented"
-    );
     let (output, output_rows, output_name, attentions, post_norm_output) = if full_model {
         let post_norm = append_siglip_post_layer_norm_with_memory_policy(
             &mut plan.schedule,
@@ -409,11 +405,12 @@ fn main() {
             &mut host,
         )
         .unwrap();
-        let map = append_siglip_map_head_with_memory_policy(
+        let map = append_siglip_map_head_batched_with_memory_policy(
             &mut plan.schedule,
             &post_norm,
             &model,
-            rows,
+            batch_size,
+            sequence_length,
             row_block_dimension,
             TILE_COUNT,
             DATA_BASE,
@@ -424,7 +421,7 @@ fn main() {
         .unwrap();
         (
             map.output,
-            12,
+            batch_size.checked_mul(12).unwrap(),
             "pooler_output".to_string(),
             vec![attention, map.attention],
             Some(post_norm),
@@ -438,7 +435,7 @@ fn main() {
             None,
         )
     };
-    let attention_variant = consolidate_attention_kernel_variants(&mut plan.schedule, &attentions);
+    let attention_variants = consolidate_attention_kernel_variants(&mut plan.schedule, &attentions);
     let profiled_end = profile_regions.last().unwrap().phases.end;
     if profiled_end < plan.schedule.phases.len() {
         profile_regions.push(StaticProfileRegion {
@@ -452,7 +449,7 @@ fn main() {
     }
     let phase_count = plan.schedule.phases.len();
     specialize_gemm_row_operations(&mut plan.schedule, 0..phase_count);
-    let objects = compile_objects(&plan.schedule, &attentions, attention_variant).unwrap();
+    let objects = compile_objects(&plan.schedule, &attentions, &attention_variants).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
         bytes: host_input,
@@ -799,6 +796,12 @@ fn main() {
         limit,
         "SigLIP verification results"
     );
+    match cosine_similarity {
+        Some(cosine) => println!(
+            "siglip_verification max_error={layer_error:.8} cosine_similarity={cosine:.10}"
+        ),
+        None => println!("siglip_verification max_error={layer_error:.8}"),
+    }
     if let Some(error) = norm2_error {
         assert!(error <= limit, "norm2 max error {error} exceeds {limit}");
     }
@@ -924,11 +927,11 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
             .collect::<Vec<_>>();
         (map.output, 12, map.attention, expected)
     };
-    let attention_variant =
+    let attention_variants =
         consolidate_attention_kernel_variants(&mut schedule, std::slice::from_ref(&attention));
     let phase_count = schedule.phases.len();
     specialize_gemm_row_operations(&mut schedule, 0..phase_count);
-    let objects = compile_objects(&schedule, &[attention], attention_variant).unwrap();
+    let objects = compile_objects(&schedule, &[attention], &attention_variants).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
         bytes: host_input,
@@ -1154,7 +1157,7 @@ fn append_adjustment_phase(
 fn compile_objects(
     schedule: &ipu_compiler::Schedule,
     attentions: &[FlashAttentionPlan],
-    attention_variant: ipu_runtime::AttentionKernelVariant,
+    attention_variants: &[ipu_runtime::AttentionKernelVariant],
 ) -> ipu_runtime::Result<Vec<Vec<u8>>> {
     let sdk = PathBuf::from(required_env("POPLAR_SDK_ENABLED"));
     let artifacts = std::env::temp_dir().join(format!("ipu-siglip-patch-{}", std::process::id()));
@@ -1278,8 +1281,12 @@ fn compile_objects(
         "attention-unpack-wrapper",
         &[],
     )?;
-    let attention_objects =
-        compile_attention_variant(&toolchain, &artifacts, attention, attention_variant)?;
+    let mut attention_objects = Vec::new();
+    for &variant in attention_variants {
+        attention_objects.extend(compile_attention_variant(
+            &toolchain, &artifacts, attention, variant,
+        )?);
+    }
     let worker_support = toolchain.compile(
         source("worker_support.S"),
         &artifacts,

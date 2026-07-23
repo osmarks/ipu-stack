@@ -258,47 +258,73 @@ pub fn attention_kernel_variant(plan: &FlashAttentionPlan) -> AttentionKernelVar
     }
 }
 
+fn group_attention_kernel_variants(
+    variants: impl IntoIterator<Item = AttentionKernelVariant>,
+) -> Vec<Vec<AttentionKernelVariant>> {
+    let mut groups = Vec::<Vec<AttentionKernelVariant>>::new();
+    for variant in variants {
+        let compatible = |group: &[AttentionKernelVariant]| {
+            let query_rows = group
+                .iter()
+                .flat_map(|item| [item.small_query_rows, item.large_query_rows])
+                .chain([variant.small_query_rows, variant.large_query_rows])
+                .collect::<HashSet<_>>();
+            let key_rows = group
+                .iter()
+                .flat_map(|item| [item.small_key_rows, item.large_key_rows])
+                .chain([variant.small_key_rows, variant.large_key_rows])
+                .collect::<HashSet<_>>();
+            query_rows.len() <= 2 && key_rows.len() <= 2
+        };
+        if let Some(group) = groups.iter_mut().find(|group| compatible(group)) {
+            if !group.contains(&variant) {
+                group.push(variant);
+            }
+        } else {
+            groups.push(vec![variant]);
+        }
+    }
+    groups
+}
+
 pub fn consolidate_attention_kernel_variants(
     schedule: &mut Schedule,
     plans: &[FlashAttentionPlan],
-) -> AttentionKernelVariant {
-    let variants = plans
+) -> Vec<AttentionKernelVariant> {
+    let groups = group_attention_kernel_variants(plans.iter().map(attention_kernel_variant));
+    let domains = groups
         .iter()
-        .map(attention_kernel_variant)
+        .map(|group| AttentionKernelVariant {
+            small_query_rows: group
+                .iter()
+                .map(|variant| variant.small_query_rows)
+                .min()
+                .unwrap(),
+            large_query_rows: group
+                .iter()
+                .map(|variant| variant.large_query_rows)
+                .max()
+                .unwrap(),
+            small_key_rows: group
+                .iter()
+                .map(|variant| variant.small_key_rows)
+                .min()
+                .unwrap(),
+            large_key_rows: group
+                .iter()
+                .map(|variant| variant.large_key_rows)
+                .max()
+                .unwrap(),
+        })
         .collect::<Vec<_>>();
-    let domain = AttentionKernelVariant {
-        small_query_rows: variants
-            .iter()
-            .map(|variant| variant.small_query_rows)
-            .min()
-            .unwrap(),
-        large_query_rows: variants
-            .iter()
-            .map(|variant| variant.large_query_rows)
-            .max()
-            .unwrap(),
-        small_key_rows: variants
-            .iter()
-            .map(|variant| variant.small_key_rows)
-            .min()
-            .unwrap(),
-        large_key_rows: variants
-            .iter()
-            .map(|variant| variant.large_key_rows)
-            .max()
-            .unwrap(),
-    };
-    assert!(variants.iter().all(|variant| {
-        [variant.small_query_rows, variant.large_query_rows]
-            .into_iter()
-            .all(|rows| rows == domain.small_query_rows || rows == domain.large_query_rows)
-            && [variant.small_key_rows, variant.large_key_rows]
-                .into_iter()
-                .all(|rows| rows == domain.small_key_rows || rows == domain.large_key_rows)
-    }));
-    let local_suffixes = variants
+    let local_domains = groups
         .iter()
-        .map(|variant| (format!("_{}", variant.suffix()), *variant))
+        .zip(&domains)
+        .flat_map(|(group, &domain)| {
+            group
+                .iter()
+                .map(move |&local| (format!("_{}", local.suffix()), local, domain))
+        })
         .collect::<Vec<_>>();
 
     for phase in &mut schedule.phases {
@@ -311,9 +337,9 @@ pub fn consolidate_attention_kernel_variants(
             if !operation.starts_with("attention_") {
                 continue;
             }
-            let Some((suffix, local)) = local_suffixes
+            let Some((suffix, local, domain)) = local_domains
                 .iter()
-                .find(|(suffix, _)| operation.ends_with(suffix))
+                .find(|(suffix, _, _)| operation.ends_with(suffix))
             else {
                 continue;
             };
@@ -339,7 +365,7 @@ pub fn consolidate_attention_kernel_variants(
                 format!("{base}_{}", domain.suffix()).into();
         }
     }
-    domain
+    domains
 }
 
 fn row_role(rows: u16, small_rows: u16) -> &'static str {
@@ -834,20 +860,61 @@ pub fn append_siglip_map_head_with_memory_policy(
     memory: &MemoryPolicy,
     host: &mut HostTensorSet,
 ) -> Result<SiglipMapHead> {
+    append_siglip_map_head_batched_with_memory_policy(
+        schedule,
+        input,
+        model,
+        1,
+        rows,
+        row_block_dimension,
+        tile_count,
+        data_base,
+        data_limit,
+        memory,
+        host,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_siglip_map_head_batched_with_memory_policy(
+    schedule: &mut Schedule,
+    input: &[RowShardPlacement],
+    model: &SiglipWeights,
+    batch_size: u16,
+    sequence_length: u16,
+    row_block_dimension: u16,
+    tile_count: u16,
+    data_base: u32,
+    data_limit: u32,
+    memory: &MemoryPolicy,
+    host: &mut HostTensorSet,
+) -> Result<SiglipMapHead> {
     const PROBE_ROWS: u16 = 12;
+    if batch_size == 0 || sequence_length == 0 {
+        return Err("MAP head batch size and sequence length must be nonzero".into());
+    }
+    let input_rows = batch_size
+        .checked_mul(sequence_length)
+        .ok_or("MAP head input row count exceeds u16")?;
+    if input.iter().map(|shard| u32::from(shard.rows)).sum::<u32>() != u32::from(input_rows) {
+        return Err("MAP head input shards do not match its batch and sequence dimensions".into());
+    }
+    let map_rows = batch_size
+        .checked_mul(PROBE_ROWS)
+        .ok_or("MAP head probe row count exceeds u16")?;
     let config = &model.config;
     let columns = u16::try_from(config.hidden_size)?;
     let intermediate_columns = u16::try_from(config.intermediate_size.div_ceil(64) * 64)?;
     let probe = model.tensor_f32("vision_model.head.probe")?;
-    let mut repeated_probe = Vec::with_capacity(usize::from(PROBE_ROWS) * probe.len());
-    for _ in 0..PROBE_ROWS {
+    let mut repeated_probe = Vec::with_capacity(usize::from(map_rows) * probe.len());
+    for _ in 0..map_rows {
         repeated_probe.extend_from_slice(&probe);
     }
     let probe = append_host_a16_matrix_in_arenas(
         schedule,
         "map.probe",
         &repeated_probe,
-        PROBE_ROWS,
+        map_rows,
         columns,
         PROBE_ROWS,
         &memory.resident,
@@ -858,7 +925,7 @@ pub fn append_siglip_map_head_with_memory_policy(
     let query = append_a16_linear_c16_with_memory_policy(
         schedule,
         &probe,
-        PROBE_ROWS,
+        map_rows,
         columns,
         columns,
         columns,
@@ -888,7 +955,7 @@ pub fn append_siglip_map_head_with_memory_policy(
     let key_value = append_a16_linear_c16_with_memory_policy(
         schedule,
         input,
-        rows,
+        input_rows,
         columns,
         columns * 2,
         columns,
@@ -932,9 +999,9 @@ pub fn append_siglip_map_head_with_memory_policy(
         &key,
         &value,
         FlashAttentionConfig {
-            batch_size: 1,
+            batch_size,
             query_sequence_length: PROBE_ROWS,
-            sequence_length: rows,
+            sequence_length,
             hidden_size: columns,
             attention_heads: u16::try_from(config.num_attention_heads)?,
             query_block_rows: PROBE_ROWS,
@@ -963,7 +1030,7 @@ pub fn append_siglip_map_head_with_memory_policy(
     let projected = append_a16_linear_c16_with_memory_policy(
         schedule,
         &attention_shards,
-        PROBE_ROWS,
+        map_rows,
         columns,
         columns,
         columns,
@@ -1015,7 +1082,7 @@ pub fn append_siglip_map_head_with_memory_policy(
     let up = append_a16_linear_c16_with_memory_policy(
         schedule,
         &norm.output,
-        PROBE_ROWS,
+        map_rows,
         columns,
         intermediate_columns,
         columns,
@@ -1038,7 +1105,7 @@ pub fn append_siglip_map_head_with_memory_policy(
         schedule,
         &gelu,
         gemm_config(
-            PROBE_ROWS,
+            map_rows,
             intermediate_columns,
             columns,
             PROBE_ROWS,
@@ -2363,6 +2430,26 @@ mod tests {
                 ..precision(-6)
             })
         );
+    }
+
+    #[test]
+    fn attention_variants_split_only_when_one_kernel_cannot_cover_their_rows() {
+        let encoder = AttentionKernelVariant {
+            small_query_rows: 9,
+            large_query_rows: 18,
+            small_key_rows: 85,
+            large_key_rows: 92,
+        };
+        let map = AttentionKernelVariant {
+            small_query_rows: 12,
+            large_query_rows: 12,
+            small_key_rows: 85,
+            large_key_rows: 92,
+        };
+        let duplicate = encoder;
+
+        let groups = group_attention_kernel_variants([encoder, map, duplicate]);
+        assert_eq!(groups, vec![vec![encoder], vec![map]]);
     }
 
     #[test]
