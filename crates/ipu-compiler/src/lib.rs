@@ -3953,7 +3953,17 @@ impl Schedule {
             source: u16,
             tensor: TensorId,
             bytes: u32,
-            destinations: Vec<(u16, Option<u32>)>,
+            source_address: u32,
+            destinations: Vec<(u16, u32)>,
+        }
+
+        #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+        struct ResolvedTransfer {
+            source_tile: u16,
+            destination_tile: u16,
+            bytes: u32,
+            source_address: u32,
+            destination_address: u32,
         }
 
         let mut staging_additions = vec![Vec::new(); self.phases.len() + 1];
@@ -3974,6 +3984,10 @@ impl Schedule {
         }
         let mut available_staging = HashSet::<(TensorId, u16)>::default();
         let mut available_staging_counts = HashMap::<(TensorId, u16), usize>::default();
+        let mut phase_cache =
+            HashMap::<Vec<ResolvedTransfer>, (Vec<LoweredExchangeEpoch>, ExchangeCost)>::default();
+        let mut phase_cache_hits = 0usize;
+        let mut phase_cache_misses = 0usize;
 
         let mut lowered_phases = Vec::new();
         for (phase_index, phase) in self.phases.iter().enumerate() {
@@ -4003,21 +4017,116 @@ impl Schedule {
                         .map(|address| ((transfer.tensor, transfer.destination_tile), address))
                 })
                 .collect::<HashMap<_, _>>();
+            let location_available = |tensor, tile| {
+                available_staging.contains(&(tensor, tile))
+                    || allocation_index
+                        .at(tensor, tile)
+                        .any(|allocation| allocation.kind.has_home_address())
+            };
+            let resolved_transfers = transfers
+                .iter()
+                .map(|transfer| {
+                    let candidates = allocation_index.at(transfer.tensor, transfer.source_tile);
+                    let same_phase_staging = || {
+                        candidates.clone().find(|allocation| {
+                            allocation.kind
+                                == AllocationKind::ExchangeStaging { phase: phase_index }
+                        })
+                    };
+                    let earlier_staging = || {
+                        candidates.clone().find(|allocation| {
+                            matches!(
+                                allocation.kind,
+                                AllocationKind::ExchangeStaging { phase }
+                                    if phase < phase_index
+                            ) && allocation.live_from <= phase_index
+                                && allocation.live_until > phase_index
+                        })
+                    };
+                    let home = || {
+                        candidates
+                            .clone()
+                            .find(|allocation| allocation.kind.has_home_address())
+                    };
+                    let direct_same_phase = direct_staging
+                        .get(&(transfer.tensor, transfer.source_tile))
+                        .copied();
+                    let source_address =
+                        if location_available(transfer.tensor, transfer.source_tile) {
+                            earlier_staging()
+                                .or_else(home)
+                                .or_else(same_phase_staging)
+                                .map(|allocation| allocation.address)
+                                .or(direct_same_phase)
+                        } else {
+                            direct_same_phase.or_else(|| {
+                                same_phase_staging()
+                                    .or_else(earlier_staging)
+                                    .or_else(home)
+                                    .map(|allocation| allocation.address)
+                            })
+                        }
+                        .ok_or_else(|| {
+                            CompileError::Memory(format!(
+                                "missing source allocation for tensor {} on tile {}",
+                                transfer.tensor.0, transfer.source_tile
+                            ))
+                        })?;
+                    let destination_address = transfer
+                        .staging_address
+                        .or_else(|| {
+                            allocation_index
+                                .at(transfer.tensor, transfer.destination_tile)
+                                .find(|allocation| {
+                                    allocation.kind
+                                        == AllocationKind::ExchangeStaging { phase: phase_index }
+                                })
+                                .map(|allocation| allocation.address)
+                        })
+                        .ok_or_else(|| {
+                            CompileError::Memory(format!(
+                                "missing staging address for tensor {} on tile {}",
+                                transfer.tensor.0, transfer.destination_tile
+                            ))
+                        })?;
+                    Ok(ResolvedTransfer {
+                        source_tile: transfer.source_tile,
+                        destination_tile: transfer.destination_tile,
+                        bytes: transfer.bytes,
+                        source_address,
+                        destination_address,
+                    })
+                })
+                .collect::<Result<Vec<_>, CompileError>>()?;
+            if !retain_groups && let Some((epochs, cost)) = phase_cache.get(&resolved_transfers) {
+                phase_cache_hits += 1;
+                lowered_phases.push(LoweredExchangePhase {
+                    phase: phase_index,
+                    epochs: epochs.clone(),
+                    cost: *cost,
+                });
+                continue;
+            }
+            phase_cache_misses += 1;
             let mut groups: Vec<PendingGroup> = Vec::new();
             let mut group_indices = HashMap::<(u16, TensorId, u32), usize>::default();
-            for transfer in transfers {
+            for (transfer, resolved) in transfers.iter().zip(&resolved_transfers) {
                 let key = (transfer.source_tile, transfer.tensor, transfer.bytes);
                 if let Some(&index) = group_indices.get(&key) {
                     groups[index]
                         .destinations
-                        .push((transfer.destination_tile, transfer.staging_address));
+                        .push((transfer.destination_tile, resolved.destination_address));
                 } else {
                     group_indices.insert(key, groups.len());
                     groups.push(PendingGroup {
                         source: transfer.source_tile,
                         tensor: transfer.tensor,
                         bytes: transfer.bytes,
-                        destinations: vec![(transfer.destination_tile, transfer.staging_address)],
+                        source_address: resolved.source_address,
+                        destinations: vec![(
+                            transfer.destination_tile,
+                            resolved.destination_address,
+                        )],
                     });
                 }
             }
@@ -4097,7 +4206,6 @@ impl Schedule {
                 colored_groups[color].push(group);
             }
             let mut available = available_staging.clone();
-            let available_before_phase = available.clone();
             let location_available = |available: &HashSet<_>, tensor, tile| {
                 available.contains(&(tensor, tile))
                     || allocation_index
@@ -4154,6 +4262,7 @@ impl Schedule {
                     source,
                     tensor,
                     bytes,
+                    source_address,
                     destinations: destination_entries,
                 } in pending
                 {
@@ -4168,73 +4277,10 @@ impl Schedule {
                         )));
                     }
                     let words = bytes / 4;
-                    let candidates = allocation_index.at(tensor, source);
-                    let same_phase_staging = || {
-                        candidates.clone().find(|allocation| {
-                            allocation.kind
-                                == AllocationKind::ExchangeStaging { phase: phase_index }
-                        })
-                    };
-                    let earlier_staging = || {
-                        candidates.clone().find(|allocation| {
-                            matches!(
-                                allocation.kind,
-                                AllocationKind::ExchangeStaging { phase }
-                                    if phase < phase_index
-                            ) && allocation.live_from <= phase_index
-                                && allocation.live_until > phase_index
-                        })
-                    };
-                    let home = || {
-                        candidates
-                            .clone()
-                            .find(|allocation| allocation.kind.has_home_address())
-                    };
-                    let direct_same_phase = direct_staging.get(&(tensor, source)).copied();
-                    let source_address =
-                        if location_available(&available_before_phase, tensor, source) {
-                            earlier_staging()
-                                .or_else(home)
-                                .or_else(same_phase_staging)
-                                .map(|allocation| allocation.address)
-                                .or(direct_same_phase)
-                        } else {
-                            direct_same_phase.or_else(|| {
-                                same_phase_staging()
-                                    .or_else(earlier_staging)
-                                    .or_else(home)
-                                    .map(|allocation| allocation.address)
-                            })
-                        }
-                        .ok_or_else(|| {
-                            CompileError::Memory(format!(
-                                "missing source allocation for tensor {} on tile {source}",
-                                tensor.0
-                            ))
-                        })?;
                     let destination_addresses = destination_entries
                         .iter()
-                        .map(|&(destination, direct_address)| {
-                            direct_address
-                                .or_else(|| {
-                                    allocation_index
-                                        .at(tensor, destination)
-                                        .find(|allocation| {
-                                            allocation.kind
-                                                == AllocationKind::ExchangeStaging {
-                                                    phase: phase_index,
-                                                }
-                                        })
-                                        .map(|allocation| allocation.address)
-                                })
-                                .ok_or_else(|| {
-                                    CompileError::Memory(format!(
-                                        "missing staging address for tensor {} on tile {destination}",
-                                        tensor.0
-                                    ))
-                                })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+                        .map(|&(_, address)| address)
+                        .collect::<Vec<_>>();
                     let mut plan: MulticastPlan = if destinations.len() == 1 && schedule_offset == 0
                     {
                         let point = topology.point_to_point(source, destinations[0], words)?;
@@ -4322,6 +4368,9 @@ impl Schedule {
                 }]
             };
             let phase_cost = cost;
+            if !retain_groups {
+                phase_cache.insert(resolved_transfers, (epochs.clone(), phase_cost));
+            }
             lowered_phases.push(LoweredExchangePhase {
                 phase: phase_index,
                 epochs,
@@ -4331,7 +4380,7 @@ impl Schedule {
         let launches: u32 = lowered_phases.iter().map(|phase| phase.cost.launches).sum();
         info!(
             phases = lowered_phases.len(),
-            launches, "lowered exchange schedule"
+            launches, phase_cache_hits, phase_cache_misses, "lowered exchange schedule"
         );
         Ok(lowered_phases)
     }
