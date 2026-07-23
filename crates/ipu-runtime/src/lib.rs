@@ -8,7 +8,7 @@ use ipu_package::{
     TileMemory,
 };
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
@@ -1002,6 +1002,101 @@ fn placement_diagnostics(
     (capacity, free, largest)
 }
 
+fn select_eviction_window(
+    allocation: &ipu_compiler::Allocation,
+    placed: &[(usize, u32)],
+    allocations: &[ipu_compiler::Allocation],
+    permanent: &[(u32, u32)],
+    forbidden_starts: &[(u32, u32)],
+    arenas: &[ipu_compiler::MemoryArena],
+    protected: &HashSet<usize>,
+    alignment: u32,
+) -> Option<(u32, Vec<usize>)> {
+    let lifetime_overlaps = |other: &ipu_compiler::Allocation| {
+        allocation.live_from < other.live_until && other.live_from < allocation.live_until
+    };
+    let placed_ranges = placed
+        .iter()
+        .map(|&(index, address)| {
+            (
+                index,
+                address,
+                address.saturating_add(allocations[index].size),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut best = None::<((u64, usize, usize, u32, u32), u32, Vec<usize>)>;
+    for (arena_index, arena) in arenas.iter().enumerate() {
+        let mut candidates = BTreeSet::new();
+        candidates.insert(align_up(arena.base, alignment));
+        if let Some(address) = arena
+            .limit
+            .checked_sub(allocation.size)
+            .map(|address| align_down(address, alignment))
+        {
+            candidates.insert(address);
+        }
+        for &(start, end) in permanent {
+            candidates.insert(align_up(end, alignment));
+            if let Some(address) = start
+                .checked_sub(allocation.size)
+                .map(|address| align_down(address, alignment))
+            {
+                candidates.insert(address);
+            }
+        }
+        for &(_, start, end) in &placed_ranges {
+            candidates.insert(align_up(end, alignment));
+            if let Some(address) = start
+                .checked_sub(allocation.size)
+                .map(|address| align_down(address, alignment))
+            {
+                candidates.insert(address);
+            }
+        }
+        for address in candidates {
+            let Some(end) = address.checked_add(allocation.size) else {
+                continue;
+            };
+            if address < arena.base
+                || end > arena.limit
+                || permanent
+                    .iter()
+                    .any(|&(start, occupied_end)| ranges_overlap(address, end, start, occupied_end))
+                || forbidden_starts
+                    .iter()
+                    .any(|&(start, forbidden_end)| start <= address && address < forbidden_end)
+            {
+                continue;
+            }
+            let blockers = placed_ranges
+                .iter()
+                .filter(|&&(index, start, occupied_end)| {
+                    lifetime_overlaps(&allocations[index])
+                        && ranges_overlap(address, end, start, occupied_end)
+                })
+                .map(|&(index, _, _)| index)
+                .collect::<Vec<_>>();
+            if blockers.is_empty() || blockers.iter().any(|index| protected.contains(index)) {
+                continue;
+            }
+            let bytes = blockers
+                .iter()
+                .map(|&index| u64::from(allocations[index].size))
+                .sum::<u64>();
+            let distance = match arena.placement {
+                ipu_compiler::MemoryPlacement::Low => address - arena.base,
+                ipu_compiler::MemoryPlacement::High => arena.limit - end,
+            };
+            let score = (bytes, blockers.len(), arena_index, distance, address);
+            if best.as_ref().is_none_or(|(current, ..)| score < *current) {
+                best = Some((score, address, blockers));
+            }
+        }
+    }
+    best.map(|(_, address, blockers)| (address, blockers))
+}
+
 fn fixed_allocation_ranges_by_tile(
     graph: &ExecutableGraph,
     tile_count: usize,
@@ -1448,13 +1543,7 @@ fn compact_allocations_around(
                 let access_conflicts_with_reservation = reservations[tile]
                     .iter()
                     .any(|&(start, end)| ranges_overlap(allocation.address, access_end, start, end));
-                // A resident-aware compaction is the fallback after stable
-                // transient placement proved insufficient. Repack every
-                // movable object on that tile so large constrained objects are
-                // ordered before smaller allocations instead of inheriting
-                // fragmentation from the incremental graph builder.
-                if !move_resident
-                    && fits_arena
+                if fits_arena
                     && !storage_conflicts_with_permanent
                     && !access_conflicts_with_reservation
                 {
@@ -1473,21 +1562,30 @@ fn compact_allocations_around(
                     compact.push(index);
                 }
             }
-            let compact_set = compact.iter().copied().collect::<HashSet<_>>();
+            let mut compact_set = compact.iter().copied().collect::<HashSet<_>>();
             let mut placed_addresses = result.iter().copied().collect::<HashMap<_, _>>();
-                compact.sort_unstable_by_key(|&index| {
-                    let allocation = &graph.schedule.allocations[index];
-                    (
-                        !memory_constraints.required_interleaved.contains(&index),
-                        !memory_constraints.relations.contains_key(&index),
-                        allocation.live_until != usize::MAX,
-                        std::cmp::Reverse(allocation.size),
-                        allocation.live_from,
-                        allocation.live_until,
-                        allocation.tensor.0,
-                    )
+            compact.sort_unstable_by_key(|&index| {
+                let allocation = &graph.schedule.allocations[index];
+                (
+                    !memory_constraints.required_interleaved.contains(&index),
+                    !memory_constraints.relations.contains_key(&index),
+                    allocation.live_until != usize::MAX,
+                    std::cmp::Reverse(allocation.size),
+                    allocation.live_from,
+                    allocation.live_until,
+                    allocation.tensor.0,
+                )
             });
-            for index in compact {
+            let mut compact = VecDeque::from(compact);
+            let protected = memory_constraints
+                .pinned
+                .iter()
+                .chain(&memory_constraints.required_interleaved)
+                .chain(memory_constraints.relations.keys())
+                .copied()
+                .collect::<HashSet<_>>();
+            let mut eviction_counts = HashMap::<usize, usize>::new();
+            while let Some(index) = compact.pop_front() {
                     let allocation = &graph.schedule.allocations[index];
                     let arenas = if allocation.live_until == usize::MAX {
                         &resident_arenas
@@ -1582,18 +1680,71 @@ fn compact_allocations_around(
                                     .iter()
                                     .any(|&(start, end)| start <= address && address < end)
                         });
-                    let address = preferred
-                        .or_else(|| {
-                            allocate_from_sorted_ranges(
-                                &occupied,
-                                &BTreeMap::new(),
-                                &forbidden_starts,
-                                allocation.size,
-                                &compatible_arenas,
-                                32,
-                            )
-                        })
-                    .ok_or_else(|| {
+                    let mut address = preferred.or_else(|| {
+                        allocate_from_sorted_ranges(
+                            &occupied,
+                            &BTreeMap::new(),
+                            &forbidden_starts,
+                            allocation.size,
+                            &compatible_arenas,
+                            32,
+                        )
+                    });
+                    if address.is_none()
+                        && move_resident
+                        && let Some((candidate, blockers)) = select_eviction_window(
+                            allocation,
+                            &result,
+                            &graph.schedule.allocations,
+                            &permanent,
+                            &forbidden_starts,
+                            &compatible_arenas,
+                            &protected,
+                            32,
+                        )
+                    {
+                        let blocker_set = blockers.iter().copied().collect::<HashSet<_>>();
+                        if blockers
+                            .iter()
+                            .all(|blocker| eviction_counts.get(blocker).copied().unwrap_or(0) < 2)
+                        {
+                            result.retain(|(placed, _)| !blocker_set.contains(placed));
+                            for blocker in &blockers {
+                                placed_addresses.remove(blocker);
+                                compact_set.insert(*blocker);
+                                *eviction_counts.entry(*blocker).or_default() += 1;
+                                compact.push_back(*blocker);
+                            }
+                            for occupied in &mut occupied_by_phase {
+                                occupied.clear();
+                            }
+                            for &(placed, placed_address) in &result {
+                                let placed_allocation = &graph.schedule.allocations[placed];
+                                let range = (
+                                    placed_address,
+                                    placed_address.saturating_add(placed_allocation.size),
+                                );
+                                for occupied in
+                                    &mut occupied_by_phase[lifetime(placed_allocation)]
+                                {
+                                    occupied.push(range);
+                                }
+                            }
+                            debug!(
+                                tile,
+                                tensor = allocation.tensor.0,
+                                address = format_args!("0x{candidate:x}"),
+                                evicted = blockers.len(),
+                                evicted_bytes = blockers
+                                    .iter()
+                                    .map(|&blocker| graph.schedule.allocations[blocker].size)
+                                    .sum::<u32>(),
+                                "defragmented tile allocation window"
+                            );
+                            address = Some(candidate);
+                        }
+                    }
+                    let address = address.ok_or_else(|| {
                         let (capacity, free, largest) = placement_diagnostics(
                             &occupied,
                             &BTreeMap::new(),
@@ -1637,10 +1788,10 @@ fn compact_allocations_around(
                             capacity, free, largest,
                         )
                     })?;
-                    let range = (address, address.saturating_add(allocation.size));
-                    for phase in &mut occupied_by_phase[allocation_lifetime] {
-                        phase.push(range);
-                    }
+                let range = (address, address.saturating_add(allocation.size));
+                for phase in &mut occupied_by_phase[allocation_lifetime] {
+                    phase.push(range);
+                }
                 placed_addresses.insert(index, address);
                 result.push((index, address));
             }
@@ -7377,7 +7528,7 @@ mod tests {
         let topology = Topology::c600();
         let arena = 0x88000..0xa8000;
         let mut reservations = vec![Vec::new(); topology.tile_count()];
-        reservations[0].push((0x90000, 0x98000));
+        reservations[0].push((0x8e000, 0x98000));
         let mut graph = ExecutableGraph {
             memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(
                 arena.start,
