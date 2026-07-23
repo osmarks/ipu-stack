@@ -588,6 +588,24 @@ impl SiglipEncoderPrecision {
             mlp_down: precision,
         }
     }
+
+    /// Whether two layer instances use the same kernels, layouts, and memory
+    /// objects. Native-FP8 exponent scales are call arguments and therefore do
+    /// not change the reusable program body.
+    pub fn has_same_execution_shape(self, other: Self) -> bool {
+        fn linear_shape(precision: SiglipLinearPrecision) -> u8 {
+            match precision {
+                SiglipLinearPrecision::F16 => 0,
+                SiglipLinearPrecision::F143Expanded => 1,
+                SiglipLinearPrecision::F143Native { .. } => 2,
+            }
+        }
+
+        linear_shape(self.qkv) == linear_shape(other.qkv)
+            && linear_shape(self.attention_output) == linear_shape(other.attention_output)
+            && linear_shape(self.mlp_up) == linear_shape(other.mlp_up)
+            && linear_shape(self.mlp_down) == linear_shape(other.mlp_down)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2295,6 +2313,26 @@ mod tests {
         assert!(
             choose_gemm_output_block_columns(4096, 18, 128, 1152, 1472, GemmDataType::F16, 128,)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn native_fp8_scales_are_instance_data_not_execution_shape() {
+        let precision = |scale| SiglipEncoderPrecision {
+            qkv: SiglipLinearPrecision::F143Native {
+                activation_scale: scale,
+            },
+            attention_output: SiglipLinearPrecision::F143Expanded,
+            mlp_up: SiglipLinearPrecision::F143Expanded,
+            mlp_down: SiglipLinearPrecision::F143Expanded,
+        };
+
+        assert!(precision(-6).has_same_execution_shape(precision(1)));
+        assert!(
+            !precision(-6).has_same_execution_shape(SiglipEncoderPrecision {
+                qkv: SiglipLinearPrecision::F143Expanded,
+                ..precision(-6)
+            })
         );
     }
 

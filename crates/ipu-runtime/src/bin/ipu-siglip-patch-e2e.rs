@@ -188,7 +188,7 @@ fn main() {
         Ok("f143") | Err(_) => SiglipWeightStorage::F143,
         Ok(value) => panic!("unsupported SigLIP weight storage {value}"),
     };
-    let precision = siglip_encoder_precision(weight_storage);
+    let precision = siglip_encoder_precision_schedule(weight_storage, layer_count);
     let resident_f16_layers = usize::try_from(env_u32(
         "IPU_SIGLIP_RESIDENT_F16_PREFIX_LAYERS",
         u32::try_from(layer_count).unwrap(),
@@ -250,7 +250,7 @@ fn main() {
         transient = ?memory.transient,
         resident = ?memory.resident,
         ?weight_storage,
-        ?precision,
+        precision = ?precision.first().unwrap(),
         resident_f16_layers,
         ?tuning,
         "configured encoder tile-memory policy"
@@ -275,6 +275,7 @@ fn main() {
         phases: 0..plan.schedule.phases.len(),
     }];
     let precision_for_layer = |layer: usize| {
+        let precision = precision[layer];
         if layer < resident_f16_layers {
             precision
         } else {
@@ -286,7 +287,7 @@ fn main() {
         let layer_precision = precision_for_layer(layer);
         let layer_memory = if let Some((group_precision, template)) =
             resident_placement_groups.last()
-            && *group_precision == layer_precision
+            && group_precision.has_same_execution_shape(layer_precision)
         {
             memory.replay_resident_placement(template).unwrap()
         } else {
@@ -351,7 +352,7 @@ fn main() {
             plan.schedule.discard_profile_metadata(phase_range.clone());
         }
         if let Some((group_precision, region)) = layer_template_groups.last_mut()
-            && *group_precision == layer_precision
+            && group_precision.has_same_execution_shape(layer_precision)
             && region.is_compatible(&plan.schedule, phase_range.clone())
         {
             region.push_instance(&plan.schedule, phase_range).unwrap();
@@ -1609,17 +1610,27 @@ fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
 }
 
-fn siglip_encoder_precision(storage: SiglipWeightStorage) -> SiglipEncoderPrecision {
+fn siglip_encoder_precision_schedule(
+    storage: SiglipWeightStorage,
+    layers: usize,
+) -> Vec<SiglipEncoderPrecision> {
     let fallback = match storage {
         SiglipWeightStorage::F16 => SiglipLinearPrecision::F16,
         SiglipWeightStorage::F143 => SiglipLinearPrecision::F143Expanded,
     };
-    SiglipEncoderPrecision {
-        qkv: linear_precision("IPU_SIGLIP_QKV", fallback),
-        attention_output: linear_precision("IPU_SIGLIP_ATTENTION_OUTPUT", fallback),
-        mlp_up: linear_precision("IPU_SIGLIP_MLP_UP", fallback),
-        mlp_down: linear_precision("IPU_SIGLIP_MLP_DOWN", fallback),
-    }
+    let qkv = linear_precision_schedule("IPU_SIGLIP_QKV", fallback, layers);
+    let attention_output =
+        linear_precision_schedule("IPU_SIGLIP_ATTENTION_OUTPUT", fallback, layers);
+    let mlp_up = linear_precision_schedule("IPU_SIGLIP_MLP_UP", fallback, layers);
+    let mlp_down = linear_precision_schedule("IPU_SIGLIP_MLP_DOWN", fallback, layers);
+    (0..layers)
+        .map(|layer| SiglipEncoderPrecision {
+            qkv: qkv[layer],
+            attention_output: attention_output[layer],
+            mlp_up: mlp_up[layer],
+            mlp_down: mlp_down[layer],
+        })
+        .collect()
 }
 
 fn expanded_storage_fallback(precision: SiglipEncoderPrecision) -> SiglipEncoderPrecision {
@@ -1635,19 +1646,53 @@ fn expanded_storage_fallback(precision: SiglipEncoderPrecision) -> SiglipEncoder
     }
 }
 
-fn linear_precision(prefix: &str, fallback: SiglipLinearPrecision) -> SiglipLinearPrecision {
+fn linear_precision_schedule(
+    prefix: &str,
+    fallback: SiglipLinearPrecision,
+    layers: usize,
+) -> Vec<SiglipLinearPrecision> {
     let name = format!("{prefix}_PRECISION");
     match std::env::var(&name).as_deref() {
-        Err(_) => fallback,
-        Ok("f16") => SiglipLinearPrecision::F16,
-        Ok("f143-expanded") => SiglipLinearPrecision::F143Expanded,
+        Err(_) => vec![fallback; layers],
+        Ok("f16") => vec![SiglipLinearPrecision::F16; layers],
+        Ok("f143-expanded") => vec![SiglipLinearPrecision::F143Expanded; layers],
         Ok("f143-native") => {
-            let scale_name = format!("{prefix}_ACTIVATION_SCALE");
-            let activation_scale = std::env::var(&scale_name)
-                .unwrap_or_else(|_| panic!("{scale_name} is required for native FP8"))
-                .parse()
-                .unwrap_or_else(|_| panic!("{scale_name} must be an i8"));
-            SiglipLinearPrecision::F143Native { activation_scale }
+            let plural_name = format!("{prefix}_ACTIVATION_SCALES");
+            let singular_name = format!("{prefix}_ACTIVATION_SCALE");
+            let values = std::env::var(&plural_name)
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(|value| {
+                            value.parse::<i8>().unwrap_or_else(|_| {
+                                panic!("{plural_name} must be a comma-separated list of i8 values")
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|_| {
+                    vec![
+                        std::env::var(&singular_name)
+                            .unwrap_or_else(|_| {
+                                panic!(
+                                    "{singular_name} or {plural_name} is required for native FP8"
+                                )
+                            })
+                            .parse()
+                            .unwrap_or_else(|_| panic!("{singular_name} must be an i8")),
+                    ]
+                });
+            let values = match values.as_slice() {
+                [value] => vec![*value; layers],
+                values if values.len() == layers => values.to_vec(),
+                _ => {
+                    panic!("{plural_name} must contain one value or exactly {layers} layer values")
+                }
+            };
+            values
+                .into_iter()
+                .map(|activation_scale| SiglipLinearPrecision::F143Native { activation_scale })
+                .collect()
         }
         Ok(value) => panic!("unsupported precision {value:?} in {name}"),
     }
