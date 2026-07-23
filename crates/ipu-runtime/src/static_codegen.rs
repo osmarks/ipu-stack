@@ -54,6 +54,71 @@ pub(crate) struct StepCodeSize {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct GeneratedProgram {
+    pub bytes: Vec<u8>,
+    pub objects: Vec<Range<usize>>,
+}
+
+impl GeneratedProgram {
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn object_sizes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.objects.iter().map(Range::len)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GeneratedCodeLayout {
+    objects: Vec<(Range<usize>, u32)>,
+}
+
+impl GeneratedCodeLayout {
+    pub fn new(program: &GeneratedProgram, placements: &[(u32, u32)]) -> Result<Self> {
+        if program.objects.len() != placements.len() {
+            return Err("generated object placement count differs from the program".into());
+        }
+        let objects = program
+            .objects
+            .iter()
+            .zip(placements)
+            .map(|(object, &(address, end))| -> Result<_> {
+                if end.checked_sub(address).is_none_or(|size| {
+                    usize::try_from(size)
+                        .ok()
+                        .is_none_or(|size| size < object.len())
+                }) {
+                    return Err("generated object placement is too small".into());
+                }
+                Ok((object.clone(), address))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { objects })
+    }
+
+    fn address(&self, word: usize) -> Result<u32> {
+        let byte = word
+            .checked_mul(4)
+            .ok_or("generated code offset overflow")?;
+        let (object, address) = self
+            .objects
+            .iter()
+            .find(|(object, _)| object.contains(&byte))
+            .ok_or("generated code target is outside its objects")?;
+        address
+            .checked_add(u32::try_from(byte - object.start)?)
+            .ok_or_else(|| "generated code address overflow".into())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum GeneratedAddressMap<'a> {
+    Contiguous(u32),
+    Segmented(&'a GeneratedCodeLayout),
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ExchangeComputeRun {
     pub start_step: usize,
     pub iterations: usize,
@@ -1363,9 +1428,9 @@ pub(crate) fn emit(
     templates: &[StaticTemplatePlan],
     host: HostCode<'_>,
     profile: Option<&ProfileCode>,
-    generated_base: u32,
+    generated_addresses: GeneratedAddressMap<'_>,
     invocations: u32,
-) -> Result<Vec<u8>> {
+) -> Result<GeneratedProgram> {
     if invocations == 0 {
         return Err("static graph invocation count must be nonzero".into());
     }
@@ -1406,7 +1471,7 @@ pub(crate) fn emit(
         code.setzi(0, invocations)?;
         code.st32(0, 11, 15, 0)?;
     }
-    let invocation_start = generated_address(generated_base, code.words.len())?;
+    let invocation_start = generated_address(generated_addresses, code.words.len())?;
     emit_host_phases(&mut code, symbols, host.inputs)?;
     if program.steps.iter().any(|step| {
         matches!(
@@ -1447,7 +1512,7 @@ pub(crate) fn emit(
             code.st32(2, 11, 15, 4)?;
             code.setzi(2, template.patch_table_address)?;
             code.st32(2, 11, 15, 5)?;
-            let loop_start = generated_address(generated_base, code.words.len())?;
+            let loop_start = generated_address(generated_addresses, code.words.len())?;
             let call = code.words.len();
             code.call(0, 9)?;
             template_calls.push((call, template_index));
@@ -1463,7 +1528,7 @@ pub(crate) fn emit(
                 record_split,
             )?;
             code.jump(loop_start)?;
-            let after_loop = generated_address(generated_base, code.words.len())?;
+            let after_loop = generated_address(generated_addresses, code.words.len())?;
             code.words[loop_done] = ipu_exchange::encode_brz_m_immediate(2, after_loop)?;
             if template.patches.len() > template.records.len() {
                 emit_template_patches(
@@ -1586,21 +1651,26 @@ pub(crate) fn emit(
         let done_branch = code.words.len();
         code.brz(0, 0)?;
         code.jump(invocation_start)?;
-        let done = generated_address(generated_base, code.words.len())?;
+        let done = generated_address(generated_addresses, code.words.len())?;
         code.words[done_branch] = ipu_exchange::encode_brz_m_immediate(0, done)?;
         code.add_immediate(11, 11, 8)?;
     }
     code.jump(symbol(symbols, COMPLETE)?)?;
+    let main_end = code.words.len();
+    let mut object_words = vec![0..main_end];
     let template_exchanges = if templates.is_empty() {
         None
     } else {
-        let address = generated_address(generated_base, code.words.len())?;
-        emit_static_template_exchange(&mut code, worker_barrier, generated_base)?;
+        let start = code.words.len();
+        let address = generated_address(generated_addresses, start)?;
+        emit_static_template_exchange(&mut code, worker_barrier, generated_addresses)?;
+        object_words.push(start..code.words.len());
         Some(address)
     };
     let mut template_bodies = Vec::with_capacity(templates.len());
     for template in templates {
-        template_bodies.push(code.words.len());
+        let start = code.words.len();
+        template_bodies.push(start);
         let profile_after_sync = profile.map(|profile| {
             let first = &template.instance_steps[0];
             &profile.after_sync[first.clone()]
@@ -1614,7 +1684,7 @@ pub(crate) fn emit(
             template,
             symbols,
             template_exchanges.unwrap(),
-            generated_base,
+            generated_addresses,
             template
                 .record_addresses
                 .windows(2)
@@ -1626,12 +1696,20 @@ pub(crate) fn emit(
             profile_after_sync,
             profile_after_step,
         )?;
+        object_words.push(start..code.words.len());
     }
     for (call, template) in template_calls {
-        let target = generated_address(generated_base, template_bodies[template])?;
+        let target = generated_address(generated_addresses, template_bodies[template])?;
         code.words[call] = ipu_exchange::encode_call_m_immediate(9, target)?;
     }
-    Ok(code.words.into_iter().flat_map(u32::to_le_bytes).collect())
+    let objects = object_words
+        .into_iter()
+        .map(|words| words.start * 4..words.end * 4)
+        .collect();
+    Ok(GeneratedProgram {
+        bytes: code.words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        objects,
+    })
 }
 
 fn emit_template_patches(
@@ -1657,14 +1735,14 @@ fn emit_template_patches(
 fn emit_static_template_exchange(
     code: &mut TileCode,
     worker_barrier: u32,
-    generated_base: u32,
+    generated_addresses: GeneratedAddressMap<'_>,
 ) -> Result<()> {
     let skip_barrier = code.words.len();
     code.brz(0, 0)?;
     code.call(worker_barrier, 7)?;
-    let after_barrier = generated_address(generated_base, code.words.len())?;
+    let after_barrier = generated_address(generated_addresses, code.words.len())?;
     code.words[skip_barrier] = ipu_exchange::encode_brz_m_immediate(0, after_barrier)?;
-    let return_address = generated_address(generated_base, code.words.len() + 2)?;
+    let return_address = generated_address(generated_addresses, code.words.len() + 2)?;
     code.setzi(10, return_address)?;
     code.branch(8)?;
     code.branch(9)?;
@@ -1701,7 +1779,7 @@ fn emit_static_template_body(
     template: &StaticTemplatePlan,
     symbols: &BTreeMap<String, u32>,
     template_exchange: u32,
-    generated_base: u32,
+    generated_addresses: GeneratedAddressMap<'_>,
     record_addresses_in_parent_frame: bool,
     profile_after_sync: Option<&[bool]>,
     profile_after_step: Option<&[bool]>,
@@ -1778,7 +1856,7 @@ fn emit_static_template_body(
                         )?;
                         code.st32(3, 8, 15, sender_word_offset.unwrap())?;
                     }
-                    let after_patch = generated_address(generated_base, code.words.len())?;
+                    let after_patch = generated_address(generated_addresses, code.words.len())?;
                     code.words[skip_patch] = ipu_exchange::encode_brz_m_immediate(3, after_patch)?;
                 }
                 emit_template_value(
@@ -1841,14 +1919,15 @@ fn emit_static_template_body(
                     None
                 };
                 if kernel.is_some() {
-                    let return_address = generated_address(generated_base, code.words.len() + 2)?;
+                    let return_address =
+                        generated_address(generated_addresses, code.words.len() + 2)?;
                     code.setzi(10, return_address)?;
                     code.branch(8)?;
                 } else {
                     code.call(symbol(symbols, &format!("ipu_stack_{operation}"))?, 10)?;
                 }
                 if let Some(branch) = skip_call {
-                    let after_call = generated_address(generated_base, code.words.len())?;
+                    let after_call = generated_address(generated_addresses, code.words.len())?;
                     code.words[branch] = ipu_exchange::encode_brz_m_immediate(0, after_call)?;
                 }
             }
@@ -1866,13 +1945,17 @@ fn emit_static_template_body(
     Ok(())
 }
 
-fn generated_address(base: u32, word: usize) -> Result<u32> {
-    base.checked_add(
-        u32::try_from(word)?
-            .checked_mul(4)
-            .ok_or("generated code offset overflow")?,
-    )
-    .ok_or_else(|| "generated code address overflow".into())
+fn generated_address(addresses: GeneratedAddressMap<'_>, word: usize) -> Result<u32> {
+    match addresses {
+        GeneratedAddressMap::Contiguous(base) => base
+            .checked_add(
+                u32::try_from(word)?
+                    .checked_mul(4)
+                    .ok_or("generated code offset overflow")?,
+            )
+            .ok_or_else(|| "generated code address overflow".into()),
+        GeneratedAddressMap::Segmented(layout) => layout.address(word),
+    }
 }
 
 fn emit_next_cycle_sample(
@@ -2467,7 +2550,7 @@ mod tests {
             &templates,
             host(),
             None,
-            0x70000,
+            GeneratedAddressMap::Contiguous(0x70000),
             1,
         )
         .unwrap();
@@ -2485,12 +2568,37 @@ mod tests {
                 after_step: vec![true; 4],
                 aggregate_end: None,
             }),
-            0x70000,
+            GeneratedAddressMap::Contiguous(0x70000),
             1,
         )
         .unwrap();
 
         assert!(profiled.len() > unprofiled.len());
+        assert_eq!(unprofiled.objects.len(), 3);
+        let placements = unprofiled
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| {
+                let start = 0x60000 + u32::try_from(index).unwrap() * 0x8000;
+                (start, start + u32::try_from(object.len()).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let layout = GeneratedCodeLayout::new(&unprofiled, &placements).unwrap();
+        let segmented = emit(
+            &program,
+            &symbols,
+            &plans,
+            &[],
+            &templates,
+            host(),
+            None,
+            GeneratedAddressMap::Segmented(&layout),
+            1,
+        )
+        .unwrap();
+        assert_eq!(segmented.objects, unprofiled.objects);
+        assert_ne!(segmented.bytes, unprofiled.bytes);
     }
 
     #[test]
@@ -2538,7 +2646,7 @@ mod tests {
                 after_step: vec![false; 3],
                 aggregate_end: Some(0x68004),
             }),
-            0x70000,
+            GeneratedAddressMap::Contiguous(0x70000),
             1,
         )
         .unwrap();
@@ -2599,7 +2707,7 @@ mod tests {
                     outputs: &[],
                 },
                 None,
-                0x70000,
+                GeneratedAddressMap::Contiguous(0x70000),
                 2,
             )
             .unwrap()

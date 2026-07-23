@@ -407,13 +407,16 @@ fn pack_sized_objects_in_gaps(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExecutablePlacement {
-    generated: (u32, u32),
+    generated: Vec<(u32, u32)>,
     support: Vec<(u32, u32)>,
 }
 
 impl ExecutablePlacement {
     fn ranges(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        std::iter::once(self.generated).chain(self.support.iter().copied())
+        self.generated
+            .iter()
+            .copied()
+            .chain(self.support.iter().copied())
     }
 }
 
@@ -435,93 +438,178 @@ fn subtract_address_range(regions: &[(u32, u32)], reserved: (u32, u32)) -> Vec<(
 
 fn place_generated_with_segmented_support(
     tile: u16,
-    generated_size: u32,
+    generated_sizes: &[u32],
     objects: &[Vec<u8>],
     retained_symbols: &[String],
     free_regions: &[(u32, u32)],
 ) -> Result<ExecutablePlacement> {
-    let generated_size = align_up(generated_size, 8);
-    let mut candidates = free_regions
-        .iter()
-        .filter_map(|&(start, end)| {
-            let start = align_up(start, 8);
-            let generated_end = start.checked_add(generated_size)?;
-            (generated_end <= end).then_some(((start, generated_end), end - generated_end))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_unstable_by_key(|&(_, remaining)| remaining);
-    let mut last_error = None;
-    for (generated, _) in candidates {
-        let support_regions = subtract_address_range(free_regions, generated);
-        if support_regions.is_empty() {
-            continue;
-        }
-        match link(
-            objects,
-            &LinkOptions {
-                image_base: ipu_package::TILE_MEMORY_BASE,
-                regions: support_regions,
-                entry_symbol: "ipu_stack_static_start".into(),
-                retained_symbols: retained_symbols.to_vec(),
-                externals: HashMap::new(),
-            },
-        ) {
-            Ok(image) => {
-                let support_ranges = image
-                    .segments
-                    .iter()
-                    .map(|segment| -> Result<_> {
-                        let size = u32::try_from(segment.size)?;
-                        Ok((
-                            segment.address,
-                            segment
-                                .address
-                                .checked_add(size)
-                                .ok_or("support segment address overflow")?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let support = merge_address_ranges(support_ranges);
-                if support.is_empty() {
-                    return Err(format!("support image for tile {tile} has no segments").into());
-                }
-                return Ok(ExecutablePlacement { generated, support });
-            }
-            Err(error) => last_error = Some(error),
-        }
+    if generated_sizes.is_empty() {
+        return Err("generated program has no independently placeable objects".into());
     }
-    let free = free_regions
+    let generated = pack_sized_objects_in_gaps(
+        tile,
+        generated_sizes,
+        free_regions.to_vec(),
+        8,
+        "generated-code",
+    )?;
+    let support_regions = generated
         .iter()
-        .map(|&(start, end)| end - start)
-        .sum::<u32>();
-    let largest = free_regions
+        .fold(free_regions.to_vec(), |regions, &range| {
+            subtract_address_range(&regions, range)
+        });
+    let image = link(
+        objects,
+        &LinkOptions {
+            image_base: ipu_package::TILE_MEMORY_BASE,
+            regions: support_regions,
+            entry_symbol: "ipu_stack_static_start".into(),
+            retained_symbols: retained_symbols.to_vec(),
+            externals: HashMap::new(),
+        },
+    )?;
+    let support_ranges = image
+        .segments
         .iter()
-        .map(|&(start, end)| end - start)
-        .max()
-        .unwrap_or(0);
-    Err(format!(
-        "cannot place generated program and segmented support image on tile {tile}: {free} executable bytes free, {largest}-byte largest gap{}",
-        last_error.map_or_else(String::new, |error| format!(": {error}")),
+        .map(|segment| -> Result<_> {
+            let size = u32::try_from(segment.size)?;
+            Ok((
+                segment.address,
+                segment
+                    .address
+                    .checked_add(size)
+                    .ok_or("support segment address overflow")?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let support = merge_address_ranges(support_ranges);
+    if support.is_empty() {
+        return Err(format!("support image for tile {tile} has no segments").into());
+    }
+    Ok(ExecutablePlacement { generated, support })
+}
+
+fn generated_object_sizes_with_host_pool(
+    generated: &static_codegen::GeneratedProgram,
+    host_objects: &[Range<u32>],
+) -> Result<Vec<u32>> {
+    let mut sizes = generated
+        .object_sizes()
+        .map(u32::try_from)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let host_pool = host_objects
+        .iter()
+        .try_fold(0u32, |size, object| -> Result<u32> {
+            Ok(align_up(size, 8)
+                .checked_add(u32::try_from(object.len())?)
+                .ok_or("host executable-object pool size overflow")?)
+        })?;
+    if host_pool != 0 {
+        sizes.push(host_pool);
+    }
+    Ok(sizes)
+}
+
+fn generated_code_placements<'a>(
+    generated: &static_codegen::GeneratedProgram,
+    placement: &'a ExecutablePlacement,
+) -> Result<&'a [(u32, u32)]> {
+    placement
+        .generated
+        .get(..generated.objects.len())
+        .ok_or_else(|| "generated placement omits control-code objects".into())
+}
+
+fn generated_host_pool(
+    generated: &static_codegen::GeneratedProgram,
+    placement: &ExecutablePlacement,
+) -> Result<Option<(u32, u32)>> {
+    match placement.generated.get(generated.objects.len()..) {
+        Some([]) => Ok(None),
+        Some([pool]) => Ok(Some(*pool)),
+        _ => Err("generated placement has an invalid host-object pool".into()),
+    }
+}
+
+fn generated_code_layout(
+    generated: &static_codegen::GeneratedProgram,
+    placement: &ExecutablePlacement,
+) -> Result<static_codegen::GeneratedCodeLayout> {
+    static_codegen::GeneratedCodeLayout::new(
+        generated,
+        generated_code_placements(generated, placement)?,
     )
-    .into())
+}
+
+fn generated_code_ranges(
+    generated: &static_codegen::GeneratedProgram,
+    placement: &ExecutablePlacement,
+) -> Result<Vec<(u32, u32)>> {
+    Ok(generated_code_placements(generated, placement)?.to_vec())
+}
+
+fn generated_code_entry(
+    generated: &static_codegen::GeneratedProgram,
+    placement: &ExecutablePlacement,
+) -> Result<u32> {
+    generated_code_placements(generated, placement)?
+        .first()
+        .map(|&(start, _)| start)
+        .ok_or_else(|| "generated program has no entry object".into())
+}
+
+fn generated_code_segments(
+    generated: &static_codegen::GeneratedProgram,
+    placement: &ExecutablePlacement,
+    blob: usize,
+) -> Result<Vec<Segment>> {
+    generated
+        .objects
+        .iter()
+        .zip(generated_code_placements(generated, placement)?)
+        .map(|(object, &(address, end))| -> Result<_> {
+            let size = u32::try_from(object.len())?;
+            if end - address < size {
+                return Err("generated code segment exceeds its placement".into());
+            }
+            Ok(Segment {
+                address,
+                memory_size: size,
+                blob,
+                blob_offset: u64::try_from(object.start)?,
+                file_size: size,
+                flags: SEGMENT_READ | SEGMENT_EXECUTE,
+            })
+        })
+        .collect()
 }
 
 fn validate_pinned_executable_placement(
     tile: u16,
-    generated_size: u32,
+    generated_sizes: &[u32],
     support_size: u32,
     pinned: &ExecutablePlacement,
     free_regions: &[(u32, u32)],
 ) -> Result<ExecutablePlacement> {
-    let generated_bytes = pinned.generated.1.saturating_sub(pinned.generated.0);
+    let generated_bytes = pinned
+        .generated
+        .iter()
+        .map(|&(start, end)| end.saturating_sub(start))
+        .collect::<Vec<_>>();
     let support_bytes = pinned
         .support
         .iter()
         .map(|&(start, end)| end.saturating_sub(start))
         .sum::<u32>();
-    if generated_bytes < generated_size || support_bytes < support_size {
+    if generated_bytes.len() != generated_sizes.len()
+        || generated_bytes
+            .iter()
+            .zip(generated_sizes)
+            .any(|(&actual, &required)| actual < required)
+        || support_bytes < support_size
+    {
         return Err(format!(
-            "pinned executable placement on tile {tile} is too small: generated {generated_bytes}/{generated_size} bytes, support {support_bytes}/{support_size} bytes"
+            "pinned executable placement on tile {tile} is too small: generated {generated_bytes:?}/{generated_sizes:?} bytes, support {support_bytes}/{support_size} bytes"
         )
         .into());
     }
@@ -4442,10 +4530,10 @@ fn package_graph_impl_attempt(
     // Instruction fetch and data access cannot share a tile-memory element. Measure the
     // address-invariant generated code before relocating host state so data packing can
     // preserve enough complete elements for it.
-    let preliminary_program_sizes = programs
+    let initial_generated = programs
         .par_iter()
         .enumerate()
-        .map(|(program_index, program)| -> Result<u32> {
+        .map(|(program_index, program)| -> Result<_> {
             let mut symbols = BTreeMap::new();
             for name in [
                 static_codegen::WORKER_BARRIER,
@@ -4477,43 +4565,32 @@ fn package_graph_impl_attempt(
             let host_weights = host_phase_calls(plans, physical, 0, &host.weights);
             let host_inputs = host_phase_calls(plans, physical, weight_end, &host.inputs);
             let host_outputs = host_phase_calls(plans, physical, input_end, &host.outputs);
-            Ok(u32::try_from(
-                static_codegen::emit(
-                    program,
-                    &symbols,
-                    &tile_exchange_plans[program_index].addresses,
-                    &tile_exchange_plans[program_index].compute_runs,
-                    &tile_exchange_plans[program_index].templates,
-                    static_codegen::HostCode {
-                        weights: &host_weights,
-                        inputs: &host_inputs,
-                        outputs: &host_outputs,
-                    },
-                    profile_code.get(program_index),
-                    0,
-                    invocations,
-                )?
-                .len(),
-            )?)
+            static_codegen::emit(
+                program,
+                &symbols,
+                &tile_exchange_plans[program_index].addresses,
+                &tile_exchange_plans[program_index].compute_runs,
+                &tile_exchange_plans[program_index].templates,
+                static_codegen::HostCode {
+                    weights: &host_weights,
+                    inputs: &host_inputs,
+                    outputs: &host_outputs,
+                },
+                profile_code.get(program_index),
+                static_codegen::GeneratedAddressMap::Contiguous(0),
+                invocations,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     info!(
-        tiles = preliminary_program_sizes.len(),
+        tiles = initial_generated.len(),
         "measured generated tile programs"
     );
-    let program_reservation_sizes = preliminary_program_sizes
+    let program_reservation_sizes = initial_generated
         .iter()
         .zip(&tile_host_plans)
-        .map(|(&program_size, plans)| -> Result<u32> {
-            plans
-                .executable_objects
-                .iter()
-                .try_fold(program_size, |size, object| {
-                    let object_size = u32::try_from(object.len())?;
-                    align_up(size, 8)
-                        .checked_add(object_size)
-                        .ok_or_else(|| "generated program and host plan size overflow".into())
-                })
+        .map(|(generated, plans)| {
+            generated_object_sizes_with_host_pool(generated, &plans.executable_objects)
         })
         .collect::<Result<Vec<_>>>()?;
     // Generated and support code are independently relocatable. Reserving them
@@ -4526,7 +4603,7 @@ fn package_graph_impl_attempt(
             .zip(&preliminary_images)
             .zip(pinned)
             .map(
-                |((((program, plans), &program_size), image), pinned)| -> Result<_> {
+                |((((program, plans), program_sizes), image), pinned)| -> Result<_> {
                     let regions = executable_regions_for_tile(
                         &allocation_ranges_by_tile[usize::from(program.tile)],
                         plans.end,
@@ -4534,7 +4611,7 @@ fn package_graph_impl_attempt(
                     )?;
                     validate_pinned_executable_placement(
                         program.tile,
-                        program_size,
+                        program_sizes,
                         u32::try_from(image.bytes.len())?,
                         pinned,
                         &regions,
@@ -4561,7 +4638,7 @@ fn package_graph_impl_attempt(
             .zip(&preliminary_images)
             .zip(&tile_retained_symbols)
             .map(
-                |((((program, plans), &program_size), image), symbols)| -> Result<_> {
+                |((((program, plans), program_sizes), image), symbols)| -> Result<_> {
                     let regions = executable_regions_for_tile(
                         &allocation_ranges_by_tile[usize::from(program.tile)],
                         plans.end,
@@ -4569,16 +4646,16 @@ fn package_graph_impl_attempt(
                     )?;
                     place_generated_with_segmented_support(
                         program.tile,
-                        program_size,
+                        program_sizes,
                         objects,
                         symbols,
                         &regions,
                     )
                     .map_err(|error| {
                         format!(
-                            "tile {} needs {} bytes for generated code and host executable objects plus {} bytes of preliminary support image: {error}",
+                            "tile {} needs {:?} bytes for generated code and host executable objects plus {} bytes of preliminary support image: {error}",
                             program.tile,
-                            program_size,
+                            program_sizes,
                             image.bytes.len(),
                         )
                         .into()
@@ -4597,7 +4674,7 @@ fn package_graph_impl_attempt(
                         .zip(&program_reservation_sizes)
                         .zip(&tile_retained_symbols)
                         .map(
-                            |(((program, plans), &program_size), symbols)| -> Result<_> {
+                            |(((program, plans), program_sizes), symbols)| -> Result<_> {
                                 let regions = executable_regions_for_tile(
                                     &allocation_ranges[usize::from(program.tile)],
                                     plans.end,
@@ -4605,7 +4682,7 @@ fn package_graph_impl_attempt(
                                 )?;
                                 place_generated_with_segmented_support(
                                     program.tile,
-                                    program_size,
+                                    program_sizes,
                                     objects,
                                     symbols,
                                     &regions,
@@ -4674,7 +4751,7 @@ fn package_graph_impl_attempt(
     );
     let program_reservations = executable_placements
         .iter()
-        .map(|placement| placement.generated)
+        .map(|placement| placement.generated.clone())
         .collect::<Vec<_>>();
     let support_reservations = executable_placements
         .iter()
@@ -4689,20 +4766,24 @@ fn package_graph_impl_attempt(
         .enumerate()
         .map(|(tile_index, plans)| -> Result<_> {
             let tile = programs[tile_index].tile;
-            let program_tail_start = program_reservations[tile_index]
-                .0
-                .checked_add(preliminary_program_sizes[tile_index])
-                .ok_or("generated program tail overflow")?;
-            let executable_reserved = std::iter::once(program_reservations[tile_index])
+            let executable_reserved = program_reservations[tile_index]
+                .iter()
+                .copied()
                 .chain(support_reservations[tile_index].iter().copied())
                 .collect::<Vec<_>>();
+            let available = generated_host_pool(
+                &initial_generated[tile_index],
+                &executable_placements[tile_index],
+            )?
+            .into_iter()
+            .collect::<Vec<_>>();
             pack_executable_objects_for_tile(
                 &allocation_ranges_by_tile[usize::from(tile)],
                 tile,
                 tile_exchange_plans[tile_index].end,
                 &plans.executable_objects,
                 &executable_reserved,
-                &[(program_tail_start, program_reservations[tile_index].1)],
+                &available,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -5240,7 +5321,9 @@ fn package_graph_impl_attempt(
         );
     }
     let emit_program =
-        |program_index: usize, symbols: &BTreeMap<String, u32>, generated_base: u32| {
+        |program_index: usize,
+         symbols: &BTreeMap<String, u32>,
+         generated_addresses: static_codegen::GeneratedAddressMap<'_>| {
             let program = &programs[program_index];
             let host_plans = &tile_host_plans[program_index];
             let physical = topology.physical(program.tile)?;
@@ -5261,26 +5344,40 @@ fn package_graph_impl_attempt(
                     outputs: &host_outputs,
                 },
                 profile_code.get(program_index),
-                generated_base,
+                generated_addresses,
                 invocations,
             )
         };
     let preliminary_generated = preliminary_images
         .par_iter()
         .enumerate()
-        .map(|(index, image)| emit_program(index, &image.symbols, 0))
+        .map(|(index, image)| {
+            emit_program(
+                index,
+                &image.symbols,
+                static_codegen::GeneratedAddressMap::Contiguous(0),
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     if preliminary_generated
         .iter()
-        .zip(&preliminary_program_sizes)
-        .any(|(generated, &size)| generated.len() != size as usize)
+        .zip(&initial_generated)
+        .any(|(generated, initial)| {
+            generated.len() != initial.len() || generated.objects != initial.objects
+        })
     {
-        return Err("generated program size changed after static-data relocation".into());
+        return Err("generated program shape changed after static-data relocation".into());
     }
-    let program_bases = program_reservations
+    let program_layouts = preliminary_generated
         .iter()
-        .map(|&(base, _)| base)
-        .collect::<Vec<_>>();
+        .zip(&executable_placements)
+        .map(|(generated, placement)| generated_code_layout(generated, placement))
+        .collect::<Result<Vec<_>>>()?;
+    let program_bases = preliminary_generated
+        .iter()
+        .zip(&executable_placements)
+        .map(|(generated, placement)| generated_code_entry(generated, placement))
+        .collect::<Result<Vec<_>>>()?;
     // Relink into the exact element reservations established by preliminary
     // section placement. Keeping the support image inside those intervals makes
     // the later static-data placement and kernel access validation independent
@@ -5426,16 +5523,24 @@ fn package_graph_impl_attempt(
     }
     let generated = images
         .par_iter()
-        .zip(&program_bases)
+        .zip(&program_layouts)
         .enumerate()
-        .map(|(index, (image, &base))| emit_program(index, &image.symbols, base))
+        .map(|(index, (image, layout))| {
+            emit_program(
+                index,
+                &image.symbols,
+                static_codegen::GeneratedAddressMap::Segmented(layout),
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     if generated
         .iter()
         .zip(&preliminary_generated)
-        .any(|(final_code, preliminary)| final_code.len() != preliminary.len())
+        .any(|(final_code, preliminary)| {
+            final_code.len() != preliminary.len() || final_code.objects != preliminary.objects
+        })
     {
-        return Err("generated program size changed after executable placement".into());
+        return Err("generated program shape changed after executable placement".into());
     }
     validate_kernel_memory_constraints(
         &resolved_memory_constraints,
@@ -5577,10 +5682,8 @@ fn package_graph_impl_attempt(
                 .ok_or("allocation address overflow")?;
             let tile = usize::from(allocation.tile);
             let runtime_end = tile_exchange_plans[tile].end;
-            let program_base = program_bases[tile];
-            let program_end = program_base
-                .checked_add(u32::try_from(generated[tile].len())?)
-                .ok_or("generated tile program address overflow")?;
+            let program_ranges =
+                generated_code_ranges(&generated[tile], &executable_placements[tile])?;
             let image = &images[tile];
             if executable_element_reservations[tile]
                 .iter()
@@ -5594,7 +5697,9 @@ fn package_graph_impl_attempt(
                     allocation.address,
                     end,
                 )
-            }) || ranges_overlap(program_base, program_end, allocation.address, end)
+            }) || program_ranges.iter().any(|&(start, stop)| {
+                ranges_overlap(start, stop, allocation.address, end)
+            })
                 || ranges_overlap(PLAN_BASE, runtime_end, allocation.address, end)
                 || host_runtime_ranges[tile]
                     .iter()
@@ -5638,15 +5743,23 @@ fn package_graph_impl_attempt(
         })
         .map(|program| program.tile)
         .ok_or("diagnostic completion tile is outside the schedule")?;
-    let max_program_bytes = generated.iter().map(Vec::len).max().unwrap_or(0);
+    let max_program_bytes = generated
+        .iter()
+        .map(|program| program.len())
+        .max()
+        .unwrap_or(0);
     let mut app = Application::default();
     for (
         tile_index,
-        (((((program, generated_code), &program_base), image), host_plans), &completion_address),
+        (
+            (((((program, mut generated_code), &program_base), placement), image), host_plans),
+            &completion_address,
+        ),
     ) in programs
         .iter()
         .zip(generated)
         .zip(&program_bases)
+        .zip(&executable_placements)
         .zip(&images)
         .zip(&tile_host_plans)
         .zip(&completion_addresses)
@@ -5721,16 +5834,12 @@ fn package_graph_impl_attempt(
             file_size: segment.size as u32,
             flags: SEGMENT_READ | SEGMENT_EXECUTE,
         }));
-        let generated_size = u32::try_from(generated_code.len())?;
-        let generated_blob = app.add_blob(generated_code);
-        segments.push(Segment {
-            address: program_base,
-            memory_size: generated_size,
-            blob: generated_blob,
-            blob_offset: 0,
-            file_size: generated_size,
-            flags: SEGMENT_READ | SEGMENT_EXECUTE,
-        });
+        let generated_blob = app.add_blob(std::mem::take(&mut generated_code.bytes));
+        segments.extend(generated_code_segments(
+            &generated_code,
+            placement,
+            generated_blob,
+        )?);
 
         let plan_region_size = usize::try_from(tile_exchange_plans[tile_index].end - PLAN_BASE)?;
         let mut plan_region = vec![0; plan_region_size];
@@ -8104,7 +8213,10 @@ mod tests {
     fn segmented_executable_placement_preserves_each_reserved_interval() {
         let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
         let pinned = ExecutablePlacement {
-            generated: (0x50000, 0x50000 + element),
+            generated: vec![
+                (0x50000, 0x50000 + element / 2),
+                (0x52000, 0x52000 + element / 2),
+            ],
             support: vec![(0x58000, 0x58000 + element), (0x68000, 0x68000 + element)],
         };
         let free = vec![
@@ -8114,26 +8226,43 @@ mod tests {
         ];
 
         assert_eq!(
-            validate_pinned_executable_placement(17, element / 2, element + 1, &pinned, &free,)
-                .unwrap(),
+            validate_pinned_executable_placement(
+                17,
+                &[element / 2, element / 2],
+                element + 1,
+                &pinned,
+                &free,
+            )
+            .unwrap(),
             pinned
         );
 
-        let remaining = subtract_address_range(&free, pinned.generated);
-        assert!(!remaining.iter().any(|&(start, end)| ranges_overlap(
-            start,
-            end,
-            pinned.generated.0,
-            pinned.generated.1,
-        )));
-        assert!(validate_pinned_executable_placement(
-            17,
-            element / 2,
-            element + 1,
-            &pinned,
-            &free[..2],
-        )
-        .is_err());
+        let remaining = pinned
+            .generated
+            .iter()
+            .fold(free.clone(), |regions, &reserved| {
+                subtract_address_range(&regions, reserved)
+            });
+        assert!(
+            pinned
+                .generated
+                .iter()
+                .all(|&(generated_start, generated_end)| {
+                    !remaining.iter().any(|&(start, end)| {
+                        ranges_overlap(start, end, generated_start, generated_end)
+                    })
+                })
+        );
+        assert!(
+            validate_pinned_executable_placement(
+                17,
+                &[element / 2, element / 2],
+                element + 1,
+                &pinned,
+                &free[..2],
+            )
+            .is_err()
+        );
     }
 
     #[test]
