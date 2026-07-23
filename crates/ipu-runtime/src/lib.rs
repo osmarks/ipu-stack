@@ -572,6 +572,49 @@ fn merge_address_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     merged
 }
 
+fn effective_element_reservations(
+    ranges: impl IntoIterator<Item = (u32, u32)>,
+) -> Result<Vec<(u32, u32)>> {
+    let mut elements = Vec::new();
+    for (start, end) in ranges {
+        if start >= end {
+            continue;
+        }
+        let bytes = end
+            .checked_sub(start)
+            .ok_or("executable memory range underflow")?;
+        elements.extend(
+            ipu_package::ipu21_effective_memory_elements(start, bytes)
+                .ok_or_else(|| {
+                    format!("executable memory range 0x{start:x}..0x{end:x} is outside tile SRAM")
+                })?
+                .into_iter()
+                .map(|(_, element_start, element_end)| (element_start, element_end)),
+        );
+    }
+    Ok(merge_address_ranges(elements))
+}
+
+fn validate_data_element_separation(
+    tile: u16,
+    description: &str,
+    data_ranges: &[(u32, u32)],
+    executable_elements: &[(u32, u32)],
+) -> Result<()> {
+    for &(data_start, data_end) in data_ranges {
+        if let Some(&(code_start, code_end)) = executable_elements
+            .iter()
+            .find(|&&(start, end)| ranges_overlap(data_start, data_end, start, end))
+        {
+            return Err(format!(
+                "{description} on tile {tile} at 0x{data_start:x}..0x{data_end:x} shares executable memory element 0x{code_start:x}..0x{code_end:x}"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 fn static_placement_ranges(
     reserved: &[(u32, u32)],
     graph_allocations: &[(u32, u32)],
@@ -1786,6 +1829,10 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
     package_graph_impl(graph, objects, &[], None, &[], 1)
 }
 
+pub fn package_graph_owned(graph: ExecutableGraph, objects: &[Vec<u8>]) -> Result<Application> {
+    package_graph_impl_owned(graph, objects, &[], None, &[], 1)
+}
+
 pub fn package_graph_repeated(
     graph: &ExecutableGraph,
     objects: &[Vec<u8>],
@@ -1797,12 +1844,31 @@ pub fn package_graph_repeated(
     package_graph_impl(graph, objects, &[], None, &[], invocations)
 }
 
+pub fn package_graph_repeated_owned(
+    graph: ExecutableGraph,
+    objects: &[Vec<u8>],
+    invocations: u32,
+) -> Result<Application> {
+    if invocations == 0 {
+        return Err("graph invocation count must be nonzero".into());
+    }
+    package_graph_impl_owned(graph, objects, &[], None, &[], invocations)
+}
+
 pub fn package_graph_with_templates(
     graph: &ExecutableGraph,
     objects: &[Vec<u8>],
     templates: &[StaticTemplateRegion],
 ) -> Result<Application> {
     package_graph_impl(graph, objects, &[], None, templates, 1)
+}
+
+pub fn package_graph_with_templates_owned(
+    graph: ExecutableGraph,
+    objects: &[Vec<u8>],
+    templates: &[StaticTemplateRegion],
+) -> Result<Application> {
+    package_graph_impl_owned(graph, objects, &[], None, templates, 1)
 }
 
 pub fn package_graph_repeated_with_templates(
@@ -1815,6 +1881,18 @@ pub fn package_graph_repeated_with_templates(
         return Err("graph invocation count must be nonzero".into());
     }
     package_graph_impl(graph, objects, &[], None, templates, invocations)
+}
+
+pub fn package_graph_repeated_with_templates_owned(
+    graph: ExecutableGraph,
+    objects: &[Vec<u8>],
+    templates: &[StaticTemplateRegion],
+    invocations: u32,
+) -> Result<Application> {
+    if invocations == 0 {
+        return Err("graph invocation count must be nonzero".into());
+    }
+    package_graph_impl_owned(graph, objects, &[], None, templates, invocations)
 }
 
 pub fn allocator_memory_profile(graph: &ExecutableGraph) -> Result<MemoryProfile> {
@@ -2600,6 +2678,24 @@ impl std::fmt::Display for ProfileRelayout {
 
 impl std::error::Error for ProfileRelayout {}
 
+struct PackageRelayout {
+    graph: ExecutableGraph,
+}
+
+impl std::fmt::Debug for PackageRelayout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("package requires final-layout lowering")
+    }
+}
+
+impl std::fmt::Display for PackageRelayout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("package requires final-layout lowering")
+    }
+}
+
+impl std::error::Error for PackageRelayout {}
+
 fn annotate_semantic_regions(
     steps: &mut [ipu_package::ProfileStep],
     regions: &[StaticProfileRegion],
@@ -2810,8 +2906,8 @@ fn package_graph_with_profile_options(
         shape: vec![(file_offset / 4) as u32],
         slices,
     });
-    let app = match package_graph_impl(
-        &profile_graph,
+    let app = match package_graph_impl_owned(
+        profile_graph,
         objects,
         &profile_code,
         Some(programs),
@@ -2862,15 +2958,42 @@ fn package_graph_impl(
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
 ) -> Result<Application> {
-    package_graph_impl_attempt(
-        graph,
+    package_graph_impl_owned(
+        graph.clone(),
         objects,
         profile_code,
         lowered_programs,
         template_regions,
         invocations,
-        Vec::new(),
     )
+}
+
+fn package_graph_impl_owned(
+    mut graph: ExecutableGraph,
+    objects: &[Vec<u8>],
+    profile_code: &[static_codegen::ProfileCode],
+    mut lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
+    template_regions: &[StaticTemplateRegion],
+    invocations: u32,
+) -> Result<Application> {
+    let mut executable_placement_history = Vec::new();
+    loop {
+        match package_graph_impl_attempt(
+            graph,
+            objects,
+            profile_code,
+            lowered_programs.take(),
+            template_regions,
+            invocations,
+            &mut executable_placement_history,
+        ) {
+            Ok(app) => return Ok(app),
+            Err(error) => match error.downcast::<PackageRelayout>() {
+                Ok(relayout) => graph = relayout.graph,
+                Err(error) => return Err(error),
+            },
+        }
+    }
 }
 
 fn plan_tile_exchange(
@@ -3132,19 +3255,19 @@ fn validate_kernel_memory_constraints(
 }
 
 fn package_graph_impl_attempt(
-    graph: &ExecutableGraph,
+    mut graph: ExecutableGraph,
     objects: &[Vec<u8>],
     profile_code: &[static_codegen::ProfileCode],
     lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
-    mut executable_placement_history: Vec<Vec<[(u32, u32); 2]>>,
+    executable_placement_history: &mut Vec<Vec<[(u32, u32); 2]>>,
 ) -> Result<Application> {
     let topology = Topology::c600();
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
         return Err("the direct C600 runtime requires a schedule for every discovered tile".into());
     }
-    validate_resident_host_bindings(graph, &topology)?;
+    validate_resident_host_bindings(&graph, &topology)?;
     graph.schedule.validate_allocations()?;
     let stream_templates =
         lowered_programs.is_none() && profile_code.is_empty() && !template_regions.is_empty();
@@ -3209,7 +3332,7 @@ fn package_graph_impl_attempt(
         "resolved kernel memory constraints"
     );
     let relocation_constraints =
-        relocation_memory_constraints(graph, &resolved_memory_constraints)?;
+        relocation_memory_constraints(&graph, &resolved_memory_constraints)?;
     if !profile_code.is_empty() && profile_code.len() != programs.len() {
         return Err("profile layout tile count differs from schedule".into());
     }
@@ -3251,14 +3374,17 @@ fn package_graph_impl_attempt(
         })
         .collect::<Result<Vec<_>>>()?;
     let allocation_ranges_by_tile = allocation_footprints_by_tile(
-        graph,
+        &graph,
         usize::from(graph.schedule.tile_count),
         Some(&relocation_constraints),
     )?;
     let fixed_allocation_ranges =
-        fixed_allocation_ranges_by_tile(graph, topology.tile_count(), &relocation_constraints)?;
-    let immovable_allocation_ranges =
-        immovable_allocation_ranges_by_tile(graph, topology.tile_count(), &relocation_constraints)?;
+        fixed_allocation_ranges_by_tile(&graph, topology.tile_count(), &relocation_constraints)?;
+    let immovable_allocation_ranges = immovable_allocation_ranges_by_tile(
+        &graph,
+        topology.tile_count(),
+        &relocation_constraints,
+    )?;
     let exchange_count = tile_exchange_plans
         .first()
         .map(|plans| plans.addresses.len())
@@ -3293,7 +3419,7 @@ fn package_graph_impl_attempt(
             static_codegen::compact_template_instances(program, &mut plans.templates)?;
         }
     }
-    let host = build_static_host_layout(graph, invocations)?;
+    let host = build_static_host_layout(&graph, invocations)?;
     let host_transfers = host
         .weights
         .iter()
@@ -3674,7 +3800,6 @@ fn package_graph_impl_attempt(
                     Err(_) => (place(&immovable_allocation_ranges)?, true),
                 };
                 executable_placement_history.push(desired.clone());
-                let mut relocated_graph = graph.clone();
                 let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
                 let reservations = desired
                     .iter()
@@ -3691,7 +3816,7 @@ fn package_graph_impl_attempt(
                     .collect::<Vec<_>>();
                 let moved = if move_resident {
                     compact_all_allocations_around(
-                        &mut relocated_graph,
+                        &mut graph,
                         &topology,
                         &reservations,
                         Some(&resolved_memory_constraints),
@@ -3699,7 +3824,7 @@ fn package_graph_impl_attempt(
                     )?
                 } else {
                     compact_transient_allocations_around(
-                        &mut relocated_graph,
+                        &mut graph,
                         &topology,
                         &reservations,
                         Some(&resolved_memory_constraints),
@@ -3714,19 +3839,9 @@ fn package_graph_impl_attempt(
                     move_resident, "relocated transient tensors for measured executable images"
                 );
                 if !profile_code.is_empty() {
-                    return Err(Box::new(ProfileRelayout {
-                        graph: relocated_graph,
-                    }));
+                    return Err(Box::new(ProfileRelayout { graph }));
                 }
-                return package_graph_impl_attempt(
-                    &relocated_graph,
-                    objects,
-                    &profile_code,
-                    None,
-                    template_regions,
-                    invocations,
-                    executable_placement_history,
-                );
+                return Err(Box::new(PackageRelayout { graph }));
             }
         }
     };
@@ -3742,7 +3857,10 @@ fn package_graph_impl_attempt(
         .iter()
         .map(|reservations| reservations[1])
         .collect::<Vec<_>>();
-    let image_executable_elements = executable_reservations.iter().copied().collect::<Vec<_>>();
+    let image_executable_elements = executable_reservations
+        .iter()
+        .map(|reservations| effective_element_reservations(reservations.iter().copied()))
+        .collect::<Result<Vec<_>>>()?;
     let mut host_executable_placements = tile_host_plans
         .iter()
         .enumerate()
@@ -3949,11 +4067,16 @@ fn package_graph_impl_attempt(
             .map(|object| -> Result<u32> { Ok(u32::try_from(object.len())?) })
             .collect::<Result<Vec<_>>>()?;
         data_sizes.extend(sizes);
-        let executable_reserved = executable_elements
-            .iter()
-            .copied()
-            .chain(image_executable_elements[tile_index])
-            .collect::<Vec<_>>();
+        let plan_executable_elements =
+            effective_element_reservations(std::iter::once((PLAN_BASE, runtime_end)))?;
+        let executable_reserved = merge_address_ranges(
+            executable_elements
+                .iter()
+                .copied()
+                .chain(image_executable_elements[tile_index].iter().copied())
+                .chain(plan_executable_elements)
+                .collect(),
+        );
         executable_element_reservations.push(executable_reserved.clone());
         let place = |allocation_ranges: &[(u32, u32)]| -> Result<_> {
             // Linker/runtime data can displace ordinary graph allocations, which
@@ -3990,6 +4113,16 @@ fn package_graph_impl_attempt(
             place(&allocation_ranges_by_tile[usize::from(tile)])
                 .or_else(|_| place(&fixed_allocation_ranges[usize::from(tile)]))
                 .or_else(|_| place(&immovable_allocation_ranges[usize::from(tile)]))?;
+        validate_data_element_separation(
+            tile,
+            "static runtime data",
+            &ordinary_ranges
+                .iter()
+                .copied()
+                .chain(data_placements.iter().copied())
+                .collect::<Vec<_>>(),
+            &executable_reserved,
+        )?;
         relocations.extend(ordinary_relocations);
         let (host_data_placements, placements) = data_placements.split_at(host_data_count);
         for (object, &(address, _)) in host_plans.data_objects.iter().zip(host_data_placements) {
@@ -4134,10 +4267,9 @@ fn package_graph_impl_attempt(
                     && overlaps_static_reservation(index, allocation)
             });
     if needs_resident_relocation || needs_transient_relocation {
-        let mut relocated_graph = graph.clone();
         let moved = if needs_resident_relocation {
             compact_all_allocations_around(
-                &mut relocated_graph,
+                &mut graph,
                 &topology,
                 &static_relocation_reservations,
                 Some(&resolved_memory_constraints),
@@ -4145,7 +4277,7 @@ fn package_graph_impl_attempt(
             )?
         } else {
             match compact_transient_allocations_around(
-                &mut relocated_graph,
+                &mut graph,
                 &topology,
                 &static_relocation_reservations,
                 Some(&resolved_memory_constraints),
@@ -4153,7 +4285,7 @@ fn package_graph_impl_attempt(
             ) {
                 Ok(moved) => moved,
                 Err(_) if graph.memory_policy.is_some() => compact_all_allocations_around(
-                    &mut relocated_graph,
+                    &mut graph,
                     &topology,
                     &static_relocation_reservations,
                     Some(&resolved_memory_constraints),
@@ -4170,19 +4302,9 @@ fn package_graph_impl_attempt(
             needs_resident_relocation, "relocated graph allocations for static runtime"
         );
         if !profile_code.is_empty() {
-            return Err(Box::new(ProfileRelayout {
-                graph: relocated_graph,
-            }));
+            return Err(Box::new(ProfileRelayout { graph }));
         }
-        return package_graph_impl_attempt(
-            &relocated_graph,
-            objects,
-            &profile_code,
-            None,
-            template_regions,
-            invocations,
-            executable_placement_history,
-        );
+        return Err(Box::new(PackageRelayout { graph }));
     }
     debug!(
         minimum_end = format_args!(
@@ -7343,5 +7465,32 @@ mod tests {
                 .iter()
                 .any(|&(start, end)| address >= start && address < end)
         }));
+    }
+
+    #[test]
+    fn executable_tail_cannot_be_reused_for_data() {
+        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        let code_start = ipu_package::TILE_MEMORY_BASE + 3 * element;
+        let used_code_end = code_start + element / 2;
+        let executable = effective_element_reservations([(code_start, used_code_end)]).unwrap();
+
+        assert!(
+            validate_data_element_separation(
+                0,
+                "test data",
+                &[(used_code_end, used_code_end + 4)],
+                &executable,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_data_element_separation(
+                0,
+                "test data",
+                &[(code_start + element, code_start + element + 4)],
+                &executable,
+            )
+            .is_ok()
+        );
     }
 }

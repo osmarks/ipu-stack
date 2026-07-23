@@ -19,7 +19,7 @@ use ipu_runtime::{
     append_siglip_post_layer_norm_with_memory_policy, block_binding_typed, block_coordinates,
     blocked_matrix_f16, consolidate_attention_kernel_variants, defer_terminal_residual_add,
     fuse_deferred_residual_into_layer_norm, materialize_deferred_residual_add,
-    package_graph_repeated, package_graph_repeated_with_templates,
+    package_graph_repeated, package_graph_repeated_with_templates_owned,
     package_graph_repeated_with_templates_profiled_regions,
     package_graph_repeated_with_templates_profiled_with_regions, run_host_with_options,
 };
@@ -554,7 +554,7 @@ fn main() {
         (app, Some(layout))
     } else {
         (
-            package_graph_repeated_with_templates(&graph, &objects, &templates, invocations)
+            package_graph_repeated_with_templates_owned(graph, &objects, &templates, invocations)
                 .unwrap(),
             None,
         )
