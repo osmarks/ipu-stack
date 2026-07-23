@@ -2019,7 +2019,7 @@ fn push_gemm_weight(
     placements: &[BlockPlacement],
     data_type: GemmDataType,
     phase_start: usize,
-    value: impl Fn(u16, u16) -> f32,
+    value: impl Fn(u16, u16) -> f32 + Sync,
 ) -> Result<()> {
     let (dtype, bytes) = match data_type {
         GemmDataType::F16 => (

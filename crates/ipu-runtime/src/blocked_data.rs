@@ -1,8 +1,10 @@
 use ipu_compiler::BlockPlacement;
 use ipu_package::{Binding, RegionSlice};
+use rayon::prelude::*;
 
 const INNER_MICRO_DIMENSION: u16 = 8;
 const COLUMN_MICRO_DIMENSION: u16 = 16;
+const PARALLEL_BLOCK_CHUNK: usize = 64;
 
 #[derive(Clone, Copy)]
 pub enum BlockLayout {
@@ -125,40 +127,67 @@ pub fn block_coordinates(layout: BlockLayout, rows: u16, _columns: u16, linear: 
 pub fn blocked_matrix(
     placements: &[BlockPlacement],
     layout: BlockLayout,
-    value: impl Fn(u16, u16) -> f32,
+    value: impl Fn(u16, u16) -> f32 + Sync,
 ) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for placement in placements {
-        for linear in 0..placement.rows * placement.columns {
-            let (row, column) =
-                block_coordinates(layout, placement.rows, placement.columns, linear);
-            bytes.extend_from_slice(
-                &value(placement.row_start + row, placement.column_start + column).to_le_bytes(),
+    placements
+        .par_chunks(PARALLEL_BLOCK_CHUNK)
+        .map(|placements| {
+            let mut bytes = Vec::with_capacity(
+                placements
+                    .iter()
+                    .map(|placement| {
+                        usize::from(placement.rows) * usize::from(placement.columns) * 4
+                    })
+                    .sum(),
             );
-        }
-    }
-    bytes
+            for placement in placements {
+                for linear in 0..placement.rows * placement.columns {
+                    let (row, column) =
+                        block_coordinates(layout, placement.rows, placement.columns, linear);
+                    bytes.extend_from_slice(
+                        &value(placement.row_start + row, placement.column_start + column)
+                            .to_le_bytes(),
+                    );
+                }
+            }
+            bytes
+        })
+        .collect::<Vec<_>>()
+        .concat()
 }
 
 pub fn blocked_matrix_f16(
     placements: &[BlockPlacement],
     layout: BlockLayout,
-    value: impl Fn(u16, u16) -> f32,
+    value: impl Fn(u16, u16) -> f32 + Sync,
 ) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for placement in placements {
-        for linear in 0..placement.rows * placement.columns {
-            let (row, column) =
-                block_coordinates(layout, placement.rows, placement.columns, linear);
-            let bits = half::f16::from_f32(value(
-                placement.row_start + row,
-                placement.column_start + column,
-            ))
-            .to_bits();
-            bytes.extend_from_slice(&bits.to_le_bytes());
-        }
-    }
-    bytes
+    placements
+        .par_chunks(PARALLEL_BLOCK_CHUNK)
+        .map(|placements| {
+            let mut bytes = Vec::with_capacity(
+                placements
+                    .iter()
+                    .map(|placement| {
+                        usize::from(placement.rows) * usize::from(placement.columns) * 2
+                    })
+                    .sum(),
+            );
+            for placement in placements {
+                for linear in 0..placement.rows * placement.columns {
+                    let (row, column) =
+                        block_coordinates(layout, placement.rows, placement.columns, linear);
+                    let bits = half::f16::from_f32(value(
+                        placement.row_start + row,
+                        placement.column_start + column,
+                    ))
+                    .to_bits();
+                    bytes.extend_from_slice(&bits.to_le_bytes());
+                }
+            }
+            bytes
+        })
+        .collect::<Vec<_>>()
+        .concat()
 }
 
 pub fn f143_scale(values: impl IntoIterator<Item = f32>) -> i8 {
@@ -229,28 +258,39 @@ pub fn blocked_matrix_f8_f143(
     placements: &[BlockPlacement],
     layout: BlockLayout,
     scale: i8,
-    value: impl Fn(u16, u16) -> f32,
+    value: impl Fn(u16, u16) -> f32 + Sync,
 ) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for placement in placements {
-        for linear in 0..placement.rows * placement.columns {
-            let (row, column) =
-                block_coordinates(layout, placement.rows, placement.columns, linear);
-            bytes.push(f143_from_f32(
-                value(placement.row_start + row, placement.column_start + column),
-                scale,
-            ));
-        }
-    }
-    bytes
+    placements
+        .par_chunks(PARALLEL_BLOCK_CHUNK)
+        .map(|placements| {
+            let mut bytes = Vec::with_capacity(
+                placements
+                    .iter()
+                    .map(|placement| usize::from(placement.rows) * usize::from(placement.columns))
+                    .sum(),
+            );
+            for placement in placements {
+                for linear in 0..placement.rows * placement.columns {
+                    let (row, column) =
+                        block_coordinates(layout, placement.rows, placement.columns, linear);
+                    bytes.push(f143_from_f32(
+                        value(placement.row_start + row, placement.column_start + column),
+                        scale,
+                    ));
+                }
+            }
+            bytes
+        })
+        .collect::<Vec<_>>()
+        .concat()
 }
 
 pub fn f143_block_scales(
     placements: &[BlockPlacement],
-    value: &impl Fn(u16, u16) -> f32,
+    value: &(impl Fn(u16, u16) -> f32 + Sync),
 ) -> Vec<i8> {
     placements
-        .iter()
+        .par_iter()
         .map(|placement| {
             f143_scale((0..placement.rows * placement.columns).map(|linear| {
                 let row = linear / placement.columns;
@@ -265,27 +305,34 @@ pub fn blocked_matrix_f8_f143_by_block(
     placements: &[BlockPlacement],
     layout: BlockLayout,
     scales: &[i8],
-    value: impl Fn(u16, u16) -> f32,
+    value: impl Fn(u16, u16) -> f32 + Sync,
 ) -> Vec<u8> {
     assert_eq!(placements.len(), scales.len());
-    let mut bytes = Vec::with_capacity(
-        placements
-            .iter()
-            .map(|placement| usize::from(placement.rows) * usize::from(placement.columns))
-            .sum(),
-    );
-    for (placement, &scale) in placements.iter().zip(scales) {
-        let scale_multiplier = f32::from_bits(((127 - i32::from(scale)) as u32) << 23);
-        for linear in 0..placement.rows * placement.columns {
-            let (row, column) =
-                block_coordinates(layout, placement.rows, placement.columns, linear);
-            bytes.push(f143_from_scaled_f32(
-                value(placement.row_start + row, placement.column_start + column)
-                    * scale_multiplier,
-            ));
-        }
-    }
-    bytes
+    placements
+        .par_chunks(PARALLEL_BLOCK_CHUNK)
+        .zip(scales.par_chunks(PARALLEL_BLOCK_CHUNK))
+        .map(|(placements, scales)| {
+            let mut bytes = Vec::with_capacity(
+                placements
+                    .iter()
+                    .map(|placement| usize::from(placement.rows) * usize::from(placement.columns))
+                    .sum(),
+            );
+            for (placement, &scale) in placements.iter().zip(scales) {
+                let scale_multiplier = f32::from_bits(((127 - i32::from(scale)) as u32) << 23);
+                for linear in 0..placement.rows * placement.columns {
+                    let (row, column) =
+                        block_coordinates(layout, placement.rows, placement.columns, linear);
+                    bytes.push(f143_from_scaled_f32(
+                        value(placement.row_start + row, placement.column_start + column)
+                            * scale_multiplier,
+                    ));
+                }
+            }
+            bytes
+        })
+        .collect::<Vec<_>>()
+        .concat()
 }
 
 pub fn normal_f16(elements: usize, seed: u64, standard_deviation: f32) -> Vec<half::f16> {
