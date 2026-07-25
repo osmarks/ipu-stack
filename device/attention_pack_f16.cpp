@@ -87,11 +87,16 @@ public:
       for (unsigned rowGroup = 0;
            rowGroup < ATTENTION_KEY_BLOCK_COLUMNS / 16; ++rowGroup) {
         const unsigned destinationRow = rowGroup * 16 + rowInGroup;
-        if (destinationRow < destinationRowStart ||
-            destinationRow >= destinationRowStart + copyRows)
+        const bool copy =
+            destinationRow >= destinationRowStart &&
+            destinationRow < destinationRowStart + copyRows;
+        const bool padding = destinationRow >= destinationRows;
+        if (!copy && !padding)
           continue;
-        const unsigned sourceRow =
-            sourceRowStart + destinationRow - destinationRowStart;
+        const unsigned sourceRow = copy
+                                       ? sourceRowStart + destinationRow -
+                                             destinationRowStart
+                                       : 0;
         for (unsigned innerGroup = 0; innerGroup < innerGroups;
              ++innerGroup) {
           const unsigned outputBase =
@@ -99,7 +104,7 @@ public:
           for (unsigned inner = 0; inner < 16; inner += 4) {
             const unsigned logicalInner = innerGroup * 16 + inner;
             half4 packed = {};
-            if (logicalInner + 3 < ATTENTION_HEAD_DIMENSION) {
+            if (copy && logicalInner + 3 < ATTENTION_HEAD_DIMENSION) {
               const unsigned input =
                   sourceIndex(sourceRows, sourceRow, headStart + logicalInner);
               packed = *reinterpret_cast<const half4 *>(&source[input]);
@@ -189,6 +194,20 @@ public:
                 sourceRows, sourceRow, headStart + logicalColumn)];
           }
           *reinterpret_cast<half2 *>(&output[outputBase + pairRow]) = values;
+        }
+        for (unsigned pairRow = destinationRows & ~1u;
+             pairRow < ATTENTION_KEY_BLOCK_COLUMNS; pairRow += 2) {
+          const unsigned keyGroup = pairRow / 16;
+          const unsigned row = pairRow % 16;
+          const unsigned outputBase =
+              (panel * keyGroups + keyGroup) * 256 + loadChannel * 16;
+          half2 values =
+              *reinterpret_cast<const half2 *>(&output[outputBase + row]);
+          if (pairRow >= destinationRows)
+            values[0] = 0.0;
+          if (pairRow + 1 >= destinationRows)
+            values[1] = 0.0;
+          *reinterpret_cast<half2 *>(&output[outputBase + row]) = values;
         }
       }
     }
