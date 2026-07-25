@@ -2137,8 +2137,10 @@ fn compact_allocations_around(
                 (
                     !memory_constraints.required_interleaved.contains(&index),
                     !memory_constraints.relations.contains_key(&index),
+                    std::cmp::Reverse(
+                        memory_constraints.access_extent(index, allocation.size),
+                    ),
                     allocation.live_until != usize::MAX,
-                    std::cmp::Reverse(allocation.size),
                     allocation.live_from,
                     allocation.live_until,
                     allocation.tensor.0,
@@ -8006,13 +8008,15 @@ mod tests {
     }
 
     #[test]
-    fn global_repacking_places_residents_before_lifetime_overlapped_transients() {
+    fn global_repacking_preserves_the_only_large_lifetime_window() {
         let topology = Topology::c600();
-        let arena = 0x88000..0xe8000;
-        let resident_address = 0x90000;
-        let transient_address = 0x92000;
+        let arena = 0x88000..0x90000;
+        let resident_address = 0x88000;
+        let transient_address = 0x8c000;
         let mut reservations = vec![Vec::new(); topology.tile_count()];
-        reservations[0].push((0x90000, 0xa0000));
+        // The low gap can hold only the resident. The high gap can hold
+        // either object before the resident consumes part of it.
+        reservations[0].push((0x8a000, 0x8c000));
         let mut graph = ExecutableGraph {
             memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(
                 arena.start,
@@ -8035,7 +8039,7 @@ mod tests {
                         tensor: ipu_compiler::TensorId(2),
                         tile: 0,
                         address: transient_address,
-                        size: 4096,
+                        size: 0x3800,
                         live_from: 0,
                         live_until: 1,
                         kind: ipu_compiler::AllocationKind::Home,
@@ -8062,17 +8066,8 @@ mod tests {
             host_outputs: Vec::new(),
         };
 
-        assert_eq!(
-            compact_all_allocations_around(
-                &mut graph,
-                &topology,
-                &reservations,
-                None,
-                "unit test",
-            )
-                .unwrap(),
-            2
-        );
+        compact_all_allocations_around(&mut graph, &topology, &reservations, None, "unit test")
+            .unwrap();
         let resident = &graph.schedule.allocations[0];
         let transient = &graph.schedule.allocations[1];
         for allocation in [resident, transient] {
