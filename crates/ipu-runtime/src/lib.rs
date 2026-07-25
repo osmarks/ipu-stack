@@ -2034,6 +2034,25 @@ fn compact_transient_allocations_around(
         memory_constraints,
         reason,
         false,
+        false,
+    )
+}
+
+fn repack_transient_allocations_around(
+    graph: &mut ExecutableGraph,
+    topology: &Topology,
+    reservations: &[Vec<(u32, u32)>],
+    memory_constraints: Option<&ipu_compiler::ResolvedKernelMemoryConstraints>,
+    reason: &str,
+) -> Result<usize> {
+    compact_allocations_around(
+        graph,
+        topology,
+        reservations,
+        memory_constraints,
+        reason,
+        false,
+        true,
     )
 }
 
@@ -2051,6 +2070,7 @@ fn compact_all_allocations_around(
         memory_constraints,
         reason,
         true,
+        true,
     )
 }
 
@@ -2061,6 +2081,7 @@ fn compact_allocations_around(
     resolved_memory_constraints: Option<&ipu_compiler::ResolvedKernelMemoryConstraints>,
     reason: &str,
     move_resident: bool,
+    repack_stable_transients: bool,
 ) -> Result<usize> {
     if reservations.len() != topology.tile_count() {
         return Err("invalid transient repacking reservations".into());
@@ -2204,7 +2225,7 @@ fn compact_allocations_around(
                 let stable = fits_arena
                     && !access_conflicts_with_permanent
                     && !access_conflicts_with_reservation;
-                if move_resident || !stable {
+                if move_resident || repack_stable_transients || !stable {
                     compact.push(index);
                 } else {
                     let range = (allocation.address, access_end);
@@ -4898,7 +4919,7 @@ fn package_graph_impl_attempt(
                         "measured executable placement",
                     )?
                 } else {
-                    compact_transient_allocations_around(
+                    repack_transient_allocations_around(
                         &mut graph,
                         &topology,
                         &reservations,
@@ -5363,7 +5384,7 @@ fn package_graph_impl_attempt(
                 "static runtime placement",
             )?
         } else {
-            match compact_transient_allocations_around(
+            match repack_transient_allocations_around(
                 &mut graph,
                 &topology,
                 &static_relocation_reservations,
@@ -8317,6 +8338,83 @@ mod tests {
             graph.host_weights[0].slices[0].tile_address,
             resident.address + 8
         );
+    }
+
+    #[test]
+    fn transient_repacking_recolors_individually_stable_storage() {
+        let topology = Topology::c600();
+        let arena = 0x88000..0x90000;
+        let mut reservations = vec![Vec::new(); topology.tile_count()];
+        reservations[0].push((0x8a000, 0x8c000));
+        let mut graph = ExecutableGraph {
+            memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(
+                arena.start,
+                arena.end,
+            )),
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: vec![ipu_compiler::Phase::Compute {
+                    op: ipu_compiler::OpId(0),
+                    commands: Vec::new(),
+                }],
+                allocations: vec![
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(1),
+                        tile: 0,
+                        address: 0x89000,
+                        size: 0x3800,
+                        live_from: 0,
+                        live_until: 1,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(2),
+                        tile: 0,
+                        address: 0x8f000,
+                        size: 0x1000,
+                        live_from: 0,
+                        live_until: 1,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                ]
+                .into(),
+                tile_count: u16::try_from(topology.tile_count()).unwrap(),
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+
+        repack_transient_allocations_around(
+            &mut graph,
+            &topology,
+            &reservations,
+            None,
+            "transient recoloring test",
+        )
+        .unwrap();
+
+        for allocation in &graph.schedule.allocations {
+            let end = allocation.address + allocation.size;
+            assert!(allocation.address >= arena.start && end <= arena.end);
+            assert!(!ranges_overlap(
+                allocation.address,
+                end,
+                reservations[0][0].0,
+                reservations[0][0].1,
+            ));
+        }
+        let first = &graph.schedule.allocations[0];
+        let second = &graph.schedule.allocations[1];
+        assert!(!ranges_overlap(
+            first.address,
+            first.address + first.size,
+            second.address,
+            second.address + second.size,
+        ));
     }
 
     #[test]
