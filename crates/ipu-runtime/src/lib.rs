@@ -3765,6 +3765,8 @@ fn package_graph_with_profile_options(
     invocations: u32,
 ) -> Result<(Application, ProfileLayout)> {
     let topology = Topology::c600();
+    let mut graph = graph.clone();
+    normalize_provisional_memory_layout(&mut graph, &topology)?;
     let profile_started = Instant::now();
     let programs = graph.schedule.lower_tile_programs(&topology)?;
     let lowering_elapsed = profile_started.elapsed();
@@ -3871,7 +3873,7 @@ fn package_graph_with_profile_options(
         tiles = prepared.len(),
         "prepared all-tile profile layout"
     );
-    let mut profile_graph = graph.clone();
+    let mut profile_graph = graph;
     let mut profile_code = Vec::with_capacity(programs.len());
     let mut profile_tiles = Vec::with_capacity(programs.len());
     let mut slices = Vec::with_capacity(programs.len());
@@ -4025,6 +4027,16 @@ fn package_graph_impl_owned_with_final_graph(
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
 ) -> Result<(Application, ExecutableGraph)> {
+    let topology = Topology::c600();
+    let normalized = normalize_provisional_memory_layout(&mut graph, &topology)?;
+    if normalized != 0 && lowered_programs.is_some() {
+        if !profile_code.is_empty() {
+            return Err(
+                "profile programs were lowered before provisional memory normalization".into(),
+            );
+        }
+        lowered_programs = None;
+    }
     let mut executable_placement_history = Vec::new();
     loop {
         match package_graph_impl_attempt(
@@ -4043,6 +4055,39 @@ fn package_graph_impl_owned_with_final_graph(
             },
         }
     }
+}
+
+fn normalize_provisional_memory_layout(
+    graph: &mut ExecutableGraph,
+    topology: &Topology,
+) -> Result<usize> {
+    let Err(error) = graph.schedule.validate_allocations() else {
+        return Ok(0);
+    };
+    if graph.memory_policy.is_none() {
+        return Err(error.into());
+    }
+    if usize::from(graph.schedule.tile_count) != topology.tile_count() {
+        return Err(error.into());
+    }
+
+    info!(
+        error = %error,
+        "normalizing provisional graph memory placement"
+    );
+    let programs = graph.schedule.lower_tile_programs_for_codegen(topology)?;
+    let constraints = graph.schedule.resolve_memory_constraints(&programs)?;
+    let reservations = vec![Vec::new(); topology.tile_count()];
+    let moved = compact_all_allocations_around(
+        graph,
+        topology,
+        &reservations,
+        Some(&constraints),
+        "provisional graph placement",
+    )?;
+    graph.schedule.validate_allocations()?;
+    info!(moved, "normalized provisional graph memory placement");
+    Ok(moved)
 }
 
 fn plan_tile_exchange(
@@ -7465,6 +7510,65 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn provisional_resident_overlap_is_colored_before_packaging() {
+        let topology = Topology::c600();
+        let address = 0x60000;
+        let mut graph = ExecutableGraph {
+            memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(
+                address,
+                address + 0x10000,
+            )),
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: vec![
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(1),
+                        tile: 0,
+                        address,
+                        size: 0x1000,
+                        live_from: 0,
+                        live_until: 1,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(2),
+                        tile: 0,
+                        address,
+                        size: 0x1000,
+                        live_from: 0,
+                        live_until: usize::MAX,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                ]
+                .into(),
+                tile_count: u16::try_from(topology.tile_count()).unwrap(),
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+
+        assert!(graph.schedule.validate_allocations().is_err());
+        assert_ne!(
+            normalize_provisional_memory_layout(&mut graph, &topology).unwrap(),
+            0
+        );
+        graph.schedule.validate_allocations().unwrap();
+        let transient = &graph.schedule.allocations[0];
+        let resident = &graph.schedule.allocations[1];
+        assert!(!ranges_overlap(
+            transient.address,
+            transient.address + transient.size,
+            resident.address,
+            resident.address + resident.size,
+        ));
+    }
 
     #[test]
     fn allocation_footprints_merge_owned_storage_and_ignore_aliases() {

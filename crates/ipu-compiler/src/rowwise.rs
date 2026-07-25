@@ -1208,8 +1208,13 @@ fn append_affine_layer_norm_f16_impl(
         .map(|arena| arena.limit)
         .max()
         .unwrap();
-    let resident_occupied = schedule.allocations.all_occupied_intervals_by_tile(
+    // Dead transient storage can be recolored once the complete graph is
+    // available. Only storage live when these resident parameters are first
+    // exchanged must constrain their provisional address.
+    let resident_occupied = schedule.allocations.occupied_intervals_by_tile(
         schedule.tile_count,
+        exchange_phase,
+        usize::MAX,
         resident_base,
         resident_limit,
     );
@@ -2011,7 +2016,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(appended.output[0].address, 0xa0000);
-        assert_ne!(appended.affine[0].address, appended.output[0].address);
+        let affine = appended.affine[0].address..appended.affine[0].address + 64;
+        let output = appended.output[0].address..appended.output[0].address + 128;
+        assert!(affine.start >= 0xa0000 && affine.end <= 0xa00c0);
+        assert!(output.start >= 0xa0000 && output.end <= 0xa00c0);
+        assert!(affine.end <= output.start || output.end <= affine.start);
     }
 }

@@ -1511,12 +1511,6 @@ impl MemoryPolicy {
         }
         Ok(())
     }
-
-    fn occupied_all(&self, schedule: &Schedule, base: u32, limit: u32) -> Vec<Vec<(u32, u32)>> {
-        schedule
-            .allocations
-            .all_occupied_intervals_by_tile(schedule.tile_count, base, limit)
-    }
 }
 
 fn unique_ipu21_regions(regions: &[Ipu21MemoryRegion]) -> bool {
@@ -2896,11 +2890,11 @@ fn plan_appended_blocked_gemm_with_memory_policy(
         arena_base,
         arena_limit,
     );
-    let mut occupied_all = memory.occupied_all(parent, arena_base, arena_limit);
-    for (all, current) in occupied_all.iter_mut().zip(&occupied_current) {
-        all.extend_from_slice(current);
-    }
-    merge_occupied_intervals(&mut occupied_all);
+    // A resident object must avoid prior resident data and state live at this
+    // append point. Expired transients are movable during final whole-graph
+    // coloring, so reserving every address they ever used needlessly makes
+    // incremental planning depend on layer count.
+    let mut occupied_all = occupied_current.clone();
     let movable = regions
         .iter()
         .map(|&(tensor, ..)| tensor)
@@ -3124,7 +3118,13 @@ fn choose_resident_tile_rotation_with_projection(
         .map(|arena| arena.limit)
         .max()
         .unwrap_or(0);
-    let occupied = memory.occupied_all(parent, arena_base, arena_limit);
+    let occupied = parent.allocations.occupied_intervals_by_tile(
+        parent.tile_count,
+        parent.phases.len(),
+        usize::MAX,
+        arena_base,
+        arena_limit,
+    );
     let parent_bytes = occupied
         .iter()
         .map(|intervals| {
@@ -8137,28 +8137,55 @@ mod tests {
     }
 
     #[test]
-    fn resident_occupancy_includes_physical_allocations_with_empty_lifetimes() {
-        let memory = MemoryPolicy::contiguous(0xa0000, 0xe8000);
+    fn appended_resident_occupancy_excludes_dead_transients() {
         let schedule = Schedule {
             layouts: Vec::new(),
-            phases: Vec::new(),
-            allocations: vec![Allocation {
-                tensor: TensorId(1),
-                tile: 2,
-                address: 0xb0000,
-                size: 4096,
-                live_from: 7,
-                live_until: 7,
-                kind: AllocationKind::Home,
-            }]
+            phases: vec![Phase::Exchange {
+                transfers: Vec::new(),
+            }],
+            allocations: vec![
+                Allocation {
+                    tensor: TensorId(1),
+                    tile: 2,
+                    address: 0xb0000,
+                    size: 4096,
+                    live_from: 0,
+                    live_until: 1,
+                    kind: AllocationKind::Home,
+                },
+                Allocation {
+                    tensor: TensorId(2),
+                    tile: 2,
+                    address: 0xc0000,
+                    size: 4096,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                },
+            ]
             .into(),
             tile_count: 4,
             peak_sram: BTreeMap::new(),
         };
 
-        let occupied = memory.occupied_all(&schedule, 0xa0000, 0xe8000);
+        let occupied = schedule.allocations.occupied_intervals_by_tile(
+            schedule.tile_count,
+            schedule.phases.len(),
+            usize::MAX,
+            0xa0000,
+            0xe8000,
+        );
 
-        assert_eq!(occupied[2], vec![(0xb0000, 0xb1000)]);
+        assert!(
+            occupied[2]
+                .iter()
+                .any(|&(start, end)| start <= 0xc0000 && end >= 0xc1000)
+        );
+        assert!(
+            occupied[2]
+                .iter()
+                .all(|&(start, end)| end <= 0xb0000 || start >= 0xb1000)
+        );
     }
 
     #[test]
