@@ -1562,7 +1562,6 @@ fn select_eviction_window(
     permanent: &[(u32, u32)],
     forbidden_starts: &[(u32, u32)],
     arenas: &[ipu_compiler::MemoryArena],
-    protected: &HashSet<usize>,
     alignment: u32,
 ) -> Option<(u32, Vec<usize>)> {
     let allocation_extent = memory_constraints.access_extent(allocation_index, allocation.size);
@@ -1633,7 +1632,7 @@ fn select_eviction_window(
                 })
                 .map(|&(index, _, _)| index)
                 .collect::<Vec<_>>();
-            if blockers.is_empty() || blockers.iter().any(|index| protected.contains(index)) {
+            if blockers.is_empty() {
                 continue;
             }
             let bytes = blockers
@@ -1671,7 +1670,7 @@ fn fixed_allocation_ranges_by_tile(
             allocation.kind,
             ipu_compiler::AllocationKind::HomeAlias { .. }
         ) || is_movable_transient_storage(allocation, transient_arenas);
-        if movable && !memory_constraints.pinned.contains(&index) {
+        if movable {
             continue;
         }
         let bytes = memory_constraints.access_extent(index, allocation.size);
@@ -1709,7 +1708,7 @@ fn immovable_allocation_ranges_by_tile(
             ipu_compiler::AllocationKind::HomeAlias { .. }
         ) || is_movable_transient_storage(allocation, transient_arenas)
             || is_movable_resident_home(allocation, resident_arenas);
-        if movable && !memory_constraints.pinned.contains(&index) {
+        if movable {
             continue;
         }
         let bytes = memory_constraints.access_extent(index, allocation.size);
@@ -1744,10 +1743,18 @@ struct MemoryElementRelation {
     neighbor: MemoryElementNeighbor,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct MemoryElementSelfSeparation {
+    first_offset: u32,
+    first_bytes: u32,
+    second_offset: u32,
+    second_bytes: u32,
+}
+
 #[derive(Default)]
 struct RelocationMemoryConstraints {
     relations: HashMap<usize, Vec<MemoryElementRelation>>,
-    pinned: HashSet<usize>,
+    self_separations: HashMap<usize, Vec<MemoryElementSelfSeparation>>,
     required_interleaved: HashSet<usize>,
     /// Maximum base-relative address touched by a kernel. The logical
     /// allocation size remains unchanged, but placement reserves this full
@@ -1778,6 +1785,49 @@ fn memory_spans_share_effective_element(
     Ok(first
         .iter()
         .any(|first| second.iter().any(|second| first.0 == second.0)))
+}
+
+fn self_separation_forbidden_starts(
+    separations: &[MemoryElementSelfSeparation],
+    access_extent: u32,
+    arenas: &[ipu_compiler::MemoryArena],
+    alignment: u32,
+) -> Result<Vec<(u32, u32)>> {
+    let mut forbidden = Vec::new();
+    for arena in arenas {
+        let Some(last) = arena.limit.checked_sub(access_extent) else {
+            continue;
+        };
+        let mut address = align_up(arena.base, alignment);
+        while address <= last {
+            let mut invalid = false;
+            for separation in separations {
+                let first = address
+                    .checked_add(separation.first_offset)
+                    .ok_or("self-separation first operand address overflow")?;
+                let second = address
+                    .checked_add(separation.second_offset)
+                    .ok_or("self-separation second operand address overflow")?;
+                if memory_spans_share_effective_element(
+                    first,
+                    separation.first_bytes,
+                    second,
+                    separation.second_bytes,
+                )? {
+                    invalid = true;
+                    break;
+                }
+            }
+            if invalid {
+                forbidden.push((address, address.saturating_add(alignment)));
+            }
+            let Some(next) = address.checked_add(alignment) else {
+                break;
+            };
+            address = next;
+        }
+    }
+    Ok(merge_address_ranges(forbidden))
 }
 
 fn relocation_memory_constraints(
@@ -1906,9 +1956,28 @@ fn relocation_memory_constraints(
                         "two operands in one allocation require distinct memory elements".into(),
                     );
                 }
-                // Their relative offsets are fixed, but crossing an element boundary can
-                // depend on the allocation base. Preserve a known-valid base.
-                constraints.pinned.insert(first);
+                let ((first_offset, first_bytes), (second_offset, second_bytes)) =
+                    if (first_offset, separation.first.bytes)
+                        <= (second_offset, separation.second.bytes)
+                    {
+                        (
+                            (first_offset, separation.first.bytes),
+                            (second_offset, separation.second.bytes),
+                        )
+                    } else {
+                        (
+                            (second_offset, separation.second.bytes),
+                            (first_offset, separation.first.bytes),
+                        )
+                    };
+                constraints.self_separations.entry(first).or_default().push(
+                    MemoryElementSelfSeparation {
+                        first_offset,
+                        first_bytes,
+                        second_offset,
+                        second_bytes,
+                    },
+                );
             }
             ((Some(first), first_offset), (Some(second), second_offset)) => {
                 constraints
@@ -1943,6 +2012,10 @@ fn relocation_memory_constraints(
     for relations in constraints.relations.values_mut() {
         relations.sort_unstable();
         relations.dedup();
+    }
+    for separations in constraints.self_separations.values_mut() {
+        separations.sort_unstable();
+        separations.dedup();
     }
     Ok(constraints)
 }
@@ -2035,6 +2108,34 @@ fn compact_allocations_around(
             ));
         }
     }
+    let mut self_separation_cache =
+        HashMap::<(Vec<MemoryElementSelfSeparation>, u32, bool, bool), Vec<(u32, u32)>>::new();
+    for (&index, separations) in &memory_constraints.self_separations {
+        let allocation = &graph.schedule.allocations[index];
+        let resident = allocation.live_until == usize::MAX;
+        if resident && !move_resident {
+            continue;
+        }
+        let requires_interleaved = memory_constraints.required_interleaved.contains(&index);
+        let key = (
+            separations.clone(),
+            memory_constraints.access_extent(index, allocation.size),
+            resident,
+            requires_interleaved,
+        );
+        if self_separation_cache.contains_key(&key) {
+            continue;
+        }
+        let arenas = if resident {
+            &resident_arenas
+        } else {
+            &transient_arenas
+        };
+        let compatible =
+            relocation_arenas_for_allocation(allocation, arenas, requires_interleaved)?;
+        let forbidden = self_separation_forbidden_starts(separations, key.1, &compatible, 32)?;
+        self_separation_cache.insert(key, forbidden);
+    }
     let placements = transient_by_tile
         .into_par_iter()
         .zip(resident_by_tile)
@@ -2086,10 +2187,6 @@ fn compact_allocations_around(
                     arenas,
                     requires_interleaved,
                 )?;
-                let storage_end = allocation
-                    .address
-                    .checked_add(allocation.size)
-                    .ok_or("allocation address overflow during stable placement")?;
                 let access_extent = memory_constraints.access_extent(index, allocation.size);
                 let access_end = allocation
                     .address
@@ -2107,20 +2204,7 @@ fn compact_allocations_around(
                 let stable = fits_arena
                     && !access_conflicts_with_permanent
                     && !access_conflicts_with_reservation;
-                if memory_constraints.pinned.contains(&index) {
-                    if !stable {
-                        return Err(format!(
-                            "pinned tensor {} on tile {} at 0x{:x}..0x{storage_end:x} conflicts with {reason}",
-                            allocation.tensor.0, allocation.tile, allocation.address,
-                        )
-                        .into());
-                    }
-                    let range = (allocation.address, access_end);
-                    for occupied in &mut occupied_by_phase[lifetime(allocation)] {
-                        occupied.push(range);
-                    }
-                    result.push((index, allocation.address));
-                } else if move_resident || !stable {
+                if move_resident || !stable {
                     compact.push(index);
                 } else {
                     let range = (allocation.address, access_end);
@@ -2139,7 +2223,8 @@ fn compact_allocations_around(
                     std::cmp::Reverse(
                         memory_constraints.access_extent(index, allocation.size),
                     ),
-                    !memory_constraints.relations.contains_key(&index),
+                    !(memory_constraints.relations.contains_key(&index)
+                        || memory_constraints.self_separations.contains_key(&index)),
                     allocation.live_until != usize::MAX,
                     allocation.live_from,
                     allocation.live_until,
@@ -2154,9 +2239,7 @@ fn compact_allocations_around(
             let mut compact = VecDeque::from(compact);
             // Relation-constrained objects remain movable: every relation is
             // stored in both directions, so re-placing an evicted object checks
-            // it against the neighbor's current address. Only an allocation
-            // whose correctness depends on its exact base is immovable.
-            let protected = memory_constraints.pinned.clone();
+            // it against the neighbor's current address.
             while let Some(index) = compact.pop_front() {
                     let allocation = &graph.schedule.allocations[index];
                     let arenas = if allocation.live_until == usize::MAX {
@@ -2182,7 +2265,7 @@ fn compact_allocations_around(
                     );
                     let occupied = merge_address_ranges(occupied);
                     let access_extent = memory_constraints.access_extent(index, allocation.size);
-                    let forbidden_starts = memory_constraints
+                    let mut forbidden_starts = memory_constraints
                         .relations
                         .get(&index)
                         .into_iter()
@@ -2231,14 +2314,22 @@ fn compact_allocations_around(
                             (forbidden_start < end).then_some((forbidden_start, end))
                         }))
                         .collect::<Vec<_>>();
+                    if let Some(separations) = memory_constraints.self_separations.get(&index) {
+                        let key = (
+                            separations.clone(),
+                            access_extent,
+                            allocation.live_until == usize::MAX,
+                            requires_interleaved,
+                        );
+                        forbidden_starts.extend_from_slice(&self_separation_cache[&key]);
+                    }
                     let forbidden_starts = merge_address_ranges(forbidden_starts);
                     // Cross-allocation effective-element constraints are
                     // non-convex. Prefer the builder's known-valid base when
                     // it remains available; unconstrained allocations are
                     // still fully repacked around these anchors.
-                    let preferred = memory_constraints
-                        .relations
-                        .contains_key(&index)
+                    let preferred = (memory_constraints.relations.contains_key(&index)
+                        || memory_constraints.self_separations.contains_key(&index))
                         .then_some(allocation.address)
                         .filter(|&address| {
                             let end = address.saturating_add(access_extent);
@@ -2273,7 +2364,6 @@ fn compact_allocations_around(
                             &permanent,
                             &forbidden_starts,
                             &compatible_arenas,
-                            &protected,
                             32,
                         )
                     {
@@ -2338,6 +2428,47 @@ fn compact_allocations_around(
                         let old_forbidden = forbidden_starts.iter().find(|&&(start, end)| {
                             start <= allocation.address && allocation.address < end
                         });
+                        let old_storage_blockers = result
+                            .iter()
+                            .filter_map(|&(blocker, address)| {
+                                let other = &graph.schedule.allocations[blocker];
+                                let end = address.saturating_add(
+                                    memory_constraints.access_extent(blocker, other.size),
+                                );
+                                let lifetimes_overlap = allocation.live_from < other.live_until
+                                    && other.live_from < allocation.live_until;
+                                (lifetimes_overlap
+                                    && ranges_overlap(
+                                        allocation.address,
+                                        old_end,
+                                        address,
+                                        end,
+                                    ))
+                                .then_some((
+                                    other.tensor.0,
+                                    address,
+                                    end,
+                                    other.live_from,
+                                    other.live_until,
+                                    placement_priority.get(&blocker).copied(),
+                                    memory_constraints.relations.contains_key(&blocker),
+                                ))
+                            })
+                            .collect::<Vec<_>>();
+                        let permanent_layout = permanent
+                            .iter()
+                            .copied()
+                            .filter(|&(start, end)| {
+                                compatible_arenas.iter().any(|arena| {
+                                    ranges_overlap(
+                                        start,
+                                        end,
+                                        arena.base,
+                                        arena.limit,
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>();
                         let allowed_start_ranges = merge_address_ranges(
                             compatible_arenas
                                 .iter()
@@ -2355,13 +2486,19 @@ fn compact_allocations_around(
                             })
                             .sum::<u32>();
                         format!(
-                            "cannot compact tensor {} on tile {} for {reason}: no arena can hold a {}-byte SRAM allocation with a {}-byte static access span at lifetime {}..{} (old=0x{:x}..0x{:x}, old_fits_arena={}, old_storage_conflict={:?}, old_forbidden={:?}, relations={}, forbidden_start_ranges={}, forbidden_start_bytes={}, {} bytes capacity, {} bytes free, {}-byte largest aligned gap)",
+                            "cannot compact tensor {} on tile {} for {reason}: no arena can hold a {}-byte SRAM allocation with a {}-byte static access span at lifetime {}..{} (old=0x{:x}..0x{:x}, old_fits_arena={}, old_storage_conflict={:?}, old_storage_blockers={:?}, old_forbidden={:?}, relations={}, priority={}, forbidden_start_ranges={}, forbidden_start_bytes={}, permanent_layout={:?}, {} bytes capacity, {} bytes free, {}-byte largest aligned gap)",
                             allocation.tensor.0, allocation.tile, allocation.size, access_extent,
                             allocation.live_from, allocation.live_until,
                             allocation.address, old_end, old_fits_arena, old_storage_conflict,
-                            old_forbidden,
-                            memory_constraints.relations.get(&index).map_or(0, Vec::len),
+                            old_storage_blockers, old_forbidden,
+                            memory_constraints.relations.get(&index).map_or(0, Vec::len)
+                                + memory_constraints
+                                    .self_separations
+                                    .get(&index)
+                                    .map_or(0, Vec::len),
+                            placement_priority[&index],
                             forbidden_starts.len(), forbidden_start_bytes,
+                            permanent_layout,
                             capacity, free, largest,
                         )
                     })?;
@@ -7885,6 +8022,92 @@ mod tests {
             static_reservation.1,
         ));
         graph.schedule.validate_allocations().unwrap();
+    }
+
+    #[test]
+    fn compaction_relocates_self_separated_memory_operands() {
+        let topology = Topology::c600();
+        let old_address = 0x90000;
+        let allocation_size = 0x10000;
+        let operand_bytes = 32;
+        let second_offset = (32..allocation_size)
+            .step_by(32)
+            .find(|&offset| {
+                !memory_spans_share_effective_element(
+                    old_address,
+                    operand_bytes,
+                    old_address + offset,
+                    operand_bytes,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        let mut graph = ExecutableGraph {
+            memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(0x88000, 0xe8000)),
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: vec![ipu_compiler::Phase::Compute {
+                    op: ipu_compiler::OpId(0),
+                    commands: Vec::new(),
+                }],
+                allocations: vec![ipu_compiler::Allocation {
+                    tensor: ipu_compiler::TensorId(1),
+                    tile: 0,
+                    address: old_address,
+                    size: allocation_size,
+                    live_from: 0,
+                    live_until: 1,
+                    kind: ipu_compiler::AllocationKind::Home,
+                }]
+                .into(),
+                tile_count: u16::try_from(topology.tile_count()).unwrap(),
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+        let operand = |offset| ipu_compiler::ResolvedMemoryOperand {
+            allocation: Some(0),
+            tile: 0,
+            address: old_address + offset,
+            bytes: operand_bytes,
+        };
+        let resolved = ipu_compiler::ResolvedKernelMemoryConstraints {
+            accesses: Vec::new(),
+            classes: Vec::new(),
+            separations: vec![ipu_compiler::ResolvedMemorySeparation {
+                first: operand(0),
+                second: operand(second_offset),
+            }],
+        };
+        let constraints = relocation_memory_constraints(&graph, &resolved).unwrap();
+        assert!(constraints.self_separations.contains_key(&0));
+        let mut reservations = vec![Vec::new(); topology.tile_count()];
+        reservations[0].push((old_address, old_address + allocation_size));
+
+        compact_transient_allocations_around(
+            &mut graph,
+            &topology,
+            &reservations,
+            Some(&resolved),
+            "self-separation test",
+        )
+        .unwrap();
+
+        let address = graph.schedule.allocations[0].address;
+        assert_ne!(address, old_address);
+        assert!(
+            !memory_spans_share_effective_element(
+                address,
+                operand_bytes,
+                address + second_offset,
+                operand_bytes,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
