@@ -235,22 +235,6 @@ fn balance_attention_tiles_for_parent(
     let tile_count = usize::from(parent.tile_count);
     let data_base = arenas.iter().map(|arena| arena.base).min().unwrap();
     let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
-    let occupied = parent.allocations.occupied_intervals_by_tile(
-        parent.tile_count,
-        parent.phases.len(),
-        usize::MAX,
-        data_base,
-        data_limit,
-    );
-    let total_pressure = occupied
-        .iter()
-        .map(|intervals| {
-            intervals
-                .iter()
-                .map(|&(start, end)| u64::from(end - start))
-                .sum::<u64>()
-        })
-        .collect::<Vec<_>>();
     let mut current_pressure = vec![0u64; tile_count];
     for allocation in parent
         .allocations
@@ -275,13 +259,7 @@ fn balance_attention_tiles_for_parent(
         (std::cmp::Reverse(logical_pressure[usize::from(tile)]), tile)
     });
     let mut physical_tiles = (0..parent.tile_count).collect::<Vec<_>>();
-    physical_tiles.sort_unstable_by_key(|&tile| {
-        (
-            current_pressure[usize::from(tile)],
-            total_pressure[usize::from(tile)],
-            tile,
-        )
-    });
+    physical_tiles.sort_unstable_by_key(|&tile| (current_pressure[usize::from(tile)], tile));
     let mut mapping = vec![0u16; tile_count];
     for (logical, physical) in logical_tiles.into_iter().zip(physical_tiles) {
         mapping[usize::from(logical)] = physical;
@@ -2018,15 +1996,26 @@ mod tests {
         let mut parent = Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
-            allocations: vec![Allocation {
-                tensor: TensorId(100),
-                tile: 0,
-                address: 0x90000,
-                size: 0x20000,
-                live_from: 0,
-                live_until: usize::MAX,
-                kind: AllocationKind::Home,
-            }]
+            allocations: vec![
+                Allocation {
+                    tensor: TensorId(100),
+                    tile: 0,
+                    address: 0x90000,
+                    size: 0x20000,
+                    live_from: 1,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                },
+                Allocation {
+                    tensor: TensorId(101),
+                    tile: 1,
+                    address: 0x90000,
+                    size: 0x30000,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                },
+            ]
             .into(),
             tile_count: 4,
             peak_sram: BTreeMap::new(),
