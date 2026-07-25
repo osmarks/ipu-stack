@@ -1818,6 +1818,9 @@ fn relocation_memory_constraints(
     }
 
     let mut constraints = RelocationMemoryConstraints::default();
+    for &access in &resolved.accesses {
+        allocation_endpoint(graph, access, &mut constraints.access_extents)?;
+    }
     for &class in &resolved.classes {
         let endpoint = allocation_endpoint(graph, class.operand, &mut constraints.access_extents)?;
         match (class.class, endpoint) {
@@ -4053,9 +4056,12 @@ fn merge_kernel_memory_constraints(
 ) -> ipu_compiler::ResolvedKernelMemoryConstraints {
     let mut merged = ipu_compiler::ResolvedKernelMemoryConstraints::default();
     for mut constraints in constraints {
+        merged.accesses.append(&mut constraints.accesses);
         merged.classes.append(&mut constraints.classes);
         merged.separations.append(&mut constraints.separations);
     }
+    merged.accesses.sort_unstable();
+    merged.accesses.dedup();
     merged.classes.sort_unstable();
     merged.classes.dedup();
     merged.separations.sort_unstable();
@@ -4089,6 +4095,9 @@ fn validate_kernel_memory_constraints(
         }
         Ok(())
     };
+    for &access in &constraints.accesses {
+        validate_address(access)?;
+    }
     for class in &constraints.classes {
         validate_address(class.operand)?;
         match class.class {
@@ -4128,6 +4137,32 @@ fn validate_kernel_memory_constraints(
                 separation.first.address.saturating_add(separation.first.bytes),
                 separation.second.address,
                 separation.second.address.saturating_add(separation.second.bytes),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_kernel_accesses_against_static_data(
+    constraints: &ipu_compiler::ResolvedKernelMemoryConstraints,
+    static_ranges: &[Vec<(u32, u32)>],
+) -> Result<()> {
+    for access in &constraints.accesses {
+        let end = access
+            .address
+            .checked_add(access.bytes)
+            .ok_or("kernel operand span overflows tile address space")?;
+        let ranges = static_ranges
+            .get(usize::from(access.tile))
+            .ok_or("kernel operand references a tile outside the static layout")?;
+        if let Some(&(start, stop)) = ranges
+            .iter()
+            .find(|&&(start, stop)| ranges_overlap(access.address, end, start, stop))
+        {
+            return Err(format!(
+                "kernel operand on tile {} at 0x{:x}..0x{end:x} overlaps static runtime data at 0x{start:x}..0x{stop:x}",
+                access.tile, access.address,
             )
             .into());
         }
@@ -4208,6 +4243,7 @@ fn package_graph_impl_attempt(
         (programs, plans, memory_constraints)
     };
     info!(
+        memory_accesses = resolved_memory_constraints.accesses.len(),
         memory_classes = resolved_memory_constraints.classes.len(),
         memory_separations = resolved_memory_constraints.separations.len(),
         "resolved kernel memory constraints"
@@ -5545,6 +5581,10 @@ fn package_graph_impl_attempt(
     validate_kernel_memory_constraints(
         &resolved_memory_constraints,
         &executable_element_reservations,
+    )?;
+    validate_kernel_accesses_against_static_data(
+        &resolved_memory_constraints,
+        &static_relocation_reservations,
     )?;
     programs
         .par_iter()
@@ -7642,6 +7682,12 @@ mod tests {
             host_outputs: Vec::new(),
         };
         let resolved = ipu_compiler::ResolvedKernelMemoryConstraints {
+            accesses: vec![ipu_compiler::ResolvedMemoryOperand {
+                allocation: Some(0),
+                tile: 0,
+                address: 0x80000,
+                bytes: access_bytes,
+            }],
             classes: vec![ipu_compiler::ResolvedMemoryClassConstraint {
                 operand: ipu_compiler::ResolvedMemoryOperand {
                     allocation: Some(0),
@@ -7682,15 +7728,37 @@ mod tests {
     }
 
     #[test]
+    fn kernel_access_spans_cannot_overlap_static_runtime_data() {
+        let constraints = ipu_compiler::ResolvedKernelMemoryConstraints {
+            accesses: vec![ipu_compiler::ResolvedMemoryOperand {
+                allocation: None,
+                tile: 3,
+                address: 0x80100,
+                bytes: 0x80,
+            }],
+            classes: Vec::new(),
+            separations: Vec::new(),
+        };
+        let mut static_ranges = vec![Vec::new(); 4];
+        static_ranges[3].push((0x80140, 0x80200));
+
+        let error = validate_kernel_accesses_against_static_data(&constraints, &static_ranges)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overlaps static runtime data"));
+    }
+
+    #[test]
     fn compaction_preserves_kernel_memory_constraints_and_static_access_spans() {
         let topology = Topology::c600();
         let output = ipu_compiler::TensorId(1);
         let input = ipu_compiler::TensorId(2);
-        let unrelated = ipu_compiler::TensorId(3);
+        let right = ipu_compiler::TensorId(3);
+        let unrelated = ipu_compiler::TensorId(4);
         let command = Arc::new(ipu_compiler::KernelCommand {
             tile: 0,
             output,
-            inputs: vec![input],
+            inputs: vec![input, right],
             arguments: Vec::new(),
             specialization: Arc::new(ipu_compiler::SpecializationKey {
                 operation: "gemm_f16_accumulate_small_rows".into(),
@@ -7736,6 +7804,15 @@ mod tests {
                         kind: ipu_compiler::AllocationKind::Home,
                     },
                     ipu_compiler::Allocation {
+                        tensor: right,
+                        tile: 0,
+                        address: 0x84000,
+                        size: 16 * 16 * 2,
+                        live_from: 0,
+                        live_until: 2,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
                         tensor: unrelated,
                         tile: 0,
                         address: 0x8c000,
@@ -7764,7 +7841,7 @@ mod tests {
                     phase_tile_command_index: 0,
                     command,
                     output_address: 0x80000,
-                    input_addresses: smallvec::smallvec![0x88000],
+                    input_addresses: smallvec::smallvec![0x88000, 0x84000],
                 },
             )],
         }];

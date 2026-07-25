@@ -94,16 +94,24 @@ fn main() {
 
 fn run_template_patch(objects: &[Vec<u8>], bootloader: &[u8], configuration: &[u8], device: &str) {
     const TILE: u16 = 17;
-    const CALLS: usize = 130;
+    const CALLS: usize = 2048;
     const INSTANCES: usize = 27;
+    const OUTPUT_ADDRESS: u32 = 0xd0000;
+    const LEFT_ADDRESS: u32 = 0xd2000;
+    const RIGHT_ADDRESS: u32 = 0xd4000;
+    const OUTPUT_TENSOR: TensorId = TensorId(0);
+    const LEFT_TENSOR: TensorId = TensorId(1);
+    const RIGHT_TENSOR: TensorId = TensorId(2);
     let topology = ipu_exchange::Topology::c600();
     let mut rng = fastrand::Rng::with_seed(0x7465_6d70_6c61_7465);
     let mut phases = Vec::new();
-    let mut allocations = Vec::new();
-    let mut initial_buffers = Vec::new();
-    let mut outputs = Vec::new();
-    let mut expected = Vec::new();
-    let idle_tensor_base = INSTANCES * CALLS * 3;
+    let bytes = u32::try_from(CALLS * 4).unwrap();
+    let mut allocations = vec![
+        home(OUTPUT_TENSOR, TILE, OUTPUT_ADDRESS, bytes),
+        home(LEFT_TENSOR, TILE, LEFT_ADDRESS, bytes),
+        home(RIGHT_TENSOR, TILE, RIGHT_ADDRESS, bytes),
+    ];
+    let idle_tensor_base = 3 + INSTANCES * CALLS * 3;
     for tile in 0..TILE_COUNT {
         if tile != TILE {
             allocations.push(home(
@@ -114,46 +122,73 @@ fn run_template_patch(objects: &[Vec<u8>], bootloader: &[u8], configuration: &[u
             ));
         }
     }
+    let left_values = (0..CALLS).map(|_| rng.u32(..)).collect::<Vec<_>>();
+    let right_values = (0..CALLS).map(|_| rng.u32(..)).collect::<Vec<_>>();
+    let initial_buffers = vec![
+        InitialBuffer {
+            tile: TILE,
+            address: OUTPUT_ADDRESS,
+            words: vec![0; CALLS],
+        },
+        InitialBuffer {
+            tile: TILE,
+            address: LEFT_ADDRESS,
+            words: left_values.clone(),
+        },
+        InitialBuffer {
+            tile: TILE,
+            address: RIGHT_ADDRESS,
+            words: right_values.clone(),
+        },
+    ];
+    let mut expected = vec![0; CALLS];
+    let mut next_tensor = 3usize;
     for instance in 0..INSTANCES {
-        let mut commands = Vec::with_capacity(CALLS + usize::from(TILE_COUNT) - 1);
+        let mut commands = Vec::with_capacity(CALLS);
         for call in 0..CALLS {
-            let call_offset = u32::try_from(call).unwrap() * 0x30;
-            let base = if call.is_multiple_of(2) {
-                0x60000 + u32::try_from(instance).unwrap() * 0x2000 + call_offset
-            } else {
-                let slot = (instance * 11) % INSTANCES;
-                0xa0000 + u32::try_from(slot).unwrap() * 0x2000 + call_offset
-            };
-            let tensor = (instance * CALLS + call) * 3;
-            let output = TensorId(tensor);
-            let left = TensorId(tensor + 1);
-            let right = TensorId(tensor + 2);
+            let output_slot = (call + instance * 37) % CALLS;
+            let left_slot = (call + instance * 73) % CALLS;
+            let right_slot = (call + instance * 109) % CALLS;
+            let output = TensorId(next_tensor);
+            let left = TensorId(next_tensor + 1);
+            let right = TensorId(next_tensor + 2);
+            next_tensor += 3;
             allocations.extend([
-                home(output, TILE, base, 4),
-                home(left, TILE, base + 0x10, 4),
-                home(right, TILE, base + 0x20, 4),
-            ]);
-            let left_value = rng.u32(..);
-            let right_value = rng.u32(..);
-            expected.push(left_value.wrapping_add(right_value));
-            initial_buffers.extend([
-                InitialBuffer {
+                Allocation {
+                    tensor: output,
                     tile: TILE,
-                    address: base + 0x10,
-                    words: vec![left_value],
+                    address: OUTPUT_ADDRESS + u32::try_from(output_slot * 4).unwrap(),
+                    size: 4,
+                    live_from: instance,
+                    live_until: instance + 1,
+                    kind: AllocationKind::HomeAlias {
+                        source: OUTPUT_TENSOR,
+                    },
                 },
-                InitialBuffer {
+                Allocation {
+                    tensor: left,
                     tile: TILE,
-                    address: base + 0x20,
-                    words: vec![right_value],
+                    address: LEFT_ADDRESS + u32::try_from(left_slot * 4).unwrap(),
+                    size: 4,
+                    live_from: instance,
+                    live_until: instance + 1,
+                    kind: AllocationKind::HomeAlias {
+                        source: LEFT_TENSOR,
+                    },
+                },
+                Allocation {
+                    tensor: right,
+                    tile: TILE,
+                    address: RIGHT_ADDRESS + u32::try_from(right_slot * 4).unwrap(),
+                    size: 4,
+                    live_from: instance,
+                    live_until: instance + 1,
+                    kind: AllocationKind::HomeAlias {
+                        source: RIGHT_TENSOR,
+                    },
                 },
             ]);
-            outputs.push(RegionSlice {
-                tile: u32::from(topology.physical(TILE).unwrap()),
-                tile_address: base,
-                file_offset: u64::try_from(expected.len() * 4 - 4).unwrap(),
-                size: 4,
-            });
+            expected[output_slot] = left_values[left_slot].wrapping_add(right_values[right_slot]);
             commands.push(Arc::new(KernelCommand {
                 tile: TILE,
                 output,
@@ -218,7 +253,12 @@ fn run_template_patch(objects: &[Vec<u8>], bootloader: &[u8], configuration: &[u
             name: "template-results".into(),
             dtype: "u32".into(),
             shape: vec![u32::try_from(expected.len()).unwrap()],
-            slices: outputs,
+            slices: vec![RegionSlice {
+                tile: u32::from(topology.physical(TILE).unwrap()),
+                tile_address: OUTPUT_ADDRESS,
+                file_offset: 0,
+                size: u64::from(bytes),
+            }],
         }],
         host_inputs: Vec::new(),
         host_outputs: Vec::new(),

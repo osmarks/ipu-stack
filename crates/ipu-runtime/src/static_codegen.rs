@@ -11,6 +11,9 @@ const INCOMING_DCOUNT: u8 = 0xa6;
 const INCOMING_SBASE: u8 = 0xa7;
 const KERNEL_FIRST_INPUT_REGISTER: u8 = 3;
 const KERNEL_LAST_VALUE_REGISTER: u8 = 9;
+const DYNAMIC_KERNEL_TARGET_REGISTER: u8 = 0;
+const TEMPLATE_CODE_SEGMENT_TARGET_BYTES: usize =
+    ipu_package::TILE_MEMORY_ELEMENT_SIZE as usize / 2;
 
 pub(crate) const WORKER_BARRIER: &str = "ipu_stack_static_worker_barrier";
 pub(crate) const COMPLETE: &str = "ipu_stack_static_complete";
@@ -596,6 +599,244 @@ pub(crate) fn validate_template_kernel_operands(template: &StaticTemplatePlan) -
     Ok(())
 }
 
+fn validate_template_compute_expansion(
+    program: &LoweredTileProgram,
+    template: &StaticTemplatePlan,
+) -> Result<()> {
+    for (instance, steps) in template.instance_steps.iter().enumerate() {
+        let expected = program.steps[steps.clone()]
+            .iter()
+            .filter_map(|step| {
+                let LoweredTileStep::Compute(command) = step else {
+                    return None;
+                };
+                Some((
+                    command.specialization.operation.as_ref(),
+                    command.specialization.abi,
+                    command.input_addresses.len(),
+                    std::iter::once(command.output_address)
+                        .chain(command.input_addresses.iter().copied())
+                        .chain(command.arguments.iter().copied())
+                        .collect::<Vec<_>>(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut actual = Vec::with_capacity(expected.len());
+        for step in &template.steps {
+            let StaticTemplateStep::Compute {
+                operation,
+                abi,
+                input_count,
+                operands,
+                kernel,
+                condition,
+            } = step
+            else {
+                continue;
+            };
+            if let Some(condition) = condition {
+                if template_instance_value(template, instance, *condition)? == 0 {
+                    continue;
+                }
+            }
+            let operation = if let Some(kernel) = kernel {
+                let StaticTemplateRecordWord::Symbol(symbol) =
+                    template_instance_word(template, instance, *kernel)?
+                else {
+                    return Err("static template dynamic kernel is not symbolic".into());
+                };
+                symbol
+                    .strip_prefix("ipu_stack_")
+                    .ok_or("static template dynamic kernel has no runtime prefix")?
+                    .to_string()
+            } else {
+                operation.clone()
+            };
+            actual.push((
+                operation,
+                *abi,
+                *input_count,
+                operands
+                    .iter()
+                    .map(|&operand| template_instance_value(template, instance, operand))
+                    .collect::<Result<Vec<_>>>()?,
+            ));
+        }
+        if actual.len() != expected.len() {
+            return Err(format!(
+                "static template {} instance {instance} expands to {} compute calls, expected {}",
+                template.name,
+                actual.len(),
+                expected.len(),
+            )
+            .into());
+        }
+        for (call, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            if actual.0 != expected.0
+                || actual.1 != expected.1
+                || actual.2 != expected.2
+                || actual.3 != expected.3
+            {
+                return Err(format!(
+                    "static template {} instance {instance} compute call {call} does not match the lowered tile program",
+                    template.name,
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_template_exchange_expansion(
+    program: &LoweredTileProgram,
+    template: &StaticTemplatePlan,
+    plan_by_step: &[Option<u32>],
+    row_by_step: &[Option<&[u32]>],
+    patch_by_step: &[Option<StaticPlanPatch>],
+) -> Result<()> {
+    let expected = template
+        .instance_steps
+        .iter()
+        .map(|steps| {
+            steps
+                .clone()
+                .filter(|&step| matches!(program.steps[step], LoweredTileStep::Exchange { .. }))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let actual = template
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            StaticTemplateStep::Exchange { .. } => Some(step),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if expected.iter().any(|steps| steps.len() != actual.len()) {
+        return Err(format!(
+            "static template {} exchange count differs from the lowered tile program",
+            template.name,
+        )
+        .into());
+    }
+
+    for (exchange, &actual) in actual.iter().enumerate() {
+        let StaticTemplateStep::Exchange {
+            sender_word_offset,
+            sender_address,
+            sender_instruction,
+            plan_words,
+            plan_address,
+            active,
+        } = actual
+        else {
+            unreachable!();
+        };
+        let rows = expected
+            .iter()
+            .map(|steps| {
+                row_by_step[steps[exchange]]
+                    .ok_or_else(|| "static template exchange has no normalized row".into())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let row_words = rows.iter().map(|row| row.len()).max().unwrap_or(0);
+        for word in 0..row_words {
+            let first = rows[0].get(word).copied().unwrap_or(0);
+            let varies = rows
+                .iter()
+                .skip(1)
+                .any(|row| row.get(word).copied().unwrap_or(0) != first);
+            let represented = plan_words
+                .iter()
+                .any(|&(candidate, _)| usize::from(candidate) == word);
+            if varies != represented {
+                return Err(format!(
+                    "static template {} exchange {exchange} dynamic plan word {word} representation differs from the lowered tile program",
+                    template.name,
+                )
+                .into());
+            }
+        }
+
+        for (instance, steps) in expected.iter().enumerate() {
+            let step = steps[exchange];
+            let expected_row = rows[instance];
+            let expected_address =
+                plan_by_step[step].ok_or("static template exchange has no plan address")?;
+            let LoweredTileStep::Exchange { row, .. } = &program.steps[step] else {
+                unreachable!();
+            };
+            if template_instance_value(template, instance, *plan_address)? != expected_address
+                || template_instance_value(template, instance, *active)?
+                    != u32::from(row.first() != Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION))
+            {
+                return Err(format!(
+                    "static template {} instance {instance} exchange {exchange} control does not match the lowered tile program",
+                    template.name,
+                )
+                .into());
+            }
+            for &(word, value) in plan_words {
+                if template_instance_value(template, instance, value)?
+                    != expected_row.get(usize::from(word)).copied().unwrap_or(0)
+                {
+                    return Err(format!(
+                        "static template {} instance {instance} exchange {exchange} plan word {word} does not match the lowered tile program",
+                        template.name,
+                    )
+                    .into());
+                }
+            }
+
+            let expected_patch = patch_by_step[step];
+            match sender_instruction {
+                Some(instruction) => {
+                    if template_instance_value(template, instance, *instruction)?
+                        != expected_patch.map_or(0, |patch| patch.instruction)
+                    {
+                        return Err(format!(
+                            "static template {} instance {instance} exchange {exchange} sender instruction does not match the lowered tile program",
+                            template.name,
+                        )
+                        .into());
+                    }
+                }
+                None if expected_patch.is_some() => {
+                    return Err(format!(
+                        "static template {} instance {instance} exchange {exchange} omits a sender patch",
+                        template.name,
+                    )
+                    .into());
+                }
+                None => {}
+            }
+            if let Some(patch) = expected_patch {
+                if let Some(address) = sender_address {
+                    if template_instance_value(template, instance, *address)? != patch.word_address
+                    {
+                        return Err(format!(
+                            "static template {} instance {instance} exchange {exchange} sender address does not match the lowered tile program",
+                            template.name,
+                        )
+                        .into());
+                    }
+                } else if *sender_word_offset != Some(patch.word_offset)
+                    || expected_address.checked_add(u32::from(patch.word_offset) * 4)
+                        != Some(patch.word_address)
+                {
+                    return Err(format!(
+                        "static template {} instance {instance} exchange {exchange} sender offset does not address the lowered plan word",
+                        template.name,
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn template_patch_ranges(record_words: usize, split: usize) -> Vec<Range<usize>> {
     [0..split, split..record_words]
         .into_iter()
@@ -1008,7 +1249,7 @@ pub(crate) fn plan_static_templates(
                     .ok_or("static template patch table size overflow")?,
             )
             .ok_or("static template patch table address overflow")?;
-        templates.push(StaticTemplatePlan {
+        let template = StaticTemplatePlan {
             name: region.name.clone(),
             instance_steps,
             record_addresses: vec![primary_address; records.rows.len()],
@@ -1022,7 +1263,16 @@ pub(crate) fn plan_static_templates(
             shared: records.shared,
             exchange_step_count: 0,
             steps: template_steps,
-        });
+        };
+        validate_template_compute_expansion(program, &template)?;
+        validate_template_exchange_expansion(
+            program,
+            &template,
+            &plan_by_step,
+            &row_by_step,
+            &patch_by_step,
+        )?;
+        templates.push(template);
     }
     Ok((templates, cursor))
 }
@@ -1679,7 +1929,7 @@ pub(crate) fn emit(
             let first = &template.instance_steps[0];
             &profile.after_step[first.clone()]
         });
-        emit_static_template_body(
+        let segments = emit_static_template_body(
             &mut code,
             template,
             symbols,
@@ -1696,7 +1946,7 @@ pub(crate) fn emit(
             profile_after_sync,
             profile_after_step,
         )?;
-        object_words.push(start..code.words.len());
+        object_words.extend(segments);
     }
     for (call, template) in template_calls {
         let target = generated_address(generated_addresses, template_bodies[template])?;
@@ -1783,7 +2033,9 @@ fn emit_static_template_body(
     record_addresses_in_parent_frame: bool,
     profile_after_sync: Option<&[bool]>,
     profile_after_step: Option<&[bool]>,
-) -> Result<()> {
+) -> Result<Vec<Range<usize>>> {
+    let mut segments = Vec::new();
+    let mut segment_start = code.words.len();
     code.add_immediate(11, 11, -16)?;
     if record_addresses_in_parent_frame {
         code.ld32(2, 11, 15, 4)?;
@@ -1793,6 +2045,17 @@ fn emit_static_template_body(
     code.st32(3, 11, 15, 1)?;
     code.st32(9, 11, 15, 2)?;
     for (step_index, planned) in template.steps.iter().enumerate() {
+        if (code.words.len() - segment_start) * 4 >= TEMPLATE_CODE_SEGMENT_TARGET_BYTES {
+            let next_segment_word = code
+                .words
+                .len()
+                .checked_add(2)
+                .ok_or("generated template code offset overflow")?;
+            let next_segment = generated_address(generated_addresses, next_segment_word)?;
+            code.jump(next_segment)?;
+            segments.push(segment_start..code.words.len());
+            segment_start = code.words.len();
+        }
         match planned {
             StaticTemplateStep::Exchange {
                 sender_word_offset,
@@ -1887,16 +2150,7 @@ fn emit_static_template_body(
                     emit_template_value(
                         code,
                         *condition,
-                        0,
-                        template.shared_address,
-                        template.record_split,
-                    )?;
-                }
-                if let Some(kernel) = kernel {
-                    emit_template_value(
-                        code,
-                        *kernel,
-                        8,
+                        DYNAMIC_KERNEL_TARGET_REGISTER,
                         template.shared_address,
                         template.record_split,
                     )?;
@@ -1918,11 +2172,18 @@ fn emit_static_template_body(
                 } else {
                     None
                 };
-                if kernel.is_some() {
+                if let Some(kernel) = kernel {
+                    emit_template_value(
+                        code,
+                        *kernel,
+                        0,
+                        template.shared_address,
+                        template.record_split,
+                    )?;
                     let return_address =
                         generated_address(generated_addresses, code.words.len() + 2)?;
                     code.setzi(10, return_address)?;
-                    code.branch(8)?;
+                    code.branch(DYNAMIC_KERNEL_TARGET_REGISTER)?;
                 } else {
                     code.call(symbol(symbols, &format!("ipu_stack_{operation}"))?, 10)?;
                 }
@@ -1942,7 +2203,19 @@ fn emit_static_template_body(
     code.ld32(9, 11, 15, 2)?;
     code.add_immediate(11, 11, 16)?;
     code.branch(9)?;
-    Ok(())
+    segments.push(segment_start..code.words.len());
+    for segment in &segments {
+        let bytes = segment.len() * 4;
+        if bytes > ipu_package::TILE_MEMORY_ELEMENT_SIZE as usize {
+            return Err(format!(
+                "static template {} has a {bytes}-byte code segment, exceeding the {}-byte executable memory element",
+                template.name,
+                ipu_package::TILE_MEMORY_ELEMENT_SIZE
+            )
+            .into());
+        }
+    }
+    Ok(segments)
 }
 
 fn generated_address(addresses: GeneratedAddressMap<'_>, word: usize) -> Result<u32> {
