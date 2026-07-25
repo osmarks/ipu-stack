@@ -2020,6 +2020,7 @@ fn relocation_memory_constraints(
     Ok(constraints)
 }
 
+#[cfg(test)]
 fn compact_transient_allocations_around(
     graph: &mut ExecutableGraph,
     topology: &Topology,
@@ -4910,29 +4911,45 @@ fn package_graph_impl_attempt(
                             .collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>();
-                let moved = if move_resident {
-                    compact_all_allocations_around(
-                        &mut graph,
-                        &topology,
-                        &reservations,
-                        Some(&resolved_memory_constraints),
-                        "measured executable placement",
-                    )?
+                let (moved, moved_resident) = if move_resident {
+                    (
+                        compact_all_allocations_around(
+                            &mut graph,
+                            &topology,
+                            &reservations,
+                            Some(&resolved_memory_constraints),
+                            "measured executable placement",
+                        )?,
+                        true,
+                    )
                 } else {
-                    repack_transient_allocations_around(
+                    match repack_transient_allocations_around(
                         &mut graph,
                         &topology,
                         &reservations,
                         Some(&resolved_memory_constraints),
                         "measured executable placement",
-                    )?
+                    ) {
+                        Ok(moved) => (moved, false),
+                        Err(_) if graph.memory_policy.is_some() => (
+                            compact_all_allocations_around(
+                                &mut graph,
+                                &topology,
+                                &reservations,
+                                Some(&resolved_memory_constraints),
+                                "measured executable placement",
+                            )?,
+                            true,
+                        ),
+                        Err(error) => return Err(error),
+                    }
                 };
                 if moved == 0 {
                     return Err(error);
                 }
                 info!(
                     moved,
-                    move_resident, "relocated transient tensors for measured executable images"
+                    moved_resident, "relocated graph tensors for measured executable images"
                 );
                 if !profile_code.is_empty() {
                     return Err(Box::new(ProfileRelayout { graph }));
