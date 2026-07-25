@@ -462,6 +462,10 @@ pub struct ResolvedMemoryClassConstraint {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResolvedKernelMemoryConstraints {
+    /// Every operand span accessed by a kernel with a hardware-specific memory
+    /// ABI. These spans reserve physical memory elements independently of any
+    /// class or separation requirements.
+    pub accesses: Vec<ResolvedMemoryOperand>,
     pub classes: Vec<ResolvedMemoryClassConstraint>,
     pub separations: Vec<ResolvedMemorySeparation>,
 }
@@ -1670,12 +1674,29 @@ pub fn allocate_from_occupied(
     constraint: MemoryConstraint,
 ) -> Result<u32, CompileError> {
     normalize_occupied_intervals(occupied);
+    let address = find_unoccupied_address(occupied, size, constraint)
+        .ok_or_else(|| CompileError::Memory(format!("no {size}-byte region in SRAM arena")))?;
+    let end = address + size;
+    insert_occupied_interval(occupied, (address, end));
+    Ok(address)
+}
+
+fn find_unoccupied_address(
+    occupied: &[(u32, u32)],
+    size: u32,
+    constraint: MemoryConstraint,
+) -> Option<u32> {
     let alignment = constraint.alignment;
-    let address = match constraint.placement {
+    match constraint.placement {
         MemoryPlacement::Low => {
             let mut cursor = constraint.base;
             let mut found = None;
             for &(start, end) in occupied.iter() {
+                let start = start.max(constraint.base);
+                let end = end.min(constraint.limit);
+                if start >= end {
+                    continue;
+                }
                 if cursor < start {
                     let candidate = align_u32(cursor, alignment);
                     if candidate
@@ -1700,6 +1721,11 @@ pub fn allocate_from_occupied(
             let mut cursor = constraint.limit;
             let mut found = None;
             for &(start, end) in occupied.iter().rev() {
+                let start = start.max(constraint.base);
+                let end = end.min(constraint.limit);
+                if start >= end {
+                    continue;
+                }
                 if end < cursor {
                     let candidate = cursor
                         .checked_sub(size)
@@ -1719,10 +1745,6 @@ pub fn allocate_from_occupied(
             })
         }
     }
-    .ok_or_else(|| CompileError::Memory(format!("no {size}-byte region in SRAM arena")))?;
-    let end = address + size;
-    insert_occupied_interval(occupied, (address, end));
-    Ok(address)
 }
 
 pub fn allocate_from_occupied_arenas(
@@ -1740,16 +1762,8 @@ pub fn allocate_from_occupied_arenas(
     }
     normalize_occupied_intervals(occupied);
     for arena in arenas {
-        let mut arena_occupied = occupied
-            .iter()
-            .filter_map(|&(start, end)| {
-                let start = start.max(arena.base);
-                let end = end.min(arena.limit);
-                (start < end).then_some((start, end))
-            })
-            .collect::<Vec<_>>();
-        let address = allocate_from_occupied(
-            &mut arena_occupied,
+        let Some(address) = find_unoccupied_address(
+            occupied,
             size,
             MemoryConstraint {
                 base: arena.base,
@@ -1757,21 +1771,12 @@ pub fn allocate_from_occupied_arenas(
                 alignment,
                 placement: arena.placement,
             },
-        );
-        let Ok(address) = address else {
+        ) else {
             continue;
         };
         let end = address
             .checked_add(size)
             .ok_or_else(|| CompileError::Memory("SRAM arena allocation overflow".into()))?;
-        if let Some(&(start, occupied_end)) = occupied
-            .iter()
-            .find(|&&(start, occupied_end)| address < occupied_end && start < end)
-        {
-            return Err(CompileError::Memory(format!(
-                "SRAM arena allocator selected occupied range 0x{address:x}..0x{end:x} overlapping 0x{start:x}..0x{occupied_end:x}"
-            )));
-        }
         insert_occupied_interval(occupied, (address, end));
         return Ok(address);
     }
@@ -4598,6 +4603,7 @@ impl Schedule {
         }
 
         self.allocations.with_index(|index| {
+            let mut accesses = HashSet::default();
             let mut separations = HashSet::default();
             let mut classes = HashSet::default();
             for program in programs {
@@ -4605,6 +4611,20 @@ impl Schedule {
                     let LoweredTileStep::Compute(command) = step else {
                         continue;
                     };
+                    if matches!(command.specialization.abi, KernelAbi::Pace { .. }) {
+                        for operand in [
+                            KernelOperand::Output,
+                            KernelOperand::Input(0),
+                            KernelOperand::Input(1),
+                        ] {
+                            accesses.insert(resolve_command_operand(
+                                &self.allocations,
+                                index,
+                                command,
+                                operand,
+                            )?);
+                        }
+                    }
                     for constraint in command.specialization.memory_constraints() {
                         match constraint {
                             KernelMemoryConstraint::InClass(operand, class) => {
@@ -4649,7 +4669,10 @@ impl Schedule {
             separations.sort_unstable();
             let mut classes = classes.into_iter().collect::<Vec<_>>();
             classes.sort_unstable();
+            let mut accesses = accesses.into_iter().collect::<Vec<_>>();
+            accesses.sort_unstable();
             Ok(ResolvedKernelMemoryConstraints {
+                accesses,
                 classes,
                 separations,
             })
@@ -6922,6 +6945,63 @@ mod tests {
     }
 
     #[test]
+    fn resolved_pace_accesses_include_unconstrained_right_operand() {
+        let plan = plan_blocked_gemm(BlockedGemmConfig {
+            rows: 12,
+            inner_dimension: 64,
+            columns: 64,
+            block_dimension: 64,
+            inner_block_dimension: 64,
+            row_block_dimension: 12,
+            tile_count: 4,
+            data_base: 0xa0000,
+            data_limit: 0xe8000,
+            data_type: GemmDataType::F16,
+            retain_profile_metadata: false,
+        })
+        .unwrap();
+        let programs = plan
+            .schedule
+            .lower_tile_programs_for_codegen(&Topology::c600())
+            .unwrap();
+        let command = programs[0]
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                LoweredTileStep::Compute(command)
+                    if matches!(command.specialization.abi, KernelAbi::Pace { .. }) =>
+                {
+                    Some(command)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let right = ResolvedMemoryOperand {
+            allocation: plan.schedule.allocations.iter().position(|allocation| {
+                allocation.tensor == command.inputs[1]
+                    && allocation.tile == command.tile
+                    && allocation.address <= command.input_addresses[1]
+                    && command.input_addresses[1] < allocation.address + allocation.size
+            }),
+            tile: command.tile,
+            address: command.input_addresses[1],
+            bytes: command
+                .specialization
+                .operand_access_bytes(KernelOperand::Input(1))
+                .unwrap(),
+        };
+
+        let resolved = plan.schedule.resolve_memory_constraints(&programs).unwrap();
+        assert!(resolved.accesses.contains(&right));
+        assert!(
+            !resolved
+                .classes
+                .iter()
+                .any(|constraint| constraint.operand == right)
+        );
+    }
+
+    #[test]
     fn fp8_weight_storage_expands_transiently_before_fp16_gemm() {
         let mut plan = plan_blocked_gemm(BlockedGemmConfig {
             // More output blocks than tiles force the same right-hand block to
@@ -7948,6 +8028,58 @@ mod tests {
         let address = allocate_from_occupied_arenas(&mut occupied, 4096, &arenas, 32).unwrap();
 
         assert_eq!(address, 0x79b00);
+    }
+
+    #[test]
+    fn arena_allocator_matches_clipped_interval_reference() {
+        let mut rng = fastrand::Rng::with_seed(0x6172_656e_615f_7363);
+        for _ in 0..1_000 {
+            let arenas = [
+                MemoryArena::low(0x1000, 0x1800),
+                MemoryArena::high(0x2000, 0x2c00),
+            ];
+            let mut occupied = (0..rng.usize(0..40))
+                .map(|_| {
+                    let start = rng.u32(0x800..0x3400) & !7;
+                    let end = start + rng.u32(1..0x300);
+                    (start, end)
+                })
+                .collect::<Vec<_>>();
+            normalize_occupied_intervals(&mut occupied);
+            let mut reference = occupied.clone();
+            let size = rng.u32(1..0x500);
+            let alignment = 1 << rng.u32(0..7);
+
+            let expected = arenas.iter().find_map(|arena| {
+                let mut clipped = reference
+                    .iter()
+                    .filter_map(|&(start, end)| {
+                        let start = start.max(arena.base);
+                        let end = end.min(arena.limit);
+                        (start < end).then_some((start, end))
+                    })
+                    .collect::<Vec<_>>();
+                allocate_from_occupied(
+                    &mut clipped,
+                    size,
+                    MemoryConstraint {
+                        base: arena.base,
+                        limit: arena.limit,
+                        alignment,
+                        placement: arena.placement,
+                    },
+                )
+                .ok()
+            });
+            if let Some(address) = expected {
+                insert_occupied_interval(&mut reference, (address, address + size));
+            }
+
+            let actual =
+                allocate_from_occupied_arenas(&mut occupied, size, &arenas, alignment).ok();
+            assert_eq!(actual, expected);
+            assert_eq!(occupied, reference);
+        }
     }
 
     #[test]
