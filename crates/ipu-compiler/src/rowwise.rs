@@ -373,12 +373,19 @@ pub fn append_c16_to_a16_blocks_gelu_f16_in_arenas(
     );
     for block in source {
         let bytes = u32::from(block.rows) * u32::from(block.columns) * 2;
-        let address = allocate_from_occupied_arenas(
-            &mut occupied[usize::from(block.tile)],
-            bytes,
-            arenas,
-            8,
-        )?;
+        let address =
+            allocate_from_occupied_arenas(&mut occupied[usize::from(block.tile)], bytes, arenas, 8)
+                .map_err(|error| {
+                    CompileError::Memory(format!(
+                        "cannot place {bytes}-byte blocked GeLU output on tile {} \
+                 for rows {}..{} and columns {}..{} at phase {phase}: {error}",
+                        block.tile,
+                        block.row_start,
+                        block.row_start + block.rows,
+                        block.column_start,
+                        block.column_start + block.columns,
+                    ))
+                })?;
         let tensor = TensorId(next_tensor);
         next_tensor += 1;
         let placement = BlockPlacement {
@@ -1183,36 +1190,59 @@ fn append_affine_layer_norm_f16_impl(
             resident_pressure[usize::from(allocation.tile)] += u64::from(allocation.size);
         }
     }
-    let owner = input
-        .iter()
-        .min_by_key(|candidate| {
-            (
-                resident_pressure[usize::from(candidate.tile)],
-                candidate.tile,
-            )
-        })
-        .unwrap();
     let constraint = MemoryConstraint {
         base: config.data_base,
         limit: config.data_limit,
         alignment: 8,
         placement: MemoryPlacement::High,
     };
-    let affine_address = schedule.allocations.find_free_region_in_arenas(
-        owner.tile,
-        affine_bytes,
+    let resident_base = memory
+        .resident
+        .iter()
+        .map(|arena| arena.base)
+        .min()
+        .unwrap();
+    let resident_limit = memory
+        .resident
+        .iter()
+        .map(|arena| arena.limit)
+        .max()
+        .unwrap();
+    let resident_occupied = schedule.allocations.occupied_intervals_by_tile(
+        schedule.tile_count,
         0,
         usize::MAX,
-        &memory.resident,
-        8,
-    )?;
+        resident_base,
+        resident_limit,
+    );
+    let input_tiles = input.iter().map(|shard| shard.tile).collect::<HashSet<_>>();
+    let (owner_tile, affine_address) = (0..schedule.tile_count)
+        .filter_map(|tile| {
+            let mut occupied = resident_occupied[usize::from(tile)].clone();
+            let address =
+                allocate_from_occupied_arenas(&mut occupied, affine_bytes, &memory.resident, 8)
+                    .ok()?;
+            Some((tile, address))
+        })
+        .min_by_key(|&(tile, _)| {
+            (
+                resident_pressure[usize::from(tile)],
+                !input_tiles.contains(&tile),
+                tile,
+            )
+        })
+        .ok_or_else(|| {
+            CompileError::Memory(format!(
+                "no tile can hold the {affine_bytes}-byte affine LayerNorm parameters"
+            ))
+        })?;
     let affine_tensors = [TensorId(next_tensor), TensorId(next_tensor + 1)];
     next_tensor += 2;
     let affine = affine_tensors
         .iter()
         .enumerate()
         .map(|(row, &tensor)| RowShardPlacement {
-            tile: owner.tile,
+            tile: owner_tile,
             row_start: row as u16,
             rows: 1,
             columns,
@@ -1222,7 +1252,7 @@ fn append_affine_layer_norm_f16_impl(
         .collect::<Vec<_>>();
     schedule.allocations.push(Allocation {
         tensor: affine_tensors[0],
-        tile: owner.tile,
+        tile: owner_tile,
         address: affine_address,
         size: affine_bytes,
         live_from: 0,
@@ -1231,7 +1261,7 @@ fn append_affine_layer_norm_f16_impl(
     });
     schedule.allocations.push(Allocation {
         tensor: affine_tensors[1],
-        tile: owner.tile,
+        tile: owner_tile,
         address: affine_address + affine_row_bytes,
         size: affine_row_bytes,
         live_from: 0,
@@ -1282,11 +1312,26 @@ fn append_affine_layer_norm_f16_impl(
             activation_bytes,
             &memory.transient,
             constraint.alignment,
-        )?;
-        if shard.tile != owner.tile {
+        )
+        .map_err(|error| {
+            let occupied_bytes = output_occupied[usize::from(shard.tile)]
+                .iter()
+                .map(|&(start, end)| end.saturating_sub(start))
+                .sum::<u32>();
+            CompileError::Memory(format!(
+                "cannot place {activation_bytes}-byte LayerNorm output on tile {} \
+                 for rows {}..{} at phase {compute_phase} \
+                 ({occupied_bytes} occupied bytes across {} ranges): {error}",
+                shard.tile,
+                shard.row_start,
+                shard.row_start + shard.rows,
+                output_occupied[usize::from(shard.tile)].len(),
+            ))
+        })?;
+        if shard.tile != owner_tile {
             for (row, &tensor) in affine_tensors.iter().enumerate() {
                 transfers.push(Transfer {
-                    source_tile: owner.tile,
+                    source_tile: owner_tile,
                     destination_tile: shard.tile,
                     tensor,
                     bytes: affine_row_bytes,
@@ -1569,6 +1614,80 @@ mod tests {
                 source: affine_owner.tensor
             }
         );
+        schedule.validate_allocations().unwrap();
+    }
+
+    #[test]
+    fn affine_layer_norm_selects_a_feasible_parameter_owner() {
+        let input = (0..2)
+            .map(|tile| RowShardPlacement {
+                tile,
+                row_start: tile,
+                rows: 1,
+                columns: 64,
+                tensor: TensorId(usize::from(tile)),
+                address: 0xb0000,
+            })
+            .collect::<Vec<_>>();
+        let mut allocations = input
+            .iter()
+            .map(|shard| Allocation {
+                tensor: shard.tensor,
+                tile: shard.tile,
+                address: shard.address,
+                size: 128,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            })
+            .collect::<Vec<_>>();
+        for (index, address) in [0xc0000, 0xc0100, 0xc0200, 0xc0300].into_iter().enumerate() {
+            allocations.push(Allocation {
+                tensor: TensorId(index + 2),
+                tile: 0,
+                address,
+                size: 128,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            });
+        }
+        allocations.push(Allocation {
+            tensor: TensorId(6),
+            tile: 1,
+            address: 0xc0000,
+            size: 640,
+            live_from: 0,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        });
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: allocations.into(),
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+        let memory = MemoryPolicy {
+            resident: vec![MemoryArena::low(0xc0000, 0xc0400)],
+            transient: vec![MemoryArena::low(0xb0000, 0xb1000)],
+            resident_tile_assignment: crate::ResidentTileAssignment::Balanced,
+            resident_placement_session: None,
+        };
+
+        let appended = append_affine_layer_norm_f16_with_memory_policy(
+            &mut schedule,
+            &input,
+            AppendAffineLayerNormConfig {
+                data_base: 0xb0000,
+                data_limit: 0xc0400,
+                epsilon_bits: 1e-6f32.to_bits(),
+            },
+            &memory,
+        )
+        .unwrap();
+
+        assert!(appended.affine.iter().all(|parameter| parameter.tile == 1));
         schedule.validate_allocations().unwrap();
     }
 
