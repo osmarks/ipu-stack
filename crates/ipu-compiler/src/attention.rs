@@ -137,6 +137,7 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
     // of the producer's row shards. Preserve zero so the attention planner can
     // choose query blocking from the available tile count.
     let mut plan = plan_flash_attention(config)?;
+    balance_attention_tiles_for_parent(schedule, &mut plan, arenas)?;
     relocate_appended_attention(schedule, &mut plan, arenas)?;
     let tensor_base = schedule.allocations.next_tensor_id();
     remap_attention_tensors(&mut plan, tensor_base)?;
@@ -221,6 +222,115 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
     Ok(plan)
 }
 
+fn balance_attention_tiles_for_parent(
+    parent: &Schedule,
+    plan: &mut FlashAttentionPlan,
+    arenas: &[MemoryArena],
+) -> Result<(), CompileError> {
+    if parent.tile_count != plan.schedule.tile_count || arenas.is_empty() {
+        return Err(CompileError::Graph(
+            "attention tile balancing requires matching non-empty tile memory".into(),
+        ));
+    }
+    let tile_count = usize::from(parent.tile_count);
+    let data_base = arenas.iter().map(|arena| arena.base).min().unwrap();
+    let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
+    let occupied = parent.allocations.occupied_intervals_by_tile(
+        parent.tile_count,
+        parent.phases.len(),
+        usize::MAX,
+        data_base,
+        data_limit,
+    );
+    let total_pressure = occupied
+        .iter()
+        .map(|intervals| {
+            intervals
+                .iter()
+                .map(|&(start, end)| u64::from(end - start))
+                .sum::<u64>()
+        })
+        .collect::<Vec<_>>();
+    let mut current_pressure = vec![0u64; tile_count];
+    for allocation in parent
+        .allocations
+        .overlapping_allocations(parent.phases.len(), usize::MAX)
+    {
+        if allocation.live_from != 0
+            && allocation.address < data_limit
+            && allocation.address.saturating_add(allocation.size) > data_base
+            && !matches!(allocation.kind, AllocationKind::HomeAlias { .. })
+        {
+            current_pressure[usize::from(allocation.tile)] += u64::from(allocation.size);
+        }
+    }
+    let mut logical_pressure = vec![0u64; tile_count];
+    for allocation in &plan.schedule.allocations {
+        if !matches!(allocation.kind, AllocationKind::HomeAlias { .. }) {
+            logical_pressure[usize::from(allocation.tile)] += u64::from(allocation.size);
+        }
+    }
+    let mut logical_tiles = (0..parent.tile_count).collect::<Vec<_>>();
+    logical_tiles.sort_unstable_by_key(|&tile| {
+        (std::cmp::Reverse(logical_pressure[usize::from(tile)]), tile)
+    });
+    let mut physical_tiles = (0..parent.tile_count).collect::<Vec<_>>();
+    physical_tiles.sort_unstable_by_key(|&tile| {
+        (
+            current_pressure[usize::from(tile)],
+            total_pressure[usize::from(tile)],
+            tile,
+        )
+    });
+    let mut mapping = vec![0u16; tile_count];
+    for (logical, physical) in logical_tiles.into_iter().zip(physical_tiles) {
+        mapping[usize::from(logical)] = physical;
+    }
+    if mapping
+        .iter()
+        .enumerate()
+        .all(|(logical, &physical)| logical == usize::from(physical))
+    {
+        return Ok(());
+    }
+    let map = |tile: u16| mapping[usize::from(tile)];
+    for task in &mut plan.tasks {
+        task.tile = map(task.tile);
+    }
+    for block in &mut plan.key_values {
+        block.tile = map(block.tile);
+    }
+    for allocation in &mut plan.schedule.allocations {
+        allocation.tile = map(allocation.tile);
+    }
+    for layout in &mut plan.schedule.layouts {
+        for tile in &mut layout.tiles {
+            *tile = map(*tile);
+        }
+    }
+    for phase in &mut plan.schedule.phases {
+        match phase {
+            Phase::Exchange { transfers } => {
+                for transfer in transfers {
+                    transfer.source_tile = map(transfer.source_tile);
+                    transfer.destination_tile = map(transfer.destination_tile);
+                }
+            }
+            Phase::Compute { commands, .. } => {
+                for command in commands {
+                    let tile = command.tile;
+                    Arc::make_mut(command).tile = map(tile);
+                }
+            }
+        }
+    }
+    plan.schedule.peak_sram = std::mem::take(&mut plan.schedule.peak_sram)
+        .into_iter()
+        .map(|(tile, bytes)| (map(tile), bytes))
+        .collect();
+    Ok(())
+}
+
 fn relocate_appended_attention(
     parent: &Schedule,
     plan: &mut FlashAttentionPlan,
@@ -263,7 +373,13 @@ fn relocate_appended_attention(
             size,
             &score_arenas,
             8,
-        )?;
+        )
+        .map_err(|error| {
+            CompileError::Memory(format!(
+                "cannot place {size}-byte attention score tensor {} on tile {}: {error}",
+                task.scores.0, task.tile,
+            ))
+        })?;
         relocated.insert(task.scores.0, address);
     }
     let mut regions = Vec::<(TensorId, u16, u32, u32)>::new();
@@ -313,8 +429,18 @@ fn relocate_appended_attention(
     }
     regions.sort_unstable_by_key(|&(_, _, _, size)| std::cmp::Reverse(size));
     for &(tensor, tile, _address, size) in &regions {
-        let address =
-            allocate_from_occupied_arenas(&mut occupied[usize::from(tile)], size, arenas, 8)?;
+        let address = allocate_from_occupied_arenas(
+            &mut occupied[usize::from(tile)],
+            size,
+            arenas,
+            8,
+        )
+        .map_err(|error| {
+            CompileError::Memory(format!(
+                "cannot place {size}-byte attention operand tensor {} on tile {tile}: {error}",
+                tensor.0
+            ))
+        })?;
         relocated.insert(tensor.0, address);
     }
     for task in &mut plan.tasks {
@@ -1885,6 +2011,56 @@ mod tests {
         .unwrap();
 
         schedule.validate_allocations().unwrap();
+    }
+
+    #[test]
+    fn attention_tile_balancing_avoids_parent_pressure() {
+        let mut parent = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![Allocation {
+                tensor: TensorId(100),
+                tile: 0,
+                address: 0x90000,
+                size: 0x20000,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            }]
+            .into(),
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+        parent.phases.push(Phase::Compute {
+            op: OpId(0),
+            commands: Vec::new(),
+        });
+        let mut plan = plan_flash_attention(FlashAttentionConfig {
+            batch_size: 1,
+            query_sequence_length: 8,
+            sequence_length: 8,
+            hidden_size: 64,
+            attention_heads: 1,
+            query_block_rows: 8,
+            key_block_rows: 8,
+            tile_count: 4,
+            data_base: 0x88000,
+            data_limit: 0xe8000,
+        })
+        .unwrap();
+
+        balance_attention_tiles_for_parent(
+            &parent,
+            &mut plan,
+            &[MemoryArena::low(0x88000, 0xe8000)],
+        )
+        .unwrap();
+
+        assert!(plan.tasks.iter().all(|task| task.tile != 0));
+        assert!(plan.key_values.iter().all(|block| block.tile != 0));
+        plan.schedule
+            .lower_tile_programs(&ipu_exchange::Topology::c600())
+            .unwrap();
     }
 
     #[test]
