@@ -65,6 +65,45 @@ pub fn choose_row_shard_rows_for_copies_in_arenas(
     copies: usize,
     arenas: &[MemoryArena],
 ) -> Option<u16> {
+    choose_row_shard_rows_for_copies_impl(
+        schedule,
+        rows,
+        columns,
+        maximum_rows,
+        copies,
+        arenas,
+        false,
+    )
+}
+
+pub fn choose_colocated_row_shard_rows_for_copies_in_arenas(
+    schedule: &Schedule,
+    rows: u16,
+    columns: u16,
+    maximum_rows: u16,
+    copies: usize,
+    arenas: &[MemoryArena],
+) -> Option<u16> {
+    choose_row_shard_rows_for_copies_impl(
+        schedule,
+        rows,
+        columns,
+        maximum_rows,
+        copies,
+        arenas,
+        true,
+    )
+}
+
+fn choose_row_shard_rows_for_copies_impl(
+    schedule: &Schedule,
+    rows: u16,
+    columns: u16,
+    maximum_rows: u16,
+    copies: usize,
+    arenas: &[MemoryArena],
+    colocated: bool,
+) -> Option<u16> {
     if rows == 0 || columns == 0 || maximum_rows == 0 || copies == 0 || arenas.is_empty() {
         return None;
     }
@@ -87,18 +126,83 @@ pub fn choose_row_shard_rows_for_copies_in_arenas(
         previous_grid = Some(row_grid);
         let base_rows = rows / row_grid;
         let larger_shards = rows % row_grid;
-        let fits = (0..row_grid).all(|index| {
-            let shard_rows = base_rows + u16::from(index < larger_shards);
-            let mut tile_occupied = occupied[usize::from(index)].clone();
-            u32::from(shard_rows)
-                .checked_mul(u32::from(columns))
-                .and_then(|elements| elements.checked_mul(2))
-                .is_some_and(|bytes| {
-                    (0..copies).all(|_| {
-                        allocate_from_occupied_arenas(&mut tile_occupied, bytes, arenas, 8).is_ok()
+        let mut simulated = occupied.clone();
+        let fits = if colocated {
+            let mut used = HashSet::default();
+            (0..row_grid).all(|index| {
+                let shard_rows = base_rows + u16::from(index < larger_shards);
+                let Some(bytes) = u32::from(shard_rows)
+                    .checked_mul(u32::from(columns))
+                    .and_then(|elements| elements.checked_mul(2))
+                else {
+                    return false;
+                };
+                let Some((tile, tile_occupied)) = (0..schedule.tile_count)
+                    .filter(|tile| !used.contains(tile))
+                    .filter_map(|tile| {
+                        let mut candidate = simulated[usize::from(tile)].clone();
+                        (0..copies)
+                            .try_for_each(|_| {
+                                allocate_from_occupied_arenas(&mut candidate, bytes, arenas, 8)
+                                    .map(|_| ())
+                            })
+                            .ok()?;
+                        let occupied_bytes = candidate
+                            .iter()
+                            .flat_map(|&(start, end)| {
+                                arenas.iter().map(move |arena| {
+                                    end.min(arena.limit).saturating_sub(start.max(arena.base))
+                                })
+                            })
+                            .sum::<u32>();
+                        Some((occupied_bytes, tile, candidate))
                     })
+                    .min_by_key(|&(occupied_bytes, tile, ..)| (occupied_bytes, tile))
+                    .map(|(_, tile, occupied)| (tile, occupied))
+                else {
+                    return false;
+                };
+                used.insert(tile);
+                simulated[usize::from(tile)] = tile_occupied;
+                true
+            })
+        } else {
+            (0..copies).all(|_| {
+                let mut used = HashSet::default();
+                (0..row_grid).all(|index| {
+                    let shard_rows = base_rows + u16::from(index < larger_shards);
+                    let Some(bytes) = u32::from(shard_rows)
+                        .checked_mul(u32::from(columns))
+                        .and_then(|elements| elements.checked_mul(2))
+                    else {
+                        return false;
+                    };
+                    let Some((tile, tile_occupied)) = (0..schedule.tile_count)
+                        .filter(|tile| !used.contains(tile))
+                        .filter_map(|tile| {
+                            let mut candidate = simulated[usize::from(tile)].clone();
+                            allocate_from_occupied_arenas(&mut candidate, bytes, arenas, 8).ok()?;
+                            let occupied_bytes = candidate
+                                .iter()
+                                .flat_map(|&(start, end)| {
+                                    arenas.iter().map(move |arena| {
+                                        end.min(arena.limit).saturating_sub(start.max(arena.base))
+                                    })
+                                })
+                                .sum::<u32>();
+                            Some((occupied_bytes, tile, candidate))
+                        })
+                        .min_by_key(|&(occupied_bytes, tile, ..)| (occupied_bytes, tile))
+                        .map(|(_, tile, occupied)| (tile, occupied))
+                    else {
+                        return false;
+                    };
+                    used.insert(tile);
+                    simulated[usize::from(tile)] = tile_occupied;
+                    true
                 })
-        });
+            })
+        };
         if fits {
             return Some(base_rows + u16::from(larger_shards != 0));
         }
@@ -111,52 +215,57 @@ pub fn end_tensor_lifetimes(
     tensors: impl IntoIterator<Item = TensorId>,
 ) -> Result<(), CompileError> {
     let phase = schedule.phases.len();
-    let tensors = tensors.into_iter().collect::<HashSet<_>>();
-    let mut regions = vec![Vec::<(u32, u32)>::new(); usize::from(schedule.tile_count)];
-    let target_indices = schedule.allocations.indices_for_tensors(&tensors);
-    let targets = target_indices
+    let requested = tensors.into_iter().collect::<HashSet<_>>();
+    let found = schedule
+        .allocations
         .iter()
-        .map(|&index| &schedule.allocations[index])
-        .map(|allocation| {
-            (
-                allocation.tensor,
-                allocation.tile,
-                allocation.address,
-                allocation.address.saturating_add(allocation.size),
-                allocation.kind == AllocationKind::Home,
-            )
+        .filter_map(|allocation| {
+            requested
+                .contains(&allocation.tensor)
+                .then_some(allocation.tensor)
         })
-        .collect::<Vec<_>>();
-    let found = targets
-        .iter()
-        .map(|&(tensor, _, _, _, _)| tensor)
         .collect::<HashSet<_>>();
-    for &(_, tile, start, end, home) in &targets {
-        if home {
-            regions[usize::from(tile)].push((start, end));
-        }
-    }
-    if let Some(tensor) = tensors.difference(&found).next() {
+    if let Some(tensor) = requested.difference(&found).next() {
         return Err(CompileError::Graph(format!(
             "cannot end unknown tensor {}",
             tensor.0
         )));
     }
-    for tile_regions in &mut regions {
-        tile_regions.sort_unstable();
-        let mut merged = Vec::<(u32, u32)>::with_capacity(tile_regions.len());
-        for &(start, end) in tile_regions.iter() {
-            if let Some(previous) = merged.last_mut()
-                && start <= previous.1
-            {
-                previous.1 = previous.1.max(end);
-            } else {
-                merged.push((start, end));
+
+    // Address containment does not imply ownership: a later tensor may
+    // legitimately reuse the same SRAM after the requested tensor dies.
+    // Follow only explicit alias relationships in either direction.
+    let mut owned = requested;
+    loop {
+        let mut changed = false;
+        for allocation in &schedule.allocations {
+            let AllocationKind::HomeAlias { source } = allocation.kind else {
+                continue;
+            };
+            if owned.contains(&allocation.tensor) || owned.contains(&source) {
+                changed |= owned.insert(allocation.tensor);
+                changed |= owned.insert(source);
             }
         }
-        *tile_regions = merged;
+        if !changed {
+            break;
+        }
     }
-    let ending = schedule.allocations.live_home_indices_in_regions(&regions);
+
+    let ending = schedule
+        .allocations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, allocation)| {
+            (owned.contains(&allocation.tensor)
+                && allocation.live_until == usize::MAX
+                && matches!(
+                    allocation.kind,
+                    AllocationKind::Home | AllocationKind::HomeAlias { .. }
+                ))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
     if ending
         .iter()
         .any(|&index| schedule.allocations[index].live_from >= phase)
@@ -360,8 +469,6 @@ pub fn append_c16_to_a16_blocks_gelu_f16_in_arenas(
     }
     let phase = schedule.phases.len();
     let mut next_tensor = schedule.allocations.next_tensor_id();
-    let mut output = Vec::with_capacity(source.len());
-    let mut commands = Vec::with_capacity(source.len());
     let data_base = arenas.iter().map(|arena| arena.base).min().unwrap();
     let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
     let mut occupied = schedule.allocations.occupied_intervals_by_tile(
@@ -371,49 +478,97 @@ pub fn append_c16_to_a16_blocks_gelu_f16_in_arenas(
         data_base,
         data_limit,
     );
+    let mut remote_destinations = HashSet::default();
+    let mut planned = Vec::with_capacity(source.len());
     for block in source {
         let bytes = u32::from(block.rows) * u32::from(block.columns) * 2;
-        let address =
+        let local =
             allocate_from_occupied_arenas(&mut occupied[usize::from(block.tile)], bytes, arenas, 8)
-                .map_err(|error| {
+                .ok()
+                .map(|address| (block.tile, address));
+        let (tile, address) = if let Some(local) = local {
+            local
+        } else {
+            let (tile, address, tile_occupied) = (0..schedule.tile_count)
+                .filter(|&tile| tile != block.tile && !remote_destinations.contains(&tile))
+                .filter_map(|tile| {
+                    let mut candidate = occupied[usize::from(tile)].clone();
+                    let address =
+                        allocate_from_occupied_arenas(&mut candidate, bytes, arenas, 8).ok()?;
+                    let occupied_bytes = candidate
+                        .iter()
+                        .flat_map(|&(start, end)| {
+                            arenas.iter().map(move |arena| {
+                                end.min(arena.limit).saturating_sub(start.max(arena.base))
+                            })
+                        })
+                        .sum::<u32>();
+                    Some((occupied_bytes, tile, address, candidate))
+                })
+                .min_by_key(|&(occupied_bytes, tile, ..)| (occupied_bytes, tile))
+                .map(|(_, tile, address, occupied)| (tile, address, occupied))
+                .ok_or_else(|| {
                     CompileError::Memory(format!(
-                        "cannot place {bytes}-byte blocked GeLU output on tile {} \
-                 for rows {}..{} and columns {}..{} at phase {phase}: {error}",
-                        block.tile,
+                        "cannot place {bytes}-byte blocked GeLU output for rows {}..{} \
+                         and columns {}..{} on its source tile {} or a distinct remote tile \
+                         at phase {phase}",
                         block.row_start,
                         block.row_start + block.rows,
                         block.column_start,
                         block.column_start + block.columns,
+                        block.tile,
                     ))
                 })?;
+            remote_destinations.insert(tile);
+            occupied[usize::from(tile)] = tile_occupied;
+            (tile, address)
+        };
         let tensor = TensorId(next_tensor);
         next_tensor += 1;
         let placement = BlockPlacement {
             tensor,
+            tile,
             address,
             ..*block
         };
+        planned.push((*block, placement));
+    }
+    let remote = planned
+        .iter()
+        .any(|(source, output)| source.tile != output.tile);
+    let first_compute_phase = phase + usize::from(remote);
+    let mut output = Vec::with_capacity(planned.len());
+    for (_, placement) in &planned {
+        let bytes = u32::from(placement.rows) * u32::from(placement.columns) * 2;
         schedule.allocations.push(Allocation {
-            tensor,
-            tile: block.tile,
-            address,
+            tensor: placement.tensor,
+            tile: placement.tile,
+            address: placement.address,
             size: bytes,
-            live_from: phase,
+            live_from: first_compute_phase,
             live_until: usize::MAX,
             kind: AllocationKind::Home,
         });
-        commands.push(KernelCommand {
-            tile: block.tile,
-            output: tensor,
-            inputs: vec![block.tensor, block.tensor],
+        output.push(*placement);
+    }
+    let make_command = |source: &BlockPlacement,
+                        output: TensorId,
+                        input: TensorId,
+                        tile: u16,
+                        column_offset: u16,
+                        columns: u16| {
+        KernelCommand {
+            tile,
+            output,
+            inputs: vec![input, input],
             arguments: vec![
-                u32::from(block.rows),
-                u32::from(block.rows / 6) | (u32::from(block.columns / 16) << 16),
-                u32::from(block.rows % 6),
+                u32::from(source.rows),
+                u32::from(source.rows / 6) | (u32::from(columns / 16) << 16),
+                u32::from(source.rows % 6),
             ],
             specialization: Arc::new(SpecializationKey {
                 operation: "gelu_f16_c16_to_a16".into(),
-                shape: vec![usize::from(block.rows), usize::from(block.columns)],
+                shape: vec![usize::from(source.rows), usize::from(columns)],
                 worker_count: 6,
                 role: "blocked-gelu".into(),
                 alignment: 8,
@@ -421,16 +576,131 @@ pub fn append_c16_to_a16_blocks_gelu_f16_in_arenas(
             }),
             metadata: BTreeMap::from([
                 ("label".into(), "blocked GeLU".into()),
-                ("row_start".into(), block.row_start.to_string()),
-                ("column_start".into(), block.column_start.to_string()),
+                ("row_start".into(), source.row_start.to_string()),
+                (
+                    "column_start".into(),
+                    (source.column_start + column_offset).to_string(),
+                ),
             ]),
+        }
+    };
+    if !remote {
+        let commands = planned
+            .iter()
+            .map(|(source, output)| {
+                Arc::new(make_command(
+                    source,
+                    output.tensor,
+                    source.tensor,
+                    source.tile,
+                    0,
+                    source.columns,
+                ))
+            })
+            .collect();
+        schedule.phases.push(Phase::Compute {
+            op: OpId(phase),
+            commands,
         });
-        output.push(placement);
+        return Ok(output);
     }
-    schedule.phases.push(Phase::Compute {
-        op: OpId(phase),
-        commands: commands.into_iter().map(Arc::new).collect(),
-    });
+
+    let mut passes = Vec::<(Vec<Transfer>, Vec<Arc<KernelCommand>>)>::new();
+    passes.push((Vec::new(), Vec::new()));
+    for (source, output) in &planned {
+        if source.tile == output.tile {
+            passes[0].1.push(Arc::new(make_command(
+                source,
+                output.tensor,
+                source.tensor,
+                source.tile,
+                0,
+                source.columns,
+            )));
+            continue;
+        }
+        let panel_bytes = u32::from(source.rows) * 32;
+        let maximum_panels = ipu_exchange::MAX_TRANSFER_WORDS * 4 / panel_bytes;
+        if maximum_panels == 0 {
+            return Err(CompileError::Memory(format!(
+                "one {}-row GeLU panel exceeds the exchange transfer limit",
+                source.rows
+            )));
+        }
+        let mut panel = 0u16;
+        let panel_count = source.columns / 16;
+        let mut pass = 0usize;
+        let mut staging_offset = 0u32;
+        while panel < panel_count {
+            let available_panels =
+                (ipu_exchange::EXCHANGE_WINDOW_BYTES - staging_offset) / panel_bytes;
+            if available_panels == 0 {
+                pass += 1;
+                staging_offset = 0;
+                continue;
+            }
+            let panels = u32::from(panel_count - panel)
+                .min(maximum_panels)
+                .min(available_panels) as u16;
+            let bytes = u32::from(panels) * panel_bytes;
+            while passes.len() <= pass {
+                passes.push((Vec::new(), Vec::new()));
+            }
+            let exchange_phase = phase + pass * 2;
+            let compute_phase = exchange_phase + 1;
+            let input = TensorId(next_tensor);
+            next_tensor += 1;
+            let output_alias = TensorId(next_tensor);
+            next_tensor += 1;
+            let offset = u32::from(panel) * panel_bytes;
+            schedule.allocations.push(Allocation {
+                tensor: input,
+                tile: source.tile,
+                address: source.address + offset,
+                size: bytes,
+                live_from: exchange_phase,
+                live_until: compute_phase + 1,
+                kind: AllocationKind::HomeAlias {
+                    source: source.tensor,
+                },
+            });
+            schedule.allocations.push(Allocation {
+                tensor: output_alias,
+                tile: output.tile,
+                address: output.address + offset,
+                size: bytes,
+                live_from: compute_phase,
+                live_until: compute_phase + 1,
+                kind: AllocationKind::HomeAlias {
+                    source: output.tensor,
+                },
+            });
+            passes[pass].0.push(Transfer {
+                source_tile: source.tile,
+                destination_tile: output.tile,
+                tensor: input,
+                bytes,
+                staging_address: Some(ipu_exchange::EXCHANGE_WINDOW_BASE + staging_offset),
+            });
+            passes[pass].1.push(Arc::new(make_command(
+                source,
+                output_alias,
+                input,
+                output.tile,
+                panel * 16,
+                panels * 16,
+            )));
+            panel += panels;
+            staging_offset += bytes;
+        }
+    }
+    for (pass, (transfers, commands)) in passes.into_iter().enumerate() {
+        schedule.phases.push(Phase::Exchange { transfers });
+        schedule.phases.push(Phase::Compute {
+            op: OpId(phase + pass * 2 + 1),
+            commands,
+        });
+    }
     Ok(output)
 }
 
@@ -678,6 +948,62 @@ pub fn append_c16_to_a16_row_shards_reblocked_in_arenas(
         columns,
         row_block_dimension,
         arenas,
+        None,
+    )
+}
+
+pub fn append_c16_to_a16_row_shards_reblocked_like_in_arenas(
+    schedule: &mut Schedule,
+    source: &[BlockPlacement],
+    destination_layout: &[RowShardPlacement],
+    arenas: &[MemoryArena],
+) -> Result<Vec<RowShardPlacement>, CompileError> {
+    let columns = destination_layout
+        .first()
+        .map(|shard| shard.columns)
+        .unwrap_or(0);
+    let row_block_dimension = destination_layout
+        .iter()
+        .map(|shard| shard.rows)
+        .max()
+        .unwrap_or(0);
+    if source.is_empty()
+        || destination_layout.is_empty()
+        || columns == 0
+        || !columns.is_multiple_of(64)
+        || row_block_dimension == 0
+        || arenas.is_empty()
+        || arenas
+            .iter()
+            .any(|arena| arena.base & 7 != 0 || arena.base >= arena.limit)
+        || destination_layout
+            .iter()
+            .any(|shard| shard.columns != columns)
+    {
+        return Err(CompileError::Graph(
+            "C16 row reblocking destination layout is empty or inconsistent".into(),
+        ));
+    }
+    let source = source
+        .iter()
+        .map(|block| ReblockSource {
+            tensor: block.tensor,
+            tile: block.tile,
+            address: block.address,
+            row_start: block.row_start,
+            rows: block.rows,
+            column_start: block.column_start,
+            columns: block.columns,
+            layout: ReblockSourceLayout::C16,
+        })
+        .collect::<Vec<_>>();
+    append_to_a16_row_shards_reblocked_in_arenas(
+        schedule,
+        &source,
+        columns,
+        row_block_dimension,
+        arenas,
+        Some(destination_layout),
     )
 }
 
@@ -739,6 +1065,7 @@ pub fn append_a16_to_a16_row_shards_reblocked_in_arenas(
         columns,
         row_block_dimension,
         arenas,
+        None,
     )
 }
 
@@ -766,6 +1093,7 @@ fn append_to_a16_row_shards_reblocked_in_arenas(
     columns: u16,
     row_block_dimension: u16,
     arenas: &[MemoryArena],
+    destination_layout: Option<&[RowShardPlacement]>,
 ) -> Result<Vec<RowShardPlacement>, CompileError> {
     let rows = source
         .iter()
@@ -773,6 +1101,11 @@ fn append_to_a16_row_shards_reblocked_in_arenas(
         .max()
         .unwrap();
     let row_grid = rows.div_ceil(row_block_dimension);
+    if destination_layout.is_some_and(|layout| layout.len() != usize::from(row_grid)) {
+        return Err(CompileError::Graph(
+            "requested A16 row-shard layout has the wrong shard count".into(),
+        ));
+    }
     let base_rows = rows / row_grid;
     let larger_shards = rows % row_grid;
     let phase = schedule.phases.len();
@@ -789,22 +1122,53 @@ fn append_to_a16_row_shards_reblocked_in_arenas(
     let mut next_tensor = schedule.allocations.next_tensor_id();
     let mut destinations = Vec::with_capacity(usize::from(row_grid));
     let mut groups = Vec::with_capacity(usize::from(row_grid));
+    let mut destination_tiles = HashSet::default();
     let mut row_start = 0u16;
     for index in 0..row_grid {
         let destination_rows = base_rows + u16::from(index < larger_shards);
-        let destination_tile = index;
-        if destination_tile >= schedule.tile_count {
-            return Err(CompileError::Graph(
-                "C16 row reblocking needs more destination tiles".into(),
-            ));
-        }
         let bytes = u32::from(destination_rows) * u32::from(columns) * 2;
-        let address = allocate_from_occupied_arenas(
-            &mut occupied[usize::from(destination_tile)],
-            bytes,
-            arenas,
-            8,
-        )?;
+        let requested_tile = destination_layout
+            .and_then(|layout| layout.get(usize::from(index)))
+            .map(|shard| {
+                if shard.row_start != row_start
+                    || shard.rows != destination_rows
+                    || shard.columns != columns
+                {
+                    return Err(CompileError::Graph(
+                        "requested A16 row-shard layout does not match the reblocked rows".into(),
+                    ));
+                }
+                Ok(shard.tile)
+            })
+            .transpose()?;
+        let (destination_tile, address, tile_occupied) = (0..schedule.tile_count)
+            .filter(|tile| requested_tile.is_none_or(|requested| requested == *tile))
+            .filter(|tile| !destination_tiles.contains(tile))
+            .filter_map(|tile| {
+                let mut candidate = occupied.get(usize::from(tile))?.clone();
+                let address =
+                    allocate_from_occupied_arenas(&mut candidate, bytes, arenas, 8).ok()?;
+                let occupied_bytes = candidate
+                    .iter()
+                    .flat_map(|&(start, end)| {
+                        arenas.iter().map(move |arena| {
+                            end.min(arena.limit).saturating_sub(start.max(arena.base))
+                        })
+                    })
+                    .sum::<u32>();
+                Some((occupied_bytes, tile, address, candidate))
+            })
+            .min_by_key(|&(occupied_bytes, tile, ..)| (occupied_bytes, tile))
+            .map(|(_, tile, address, occupied)| (tile, address, occupied))
+            .ok_or_else(|| {
+                CompileError::Memory(format!(
+                    "no requested tile can hold a {bytes}-byte A16 row shard for rows \
+                     {row_start}..{}",
+                    row_start + destination_rows,
+                ))
+            })?;
+        destination_tiles.insert(destination_tile);
+        occupied[usize::from(destination_tile)] = tile_occupied;
         let tensor = TensorId(next_tensor);
         next_tensor += 1;
         schedule.allocations.push(Allocation {
@@ -1436,10 +1800,9 @@ mod tests {
     }
 
     #[test]
-    fn lifetime_index_tracks_appends_and_only_ends_contained_home_storage() {
+    fn lifetime_end_follows_explicit_alias_ownership_not_reused_addresses() {
         let owner = TensorId(10);
         let owner_start = 0x80000;
-        let owner_end = owner_start + 0x100;
         let allocation = |tensor, tile, address, size, live_until, kind| Allocation {
             tensor: TensorId(tensor),
             tile,
@@ -1495,7 +1858,7 @@ mod tests {
                 owner_start + 0x40,
                 0x20,
                 usize::MAX,
-                AllocationKind::Home,
+                AllocationKind::HomeAlias { source: owner },
             ),
             allocation(
                 15,
@@ -1505,6 +1868,14 @@ mod tests {
                 usize::MAX,
                 AllocationKind::ExchangeStaging { phase: 0 },
             ),
+            allocation(
+                16,
+                0,
+                owner_start + 0x80,
+                0x20,
+                usize::MAX,
+                AllocationKind::Home,
+            ),
         ]);
         let before = schedule.allocations.clone();
 
@@ -1512,14 +1883,12 @@ mod tests {
 
         let end_phase = schedule.phases.len();
         for (before, after) in before.iter().zip(schedule.allocations.iter()) {
-            let contained_live_home = before.tile == 0
-                && before.kind == AllocationKind::Home
-                && before.live_until == usize::MAX
-                && before.address >= owner_start
-                && before.address.saturating_add(before.size) <= owner_end;
+            let owned_live_home = before.live_until == usize::MAX
+                && (before.tensor == owner
+                    || before.kind == AllocationKind::HomeAlias { source: owner });
             assert_eq!(
                 after.live_until,
-                if contained_live_home {
+                if owned_live_home {
                     end_phase
                 } else {
                     before.live_until
@@ -1809,6 +2178,77 @@ mod tests {
     }
 
     #[test]
+    fn blocked_gelu_moves_and_fragments_an_output_when_its_source_tile_is_full() {
+        let base = 0xa0000;
+        let limit = 0xb0000;
+        let source = BlockPlacement {
+            tensor: TensorId(0),
+            tile: 0,
+            address: base,
+            block_row: 0,
+            block_column: 0,
+            row_start: 0,
+            column_start: 0,
+            rows: 72,
+            columns: 128,
+        };
+        let bytes = u32::from(source.rows) * u32::from(source.columns) * 2;
+        let mut schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![
+                Allocation {
+                    tensor: source.tensor,
+                    tile: source.tile,
+                    address: source.address,
+                    size: bytes,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                },
+                Allocation {
+                    tensor: TensorId(1),
+                    tile: source.tile,
+                    address: base + bytes,
+                    size: limit - base - bytes,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                },
+            ]
+            .into(),
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let output =
+            append_c16_to_a16_blocks_gelu_f16(&mut schedule, &[source], base, limit).unwrap();
+
+        assert_ne!(output[0].tile, source.tile);
+        let transfers = match &schedule.phases[0] {
+            Phase::Exchange { transfers } => transfers,
+            _ => panic!("remote GeLU must start with exchange"),
+        };
+        assert_eq!(
+            transfers.iter().map(|transfer| transfer.bytes).sum::<u32>(),
+            bytes
+        );
+        assert!(
+            transfers
+                .iter()
+                .all(|transfer| transfer.bytes <= ipu_exchange::MAX_TRANSFER_WORDS * 4)
+        );
+        assert!(matches!(
+            &schedule.phases[1],
+            Phase::Compute { commands, .. } if commands.len() == transfers.len()
+        ));
+        schedule.validate_allocations().unwrap();
+        schedule
+            .lower_tile_programs(&ipu_exchange::Topology::c600())
+            .unwrap();
+    }
+
+    #[test]
     fn c16_outputs_reblock_to_complete_balanced_row_shards() {
         let mut source = Vec::new();
         let mut allocations = Vec::new();
@@ -1942,7 +2382,7 @@ mod tests {
     }
 
     #[test]
-    fn row_shard_choice_accounts_for_simultaneously_live_copies() {
+    fn row_shard_choice_distributes_simultaneously_live_copies() {
         let schedule = Schedule {
             layouts: Vec::new(),
             phases: Vec::new(),
@@ -1954,7 +2394,7 @@ mod tests {
 
         assert_eq!(
             choose_row_shard_rows_for_copies_in_arenas(&schedule, 12, 16, 12, 2, &[arena]),
-            Some(6)
+            Some(12)
         );
         assert_eq!(
             choose_row_shard_rows_for_copies_in_arenas(&schedule, 12, 16, 12, 3, &[arena]),

@@ -136,9 +136,36 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
     // Query, key, and value packing can assemble attention blocks independently
     // of the producer's row shards. Preserve zero so the attention planner can
     // choose query blocking from the available tile count.
-    let mut plan = plan_flash_attention(config)?;
-    balance_attention_tiles_for_parent(schedule, &mut plan, arenas)?;
-    relocate_appended_attention(schedule, &mut plan, arenas)?;
+    let provisional_pack_end = usize::MAX - 1;
+    end_attention_source_lifetimes(
+        schedule,
+        [
+            (query, provisional_pack_end),
+            (key, provisional_pack_end),
+            (value, provisional_pack_end),
+        ],
+    )?;
+    let automatic_query_blocking = config.query_block_rows == 0;
+    let mut planned_config = config;
+    let mut plan = loop {
+        let mut candidate = plan_flash_attention(planned_config)?;
+        match balance_attention_tiles_for_parent(
+            schedule,
+            &mut candidate,
+            arenas,
+            provisional_pack_end,
+        ) {
+            Ok(()) => break candidate,
+            Err(error) if automatic_query_blocking => {
+                let query_blocks = query_sequence_length.div_ceil(candidate.query_block_rows);
+                if query_blocks <= 1 {
+                    return Err(error);
+                }
+                planned_config.query_block_rows = query_sequence_length.div_ceil(query_blocks - 1);
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let tensor_base = schedule.allocations.next_tensor_id();
     remap_attention_tensors(&mut plan, tensor_base)?;
     let mut next_tensor = schedule
@@ -158,6 +185,7 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
         &plan,
         AttentionPackKind::Query,
     )?;
+    let query_live_until = schedule.phases.len();
     let key_live_from = schedule.phases.len() + 1;
     append_attention_pack_phase(
         schedule,
@@ -166,6 +194,7 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
         &plan,
         AttentionPackKind::Key,
     )?;
+    let key_live_until = schedule.phases.len();
     let value_live_from = schedule.phases.len() + 1;
     append_attention_pack_phase(
         schedule,
@@ -174,6 +203,16 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
         &plan,
         AttentionPackKind::Value,
     )?;
+    let value_live_until = schedule.phases.len();
+    end_attention_source_lifetimes(
+        schedule,
+        [
+            (query, query_live_until),
+            (key, key_live_until),
+            (value, value_live_until),
+        ],
+    )?;
+    relocate_appended_attention(schedule, &mut plan, arenas)?;
     let output_tensors = plan
         .tasks
         .iter()
@@ -222,10 +261,50 @@ pub fn append_flash_attention_from_a16_qkv_in_arenas(
     Ok(plan)
 }
 
+fn end_attention_source_lifetimes(
+    schedule: &mut Schedule,
+    sources: [(&[RowShardPlacement], usize); 3],
+) -> Result<(), CompileError> {
+    let mut live_until_by_tensor = BTreeMap::<usize, usize>::new();
+    for (shards, live_until) in sources {
+        for shard in shards {
+            live_until_by_tensor
+                .entry(shard.tensor.0)
+                .and_modify(|existing| *existing = (*existing).max(live_until))
+                .or_insert(live_until);
+        }
+    }
+    for (tensor, live_until) in live_until_by_tensor {
+        let tensor = TensorId(tensor);
+        let tensors = HashSet::from_iter([tensor]);
+        let indices = schedule
+            .allocations
+            .home_indices_for_tensors_since(&tensors, 0);
+        if indices.is_empty() {
+            return Err(CompileError::Graph(format!(
+                "attention source tensor {} has no home allocation",
+                tensor.0
+            )));
+        }
+        if indices
+            .iter()
+            .any(|&index| schedule.allocations[index].live_from >= live_until)
+        {
+            return Err(CompileError::Graph(format!(
+                "attention source tensor {} is not live for its pack phase",
+                tensor.0
+            )));
+        }
+        schedule.allocations.set_live_until(&indices, live_until);
+    }
+    Ok(())
+}
+
 fn balance_attention_tiles_for_parent(
     parent: &Schedule,
     plan: &mut FlashAttentionPlan,
     arenas: &[MemoryArena],
+    live_from: usize,
 ) -> Result<(), CompileError> {
     if parent.tile_count != plan.schedule.tile_count || arenas.is_empty() {
         return Err(CompileError::Graph(
@@ -235,10 +314,26 @@ fn balance_attention_tiles_for_parent(
     let tile_count = usize::from(parent.tile_count);
     let data_base = arenas.iter().map(|arena| arena.base).min().unwrap();
     let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
+    let occupied = parent.allocations.occupied_intervals_by_tile(
+        parent.tile_count,
+        live_from,
+        usize::MAX,
+        data_base,
+        data_limit,
+    );
+    let total_pressure = occupied
+        .iter()
+        .map(|intervals| {
+            intervals
+                .iter()
+                .map(|&(start, end)| u64::from(end - start))
+                .sum::<u64>()
+        })
+        .collect::<Vec<_>>();
     let mut current_pressure = vec![0u64; tile_count];
     for allocation in parent
         .allocations
-        .overlapping_allocations(parent.phases.len(), usize::MAX)
+        .overlapping_allocations(live_from, usize::MAX)
     {
         if allocation.live_from != 0
             && allocation.address < data_limit
@@ -248,10 +343,48 @@ fn balance_attention_tiles_for_parent(
             current_pressure[usize::from(allocation.tile)] += u64::from(allocation.size);
         }
     }
-    let mut logical_pressure = vec![0u64; tile_count];
-    for allocation in &plan.schedule.allocations {
-        if !matches!(allocation.kind, AllocationKind::HomeAlias { .. }) {
-            logical_pressure[usize::from(allocation.tile)] += u64::from(allocation.size);
+    let mut score_requirements = vec![Vec::<u32>::new(); tile_count];
+    let mut ordinary_requirements = vec![Vec::<u32>::new(); tile_count];
+    for task in &plan.tasks {
+        let tile = usize::from(task.tile);
+        score_requirements[tile].push(attention_scratch_bytes(
+            task.query_rows,
+            plan.key_block_columns,
+            plan.padded_head_dimension,
+        ));
+        ordinary_requirements[tile].extend([
+            u32::from(task.query_rows) * u32::from(plan.padded_head_dimension) * 2,
+            u32::from(task.query_rows) * (u32::from(plan.head_dimension) * 4 + 8),
+            u32::from(task.query_rows) * (u32::from(plan.key_block_columns) * 2 + 8),
+            u32::from(task.query_rows) * u32::from(plan.head_dimension) * 2,
+        ]);
+    }
+    for block in &plan.key_values {
+        ordinary_requirements[usize::from(block.tile)]
+            .extend([block.matrix_size, block.matrix_size]);
+    }
+    for requirements in &mut ordinary_requirements {
+        requirements.sort_unstable_by_key(|&size| std::cmp::Reverse(size));
+    }
+    let logical_pressure = score_requirements
+        .iter()
+        .zip(&ordinary_requirements)
+        .map(|(score, ordinary)| {
+            score
+                .iter()
+                .chain(ordinary)
+                .map(|&size| u64::from(size))
+                .sum::<u64>()
+        })
+        .collect::<Vec<_>>();
+    let mut score_arenas = vec![MemoryArena {
+        base: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+        limit: ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT,
+        placement: MemoryPlacement::Low,
+    }];
+    for arena in arenas {
+        if !score_arenas.contains(arena) {
+            score_arenas.push(*arena);
         }
     }
     let mut logical_tiles = (0..parent.tile_count).collect::<Vec<_>>();
@@ -259,10 +392,89 @@ fn balance_attention_tiles_for_parent(
         (std::cmp::Reverse(logical_pressure[usize::from(tile)]), tile)
     });
     let mut physical_tiles = (0..parent.tile_count).collect::<Vec<_>>();
-    physical_tiles.sort_unstable_by_key(|&tile| (current_pressure[usize::from(tile)], tile));
+    physical_tiles.sort_unstable_by_key(|&tile| {
+        (
+            current_pressure[usize::from(tile)],
+            total_pressure[usize::from(tile)],
+            tile,
+        )
+    });
+    let mut candidate_cache = BTreeMap::<(Vec<u32>, Vec<u32>), Arc<[u16]>>::new();
+    let mut candidates = vec![Arc::<[u16]>::from([]); tile_count];
+    for &logical in &logical_tiles {
+        let logical_index = usize::from(logical);
+        let key = (
+            score_requirements[logical_index].clone(),
+            ordinary_requirements[logical_index].clone(),
+        );
+        let feasible = candidate_cache
+            .entry(key)
+            .or_insert_with(|| {
+                physical_tiles
+                    .iter()
+                    .copied()
+                    .filter(|&physical| {
+                        let mut candidate = occupied[usize::from(physical)].clone();
+                        score_requirements[logical_index].iter().all(|&size| {
+                            allocate_from_occupied_arenas(&mut candidate, size, &score_arenas, 8)
+                                .is_ok()
+                        }) && ordinary_requirements[logical_index].iter().all(|&size| {
+                            allocate_from_occupied_arenas(&mut candidate, size, arenas, 8).is_ok()
+                        })
+                    })
+                    .collect::<Arc<[_]>>()
+            })
+            .clone();
+        if feasible.is_empty() {
+            return Err(CompileError::Memory(format!(
+                "no physical tile can hold the {}-byte attention bundle for logical tile {logical}",
+                logical_pressure[logical_index],
+            )));
+        }
+        candidates[logical_index] = feasible;
+    }
+    fn assign_attention_tile(
+        logical: u16,
+        candidates: &[Arc<[u16]>],
+        physical_owner: &mut [Option<u16>],
+        visited: &mut [bool],
+    ) -> bool {
+        for &physical in candidates[usize::from(logical)].iter() {
+            let physical_index = usize::from(physical);
+            if std::mem::replace(&mut visited[physical_index], true) {
+                continue;
+            }
+            let available = match physical_owner[physical_index] {
+                None => true,
+                Some(owner) => assign_attention_tile(owner, candidates, physical_owner, visited),
+            };
+            if available {
+                physical_owner[physical_index] = Some(logical);
+                return true;
+            }
+        }
+        false
+    }
+    let mut physical_owner = vec![None; tile_count];
+    // Augmenting paths give the latest logical tile its preferred candidate.
+    // Place flexible/empty bundles first so larger bundles displace them from
+    // low-pressure physical tiles rather than the reverse.
+    for logical in logical_tiles.into_iter().rev() {
+        let mut visited = vec![false; tile_count];
+        if !assign_attention_tile(logical, &candidates, &mut physical_owner, &mut visited) {
+            return Err(CompileError::Memory(format!(
+                "attention bundle matching cannot place logical tile {logical} with {} feasible physical tiles",
+                candidates[usize::from(logical)].len(),
+            )));
+        }
+    }
     let mut mapping = vec![0u16; tile_count];
-    for (logical, physical) in logical_tiles.into_iter().zip(physical_tiles) {
-        mapping[usize::from(logical)] = physical;
+    for (physical, logical) in physical_owner.into_iter().enumerate() {
+        let logical = logical.ok_or_else(|| {
+            CompileError::Memory("attention bundle matching left a physical tile unused".into())
+        })?;
+        mapping[usize::from(logical)] = u16::try_from(physical)
+            .map_err(|_| CompileError::Graph("attention tile index overflow".into()))?;
     }
     if mapping
         .iter()
@@ -494,11 +706,19 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
     }
     let mut next_tensor = schedule.allocations.next_tensor_id();
     let first_compute_phase = schedule.phases.len() + 1;
+    let data_base = arenas.iter().map(|arena| arena.base).min().unwrap();
+    let data_limit = arenas.iter().map(|arena| arena.limit).max().unwrap();
+    let mut occupied = schedule.allocations.occupied_intervals_by_tile(
+        schedule.tile_count,
+        first_compute_phase,
+        usize::MAX,
+        data_base,
+        data_limit,
+    );
+    let mut destination_tiles = HashSet::default();
     let mut destinations = Vec::with_capacity(groups.len());
     let mut output_groups = Vec::with_capacity(groups.len());
-    for (destination_index, ((batch, batch_row_start, rows), mut tasks)) in
-        groups.into_iter().enumerate()
-    {
+    for ((batch, batch_row_start, rows), mut tasks) in groups {
         let row_start = batch
             .checked_mul(query_sequence_length)
             .and_then(|offset| offset.checked_add(batch_row_start))
@@ -514,22 +734,33 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
                 "attention output has incomplete head coverage".into(),
             ));
         }
-        let destination_tile = u16::try_from(destination_index)
-            .map_err(|_| CompileError::Graph("attention destination tile overflow".into()))?;
-        if destination_tile >= schedule.tile_count {
-            return Err(CompileError::Graph(
-                "attention output needs more row-shard destination tiles".into(),
-            ));
-        }
         let activation_bytes = u32::from(rows) * u32::from(hidden_size) * 2;
-        let address = schedule.allocations.find_free_region_in_arenas(
-            destination_tile,
-            activation_bytes,
-            first_compute_phase,
-            usize::MAX,
-            arenas,
-            8,
-        )?;
+        let (destination_tile, address, tile_occupied) = (0..schedule.tile_count)
+            .filter(|tile| !destination_tiles.contains(tile))
+            .filter_map(|tile| {
+                let mut candidate = occupied[usize::from(tile)].clone();
+                let address =
+                    allocate_from_occupied_arenas(&mut candidate, activation_bytes, arenas, 8)
+                        .ok()?;
+                let occupied_bytes = candidate
+                    .iter()
+                    .flat_map(|&(start, end)| {
+                        arenas.iter().map(move |arena| {
+                            end.min(arena.limit).saturating_sub(start.max(arena.base))
+                        })
+                    })
+                    .sum::<u32>();
+                Some((occupied_bytes, tile, address, candidate))
+            })
+            .min_by_key(|&(occupied_bytes, tile, ..)| (occupied_bytes, tile))
+            .map(|(_, tile, address, occupied)| (tile, address, occupied))
+            .ok_or_else(|| {
+                CompileError::Memory(format!(
+                    "no distinct tile can hold a {activation_bytes}-byte attention output shard"
+                ))
+            })?;
+        destination_tiles.insert(destination_tile);
+        occupied[usize::from(destination_tile)] = tile_occupied;
         let destination_tensor = fresh_tensor(&mut next_tensor);
         schedule.allocations.push(Allocation {
             tensor: destination_tensor,
@@ -638,12 +869,17 @@ fn append_attention_pack_phase(
     plan: &FlashAttentionPlan,
     kind: AttentionPackKind,
 ) -> Result<(), CompileError> {
-    let exchange_phase = schedule.phases.len();
-    let compute_phase = exchange_phase + 1;
-    let mut transfers = Vec::new();
-    let mut commands = Vec::new();
-    let mut staging_cursors =
-        vec![ipu_exchange::EXCHANGE_WINDOW_BASE; usize::from(schedule.tile_count)];
+    struct PackPass {
+        transfers: Vec<Transfer>,
+        commands: Vec<Arc<KernelCommand>>,
+        staging_cursors: Vec<u32>,
+    }
+    let phase_start = schedule.phases.len();
+    let mut passes = vec![PackPass {
+        transfers: Vec::new(),
+        commands: Vec::new(),
+        staging_cursors: vec![ipu_exchange::EXCHANGE_WINDOW_BASE; usize::from(schedule.tile_count)],
+    }];
     let mut append = |shard: &RowShardPlacement,
                       head: u16,
                       destination_tile: u16,
@@ -670,6 +906,29 @@ fn append_attention_pack_phase(
                 "attention source shard is {bytes} bytes, larger than one exchange transfer"
             )));
         }
+        let pass = if shard.tile == destination_tile {
+            0
+        } else {
+            let destination = usize::from(destination_tile);
+            let limit = ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
+            let available = passes.iter().position(|pass| {
+                crate::align_u32(pass.staging_cursors[destination].saturating_add(bytes), 32)
+                    <= limit
+            });
+            available.unwrap_or_else(|| {
+                passes.push(PackPass {
+                    transfers: Vec::new(),
+                    commands: Vec::new(),
+                    staging_cursors: vec![
+                        ipu_exchange::EXCHANGE_WINDOW_BASE;
+                        usize::from(schedule.tile_count)
+                    ],
+                });
+                passes.len() - 1
+            })
+        };
+        let exchange_phase = phase_start + pass * 2;
+        let compute_phase = exchange_phase + 1;
         let alias = TensorId(*next_tensor);
         *next_tensor += 1;
         let source_address = shard
@@ -688,7 +947,7 @@ fn append_attention_pack_phase(
             },
         });
         if shard.tile != destination_tile {
-            let cursor = &mut staging_cursors[usize::from(destination_tile)];
+            let cursor = &mut passes[pass].staging_cursors[usize::from(destination_tile)];
             let staging_address = *cursor;
             *cursor = crate::align_u32(
                 cursor.checked_add(bytes).ok_or_else(|| {
@@ -696,12 +955,7 @@ fn append_attention_pack_phase(
                 })?,
                 32,
             );
-            if *cursor > ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES {
-                return Err(CompileError::Memory(format!(
-                    "attention packing exhausts tile {destination_tile} exchange window"
-                )));
-            }
-            transfers.push(Transfer {
+            passes[pass].transfers.push(Transfer {
                 source_tile: shard.tile,
                 destination_tile,
                 tensor: alias,
@@ -709,7 +963,7 @@ fn append_attention_pack_phase(
                 staging_address: Some(staging_address),
             });
         }
-        commands.push(KernelCommand {
+        passes[pass].commands.push(Arc::new(KernelCommand {
             tile: destination_tile,
             output,
             inputs: vec![alias, alias],
@@ -751,7 +1005,7 @@ fn append_attention_pack_phase(
                 ),
                 ("head".into(), head.to_string()),
             ]),
-        });
+        }));
         Ok(())
     };
     let mut append_range = |row_start: u16,
@@ -849,11 +1103,15 @@ fn append_attention_pack_phase(
             }
         }
     }
-    schedule.phases.push(Phase::Exchange { transfers });
-    schedule.phases.push(Phase::Compute {
-        op: OpId(compute_phase),
-        commands: commands.into_iter().map(Arc::new).collect(),
-    });
+    for (pass, packed) in passes.into_iter().enumerate() {
+        schedule.phases.push(Phase::Exchange {
+            transfers: packed.transfers,
+        });
+        schedule.phases.push(Phase::Compute {
+            op: OpId(phase_start + pass * 2 + 1),
+            commands: packed.commands,
+        });
+    }
     Ok(())
 }
 
@@ -2042,6 +2300,7 @@ mod tests {
             &parent,
             &mut plan,
             &[MemoryArena::low(0x88000, 0xe8000)],
+            parent.phases.len(),
         )
         .unwrap();
 
@@ -2105,12 +2364,23 @@ mod tests {
             },
         )
         .unwrap();
+        let blocked_tile = 0;
+        schedule.allocations.push(Allocation {
+            tensor: TensorId(schedule.allocations.next_tensor_id()),
+            tile: blocked_tile,
+            address: 0xc0000,
+            size: 0x20000,
+            live_from: 0,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        });
         let output =
             append_flash_attention_to_a16_row_shards(&mut schedule, &plan, 0xc0000, 0xe8000)
                 .unwrap();
 
         assert!(plan.tasks.iter().any(|task| task.batch == 0));
         assert!(plan.tasks.iter().any(|task| task.batch == 1));
+        assert!(output.iter().all(|shard| shard.tile != blocked_tile));
         let mut output = output
             .iter()
             .map(|shard| (shard.row_start, shard.rows))

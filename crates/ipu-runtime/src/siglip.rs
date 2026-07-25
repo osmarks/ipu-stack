@@ -6,16 +6,17 @@ use half::f16;
 use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
     CompileError, FlashAttentionConfig, FlashAttentionPlan, GemmDataType, MemoryArena,
-    MemoryPolicy, Phase, RowShardPlacement, RowShardTransitionConfig, Schedule, TensorId,
-    allocate_from_occupied_arenas, append_a16_to_a16_row_shards_reblocked_in_arenas,
+    MemoryPolicy, Phase, RowShardPlacement, Schedule, TensorId, allocate_from_occupied_arenas,
+    append_a16_to_a16_row_shards_reblocked_in_arenas,
     append_add_affine_layer_norm_f16_with_memory_policy, append_add_f16_row_shards_in_place,
     append_affine_layer_norm_f16_with_memory_policy, append_bias_f16_c16_in_arenas,
     append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
     append_blocked_gemm_f16_with_a16_input_with_memory_policy,
-    append_c16_to_a16_blocks_gelu_f16_in_arenas, append_c16_to_a16_row_shards,
-    append_c16_to_a16_row_shards_reblocked_in_arenas,
+    append_c16_to_a16_blocks_gelu_f16_in_arenas, append_c16_to_a16_row_shards_reblocked_in_arenas,
+    append_c16_to_a16_row_shards_reblocked_like_in_arenas,
     append_flash_attention_from_a16_qkv_in_arenas,
-    append_flash_attention_to_a16_row_shards_in_arenas, choose_gemm_row_block_for,
+    append_flash_attention_to_a16_row_shards_in_arenas,
+    choose_colocated_row_shard_rows_for_copies_in_arenas, choose_gemm_row_block_for,
     choose_gemm_row_block_for_shape, choose_gemm_row_block_for_shape_max_rows,
     choose_row_shard_rows_for_copies_in_arenas, end_tensor_lifetimes,
     gemm_row_block_candidates_for, gemm_row_block_cost, make_tensors_resident,
@@ -996,14 +997,12 @@ pub fn append_siglip_map_head_batched_with_memory_policy(
         host,
     )?;
     end_tensor_lifetimes(schedule, probe.iter().map(|shard| shard.tensor))?;
-    let query = append_c16_to_a16_row_shards(
+    let query = append_c16_to_a16_row_shards_reblocked_in_arenas(
         schedule,
         &query,
-        RowShardTransitionConfig {
-            columns,
-            data_base,
-            data_limit,
-        },
+        columns,
+        PROBE_ROWS,
+        &memory.transient,
     )?;
 
     let key_value = append_a16_linear_c16_with_memory_policy(
@@ -1025,23 +1024,19 @@ pub fn append_siglip_map_head_batched_with_memory_policy(
         memory,
         host,
     )?;
-    let key = append_c16_to_a16_row_shards(
+    let key = append_c16_to_a16_row_shards_reblocked_in_arenas(
         schedule,
         &projection_blocks(&key_value, 0, columns),
-        RowShardTransitionConfig {
-            columns,
-            data_base,
-            data_limit,
-        },
+        columns,
+        row_block_dimension,
+        &memory.transient,
     )?;
-    let value = append_c16_to_a16_row_shards(
+    let value = append_c16_to_a16_row_shards_reblocked_in_arenas(
         schedule,
         &projection_blocks(&key_value, 1, columns),
-        RowShardTransitionConfig {
-            columns,
-            data_base,
-            data_limit,
-        },
+        columns,
+        row_block_dimension,
+        &memory.transient,
     )?;
     end_tensor_lifetimes(schedule, key_value.iter().map(|block| block.tensor))?;
     if !retain_diagnostics {
@@ -1128,14 +1123,12 @@ pub fn append_siglip_map_head_batched_with_memory_policy(
     if !retain_diagnostics {
         end_tensor_lifetimes(schedule, attention_shards.iter().map(|shard| shard.tensor))?;
     }
-    let residual = append_c16_to_a16_row_shards(
+    let residual = append_c16_to_a16_row_shards_reblocked_in_arenas(
         schedule,
         &projected,
-        RowShardTransitionConfig {
-            columns,
-            data_base,
-            data_limit,
-        },
+        columns,
+        PROBE_ROWS,
+        &memory.transient,
     )?;
     end_tensor_lifetimes(schedule, projected.iter().map(|block| block.tensor))?;
 
@@ -1238,14 +1231,11 @@ pub fn append_siglip_map_head_batched_with_memory_policy(
         }),
     )?;
     make_tensors_resident(schedule, down_bias.iter().map(|block| block.tensor))?;
-    let output = append_c16_to_a16_row_shards(
+    let output = append_c16_to_a16_row_shards_reblocked_like_in_arenas(
         schedule,
         &down.output,
-        RowShardTransitionConfig {
-            columns,
-            data_base,
-            data_limit,
-        },
+        &residual,
+        &memory.transient,
     )?;
     end_tensor_lifetimes(schedule, down.output.iter().map(|block| block.tensor))?;
     let output = append_add_f16_row_shards_in_place(schedule, &output, &residual)?;
@@ -1596,25 +1586,13 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     let qkv_shards = (0..3)
         .map(|projection| {
             let blocks = projection_blocks(&qkv.output, projection, columns);
-            if qkv_destination_rows == qkv_row_block_dimension {
-                append_c16_to_a16_row_shards(
-                    schedule,
-                    &blocks,
-                    RowShardTransitionConfig {
-                        columns,
-                        data_base,
-                        data_limit,
-                    },
-                )
-            } else {
-                append_c16_to_a16_row_shards_reblocked_in_arenas(
-                    schedule,
-                    &blocks,
-                    columns,
-                    qkv_destination_rows,
-                    &memory.transient,
-                )
-            }
+            append_c16_to_a16_row_shards_reblocked_in_arenas(
+                schedule,
+                &blocks,
+                columns,
+                qkv_destination_rows,
+                &memory.transient,
+            )
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     end_tensor_lifetimes(schedule, qkv.output.iter().map(|block| block.tensor))?;
@@ -1745,12 +1723,12 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     // can no longer hold the residual, projection, and normalized output
     // together. Only that edge is then transitioned to a smaller shard grid.
     let residual_source_rows = input.iter().map(|shard| shard.rows).max().unwrap_or(1);
-    let residual_rows = choose_row_shard_rows_for_copies_in_arenas(
+    let residual_rows = choose_colocated_row_shard_rows_for_copies_in_arenas(
         schedule,
         rows,
         columns,
         residual_source_rows,
-        2,
+        3,
         &memory.transient,
     )
     .ok_or_else(|| {
@@ -1775,25 +1753,12 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         destination_row_block_rows = residual_rows,
         "selected attention residual row-shard placement"
     );
-    let projected_shards = if output_row_block_dimension == residual_rows {
-        append_c16_to_a16_row_shards(
-            schedule,
-            &output_projection.output,
-            RowShardTransitionConfig {
-                columns,
-                data_base,
-                data_limit,
-            },
-        )?
-    } else {
-        append_c16_to_a16_row_shards_reblocked_in_arenas(
-            schedule,
-            &output_projection.output,
-            columns,
-            residual_rows,
-            &memory.transient,
-        )?
-    };
+    let projected_shards = append_c16_to_a16_row_shards_reblocked_like_in_arenas(
+        schedule,
+        &output_projection.output,
+        &residual_input,
+        &memory.transient,
+    )?;
     end_tensor_lifetimes(
         schedule,
         output_projection.output.iter().map(|block| block.tensor),
@@ -2112,30 +2077,12 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
         mlp_down_adjustment_allocation_start,
         mlp_down_adjustment.iter().map(|block| block.tensor),
     )?;
-    let output_row_block_dimension = attention_residual
-        .iter()
-        .map(|shard| shard.rows)
-        .max()
-        .ok_or("attention residual has no row shards")?;
-    let output = if mlp_down_row_block_dimension == output_row_block_dimension {
-        append_c16_to_a16_row_shards(
-            schedule,
-            &mlp_down.output,
-            RowShardTransitionConfig {
-                columns,
-                data_base,
-                data_limit,
-            },
-        )?
-    } else {
-        append_c16_to_a16_row_shards_reblocked_in_arenas(
-            schedule,
-            &mlp_down.output,
-            columns,
-            output_row_block_dimension,
-            &memory.transient,
-        )?
-    };
+    let output = append_c16_to_a16_row_shards_reblocked_like_in_arenas(
+        schedule,
+        &mlp_down.output,
+        &attention_residual,
+        &memory.transient,
+    )?;
     end_tensor_lifetimes(schedule, mlp_down.output.iter().map(|block| block.tensor))?;
     let output = append_add_f16_row_shards_in_place(schedule, &output, &attention_residual)?;
     if !retain_diagnostics {

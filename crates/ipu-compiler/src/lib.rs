@@ -37,6 +37,8 @@ pub use rowwise::{
     append_affine_layer_norm_f16_with_memory_policy, append_c16_to_a16_blocks_gelu_f16,
     append_c16_to_a16_blocks_gelu_f16_in_arenas, append_c16_to_a16_row_shards,
     append_c16_to_a16_row_shards_gelu_f16, append_c16_to_a16_row_shards_reblocked_in_arenas,
+    append_c16_to_a16_row_shards_reblocked_like_in_arenas,
+    choose_colocated_row_shard_rows_for_copies_in_arenas,
     choose_row_shard_rows_for_copies_in_arenas, end_tensor_lifetimes, make_tensors_resident,
     make_tensors_resident_since, plan_affine_layer_norm_f16, retain_tensor_lifetimes,
 };
@@ -1117,33 +1119,6 @@ impl AllocationStore {
             .into_iter()
             .filter(|&index| index >= start && self.values[index].kind.has_home_address())
             .collect()
-    }
-
-    pub(crate) fn live_home_indices_in_regions(&self, regions: &[Vec<(u32, u32)>]) -> Vec<usize> {
-        self.with_index(|index| {
-            regions
-                .iter()
-                .enumerate()
-                .flat_map(|(tile, regions)| {
-                    index
-                        .homes_by_tile
-                        .get(tile)
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                        .filter(move |&allocation_index| {
-                            let allocation = &self.values[allocation_index];
-                            if allocation.live_until != usize::MAX {
-                                return false;
-                            }
-                            let end = allocation.address.saturating_add(allocation.size);
-                            regions.iter().any(|&(start, region_end)| {
-                                allocation.address >= start && end <= region_end
-                            })
-                        })
-                })
-                .collect()
-        })
     }
 
     pub(crate) fn set_live_until(&mut self, indices: &[usize], phase: usize) {
@@ -2841,6 +2816,34 @@ fn plan_appended_blocked_gemm_with_memory_policy(
     let mut plan = plan_blocked_gemm(config)?;
     let tile_rotation = resident_tile_rotation(parent, config, &plan.right, memory)?;
     rotate_gemm_plan_tiles(&mut plan, tile_rotation)?;
+    let mut last_error = None;
+    for additional_rotation in 0..parent.tile_count {
+        match relocate_appended_blocked_gemm(parent, &mut plan, config, memory) {
+            Ok(()) => {
+                if additional_rotation != 0 {
+                    info!(
+                        preferred_rotation = tile_rotation,
+                        additional_rotation, "rotated GEMM placement to satisfy tile memory"
+                    );
+                }
+                return Ok(plan);
+            }
+            Err(error) => last_error = Some(error),
+        }
+        rotate_gemm_plan_tiles(&mut plan, 1)?;
+    }
+    Err(CompileError::Memory(format!(
+        "no tile rotation can place appended GEMM: {}",
+        last_error.unwrap()
+    )))
+}
+
+fn relocate_appended_blocked_gemm(
+    parent: &Schedule,
+    plan: &mut BlockedGemmPlan,
+    config: BlockedGemmConfig,
+    memory: &MemoryPolicy,
+) -> Result<(), CompileError> {
     let mut regions = plan
         .left
         .iter()
@@ -2993,7 +2996,7 @@ fn plan_appended_blocked_gemm_with_memory_policy(
             allocation.address = relocated[&owner.0] + allocation.address - owner.2;
         }
     }
-    Ok(plan)
+    Ok(())
 }
 
 fn resident_tile_rotation(
@@ -4821,8 +4824,31 @@ impl Schedule {
                                 transfer.tensor,
                                 transfer.source_tile,
                             );
+                            let producers = self
+                                .phases
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(producer_phase, phase)| {
+                                    let Phase::Compute { commands, .. } = phase else {
+                                        return None;
+                                    };
+                                    commands
+                                        .iter()
+                                        .find(|command| {
+                                            command.tile == transfer.source_tile
+                                                && command.output == transfer.tensor
+                                        })
+                                        .map(|command| {
+                                            format!(
+                                                "{producer_phase}/{}",
+                                                command.specialization.operation
+                                            )
+                                        })
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",");
                             CompileError::Memory(format!(
-                                "missing source allocation for tensor {} on tile {} at phase {phase_index}; homes: {homes}",
+                                "missing source allocation for tensor {} on tile {} at phase {phase_index}; homes: {homes}; producers: {producers}",
                                 transfer.tensor.0, transfer.source_tile,
                             ))
                         })?;
@@ -5472,8 +5498,11 @@ impl<'a> AllocationIndex<'a> {
             .filter(|allocation| allocation.kind.has_home_address())
             .map(|allocation| {
                 format!(
-                    "0x{:x}/{}..{}",
-                    allocation.address, allocation.live_from, allocation.live_until
+                    "0x{:x}/{}..{}/{:?}",
+                    allocation.address,
+                    allocation.live_from,
+                    allocation.live_until,
+                    allocation.kind
                 )
             })
             .collect::<Vec<_>>();
@@ -6758,6 +6787,53 @@ mod tests {
 
         assert_ne!(rotation, 0);
         assert_ne!(rotation, 3);
+    }
+
+    #[test]
+    fn appended_gemm_uses_a_feasible_rotation_when_the_preference_is_full() {
+        let base = 0xa0000;
+        let limit = base + 0x10000;
+        let parent = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![Allocation {
+                tensor: TensorId(0),
+                tile: 0,
+                address: base,
+                size: limit - base,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            }]
+            .into(),
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+        let mut memory = MemoryPolicy::contiguous(base, limit);
+        memory.resident_tile_assignment = ResidentTileAssignment::Fixed;
+        let config = BlockedGemmConfig {
+            rows: 64,
+            inner_dimension: 64,
+            columns: 64,
+            block_dimension: 64,
+            inner_block_dimension: 32,
+            row_block_dimension: 64,
+            tile_count: parent.tile_count,
+            data_base: base,
+            data_limit: limit,
+            data_type: GemmDataType::F16,
+            retain_profile_metadata: false,
+        };
+
+        let plan = plan_appended_blocked_gemm_with_memory_policy(&parent, config, &memory).unwrap();
+
+        assert!(
+            plan.left
+                .iter()
+                .chain(&plan.right)
+                .chain(&plan.output)
+                .all(|placement| placement.tile != 0)
+        );
     }
 
     #[test]
