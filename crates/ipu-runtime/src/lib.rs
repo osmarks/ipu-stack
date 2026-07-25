@@ -706,15 +706,12 @@ struct AllocationReferenceIndex<'a> {
     by_tensor_tile: HashMap<(ipu_compiler::TensorId, u16), Vec<usize>>,
     homes_by_tile: Vec<Vec<usize>>,
     home_prefix_ends: Vec<Vec<u32>>,
-    storage_by_tile: Vec<Vec<usize>>,
-    storage_prefix_ends: Vec<Vec<u32>>,
 }
 
 impl<'a> AllocationReferenceIndex<'a> {
     fn new(allocations: &'a [ipu_compiler::Allocation], tile_count: usize) -> Self {
         let mut by_tensor_tile = HashMap::<_, Vec<_>>::default();
         let mut homes_by_tile = vec![Vec::new(); tile_count];
-        let mut storage_by_tile = vec![Vec::new(); tile_count];
         for (index, allocation) in allocations.iter().enumerate() {
             by_tensor_tile
                 .entry((allocation.tensor, allocation.tile))
@@ -722,12 +719,6 @@ impl<'a> AllocationReferenceIndex<'a> {
                 .push(index);
             if matches!(allocation.kind, ipu_compiler::AllocationKind::Home) {
                 homes_by_tile[usize::from(allocation.tile)].push(index);
-            }
-            if !matches!(
-                allocation.kind,
-                ipu_compiler::AllocationKind::HomeAlias { .. }
-            ) {
-                storage_by_tile[usize::from(allocation.tile)].push(index);
             }
         }
         let prepare = |by_tile: &mut [Vec<usize>]| {
@@ -754,53 +745,12 @@ impl<'a> AllocationReferenceIndex<'a> {
                 .collect::<Vec<_>>()
         };
         let home_prefix_ends = prepare(&mut homes_by_tile);
-        let storage_prefix_ends = prepare(&mut storage_by_tile);
         Self {
             allocations,
             by_tensor_tile,
             homes_by_tile,
             home_prefix_ends,
-            storage_by_tile,
-            storage_prefix_ends,
         }
-    }
-
-    fn moved_overlap(
-        &self,
-        tile: u16,
-        address: u32,
-        bytes: u32,
-        plan: &AllocationAddressPlan,
-    ) -> Result<Option<usize>> {
-        let end = address
-            .checked_add(bytes)
-            .ok_or("graph address span overflow")?;
-        let entries = self
-            .storage_by_tile
-            .get(usize::from(tile))
-            .ok_or("graph address tile is outside the allocation index")?;
-        let prefix_ends = &self.storage_prefix_ends[usize::from(tile)];
-        let mut position = entries.partition_point(|&index| self.allocations[index].address < end);
-        while position != 0 && prefix_ends[position - 1] > address {
-            position -= 1;
-            let index = entries[position];
-            let allocation = &self.allocations[index];
-            if plan.changed(
-                self.allocations,
-                AllocationAddressRef {
-                    allocation: index,
-                    offset: 0,
-                },
-            ) && ranges_overlap(
-                address,
-                end,
-                allocation.address,
-                allocation.address.saturating_add(allocation.size),
-            ) {
-                return Ok(Some(index));
-            }
-        }
-        Ok(None)
     }
 
     fn tensor_span(
@@ -945,6 +895,7 @@ impl<'a> AllocationReferenceIndex<'a> {
 
 struct AllocationAddressPlan {
     addresses: Vec<u32>,
+    moved_storage_by_tile: Vec<Vec<(u32, u32)>>,
 }
 
 impl AllocationAddressPlan {
@@ -1022,8 +973,31 @@ impl AllocationAddressPlan {
                 &mut visiting,
             )?;
         }
+        let addresses = addresses
+            .into_iter()
+            .map(Option::unwrap)
+            .collect::<Vec<_>>();
+        let mut moved_storage_by_tile = vec![Vec::new(); usize::from(graph.schedule.tile_count)];
+        for (index, allocation) in allocations.iter().enumerate() {
+            if addresses[index] == allocation.address
+                || matches!(
+                    allocation.kind,
+                    ipu_compiler::AllocationKind::HomeAlias { .. }
+                )
+            {
+                continue;
+            }
+            moved_storage_by_tile[usize::from(allocation.tile)].push((
+                allocation.address,
+                allocation.address.saturating_add(allocation.size),
+            ));
+        }
+        for ranges in &mut moved_storage_by_tile {
+            *ranges = merge_address_ranges(std::mem::take(ranges));
+        }
         Ok(Self {
-            addresses: addresses.into_iter().map(Option::unwrap).collect(),
+            addresses,
+            moved_storage_by_tile,
         })
     }
 
@@ -1039,6 +1013,18 @@ impl AllocationAddressPlan {
         reference: AllocationAddressRef,
     ) -> bool {
         self.addresses[reference.allocation] != allocations[reference.allocation].address
+    }
+
+    fn moved_overlap(&self, tile: u16, address: u32, bytes: u32) -> Result<bool> {
+        let end = address
+            .checked_add(bytes)
+            .ok_or("graph address span overflow")?;
+        let ranges = self
+            .moved_storage_by_tile
+            .get(usize::from(tile))
+            .ok_or("graph address tile is outside the allocation plan")?;
+        let position = ranges.partition_point(|&(start, _)| start < end);
+        Ok(position != 0 && ranges[position - 1].1 > address)
     }
 }
 
@@ -1070,14 +1056,9 @@ impl GraphAddressReferences {
                     continue;
                 };
                 let Some(reference) = index.transfer_destination(transfer, phase, address)? else {
-                    if let Some(allocation) = index.moved_overlap(
-                        transfer.destination_tile,
-                        address,
-                        transfer.bytes,
-                        plan,
-                    )? {
+                    if plan.moved_overlap(transfer.destination_tile, address, transfer.bytes)? {
                         return Err(format!(
-                            "exchange destination for tensor {} at phase {phase} overlaps moved allocation {allocation} but has no allocation owner",
+                            "exchange destination for tensor {} at phase {phase} overlaps moved storage but has no allocation owner",
                             transfer.tensor.0
                         )
                         .into());
@@ -1101,11 +1082,9 @@ impl GraphAddressReferences {
             let Some(reference) =
                 index.boundary(buffer.tile, buffer.address, bytes, GraphBoundary::Input)?
             else {
-                if let Some(allocation) =
-                    index.moved_overlap(buffer.tile, buffer.address, bytes, plan)?
-                {
+                if plan.moved_overlap(buffer.tile, buffer.address, bytes)? {
                     return Err(format!(
-                        "initial buffer {buffer_index} overlaps moved allocation {allocation} but has no allocation owner"
+                        "initial buffer {buffer_index} overlaps moved storage but has no allocation owner"
                     )
                     .into());
                 }
@@ -1163,11 +1142,9 @@ impl GraphAddressReferences {
                 let Some(reference) =
                     index.boundary(logical, slice.tile_address, bytes, boundary)?
                 else {
-                    if let Some(allocation) =
-                        index.moved_overlap(logical, slice.tile_address, bytes, plan)?
-                    {
+                    if plan.moved_overlap(logical, slice.tile_address, bytes)? {
                         return Err(format!(
-                            "binding {} slice {slice_index} overlaps moved allocation {allocation} but has no allocation owner",
+                            "binding {} slice {slice_index} overlaps moved storage but has no allocation owner",
                             binding.name
                         )
                         .into());
@@ -7526,6 +7503,67 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn moved_storage_index_merges_overlapping_old_ranges() {
+        let owner = ipu_compiler::TensorId(1);
+        let graph = ExecutableGraph {
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases: Vec::new(),
+                allocations: vec![
+                    ipu_compiler::Allocation {
+                        tensor: owner,
+                        tile: 0,
+                        address: 0x60000,
+                        size: 0x100,
+                        live_from: 0,
+                        live_until: usize::MAX,
+                        kind: ipu_compiler::AllocationKind::Home,
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(2),
+                        tile: 0,
+                        address: 0x60040,
+                        size: 0x100,
+                        live_from: 0,
+                        live_until: 1,
+                        kind: ipu_compiler::AllocationKind::ExchangeStaging { phase: 0 },
+                    },
+                    ipu_compiler::Allocation {
+                        tensor: ipu_compiler::TensorId(3),
+                        tile: 0,
+                        address: 0x60020,
+                        size: 0x20,
+                        live_from: 0,
+                        live_until: 1,
+                        kind: ipu_compiler::AllocationKind::HomeAlias { source: owner },
+                    },
+                ]
+                .into(),
+                tile_count: 1,
+                peak_sram: BTreeMap::new(),
+            },
+            memory_policy: None,
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+        let index = AllocationReferenceIndex::new(&graph.schedule.allocations, 1);
+        let plan = AllocationAddressPlan::new(
+            &graph,
+            [(0, 0x70000), (1, 0x70100)],
+            &index,
+        )
+        .unwrap();
+
+        assert!(plan.moved_overlap(0, 0x60000, 0x140).unwrap());
+        assert!(plan.moved_overlap(0, 0x60120, 0x40).unwrap());
+        assert!(!plan.moved_overlap(0, 0x60140, 0x20).unwrap());
+        assert!(!plan.moved_overlap(0, 0x50000, 0x8000).unwrap());
+    }
 
     #[test]
     fn provisional_resident_overlap_is_colored_before_packaging() {
