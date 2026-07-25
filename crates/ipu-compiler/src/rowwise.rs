@@ -1208,10 +1208,8 @@ fn append_affine_layer_norm_f16_impl(
         .map(|arena| arena.limit)
         .max()
         .unwrap();
-    let resident_occupied = schedule.allocations.occupied_intervals_by_tile(
+    let resident_occupied = schedule.allocations.all_occupied_intervals_by_tile(
         schedule.tile_count,
-        0,
-        usize::MAX,
         resident_base,
         resident_limit,
     );
@@ -1647,8 +1645,8 @@ mod tests {
                 tile: 0,
                 address,
                 size: 128,
-                live_from: 0,
-                live_until: usize::MAX,
+                live_from: 1,
+                live_until: 1,
                 kind: AllocationKind::Home,
             });
         }
