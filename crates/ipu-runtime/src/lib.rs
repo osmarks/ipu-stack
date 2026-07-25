@@ -2136,10 +2136,10 @@ fn compact_allocations_around(
                 let allocation = &graph.schedule.allocations[index];
                 (
                     !memory_constraints.required_interleaved.contains(&index),
-                    !memory_constraints.relations.contains_key(&index),
                     std::cmp::Reverse(
                         memory_constraints.access_extent(index, allocation.size),
                     ),
+                    !memory_constraints.relations.contains_key(&index),
                     allocation.live_until != usize::MAX,
                     allocation.live_from,
                     allocation.live_until,
