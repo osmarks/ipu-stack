@@ -750,10 +750,11 @@ pub fn append_flash_attention_to_a16_row_shards_in_arenas(
                         })
                     })
                     .sum::<u32>();
-                Some((occupied_bytes, tile, address, candidate))
+                let remote = !tasks.iter().any(|task| task.tile == tile);
+                Some((remote, occupied_bytes, tile, address, candidate))
             })
-            .min_by_key(|&(occupied_bytes, tile, ..)| (occupied_bytes, tile))
-            .map(|(_, tile, address, occupied)| (tile, address, occupied))
+            .min_by_key(|&(remote, occupied_bytes, tile, ..)| (remote, occupied_bytes, tile))
+            .map(|(_, _, tile, address, occupied)| (tile, address, occupied))
             .ok_or_else(|| {
                 CompileError::Memory(format!(
                     "no distinct tile can hold a {activation_bytes}-byte attention output shard"

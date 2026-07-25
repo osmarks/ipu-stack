@@ -7071,10 +7071,17 @@ fn run_host_impl(
     let (invocation_inputs, resident_input) =
         input.split_at(usize::try_from(invocation_region_bytes)?);
     if let Some(call) = calls.iter().find(|call| call.name == "initialize") {
+        let started = Instant::now();
         let completed = session
             .invoke_streaming_deferred(&call.name, call_input(call, resident_input)?)
             .map_err(|error| generated_call_error(&device, app, call, error))?;
         session.collect(&completed)?;
+        info!(
+            call = %call.name,
+            input_bytes = resident_input.len(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            "completed generated host call"
+        );
     }
     let mut output = Vec::with_capacity(
         usize::try_from(output_size)? * usize::try_from(graph_call.invocations)?,
@@ -7082,6 +7089,7 @@ fn run_host_impl(
     for invocation in 0..graph_call.invocations {
         let start = usize::try_from(u64::from(invocation) * invocation_input_bytes)?;
         let end = start + usize::try_from(invocation_input_bytes)?;
+        let started = Instant::now();
         let deferred = session
             .invoke_streaming_deferred(
                 &graph_call.name,
@@ -7093,6 +7101,14 @@ fn run_host_impl(
             verify_runtime_completion(&device, app)?;
         }
         let call_output = session.collect(&deferred)?;
+        info!(
+            call = %graph_call.name,
+            invocation,
+            input_bytes = invocation_input_bytes,
+            output_bytes = output_size,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            "completed generated host call"
+        );
         output.extend_from_slice(&call_output[..usize::try_from(output_size)?]);
     }
     debug!(states = %supervisor_state_summary(&device, app), "host exchange supervisor states");

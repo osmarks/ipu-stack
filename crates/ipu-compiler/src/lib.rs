@@ -3121,14 +3121,22 @@ fn choose_resident_tile_rotation_with_projection(
         .map(|arena| arena.limit)
         .max()
         .unwrap_or(0);
-    let occupied = parent.allocations.occupied_intervals_by_tile(
-        parent.tile_count,
-        parent.phases.len(),
-        usize::MAX,
-        arena_base,
-        arena_limit,
-    );
-    let parent_bytes = occupied
+    let mut resident_occupied = vec![Vec::new(); tile_count];
+    for allocation in &parent.allocations {
+        if allocation.kind != AllocationKind::Home || allocation.live_until != usize::MAX {
+            continue;
+        }
+        let start = allocation.address.max(arena_base);
+        let end = allocation
+            .address
+            .saturating_add(allocation.size)
+            .min(arena_limit);
+        if start < end {
+            resident_occupied[usize::from(allocation.tile)].push((start, end));
+        }
+    }
+    merge_occupied_intervals(&mut resident_occupied);
+    let parent_bytes = resident_occupied
         .iter()
         .map(|intervals| {
             intervals
@@ -3146,19 +3154,55 @@ fn choose_resident_tile_rotation_with_projection(
         child_bytes[usize::from(block.tile)] +=
             u64::from(block.rows) * u64::from(block.columns) * u64::from(element_bytes);
     }
+    let mut static_activity = vec![0u64; tile_count];
+    for phase in &parent.phases {
+        match phase {
+            Phase::Exchange { transfers } => {
+                for transfer in transfers {
+                    static_activity[usize::from(transfer.source_tile)] += 1;
+                    static_activity[usize::from(transfer.destination_tile)] += 1;
+                }
+            }
+            Phase::Compute { commands, .. } => {
+                for command in commands {
+                    static_activity[usize::from(command.tile)] += 1;
+                }
+            }
+        }
+    }
     (0..tile_count)
         .min_by_key(|&rotation| {
-            let loads = (0..tile_count).map(|tile| {
-                parent_bytes[tile]
-                    + projected_extra[tile]
-                    + child_bytes[(tile + tile_count - rotation) % tile_count]
-                        * u64::try_from(child_instances).unwrap()
-            });
-            let maximum = loads.clone().max().unwrap_or(0);
+            let loads = (0..tile_count)
+                .map(|tile| {
+                    parent_bytes[tile]
+                        + projected_extra[tile]
+                        + child_bytes[(tile + tile_count - rotation) % tile_count]
+                            * u64::try_from(child_instances).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let maximum = loads.iter().copied().max().unwrap_or(0);
             let squared = loads
-                .map(|load| u128::from(load) * u128::from(load))
+                .iter()
+                .map(|&load| u128::from(load) * u128::from(load))
                 .sum::<u128>();
-            (maximum, squared, rotation)
+            let maximum_activity = loads
+                .iter()
+                .zip(&static_activity)
+                .filter_map(|(&load, &activity)| (load == maximum).then_some(activity))
+                .max()
+                .unwrap_or(0);
+            let weighted_activity = loads
+                .iter()
+                .zip(&static_activity)
+                .map(|(&load, &activity)| u128::from(load) * u128::from(activity))
+                .sum::<u128>();
+            (
+                maximum,
+                squared,
+                maximum_activity,
+                weighted_activity,
+                rotation,
+            )
         })
         .unwrap_or(0) as u16
 }
@@ -6787,6 +6831,125 @@ mod tests {
 
         assert_ne!(rotation, 0);
         assert_ne!(rotation, 3);
+    }
+
+    #[test]
+    fn transient_pressure_does_not_skew_resident_tile_balance() {
+        let resident = Allocation {
+            tensor: TensorId(0),
+            tile: 0,
+            address: 0xa0000,
+            size: 128,
+            live_from: 0,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        };
+        let parent = |transient| Schedule {
+            layouts: Vec::new(),
+            phases: vec![Phase::Exchange {
+                transfers: Vec::new(),
+            }],
+            allocations: std::iter::once(resident.clone()).chain(transient).collect(),
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+        let child = vec![
+            BlockPlacement {
+                tensor: TensorId(1),
+                tile: 0,
+                address: 0xa0000,
+                block_row: 0,
+                block_column: 0,
+                row_start: 0,
+                rows: 1,
+                column_start: 0,
+                columns: 32,
+            },
+            BlockPlacement {
+                tensor: TensorId(2),
+                tile: 1,
+                address: 0xa0000,
+                block_row: 0,
+                block_column: 1,
+                row_start: 0,
+                rows: 1,
+                column_start: 32,
+                columns: 32,
+            },
+        ];
+        let memory = MemoryPolicy::contiguous(0xa0000, 0xe8000);
+        let baseline = choose_resident_tile_rotation_in_arenas(
+            &parent(None),
+            &child,
+            GemmDataType::F16.element_bytes(),
+            &memory,
+        );
+        let transient = Allocation {
+            tensor: TensorId(3),
+            tile: baseline,
+            address: 0xa1000,
+            size: 0x20000,
+            live_from: 0,
+            live_until: 2,
+            kind: AllocationKind::Home,
+        };
+        let with_transient = choose_resident_tile_rotation_in_arenas(
+            &parent(Some(transient)),
+            &child,
+            GemmDataType::F16.element_bytes(),
+            &memory,
+        );
+
+        assert_eq!(with_transient, baseline);
+    }
+
+    #[test]
+    fn resident_rotation_uses_static_activity_to_break_load_ties() {
+        let parent = Schedule {
+            layouts: Vec::new(),
+            phases: vec![Phase::Compute {
+                op: OpId(0),
+                commands: vec![Arc::new(KernelCommand {
+                    tile: 0,
+                    output: TensorId(0),
+                    inputs: Vec::new(),
+                    arguments: Vec::new(),
+                    specialization: Arc::new(SpecializationKey {
+                        operation: "busy_tile".into(),
+                        shape: Vec::new(),
+                        worker_count: 1,
+                        role: "test".into(),
+                        alignment: 8,
+                        abi: KernelAbi::Generic,
+                    }),
+                    metadata: BTreeMap::new(),
+                })],
+            }],
+            allocations: Vec::new().into(),
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+        let child = [BlockPlacement {
+            tensor: TensorId(1),
+            tile: 0,
+            address: 0xa0000,
+            block_row: 0,
+            block_column: 0,
+            row_start: 0,
+            rows: 1,
+            column_start: 0,
+            columns: 32,
+        }];
+        let memory = MemoryPolicy::contiguous(0xa0000, 0xe8000);
+
+        let rotation = choose_resident_tile_rotation_in_arenas(
+            &parent,
+            &child,
+            GemmDataType::F16.element_bytes(),
+            &memory,
+        );
+
+        assert_ne!(rotation, 0);
     }
 
     #[test]
