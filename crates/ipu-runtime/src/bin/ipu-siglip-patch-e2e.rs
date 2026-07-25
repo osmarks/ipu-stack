@@ -2151,34 +2151,74 @@ fn materialize_finite_checks(
     memory: &MemoryPolicy,
 ) -> Result<(), ipu_compiler::CompileError> {
     const BYTES: u32 = 6 * 4;
+    let arena_base = memory
+        .transient
+        .iter()
+        .map(|arena| arena.base)
+        .min()
+        .ok_or_else(|| ipu_compiler::CompileError::Memory("finite checks need SRAM".into()))?;
+    let arena_limit = memory
+        .transient
+        .iter()
+        .map(|arena| arena.limit)
+        .max()
+        .unwrap();
+    let mut order = stages
+        .iter()
+        .enumerate()
+        .flat_map(|(stage, (_, checks))| {
+            checks
+                .iter()
+                .enumerate()
+                .map(move |(check, placement)| (placement.phase, stage, check))
+        })
+        .collect::<Vec<_>>();
+    order.sort_unstable();
+
     let mut next_tensor = schedule.allocations.next_tensor_id();
-    for (_, checks) in stages {
-        for check in checks {
-            let tensor = TensorId(next_tensor);
-            next_tensor += 1;
-            check.address = schedule.allocations.find_free_region_in_arenas(
-                check.tile,
-                BYTES,
-                check.phase,
+    let mut current_phase = None;
+    let mut occupied = Vec::new();
+    let mut diagnostics = vec![Vec::<(u32, u32)>::new(); usize::from(schedule.tile_count)];
+    let mut allocations = Vec::with_capacity(order.len());
+    for (phase, stage, index) in order {
+        if current_phase != Some(phase) {
+            occupied = schedule.allocations.occupied_intervals_by_tile(
+                schedule.tile_count,
+                phase,
                 usize::MAX,
-                &memory.transient,
-                8,
-            )?;
-            schedule.allocations.push(Allocation {
-                tensor,
-                tile: check.tile,
-                address: check.address,
-                size: BYTES,
-                live_from: check.phase,
-                live_until: usize::MAX,
-                kind: AllocationKind::Home,
-            });
-            let Phase::Compute { commands, .. } = &mut schedule.phases[check.phase] else {
-                unreachable!("finite-check phase changed kind")
-            };
-            Arc::make_mut(&mut commands[check.command]).output = tensor;
+                arena_base,
+                arena_limit,
+            );
+            for (tile_occupied, diagnostic) in occupied.iter_mut().zip(&diagnostics) {
+                tile_occupied.extend_from_slice(diagnostic);
+            }
+            current_phase = Some(phase);
         }
+        let check = &mut stages[stage].1[index];
+        check.address = ipu_compiler::allocate_from_occupied_arenas(
+            &mut occupied[usize::from(check.tile)],
+            BYTES,
+            &memory.transient,
+            8,
+        )?;
+        diagnostics[usize::from(check.tile)].push((check.address, check.address + BYTES));
+        let tensor = TensorId(next_tensor);
+        next_tensor += 1;
+        allocations.push(Allocation {
+            tensor,
+            tile: check.tile,
+            address: check.address,
+            size: BYTES,
+            live_from: check.phase,
+            live_until: usize::MAX,
+            kind: AllocationKind::Home,
+        });
+        let Phase::Compute { commands, .. } = &mut schedule.phases[check.phase] else {
+            unreachable!("finite-check phase changed kind")
+        };
+        Arc::make_mut(&mut commands[check.command]).output = tensor;
     }
+    schedule.allocations.extend(allocations);
     Ok(())
 }
 
