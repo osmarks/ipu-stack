@@ -2146,13 +2146,17 @@ fn compact_allocations_around(
                     allocation.tensor.0,
                 )
             });
+            let placement_priority = compact
+                .iter()
+                .enumerate()
+                .map(|(priority, &index)| (index, priority))
+                .collect::<HashMap<_, _>>();
             let mut compact = VecDeque::from(compact);
             // Relation-constrained objects remain movable: every relation is
             // stored in both directions, so re-placing an evicted object checks
             // it against the neighbor's current address. Only an allocation
             // whose correctness depends on its exact base is immovable.
             let protected = memory_constraints.pinned.clone();
-            let mut eviction_counts = HashMap::<usize, usize>::new();
             while let Some(index) = compact.pop_front() {
                     let allocation = &graph.schedule.allocations[index];
                     let arenas = if allocation.live_until == usize::MAX {
@@ -2273,16 +2277,16 @@ fn compact_allocations_around(
                             32,
                         )
                     {
-                        let blocker_set = blockers.iter().copied().collect::<HashSet<_>>();
+                        let priority = placement_priority[&index];
                         if blockers
                             .iter()
-                            .all(|blocker| eviction_counts.get(blocker).copied().unwrap_or(0) < 2)
+                            .all(|blocker| placement_priority[blocker] > priority)
                         {
+                            let blocker_set = blockers.iter().copied().collect::<HashSet<_>>();
                             result.retain(|(placed, _)| !blocker_set.contains(placed));
                             for blocker in &blockers {
                                 placed_addresses.remove(blocker);
                                 compact_set.insert(*blocker);
-                                *eviction_counts.entry(*blocker).or_default() += 1;
                                 compact.push_back(*blocker);
                             }
                             for occupied in &mut occupied_by_phase {
