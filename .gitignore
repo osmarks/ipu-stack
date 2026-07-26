@@ -4,3 +4,8 @@ __pycache__/
 *.ipuexe
 *.gp
 *.o
+*.capnp
+*.html
+perf.data
+bugs.md
+profiles
