@@ -2173,9 +2173,9 @@ impl MemoryPolicy {
                     )
                 })?;
         }
-        let mut role_load = role_headroom.to_vec();
+        let mut resident_role_load = vec![0u64; tile_count];
         for decision in &decisions {
-            for (tile, load) in role_load.iter_mut().enumerate() {
+            for (tile, load) in resident_role_load.iter_mut().enumerate() {
                 *load += rotated_bytes(&decision.resident_bytes, decision.rotation, tile)
                     * repetition_bytes;
             }
@@ -2184,24 +2184,38 @@ impl MemoryPolicy {
             for instance in 0..repetitions {
                 let offset = instance * tile_count / repetitions;
                 let tile = (usize::from(decision.tile) + offset) % tile_count;
-                role_load[tile] += u64::from(decision.key.bytes);
+                resident_role_load[tile] += u64::from(decision.key.bytes);
             }
         }
+        let role_load = resident_role_load
+            .iter()
+            .zip(role_headroom)
+            .map(|(&resident, &headroom)| resident + headroom)
+            .collect::<Vec<_>>();
         let score = |offset: usize| {
-            let mut maximum = 0;
+            let mut resident_maximum = 0;
+            let mut combined_maximum = 0;
             let mut squares = 0u128;
             for (tile, &fixed) in fixed.iter().enumerate() {
                 let source = (tile + tile_count - offset) % tile_count;
-                let load = fixed + role_load[source];
-                maximum = maximum.max(load);
-                squares += u128::from(load) * u128::from(load);
+                let resident = fixed + resident_role_load[source];
+                let combined = fixed + role_load[source];
+                resident_maximum = resident_maximum.max(resident);
+                combined_maximum = combined_maximum.max(combined);
+                squares += u128::from(combined) * u128::from(combined);
             }
-            (maximum, squares)
+            (resident_maximum, combined_maximum, squares)
         };
-        let best_offset = if score(0).0 <= capacity {
+        let best_offset = if score(0).1 <= capacity {
             0
         } else {
-            (0..tile_count).min_by_key(|&offset| score(offset)).unwrap()
+            (0..tile_count)
+                .filter(|&offset| score(offset).0 <= capacity)
+                .min_by_key(|&offset| {
+                    let (_, combined, squares) = score(offset);
+                    (combined, squares, offset)
+                })
+                .unwrap_or_else(|| (0..tile_count).min_by_key(|&offset| score(offset)).unwrap())
         };
         for decision in &mut decisions {
             decision.rotation =
@@ -8024,6 +8038,63 @@ mod tests {
         assert_eq!(slack, vec![900; 4]);
         let owners = template.owner_decisions.lock().unwrap();
         assert_ne!(owners[0].tile % 2, owners[1].tile % 2);
+    }
+
+    #[test]
+    fn global_role_rotation_preserves_resident_feasibility() {
+        let config = BlockedGemmConfig {
+            rows: 1,
+            inner_dimension: 1,
+            columns: 1,
+            block_dimension: 1,
+            inner_block_dimension: 1,
+            row_block_dimension: 1,
+            tile_count: 2,
+            data_base: 0,
+            data_limit: 1000,
+            data_type: GemmDataType::F16,
+            retain_profile_metadata: false,
+        };
+        let template = ResidentPlacementTemplate::default();
+        template
+            .decisions
+            .lock()
+            .unwrap()
+            .push(ResidentPlacementDecision {
+                key: config.into(),
+                rotation: 0,
+                resident_bytes: vec![800, 0].into(),
+            });
+        let probe = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![Allocation {
+                tensor: TensorId(0),
+                tile: 0,
+                address: 0,
+                size: 800,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            }]
+            .into(),
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let slack = MemoryPolicy::contiguous(0, 1000)
+            .optimize_repeated_resident_global_rotation(
+                &template,
+                &probe,
+                0,
+                1,
+                &[200, 300],
+                &[0, 900],
+            )
+            .unwrap();
+
+        assert_eq!(template.rotation_signature(), vec![0]);
+        assert_eq!(slack, vec![0, -200]);
     }
 
     #[test]
