@@ -3044,7 +3044,6 @@ fn resident_tile_rotation(
                         memory,
                         &projected_extra,
                         session.repetitions,
-                        true,
                     )
                 }
                 ResidentTileAssignment::Fixed => 0,
@@ -3095,7 +3094,6 @@ fn choose_resident_tile_rotation_in_arenas(
         memory,
         &vec![0; usize::from(parent.tile_count)],
         1,
-        false,
     )
 }
 
@@ -3106,7 +3104,6 @@ fn choose_resident_tile_rotation_with_projection(
     memory: &MemoryPolicy,
     projected_extra: &[u64],
     child_instances: usize,
-    reserve_open_values: bool,
 ) -> u16 {
     let tile_count = usize::from(parent.tile_count);
     if tile_count == 0 || projected_extra.len() != tile_count || child_instances == 0 {
@@ -3152,30 +3149,6 @@ fn choose_resident_tile_rotation_with_projection(
                 .sum::<u64>()
         })
         .collect::<Vec<_>>();
-    let mut open_value_bytes = vec![0u64; tile_count];
-    if reserve_open_values {
-        for allocation in &parent.allocations {
-            if allocation.kind != AllocationKind::Home
-                || allocation.live_from == 0
-                || allocation.live_until != usize::MAX
-            {
-                continue;
-            }
-            open_value_bytes[usize::from(allocation.tile)] += memory
-                .resident
-                .iter()
-                .map(|arena| {
-                    u64::from(
-                        allocation
-                            .address
-                            .saturating_add(allocation.size)
-                            .min(arena.limit)
-                            .saturating_sub(allocation.address.max(arena.base)),
-                    )
-                })
-                .sum::<u64>();
-        }
-    }
     let mut child_bytes = vec![0u64; tile_count];
     for block in child_resident {
         child_bytes[usize::from(block.tile)] +=
@@ -3203,7 +3176,6 @@ fn choose_resident_tile_rotation_with_projection(
                 .map(|tile| {
                     parent_bytes[tile]
                         + projected_extra[tile]
-                        + open_value_bytes[tile]
                         + child_bytes[(tile + tile_count - rotation) % tile_count]
                             * u64::try_from(child_instances).unwrap()
                 })
@@ -6944,64 +6916,6 @@ mod tests {
         );
 
         assert_eq!(with_transient, baseline);
-    }
-
-    #[test]
-    fn repeated_resident_projection_reserves_open_value_headroom() {
-        let parent = Schedule {
-            layouts: Vec::new(),
-            phases: Vec::new(),
-            allocations: vec![
-                Allocation {
-                    tensor: TensorId(0),
-                    tile: 2,
-                    address: 0xa0000,
-                    size: 50,
-                    live_from: 1,
-                    live_until: usize::MAX,
-                    kind: AllocationKind::Home,
-                },
-                Allocation {
-                    tensor: TensorId(1),
-                    tile: 3,
-                    address: 0xa0000,
-                    size: 100,
-                    live_from: 1,
-                    live_until: usize::MAX,
-                    kind: AllocationKind::Home,
-                },
-            ]
-            .into(),
-            tile_count: 4,
-            peak_sram: BTreeMap::new(),
-        };
-        let child = [(1, 50), (2, 50), (3, 100)]
-            .into_iter()
-            .enumerate()
-            .map(|(index, (tile, columns))| BlockPlacement {
-                tensor: TensorId(index + 2),
-                tile,
-                address: 0xa0000,
-                block_row: 0,
-                block_column: index as u16,
-                row_start: 0,
-                rows: 1,
-                column_start: 0,
-                columns,
-            })
-            .collect::<Vec<_>>();
-        let memory = MemoryPolicy::contiguous(0xa0000, 0xe8000);
-        let projected = vec![0; 4];
-
-        let without_headroom = choose_resident_tile_rotation_with_projection(
-            &parent, &child, 1, &memory, &projected, 1, false,
-        );
-        let with_headroom = choose_resident_tile_rotation_with_projection(
-            &parent, &child, 1, &memory, &projected, 1, true,
-        );
-
-        assert_eq!(without_headroom, 2);
-        assert_eq!(with_headroom, 3);
     }
 
     #[test]
