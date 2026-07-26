@@ -4933,25 +4933,40 @@ impl Schedule {
             }
             phase_cache_misses += 1;
             let mut groups: Vec<PendingGroup> = Vec::new();
-            let mut group_indices = HashMap::<(u16, TensorId, u32), usize>::default();
+            let mut group_indices = HashMap::<(u16, TensorId, u32, u32), usize>::default();
             for (transfer, resolved) in transfers.iter().zip(&resolved_transfers) {
-                let key = (transfer.source_tile, transfer.tensor, transfer.bytes);
-                if let Some(&index) = group_indices.get(&key) {
-                    groups[index]
-                        .destinations
-                        .push((transfer.destination_tile, resolved.destination_address));
-                } else {
-                    group_indices.insert(key, groups.len());
-                    groups.push(PendingGroup {
-                        source: transfer.source_tile,
-                        tensor: transfer.tensor,
-                        bytes: transfer.bytes,
-                        source_address: resolved.source_address,
-                        destinations: vec![(
-                            transfer.destination_tile,
-                            resolved.destination_address,
-                        )],
-                    });
+                let maximum_bytes = ipu_exchange::MAX_TRANSFER_WORDS * 4;
+                let mut offset = 0;
+                while offset < transfer.bytes {
+                    let bytes = (transfer.bytes - offset).min(maximum_bytes);
+                    let source_address =
+                        resolved.source_address.checked_add(offset).ok_or_else(|| {
+                            CompileError::Memory("split exchange source address overflow".into())
+                        })?;
+                    let destination_address = resolved
+                        .destination_address
+                        .checked_add(offset)
+                        .ok_or_else(|| {
+                            CompileError::Memory(
+                                "split exchange destination address overflow".into(),
+                            )
+                        })?;
+                    let key = (transfer.source_tile, transfer.tensor, source_address, bytes);
+                    if let Some(&index) = group_indices.get(&key) {
+                        groups[index]
+                            .destinations
+                            .push((transfer.destination_tile, destination_address));
+                    } else {
+                        group_indices.insert(key, groups.len());
+                        groups.push(PendingGroup {
+                            source: transfer.source_tile,
+                            tensor: transfer.tensor,
+                            bytes,
+                            source_address,
+                            destinations: vec![(transfer.destination_tile, destination_address)],
+                        });
+                    }
+                    offset += bytes;
                 }
             }
             for group in &mut groups {
@@ -7977,6 +7992,39 @@ mod tests {
             !matches!(allocation.kind, AllocationKind::ExchangeStaging { .. })
         }));
         schedule.lower_exchanges(&Topology::c600()).unwrap();
+        schedule.lower_tile_programs(&Topology::c600()).unwrap();
+    }
+
+    #[test]
+    fn lowering_splits_large_transfers_on_one_static_timeline() {
+        let words = ipu_exchange::MAX_TRANSFER_WORDS + 460;
+        let schedule = exchange_schedule(vec![Transfer {
+            source_tile: 0,
+            destination_tile: 1,
+            tensor: TensorId(0),
+            bytes: words * 4,
+            staging_address: Some(0x50000),
+        }]);
+
+        let lowered = schedule.lower_exchanges(&Topology::c600()).unwrap();
+        assert_eq!(lowered[0].cost.launches, 1);
+        assert_eq!(lowered[0].cost.payload_words, u64::from(words));
+        assert_eq!(lowered[0].epochs.len(), 1);
+        assert_eq!(lowered[0].epochs[0].groups.len(), 2);
+        assert_eq!(
+            lowered[0].epochs[0]
+                .groups
+                .iter()
+                .map(|group| group.bytes)
+                .sum::<u32>(),
+            words * 4
+        );
+        assert!(
+            lowered[0].epochs[0]
+                .groups
+                .iter()
+                .all(|group| group.bytes <= ipu_exchange::MAX_TRANSFER_WORDS * 4)
+        );
         schedule.lower_tile_programs(&Topology::c600()).unwrap();
     }
 
