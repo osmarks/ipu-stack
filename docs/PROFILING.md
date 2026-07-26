@@ -7,12 +7,13 @@ renderer.
 
 ## Collection granularity
 
-Set `IPU_PROFILE_OUTPUT` to enable profiling and select one of three levels with
+Set `IPU_PROFILE_OUTPUT` to enable profiling and select one of four levels with
 `IPU_PROFILE_GRANULARITY`:
 
 | Value | Intervals on each tile | Intended use |
 | --- | --- | --- |
 | `graph` | One for the complete graph | Low-overhead benchmark timing |
+| `region` | Model-defined semantic stages, when supplied by the runner | Compact model-level diagnosis |
 | `phase` | Compute phases plus separate sync/exchange intervals | Coarse semantic analysis; default |
 | `step` | Sync/exchange intervals plus every lowered kernel call | Detailed code-generation diagnostics |
 

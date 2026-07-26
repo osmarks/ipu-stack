@@ -225,6 +225,8 @@ address, size, lifetime, allocation kind, and matching host binding name.
 `IPU_PROFILE_GRANULARITY` controls cycle instrumentation:
 
 - `graph` records one interval per tile for low-overhead whole-graph timing.
+- `region` records model-defined semantic stages such as projections,
+  attention, activations, and normalization when the runner provides them.
 - `phase` records each static compute phase and separates every exchange epoch
   into synchronization wait and active exchange intervals. This is the default
   and the recommended semantic overview: exchanges, GEMM, GeLU, layout kernels,

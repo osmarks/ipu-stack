@@ -2631,6 +2631,7 @@ pub struct ProfileLayout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProfileGranularity {
     Graph,
+    Region,
     Phase,
     Step,
 }
@@ -2645,10 +2646,11 @@ impl ProfileGranularity {
             .as_str()
         {
             "graph" => Ok(Self::Graph),
+            "region" => Ok(Self::Region),
             "phase" => Ok(Self::Phase),
             "step" => Ok(Self::Step),
             value => Err(format!(
-                "IPU_PROFILE_GRANULARITY must be graph, phase, or step; got {value:?}"
+                "IPU_PROFILE_GRANULARITY must be graph, region, phase, or step; got {value:?}"
             )
             .into()),
         }
@@ -2800,7 +2802,7 @@ pub fn package_graph(graph: &ExecutableGraph, objects: &[Vec<u8>]) -> Result<App
 }
 
 pub fn package_graph_owned(graph: ExecutableGraph, objects: &[Vec<u8>]) -> Result<Application> {
-    package_graph_impl_owned(graph, objects, &[], None, &[], 1)
+    package_graph_impl_owned(graph, objects, &[], None, false, &[], 1)
 }
 
 pub fn package_graph_repeated(
@@ -2822,7 +2824,7 @@ pub fn package_graph_repeated_owned(
     if invocations == 0 {
         return Err("graph invocation count must be nonzero".into());
     }
-    package_graph_impl_owned(graph, objects, &[], None, &[], invocations)
+    package_graph_impl_owned(graph, objects, &[], None, false, &[], invocations)
 }
 
 pub fn package_graph_with_templates(
@@ -2838,7 +2840,7 @@ pub fn package_graph_with_templates_owned(
     objects: &[Vec<u8>],
     templates: &[StaticTemplateRegion],
 ) -> Result<Application> {
-    package_graph_impl_owned(graph, objects, &[], None, templates, 1)
+    package_graph_impl_owned(graph, objects, &[], None, false, templates, 1)
 }
 
 pub fn package_graph_repeated_with_templates(
@@ -2862,7 +2864,7 @@ pub fn package_graph_repeated_with_templates_owned(
     if invocations == 0 {
         return Err("graph invocation count must be nonzero".into());
     }
-    package_graph_impl_owned(graph, objects, &[], None, templates, invocations)
+    package_graph_impl_owned(graph, objects, &[], None, false, templates, invocations)
 }
 
 pub fn package_graph_repeated_with_templates_owned_and_memory_profile(
@@ -2879,6 +2881,7 @@ pub fn package_graph_repeated_with_templates_owned_and_memory_profile(
         objects,
         &[],
         None,
+        false,
         templates,
         invocations,
     )?;
@@ -3550,6 +3553,9 @@ fn profile_steps(
 
     match granularity {
         ProfileGranularity::Graph => {}
+        ProfileGranularity::Region => {
+            unreachable!("region profiles require explicit semantic regions")
+        }
         ProfileGranularity::Step => {
             for (step_index, step) in program.steps.iter().enumerate() {
                 match step {
@@ -3819,6 +3825,12 @@ fn package_graph_with_profile_options(
         .par_iter()
         .map(|program| -> Result<PreparedProfileTile> {
             let (mut steps, boundaries) = match selection {
+                ProfileSelection::Granularity(ProfileGranularity::Region, Some(regions)) => {
+                    region_profile_steps(&graph.schedule, program, regions)?
+                }
+                ProfileSelection::Granularity(ProfileGranularity::Region, None) => {
+                    return Err("region profile granularity requires semantic regions".into());
+                }
                 ProfileSelection::Granularity(granularity, regions) => {
                     let (mut steps, boundaries) =
                         profile_steps(&graph.schedule, program, granularity);
@@ -3951,6 +3963,7 @@ fn package_graph_with_profile_options(
         objects,
         &profile_code,
         Some(programs),
+        !aggregate,
         templates,
         invocations,
     )?;
@@ -3976,6 +3989,7 @@ fn package_graph_impl(
         objects,
         profile_code,
         lowered_programs,
+        false,
         template_regions,
         invocations,
     )
@@ -3986,6 +4000,7 @@ fn package_graph_impl_owned(
     objects: &[Vec<u8>],
     profile_code: &[static_codegen::ProfileCode],
     lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
+    complete_programs: bool,
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
 ) -> Result<Application> {
@@ -3994,6 +4009,7 @@ fn package_graph_impl_owned(
         objects,
         profile_code,
         lowered_programs,
+        complete_programs,
         template_regions,
         invocations,
     )
@@ -4005,6 +4021,7 @@ fn package_graph_impl_owned_with_final_graph(
     objects: &[Vec<u8>],
     profile_code: &[static_codegen::ProfileCode],
     mut lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
+    complete_programs: bool,
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
 ) -> Result<(Application, ExecutableGraph)> {
@@ -4028,6 +4045,7 @@ fn package_graph_impl_owned_with_final_graph(
             objects,
             profile_code,
             lowered_programs.take(),
+            complete_programs,
             template_regions,
             invocations,
             &mut executable_placement_state,
@@ -4091,6 +4109,7 @@ fn normalize_provisional_memory_layout(
 fn plan_tile_exchange(
     program: &ipu_compiler::LoweredTileProgram,
     template_regions: &[StaticTemplateRegion],
+    profile: Option<&static_codegen::ProfileCode>,
     enable_compute_runs: bool,
     cyclic_templates: bool,
 ) -> Result<TileExchangePlans> {
@@ -4229,6 +4248,7 @@ fn plan_tile_exchange(
         &plan_rows,
         &patches,
         template_regions,
+        profile,
         0,
         cyclic_templates,
     )?;
@@ -4383,6 +4403,7 @@ fn package_graph_impl_attempt(
     objects: &[Vec<u8>],
     profile_code: &[static_codegen::ProfileCode],
     lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
+    complete_programs: bool,
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
     executable_placement_state: &mut ExecutablePlacementState,
@@ -4407,7 +4428,7 @@ fn package_graph_impl_attempt(
                     .schedule
                     .resolve_memory_constraints(std::slice::from_ref(&program))?;
                 let mut plans =
-                    plan_tile_exchange(&program, template_regions, false, invocations > 1)?;
+                    plan_tile_exchange(&program, template_regions, None, false, invocations > 1)?;
                 static_codegen::compact_template_instances(&mut program, &mut plans.templates)?;
                 Ok((program, plans, memory_constraints))
             })
@@ -4434,14 +4455,26 @@ fn package_graph_impl_attempt(
     } else {
         let programs = match lowered_programs {
             Some(programs) => programs,
+            None if complete_programs => graph.schedule.lower_tile_programs(&topology)?,
             None => graph.schedule.lower_tile_programs_for_codegen(&topology)?,
         };
         let plans = programs
             .par_iter()
-            .map(|program| {
+            .enumerate()
+            .map(|(index, program)| {
+                let profile = if profile_code.is_empty() {
+                    None
+                } else {
+                    Some(
+                        profile_code
+                            .get(index)
+                            .ok_or("profile code omits a tile program")?,
+                    )
+                };
                 plan_tile_exchange(
                     program,
                     template_regions,
+                    profile,
                     profile_code.is_empty() && template_regions.is_empty(),
                     invocations > 1,
                 )
@@ -7541,9 +7574,7 @@ mod tests {
         }
         let smaller = vec![vec![1; 3], vec![1; 2]];
         assert_eq!(
-            state
-                .update_generated_requirements(&smaller)
-                .unwrap(),
+            state.update_generated_requirements(&smaller).unwrap(),
             requirements
         );
     }

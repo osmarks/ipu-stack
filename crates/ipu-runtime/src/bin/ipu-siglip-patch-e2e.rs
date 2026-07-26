@@ -283,7 +283,7 @@ fn main() {
     let retain_profile_metadata = std::env::var_os("IPU_SIGLIP_RETAIN_PROFILE_METADATA").is_some()
         || matches!(
             profile_granularity,
-            Some(ProfileGranularity::Phase | ProfileGranularity::Step)
+            Some(ProfileGranularity::Region | ProfileGranularity::Phase | ProfileGranularity::Step)
         );
     let mut current = row_shards;
     let mut last_layer = None;

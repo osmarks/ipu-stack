@@ -144,6 +144,8 @@ pub(crate) struct StaticTemplatePlan {
     pub shared: Vec<StaticTemplateRecordWord>,
     pub exchange_step_count: usize,
     steps: Vec<StaticTemplateStep>,
+    profile_after_sync: Vec<Option<TemplateValue>>,
+    profile_after_step: Vec<Option<TemplateValue>>,
 }
 
 pub(crate) fn compact_template_instances(
@@ -974,15 +976,68 @@ fn hash_record_words(words: &[StaticTemplateRecordWord]) -> u64 {
     hasher.finish()
 }
 
+fn plan_template_profile_boundaries(
+    records: &mut TemplateRecords,
+    step_sources: &[Vec<Option<usize>>],
+    instance_steps: &[Range<usize>],
+    boundaries: Option<&[bool]>,
+) -> Result<Vec<Option<TemplateValue>>> {
+    let Some(boundaries) = boundaries else {
+        return Ok(vec![None; step_sources.len()]);
+    };
+    let mut represented = vec![0usize; instance_steps.len()];
+    let planned = step_sources
+        .iter()
+        .map(|sources| -> Result<_> {
+            if sources.len() != instance_steps.len() {
+                return Err("static template source map has an invalid instance count".into());
+            }
+            let values = sources
+                .iter()
+                .enumerate()
+                .map(|(instance, source)| {
+                    let enabled = source.is_some_and(|step| boundaries[step]);
+                    represented[instance] += usize::from(enabled);
+                    u32::from(enabled)
+                })
+                .collect::<Vec<_>>();
+            values
+                .iter()
+                .any(|&enabled| enabled != 0)
+                .then(|| records.values(values))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (instance, steps) in instance_steps.iter().enumerate() {
+        let expected = boundaries[steps.clone()]
+            .iter()
+            .filter(|&&boundary| boundary)
+            .count();
+        if represented[instance] != expected {
+            return Err(
+                "static template profile boundary is not represented in aligned code".into(),
+            );
+        }
+    }
+    Ok(planned)
+}
+
 pub(crate) fn plan_static_templates(
     program: &LoweredTileProgram,
     plan_addresses: &[u32],
     plan_rows: &[Vec<u32>],
     plan_patches: &[Option<StaticPlanPatch>],
     regions: &[crate::StaticTemplateRegion],
+    profile: Option<&ProfileCode>,
     mut cursor: u32,
     cyclic: bool,
 ) -> Result<(Vec<StaticTemplatePlan>, u32)> {
+    if let Some(profile) = profile
+        && (profile.after_sync.len() != program.steps.len()
+            || profile.after_step.len() != program.steps.len())
+    {
+        return Err("profile boundary count differs from tile step count".into());
+    }
     let mut plan_by_step = vec![None; program.steps.len()];
     let mut row_by_step = vec![None; program.steps.len()];
     let mut patch_by_step = vec![None; program.steps.len()];
@@ -1048,6 +1103,7 @@ pub(crate) fn plan_static_templates(
             .collect::<Result<Vec<_>>>()?;
         let mut records = TemplateRecords::new(instance_steps.len());
         let mut template_steps = Vec::new();
+        let mut step_sources = Vec::<Vec<Option<usize>>>::new();
         for relative_phase in 0..phase_count {
             let phase_steps = instance_phase_steps
                 .iter()
@@ -1155,6 +1211,12 @@ pub(crate) fn plan_static_templates(
                         plan_address,
                         active,
                     });
+                    step_sources.push(
+                        phase_steps
+                            .iter()
+                            .map(|steps| Some(steps.start + epoch))
+                            .collect(),
+                    );
                 }
             } else if all_compute {
                 let commands = align_template_commands(
@@ -1176,8 +1238,29 @@ pub(crate) fn plan_static_templates(
                 let command_count = commands.first().map_or(0, Vec::len);
                 if command_count == 0 {
                     template_steps.push(StaticTemplateStep::Idle);
+                    step_sources.push(
+                        phase_steps
+                            .iter()
+                            .map(|steps| steps.end.checked_sub(1))
+                            .collect(),
+                    );
                 } else {
                     for command_index in 0..command_count {
+                        let sources = commands
+                            .iter()
+                            .zip(&phase_steps)
+                            .map(|(commands, steps)| {
+                                commands[command_index].and_then(|target| {
+                                    steps.clone().find(|&step| {
+                                        matches!(
+                                            &program.steps[step],
+                                            LoweredTileStep::Compute(command)
+                                                if std::ptr::eq(command, target)
+                                        )
+                                    })
+                                })
+                            })
+                            .collect();
                         template_steps.push(plan_template_compute_step(
                             &commands,
                             command_index,
@@ -1185,6 +1268,13 @@ pub(crate) fn plan_static_templates(
                             &region.name,
                             relative_phase,
                         )?);
+                        step_sources.push(sources);
+                    }
+                    for (instance, commands) in commands.iter().enumerate() {
+                        if commands.iter().all(Option::is_none) {
+                            step_sources.last_mut().unwrap()[instance] =
+                                phase_steps[instance].end.checked_sub(1);
+                        }
                     }
                 }
             } else {
@@ -1195,6 +1285,18 @@ pub(crate) fn plan_static_templates(
                 .into());
             }
         }
+        let profile_after_sync = plan_template_profile_boundaries(
+            &mut records,
+            &step_sources,
+            &instance_steps,
+            profile.map(|profile| profile.after_sync.as_slice()),
+        )?;
+        let profile_after_step = plan_template_profile_boundaries(
+            &mut records,
+            &step_sources,
+            &instance_steps,
+            profile.map(|profile| profile.after_step.as_slice()),
+        )?;
         previous_end = instance_steps.last().unwrap().end;
         let record_split = u16::try_from(
             records
@@ -1263,6 +1365,8 @@ pub(crate) fn plan_static_templates(
             shared: records.shared,
             exchange_step_count: 0,
             steps: template_steps,
+            profile_after_sync,
+            profile_after_step,
         };
         validate_template_compute_expansion(program, &template)?;
         validate_template_exchange_expansion(
@@ -1690,29 +1794,6 @@ pub(crate) fn emit(
     {
         return Err("profile boundary count differs from tile step count".into());
     }
-    if let Some(profile) = profile {
-        for template in templates {
-            let first = &template.instance_steps[0];
-            let after_sync = &profile.after_sync[first.clone()];
-            let after_step = &profile.after_step[first.clone()];
-            if !after_sync
-                .iter()
-                .chain(after_step)
-                .any(|boundary| *boundary)
-            {
-                continue;
-            }
-            for instance in &template.instance_steps[1..] {
-                if profile.after_sync[instance.clone()] != *after_sync
-                    || profile.after_step[instance.clone()] != *after_step
-                {
-                    return Err(
-                        "static template instances have different profile boundaries".into(),
-                    );
-                }
-            }
-        }
-    }
     let mut code = TileCode::new();
     let worker_barrier = symbol(symbols, WORKER_BARRIER)?;
     emit_host_phases(&mut code, symbols, host.weights)?;
@@ -1921,14 +2002,6 @@ pub(crate) fn emit(
     for template in templates {
         let start = code.words.len();
         template_bodies.push(start);
-        let profile_after_sync = profile.map(|profile| {
-            let first = &template.instance_steps[0];
-            &profile.after_sync[first.clone()]
-        });
-        let profile_after_step = profile.map(|profile| {
-            let first = &template.instance_steps[0];
-            &profile.after_step[first.clone()]
-        });
         let segments = emit_static_template_body(
             &mut code,
             template,
@@ -1943,8 +2016,8 @@ pub(crate) fn emit(
                     .record_secondary_addresses
                     .windows(2)
                     .all(|pair| pair[0] == pair[1]),
-            profile_after_sync,
-            profile_after_step,
+            &template.profile_after_sync,
+            &template.profile_after_step,
         )?;
         object_words.extend(segments);
     }
@@ -2024,6 +2097,34 @@ fn emit_template_value(
     }
 }
 
+fn emit_template_cycle_sample(
+    code: &mut TileCode,
+    symbols: &BTreeMap<String, u32>,
+    template: &StaticTemplatePlan,
+    enabled: Option<TemplateValue>,
+    generated_addresses: GeneratedAddressMap<'_>,
+) -> Result<()> {
+    match enabled {
+        None | Some(TemplateValue::Constant(0)) => Ok(()),
+        Some(TemplateValue::Constant(_)) => code.call(symbol(symbols, SAMPLE_CYCLE_NEXT)?, 10),
+        Some(enabled) => {
+            emit_template_value(
+                code,
+                enabled,
+                0,
+                template.shared_address,
+                template.record_split,
+            )?;
+            let skip = code.words.len();
+            code.brz(0, 0)?;
+            code.call(symbol(symbols, SAMPLE_CYCLE_NEXT)?, 10)?;
+            let after = generated_address(generated_addresses, code.words.len())?;
+            code.words[skip] = ipu_exchange::encode_brz_m_immediate(0, after)?;
+            Ok(())
+        }
+    }
+}
+
 fn emit_static_template_body(
     code: &mut TileCode,
     template: &StaticTemplatePlan,
@@ -2031,9 +2132,14 @@ fn emit_static_template_body(
     template_exchange: u32,
     generated_addresses: GeneratedAddressMap<'_>,
     record_addresses_in_parent_frame: bool,
-    profile_after_sync: Option<&[bool]>,
-    profile_after_step: Option<&[bool]>,
+    profile_after_sync: &[Option<TemplateValue>],
+    profile_after_step: &[Option<TemplateValue>],
 ) -> Result<Vec<Range<usize>>> {
+    if profile_after_sync.len() != template.steps.len()
+        || profile_after_step.len() != template.steps.len()
+    {
+        return Err("static template profile map differs from its generated steps".into());
+    }
     let mut segments = Vec::new();
     let mut segment_start = code.words.len();
     code.add_immediate(11, 11, -16)?;
@@ -2066,10 +2172,12 @@ fn emit_static_template_body(
                 active,
             } => {
                 code.instruction(ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
-                emit_next_cycle_sample(
+                emit_template_cycle_sample(
                     code,
                     symbols,
-                    profile_after_sync.and_then(|samples| samples.get(step_index).copied()),
+                    template,
+                    profile_after_sync[step_index],
+                    generated_addresses,
                 )?;
                 if !plan_words.is_empty() {
                     emit_template_value(
@@ -2194,10 +2302,12 @@ fn emit_static_template_body(
             }
             StaticTemplateStep::Idle => {}
         }
-        emit_next_cycle_sample(
+        emit_template_cycle_sample(
             code,
             symbols,
-            profile_after_step.and_then(|samples| samples.get(step_index).copied()),
+            template,
+            profile_after_step[step_index],
+            generated_addresses,
         )?;
     }
     code.ld32(9, 11, 15, 2)?;
@@ -2591,6 +2701,7 @@ mod tests {
             &plan_rows,
             &patches,
             &regions,
+            None,
             0x53002,
             true,
         )
@@ -2796,6 +2907,7 @@ mod tests {
             &rows,
             &[None, None],
             &regions,
+            None,
             0x60000,
             false,
         )
@@ -2875,6 +2987,119 @@ mod tests {
     }
 
     #[test]
+    fn template_profiles_follow_aligned_commands() {
+        let program = LoweredTileProgram {
+            tile: 7,
+            steps: vec![
+                compute_with_operation(0, 0x54000, Vec::new(), "gemm_f16_accumulate"),
+                compute_with_operation(0, 0x58000, Vec::new(), "add_f16"),
+                compute_with_operation(1, 0x5c000, Vec::new(), "add_f16"),
+            ],
+        };
+        let regions = [crate::StaticTemplateRegion {
+            name: "encoder_layer".into(),
+            phase_instances: vec![0..1, 1..2],
+        }];
+        let profile = ProfileCode {
+            allocation: None,
+            initial: 0x68000,
+            after_sync: vec![false; 3],
+            after_step: vec![false, true, true],
+            aggregate_end: None,
+        };
+        let (templates, _) = plan_static_templates(
+            &program,
+            &[],
+            &[],
+            &[],
+            &regions,
+            Some(&profile),
+            0x60000,
+            false,
+        )
+        .unwrap();
+
+        assert!(templates[0].profile_after_sync.iter().all(Option::is_none));
+        assert_eq!(
+            templates[0].profile_after_step,
+            [None, Some(TemplateValue::Constant(1))]
+        );
+
+        let misaligned = ProfileCode {
+            after_step: vec![true, false, true],
+            ..profile
+        };
+        let (templates, _) = plan_static_templates(
+            &program,
+            &[],
+            &[],
+            &[],
+            &regions,
+            Some(&misaligned),
+            0x60000,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            templates[0]
+                .profile_after_step
+                .iter()
+                .filter(|boundary| boundary.is_some())
+                .count(),
+            2
+        );
+        assert!(
+            templates[0]
+                .profile_after_step
+                .iter()
+                .flatten()
+                .all(|boundary| matches!(boundary, TemplateValue::Record(_)))
+        );
+    }
+
+    #[test]
+    fn template_profiles_map_idle_roles_to_phase_end() {
+        let program = LoweredTileProgram {
+            tile: 7,
+            steps: vec![
+                compute(0, 0x54000, Vec::new()),
+                LoweredTileStep::IdleCompute {
+                    op: OpId(1),
+                    phase: 1,
+                },
+            ],
+        };
+        let regions = [crate::StaticTemplateRegion {
+            name: "encoder_layer".into(),
+            phase_instances: vec![0..1, 1..2],
+        }];
+        let profile = ProfileCode {
+            allocation: None,
+            initial: 0x68000,
+            after_sync: vec![false; 2],
+            after_step: vec![true; 2],
+            aggregate_end: None,
+        };
+
+        let (templates, _) = plan_static_templates(
+            &program,
+            &[],
+            &[],
+            &[],
+            &regions,
+            Some(&profile),
+            0x60000,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            templates[0].profile_after_step,
+            [Some(TemplateValue::Constant(1))]
+        );
+    }
+
+    #[test]
     fn aggregate_profile_allows_different_template_instance_step_counts() {
         let program = LoweredTileProgram {
             tile: 7,
@@ -2889,7 +3114,7 @@ mod tests {
             phase_instances: vec![0..1, 1..2],
         }];
         let (templates, _) =
-            plan_static_templates(&program, &[], &[], &[], &regions, 0x60000, false).unwrap();
+            plan_static_templates(&program, &[], &[], &[], &regions, None, 0x60000, false).unwrap();
         let symbols = BTreeMap::from([
             (WORKER_BARRIER.into(), 0x50000),
             (COMPLETE.into(), 0x50020),
@@ -2955,6 +3180,7 @@ mod tests {
                 &plan_rows,
                 &vec![None; instance_count],
                 &regions,
+                None,
                 0x60000,
                 true,
             )
