@@ -1325,7 +1325,7 @@ fn append_to_a16_row_shards_reblocked_in_arenas(
                             usize::from(*destination_rows),
                             usize::from(copy_rows),
                         ],
-                        worker_count: 1,
+                        worker_count: 6,
                         role: match block.layout {
                             ReblockSourceLayout::A16 => "A16 row-shard transition",
                             ReblockSourceLayout::C16 => "C16 to A16 row reblocking",

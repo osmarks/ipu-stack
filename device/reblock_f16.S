@@ -2,6 +2,7 @@
 
 	.text
 	.allow_optimizations
+	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
 	.set REBLOCK_ROW_BITS, 10
 	.set REBLOCK_ROW_MASK, (1 << REBLOCK_ROW_BITS) - 1
 
@@ -74,17 +75,48 @@
 	add $m5, $m5, $m3
 	.endm
 
-	.section .text.ipu_stack_reblock_f16_a16_to_a16,"ax",@progbits
-	.globl ipu_stack_reblock_f16_a16_to_a16
+	.macro REBLOCK_WRAPPER name, worker
+	.section .text.\name,"ax",@progbits
+	.globl \name
 	.p2align 2
-	.type ipu_stack_reblock_f16_a16_to_a16,@function
-ipu_stack_reblock_f16_a16_to_a16:
+	.type \name,@function
+\name:
 	.supervisor
-	add $m11, $m11, -8
+	add $m11, $m11, -24
+	st32 $m2, $m11, $m15, 0
+	st32 $m3, $m11, $m15, 1
+	st32 $m5, $m11, $m15, 2
+	st32 $m6, $m11, $m15, 3
+	st32 $m7, $m11, $m15, 4
+	setzi $m0, \worker
+	runall $m0, $m11, 0
+	sync SYNC_COMPUTE_SET
+	add $m11, $m11, 24
+	br $m10
+	.size \name, .-\name
+	.endm
+
+	REBLOCK_WRAPPER ipu_stack_reblock_f16_a16_to_a16, .La16_worker
+	REBLOCK_WRAPPER ipu_stack_reblock_f16_c16_to_a16, .Lc16_worker
+
+	.macro REBLOCK_WORKER_SETUP
+	ld32 $m2, $mvertex_base, $m15, 0
+	ld32 $m3, $mvertex_base, $m15, 1
+	ld32 $m5, $mvertex_base, $m15, 2
+	ld32 $m6, $mvertex_base, $m15, 3
+	ld32 $m7, $mvertex_base, $m15, 4
 	REBLOCK_SETUP
+	get $m4, $WSR
+	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
+	.endm
+
+	.worker
+	.p2align 3
+.La16_worker:
+	REBLOCK_WORKER_SETUP
 .La16_row:
 	REBLOCK_ROW_POINTERS .La16_done
-	st32 $m4, $m11, $m15, 0
+	mov $m10, $m4
 	zero $m4
 .La16_panel:
 	shr $m6, $m7, 16
@@ -94,25 +126,19 @@ ipu_stack_reblock_f16_a16_to_a16:
 	add $m4, $m4, 1
 	bri .La16_panel
 .La16_row_done:
-	ld32 $m4, $m11, $m15, 0
-	add $m4, $m4, 1
+	mov $m4, $m10
+	add $m4, $m4, 6
 	bri .La16_row
 .La16_done:
-	add $m11, $m11, 8
-	br $m10
-	.size ipu_stack_reblock_f16_a16_to_a16, .-ipu_stack_reblock_f16_a16_to_a16
+	exitz $m15
 
-	.section .text.ipu_stack_reblock_f16_c16_to_a16,"ax",@progbits
-	.globl ipu_stack_reblock_f16_c16_to_a16
-	.p2align 2
-	.type ipu_stack_reblock_f16_c16_to_a16,@function
-ipu_stack_reblock_f16_c16_to_a16:
-	.supervisor
-	add $m11, $m11, -8
-	REBLOCK_SETUP
+	.worker
+	.p2align 3
+.Lc16_worker:
+	REBLOCK_WORKER_SETUP
 .Lc16_row:
 	REBLOCK_ROW_POINTERS .Lc16_done
-	st32 $m4, $m11, $m15, 0
+	mov $m10, $m4
 	zero $m4
 .Lc16_panel:
 	shr $m6, $m7, 16
@@ -122,10 +148,8 @@ ipu_stack_reblock_f16_c16_to_a16:
 	add $m4, $m4, 1
 	bri .Lc16_panel
 .Lc16_row_done:
-	ld32 $m4, $m11, $m15, 0
-	add $m4, $m4, 1
+	mov $m4, $m10
+	add $m4, $m4, 6
 	bri .Lc16_row
 .Lc16_done:
-	add $m11, $m11, 8
-	br $m10
-	.size ipu_stack_reblock_f16_c16_to_a16, .-ipu_stack_reblock_f16_c16_to_a16
+	exitz $m15
