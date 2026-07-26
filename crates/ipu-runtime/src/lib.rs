@@ -1753,6 +1753,7 @@ fn select_eviction_window(
     forbidden_starts: &[(u32, u32)],
     arenas: &[ipu_compiler::MemoryArena],
     alignment: u32,
+    protected: &HashSet<usize>,
 ) -> Option<(u32, Vec<usize>)> {
     let allocation_extent = memory_constraints.access_extent(allocation_index, allocation.size);
     let lifetime_overlaps = |other: &ipu_compiler::Allocation| {
@@ -1822,7 +1823,7 @@ fn select_eviction_window(
                 })
                 .map(|&(index, _, _)| index)
                 .collect::<Vec<_>>();
-            if blockers.is_empty() {
+            if blockers.is_empty() || blockers.iter().any(|blocker| protected.contains(blocker)) {
                 continue;
             }
             let bytes = blockers
@@ -2511,6 +2512,7 @@ fn compact_allocations_around(
                 .map(|(priority, &index)| (index, priority))
                 .collect::<HashMap<_, _>>();
             let mut compact = VecDeque::from(compact);
+            let mut eviction_protected = HashSet::new();
             // Relation-constrained objects remain movable: every relation is
             // stored in both directions, so re-placing an evicted object checks
             // it against the neighbor's current address.
@@ -2643,51 +2645,46 @@ fn compact_allocations_around(
                             &forbidden_starts,
                             &compatible_arenas,
                             32,
+                            &eviction_protected,
                         )
                     {
-                        let priority = placement_priority[&index];
-                        if blockers
-                            .iter()
-                            .all(|blocker| placement_priority[blocker] > priority)
-                        {
-                            let blocker_set = blockers.iter().copied().collect::<HashSet<_>>();
-                            result.retain(|(placed, _)| !blocker_set.contains(placed));
-                            for blocker in &blockers {
-                                placed_addresses.remove(blocker);
-                                compact_set.insert(*blocker);
-                                compact.push_back(*blocker);
-                            }
-                            for occupied in &mut occupied_by_phase {
-                                occupied.clear();
-                            }
-                            for &(placed, placed_address) in &result {
-                                let placed_allocation = &graph.schedule.allocations[placed];
-                                let range = (
-                                    placed_address,
-                                    placed_address.saturating_add(memory_constraints.access_extent(
-                                        placed,
-                                        placed_allocation.size,
-                                    )),
-                                );
-                                for occupied in
-                                    &mut occupied_by_phase[lifetime(placed_allocation)]
-                                {
-                                    occupied.push(range);
-                                }
-                            }
-                            debug!(
-                                tile,
-                                tensor = allocation.tensor.0,
-                                address = format_args!("0x{candidate:x}"),
-                                evicted = blockers.len(),
-                                evicted_bytes = blockers
-                                    .iter()
-                                    .map(|&blocker| graph.schedule.allocations[blocker].size)
-                                    .sum::<u32>(),
-                                "defragmented tile allocation window"
-                            );
-                            address = Some(candidate);
+                        let blocker_set = blockers.iter().copied().collect::<HashSet<_>>();
+                        result.retain(|(placed, _)| !blocker_set.contains(placed));
+                        for blocker in &blockers {
+                            placed_addresses.remove(blocker);
+                            compact_set.insert(*blocker);
+                            compact.push_back(*blocker);
                         }
+                        for occupied in &mut occupied_by_phase {
+                            occupied.clear();
+                        }
+                        for &(placed, placed_address) in &result {
+                            let placed_allocation = &graph.schedule.allocations[placed];
+                            let range = (
+                                placed_address,
+                                placed_address.saturating_add(memory_constraints.access_extent(
+                                    placed,
+                                    placed_allocation.size,
+                                )),
+                            );
+                            for occupied in &mut occupied_by_phase[lifetime(placed_allocation)] {
+                                occupied.push(range);
+                            }
+                        }
+                        eviction_protected.insert(index);
+                        debug!(
+                            tile,
+                            tensor = allocation.tensor.0,
+                            address = format_args!("0x{candidate:x}"),
+                            evicted = blockers.len(),
+                            evicted_bytes = blockers
+                                .iter()
+                                .map(|&blocker| graph.schedule.allocations[blocker].size)
+                                .sum::<u32>(),
+                            protected = eviction_protected.len(),
+                            "defragmented tile allocation window"
+                        );
+                        address = Some(candidate);
                     }
                     let address = address.ok_or_else(|| {
                         let (capacity, free, largest) = placement_diagnostics(
@@ -8930,6 +8927,72 @@ mod tests {
             graph.host_weights[0].slices[0].tile_address,
             resident.address + 8
         );
+    }
+
+    #[test]
+    fn global_repacking_backtracks_across_lifetime_colors() {
+        let topology = Topology::c600();
+        let arena = 0x88000..0x91000;
+        let mut reservations = vec![Vec::new(); topology.tile_count()];
+        reservations[0].push((0x8b000, 0x8c000));
+        let phases = (0..2)
+            .map(|op| ipu_compiler::Phase::Compute {
+                op: ipu_compiler::OpId(op),
+                commands: Vec::new(),
+            })
+            .collect();
+        let allocation = |tensor, address, size, live_from, live_until| ipu_compiler::Allocation {
+            tensor: ipu_compiler::TensorId(tensor),
+            tile: 0,
+            address,
+            size,
+            live_from,
+            live_until,
+            kind: ipu_compiler::AllocationKind::Home,
+        };
+        let mut graph = ExecutableGraph {
+            memory_policy: Some(ipu_compiler::MemoryPolicy::contiguous(
+                arena.start,
+                arena.end,
+            )),
+            schedule: Schedule {
+                layouts: Vec::new(),
+                phases,
+                allocations: vec![
+                    allocation(1, 0x88000, 0x3000, 0, 1),
+                    allocation(2, 0x8c000, 0x5000, 1, 2),
+                    allocation(3, 0x88000, 0x1000, 0, usize::MAX),
+                ]
+                .into(),
+                tile_count: u16::try_from(topology.tile_count()).unwrap(),
+                peak_sram: BTreeMap::new(),
+            },
+            initial_buffers: Vec::new(),
+            outputs: Vec::new(),
+            host_weights: Vec::new(),
+            host_inputs: Vec::new(),
+            host_outputs: Vec::new(),
+        };
+
+        compact_all_allocations_around(&mut graph, &topology, &reservations, None, "unit test")
+            .unwrap();
+
+        let resident = &graph.schedule.allocations[2];
+        for transient in &graph.schedule.allocations[..2] {
+            assert!(!ranges_overlap(
+                transient.address,
+                transient.address + transient.size,
+                resident.address,
+                resident.address + resident.size,
+            ));
+        }
+        let transients = &graph.schedule.allocations[..2];
+        assert!(ranges_overlap(
+            transients[0].address,
+            transients[0].address + transients[0].size,
+            transients[1].address,
+            transients[1].address + transients[1].size,
+        ));
     }
 
     #[test]
