@@ -2303,8 +2303,8 @@ impl OfflinePackingStrategy {
         required_interleaved: bool,
         constrained: bool,
     ) -> (
-        bool,
         u8,
+        bool,
         usize,
         std::cmp::Reverse<u32>,
         bool,
@@ -2324,8 +2324,8 @@ impl OfflinePackingStrategy {
             Self::TransientLifetimeFirst => (u8::from(resident), allocation.live_from),
         };
         (
-            !required_interleaved,
             class,
+            !required_interleaved,
             time,
             std::cmp::Reverse(access_extent),
             !constrained,
