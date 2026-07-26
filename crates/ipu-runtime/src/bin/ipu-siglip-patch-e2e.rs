@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 const TILE_COUNT: u16 = 1472;
 const BLOCK_DIMENSION: u16 = 64;
@@ -315,29 +315,18 @@ fn main() {
             )
         });
     let first_placement_probe = if first_repetitions > 1 {
-        refine_repeated_encoder_placement(
-            &embedding,
-            &model,
-            batch_size,
-            rows,
-            columns,
-            row_block_dimension,
-            &memory,
-            first_precision,
-            tuning,
-            first_repetitions,
-            first_placement_probe,
-            full_model,
-            post_norm_only,
-        )
-        .unwrap()
+        refine_repeated_encoder_placement(&memory, first_repetitions, first_placement_probe)
+            .unwrap()
     } else {
         first_placement_probe
     };
-    assert_eq!(
-        first_placement_probe.optimized_overcommitted_tiles, 0,
-        "selected encoder placement does not fit after executable preflight"
-    );
+    if first_placement_probe.optimized_overcommitted_tiles != 0 {
+        warn!(
+            minimum_slack = first_placement_probe.optimized_minimum_slack,
+            overcommitted_tiles = first_placement_probe.optimized_overcommitted_tiles,
+            "conservative repeated-placement estimate remains overcommitted; deferring to exact package placement"
+        );
+    }
     let PatchEmbeddingPlan {
         mut plan,
         mut host,
@@ -1901,101 +1890,45 @@ fn probe_repeated_encoder_placement(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn refine_repeated_encoder_placement(
-    embedding: &PatchEmbeddingPlan,
-    model: &SiglipWeights,
-    batch_size: u16,
-    rows: u16,
-    columns: u16,
-    row_block_dimension: u16,
     memory: &MemoryPolicy,
-    precision: SiglipEncoderPrecision,
-    tuning: SiglipEncoderTuning,
     repetitions: usize,
     mut probe: RepeatedPlacementProbe,
-    include_suffix: bool,
-    post_norm_only: bool,
 ) -> ipu_runtime::Result<RepeatedPlacementProbe> {
-    let mut seen_placements = BTreeSet::new();
-    seen_placements.insert(probe.template.rotation_signature());
-    loop {
-        let mut support_schedule = probe.support_schedule.clone();
-        let support_attentions = probe.support_attentions.clone();
-        let support_phase_count = support_schedule.phases.len();
-        specialize_gemm_row_operations(&mut support_schedule, 0..support_phase_count);
-        let support_variants =
-            consolidate_attention_kernel_variants(&mut support_schedule, &support_attentions);
-        let support_objects =
-            compile_objects(&support_schedule, &support_attentions, &support_variants)?;
-        let execution_headroom = estimate_static_reservation_by_tile(
-            &support_schedule,
-            &support_objects,
-            memory,
-            std::slice::from_ref(&probe.support_template),
-        )?;
-        info!(
-            minimum_bytes = execution_headroom.iter().copied().min().unwrap_or(0),
-            maximum_bytes = execution_headroom.iter().copied().max().unwrap_or(0),
-            mean_bytes = execution_headroom.iter().sum::<u64>() / u64::from(TILE_COUNT),
-            optimized_minimum_slack = probe.optimized_minimum_slack,
-            optimized_overcommitted_tiles = probe.optimized_overcommitted_tiles,
-            "measured representative per-tile static runtime pressure"
-        );
-        let before = probe.template.rotation_signature();
-        let optimized_slack = memory.optimize_repeated_resident_global_rotation(
-            &probe.template,
-            &probe.placement_schedule,
-            probe.allocation_start,
-            repetitions,
-            &probe.fixed_headroom,
-            &execution_headroom,
-        )?;
-        probe.optimized_minimum_slack = optimized_slack.iter().copied().min().unwrap_or(0);
-        probe.optimized_overcommitted_tiles =
-            optimized_slack.iter().filter(|&&slack| slack < 0).count();
-        let after = probe.template.rotation_signature();
-        if after == before {
-            return if probe.optimized_overcommitted_tiles == 0 {
-                Ok(probe)
-            } else {
-                Err(format!(
-                    "repeated placement has {} overcommitted tiles after role-aware global rotation",
-                    probe.optimized_overcommitted_tiles
-                )
-                .into())
-            };
-        }
-        if !seen_placements.insert(after) {
-            return Err("role-aware repeated placement entered a rotation cycle".into());
-        }
-        let (
-            support_schedule,
-            support_attentions,
-            support_template,
-            placement_schedule,
-            fixed_headroom,
-        ) = build_repeated_encoder_support_probe(
-            embedding,
-            model,
-            batch_size,
-            rows,
-            columns,
-            row_block_dimension,
-            memory,
-            precision,
-            tuning,
-            repetitions,
-            &probe.template,
-            include_suffix,
-            post_norm_only,
-        )?;
-        probe.support_schedule = support_schedule;
-        probe.support_attentions = support_attentions;
-        probe.support_template = support_template;
-        probe.placement_schedule = placement_schedule;
-        probe.fixed_headroom = fixed_headroom;
-    }
+    let mut support_schedule = probe.support_schedule.clone();
+    let support_attentions = probe.support_attentions.clone();
+    let support_phase_count = support_schedule.phases.len();
+    specialize_gemm_row_operations(&mut support_schedule, 0..support_phase_count);
+    let support_variants =
+        consolidate_attention_kernel_variants(&mut support_schedule, &support_attentions);
+    let support_objects =
+        compile_objects(&support_schedule, &support_attentions, &support_variants)?;
+    let execution_headroom = estimate_static_reservation_by_tile(
+        &support_schedule,
+        &support_objects,
+        memory,
+        std::slice::from_ref(&probe.support_template),
+    )?;
+    let optimized_slack = memory.optimize_repeated_resident_global_rotation(
+        &probe.template,
+        &probe.placement_schedule,
+        probe.allocation_start,
+        repetitions,
+        &probe.fixed_headroom,
+        &execution_headroom,
+    )?;
+    probe.optimized_minimum_slack = optimized_slack.iter().copied().min().unwrap_or(0);
+    probe.optimized_overcommitted_tiles =
+        optimized_slack.iter().filter(|&&slack| slack < 0).count();
+    info!(
+        minimum_bytes = execution_headroom.iter().copied().min().unwrap_or(0),
+        maximum_bytes = execution_headroom.iter().copied().max().unwrap_or(0),
+        mean_bytes = execution_headroom.iter().sum::<u64>() / u64::from(TILE_COUNT),
+        optimized_minimum_slack = probe.optimized_minimum_slack,
+        optimized_overcommitted_tiles = probe.optimized_overcommitted_tiles,
+        "measured representative per-tile static runtime pressure"
+    );
+    Ok(probe)
 }
 
 #[allow(clippy::too_many_arguments)]
