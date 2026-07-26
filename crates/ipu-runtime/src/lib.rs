@@ -3765,20 +3765,18 @@ impl ExecutablePlacementState {
             if self.generated_requirements.len() != measured.len() {
                 return Err("generated tile count changed across graph relayout".into());
             }
-            for (tile, (required, measured)) in self
+            if self
                 .generated_requirements
-                .iter_mut()
+                .iter()
                 .zip(measured)
-                .enumerate()
+                .any(|(required, measured)| required.len() != measured.len())
             {
-                if required.len() != measured.len() {
-                    return Err(format!(
-                        "generated object count changed across graph relayout on tile {tile}: {} to {}",
-                        required.len(),
-                        measured.len()
-                    )
-                    .into());
-                }
+                info!("invalidating executable placement after generated object topology changed");
+                self.generated_requirements = measured.to_vec();
+                self.placements = None;
+                return Ok(self.generated_requirements.clone());
+            }
+            for (required, measured) in self.generated_requirements.iter_mut().zip(measured) {
                 for (required, &measured) in required.iter_mut().zip(measured) {
                     *required = (*required).max(measured);
                 }
@@ -7643,6 +7641,24 @@ mod tests {
             state.update_generated_requirements(&smaller).unwrap(),
             requirements
         );
+    }
+
+    #[test]
+    fn generated_object_topology_change_invalidates_executable_placement() {
+        let mut state = ExecutablePlacementState {
+            placements: Some(vec![ExecutablePlacement {
+                generated: vec![(0x60000, 0x60100)],
+                support: vec![(0x64000, 0x64100)],
+            }]),
+            generated_requirements: vec![vec![0x100]],
+        };
+
+        let requirements = state
+            .update_generated_requirements(&[vec![0x80, 0x40]])
+            .unwrap();
+
+        assert_eq!(requirements, vec![vec![0x80, 0x40]]);
+        assert!(state.placements.is_none());
     }
 
     #[test]
