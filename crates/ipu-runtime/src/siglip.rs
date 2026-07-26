@@ -1347,7 +1347,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     // The standalone kernel planners use this ordinary-memory window before
     // policy-aware composition relocates movable operands into their arenas.
     let data_base = ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
-    let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
+    let data_limit = ipu_driver::APPLICATION_LOAD_LIMIT;
     let span = info_span!("siglip_encoder_layer", layer);
     let _guard = span.enter();
     let config = &model.config;

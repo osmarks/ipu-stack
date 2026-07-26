@@ -34,6 +34,7 @@ const TILE_COUNT: u16 = 1472;
 const BLOCK_DIMENSION: u16 = 64;
 const INNER_BLOCK_DIMENSION: u16 = 64;
 const DATA_BASE: u32 = ipu_package::IPU21_INTERLEAVED_MEMORY_LIMIT;
+const DATA_LIMIT: u32 = ipu_driver::APPLICATION_LOAD_LIMIT;
 const ORDINARY_LOW_BASE: u32 =
     ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
 
@@ -75,7 +76,7 @@ fn main() {
     let patch_elements = config.num_channels * config.patch_size.pow(2);
     let inner = u16::try_from(patch_elements.div_ceil(64) * 64).unwrap();
     let columns = u16::try_from(config.hidden_size).unwrap();
-    let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
+    let data_limit = DATA_LIMIT;
     let memory = encoder_memory_policy(data_limit);
     let automatic_row_block_dimension = choose_gemm_row_block_for_shape(
         rows,
@@ -1477,7 +1478,7 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         columns,
         row_block_dimension,
         DATA_BASE,
-        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        DATA_LIMIT,
         &mut host,
     )
     .unwrap();
@@ -1486,7 +1487,7 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
         &input,
         model,
         DATA_BASE,
-        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        DATA_LIMIT,
         &mut host,
     )
     .unwrap();
@@ -1502,7 +1503,7 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
             key_block_rows: 0,
             tile_count: TILE_COUNT,
             data_base: DATA_BASE,
-            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            data_limit: DATA_LIMIT,
         })
         .unwrap();
         (
@@ -1515,7 +1516,7 @@ fn run_map_only(model: &SiglipWeights, reference: &TensorArchive) {
                 .repeat(usize::from(batch_size)),
         )
     } else {
-        let data_limit = ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
+        let data_limit = DATA_LIMIT;
         let memory = if std::env::var_os("IPU_SIGLIP_MAP_USE_ENCODER_MEMORY_POLICY").is_some() {
             encoder_memory_policy(data_limit)
         } else {
@@ -2132,7 +2133,7 @@ fn build_repeated_encoder_support_probe(
                 row_block_dimension,
                 TILE_COUNT,
                 DATA_BASE,
-                ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                DATA_LIMIT,
                 &suffix_memory,
                 false,
                 &mut host,
@@ -2184,7 +2185,7 @@ fn plan_patch_embedding(
         row_block_dimension,
         tile_count: TILE_COUNT,
         data_base: DATA_BASE,
-        data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        data_limit: DATA_LIMIT,
         data_type: GemmDataType::F16,
         retain_profile_metadata: true,
     })?;
@@ -2239,7 +2240,7 @@ fn plan_patch_embedding(
         RowShardTransitionConfig {
             columns,
             data_base: transition_base,
-            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            data_limit: DATA_LIMIT,
         },
     )?;
     end_tensor_lifetimes(
@@ -2283,7 +2284,7 @@ fn append_adjustment_phase(
             phase + 1,
             MemoryConstraint {
                 base: DATA_BASE,
-                limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                limit: DATA_LIMIT,
                 alignment: 8,
                 placement: MemoryPlacement::Low,
             },
