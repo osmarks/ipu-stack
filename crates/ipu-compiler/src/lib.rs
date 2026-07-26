@@ -32,12 +32,14 @@ pub use rowwise::{
     AffineLayerNormConfig, AffineLayerNormPlan, AppendAffineLayerNormConfig,
     AppendedAffineLayerNorm, RowShardPlacement, RowShardTransitionConfig,
     append_a16_to_a16_row_shards_reblocked_in_arenas,
+    append_a16_to_a16_row_shards_reblocked_on_tiles_in_arenas,
     append_add_affine_layer_norm_f16_with_memory_policy, append_add_f16_row_shards_in_place,
     append_affine_layer_norm_f16, append_affine_layer_norm_f16_in_arenas,
     append_affine_layer_norm_f16_with_memory_policy, append_c16_to_a16_blocks_gelu_f16,
     append_c16_to_a16_blocks_gelu_f16_in_arenas, append_c16_to_a16_row_shards,
     append_c16_to_a16_row_shards_gelu_f16, append_c16_to_a16_row_shards_reblocked_in_arenas,
     append_c16_to_a16_row_shards_reblocked_like_in_arenas,
+    choose_colocated_row_shard_layout_for_copies_in_arenas,
     choose_colocated_row_shard_rows_for_copies_in_arenas,
     choose_row_shard_rows_for_copies_in_arenas, end_tensor_lifetimes, make_tensors_resident,
     make_tensors_resident_since, plan_affine_layer_norm_f16, retain_tensor_lifetimes,
@@ -1234,12 +1236,62 @@ pub struct MemoryPolicy {
 #[derive(Clone, Debug, Default)]
 pub struct ResidentPlacementTemplate {
     decisions: Arc<Mutex<Vec<ResidentPlacementDecision>>>,
+    owner_decisions: Arc<Mutex<Vec<ResidentOwnerDecision>>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl ResidentPlacementTemplate {
+    /// Stable signature used to detect convergence of repeated-placement
+    /// optimization and a subsequent measured replay.
+    pub fn rotation_signature(&self) -> Vec<u16> {
+        let mut signature = self
+            .decisions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|decision| decision.rotation)
+            .collect::<Vec<_>>();
+        signature.extend(
+            self.owner_decisions
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|decision| decision.tile),
+        );
+        signature
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ResidentPlacementDecision {
     key: ResidentPlacementKey,
     rotation: u16,
+    resident_bytes: Arc<[u64]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResidentOwnerDecision {
+    key: ResidentOwnerKey,
+    tile: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentOwnerKey {
+    kind: ResidentOwnerKind,
+    bytes: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResidentOwnerKind {
+    AffineLayerNorm,
+}
+
+impl ResidentOwnerKey {
+    pub const fn affine_layer_norm(bytes: u32) -> Self {
+        Self {
+            kind: ResidentOwnerKind::AffineLayerNorm,
+            bytes,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1300,6 +1352,9 @@ struct ResidentPlacementSession {
     cursor: Arc<AtomicUsize>,
     allocation_start: usize,
     repetitions: usize,
+    transient_headroom: Arc<[u64]>,
+    owner_cursor: Arc<AtomicUsize>,
+    instance: usize,
 }
 
 impl PartialEq for ResidentPlacementSession {
@@ -1432,12 +1487,37 @@ impl MemoryPolicy {
         schedule: &Schedule,
         repetitions: usize,
     ) -> Result<Self, CompileError> {
+        self.record_resident_placement_with_transient_headroom(
+            template,
+            schedule,
+            repetitions,
+            &vec![0; usize::from(schedule.tile_count)],
+        )
+    }
+
+    /// Records repeated resident placement while reserving measured transient
+    /// demand on each tile.
+    pub fn record_resident_placement_with_transient_headroom(
+        &self,
+        template: &ResidentPlacementTemplate,
+        schedule: &Schedule,
+        repetitions: usize,
+        transient_headroom: &[u64],
+    ) -> Result<Self, CompileError> {
         if repetitions == 0 {
             return Err(CompileError::Memory(
                 "resident placement template requires at least one instance".into(),
             ));
         }
+        if transient_headroom.len() != usize::from(schedule.tile_count) {
+            return Err(CompileError::Memory(format!(
+                "repeated resident placement has {} transient-headroom entries for {} tiles",
+                transient_headroom.len(),
+                schedule.tile_count
+            )));
+        }
         template.decisions.lock().unwrap().clear();
+        template.owner_decisions.lock().unwrap().clear();
         let mut policy = self.clone();
         policy.resident_placement_session = Some(ResidentPlacementSession {
             template: template.clone(),
@@ -1445,6 +1525,9 @@ impl MemoryPolicy {
             cursor: Arc::new(AtomicUsize::new(0)),
             allocation_start: schedule.allocations.len(),
             repetitions,
+            transient_headroom: transient_headroom.into(),
+            owner_cursor: Arc::new(AtomicUsize::new(0)),
+            instance: 0,
         });
         Ok(policy)
     }
@@ -1455,9 +1538,27 @@ impl MemoryPolicy {
         &self,
         template: &ResidentPlacementTemplate,
     ) -> Result<Self, CompileError> {
-        if template.decisions.lock().unwrap().is_empty() {
+        self.replay_resident_placement_instance(template, 0, 1)
+    }
+
+    /// Replays one repeated block instance. Singleton resident owners are
+    /// spread evenly across instances while GEMM execution roles stay fixed.
+    pub fn replay_resident_placement_instance(
+        &self,
+        template: &ResidentPlacementTemplate,
+        instance: usize,
+        repetitions: usize,
+    ) -> Result<Self, CompileError> {
+        if template.decisions.lock().unwrap().is_empty()
+            && template.owner_decisions.lock().unwrap().is_empty()
+        {
             return Err(CompileError::Memory(
                 "cannot replay an empty resident placement template".into(),
+            ));
+        }
+        if repetitions == 0 || instance >= repetitions {
+            return Err(CompileError::Memory(
+                "resident placement replay instance is out of range".into(),
             ));
         }
         let mut policy = self.clone();
@@ -1466,9 +1567,398 @@ impl MemoryPolicy {
             mode: ResidentPlacementMode::Replay,
             cursor: Arc::new(AtomicUsize::new(0)),
             allocation_start: 0,
-            repetitions: 1,
+            repetitions,
+            transient_headroom: Arc::from([]),
+            owner_cursor: Arc::new(AtomicUsize::new(0)),
+            instance,
         });
         Ok(policy)
+    }
+
+    pub fn select_repeated_resident_owner(
+        &self,
+        key: ResidentOwnerKey,
+        tile_count: u16,
+        default_owner: u16,
+    ) -> Result<u16, CompileError> {
+        if tile_count == 0 || default_owner >= tile_count {
+            return Err(CompileError::Memory(
+                "resident owner selection has an invalid tile".into(),
+            ));
+        }
+        let Some(session) = &self.resident_placement_session else {
+            return Ok(default_owner);
+        };
+        let index = session.owner_cursor.fetch_add(1, Ordering::Relaxed);
+        match session.mode {
+            ResidentPlacementMode::Record => {
+                let mut decisions = session.template.owner_decisions.lock().unwrap();
+                if index != decisions.len() {
+                    return Err(CompileError::Memory(
+                        "resident owner template was recorded out of order".into(),
+                    ));
+                }
+                decisions.push(ResidentOwnerDecision {
+                    key,
+                    tile: default_owner,
+                });
+                Ok(default_owner)
+            }
+            ResidentPlacementMode::Replay => {
+                let decision = session
+                    .template
+                    .owner_decisions
+                    .lock()
+                    .unwrap()
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| {
+                        CompileError::Memory(format!(
+                            "resident placement instance has an unexpected owner at index {index}"
+                        ))
+                    })?;
+                if decision.key != key {
+                    return Err(CompileError::Memory(format!(
+                        "resident owner {index} changed from {:?} to {:?}",
+                        decision.key, key
+                    )));
+                }
+                let offset = session
+                    .instance
+                    .checked_mul(usize::from(tile_count))
+                    .unwrap()
+                    / session.repetitions;
+                Ok(((usize::from(decision.tile) + offset) % usize::from(tile_count)) as u16)
+            }
+        }
+    }
+
+    /// Measures the peak finite-lifetime home storage in a program region.
+    ///
+    /// Permanent objects (`0..usize::MAX`) are resident load rather than
+    /// transient headroom. Aliases and exchange staging do not own home SRAM.
+    pub fn transient_peak_bytes_by_tile(
+        &self,
+        schedule: &Schedule,
+        phases: Range<usize>,
+    ) -> Result<Vec<u64>, CompileError> {
+        if phases.start >= phases.end || phases.end > schedule.phases.len() {
+            return Err(CompileError::Memory(format!(
+                "invalid transient-profile phase range {}..{} for {} phases",
+                phases.start,
+                phases.end,
+                schedule.phases.len()
+            )));
+        }
+        let mut arena_intervals = self
+            .transient
+            .iter()
+            .map(|arena| (arena.base, arena.limit))
+            .collect::<Vec<_>>();
+        normalize_occupied_intervals(&mut arena_intervals);
+        let phase_count = phases.end - phases.start;
+        let mut events = vec![vec![0i64; phase_count + 1]; usize::from(schedule.tile_count)];
+        for allocation in &schedule.allocations {
+            if allocation.kind != AllocationKind::Home
+                || (allocation.live_from == 0 && allocation.live_until == usize::MAX)
+            {
+                continue;
+            }
+            let live_from = allocation.live_from.max(phases.start);
+            let live_until = allocation.live_until.min(phases.end);
+            if live_from >= live_until {
+                continue;
+            }
+            let allocation_end = allocation.address.saturating_add(allocation.size);
+            let bytes = arena_intervals
+                .iter()
+                .map(|&(base, limit)| {
+                    u64::from(
+                        allocation_end
+                            .min(limit)
+                            .saturating_sub(allocation.address.max(base)),
+                    )
+                })
+                .sum::<u64>();
+            if bytes == 0 {
+                continue;
+            }
+            let bytes = i64::try_from(bytes).map_err(|_| {
+                CompileError::Memory("transient-profile byte count exceeds i64".into())
+            })?;
+            let tile_events = &mut events[usize::from(allocation.tile)];
+            tile_events[live_from - phases.start] += bytes;
+            tile_events[live_until - phases.start] -= bytes;
+        }
+        Ok(events
+            .into_iter()
+            .map(|events| {
+                let mut live = 0i64;
+                let mut peak = 0i64;
+                for event in events {
+                    live += event;
+                    peak = peak.max(live);
+                }
+                u64::try_from(peak).unwrap()
+            })
+            .collect())
+    }
+
+    /// Computes allocatable bytes left after replicating one recorded block's
+    /// resident allocations and reserving its measured transient peak.
+    pub fn repeated_resident_slack_by_tile(
+        &self,
+        schedule: &Schedule,
+        allocation_start: usize,
+        repetitions: usize,
+        transient_headroom: &[u64],
+    ) -> Result<Vec<i64>, CompileError> {
+        if allocation_start > schedule.allocations.len()
+            || repetitions == 0
+            || transient_headroom.len() != usize::from(schedule.tile_count)
+        {
+            return Err(CompileError::Memory(
+                "invalid repeated resident-capacity query".into(),
+            ));
+        }
+        let mut arena_intervals = self
+            .resident
+            .iter()
+            .map(|arena| (arena.base, arena.limit))
+            .collect::<Vec<_>>();
+        normalize_occupied_intervals(&mut arena_intervals);
+        let capacity = arena_intervals
+            .iter()
+            .map(|&(base, limit)| u64::from(limit - base))
+            .sum::<u64>();
+        let mut used = transient_headroom.to_vec();
+        for (index, allocation) in schedule.allocations.iter().enumerate() {
+            if allocation.kind != AllocationKind::Home
+                || allocation.live_from != 0
+                || allocation.live_until != usize::MAX
+            {
+                continue;
+            }
+            let allocation_end = allocation.address.saturating_add(allocation.size);
+            let bytes = arena_intervals
+                .iter()
+                .map(|&(base, limit)| {
+                    u64::from(
+                        allocation_end
+                            .min(limit)
+                            .saturating_sub(allocation.address.max(base)),
+                    )
+                })
+                .sum::<u64>();
+            let instances = if index < allocation_start {
+                1
+            } else {
+                repetitions
+            };
+            used[usize::from(allocation.tile)] = used[usize::from(allocation.tile)]
+                .checked_add(
+                    bytes
+                        .checked_mul(u64::try_from(instances).unwrap())
+                        .ok_or_else(|| {
+                            CompileError::Memory(
+                                "repeated resident-capacity byte count overflow".into(),
+                            )
+                        })?,
+                )
+                .ok_or_else(|| {
+                    CompileError::Memory("repeated resident-capacity aggregate overflow".into())
+                })?;
+        }
+        Ok(used
+            .into_iter()
+            .map(|used| i128::from(capacity) - i128::from(used))
+            .map(|slack| {
+                i64::try_from(slack).map_err(|_| {
+                    CompileError::Memory("repeated resident-capacity slack exceeds i64".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Jointly optimizes the GEMM rotations recorded by a repeated-block probe.
+    ///
+    /// Online placement can only account for operations already seen. This
+    /// pass has the complete block, so it minimizes peak resident plus
+    /// transient demand while retaining the same operation and block shapes.
+    pub fn optimize_repeated_resident_placement(
+        &self,
+        template: &ResidentPlacementTemplate,
+        probe: &Schedule,
+        allocation_start: usize,
+        repetitions: usize,
+        transient_headroom: &[u64],
+    ) -> Result<Vec<i64>, CompileError> {
+        let tile_count = usize::from(probe.tile_count);
+        if tile_count == 0
+            || allocation_start > probe.allocations.len()
+            || repetitions == 0
+            || transient_headroom.len() != tile_count
+        {
+            return Err(CompileError::Memory(
+                "invalid repeated resident-placement optimization".into(),
+            ));
+        }
+        let mut decisions = template.decisions.lock().unwrap().clone();
+        let owner_decisions = template.owner_decisions.lock().unwrap().clone();
+        if decisions.is_empty()
+            || decisions
+                .iter()
+                .any(|decision| decision.resident_bytes.len() != tile_count)
+        {
+            return Err(CompileError::Memory(
+                "repeated resident-placement optimization has no complete decisions".into(),
+            ));
+        }
+        let mut arena_intervals = self
+            .resident
+            .iter()
+            .map(|arena| (arena.base, arena.limit))
+            .collect::<Vec<_>>();
+        normalize_occupied_intervals(&mut arena_intervals);
+        let capacity = arena_intervals
+            .iter()
+            .map(|&(base, limit)| u64::from(limit - base))
+            .sum::<u64>();
+        let allocation_bytes = |allocation: &Allocation| {
+            let end = allocation.address.saturating_add(allocation.size);
+            arena_intervals
+                .iter()
+                .map(|&(base, limit)| {
+                    u64::from(end.min(limit).saturating_sub(allocation.address.max(base)))
+                })
+                .sum::<u64>()
+        };
+        let mut baseline = transient_headroom.to_vec();
+        let mut probed_resident = vec![0u64; tile_count];
+        for (index, allocation) in probe.allocations.iter().enumerate() {
+            if allocation.kind != AllocationKind::Home
+                || allocation.live_from != 0
+                || allocation.live_until != usize::MAX
+            {
+                continue;
+            }
+            let bytes = allocation_bytes(allocation);
+            if index < allocation_start {
+                baseline[usize::from(allocation.tile)] += bytes;
+            } else {
+                probed_resident[usize::from(allocation.tile)] += bytes;
+            }
+        }
+        let rotated_bytes = |bytes: &[u64], rotation: u16, tile: usize| {
+            bytes[(tile + tile_count - usize::from(rotation)) % tile_count]
+        };
+        let mut represented = vec![0u64; tile_count];
+        for decision in &decisions {
+            for (tile, represented) in represented.iter_mut().enumerate() {
+                *represented += rotated_bytes(&decision.resident_bytes, decision.rotation, tile);
+            }
+        }
+        for decision in &owner_decisions {
+            represented[usize::from(decision.tile)] += u64::from(decision.key.bytes);
+        }
+        let repetition_count = repetitions;
+        let repetitions = u64::try_from(repetition_count).unwrap();
+        for tile in 0..tile_count {
+            let fixed = probed_resident[tile]
+                .checked_sub(represented[tile])
+                .ok_or_else(|| {
+                    CompileError::Memory(
+                        "recorded resident-placement bytes exceed probe resident storage".into(),
+                    )
+                })?;
+            baseline[tile] += fixed * repetitions;
+        }
+        let mut loads = baseline;
+        for decision in &decisions {
+            for (tile, load) in loads.iter_mut().enumerate() {
+                *load +=
+                    rotated_bytes(&decision.resident_bytes, decision.rotation, tile) * repetitions;
+            }
+        }
+        for decision in &owner_decisions {
+            for instance in 0..repetition_count {
+                let offset = instance.checked_mul(tile_count).ok_or_else(|| {
+                    CompileError::Memory("resident owner distribution index overflow".into())
+                })? / repetition_count;
+                let tile = (usize::from(decision.tile) + offset) % tile_count;
+                loads[tile] = loads[tile]
+                    .checked_add(u64::from(decision.key.bytes))
+                    .ok_or_else(|| {
+                        CompileError::Memory(
+                            "resident owner distribution byte count overflow".into(),
+                        )
+                    })?;
+            }
+        }
+        let score = |loads: &[u64]| {
+            (
+                loads.iter().copied().max().unwrap_or(0),
+                loads
+                    .iter()
+                    .map(|&load| u128::from(load) * u128::from(load))
+                    .sum::<u128>(),
+            )
+        };
+        loop {
+            let mut changed = false;
+            for decision in &mut decisions {
+                for (tile, load) in loads.iter_mut().enumerate() {
+                    *load -= rotated_bytes(&decision.resident_bytes, decision.rotation, tile)
+                        * repetitions;
+                }
+                let mut best_rotation = decision.rotation;
+                let mut best_score = {
+                    let candidate = (0..tile_count)
+                        .map(|tile| {
+                            loads[tile]
+                                + rotated_bytes(&decision.resident_bytes, decision.rotation, tile)
+                                    * repetitions
+                        })
+                        .collect::<Vec<_>>();
+                    score(&candidate)
+                };
+                for rotation in 0..probe.tile_count {
+                    if rotation == decision.rotation {
+                        continue;
+                    }
+                    let candidate = (0..tile_count)
+                        .map(|tile| {
+                            loads[tile]
+                                + rotated_bytes(&decision.resident_bytes, rotation, tile)
+                                    * repetitions
+                        })
+                        .collect::<Vec<_>>();
+                    let candidate_score = score(&candidate);
+                    if candidate_score < best_score {
+                        best_score = candidate_score;
+                        best_rotation = rotation;
+                    }
+                }
+                changed |= best_rotation != decision.rotation;
+                decision.rotation = best_rotation;
+                for (tile, load) in loads.iter_mut().enumerate() {
+                    *load += rotated_bytes(&decision.resident_bytes, decision.rotation, tile)
+                        * repetitions;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        *template.decisions.lock().unwrap() = decisions;
+        loads
+            .into_iter()
+            .map(|load| {
+                i64::try_from(i128::from(capacity) - i128::from(load)).map_err(|_| {
+                    CompileError::Memory("optimized repeated-placement slack exceeds i64".into())
+                })
+            })
+            .collect()
     }
 
     /// Verifies that a recorded or replayed instance consumed exactly the
@@ -1479,9 +1969,12 @@ impl MemoryPolicy {
         };
         let consumed = session.cursor.load(Ordering::Relaxed);
         let expected = session.template.decisions.lock().unwrap().len();
-        if consumed != expected {
+        let consumed_owners = session.owner_cursor.load(Ordering::Relaxed);
+        let expected_owners = session.template.owner_decisions.lock().unwrap().len();
+        if consumed != expected || consumed_owners != expected_owners {
             return Err(CompileError::Memory(format!(
-                "resident placement instance consumed {consumed} decisions, expected {expected}"
+                "resident placement instance consumed {consumed}/{consumed_owners} \
+                 GEMM/owner decisions, expected {expected}/{expected_owners}"
             )));
         }
         Ok(())
@@ -3021,6 +3514,11 @@ fn resident_tile_rotation(
     let index = session.cursor.fetch_add(1, Ordering::Relaxed);
     match session.mode {
         ResidentPlacementMode::Record => {
+            let resident_bytes = resident_block_bytes_by_tile(
+                parent.tile_count,
+                child_resident,
+                config.data_type.weight_element_bytes(),
+            );
             let rotation = match memory.resident_tile_assignment {
                 ResidentTileAssignment::Balanced => {
                     let mut projected_extra = vec![0u64; usize::from(parent.tile_count)];
@@ -3043,6 +3541,7 @@ fn resident_tile_rotation(
                         config.data_type.weight_element_bytes(),
                         memory,
                         &projected_extra,
+                        &session.transient_headroom,
                         session.repetitions,
                     )
                 }
@@ -3054,7 +3553,11 @@ fn resident_tile_rotation(
                     "resident placement template was recorded out of order".into(),
                 ));
             }
-            decisions.push(ResidentPlacementDecision { key, rotation });
+            decisions.push(ResidentPlacementDecision {
+                key,
+                rotation,
+                resident_bytes: resident_bytes.into(),
+            });
             Ok(rotation)
         }
         ResidentPlacementMode::Replay => {
@@ -3064,7 +3567,7 @@ fn resident_tile_rotation(
                 .lock()
                 .unwrap()
                 .get(index)
-                .copied()
+                .cloned()
                 .ok_or_else(|| {
                     CompileError::Memory(format!(
                         "resident placement instance has an unexpected operation at index {index}"
@@ -3081,6 +3584,19 @@ fn resident_tile_rotation(
     }
 }
 
+fn resident_block_bytes_by_tile(
+    tile_count: u16,
+    blocks: &[BlockPlacement],
+    element_bytes: u32,
+) -> Vec<u64> {
+    let mut bytes = vec![0u64; usize::from(tile_count)];
+    for block in blocks {
+        bytes[usize::from(block.tile)] +=
+            u64::from(block.rows) * u64::from(block.columns) * u64::from(element_bytes);
+    }
+    bytes
+}
+
 fn choose_resident_tile_rotation_in_arenas(
     parent: &Schedule,
     child_resident: &[BlockPlacement],
@@ -3093,6 +3609,7 @@ fn choose_resident_tile_rotation_in_arenas(
         element_bytes,
         memory,
         &vec![0; usize::from(parent.tile_count)],
+        &vec![0; usize::from(parent.tile_count)],
         1,
     )
 }
@@ -3103,10 +3620,15 @@ fn choose_resident_tile_rotation_with_projection(
     element_bytes: u32,
     memory: &MemoryPolicy,
     projected_extra: &[u64],
+    transient_headroom: &[u64],
     child_instances: usize,
 ) -> u16 {
     let tile_count = usize::from(parent.tile_count);
-    if tile_count == 0 || projected_extra.len() != tile_count || child_instances == 0 {
+    if tile_count == 0
+        || projected_extra.len() != tile_count
+        || transient_headroom.len() != tile_count
+        || child_instances == 0
+    {
         return 0;
     }
     let arena_base = memory
@@ -3123,7 +3645,10 @@ fn choose_resident_tile_rotation_with_projection(
         .unwrap_or(0);
     let mut resident_occupied = vec![Vec::new(); tile_count];
     for allocation in &parent.allocations {
-        if allocation.kind != AllocationKind::Home || allocation.live_until != usize::MAX {
+        if allocation.kind != AllocationKind::Home
+            || allocation.live_from != 0
+            || allocation.live_until != usize::MAX
+        {
             continue;
         }
         let start = allocation.address.max(arena_base);
@@ -3149,11 +3674,8 @@ fn choose_resident_tile_rotation_with_projection(
                 .sum::<u64>()
         })
         .collect::<Vec<_>>();
-    let mut child_bytes = vec![0u64; tile_count];
-    for block in child_resident {
-        child_bytes[usize::from(block.tile)] +=
-            u64::from(block.rows) * u64::from(block.columns) * u64::from(element_bytes);
-    }
+    let child_bytes =
+        resident_block_bytes_by_tile(parent.tile_count, child_resident, element_bytes);
     let mut static_activity = vec![0u64; tile_count];
     for phase in &parent.phases {
         match phase {
@@ -3176,6 +3698,7 @@ fn choose_resident_tile_rotation_with_projection(
                 .map(|tile| {
                     parent_bytes[tile]
                         + projected_extra[tile]
+                        + transient_headroom[tile]
                         + child_bytes[(tile + tile_count - rotation) % tile_count]
                             * u64::try_from(child_instances).unwrap()
                 })
@@ -6916,6 +7439,340 @@ mod tests {
         );
 
         assert_eq!(with_transient, baseline);
+    }
+
+    #[test]
+    fn transient_profile_measures_peak_owned_storage_per_tile() {
+        let schedule = Schedule {
+            layouts: Vec::new(),
+            phases: (0..6)
+                .map(|_| Phase::Exchange {
+                    transfers: Vec::new(),
+                })
+                .collect(),
+            allocations: vec![
+                Allocation {
+                    tensor: TensorId(0),
+                    tile: 0,
+                    address: 0xa0000,
+                    size: 100,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                },
+                Allocation {
+                    tensor: TensorId(1),
+                    tile: 0,
+                    address: 0xa0100,
+                    size: 80,
+                    live_from: 1,
+                    live_until: 4,
+                    kind: AllocationKind::Home,
+                },
+                Allocation {
+                    tensor: TensorId(2),
+                    tile: 0,
+                    address: 0xa0200,
+                    size: 120,
+                    live_from: 3,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                },
+                Allocation {
+                    tensor: TensorId(3),
+                    tile: 1,
+                    address: 0xa0300,
+                    size: 64,
+                    live_from: 2,
+                    live_until: 3,
+                    kind: AllocationKind::Home,
+                },
+            ]
+            .into(),
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+        let memory = MemoryPolicy::contiguous(0xa0000, 0xb0000);
+
+        let peaks = memory
+            .transient_peak_bytes_by_tile(&schedule, 1..5)
+            .unwrap();
+
+        assert_eq!(peaks, vec![200, 64]);
+    }
+
+    #[test]
+    fn repeated_resident_placement_reserves_measured_transient_headroom() {
+        let parent = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: Vec::new().into(),
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+        let child = [BlockPlacement {
+            tensor: TensorId(0),
+            tile: 0,
+            address: 0xa0000,
+            block_row: 0,
+            block_column: 0,
+            row_start: 0,
+            rows: 1,
+            column_start: 0,
+            columns: 64,
+        }];
+        let config = BlockedGemmConfig {
+            rows: 64,
+            inner_dimension: 64,
+            columns: 64,
+            block_dimension: 64,
+            inner_block_dimension: 64,
+            row_block_dimension: 64,
+            tile_count: 2,
+            data_base: 0xa0000,
+            data_limit: 0xb0000,
+            data_type: GemmDataType::F16,
+            retain_profile_metadata: false,
+        };
+        let memory = MemoryPolicy::contiguous(0xa0000, 0xb0000);
+        let template = ResidentPlacementTemplate::default();
+        let recording = memory
+            .record_resident_placement_with_transient_headroom(&template, &parent, 1, &[4096, 0])
+            .unwrap();
+
+        let rotation = resident_tile_rotation(&parent, config, &child, &recording).unwrap();
+
+        assert_eq!(rotation, 1);
+    }
+
+    #[test]
+    fn repeated_resident_capacity_accounts_for_baseline_and_replicas() {
+        let schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![
+                Allocation {
+                    tensor: TensorId(0),
+                    tile: 0,
+                    address: 0xa0000,
+                    size: 100,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                },
+                Allocation {
+                    tensor: TensorId(1),
+                    tile: 0,
+                    address: 0xa0100,
+                    size: 40,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                },
+                Allocation {
+                    tensor: TensorId(2),
+                    tile: 1,
+                    address: 0xa0200,
+                    size: 20,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                },
+            ]
+            .into(),
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+        let memory = MemoryPolicy::contiguous(0xa0000, 0xa1000);
+
+        let slack = memory
+            .repeated_resident_slack_by_tile(&schedule, 1, 3, &[10, 30])
+            .unwrap();
+
+        assert_eq!(slack, vec![3866, 4006]);
+    }
+
+    #[test]
+    fn repeated_resident_owner_replay_distributes_instances_across_tiles() {
+        let schedule = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: Vec::new().into(),
+            tile_count: 8,
+            peak_sram: BTreeMap::new(),
+        };
+        let memory = MemoryPolicy::contiguous(0xa0000, 0xb0000);
+        let template = ResidentPlacementTemplate::default();
+        let key = ResidentOwnerKey::affine_layer_norm(128);
+        let recording = memory
+            .record_resident_placement(&template, &schedule, 4)
+            .unwrap();
+
+        assert_eq!(
+            recording
+                .select_repeated_resident_owner(key, schedule.tile_count, 1)
+                .unwrap(),
+            1
+        );
+        recording.finish_resident_placement().unwrap();
+
+        let owners = (0..4)
+            .map(|instance| {
+                let replay = memory
+                    .replay_resident_placement_instance(&template, instance, 4)
+                    .unwrap();
+                let owner = replay
+                    .select_repeated_resident_owner(key, schedule.tile_count, 7)
+                    .unwrap();
+                replay.finish_resident_placement().unwrap();
+                owner
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(owners, vec![1, 3, 5, 7]);
+    }
+
+    #[test]
+    fn repeated_resident_optimizer_projects_distributed_owners() {
+        let config = BlockedGemmConfig {
+            rows: 1,
+            inner_dimension: 1,
+            columns: 1,
+            block_dimension: 1,
+            inner_block_dimension: 1,
+            row_block_dimension: 1,
+            tile_count: 4,
+            data_base: 0,
+            data_limit: 1000,
+            data_type: GemmDataType::F16,
+            retain_profile_metadata: false,
+        };
+        let template = ResidentPlacementTemplate::default();
+        template
+            .decisions
+            .lock()
+            .unwrap()
+            .push(ResidentPlacementDecision {
+                key: config.into(),
+                rotation: 0,
+                resident_bytes: vec![0; 4].into(),
+            });
+        template
+            .owner_decisions
+            .lock()
+            .unwrap()
+            .push(ResidentOwnerDecision {
+                key: ResidentOwnerKey::affine_layer_norm(100),
+                tile: 1,
+            });
+        let probe = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![Allocation {
+                tensor: TensorId(0),
+                tile: 1,
+                address: 0,
+                size: 100,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            }]
+            .into(),
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let slack = MemoryPolicy::contiguous(0, 1000)
+            .optimize_repeated_resident_placement(&template, &probe, 0, 2, &[0; 4])
+            .unwrap();
+
+        assert_eq!(slack, vec![1000, 900, 1000, 900]);
+    }
+
+    #[test]
+    fn repeated_resident_optimizer_coordinates_recorded_operations() {
+        let parent = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: Vec::new().into(),
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+        let child = [BlockPlacement {
+            tensor: TensorId(0),
+            tile: 0,
+            address: 0xa0000,
+            block_row: 0,
+            block_column: 0,
+            row_start: 0,
+            rows: 1,
+            column_start: 0,
+            columns: 100,
+        }];
+        let config = BlockedGemmConfig {
+            rows: 64,
+            inner_dimension: 64,
+            columns: 64,
+            block_dimension: 64,
+            inner_block_dimension: 64,
+            row_block_dimension: 64,
+            tile_count: 4,
+            data_base: 0xa0000,
+            data_limit: 0xb0000,
+            data_type: GemmDataType::F16,
+            retain_profile_metadata: false,
+        };
+        let memory = MemoryPolicy::contiguous(0xa0000, 0xb0000);
+        let template = ResidentPlacementTemplate::default();
+        let recording = memory
+            .record_resident_placement_with_transient_headroom(
+                &template,
+                &parent,
+                2,
+                &[300, 0, 0, 0],
+            )
+            .unwrap();
+        resident_tile_rotation(&parent, config, &child, &recording).unwrap();
+        resident_tile_rotation(&parent, config, &child, &recording).unwrap();
+        recording.finish_resident_placement().unwrap();
+        let initial = template
+            .decisions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|decision| decision.rotation)
+            .collect::<Vec<_>>();
+        let probe = Schedule {
+            allocations: initial
+                .iter()
+                .enumerate()
+                .map(|(tensor, &tile)| Allocation {
+                    tensor: TensorId(tensor),
+                    tile,
+                    address: 0xa0000,
+                    size: 200,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            ..parent
+        };
+
+        let slack = memory
+            .optimize_repeated_resident_placement(&template, &probe, 0, 2, &[300, 0, 0, 0])
+            .unwrap();
+        let optimized = template
+            .decisions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|decision| decision.rotation)
+            .collect::<Vec<_>>();
+
+        assert_ne!(optimized[0], optimized[1]);
+        assert!(slack.iter().copied().min().unwrap() > 0);
     }
 
     #[test]

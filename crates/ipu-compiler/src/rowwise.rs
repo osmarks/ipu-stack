@@ -1,7 +1,7 @@
 use crate::{
     Allocation, AllocationKind, BlockPlacement, CompileError, KernelCommand, MemoryArena,
-    MemoryConstraint, MemoryPlacement, MemoryPolicy, OpId, Phase, Schedule, SpecializationKey,
-    TensorId, Transfer, allocate_from_occupied, allocate_from_occupied_arenas,
+    MemoryConstraint, MemoryPlacement, MemoryPolicy, OpId, Phase, ResidentOwnerKey, Schedule,
+    SpecializationKey, TensorId, Transfer, allocate_from_occupied, allocate_from_occupied_arenas,
 };
 use rustc_hash::FxHashSet as HashSet;
 use serde::{Deserialize, Serialize};
@@ -74,6 +74,7 @@ pub fn choose_row_shard_rows_for_copies_in_arenas(
         arenas,
         false,
     )
+    .map(|(rows, _)| rows)
 }
 
 pub fn choose_colocated_row_shard_rows_for_copies_in_arenas(
@@ -84,6 +85,25 @@ pub fn choose_colocated_row_shard_rows_for_copies_in_arenas(
     copies: usize,
     arenas: &[MemoryArena],
 ) -> Option<u16> {
+    choose_colocated_row_shard_layout_for_copies_in_arenas(
+        schedule,
+        rows,
+        columns,
+        maximum_rows,
+        copies,
+        arenas,
+    )
+    .map(|(rows, _)| rows)
+}
+
+pub fn choose_colocated_row_shard_layout_for_copies_in_arenas(
+    schedule: &Schedule,
+    rows: u16,
+    columns: u16,
+    maximum_rows: u16,
+    copies: usize,
+    arenas: &[MemoryArena],
+) -> Option<(u16, Vec<u16>)> {
     choose_row_shard_rows_for_copies_impl(
         schedule,
         rows,
@@ -103,7 +123,7 @@ fn choose_row_shard_rows_for_copies_impl(
     copies: usize,
     arenas: &[MemoryArena],
     colocated: bool,
-) -> Option<u16> {
+) -> Option<(u16, Vec<u16>)> {
     if rows == 0 || columns == 0 || maximum_rows == 0 || copies == 0 || arenas.is_empty() {
         return None;
     }
@@ -127,6 +147,7 @@ fn choose_row_shard_rows_for_copies_impl(
         let base_rows = rows / row_grid;
         let larger_shards = rows % row_grid;
         let mut simulated = occupied.clone();
+        let mut selected_tiles = Vec::with_capacity(usize::from(row_grid));
         let fits = if colocated {
             let mut used = HashSet::default();
             (0..row_grid).all(|index| {
@@ -163,6 +184,7 @@ fn choose_row_shard_rows_for_copies_impl(
                     return false;
                 };
                 used.insert(tile);
+                selected_tiles.push(tile);
                 simulated[usize::from(tile)] = tile_occupied;
                 true
             })
@@ -204,7 +226,7 @@ fn choose_row_shard_rows_for_copies_impl(
             })
         };
         if fits {
-            return Some(base_rows + u16::from(larger_shards != 0));
+            return Some((base_rows + u16::from(larger_shards != 0), selected_tiles));
         }
     }
     None
@@ -1013,7 +1035,28 @@ pub fn append_a16_to_a16_row_shards_reblocked_in_arenas(
     row_block_dimension: u16,
     arenas: &[MemoryArena],
 ) -> Result<Vec<RowShardPlacement>, CompileError> {
+    append_a16_to_a16_row_shards_reblocked_on_tiles_in_arenas(
+        schedule,
+        source,
+        row_block_dimension,
+        &[],
+        arenas,
+    )
+}
+
+pub fn append_a16_to_a16_row_shards_reblocked_on_tiles_in_arenas(
+    schedule: &mut Schedule,
+    source: &[RowShardPlacement],
+    row_block_dimension: u16,
+    destination_tiles: &[u16],
+    arenas: &[MemoryArena],
+) -> Result<Vec<RowShardPlacement>, CompileError> {
     let columns = source.first().map(|shard| shard.columns).unwrap_or(0);
+    let rows = source
+        .iter()
+        .map(|shard| shard.row_start + shard.rows)
+        .max()
+        .unwrap_or(0);
     if source.is_empty()
         || columns == 0
         || !columns.is_multiple_of(16)
@@ -1027,8 +1070,19 @@ pub fn append_a16_to_a16_row_shards_reblocked_in_arenas(
             .any(|arena| arena.base & 7 != 0 || arena.base >= arena.limit)
     {
         return Err(CompileError::Graph(
-            "A16 row reblocking requires consistent 16-column panels, a row block size, and aligned SRAM"
+            "A16 row reblocking requires consistent panels, row and tile grids, and aligned SRAM"
                 .into(),
+        ));
+    }
+    let row_grid = rows.div_ceil(row_block_dimension);
+    if !destination_tiles.is_empty()
+        && (destination_tiles.len() != usize::from(row_grid)
+            || destination_tiles
+                .iter()
+                .any(|&tile| tile >= schedule.tile_count))
+    {
+        return Err(CompileError::Graph(
+            "A16 row reblocking destination tile grid is incompatible".into(),
         ));
     }
     let source = source
@@ -1059,13 +1113,35 @@ pub fn append_a16_to_a16_row_shards_reblocked_in_arenas(
                 })
         })
         .collect::<Vec<_>>();
+    let destination_layout = (!destination_tiles.is_empty()).then(|| {
+        let base_rows = rows / row_grid;
+        let larger_shards = rows % row_grid;
+        let mut row_start = 0;
+        destination_tiles
+            .iter()
+            .enumerate()
+            .map(|(index, &tile)| {
+                let shard_rows = base_rows + u16::from(index < usize::from(larger_shards));
+                let shard = RowShardPlacement {
+                    tile,
+                    row_start,
+                    rows: shard_rows,
+                    columns,
+                    tensor: TensorId(0),
+                    address: 0,
+                };
+                row_start += shard_rows;
+                shard
+            })
+            .collect::<Vec<_>>()
+    });
     append_to_a16_row_shards_reblocked_in_arenas(
         schedule,
         &source,
         columns,
         row_block_dimension,
         arenas,
-        None,
+        destination_layout.as_deref(),
     )
 }
 
@@ -1692,7 +1768,7 @@ fn append_affine_layer_norm_f16_impl(
         resident_limit,
     );
     let input_tiles = input.iter().map(|shard| shard.tile).collect::<HashSet<_>>();
-    let (owner_tile, affine_address) = (0..schedule.tile_count)
+    let owner_candidates = (0..schedule.tile_count)
         .filter_map(|tile| {
             let mut occupied = resident_occupied[usize::from(tile)].clone();
             let address =
@@ -1700,6 +1776,10 @@ fn append_affine_layer_norm_f16_impl(
                     .ok()?;
             Some((tile, address))
         })
+        .collect::<Vec<_>>();
+    let default_owner = owner_candidates
+        .iter()
+        .copied()
         .min_by_key(|&(tile, _)| {
             (
                 resident_pressure[usize::from(tile)],
@@ -1710,6 +1790,19 @@ fn append_affine_layer_norm_f16_impl(
         .ok_or_else(|| {
             CompileError::Memory(format!(
                 "no tile can hold the {affine_bytes}-byte affine LayerNorm parameters"
+            ))
+        })?;
+    let owner_tile = memory.select_repeated_resident_owner(
+        ResidentOwnerKey::affine_layer_norm(affine_bytes),
+        schedule.tile_count,
+        default_owner.0,
+    )?;
+    let affine_address = owner_candidates
+        .iter()
+        .find_map(|&(tile, address)| (tile == owner_tile).then_some(address))
+        .ok_or_else(|| {
+            CompileError::Memory(format!(
+                "replayed affine LayerNorm owner tile {owner_tile} cannot hold {affine_bytes} bytes"
             ))
         })?;
     let affine_tensors = [TensorId(next_tensor), TensorId(next_tensor + 1)];

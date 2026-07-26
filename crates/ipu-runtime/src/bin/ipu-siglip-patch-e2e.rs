@@ -1,11 +1,11 @@
 use half::f16;
 use ipu_compiler::{
-    Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, FlashAttentionConfig,
-    FlashAttentionPlan, GemmDataType, Ipu21MemoryRegion, KernelCommand, MemoryConstraint,
-    MemoryPlacement, MemoryPolicy, OpId, Phase, RepeatedRegion, ResidentPlacementTemplate,
-    RowShardPlacement, RowShardTransitionConfig, SpecializationKey, TensorId,
-    append_c16_to_a16_row_shards, choose_gemm_row_block_for_shape, end_tensor_lifetimes,
-    make_tensors_resident, plan_blocked_gemm, plan_flash_attention,
+    Allocation, AllocationKind, BlockPlacement, BlockedGemmConfig, BlockedGemmPlan,
+    FlashAttentionConfig, FlashAttentionPlan, GemmDataType, Ipu21MemoryRegion, KernelCommand,
+    MemoryConstraint, MemoryPlacement, MemoryPolicy, OpId, Phase, RepeatedRegion,
+    ResidentPlacementTemplate, RowShardPlacement, RowShardTransitionConfig, SpecializationKey,
+    TensorId, append_c16_to_a16_row_shards, choose_gemm_row_block_for_shape, end_tensor_lifetimes,
+    gemm_row_block_candidates_for, plan_blocked_gemm, plan_flash_attention,
 };
 use ipu_elf::{KernelArtifact, Toolchain};
 use ipu_models::{SiglipWeights, TensorArchive};
@@ -87,107 +87,11 @@ fn main() {
         GemmDataType::F16,
     )
     .unwrap();
-    let row_block_dimension = std::env::var("IPU_SIGLIP_ROW_BLOCK_ROWS")
+    let requested_row_block_dimension = std::env::var("IPU_SIGLIP_ROW_BLOCK_ROWS")
         .map(|value| value.parse().unwrap())
-        .unwrap_or(automatic_row_block_dimension);
-    let mut plan = plan_blocked_gemm(BlockedGemmConfig {
-        rows,
-        inner_dimension: inner,
-        columns,
-        block_dimension: BLOCK_DIMENSION,
-        inner_block_dimension: INNER_BLOCK_DIMENSION,
-        row_block_dimension,
-        tile_count: TILE_COUNT,
-        data_base: DATA_BASE,
-        data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-        data_type: GemmDataType::F16,
-        retain_profile_metadata: true,
-    })
-    .unwrap();
-
-    let pixels = reference.tensor_f32("pixel_values").unwrap();
-    let weights = model
-        .tensor_f32("vision_model.embeddings.patch_embedding.weight")
-        .unwrap();
-    let bias = model
-        .tensor_f32("vision_model.embeddings.patch_embedding.bias")
-        .unwrap();
-    let position = model
-        .tensor_f32("vision_model.embeddings.position_embedding.weight")
-        .unwrap();
-    let mut host = HostTensorSet::default();
-    let patch_bytes = blocked_matrix_f16(&plan.left, BlockLayout::AmpA16, |row, column| {
-        patch_value(&pixels, config, row % sequence_length, column)
-    });
-    host.push_input(
-        block_binding_typed("patches", rows, inner, &plan.left, "f16", 2),
-        patch_bytes,
-    )
-    .unwrap();
-    let patch_weight_bytes =
-        blocked_matrix_f16(&plan.right, BlockLayout::AmpB16x16, |row, column| {
-            if usize::from(row) < patch_elements {
-                weights[usize::from(column) * patch_elements + usize::from(row)]
-            } else {
-                0.0
-            }
-        });
-    host.push(
-        block_binding_typed("patch_weight", inner, columns, &plan.right, "f16", 2),
-        patch_weight_bytes,
-    )
-    .unwrap();
-    make_tensors_resident(
-        &mut plan.schedule,
-        plan.right.iter().map(|block| block.tensor),
-    )
-    .unwrap();
-
-    let adjustment = append_adjustment_phase(&mut plan.schedule, &plan.output).unwrap();
-    let adjustment_bytes =
-        blocked_matrix_f16(&adjustment, BlockLayout::AmpC16F16, |row, column| {
-            position[usize::from(row % sequence_length) * config.hidden_size + usize::from(column)]
-                + bias[usize::from(column)]
-        });
-    host.push(
-        block_binding_typed("position_bias", rows, columns, &adjustment, "f16", 2),
-        adjustment_bytes,
-    )
-    .unwrap();
-    make_tensors_resident(
-        &mut plan.schedule,
-        adjustment.iter().map(|block| block.tensor),
-    )
-    .unwrap();
-    let transition_base = plan
-        .schedule
-        .allocations
-        .iter()
-        .filter(|allocation| {
-            allocation.kind == AllocationKind::Home && allocation.address >= DATA_BASE
-        })
-        .map(|allocation| allocation.address + allocation.size)
-        .max()
-        .map(|address| (address + 31) & !31)
-        .unwrap_or(DATA_BASE);
-    let row_shards = append_c16_to_a16_row_shards(
-        &mut plan.schedule,
-        &plan.output,
-        RowShardTransitionConfig {
-            columns,
-            data_base: transition_base,
-            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-        },
-    )
-    .unwrap();
-    end_tensor_lifetimes(
-        &mut plan.schedule,
-        plan.left
-            .iter()
-            .chain(&plan.output)
-            .map(|block| block.tensor),
-    )
-    .unwrap();
+        .ok();
+    let row_block_dimension =
+        requested_row_block_dimension.unwrap_or(automatic_row_block_dimension);
     let layer_count = std::env::var("IPU_SIGLIP_LAYER_COUNT")
         .map(|value| value.parse::<usize>().unwrap())
         .unwrap_or(1);
@@ -266,12 +170,153 @@ fn main() {
         attention_key_block_rows: u16::try_from(env_u32("IPU_SIGLIP_ATTENTION_KEY_BLOCK_ROWS", 0))
             .expect("attention key block rows exceed u16"),
     };
+    let precision_for_layer = |layer: usize| {
+        let precision = precision[layer];
+        if layer < resident_f16_layers {
+            precision
+        } else {
+            expanded_storage_fallback(precision)
+        }
+    };
+    let first_precision = precision_for_layer(0);
+    let first_repetitions = (0..layer_count)
+        .take_while(|&layer| precision_for_layer(layer) == first_precision)
+        .count();
+    let legal_row_candidates = if requested_row_block_dimension.is_none() {
+        gemm_row_block_candidates_for(
+            rows,
+            INNER_BLOCK_DIMENSION,
+            columns,
+            BLOCK_DIMENSION,
+            TILE_COUNT,
+            GemmDataType::F16,
+        )
+        .into_iter()
+        .filter(|&candidate| candidate <= automatic_row_block_dimension)
+        .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    let mut tuning_candidates = vec![tuning];
+    if tuning.gemm_output_block_columns == 0 {
+        for output_columns in [64, 32] {
+            let candidate = SiglipEncoderTuning {
+                gemm_output_block_columns: output_columns,
+                ..tuning
+            };
+            if !tuning_candidates.contains(&candidate) {
+                tuning_candidates.push(candidate);
+            }
+        }
+    }
+    let mut selected = None;
+    let mut best_minimum_slack = i64::MIN;
+    let mut candidate_rows = row_block_dimension;
+    'placement_search: loop {
+        let embedding = plan_patch_embedding(
+            &model,
+            &reference,
+            batch_size,
+            rows,
+            inner,
+            columns,
+            candidate_rows,
+        )
+        .unwrap();
+        let mut best_row_probe = None::<(i64, u64)>;
+        for candidate_tuning in &tuning_candidates {
+            let probe = match probe_repeated_encoder_placement(
+                &embedding,
+                &model,
+                batch_size,
+                rows,
+                columns,
+                candidate_rows,
+                &memory,
+                first_precision,
+                *candidate_tuning,
+                first_repetitions,
+            ) {
+                Ok(probe) => probe,
+                Err(error) => {
+                    info!(
+                        row_block_rows = candidate_rows,
+                        output_block_columns = candidate_tuning.gemm_output_block_columns,
+                        error = %error,
+                        "rejected infeasible encoder blocking"
+                    );
+                    continue;
+                }
+            };
+            info!(
+                row_block_rows = candidate_rows,
+                output_block_columns = candidate_tuning.gemm_output_block_columns,
+                maximum_transient_headroom = probe.maximum_transient_headroom,
+                mean_transient_headroom = probe.mean_transient_headroom,
+                initial_minimum_slack = probe.initial_minimum_slack,
+                initial_overcommitted_tiles = probe.initial_overcommitted_tiles,
+                optimized_minimum_slack = probe.optimized_minimum_slack,
+                optimized_overcommitted_tiles = probe.optimized_overcommitted_tiles,
+                "evaluated repeated-block placement"
+            );
+            best_minimum_slack = best_minimum_slack.max(probe.optimized_minimum_slack);
+            if probe.optimized_overcommitted_tiles == 0 {
+                selected = Some((embedding.clone(), candidate_rows, *candidate_tuning, probe));
+                break 'placement_search;
+            }
+            if best_row_probe.is_none_or(|(slack, _)| probe.optimized_minimum_slack > slack) {
+                best_row_probe = Some((
+                    probe.optimized_minimum_slack,
+                    probe.maximum_transient_headroom,
+                ));
+            }
+        }
+        if requested_row_block_dimension.is_some() {
+            break;
+        }
+        let Some((minimum_slack, transient_pressure)) = best_row_probe else {
+            break;
+        };
+        let pressure = transient_pressure.max(1);
+        let retained_pressure = pressure.saturating_sub(minimum_slack.unsigned_abs()).max(1);
+        let target = u64::from(candidate_rows)
+            .saturating_mul(retained_pressure)
+            .div_ceil(pressure)
+            .min(u64::from(candidate_rows.saturating_sub(1)));
+        let Some(next_rows) = legal_row_candidates
+            .range(..=u16::try_from(target).unwrap_or(0))
+            .next_back()
+            .copied()
+            .or_else(|| {
+                legal_row_candidates
+                    .range(..candidate_rows)
+                    .next_back()
+                    .copied()
+            })
+        else {
+            break;
+        };
+        candidate_rows = next_rows;
+    }
+    let (embedding, row_block_dimension, tuning, first_placement_probe) =
+        selected.unwrap_or_else(|| {
+            panic!(
+                "no encoder blocking candidate fits repeated resident and transient storage; best minimum slack {best_minimum_slack} bytes"
+            )
+        });
+    let PatchEmbeddingPlan {
+        mut plan,
+        mut host,
+        row_shards,
+    } = embedding;
+    let mut first_placement_probe = Some(first_placement_probe);
     info!(
         transient = ?memory.transient,
         resident = ?memory.resident,
         ?weight_storage,
         precision = ?precision.first().unwrap(),
         resident_f16_layers,
+        row_block_dimension,
         ?tuning,
         "configured encoder tile-memory policy"
     );
@@ -303,37 +348,132 @@ fn main() {
     );
     let mut diagnostic_finite_checks = Vec::new();
     let mut layer_template_groups = Vec::<(SiglipEncoderPrecision, bool, RepeatedRegion)>::new();
-    let mut resident_placement_groups =
-        Vec::<(SiglipEncoderPrecision, ResidentPlacementTemplate)>::new();
+    let mut resident_placement_groups = Vec::<(
+        SiglipEncoderPrecision,
+        ResidentPlacementTemplate,
+        usize,
+        usize,
+    )>::new();
     let mut profile_regions = vec![StaticProfileRegion {
         name: "embedding".into(),
         phases: 0..plan.schedule.phases.len(),
     }];
-    let precision_for_layer = |layer: usize| {
-        let precision = precision[layer];
-        if layer < resident_f16_layers {
-            precision
-        } else {
-            expanded_storage_fallback(precision)
-        }
-    };
     for layer in 0..layer_count {
         let phase_start = plan.schedule.phases.len();
         let layer_precision = precision_for_layer(layer);
-        let layer_memory = if let Some((group_precision, template)) =
+        let replay_template = if let Some((group_precision, template, group_start, repetitions)) =
             resident_placement_groups.last()
             && group_precision.has_same_execution_shape(layer_precision)
         {
-            memory.replay_resident_placement(template).unwrap()
+            Some((template.clone(), *group_start, *repetitions))
         } else {
-            resident_placement_groups.push((layer_precision, ResidentPlacementTemplate::default()));
+            None
+        };
+        let layer_memory = if let Some((template, group_start, repetitions)) = replay_template {
+            memory
+                .replay_resident_placement_instance(&template, layer - group_start, repetitions)
+                .unwrap()
+        } else if layer == 0 {
+            let probe = first_placement_probe
+                .take()
+                .expect("initial repeated placement probe was already consumed");
+            resident_placement_groups.push((
+                layer_precision,
+                probe.template,
+                layer,
+                first_repetitions,
+            ));
+            memory
+                .replay_resident_placement_instance(
+                    &resident_placement_groups.last().unwrap().1,
+                    0,
+                    first_repetitions,
+                )
+                .unwrap()
+        } else {
             let repetitions = (layer..layer_count)
                 .take_while(|&instance| precision_for_layer(instance) == layer_precision)
                 .count();
-            memory
-                .record_resident_placement(
-                    &resident_placement_groups.last().unwrap().1,
+            let schedule_checkpoint = plan.schedule.clone();
+            let host_checkpoint = (
+                host.bindings.len(),
+                host.bytes.len(),
+                host.resident_bindings.len(),
+                host.resident_bytes.len(),
+            );
+            let probe_template = ResidentPlacementTemplate::default();
+            let probe_memory = memory
+                .record_resident_placement(&probe_template, &plan.schedule, repetitions)
+                .unwrap();
+            append_siglip_encoder_layer_batched_with_precision(
+                &mut plan.schedule,
+                &current,
+                &model,
+                layer,
+                batch_size,
+                rows,
+                columns,
+                row_block_dimension,
+                TILE_COUNT,
+                &probe_memory,
+                layer_precision,
+                tuning,
+                false,
+                false,
+                &mut host,
+            )
+            .unwrap();
+            probe_memory.finish_resident_placement().unwrap();
+            let transient_headroom = memory
+                .transient_peak_bytes_by_tile(
                     &plan.schedule,
+                    phase_start..plan.schedule.phases.len(),
+                )
+                .unwrap();
+            let maximum_transient_headroom = transient_headroom.iter().copied().max().unwrap_or(0);
+            let total_transient_headroom = transient_headroom.iter().copied().sum::<u64>();
+            let repeated_slack = memory
+                .repeated_resident_slack_by_tile(
+                    &plan.schedule,
+                    schedule_checkpoint.allocations.len(),
+                    repetitions,
+                    &transient_headroom,
+                )
+                .unwrap();
+            let optimized_slack = memory
+                .optimize_repeated_resident_placement(
+                    &probe_template,
+                    &plan.schedule,
+                    schedule_checkpoint.allocations.len(),
+                    repetitions,
+                    &transient_headroom,
+                )
+                .unwrap();
+            info!(
+                layer,
+                repetitions,
+                maximum_transient_headroom,
+                mean_transient_headroom =
+                    total_transient_headroom / u64::from(plan.schedule.tile_count),
+                initial_minimum_slack = repeated_slack.iter().copied().min().unwrap_or(0),
+                initial_overcommitted_tiles =
+                    repeated_slack.iter().filter(|&&slack| slack < 0).count(),
+                optimized_minimum_slack = optimized_slack.iter().copied().min().unwrap_or(0),
+                optimized_overcommitted_tiles =
+                    optimized_slack.iter().filter(|&&slack| slack < 0).count(),
+                "measured repeated-block transient headroom"
+            );
+            plan.schedule = schedule_checkpoint;
+            host.bindings.truncate(host_checkpoint.0);
+            host.bytes.truncate(host_checkpoint.1);
+            host.resident_bindings.truncate(host_checkpoint.2);
+            host.resident_bytes.truncate(host_checkpoint.3);
+
+            resident_placement_groups.push((layer_precision, probe_template, layer, repetitions));
+            memory
+                .replay_resident_placement_instance(
+                    &resident_placement_groups.last().unwrap().1,
+                    0,
                     repetitions,
                 )
                 .unwrap()
@@ -1581,6 +1721,211 @@ fn patch_value(
     let y = patch_y * config.patch_size + within_channel / config.patch_size;
     let x = patch_x * config.patch_size + within_channel % config.patch_size;
     pixels[(channel * config.image_size + y) * config.image_size + x]
+}
+
+#[derive(Clone)]
+struct PatchEmbeddingPlan {
+    plan: BlockedGemmPlan,
+    host: HostTensorSet,
+    row_shards: Vec<RowShardPlacement>,
+}
+
+struct RepeatedPlacementProbe {
+    template: ResidentPlacementTemplate,
+    maximum_transient_headroom: u64,
+    mean_transient_headroom: u64,
+    initial_minimum_slack: i64,
+    initial_overcommitted_tiles: usize,
+    optimized_minimum_slack: i64,
+    optimized_overcommitted_tiles: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_repeated_encoder_placement(
+    embedding: &PatchEmbeddingPlan,
+    model: &SiglipWeights,
+    batch_size: u16,
+    rows: u16,
+    columns: u16,
+    row_block_dimension: u16,
+    memory: &MemoryPolicy,
+    precision: SiglipEncoderPrecision,
+    tuning: SiglipEncoderTuning,
+    repetitions: usize,
+) -> ipu_runtime::Result<RepeatedPlacementProbe> {
+    let template = ResidentPlacementTemplate::default();
+    let mut record = true;
+    let mut seen_rotations = BTreeSet::new();
+    let mut initial_minimum_slack = 0;
+    let mut initial_overcommitted_tiles = 0;
+    loop {
+        let mut schedule = embedding.plan.schedule.clone();
+        let mut host = embedding.host.clone();
+        let phase_start = schedule.phases.len();
+        let allocation_start = schedule.allocations.len();
+        let probe_memory = if record {
+            memory.record_resident_placement(&template, &schedule, repetitions)?
+        } else {
+            memory.replay_resident_placement(&template)?
+        };
+        append_siglip_encoder_layer_batched_with_precision(
+            &mut schedule,
+            &embedding.row_shards,
+            model,
+            0,
+            batch_size,
+            rows,
+            columns,
+            row_block_dimension,
+            TILE_COUNT,
+            &probe_memory,
+            precision,
+            tuning,
+            false,
+            false,
+            &mut host,
+        )?;
+        probe_memory.finish_resident_placement()?;
+        let transient_headroom =
+            memory.transient_peak_bytes_by_tile(&schedule, phase_start..schedule.phases.len())?;
+        let measured_slack = memory.repeated_resident_slack_by_tile(
+            &schedule,
+            allocation_start,
+            repetitions,
+            &transient_headroom,
+        )?;
+        let minimum_slack = measured_slack.iter().copied().min().unwrap_or(0);
+        let overcommitted_tiles = measured_slack.iter().filter(|&&slack| slack < 0).count();
+        if record {
+            initial_minimum_slack = minimum_slack;
+            initial_overcommitted_tiles = overcommitted_tiles;
+        }
+        let before = template.rotation_signature();
+        seen_rotations.insert(before.clone());
+        let optimized_slack = memory.optimize_repeated_resident_placement(
+            &template,
+            &schedule,
+            allocation_start,
+            repetitions,
+            &transient_headroom,
+        )?;
+        let optimized_minimum_slack = optimized_slack.iter().copied().min().unwrap_or(0);
+        let optimized_overcommitted_tiles =
+            optimized_slack.iter().filter(|&&slack| slack < 0).count();
+        let after = template.rotation_signature();
+        if after == before || !seen_rotations.insert(after) {
+            return Ok(RepeatedPlacementProbe {
+                template,
+                maximum_transient_headroom: transient_headroom.iter().copied().max().unwrap_or(0),
+                mean_transient_headroom: transient_headroom.iter().sum::<u64>()
+                    / u64::from(schedule.tile_count),
+                initial_minimum_slack,
+                initial_overcommitted_tiles,
+                optimized_minimum_slack,
+                optimized_overcommitted_tiles,
+            });
+        }
+        record = false;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_patch_embedding(
+    model: &SiglipWeights,
+    reference: &TensorArchive,
+    batch_size: u16,
+    rows: u16,
+    inner: u16,
+    columns: u16,
+    row_block_dimension: u16,
+) -> ipu_runtime::Result<PatchEmbeddingPlan> {
+    let config = &model.config;
+    let sequence_length = u16::try_from(model.sequence_length())?;
+    let patch_elements = config.num_channels * config.patch_size.pow(2);
+    let mut plan = plan_blocked_gemm(BlockedGemmConfig {
+        rows,
+        inner_dimension: inner,
+        columns,
+        block_dimension: BLOCK_DIMENSION,
+        inner_block_dimension: INNER_BLOCK_DIMENSION,
+        row_block_dimension,
+        tile_count: TILE_COUNT,
+        data_base: DATA_BASE,
+        data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        data_type: GemmDataType::F16,
+        retain_profile_metadata: true,
+    })?;
+    let pixels = reference.tensor_f32("pixel_values")?;
+    let weights = model.tensor_f32("vision_model.embeddings.patch_embedding.weight")?;
+    let bias = model.tensor_f32("vision_model.embeddings.patch_embedding.bias")?;
+    let position = model.tensor_f32("vision_model.embeddings.position_embedding.weight")?;
+    let mut host = HostTensorSet::default();
+    let patch_bytes = blocked_matrix_f16(&plan.left, BlockLayout::AmpA16, |row, column| {
+        patch_value(&pixels, config, row % sequence_length, column)
+    });
+    host.push_input(
+        block_binding_typed("patches", rows, inner, &plan.left, "f16", 2),
+        patch_bytes,
+    )?;
+    let patch_weight_bytes =
+        blocked_matrix_f16(&plan.right, BlockLayout::AmpB16x16, |row, column| {
+            if usize::from(row) < patch_elements {
+                weights[usize::from(column) * patch_elements + usize::from(row)]
+            } else {
+                0.0
+            }
+        });
+    host.push_input(
+        block_binding_typed("patch_weight", inner, columns, &plan.right, "f16", 2),
+        patch_weight_bytes,
+    )?;
+    let adjustment = append_adjustment_phase(&mut plan.schedule, &plan.output)?;
+    let adjustment_bytes =
+        blocked_matrix_f16(&adjustment, BlockLayout::AmpC16F16, |row, column| {
+            position[usize::from(row % sequence_length) * config.hidden_size + usize::from(column)]
+                + bias[usize::from(column)]
+        });
+    host.push_input(
+        block_binding_typed("position_bias", rows, columns, &adjustment, "f16", 2),
+        adjustment_bytes,
+    )?;
+    let transition_base = plan
+        .schedule
+        .allocations
+        .iter()
+        .filter(|allocation| {
+            allocation.kind == AllocationKind::Home && allocation.address >= DATA_BASE
+        })
+        .map(|allocation| allocation.address + allocation.size)
+        .max()
+        .map(|address| (address + 31) & !31)
+        .unwrap_or(DATA_BASE);
+    let row_shards = append_c16_to_a16_row_shards(
+        &mut plan.schedule,
+        &plan.output,
+        RowShardTransitionConfig {
+            columns,
+            data_base: transition_base,
+            data_limit: ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        },
+    )?;
+    end_tensor_lifetimes(
+        &mut plan.schedule,
+        plan.left
+            .iter()
+            .chain(&plan.right)
+            .chain(&plan.output)
+            .map(|block| block.tensor),
+    )?;
+    debug_assert_eq!(
+        u32::from(rows),
+        u32::from(batch_size) * u32::from(sequence_length)
+    );
+    Ok(PatchEmbeddingPlan {
+        plan,
+        host,
+        row_shards,
+    })
 }
 
 fn append_adjustment_phase(

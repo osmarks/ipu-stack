@@ -7,7 +7,7 @@ use ipu_compiler::{
     Allocation, AllocationKind, AppendAffineLayerNormConfig, BlockPlacement, BlockedGemmConfig,
     CompileError, FlashAttentionConfig, FlashAttentionPlan, GemmDataType, MemoryArena,
     MemoryPolicy, Phase, RowShardPlacement, Schedule, TensorId, allocate_from_occupied_arenas,
-    append_a16_to_a16_row_shards_reblocked_in_arenas,
+    append_a16_to_a16_row_shards_reblocked_on_tiles_in_arenas,
     append_add_affine_layer_norm_f16_with_memory_policy, append_add_f16_row_shards_in_place,
     append_affine_layer_norm_f16_with_memory_policy, append_bias_f16_c16_in_arenas,
     append_blocked_gemm_f16_with_a16_blocks_with_memory_policy,
@@ -16,7 +16,7 @@ use ipu_compiler::{
     append_c16_to_a16_row_shards_reblocked_like_in_arenas,
     append_flash_attention_from_a16_qkv_in_arenas,
     append_flash_attention_to_a16_row_shards_in_arenas,
-    choose_colocated_row_shard_rows_for_copies_in_arenas, choose_gemm_row_block_for,
+    choose_colocated_row_shard_layout_for_copies_in_arenas, choose_gemm_row_block_for,
     choose_gemm_row_block_for_shape, choose_gemm_row_block_for_shape_max_rows,
     choose_row_shard_rows_for_copies_in_arenas, end_tensor_lifetimes,
     gemm_row_block_candidates_for, gemm_row_block_cost, make_tensors_resident,
@@ -29,7 +29,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 use tracing::{info, info_span};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct HostTensorSet {
     pub bindings: Vec<Binding>,
     pub bytes: Vec<u8>,
@@ -1723,7 +1723,7 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     // can no longer hold the residual, projection, and normalized output
     // together. Only that edge is then transitioned to a smaller shard grid.
     let residual_source_rows = input.iter().map(|shard| shard.rows).max().unwrap_or(1);
-    let residual_rows = choose_colocated_row_shard_rows_for_copies_in_arenas(
+    let (residual_rows, residual_tiles) = choose_colocated_row_shard_layout_for_copies_in_arenas(
         schedule,
         rows,
         columns,
@@ -1734,13 +1734,19 @@ pub fn append_siglip_encoder_layer_batched_with_precision(
     .ok_or_else(|| {
         CompileError::Memory("attention residual has no feasible row-shard placement".into())
     })?;
-    let residual_input = if residual_rows == residual_source_rows {
+    let preserves_input_layout = residual_rows == residual_source_rows
+        && input
+            .iter()
+            .map(|shard| shard.tile)
+            .eq(residual_tiles.iter().copied());
+    let residual_input = if preserves_input_layout {
         input.to_vec()
     } else {
-        let transitioned = append_a16_to_a16_row_shards_reblocked_in_arenas(
+        let transitioned = append_a16_to_a16_row_shards_reblocked_on_tiles_in_arenas(
             schedule,
             input,
             residual_rows,
+            &residual_tiles,
             &memory.transient,
         )?;
         if !retain_diagnostics {
