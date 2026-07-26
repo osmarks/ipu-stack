@@ -2127,6 +2127,7 @@ impl MemoryPolicy {
         let packing_headroom = probe
             .allocations
             .iter()
+            .skip(allocation_start)
             .filter(|allocation| {
                 allocation.kind == AllocationKind::Home
                     && allocation.live_from == 0
