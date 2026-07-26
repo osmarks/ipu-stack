@@ -497,6 +497,72 @@ fn linked_image_occupied_bytes(image: &ipu_elf::LinkedImage) -> Result<u32> {
     })
 }
 
+/// Estimates heterogeneous executable SRAM pressure from the kernel roles
+/// assigned to each tile.
+///
+/// Generated control code and static exchange state are handled later by the
+/// package placer. This preflight captures the support-image component that
+/// varies with each tile's retained kernel set, allowing repeated resident
+/// placement to avoid concentrating weights on code-heavy tiles.
+pub fn estimate_support_image_reservation_by_tile(
+    schedule: &ipu_compiler::Schedule,
+    objects: &[Vec<u8>],
+) -> Result<Vec<u64>> {
+    let mut symbols = vec![
+        vec![
+            static_codegen::WORKER_BARRIER.into(),
+            static_codegen::COMPLETE.into(),
+            static_codegen::HOST_RUN.into(),
+            static_codegen::REPEAT_CALL.into(),
+            static_codegen::EXCHANGE_COMPUTE_RUN.into(),
+            static_codegen::TEMPLATE_PATCH.into(),
+        ];
+        usize::from(schedule.tile_count)
+    ];
+    for phase in &schedule.phases {
+        let ipu_compiler::Phase::Compute { commands, .. } = phase else {
+            continue;
+        };
+        for command in commands {
+            symbols[usize::from(command.tile)]
+                .push(format!("ipu_stack_{}", command.specialization.operation));
+        }
+    }
+    for symbols in &mut symbols {
+        symbols.sort_unstable();
+        symbols.dedup();
+    }
+    let mut unique = HashMap::<Vec<String>, u64>::new();
+    for retained_symbols in &symbols {
+        if unique.contains_key(retained_symbols) {
+            continue;
+        }
+        let image = link(
+            objects,
+            &LinkOptions {
+                image_base: ipu_package::TILE_MEMORY_BASE,
+                regions: vec![(
+                    ipu_driver::APPLICATION_LOAD_BASE,
+                    ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                )],
+                entry_symbol: "ipu_stack_static_start".into(),
+                retained_symbols: retained_symbols.clone(),
+                externals: HashMap::new(),
+            },
+        )?;
+        let occupied = linked_image_occupied_bytes(&image)?;
+        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        unique.insert(
+            retained_symbols.clone(),
+            u64::from(align_up(occupied, element)),
+        );
+    }
+    Ok(symbols
+        .iter()
+        .map(|symbols| unique[symbols])
+        .collect::<Vec<_>>())
+}
+
 fn generated_object_sizes_with_host_pool(
     generated: &static_codegen::GeneratedProgram,
     host_objects: &[Range<u32>],
@@ -1373,7 +1439,6 @@ fn allocate_from_sorted_ranges(
         match arena.placement {
             ipu_compiler::MemoryPlacement::Low => {
                 let mut cursor = align_up(arena.base, alignment);
-                let mut best = None::<(u32, u32)>;
                 let mut permanent = permanent.iter().copied().peekable();
                 let mut active = active
                     .iter()
@@ -1391,12 +1456,8 @@ fn allocate_from_sorted_ranges(
                     if end <= cursor || start >= arena.limit {
                         continue;
                     }
-                    let gap_end = start.min(arena.limit);
-                    if let Some(candidate) = allowed_start(cursor, gap_end, arena.placement) {
-                        let waste = gap_end - cursor - size;
-                        if best.is_none_or(|current| (waste, candidate) < current) {
-                            best = Some((waste, candidate));
-                        }
+                    if let Some(candidate) = allowed_start(cursor, start, arena.placement) {
+                        return Some(candidate);
                     }
                     cursor = align_up(cursor.max(end), alignment);
                     if cursor >= arena.limit {
@@ -1404,18 +1465,11 @@ fn allocate_from_sorted_ranges(
                     }
                 }
                 if let Some(candidate) = allowed_start(cursor, arena.limit, arena.placement) {
-                    let waste = arena.limit - cursor - size;
-                    if best.is_none_or(|current| (waste, candidate) < current) {
-                        best = Some((waste, candidate));
-                    }
-                }
-                if let Some((_, candidate)) = best {
                     return Some(candidate);
                 }
             }
             ipu_compiler::MemoryPlacement::High => {
                 let mut cursor = arena.limit;
-                let mut best = None::<(u32, std::cmp::Reverse<u32>)>;
                 let mut permanent = permanent.iter().copied().rev().peekable();
                 let mut active = active
                     .iter()
@@ -1434,13 +1488,8 @@ fn allocate_from_sorted_ranges(
                     if start >= cursor || end <= arena.base {
                         continue;
                     }
-                    let gap_start = end.max(arena.base);
-                    if let Some(candidate) = allowed_start(gap_start, cursor, arena.placement) {
-                        let waste = cursor - gap_start - size;
-                        let score = (waste, std::cmp::Reverse(candidate));
-                        if best.is_none_or(|current| score < current) {
-                            best = Some(score);
-                        }
+                    if let Some(candidate) = allowed_start(end, cursor, arena.placement) {
+                        return Some(candidate);
                     }
                     cursor = cursor.min(start);
                     if cursor <= arena.base {
@@ -1448,13 +1497,6 @@ fn allocate_from_sorted_ranges(
                     }
                 }
                 if let Some(candidate) = allowed_start(arena.base, cursor, arena.placement) {
-                    let waste = cursor - arena.base - size;
-                    let score = (waste, std::cmp::Reverse(candidate));
-                    if best.is_none_or(|current| score < current) {
-                        best = Some(score);
-                    }
-                }
-                if let Some((_, std::cmp::Reverse(candidate))) = best {
                     return Some(candidate);
                 }
             }

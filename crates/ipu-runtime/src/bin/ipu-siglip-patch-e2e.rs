@@ -18,8 +18,8 @@ use ipu_runtime::{
     append_siglip_map_head_batched_with_memory_policy, append_siglip_post_layer_norm,
     append_siglip_post_layer_norm_with_memory_policy, block_binding_typed, block_coordinates,
     blocked_matrix_f16, consolidate_attention_kernel_variants, defer_terminal_residual_add,
-    fuse_deferred_residual_into_layer_norm, materialize_deferred_residual_add,
-    package_graph_repeated_with_templates_owned,
+    estimate_support_image_reservation_by_tile, fuse_deferred_residual_into_layer_norm,
+    materialize_deferred_residual_add, package_graph_repeated_with_templates_owned,
     package_graph_repeated_with_templates_owned_and_memory_profile,
     package_graph_repeated_with_templates_profiled_with,
     package_graph_repeated_with_templates_profiled_with_regions, run_host_with_options,
@@ -212,6 +212,7 @@ fn main() {
     let mut selected = None;
     let mut best_minimum_slack = i64::MIN;
     let mut candidate_rows = row_block_dimension;
+    let no_execution_headroom = vec![0; usize::from(TILE_COUNT)];
     'placement_search: loop {
         let embedding = plan_patch_embedding(
             &model,
@@ -236,6 +237,7 @@ fn main() {
                 first_precision,
                 *candidate_tuning,
                 first_repetitions,
+                &no_execution_headroom,
             ) {
                 Ok(probe) => probe,
                 Err(error) => {
@@ -304,6 +306,47 @@ fn main() {
                 "no encoder blocking candidate fits repeated resident and transient storage; best minimum slack {best_minimum_slack} bytes"
             )
         });
+    let first_placement_probe = if first_repetitions > 1 {
+        let mut support_schedule = first_placement_probe.support_schedule.clone();
+        let support_attention = first_placement_probe.support_attention.clone();
+        let support_phase_count = support_schedule.phases.len();
+        specialize_gemm_row_operations(&mut support_schedule, 0..support_phase_count);
+        let support_variants = consolidate_attention_kernel_variants(
+            &mut support_schedule,
+            std::slice::from_ref(&support_attention),
+        );
+        let support_objects =
+            compile_objects(&support_schedule, &[support_attention], &support_variants).unwrap();
+        let execution_headroom =
+            estimate_support_image_reservation_by_tile(&support_schedule, &support_objects)
+                .unwrap();
+        info!(
+            minimum_bytes = execution_headroom.iter().copied().min().unwrap_or(0),
+            maximum_bytes = execution_headroom.iter().copied().max().unwrap_or(0),
+            mean_bytes = execution_headroom.iter().sum::<u64>() / u64::from(TILE_COUNT),
+            "measured representative per-tile support-image pressure"
+        );
+        probe_repeated_encoder_placement(
+            &embedding,
+            &model,
+            batch_size,
+            rows,
+            columns,
+            row_block_dimension,
+            &memory,
+            first_precision,
+            tuning,
+            first_repetitions,
+            &execution_headroom,
+        )
+        .unwrap()
+    } else {
+        first_placement_probe
+    };
+    assert_eq!(
+        first_placement_probe.optimized_overcommitted_tiles, 0,
+        "selected encoder placement does not fit after executable preflight"
+    );
     let PatchEmbeddingPlan {
         mut plan,
         mut host,
@@ -1732,6 +1775,8 @@ struct PatchEmbeddingPlan {
 
 struct RepeatedPlacementProbe {
     template: ResidentPlacementTemplate,
+    support_schedule: ipu_compiler::Schedule,
+    support_attention: FlashAttentionPlan,
     maximum_transient_headroom: u64,
     mean_transient_headroom: u64,
     initial_minimum_slack: i64,
@@ -1752,7 +1797,11 @@ fn probe_repeated_encoder_placement(
     precision: SiglipEncoderPrecision,
     tuning: SiglipEncoderTuning,
     repetitions: usize,
+    execution_headroom: &[u64],
 ) -> ipu_runtime::Result<RepeatedPlacementProbe> {
+    if execution_headroom.len() != usize::from(TILE_COUNT) {
+        return Err("support-image headroom does not cover every tile".into());
+    }
     let template = ResidentPlacementTemplate::default();
     let mut record = true;
     let mut seen_rotations = BTreeSet::new();
@@ -1768,7 +1817,7 @@ fn probe_repeated_encoder_placement(
         } else {
             memory.replay_resident_placement(&template)?
         };
-        append_siglip_encoder_layer_batched_with_precision(
+        let appended = append_siglip_encoder_layer_batched_with_precision(
             &mut schedule,
             &embedding.row_shards,
             model,
@@ -1788,11 +1837,16 @@ fn probe_repeated_encoder_placement(
         probe_memory.finish_resident_placement()?;
         let transient_headroom =
             memory.transient_peak_bytes_by_tile(&schedule, phase_start..schedule.phases.len())?;
+        let placement_headroom = transient_headroom
+            .iter()
+            .zip(execution_headroom)
+            .map(|(&transient, &executable)| transient.saturating_add(executable))
+            .collect::<Vec<_>>();
         let measured_slack = memory.repeated_resident_slack_by_tile(
             &schedule,
             allocation_start,
             repetitions,
-            &transient_headroom,
+            &placement_headroom,
         )?;
         let minimum_slack = measured_slack.iter().copied().min().unwrap_or(0);
         let overcommitted_tiles = measured_slack.iter().filter(|&&slack| slack < 0).count();
@@ -1807,7 +1861,7 @@ fn probe_repeated_encoder_placement(
             &schedule,
             allocation_start,
             repetitions,
-            &transient_headroom,
+            &placement_headroom,
         )?;
         let optimized_minimum_slack = optimized_slack.iter().copied().min().unwrap_or(0);
         let optimized_overcommitted_tiles =
@@ -1823,6 +1877,8 @@ fn probe_repeated_encoder_placement(
                 initial_overcommitted_tiles,
                 optimized_minimum_slack,
                 optimized_overcommitted_tiles,
+                support_schedule: schedule,
+                support_attention: appended.attention,
             });
         }
         record = false;
