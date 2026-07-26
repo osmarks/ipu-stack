@@ -1767,6 +1767,9 @@ struct RepeatedPlacementProbe {
     placement_schedule: ipu_compiler::Schedule,
     allocation_start: usize,
     fixed_headroom: Vec<u64>,
+    fixed_resident_headroom: Vec<u64>,
+    fixed_transient_headroom: Vec<u64>,
+    role_transient_headroom: Vec<u64>,
     support_schedule: ipu_compiler::Schedule,
     support_attentions: Vec<FlashAttentionPlan>,
     support_template: StaticTemplateRegion,
@@ -1869,6 +1872,9 @@ fn probe_repeated_encoder_placement(
                 support_template,
                 placement_schedule,
                 fixed_headroom,
+                fixed_resident_headroom,
+                fixed_transient_headroom,
+                role_transient_headroom,
             ) = build_repeated_encoder_support_probe(
                 embedding,
                 model,
@@ -1889,6 +1895,9 @@ fn probe_repeated_encoder_placement(
                 placement_schedule,
                 allocation_start,
                 fixed_headroom,
+                fixed_resident_headroom,
+                fixed_transient_headroom,
+                role_transient_headroom,
                 maximum_transient_headroom: transient_headroom.iter().copied().max().unwrap_or(0),
                 mean_transient_headroom: transient_headroom.iter().sum::<u64>()
                     / u64::from(schedule.tile_count),
@@ -1948,6 +1957,9 @@ fn refine_repeated_encoder_placement(
             support_template,
             placement_schedule,
             fixed_headroom,
+            fixed_resident_headroom,
+            fixed_transient_headroom,
+            role_transient_headroom,
         ) = build_repeated_encoder_support_probe(
             embedding,
             model,
@@ -1968,6 +1980,9 @@ fn refine_repeated_encoder_placement(
         probe.support_template = support_template;
         probe.placement_schedule = placement_schedule;
         probe.fixed_headroom = fixed_headroom;
+        probe.fixed_resident_headroom = fixed_resident_headroom;
+        probe.fixed_transient_headroom = fixed_transient_headroom;
+        probe.role_transient_headroom = role_transient_headroom;
     }
     info!(
         optimized_minimum_slack = probe.optimized_minimum_slack,
@@ -1988,12 +2003,14 @@ fn refine_repeated_encoder_placement(
         memory,
         std::slice::from_ref(&probe.support_template),
     )?;
-    let optimized_slack = memory.optimize_repeated_resident_global_rotation(
+    let optimized_slack = memory.optimize_repeated_resident_global_rotation_with_transients(
         &probe.template,
         &probe.placement_schedule,
         probe.allocation_start,
         repetitions,
-        &probe.fixed_headroom,
+        &probe.fixed_resident_headroom,
+        &probe.fixed_transient_headroom,
+        &probe.role_transient_headroom,
         &execution_headroom,
     )?;
     probe.optimized_minimum_slack = optimized_slack.iter().copied().min().unwrap_or(0);
@@ -2030,6 +2047,9 @@ fn build_repeated_encoder_support_probe(
     Vec<FlashAttentionPlan>,
     StaticTemplateRegion,
     ipu_compiler::Schedule,
+    Vec<u64>,
+    Vec<u64>,
+    Vec<u64>,
     Vec<u64>,
 )> {
     let instance_count = repetitions.min(2);
@@ -2089,7 +2109,10 @@ fn build_repeated_encoder_support_probe(
         current = appended.output;
         attentions.push(appended.attention);
     }
-    let mut fixed_headroom = transient_headroom;
+    let role_transient_headroom = transient_headroom;
+    let mut fixed_headroom = role_transient_headroom.clone();
+    let mut fixed_resident_headroom = vec![0u64; usize::from(TILE_COUNT)];
+    let mut fixed_transient_headroom = vec![0u64; usize::from(TILE_COUNT)];
     if include_suffix {
         let placement_probe = placement_schedule
             .as_ref()
@@ -2157,6 +2180,8 @@ fn build_repeated_encoder_support_probe(
             &schedule,
             suffix_allocation_start..schedule.allocations.len(),
         )?;
+        fixed_resident_headroom.clone_from(&suffix_resident);
+        fixed_transient_headroom.clone_from(&suffix_transient);
         for ((fixed, transient), resident) in fixed_headroom
             .iter_mut()
             .zip(suffix_transient)
@@ -2171,6 +2196,9 @@ fn build_repeated_encoder_support_probe(
         StaticTemplateRegion::from(region.ok_or("support probe has no repeated instance")?),
         placement_schedule.ok_or("support probe has no placement schedule")?,
         fixed_headroom,
+        fixed_resident_headroom,
+        fixed_transient_headroom,
+        role_transient_headroom,
     ))
 }
 

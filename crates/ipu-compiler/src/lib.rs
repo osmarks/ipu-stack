@@ -2083,12 +2083,41 @@ impl MemoryPolicy {
         fixed_headroom: &[u64],
         role_headroom: &[u64],
     ) -> Result<Vec<i64>, CompileError> {
+        let zero = vec![0; usize::from(probe.tile_count)];
+        self.optimize_repeated_resident_global_rotation_with_transients(
+            template,
+            probe,
+            allocation_start,
+            repetitions,
+            fixed_headroom,
+            &zero,
+            &zero,
+            role_headroom,
+        )
+    }
+
+    /// Rotates repeated resident, transient, and static role pressure while
+    /// preserving fixed-phase lifetime reuse.
+    #[allow(clippy::too_many_arguments)]
+    pub fn optimize_repeated_resident_global_rotation_with_transients(
+        &self,
+        template: &ResidentPlacementTemplate,
+        probe: &Schedule,
+        allocation_start: usize,
+        repetitions: usize,
+        fixed_resident_headroom: &[u64],
+        fixed_transient_headroom: &[u64],
+        role_transient_headroom: &[u64],
+        role_static_headroom: &[u64],
+    ) -> Result<Vec<i64>, CompileError> {
         let tile_count = usize::from(probe.tile_count);
         if tile_count == 0
             || allocation_start > probe.allocations.len()
             || repetitions == 0
-            || fixed_headroom.len() != tile_count
-            || role_headroom.len() != tile_count
+            || fixed_resident_headroom.len() != tile_count
+            || fixed_transient_headroom.len() != tile_count
+            || role_transient_headroom.len() != tile_count
+            || role_static_headroom.len() != tile_count
         {
             return Err(CompileError::Memory(
                 "invalid repeated resident global-rotation optimization".into(),
@@ -2140,7 +2169,7 @@ impl MemoryPolicy {
         let rotated_bytes = |bytes: &[u64], rotation: u16, tile: usize| {
             bytes[(tile + tile_count - usize::from(rotation)) % tile_count]
         };
-        let mut fixed = fixed_headroom.to_vec();
+        let mut fixed_resident = fixed_resident_headroom.to_vec();
         let mut probed_resident = vec![0u64; tile_count];
         for (index, allocation) in probe.allocations.iter().enumerate() {
             if allocation.kind != AllocationKind::Home
@@ -2151,7 +2180,7 @@ impl MemoryPolicy {
             }
             let bytes = allocation_bytes(allocation);
             if index < allocation_start {
-                fixed[usize::from(allocation.tile)] += bytes;
+                fixed_resident[usize::from(allocation.tile)] += bytes;
             } else {
                 probed_resident[usize::from(allocation.tile)] += bytes;
             }
@@ -2174,7 +2203,7 @@ impl MemoryPolicy {
                         "recorded resident-placement bytes exceed probe resident storage".into(),
                     )
                 })?;
-            fixed[tile] = fixed[tile]
+            fixed_resident[tile] = fixed_resident[tile]
                 .checked_add(unrepresented.checked_mul(repetition_bytes).ok_or_else(|| {
                     CompileError::Memory(
                         "repeated resident global-rotation byte count overflow".into(),
@@ -2200,24 +2229,28 @@ impl MemoryPolicy {
                 resident_role_load[tile] += u64::from(decision.key.bytes);
             }
         }
-        let role_load = resident_role_load
+        let role_static_load = resident_role_load
             .iter()
-            .zip(role_headroom)
+            .zip(role_static_headroom)
             .map(|(&resident, &headroom)| resident + headroom)
             .collect::<Vec<_>>();
         let score = |offset: usize| {
-            let mut resident_maximum = 0;
+            let mut working_maximum = 0;
             let mut combined_maximum = 0;
             let mut squares = 0u128;
-            for (tile, &fixed) in fixed.iter().enumerate() {
+            for (tile, &fixed_resident) in fixed_resident.iter().enumerate() {
                 let source = (tile + tile_count - offset) % tile_count;
-                let resident = fixed + resident_role_load[source];
-                let combined = fixed + role_load[source];
-                resident_maximum = resident_maximum.max(resident);
+                let resident = fixed_resident + resident_role_load[source];
+                let working =
+                    resident + fixed_transient_headroom[tile].max(role_transient_headroom[source]);
+                let combined = fixed_resident
+                    + role_static_load[source]
+                    + fixed_transient_headroom[tile].max(role_transient_headroom[source]);
+                working_maximum = working_maximum.max(working);
                 combined_maximum = combined_maximum.max(combined);
                 squares += u128::from(combined) * u128::from(combined);
             }
-            (resident_maximum, combined_maximum, squares)
+            (working_maximum, combined_maximum, squares)
         };
         let packing_feasible_offsets = (0..tile_count)
             .filter(|&offset| score(offset).0 <= resident_packing_limit)
@@ -2253,7 +2286,7 @@ impl MemoryPolicy {
             packing_feasible_offsets,
             resident_feasible_offsets,
             selected_offset = best_offset,
-            selected_resident_maximum,
+            selected_working_maximum = selected_resident_maximum,
             selected_combined_maximum,
             "selected repeated resident global rotation"
         );
@@ -2270,7 +2303,9 @@ impl MemoryPolicy {
         (0..tile_count)
             .map(|tile| {
                 let source = (tile + tile_count - best_offset) % tile_count;
-                let load = fixed[tile] + role_load[source];
+                let load = fixed_resident[tile]
+                    + role_static_load[source]
+                    + fixed_transient_headroom[tile].max(role_transient_headroom[source]);
                 i64::try_from(i128::from(capacity) - i128::from(load)).map_err(|_| {
                     CompileError::Memory(
                         "globally rotated repeated-placement slack exceeds i64".into(),
@@ -8192,6 +8227,65 @@ mod tests {
 
         assert_eq!(template.rotation_signature(), vec![1]);
         assert_eq!(slack, vec![-700, 800]);
+    }
+
+    #[test]
+    fn global_role_rotation_reuses_fixed_and_repeated_transient_lifetimes() {
+        let config = BlockedGemmConfig {
+            rows: 1,
+            inner_dimension: 1,
+            columns: 1,
+            block_dimension: 1,
+            inner_block_dimension: 1,
+            row_block_dimension: 1,
+            tile_count: 2,
+            data_base: 0,
+            data_limit: 1000,
+            data_type: GemmDataType::F16,
+            retain_profile_metadata: false,
+        };
+        let template = ResidentPlacementTemplate::default();
+        template
+            .decisions
+            .lock()
+            .unwrap()
+            .push(ResidentPlacementDecision {
+                key: config.into(),
+                rotation: 0,
+                resident_bytes: vec![100, 0].into(),
+            });
+        let probe = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![Allocation {
+                tensor: TensorId(0),
+                tile: 0,
+                address: 0,
+                size: 100,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            }]
+            .into(),
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let slack = MemoryPolicy::contiguous(0, 1000)
+            .optimize_repeated_resident_global_rotation_with_transients(
+                &template,
+                &probe,
+                0,
+                1,
+                &[0, 0],
+                &[900, 0],
+                &[900, 0],
+                &[0, 0],
+            )
+            .unwrap();
+
+        assert_eq!(template.rotation_signature(), vec![0]);
+        assert_eq!(slack, vec![0, 1000]);
     }
 
     #[test]
