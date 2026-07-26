@@ -1245,6 +1245,17 @@ pub struct ResidentPlacementTemplate {
 }
 
 impl ResidentPlacementTemplate {
+    /// Copies the current decisions into independently mutable storage.
+    ///
+    /// Placement probes can optimize a projected layout without changing the
+    /// template used to build the schedule being measured.
+    pub fn snapshot(&self) -> Self {
+        Self {
+            decisions: Arc::new(Mutex::new(self.decisions.lock().unwrap().clone())),
+            owner_decisions: Arc::new(Mutex::new(self.owner_decisions.lock().unwrap().clone())),
+        }
+    }
+
     /// Stable signature used to detect convergence of repeated-placement
     /// optimization and a subsequent measured replay.
     pub fn rotation_signature(&self) -> Vec<u16> {
@@ -8168,6 +8179,25 @@ mod tests {
 
         assert_eq!(template.rotation_signature(), vec![0]);
         assert_eq!(slack, vec![0, -200]);
+    }
+
+    #[test]
+    fn resident_placement_snapshot_has_independent_decisions() {
+        let template = ResidentPlacementTemplate::default();
+        template
+            .owner_decisions
+            .lock()
+            .unwrap()
+            .push(ResidentOwnerDecision {
+                key: ResidentOwnerKey::affine_layer_norm(64),
+                tile: 0,
+            });
+
+        let snapshot = template.snapshot();
+        snapshot.owner_decisions.lock().unwrap()[0].tile = 1;
+
+        assert_eq!(template.rotation_signature(), vec![0]);
+        assert_eq!(snapshot.rotation_signature(), vec![1]);
     }
 
     #[test]

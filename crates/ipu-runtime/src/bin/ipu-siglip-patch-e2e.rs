@@ -2118,8 +2118,9 @@ fn build_repeated_encoder_support_probe(
             .as_ref()
             .ok_or("support probe has no placement schedule")?;
         let zero_headroom = vec![0; usize::from(TILE_COUNT)];
+        let projection_template = template.snapshot();
         let projected_slack = memory.optimize_repeated_resident_global_rotation(
-            template,
+            &projection_template,
             placement_probe,
             embedding.plan.schedule.allocations.len(),
             repetitions,
