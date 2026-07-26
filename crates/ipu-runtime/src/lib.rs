@@ -680,47 +680,6 @@ pub fn estimate_static_reservation_by_tile(
         .collect())
 }
 
-/// Measures physical bytes touched beyond the logical sizes of retained home
-/// allocations. The result follows tile roles and can therefore be rotated
-/// with a repeated placement template.
-pub fn resident_access_overhead_by_tile(
-    schedule: &ipu_compiler::Schedule,
-    allocations: Range<usize>,
-) -> Result<Vec<u64>> {
-    if allocations.end > schedule.allocations.len() || allocations.start > allocations.end {
-        return Err("invalid resident access-overhead allocation range".into());
-    }
-    let topology = Topology::c600();
-    if usize::from(schedule.tile_count) != topology.tile_count() {
-        return Err("resident access-overhead measurement requires the complete topology".into());
-    }
-    let programs = schedule.lower_tile_programs_for_codegen(&topology)?;
-    let resolved = schedule.resolve_memory_constraints(&programs)?;
-    let graph = ExecutableGraph {
-        schedule: schedule.clone(),
-        memory_policy: None,
-        initial_buffers: Vec::new(),
-        outputs: Vec::new(),
-        host_weights: Vec::new(),
-        host_inputs: Vec::new(),
-        host_outputs: Vec::new(),
-    };
-    let constraints = relocation_memory_constraints(&graph, &resolved)?;
-    let mut overhead = vec![0u64; topology.tile_count()];
-    for index in allocations {
-        let allocation = &schedule.allocations[index];
-        if allocation.kind != ipu_compiler::AllocationKind::Home
-            || allocation.live_from != 0
-            || allocation.live_until != usize::MAX
-        {
-            continue;
-        }
-        let extent = constraints.access_extent(index, allocation.size);
-        overhead[usize::from(allocation.tile)] += u64::from(extent - allocation.size);
-    }
-    Ok(overhead)
-}
-
 fn generated_object_sizes_with_host_pool(
     generated: &static_codegen::GeneratedProgram,
     host_objects: &[Range<u32>],
