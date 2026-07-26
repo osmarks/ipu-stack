@@ -2030,7 +2030,7 @@ fn build_repeated_encoder_support_probe(
     let mut region = None::<RepeatedRegion>;
     let mut attentions = Vec::with_capacity(instance_count);
     let mut placement_schedule = None;
-    let mut transient_headroom = None;
+    let mut transient_headroom = vec![0u64; usize::from(TILE_COUNT)];
     for instance in 0..instance_count {
         let phase_start = schedule.phases.len();
         let instance_memory =
@@ -2054,10 +2054,6 @@ fn build_repeated_encoder_support_probe(
         )?;
         instance_memory.finish_resident_placement()?;
         if instance == 0 {
-            transient_headroom = Some(
-                memory
-                    .transient_peak_bytes_by_tile(&schedule, phase_start..schedule.phases.len())?,
-            );
             placement_schedule = Some(schedule.clone());
         }
         if let Some(deferred) = deferred_residual.take() {
@@ -2065,6 +2061,11 @@ fn build_repeated_encoder_support_probe(
         }
         deferred_residual = defer_terminal_residual_add(&mut schedule)?;
         let phase_range = phase_start..schedule.phases.len();
+        let instance_transient =
+            memory.transient_peak_bytes_by_tile(&schedule, phase_range.clone())?;
+        for (peak, instance_peak) in transient_headroom.iter_mut().zip(instance_transient) {
+            *peak = (*peak).max(instance_peak);
+        }
         specialize_gemm_row_operations(&mut schedule, phase_range.clone());
         if let Some(region) = &mut region {
             region.push_instance(&schedule, phase_range)?;
@@ -2078,7 +2079,7 @@ fn build_repeated_encoder_support_probe(
         current = appended.output;
         attentions.push(appended.attention);
     }
-    let mut fixed_headroom = transient_headroom.ok_or("support probe has no transient headroom")?;
+    let mut fixed_headroom = transient_headroom;
     if include_suffix {
         let placement_probe = placement_schedule
             .as_ref()
