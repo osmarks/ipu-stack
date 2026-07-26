@@ -2274,6 +2274,7 @@ fn compact_all_allocations_around(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OfflinePackingStrategy {
+    ResidentLifetimeFirst,
     TransientSizeFirst,
     ResidentSizeFirst,
     GlobalSizeFirst,
@@ -2284,7 +2285,8 @@ enum OfflinePackingStrategy {
 }
 
 impl OfflinePackingStrategy {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
+        Self::ResidentLifetimeFirst,
         Self::TransientSizeFirst,
         Self::ResidentSizeFirst,
         Self::GlobalSizeFirst,
@@ -2312,6 +2314,10 @@ impl OfflinePackingStrategy {
     ) {
         let resident = allocation.live_until == usize::MAX;
         let (class, time) = match self {
+            Self::ResidentLifetimeFirst => (
+                u8::from(!resident),
+                if resident { 0 } else { allocation.live_from },
+            ),
             Self::TransientSizeFirst | Self::TransientBestFit => (u8::from(resident), 0),
             Self::ResidentSizeFirst | Self::ResidentBestFit => (u8::from(!resident), 0),
             Self::GlobalSizeFirst | Self::GlobalBestFit => (0, 0),
@@ -2331,7 +2337,7 @@ impl OfflinePackingStrategy {
 
     fn use_best_fit(self, resident: bool) -> bool {
         match self {
-            Self::ResidentSizeFirst | Self::GlobalSizeFirst => false,
+            Self::ResidentLifetimeFirst | Self::ResidentSizeFirst | Self::GlobalSizeFirst => false,
             Self::GlobalBestFit | Self::TransientBestFit | Self::ResidentBestFit => true,
             Self::TransientSizeFirst | Self::TransientLifetimeFirst => resident,
         }
@@ -2800,7 +2806,7 @@ fn compact_allocations_around(
             })();
             match attempt {
                 Ok(result) => {
-                    if strategy != OfflinePackingStrategy::TransientSizeFirst {
+                    if strategy != OfflinePackingStrategy::ResidentLifetimeFirst {
                         debug!(
                             tile,
                             ?strategy,
