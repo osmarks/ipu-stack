@@ -2361,9 +2361,8 @@ fn compact_allocations_around(
                 .collect(),
             );
             let mut result = Vec::with_capacity(residents.len() + transients.len());
-            // Place resident and transient objects in one offline lifetime
-            // coloring problem. Resident objects cover the complete timeline;
-            // transient storage can be reused across disjoint phase intervals.
+            // Color transient lifetimes into a reusable workspace first, then
+            // best-fit permanent residents into the remaining gaps.
             let phase_count = transients
                     .iter()
                     .map(|&index| graph.schedule.allocations[index].live_until)
@@ -2432,7 +2431,7 @@ fn compact_allocations_around(
                 let allocation = &graph.schedule.allocations[index];
                 (
                     !memory_constraints.required_interleaved.contains(&index),
-                    allocation.live_until != usize::MAX,
+                    allocation.live_until == usize::MAX,
                     std::cmp::Reverse(
                         memory_constraints.access_extent(index, allocation.size),
                     ),
