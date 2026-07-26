@@ -2330,11 +2330,11 @@ impl OfflinePackingStrategy {
     }
 
     fn use_best_fit(self, resident: bool) -> bool {
-        resident
-            || matches!(
-                self,
-                Self::GlobalBestFit | Self::TransientBestFit | Self::ResidentBestFit
-            )
+        match self {
+            Self::ResidentSizeFirst | Self::GlobalSizeFirst => false,
+            Self::GlobalBestFit | Self::TransientBestFit | Self::ResidentBestFit => true,
+            Self::TransientSizeFirst | Self::TransientLifetimeFirst => resident,
+        }
     }
 }
 
