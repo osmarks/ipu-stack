@@ -2219,6 +2219,12 @@ impl MemoryPolicy {
             }
             (resident_maximum, combined_maximum, squares)
         };
+        let packing_feasible_offsets = (0..tile_count)
+            .filter(|&offset| score(offset).0 <= resident_packing_limit)
+            .count();
+        let resident_feasible_offsets = (0..tile_count)
+            .filter(|&offset| score(offset).0 <= capacity)
+            .count();
         let best_offset = if score(0).0 <= resident_packing_limit && score(0).1 <= capacity {
             0
         } else {
@@ -2238,6 +2244,19 @@ impl MemoryPolicy {
                 })
                 .unwrap_or_else(|| (0..tile_count).min_by_key(|&offset| score(offset)).unwrap())
         };
+        let (selected_resident_maximum, selected_combined_maximum, _) = score(best_offset);
+        info!(
+            target: "ipu_compiler::placement",
+            capacity,
+            packing_headroom,
+            resident_packing_limit,
+            packing_feasible_offsets,
+            resident_feasible_offsets,
+            selected_offset = best_offset,
+            selected_resident_maximum,
+            selected_combined_maximum,
+            "selected repeated resident global rotation"
+        );
         for decision in &mut decisions {
             decision.rotation =
                 u16::try_from((usize::from(decision.rotation) + best_offset) % tile_count).unwrap();
