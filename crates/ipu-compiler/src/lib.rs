@@ -1804,7 +1804,7 @@ impl MemoryPolicy {
             ));
         }
         let mut decisions = template.decisions.lock().unwrap().clone();
-        let owner_decisions = template.owner_decisions.lock().unwrap().clone();
+        let mut owner_decisions = template.owner_decisions.lock().unwrap().clone();
         if decisions.is_empty()
             || decisions
                 .iter()
@@ -1904,6 +1904,31 @@ impl MemoryPolicy {
                     .sum::<u128>(),
             )
         };
+        let score_with_rotation =
+            |loads: &[u64], decision: &ResidentPlacementDecision, rotation| {
+                let mut maximum = 0;
+                let mut squares = 0u128;
+                for (tile, &load) in loads.iter().enumerate() {
+                    let load = load
+                        + rotated_bytes(&decision.resident_bytes, rotation, tile) * repetitions;
+                    maximum = maximum.max(load);
+                    squares += u128::from(load) * u128::from(load);
+                }
+                (maximum, squares)
+            };
+        let owner_offsets = (0..repetition_count)
+            .map(|instance| instance * tile_count / repetition_count)
+            .collect::<Vec<_>>();
+        let adjust_owner = |loads: &mut [u64], decision: &ResidentOwnerDecision, add: bool| {
+            for &offset in &owner_offsets {
+                let tile = (usize::from(decision.tile) + offset) % tile_count;
+                if add {
+                    loads[tile] += u64::from(decision.key.bytes);
+                } else {
+                    loads[tile] -= u64::from(decision.key.bytes);
+                }
+            }
+        };
         loop {
             let mut changed = false;
             for decision in &mut decisions {
@@ -1912,28 +1937,12 @@ impl MemoryPolicy {
                         * repetitions;
                 }
                 let mut best_rotation = decision.rotation;
-                let mut best_score = {
-                    let candidate = (0..tile_count)
-                        .map(|tile| {
-                            loads[tile]
-                                + rotated_bytes(&decision.resident_bytes, decision.rotation, tile)
-                                    * repetitions
-                        })
-                        .collect::<Vec<_>>();
-                    score(&candidate)
-                };
+                let mut best_score = score_with_rotation(&loads, decision, decision.rotation);
                 for rotation in 0..probe.tile_count {
                     if rotation == decision.rotation {
                         continue;
                     }
-                    let candidate = (0..tile_count)
-                        .map(|tile| {
-                            loads[tile]
-                                + rotated_bytes(&decision.resident_bytes, rotation, tile)
-                                    * repetitions
-                        })
-                        .collect::<Vec<_>>();
-                    let candidate_score = score(&candidate);
+                    let candidate_score = score_with_rotation(&loads, decision, rotation);
                     if candidate_score < best_score {
                         best_score = candidate_score;
                         best_rotation = rotation;
@@ -1946,11 +1955,36 @@ impl MemoryPolicy {
                         * repetitions;
                 }
             }
+            for decision in &mut owner_decisions {
+                adjust_owner(&mut loads, decision, false);
+                let current_tile = decision.tile;
+                let mut best_tile = current_tile;
+                adjust_owner(&mut loads, decision, true);
+                let mut best_score = score(&loads);
+                adjust_owner(&mut loads, decision, false);
+                for tile in 0..probe.tile_count {
+                    if tile == current_tile {
+                        continue;
+                    }
+                    decision.tile = tile;
+                    adjust_owner(&mut loads, decision, true);
+                    let candidate_score = score(&loads);
+                    adjust_owner(&mut loads, decision, false);
+                    if candidate_score < best_score {
+                        best_score = candidate_score;
+                        best_tile = tile;
+                    }
+                }
+                changed |= best_tile != current_tile;
+                decision.tile = best_tile;
+                adjust_owner(&mut loads, decision, true);
+            }
             if !changed {
                 break;
             }
         }
         *template.decisions.lock().unwrap() = decisions;
+        *template.owner_decisions.lock().unwrap() = owner_decisions;
         loads
             .into_iter()
             .map(|load| {
@@ -7687,6 +7721,69 @@ mod tests {
             .unwrap();
 
         assert_eq!(slack, vec![1000, 900, 1000, 900]);
+    }
+
+    #[test]
+    fn repeated_resident_optimizer_separates_owner_sequences() {
+        let config = BlockedGemmConfig {
+            rows: 1,
+            inner_dimension: 1,
+            columns: 1,
+            block_dimension: 1,
+            inner_block_dimension: 1,
+            row_block_dimension: 1,
+            tile_count: 4,
+            data_base: 0,
+            data_limit: 1000,
+            data_type: GemmDataType::F16,
+            retain_profile_metadata: false,
+        };
+        let template = ResidentPlacementTemplate::default();
+        template
+            .decisions
+            .lock()
+            .unwrap()
+            .push(ResidentPlacementDecision {
+                key: config.into(),
+                rotation: 0,
+                resident_bytes: vec![0; 4].into(),
+            });
+        template.owner_decisions.lock().unwrap().extend([
+            ResidentOwnerDecision {
+                key: ResidentOwnerKey::affine_layer_norm(100),
+                tile: 1,
+            },
+            ResidentOwnerDecision {
+                key: ResidentOwnerKey::affine_layer_norm(100),
+                tile: 1,
+            },
+        ]);
+        let probe = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: (0..2)
+                .map(|tensor| Allocation {
+                    tensor: TensorId(tensor),
+                    tile: 1,
+                    address: tensor as u32 * 100,
+                    size: 100,
+                    live_from: 0,
+                    live_until: usize::MAX,
+                    kind: AllocationKind::Home,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            tile_count: 4,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let slack = MemoryPolicy::contiguous(0, 1000)
+            .optimize_repeated_resident_placement(&template, &probe, 0, 2, &[0; 4])
+            .unwrap();
+
+        assert_eq!(slack, vec![900; 4]);
+        let owners = template.owner_decisions.lock().unwrap();
+        assert_ne!(owners[0].tile % 2, owners[1].tile % 2);
     }
 
     #[test]
