@@ -36,6 +36,7 @@ const LD32_M_IMMEDIATE_OPCODE: u32 = 0x0100_0000;
 const ST32_M_IMMEDIATE_OPCODE: u32 = 0x4f00_0000;
 const ADD_M_IMMEDIATE_OPCODE: u32 = 0x2200_0000;
 const AND_M_IMMEDIATE_OPCODE: u32 = 0x4200_0000;
+const SHL_M_IMMEDIATE_OPCODE: u32 = 0x4200_a000;
 const BRZ_M_IMMEDIATE_OPCODE: u32 = 0x1300_0000;
 const INCOMING_MUX_REGISTER: u8 = 0xa0;
 const INCOMING_DCOUNT_REGISTER: u8 = 0xa6;
@@ -153,6 +154,20 @@ pub fn encode_and_m_immediate(
         return Err(ExchangeError::Schedule("and operand"));
     }
     Ok(AND_M_IMMEDIATE_OPCODE
+        | (u32::from(source) << 20)
+        | (u32::from(destination) << 16)
+        | u32::from(immediate))
+}
+
+pub fn encode_shl_m_immediate(
+    destination: u8,
+    source: u8,
+    immediate: u16,
+) -> Result<u32, ExchangeError> {
+    if destination >= 16 || source >= 16 || immediate >= 1 << 12 {
+        return Err(ExchangeError::Schedule("shift-left operand"));
+    }
+    Ok(SHL_M_IMMEDIATE_OPCODE
         | (u32::from(source) << 20)
         | (u32::from(destination) << 16)
         | u32::from(immediate))
@@ -1219,6 +1234,8 @@ mod tests {
         assert_eq!(encode_st32_m_immediate(2, 11, 15, 0).unwrap(), 0x4fb2_f000);
         assert_eq!(encode_add_m_immediate(11, 11, -32).unwrap(), 0x22bb_ffe0);
         assert_eq!(encode_and_m_immediate(0, 8, 1).unwrap(), 0x4280_0001);
+        assert_eq!(encode_shl_m_immediate(10, 7, 2).unwrap(), 0x427a_a002);
+        assert!(encode_shl_m_immediate(0, 0, 1 << 12).is_err());
         assert_eq!(encode_brz_m_immediate(0, 0x4c100).unwrap(), 0x1301_3040);
     }
 

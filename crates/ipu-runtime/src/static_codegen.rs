@@ -1763,7 +1763,15 @@ pub(crate) fn step_code_size(
                 size.exchange += (2 + usize::from(active)) * 4;
             }
             LoweredTileStep::Compute(command) => {
-                size.compute += (2 + command.input_addresses.len() + command.arguments.len()) * 4;
+                size.compute += (2
+                    + command.input_addresses.len()
+                    + command
+                        .arguments
+                        .iter()
+                        .copied()
+                        .map(constant_load_words)
+                        .sum::<usize>())
+                    * 4;
                 size.compute_calls += 1;
                 size.compute_argument_words += command.arguments.len();
             }
@@ -1772,6 +1780,10 @@ pub(crate) fn step_code_size(
         step_index += 1;
     }
     size
+}
+
+fn constant_load_words(value: u32) -> usize {
+    if value < 1 << 20 { 1 } else { 3 }
 }
 
 pub(crate) fn emit(
@@ -2416,8 +2428,21 @@ impl TileCode {
     }
 
     fn setzi(&mut self, register: u8, immediate: u32) -> Result<()> {
+        if immediate < 1 << 20 {
+            self.words
+                .push(ipu_exchange::encode_setzi_m(register, immediate)?);
+            return Ok(());
+        }
         self.words
-            .push(ipu_exchange::encode_setzi_m(register, immediate)?);
+            .push(ipu_exchange::encode_setzi_m(register, immediate >> 12)?);
+        self.words.push(ipu_exchange::encode_shl_m_immediate(
+            register, register, 12,
+        )?);
+        self.words.push(ipu_exchange::encode_add_m_immediate(
+            register,
+            register,
+            i32::from((immediate & 0xfff) as u16),
+        )?);
         Ok(())
     }
 
@@ -2543,6 +2568,20 @@ mod tests {
             output_address: 0x80000,
             input_addresses: smallvec::smallvec![0x50000, input_address],
         })
+    }
+
+    #[test]
+    fn tile_code_materializes_full_width_constants() {
+        let mut code = TileCode::new();
+        code.setzi(9, 0xfffff).unwrap();
+        code.setzi(9, 0x0200_0024).unwrap();
+
+        assert_eq!(
+            code.words,
+            [0x199f_ffff, 0x1990_2000, 0x4299_a00c, 0x2299_0024]
+        );
+        assert_eq!(constant_load_words(0xfffff), 1);
+        assert_eq!(constant_load_words(0x0200_0024), 3);
     }
 
     #[test]
