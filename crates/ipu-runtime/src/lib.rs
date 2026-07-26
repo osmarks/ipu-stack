@@ -1373,6 +1373,7 @@ fn allocate_from_sorted_ranges(
         match arena.placement {
             ipu_compiler::MemoryPlacement::Low => {
                 let mut cursor = align_up(arena.base, alignment);
+                let mut best = None::<(u32, u32)>;
                 let mut permanent = permanent.iter().copied().peekable();
                 let mut active = active
                     .iter()
@@ -1390,8 +1391,12 @@ fn allocate_from_sorted_ranges(
                     if end <= cursor || start >= arena.limit {
                         continue;
                     }
-                    if let Some(candidate) = allowed_start(cursor, start, arena.placement) {
-                        return Some(candidate);
+                    let gap_end = start.min(arena.limit);
+                    if let Some(candidate) = allowed_start(cursor, gap_end, arena.placement) {
+                        let waste = gap_end - cursor - size;
+                        if best.is_none_or(|current| (waste, candidate) < current) {
+                            best = Some((waste, candidate));
+                        }
                     }
                     cursor = align_up(cursor.max(end), alignment);
                     if cursor >= arena.limit {
@@ -1399,11 +1404,18 @@ fn allocate_from_sorted_ranges(
                     }
                 }
                 if let Some(candidate) = allowed_start(cursor, arena.limit, arena.placement) {
+                    let waste = arena.limit - cursor - size;
+                    if best.is_none_or(|current| (waste, candidate) < current) {
+                        best = Some((waste, candidate));
+                    }
+                }
+                if let Some((_, candidate)) = best {
                     return Some(candidate);
                 }
             }
             ipu_compiler::MemoryPlacement::High => {
                 let mut cursor = arena.limit;
+                let mut best = None::<(u32, std::cmp::Reverse<u32>)>;
                 let mut permanent = permanent.iter().copied().rev().peekable();
                 let mut active = active
                     .iter()
@@ -1422,8 +1434,13 @@ fn allocate_from_sorted_ranges(
                     if start >= cursor || end <= arena.base {
                         continue;
                     }
-                    if let Some(candidate) = allowed_start(end, cursor, arena.placement) {
-                        return Some(candidate);
+                    let gap_start = end.max(arena.base);
+                    if let Some(candidate) = allowed_start(gap_start, cursor, arena.placement) {
+                        let waste = cursor - gap_start - size;
+                        let score = (waste, std::cmp::Reverse(candidate));
+                        if best.is_none_or(|current| score < current) {
+                            best = Some(score);
+                        }
                     }
                     cursor = cursor.min(start);
                     if cursor <= arena.base {
@@ -1431,6 +1448,13 @@ fn allocate_from_sorted_ranges(
                     }
                 }
                 if let Some(candidate) = allowed_start(arena.base, cursor, arena.placement) {
+                    let waste = cursor - arena.base - size;
+                    let score = (waste, std::cmp::Reverse(candidate));
+                    if best.is_none_or(|current| score < current) {
+                        best = Some(score);
+                    }
+                }
+                if let Some((_, std::cmp::Reverse(candidate))) = best {
                     return Some(candidate);
                 }
             }
@@ -2227,12 +2251,12 @@ fn compact_allocations_around(
                 let allocation = &graph.schedule.allocations[index];
                 (
                     !memory_constraints.required_interleaved.contains(&index),
+                    allocation.live_until != usize::MAX,
                     std::cmp::Reverse(
                         memory_constraints.access_extent(index, allocation.size),
                     ),
                     !(memory_constraints.relations.contains_key(&index)
                         || memory_constraints.self_separations.contains_key(&index)),
-                    allocation.live_until != usize::MAX,
                     allocation.live_from,
                     allocation.live_until,
                     allocation.tensor.0,
