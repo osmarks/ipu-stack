@@ -489,6 +489,14 @@ fn place_generated_with_segmented_support(
     Ok(ExecutablePlacement { generated, support })
 }
 
+fn linked_image_occupied_bytes(image: &ipu_elf::LinkedImage) -> Result<u32> {
+    image.segments.iter().try_fold(0u32, |total, segment| {
+        total
+            .checked_add(u32::try_from(segment.size)?)
+            .ok_or_else(|| "linked image occupied size overflow".into())
+    })
+}
+
 fn generated_object_sizes_with_host_pool(
     generated: &static_codegen::GeneratedProgram,
     host_objects: &[Range<u32>],
@@ -3667,26 +3675,45 @@ enum ProfileSelection<'a> {
     Regions(&'a [StaticProfileRegion]),
 }
 
-struct ProfileRelayout {
-    graph: ExecutableGraph,
-}
-
-impl std::fmt::Debug for ProfileRelayout {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("profile graph requires final-layout lowering")
-    }
-}
-
-impl std::fmt::Display for ProfileRelayout {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("profile graph requires final-layout lowering")
-    }
-}
-
-impl std::error::Error for ProfileRelayout {}
-
 struct PackageRelayout {
     graph: ExecutableGraph,
+}
+
+#[derive(Default)]
+struct ExecutablePlacementState {
+    placements: Option<Vec<ExecutablePlacement>>,
+    generated_requirements: Vec<Vec<u32>>,
+}
+
+impl ExecutablePlacementState {
+    fn update_generated_requirements(&mut self, measured: &[Vec<u32>]) -> Result<Vec<Vec<u32>>> {
+        if self.generated_requirements.is_empty() {
+            self.generated_requirements = measured.to_vec();
+        } else {
+            if self.generated_requirements.len() != measured.len() {
+                return Err("generated tile count changed across graph relayout".into());
+            }
+            for (tile, (required, measured)) in self
+                .generated_requirements
+                .iter_mut()
+                .zip(measured)
+                .enumerate()
+            {
+                if required.len() != measured.len() {
+                    return Err(format!(
+                        "generated object count changed across graph relayout on tile {tile}: {} to {}",
+                        required.len(),
+                        measured.len()
+                    )
+                    .into());
+                }
+                for (required, &measured) in required.iter_mut().zip(measured) {
+                    *required = (*required).max(measured);
+                }
+            }
+        }
+        Ok(self.generated_requirements.clone())
+    }
 }
 
 impl std::fmt::Debug for PackageRelayout {
@@ -3745,7 +3772,15 @@ fn package_graph_with_profile_options(
     let mut graph = graph.clone();
     normalize_provisional_memory_layout(&mut graph, &topology)?;
     let profile_started = Instant::now();
-    let programs = graph.schedule.lower_tile_programs(&topology)?;
+    let aggregate = matches!(
+        selection,
+        ProfileSelection::Granularity(ProfileGranularity::Graph, _)
+    );
+    let programs = if aggregate {
+        graph.schedule.lower_tile_programs_for_codegen(&topology)?
+    } else {
+        graph.schedule.lower_tile_programs(&topology)?
+    };
     let lowering_elapsed = profile_started.elapsed();
     let output_offset = graph
         .host_outputs
@@ -3757,10 +3792,6 @@ fn package_graph_with_profile_options(
                     .ok_or_else(|| "profile output offset overflow".into())
             })
         })?;
-    let aggregate = matches!(
-        selection,
-        ProfileSelection::Granularity(ProfileGranularity::Graph, _)
-    );
     let profile_tensor_base = graph
         .schedule
         .allocations
@@ -3915,41 +3946,14 @@ fn package_graph_with_profile_options(
         shape: vec![(file_offset / 4) as u32],
         slices,
     });
-    let app = match package_graph_impl_owned(
+    let app = package_graph_impl_owned(
         profile_graph,
         objects,
         &profile_code,
         Some(programs),
         templates,
         invocations,
-    ) {
-        Ok(app) => app,
-        Err(error) => match error.downcast::<ProfileRelayout>() {
-            Ok(relayout) => {
-                let mut relocated = relayout.graph;
-                relocated
-                    .schedule
-                    .allocations
-                    .retain(|allocation| allocation.tensor.0 < profile_tensor_base);
-                let binding = relocated
-                    .host_outputs
-                    .pop()
-                    .ok_or("relocated profile graph lost its profile binding")?;
-                if binding.name != "runtime-profile" {
-                    return Err("relocated profile graph has an unexpected final binding".into());
-                }
-                info!("rebuilding profile boundaries after final memory placement");
-                return package_graph_with_profile_options(
-                    &relocated,
-                    objects,
-                    selection,
-                    templates,
-                    invocations,
-                );
-            }
-            Err(error) => return Err(error),
-        },
-    };
+    )?;
     Ok((
         app,
         ProfileLayout {
@@ -4014,8 +4018,11 @@ fn package_graph_impl_owned_with_final_graph(
         }
         lowered_programs = None;
     }
-    let mut executable_placement_history = Vec::new();
+    let mut executable_placement_state = ExecutablePlacementState::default();
+    let mut attempt = 0usize;
     loop {
+        attempt += 1;
+        let started = Instant::now();
         match package_graph_impl_attempt(
             graph,
             objects,
@@ -4023,11 +4030,25 @@ fn package_graph_impl_owned_with_final_graph(
             lowered_programs.take(),
             template_regions,
             invocations,
-            &mut executable_placement_history,
+            &mut executable_placement_state,
         ) {
-            Ok(result) => return Ok(result),
+            Ok(result) => {
+                info!(
+                    attempt,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "completed graph packaging attempt"
+                );
+                return Ok(result);
+            }
             Err(error) => match error.downcast::<PackageRelayout>() {
-                Ok(relayout) => graph = relayout.graph,
+                Ok(relayout) => {
+                    info!(
+                        attempt,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "restarting graph packaging after memory relayout"
+                    );
+                    graph = relayout.graph;
+                }
                 Err(error) => return Err(error),
             },
         }
@@ -4364,7 +4385,7 @@ fn package_graph_impl_attempt(
     lowered_programs: Option<Vec<ipu_compiler::LoweredTileProgram>>,
     template_regions: &[StaticTemplateRegion],
     invocations: u32,
-    executable_placement_history: &mut Vec<Vec<ExecutablePlacement>>,
+    executable_placement_state: &mut ExecutablePlacementState,
 ) -> Result<(Application, ExecutableGraph)> {
     let topology = Topology::c600();
     if usize::from(graph.schedule.tile_count) != topology.tile_count() {
@@ -4816,13 +4837,15 @@ fn package_graph_impl_attempt(
             generated_object_sizes_with_host_pool(generated, &plans.executable_objects)
         })
         .collect::<Result<Vec<_>>>()?;
+    let placement_program_sizes =
+        executable_placement_state.update_generated_requirements(&program_reservation_sizes)?;
     // Generated and support code are independently relocatable. Reserving them
     // separately avoids requiring one artificial contiguous executable extent.
-    let executable_placements = if let Some(pinned) = executable_placement_history.last() {
+    let executable_placements = if let Some(pinned) = &executable_placement_state.placements {
         let validated = programs
             .par_iter()
             .zip(&tile_exchange_plans)
-            .zip(&program_reservation_sizes)
+            .zip(&placement_program_sizes)
             .zip(&preliminary_images)
             .zip(pinned)
             .map(
@@ -4835,7 +4858,7 @@ fn package_graph_impl_attempt(
                     validate_pinned_executable_placement(
                         program.tile,
                         program_sizes,
-                        u32::try_from(image.bytes.len())?,
+                        linked_image_occupied_bytes(image)?,
                         pinned,
                         &regions,
                     )
@@ -4849,7 +4872,7 @@ fn package_graph_impl_attempt(
                     error = %error,
                     "recomputing executable placement after graph relayout changed its requirements"
                 );
-                executable_placement_history.pop();
+                executable_placement_state.placements = None;
                 return Err(Box::new(PackageRelayout { graph }));
             }
         }
@@ -4857,7 +4880,7 @@ fn package_graph_impl_attempt(
         let attempted = programs
             .par_iter()
             .zip(&tile_exchange_plans)
-            .zip(&program_reservation_sizes)
+            .zip(&placement_program_sizes)
             .zip(&preliminary_images)
             .zip(&tile_retained_symbols)
             .map(
@@ -4867,6 +4890,7 @@ fn package_graph_impl_attempt(
                         plans.end,
                         &[],
                     )?;
+                    let support_bytes = linked_image_occupied_bytes(image)?;
                     place_generated_with_segmented_support(
                         program.tile,
                         program_sizes,
@@ -4879,7 +4903,7 @@ fn package_graph_impl_attempt(
                             "tile {} needs {:?} bytes for generated code and host executable objects plus {} bytes of preliminary support image: {error}",
                             program.tile,
                             program_sizes,
-                            image.bytes.len(),
+                            support_bytes,
                         )
                         .into()
                     })
@@ -4887,14 +4911,17 @@ fn package_graph_impl_attempt(
             )
             .collect::<Result<Vec<_>>>();
         match attempted {
-            Ok(reservations) => reservations,
+            Ok(reservations) => {
+                executable_placement_state.placements = Some(reservations.clone());
+                reservations
+            }
             Err(error) => {
                 info!(error = %error, "segmented executable placement requires tensor relayout");
                 let place = |allocation_ranges: &[Vec<(u32, u32)>]| {
                     programs
                         .par_iter()
                         .zip(&tile_exchange_plans)
-                        .zip(&program_reservation_sizes)
+                        .zip(&placement_program_sizes)
                         .zip(&tile_retained_symbols)
                         .map(
                             |(((program, plans), program_sizes), symbols)| -> Result<_> {
@@ -4918,7 +4945,7 @@ fn package_graph_impl_attempt(
                     Ok(desired) => (desired, false),
                     Err(_) => (place(&immovable_allocation_ranges)?, true),
                 };
-                executable_placement_history.push(desired.clone());
+                executable_placement_state.placements = Some(desired.clone());
                 let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
                 let reservations = desired
                     .iter()
@@ -4973,9 +5000,6 @@ fn package_graph_impl_attempt(
                     moved,
                     moved_resident, "relocated graph tensors for measured executable images"
                 );
-                if !profile_code.is_empty() {
-                    return Err(Box::new(ProfileRelayout { graph }));
-                }
                 return Err(Box::new(PackageRelayout { graph }));
             }
         }
@@ -5448,9 +5472,6 @@ fn package_graph_impl_attempt(
             moved,
             needs_resident_relocation, "relocated graph allocations for static runtime"
         );
-        if !profile_code.is_empty() {
-            return Err(Box::new(ProfileRelayout { graph }));
-        }
         return Err(Box::new(PackageRelayout { graph }));
     }
     debug!(
@@ -7505,6 +7526,29 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn executable_requirements_are_monotone_across_relayouts() {
+        let mut state = ExecutablePlacementState::default();
+        let first = vec![vec![32, 64, 16], vec![48, 24]];
+        let second = vec![vec![40, 56, 20], vec![32, 28]];
+
+        state.update_generated_requirements(&first).unwrap();
+        let requirements = state.update_generated_requirements(&second).unwrap();
+
+        for ((required, first), second) in requirements.iter().zip(&first).zip(&second) {
+            for ((&required, &first), &second) in required.iter().zip(first).zip(second) {
+                assert_eq!(required, first.max(second));
+            }
+        }
+        let smaller = vec![vec![1; 3], vec![1; 2]];
+        assert_eq!(
+            state
+                .update_generated_requirements(&smaller)
+                .unwrap(),
+            requirements
+        );
+    }
+
+    #[test]
     fn moved_storage_index_merges_overlapping_old_ranges() {
         let owner = ipu_compiler::TensorId(1);
         let graph = ExecutableGraph {
@@ -7552,12 +7596,8 @@ mod tests {
             host_outputs: Vec::new(),
         };
         let index = AllocationReferenceIndex::new(&graph.schedule.allocations, 1);
-        let plan = AllocationAddressPlan::new(
-            &graph,
-            [(0, 0x70000), (1, 0x70100)],
-            &index,
-        )
-        .unwrap();
+        let plan =
+            AllocationAddressPlan::new(&graph, [(0, 0x70000), (1, 0x70100)], &index).unwrap();
 
         assert!(plan.moved_overlap(0, 0x60000, 0x140).unwrap());
         assert!(plan.moved_overlap(0, 0x60120, 0x40).unwrap());
