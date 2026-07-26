@@ -1921,17 +1921,27 @@ fn refine_repeated_encoder_placement(
     include_suffix: bool,
     post_norm_only: bool,
 ) -> ipu_runtime::Result<RepeatedPlacementProbe> {
-    let before = probe.template.rotation_signature();
-    let suffix_slack = memory.optimize_repeated_resident_placement(
-        &probe.template,
-        &probe.placement_schedule,
-        probe.allocation_start,
-        repetitions,
-        &probe.fixed_headroom,
-    )?;
-    probe.optimized_minimum_slack = suffix_slack.iter().copied().min().unwrap_or(0);
-    probe.optimized_overcommitted_tiles = suffix_slack.iter().filter(|&&slack| slack < 0).count();
-    if probe.template.rotation_signature() != before {
+    let mut seen_placements = BTreeSet::new();
+    seen_placements.insert(probe.template.rotation_signature());
+    loop {
+        let before = probe.template.rotation_signature();
+        let suffix_slack = memory.optimize_repeated_resident_placement(
+            &probe.template,
+            &probe.placement_schedule,
+            probe.allocation_start,
+            repetitions,
+            &probe.fixed_headroom,
+        )?;
+        probe.optimized_minimum_slack = suffix_slack.iter().copied().min().unwrap_or(0);
+        probe.optimized_overcommitted_tiles =
+            suffix_slack.iter().filter(|&&slack| slack < 0).count();
+        let after = probe.template.rotation_signature();
+        if after == before {
+            break;
+        }
+        if !seen_placements.insert(after) {
+            return Err("suffix-aware repeated placement entered a rotation cycle".into());
+        }
         let (
             support_schedule,
             support_attentions,
