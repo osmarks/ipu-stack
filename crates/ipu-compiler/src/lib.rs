@@ -2121,11 +2121,41 @@ impl MemoryPolicy {
         role_transient_headroom: &[u64],
         role_static_headroom: &[u64],
     ) -> Result<Vec<i64>, CompileError> {
+        let zero = vec![0; usize::from(probe.tile_count)];
+        self.optimize_repeated_resident_global_rotation_with_memory_pressure(
+            template,
+            probe,
+            allocation_start,
+            repetitions,
+            fixed_resident_headroom,
+            &zero,
+            fixed_transient_headroom,
+            role_transient_headroom,
+            role_static_headroom,
+        )
+    }
+
+    /// Rotates a repeated tile-role assignment using separately measured
+    /// resident access extents, transient workspaces, and static code pressure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn optimize_repeated_resident_global_rotation_with_memory_pressure(
+        &self,
+        template: &ResidentPlacementTemplate,
+        probe: &Schedule,
+        allocation_start: usize,
+        repetitions: usize,
+        fixed_resident_headroom: &[u64],
+        role_resident_headroom: &[u64],
+        fixed_transient_headroom: &[u64],
+        role_transient_headroom: &[u64],
+        role_static_headroom: &[u64],
+    ) -> Result<Vec<i64>, CompileError> {
         let tile_count = usize::from(probe.tile_count);
         if tile_count == 0
             || allocation_start > probe.allocations.len()
             || repetitions == 0
             || fixed_resident_headroom.len() != tile_count
+            || role_resident_headroom.len() != tile_count
             || fixed_transient_headroom.len() != tile_count
             || role_transient_headroom.len() != tile_count
             || role_static_headroom.len() != tile_count
@@ -2240,6 +2270,11 @@ impl MemoryPolicy {
                 resident_role_load[tile] += u64::from(decision.key.bytes);
             }
         }
+        let resident_role_load = resident_role_load
+            .iter()
+            .zip(role_resident_headroom)
+            .map(|(&resident, &headroom)| resident + headroom)
+            .collect::<Vec<_>>();
         let role_static_load = resident_role_load
             .iter()
             .zip(role_static_headroom)

@@ -22,7 +22,8 @@ use ipu_runtime::{
     materialize_deferred_residual_add, package_graph_repeated_with_templates_owned,
     package_graph_repeated_with_templates_owned_and_memory_profile,
     package_graph_repeated_with_templates_profiled_with,
-    package_graph_repeated_with_templates_profiled_with_regions, run_host_with_options,
+    package_graph_repeated_with_templates_profiled_with_regions, resident_access_overhead_by_tile,
+    run_host_with_options,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -2003,12 +2004,38 @@ fn refine_repeated_encoder_placement(
         memory,
         std::slice::from_ref(&probe.support_template),
     )?;
-    let optimized_slack = memory.optimize_repeated_resident_global_rotation_with_transients(
+    let instance_resident_access_overhead = resident_access_overhead_by_tile(
+        &probe.placement_schedule,
+        probe.allocation_start..probe.placement_schedule.allocations.len(),
+    )?;
+    let role_resident_access_overhead = instance_resident_access_overhead
+        .iter()
+        .map(|&bytes| {
+            bytes
+                .checked_mul(u64::try_from(repetitions).unwrap())
+                .ok_or("repeated resident access overhead overflow")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    info!(
+        maximum_instance_bytes = instance_resident_access_overhead
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0),
+        maximum_repeated_bytes = role_resident_access_overhead
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0),
+        "measured repeated resident access-span overhead"
+    );
+    let optimized_slack = memory.optimize_repeated_resident_global_rotation_with_memory_pressure(
         &probe.template,
         &probe.placement_schedule,
         probe.allocation_start,
         repetitions,
         &probe.fixed_resident_headroom,
+        &role_resident_access_overhead,
         &probe.fixed_transient_headroom,
         &probe.role_transient_headroom,
         &execution_headroom,
