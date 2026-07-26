@@ -2124,6 +2124,18 @@ impl MemoryPolicy {
                 })
                 .sum::<u64>()
         };
+        let packing_headroom = probe
+            .allocations
+            .iter()
+            .filter(|allocation| {
+                allocation.kind == AllocationKind::Home
+                    && allocation.live_from == 0
+                    && allocation.live_until == usize::MAX
+            })
+            .map(&allocation_bytes)
+            .max()
+            .unwrap_or(0);
+        let resident_packing_limit = capacity.saturating_sub(packing_headroom);
         let rotated_bytes = |bytes: &[u64], rotation: u16, tile: usize| {
             bytes[(tile + tile_count - usize::from(rotation)) % tile_count]
         };
@@ -2206,14 +2218,22 @@ impl MemoryPolicy {
             }
             (resident_maximum, combined_maximum, squares)
         };
-        let best_offset = if score(0).1 <= capacity {
+        let best_offset = if score(0).0 <= resident_packing_limit && score(0).1 <= capacity {
             0
         } else {
             (0..tile_count)
-                .filter(|&offset| score(offset).0 <= capacity)
+                .filter(|&offset| score(offset).0 <= resident_packing_limit)
                 .min_by_key(|&offset| {
                     let (_, combined, squares) = score(offset);
                     (combined, squares, offset)
+                })
+                .or_else(|| {
+                    (0..tile_count)
+                        .filter(|&offset| score(offset).0 <= capacity)
+                        .min_by_key(|&offset| {
+                            let (_, combined, squares) = score(offset);
+                            (combined, squares, offset)
+                        })
                 })
                 .unwrap_or_else(|| (0..tile_count).min_by_key(|&offset| score(offset)).unwrap())
         };
@@ -8095,6 +8115,63 @@ mod tests {
 
         assert_eq!(template.rotation_signature(), vec![0]);
         assert_eq!(slack, vec![0, -200]);
+    }
+
+    #[test]
+    fn global_role_rotation_keeps_one_resident_object_of_packing_slack() {
+        let config = BlockedGemmConfig {
+            rows: 1,
+            inner_dimension: 1,
+            columns: 1,
+            block_dimension: 1,
+            inner_block_dimension: 1,
+            row_block_dimension: 1,
+            tile_count: 2,
+            data_base: 0,
+            data_limit: 1000,
+            data_type: GemmDataType::F16,
+            retain_profile_metadata: false,
+        };
+        let template = ResidentPlacementTemplate::default();
+        template
+            .decisions
+            .lock()
+            .unwrap()
+            .push(ResidentPlacementDecision {
+                key: config.into(),
+                rotation: 0,
+                resident_bytes: vec![200, 0].into(),
+            });
+        let probe = Schedule {
+            layouts: Vec::new(),
+            phases: Vec::new(),
+            allocations: vec![Allocation {
+                tensor: TensorId(0),
+                tile: 0,
+                address: 0,
+                size: 200,
+                live_from: 0,
+                live_until: usize::MAX,
+                kind: AllocationKind::Home,
+            }]
+            .into(),
+            tile_count: 2,
+            peak_sram: BTreeMap::new(),
+        };
+
+        let slack = MemoryPolicy::contiguous(0, 1000)
+            .optimize_repeated_resident_global_rotation(
+                &template,
+                &probe,
+                0,
+                1,
+                &[800, 0],
+                &[0, 900],
+            )
+            .unwrap();
+
+        assert_eq!(template.rotation_signature(), vec![1]);
+        assert_eq!(slack, vec![-700, 800]);
     }
 
     #[test]
