@@ -2563,7 +2563,7 @@ fn compact_allocations_around(
                             access_extent,
                             &compatible_arenas,
                             32,
-                            move_resident,
+                            move_resident && allocation.live_until == usize::MAX,
                         )
                     });
                     if address.is_none()
