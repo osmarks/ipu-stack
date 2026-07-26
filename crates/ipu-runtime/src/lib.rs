@@ -2265,6 +2265,66 @@ fn compact_all_allocations_around(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OfflinePackingStrategy {
+    TransientSizeFirst,
+    ResidentSizeFirst,
+    GlobalSizeFirst,
+    TransientLifetimeFirst,
+    TransientBestFit,
+    ResidentBestFit,
+}
+
+impl OfflinePackingStrategy {
+    const ALL: [Self; 6] = [
+        Self::TransientSizeFirst,
+        Self::ResidentSizeFirst,
+        Self::GlobalSizeFirst,
+        Self::TransientLifetimeFirst,
+        Self::TransientBestFit,
+        Self::ResidentBestFit,
+    ];
+
+    fn sort_key(
+        self,
+        allocation: &ipu_compiler::Allocation,
+        access_extent: u32,
+        required_interleaved: bool,
+        constrained: bool,
+    ) -> (
+        bool,
+        u8,
+        usize,
+        std::cmp::Reverse<u32>,
+        bool,
+        usize,
+        usize,
+        usize,
+    ) {
+        let resident = allocation.live_until == usize::MAX;
+        let (class, time) = match self {
+            Self::TransientSizeFirst | Self::TransientBestFit => (u8::from(resident), 0),
+            Self::ResidentSizeFirst | Self::ResidentBestFit => (u8::from(!resident), 0),
+            Self::GlobalSizeFirst => (0, 0),
+            Self::TransientLifetimeFirst => (u8::from(resident), allocation.live_from),
+        };
+        (
+            !required_interleaved,
+            class,
+            time,
+            std::cmp::Reverse(access_extent),
+            !constrained,
+            allocation.live_from,
+            allocation.live_until,
+            allocation.tensor.0,
+        )
+    }
+
+    fn use_best_fit(self, resident: bool) -> bool {
+        resident || matches!(self, Self::TransientBestFit | Self::ResidentBestFit)
+    }
+}
+
 fn compact_allocations_around(
     graph: &mut ExecutableGraph,
     topology: &Topology,
@@ -2425,21 +2485,24 @@ fn compact_allocations_around(
                     result.push((index, allocation.address));
                 }
             }
+            let compact_candidates = compact;
+            let initial_result = result;
+            let initial_occupied_by_phase = occupied_by_phase;
+            let mut failures = Vec::new();
+            for strategy in OfflinePackingStrategy::ALL {
+            let mut compact = compact_candidates.clone();
+            let mut result = initial_result.clone();
+            let mut occupied_by_phase = initial_occupied_by_phase.clone();
             let mut compact_set = compact.iter().copied().collect::<HashSet<_>>();
             let mut placed_addresses = result.iter().copied().collect::<HashMap<_, _>>();
             compact.sort_unstable_by_key(|&index| {
                 let allocation = &graph.schedule.allocations[index];
-                (
-                    !memory_constraints.required_interleaved.contains(&index),
-                    allocation.live_until == usize::MAX,
-                    std::cmp::Reverse(
-                        memory_constraints.access_extent(index, allocation.size),
-                    ),
-                    !(memory_constraints.relations.contains_key(&index)
-                        || memory_constraints.self_separations.contains_key(&index)),
-                    allocation.live_from,
-                    allocation.live_until,
-                    allocation.tensor.0,
+                strategy.sort_key(
+                    allocation,
+                    memory_constraints.access_extent(index, allocation.size),
+                    memory_constraints.required_interleaved.contains(&index),
+                    memory_constraints.relations.contains_key(&index)
+                        || memory_constraints.self_separations.contains_key(&index),
                 )
             });
             let placement_priority = compact
@@ -2451,7 +2514,8 @@ fn compact_allocations_around(
             // Relation-constrained objects remain movable: every relation is
             // stored in both directions, so re-placing an evicted object checks
             // it against the neighbor's current address.
-            while let Some(index) = compact.pop_front() {
+            let attempt = (|| -> Result<Vec<(usize, u32)>> {
+                while let Some(index) = compact.pop_front() {
                     let allocation = &graph.schedule.allocations[index];
                     let arenas = if allocation.live_until == usize::MAX {
                         &resident_arenas
@@ -2562,7 +2626,9 @@ fn compact_allocations_around(
                             access_extent,
                             &compatible_arenas,
                             32,
-                            move_resident && allocation.live_until == usize::MAX,
+                            move_resident
+                                && strategy
+                                    .use_best_fit(allocation.live_until == usize::MAX),
                         )
                     });
                     if address.is_none()
@@ -2721,7 +2787,31 @@ fn compact_allocations_around(
                 placed_addresses.insert(index, address);
                 result.push((index, address));
             }
-            Ok(result)
+                Ok(result)
+            })();
+            match attempt {
+                Ok(result) => {
+                    if strategy != OfflinePackingStrategy::TransientSizeFirst {
+                        debug!(
+                            tile,
+                            ?strategy,
+                            failed_strategies = failures.len(),
+                            "selected alternate offline SRAM coloring"
+                        );
+                    }
+                    return Ok(result);
+                }
+                Err(error) => failures.push((strategy, error.to_string())),
+            }
+            }
+            let (strategy, error) = failures
+                .pop()
+                .ok_or("offline SRAM coloring had no strategies")?;
+            Err(format!(
+                "all {} offline SRAM coloring strategies failed; final strategy {strategy:?}: {error}",
+                OfflinePackingStrategy::ALL.len()
+            )
+            .into())
         })
         .collect::<Result<Vec<_>>>()?;
     let placements = placements.into_iter().flatten().collect::<Vec<_>>();
