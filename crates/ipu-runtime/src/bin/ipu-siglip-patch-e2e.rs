@@ -713,6 +713,31 @@ fn main() {
     }
     let phase_count = plan.schedule.phases.len();
     specialize_gemm_row_operations(&mut plan.schedule, 0..phase_count);
+    let permanent_bytes = memory
+        .permanent_bytes_by_tile(&plan.schedule, 0..plan.schedule.allocations.len())
+        .unwrap();
+    let transient_bytes = memory
+        .transient_peak_bytes_by_tile(&plan.schedule, 0..phase_count)
+        .unwrap();
+    let (worst_tile, worst_working_bytes) = permanent_bytes
+        .iter()
+        .zip(&transient_bytes)
+        .enumerate()
+        .map(|(tile, (&permanent, &transient))| (tile, permanent + transient))
+        .max_by_key(|&(_, bytes)| bytes)
+        .unwrap();
+    info!(
+        worst_tile,
+        worst_working_bytes,
+        permanent_bytes = permanent_bytes[worst_tile],
+        transient_bytes = transient_bytes[worst_tile],
+        minimum_slack =
+            i128::from(memory.resident_capacity_bytes()) - i128::from(worst_working_bytes),
+        "measured complete graph logical memory pressure"
+    );
+    if std::env::var_os("IPU_SIGLIP_PLAN_ONLY").is_some() {
+        return;
+    }
     let objects = compile_objects(&plan.schedule, &attentions, &attention_variants).unwrap();
     let HostTensorSet {
         bindings: host_inputs,
