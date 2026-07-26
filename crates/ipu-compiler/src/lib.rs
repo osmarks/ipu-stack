@@ -1661,7 +1661,7 @@ impl MemoryPolicy {
 
     /// Measures the peak finite-lifetime home storage in a program region.
     ///
-    /// Permanent objects (`0..usize::MAX`) are resident load rather than
+    /// Objects retained through `usize::MAX` are resident load rather than
     /// transient headroom. Aliases and exchange staging do not own home SRAM.
     pub fn transient_peak_bytes_by_tile(
         &self,
@@ -1685,9 +1685,7 @@ impl MemoryPolicy {
         let phase_count = phases.end - phases.start;
         let mut events = vec![vec![0i64; phase_count + 1]; usize::from(schedule.tile_count)];
         for allocation in &schedule.allocations {
-            if allocation.kind != AllocationKind::Home
-                || (allocation.live_from == 0 && allocation.live_until == usize::MAX)
-            {
+            if allocation.kind != AllocationKind::Home || allocation.live_until == usize::MAX {
                 continue;
             }
             let live_from = allocation.live_from.max(phases.start);
@@ -1755,10 +1753,7 @@ impl MemoryPolicy {
         normalize_occupied_intervals(&mut arena_intervals);
         let mut bytes_by_tile = vec![0u64; usize::from(schedule.tile_count)];
         for allocation in selected {
-            if allocation.kind != AllocationKind::Home
-                || allocation.live_from != 0
-                || allocation.live_until != usize::MAX
-            {
+            if allocation.kind != AllocationKind::Home || allocation.live_until != usize::MAX {
                 continue;
             }
             let end = allocation.address.saturating_add(allocation.size);
@@ -1805,10 +1800,7 @@ impl MemoryPolicy {
             .sum::<u64>();
         let mut used = transient_headroom.to_vec();
         for (index, allocation) in schedule.allocations.iter().enumerate() {
-            if allocation.kind != AllocationKind::Home
-                || allocation.live_from != 0
-                || allocation.live_until != usize::MAX
-            {
+            if allocation.kind != AllocationKind::Home || allocation.live_until != usize::MAX {
                 continue;
             }
             let allocation_end = allocation.address.saturating_add(allocation.size);
@@ -1908,10 +1900,7 @@ impl MemoryPolicy {
         let mut baseline = transient_headroom.to_vec();
         let mut probed_resident = vec![0u64; tile_count];
         for (index, allocation) in probe.allocations.iter().enumerate() {
-            if allocation.kind != AllocationKind::Home
-                || allocation.live_from != 0
-                || allocation.live_until != usize::MAX
-            {
+            if allocation.kind != AllocationKind::Home || allocation.live_until != usize::MAX {
                 continue;
             }
             let bytes = allocation_bytes(allocation);
@@ -2158,9 +2147,7 @@ impl MemoryPolicy {
             .iter()
             .skip(allocation_start)
             .filter(|allocation| {
-                allocation.kind == AllocationKind::Home
-                    && allocation.live_from == 0
-                    && allocation.live_until == usize::MAX
+                allocation.kind == AllocationKind::Home && allocation.live_until == usize::MAX
             })
             .map(&allocation_bytes)
             .max()
@@ -2172,10 +2159,7 @@ impl MemoryPolicy {
         let mut fixed_resident = fixed_resident_headroom.to_vec();
         let mut probed_resident = vec![0u64; tile_count];
         for (index, allocation) in probe.allocations.iter().enumerate() {
-            if allocation.kind != AllocationKind::Home
-                || allocation.live_from != 0
-                || allocation.live_until != usize::MAX
-            {
+            if allocation.kind != AllocationKind::Home || allocation.live_until != usize::MAX {
                 continue;
             }
             let bytes = allocation_bytes(allocation);
@@ -3882,7 +3866,6 @@ fn resident_tile_rotation(
                     if additional_instances != 0 {
                         for allocation in &parent.allocations[session.allocation_start..] {
                             if allocation.kind == AllocationKind::Home
-                                && allocation.live_from == 0
                                 && allocation.live_until == usize::MAX
                             {
                                 projected_extra[usize::from(allocation.tile)] +=
@@ -4003,10 +3986,7 @@ fn choose_resident_tile_rotation_with_projection(
         .unwrap_or(0);
     let mut resident_occupied = vec![Vec::new(); tile_count];
     for allocation in &parent.allocations {
-        if allocation.kind != AllocationKind::Home
-            || allocation.live_from != 0
-            || allocation.live_until != usize::MAX
-        {
+        if allocation.kind != AllocationKind::Home || allocation.live_until != usize::MAX {
             continue;
         }
         let start = allocation.address.max(arena_base);
@@ -7805,7 +7785,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_profile_measures_peak_owned_storage_per_tile() {
+    fn memory_profile_classifies_retained_storage_as_resident() {
         let schedule = Schedule {
             layouts: Vec::new(),
             phases: (0..6)
@@ -7860,8 +7840,12 @@ mod tests {
         let peaks = memory
             .transient_peak_bytes_by_tile(&schedule, 1..5)
             .unwrap();
+        let resident = memory
+            .permanent_bytes_by_tile(&schedule, 0..schedule.allocations.len())
+            .unwrap();
 
-        assert_eq!(peaks, vec![200, 64]);
+        assert_eq!(peaks, vec![80, 64]);
+        assert_eq!(resident, vec![220, 0]);
     }
 
     #[test]
