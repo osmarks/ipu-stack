@@ -62,6 +62,8 @@ struct HostCall {
   inputs @3 :List(HostSlice);
   outputs @4 :List(HostSlice);
   invocations @5 :UInt32 = 1;
+  inputBatchEnds @6 :List(UInt32);
+  outputBatchEnds @7 :List(UInt32);
 }
 
 struct HostExchange {

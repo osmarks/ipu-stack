@@ -154,6 +154,23 @@ fn distinct_sources_can_write_disjoint_host_ranges() {
 }
 
 #[test]
+fn all_tiles_transfer_staged_pages_in_parallel() {
+    let _device = device();
+    let tiles = (0..1472)
+        .map(|tile| tile.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    require_success(
+        "all-tile parallel staged H2D and D2H",
+        host_test(&[
+            ("IPU_HOST_TEST_TILES", &tiles),
+            ("IPU_HOST_TEST_BYTES", "4096"),
+            ("IPU_HOST_TEST_ADDRESS", "0x60000"),
+        ]),
+    );
+}
+
+#[test]
 fn host_routes_cover_every_endpoint_field() {
     let _device = device();
     let topology = ipu_exchange::Topology::c600();

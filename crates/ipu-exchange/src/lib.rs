@@ -350,17 +350,29 @@ pub fn assemble_host_xreq_program(
     target_physical_tile: u16,
     packet_address: u32,
 ) -> Result<TileToHostProgram, ExchangeError> {
-    validate_host_tile(target_physical_tile)?;
+    assemble_host_xreq_program_for_targets(&[target_physical_tile], packet_address)
+}
+
+pub fn assemble_host_xreq_program_for_targets(
+    target_physical_tiles: &[u16],
+    packet_address: u32,
+) -> Result<TileToHostProgram, ExchangeError> {
+    if target_physical_tiles.is_empty() {
+        return Err(ExchangeError::HostPacket);
+    }
     if packet_address & 7 != 0 {
         return Err(ExchangeError::HostPacket);
     }
-    let bitmap_index =
-        u32::from(target_physical_tile / 64) * 2 + u32::from((target_physical_tile >> 1) & 1);
     let mut bitmap = [0u32; 2];
-    if bitmap_index < XREQ_BITMAP0_BITS {
-        bitmap[0] = 1 << bitmap_index;
-    } else {
-        bitmap[1] = 1 << (bitmap_index - XREQ_BITMAP0_BITS);
+    for &target_physical_tile in target_physical_tiles {
+        validate_host_tile(target_physical_tile)?;
+        let bitmap_index =
+            u32::from(target_physical_tile / 64) * 2 + u32::from((target_physical_tile >> 1) & 1);
+        if bitmap_index < XREQ_BITMAP0_BITS {
+            bitmap[0] |= 1 << bitmap_index;
+        } else {
+            bitmap[1] |= 1 << (bitmap_index - XREQ_BITMAP0_BITS);
+        }
     }
     Ok(TileToHostProgram {
         instructions: vec![
@@ -1709,6 +1721,31 @@ mod tests {
         for (physical_tile, mux) in [(116, 0x634), (582, 0x604), (1173, 0x615)] {
             assert_eq!(host_mux_for_tile(physical_tile).unwrap(), mux);
         }
+    }
+
+    #[test]
+    fn host_xreq_combines_target_endpoint_bits() {
+        let targets = [31, 81, 768, 1471];
+        let combined = assemble_host_xreq_program_for_targets(&targets, 0x50120).unwrap();
+        let expected = targets
+            .into_iter()
+            .map(|target| {
+                assemble_host_xreq_program(target, 0x50120)
+                    .unwrap()
+                    .packet_words
+            })
+            .fold([0u32; 2], |mut bitmap, words| {
+                bitmap[0] |= words[0];
+                bitmap[1] |= words[1];
+                bitmap
+            });
+        assert_eq!(combined.packet_words, expected);
+        assert_eq!(
+            combined.instructions,
+            assemble_host_xreq_program(31, 0x50120)
+                .unwrap()
+                .instructions
+        );
     }
 
     #[test]

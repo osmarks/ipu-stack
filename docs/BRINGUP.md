@@ -145,10 +145,14 @@ target selects bit `2 * (target / 64) + ((target >> 1) & 1)`, with bits 0-23
 in word 0 and bits 24-45 in word 1. Extracted SDK vectors for physical tiles
 31, 81, 260, and 785 verify the row, pair, and word-boundary fields.
 
-Transfers are split at 4-KiB attached-page boundaries. H2D destinations outside
-the packet field's 16-KiB tile window use an automatically allocated staging
-range and a generated target-tile copy. A 64-KiB round trip at `0x60000` passes
-on hardware; D2H reads directly from that high address.
+Transfers are split at 4-KiB HexOPT translation boundaries. Static host phases
+contain at most one pending transfer per target tile. XREQ owners combine the
+endpoint bits for every target they activate in that phase, so independent
+tiles transfer concurrently from disjoint slots in one rolling host
+attachment. H2D destinations outside the packet field's 16-KiB tile window use
+an automatically allocated staging range and a generated target-tile copy.
+Parallel all-tile 4-KiB round trips pass both direct and staged paths; D2H reads
+directly from high SRAM.
 
 TDI reports both inactive and WAEX as context state zero. Architectural
 exceptions are only classified when exception metadata is nonzero; attempting

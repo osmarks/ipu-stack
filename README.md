@@ -108,17 +108,19 @@ the final wrapping result on the host. A 64-KiB round trip at tile address
 exchange window and copied to ordinary SRAM, while D2H sends directly from the
 high address.
 
-Host transfers are split at the recovered short/long packet limits and 4 KiB
-attachment boundaries. The runtime allocates one attached buffer per page,
-places the command page after the data pages, and derives one self-contained
-call's HSP phase count from its generated operations. Multi-page layouts and
-packet boundaries pass direct hardware acceptance.
+Host packets are split at the recovered short/long limits and 4 KiB HexOPT
+translation boundaries. A rolling data attachment gives each participating
+physical tile a stable 4 KiB slot. Static lowering groups one pending transfer
+per tile into a phase, ORs all endpoint bits owned by each XREQ tile, and runs
+those independent H2D or D2H operations concurrently. Per-tile order is
+preserved when a tensor needs several phases.
 
-Large sparse host schedules do not duplicate one follower call per 4 KiB page
-on every tile. The packager emits the tile's specialized active transfers and
-compresses consecutive inactive phases into calls to a static counted loop.
-For the 2048 GEMM this keeps the largest generated tile program below 13 KiB
-despite 12,288 host attachment phases.
+All 1,472 tiles pass exact parallel 4 KiB round trips both in the directly
+packet-addressable window and through generated high-SRAM staging copies. A
+453,752,832-byte resident upload uses 76 payload batches and completes in about
+116 ms on the attached C600; D2H sampling verifies a word from every uploaded
+4 KiB chunk. The former one-transfer-per-phase layout needed 230,940 HSP
+rendezvous phases and about 36.3 seconds for the comparable model weights.
 
 Host binding sizes and D2H source addresses must be word aligned. Direct H2D
 destinations must be 32-byte aligned; aligned destinations outside the directly

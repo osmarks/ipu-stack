@@ -1542,6 +1542,8 @@ fn parse_host_manifest(text: &str) -> Result<HostExchange> {
                 invocations: 1,
                 inputs: Vec::new(),
                 outputs: Vec::new(),
+                input_batch_ends: Vec::new(),
+                output_batch_ends: Vec::new(),
             }),
             [
                 direction @ ("input" | "output"),

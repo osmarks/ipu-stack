@@ -1279,22 +1279,28 @@ impl<'a> HostSession<'a> {
             phases = call.phases,
             "invoking streaming host exchange call"
         );
+        let input_batches = host_batch_ranges(&call.input_batch_ends, call.inputs.len());
+        let output_batches = host_batch_ranges(&call.output_batch_ends, call.outputs.len());
         for phase in 0..call.phases {
             self.device
                 .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
             if phase & 1 == 0 {
-                let transfer = usize::try_from(phase / 2).unwrap();
-                if let Some(slice) = call.inputs.get(transfer) {
-                    copy_input_slice(&mut self.storage, &self.pages, slice, input)?;
+                let batch = usize::try_from(phase / 2).unwrap();
+                if let Some(range) = input_batches.get(batch) {
+                    for slice in &call.inputs[range.clone()] {
+                        copy_input_slice(&mut self.storage, &self.pages, slice, input)?;
+                    }
                 } else {
-                    let output = transfer - call.inputs.len();
+                    let output = batch - input_batches.len();
                     if output != 0 {
-                        capture_output_slice(
-                            &mut self.storage,
-                            &self.pages,
-                            &call.outputs[output - 1],
-                            self.streamed_output.as_mut().unwrap(),
-                        )?;
+                        for slice in &call.outputs[output_batches[output - 1].clone()] {
+                            capture_output_slice(
+                                &mut self.storage,
+                                &self.pages,
+                                slice,
+                                self.streamed_output.as_mut().unwrap(),
+                            )?;
+                        }
                     }
                 }
                 fence(Ordering::SeqCst);
@@ -1407,6 +1413,21 @@ fn host_call_reuses_storage(call: &HostCall) -> bool {
         ranges.push((slice.page, slice.page_offset, end));
         overlaps
     })
+}
+
+fn host_batch_ranges(ends: &[u32], slices: usize) -> Vec<std::ops::Range<usize>> {
+    if ends.is_empty() {
+        return (0..slices).map(|index| index..index + 1).collect();
+    }
+    let mut start = 0usize;
+    ends.iter()
+        .map(|&end| {
+            let end = end as usize;
+            let range = start..end;
+            start = end;
+            range
+        })
+        .collect()
 }
 
 impl Drop for HostSession<'_> {
@@ -1607,11 +1628,19 @@ mod tests {
             invocations: 1,
             inputs: vec![host_slice(1, 0, 4096), host_slice(2, 0, 4096)],
             outputs: vec![host_slice(1, 4096, 4)],
+            input_batch_ends: Vec::new(),
+            output_batch_ends: Vec::new(),
         };
         assert!(!host_call_reuses_storage(&call));
 
         call.inputs[1].page = 1;
         assert!(host_call_reuses_storage(&call));
+    }
+
+    #[test]
+    fn host_batch_ranges_support_parallel_and_legacy_calls() {
+        assert_eq!(host_batch_ranges(&[2, 5], 5), vec![0..2, 2..5]);
+        assert_eq!(host_batch_ranges(&[], 3), vec![0..1, 1..2, 2..3]);
     }
 
     #[test]

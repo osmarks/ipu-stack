@@ -27,9 +27,12 @@ in synchronization required by the phase; they are not modeled as forwarding
 tiles. Multiple transfers in one phase are placed on one static event timeline.
 
 Host operations are lowered to straight-line calls before and after graph
-phases. Each payload phase contains generated XREQ/target code and synchronization
-followers; host-page layout and HSP phase counts remain whole-device metadata in
-`.ipuexe`. There is no all-tile command broadcast or device dispatch loop.
+phases. Each payload phase can contain one transfer per target tile. XREQ
+owners send an aggregate endpoint bitmap, target tiles use disjoint rolling
+host-buffer slots, and inactive tiles execute synchronization followers.
+Host-page layout, slice-batch boundaries, and HSP phase counts remain
+whole-device metadata in `.ipuexe`. There is no all-tile command broadcast or
+device dispatch loop.
 
 The linker resolves calls from generated tile programs to kernel ELF symbols.
 Kernel artifacts stay reusable and independent of the final tile and device

@@ -64,10 +64,20 @@ struct StaticHostTransfer {
     copy_destination: Option<u32>,
 }
 
+#[derive(Clone, Debug)]
+struct StaticHostPhase {
+    transfers: Vec<StaticHostTransfer>,
+}
+
+struct PendingHostTransfer {
+    transfer: StaticHostTransfer,
+    file_offset: u64,
+}
+
 struct StaticHostLayout {
-    weights: Vec<StaticHostTransfer>,
-    inputs: Vec<StaticHostTransfer>,
-    outputs: Vec<StaticHostTransfer>,
+    weights: Vec<StaticHostPhase>,
+    inputs: Vec<StaticHostPhase>,
+    outputs: Vec<StaticHostPhase>,
     staging_address: u32,
     protocol: HostExchange,
 }
@@ -4896,26 +4906,28 @@ fn package_graph_impl_attempt(
         }
     }
     let host = build_static_host_layout(&graph, invocations)?;
-    let host_transfers = host
+    let host_phases = host
         .weights
         .iter()
         .chain(&host.inputs)
         .chain(&host.outputs)
-        .copied()
+        .cloned()
         .collect::<Vec<_>>();
-    for (index, transfer) in host_transfers.iter().enumerate() {
-        let hierarchy = ipu_exchange::host_hierarchy(transfer.physical_tile)?;
-        debug!(
-            index,
-            direction = ?transfer.direction,
-            physical_tile = transfer.physical_tile,
-            xreq_physical_tile = hierarchy.xreq_physical_tile,
-            tile_address = format_args!("0x{:x}", transfer.tile_address),
-            host_offset = format_args!("0x{:x}", transfer.host_offset),
-            bytes = transfer.bytes,
-            copy_destination = transfer.copy_destination.map(|address| format!("0x{address:x}")),
-            "planned static host transfer"
-        );
+    for (phase_index, phase) in host_phases.iter().enumerate() {
+        for transfer in &phase.transfers {
+            let hierarchy = ipu_exchange::host_hierarchy(transfer.physical_tile)?;
+            debug!(
+                phase_index,
+                direction = ?transfer.direction,
+                physical_tile = transfer.physical_tile,
+                xreq_physical_tile = hierarchy.xreq_physical_tile,
+                tile_address = format_args!("0x{:x}", transfer.tile_address),
+                host_offset = format_args!("0x{:x}", transfer.host_offset),
+                bytes = transfer.bytes,
+                copy_destination = transfer.copy_destination.map(|address| format!("0x{address:x}")),
+                "planned static host transfer"
+            );
+        }
     }
     let mut tile_host_plans = programs
         .par_iter()
@@ -4927,19 +4939,19 @@ fn package_graph_impl_attempt(
             let mut executable_objects = vec![follower_address..follower_address + 3 * 4];
             let ordinary_data_objects = Vec::new();
             let mut data_objects = Vec::new();
-            let mut cursor = if host_transfers.is_empty() {
+            let mut cursor = if host_phases.is_empty() {
                 plan_end
             } else {
                 follower_address + 3 * 4
             };
-            let mut addresses = Vec::with_capacity(host_transfers.len());
-            let mut packet_copies = Vec::with_capacity(host_transfers.len());
+            let mut addresses = Vec::with_capacity(host_phases.len());
+            let mut packet_copies = Vec::with_capacity(host_phases.len());
             let mut instruction_addresses = HashMap::<Vec<u32>, u32>::new();
             let mut packet_addresses = HashMap::<Vec<u32>, u32>::new();
-            for &transfer in &host_transfers {
-                if host_phase_is_active(physical, &transfer) {
+            for phase in &host_phases {
+                if host_phase_is_active(physical, phase) {
                     let (instructions, packet_words) =
-                        host_phase_instructions(physical, transfer, HOST_PACKET_ADDRESS)?;
+                        host_phase_instructions(physical, phase, HOST_PACKET_ADDRESS)?;
                     let packet_words = packet_words.ok_or("active host phase has no packet")?;
                     let address = if let Some(&address) = instruction_addresses.get(&instructions) {
                         address
@@ -4971,10 +4983,7 @@ fn package_graph_impl_attempt(
                         source
                     };
                     let words = u32::try_from(packet_words.len())?;
-                    let hierarchy = ipu_exchange::host_hierarchy(transfer.physical_tile)?;
-                    let destination = if physical == transfer.physical_tile
-                        && hierarchy.xreq_physical_tile != transfer.physical_tile
-                    {
+                    let destination = if host_phase_xreq_targets(physical, phase)?.is_empty() {
                         HOST_PACKET_ADDRESS + 8
                     } else {
                         HOST_PACKET_ADDRESS
@@ -4989,31 +4998,31 @@ fn package_graph_impl_attempt(
                     packet_copies.push(None);
                 }
             }
-            let mut run_tables = vec![None; host_transfers.len()];
+            let mut run_tables = vec![None; host_phases.len()];
             let mut run_table_addresses = HashMap::<Vec<u32>, u32>::new();
             let weight_end = host.weights.len();
             let input_end = weight_end + host.inputs.len();
             for range in [
                 0..weight_end,
                 weight_end..input_end,
-                input_end..host_transfers.len(),
+                input_end..host_phases.len(),
             ] {
                 let mut index = range.start;
                 while index < range.end {
-                    if !host_phase_is_active(physical, &host_transfers[index]) {
+                    if !host_phase_is_active(physical, &host_phases[index]) {
                         index += 1;
                         continue;
                     }
                     let start = index;
                     while index < range.end
-                        && host_phase_is_active(physical, &host_transfers[index])
+                        && host_phase_is_active(physical, &host_phases[index])
                         && addresses[index] == addresses[start]
                     {
                         index += 1;
                     }
                     let descriptors = host_run_descriptor_words(
                         physical,
-                        &host_transfers[start..index],
+                        &host_phases[start..index],
                         &packet_copies[start..index],
                     )?;
                     let address = if let Some(&address) = run_table_addresses.get(&descriptors) {
@@ -6475,7 +6484,7 @@ fn package_graph_impl_attempt(
         write_static_host_plans(
             physical as u16,
             StaticHostPacketLayout {
-                transfers: &host_transfers,
+                phases: &host_phases,
                 plan_addresses: &host_plans.addresses,
                 packet_copies: &host_plans.packet_copies,
                 run_tables: &host_plans.run_tables,
@@ -6731,54 +6740,54 @@ fn build_static_host_layout(graph: &ExecutableGraph, invocations: u32) -> Result
     let mut weight_file_cursor = 0u64;
     let mut input_file_cursor = 0u64;
     let mut output_file_cursor = 0u64;
-    let mut weights = Vec::new();
-    let mut inputs = Vec::new();
-    let mut outputs = Vec::new();
-    let mut calls = Vec::new();
-    append_host_bindings(
+    let pending_weights = collect_host_bindings(
         &graph.host_weights,
         HostDirection::ToTile,
         &mut weight_file_cursor,
-        &mut weights,
-        &mut calls,
     )?;
-    append_host_bindings(
+    let pending_inputs = collect_host_bindings(
         &graph.host_inputs,
         HostDirection::ToTile,
         &mut input_file_cursor,
-        &mut inputs,
-        &mut calls,
     )?;
-    append_host_bindings(
+    let pending_outputs = collect_host_bindings(
         &graph.host_outputs,
         HostDirection::ToHost,
         &mut output_file_cursor,
-        &mut outputs,
-        &mut calls,
     )?;
+    let participating_tiles = pending_weights
+        .iter()
+        .chain(&pending_inputs)
+        .chain(&pending_outputs)
+        .map(|pending| pending.transfer.physical_tile)
+        .collect::<BTreeSet<_>>();
+    let host_slots = participating_tiles
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(slot, tile)| Ok((tile, u32::try_from(slot)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let (mut weights, weight_inputs, weight_input_batch_ends) =
+        batch_host_transfers(pending_weights, &host_slots)?;
+    let (mut inputs, call_inputs, input_batch_ends) =
+        batch_host_transfers(pending_inputs, &host_slots)?;
+    let (outputs, call_outputs, output_batch_ends) =
+        batch_host_transfers(pending_outputs, &host_slots)?;
     let host_to_tile_limit =
         ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES;
     let staging_bytes = weights
         .iter()
         .chain(&inputs)
-        .filter(|transfer| {
-            transfer
-                .tile_address
-                .checked_add(transfer.bytes)
-                .is_none_or(|end| end > host_to_tile_limit)
-        })
+        .flat_map(|phase| &phase.transfers)
+        .filter(|transfer| host_transfer_needs_staging(transfer, host_to_tile_limit))
         .map(|transfer| transfer.bytes)
         .max()
         .unwrap_or(0);
     let staging_tiles = weights
         .iter()
         .chain(&inputs)
-        .filter(|transfer| {
-            transfer
-                .tile_address
-                .checked_add(transfer.bytes)
-                .is_none_or(|end| end > host_to_tile_limit)
-        })
+        .flat_map(|phase| &phase.transfers)
+        .filter(|transfer| host_transfer_needs_staging(transfer, host_to_tile_limit))
         .map(|transfer| transfer.physical_tile)
         .collect::<BTreeSet<_>>();
     let staging_range = if staging_bytes == 0 {
@@ -6788,53 +6797,52 @@ fn build_static_host_layout(graph: &ExecutableGraph, invocations: u32) -> Result
             allocate_low_runtime_range(&graph.schedule, staging_bytes, &staging_tiles, &[])?;
         Some((address, address + staging_bytes))
     };
-    for transfer in weights.iter_mut().chain(&mut inputs) {
-        if transfer
-            .tile_address
-            .checked_add(transfer.bytes)
-            .is_none_or(|end| end > host_to_tile_limit)
-        {
-            let destination = transfer.tile_address;
-            transfer.tile_address = staging_range.ok_or("missing host staging allocation")?.0;
-            transfer.copy_destination = Some(destination);
+    for phase in weights.iter_mut().chain(&mut inputs) {
+        for transfer in &mut phase.transfers {
+            if host_transfer_needs_staging(transfer, host_to_tile_limit) {
+                let destination = transfer.tile_address;
+                transfer.tile_address = staging_range.ok_or("missing host staging allocation")?.0;
+                transfer.copy_destination = Some(destination);
+            }
+            ipu_exchange::plan_host_to_tile(
+                transfer.physical_tile,
+                transfer.tile_address,
+                transfer.host_offset,
+                transfer.bytes,
+            )?;
         }
-        ipu_exchange::plan_host_to_tile(
+    }
+    for transfer in outputs.iter().flat_map(|phase| &phase.transfers) {
+        ipu_exchange::plan_tile_to_host(
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
             transfer.bytes,
         )?;
     }
-    let weight_transfer_count = weights.len();
-    let input_transfer_count = inputs.len();
-    let weight_inputs = calls[..weight_transfer_count]
-        .iter()
-        .flat_map(|call| call.inputs.iter().cloned())
-        .collect();
-    let call_inputs = calls[weight_transfer_count..weight_transfer_count + input_transfer_count]
-        .iter()
-        .flat_map(|call| call.inputs.iter().cloned())
-        .collect();
-    let call_outputs = calls[weight_transfer_count + input_transfer_count..]
-        .iter()
-        .flat_map(|call| call.outputs.iter().cloned())
-        .collect();
-    let graph_transfers = u32::try_from(inputs.len() + outputs.len())?;
+    let graph_batches = u32::try_from(inputs.len() + outputs.len())?;
+    let weight_transfer_count = host_transfer_count(&weights);
+    let input_transfer_count = host_transfer_count(&inputs);
+    let output_transfer_count = host_transfer_count(&outputs);
     info!(
-        weight_transfers = weights.len(),
-        input_transfers = inputs.len(),
-        output_transfers = outputs.len(),
+        weight_transfers = weight_transfer_count,
+        weight_batches = weights.len(),
+        input_transfers = input_transfer_count,
+        input_batches = inputs.len(),
+        output_transfers = output_transfer_count,
+        output_batches = outputs.len(),
+        host_buffer_bytes = host_slots.len() * ipu_exchange::HOST_PAGE_BYTES as usize,
         staging_bytes,
         "planned static host-transfer layout"
     );
     let graph_phases = if invocations == 1 {
-        host_transfer_phase_count(graph_transfers)?
+        host_transfer_phase_count(graph_batches)?
     } else {
-        graph_transfers
+        graph_batches
             .checked_mul(2)
             .ok_or("host graph phase count overflow")?
     };
-    calls = Vec::new();
+    let mut calls = Vec::new();
     if !weights.is_empty() {
         calls.push(HostCall {
             name: "initialize".into(),
@@ -6845,6 +6853,8 @@ fn build_static_host_layout(graph: &ExecutableGraph, invocations: u32) -> Result
                 .ok_or("host initialization phase count overflow")?,
             inputs: weight_inputs,
             outputs: Vec::new(),
+            input_batch_ends: weight_input_batch_ends,
+            output_batch_ends: Vec::new(),
         });
     }
     calls.push(HostCall {
@@ -6854,6 +6864,8 @@ fn build_static_host_layout(graph: &ExecutableGraph, invocations: u32) -> Result
         phases: graph_phases,
         inputs: call_inputs,
         outputs: call_outputs,
+        input_batch_ends,
+        output_batch_ends,
     });
 
     let command_page = 0;
@@ -6867,13 +6879,18 @@ fn build_static_host_layout(graph: &ExecutableGraph, invocations: u32) -> Result
             startup_mark: ipu_driver::HOST_EXCHANGE_HANDOFF_MARK,
             command_page,
             command_offset: 0,
-            pages: [command_page, data_page]
-                .into_iter()
-                .map(|index| HostPage {
-                    index,
+            pages: vec![
+                HostPage {
+                    index: command_page,
                     size: u64::from(ipu_exchange::HOST_PAGE_BYTES),
-                })
-                .collect(),
+                },
+                HostPage {
+                    index: data_page,
+                    size: u64::try_from(host_slots.len().max(1))?
+                        .checked_mul(u64::from(ipu_exchange::HOST_PAGE_BYTES))
+                        .ok_or("host data buffer size overflow")?,
+                },
+            ],
             attach_order: vec![command_page, data_page],
             calls,
         },
@@ -6892,13 +6909,12 @@ fn host_transfer_phase_count(transfers: u32) -> Result<u32> {
         .ok_or_else(|| "host phase count overflow".into())
 }
 
-fn append_host_bindings(
+fn collect_host_bindings(
     bindings: &[Binding],
     direction: HostDirection,
     file_cursor: &mut u64,
-    transfers: &mut Vec<StaticHostTransfer>,
-    calls: &mut Vec<HostCall>,
-) -> Result<()> {
+) -> Result<Vec<PendingHostTransfer>> {
+    let mut transfers = Vec::new();
     for binding in bindings {
         let binding_file_base = *file_cursor;
         for slice in &binding.slices {
@@ -6906,42 +6922,17 @@ fn append_host_bindings(
             let mut file_offset = binding_file_base + slice.file_offset;
             let mut remaining = u32::try_from(slice.size)?;
             while remaining != 0 {
-                let host_offset = HOST_DATA_START;
                 let bytes = remaining.min(ipu_exchange::HOST_PAGE_BYTES);
-                let transfer = StaticHostTransfer {
-                    direction,
-                    physical_tile: u16::try_from(slice.tile)?,
-                    tile_address,
-                    host_offset,
-                    bytes,
-                    copy_destination: None,
-                };
-                if matches!(direction, HostDirection::ToHost) {
-                    ipu_exchange::plan_tile_to_host(
-                        transfer.physical_tile,
-                        transfer.tile_address,
-                        transfer.host_offset,
-                        transfer.bytes,
-                    )?;
-                }
-                let mut host_slices = Vec::new();
-                append_host_slices(&mut host_slices, host_offset, file_offset, u64::from(bytes))?;
-                let index = transfers.len();
-                transfers.push(transfer);
-                calls.push(HostCall {
-                    name: match direction {
-                        HostDirection::ToTile => format!("host-input-{index}"),
-                        HostDirection::ToHost => format!("host-output-{index}"),
+                transfers.push(PendingHostTransfer {
+                    transfer: StaticHostTransfer {
+                        direction,
+                        physical_tile: u16::try_from(slice.tile)?,
+                        tile_address,
+                        host_offset: 0,
+                        bytes,
+                        copy_destination: None,
                     },
-                    command: 0,
-                    phases: 0,
-                    invocations: 1,
-                    inputs: matches!(direction, HostDirection::ToTile)
-                        .then_some(host_slices.clone())
-                        .unwrap_or_default(),
-                    outputs: matches!(direction, HostDirection::ToHost)
-                        .then_some(host_slices)
-                        .unwrap_or_default(),
+                    file_offset,
                 });
                 tile_address = tile_address
                     .checked_add(bytes)
@@ -6957,34 +6948,61 @@ fn append_host_bindings(
             .checked_add(size)
             .ok_or("host binding file range overflow")?;
     }
-    Ok(())
+    Ok(transfers)
 }
 
-fn append_host_slices(
-    slices: &mut Vec<HostSlice>,
-    mut host_offset: u32,
-    mut file_offset: u64,
-    mut size: u64,
-) -> Result<()> {
-    while size != 0 {
-        let page = host_offset / ipu_exchange::HOST_PAGE_BYTES;
-        let page_offset = host_offset % ipu_exchange::HOST_PAGE_BYTES;
-        let count = size.min(u64::from(ipu_exchange::HOST_PAGE_BYTES - page_offset));
-        slices.push(HostSlice {
-            page,
-            page_offset: u64::from(page_offset),
-            file_offset,
-            size: count,
-        });
-        host_offset = host_offset
-            .checked_add(u32::try_from(count)?)
-            .ok_or("host page offset overflow")?;
-        file_offset = file_offset
-            .checked_add(count)
-            .ok_or("host file offset overflow")?;
-        size -= count;
+fn batch_host_transfers(
+    pending: Vec<PendingHostTransfer>,
+    slots: &BTreeMap<u16, u32>,
+) -> Result<(Vec<StaticHostPhase>, Vec<HostSlice>, Vec<u32>)> {
+    let mut queues = BTreeMap::<u16, std::collections::VecDeque<_>>::new();
+    for transfer in pending {
+        queues
+            .entry(transfer.transfer.physical_tile)
+            .or_default()
+            .push_back(transfer);
     }
-    Ok(())
+    let mut phases = Vec::new();
+    let mut slices = Vec::new();
+    let mut batch_ends = Vec::new();
+    while queues.values().any(|queue| !queue.is_empty()) {
+        let mut transfers = Vec::new();
+        for (&physical_tile, queue) in &mut queues {
+            let Some(mut pending) = queue.pop_front() else {
+                continue;
+            };
+            let slot = *slots
+                .get(&physical_tile)
+                .ok_or("host transfer tile has no buffer slot")?;
+            let page_offset = slot
+                .checked_mul(ipu_exchange::HOST_PAGE_BYTES)
+                .ok_or("host buffer slot offset overflow")?;
+            pending.transfer.host_offset = HOST_DATA_START
+                .checked_add(page_offset)
+                .ok_or("host packet offset overflow")?;
+            slices.push(HostSlice {
+                page: 1,
+                page_offset: u64::from(page_offset),
+                file_offset: pending.file_offset,
+                size: u64::from(pending.transfer.bytes),
+            });
+            transfers.push(pending.transfer);
+        }
+        phases.push(StaticHostPhase { transfers });
+        batch_ends.push(u32::try_from(slices.len())?);
+    }
+    Ok((phases, slices, batch_ends))
+}
+
+fn host_transfer_needs_staging(transfer: &StaticHostTransfer, limit: u32) -> bool {
+    transfer
+        .tile_address
+        .checked_add(transfer.bytes)
+        .is_none_or(|end| end > limit)
+}
+
+fn host_transfer_count(phases: &[StaticHostPhase]) -> usize {
+    phases.iter().map(|phase| phase.transfers.len()).sum()
 }
 
 fn binding_size(binding: &Binding) -> Result<u64> {
@@ -7020,27 +7038,48 @@ fn host_target_program(
     })
 }
 
-fn host_phase_is_active(physical_tile: u16, transfer: &StaticHostTransfer) -> bool {
-    ipu_exchange::host_hierarchy(transfer.physical_tile).is_ok_and(|hierarchy| {
-        physical_tile == transfer.physical_tile || physical_tile == hierarchy.xreq_physical_tile
-    })
+fn host_phase_target(physical_tile: u16, phase: &StaticHostPhase) -> Option<&StaticHostTransfer> {
+    phase
+        .transfers
+        .iter()
+        .find(|transfer| transfer.physical_tile == physical_tile)
+}
+
+fn host_phase_xreq_targets(physical_tile: u16, phase: &StaticHostPhase) -> Result<Vec<u16>> {
+    phase
+        .transfers
+        .iter()
+        .filter_map(|transfer| {
+            let target = transfer.physical_tile;
+            match ipu_exchange::host_hierarchy(target) {
+                Ok(hierarchy) if hierarchy.xreq_physical_tile == physical_tile => Some(Ok(target)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error.into())),
+            }
+        })
+        .collect()
+}
+
+fn host_phase_is_active(physical_tile: u16, phase: &StaticHostPhase) -> bool {
+    host_phase_target(physical_tile, phase).is_some()
+        || host_phase_xreq_targets(physical_tile, phase).is_ok_and(|targets| !targets.is_empty())
 }
 
 fn host_phase_calls(
     plans: &TileHostPlans,
     physical_tile: u16,
     offset: usize,
-    transfers: &[StaticHostTransfer],
+    phases: &[StaticHostPhase],
 ) -> Vec<static_codegen::HostPhaseCall> {
-    plans.addresses[offset..offset + transfers.len()]
+    plans.addresses[offset..offset + phases.len()]
         .iter()
         .copied()
-        .zip(&plans.run_tables[offset..offset + transfers.len()])
-        .zip(transfers)
+        .zip(&plans.run_tables[offset..offset + phases.len()])
+        .zip(phases)
         .map(
-            |((address, &run_table), transfer)| static_codegen::HostPhaseCall {
+            |((address, &run_table), phase)| static_codegen::HostPhaseCall {
                 address,
-                active: host_phase_is_active(physical_tile, transfer),
+                active: host_phase_is_active(physical_tile, phase),
                 run_table,
             },
         )
@@ -7049,50 +7088,53 @@ fn host_phase_calls(
 
 fn host_phase_instructions(
     physical_tile: u16,
-    transfer: StaticHostTransfer,
+    phase: &StaticHostPhase,
     packet_address: u32,
 ) -> Result<(Vec<u32>, Option<Vec<u32>>)> {
-    let target = host_target_program(transfer, packet_address + 8)?;
-    let hierarchy = ipu_exchange::host_hierarchy(transfer.physical_tile)?;
-    if hierarchy.xreq_physical_tile == transfer.physical_tile
-        && physical_tile == transfer.physical_tile
-    {
-        let mut packets = vec![1, 0];
-        packets.extend_from_slice(&target.packet_words);
-        Ok((
-            ipu_exchange::wrap_combined_host_operation(
-                transfer.physical_tile,
-                &target.instructions,
-                packet_address,
-            )?,
-            Some(packets),
-        ))
-    } else if physical_tile == hierarchy.xreq_physical_tile {
-        let xreq =
-            ipu_exchange::assemble_host_xreq_program(transfer.physical_tile, packet_address)?;
-        Ok((
+    let target = host_phase_target(physical_tile, phase)
+        .copied()
+        .map(|transfer| host_target_program(transfer, packet_address + 8))
+        .transpose()?;
+    let xreq_targets = host_phase_xreq_targets(physical_tile, phase)?;
+    let xreq = (!xreq_targets.is_empty())
+        .then(|| {
+            ipu_exchange::assemble_host_xreq_program_for_targets(&xreq_targets, packet_address)
+        })
+        .transpose()?;
+    match (target, xreq) {
+        (Some(target), Some(xreq)) => {
+            let mut packets = xreq.packet_words;
+            packets.extend_from_slice(&target.packet_words);
+            Ok((
+                ipu_exchange::wrap_combined_host_operation(
+                    physical_tile,
+                    &target.instructions,
+                    packet_address,
+                )?,
+                Some(packets),
+            ))
+        }
+        (None, Some(xreq)) => Ok((
             ipu_exchange::wrap_host_xreq_operation(physical_tile, &xreq.instructions)?,
             Some(xreq.packet_words),
-        ))
-    } else if physical_tile == transfer.physical_tile {
-        Ok((
+        )),
+        (Some(target), None) => Ok((
             ipu_exchange::wrap_host_target_operation(physical_tile, &target.instructions)?,
             Some(target.packet_words),
-        ))
-    } else {
-        Ok((
+        )),
+        (None, None) => Ok((
             vec![
                 ipu_exchange::sans(1),
                 ipu_exchange::SYNC_ANS_INSTRUCTION,
                 ipu_exchange::RETURN_M10_INSTRUCTION,
             ],
             None,
-        ))
+        )),
     }
 }
 
 struct StaticHostPacketLayout<'a> {
-    transfers: &'a [StaticHostTransfer],
+    phases: &'a [StaticHostPhase],
     plan_addresses: &'a [u32],
     packet_copies: &'a [Option<HostPacketCopy>],
     run_tables: &'a [Option<u32>],
@@ -7100,22 +7142,23 @@ struct StaticHostPacketLayout<'a> {
 
 fn host_run_descriptor_words(
     physical_tile: u16,
-    transfers: &[StaticHostTransfer],
+    phases: &[StaticHostPhase],
     packet_copies: &[Option<HostPacketCopy>],
 ) -> Result<Vec<u32>> {
-    if transfers.len() != packet_copies.len() {
-        return Err("host run transfer and packet counts differ".into());
+    if phases.len() != packet_copies.len() {
+        return Err("host run phase and packet counts differ".into());
     }
-    let mut descriptors = Vec::with_capacity(transfers.len() * HOST_RUN_DESCRIPTOR_WORDS as usize);
-    for (&transfer, &packet) in transfers.iter().zip(packet_copies) {
-        if !host_phase_is_active(physical_tile, &transfer) {
-            return Err("inactive transfer included in a static host run".into());
+    let mut descriptors = Vec::with_capacity(phases.len() * HOST_RUN_DESCRIPTOR_WORDS as usize);
+    for (phase, &packet) in phases.iter().zip(packet_copies) {
+        if !host_phase_is_active(physical_tile, phase) {
+            return Err("inactive phase included in a static host run".into());
         }
-        let copy = (transfer.physical_tile == physical_tile)
-            .then_some(transfer.copy_destination)
-            .flatten();
+        let target = host_phase_target(physical_tile, phase);
+        let copy = target.and_then(|transfer| transfer.copy_destination);
         let packet = packet.ok_or("active host run has no packet copy")?;
-        let copy_words = copy.map_or(0, |_| transfer.bytes / 4);
+        let copy_words = target
+            .filter(|transfer| transfer.copy_destination.is_some())
+            .map_or(0, |transfer| transfer.bytes / 4);
         if copy_words >= 1 << 23 || packet.words >= 1 << 8 {
             return Err("host descriptor copy count exceeds packed field".into());
         }
@@ -7139,21 +7182,21 @@ fn write_static_host_plans(
     regions: &mut [(u32, Vec<u8>)],
 ) -> Result<()> {
     let StaticHostPacketLayout {
-        transfers,
+        phases,
         plan_addresses,
         packet_copies,
         run_tables,
     } = layout;
     let mut follower_written = false;
-    for ((transfer, &plan_address), &packet_copy) in
-        transfers.iter().zip(plan_addresses).zip(packet_copies)
+    for ((phase, &plan_address), &packet_copy) in
+        phases.iter().zip(plan_addresses).zip(packet_copies)
     {
-        let active = host_phase_is_active(physical_tile, transfer);
+        let active = host_phase_is_active(physical_tile, phase);
         if !active && follower_written {
             continue;
         }
         let (instructions, packet_words) =
-            host_phase_instructions(physical_tile, *transfer, HOST_PACKET_ADDRESS)?;
+            host_phase_instructions(physical_tile, phase, HOST_PACKET_ADDRESS)?;
         let instruction_bytes = words_to_bytes(&instructions);
         write_sparse_region_bytes(regions, plan_address, &instruction_bytes)?;
         if let Some(packet_words) = packet_words {
@@ -7171,15 +7214,15 @@ fn write_static_host_plans(
             continue;
         };
         let mut index = start;
-        while index < transfers.len()
+        while index < phases.len()
             && (index == start || run_tables[index].is_none())
-            && host_phase_is_active(physical_tile, &transfers[index])
+            && host_phase_is_active(physical_tile, &phases[index])
         {
             index += 1;
         }
         let descriptors = host_run_descriptor_words(
             physical_tile,
-            &transfers[start..index],
+            &phases[start..index],
             &packet_copies[start..index],
         )?;
         if let Some(previous) = written_tables.insert(table_address, descriptors.clone()) {
@@ -9809,6 +9852,55 @@ mod tests {
             assert_eq!(phases.div_ceil(2), transfers);
             assert_eq!(phases % 2, 1);
         }
+    }
+
+    #[test]
+    fn host_transfer_batches_preserve_per_tile_order() {
+        let pending = [
+            (5, 0x51000, 0),
+            (2, 0x52000, 4),
+            (5, 0x53000, 8),
+            (9, 0x54000, 12),
+        ]
+        .into_iter()
+        .map(
+            |(physical_tile, tile_address, file_offset)| PendingHostTransfer {
+                transfer: StaticHostTransfer {
+                    direction: HostDirection::ToTile,
+                    physical_tile,
+                    tile_address,
+                    host_offset: 0,
+                    bytes: 4,
+                    copy_destination: None,
+                },
+                file_offset,
+            },
+        )
+        .collect();
+        let slots = BTreeMap::from([(2, 0), (5, 1), (9, 2)]);
+        let (phases, slices, ends) = batch_host_transfers(pending, &slots).unwrap();
+
+        assert_eq!(ends, [3, 4]);
+        assert_eq!(
+            phases[0]
+                .transfers
+                .iter()
+                .map(|transfer| transfer.physical_tile)
+                .collect::<Vec<_>>(),
+            [2, 5, 9]
+        );
+        assert_eq!(phases[1].transfers[0].physical_tile, 5);
+        assert_eq!(phases[0].transfers[1].tile_address, 0x51000);
+        assert_eq!(phases[1].transfers[0].tile_address, 0x53000);
+        assert_eq!(
+            slices
+                .iter()
+                .take(3)
+                .map(|slice| slice.page_offset)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3
+        );
     }
 
     #[test]

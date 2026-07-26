@@ -13,8 +13,11 @@ a matching SDK schedule capture at load time.
 
 Bindings map a logical tensor byte range to one or more `(tile, address)` SRAM
 ranges. Host calls map input and output ranges onto driver-attached pages and
-specify the number of HSP phases. This keeps offline application packaging
-separate from the Linux transport used to load or invoke it.
+specify the number of HSP phases. Their optional input and output batch
+boundaries group slices transferred concurrently during one device/host
+rendezvous; absent boundaries preserve the legacy one-slice-per-rendezvous
+interpretation. This keeps offline application packaging separate from the
+Linux transport used to load or invoke it.
 
 The command graph is not serialized into tile SRAM. Executable lowering resolves
 tensor IDs through SRAM allocations, emits final exchange rows, chooses

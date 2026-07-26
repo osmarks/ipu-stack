@@ -75,6 +75,7 @@ fn main() {
         })
         .ok();
     let d2h_only = std::env::var_os("IPU_HOST_TEST_D2H_ONLY").is_some();
+    let upload_only = std::env::var_os("IPU_HOST_TEST_UPLOAD_ONLY").is_some();
     let initialized_exchange = std::env::var_os("IPU_HOST_TEST_INITIALIZED_EXCHANGE").is_some();
     let compute_relay = std::env::var_os("IPU_HOST_TEST_COMPUTE_RELAY").is_some();
     assert!(output_count != 0, "IPU_HOST_TEST_OUTPUTS must be nonzero");
@@ -132,7 +133,11 @@ fn main() {
         (graph, Vec::new(), payload)
     } else if let Some(host_tiles) = host_tiles {
         let graph = multi_tile_host_graph(transfer_bytes, &host_tiles).unwrap();
-        (graph, payload.clone(), payload)
+        if upload_only {
+            (graph, payload, Vec::new())
+        } else {
+            (graph, payload.clone(), payload)
+        }
     } else {
         let graph = host_exchange_graph(
             transfer_bytes,
@@ -146,6 +151,15 @@ fn main() {
     };
     if let Some(address) = host_test_address() {
         relocate_direct_host_graph(&mut graph, address);
+    }
+    if upload_only {
+        assert!(
+            std::env::var_os("IPU_HOST_TEST_RESIDENT_INPUT").is_some(),
+            "upload-only mode requires a resident input"
+        );
+        let (samples, sample_binding) = resident_upload_samples(&graph.host_inputs, &input);
+        expected = samples;
+        graph.host_outputs = vec![sample_binding];
     }
     if std::env::var_os("IPU_HOST_TEST_RESIDENT_INPUT").is_some() {
         graph.host_weights.append(&mut graph.host_inputs);
@@ -421,19 +435,36 @@ fn relocate_direct_host_graph(graph: &mut ExecutableGraph, address: u32) {
         graph.schedule.phases.is_empty(),
         "IPU_HOST_TEST_ADDRESS requires a direct host graph"
     );
-    assert_eq!(
-        graph.schedule.allocations.len(),
-        1,
-        "IPU_HOST_TEST_ADDRESS requires one allocation"
-    );
-    let old_address = graph.schedule.allocations[0].address;
-    graph.schedule.allocations[0].address = address;
+    let topology = ipu_exchange::Topology::c600();
+    let old_ranges = graph
+        .schedule
+        .allocations
+        .iter()
+        .map(|allocation| {
+            (
+                topology.physical(allocation.tile).unwrap(),
+                allocation.address,
+                allocation.address + allocation.size,
+            )
+        })
+        .collect::<Vec<_>>();
+    for allocation in graph.schedule.allocations.iter_mut() {
+        allocation.address = address;
+    }
     for slice in graph
         .host_inputs
         .iter_mut()
         .chain(&mut graph.host_outputs)
         .flat_map(|binding| &mut binding.slices)
     {
+        let (_, old_address, _) = old_ranges
+            .iter()
+            .find(|&&(physical_tile, start, end)| {
+                u32::from(physical_tile) == slice.tile
+                    && slice.tile_address >= start
+                    && slice.tile_address < end
+            })
+            .expect("host slice must refer to a direct graph allocation");
         slice.tile_address = address + (slice.tile_address - old_address);
     }
 }
@@ -443,6 +474,45 @@ fn host_test_address() -> Option<u32> {
         u32::from_str_radix(address.trim_start_matches("0x"), 16)
             .expect("IPU_HOST_TEST_ADDRESS must be hexadecimal")
     })
+}
+
+fn resident_upload_samples(inputs: &[Binding], bytes: &[u8]) -> (Vec<u8>, Binding) {
+    let mut samples = Vec::new();
+    let mut slices = Vec::new();
+    let mut binding_base = 0u64;
+    for binding in inputs {
+        for slice in &binding.slices {
+            let mut offset = 0u64;
+            while offset < slice.size {
+                let source = usize::try_from(binding_base + slice.file_offset + offset).unwrap();
+                let size = usize::try_from((slice.size - offset).min(4)).unwrap();
+                let file_offset = samples.len() as u64;
+                samples.extend_from_slice(&bytes[source..source + size]);
+                slices.push(RegionSlice {
+                    tile: slice.tile,
+                    tile_address: slice.tile_address + u32::try_from(offset).unwrap(),
+                    file_offset,
+                    size: size as u64,
+                });
+                offset += u64::from(ipu_exchange::HOST_PAGE_BYTES);
+            }
+        }
+        binding_base += binding
+            .slices
+            .iter()
+            .map(|slice| slice.file_offset + slice.size)
+            .max()
+            .unwrap_or(0);
+    }
+    (
+        samples,
+        Binding {
+            name: "upload-samples".into(),
+            dtype: "u32".into(),
+            shape: vec![u32::try_from(slices.len()).unwrap()],
+            slices,
+        },
+    )
 }
 
 fn assert_transfer_eq(actual: &[u8], expected: &[u8]) {
@@ -530,9 +600,14 @@ fn multi_tile_host_graph(
         "IPU_HOST_TEST_TILES must not contain duplicates"
     );
     let topology = ipu_exchange::Topology::c600();
+    let requested_address = host_test_address();
     let constraint = MemoryConstraint {
-        base: ipu_exchange::EXCHANGE_WINDOW_BASE,
-        limit: ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES,
+        base: requested_address.unwrap_or(ipu_exchange::EXCHANGE_WINDOW_BASE),
+        limit: requested_address
+            .and_then(|address| address.checked_add(transfer_bytes))
+            .unwrap_or(
+                ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::HOST_TO_TILE_WINDOW_BYTES,
+            ),
         alignment: 32,
         placement: MemoryPlacement::High,
     };

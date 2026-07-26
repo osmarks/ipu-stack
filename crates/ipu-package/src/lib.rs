@@ -323,6 +323,12 @@ pub struct HostCall {
     pub inputs: Vec<HostSlice>,
     pub outputs: Vec<HostSlice>,
     pub invocations: u32,
+    /// Exclusive slice indices for each rolling-buffer input batch.
+    /// Empty metadata denotes the legacy one-slice-per-batch layout.
+    pub input_batch_ends: Vec<u32>,
+    /// Exclusive slice indices for each rolling-buffer output batch.
+    /// Empty metadata denotes the legacy one-slice-per-batch layout.
+    pub output_batch_ends: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -608,6 +614,8 @@ impl Application {
                     call.name
                 )));
             }
+            validate_host_batch_ends(call, "input", &call.input_batch_ends, call.inputs.len())?;
+            validate_host_batch_ends(call, "output", &call.output_batch_ends, call.outputs.len())?;
             for slice in call.inputs.iter().chain(&call.outputs) {
                 let Some(page_size) = pages.get(&slice.page) else {
                     return Err(PackageError::Invalid(format!(
@@ -882,6 +890,15 @@ impl Application {
                     hash.update(slice.size.to_le_bytes());
                 }
             }
+            if !call.input_batch_ends.is_empty() || !call.output_batch_ends.is_empty() {
+                hash.update(b"host-batches");
+                for ends in [&call.input_batch_ends, &call.output_batch_ends] {
+                    hash_len(&mut hash, ends.len());
+                    for end in ends {
+                        hash.update(end.to_le_bytes());
+                    }
+                }
+            }
         }
         hash_len(&mut hash, self.entry_points.len());
         for entry in &self.entry_points {
@@ -908,6 +925,36 @@ fn hash_string(hash: &mut Sha256, value: &str) {
 
 fn hash_len(hash: &mut Sha256, length: usize) {
     hash.update((length as u64).to_le_bytes());
+}
+
+fn validate_host_batch_ends(
+    call: &HostCall,
+    direction: &str,
+    ends: &[u32],
+    slice_count: usize,
+) -> Result<(), PackageError> {
+    if ends.is_empty() {
+        return Ok(());
+    }
+    let mut previous = 0usize;
+    for &end in ends {
+        let end = usize::try_from(end)
+            .map_err(|_| PackageError::Invalid("host batch index exceeds usize".into()))?;
+        if end <= previous || end > slice_count {
+            return Err(PackageError::Invalid(format!(
+                "host call {} has invalid {direction} batch boundary {end}",
+                call.name
+            )));
+        }
+        previous = end;
+    }
+    if previous != slice_count {
+        return Err(PackageError::Invalid(format!(
+            "host call {} {direction} batches cover {previous} of {slice_count} slices",
+            call.name
+        )));
+    }
+    Ok(())
 }
 
 fn legacy_u32(bytes: &[u8], offset: usize) -> Result<u32, PackageError> {
@@ -1067,6 +1114,18 @@ fn write_host_exchange(
         item.set_command(call.command);
         item.set_phases(call.phases);
         item.set_invocations(call.invocations);
+        let mut input_batch_ends = item
+            .reborrow()
+            .init_input_batch_ends(call.input_batch_ends.len() as u32);
+        for (index, end) in call.input_batch_ends.iter().enumerate() {
+            input_batch_ends.set(index as u32, *end);
+        }
+        let mut output_batch_ends = item
+            .reborrow()
+            .init_output_batch_ends(call.output_batch_ends.len() as u32);
+        for (index, end) in call.output_batch_ends.iter().enumerate() {
+            output_batch_ends.set(index as u32, *end);
+        }
         write_host_slices(
             item.reborrow().init_inputs(call.inputs.len() as u32),
             &call.inputs,
@@ -1118,6 +1177,8 @@ fn read_host_exchange(
                     invocations: call.get_invocations(),
                     inputs: read_host_slices(call.get_inputs()?),
                     outputs: read_host_slices(call.get_outputs()?),
+                    input_batch_ends: call.get_input_batch_ends()?.iter().collect(),
+                    output_batch_ends: call.get_output_batch_ends()?.iter().collect(),
                 })
             })
             .collect::<Result<_, PackageError>>()?,
@@ -1170,6 +1231,50 @@ mod tests {
             offset: 0x4018,
             value: 0xc000_000d,
         });
+        app.host_exchange = HostExchange {
+            startup_mark: 1,
+            command_page: 0,
+            command_offset: 0,
+            pages: vec![
+                HostPage {
+                    index: 0,
+                    size: 4096,
+                },
+                HostPage {
+                    index: 1,
+                    size: 8192,
+                },
+            ],
+            attach_order: vec![0, 1],
+            calls: vec![HostCall {
+                name: "batched".into(),
+                command: 2,
+                phases: 4,
+                inputs: vec![
+                    HostSlice {
+                        page: 1,
+                        page_offset: 0,
+                        file_offset: 0,
+                        size: 16,
+                    },
+                    HostSlice {
+                        page: 1,
+                        page_offset: 4096,
+                        file_offset: 16,
+                        size: 16,
+                    },
+                ],
+                outputs: vec![HostSlice {
+                    page: 1,
+                    page_offset: 0,
+                    file_offset: 0,
+                    size: 32,
+                }],
+                invocations: 1,
+                input_batch_ends: vec![2],
+                output_batch_ends: vec![1],
+            }],
+        };
         let mut encoded = Vec::new();
         app.write(&mut encoded).unwrap();
         let decoded = Application::read(encoded.as_slice()).unwrap();
