@@ -1513,6 +1513,7 @@ fn allocate_from_sorted_ranges(
     size: u32,
     arenas: &[ipu_compiler::MemoryArena],
     alignment: u32,
+    best_fit: bool,
 ) -> Option<u32> {
     let allowed_start =
         |gap_start: u32, gap_end: u32, placement: ipu_compiler::MemoryPlacement| match placement {
@@ -1552,7 +1553,20 @@ fn allocate_from_sorted_ranges(
                 }
             }
         };
-    for arena in arenas {
+    let mut best = None::<((u32, usize, u32), u32)>;
+    let mut consider =
+        |arena_index: usize, gap_start: u32, gap_end: u32, candidate: u32| -> Option<u32> {
+            if !best_fit {
+                return Some(candidate);
+            }
+            let waste = gap_end.saturating_sub(gap_start).saturating_sub(size);
+            let score = (waste, arena_index, candidate);
+            if best.as_ref().is_none_or(|(current, _)| score < *current) {
+                best = Some((score, candidate));
+            }
+            None
+        };
+    for (arena_index, arena) in arenas.iter().enumerate() {
         match arena.placement {
             ipu_compiler::MemoryPlacement::Low => {
                 let mut cursor = align_up(arena.base, alignment);
@@ -1573,7 +1587,9 @@ fn allocate_from_sorted_ranges(
                     if end <= cursor || start >= arena.limit {
                         continue;
                     }
-                    if let Some(candidate) = allowed_start(cursor, start, arena.placement) {
+                    if let Some(candidate) = allowed_start(cursor, start, arena.placement)
+                        && let Some(candidate) = consider(arena_index, cursor, start, candidate)
+                    {
                         return Some(candidate);
                     }
                     cursor = align_up(cursor.max(end), alignment);
@@ -1581,7 +1597,9 @@ fn allocate_from_sorted_ranges(
                         break;
                     }
                 }
-                if let Some(candidate) = allowed_start(cursor, arena.limit, arena.placement) {
+                if let Some(candidate) = allowed_start(cursor, arena.limit, arena.placement)
+                    && let Some(candidate) = consider(arena_index, cursor, arena.limit, candidate)
+                {
                     return Some(candidate);
                 }
             }
@@ -1605,7 +1623,9 @@ fn allocate_from_sorted_ranges(
                     if start >= cursor || end <= arena.base {
                         continue;
                     }
-                    if let Some(candidate) = allowed_start(end, cursor, arena.placement) {
+                    if let Some(candidate) = allowed_start(end, cursor, arena.placement)
+                        && let Some(candidate) = consider(arena_index, end, cursor, candidate)
+                    {
                         return Some(candidate);
                     }
                     cursor = cursor.min(start);
@@ -1613,13 +1633,15 @@ fn allocate_from_sorted_ranges(
                         break;
                     }
                 }
-                if let Some(candidate) = allowed_start(arena.base, cursor, arena.placement) {
+                if let Some(candidate) = allowed_start(arena.base, cursor, arena.placement)
+                    && let Some(candidate) = consider(arena_index, arena.base, cursor, candidate)
+                {
                     return Some(candidate);
                 }
             }
         }
     }
-    None
+    best.map(|(_, candidate)| candidate)
 }
 
 fn relocation_arenas_for_allocation(
@@ -2541,6 +2563,7 @@ fn compact_allocations_around(
                             access_extent,
                             &compatible_arenas,
                             32,
+                            move_resident,
                         )
                     });
                     if address.is_none()
@@ -7743,6 +7766,36 @@ const fn ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn offline_best_fit_packs_unequal_arenas_that_policy_order_strands() {
+        let arenas = [
+            ipu_compiler::MemoryArena::low(0x1000, 0x1100),
+            ipu_compiler::MemoryArena::low(0x2000, 0x20e0),
+        ];
+        let pack = |best_fit| {
+            let mut occupied = Vec::new();
+            let mut addresses = Vec::new();
+            for size in [0xe0, 0xa0, 0x60] {
+                let address = allocate_from_sorted_ranges(
+                    &occupied,
+                    &BTreeMap::new(),
+                    &[],
+                    size,
+                    &arenas,
+                    0x20,
+                    best_fit,
+                )?;
+                occupied.push((address, address + size));
+                occupied = merge_address_ranges(occupied);
+                addresses.push(address);
+            }
+            Some(addresses)
+        };
+
+        assert_eq!(pack(false), None);
+        assert_eq!(pack(true), Some(vec![0x2000, 0x1000, 0x10a0]));
+    }
 
     #[test]
     fn executable_requirements_are_monotone_across_relayouts() {
