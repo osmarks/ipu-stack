@@ -315,8 +315,22 @@ fn main() {
             )
         });
     let first_placement_probe = if first_repetitions > 1 {
-        refine_repeated_encoder_placement(&memory, first_repetitions, first_placement_probe)
-            .unwrap()
+        refine_repeated_encoder_placement(
+            &embedding,
+            &model,
+            batch_size,
+            rows,
+            columns,
+            row_block_dimension,
+            &memory,
+            first_precision,
+            tuning,
+            first_repetitions,
+            first_placement_probe,
+            full_model,
+            post_norm_only,
+        )
+        .unwrap()
     } else {
         first_placement_probe
     };
@@ -1890,11 +1904,65 @@ fn probe_repeated_encoder_placement(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refine_repeated_encoder_placement(
+    embedding: &PatchEmbeddingPlan,
+    model: &SiglipWeights,
+    batch_size: u16,
+    rows: u16,
+    columns: u16,
+    row_block_dimension: u16,
     memory: &MemoryPolicy,
+    precision: SiglipEncoderPrecision,
+    tuning: SiglipEncoderTuning,
     repetitions: usize,
     mut probe: RepeatedPlacementProbe,
+    include_suffix: bool,
+    post_norm_only: bool,
 ) -> ipu_runtime::Result<RepeatedPlacementProbe> {
+    let before = probe.template.rotation_signature();
+    let suffix_slack = memory.optimize_repeated_resident_placement(
+        &probe.template,
+        &probe.placement_schedule,
+        probe.allocation_start,
+        repetitions,
+        &probe.fixed_headroom,
+    )?;
+    probe.optimized_minimum_slack = suffix_slack.iter().copied().min().unwrap_or(0);
+    probe.optimized_overcommitted_tiles = suffix_slack.iter().filter(|&&slack| slack < 0).count();
+    if probe.template.rotation_signature() != before {
+        let (
+            support_schedule,
+            support_attentions,
+            support_template,
+            placement_schedule,
+            fixed_headroom,
+        ) = build_repeated_encoder_support_probe(
+            embedding,
+            model,
+            batch_size,
+            rows,
+            columns,
+            row_block_dimension,
+            memory,
+            precision,
+            tuning,
+            repetitions,
+            &probe.template,
+            include_suffix,
+            post_norm_only,
+        )?;
+        probe.support_schedule = support_schedule;
+        probe.support_attentions = support_attentions;
+        probe.support_template = support_template;
+        probe.placement_schedule = placement_schedule;
+        probe.fixed_headroom = fixed_headroom;
+    }
+    info!(
+        optimized_minimum_slack = probe.optimized_minimum_slack,
+        optimized_overcommitted_tiles = probe.optimized_overcommitted_tiles,
+        "optimized repeated placement against suffix memory pressure"
+    );
     let mut support_schedule = probe.support_schedule.clone();
     let support_attentions = probe.support_attentions.clone();
     let support_phase_count = support_schedule.phases.len();
