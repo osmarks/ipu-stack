@@ -1823,7 +1823,13 @@ fn select_eviction_window(
                 })
                 .map(|&(index, _, _)| index)
                 .collect::<Vec<_>>();
-            if blockers.is_empty() || blockers.iter().any(|blocker| protected.contains(blocker)) {
+            if blockers.is_empty()
+                || blockers.iter().any(|blocker| protected.contains(blocker))
+                || blockers.iter().any(|&blocker| {
+                    memory_constraints.access_extent(blocker, allocations[blocker].size)
+                        > allocation_extent
+                })
+            {
                 continue;
             }
             let bytes = blockers
@@ -2271,16 +2277,18 @@ enum OfflinePackingStrategy {
     TransientSizeFirst,
     ResidentSizeFirst,
     GlobalSizeFirst,
+    GlobalBestFit,
     TransientLifetimeFirst,
     TransientBestFit,
     ResidentBestFit,
 }
 
 impl OfflinePackingStrategy {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::TransientSizeFirst,
         Self::ResidentSizeFirst,
         Self::GlobalSizeFirst,
+        Self::GlobalBestFit,
         Self::TransientLifetimeFirst,
         Self::TransientBestFit,
         Self::ResidentBestFit,
@@ -2306,7 +2314,7 @@ impl OfflinePackingStrategy {
         let (class, time) = match self {
             Self::TransientSizeFirst | Self::TransientBestFit => (u8::from(resident), 0),
             Self::ResidentSizeFirst | Self::ResidentBestFit => (u8::from(!resident), 0),
-            Self::GlobalSizeFirst => (0, 0),
+            Self::GlobalSizeFirst | Self::GlobalBestFit => (0, 0),
             Self::TransientLifetimeFirst => (u8::from(resident), allocation.live_from),
         };
         (
@@ -2322,7 +2330,11 @@ impl OfflinePackingStrategy {
     }
 
     fn use_best_fit(self, resident: bool) -> bool {
-        resident || matches!(self, Self::TransientBestFit | Self::ResidentBestFit)
+        resident
+            || matches!(
+                self,
+                Self::GlobalBestFit | Self::TransientBestFit | Self::ResidentBestFit
+            )
     }
 }
 
@@ -2801,12 +2813,17 @@ fn compact_allocations_around(
                 Err(error) => failures.push((strategy, error.to_string())),
             }
             }
-            let (strategy, error) = failures
-                .pop()
-                .ok_or("offline SRAM coloring had no strategies")?;
+            if failures.is_empty() {
+                return Err("offline SRAM coloring had no strategies".into());
+            }
+            let diagnostics = failures
+                .iter()
+                .map(|(strategy, error)| format!("{strategy:?}: {error}"))
+                .collect::<Vec<_>>()
+                .join("\n");
             Err(format!(
-                "all {} offline SRAM coloring strategies failed; final strategy {strategy:?}: {error}",
-                OfflinePackingStrategy::ALL.len()
+                "all {} offline SRAM coloring strategies failed:\n{diagnostics}",
+                failures.len()
             )
             .into())
         })
