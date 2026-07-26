@@ -2258,25 +2258,23 @@ impl MemoryPolicy {
         let resident_feasible_offsets = (0..tile_count)
             .filter(|&offset| score(offset).0 <= capacity)
             .count();
-        let best_offset = if score(0).0 <= resident_packing_limit && score(0).1 <= capacity {
-            0
-        } else {
-            (0..tile_count)
-                .filter(|&offset| score(offset).0 <= resident_packing_limit)
-                .min_by_key(|&offset| {
-                    let (_, combined, squares) = score(offset);
-                    (combined, squares, offset)
-                })
-                .or_else(|| {
-                    (0..tile_count)
-                        .filter(|&offset| score(offset).0 <= capacity)
-                        .min_by_key(|&offset| {
-                            let (_, combined, squares) = score(offset);
-                            (combined, squares, offset)
-                        })
-                })
-                .unwrap_or_else(|| (0..tile_count).min_by_key(|&offset| score(offset)).unwrap())
+        let score_key = |offset| {
+            let (working, combined, squares) = score(offset);
+            (working, combined, squares, offset)
         };
+        let best_offset = (0..tile_count)
+            .filter(|&offset| score(offset).0 <= resident_packing_limit)
+            .min_by_key(|&offset| score_key(offset))
+            .or_else(|| {
+                (0..tile_count)
+                    .filter(|&offset| score(offset).0 <= capacity)
+                    .min_by_key(|&offset| score_key(offset))
+            })
+            .unwrap_or_else(|| {
+                (0..tile_count)
+                    .min_by_key(|&offset| score_key(offset))
+                    .unwrap()
+            });
         let (selected_resident_maximum, selected_combined_maximum, _) = score(best_offset);
         info!(
             target: "ipu_compiler::placement",
