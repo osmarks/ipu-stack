@@ -1224,6 +1224,11 @@ pub struct MemoryPolicy {
     /// tiles, or retains the child planner's tile assignment unchanged.
     #[serde(default)]
     pub resident_tile_assignment: ResidentTileAssignment,
+    /// Additional permanent bytes expected before subsequently planned
+    /// resident operations. Used when a repeated region is represented
+    /// structurally rather than materialized in the parent schedule.
+    #[serde(skip)]
+    projected_resident_bytes: Arc<[u64]>,
     #[serde(skip)]
     resident_placement_session: Option<ResidentPlacementSession>,
 }
@@ -1423,6 +1428,7 @@ impl MemoryPolicy {
             resident: vec![resident],
             transient: vec![transient],
             resident_tile_assignment: ResidentTileAssignment::Balanced,
+            projected_resident_bytes: Arc::from([]),
             resident_placement_session: None,
         }
     }
@@ -1459,6 +1465,7 @@ impl MemoryPolicy {
             resident: expand(resident_order, MemoryPlacement::High),
             transient: expand(transient_order, MemoryPlacement::Low),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
+            projected_resident_bytes: Arc::from([]),
             resident_placement_session: None,
         };
         policy.validate()?;
@@ -1477,6 +1484,25 @@ impl MemoryPolicy {
             return Err(CompileError::Memory("invalid tile-memory policy".into()));
         }
         Ok(())
+    }
+
+    pub fn with_projected_resident_bytes(&self, bytes_by_tile: &[u64]) -> Self {
+        let mut policy = self.clone();
+        policy.projected_resident_bytes = bytes_by_tile.into();
+        policy
+    }
+
+    pub fn resident_capacity_bytes(&self) -> u64 {
+        let mut intervals = self
+            .resident
+            .iter()
+            .map(|arena| (arena.base, arena.limit))
+            .collect::<Vec<_>>();
+        normalize_occupied_intervals(&mut intervals);
+        intervals
+            .into_iter()
+            .map(|(base, limit)| u64::from(limit - base))
+            .sum()
     }
 
     /// Returns a policy which records the balanced resident tile rotations
@@ -1702,6 +1728,52 @@ impl MemoryPolicy {
                 u64::try_from(peak).unwrap()
             })
             .collect())
+    }
+
+    /// Measures permanent home storage introduced by an allocation range.
+    pub fn permanent_bytes_by_tile(
+        &self,
+        schedule: &Schedule,
+        allocations: Range<usize>,
+    ) -> Result<Vec<u64>, CompileError> {
+        let selected = schedule
+            .allocations
+            .get(allocations.clone())
+            .ok_or_else(|| {
+                CompileError::Memory(format!(
+                    "invalid permanent-allocation range {}..{} for {} allocations",
+                    allocations.start,
+                    allocations.end,
+                    schedule.allocations.len()
+                ))
+            })?;
+        let mut arena_intervals = self
+            .resident
+            .iter()
+            .map(|arena| (arena.base, arena.limit))
+            .collect::<Vec<_>>();
+        normalize_occupied_intervals(&mut arena_intervals);
+        let mut bytes_by_tile = vec![0u64; usize::from(schedule.tile_count)];
+        for allocation in selected {
+            if allocation.kind != AllocationKind::Home
+                || allocation.live_from != 0
+                || allocation.live_until != usize::MAX
+            {
+                continue;
+            }
+            let end = allocation.address.saturating_add(allocation.size);
+            let bytes = arena_intervals
+                .iter()
+                .map(|&(base, limit)| {
+                    u64::from(end.min(limit).saturating_sub(allocation.address.max(base)))
+                })
+                .sum::<u64>();
+            bytes_by_tile[usize::from(allocation.tile)] = bytes_by_tile
+                [usize::from(allocation.tile)]
+            .checked_add(bytes)
+            .ok_or_else(|| CompileError::Memory("permanent per-tile byte count overflow".into()))?;
+        }
+        Ok(bytes_by_tile)
     }
 
     /// Computes allocatable bytes left after replicating one recorded block's
@@ -1990,6 +2062,165 @@ impl MemoryPolicy {
             .map(|load| {
                 i64::try_from(i128::from(capacity) - i128::from(load)).map_err(|_| {
                     CompileError::Memory("optimized repeated-placement slack exceeds i64".into())
+                })
+            })
+            .collect()
+    }
+
+    /// Rotates a complete repeated tile-role assignment together with measured
+    /// role-local storage pressure.
+    ///
+    /// Kernel images and static exchange state follow their compute roles. A
+    /// common rotation therefore preserves the internal placement chosen for a
+    /// repeated block while allowing the combined resident and executable load
+    /// to avoid fixed parent allocations and transient peaks.
+    pub fn optimize_repeated_resident_global_rotation(
+        &self,
+        template: &ResidentPlacementTemplate,
+        probe: &Schedule,
+        allocation_start: usize,
+        repetitions: usize,
+        fixed_headroom: &[u64],
+        role_headroom: &[u64],
+    ) -> Result<Vec<i64>, CompileError> {
+        let tile_count = usize::from(probe.tile_count);
+        if tile_count == 0
+            || allocation_start > probe.allocations.len()
+            || repetitions == 0
+            || fixed_headroom.len() != tile_count
+            || role_headroom.len() != tile_count
+        {
+            return Err(CompileError::Memory(
+                "invalid repeated resident global-rotation optimization".into(),
+            ));
+        }
+        let mut decisions = template.decisions.lock().unwrap().clone();
+        let mut owner_decisions = template.owner_decisions.lock().unwrap().clone();
+        if decisions.is_empty()
+            || decisions
+                .iter()
+                .any(|decision| decision.resident_bytes.len() != tile_count)
+        {
+            return Err(CompileError::Memory(
+                "global-rotation optimization has no complete placement decisions".into(),
+            ));
+        }
+        let mut arena_intervals = self
+            .resident
+            .iter()
+            .map(|arena| (arena.base, arena.limit))
+            .collect::<Vec<_>>();
+        normalize_occupied_intervals(&mut arena_intervals);
+        let capacity = arena_intervals
+            .iter()
+            .map(|&(base, limit)| u64::from(limit - base))
+            .sum::<u64>();
+        let allocation_bytes = |allocation: &Allocation| {
+            let end = allocation.address.saturating_add(allocation.size);
+            arena_intervals
+                .iter()
+                .map(|&(base, limit)| {
+                    u64::from(end.min(limit).saturating_sub(allocation.address.max(base)))
+                })
+                .sum::<u64>()
+        };
+        let rotated_bytes = |bytes: &[u64], rotation: u16, tile: usize| {
+            bytes[(tile + tile_count - usize::from(rotation)) % tile_count]
+        };
+        let mut fixed = fixed_headroom.to_vec();
+        let mut probed_resident = vec![0u64; tile_count];
+        for (index, allocation) in probe.allocations.iter().enumerate() {
+            if allocation.kind != AllocationKind::Home
+                || allocation.live_from != 0
+                || allocation.live_until != usize::MAX
+            {
+                continue;
+            }
+            let bytes = allocation_bytes(allocation);
+            if index < allocation_start {
+                fixed[usize::from(allocation.tile)] += bytes;
+            } else {
+                probed_resident[usize::from(allocation.tile)] += bytes;
+            }
+        }
+        let mut represented = vec![0u64; tile_count];
+        for decision in &decisions {
+            for (tile, represented) in represented.iter_mut().enumerate() {
+                *represented += rotated_bytes(&decision.resident_bytes, decision.rotation, tile);
+            }
+        }
+        for decision in &owner_decisions {
+            represented[usize::from(decision.tile)] += u64::from(decision.key.bytes);
+        }
+        let repetition_bytes = u64::try_from(repetitions).unwrap();
+        for tile in 0..tile_count {
+            let unrepresented = probed_resident[tile]
+                .checked_sub(represented[tile])
+                .ok_or_else(|| {
+                    CompileError::Memory(
+                        "recorded resident-placement bytes exceed probe resident storage".into(),
+                    )
+                })?;
+            fixed[tile] = fixed[tile]
+                .checked_add(unrepresented.checked_mul(repetition_bytes).ok_or_else(|| {
+                    CompileError::Memory(
+                        "repeated resident global-rotation byte count overflow".into(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    CompileError::Memory(
+                        "repeated resident global-rotation aggregate overflow".into(),
+                    )
+                })?;
+        }
+        let mut role_load = role_headroom.to_vec();
+        for decision in &decisions {
+            for (tile, load) in role_load.iter_mut().enumerate() {
+                *load += rotated_bytes(&decision.resident_bytes, decision.rotation, tile)
+                    * repetition_bytes;
+            }
+        }
+        for decision in &owner_decisions {
+            for instance in 0..repetitions {
+                let offset = instance * tile_count / repetitions;
+                let tile = (usize::from(decision.tile) + offset) % tile_count;
+                role_load[tile] += u64::from(decision.key.bytes);
+            }
+        }
+        let score = |offset: usize| {
+            let mut maximum = 0;
+            let mut squares = 0u128;
+            for (tile, &fixed) in fixed.iter().enumerate() {
+                let source = (tile + tile_count - offset) % tile_count;
+                let load = fixed + role_load[source];
+                maximum = maximum.max(load);
+                squares += u128::from(load) * u128::from(load);
+            }
+            (maximum, squares)
+        };
+        let best_offset = if score(0).0 <= capacity {
+            0
+        } else {
+            (0..tile_count).min_by_key(|&offset| score(offset)).unwrap()
+        };
+        for decision in &mut decisions {
+            decision.rotation =
+                u16::try_from((usize::from(decision.rotation) + best_offset) % tile_count).unwrap();
+        }
+        for decision in &mut owner_decisions {
+            decision.tile =
+                u16::try_from((usize::from(decision.tile) + best_offset) % tile_count).unwrap();
+        }
+        *template.decisions.lock().unwrap() = decisions;
+        *template.owner_decisions.lock().unwrap() = owner_decisions;
+        (0..tile_count)
+            .map(|tile| {
+                let source = (tile + tile_count - best_offset) % tile_count;
+                let load = fixed[tile] + role_load[source];
+                i64::try_from(i128::from(capacity) - i128::from(load)).map_err(|_| {
+                    CompileError::Memory(
+                        "globally rotated repeated-placement slack exceeds i64".into(),
+                    )
                 })
             })
             .collect()
@@ -2790,6 +3021,7 @@ pub fn append_blocked_gemm_f16_with_a16_input_in_arenas(
                 .collect(),
             transient: arenas.to_vec(),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
+            projected_resident_bytes: Arc::from([]),
             resident_placement_session: None,
         },
     )
@@ -3063,6 +3295,7 @@ pub fn append_blocked_gemm_f16_with_a16_blocks_in_arenas(
                 .collect(),
             transient: arenas.to_vec(),
             resident_tile_assignment: ResidentTileAssignment::Balanced,
+            projected_resident_bytes: Arc::from([]),
             resident_placement_session: None,
         },
     )
@@ -3661,6 +3894,8 @@ fn choose_resident_tile_rotation_with_projection(
     if tile_count == 0
         || projected_extra.len() != tile_count
         || transient_headroom.len() != tile_count
+        || (!memory.projected_resident_bytes.is_empty()
+            && memory.projected_resident_bytes.len() != tile_count)
         || child_instances == 0
     {
         return 0;
@@ -3732,6 +3967,11 @@ fn choose_resident_tile_rotation_with_projection(
                 .map(|tile| {
                     parent_bytes[tile]
                         + projected_extra[tile]
+                        + memory
+                            .projected_resident_bytes
+                            .get(tile)
+                            .copied()
+                            .unwrap_or(0)
                         + transient_headroom[tile]
                         + child_bytes[(tile + tile_count - rotation) % tile_count]
                             * u64::try_from(child_instances).unwrap()

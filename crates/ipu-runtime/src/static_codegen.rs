@@ -1652,6 +1652,7 @@ pub(crate) fn plan_exchange_compute_runs(
     plan_addresses: &[u32],
     mut cursor: u32,
     enabled: bool,
+    excluded_phases: &[Range<usize>],
 ) -> Result<(Vec<ExchangeComputeRun>, u32)> {
     if !enabled {
         return Ok((Vec::new(), cursor));
@@ -1669,24 +1670,35 @@ pub(crate) fn plan_exchange_compute_runs(
     let mut runs = Vec::new();
     let mut step_index = 0;
     while step_index + 3 < program.steps.len() {
-        let (LoweredTileStep::Exchange { .. }, LoweredTileStep::Compute(first)) =
-            (&program.steps[step_index], &program.steps[step_index + 1])
+        let (
+            LoweredTileStep::Exchange {
+                phase: first_phase, ..
+            },
+            LoweredTileStep::Compute(first),
+        ) = (&program.steps[step_index], &program.steps[step_index + 1])
         else {
             step_index += 1;
             continue;
         };
-        if !first.arguments.is_empty() || first.input_addresses.len() != 2 {
+        if excluded_phases
+            .iter()
+            .any(|range| range.contains(first_phase))
+            || !first.arguments.is_empty()
+            || first.input_addresses.len() != 2
+        {
             step_index += 1;
             continue;
         }
         let mut end = step_index + 2;
         while end + 1 < program.steps.len() {
-            let (LoweredTileStep::Exchange { .. }, LoweredTileStep::Compute(command)) =
+            let (LoweredTileStep::Exchange { phase, .. }, LoweredTileStep::Compute(command)) =
                 (&program.steps[end], &program.steps[end + 1])
             else {
                 break;
             };
-            if !same_compute_abi(first, command) {
+            if excluded_phases.iter().any(|range| range.contains(phase))
+                || !same_compute_abi(first, command)
+            {
                 break;
             }
             end += 2;
@@ -2084,27 +2096,60 @@ fn emit_static_template_exchange(
     Ok(())
 }
 
+#[derive(Default)]
+struct TemplateLoadBases {
+    primary_record: bool,
+    secondary_record: bool,
+    shared: bool,
+}
+
+impl TemplateLoadBases {
+    fn invalidate(&mut self, register: u8) {
+        match register {
+            1 => self.primary_record = false,
+            9 => self.secondary_record = false,
+            10 => self.shared = false,
+            _ => {}
+        }
+    }
+}
+
 fn emit_template_value(
     code: &mut TileCode,
     value: TemplateValue,
     register: u8,
     shared_address: u32,
     record_split: u16,
+    bases: &mut TemplateLoadBases,
 ) -> Result<()> {
     match value {
-        TemplateValue::Constant(value) => code.setzi(register, value),
+        TemplateValue::Constant(value) => {
+            code.setzi(register, value)?;
+            bases.invalidate(register);
+            Ok(())
+        }
         TemplateValue::Record(slot) => {
-            let (base, offset) = if slot < record_split {
-                (0, slot)
+            let (base_register, base_offset, value_offset, loaded) = if slot < record_split {
+                (1, 0, slot, &mut bases.primary_record)
             } else {
-                (1, slot - record_split)
+                (9, 1, slot - record_split, &mut bases.secondary_record)
             };
-            code.ld32(1, 11, 15, base)?;
-            code.ld32(register, 1, 15, offset)
+            if !*loaded {
+                code.ld32(base_register, 11, 15, base_offset)?;
+                *loaded = true;
+            }
+            code.ld32(register, base_register, 15, value_offset)?;
+            bases.invalidate(register);
+            Ok(())
         }
         TemplateValue::Shared(slot) => {
-            code.setzi(1, shared_address)?;
-            code.ld32(register, 1, 15, slot)
+            if !bases.shared {
+                code.setzi(10, shared_address)?;
+                bases.shared = true;
+            }
+            code.ld32(register, 10, 15, slot)?;
+            bases.invalidate(register);
+            Ok(())
         }
     }
 }
@@ -2120,12 +2165,14 @@ fn emit_template_cycle_sample(
         None | Some(TemplateValue::Constant(0)) => Ok(()),
         Some(TemplateValue::Constant(_)) => code.call(symbol(symbols, SAMPLE_CYCLE_NEXT)?, 10),
         Some(enabled) => {
+            let mut bases = TemplateLoadBases::default();
             emit_template_value(
                 code,
                 enabled,
                 0,
                 template.shared_address,
                 template.record_split,
+                &mut bases,
             )?;
             let skip = code.words.len();
             code.brz(0, 0)?;
@@ -2191,6 +2238,7 @@ fn emit_static_template_body(
                     profile_after_sync[step_index],
                     generated_addresses,
                 )?;
+                let mut bases = TemplateLoadBases::default();
                 if !plan_words.is_empty() {
                     emit_template_value(
                         code,
@@ -2198,6 +2246,7 @@ fn emit_static_template_body(
                         8,
                         template.shared_address,
                         template.record_split,
+                        &mut bases,
                     )?;
                     for &(word, value) in plan_words {
                         emit_template_value(
@@ -2206,6 +2255,7 @@ fn emit_static_template_body(
                             3,
                             template.shared_address,
                             template.record_split,
+                            &mut bases,
                         )?;
                         code.st32(3, 8, 15, word)?;
                     }
@@ -2217,6 +2267,7 @@ fn emit_static_template_body(
                         3,
                         template.shared_address,
                         template.record_split,
+                        &mut bases,
                     )?;
                     let skip_patch = code.words.len();
                     code.brz(3, 0)?;
@@ -2227,6 +2278,7 @@ fn emit_static_template_body(
                             8,
                             template.shared_address,
                             template.record_split,
+                            &mut bases,
                         )?;
                         code.st32(3, 8, 15, 0)?;
                     } else {
@@ -2236,6 +2288,7 @@ fn emit_static_template_body(
                             8,
                             template.shared_address,
                             template.record_split,
+                            &mut bases,
                         )?;
                         code.st32(3, 8, 15, sender_word_offset.unwrap())?;
                     }
@@ -2248,6 +2301,7 @@ fn emit_static_template_body(
                     8,
                     template.shared_address,
                     template.record_split,
+                    &mut bases,
                 )?;
                 emit_template_value(
                     code,
@@ -2255,6 +2309,7 @@ fn emit_static_template_body(
                     0,
                     template.shared_address,
                     template.record_split,
+                    &mut bases,
                 )?;
                 code.call(template_exchange, 9)?;
             }
@@ -2266,6 +2321,7 @@ fn emit_static_template_body(
                 kernel,
                 condition,
             } => {
+                let mut bases = TemplateLoadBases::default();
                 if let Some(condition) = condition {
                     emit_template_value(
                         code,
@@ -2273,6 +2329,7 @@ fn emit_static_template_body(
                         DYNAMIC_KERNEL_TARGET_REGISTER,
                         template.shared_address,
                         template.record_split,
+                        &mut bases,
                     )?;
                 }
                 for (operand, &value) in operands.iter().enumerate() {
@@ -2283,6 +2340,7 @@ fn emit_static_template_body(
                         register,
                         template.shared_address,
                         template.record_split,
+                        &mut bases,
                     )?;
                 }
                 let skip_call = if condition.is_some() {
@@ -2299,6 +2357,7 @@ fn emit_static_template_body(
                         0,
                         template.shared_address,
                         template.record_split,
+                        &mut bases,
                     )?;
                     let return_address =
                         generated_address(generated_addresses, code.words.len() + 2)?;
@@ -2585,6 +2644,53 @@ mod tests {
     }
 
     #[test]
+    fn template_values_reuse_call_local_base_registers() {
+        let mut code = TileCode::new();
+        let mut bases = TemplateLoadBases::default();
+
+        emit_template_value(
+            &mut code,
+            TemplateValue::Shared(2),
+            2,
+            0x60000,
+            4,
+            &mut bases,
+        )
+        .unwrap();
+        emit_template_value(
+            &mut code,
+            TemplateValue::Record(3),
+            3,
+            0x60000,
+            4,
+            &mut bases,
+        )
+        .unwrap();
+        emit_template_value(
+            &mut code,
+            TemplateValue::Record(1),
+            5,
+            0x60000,
+            4,
+            &mut bases,
+        )
+        .unwrap();
+        emit_template_value(
+            &mut code,
+            TemplateValue::Shared(5),
+            4,
+            0x60000,
+            4,
+            &mut bases,
+        )
+        .unwrap();
+
+        assert_eq!(code.words.len(), 6);
+        assert!(bases.primary_record);
+        assert!(bases.shared);
+    }
+
+    #[test]
     fn template_records_intern_repeated_instance_columns() {
         let mut records = TemplateRecords::new(3);
 
@@ -2862,7 +2968,7 @@ mod tests {
             ],
         };
         let plans = [0x52000, 0x52020, 0x52040];
-        let (runs, end) = plan_exchange_compute_runs(&program, &plans, 0x53002, true).unwrap();
+        let (runs, end) = plan_exchange_compute_runs(&program, &plans, 0x53002, true, &[]).unwrap();
 
         assert_eq!(runs.len(), 1);
         let run = &runs[0];
@@ -2898,6 +3004,7 @@ mod tests {
             &[0x52000, 0x52020, 0x52040, 0x52060],
             0x53000,
             true,
+            &[],
         )
         .unwrap();
 
@@ -2917,7 +3024,7 @@ mod tests {
             ],
         };
         let (runs, end) =
-            plan_exchange_compute_runs(&program, &[0x52000, 0x52020], 0x53000, false).unwrap();
+            plan_exchange_compute_runs(&program, &[0x52000, 0x52020], 0x53000, false, &[]).unwrap();
 
         assert!(runs.is_empty());
         assert_eq!(end, 0x53000);

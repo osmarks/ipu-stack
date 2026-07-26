@@ -1653,6 +1653,7 @@ pub fn append_affine_layer_norm_f16_in_arenas(
                 placement: MemoryPlacement::Low,
             }],
             resident_tile_assignment: crate::ResidentTileAssignment::Balanced,
+            projected_resident_bytes: Arc::from([]),
             resident_placement_session: None,
         },
     )
@@ -2137,6 +2138,7 @@ mod tests {
             resident: vec![MemoryArena::high(0xc0000, 0xe8000)],
             transient: vec![MemoryArena::low(0xb0000, 0xc0000)],
             resident_tile_assignment: crate::ResidentTileAssignment::Balanced,
+            projected_resident_bytes: Arc::from([]),
             resident_placement_session: None,
         };
 
@@ -2246,6 +2248,7 @@ mod tests {
             resident: vec![MemoryArena::low(0xc0000, 0xc0400)],
             transient: vec![MemoryArena::low(0xb0000, 0xb1000)],
             resident_tile_assignment: crate::ResidentTileAssignment::Balanced,
+            projected_resident_bytes: Arc::from([]),
             resident_placement_session: None,
         };
 

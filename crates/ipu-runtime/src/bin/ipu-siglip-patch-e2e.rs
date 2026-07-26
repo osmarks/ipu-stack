@@ -96,6 +96,12 @@ fn main() {
         .map(|value| value.parse::<usize>().unwrap())
         .unwrap_or(1);
     assert!((1..=config.num_hidden_layers).contains(&layer_count));
+    let full_model = std::env::var_os("IPU_SIGLIP_FULL_MODEL").is_some();
+    let post_norm_only = std::env::var_os("IPU_SIGLIP_POST_NORM_ONLY").is_some();
+    assert!(
+        !full_model || layer_count == config.num_hidden_layers,
+        "full-model execution requires every encoder layer"
+    );
     let weight_storage = match std::env::var("IPU_SIGLIP_WEIGHT_STORAGE").as_deref() {
         Ok("f16") => SiglipWeightStorage::F16,
         Ok("f143") | Err(_) => SiglipWeightStorage::F143,
@@ -238,6 +244,8 @@ fn main() {
                 *candidate_tuning,
                 first_repetitions,
                 &no_execution_headroom,
+                full_model,
+                post_norm_only,
             ) {
                 Ok(probe) => probe,
                 Err(error) => {
@@ -307,25 +315,7 @@ fn main() {
             )
         });
     let first_placement_probe = if first_repetitions > 1 {
-        let mut support_schedule = first_placement_probe.support_schedule.clone();
-        let support_attention = first_placement_probe.support_attention.clone();
-        let support_phase_count = support_schedule.phases.len();
-        specialize_gemm_row_operations(&mut support_schedule, 0..support_phase_count);
-        let support_variants = consolidate_attention_kernel_variants(
-            &mut support_schedule,
-            std::slice::from_ref(&support_attention),
-        );
-        let support_objects =
-            compile_objects(&support_schedule, &[support_attention], &support_variants).unwrap();
-        let execution_headroom =
-            estimate_static_reservation_by_tile(&support_schedule, &support_objects).unwrap();
-        info!(
-            minimum_bytes = execution_headroom.iter().copied().min().unwrap_or(0),
-            maximum_bytes = execution_headroom.iter().copied().max().unwrap_or(0),
-            mean_bytes = execution_headroom.iter().sum::<u64>() / u64::from(TILE_COUNT),
-            "measured representative per-tile static runtime pressure"
-        );
-        probe_repeated_encoder_placement(
+        refine_repeated_encoder_placement(
             &embedding,
             &model,
             batch_size,
@@ -336,7 +326,9 @@ fn main() {
             first_precision,
             tuning,
             first_repetitions,
-            &execution_headroom,
+            first_placement_probe,
+            full_model,
+            post_norm_only,
         )
         .unwrap()
     } else {
@@ -629,12 +621,6 @@ fn main() {
     let attention = last_layer.attention;
     let diagnostics = last_layer.diagnostics;
     let intermediate_columns = u16::try_from(config.intermediate_size.div_ceil(64) * 64).unwrap();
-    let full_model = std::env::var_os("IPU_SIGLIP_FULL_MODEL").is_some();
-    let post_norm_only = std::env::var_os("IPU_SIGLIP_POST_NORM_ONLY").is_some();
-    assert!(
-        !full_model || layer_count == config.num_hidden_layers,
-        "full-model execution requires every encoder layer"
-    );
     let (
         output,
         output_rows,
@@ -1774,8 +1760,12 @@ struct PatchEmbeddingPlan {
 
 struct RepeatedPlacementProbe {
     template: ResidentPlacementTemplate,
+    placement_schedule: ipu_compiler::Schedule,
+    allocation_start: usize,
+    fixed_headroom: Vec<u64>,
     support_schedule: ipu_compiler::Schedule,
-    support_attention: FlashAttentionPlan,
+    support_attentions: Vec<FlashAttentionPlan>,
+    support_template: StaticTemplateRegion,
     maximum_transient_headroom: u64,
     mean_transient_headroom: u64,
     initial_minimum_slack: i64,
@@ -1797,6 +1787,8 @@ fn probe_repeated_encoder_placement(
     tuning: SiglipEncoderTuning,
     repetitions: usize,
     execution_headroom: &[u64],
+    include_suffix: bool,
+    post_norm_only: bool,
 ) -> ipu_runtime::Result<RepeatedPlacementProbe> {
     if execution_headroom.len() != usize::from(TILE_COUNT) {
         return Err("support-image headroom does not cover every tile".into());
@@ -1816,7 +1808,7 @@ fn probe_repeated_encoder_placement(
         } else {
             memory.replay_resident_placement(&template)?
         };
-        let appended = append_siglip_encoder_layer_batched_with_precision(
+        append_siglip_encoder_layer_batched_with_precision(
             &mut schedule,
             &embedding.row_shards,
             model,
@@ -1867,8 +1859,32 @@ fn probe_repeated_encoder_placement(
             optimized_slack.iter().filter(|&&slack| slack < 0).count();
         let after = template.rotation_signature();
         if after == before || !seen_rotations.insert(after) {
+            let (
+                support_schedule,
+                support_attentions,
+                support_template,
+                placement_schedule,
+                fixed_headroom,
+            ) = build_repeated_encoder_support_probe(
+                embedding,
+                model,
+                batch_size,
+                rows,
+                columns,
+                row_block_dimension,
+                memory,
+                precision,
+                tuning,
+                repetitions,
+                &template,
+                include_suffix,
+                post_norm_only,
+            )?;
             return Ok(RepeatedPlacementProbe {
                 template,
+                placement_schedule,
+                allocation_start,
+                fixed_headroom,
                 maximum_transient_headroom: transient_headroom.iter().copied().max().unwrap_or(0),
                 mean_transient_headroom: transient_headroom.iter().sum::<u64>()
                     / u64::from(schedule.tile_count),
@@ -1876,12 +1892,273 @@ fn probe_repeated_encoder_placement(
                 initial_overcommitted_tiles,
                 optimized_minimum_slack,
                 optimized_overcommitted_tiles,
-                support_schedule: schedule,
-                support_attention: appended.attention,
+                support_schedule,
+                support_attentions,
+                support_template,
             });
         }
         record = false;
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refine_repeated_encoder_placement(
+    embedding: &PatchEmbeddingPlan,
+    model: &SiglipWeights,
+    batch_size: u16,
+    rows: u16,
+    columns: u16,
+    row_block_dimension: u16,
+    memory: &MemoryPolicy,
+    precision: SiglipEncoderPrecision,
+    tuning: SiglipEncoderTuning,
+    repetitions: usize,
+    mut probe: RepeatedPlacementProbe,
+    include_suffix: bool,
+    post_norm_only: bool,
+) -> ipu_runtime::Result<RepeatedPlacementProbe> {
+    let mut seen_placements = BTreeSet::new();
+    seen_placements.insert(probe.template.rotation_signature());
+    loop {
+        let mut support_schedule = probe.support_schedule.clone();
+        let support_attentions = probe.support_attentions.clone();
+        let support_phase_count = support_schedule.phases.len();
+        specialize_gemm_row_operations(&mut support_schedule, 0..support_phase_count);
+        let support_variants =
+            consolidate_attention_kernel_variants(&mut support_schedule, &support_attentions);
+        let support_objects =
+            compile_objects(&support_schedule, &support_attentions, &support_variants)?;
+        let execution_headroom = estimate_static_reservation_by_tile(
+            &support_schedule,
+            &support_objects,
+            memory,
+            std::slice::from_ref(&probe.support_template),
+        )?;
+        info!(
+            minimum_bytes = execution_headroom.iter().copied().min().unwrap_or(0),
+            maximum_bytes = execution_headroom.iter().copied().max().unwrap_or(0),
+            mean_bytes = execution_headroom.iter().sum::<u64>() / u64::from(TILE_COUNT),
+            optimized_minimum_slack = probe.optimized_minimum_slack,
+            optimized_overcommitted_tiles = probe.optimized_overcommitted_tiles,
+            "measured representative per-tile static runtime pressure"
+        );
+        let before = probe.template.rotation_signature();
+        let optimized_slack = memory.optimize_repeated_resident_global_rotation(
+            &probe.template,
+            &probe.placement_schedule,
+            probe.allocation_start,
+            repetitions,
+            &probe.fixed_headroom,
+            &execution_headroom,
+        )?;
+        probe.optimized_minimum_slack = optimized_slack.iter().copied().min().unwrap_or(0);
+        probe.optimized_overcommitted_tiles =
+            optimized_slack.iter().filter(|&&slack| slack < 0).count();
+        let after = probe.template.rotation_signature();
+        if after == before {
+            return if probe.optimized_overcommitted_tiles == 0 {
+                Ok(probe)
+            } else {
+                Err(format!(
+                    "repeated placement has {} overcommitted tiles after role-aware global rotation",
+                    probe.optimized_overcommitted_tiles
+                )
+                .into())
+            };
+        }
+        if !seen_placements.insert(after) {
+            return Err("role-aware repeated placement entered a rotation cycle".into());
+        }
+        let (
+            support_schedule,
+            support_attentions,
+            support_template,
+            placement_schedule,
+            fixed_headroom,
+        ) = build_repeated_encoder_support_probe(
+            embedding,
+            model,
+            batch_size,
+            rows,
+            columns,
+            row_block_dimension,
+            memory,
+            precision,
+            tuning,
+            repetitions,
+            &probe.template,
+            include_suffix,
+            post_norm_only,
+        )?;
+        probe.support_schedule = support_schedule;
+        probe.support_attentions = support_attentions;
+        probe.support_template = support_template;
+        probe.placement_schedule = placement_schedule;
+        probe.fixed_headroom = fixed_headroom;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_repeated_encoder_support_probe(
+    embedding: &PatchEmbeddingPlan,
+    model: &SiglipWeights,
+    batch_size: u16,
+    rows: u16,
+    columns: u16,
+    row_block_dimension: u16,
+    memory: &MemoryPolicy,
+    precision: SiglipEncoderPrecision,
+    tuning: SiglipEncoderTuning,
+    repetitions: usize,
+    template: &ResidentPlacementTemplate,
+    include_suffix: bool,
+    post_norm_only: bool,
+) -> ipu_runtime::Result<(
+    ipu_compiler::Schedule,
+    Vec<FlashAttentionPlan>,
+    StaticTemplateRegion,
+    ipu_compiler::Schedule,
+    Vec<u64>,
+)> {
+    let instance_count = repetitions.min(2);
+    let mut schedule = embedding.plan.schedule.clone();
+    let mut host = embedding.host.clone();
+    let mut current = embedding.row_shards.clone();
+    let mut deferred_residual = None;
+    let mut region = None::<RepeatedRegion>;
+    let mut attentions = Vec::with_capacity(instance_count);
+    let mut placement_schedule = None;
+    let mut transient_headroom = None;
+    for instance in 0..instance_count {
+        let phase_start = schedule.phases.len();
+        let instance_memory =
+            memory.replay_resident_placement_instance(template, instance, repetitions)?;
+        let appended = append_siglip_encoder_layer_batched_with_precision(
+            &mut schedule,
+            &current,
+            model,
+            instance,
+            batch_size,
+            rows,
+            columns,
+            row_block_dimension,
+            TILE_COUNT,
+            &instance_memory,
+            precision,
+            tuning,
+            false,
+            false,
+            &mut host,
+        )?;
+        instance_memory.finish_resident_placement()?;
+        if instance == 0 {
+            transient_headroom = Some(
+                memory
+                    .transient_peak_bytes_by_tile(&schedule, phase_start..schedule.phases.len())?,
+            );
+            placement_schedule = Some(schedule.clone());
+        }
+        if let Some(deferred) = deferred_residual.take() {
+            fuse_deferred_residual_into_layer_norm(&mut schedule, phase_start, deferred)?;
+        }
+        deferred_residual = defer_terminal_residual_add(&mut schedule)?;
+        let phase_range = phase_start..schedule.phases.len();
+        specialize_gemm_row_operations(&mut schedule, phase_range.clone());
+        if let Some(region) = &mut region {
+            region.push_instance(&schedule, phase_range)?;
+        } else {
+            region = Some(RepeatedRegion::new(
+                "representative_repeated_block",
+                &schedule,
+                phase_range,
+            )?);
+        }
+        current = appended.output;
+        attentions.push(appended.attention);
+    }
+    let mut fixed_headroom = transient_headroom.ok_or("support probe has no transient headroom")?;
+    if include_suffix {
+        let placement_probe = placement_schedule
+            .as_ref()
+            .ok_or("support probe has no placement schedule")?;
+        let zero_headroom = vec![0; usize::from(TILE_COUNT)];
+        let projected_slack = memory.optimize_repeated_resident_global_rotation(
+            template,
+            placement_probe,
+            embedding.plan.schedule.allocations.len(),
+            repetitions,
+            &zero_headroom,
+            &zero_headroom,
+        )?;
+        let resident_capacity = memory.resident_capacity_bytes();
+        let projected_resident = projected_slack
+            .into_iter()
+            .map(|slack| {
+                u64::try_from(i128::from(resident_capacity) - i128::from(slack))
+                    .map_err(|_| "projected resident load is outside u64")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let materialized_resident =
+            memory.permanent_bytes_by_tile(&schedule, 0..schedule.allocations.len())?;
+        let missing_resident = projected_resident
+            .iter()
+            .zip(materialized_resident)
+            .map(|(&projected, materialized)| projected.saturating_sub(materialized))
+            .collect::<Vec<_>>();
+        let suffix_memory = memory.with_projected_resident_bytes(&missing_resident);
+        let suffix_allocation_start = schedule.allocations.len();
+        let suffix_phase_start = schedule.phases.len();
+        materialize_deferred_residual_add(
+            &mut schedule,
+            deferred_residual
+                .take()
+                .ok_or("support probe has no deferred residual tail")?,
+        )?;
+        let post_norm = append_siglip_post_layer_norm_with_memory_policy(
+            &mut schedule,
+            &current,
+            model,
+            &suffix_memory,
+            &mut host,
+        )?;
+        if !post_norm_only {
+            let map = append_siglip_map_head_batched_with_memory_policy(
+                &mut schedule,
+                &post_norm,
+                model,
+                batch_size,
+                u16::try_from(model.sequence_length())?,
+                row_block_dimension,
+                TILE_COUNT,
+                DATA_BASE,
+                ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                &suffix_memory,
+                false,
+                &mut host,
+            )?;
+            attentions.push(map.attention);
+        }
+        let suffix_transient = memory
+            .transient_peak_bytes_by_tile(&schedule, suffix_phase_start..schedule.phases.len())?;
+        let suffix_resident = memory.permanent_bytes_by_tile(
+            &schedule,
+            suffix_allocation_start..schedule.allocations.len(),
+        )?;
+        for ((fixed, transient), resident) in fixed_headroom
+            .iter_mut()
+            .zip(suffix_transient)
+            .zip(suffix_resident)
+        {
+            *fixed = (*fixed).max(transient).saturating_add(resident);
+        }
+    }
+    Ok((
+        schedule,
+        attentions,
+        StaticTemplateRegion::from(region.ok_or("support probe has no repeated instance")?),
+        placement_schedule.ok_or("support probe has no placement schedule")?,
+        fixed_headroom,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

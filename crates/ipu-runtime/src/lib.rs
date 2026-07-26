@@ -176,7 +176,7 @@ fn executable_regions_for_tile(
             .chain(allocation_ranges.iter().copied())
             .chain(additional_reserved.iter().copied()),
     );
-    Ok(space
+    let mut regions = space
         .free_regions(element_size)
         .into_iter()
         .flat_map(|(start, end)| (start..end).step_by(element_size as usize))
@@ -186,7 +186,23 @@ fn executable_regions_for_tile(
                 .checked_sub(ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD)?;
             (start < end).then_some((start, end))
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let launch_element = (
+        ipu_package::TILE_MEMORY_BASE,
+        ipu_package::TILE_MEMORY_BASE + element_size,
+    );
+    let launch_has_data = allocation_ranges
+        .iter()
+        .chain(additional_reserved)
+        .any(|&(start, end)| ranges_overlap(start, end, launch_element.0, launch_element.1));
+    if !launch_has_data {
+        regions.push((
+            ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES,
+            launch_element.1 - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
+        ));
+    }
+    regions.sort_unstable();
+    Ok(regions)
 }
 
 #[cfg(test)]
@@ -507,15 +523,25 @@ fn linked_image_occupied_bytes(image: &ipu_elf::LinkedImage) -> Result<u32> {
 pub fn estimate_static_reservation_by_tile(
     schedule: &ipu_compiler::Schedule,
     objects: &[Vec<u8>],
+    memory_policy: &ipu_compiler::MemoryPolicy,
+    template_regions: &[StaticTemplateRegion],
 ) -> Result<Vec<u64>> {
     let topology = Topology::c600();
     if usize::from(schedule.tile_count) != topology.tile_count() {
         return Err("static reservation preflight requires the complete tile topology".into());
     }
+    memory_policy.validate()?;
+    let allocatable = merge_address_ranges(
+        memory_policy
+            .resident
+            .iter()
+            .map(|arena| (arena.base, arena.limit))
+            .collect(),
+    );
     let programs = schedule.lower_tile_programs_for_codegen(&topology)?;
     let plans = programs
         .par_iter()
-        .map(|program| plan_tile_exchange(program, &[], None, true, false))
+        .map(|program| plan_tile_exchange(program, template_regions, None, true, false))
         .collect::<Result<Vec<_>>>()?;
     let symbols = programs
         .iter()
@@ -526,9 +552,13 @@ pub fn estimate_static_reservation_by_tile(
                 static_codegen::COMPLETE.into(),
                 static_codegen::HOST_RUN.into(),
                 static_codegen::REPEAT_CALL.into(),
-                static_codegen::EXCHANGE_COMPUTE_RUN.into(),
-                static_codegen::TEMPLATE_PATCH.into(),
             ];
+            if !template_regions.is_empty() {
+                symbols.push(static_codegen::TEMPLATE_PATCH.into());
+            }
+            if !plans.compute_runs.is_empty() {
+                symbols.push(static_codegen::EXCHANGE_COMPUTE_RUN.into());
+            }
             symbols.extend(program.steps.iter().filter_map(|step| {
                 let ipu_compiler::LoweredTileStep::Compute(command) = step else {
                     return None;
@@ -541,74 +571,113 @@ pub fn estimate_static_reservation_by_tile(
             symbols
         })
         .collect::<Vec<_>>();
-    let mut unique = HashMap::<Vec<String>, u64>::new();
-    for retained_symbols in &symbols {
-        if unique.contains_key(retained_symbols) {
-            continue;
-        }
-        let image = link(
-            objects,
-            &LinkOptions {
-                image_base: ipu_package::TILE_MEMORY_BASE,
-                regions: vec![(
-                    ipu_driver::APPLICATION_LOAD_BASE,
-                    ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-                )],
-                entry_symbol: "ipu_stack_static_start".into(),
-                retained_symbols: retained_symbols.clone(),
-                externals: HashMap::new(),
-            },
-        )?;
-        let occupied = linked_image_occupied_bytes(&image)?;
-        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
-        unique.insert(
-            retained_symbols.clone(),
-            u64::from(align_up(occupied, element)),
-        );
-    }
-    let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
-    programs
+    let measured = programs
         .par_iter()
         .zip(&plans)
         .zip(&symbols)
-        .map(|((program, plans), retained_symbols)| -> Result<u64> {
-            let mut symbol_addresses = BTreeMap::new();
-            for symbol in retained_symbols {
-                symbol_addresses.insert(symbol.clone(), ipu_driver::APPLICATION_LOAD_BASE);
-            }
-            let generated = static_codegen::emit(
-                program,
-                &symbol_addresses,
-                &plans.addresses,
-                &plans.compute_runs,
-                &plans.templates,
-                static_codegen::HostCode {
-                    weights: &[],
-                    inputs: &[],
-                    outputs: &[],
-                },
-                None,
-                static_codegen::GeneratedAddressMap::Contiguous(0),
-                1,
-            )?;
-            let generated_bytes =
-                generated
+        .map(
+            |((program, plans), retained_symbols)| -> Result<(u64, u64, u64, u64, u64, u64)> {
+                let mut symbol_addresses = BTreeMap::new();
+                for symbol in retained_symbols {
+                    symbol_addresses.insert(symbol.clone(), ipu_driver::APPLICATION_LOAD_BASE);
+                }
+                let generated = static_codegen::emit(
+                    program,
+                    &symbol_addresses,
+                    &plans.addresses,
+                    &plans.compute_runs,
+                    &plans.templates,
+                    static_codegen::HostCode {
+                        weights: &[],
+                        inputs: &[],
+                        outputs: &[],
+                    },
+                    None,
+                    static_codegen::GeneratedAddressMap::Contiguous(0),
+                    1,
+                )?;
+                let generated_sizes = generated
                     .object_sizes()
-                    .try_fold(0u32, |total, bytes| -> Result<u32> {
-                        total
-                            .checked_add(u32::try_from(bytes)?)
-                            .ok_or_else(|| "generated preflight byte count overflow".into())
-                    })?;
-            let plan_bytes = plans
-                .end
-                .checked_sub(PLAN_BASE)
-                .ok_or("representative exchange plan precedes its base")?;
-            unique[retained_symbols]
-                .checked_add(u64::from(align_up(generated_bytes, element)))
-                .and_then(|bytes| bytes.checked_add(u64::from(plan_bytes)))
-                .ok_or_else(|| "static reservation preflight byte count overflow".into())
-        })
-        .collect()
+                    .map(|bytes| {
+                        u32::try_from(bytes)
+                            .map_err(|_| "generated preflight object exceeds u32".into())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let generated_bytes = generated_sizes.iter().map(|&bytes| u64::from(bytes)).sum();
+                let generated_main_bytes =
+                    generated_sizes.first().copied().map(u64::from).unwrap_or(0);
+                let free_regions = executable_regions_for_tile(&[], plans.end, &[])?;
+                let executable = place_generated_with_segmented_support(
+                    program.tile,
+                    &generated_sizes,
+                    objects,
+                    retained_symbols,
+                    &free_regions,
+                )?;
+                let unavailable = effective_element_reservations(
+                    executable
+                        .ranges()
+                        .chain(std::iter::once((PLAN_BASE, plans.end))),
+                )?;
+                let unavailable_bytes = unavailable
+                    .iter()
+                    .flat_map(|&(reserved_start, reserved_end)| {
+                        allocatable.iter().map(move |&(arena_start, arena_end)| {
+                            u64::from(
+                                reserved_end
+                                    .min(arena_end)
+                                    .saturating_sub(reserved_start.max(arena_start)),
+                            )
+                        })
+                    })
+                    .sum();
+                let support_bytes = executable
+                    .support
+                    .iter()
+                    .map(|&(start, end)| u64::from(end - start))
+                    .sum();
+                let plan_bytes = u64::from(
+                    plans
+                        .end
+                        .checked_sub(PLAN_BASE)
+                        .ok_or("representative exchange plan precedes its base")?,
+                );
+                Ok((
+                    unavailable_bytes,
+                    generated_bytes,
+                    support_bytes,
+                    plan_bytes,
+                    generated_main_bytes,
+                    generated_bytes - generated_main_bytes,
+                ))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    let maximum = |field: fn(&(u64, u64, u64, u64, u64, u64)) -> u64| {
+        measured.iter().map(field).max().unwrap_or(0)
+    };
+    let worst = measured
+        .iter()
+        .max_by_key(|(unavailable, ..)| unavailable)
+        .copied()
+        .unwrap_or_default();
+    info!(
+        target: "ipu_runtime::placement",
+        maximum_unavailable_bytes = maximum(|entry| entry.0),
+        maximum_generated_bytes = maximum(|entry| entry.1),
+        maximum_support_bytes = maximum(|entry| entry.2),
+        maximum_plan_bytes = maximum(|entry| entry.3),
+        worst_generated_bytes = worst.1,
+        worst_support_bytes = worst.2,
+        worst_plan_bytes = worst.3,
+        worst_generated_main_bytes = worst.4,
+        worst_generated_template_bytes = worst.5,
+        "measured representative static runtime components"
+    );
+    Ok(measured
+        .into_iter()
+        .map(|(unavailable, ..)| unavailable)
+        .collect())
 }
 
 fn generated_object_sizes_with_host_pool(
@@ -4348,11 +4417,16 @@ fn plan_tile_exchange(
                 .transpose()?,
         );
     }
+    let excluded_phases = template_regions
+        .iter()
+        .flat_map(|region| region.phase_instances.iter().cloned())
+        .collect::<Vec<_>>();
     let (compute_runs, end) = static_codegen::plan_exchange_compute_runs(
         program,
         &addresses,
         cursor,
         enable_compute_runs,
+        &excluded_phases,
     )?;
     let (templates, _) = static_codegen::plan_static_templates(
         program,
@@ -8970,15 +9044,40 @@ mod tests {
     }
 
     #[test]
-    fn executable_regions_leave_the_supervisor_fetch_lookahead_unused() {
+    fn executable_regions_reuse_the_launch_element_and_leave_fetch_guards() {
         let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
         let regions = executable_regions_for_tile(&[], PLAN_BASE, &[]).unwrap();
 
         assert!(!regions.is_empty());
-        assert!(regions.iter().all(|&(start, end)| {
+        assert_eq!(
+            regions[0],
+            (
+                ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES,
+                ipu_exchange::EXCHANGE_WINDOW_BASE - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
+            )
+        );
+        assert!(regions[1..].iter().all(|&(start, end)| {
             start % element == 0
                 && end - start == element - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD
                 && end % element == element - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD
+        }));
+    }
+
+    #[test]
+    fn executable_regions_do_not_share_a_launch_element_with_data() {
+        let allocation = (
+            ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES,
+            ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES + 4,
+        );
+        let regions = executable_regions_for_tile(&[allocation], PLAN_BASE, &[]).unwrap();
+
+        assert!(regions.iter().all(|&(start, end)| {
+            !ranges_overlap(
+                start,
+                end,
+                ipu_package::TILE_MEMORY_BASE,
+                ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+            )
         }));
     }
 
@@ -9071,8 +9170,10 @@ mod tests {
         let base = executable_region_base(&graph, runtime_end, required).unwrap();
         let end = base + align_up(required, 8);
 
-        assert_eq!(base % element, 0);
-        assert!(base >= align_up(runtime_end, element));
+        assert_eq!(
+            base,
+            ipu_driver::APPLICATION_LOAD_BASE + ENTRY_TRAMPOLINE_BYTES
+        );
         assert!(!ranges_overlap(
             base,
             end,
