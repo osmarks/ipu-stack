@@ -18,7 +18,7 @@ use ipu_runtime::{
     append_siglip_map_head_batched_with_memory_policy, append_siglip_post_layer_norm,
     append_siglip_post_layer_norm_with_memory_policy, block_binding_typed, block_coordinates,
     blocked_matrix_f16, consolidate_attention_kernel_variants, defer_terminal_residual_add,
-    estimate_support_image_reservation_by_tile, fuse_deferred_residual_into_layer_norm,
+    estimate_static_reservation_by_tile, fuse_deferred_residual_into_layer_norm,
     materialize_deferred_residual_add, package_graph_repeated_with_templates_owned,
     package_graph_repeated_with_templates_owned_and_memory_profile,
     package_graph_repeated_with_templates_profiled_with,
@@ -318,13 +318,12 @@ fn main() {
         let support_objects =
             compile_objects(&support_schedule, &[support_attention], &support_variants).unwrap();
         let execution_headroom =
-            estimate_support_image_reservation_by_tile(&support_schedule, &support_objects)
-                .unwrap();
+            estimate_static_reservation_by_tile(&support_schedule, &support_objects).unwrap();
         info!(
             minimum_bytes = execution_headroom.iter().copied().min().unwrap_or(0),
             maximum_bytes = execution_headroom.iter().copied().max().unwrap_or(0),
             mean_bytes = execution_headroom.iter().sum::<u64>() / u64::from(TILE_COUNT),
-            "measured representative per-tile support-image pressure"
+            "measured representative per-tile static runtime pressure"
         );
         probe_repeated_encoder_placement(
             &embedding,

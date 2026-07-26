@@ -497,41 +497,50 @@ fn linked_image_occupied_bytes(image: &ipu_elf::LinkedImage) -> Result<u32> {
     })
 }
 
-/// Estimates heterogeneous executable SRAM pressure from the kernel roles
-/// assigned to each tile.
+/// Estimates heterogeneous static SRAM pressure from the kernel and exchange
+/// roles assigned to each tile.
 ///
-/// Generated control code and static exchange state are handled later by the
-/// package placer. This preflight captures the support-image component that
-/// varies with each tile's retained kernel set, allowing repeated resident
-/// placement to avoid concentrating weights on code-heavy tiles.
-pub fn estimate_support_image_reservation_by_tile(
+/// Final placement is still performed by the package builder. This preflight
+/// measures address-invariant support images, generated control objects, and
+/// exchange plans for a representative schedule so repeated resident
+/// placement does not concentrate weights on code-heavy tiles.
+pub fn estimate_static_reservation_by_tile(
     schedule: &ipu_compiler::Schedule,
     objects: &[Vec<u8>],
 ) -> Result<Vec<u64>> {
-    let mut symbols = vec![
-        vec![
-            static_codegen::WORKER_BARRIER.into(),
-            static_codegen::COMPLETE.into(),
-            static_codegen::HOST_RUN.into(),
-            static_codegen::REPEAT_CALL.into(),
-            static_codegen::EXCHANGE_COMPUTE_RUN.into(),
-            static_codegen::TEMPLATE_PATCH.into(),
-        ];
-        usize::from(schedule.tile_count)
-    ];
-    for phase in &schedule.phases {
-        let ipu_compiler::Phase::Compute { commands, .. } = phase else {
-            continue;
-        };
-        for command in commands {
-            symbols[usize::from(command.tile)]
-                .push(format!("ipu_stack_{}", command.specialization.operation));
-        }
+    let topology = Topology::c600();
+    if usize::from(schedule.tile_count) != topology.tile_count() {
+        return Err("static reservation preflight requires the complete tile topology".into());
     }
-    for symbols in &mut symbols {
-        symbols.sort_unstable();
-        symbols.dedup();
-    }
+    let programs = schedule.lower_tile_programs_for_codegen(&topology)?;
+    let plans = programs
+        .par_iter()
+        .map(|program| plan_tile_exchange(program, &[], None, true, false))
+        .collect::<Result<Vec<_>>>()?;
+    let symbols = programs
+        .iter()
+        .zip(&plans)
+        .map(|(program, plans)| {
+            let mut symbols = vec![
+                static_codegen::WORKER_BARRIER.into(),
+                static_codegen::COMPLETE.into(),
+                static_codegen::HOST_RUN.into(),
+                static_codegen::REPEAT_CALL.into(),
+                static_codegen::EXCHANGE_COMPUTE_RUN.into(),
+                static_codegen::TEMPLATE_PATCH.into(),
+            ];
+            symbols.extend(program.steps.iter().filter_map(|step| {
+                let ipu_compiler::LoweredTileStep::Compute(command) = step else {
+                    return None;
+                };
+                Some(format!("ipu_stack_{}", command.specialization.operation))
+            }));
+            symbols.extend(plans.kernel_symbols.iter().cloned());
+            symbols.sort_unstable();
+            symbols.dedup();
+            symbols
+        })
+        .collect::<Vec<_>>();
     let mut unique = HashMap::<Vec<String>, u64>::new();
     for retained_symbols in &symbols {
         if unique.contains_key(retained_symbols) {
@@ -557,10 +566,49 @@ pub fn estimate_support_image_reservation_by_tile(
             u64::from(align_up(occupied, element)),
         );
     }
-    Ok(symbols
-        .iter()
-        .map(|symbols| unique[symbols])
-        .collect::<Vec<_>>())
+    let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+    programs
+        .par_iter()
+        .zip(&plans)
+        .zip(&symbols)
+        .map(|((program, plans), retained_symbols)| -> Result<u64> {
+            let mut symbol_addresses = BTreeMap::new();
+            for symbol in retained_symbols {
+                symbol_addresses.insert(symbol.clone(), ipu_driver::APPLICATION_LOAD_BASE);
+            }
+            let generated = static_codegen::emit(
+                program,
+                &symbol_addresses,
+                &plans.addresses,
+                &plans.compute_runs,
+                &plans.templates,
+                static_codegen::HostCode {
+                    weights: &[],
+                    inputs: &[],
+                    outputs: &[],
+                },
+                None,
+                static_codegen::GeneratedAddressMap::Contiguous(0),
+                1,
+            )?;
+            let generated_bytes =
+                generated
+                    .object_sizes()
+                    .try_fold(0u32, |total, bytes| -> Result<u32> {
+                        total
+                            .checked_add(u32::try_from(bytes)?)
+                            .ok_or_else(|| "generated preflight byte count overflow".into())
+                    })?;
+            let plan_bytes = plans
+                .end
+                .checked_sub(PLAN_BASE)
+                .ok_or("representative exchange plan precedes its base")?;
+            unique[retained_symbols]
+                .checked_add(u64::from(align_up(generated_bytes, element)))
+                .and_then(|bytes| bytes.checked_add(u64::from(plan_bytes)))
+                .ok_or_else(|| "static reservation preflight byte count overflow".into())
+        })
+        .collect()
 }
 
 fn generated_object_sizes_with_host_pool(
