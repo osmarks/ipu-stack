@@ -6,6 +6,7 @@ __pycache__/
 *.o
 *.capnp
 *.html
+!crates/ipu-cli/src/profile_viewer.html
 perf.data
 bugs.md
 profiles

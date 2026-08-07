@@ -1,24 +1,10 @@
 @0xd3bce605d3d25b4f;
 
-enum BlobCodec {
-  raw @0;
-  zstd @1;
-}
-
-struct Blob {
-  sha256 @0 :Data;
-  uncompressedSize @1 :UInt64;
-  codec @2 :BlobCodec;
-  data @3 :Data;
-}
-
 struct Segment {
   address @0 :UInt32;
   memorySize @1 :UInt32;
-  blobIndex @2 :UInt32;
-  blobOffset @3 :UInt64;
-  fileSize @4 :UInt32;
-  flags @5 :UInt32;
+  data @2 :Data;
+  flags @3 :UInt32;
 }
 
 struct TileImage {
@@ -92,13 +78,11 @@ struct Application {
   target @2 :Text;
   tileMemoryBase @3 :UInt32;
   tileMemorySize @4 :UInt32;
-  blobs @5 :List(Blob);
-  tiles @6 :List(TileImage);
-  inputs @7 :List(Binding);
-  outputs @8 :List(Binding);
-  weights @9 :List(Binding);
-  hostExchange @10 :HostExchange;
-  entryPoints @11 :List(EntryPoint);
-  buildDigest @12 :Data;
-  deviceConfigWrites @13 :List(DeviceConfigWrite);
+  tiles @5 :List(TileImage);
+  inputs @6 :List(Binding);
+  outputs @7 :List(Binding);
+  weights @8 :List(Binding);
+  hostExchange @9 :HostExchange;
+  entryPoints @10 :List(EntryPoint);
+  deviceConfigWrites @11 :List(DeviceConfigWrite);
 }

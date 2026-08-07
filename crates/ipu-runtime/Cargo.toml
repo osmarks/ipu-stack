@@ -5,20 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-fastrand.workspace = true
-half.workspace = true
-ipu-compiler = { path = "../ipu-compiler" }
 ipu-driver = { path = "../ipu-driver" }
-ipu-elf = { path = "../ipu-elf" }
-ipu-exchange = { path = "../ipu-exchange" }
-ipu-models = { path = "../ipu-models" }
 ipu-package = { path = "../ipu-package" }
-rayon.workspace = true
-rustc-hash.workspace = true
-smallvec.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
-
-[dev-dependencies]
-ipu-elf = { path = "../ipu-elf" }

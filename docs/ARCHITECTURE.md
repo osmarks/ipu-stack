@@ -1,94 +1,72 @@
-# Compiler architecture
+# Architecture
 
-The stack has three artifact levels:
+The package path has four explicit components:
 
-1. A kernel artifact is one specialized tile operation compiled by `popc` to a
-   relocatable Colossus ELF object plus metadata.
-2. A tile program is a straight-line supervisor program linked with only the
-   kernel sections and constants used by that tile.
-3. An `.ipuexe` is a Cap'n Proto whole-device image containing all tile
-   programs, SRAM initializers, tensor bindings, host calls, and device setup.
+1. `ipu-exchange` produces exchange rows.
+2. `ipu-codegen` lowers a `ComputeGraph`, emits supervisor code, and coordinates
+   package construction according to `PackageConfig`.
+3. `ipu-elf` compiles and links the static runtime and selected kernels.
+4. `ipu-package` stores final tile images and host protocol metadata for
+   `ipu-driver` and `ipu-runtime`.
 
-The graph compiler produces globally ordered exchange and compute phases. It
-then lowers that schedule to one `LoweredTileProgram` per logical tile. A tile
-program contains concrete exchange rows and concrete compute calls with final
-SRAM addresses. It does not contain opcodes for a device-side interpreter.
+`ComputeGraph` is a shaped, structured SSA graph. Values have globally unique
+identities, operations refer to explicit inputs, and `Repeat` contains a shared
+region with carried values, invariants, and per-iteration value sequences.
+Shapes are semantic and support arbitrary rank; GEMM operates on the final two
+axes and broadcasts leading batch axes.
 
-The final code generator emits a distinct instruction stream for every tile:
+## Mid-level IR
 
-- initialize the supervisor and six workers once;
-- execute each required device synchronization;
-- call an inline exchange row when the tile is a source or destination;
-- call a specialized compute kernel when the tile owns that operation;
-- perform the final completion synchronization and stop.
+`ipu_codegen::mid` is the layout-aware boundary. Every value has a logical
+shape plus a `TensorFormat` containing:
 
-A D2D exchange has source and destination actions. Other tiles participate only
-in synchronization required by the phase; they are not modeled as forwarding
-tiles. Multiple transfers in one phase are placed on one static event timeline.
+- storage precision (`F8F143`, `F16`, or `F32`), with accumulation precision
+  recorded separately on kernels;
+- element order (row-major or parameterized AMP left/right/output order);
+- coarse sharding (replicated, rows, columns, or heads) and logical tile-group
+  size;
+- contiguous or memory-bank-interleaved storage and alignment.
 
-Host operations are lowered to straight-line calls before and after graph
-phases. Each payload phase can contain one transfer per target tile. XREQ
-owners send an aggregate endpoint bitmap, target tiles use disjoint rolling
-host-buffer slots, and inactive tiles execute synchronization followers.
-Host-page layout, slice-batch boundaries, and HSP phase counts remain
-whole-device metadata in `.ipuexe`. There is no all-tile command broadcast or
-device dispatch loop.
+This is deliberately less specific than placement: it records decisions that
+change a kernel or exchange plan, but not physical tile IDs, SRAM addresses,
+lifetimes, or exchange rows. AMP order parameterizes the useful parts of the
+old `A8/A16/A32`, `B8x16/B16x16/B32x16`, and `C16` layout vocabulary.
 
-The linker resolves calls from generated tile programs to kernel ELF symbols.
-Kernel artifacts stay reusable and independent of the final tile and device
-images. Content-addressed package blobs deduplicate identical linked sections
-and generated instruction streams.
+`mid::lower` considers legal formats for each semantic operation. The initial
+toy model compares rough arithmetic throughput with bytes moved. When a chosen
+kernel format differs from its producer, lowering inserts `CastPrecision` and
+`Rearrange` operations explicitly. Repeated regions stay structured; their
+iterated value sequences are normalized once outside the body rather than
+causing the body to be unrolled.
 
-## Tile-memory placement
+The toy choices currently describe the retained generic kernels: FP16 GEMM
+uses AMP A16/B16x16/C16, FP32 uses A8/B8x16/C16, and right operands use
+interleaved storage. This is an inspectable scaffold for a measured cost model
+or autotuner, not a claim that those choices are globally optimal.
 
-The compiler distinguishes placement lifetime from instruction-specific memory
-requirements. `MemoryPolicy` contains ordered resident arenas for model
-parameters and ordered transient arenas for activations and ordinary scratch.
-An allocation may spill to a later arena but never spans an arena boundary.
-Resident placement is checked against every allocation in the complete schedule
-because parameters are loaded before execution and remain live throughout it;
-transient placement only considers overlapping phase lifetimes.
+The subsequent mid-to-low scheduling and placement pass does not exist yet,
+so package construction still emits a completion-only tile program.
+`TileProgram` remains the finalized representation below that future pass.
 
-FP16 GEMM B blocks use ordinary 64-bit loads and do not require interleaved
-SRAM. The AMP accumulator/output block still uses paired PACE accesses and is
-fixed in the IPU21 interleaved element. Kernel-fixed allocations are included
-in policy placement, so resident data may use otherwise-free interleaved space
-without overlapping active AMP scratch.
+## Finalized tile programs
 
-The SigLIP runner defaults to placing resident data in high ordinary SRAM, low
-ordinary SRAM, then interleaved SRAM. Transient data uses low ordinary SRAM,
-interleaved SRAM, then high ordinary SRAM. `IPU_SIGLIP_RESIDENT_ORDER` and
-`IPU_SIGLIP_TRANSIENT_ORDER` accept an ordered comma-separated selection of
-`ordinary-low`, `interleaved`, and `ordinary-high`. These controls change
-allocation preference, not kernel memory semantics or physical address bounds.
+A tile program is an ordered list of:
 
-## Migration boundary
+- an exchange row and its final address; or
+- a kernel symbol, output address, input addresses, and scalar arguments.
 
-`LoweredTileProgram` and the exchange scheduler implement the compile-time
-model. `device/static_runtime.S` supplies startup, worker rendezvous, and
-completion. The Rust emitter generates the ordered exchange and compute calls
-for each tile. The role-based command table and its dispatcher have been
-removed.
+The code generator validates only local encoding constraints. It does not check
+lifetimes, search memory, merge repeated regions, repack executable objects, or
+derive kernel memory requirements.
 
-## Static-lowering hardware evidence
+Optional cycle samples name explicit destination addresses. This is a narrow
+mechanism rather than a profiling layout policy.
 
-The static emitter consumes `LoweredTileProgram` directly, emits distinct
-straight-line programs, and branches to per-tile executable exchange rows
-without a command table. Hardware tests verify point transfer, fanout,
-multicast, an all-tile permutation, and two-launch randomized graphs with sparse
-compute between exchanges. The randomized suite passed 18 deterministic cases,
-including a second-launch receive on physical tile 0.
+## Runtime
 
-The phase boundary reproduces the SDK's internal exchange sequence. Every tile
-executes `sync INTERNAL`; active tiles then perform the local worker rendezvous
-and execute their complete exchange row, while inactive tiles execute
-`sans 0; sync ANS`. D2D phase transitions do not use a host packet, GSP, or a
-release multicast, and no tile is reserved for synchronization.
+`device/static_runtime.S` initializes workers and transfers control to emitted
+supervisor code. `ipu-runtime` initializes the device, replays configuration,
+loads an `Application`, applies package configuration writes, and creates a
+driver `HostSession`.
 
-An alternating 11-stage reduction followed by a dense all-tile permutation
-passes hardware acceptance. The earlier packet loss came from routing
-independent single-destination groups through the multicast scheduler. The SDK
-uses its point-to-point schedule for those groups; the compiler now does the
-same, finalizes the receiver's source selector, and converts its receive address
-to the compiler-allocated absolute exchange-window address. Fanout and groups
-with a nonzero dependency offset continue to use the multicast scheduler.
+Application construction is intentionally not part of the runtime.

@@ -1,8 +1,7 @@
 use capnp::{message, serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use tracing::{debug, info, trace};
+use tracing::{info, trace};
 
 pub mod application_capnp {
     include!(concat!(env!("OUT_DIR"), "/application_capnp.rs"));
@@ -12,18 +11,11 @@ pub mod profile_capnp {
     include!(concat!(env!("OUT_DIR"), "/profile_capnp.rs"));
 }
 
-pub mod memory_profile_capnp {
-    include!(concat!(env!("OUT_DIR"), "/memory_profile_capnp.rs"));
-}
-
 fn capnp_reader_options() -> message::ReaderOptions {
     let mut options = message::ReaderOptions::new();
     options.traversal_limit_in_words(None);
     options
 }
-
-mod memory_profile;
-pub use memory_profile::{MemoryProfile, MemoryRegion, TileMemory};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProfileStepKind {
@@ -174,74 +166,26 @@ impl ProfileReport {
     }
 }
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 pub const TARGET_IPU21: &str = "ipu21";
 pub const TILE_MEMORY_BASE: u32 = 0x4c000;
 pub const TILE_MEMORY_SIZE: u32 = 624 * 1024;
-/// IPU21 `TMEM_ELEMSIZE`; instruction fetch and data access cannot share an element.
+/// IPU21 `TMEM_ELEMSIZE`. Instruction fetch and data access contend at this
+/// granularity even when placement policy is supplied by another crate.
 pub const TILE_MEMORY_ELEMENT_SIZE: u32 = 0x4000;
-/// Maximum supervisor instruction-fetch lookahead used for region-0 clash checks.
+/// Maximum supervisor instruction-fetch lookahead used when checking whether
+/// executable and data ranges share a memory element.
 pub const IPU21_SUPERVISOR_FETCH_LOOKAHEAD: u32 = 8 * 8;
 /// End of IPU21 region 0, the only tile-memory region supporting instruction fetch.
 pub const IPU21_EXECUTABLE_MEMORY_LIMIT: u32 = 0x80000;
-// The first effective element of IPU21's two-way-interleaved region is kept
-// separate for operands carrying Poplar's interleaved-memory constraint. PACE
-// kernels use it for accumulator output while streaming inputs from another
-// element. These are placement bounds, not the extent of architectural region 1.
+/// First logical address of the commonly used interleaved operand window.
 pub const IPU21_INTERLEAVED_MEMORY_BASE: u32 = TILE_MEMORY_BASE + 0x34000;
+/// End of the commonly used interleaved operand window.
 pub const IPU21_INTERLEAVED_MEMORY_LIMIT: u32 = TILE_MEMORY_BASE + 0x3c000;
 /// End of architectural region 1, whose interleave factor is two on IPU21.
 pub const IPU21_INTERLEAVED_REGION_LIMIT: u32 = TILE_MEMORY_BASE + TILE_MEMORY_SIZE;
 /// Logical bytes covered by a pair of physical elements in interleaved region 1.
 pub const IPU21_INTERLEAVED_ELEMENT_SIZE: u32 = 2 * TILE_MEMORY_ELEMENT_SIZE;
-
-/// Returns the effective memory-element number and its logical address bounds.
-///
-/// Region 0 maps each 16 KiB logical interval to one physical element. Region 1
-/// stripes 64-bit words over pairs of physical elements, so a 32 KiB logical
-/// interval is the unit that must be kept distinct for packed multi-accesses
-/// whose pointers have the same 64-bit lane parity.
-pub fn ipu21_effective_memory_element(address: u32) -> Option<(u8, u32, u32)> {
-    if !(TILE_MEMORY_BASE..IPU21_INTERLEAVED_REGION_LIMIT).contains(&address) {
-        return None;
-    }
-    if address < IPU21_EXECUTABLE_MEMORY_LIMIT {
-        let index = (address - TILE_MEMORY_BASE) / TILE_MEMORY_ELEMENT_SIZE;
-        let base = TILE_MEMORY_BASE + index * TILE_MEMORY_ELEMENT_SIZE;
-        Some((
-            u8::try_from(index).ok()?,
-            base,
-            base + TILE_MEMORY_ELEMENT_SIZE,
-        ))
-    } else {
-        let region_index =
-            (address - IPU21_EXECUTABLE_MEMORY_LIMIT) / IPU21_INTERLEAVED_ELEMENT_SIZE;
-        let region0_elements =
-            (IPU21_EXECUTABLE_MEMORY_LIMIT - TILE_MEMORY_BASE) / TILE_MEMORY_ELEMENT_SIZE;
-        let base = IPU21_EXECUTABLE_MEMORY_LIMIT + region_index * IPU21_INTERLEAVED_ELEMENT_SIZE;
-        Some((
-            u8::try_from(region0_elements + region_index).ok()?,
-            base,
-            base + IPU21_INTERLEAVED_ELEMENT_SIZE,
-        ))
-    }
-}
-
-/// Returns every effective memory element touched by a non-empty byte span.
-pub fn ipu21_effective_memory_elements(address: u32, bytes: u32) -> Option<Vec<(u8, u32, u32)>> {
-    let end = address.checked_add(bytes)?;
-    if bytes == 0 || end > IPU21_INTERLEAVED_REGION_LIMIT {
-        return None;
-    }
-    let mut elements = Vec::new();
-    let mut cursor = address;
-    while cursor < end {
-        let element = ipu21_effective_memory_element(cursor)?;
-        cursor = end.min(element.2);
-        elements.push(element);
-    }
-    Some(elements)
-}
 pub const SEGMENT_READ: u32 = 1;
 pub const SEGMENT_WRITE: u32 = 2;
 pub const SEGMENT_EXECUTE: u32 = 4;
@@ -261,18 +205,10 @@ pub enum PackageError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Blob {
-    pub digest: [u8; 32],
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment {
     pub address: u32,
     pub memory_size: u32,
-    pub blob: usize,
-    pub blob_offset: u64,
-    pub file_size: u32,
+    pub data: Vec<u8>,
     pub flags: u32,
 }
 
@@ -358,7 +294,6 @@ pub struct DeviceConfigWrite {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Application {
     pub compiler_version: String,
-    pub blobs: Vec<Blob>,
     pub tiles: Vec<TileImage>,
     pub inputs: Vec<Binding>,
     pub outputs: Vec<Binding>,
@@ -366,14 +301,12 @@ pub struct Application {
     pub host_exchange: HostExchange,
     pub entry_points: Vec<EntryPoint>,
     pub device_config_writes: Vec<DeviceConfigWrite>,
-    blob_indices: HashMap<[u8; 32], usize>,
 }
 
 impl Default for Application {
     fn default() -> Self {
         Self {
             compiler_version: env!("CARGO_PKG_VERSION").into(),
-            blobs: Vec::new(),
             tiles: Vec::new(),
             inputs: Vec::new(),
             outputs: Vec::new(),
@@ -381,123 +314,11 @@ impl Default for Application {
             host_exchange: HostExchange::default(),
             entry_points: Vec::new(),
             device_config_writes: Vec::new(),
-            blob_indices: HashMap::new(),
         }
     }
 }
 
 impl Application {
-    pub fn import_ipuimg(bytes: &[u8]) -> Result<Self, PackageError> {
-        if bytes.len() < 40 || &bytes[..8] != b"IPUIMG1\0" || legacy_u32(bytes, 8)? != 1 {
-            return Err(PackageError::Invalid("invalid legacy IPUIMG header".into()));
-        }
-        let tile_count = legacy_u32(bytes, 12)? as usize;
-        let linked_base_address = legacy_u32(bytes, 16)?;
-        // IPUIMG includes the reserved launch word at the first linked address,
-        // and the secondary loader installs that complete image byte-for-byte.
-        let base_address = linked_base_address;
-        let image_size = legacy_u32(bytes, 20)? as usize;
-        let entry_point = legacy_u32(bytes, 24)?;
-        let template_crc = legacy_u32(bytes, 28)?;
-        let template_tile = legacy_u32(bytes, 32)? as usize;
-        if tile_count == 0
-            || image_size == 0
-            || template_tile >= tile_count
-            || legacy_u32(bytes, 36)? != 0
-        {
-            return Err(PackageError::Invalid(
-                "invalid legacy IPUIMG dimensions".into(),
-            ));
-        }
-        let records_end = 40usize
-            .checked_add(
-                tile_count
-                    .checked_mul(16)
-                    .ok_or_else(|| PackageError::Invalid("legacy IPUIMG record overflow".into()))?,
-            )
-            .ok_or_else(|| PackageError::Invalid("legacy IPUIMG record overflow".into()))?;
-        let template_end = records_end
-            .checked_add(image_size)
-            .ok_or_else(|| PackageError::Invalid("legacy IPUIMG template overflow".into()))?;
-        let template = bytes
-            .get(records_end..template_end)
-            .ok_or_else(|| PackageError::Invalid("truncated legacy IPUIMG template".into()))?;
-        if crc32(template) != template_crc {
-            return Err(PackageError::Invalid(
-                "legacy IPUIMG template checksum".into(),
-            ));
-        }
-
-        let mut app = Application::default();
-        for tile in 0..tile_count {
-            let record = 40 + tile * 16;
-            let patch_offset = legacy_u64(bytes, record)? as usize;
-            let patch_size = legacy_u32(bytes, record + 8)? as usize;
-            let image_crc = legacy_u32(bytes, record + 12)?;
-            let patch_end = patch_offset
-                .checked_add(patch_size)
-                .filter(|end| *end <= bytes.len())
-                .ok_or_else(|| PackageError::Invalid("legacy IPUIMG patch extent".into()))?;
-            let mut image = template.to_vec();
-            let mut cursor = patch_offset;
-            while cursor < patch_end {
-                let offset = legacy_u32(bytes, cursor)? as usize;
-                let size = legacy_u32(bytes, cursor + 4)? as usize;
-                cursor += 8;
-                let source_end = cursor
-                    .checked_add(size)
-                    .filter(|end| *end <= patch_end)
-                    .ok_or_else(|| PackageError::Invalid("legacy IPUIMG patch data".into()))?;
-                let destination_end = offset
-                    .checked_add(size)
-                    .filter(|end| *end <= image.len())
-                    .ok_or_else(|| PackageError::Invalid("legacy IPUIMG patch range".into()))?;
-                image[offset..destination_end].copy_from_slice(&bytes[cursor..source_end]);
-                cursor = source_end;
-            }
-            if crc32(&image) != image_crc {
-                return Err(PackageError::Invalid(format!(
-                    "legacy IPUIMG tile {tile} checksum"
-                )));
-            }
-            let image_len = image.len() as u32;
-            let blob = app.add_blob(image);
-            app.tiles.push(TileImage {
-                physical_tile: tile as u32,
-                entry_point,
-                command_address: 0,
-                diagnostic_address: 0,
-                segments: vec![Segment {
-                    address: base_address,
-                    memory_size: image_len,
-                    blob,
-                    blob_offset: 0,
-                    file_size: image_len,
-                    flags: SEGMENT_READ | SEGMENT_WRITE | SEGMENT_EXECUTE,
-                }],
-            });
-        }
-        app.validate()?;
-        info!(
-            tile_count,
-            blobs = app.blobs.len(),
-            "imported legacy IPUIMG"
-        );
-        Ok(app)
-    }
-
-    pub fn add_blob(&mut self, bytes: Vec<u8>) -> usize {
-        let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        if let Some(&index) = self.blob_indices.get(&digest) {
-            debug_assert_eq!(self.blobs[index].bytes, bytes);
-            return index;
-        }
-        let index = self.blobs.len();
-        self.blobs.push(Blob { digest, bytes });
-        self.blob_indices.insert(digest, index);
-        index
-    }
-
     pub fn validate(&self) -> Result<(), PackageError> {
         if self.tiles.is_empty() {
             return Err(PackageError::Invalid("application has no tiles".into()));
@@ -527,10 +348,7 @@ impl Application {
                     .ok_or_else(|| PackageError::Invalid("segment address overflow".into()))?;
                 if segment.address < TILE_MEMORY_BASE
                     || end > TILE_MEMORY_BASE + TILE_MEMORY_SIZE
-                    || segment.file_size > segment.memory_size
-                    || segment.blob >= self.blobs.len()
-                    || segment.blob_offset + u64::from(segment.file_size)
-                        > self.blobs[segment.blob].bytes.len() as u64
+                    || segment.data.len() > segment.memory_size as usize
                 {
                     return Err(PackageError::Invalid(format!(
                         "invalid segment on tile {}",
@@ -636,11 +454,7 @@ impl Application {
 
     pub fn write(&self, mut output: impl Write) -> Result<(), PackageError> {
         self.validate()?;
-        info!(
-            tiles = self.tiles.len(),
-            blobs = self.blobs.len(),
-            "writing application package"
-        );
+        info!(tiles = self.tiles.len(), "writing application package");
         let mut message = message::Builder::new_default();
         let mut root = message.init_root::<application_capnp::application::Builder>();
         root.set_schema_version(SCHEMA_VERSION);
@@ -649,26 +463,6 @@ impl Application {
         root.set_tile_memory_base(TILE_MEMORY_BASE);
         root.set_tile_memory_size(TILE_MEMORY_SIZE);
 
-        let mut blobs = root.reborrow().init_blobs(self.blobs.len() as u32);
-        for (index, blob) in self.blobs.iter().enumerate() {
-            let mut item = blobs.reborrow().get(index as u32);
-            item.set_sha256(&blob.digest);
-            item.set_uncompressed_size(blob.bytes.len() as u64);
-            let compressed = zstd::bulk::compress(&blob.bytes, 3)?;
-            debug!(
-                blob = index,
-                raw_bytes = blob.bytes.len(),
-                compressed_bytes = compressed.len(),
-                "encoded package blob"
-            );
-            if compressed.len() < blob.bytes.len() {
-                item.set_codec(application_capnp::BlobCodec::Zstd);
-                item.set_data(&compressed);
-            } else {
-                item.set_codec(application_capnp::BlobCodec::Raw);
-                item.set_data(&blob.bytes);
-            }
-        }
         write_tiles(
             root.reborrow().init_tiles(self.tiles.len() as u32),
             &self.tiles,
@@ -703,10 +497,8 @@ impl Application {
             item.set_offset(write.offset);
             item.set_value(write.value);
         }
-        let digest = self.build_digest();
-        root.set_build_digest(&digest);
         serialize::write_message(&mut output, &message)?;
-        info!(digest = %hex_digest(&digest), "application package written");
+        info!("application package written");
         Ok(())
     }
 
@@ -725,26 +517,6 @@ impl Application {
             compiler_version: root.get_compiler_version()?.to_str()?.into(),
             ..Application::default()
         };
-        for item in root.get_blobs()?.iter() {
-            let stored = item.get_data()?;
-            let bytes = match item.get_codec()? {
-                application_capnp::BlobCodec::Raw => stored.to_vec(),
-                application_capnp::BlobCodec::Zstd => {
-                    zstd::bulk::decompress(stored, item.get_uncompressed_size() as usize)?
-                }
-            };
-            let digest: [u8; 32] = Sha256::digest(&bytes).into();
-            if item.get_sha256()? != digest {
-                return Err(PackageError::Invalid("blob digest mismatch".into()));
-            }
-            let index = app.blobs.len();
-            if app.blob_indices.insert(digest, index).is_some() {
-                return Err(PackageError::Invalid(
-                    "duplicate package blob digest".into(),
-                ));
-            }
-            app.blobs.push(Blob { digest, bytes });
-        }
         app.tiles = read_tiles(root.get_tiles()?)?;
         app.inputs = read_bindings(root.get_inputs()?)?;
         app.outputs = read_bindings(root.get_outputs()?)?;
@@ -770,12 +542,8 @@ impl Application {
             })
             .collect();
         app.validate()?;
-        if root.get_build_digest()? != app.build_digest() {
-            return Err(PackageError::Invalid("build digest mismatch".into()));
-        }
         info!(
             tiles = app.tiles.len(),
-            blobs = app.blobs.len(),
             compiler = %app.compiler_version,
             "application package read"
         );
@@ -809,124 +577,11 @@ impl Application {
         );
         for segment in &tile.segments {
             let destination = (segment.address - load_base) as usize;
-            let source = segment.blob_offset as usize;
-            let size = segment.file_size as usize;
-            image[destination..destination + size]
-                .copy_from_slice(&self.blobs[segment.blob].bytes[source..source + size]);
+            image[destination..destination + segment.data.len()].copy_from_slice(&segment.data);
         }
         Ok(image)
     }
-
-    fn build_digest(&self) -> [u8; 32] {
-        let mut hash = Sha256::new();
-        hash.update(SCHEMA_VERSION.to_le_bytes());
-        hash_string(&mut hash, TARGET_IPU21);
-        hash.update(TILE_MEMORY_BASE.to_le_bytes());
-        hash.update(TILE_MEMORY_SIZE.to_le_bytes());
-        hash_string(&mut hash, &self.compiler_version);
-        hash_len(&mut hash, self.blobs.len());
-        for blob in &self.blobs {
-            hash.update(blob.digest);
-        }
-        hash_len(&mut hash, self.tiles.len());
-        for tile in &self.tiles {
-            hash.update(tile.physical_tile.to_le_bytes());
-            hash.update(tile.entry_point.to_le_bytes());
-            hash.update(tile.command_address.to_le_bytes());
-            hash.update(tile.diagnostic_address.to_le_bytes());
-            hash_len(&mut hash, tile.segments.len());
-            for segment in &tile.segments {
-                hash.update(segment.address.to_le_bytes());
-                hash.update(segment.memory_size.to_le_bytes());
-                hash.update((segment.blob as u64).to_le_bytes());
-                hash.update(segment.blob_offset.to_le_bytes());
-                hash.update(segment.file_size.to_le_bytes());
-                hash.update(segment.flags.to_le_bytes());
-            }
-        }
-        for bindings in [&self.inputs, &self.outputs, &self.weights] {
-            hash.update((bindings.len() as u64).to_le_bytes());
-            for binding in bindings {
-                hash_string(&mut hash, &binding.name);
-                hash_string(&mut hash, &binding.dtype);
-                hash_len(&mut hash, binding.shape.len());
-                for dimension in &binding.shape {
-                    hash.update(dimension.to_le_bytes());
-                }
-                hash_len(&mut hash, binding.slices.len());
-                for slice in &binding.slices {
-                    hash.update(slice.tile.to_le_bytes());
-                    hash.update(slice.tile_address.to_le_bytes());
-                    hash.update(slice.file_offset.to_le_bytes());
-                    hash.update(slice.size.to_le_bytes());
-                }
-            }
-        }
-        let host = &self.host_exchange;
-        hash.update(host.startup_mark.to_le_bytes());
-        hash.update(host.command_page.to_le_bytes());
-        hash.update(host.command_offset.to_le_bytes());
-        hash_len(&mut hash, host.pages.len());
-        for page in &host.pages {
-            hash.update(page.index.to_le_bytes());
-            hash.update(page.size.to_le_bytes());
-        }
-        hash_len(&mut hash, host.attach_order.len());
-        for page in &host.attach_order {
-            hash.update(page.to_le_bytes());
-        }
-        hash_len(&mut hash, host.calls.len());
-        for call in &host.calls {
-            hash_string(&mut hash, &call.name);
-            hash.update(call.command.to_le_bytes());
-            hash.update(call.phases.to_le_bytes());
-            hash.update(call.invocations.to_le_bytes());
-            for slices in [&call.inputs, &call.outputs] {
-                hash_len(&mut hash, slices.len());
-                for slice in slices {
-                    hash.update(slice.page.to_le_bytes());
-                    hash.update(slice.page_offset.to_le_bytes());
-                    hash.update(slice.file_offset.to_le_bytes());
-                    hash.update(slice.size.to_le_bytes());
-                }
-            }
-            if !call.input_batch_ends.is_empty() || !call.output_batch_ends.is_empty() {
-                hash.update(b"host-batches");
-                for ends in [&call.input_batch_ends, &call.output_batch_ends] {
-                    hash_len(&mut hash, ends.len());
-                    for end in ends {
-                        hash.update(end.to_le_bytes());
-                    }
-                }
-            }
-        }
-        hash_len(&mut hash, self.entry_points.len());
-        for entry in &self.entry_points {
-            hash_string(&mut hash, &entry.name);
-            hash.update(entry.command.to_le_bytes());
-            if entry.external_syncs != 0 {
-                hash.update(b"external-syncs");
-                hash.update(entry.external_syncs.to_le_bytes());
-            }
-        }
-        hash_len(&mut hash, self.device_config_writes.len());
-        for write in &self.device_config_writes {
-            hash.update(write.offset.to_le_bytes());
-            hash.update(write.value.to_le_bytes());
-        }
-        hash.finalize().into()
-    }
 }
-
-fn hash_string(hash: &mut Sha256, value: &str) {
-    hash_len(hash, value.len());
-    hash.update(value.as_bytes());
-}
-
-fn hash_len(hash: &mut Sha256, length: usize) {
-    hash.update((length as u64).to_le_bytes());
-}
-
 fn validate_host_batch_ends(
     call: &HostCall,
     direction: &str,
@@ -957,38 +612,6 @@ fn validate_host_batch_ends(
     Ok(())
 }
 
-fn legacy_u32(bytes: &[u8], offset: usize) -> Result<u32, PackageError> {
-    let value = bytes
-        .get(offset..offset + 4)
-        .ok_or_else(|| PackageError::Invalid("truncated legacy IPUIMG".into()))?;
-    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
-}
-
-fn legacy_u64(bytes: &[u8], offset: usize) -> Result<u64, PackageError> {
-    Ok(u64::from(legacy_u32(bytes, offset)?) | (u64::from(legacy_u32(bytes, offset + 4)?) << 32))
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
-        }
-    }
-    !crc
-}
-
-fn hex_digest(digest: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0xf) as usize] as char);
-    }
-    output
-}
-
 fn write_tiles(
     mut output: capnp::struct_list::Builder<'_, application_capnp::tile_image::Owned>,
     tiles: &[TileImage],
@@ -1004,9 +627,7 @@ fn write_tiles(
             let mut out = segments.reborrow().get(segment_index as u32);
             out.set_address(segment.address);
             out.set_memory_size(segment.memory_size);
-            out.set_blob_index(segment.blob as u32);
-            out.set_blob_offset(segment.blob_offset);
-            out.set_file_size(segment.file_size);
+            out.set_data(&segment.data);
             out.set_flags(segment.flags);
         }
     }
@@ -1026,15 +647,15 @@ fn read_tiles(
                 segments: item
                     .get_segments()?
                     .iter()
-                    .map(|segment| Segment {
-                        address: segment.get_address(),
-                        memory_size: segment.get_memory_size(),
-                        blob: segment.get_blob_index() as usize,
-                        blob_offset: segment.get_blob_offset(),
-                        file_size: segment.get_file_size(),
-                        flags: segment.get_flags(),
+                    .map(|segment| {
+                        Ok(Segment {
+                            address: segment.get_address(),
+                            memory_size: segment.get_memory_size(),
+                            data: segment.get_data()?.to_vec(),
+                            flags: segment.get_flags(),
+                        })
                     })
-                    .collect(),
+                    .collect::<Result<_, capnp::Error>>()?,
             })
         })
         .collect()
@@ -1205,8 +826,6 @@ mod tests {
 
     fn sample() -> Application {
         let mut app = Application::default();
-        let blob = app.add_blob(vec![1, 2, 3, 4]);
-        assert_eq!(blob, app.add_blob(vec![1, 2, 3, 4]));
         app.tiles.push(TileImage {
             physical_tile: 0,
             entry_point: TILE_MEMORY_BASE,
@@ -1215,9 +834,7 @@ mod tests {
             segments: vec![Segment {
                 address: TILE_MEMORY_BASE,
                 memory_size: 8,
-                blob,
-                blob_offset: 0,
-                file_size: 4,
+                data: vec![1, 2, 3, 4],
                 flags: SEGMENT_READ | SEGMENT_EXECUTE,
             }],
         });
@@ -1307,33 +924,6 @@ mod tests {
             },
         ];
         assert!(app.validate().is_err());
-    }
-
-    #[test]
-    fn ipu21_effective_elements_follow_region_interleaving() {
-        let low = ipu21_effective_memory_element(TILE_MEMORY_BASE).unwrap();
-        let low_tail = ipu21_effective_memory_element(IPU21_EXECUTABLE_MEMORY_LIMIT - 1).unwrap();
-        let high = ipu21_effective_memory_element(IPU21_EXECUTABLE_MEMORY_LIMIT).unwrap();
-        let high_same =
-            ipu21_effective_memory_element(IPU21_EXECUTABLE_MEMORY_LIMIT + 0x7fff).unwrap();
-        let high_next =
-            ipu21_effective_memory_element(IPU21_EXECUTABLE_MEMORY_LIMIT + 0x8000).unwrap();
-
-        assert_eq!(low, (0, TILE_MEMORY_BASE, TILE_MEMORY_BASE + 0x4000));
-        assert_eq!(low_tail.0 + 1, high.0);
-        assert_eq!(high, high_same);
-        assert_eq!(high_next.0, high.0 + 1);
-        assert_eq!(high_next.1, high.2);
-        assert_eq!(
-            ipu21_effective_memory_elements(IPU21_EXECUTABLE_MEMORY_LIMIT - 16, 32)
-                .unwrap()
-                .iter()
-                .map(|element| element.0)
-                .collect::<Vec<_>>(),
-            vec![low_tail.0, high.0]
-        );
-        assert!(ipu21_effective_memory_element(TILE_MEMORY_BASE - 1).is_none());
-        assert!(ipu21_effective_memory_element(IPU21_INTERLEAVED_REGION_LIMIT).is_none());
     }
 
     #[test]

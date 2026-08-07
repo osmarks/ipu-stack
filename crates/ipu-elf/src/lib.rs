@@ -65,11 +65,13 @@ impl Toolchain {
     ) -> Result<KernelArtifact, ElfError> {
         let source = source.as_ref();
         let cache = self.cached_artifact(source, flags)?;
-        if cache.object.is_file() && cache.metadata.is_file() && cache.gp.is_file() {
-            if cache.inspect().is_ok() {
-                debug!(source = %source.display(), name, "using cached kernel artifact");
-                return Ok(cache);
-            }
+        if cache.object.is_file()
+            && cache.metadata.is_file()
+            && cache.gp.is_file()
+            && cache.inspect().is_ok()
+        {
+            debug!(source = %source.display(), name, "using cached kernel artifact");
+            return Ok(cache);
         }
         info!(
             source = %source.display(),

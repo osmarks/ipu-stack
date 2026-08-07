@@ -1,13 +1,13 @@
 [workspace]
 members = [
   "crates/ipu-exchange",
+  "crates/ipu-codegen",
   "crates/ipu-package",
   "crates/ipu-elf",
-  "crates/ipu-compiler",
   "crates/ipu-driver",
   "crates/ipu-runtime",
+  "crates/ipu-tests",
   "crates/ipu-profile",
-  "crates/ipu-models",
   "crates/ipu-cli",
 ]
 resolver = "3"
@@ -24,18 +24,11 @@ capnpc = "0.26.0"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 fastrand = "2.3.0"
 hex = "0.4.3"
-half = "2.7.1"
 libc = "0.2.180"
-memmap2 = "0.9.9"
 object = { version = "0.39.1", features = ["read_core", "elf"] }
-rayon = "1.11.0"
-rustc-hash = "2.1.1"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"
-safetensors = "0.8.0"
 sha2 = "0.11.0"
-smallvec = { version = "1.15.1", features = ["serde"] }
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
-zstd = "0.13.3"
