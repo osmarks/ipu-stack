@@ -32,10 +32,13 @@ change a kernel or exchange plan, but not physical tile IDs, SRAM addresses,
 lifetimes, or exchange rows. AMP order represents configurable left-operand,
 right-operand, and output block dimensions.
 
-`mid::lower` considers legal formats for each semantic operation. The initial
-toy model compares rough arithmetic throughput with bytes moved. When a chosen
-kernel format differs from its producer, lowering inserts `CastPrecision` and
-`Rearrange` operations explicitly. Repeated regions stay structured; their
+`mid::lower` considers complete kernel signatures for each semantic operation.
+Signatures record every input and output format plus operation-specific compute
+precision. They can therefore describe mixed-precision and alternative-layout
+kernels. The initial toy model compares rough arithmetic throughput with bytes
+moved. When a chosen kernel format differs from its producer, lowering inserts
+`CastPrecision` and `Rearrange` operations explicitly. Repeated regions stay
+structured; their
 iterated value sequences are normalized once outside the body rather than
 causing the body to be unrolled.
 

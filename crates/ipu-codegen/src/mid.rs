@@ -144,12 +144,127 @@ impl TensorType {
 }
 
 /// Information supplied for semantic graph inputs and parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemmCandidate {
+    pub left: TensorFormat,
+    pub right: TensorFormat,
+    pub output: TensorFormat,
+    pub multiply: Precision,
+    pub accumulate: AccumulationPrecision,
+}
+
+impl GemmCandidate {
+    pub const fn new(
+        left: TensorFormat,
+        right: TensorFormat,
+        output: TensorFormat,
+        multiply: Precision,
+        accumulate: AccumulationPrecision,
+    ) -> Self {
+        Self {
+            left,
+            right,
+            output,
+            multiply,
+            accumulate,
+        }
+    }
+
+    pub const fn amp_f16(tile_count: u16) -> Self {
+        Self::new(
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::amp_left(16, tile_count),
+            },
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::amp_right(16, tile_count),
+            },
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::amp_output(tile_count),
+            },
+            Precision::F16,
+            AccumulationPrecision::F32,
+        )
+    }
+
+    pub const fn amp_f32(tile_count: u16) -> Self {
+        Self::new(
+            TensorFormat {
+                precision: Precision::F32,
+                layout: Layout::amp_left(8, tile_count),
+            },
+            TensorFormat {
+                precision: Precision::F32,
+                layout: Layout::amp_right(8, tile_count),
+            },
+            TensorFormat {
+                precision: Precision::F32,
+                layout: Layout::amp_output(tile_count),
+            },
+            Precision::F32,
+            AccumulationPrecision::F32,
+        )
+    }
+}
+
+/// Complete format signature of one available kernel implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelCandidate {
+    Gemm(GemmCandidate),
+    Gelu {
+        input: TensorFormat,
+        output: TensorFormat,
+    },
+    Add {
+        left: TensorFormat,
+        right: TensorFormat,
+        output: TensorFormat,
+    },
+    FlashAttention {
+        query: TensorFormat,
+        key: TensorFormat,
+        value: TensorFormat,
+        output: TensorFormat,
+        accumulate: AccumulationPrecision,
+    },
+}
+
+impl KernelCandidate {
+    pub const fn gelu(format: TensorFormat) -> Self {
+        Self::Gelu {
+            input: format,
+            output: format,
+        }
+    }
+
+    pub const fn add(format: TensorFormat) -> Self {
+        Self::Add {
+            left: format,
+            right: format,
+            output: format,
+        }
+    }
+
+    pub const fn flash_attention(format: TensorFormat, accumulate: AccumulationPrecision) -> Self {
+        Self::FlashAttention {
+            query: format,
+            key: format,
+            value: format,
+            output: format,
+            accumulate,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoweringConfig {
     pub tile_count: u16,
     pub inputs: BTreeMap<ValueId, TensorFormat>,
-    /// Candidate GEMM storage precisions, in tie-breaking order.
-    pub gemm_precisions: Vec<Precision>,
+    /// Signatures available independently to each operation. Earlier entries
+    /// of the appropriate operation kind win when costs are equal.
+    pub kernel_candidates: Vec<KernelCandidate>,
 }
 
 impl LoweringConfig {
@@ -157,7 +272,7 @@ impl LoweringConfig {
         Self {
             tile_count,
             inputs: BTreeMap::new(),
-            gemm_precisions: vec![Precision::F16, Precision::F32],
+            kernel_candidates: default_kernel_candidates(tile_count),
         }
     }
 
@@ -165,6 +280,35 @@ impl LoweringConfig {
         self.inputs.insert(value, format);
         self
     }
+}
+
+fn default_kernel_candidates(tile_count: u16) -> Vec<KernelCandidate> {
+    let rows_f16 = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::row_major(Sharding::Rows, tile_count),
+    };
+    let rows_f32 = TensorFormat {
+        precision: Precision::F32,
+        layout: Layout::row_major(Sharding::Rows, tile_count),
+    };
+    let heads_f16 = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::row_major(Sharding::Heads, tile_count),
+    };
+    let heads_f32 = TensorFormat {
+        precision: Precision::F32,
+        layout: Layout::row_major(Sharding::Heads, tile_count),
+    };
+    vec![
+        KernelCandidate::Gemm(GemmCandidate::amp_f16(tile_count)),
+        KernelCandidate::Gemm(GemmCandidate::amp_f32(tile_count)),
+        KernelCandidate::gelu(rows_f16),
+        KernelCandidate::gelu(rows_f32),
+        KernelCandidate::add(rows_f16),
+        KernelCandidate::add(rows_f32),
+        KernelCandidate::flash_attention(heads_f16, AccumulationPrecision::F32),
+        KernelCandidate::flash_attention(heads_f32, AccumulationPrecision::F32),
+    ]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -451,7 +595,8 @@ fn lower_operations(
         let plans = plans(operation, &input_types, &output_shape, config);
         let plan = plans
             .into_iter()
-            .map(|plan| {
+            .enumerate()
+            .map(|(order, plan)| {
                 let conversion = input_types
                     .iter()
                     .zip(&plan.inputs)
@@ -470,7 +615,7 @@ fn lower_operations(
                     })
                     .collect::<Vec<_>>();
                 let cost = conversion + costs.kernel_cost(plan.kernel, &planned_inputs, &output);
-                (cost, plan)
+                ((cost, order), plan)
             })
             .min_by_key(|(cost, _)| *cost)
             .ok_or(LoweringError::NoCandidate(operation.id))?
@@ -519,72 +664,70 @@ struct Plan {
 
 fn plans(
     operation: &Operation,
-    inputs: &[TensorType],
+    _inputs: &[TensorType],
     _output: &TensorShape,
     config: &LoweringConfig,
 ) -> Vec<Plan> {
     match operation.kind {
         OperationKind::Gemm => config
-            .gemm_precisions
+            .kernel_candidates
             .iter()
-            .filter_map(|&precision| {
-                let inner = match precision {
-                    Precision::F16 => 16,
-                    Precision::F32 => 8,
-                    Precision::F8F143 { .. } => return None,
-                };
-                Some(Plan {
+            .filter_map(|candidate| match candidate {
+                KernelCandidate::Gemm(candidate) => Some(Plan {
                     kernel: MidKernel::Gemm {
-                        multiply: precision,
-                        accumulate: AccumulationPrecision::F32,
+                        multiply: candidate.multiply,
+                        accumulate: candidate.accumulate,
                     },
-                    inputs: vec![
-                        TensorFormat {
-                            precision,
-                            layout: Layout::amp_left(inner, config.tile_count),
-                        },
-                        TensorFormat {
-                            precision,
-                            layout: Layout::amp_right(inner, config.tile_count),
-                        },
-                    ],
-                    output: TensorFormat {
-                        precision,
-                        layout: Layout::amp_output(config.tile_count),
-                    },
-                })
+                    inputs: vec![candidate.left, candidate.right],
+                    output: candidate.output,
+                }),
+                _ => None,
             })
             .collect(),
-        OperationKind::Add => inputs
+        OperationKind::Gelu => config
+            .kernel_candidates
             .iter()
-            .map(|input| input.format)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .map(|format| Plan {
-                kernel: MidKernel::Add,
-                inputs: vec![format, format],
-                output: format,
+            .filter_map(|candidate| match *candidate {
+                KernelCandidate::Gelu { input, output } => Some(Plan {
+                    kernel: MidKernel::Gelu,
+                    inputs: vec![input],
+                    output,
+                }),
+                _ => None,
             })
             .collect(),
-        OperationKind::Gelu => vec![Plan {
-            kernel: MidKernel::Gelu,
-            inputs: vec![inputs[0].format],
-            output: inputs[0].format,
-        }],
-        OperationKind::FlashAttention => [Precision::F16, Precision::F32]
-            .into_iter()
-            .map(|precision| {
-                let format = TensorFormat {
-                    precision,
-                    layout: Layout::row_major(Sharding::Heads, config.tile_count),
-                };
-                Plan {
-                    kernel: MidKernel::FlashAttention {
-                        accumulate: AccumulationPrecision::F32,
-                    },
-                    inputs: vec![format; 3],
-                    output: format,
-                }
+        OperationKind::Add => config
+            .kernel_candidates
+            .iter()
+            .filter_map(|candidate| match *candidate {
+                KernelCandidate::Add {
+                    left,
+                    right,
+                    output,
+                } => Some(Plan {
+                    kernel: MidKernel::Add,
+                    inputs: vec![left, right],
+                    output,
+                }),
+                _ => None,
+            })
+            .collect(),
+        OperationKind::FlashAttention => config
+            .kernel_candidates
+            .iter()
+            .filter_map(|candidate| match *candidate {
+                KernelCandidate::FlashAttention {
+                    query,
+                    key,
+                    value,
+                    output,
+                    accumulate,
+                } => Some(Plan {
+                    kernel: MidKernel::FlashAttention { accumulate },
+                    inputs: vec![query, key, value],
+                    output,
+                }),
+                _ => None,
             })
             .collect(),
         OperationKind::Repeat(_) => unreachable!("repeat is lowered separately"),
@@ -791,6 +934,22 @@ mod tests {
         TensorFormat { precision, layout }
     }
 
+    fn random_format(random: &mut fastrand::Rng, tiles: u16) -> TensorFormat {
+        let sharding = match random.u8(0..4) {
+            0 => Sharding::Replicated,
+            1 => Sharding::Rows,
+            2 => Sharding::Columns,
+            _ => Sharding::Heads,
+        };
+        let mut layout = Layout::row_major(sharding, tiles);
+        if random.bool() {
+            layout.storage = Storage::Interleaved {
+                grain_bytes: [4, 8, 16][random.usize(0..3)],
+            };
+        }
+        format(precision(random), layout)
+    }
+
     fn value(lowered: &MidGraph, id: MidValueId) -> &MidValue {
         &lowered.values[id.index() as usize]
     }
@@ -823,6 +982,58 @@ mod tests {
         }
     }
 
+    fn assert_kernel_signature(
+        lowered: &MidGraph,
+        operation: &MidOperation,
+        inputs: &[TensorFormat],
+        output: TensorFormat,
+    ) {
+        assert_eq!(operation.inputs.len(), inputs.len());
+        for (&value_id, &expected) in operation.inputs.iter().zip(inputs) {
+            assert_eq!(value(lowered, value_id).tensor_type.format, expected);
+        }
+        assert_eq!(
+            value(lowered, operation.results[0]).tensor_type.format,
+            output
+        );
+    }
+
+    struct ColumnParityCost;
+
+    impl CostModel for ColumnParityCost {
+        fn kernel_cost(
+            &self,
+            kernel: MidKernel,
+            _inputs: &[TensorType],
+            output: &TensorType,
+        ) -> u64 {
+            let preferred = if output.shape.0.last().unwrap().is_multiple_of(2) {
+                Precision::F16
+            } else {
+                Precision::F32
+            };
+            match kernel {
+                MidKernel::Gemm { multiply, .. } if multiply == preferred => 0,
+                MidKernel::Gemm { .. } => 1,
+                _ => 0,
+            }
+        }
+
+        fn cast_cost(&self, _shape: &TensorShape, _from: Precision, _to: Precision) -> u64 {
+            0
+        }
+
+        fn rearrange_cost(
+            &self,
+            _shape: &TensorShape,
+            _precision: Precision,
+            _from: Layout,
+            _to: Layout,
+        ) -> u64 {
+            0
+        }
+    }
+
     #[test]
     fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
         let mut random = fastrand::Rng::with_seed(0x6d69_6467);
@@ -836,7 +1047,33 @@ mod tests {
                 .map(|_| dimension(&mut random))
                 .collect::<Vec<_>>();
             let tiles = random.u16(1..=64);
-            let kernel_precision = precision(&mut random);
+            let multiply = precision(&mut random);
+            let left_format = format(
+                precision(&mut random),
+                Layout::amp_left([8, 16, 32][random.usize(0..3)], tiles),
+            );
+            let right_format = format(
+                if random.bool() {
+                    precision(&mut random)
+                } else {
+                    Precision::F8F143 {
+                        scale: random.i8(-16..=16),
+                    }
+                },
+                Layout::amp_right([8, 16, 32][random.usize(0..3)], tiles),
+            );
+            let output_format = format(precision(&mut random), Layout::amp_output(tiles));
+            let candidate = GemmCandidate::new(
+                left_format,
+                right_format,
+                output_format,
+                multiply,
+                if random.bool() {
+                    AccumulationPrecision::F16
+                } else {
+                    AccumulationPrecision::F32
+                },
+            );
             let mut left_shape = batches.clone();
             left_shape.extend([rows, inner]);
             let mut right_shape = batches;
@@ -851,7 +1088,7 @@ mod tests {
             let mut config = LoweringConfig::new(tiles)
                 .with_input(left, format(precision(&mut random), linear))
                 .with_input(right, format(precision(&mut random), linear));
-            config.gemm_precisions = vec![kernel_precision];
+            config.kernel_candidates = vec![KernelCandidate::Gemm(candidate)];
 
             let lowered = lower(&graph, &config, &ToyCostModel).unwrap();
             let kernel = lowered
@@ -859,23 +1096,23 @@ mod tests {
                 .iter()
                 .find(|operation| matches!(operation.kind, MidOperationKind::Kernel(_)))
                 .unwrap();
-            let MidOperationKind::Kernel(MidKernel::Gemm { multiply, .. }) = kernel.kind else {
+            let MidOperationKind::Kernel(MidKernel::Gemm {
+                multiply,
+                accumulate,
+            }) = kernel.kind
+            else {
                 panic!("random case {case}: expected GEMM");
             };
-            assert_eq!(multiply, kernel_precision, "random case {case}");
-            let inner_block = if kernel_precision == Precision::F16 {
-                16
-            } else {
-                8
-            };
+            assert_eq!(multiply, candidate.multiply, "random case {case}");
+            assert_eq!(accumulate, candidate.accumulate, "random case {case}");
             assert_eq!(
                 value(&lowered, kernel.inputs[0]).tensor_type.format,
-                format(kernel_precision, Layout::amp_left(inner_block, tiles)),
+                candidate.left,
                 "random case {case}"
             );
             assert_eq!(
                 value(&lowered, kernel.inputs[1]).tensor_type.format,
-                format(kernel_precision, Layout::amp_right(inner_block, tiles)),
+                candidate.right,
                 "random case {case}"
             );
             let output = value(&lowered, lowered.outputs[0]);
@@ -885,8 +1122,7 @@ mod tests {
                 "random case {case}"
             );
             assert_eq!(
-                output.tensor_type.format,
-                format(kernel_precision, Layout::amp_output(tiles)),
+                output.tensor_type.format, candidate.output,
                 "random case {case}"
             );
             assert_conversions_are_explicit(&lowered, &lowered.operations);
@@ -894,42 +1130,142 @@ mod tests {
     }
 
     #[test]
-    fn randomized_add_lowering_unifies_operand_formats() {
-        let mut random = fastrand::Rng::with_seed(0x6164_642b);
+    fn randomized_gemms_choose_precision_independently_within_one_graph() {
+        let mut random = fastrand::Rng::with_seed(0x6d75_6c74);
         for case in 0..RANDOM_CASES {
-            let shape = (0..random.usize(1..=5))
-                .map(|_| dimension(&mut random))
-                .collect::<Vec<_>>();
+            let rows = dimension(&mut random);
+            let inner = dimension(&mut random);
+            let even_columns = random.u32(1..=64) * 2;
+            let odd_columns = random.u32(1..=64) * 2 - 1;
             let tiles = random.u16(1..=64);
             let layout = Layout::row_major(Sharding::Rows, tiles);
             let mut graph = ComputeGraph::new();
-            let left = graph.host_input("left", shape.clone()).unwrap();
-            let right = graph.host_input("right", shape).unwrap();
-            let sum = graph.add(left, right).unwrap();
-            graph.set_outputs([sum]).unwrap();
+            let left = graph.host_input("left", [rows, inner]).unwrap();
+            let even_right = graph.parameter("even", [inner, even_columns]).unwrap();
+            let odd_right = graph.parameter("odd", [inner, odd_columns]).unwrap();
+            let even = graph.gemm(left, even_right).unwrap();
+            let odd = graph.gemm(left, odd_right).unwrap();
+            graph.set_outputs([even, odd]).unwrap();
+            let input_format = format(precision(&mut random), layout);
             let config = LoweringConfig::new(tiles)
-                .with_input(left, format(Precision::F16, layout))
-                .with_input(right, format(Precision::F32, layout));
+                .with_input(left, input_format)
+                .with_input(even_right, input_format)
+                .with_input(odd_right, input_format);
 
-            let lowered = lower(&graph, &config, &ToyCostModel).unwrap();
-            let kernel = lowered.operations.last().unwrap();
-            assert!(matches!(
-                kernel.kind,
-                MidOperationKind::Kernel(MidKernel::Add)
-            ));
-            let left_format = value(&lowered, kernel.inputs[0]).tensor_type.format;
-            let right_format = value(&lowered, kernel.inputs[1]).tensor_type.format;
-            assert_eq!(left_format, right_format, "random case {case}");
+            let lowered = lower(&graph, &config, &ColumnParityCost).unwrap();
+            let chosen = lowered
+                .operations
+                .iter()
+                .filter_map(|operation| match operation.kind {
+                    MidOperationKind::Kernel(MidKernel::Gemm { multiply, .. }) => Some(multiply),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             assert_eq!(
-                value(&lowered, kernel.results[0]).tensor_type.format,
-                left_format,
+                chosen,
+                vec![Precision::F16, Precision::F32],
                 "random case {case}"
             );
-            assert!(
-                lowered.operations.iter().any(|operation| matches!(
-                    operation.kind,
-                    MidOperationKind::CastPrecision { .. }
-                ))
+        }
+    }
+
+    #[test]
+    fn randomized_non_gemm_lowering_honors_complete_kernel_signatures() {
+        let mut random = fastrand::Rng::with_seed(0x6164_642b);
+        for case in 0..RANDOM_CASES {
+            let tiles = random.u16(1..=64);
+            let batch = dimension(&mut random);
+            let query_rows = dimension(&mut random);
+            let key_rows = dimension(&mut random);
+            let channels = dimension(&mut random);
+            let value_channels = dimension(&mut random);
+            let mut graph = ComputeGraph::new();
+            let activation = graph
+                .host_input("activation", [batch, query_rows, channels])
+                .unwrap();
+            let residual = graph
+                .host_input("residual", [batch, query_rows, channels])
+                .unwrap();
+            let query = graph
+                .host_input("query", [batch, query_rows, channels])
+                .unwrap();
+            let key = graph
+                .host_input("key", [batch, key_rows, channels])
+                .unwrap();
+            let attention_value = graph
+                .host_input("value", [batch, key_rows, value_channels])
+                .unwrap();
+            let activated = graph.gelu(activation).unwrap();
+            let sum = graph.add(activated, residual).unwrap();
+            let attended = graph.flash_attention(query, key, attention_value).unwrap();
+            graph.set_outputs([sum, attended]).unwrap();
+
+            let gelu_input = random_format(&mut random, tiles);
+            let gelu_output = random_format(&mut random, tiles);
+            let add_left = random_format(&mut random, tiles);
+            let add_right = random_format(&mut random, tiles);
+            let add_output = random_format(&mut random, tiles);
+            let attention_query = random_format(&mut random, tiles);
+            let attention_key = random_format(&mut random, tiles);
+            let attention_value_format = random_format(&mut random, tiles);
+            let attention_output = random_format(&mut random, tiles);
+            let attention_accumulate = if random.bool() {
+                AccumulationPrecision::F16
+            } else {
+                AccumulationPrecision::F32
+            };
+            let mut config = LoweringConfig::new(tiles)
+                .with_input(activation, random_format(&mut random, tiles))
+                .with_input(residual, random_format(&mut random, tiles))
+                .with_input(query, random_format(&mut random, tiles))
+                .with_input(key, random_format(&mut random, tiles))
+                .with_input(attention_value, random_format(&mut random, tiles));
+            config.kernel_candidates = vec![
+                KernelCandidate::Gelu {
+                    input: gelu_input,
+                    output: gelu_output,
+                },
+                KernelCandidate::Add {
+                    left: add_left,
+                    right: add_right,
+                    output: add_output,
+                },
+                KernelCandidate::FlashAttention {
+                    query: attention_query,
+                    key: attention_key,
+                    value: attention_value_format,
+                    output: attention_output,
+                    accumulate: attention_accumulate,
+                },
+            ];
+
+            let lowered = lower(&graph, &config, &ToyCostModel).unwrap();
+            let kernels = lowered
+                .operations
+                .iter()
+                .filter(|operation| matches!(operation.kind, MidOperationKind::Kernel(_)))
+                .collect::<Vec<_>>();
+            assert_eq!(kernels.len(), 3, "random case {case}");
+            assert!(matches!(
+                kernels[0].kind,
+                MidOperationKind::Kernel(MidKernel::Gelu)
+            ));
+            assert_kernel_signature(&lowered, kernels[0], &[gelu_input], gelu_output);
+            assert!(matches!(
+                kernels[1].kind,
+                MidOperationKind::Kernel(MidKernel::Add)
+            ));
+            assert_kernel_signature(&lowered, kernels[1], &[add_left, add_right], add_output);
+            assert!(matches!(
+                kernels[2].kind,
+                MidOperationKind::Kernel(MidKernel::FlashAttention { accumulate })
+                    if accumulate == attention_accumulate
+            ));
+            assert_kernel_signature(
+                &lowered,
+                kernels[2],
+                &[attention_query, attention_key, attention_value_format],
+                attention_output,
             );
             assert_conversions_are_explicit(&lowered, &lowered.operations);
         }
