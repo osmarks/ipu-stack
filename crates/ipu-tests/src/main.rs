@@ -31,11 +31,20 @@ struct Arguments {
     #[arg(long, default_value_t = 10)]
     timeout_seconds: u64,
     /// Execute one blocked F16 GEMM as a kernel/exchange smoke test.
-    #[arg(long, conflicts_with = "mlp_smoke")]
+    #[arg(long, conflicts_with_all = ["mlp_smoke", "gemm_benchmark"])]
     gemm_smoke: bool,
     /// Execute and numerically verify GEMM-GeLU-GEMM-GeLU.
-    #[arg(long, conflicts_with = "gemm_smoke")]
+    #[arg(long, conflicts_with_all = ["gemm_smoke", "gemm_benchmark"])]
     mlp_smoke: bool,
+    /// Measure a compute-dense blocked F16 GEMM using device cycle counters.
+    #[arg(long, conflicts_with_all = ["gemm_smoke", "mlp_smoke"])]
+    gemm_benchmark: bool,
+    #[arg(long, default_value_t = 256)]
+    benchmark_rows_per_tile: u32,
+    #[arg(long, default_value_t = 64)]
+    benchmark_inner: u32,
+    #[arg(long, default_value_t = 1_500_000_000)]
+    clock_hz: u64,
 }
 
 fn main() -> Result<()> {
@@ -91,6 +100,30 @@ fn main() -> Result<()> {
             .with_input(left, left_format)
             .with_input(right0, right_format.clone())
             .with_input(right1, right_format);
+    } else if arguments.gemm_benchmark {
+        let rows = u32::from(active_tiles)
+            .checked_mul(arguments.benchmark_rows_per_tile)
+            .context("benchmark row count overflow")?;
+        let left = graph.host_input("left", [rows, arguments.benchmark_inner])?;
+        let right = graph.parameter("right", [arguments.benchmark_inner, 64])?;
+        let output = graph.gemm(left, right)?;
+        graph.set_outputs([output])?;
+        pipeline.profiling.enabled = true;
+        pipeline = pipeline
+            .with_input(
+                left,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::amp_left(64, active_tiles),
+                },
+            )
+            .with_input(
+                right,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::amp_right(64, active_tiles),
+                },
+            );
     }
     let application = build_package(
         &graph,
@@ -116,7 +149,7 @@ fn main() -> Result<()> {
     let bootloader_bytes =
         fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
     let runtime = Runtime::open(&arguments.device, &configuration)?;
-    if arguments.gemm_smoke || arguments.mlp_smoke {
+    if arguments.gemm_smoke || arguments.mlp_smoke || arguments.gemm_benchmark {
         runtime.load(
             &application,
             &bootloader_bytes,
@@ -129,11 +162,21 @@ fn main() -> Result<()> {
                 active_tiles,
                 arguments.timeout_seconds,
             )?;
-        } else {
+        } else if arguments.mlp_smoke {
             run_mlp_chain(
                 &runtime,
                 &application,
                 active_tiles,
+                arguments.timeout_seconds,
+            )?;
+        } else {
+            run_gemm_benchmark(
+                &runtime,
+                &application,
+                active_tiles,
+                arguments.benchmark_rows_per_tile,
+                arguments.benchmark_inner,
+                arguments.clock_hz,
                 arguments.timeout_seconds,
             )?;
         }
@@ -252,6 +295,124 @@ fn run_mlp_chain(
     diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
     let output = session.collect(&executed)?;
     verify_mlp_output(application, active_tiles, &output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_gemm_benchmark(
+    runtime: &Runtime,
+    application: &Application,
+    active_tiles: u16,
+    rows_per_tile: u32,
+    inner: u32,
+    clock_hz: u64,
+    timeout_seconds: u64,
+) -> Result<()> {
+    if rows_per_tile == 0 || inner == 0 || !inner.is_multiple_of(64) || clock_hz == 0 {
+        bail!(
+            "benchmark rows must be nonzero, inner must be a nonzero multiple of 64, and clock must be nonzero"
+        );
+    }
+    let left = application
+        .inputs
+        .iter()
+        .find(|binding| binding.name == "left")
+        .context("benchmark package has no left binding")?;
+    let right = application
+        .weights
+        .iter()
+        .find(|binding| binding.name == "right")
+        .context("benchmark package has no right binding")?;
+    let left_bytes = filled_f16_binding(left, 0x3c00)?;
+    let right_bytes = filled_f16_binding(right, 0x3400)?;
+    let mut session = runtime.host_session(application)?;
+    session.start()?;
+    let initialized = session.invoke_streaming_deferred("initialize", &right_bytes)?;
+    session.collect(&initialized)?;
+    let executed = session.invoke_streaming_deferred("run", &left_bytes)?;
+    runtime
+        .device()
+        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+    diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
+    let output = session.collect(&executed)?;
+    let starts = binding_u32_values(application, &output, "profile.start-cycle")?;
+    let ends = binding_u32_values(application, &output, "profile.end-cycle")?;
+    if starts.len() != usize::from(active_tiles) || ends.len() != starts.len() {
+        bail!(
+            "benchmark profile bindings have {} start and {} end samples for {active_tiles} tiles",
+            starts.len(),
+            ends.len()
+        );
+    }
+    let durations = starts
+        .into_iter()
+        .zip(ends)
+        .map(|(start, end)| end.wrapping_sub(start))
+        .collect::<Vec<_>>();
+    let cycles = durations.iter().copied().max().unwrap_or(0);
+    if cycles == 0 {
+        bail!("benchmark cycle interval is zero");
+    }
+    let rows = u64::from(active_tiles) * u64::from(rows_per_tile);
+    let flops = 2.0 * rows as f64 * f64::from(inner) * 64.0;
+    let seconds = f64::from(cycles) / clock_hz as f64;
+    let tflops = flops / seconds / 1.0e12;
+    let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
+    let minimum_cycles = durations.iter().copied().min().unwrap_or(cycles);
+    println!(
+        "benchmark=gemm-f16 rows={rows} inner={inner} columns=64 tiles={active_tiles} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} tflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2}",
+        seconds * 1.0e6,
+        tflops / peak_tflops * 100.0,
+    );
+    Ok(())
+}
+
+fn binding_u32_values(application: &Application, bytes: &[u8], name: &str) -> Result<Vec<u32>> {
+    let mut binding_base = 0u64;
+    for binding in &application.outputs {
+        let binding_size = binding
+            .slices
+            .iter()
+            .map(|slice| slice.file_offset + slice.size)
+            .max()
+            .unwrap_or(0);
+        if binding.name == name {
+            let mut values = Vec::with_capacity(binding.slices.len());
+            for slice in &binding.slices {
+                if slice.size != 4 {
+                    bail!("profile binding {name} contains a non-u32 slice");
+                }
+                let start = usize::try_from(binding_base + slice.file_offset)?;
+                let end = start.checked_add(4).context("profile offset overflow")?;
+                let raw = bytes
+                    .get(start..end)
+                    .with_context(|| format!("profile binding {name} exceeds host output"))?;
+                values.push(u32::from_le_bytes(raw.try_into().unwrap()));
+            }
+            return Ok(values);
+        }
+        binding_base = binding_base
+            .checked_add(binding_size)
+            .context("host output binding offset overflow")?;
+    }
+    bail!("package has no {name} output binding")
+}
+
+fn filled_f16_binding(binding: &Binding, bits: u16) -> Result<Vec<u8>> {
+    let size = binding
+        .slices
+        .iter()
+        .map(|slice| slice.file_offset + slice.size)
+        .max()
+        .context("binding has no slices")?;
+    if size & 1 != 0 {
+        bail!("binding {} has an odd byte count", binding.name);
+    }
+    let pair = bits.to_le_bytes();
+    let mut bytes = vec![0; usize::try_from(size)?];
+    for chunk in bytes.chunks_exact_mut(2) {
+        chunk.copy_from_slice(&pair);
+    }
+    Ok(bytes)
 }
 
 fn verify_mlp_output(application: &Application, active_tiles: u16, bytes: &[u8]) -> Result<()> {

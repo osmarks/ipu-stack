@@ -1,7 +1,10 @@
 use crate::graph::ComputeGraph;
 use crate::host;
 use crate::low::{LowProgram, LowValue};
-use crate::memory::{RUNTIME_STATE_BASE, RUNTIME_STATE_BYTES, WORKER_STACK_HEADROOM};
+use crate::memory::{
+    PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE, RUNTIME_STATE_BYTES,
+    WORKER_STACK_HEADROOM,
+};
 use crate::mid::{PipelineConfig, ToyCostModel};
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, KernelBuildPlan, PRNG_SEED_SYMBOL,
@@ -144,12 +147,24 @@ fn build_package_from_objects(
         .filter(|input| input.kind == crate::GraphInputKind::Parameter)
         .map(|input| input_binding(program, &placement, &topology, input))
         .collect::<PackageBuildResult<Vec<_>>>()?;
-    let outputs = program
+    let mut outputs = program
         .outputs
         .iter()
         .enumerate()
         .map(|(index, output)| output_binding(program, &placement, &topology, output, index))
         .collect::<PackageBuildResult<Vec<_>>>()?;
+    if config.pipeline.profiling.enabled {
+        outputs.push(cycle_binding(
+            "profile.start-cycle",
+            PROFILE_START_CYCLE,
+            program.tile_count,
+        ));
+        outputs.push(cycle_binding(
+            "profile.end-cycle",
+            PROFILE_END_CYCLE,
+            program.tile_count,
+        ));
+    }
     let host = host::plan(
         &weights,
         &inputs,
@@ -183,6 +198,16 @@ fn build_package_from_objects(
                 host,
                 &CodegenOptions {
                     code_address,
+                    initial_profile_address: config
+                        .pipeline
+                        .profiling
+                        .enabled
+                        .then_some(PROFILE_START_CYCLE),
+                    final_profile_address: config
+                        .pipeline
+                        .profiling
+                        .enabled
+                        .then_some(PROFILE_END_CYCLE),
                     ..CodegenOptions::default()
                 },
             )
@@ -391,6 +416,22 @@ fn output_binding(
         format!("output.{index}"),
         &output.shards,
     )
+}
+
+fn cycle_binding(name: &str, address: u32, tile_count: u16) -> Binding {
+    Binding {
+        name: name.into(),
+        dtype: "u32".into(),
+        shape: vec![u32::from(tile_count)],
+        slices: (0..tile_count)
+            .map(|tile| RegionSlice {
+                tile: u32::from(tile),
+                tile_address: address,
+                file_offset: u64::from(tile) * 4,
+                size: 4,
+            })
+            .collect(),
+    }
 }
 
 fn binding(

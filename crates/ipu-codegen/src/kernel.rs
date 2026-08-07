@@ -99,8 +99,8 @@ pub enum KernelMaterializationError {
     Storage(#[from] StorageError),
     #[error("shard {0} has no assigned address")]
     UnplacedShard(u32),
-    #[error("kernel operand view is not one contiguous physical byte span")]
-    FragmentedView,
+    #[error("kernel operand view of shard {shard} has {spans} physical byte spans")]
+    FragmentedView { shard: u32, spans: usize },
     #[error("placed kernel address overflowed")]
     AddressOverflow,
 }
@@ -227,7 +227,10 @@ pub fn materialize_kernel_run_with_addresses(
         )?;
         let spans = view_byte_spans(shard, view)?;
         let [span] = spans.as_slice() else {
-            return Err(KernelMaterializationError::FragmentedView);
+            return Err(KernelMaterializationError::FragmentedView {
+                shard: view.shard.index(),
+                spans: spans.len(),
+            });
         };
         let base = overrides.get(&view.shard).copied().unwrap_or_else(|| {
             TileAddress::Absolute(
