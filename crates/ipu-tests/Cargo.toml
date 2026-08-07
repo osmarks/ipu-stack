@@ -17,3 +17,6 @@ ipu-elf = { path = "../ipu-elf" }
 ipu-exchange = { path = "../ipu-exchange" }
 ipu-package = { path = "../ipu-package" }
 ipu-runtime = { path = "../ipu-runtime" }
+
+[dev-dependencies]
+fastrand.workspace = true

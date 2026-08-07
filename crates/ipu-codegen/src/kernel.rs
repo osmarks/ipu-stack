@@ -395,6 +395,9 @@ pub fn tile_kernel_abi(
             if !matches!(requirements, KernelRequirements::Operator(_)) {
                 return Err(KernelAbiError::RequirementMismatch);
             }
+            if *weights == GemmWeightLoad::Interleaved && *multiply != Precision::F16 {
+                return Err(KernelAbiError::RequirementMismatch);
+            }
             let symbols = gemm_symbols(*multiply, *mode, *weights);
             let scalars = if matches!(multiply, Precision::F8F143 { .. }) {
                 scalar_arguments(2, &["scale_exponent"])

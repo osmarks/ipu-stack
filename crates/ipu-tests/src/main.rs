@@ -43,6 +43,8 @@ struct Arguments {
     benchmark_rows_per_tile: u32,
     #[arg(long, default_value_t = 64)]
     benchmark_inner: u32,
+    #[arg(long, default_value_t = 64)]
+    benchmark_columns: u32,
     #[arg(long, default_value_t = 1_500_000_000)]
     clock_hz: u64,
 }
@@ -101,11 +103,19 @@ fn main() -> Result<()> {
             .with_input(right0, right_format.clone())
             .with_input(right1, right_format);
     } else if arguments.gemm_benchmark {
+        validate_benchmark_shape(
+            arguments.benchmark_rows_per_tile,
+            arguments.benchmark_inner,
+            arguments.benchmark_columns,
+        )?;
         let rows = u32::from(active_tiles)
             .checked_mul(arguments.benchmark_rows_per_tile)
             .context("benchmark row count overflow")?;
         let left = graph.host_input("left", [rows, arguments.benchmark_inner])?;
-        let right = graph.parameter("right", [arguments.benchmark_inner, 64])?;
+        let right = graph.parameter(
+            "right",
+            [arguments.benchmark_inner, arguments.benchmark_columns],
+        )?;
         let output = graph.gemm(left, right)?;
         graph.set_outputs([output])?;
         pipeline.profiling.enabled = true;
@@ -176,6 +186,7 @@ fn main() -> Result<()> {
                 active_tiles,
                 arguments.benchmark_rows_per_tile,
                 arguments.benchmark_inner,
+                arguments.benchmark_columns,
                 arguments.clock_hz,
                 arguments.timeout_seconds,
             )?;
@@ -304,13 +315,13 @@ fn run_gemm_benchmark(
     active_tiles: u16,
     rows_per_tile: u32,
     inner: u32,
+    columns: u32,
     clock_hz: u64,
     timeout_seconds: u64,
 ) -> Result<()> {
-    if rows_per_tile == 0 || inner == 0 || !inner.is_multiple_of(64) || clock_hz == 0 {
-        bail!(
-            "benchmark rows must be nonzero, inner must be a nonzero multiple of 64, and clock must be nonzero"
-        );
+    validate_benchmark_shape(rows_per_tile, inner, columns)?;
+    if clock_hz == 0 {
+        bail!("benchmark clock must be nonzero");
     }
     let left = application
         .inputs
@@ -354,33 +365,56 @@ fn run_gemm_benchmark(
         bail!("benchmark cycle interval is zero");
     }
     let rows = u64::from(active_tiles) * u64::from(rows_per_tile);
-    let flops = 2.0 * rows as f64 * f64::from(inner) * 64.0;
+    let flops = 2.0 * rows as f64 * f64::from(inner) * f64::from(columns);
     let seconds = f64::from(cycles) / clock_hz as f64;
     let tflops = flops / seconds / 1.0e12;
     let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
     let minimum_cycles = durations.iter().copied().min().unwrap_or(cycles);
     println!(
-        "benchmark=gemm-f16 rows={rows} inner={inner} columns=64 tiles={active_tiles} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} tflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
+        "benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} tiles={active_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} tflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
+        left_bytes.len(),
+        right_bytes.len(),
         seconds * 1.0e6,
         tflops / peak_tflops * 100.0,
     );
     Ok(())
 }
 
+fn validate_benchmark_shape(rows_per_tile: u32, inner: u32, columns: u32) -> Result<()> {
+    if rows_per_tile == 0
+        || inner == 0
+        || columns == 0
+        || !inner.is_multiple_of(64)
+        || !columns.is_multiple_of(64)
+    {
+        bail!("benchmark rows must be nonzero and inner/columns must be nonzero multiples of 64");
+    }
+    let output_bytes = rows_per_tile
+        .checked_mul(columns)
+        .and_then(|elements| elements.checked_mul(2))
+        .context("benchmark output byte count overflow")?;
+    if output_bytes > ipu_codegen::memory::IPU21_INTERLEAVED_BYTES {
+        bail!(
+            "benchmark output needs {output_bytes} interleaved bytes per tile, but IPU21 provides {}",
+            ipu_codegen::memory::IPU21_INTERLEAVED_BYTES
+        );
+    }
+    Ok(())
+}
+
 fn verify_benchmark_output(application: &Application, bytes: &[u8], inner: u32) -> Result<f32> {
-    let binding = application
-        .outputs
-        .first()
-        .filter(|binding| binding.name == "output.0")
-        .context("benchmark package has no graph output")?;
-    let size = binding
-        .slices
-        .iter()
-        .map(|slice| slice.file_offset + slice.size)
-        .max()
-        .context("benchmark output has no slices")?;
+    let (binding, base) = output_binding(application, "output.0")?;
+    let size = binding_size(binding);
+    if size == 0 || !size.is_multiple_of(2) {
+        bail!("benchmark graph output is not a nonempty F16 binding");
+    }
+    let start = usize::try_from(base)?;
+    let end = usize::try_from(
+        base.checked_add(size)
+            .context("benchmark output overflow")?,
+    )?;
     let output = bytes
-        .get(..usize::try_from(size)?)
+        .get(start..end)
         .context("benchmark graph output exceeds host output")?;
     let expected = inner as f32 * 0.25;
     let mut maximum = 0.0f32;
@@ -397,34 +431,45 @@ fn verify_benchmark_output(application: &Application, bytes: &[u8], inner: u32) 
 }
 
 fn binding_u32_values(application: &Application, bytes: &[u8], name: &str) -> Result<Vec<u32>> {
-    let mut binding_base = 0u64;
-    for binding in &application.outputs {
-        let binding_size = binding
-            .slices
-            .iter()
-            .map(|slice| slice.file_offset + slice.size)
-            .max()
-            .unwrap_or(0);
-        if binding.name == name {
-            let mut values = Vec::with_capacity(binding.slices.len());
-            for slice in &binding.slices {
-                if slice.size != 4 {
-                    bail!("profile binding {name} contains a non-u32 slice");
-                }
-                let start = usize::try_from(binding_base + slice.file_offset)?;
-                let end = start.checked_add(4).context("profile offset overflow")?;
-                let raw = bytes
-                    .get(start..end)
-                    .with_context(|| format!("profile binding {name} exceeds host output"))?;
-                values.push(u32::from_le_bytes(raw.try_into().unwrap()));
-            }
-            return Ok(values);
+    let (binding, base) = output_binding(application, name)?;
+    let mut values = Vec::with_capacity(binding.slices.len());
+    for slice in &binding.slices {
+        if slice.size != 4 {
+            bail!("profile binding {name} contains a non-u32 slice");
         }
-        binding_base = binding_base
-            .checked_add(binding_size)
+        let start = usize::try_from(
+            base.checked_add(slice.file_offset)
+                .context("profile offset overflow")?,
+        )?;
+        let end = start.checked_add(4).context("profile offset overflow")?;
+        let raw = bytes
+            .get(start..end)
+            .with_context(|| format!("profile binding {name} exceeds host output"))?;
+        values.push(u32::from_le_bytes(raw.try_into().unwrap()));
+    }
+    Ok(values)
+}
+
+fn output_binding<'a>(application: &'a Application, name: &str) -> Result<(&'a Binding, u64)> {
+    let mut base = 0u64;
+    for binding in &application.outputs {
+        if binding.name == name {
+            return Ok((binding, base));
+        }
+        base = base
+            .checked_add(binding_size(binding))
             .context("host output binding offset overflow")?;
     }
     bail!("package has no {name} output binding")
+}
+
+fn binding_size(binding: &Binding) -> u64 {
+    binding
+        .slices
+        .iter()
+        .map(|slice| slice.file_offset + slice.size)
+        .max()
+        .unwrap_or(0)
 }
 
 fn filled_f16_binding(binding: &Binding, bits: u16) -> Result<Vec<u8>> {
@@ -675,4 +720,26 @@ fn summarize_states(states: &[(u16, u32)]) -> String {
         }
     }
     format!("counts={counts:?} firstUnexpected={unexpected:?}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn randomized_benchmark_shapes_enforce_blocks_and_tile_capacity() {
+        let mut random = fastrand::Rng::with_seed(0x6265_6e63_686d_6172);
+        for _ in 0..512 {
+            let rows = random.u32(1..=512);
+            let inner = random.u32(1..=16) * 64;
+            let columns = random.u32(1..=8) * 64;
+            let output_bytes = u64::from(rows) * u64::from(columns) * 2;
+            assert_eq!(
+                validate_benchmark_shape(rows, inner, columns).is_ok(),
+                output_bytes <= u64::from(ipu_codegen::memory::IPU21_INTERLEAVED_BYTES)
+            );
+            assert!(validate_benchmark_shape(rows, inner + 1, columns).is_err());
+            assert!(validate_benchmark_shape(rows, inner, columns + 1).is_err());
+        }
+    }
 }

@@ -337,6 +337,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "fastrand",
  "ipu-codegen",
  "ipu-driver",
  "ipu-elf",

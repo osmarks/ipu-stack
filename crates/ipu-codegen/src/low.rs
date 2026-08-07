@@ -14,6 +14,7 @@ use crate::mid::{
 };
 use crate::storage::{StorageError, view_byte_spans};
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LowShardId(u32);
@@ -351,11 +352,12 @@ impl LoweringState {
         Ok(id)
     }
 
-    fn can_allocate_interleaved(&self, tile: u16, bytes: u32) -> LowLoweringResult<bool> {
-        // PACE operands have a small legal access tail beyond their logical
-        // allocation. Reserve it here so this early choice remains valid when
-        // placement applies the exact kernel requirements.
-        const ACCESS_HEADROOM: u32 = 64;
+    fn interleaved_capacity_available(
+        &self,
+        tile: u16,
+        bytes: u32,
+        access_tail: u32,
+    ) -> LowLoweringResult<bool> {
         let used = self
             .shards
             .iter()
@@ -371,13 +373,81 @@ impl LoweringState {
             .try_fold(0u32, |total, shard| {
                 total
                     .checked_add(crate::shard_storage_bytes(shard)?)
-                    .and_then(|total| total.checked_add(ACCESS_HEADROOM))
+                    .and_then(|total| total.checked_add(access_tail))
                     .ok_or(LowLoweringError::IdOverflow)
             })?;
         Ok(used
             .checked_add(bytes)
-            .and_then(|total| total.checked_add(ACCESS_HEADROOM))
+            .and_then(|total| total.checked_add(access_tail))
             .is_some_and(|total| total <= crate::memory::IPU21_INTERLEAVED_BYTES))
+    }
+
+    fn right_shard_for_columns(
+        &self,
+        right_shards: &[LowShardId],
+        tile: u16,
+        column_start: u32,
+        column_end: u32,
+    ) -> Option<LowShardId> {
+        right_shards
+            .iter()
+            .copied()
+            .filter(|shard| {
+                let extents = &self.shards[shard.index() as usize].extents;
+                let columns = extents[extents.len() - 1];
+                columns.start <= column_start && columns.physical_end >= column_end
+            })
+            .min_by_key(|shard| u8::from(self.shards[shard.index() as usize].tile != tile))
+    }
+
+    fn use_uniform_interleaved_gemm_staging(
+        &self,
+        output_shards: &[LowShardId],
+        right_shards: &[LowShardId],
+        columns: Range<u32>,
+        inner: Range<u32>,
+        access_tail: u32,
+    ) -> LowLoweringResult<bool> {
+        let mut candidates = Vec::with_capacity(output_shards.len());
+        for output in output_shards {
+            let tile = self.shards[output.index() as usize].tile;
+            let Some(right) =
+                self.right_shard_for_columns(right_shards, tile, columns.start, columns.end)
+            else {
+                return Ok(false);
+            };
+            let shard = &self.shards[right.index() as usize];
+            if shard.tile != tile || shard.tensor_type.format.precision != crate::Precision::F16 {
+                return Ok(false);
+            }
+            let rank = shard.extents.len();
+            if rank < 2 {
+                return Ok(false);
+            }
+            let view = self.narrow_view(
+                right,
+                &[
+                    (rank - 2, inner.start, inner.end),
+                    (rank - 1, columns.start, columns.end),
+                ],
+            )?;
+            let spans = view_byte_spans(shard, &view)?;
+            if spans.len() <= 1 {
+                return Ok(false);
+            }
+            let bytes = spans.iter().try_fold(0u32, |total, span| {
+                total
+                    .checked_add(span.bytes)
+                    .ok_or(LowLoweringError::IdOverflow)
+            })?;
+            candidates.push((tile, bytes));
+        }
+        for (tile, bytes) in candidates {
+            if !self.interleaved_capacity_available(tile, bytes, access_tail)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn value_shards(&self, value: MidValueId) -> LowLoweringResult<&[LowShardId]> {
@@ -732,18 +802,15 @@ impl LoweringState {
         let mut local_right_staging = BTreeMap::<(u16, u32), LowShardId>::new();
         for column_start in (0..column_extent).step_by(output_column_block as usize) {
             let column_end = column_start + output_column_block;
+            let use_interleaved_staging = self.use_uniform_interleaved_gemm_staging(
+                &output_shards,
+                &right_shards,
+                column_start..column_end,
+                0..inner_block,
+                requirements.inputs[1].access_tail_bytes,
+            )?;
             for inner_start in (0..inner_extent).step_by(inner_block as usize) {
                 let inner_end = inner_start + inner_block;
-                let every_tile_has_local_right = output_shards.iter().all(|output| {
-                    let tile = self.shards[output.index() as usize].tile;
-                    right_shards.iter().copied().any(|shard| {
-                        let candidate = &self.shards[shard.index() as usize];
-                        let columns = candidate.extents[candidate.extents.len() - 1];
-                        candidate.tile == tile
-                            && columns.start <= column_start
-                            && columns.physical_end >= column_end
-                    })
-                });
                 let mut transfers = BTreeMap::<ShardView, Vec<LowShardId>>::new();
                 let mut local_copies = Vec::<(u16, LocalCopy)>::new();
                 let mut runs = Vec::with_capacity(output_shards.len());
@@ -752,17 +819,8 @@ impl LoweringState {
                     let left = self.local_shard(*left_value, tile)?;
                     let left_view =
                         self.narrow_view(left, &[(left_rank - 1, inner_start, inner_end)])?;
-                    let right = right_shards
-                        .iter()
-                        .copied()
-                        .filter(|shard| {
-                            let extents = &self.shards[shard.index() as usize].extents;
-                            let columns = extents[extents.len() - 1];
-                            columns.start <= column_start && columns.physical_end >= column_end
-                        })
-                        .min_by_key(|shard| {
-                            u8::from(self.shards[shard.index() as usize].tile != tile)
-                        })
+                    let right = self
+                        .right_shard_for_columns(&right_shards, tile, column_start, column_end)
                         .ok_or(LowLoweringError::InvalidOperatorPlan)?;
                     let right_rank = self.shards[right.index() as usize].extents.len();
                     let right_view = self.narrow_view(
@@ -778,35 +836,14 @@ impl LoweringState {
                         if spans.len() == 1 {
                             right_view
                         } else {
-                            let packed_bytes = spans.iter().try_fold(0u32, |total, span| {
-                                total
-                                    .checked_add(span.bytes)
-                                    .ok_or(LowLoweringError::IdOverflow)
-                            })?;
                             let existing_staging =
                                 local_right_staging.get(&(tile, column_start)).copied();
-                            let use_interleaved = if let Some(existing) = existing_staging {
-                                self.shards[existing.index() as usize]
-                                    .tensor_type
-                                    .format
-                                    .layout
-                                    .memory_class
-                                    == crate::MemoryClass::Ipu21Interleaved
-                            } else {
-                                every_tile_has_local_right
-                                    && self.shards[right.index() as usize]
-                                        .tensor_type
-                                        .format
-                                        .precision
-                                        == crate::Precision::F16
-                                    && self.can_allocate_interleaved(tile, packed_bytes)?
-                            };
                             let definition = existing_staging
                                 .map(ShardDefinition::Alias)
                                 .unwrap_or(ShardDefinition::LocalCopy(right));
                             let mut tensor_type =
                                 self.shards[right.index() as usize].tensor_type.clone();
-                            if use_interleaved {
+                            if use_interleaved_staging {
                                 tensor_type.format.layout.memory_class =
                                     crate::MemoryClass::Ipu21Interleaved;
                             }
