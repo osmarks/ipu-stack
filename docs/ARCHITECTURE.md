@@ -29,8 +29,8 @@ shape plus a `TensorFormat` containing:
 
 This is deliberately less specific than placement: it records decisions that
 change a kernel or exchange plan, but not physical tile IDs, SRAM addresses,
-lifetimes, or exchange rows. AMP order parameterizes the useful parts of the
-old `A8/A16/A32`, `B8x16/B16x16/B32x16`, and `C16` layout vocabulary.
+lifetimes, or exchange rows. AMP order represents configurable left-operand,
+right-operand, and output block dimensions.
 
 `mid::lower` considers legal formats for each semantic operation. The initial
 toy model compares rough arithmetic throughput with bytes moved. When a chosen
@@ -39,14 +39,14 @@ kernel format differs from its producer, lowering inserts `CastPrecision` and
 iterated value sequences are normalized once outside the body rather than
 causing the body to be unrolled.
 
-The toy choices currently describe the retained generic kernels: FP16 GEMM
+The toy choices describe the supported generic kernels: FP16 GEMM
 uses AMP A16/B16x16/C16, FP32 uses A8/B8x16/C16, and right operands use
 interleaved storage. This is an inspectable scaffold for a measured cost model
 or autotuner, not a claim that those choices are globally optimal.
 
-The subsequent mid-to-low scheduling and placement pass does not exist yet,
-so package construction still emits a completion-only tile program.
-`TileProgram` remains the finalized representation below that future pass.
+Package construction emits a completion-only tile program until mid-to-low
+scheduling and placement are implemented. `TileProgram` is the finalized
+representation consumed by code generation.
 
 ## Finalized tile programs
 

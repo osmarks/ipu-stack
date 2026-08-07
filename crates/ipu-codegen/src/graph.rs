@@ -120,7 +120,7 @@ pub enum OperationKind {
     Repeat(Repeat),
 }
 
-/// Structured repetition whose body is still an ordered SSA operation list.
+/// Structured repetition whose body is an ordered SSA operation list.
 ///
 /// Body arguments are ordered as carried values, invariants, then iterated
 /// values. Only `yields` escape the region. Each yield corresponds to one

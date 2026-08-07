@@ -10,8 +10,8 @@ Low-level codegen supports explicit sample addresses:
 - `CodegenOptions::final_profile_address`
 
 The caller owns the profile buffer layout and converts captured counter words
-into `ProfileReport`. Automatic layout, compiler phase reconstruction, repeated
-region handling, and allocator memory reports were removed.
+into `ProfileReport`. The report contains the samples and metadata explicitly
+recorded by code generation.
 
 Inspect or query a report with:
 
@@ -22,6 +22,5 @@ ipu-stack profile-query profile.capnp --group-by kernel
 ipu-stack profile-query profile.capnp --kind exchange --group-by phase
 ```
 
-The profile schema still supports operation names, phases, epochs, kernel
-symbols, and metadata so a future profiling design can use the existing query
-layer without depending on the deleted compiler.
+The profile schema supports operation names, phases, epochs, kernel symbols,
+and metadata for the query layer.

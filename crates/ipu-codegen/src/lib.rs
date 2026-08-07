@@ -87,8 +87,7 @@ pub struct ComputeStep {
 
 /// Optional explicit cycle-counter destinations around a step.
 ///
-/// The addresses belong to caller-managed tile memory. This intentionally
-/// avoids reconstructing the old compiler's profile layout policy.
+/// The addresses belong to caller-managed tile memory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepProfile {
     pub before: Option<u32>,

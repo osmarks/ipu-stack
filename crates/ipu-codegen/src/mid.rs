@@ -45,8 +45,7 @@ pub enum Sharding {
     Heads,
 }
 
-/// AMP-specific order, parameterized instead of duplicating the old A8/A16/
-/// A32 and B8x16/B16x16/B32x16 variants.
+/// AMP operand order with configurable inner and column block dimensions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AmpOrder {
     Left { inner: u16 },
