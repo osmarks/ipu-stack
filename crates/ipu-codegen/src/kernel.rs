@@ -2,8 +2,8 @@
 
 use crate::{
     ComputeStep, GemmKernelMode, KernelRequirements, KernelRun, LowProgram, LowShard, LowShardId,
-    Precision, StepProfile, StorageError, TileKernel, TileKernelSpec, TileWork, TileWorkList,
-    view_byte_spans,
+    Precision, StepProfile, StorageError, TileAddress, TileKernel, TileKernelSpec, TileWork,
+    TileWorkList, view_byte_spans,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -213,11 +213,11 @@ pub fn materialize_kernel_run(
     let input_addresses = run
         .inputs
         .iter()
-        .map(|operand| resolve(&operand.views[0]))
+        .map(|operand| resolve(&operand.views[0]).map(TileAddress::Absolute))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ComputeStep {
         symbol: call.symbol,
-        output_address,
+        output_address: TileAddress::Absolute(output_address),
         input_addresses,
         arguments: call.arguments,
         profile: StepProfile::default(),

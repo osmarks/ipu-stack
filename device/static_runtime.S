@@ -168,10 +168,10 @@ ipu_stack_copy_u64:
 	exitz $m15
 
 	.section .text.ipu_stack_static_repeat_call,"ax",@progbits
-	// Structured-repeat helper ABI: m2 iteration count, m3 body address, m9
-	// caller return address; the body returns in m10. Iterated tensor bases are
-	// maintained by emitted body/wrapper code using the per-input byte strides
-	// recorded by RepeatIterated.
+	// Compact call loop used by static host schedules. ABI: m2 iteration count,
+	// m3 body address, and m9 caller return address; the body returns in m10 and
+	// must preserve m2. General tile-program repeats keep their counter on the
+	// supervisor stack because ordinary kernel calls use m2 for their output.
 	.globl ipu_stack_static_repeat_call
 	.p2align 2
 	.type ipu_stack_static_repeat_call,@function

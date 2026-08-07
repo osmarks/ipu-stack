@@ -81,6 +81,33 @@ pub struct TileProgram {
 pub enum TileStep {
     Exchange(ExchangeStep),
     Compute(ComputeStep),
+    Repeat(RepeatStep),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepeatStep {
+    pub count: u32,
+    /// Mutable bases used by [`TileAddress::RepeatPointer`] in the body.
+    pub iterated_pointers: Vec<RepeatPointer>,
+    pub body: Vec<TileStep>,
+    #[serde(default)]
+    pub profile: StepProfile,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepeatPointer {
+    pub initial_address: u32,
+    pub stride_bytes: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TileAddress {
+    Absolute(u32),
+    /// The current base of an enclosing repeat plus a constant byte offset.
+    RepeatPointer {
+        index: u16,
+        offset: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,8 +124,8 @@ pub struct ExchangeStep {
 pub struct ComputeStep {
     /// Exact linked kernel symbol; no naming convention is applied.
     pub symbol: String,
-    pub output_address: u32,
-    pub input_addresses: Vec<u32>,
+    pub output_address: TileAddress,
+    pub input_addresses: Vec<TileAddress>,
     pub arguments: Vec<u32>,
     #[serde(default)]
     pub profile: StepProfile,
@@ -200,37 +227,16 @@ pub fn emit(
         .then(|| symbol(symbols, WORKER_BARRIER_SYMBOL))
         .transpose()?;
     let mut exchange_rows = Vec::new();
-    for step in &program.steps {
-        match step {
-            TileStep::Exchange(exchange) => {
-                if let Some(address) = exchange.profile.before {
-                    emit_cycle_sample(&mut code, symbols, address)?;
-                }
-                code.instruction(SYNC_SUPERVISOR_INSTRUCTION);
-                let active = exchange.row[0] != SANS_INACTIVE_INSTRUCTION;
-                if active {
-                    code.call(worker_barrier.expect("active exchange has barrier"), 7)?;
-                }
-                code.call(exchange.address, 10)?;
-                if let Some(address) = exchange.profile.after {
-                    emit_cycle_sample(&mut code, symbols, address)?;
-                }
-                exchange_rows.push(PlacedExchangeRow {
-                    address: exchange.address,
-                    words: exchange.row.clone(),
-                });
-            }
-            TileStep::Compute(compute) => {
-                if let Some(address) = compute.profile.before {
-                    emit_cycle_sample(&mut code, symbols, address)?;
-                }
-                emit_compute(&mut code, program.tile, compute, symbols)?;
-                if let Some(address) = compute.profile.after {
-                    emit_cycle_sample(&mut code, symbols, address)?;
-                }
-            }
-        }
-    }
+    emit_steps(
+        &mut code,
+        program.tile,
+        &program.steps,
+        symbols,
+        worker_barrier,
+        &mut exchange_rows,
+        None,
+        options.code_address,
+    )?;
 
     if let Some(address) = options.final_profile_address {
         emit_cycle_sample(&mut code, symbols, address)?;
@@ -255,8 +261,74 @@ pub fn emit(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_steps(
+    code: &mut TileCode,
+    tile: u16,
+    steps: &[TileStep],
+    symbols: &BTreeMap<String, u32>,
+    worker_barrier: Option<u32>,
+    exchange_rows: &mut Vec<PlacedExchangeRow>,
+    repeat_pointer_count: Option<usize>,
+    code_address: u32,
+) -> Result<()> {
+    for step in steps {
+        match step {
+            TileStep::Exchange(exchange) => {
+                if let Some(address) = exchange.profile.before {
+                    emit_cycle_sample(code, symbols, address)?;
+                }
+                code.instruction(SYNC_SUPERVISOR_INSTRUCTION);
+                let active = exchange.row[0] != SANS_INACTIVE_INSTRUCTION;
+                if active {
+                    code.call(worker_barrier.expect("active exchange has barrier"), 7)?;
+                }
+                code.call(exchange.address, 10)?;
+                if let Some(address) = exchange.profile.after {
+                    emit_cycle_sample(code, symbols, address)?;
+                }
+                exchange_rows.push(PlacedExchangeRow {
+                    address: exchange.address,
+                    words: exchange.row.clone(),
+                });
+            }
+            TileStep::Compute(compute) => {
+                if let Some(address) = compute.profile.before {
+                    emit_cycle_sample(code, symbols, address)?;
+                }
+                emit_compute(code, tile, compute, symbols, repeat_pointer_count)?;
+                if let Some(address) = compute.profile.after {
+                    emit_cycle_sample(code, symbols, address)?;
+                }
+            }
+            TileStep::Repeat(repeat) => {
+                if let Some(address) = repeat.profile.before {
+                    emit_cycle_sample(code, symbols, address)?;
+                }
+                emit_repeat(
+                    code,
+                    tile,
+                    repeat,
+                    symbols,
+                    worker_barrier,
+                    exchange_rows,
+                    code_address,
+                )?;
+                if let Some(address) = repeat.profile.after {
+                    emit_cycle_sample(code, symbols, address)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate(program: &TileProgram) -> Result<()> {
-    for step in &program.steps {
+    validate_steps(&program.steps, None)
+}
+
+fn validate_steps(steps: &[TileStep], repeat_pointer_count: Option<usize>) -> Result<()> {
+    for step in steps {
         match step {
             TileStep::Exchange(exchange) => {
                 if exchange.address & 3 != 0 {
@@ -281,18 +353,42 @@ fn validate(program: &TileProgram) -> Result<()> {
                         compute.symbol
                     )));
                 }
+                validate_address(compute.output_address, repeat_pointer_count)?;
+                for &address in &compute.input_addresses {
+                    validate_address(address, repeat_pointer_count)?;
+                }
+            }
+            TileStep::Repeat(repeat) => {
+                if repeat_pointer_count.is_some() {
+                    return Err(invalid("nested finalized repeats are not yet supported"));
+                }
+                if repeat.count == 0 {
+                    return Err(invalid("repeat count must be nonzero"));
+                }
+                validate_steps(&repeat.body, Some(repeat.iterated_pointers.len()))?;
             }
         }
     }
     Ok(())
 }
 
+fn validate_address(address: TileAddress, repeat_pointer_count: Option<usize>) -> Result<()> {
+    if let TileAddress::RepeatPointer { index, .. } = address
+        && repeat_pointer_count.is_none_or(|count| usize::from(index) >= count)
+    {
+        return Err(invalid(
+            "compute address refers to an unavailable repeat pointer",
+        ));
+    }
+    Ok(())
+}
+
 fn active_exchange(step: &TileStep) -> bool {
-    matches!(
-        step,
-        TileStep::Exchange(exchange)
-            if exchange.row.first() != Some(&SANS_INACTIVE_INSTRUCTION)
-    )
+    match step {
+        TileStep::Exchange(exchange) => exchange.row.first() != Some(&SANS_INACTIVE_INSTRUCTION),
+        TileStep::Repeat(repeat) => repeat.body.iter().any(active_exchange),
+        TileStep::Compute(_) => false,
+    }
 }
 
 fn emit_compute(
@@ -300,6 +396,7 @@ fn emit_compute(
     tile: u16,
     compute: &ComputeStep,
     symbols: &BTreeMap<String, u32>,
+    repeat_pointer_count: Option<usize>,
 ) -> Result<()> {
     let argument_base = FIRST_INPUT_REGISTER
         .checked_add(
@@ -307,12 +404,14 @@ fn emit_compute(
                 .map_err(|_| invalid("kernel input count exceeds u8"))?,
         )
         .ok_or_else(|| invalid("kernel input register overflow"))?;
-    code.setzi(2, compute.output_address)?;
+    emit_address(code, 2, compute.output_address, repeat_pointer_count)?;
     for (index, &address) in compute.input_addresses.iter().enumerate() {
-        code.setzi(
+        emit_address(
+            code,
             FIRST_INPUT_REGISTER
                 + u8::try_from(index).map_err(|_| invalid("kernel input count exceeds u8"))?,
             address,
+            repeat_pointer_count,
         )?;
     }
     for (index, &argument) in compute.arguments.iter().enumerate() {
@@ -329,6 +428,83 @@ fn emit_compute(
         ))
     })?;
     code.call(kernel, 10)
+}
+
+fn emit_address(
+    code: &mut TileCode,
+    register: u8,
+    address: TileAddress,
+    repeat_pointer_count: Option<usize>,
+) -> Result<()> {
+    match address {
+        TileAddress::Absolute(address) => code.setzi(register, address),
+        TileAddress::RepeatPointer { index, offset } => {
+            let count = repeat_pointer_count
+                .ok_or_else(|| invalid("repeat pointer used outside repeat body"))?;
+            if usize::from(index) >= count {
+                return Err(invalid("repeat pointer index is out of range"));
+            }
+            code.ld32(register, 11, 15, index + 1)?;
+            code.add_unsigned(register, offset)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_repeat(
+    code: &mut TileCode,
+    tile: u16,
+    repeat: &RepeatStep,
+    symbols: &BTreeMap<String, u32>,
+    worker_barrier: Option<u32>,
+    exchange_rows: &mut Vec<PlacedExchangeRow>,
+    code_address: u32,
+) -> Result<()> {
+    let words = repeat
+        .iterated_pointers
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| invalid("repeat frame size overflow"))?;
+    let frame_bytes = i32::try_from((words * 4).next_multiple_of(8))
+        .map_err(|_| invalid("repeat frame is too large"))?;
+    code.add_immediate(11, 11, -frame_bytes)?;
+    code.setzi(0, repeat.count)?;
+    code.st32(0, 11, 15, 0)?;
+    for (index, pointer) in repeat.iterated_pointers.iter().enumerate() {
+        code.setzi(0, pointer.initial_address)?;
+        code.st32(
+            0,
+            11,
+            15,
+            u16::try_from(index + 1).map_err(|_| invalid("too many repeat pointers"))?,
+        )?;
+    }
+    let loop_start = code.address(code_address)?;
+    emit_steps(
+        code,
+        tile,
+        &repeat.body,
+        symbols,
+        worker_barrier,
+        exchange_rows,
+        Some(repeat.iterated_pointers.len()),
+        code_address,
+    )?;
+    for (index, pointer) in repeat.iterated_pointers.iter().enumerate() {
+        let offset = u16::try_from(index + 1).map_err(|_| invalid("too many repeat pointers"))?;
+        code.ld32(0, 11, 15, offset)?;
+        code.add_unsigned(0, pointer.stride_bytes)?;
+        code.st32(0, 11, 15, offset)?;
+    }
+    code.ld32(0, 11, 15, 0)?;
+    code.add_immediate(0, 0, -1)?;
+    code.st32(0, 11, 15, 0)?;
+    let done_branch = code.words.len();
+    code.brz(0, 0)?;
+    code.jump(loop_start)?;
+    let done = code.address(code_address)?;
+    code.words[done_branch] = encode_brz_m_immediate(0, done)?;
+    code.add_immediate(11, 11, frame_bytes)
 }
 
 fn emit_host_phases(
@@ -463,6 +639,15 @@ impl TileCode {
         Ok(())
     }
 
+    fn add_unsigned(&mut self, register: u8, mut immediate: u32) -> Result<()> {
+        while immediate != 0 {
+            let part = immediate.min(i16::MAX as u32);
+            self.add_immediate(register, register, part as i32)?;
+            immediate -= part;
+        }
+        Ok(())
+    }
+
     fn put_special(&mut self, special: u8, register: u8) -> Result<()> {
         self.words.push(encode_put_special_m(special, register)?);
         Ok(())
@@ -517,8 +702,11 @@ mod tests {
                 }),
                 TileStep::Compute(ComputeStep {
                     symbol: "gemm".into(),
-                    output_address: 0x70000,
-                    input_addresses: vec![0x71000, 0x72000],
+                    output_address: TileAddress::Absolute(0x70000),
+                    input_addresses: vec![
+                        TileAddress::Absolute(0x71000),
+                        TileAddress::Absolute(0x72000),
+                    ],
                     arguments: vec![64],
                     profile: StepProfile::default(),
                 }),
@@ -558,5 +746,49 @@ mod tests {
             ),
             Err(CodegenError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn structured_repeat_code_size_is_independent_of_iteration_count() {
+        let program = |count| TileProgram {
+            tile: 0,
+            steps: vec![TileStep::Repeat(RepeatStep {
+                count,
+                iterated_pointers: vec![RepeatPointer {
+                    initial_address: 0x70000,
+                    stride_bytes: 0x10000,
+                }],
+                body: vec![TileStep::Compute(ComputeStep {
+                    symbol: "gemm".into(),
+                    output_address: TileAddress::Absolute(0x60000),
+                    input_addresses: vec![
+                        TileAddress::Absolute(0x68000),
+                        TileAddress::RepeatPointer {
+                            index: 0,
+                            offset: 32,
+                        },
+                    ],
+                    arguments: Vec::new(),
+                    profile: StepProfile::default(),
+                })],
+                profile: StepProfile::default(),
+            })],
+        };
+        let short = emit(
+            &program(2),
+            &symbols(),
+            &HostProgram::default(),
+            &CodegenOptions::default(),
+        )
+        .unwrap();
+        let long = emit(
+            &program(10_000),
+            &symbols(),
+            &HostProgram::default(),
+            &CodegenOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(short.bytes.len(), long.bytes.len());
+        assert!(short.exchange_rows.is_empty());
     }
 }
