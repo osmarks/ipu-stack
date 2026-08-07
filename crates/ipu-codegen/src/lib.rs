@@ -8,8 +8,10 @@ use std::collections::BTreeMap;
 
 pub mod exchange;
 pub mod graph;
+mod host;
 pub mod kernel;
 pub mod low;
+pub mod memory;
 pub mod mid;
 mod package;
 pub mod place;
@@ -36,6 +38,7 @@ pub use low::{
     RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, ShardDefinition, ShardExtent,
     ShardView, TileKernel, TileWork, TileWorkList, WorkProvenance, WorkReason, lower_to_tiles,
 };
+pub use memory::IPU21_DATA_BASE;
 pub use mid::{
     AccumulationPrecision, AmpOrder, AxisTiling, ConversionDispatch, ConversionPlan, CostModel,
     ElementOrder, GemmKernelMode, HardwareTarget, Layout, LayoutError, LoweringError,
@@ -46,8 +49,11 @@ pub use mid::{
     TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, ToyCostModel, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
-pub use place::{IPU21_DATA_BASE, Placement, PlacementError, place};
-pub use storage::{ByteSpan, StorageError, StorageResult, shard_storage_bytes, view_byte_spans};
+pub use place::{Placement, PlacementError, place};
+pub use storage::{
+    ByteSpan, StorageError, StorageResult, amp_matrix_coordinates, shard_storage_bytes,
+    view_byte_spans,
+};
 pub use tile::{
     TileLoweringError, TilePrograms, lower_to_tile_programs, lower_to_tile_programs_with_fill,
 };

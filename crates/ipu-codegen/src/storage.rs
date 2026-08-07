@@ -134,7 +134,13 @@ fn physical_coordinates(
             decode_row_major(&widths[..rank - 2], outer, &mut coordinates[..rank - 2]);
             let linear =
                 u32::try_from(physical % matrix_elements).map_err(|_| StorageError::Overflow)?;
-            let (row, column) = amp_coordinates(shard, role, rows, columns, linear)?;
+            let (row, column) = amp_matrix_coordinates(
+                role,
+                shard.tensor_type.format.precision,
+                rows,
+                columns,
+                linear,
+            )?;
             coordinates[rank - 2] = row;
             coordinates[rank - 1] = column;
         }
@@ -149,9 +155,11 @@ fn decode_row_major(widths: &[u32], mut linear: u64, output: &mut [u32]) {
     }
 }
 
-fn amp_coordinates(
-    shard: &LowShard,
+/// Maps a physical linear element in one AMP-packed matrix to its logical
+/// row and column. This is shared by package-data producers and placement.
+pub fn amp_matrix_coordinates(
     role: AmpOrder,
+    precision: Precision,
     rows: u32,
     columns: u32,
     linear: u32,
@@ -159,7 +167,7 @@ fn amp_coordinates(
     const COLUMN_MICRO: u32 = 16;
     match role {
         AmpOrder::Left => {
-            let inner = amp_micro_dimension(shard);
+            let inner = amp_micro_dimension(precision);
             if !columns.is_multiple_of(inner) {
                 return Err(StorageError::AmpBlock { role });
             }
@@ -169,7 +177,7 @@ fn amp_coordinates(
             Ok((offset / inner, panel * inner + offset % inner))
         }
         AmpOrder::Right => {
-            let inner = amp_micro_dimension(shard);
+            let inner = amp_micro_dimension(precision);
             if !rows.is_multiple_of(inner) || !columns.is_multiple_of(COLUMN_MICRO) {
                 return Err(StorageError::AmpBlock { role });
             }
@@ -207,8 +215,8 @@ fn amp_coordinates(
     }
 }
 
-fn amp_micro_dimension(shard: &LowShard) -> u32 {
-    match shard.tensor_type.format.precision {
+fn amp_micro_dimension(precision: Precision) -> u32 {
+    match precision {
         Precision::F8F143 { .. } => 32,
         Precision::F16 => 16,
         Precision::F32 => 8,

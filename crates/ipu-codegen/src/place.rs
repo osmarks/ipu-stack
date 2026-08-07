@@ -3,6 +3,7 @@
 use crate::low::{
     KernelRequirements, LowProgram, LowShardId, ShardDefinition, TileWork, TileWorkList,
 };
+use crate::memory::IPU21_DATA_BASE;
 use crate::mid::{MemoryClass, OperandRequirement};
 use crate::storage::{StorageError, shard_storage_bytes};
 use ipu_exchange::{EXCHANGE_WINDOW_BASE, EXCHANGE_WINDOW_BYTES};
@@ -11,9 +12,6 @@ use ipu_package::{
     TILE_MEMORY_SIZE,
 };
 use std::collections::{BTreeMap, BTreeSet};
-
-/// First address available to persistent standard-memory tensors.
-pub const IPU21_DATA_BASE: u32 = 0x58400;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placement {

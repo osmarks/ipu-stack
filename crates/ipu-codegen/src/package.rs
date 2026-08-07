@@ -1,11 +1,13 @@
 use crate::graph::ComputeGraph;
+use crate::host;
 use crate::low::{LowProgram, LowValue};
+use crate::memory::{RUNTIME_STATE_BASE, RUNTIME_STATE_BYTES, WORKER_STACK_HEADROOM};
 use crate::mid::{PipelineConfig, ToyCostModel};
 use crate::{
-    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HostProgram, KernelBuildPlan,
-    PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL,
-    WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower,
-    lower_exchanges, lower_to_tile_programs_with_fill, lower_to_tiles, place, shard_storage_bytes,
+    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, KernelBuildPlan, PRNG_SEED_SYMBOL,
+    PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL, WORKER_BARRIER_SYMBOL,
+    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower, lower_exchanges,
+    lower_to_tile_programs_with_fill, lower_to_tiles, place, shard_storage_bytes,
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
@@ -21,12 +23,7 @@ use std::path::PathBuf;
 
 const ENTRY_BYTES: u32 = 8;
 const SUPPORT_START: u32 = APPLICATION_LOAD_BASE + ENTRY_BYTES;
-const COMPLETION_ADDRESS: u32 =
-    ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
-const WORKER_STACK_HEADROOM: u32 = 0xe0;
-const WORKER_SYNC_STRIDE: u32 = 0x100;
-const WORKER_CONTEXTS: u32 = 6;
-const RUNTIME_STATE_BYTES: u32 = WORKER_STACK_HEADROOM + WORKER_CONTEXTS * WORKER_SYNC_STRIDE;
+const COMPLETION_ADDRESS: u32 = RUNTIME_STATE_BASE;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackageBuildError {
@@ -122,7 +119,7 @@ fn build_package_from_objects(
     let retained_runtime = runtime_retained_symbols(program, config);
     let layout = link_runtime(
         objects,
-        runtime_symbols(0, 0)?,
+        runtime_symbols(0, 0, 0)?,
         kernel_plan,
         &retained_runtime,
     )?;
@@ -135,7 +132,41 @@ fn build_package_from_objects(
         linked_end(&layout)?,
         execution_tile_count,
     )?;
-    let code_address = align_up(finalized.exchange_code_end, 4)?;
+    let inputs = program
+        .inputs
+        .iter()
+        .filter(|input| input.kind == crate::GraphInputKind::Host)
+        .map(|input| input_binding(program, &placement, &topology, input))
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    let weights = program
+        .inputs
+        .iter()
+        .filter(|input| input.kind == crate::GraphInputKind::Parameter)
+        .map(|input| input_binding(program, &placement, &topology, input))
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    let outputs = program
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| output_binding(program, &placement, &topology, output, index))
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    let host = host::plan(
+        &weights,
+        &inputs,
+        &outputs,
+        execution_tile_count,
+        finalized.exchange_code_end,
+        &(0..execution_tile_count)
+            .map(|tile| {
+                placement
+                    .tile_data_end
+                    .get(usize::from(tile))
+                    .copied()
+                    .unwrap_or(crate::IPU21_DATA_BASE)
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let code_address = align_up(host.end, 4)?;
     let symbols = layout
         .symbols
         .clone()
@@ -144,11 +175,12 @@ fn build_package_from_objects(
     let generated = finalized
         .programs
         .iter()
-        .map(|program| {
+        .zip(&host.programs)
+        .map(|(program, host)| {
             emit(
                 program,
                 &symbols,
-                &HostProgram::default(),
+                host,
                 &CodegenOptions {
                     code_address,
                     ..CodegenOptions::default()
@@ -175,23 +207,18 @@ fn build_package_from_objects(
             &retained_runtime,
             code_address,
             &generated[usize::from(physical_tile)],
+            (
+                &host.segments[usize::from(physical_tile)],
+                host.staging_address,
+            ),
         )?);
     }
     application
         .tiles
         .sort_unstable_by_key(|tile| tile.physical_tile);
-    for input in &program.inputs {
-        let binding = input_binding(program, &placement, &topology, input)?;
-        match input.kind {
-            crate::GraphInputKind::Host => application.inputs.push(binding),
-            crate::GraphInputKind::Parameter => application.weights.push(binding),
-        }
-    }
-    for (index, output) in program.outputs.iter().enumerate() {
-        application.outputs.push(output_binding(
-            program, &placement, &topology, output, index,
-        )?);
-    }
+    application.inputs = inputs;
+    application.weights = weights;
+    application.outputs = outputs;
     application.outputs.push(Binding {
         name: "completion".into(),
         dtype: "u32".into(),
@@ -208,6 +235,7 @@ fn build_package_from_objects(
         command: 0,
         external_syncs: 0,
     });
+    application.host_exchange = host.protocol;
     application.validate()?;
     Ok(application)
 }
@@ -234,10 +262,12 @@ fn build_tile(
     retained_runtime: &[String],
     code_address: u32,
     generated: &crate::GeneratedProgram,
+    host: (&[Segment], u32),
 ) -> PackageBuildResult<TileImage> {
+    let (host_segments, host_staging_address) = host;
     let linked = link_runtime(
         objects,
-        runtime_symbols(physical_tile, code_address)?,
+        runtime_symbols(physical_tile, code_address, host_staging_address)?,
         kernel_plan,
         retained_runtime,
     )?;
@@ -275,6 +305,7 @@ fn build_tile(
         data,
         flags: SEGMENT_READ | SEGMENT_EXECUTE,
     }));
+    segments.extend_from_slice(host_segments);
     segments.push(Segment {
         address: code_address,
         memory_size: generated.bytes.len() as u32,
@@ -323,6 +354,10 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
     }
     if config.pipeline.profiling.enabled {
         symbols.push(SAMPLE_CYCLE_SYMBOL.into());
+    }
+    if !program.inputs.is_empty() || !program.outputs.is_empty() {
+        symbols.push(crate::HOST_RUN_SYMBOL.into());
+        symbols.push(crate::REPEAT_CALL_SYMBOL.into());
     }
     symbols
 }
@@ -406,6 +441,7 @@ fn binding(
 fn runtime_symbols(
     physical_tile: u32,
     program_address: u32,
+    host_staging_address: u32,
 ) -> PackageBuildResult<HashMap<String, u32>> {
     let sync_context = physical_tile
         .checked_mul(8)
@@ -423,6 +459,7 @@ fn runtime_symbols(
         (PRNG_SEED_SYMBOL.into(), prng_seed),
         (PROGRAM_ADDRESS_SYMBOL.into(), program_address),
         (COMPLETION_ADDRESS_SYMBOL.into(), COMPLETION_ADDRESS),
+        (crate::HOST_STAGING_SYMBOL.into(), host_staging_address),
     ]))
 }
 
@@ -443,6 +480,6 @@ fn align_up(value: u32, alignment: u32) -> PackageBuildResult<u32> {
         .ok_or_else(|| invalid("address alignment overflow"))
 }
 
-fn invalid(message: impl Into<String>) -> PackageBuildError {
+pub(crate) fn invalid(message: impl Into<String>) -> PackageBuildError {
     PackageBuildError::Invalid(message.into())
 }

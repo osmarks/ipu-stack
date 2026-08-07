@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use ipu_codegen::{
-    ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision, TensorFormat, build_package,
+    AmpOrder, ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision, TensorFormat,
+    amp_matrix_coordinates, build_package,
 };
 use ipu_elf::Toolchain;
-use ipu_package::Application;
+use ipu_package::{Application, Binding};
 use ipu_runtime::Runtime;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -91,18 +92,161 @@ fn main() -> Result<()> {
     let bootloader_bytes =
         fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
     let runtime = Runtime::open(&arguments.device, &configuration)?;
-    runtime.load(&application, &bootloader_bytes, 0)?;
-    diagnose_completion(
-        &runtime,
-        &application,
-        Duration::from_secs(arguments.timeout_seconds),
-    )?;
+    if arguments.gemm_smoke {
+        runtime.load(
+            &application,
+            &bootloader_bytes,
+            application.host_exchange.startup_mark,
+        )?;
+        run_gemm(
+            &runtime,
+            &application,
+            active_tiles,
+            arguments.timeout_seconds,
+        )?;
+    } else {
+        runtime.load(&application, &bootloader_bytes, 0)?;
+        diagnose_completion(
+            &runtime,
+            &application,
+            Duration::from_secs(arguments.timeout_seconds),
+        )?;
+    }
     println!(
         "package={} tiles={} hardwareTest=PASS",
         arguments.package.display(),
         application.tiles.len()
     );
     Ok(())
+}
+
+fn run_gemm(
+    runtime: &Runtime,
+    application: &Application,
+    active_tiles: u16,
+    timeout_seconds: u64,
+) -> Result<()> {
+    let left = application
+        .inputs
+        .iter()
+        .find(|binding| binding.name == "left")
+        .cloned()
+        .context("GEMM package has no left input binding")?;
+    let right = application
+        .weights
+        .iter()
+        .find(|binding| binding.name == "right")
+        .cloned()
+        .context("GEMM package has no right weight binding")?;
+    let left_bytes = packed_binding(&left, |tile, linear, elements| {
+        let (row, inner) =
+            amp_matrix_coordinates(AmpOrder::Left, Precision::F16, 1, elements, linear)?;
+        debug_assert_eq!(row, 0);
+        Ok(if u32::from(tile) == inner { 0x3c00 } else { 0 })
+    })?;
+    let right_bytes = packed_binding(&right, |tile, linear, elements| {
+        let (inner, column) =
+            amp_matrix_coordinates(AmpOrder::Right, Precision::F16, 64, elements / 64, linear)?;
+        Ok(gemm_right_value(inner, u32::from(tile) * 64 + column))
+    })?;
+    if left.slices.len() != usize::from(active_tiles)
+        || right.slices.len() != usize::from(active_tiles)
+    {
+        bail!("GEMM bindings do not cover every active tile");
+    }
+    let mut session = runtime.host_session(application)?;
+    session.start()?;
+    let initialized = session.invoke_streaming_deferred("initialize", &right_bytes)?;
+    session.collect(&initialized)?;
+    let executed = session.invoke_streaming_deferred("run", &left_bytes)?;
+    runtime
+        .device()
+        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+    diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
+    let output = session.collect(&executed)?;
+    verify_gemm_output(application, active_tiles, &output)
+}
+
+fn packed_binding(
+    binding: &Binding,
+    mut value: impl FnMut(u16, u32, u32) -> Result<u16>,
+) -> Result<Vec<u8>> {
+    let total = binding
+        .slices
+        .iter()
+        .map(|slice| slice.file_offset + slice.size)
+        .max()
+        .context("binding has no slices")?;
+    let mut bytes = vec![0; usize::try_from(total)?];
+    for slice in &binding.slices {
+        if slice.size == 0 || slice.size & 1 != 0 {
+            bail!("binding {} has a non-F16 slice", binding.name);
+        }
+        let elements = u32::try_from(slice.size / 2)?;
+        let tile = u16::try_from(slice.tile)?;
+        for linear in 0..elements {
+            let bits = value(tile, linear, elements)?;
+            let offset = usize::try_from(slice.file_offset + u64::from(linear) * 2)?;
+            bytes[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+        }
+    }
+    Ok(bytes)
+}
+
+fn verify_gemm_output(application: &Application, active_tiles: u16, bytes: &[u8]) -> Result<()> {
+    let output = application
+        .outputs
+        .iter()
+        .find(|binding| binding.name == "output.0")
+        .context("GEMM package has no output binding")?;
+    let expected_bytes = output
+        .slices
+        .iter()
+        .map(|slice| slice.file_offset + slice.size)
+        .max()
+        .context("GEMM output has no slices")?;
+    if bytes.len() != usize::try_from(expected_bytes)? {
+        bail!(
+            "GEMM returned {} bytes, expected {expected_bytes}",
+            bytes.len()
+        );
+    }
+    let mut mismatches = Vec::new();
+    let mut checked = 0usize;
+    for row in 0..active_tiles {
+        let slice = output
+            .slices
+            .iter()
+            .find(|slice| slice.tile == u32::from(row))
+            .with_context(|| format!("GEMM output has no slice for tile {row}"))?;
+        let elements = u32::try_from(slice.size / 2)?;
+        for linear in 0..elements {
+            let (_, column) = amp_matrix_coordinates(
+                AmpOrder::Output,
+                Precision::F16,
+                1,
+                u32::from(active_tiles) * 64,
+                linear,
+            )?;
+            let offset = usize::try_from(slice.file_offset + u64::from(linear) * 2)?;
+            let actual = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
+            let expected = gemm_right_value(u32::from(row), column);
+            checked += 1;
+            if actual != expected && mismatches.len() < 16 {
+                mismatches.push((row, column, expected, actual));
+            }
+        }
+    }
+    if !mismatches.is_empty() {
+        bail!("GEMM numerical verification failed after {checked} checks: {mismatches:?}");
+    }
+    println!("gemmNumericalChecks={checked} numericalTest=PASS");
+    Ok(())
+}
+
+fn gemm_right_value(inner: u32, column: u32) -> u16 {
+    const VALUES: [u16; 5] = [0xbc00, 0xb800, 0x0000, 0x3800, 0x3c00];
+    VALUES[((inner * 3 + column) % VALUES.len() as u32) as usize]
 }
 
 fn c600_tile_count() -> u32 {
