@@ -1,7 +1,7 @@
 //! Conversion from logical shard views to physical byte ranges.
 
 use crate::low::{LowShard, ShardView};
-use crate::mid::{AmpOrder, ElementOrder, TensorAxis};
+use crate::mid::{AmpOrder, ElementOrder, Precision};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteSpan {
@@ -159,7 +159,7 @@ fn amp_coordinates(
     const COLUMN_MICRO: u32 = 16;
     match role {
         AmpOrder::Left => {
-            let inner = amp_block(shard, TensorAxis::FromEnd(1))?;
+            let inner = amp_micro_dimension(shard);
             if !columns.is_multiple_of(inner) {
                 return Err(StorageError::AmpBlock { role });
             }
@@ -169,7 +169,7 @@ fn amp_coordinates(
             Ok((offset / inner, panel * inner + offset % inner))
         }
         AmpOrder::Right => {
-            let inner = amp_block(shard, TensorAxis::FromEnd(2))?;
+            let inner = amp_micro_dimension(shard);
             if !rows.is_multiple_of(inner) || !columns.is_multiple_of(COLUMN_MICRO) {
                 return Err(StorageError::AmpBlock { role });
             }
@@ -207,23 +207,12 @@ fn amp_coordinates(
     }
 }
 
-fn amp_block(shard: &LowShard, axis: TensorAxis) -> StorageResult<u32> {
-    shard
-        .tensor_type
-        .format
-        .layout
-        .tiling
-        .axes
-        .iter()
-        .find(|tiling| tiling.axis == axis)
-        .map(|tiling| tiling.block_size)
-        .filter(|&block| block != 0)
-        .ok_or(StorageError::AmpBlock {
-            role: match shard.tensor_type.format.layout.order {
-                ElementOrder::Amp(role) => role,
-                ElementOrder::RowMajor => unreachable!(),
-            },
-        })
+fn amp_micro_dimension(shard: &LowShard) -> u32 {
+    match shard.tensor_type.format.precision {
+        Precision::F8F143 { .. } => 32,
+        Precision::F16 => 16,
+        Precision::F32 => 8,
+    }
 }
 
 #[cfg(test)]
@@ -260,8 +249,8 @@ mod tests {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             let batches = 1 + (state % 4);
             for (layout, physical_rows, columns) in [
-                (Layout::amp_left(16, 1), rows, 64),
-                (Layout::amp_right(16, 1), 32, 64),
+                (Layout::amp_left(64, 1), rows, 64),
+                (Layout::amp_right(64, 1), 32, 64),
                 (Layout::amp_output(1), rows, 64),
             ] {
                 let shard = shard(layout, &[batches, physical_rows, columns]);

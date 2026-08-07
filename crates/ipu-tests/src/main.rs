@@ -42,6 +42,10 @@ fn main() -> Result<()> {
         &ComputeGraph::default(),
         &PackageConfig {
             toolchain: Toolchain::from_sdk(&arguments.sdk),
+            kernel_source_directory: runtime_source
+                .parent()
+                .expect("runtime source has no parent directory")
+                .to_owned(),
             runtime_source,
             build_directory: std::env::temp_dir().join("ipu-stack-package"),
             pipeline: PipelineConfig::new(

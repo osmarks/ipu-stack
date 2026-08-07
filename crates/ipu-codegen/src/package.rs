@@ -2,9 +2,9 @@ use crate::graph::ComputeGraph;
 use crate::low::LowProgram;
 use crate::mid::{PipelineConfig, ToyCostModel};
 use crate::{
-    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HostProgram, PRNG_SEED_SYMBOL,
-    PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, TileProgram, WORKER_STACK_BASE_SYMBOL,
-    WORKER_SYNC_CONTEXT_SYMBOL, emit, lower, lower_to_tiles,
+    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HostProgram, KernelBuildPlan,
+    PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, TileProgram,
+    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower, lower_to_tiles,
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
@@ -47,6 +47,8 @@ pub enum PackageBuildError {
     Mid(#[from] crate::LoweringError),
     #[error("tile scheduling failed: {0}")]
     Low(#[from] crate::LowLoweringError),
+    #[error("kernel planning failed: {0}")]
+    Kernel(#[from] crate::KernelAbiError),
 }
 
 pub type PackageBuildResult<T> = std::result::Result<T, PackageBuildError>;
@@ -55,6 +57,7 @@ pub type PackageBuildResult<T> = std::result::Result<T, PackageBuildError>;
 pub struct PackageConfig {
     pub toolchain: Toolchain,
     pub runtime_source: PathBuf,
+    pub kernel_source_directory: PathBuf,
     pub build_directory: PathBuf,
     pub pipeline: PipelineConfig,
 }
@@ -78,22 +81,33 @@ pub fn build_package(
         exchange_phases = low.exchange_phases.len(),
         "lowered graph for package construction"
     );
-    let artifact = config.toolchain.compile(
+    let runtime_artifact = config.toolchain.compile(
         &config.runtime_source,
         &config.build_directory,
         "static_runtime",
         &[],
     )?;
-    let object = fs::read(&artifact.object)?;
-    build_package_from_object(&low, config, &object)
+    let mut objects = vec![fs::read(&runtime_artifact.object)?];
+    let kernel_plan = KernelBuildPlan::from_program(&low)?;
+    for compilation in &kernel_plan.compilations {
+        let artifact = config.toolchain.compile(
+            config.kernel_source_directory.join(compilation.source),
+            &config.build_directory,
+            &compilation.name,
+            &compilation.flags,
+        )?;
+        objects.push(fs::read(&artifact.object)?);
+    }
+    build_package_from_objects(&low, config, &objects, &kernel_plan)
 }
 
-fn build_package_from_object(
+fn build_package_from_objects(
     program: &LowProgram,
     config: &PackageConfig,
-    runtime_object: &[u8],
+    objects: &[Vec<u8>],
+    kernel_plan: &KernelBuildPlan,
 ) -> PackageBuildResult<Application> {
-    let layout = link_runtime(runtime_object, runtime_symbols(0, 0)?)?;
+    let layout = link_runtime(objects, runtime_symbols(0, 0)?, kernel_plan)?;
     let code_address = align_up(linked_end(&layout)?, 4)?;
     let generated = emit(
         &lower_graph(program),
@@ -115,7 +129,8 @@ fn build_package_from_object(
     for physical_tile in 0..u32::from(config.pipeline.tile_count) {
         application.tiles.push(build_tile(
             physical_tile,
-            runtime_object,
+            objects,
+            kernel_plan,
             code_address,
             &generated.bytes,
         )?);
@@ -153,13 +168,15 @@ fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
 
 fn build_tile(
     physical_tile: u32,
-    runtime_object: &[u8],
+    objects: &[Vec<u8>],
+    kernel_plan: &KernelBuildPlan,
     code_address: u32,
     generated: &[u8],
 ) -> PackageBuildResult<TileImage> {
     let linked = link_runtime(
-        runtime_object,
+        objects,
         runtime_symbols(physical_tile, code_address)?,
+        kernel_plan,
     )?;
     let mut entry = Vec::with_capacity(ENTRY_BYTES as usize);
     entry.extend_from_slice(&encode_setzi_m(0, linked.entry)?.to_le_bytes());
@@ -197,14 +214,20 @@ fn build_tile(
     })
 }
 
-fn link_runtime(object: &[u8], externals: HashMap<String, u32>) -> PackageBuildResult<LinkedImage> {
+fn link_runtime(
+    objects: &[Vec<u8>],
+    externals: HashMap<String, u32>,
+    kernel_plan: &KernelBuildPlan,
+) -> PackageBuildResult<LinkedImage> {
+    let mut retained_symbols = vec![COMPLETE_SYMBOL.into()];
+    retained_symbols.extend(kernel_plan.retained_symbols().map(str::to_owned));
     Ok(link(
-        &[object.to_vec()],
+        objects,
         &LinkOptions {
             image_base: TILE_MEMORY_BASE,
             regions: vec![(SUPPORT_START, ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT)],
             entry_symbol: RUNTIME_ENTRY_SYMBOL.into(),
-            retained_symbols: vec![COMPLETE_SYMBOL.into()],
+            retained_symbols,
             externals,
         },
     )?)

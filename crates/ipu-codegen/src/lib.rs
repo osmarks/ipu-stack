@@ -19,8 +19,9 @@ pub use graph::{
     ValueSequenceId,
 };
 pub use kernel::{
-    KernelAbi, KernelAbiError, KernelAvailability, KernelSymbols, ScalarArgument, tile_kernel_abi,
-    validate_kernel_run,
+    KernelAbi, KernelAbiError, KernelAvailability, KernelBuildPlan, KernelCompilation,
+    KernelMaterializationError, KernelSymbols, PlannedKernelCall, ScalarArgument,
+    materialize_kernel_run, tile_kernel_abi, validate_kernel_run,
 };
 pub use low::{
     ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun, LogicalExchange,
