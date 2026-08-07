@@ -21,6 +21,10 @@ impl LowShardId {
     pub const fn index(self) -> u32 {
         self.0
     }
+
+    pub const fn from_index(index: u32) -> Self {
+        Self(index)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

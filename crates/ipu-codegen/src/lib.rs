@@ -11,6 +11,7 @@ pub mod kernel;
 pub mod low;
 pub mod mid;
 mod package;
+pub mod storage;
 pub use graph::{
     AddOptions, AttentionOptions, AttentionScale, BroadcastMode, ComputeGraph, GemmOptions,
     GraphError, GraphInput, GraphInputKind, GraphResult, Operation, OperationId, OperationKind,
@@ -37,6 +38,7 @@ pub use mid::{
     TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, ToyCostModel, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
+pub use storage::{ByteSpan, StorageError, StorageResult, shard_storage_bytes, view_byte_spans};
 
 const INCOMING_DBASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;

@@ -749,6 +749,10 @@ impl MidValueId {
     pub const fn index(self) -> u32 {
         self.0
     }
+
+    pub const fn from_index(index: u32) -> Self {
+        Self(index)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
