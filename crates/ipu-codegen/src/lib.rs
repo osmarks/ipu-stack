@@ -1,7 +1,7 @@
 use ipu_exchange::{
-    PLAN_WORDS, SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate,
-    encode_br_m, encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate,
-    encode_put_special_m, encode_setzi_m, encode_shl_m_immediate, encode_st32_m_immediate,
+    SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate, encode_br_m,
+    encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate, encode_put_special_m,
+    encode_setzi_m, encode_shl_m_immediate, encode_st32_m_immediate,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -14,6 +14,7 @@ pub mod mid;
 mod package;
 pub mod place;
 pub mod storage;
+pub mod tile;
 pub use exchange::{ExchangeLoweringError, PhysicalExchangePhase, lower_exchanges};
 pub use graph::{
     AddOptions, AttentionOptions, AttentionScale, BroadcastMode, ComputeGraph, GemmOptions,
@@ -24,7 +25,8 @@ pub use graph::{
 pub use kernel::{
     KernelAbi, KernelAbiError, KernelAvailability, KernelBuildPlan, KernelCompilation,
     KernelMaterializationError, KernelSymbols, PlannedKernelCall, ScalarArgument,
-    materialize_kernel_run, tile_kernel_abi, validate_kernel_run,
+    materialize_kernel_run, materialize_kernel_run_with_addresses, tile_kernel_abi,
+    validate_kernel_run,
 };
 pub use low::{
     ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun, LogicalExchange,
@@ -44,6 +46,7 @@ pub use mid::{
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
 pub use place::{IPU21_DATA_BASE, Placement, PlacementError, place};
 pub use storage::{ByteSpan, StorageError, StorageResult, shard_storage_bytes, view_byte_spans};
+pub use tile::{TileLoweringError, TilePrograms, lower_to_tile_programs};
 
 const INCOMING_DBASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;
@@ -338,11 +341,14 @@ fn validate_steps(steps: &[TileStep], repeat_pointer_count: Option<usize>) -> Re
                 if exchange.address & 3 != 0 {
                     return Err(invalid("exchange row address is not word aligned"));
                 }
-                if exchange.row.len() != PLAN_WORDS {
-                    return Err(invalid(format!(
-                        "exchange row has {} words, expected {PLAN_WORDS}",
-                        exchange.row.len()
-                    )));
+                let inactive = exchange.row.first() == Some(&SANS_INACTIVE_INSTRUCTION);
+                if exchange.row.len() < 3
+                    || (!inactive && exchange.row.first() != Some(&SYNC_SUPERVISOR_INSTRUCTION))
+                    || !exchange.row.contains(&ipu_exchange::RETURN_M10_INSTRUCTION)
+                {
+                    return Err(invalid(
+                        "exchange row is not an executable supervisor program",
+                    ));
                 }
             }
             TileStep::Compute(compute) => {
@@ -694,8 +700,10 @@ mod tests {
 
     #[test]
     fn emits_resolved_exchange_and_compute_steps() {
-        let mut row = vec![0; PLAN_WORDS];
+        let mut row = vec![0; ipu_exchange::PLAN_WORDS];
         row[0] = SANS_INACTIVE_INSTRUCTION;
+        row[1] = ipu_exchange::SYNC_ANS_INSTRUCTION;
+        row[2] = ipu_exchange::RETURN_M10_INSTRUCTION;
         let program = TileProgram {
             tile: 7,
             steps: vec![

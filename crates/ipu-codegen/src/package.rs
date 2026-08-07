@@ -1,12 +1,13 @@
 use crate::graph::ComputeGraph;
-use crate::low::LowProgram;
+use crate::low::{LowProgram, LowValue};
 use crate::mid::{PipelineConfig, ToyCostModel};
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HostProgram, KernelBuildPlan,
-    PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, TileProgram,
-    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower, lower_to_tiles,
+    PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL,
+    WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower,
+    lower_exchanges, lower_to_tile_programs, lower_to_tiles, place, shard_storage_bytes,
 };
-use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
+use ipu_driver::APPLICATION_LOAD_BASE;
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
 use ipu_exchange::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
 use ipu_package::{
@@ -49,6 +50,14 @@ pub enum PackageBuildError {
     Low(#[from] crate::LowLoweringError),
     #[error("kernel planning failed: {0}")]
     Kernel(#[from] crate::KernelAbiError),
+    #[error("placement failed: {0}")]
+    Placement(#[from] crate::PlacementError),
+    #[error("exchange lowering failed: {0}")]
+    ExchangeLowering(#[from] crate::ExchangeLoweringError),
+    #[error("tile-program lowering failed: {0}")]
+    TileLowering(#[from] crate::TileLoweringError),
+    #[error("storage layout failed: {0}")]
+    Storage(#[from] crate::StorageError),
 }
 
 pub type PackageBuildResult<T> = std::result::Result<T, PackageBuildError>;
@@ -107,32 +116,79 @@ fn build_package_from_objects(
     objects: &[Vec<u8>],
     kernel_plan: &KernelBuildPlan,
 ) -> PackageBuildResult<Application> {
-    let layout = link_runtime(objects, runtime_symbols(0, 0)?, kernel_plan)?;
-    let code_address = align_up(linked_end(&layout)?, 4)?;
-    let generated = emit(
-        &lower_graph(program),
-        &BTreeMap::from([(COMPLETE_SYMBOL.into(), symbol(&layout, COMPLETE_SYMBOL)?)]),
-        &HostProgram::default(),
-        &CodegenOptions {
-            code_address,
-            ..CodegenOptions::default()
-        },
+    let topology = active_topology(program.tile_count)?;
+    let placement = place(program)?;
+    let exchanges = lower_exchanges(program, &placement, &topology)?;
+    let retained_runtime = runtime_retained_symbols(program, config);
+    let layout = link_runtime(
+        objects,
+        runtime_symbols(0, 0)?,
+        kernel_plan,
+        &retained_runtime,
     )?;
-    let code_end = code_address
-        .checked_add(u32::try_from(generated.bytes.len())?)
-        .ok_or_else(|| invalid("generated code address overflow"))?;
-    if code_end > ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT {
-        return Err(invalid("generated program does not fit executable memory"));
+    let finalized = lower_to_tile_programs(
+        program,
+        &placement,
+        &exchanges,
+        kernel_plan,
+        linked_end(&layout)?,
+    )?;
+    let code_address = align_up(finalized.exchange_code_end, 4)?;
+    let symbols = layout
+        .symbols
+        .clone()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let generated = finalized
+        .programs
+        .iter()
+        .map(|program| {
+            emit(
+                program,
+                &symbols,
+                &HostProgram::default(),
+                &CodegenOptions {
+                    code_address,
+                    ..CodegenOptions::default()
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if generated.iter().any(|program| {
+        code_address
+            .checked_add(program.bytes.len() as u32)
+            .is_none_or(|end| end > ipu_exchange::EXCHANGE_WINDOW_BASE)
+    }) {
+        return Err(invalid(
+            "generated program does not fit below the exchange window",
+        ));
     }
 
     let mut application = Application::default();
-    for physical_tile in 0..u32::from(config.pipeline.tile_count) {
+    for logical_tile in 0..config.pipeline.tile_count {
+        let physical_tile = topology.physical(logical_tile)?;
         application.tiles.push(build_tile(
-            physical_tile,
+            u32::from(physical_tile),
             objects,
             kernel_plan,
+            &retained_runtime,
             code_address,
-            &generated.bytes,
+            &generated[usize::from(logical_tile)],
+        )?);
+    }
+    application
+        .tiles
+        .sort_unstable_by_key(|tile| tile.physical_tile);
+    for input in &program.inputs {
+        let binding = input_binding(program, &placement, &topology, input)?;
+        match input.kind {
+            crate::GraphInputKind::Host => application.inputs.push(binding),
+            crate::GraphInputKind::Parameter => application.weights.push(binding),
+        }
+    }
+    for (index, output) in program.outputs.iter().enumerate() {
+        application.outputs.push(output_binding(
+            program, &placement, &topology, output, index,
         )?);
     }
     application.outputs.push(Binding {
@@ -157,26 +213,31 @@ fn build_package_from_objects(
 
 fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
     let maximum = Topology::c600().tile_count() as u32;
-    if tile_count == 0 || !tile_count.is_multiple_of(TILES_PER_BATCH as u32) || tile_count > maximum
-    {
+    if tile_count != maximum {
         return Err(invalid(format!(
-            "tile count must be a nonzero multiple of {TILES_PER_BATCH} and at most {maximum}"
+            "the static runtime currently requires all {maximum} C600 tiles"
         )));
     }
     Ok(())
+}
+
+fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
+    Ok(Topology::new((0..tile_count).collect())?)
 }
 
 fn build_tile(
     physical_tile: u32,
     objects: &[Vec<u8>],
     kernel_plan: &KernelBuildPlan,
+    retained_runtime: &[String],
     code_address: u32,
-    generated: &[u8],
+    generated: &crate::GeneratedProgram,
 ) -> PackageBuildResult<TileImage> {
     let linked = link_runtime(
         objects,
         runtime_symbols(physical_tile, code_address)?,
         kernel_plan,
+        retained_runtime,
     )?;
     let mut entry = Vec::with_capacity(ENTRY_BYTES as usize);
     entry.extend_from_slice(&encode_setzi_m(0, linked.entry)?.to_le_bytes());
@@ -193,10 +254,29 @@ fn build_tile(
         data: linked.bytes[segment.offset..segment.offset + segment.size].to_vec(),
         flags: SEGMENT_READ | SEGMENT_EXECUTE,
     }));
+    let mut exchange_rows = BTreeMap::<u32, Vec<u8>>::new();
+    for row in &generated.exchange_rows {
+        let bytes = row
+            .words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        if exchange_rows.insert(row.address, bytes).is_some() {
+            return Err(invalid(
+                "duplicate exchange-row address in one tile program",
+            ));
+        }
+    }
+    segments.extend(exchange_rows.into_iter().map(|(address, data)| Segment {
+        address,
+        memory_size: data.len() as u32,
+        data,
+        flags: SEGMENT_READ | SEGMENT_EXECUTE,
+    }));
     segments.push(Segment {
         address: code_address,
-        memory_size: generated.len() as u32,
-        data: generated.to_vec(),
+        memory_size: generated.bytes.len() as u32,
+        data: generated.bytes.clone(),
         flags: SEGMENT_READ | SEGMENT_EXECUTE,
     });
     segments.push(Segment {
@@ -218,19 +298,107 @@ fn link_runtime(
     objects: &[Vec<u8>],
     externals: HashMap<String, u32>,
     kernel_plan: &KernelBuildPlan,
+    retained_runtime: &[String],
 ) -> PackageBuildResult<LinkedImage> {
-    let mut retained_symbols = vec![COMPLETE_SYMBOL.into()];
+    let mut retained_symbols = retained_runtime.to_vec();
     retained_symbols.extend(kernel_plan.retained_symbols().map(str::to_owned));
     Ok(link(
         objects,
         &LinkOptions {
             image_base: TILE_MEMORY_BASE,
-            regions: vec![(SUPPORT_START, ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT)],
+            regions: vec![(SUPPORT_START, ipu_exchange::EXCHANGE_WINDOW_BASE)],
             entry_symbol: RUNTIME_ENTRY_SYMBOL.into(),
             retained_symbols,
             externals,
         },
     )?)
+}
+
+fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec<String> {
+    let mut symbols = vec![COMPLETE_SYMBOL.into()];
+    if !program.exchange_phases.is_empty() {
+        symbols.push(WORKER_BARRIER_SYMBOL.into());
+    }
+    if config.pipeline.profiling.enabled {
+        symbols.push(SAMPLE_CYCLE_SYMBOL.into());
+    }
+    symbols
+}
+
+fn input_binding(
+    program: &LowProgram,
+    placement: &crate::Placement,
+    topology: &Topology,
+    input: &crate::LowInput,
+) -> PackageBuildResult<Binding> {
+    binding(
+        program,
+        placement,
+        topology,
+        input.name.clone(),
+        &input.shards,
+    )
+}
+
+fn output_binding(
+    program: &LowProgram,
+    placement: &crate::Placement,
+    topology: &Topology,
+    output: &LowValue,
+    index: usize,
+) -> PackageBuildResult<Binding> {
+    binding(
+        program,
+        placement,
+        topology,
+        format!("output.{index}"),
+        &output.shards,
+    )
+}
+
+fn binding(
+    program: &LowProgram,
+    placement: &crate::Placement,
+    topology: &Topology,
+    name: String,
+    shards: &[crate::LowShardId],
+) -> PackageBuildResult<Binding> {
+    let first = shards
+        .first()
+        .and_then(|id| program.shards.get(id.index() as usize))
+        .ok_or_else(|| invalid("binding has no shards"))?;
+    let dtype = match first.tensor_type.format.precision {
+        crate::Precision::F8F143 { .. } => "f8f143",
+        crate::Precision::F16 => "f16",
+        crate::Precision::F32 => "f32",
+    };
+    let mut file_offset = 0u64;
+    let slices = shards
+        .iter()
+        .map(|id| {
+            let shard = &program.shards[id.index() as usize];
+            let size = u64::from(shard_storage_bytes(shard)?);
+            let slice = RegionSlice {
+                tile: u32::from(topology.physical(shard.tile)?),
+                tile_address: *placement
+                    .shard_addresses
+                    .get(id)
+                    .ok_or_else(|| invalid("binding shard is not placed"))?,
+                file_offset,
+                size,
+            };
+            file_offset = file_offset
+                .checked_add(size)
+                .ok_or_else(|| invalid("binding file offset overflow"))?;
+            Ok(slice)
+        })
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    Ok(Binding {
+        name,
+        dtype: dtype.into(),
+        shape: first.tensor_type.shape.0.clone(),
+        slices,
+    })
 }
 
 fn runtime_symbols(
@@ -256,14 +424,6 @@ fn runtime_symbols(
     ]))
 }
 
-fn symbol(linked: &LinkedImage, name: &str) -> PackageBuildResult<u32> {
-    linked
-        .symbols
-        .get(name)
-        .copied()
-        .ok_or_else(|| invalid(format!("linked runtime has no {name} symbol")))
-}
-
 fn linked_end(linked: &LinkedImage) -> PackageBuildResult<u32> {
     linked
         .segments
@@ -283,8 +443,4 @@ fn align_up(value: u32, alignment: u32) -> PackageBuildResult<u32> {
 
 fn invalid(message: impl Into<String>) -> PackageBuildError {
     PackageBuildError::Invalid(message.into())
-}
-
-fn lower_graph(_program: &LowProgram) -> TileProgram {
-    TileProgram::default()
 }

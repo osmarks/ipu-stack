@@ -192,6 +192,16 @@ pub fn materialize_kernel_run(
     shard_addresses: &BTreeMap<LowShardId, u32>,
     plan: &KernelBuildPlan,
 ) -> Result<ComputeStep, KernelMaterializationError> {
+    materialize_kernel_run_with_addresses(run, shards, shard_addresses, plan, &BTreeMap::new())
+}
+
+pub fn materialize_kernel_run_with_addresses(
+    run: &KernelRun,
+    shards: &[LowShard],
+    shard_addresses: &BTreeMap<LowShardId, u32>,
+    plan: &KernelBuildPlan,
+    overrides: &BTreeMap<LowShardId, TileAddress>,
+) -> Result<ComputeStep, KernelMaterializationError> {
     let call = plan.call(run)?;
     let resolve = |view: &crate::ShardView| {
         let shard = shards.get(view.shard.index() as usize).ok_or(
@@ -201,26 +211,55 @@ pub fn materialize_kernel_run(
         let [span] = spans.as_slice() else {
             return Err(KernelMaterializationError::FragmentedView);
         };
-        shard_addresses
-            .get(&view.shard)
-            .ok_or(KernelMaterializationError::UnplacedShard(
+        let base = overrides.get(&view.shard).copied().unwrap_or_else(|| {
+            TileAddress::Absolute(
+                shard_addresses
+                    .get(&view.shard)
+                    .copied()
+                    .unwrap_or_default(),
+            )
+        });
+        if !overrides.contains_key(&view.shard) && !shard_addresses.contains_key(&view.shard) {
+            return Err(KernelMaterializationError::UnplacedShard(
                 view.shard.index(),
-            ))?
-            .checked_add(span.offset)
-            .ok_or(KernelMaterializationError::AddressOverflow)
+            ));
+        }
+        add_address_offset(base, span.offset)
     };
     let output_address = resolve(&run.output)?;
     let input_addresses = run
         .inputs
         .iter()
-        .map(|operand| resolve(&operand.views[0]).map(TileAddress::Absolute))
+        .map(|operand| resolve(&operand.views[0]))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ComputeStep {
         symbol: call.symbol,
-        output_address: TileAddress::Absolute(output_address),
+        output_address,
         input_addresses,
         arguments: call.arguments,
         profile: StepProfile::default(),
+    })
+}
+
+fn add_address_offset(
+    address: TileAddress,
+    offset: u32,
+) -> Result<TileAddress, KernelMaterializationError> {
+    Ok(match address {
+        TileAddress::Absolute(address) => TileAddress::Absolute(
+            address
+                .checked_add(offset)
+                .ok_or(KernelMaterializationError::AddressOverflow)?,
+        ),
+        TileAddress::RepeatPointer {
+            index,
+            offset: existing,
+        } => TileAddress::RepeatPointer {
+            index,
+            offset: existing
+                .checked_add(offset)
+                .ok_or(KernelMaterializationError::AddressOverflow)?,
+        },
     })
 }
 
