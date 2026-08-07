@@ -6,6 +6,7 @@ use ipu_exchange::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod exchange;
 pub mod graph;
 pub mod kernel;
 pub mod low;
@@ -13,6 +14,7 @@ pub mod mid;
 mod package;
 pub mod place;
 pub mod storage;
+pub use exchange::{ExchangeLoweringError, PhysicalExchangePhase, lower_exchanges};
 pub use graph::{
     AddOptions, AttentionOptions, AttentionScale, BroadcastMode, ComputeGraph, GemmOptions,
     GraphError, GraphInput, GraphInputKind, GraphResult, Operation, OperationId, OperationKind,
