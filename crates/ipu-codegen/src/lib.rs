@@ -11,6 +11,7 @@ pub mod kernel;
 pub mod low;
 pub mod mid;
 mod package;
+pub mod place;
 pub mod storage;
 pub use graph::{
     AddOptions, AttentionOptions, AttentionScale, BroadcastMode, ComputeGraph, GemmOptions,
@@ -39,6 +40,7 @@ pub use mid::{
     TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, ToyCostModel, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
+pub use place::{IPU21_DATA_BASE, Placement, PlacementError, place};
 pub use storage::{ByteSpan, StorageError, StorageResult, shard_storage_bytes, view_byte_spans};
 
 const INCOMING_DBASE: u8 = 0xa4;
