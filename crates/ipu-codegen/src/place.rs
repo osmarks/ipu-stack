@@ -171,6 +171,12 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
         for transfer in &phase.transfers {
             for &destination in &transfer.destinations {
                 let shard = &program.shards[destination.index() as usize];
+                if !matches!(shard.definition, ShardDefinition::ExchangeCopy(_)) {
+                    if !addresses.contains_key(&destination) {
+                        return Err(PlacementError::InvalidAlias(destination.index()));
+                    }
+                    continue;
+                }
                 let requirement = root_requirements
                     .get(&sets.find(destination.index() as usize))
                     .copied()

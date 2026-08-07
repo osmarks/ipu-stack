@@ -31,8 +31,17 @@ pub enum TileLoweringError {
     InvalidRepeat,
     #[error("execution has {execution} tiles, fewer than the {scheduled} scheduled tiles")]
     MissingExecutionTiles { scheduled: u16, execution: u16 },
-    #[error("local copy addresses or size are invalid")]
-    InvalidLocalCopy,
+    #[error(
+        "tile {tile} local copy {source_shard:?}+{source_offset} -> {destination_shard:?}+{destination_offset} has invalid addresses or byte count {bytes}"
+    )]
+    InvalidLocalCopy {
+        tile: u16,
+        source_shard: LowShardId,
+        source_offset: u32,
+        destination_shard: LowShardId,
+        destination_offset: u32,
+        bytes: u32,
+    },
 }
 
 pub fn lower_to_tile_programs(
@@ -169,23 +178,31 @@ fn lower_work(
                 })
             }
             TileWork::LocalCopy(copy) => {
+                let invalid = || TileLoweringError::InvalidLocalCopy {
+                    tile: tile.tile,
+                    source_shard: copy.source,
+                    source_offset: copy.source_offset,
+                    destination_shard: copy.destination,
+                    destination_offset: copy.destination_offset,
+                    bytes: copy.bytes,
+                };
                 let source = placement
                     .shard_addresses
                     .get(&copy.source)
                     .and_then(|address| address.checked_add(copy.source_offset))
-                    .ok_or(TileLoweringError::InvalidLocalCopy)?;
+                    .ok_or_else(&invalid)?;
                 let destination = placement
                     .shard_addresses
                     .get(&copy.destination)
                     .and_then(|address| address.checked_add(copy.destination_offset))
-                    .ok_or(TileLoweringError::InvalidLocalCopy)?;
+                    .ok_or_else(&invalid)?;
                 let (symbol, arguments) = if copy.bytes != 0 && copy.bytes.is_multiple_of(8) {
                     let words = copy.bytes / 8;
                     (crate::COPY_U64_SYMBOL, vec![words / 6, words % 6])
                 } else if copy.bytes != 0 && copy.bytes.is_multiple_of(4) {
                     (crate::COPY_U32_SYMBOL, vec![copy.bytes / 4])
                 } else {
-                    return Err(TileLoweringError::InvalidLocalCopy);
+                    return Err(invalid());
                 };
                 TileStep::Compute(crate::ComputeStep {
                     symbol: symbol.into(),

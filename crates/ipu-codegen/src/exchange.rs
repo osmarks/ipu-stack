@@ -45,6 +45,7 @@ pub fn lower_exchanges(
         .map(|phase| {
             let mut builders = BTreeMap::<u16, PlanProgramBuilder>::new();
             let mut horizon = 0u32;
+            let mut tile_availability = vec![0u32; usize::from(program.tile_count)];
             for transfer in &phase.transfers {
                 let source = &program.shards[transfer.source.shard.index() as usize];
                 let source_base = placement
@@ -105,15 +106,35 @@ pub fn lower_exchanges(
                                 ))
                             })
                             .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-                        append_transfer(
+                        let schedule_offset = std::iter::once(source.tile)
+                            .chain(destination_entries.iter().map(|entry| entry.0))
+                            .map(|tile| tile_availability[usize::from(tile)])
+                            .max()
+                            .unwrap_or(0);
+                        let schedule_offset = if schedule_offset == 0 {
+                            0
+                        } else {
+                            schedule_offset
+                                .checked_add(1)
+                                .ok_or(ExchangeLoweringError::Overflow)?
+                        };
+                        let transfer_end = append_transfer(
                             topology,
-                            source.tile,
-                            &destination_entries,
-                            source_address,
-                            chunk_bytes / 4,
+                            ScheduledTransfer {
+                                source: source.tile,
+                                destinations: &destination_entries,
+                                source_address,
+                                words: chunk_bytes / 4,
+                                schedule_offset,
+                            },
                             &mut horizon,
                             &mut builders,
                         )?;
+                        for tile in std::iter::once(source.tile)
+                            .chain(destination_entries.iter().map(|entry| entry.0))
+                        {
+                            tile_availability[usize::from(tile)] = transfer_end;
+                        }
                         chunk_offset = chunk_offset
                             .checked_add(chunk_bytes)
                             .ok_or(ExchangeLoweringError::Overflow)?;
@@ -141,20 +162,31 @@ pub fn lower_exchanges(
         .collect()
 }
 
-fn append_transfer(
-    topology: &Topology,
+struct ScheduledTransfer<'a> {
     source: u16,
-    destinations: &[(u16, u32)],
+    destinations: &'a [(u16, u32)],
     source_address: u32,
     words: u32,
+    schedule_offset: u32,
+}
+
+fn append_transfer(
+    topology: &Topology,
+    transfer: ScheduledTransfer<'_>,
     horizon: &mut u32,
     builders: &mut BTreeMap<u16, PlanProgramBuilder>,
-) -> Result<(), ExchangeLoweringError> {
+) -> Result<u32, ExchangeLoweringError> {
+    let ScheduledTransfer {
+        source,
+        destinations,
+        source_address,
+        words,
+        schedule_offset,
+    } = transfer;
     if words == 0 {
         return Err(ExchangeLoweringError::UnalignedPayload);
     }
     let tiles = destinations.iter().map(|entry| entry.0).collect::<Vec<_>>();
-    let schedule_offset = if *horizon == 0 { 0 } else { *horizon + 1 };
     let mut plan = if tiles.len() == 1 && schedule_offset == 0 {
         let point = topology.point_to_point(source, tiles[0], words)?;
         MulticastPlan {
@@ -186,15 +218,15 @@ fn append_transfer(
             .or_default()
             .append_scheduled_row(row)?;
     }
-    *horizon = std::iter::once(&plan.sender)
+    let transfer_end = std::iter::once(&plan.sender)
         .chain(&plan.receivers)
         .map(|row| plan_event_cycles(row))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .max()
-        .unwrap_or(*horizon)
-        .max(*horizon);
-    Ok(())
+        .unwrap_or(schedule_offset);
+    *horizon = (*horizon).max(transfer_end);
+    Ok(transfer_end)
 }
 
 pub fn inactive_exchange_row() -> Vec<u32> {

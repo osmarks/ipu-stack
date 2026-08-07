@@ -349,6 +349,34 @@ impl Layout {
         }
     }
 
+    /// AMP right operand distributed across both K and output columns. A
+    /// blocked GEMM streams each K panel to the other output-row groups that
+    /// share its column coordinate instead of retaining a full replica.
+    pub fn amp_right_streamed(
+        inner: u16,
+        tile_count: u16,
+        row_partitions: u16,
+        column_partitions: u16,
+    ) -> Self {
+        Self {
+            order: ElementOrder::Amp(AmpOrder::Right),
+            tiling: TensorTiling {
+                tile_count,
+                replicas: 1,
+                axes: vec![
+                    AxisTiling::new(TensorAxis::FromEnd(1), column_partitions, 64, Padding::Zero),
+                    AxisTiling::new(
+                        TensorAxis::FromEnd(2),
+                        row_partitions,
+                        u32::from(inner),
+                        Padding::Zero,
+                    ),
+                ],
+            },
+            memory_class: MemoryClass::Ipu21Standard,
+        }
+    }
+
     /// AMP output distributed over both matrix axes on one tile grid.
     pub fn amp_output_grid(tile_count: u16, row_partitions: u16, column_partitions: u16) -> Self {
         if column_partitions == 1 && row_partitions == tile_count {
@@ -806,6 +834,22 @@ fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
             [
                 amp_grid_gemm_operator_candidate(Precision::F16, 64, 16, tile_count, rows, columns),
                 amp_grid_gemm_operator_candidate(Precision::F32, 64, 32, tile_count, rows, columns),
+                amp_streamed_gemm_operator_candidate(
+                    Precision::F16,
+                    64,
+                    16,
+                    tile_count,
+                    rows,
+                    columns,
+                ),
+                amp_streamed_gemm_operator_candidate(
+                    Precision::F32,
+                    64,
+                    32,
+                    tile_count,
+                    rows,
+                    columns,
+                ),
             ]
         })
         .collect::<Vec<_>>();
@@ -947,6 +991,61 @@ fn amp_grid_gemm_operator_candidate(
                 TensorFormat {
                     precision,
                     layout: Layout::amp_right_grid(
+                        inner,
+                        tile_count,
+                        row_partitions,
+                        column_partitions,
+                    ),
+                },
+                32,
+            ),
+        ],
+        OperandRequirement::new(
+            TensorFormat {
+                precision,
+                layout: Layout::amp_output_grid(tile_count, row_partitions, column_partitions),
+            },
+            32,
+        ),
+    )
+    .with_memory_relation(MemoryRelation::DistinctElements(vec![
+        MemoryOperand::Output,
+        MemoryOperand::Input(0),
+    ]))
+}
+
+fn amp_streamed_gemm_operator_candidate(
+    precision: Precision,
+    inner: u16,
+    left_tail: u32,
+    tile_count: u16,
+    row_partitions: u16,
+    column_partitions: u16,
+) -> OperatorCandidate {
+    OperatorCandidate::new(
+        MidOperator::Gemm {
+            options: GemmOptions::default(),
+            multiply: precision,
+            accumulate: AccumulationPrecision::F32,
+        },
+        [
+            OperandRequirement::new(
+                TensorFormat {
+                    precision,
+                    layout: Layout::amp_left_grid(
+                        inner,
+                        tile_count,
+                        row_partitions,
+                        column_partitions,
+                    ),
+                },
+                32,
+            )
+            .with_access_tail(left_tail),
+            OperandRequirement::new(
+                TensorFormat {
+                    precision,
+                    layout: Layout::amp_right_streamed(
                         inner,
                         tile_count,
                         row_partitions,
@@ -1144,7 +1243,14 @@ impl OperatorPlan {
                     .padded_shape(&output.shape)
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
                 let grid_plan = left.format.layout.tiling.replicas > 1
-                    || right.format.layout.tiling.replicas > 1;
+                    || right.format.layout.tiling.replicas > 1
+                    || right
+                        .format
+                        .layout
+                        .tiling
+                        .axes
+                        .iter()
+                        .any(|axis| axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1);
                 if grid_plan
                     && (!layout_shards_are_even(left)
                         || !layout_shards_are_even(right)
@@ -1391,6 +1497,7 @@ fn gemm_remote_bytes(inputs: &[TensorType], output: &TensorType) -> u64 {
     let output_column_axis = output.shape.0.len() - 1;
     let left_row_axis = left.shape.0.len() - 2;
     let right_column_axis = right.shape.0.len() - 1;
+    let right_inner_axis = right.shape.0.len() - 2;
     let k = left.shape.0[left.shape.0.len() - 1];
     (0..tiles).fold(0u64, |total, tile| {
         let Some(output_rows) = tile_axis_range(output, output_row_axis, tile) else {
@@ -1405,6 +1512,9 @@ fn gemm_remote_bytes(inputs: &[TensorType], output: &TensorType) -> u64 {
         let Some(right_columns) = tile_axis_range(right, right_column_axis, tile) else {
             return u64::MAX;
         };
+        let Some(right_inner) = tile_axis_range(right, right_inner_axis, tile) else {
+            return u64::MAX;
+        };
         let left_remote = if left_rows.start > output_rows.start || left_rows.end < output_rows.end
         {
             u64::from(output_rows.end - output_rows.start)
@@ -1415,6 +1525,8 @@ fn gemm_remote_bytes(inputs: &[TensorType], output: &TensorType) -> u64 {
         };
         let right_remote = if right_columns.start > output_columns.start
             || right_columns.end < output_columns.end
+            || right_inner.start != 0
+            || right_inner.end < k
         {
             u64::from(output_columns.end - output_columns.start)
                 .saturating_mul(u64::from(k))
@@ -1616,11 +1728,16 @@ fn lower_operations(
             .into_iter()
             .filter(|plan| {
                 let grid_plan = matches!(plan.operator, MidOperator::Gemm { .. })
-                    && plan
+                    && (plan
                         .requirements
                         .inputs
                         .iter()
-                        .any(|input| input.format.layout.tiling.replicas > 1);
+                        .any(|input| input.format.layout.tiling.replicas > 1)
+                        || plan.requirements.inputs.get(1).is_some_and(|right| {
+                            right.format.layout.tiling.axes.iter().any(|axis| {
+                                axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1
+                            })
+                        }));
                 !grid_plan
                     || input_ids
                         .iter()
