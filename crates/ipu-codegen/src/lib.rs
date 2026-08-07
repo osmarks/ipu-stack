@@ -15,7 +15,9 @@ mod package;
 pub mod place;
 pub mod storage;
 pub mod tile;
-pub use exchange::{ExchangeLoweringError, PhysicalExchangePhase, lower_exchanges};
+pub use exchange::{
+    ExchangeLoweringError, PhysicalExchangePhase, inactive_exchange_row, lower_exchanges,
+};
 pub use graph::{
     AddOptions, AttentionOptions, AttentionScale, BroadcastMode, ComputeGraph, GemmOptions,
     GraphError, GraphInput, GraphInputKind, GraphResult, Operation, OperationId, OperationKind,
@@ -46,7 +48,9 @@ pub use mid::{
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
 pub use place::{IPU21_DATA_BASE, Placement, PlacementError, place};
 pub use storage::{ByteSpan, StorageError, StorageResult, shard_storage_bytes, view_byte_spans};
-pub use tile::{TileLoweringError, TilePrograms, lower_to_tile_programs};
+pub use tile::{
+    TileLoweringError, TilePrograms, lower_to_tile_programs, lower_to_tile_programs_with_fill,
+};
 
 const INCOMING_DBASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;

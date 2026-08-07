@@ -29,6 +29,8 @@ pub enum TileLoweringError {
     Overflow,
     #[error("repeat iterated input has no placed first block")]
     InvalidRepeat,
+    #[error("execution has {execution} tiles, fewer than the {scheduled} scheduled tiles")]
+    MissingExecutionTiles { scheduled: u16, execution: u16 },
 }
 
 pub fn lower_to_tile_programs(
@@ -38,11 +40,41 @@ pub fn lower_to_tile_programs(
     kernels: &KernelBuildPlan,
     exchange_code_base: u32,
 ) -> Result<TilePrograms, TileLoweringError> {
+    lower_to_tile_programs_with_fill(
+        program,
+        placement,
+        exchanges,
+        kernels,
+        exchange_code_base,
+        program.tile_count,
+    )
+}
+
+pub fn lower_to_tile_programs_with_fill(
+    program: &LowProgram,
+    placement: &Placement,
+    exchanges: &[PhysicalExchangePhase],
+    kernels: &KernelBuildPlan,
+    exchange_code_base: u32,
+    execution_tile_count: u16,
+) -> Result<TilePrograms, TileLoweringError> {
+    if execution_tile_count < program.tile_count {
+        return Err(TileLoweringError::MissingExecutionTiles {
+            scheduled: program.tile_count,
+            execution: execution_tile_count,
+        });
+    }
     let mut cursor = align_up(exchange_code_base, 4)?;
     let mut phase_addresses = BTreeMap::<ExchangePhaseId, u32>::new();
     for phase in exchanges {
         phase_addresses.insert(phase.id, cursor);
-        let maximum_words = phase.rows.iter().map(Vec::len).max().unwrap_or(0);
+        let maximum_words = phase
+            .rows
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(ipu_exchange::PLAN_WORDS);
         cursor = cursor
             .checked_add(
                 u32::try_from(maximum_words)
@@ -56,7 +88,7 @@ pub fn lower_to_tile_programs(
         .iter()
         .map(|phase| (phase.id, phase))
         .collect::<BTreeMap<_, _>>();
-    let programs = program
+    let mut programs = program
         .tiles
         .iter()
         .map(|tile| {
@@ -75,6 +107,23 @@ pub fn lower_to_tile_programs(
             })
         })
         .collect::<Result<Vec<_>, TileLoweringError>>()?;
+    for tile in program.tile_count..execution_tile_count {
+        programs.push(TileProgram {
+            tile,
+            steps: exchanges
+                .iter()
+                .map(|phase| {
+                    Ok(TileStep::Exchange(ExchangeStep {
+                        address: *phase_addresses
+                            .get(&phase.id)
+                            .ok_or(TileLoweringError::UnknownExchange)?,
+                        row: crate::inactive_exchange_row(),
+                        profile: StepProfile::default(),
+                    }))
+                })
+                .collect::<Result<Vec<_>, TileLoweringError>>()?,
+        });
+    }
     Ok(TilePrograms {
         programs,
         exchange_code_end: cursor,
@@ -230,21 +279,37 @@ mod tests {
             let placement = place(&low).unwrap();
             let kernels = KernelBuildPlan::from_program(&low).unwrap();
             let exchanges = lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
-            let finalized =
-                lower_to_tile_programs(&low, &placement, &exchanges, &kernels, 0x4d000).unwrap();
-            assert_eq!(finalized.programs.len(), usize::from(tiles));
-            for program in finalized.programs {
+            let filler_tiles = random.u16(1..=4);
+            let finalized = lower_to_tile_programs_with_fill(
+                &low,
+                &placement,
+                &exchanges,
+                &kernels,
+                0x4d000,
+                tiles + filler_tiles,
+            )
+            .unwrap();
+            assert_eq!(finalized.programs.len(), usize::from(tiles + filler_tiles));
+            for program in &finalized.programs[..usize::from(tiles)] {
                 assert!(
                     program
                         .steps
                         .iter()
                         .any(|step| matches!(step, TileStep::Compute(_)))
                 );
-                for step in program.steps {
+                for step in &program.steps {
                     if let TileStep::Exchange(exchange) = step {
                         assert_eq!(exchange.row.last(), Some(&RETURN_M10_INSTRUCTION));
                     }
                 }
+            }
+            for program in &finalized.programs[usize::from(tiles)..] {
+                assert_eq!(program.steps.len(), exchanges.len());
+                assert!(program.steps.iter().all(|step| matches!(
+                    step,
+                    TileStep::Exchange(exchange)
+                        if exchange.row[0] == ipu_exchange::SANS_INACTIVE_INSTRUCTION
+                )));
             }
         }
     }

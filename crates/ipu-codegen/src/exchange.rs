@@ -129,7 +129,7 @@ pub fn lower_exchanges(
             let rows = (0..program.tile_count)
                 .map(|tile| match builders.remove(&tile) {
                     Some(builder) => Ok(builder.finish(horizon)?),
-                    None => Ok(inactive_row()),
+                    None => Ok(inactive_exchange_row()),
                 })
                 .collect::<Result<Vec<_>, ipu_exchange::ExchangeError>>()?;
             Ok(PhysicalExchangePhase {
@@ -197,7 +197,7 @@ fn append_transfer(
     Ok(())
 }
 
-fn inactive_row() -> Vec<u32> {
+pub fn inactive_exchange_row() -> Vec<u32> {
     let mut row = vec![0; PLAN_WORDS];
     row[0] = SANS_INACTIVE_INSTRUCTION;
     row[1] = SYNC_ANS_INSTRUCTION;

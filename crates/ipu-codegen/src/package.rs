@@ -5,9 +5,9 @@ use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HostProgram, KernelBuildPlan,
     PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL,
     WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower,
-    lower_exchanges, lower_to_tile_programs, lower_to_tiles, place, shard_storage_bytes,
+    lower_exchanges, lower_to_tile_programs_with_fill, lower_to_tiles, place, shard_storage_bytes,
 };
-use ipu_driver::APPLICATION_LOAD_BASE;
+use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
 use ipu_exchange::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
 use ipu_package::{
@@ -126,12 +126,14 @@ fn build_package_from_objects(
         kernel_plan,
         &retained_runtime,
     )?;
-    let finalized = lower_to_tile_programs(
+    let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
+    let finalized = lower_to_tile_programs_with_fill(
         program,
         &placement,
         &exchanges,
         kernel_plan,
         linked_end(&layout)?,
+        execution_tile_count,
     )?;
     let code_address = align_up(finalized.exchange_code_end, 4)?;
     let symbols = layout
@@ -165,15 +167,14 @@ fn build_package_from_objects(
     }
 
     let mut application = Application::default();
-    for logical_tile in 0..config.pipeline.tile_count {
-        let physical_tile = topology.physical(logical_tile)?;
+    for physical_tile in 0..execution_tile_count {
         application.tiles.push(build_tile(
             u32::from(physical_tile),
             objects,
             kernel_plan,
             &retained_runtime,
             code_address,
-            &generated[usize::from(logical_tile)],
+            &generated[usize::from(physical_tile)],
         )?);
     }
     application
@@ -213,9 +214,10 @@ fn build_package_from_objects(
 
 fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
     let maximum = Topology::c600().tile_count() as u32;
-    if tile_count != maximum {
+    if tile_count == 0 || !tile_count.is_multiple_of(TILES_PER_BATCH as u32) || tile_count > maximum
+    {
         return Err(invalid(format!(
-            "the static runtime currently requires all {maximum} C600 tiles"
+            "tile count must be a nonzero multiple of {TILES_PER_BATCH} and at most {maximum}"
         )));
     }
     Ok(())

@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use ipu_codegen::{ComputeGraph, PackageConfig, PipelineConfig, build_package};
+use ipu_codegen::{
+    ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision, TensorFormat, build_package,
+};
 use ipu_elf::Toolchain;
 use ipu_package::Application;
 use ipu_runtime::Runtime;
@@ -27,6 +29,9 @@ struct Arguments {
     runtime_source: Option<PathBuf>,
     #[arg(long, default_value_t = 10)]
     timeout_seconds: u64,
+    /// Execute one blocked F16 GEMM as a kernel/exchange smoke test.
+    #[arg(long)]
+    gemm_smoke: bool,
 }
 
 fn main() -> Result<()> {
@@ -38,8 +43,32 @@ fn main() -> Result<()> {
     let bootloader = arguments
         .bootloader
         .unwrap_or_else(|| arguments.sdk.join("bin/ipu/tile_bootloader_cc_ipu21.elf"));
+    let active_tiles = u16::try_from(arguments.tiles).context("tile count exceeds u16")?;
+    let mut graph = ComputeGraph::default();
+    let mut pipeline = PipelineConfig::new(active_tiles);
+    if arguments.gemm_smoke {
+        let left = graph.host_input("left", [u32::from(active_tiles), 64])?;
+        let right = graph.parameter("right", [64, u32::from(active_tiles) * 64])?;
+        let output = graph.gemm(left, right)?;
+        graph.set_outputs([output])?;
+        pipeline = pipeline
+            .with_input(
+                left,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::amp_left(64, active_tiles),
+                },
+            )
+            .with_input(
+                right,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::amp_right(64, active_tiles),
+                },
+            );
+    }
     let application = build_package(
-        &ComputeGraph::default(),
+        &graph,
         &PackageConfig {
             toolchain: Toolchain::from_sdk(&arguments.sdk),
             kernel_source_directory: runtime_source
@@ -48,9 +77,7 @@ fn main() -> Result<()> {
                 .to_owned(),
             runtime_source,
             build_directory: std::env::temp_dir().join("ipu-stack-package"),
-            pipeline: PipelineConfig::new(
-                u16::try_from(arguments.tiles).context("tile count exceeds u16")?,
-            ),
+            pipeline,
         },
     )?;
     write_package(&application, &arguments.package)?;
