@@ -122,6 +122,10 @@
 	ld64putcs 63
 	.endm
 
+	// Tile-kernel ABI for every row-specialized GEMM entry:
+	//   m2 output, m3 packed left, m4 packed right, m10 return address.
+	// The symbol fixes initialize/accumulate mode and row count; inner and
+	// output-column blocks are both 64.
 	.macro GEMM_SUPERVISOR name, clear_output
 	.section .text.\name,"ax",@progbits
 	.globl \name

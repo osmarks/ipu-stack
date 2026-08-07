@@ -56,7 +56,7 @@ pub enum MidOperator {
 }
 
 /// A tile-local callable selected by a whole-device operator plan.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileKernelSpec {
     Gemm {
         multiply: Precision,
@@ -68,6 +68,14 @@ pub enum TileKernelSpec {
     FlashAttention {
         options: AttentionOptions,
         accumulate: AccumulationPrecision,
+    },
+    Cast {
+        from: Precision,
+        to: Precision,
+    },
+    Rearrange {
+        from: Layout,
+        to: Layout,
     },
 }
 
@@ -758,6 +766,7 @@ pub struct MidOperation {
     pub results: Vec<MidValueId>,
     pub kind: MidOperationKind,
     pub operator_plan: Option<OperatorPlan>,
+    pub conversion_plan: Option<ConversionPlan>,
     pub estimated_cost: u64,
 }
 
@@ -774,6 +783,20 @@ pub struct OperatorPlan {
     pub operator: MidOperator,
     pub dispatch: OperatorDispatch,
     pub requirements: OperatorRequirements,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConversionDispatch {
+    Local,
+    Intersections,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversionPlan {
+    pub kernel: TileKernelSpec,
+    pub input: OperandRequirement,
+    pub output: OperandRequirement,
+    pub dispatch: ConversionDispatch,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -1254,6 +1277,7 @@ fn lower_operations(
                 dispatch: plan.dispatch,
                 requirements: plan.requirements,
             }),
+            conversion_plan: None,
             estimated_cost: operator_cost,
         });
         values.insert(operation.results[0], result);
@@ -1407,6 +1431,7 @@ fn lower_repeat(
             },
         }),
         operator_plan: None,
+        conversion_plan: None,
         estimated_cost: body_cost.saturating_mul(u64::from(repeat.count)),
     });
     Ok(())
@@ -1435,6 +1460,15 @@ fn ensure_format(
                 to: target.precision,
             },
             operator_plan: None,
+            conversion_plan: Some(ConversionPlan {
+                kernel: TileKernelSpec::Cast {
+                    from,
+                    to: target.precision,
+                },
+                input: OperandRequirement::new(original.tensor_type.format.clone(), 8),
+                output: OperandRequirement::new(tensor_type.format.clone(), 8),
+                dispatch: ConversionDispatch::Local,
+            }),
             estimated_cost: costs.cast_cost(&tensor_type.shape, from, target.precision),
         });
         value = result;
@@ -1454,6 +1488,15 @@ fn ensure_format(
                 to: target.layout.clone(),
             },
             operator_plan: None,
+            conversion_plan: Some(ConversionPlan {
+                kernel: TileKernelSpec::Rearrange {
+                    from: from.clone(),
+                    to: target.layout.clone(),
+                },
+                input: OperandRequirement::new(current.tensor_type.format.clone(), 8),
+                output: OperandRequirement::new(tensor_type.format.clone(), 8),
+                dispatch: ConversionDispatch::Intersections,
+            }),
             estimated_cost: costs.rearrange_cost(
                 &tensor_type.shape,
                 tensor_type.format.precision,

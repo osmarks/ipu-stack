@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub mod graph;
+pub mod kernel;
 pub mod low;
 pub mod mid;
 mod package;
@@ -16,20 +17,24 @@ pub use graph::{
     Region, RegionBuilder, Repeat, RepeatArguments, TensorShape, ValueId, ValueSequence,
     ValueSequenceId,
 };
+pub use kernel::{
+    KernelAbi, KernelAbiError, KernelAvailability, KernelSymbols, ScalarArgument, tile_kernel_abi,
+    validate_kernel_run,
+};
 pub use low::{
-    ExchangePhase, ExchangePhaseId, KernelOperand, KernelRun, LogicalExchange, LowInput,
-    LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId, LowValue, RepeatCarried,
-    RepeatInvariant, RepeatIterated, RepeatRun, ShardDefinition, ShardExtent, ShardView,
-    TileKernel, TileWork, TileWorkList, WorkProvenance, WorkReason, lower_to_tiles,
+    ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun, LogicalExchange,
+    LowInput, LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId, LowValue,
+    RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, ShardDefinition, ShardExtent,
+    ShardView, TileKernel, TileWork, TileWorkList, WorkProvenance, WorkReason, lower_to_tiles,
 };
 pub use mid::{
-    AccumulationPrecision, AmpOrder, AxisTiling, CostModel, ElementOrder, GemmKernelMode,
-    HardwareTarget, Layout, LayoutError, LoweringError, LoweringResult, MemoryClass, MemoryOperand,
-    MemoryRelation, MidGraph, MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion,
-    MidRepeat, MidValue, MidValueId, OperandRequirement, OperatorCandidate, OperatorDispatch,
-    OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, PipelineConfig,
-    Precision, ProfilingConfig, SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling,
-    TensorType, TileKernelSpec, ToyCostModel, lower,
+    AccumulationPrecision, AmpOrder, AxisTiling, ConversionDispatch, ConversionPlan, CostModel,
+    ElementOrder, GemmKernelMode, HardwareTarget, Layout, LayoutError, LoweringError,
+    LoweringResult, MemoryClass, MemoryOperand, MemoryRelation, MidGraph, MidInput, MidOperation,
+    MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId, OperandRequirement,
+    OperatorCandidate, OperatorDispatch, OperatorPlan, OperatorPlanError, OperatorRequirements,
+    OutputAliasing, Padding, PipelineConfig, Precision, ProfilingConfig, SchedulingPolicy,
+    TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, ToyCostModel, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
 

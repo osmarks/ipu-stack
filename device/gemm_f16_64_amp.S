@@ -180,6 +180,11 @@
 #endif
 	.endm
 
+	// Tile-kernel ABI for every GEMM_SUPERVISOR entry:
+	//   m2 output, m3 packed left, m4 packed right, m10 return address.
+	// The symbol fixes initialize/accumulate mode and row specialization; the
+	// inner and output-column blocks are both 64. Native F8 builds additionally
+	// consume the tensor-wide power-of-two scale exponent in m5.
 	.macro GEMM_SUPERVISOR name, initial, rows, worker, retained_output_worker, retained_inner_worker
 	.section .text.\name,"ax",@progbits
 	.globl \name

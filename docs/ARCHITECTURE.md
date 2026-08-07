@@ -75,7 +75,18 @@ optimal.
 assigns rectangular shards to logical tiles, preserves repeats as reusable tile-local
 bodies, inserts synchronized exchange phases, and emits kernel runs whose
 operand views are resident on their execution tile. Cast and rearrangement
-fallbacks remain conservative until they gain operator plans of their own.
+operations also have explicit plans: casts are local one-input/one-output
+kernel calls, while rearrangements split matching logical rectangles, move
+remote source rectangles, and repack each rectangle with a tile kernel. NumPy
+Add broadcasting similarly moves singleton input views to the tiles that need
+them. Every resulting kernel operand contains exactly one view.
+
+`ipu_codegen::kernel` is the machine-readable tile-kernel ABI registry. It
+records symbols, pointer and scalar registers, return convention, row
+specialization, and whether an implementation exists in the retained device
+sources. Missing general GeLU, Add, attention, cast, and rearrangement kernels
+are marked `Required`; they are not confused with diagnostic assembly helpers.
+The corresponding retained assembly entry points carry matching ABI comments.
 
 `PipelineConfig` is shared by mid lowering, low scheduling, and package
 construction. It contains the hardware target, one tile count, graph-input

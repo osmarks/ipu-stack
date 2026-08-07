@@ -8,8 +8,9 @@
 
 use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
-    Layout, LayoutError, MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId,
-    OperatorDispatch, OperatorRequirements, PipelineConfig, Precision, TensorType, TileKernelSpec,
+    ConversionDispatch, LayoutError, MidGraph, MidOperation, MidOperationKind, MidRepeat,
+    MidValueId, OperandRequirement, OperatorDispatch, OperatorRequirements, PipelineConfig,
+    TensorType, TileKernelSpec,
 };
 use std::collections::BTreeMap;
 
@@ -110,8 +111,15 @@ pub struct WorkProvenance {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileKernel {
     Planned(TileKernelSpec),
-    Cast { from: Precision, to: Precision },
-    Rearrange { from: Layout, to: Layout },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KernelRequirements {
+    Operator(OperatorRequirements),
+    Conversion {
+        input: OperandRequirement,
+        output: OperandRequirement,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,7 +134,7 @@ pub struct KernelRun {
     pub kernel: TileKernel,
     pub inputs: Vec<KernelOperand>,
     pub output: ShardView,
-    pub requirements: Option<OperatorRequirements>,
+    pub requirements: KernelRequirements,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,6 +209,10 @@ pub enum LowLoweringError {
     MissingOperatorPlan,
     #[error("operator plan is incompatible with its values or block dimensions")]
     InvalidOperatorPlan,
+    #[error("conversion operation is missing its selected plan")]
+    MissingConversionPlan,
+    #[error("conversion plan is incompatible with its input or output")]
+    InvalidConversionPlan,
     #[error("repeat structure is inconsistent with its inputs, arguments, yields, or results")]
     InvalidRepeat,
     #[error("too many logical shards or exchange phases")]
@@ -339,14 +351,13 @@ impl LoweringState {
                 work: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let mut resident = BTreeMap::<(LowShardId, u16), LowShardId>::new();
         for operation in operations {
             match &operation.kind {
                 MidOperationKind::Repeat(repeat) => {
                     self.lower_repeat(operation, repeat, &mut tiles)?;
                 }
                 MidOperationKind::Operator(_) => self.lower_operator(operation, &mut tiles)?,
-                kind => self.lower_conversion(operation, kind, &mut resident, &mut tiles)?,
+                kind => self.lower_conversion(operation, kind, &mut tiles)?,
             }
         }
         Ok(tiles)
@@ -356,77 +367,118 @@ impl LoweringState {
         &mut self,
         operation: &MidOperation,
         kind: &MidOperationKind,
-        resident: &mut BTreeMap<(LowShardId, u16), LowShardId>,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
+        let plan = operation
+            .conversion_plan
+            .as_ref()
+            .ok_or(LowLoweringError::MissingConversionPlan)?;
+        match plan.dispatch {
+            ConversionDispatch::Local => self.lower_local_conversion(operation, kind, plan, tiles),
+            ConversionDispatch::Intersections => {
+                self.lower_intersection_conversion(operation, kind, plan, tiles)
+            }
+        }
+    }
+
+    fn lower_local_conversion(
+        &self,
+        operation: &MidOperation,
+        kind: &MidOperationKind,
+        plan: &crate::ConversionPlan,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<()> {
+        let [input] = operation.inputs.as_slice() else {
+            return Err(LowLoweringError::InvalidConversionPlan);
+        };
         let [result] = operation.results.as_slice() else {
             return Err(LowLoweringError::ResultArity);
         };
-        let output_shards = self.value_shards(*result)?.to_vec();
-        let input_shards = operation
-            .inputs
-            .iter()
-            .map(|value| Ok((*value, self.value_shards(*value)?.to_vec())))
-            .collect::<LowLoweringResult<Vec<_>>>()?;
-        let mut transfers = BTreeMap::<LowShardId, Vec<LowShardId>>::new();
-        let mut runs = Vec::with_capacity(output_shards.len());
-        for output in output_shards {
+        for output in self.value_shards(*result)? {
             let tile = self.shards[output.index() as usize].tile;
-            let mut operands = Vec::with_capacity(input_shards.len());
-            for (_, sources) in &input_shards {
-                let mut local = Vec::with_capacity(sources.len());
-                for source in sources {
-                    local.push(self.ensure_resident(*source, tile, resident, &mut transfers)?);
-                }
-                operands.push(KernelOperand {
-                    views: local
-                        .into_iter()
-                        .map(|shard| self.full_view(shard))
-                        .collect(),
-                });
-            }
-            runs.push((
-                tile,
-                KernelRun {
+            let input = self.local_shard(*input, tile)?;
+            tiles[usize::from(tile)]
+                .work
+                .push(TileWork::Kernel(KernelRun {
                     provenance: operation_provenance(operation, kind),
-                    kernel: match kind {
-                        MidOperationKind::CastPrecision { from, to } => TileKernel::Cast {
-                            from: *from,
-                            to: *to,
-                        },
-                        MidOperationKind::Rearrange { from, to } => TileKernel::Rearrange {
-                            from: from.clone(),
-                            to: to.clone(),
-                        },
-                        MidOperationKind::Operator(_) | MidOperationKind::Repeat(_) => {
-                            unreachable!()
-                        }
+                    kernel: TileKernel::Planned(plan.kernel.clone()),
+                    inputs: vec![KernelOperand {
+                        views: vec![self.full_view(input)],
+                    }],
+                    output: self.full_view(*output),
+                    requirements: KernelRequirements::Conversion {
+                        input: plan.input.clone(),
+                        output: plan.output.clone(),
                     },
-                    inputs: operands,
-                    output: self.full_view(output),
-                    requirements: None,
-                },
-            ));
+                }));
         }
-        if !transfers.is_empty() {
-            let id = ExchangePhaseId(
-                u32::try_from(self.phases.len()).map_err(|_| LowLoweringError::IdOverflow)?,
-            );
-            self.phases.push(ExchangePhase {
-                id,
-                provenance: operation_provenance(operation, kind),
-                transfers: transfers
-                    .into_iter()
-                    .map(|(source, destinations)| LogicalExchange {
-                        source: self.full_view(source),
-                        destinations,
-                    })
-                    .collect(),
-            });
-            for tile in &mut *tiles {
-                tile.work.push(TileWork::Exchange(id));
+        Ok(())
+    }
+
+    fn lower_intersection_conversion(
+        &mut self,
+        operation: &MidOperation,
+        kind: &MidOperationKind,
+        plan: &crate::ConversionPlan,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<()> {
+        let [input] = operation.inputs.as_slice() else {
+            return Err(LowLoweringError::InvalidConversionPlan);
+        };
+        let [result] = operation.results.as_slice() else {
+            return Err(LowLoweringError::ResultArity);
+        };
+        let inputs = self.value_shards(*input)?.to_vec();
+        let outputs = self.value_shards(*result)?.to_vec();
+        let mut transfers = BTreeMap::<ShardView, Vec<LowShardId>>::new();
+        let mut runs = Vec::new();
+        for output in outputs {
+            let tile = self.shards[output.index() as usize].tile;
+            for source in &inputs {
+                let Some(extents) = intersect_extents(
+                    &self.shards[source.index() as usize].extents,
+                    &self.shards[output.index() as usize].extents,
+                ) else {
+                    continue;
+                };
+                let source_view = ShardView {
+                    shard: *source,
+                    extents: extents.clone(),
+                };
+                let resident = if self.shards[source.index() as usize].tile == tile {
+                    source_view.clone()
+                } else {
+                    let copy = self.push_shard(LowShard {
+                        id: LowShardId(0),
+                        tile,
+                        tensor_type: self.shards[source.index() as usize].tensor_type.clone(),
+                        extents: extents.clone(),
+                        definition: ShardDefinition::ExchangeCopy(*source),
+                    })?;
+                    transfers.entry(source_view).or_default().push(copy);
+                    self.full_view(copy)
+                };
+                runs.push((
+                    tile,
+                    KernelRun {
+                        provenance: operation_provenance(operation, kind),
+                        kernel: TileKernel::Planned(plan.kernel.clone()),
+                        inputs: vec![KernelOperand {
+                            views: vec![resident],
+                        }],
+                        output: ShardView {
+                            shard: output,
+                            extents,
+                        },
+                        requirements: KernelRequirements::Conversion {
+                            input: plan.input.clone(),
+                            output: plan.output.clone(),
+                        },
+                    },
+                ));
             }
         }
+        self.append_phase(transfers, operation_provenance(operation, kind), tiles)?;
         for (tile, run) in runs {
             tiles[usize::from(tile)].work.push(TileWork::Kernel(run));
         }
@@ -444,7 +496,7 @@ impl LoweringState {
             .ok_or(LowLoweringError::MissingOperatorPlan)?;
         match &plan.dispatch {
             OperatorDispatch::Pointwise { kernel } => {
-                self.lower_pointwise(operation, *kernel, &plan.requirements, tiles)
+                self.lower_pointwise(operation, kernel.clone(), &plan.requirements, tiles)
             }
             OperatorDispatch::BlockedGemm {
                 initialize,
@@ -453,8 +505,8 @@ impl LoweringState {
                 output_column_block,
             } => self.lower_blocked_gemm(
                 operation,
-                *initialize,
-                *accumulate,
+                initialize.clone(),
+                accumulate.clone(),
                 *inner_block,
                 *output_column_block,
                 &plan.requirements,
@@ -464,7 +516,7 @@ impl LoweringState {
     }
 
     fn lower_pointwise(
-        &self,
+        &mut self,
         operation: &MidOperation,
         kernel: TileKernelSpec,
         requirements: &OperatorRequirements,
@@ -473,33 +525,111 @@ impl LoweringState {
         let [result] = operation.results.as_slice() else {
             return Err(LowLoweringError::ResultArity);
         };
-        for output in self.value_shards(*result)? {
+        let outputs = self.value_shards(*result)?.to_vec();
+        let mut transfers =
+            vec![BTreeMap::<ShardView, Vec<LowShardId>>::new(); operation.inputs.len()];
+        let mut runs = Vec::with_capacity(outputs.len());
+        for output in outputs {
             let tile = self.shards[output.index() as usize].tile;
             let inputs = operation
                 .inputs
                 .iter()
-                .map(|input| {
-                    let shard = self.local_shard(*input, tile)?;
-                    Ok(KernelOperand {
-                        views: vec![self.full_view(shard)],
-                    })
+                .enumerate()
+                .map(|(index, input)| {
+                    let source_view =
+                        if matches!(&kernel, TileKernelSpec::Add | TileKernelSpec::Gelu) {
+                            self.value_shards(*input)?
+                                .iter()
+                                .find_map(|source| self.broadcast_view(*source, output))
+                                .ok_or(LowLoweringError::InvalidOperatorPlan)?
+                        } else {
+                            self.full_view(self.local_shard(*input, tile)?)
+                        };
+                    let view = if self.shards[source_view.shard.index() as usize].tile == tile {
+                        source_view
+                    } else {
+                        let copy = self.push_shard(LowShard {
+                            id: LowShardId(0),
+                            tile,
+                            tensor_type: self.shards[source_view.shard.index() as usize]
+                                .tensor_type
+                                .clone(),
+                            extents: source_view.extents.clone(),
+                            definition: ShardDefinition::ExchangeCopy(source_view.shard),
+                        })?;
+                        transfers[index].entry(source_view).or_default().push(copy);
+                        self.full_view(copy)
+                    };
+                    Ok(KernelOperand { views: vec![view] })
                 })
                 .collect::<LowLoweringResult<_>>()?;
-            tiles[usize::from(tile)]
-                .work
-                .push(TileWork::Kernel(KernelRun {
+            runs.push((
+                tile,
+                KernelRun {
                     provenance: WorkProvenance {
                         operation: operation.source,
                         value: operation.results.first().copied(),
                         reason: WorkReason::OperatorKernel,
                     },
-                    kernel: TileKernel::Planned(kernel),
+                    kernel: TileKernel::Planned(kernel.clone()),
                     inputs,
-                    output: self.full_view(*output),
-                    requirements: Some(requirements.clone()),
-                }));
+                    output: self.full_view(output),
+                    requirements: KernelRequirements::Operator(requirements.clone()),
+                },
+            ));
+        }
+        for (index, transfers) in transfers.into_iter().enumerate() {
+            self.append_phase(
+                transfers,
+                WorkProvenance {
+                    operation: operation.source,
+                    value: operation.inputs.get(index).copied(),
+                    reason: WorkReason::OperatorInput {
+                        input: u16::try_from(index).map_err(|_| LowLoweringError::IdOverflow)?,
+                    },
+                },
+                tiles,
+            )?;
+        }
+        for (tile, run) in runs {
+            tiles[usize::from(tile)].work.push(TileWork::Kernel(run));
         }
         Ok(())
+    }
+
+    fn broadcast_view(&self, source: LowShardId, output: LowShardId) -> Option<ShardView> {
+        let source_shard = &self.shards[source.index() as usize];
+        let output_shard = &self.shards[output.index() as usize];
+        let source_rank = source_shard.extents.len();
+        let output_rank = output_shard.extents.len();
+        if source_rank > output_rank {
+            return None;
+        }
+        let offset = output_rank - source_rank;
+        let mut extents = source_shard.extents.clone();
+        for (axis, extent) in extents.iter_mut().enumerate() {
+            let dimension = source_shard.tensor_type.shape.0[axis];
+            if dimension == 1 {
+                if extent.start != 0 || extent.logical_end == 0 {
+                    return None;
+                }
+                extent.start = 0;
+                extent.logical_end = 1;
+                extent.physical_end = 1;
+            } else {
+                let required = output_shard.extents[offset + axis];
+                if extent.start > required.start || extent.logical_end < required.logical_end {
+                    return None;
+                }
+                extent.start = required.start;
+                extent.logical_end = required.logical_end;
+                extent.physical_end = required.logical_end;
+            }
+        }
+        Some(ShardView {
+            shard: source,
+            extents,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -596,9 +726,9 @@ impl LoweringState {
                                 reason: WorkReason::OperatorKernel,
                             },
                             kernel: TileKernel::Planned(if inner_start == 0 {
-                                initialize
+                                initialize.clone()
                             } else {
-                                accumulate
+                                accumulate.clone()
                             }),
                             inputs: vec![
                                 KernelOperand {
@@ -609,7 +739,7 @@ impl LoweringState {
                                 },
                             ],
                             output: output_view,
-                            requirements: Some(requirements.clone()),
+                            requirements: KernelRequirements::Operator(requirements.clone()),
                         },
                     ));
                 }
@@ -692,32 +822,6 @@ impl LoweringState {
             extent.logical_end = end.min(extent.logical_end).max(start);
         }
         Ok(view)
-    }
-
-    fn ensure_resident(
-        &mut self,
-        source: LowShardId,
-        tile: u16,
-        resident: &mut BTreeMap<(LowShardId, u16), LowShardId>,
-        transfers: &mut BTreeMap<LowShardId, Vec<LowShardId>>,
-    ) -> LowLoweringResult<LowShardId> {
-        let source_shard = &self.shards[source.index() as usize];
-        if source_shard.tile == tile {
-            return Ok(source);
-        }
-        if let Some(copy) = resident.get(&(source, tile)) {
-            return Ok(*copy);
-        }
-        let copy = self.push_shard(LowShard {
-            id: LowShardId(0),
-            tile,
-            tensor_type: source_shard.tensor_type.clone(),
-            extents: source_shard.extents.clone(),
-            definition: ShardDefinition::ExchangeCopy(source),
-        })?;
-        resident.insert((source, tile), copy);
-        transfers.entry(source).or_default().push(copy);
-        Ok(copy)
     }
 
     fn lower_repeat(
@@ -805,6 +909,25 @@ fn operation_provenance(operation: &MidOperation, kind: &MidOperationKind) -> Wo
             MidOperationKind::Repeat(_) => WorkReason::Repeat,
         },
     }
+}
+
+fn intersect_extents(left: &[ShardExtent], right: &[ShardExtent]) -> Option<Vec<ShardExtent>> {
+    if left.len() != right.len() {
+        return None;
+    }
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| {
+            let start = left.start.max(right.start);
+            let end = left.logical_end.min(right.logical_end);
+            (start < end).then_some(ShardExtent {
+                axis: left.axis,
+                start,
+                logical_end: end,
+                physical_end: end,
+            })
+        })
+        .collect()
 }
 
 fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<Vec<ShardExtent>>> {
@@ -959,6 +1082,7 @@ mod tests {
             for tile in &low.tiles {
                 for work in &tile.work {
                     if let TileWork::Kernel(run) = work {
+                        crate::validate_kernel_run(run).unwrap();
                         assert_eq!(
                             low.shards[run.output.shard.index() as usize].tile,
                             tile.tile
@@ -982,6 +1106,54 @@ mod tests {
                         ShardDefinition::ExchangeCopy(source) if source == transfer.source.shard
                     )));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_broadcast_adds_schedule_remote_singleton_views() {
+        let mut random = fastrand::Rng::with_seed(0x6272_6463);
+        for case in 0..CASES {
+            let tiles = 1_u16 << random.u32(1..=3);
+            let rows = u32::from(tiles) * random.u32(1..=8);
+            let columns = random.u32(1..=8) * 16;
+            let mut graph = ComputeGraph::new();
+            let bias = graph.host_input("bias", [1, columns]).unwrap();
+            let tensor = graph.host_input("tensor", [rows, columns]).unwrap();
+            let output = graph.add(bias, tensor).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let config = PipelineConfig::new(tiles)
+                .with_input(bias, format(tiles))
+                .with_input(tensor, format(tiles));
+            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let low = lower_to_tiles(&mid, &config).unwrap();
+
+            assert!(
+                low.exchange_phases.iter().any(|phase| matches!(
+                    phase.provenance.reason,
+                    WorkReason::OperatorInput { input: 0 }
+                )),
+                "case {case}"
+            );
+            for tile in &low.tiles {
+                let add = tile
+                    .work
+                    .iter()
+                    .find_map(|work| match work {
+                        TileWork::Kernel(
+                            run @ KernelRun {
+                                kernel: TileKernel::Planned(TileKernelSpec::Add),
+                                ..
+                            },
+                        ) => Some(run),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(add.inputs[0].views[0].extents[0].logical_end, 1);
+                assert_eq!(
+                    low.shards[add.inputs[0].views[0].shard.index() as usize].tile,
+                    tile.tile
+                );
             }
         }
     }

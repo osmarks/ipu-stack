@@ -3,6 +3,9 @@
 	.text
 	.allow_optimizations
 	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
+	// Diagnostic scalar/vector entry points only. These do not implement the
+	// general Add ABI declared by ipu-codegen (which also carries element count
+	// and broadcast strides) and must not be selected for tensor Add plans.
 
 	.section .text.ipu_stack_add_u32,"ax",@progbits
 	.globl ipu_stack_add_u32

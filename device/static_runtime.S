@@ -105,6 +105,7 @@ ipu_stack_static_worker_barrier_worker:
 	.size ipu_stack_static_worker_barrier_worker, .-ipu_stack_static_worker_barrier_worker
 
 	.section .text.ipu_stack_static_copy_u32,"ax",@progbits
+	// Runtime helper ABI: m2 destination, m3 source, m4 word count, m10 return.
 	.globl ipu_stack_static_copy_u32
 	.p2align 2
 	.type ipu_stack_static_copy_u32,@function
@@ -121,6 +122,8 @@ ipu_stack_static_copy_u32:
 	.size ipu_stack_static_copy_u32, .-ipu_stack_static_copy_u32
 
 	.section .text.ipu_stack_copy_u64,"ax",@progbits
+	// Runtime helper ABI: m2 destination, m3 source, m6 words/worker, m7
+	// remainder workers, m10 return. This is not a layout-conversion kernel.
 	.globl ipu_stack_copy_u64
 	.p2align 2
 	.type ipu_stack_copy_u64,@function
