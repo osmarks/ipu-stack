@@ -42,12 +42,13 @@ pub use low::{
 pub use memory::IPU21_DATA_BASE;
 pub use mid::{
     AccumulationPrecision, AmpOrder, AxisTiling, ConversionDispatch, ConversionPlan, CostModel,
-    ElementOrder, GemmKernelMode, HardwareTarget, Layout, LayoutError, LoweringError,
-    LoweringResult, MemoryClass, MemoryOperand, MemoryRelation, MidGraph, MidInput, MidOperation,
-    MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId, OperandRequirement,
-    OperatorCandidate, OperatorDispatch, OperatorPlan, OperatorPlanError, OperatorRequirements,
-    OutputAliasing, Padding, PipelineConfig, Precision, ProfilingConfig, SchedulingPolicy,
-    TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, ToyCostModel, lower,
+    ElementOrder, GemmKernelMode, GemmWeightLoad, HardwareTarget, Layout, LayoutError,
+    LoweringError, LoweringResult, MemoryClass, MemoryOperand, MemoryRelation, MidGraph, MidInput,
+    MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId,
+    OperandRequirement, OperatorCandidate, OperatorDispatch, OperatorPlan, OperatorPlanError,
+    OperatorRequirements, OutputAliasing, Padding, PipelineConfig, Precision, ProfilingConfig,
+    SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec,
+    ToyCostModel, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
 pub use place::{Placement, PlacementError, place};

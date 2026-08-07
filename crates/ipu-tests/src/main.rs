@@ -334,6 +334,7 @@ fn run_gemm_benchmark(
         .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
     diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
     let output = session.collect(&executed)?;
+    let maximum_absolute_error = verify_benchmark_output(application, &output, inner)?;
     let starts = binding_u32_values(application, &output, "profile.start-cycle")?;
     let ends = binding_u32_values(application, &output, "profile.end-cycle")?;
     if starts.len() != usize::from(active_tiles) || ends.len() != starts.len() {
@@ -359,11 +360,40 @@ fn run_gemm_benchmark(
     let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
     let minimum_cycles = durations.iter().copied().min().unwrap_or(cycles);
     println!(
-        "benchmark=gemm-f16 rows={rows} inner={inner} columns=64 tiles={active_tiles} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} tflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2}",
+        "benchmark=gemm-f16 rows={rows} inner={inner} columns=64 tiles={active_tiles} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} tflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
         seconds * 1.0e6,
         tflops / peak_tflops * 100.0,
     );
     Ok(())
+}
+
+fn verify_benchmark_output(application: &Application, bytes: &[u8], inner: u32) -> Result<f32> {
+    let binding = application
+        .outputs
+        .first()
+        .filter(|binding| binding.name == "output.0")
+        .context("benchmark package has no graph output")?;
+    let size = binding
+        .slices
+        .iter()
+        .map(|slice| slice.file_offset + slice.size)
+        .max()
+        .context("benchmark output has no slices")?;
+    let output = bytes
+        .get(..usize::try_from(size)?)
+        .context("benchmark graph output exceeds host output")?;
+    let expected = inner as f32 * 0.25;
+    let mut maximum = 0.0f32;
+    for raw in output.chunks_exact(2) {
+        let actual = half_to_f32(u16::from_le_bytes(raw.try_into().unwrap()));
+        maximum = maximum.max((actual - expected).abs());
+    }
+    if maximum > expected.abs() * 0.002 + 0.01 {
+        bail!(
+            "benchmark numerical output differs from {expected}: maximum absolute error {maximum}"
+        );
+    }
+    Ok(maximum)
 }
 
 fn binding_u32_values(application: &Application, bytes: &[u8], name: &str) -> Result<Vec<u32>> {

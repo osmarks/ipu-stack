@@ -62,6 +62,7 @@ pub enum TileKernelSpec {
         multiply: Precision,
         accumulate: AccumulationPrecision,
         mode: GemmKernelMode,
+        weights: GemmWeightLoad,
     },
     Gelu,
     Add,
@@ -83,6 +84,12 @@ pub enum TileKernelSpec {
 pub enum GemmKernelMode {
     Initialize,
     Accumulate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GemmWeightLoad {
+    Standard,
+    Interleaved,
 }
 
 /// Shape-independent recipe which expands into ordered device-wide exchange
@@ -527,11 +534,13 @@ fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
                 multiply,
                 accumulate,
                 mode: GemmKernelMode::Initialize,
+                weights: GemmWeightLoad::Standard,
             },
             accumulate: TileKernelSpec::Gemm {
                 multiply,
                 accumulate,
                 mode: GemmKernelMode::Accumulate,
+                weights: GemmWeightLoad::Standard,
             },
             inner_block: 64,
             output_column_block: 64,
@@ -887,11 +896,13 @@ impl OperatorPlan {
                         multiply: init_multiply,
                         accumulate: init_accumulate,
                         mode: GemmKernelMode::Initialize,
+                        ..
                     },
                     TileKernelSpec::Gemm {
                         multiply: next_multiply,
                         accumulate: next_accumulate,
                         mode: GemmKernelMode::Accumulate,
+                        ..
                     },
                     MidOperator::Gemm {
                         multiply,

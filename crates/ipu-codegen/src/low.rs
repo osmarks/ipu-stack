@@ -351,6 +351,35 @@ impl LoweringState {
         Ok(id)
     }
 
+    fn can_allocate_interleaved(&self, tile: u16, bytes: u32) -> LowLoweringResult<bool> {
+        // PACE operands have a small legal access tail beyond their logical
+        // allocation. Reserve it here so this early choice remains valid when
+        // placement applies the exact kernel requirements.
+        const ACCESS_HEADROOM: u32 = 64;
+        let used = self
+            .shards
+            .iter()
+            .filter(|shard| {
+                shard.tile == tile
+                    && shard.tensor_type.format.layout.memory_class
+                        == crate::MemoryClass::Ipu21Interleaved
+                    && !matches!(
+                        shard.definition,
+                        ShardDefinition::Alias(_) | ShardDefinition::ExchangeCopy(_)
+                    )
+            })
+            .try_fold(0u32, |total, shard| {
+                total
+                    .checked_add(crate::shard_storage_bytes(shard)?)
+                    .and_then(|total| total.checked_add(ACCESS_HEADROOM))
+                    .ok_or(LowLoweringError::IdOverflow)
+            })?;
+        Ok(used
+            .checked_add(bytes)
+            .and_then(|total| total.checked_add(ACCESS_HEADROOM))
+            .is_some_and(|total| total <= crate::memory::IPU21_INTERLEAVED_BYTES))
+    }
+
     fn value_shards(&self, value: MidValueId) -> LowLoweringResult<&[LowShardId]> {
         self.canonical
             .get(value.index() as usize)
@@ -736,17 +765,41 @@ impl LoweringState {
                         if spans.len() == 1 {
                             right_view
                         } else {
-                            let definition = local_right_staging
-                                .get(&(tile, column_start))
-                                .copied()
+                            let packed_bytes = spans.iter().try_fold(0u32, |total, span| {
+                                total
+                                    .checked_add(span.bytes)
+                                    .ok_or(LowLoweringError::IdOverflow)
+                            })?;
+                            let existing_staging =
+                                local_right_staging.get(&(tile, column_start)).copied();
+                            let use_interleaved = if let Some(existing) = existing_staging {
+                                self.shards[existing.index() as usize]
+                                    .tensor_type
+                                    .format
+                                    .layout
+                                    .memory_class
+                                    == crate::MemoryClass::Ipu21Interleaved
+                            } else {
+                                self.shards[right.index() as usize]
+                                    .tensor_type
+                                    .format
+                                    .precision
+                                    == crate::Precision::F16
+                                    && self.can_allocate_interleaved(tile, packed_bytes)?
+                            };
+                            let definition = existing_staging
                                 .map(ShardDefinition::Alias)
                                 .unwrap_or(ShardDefinition::LocalCopy(right));
+                            let mut tensor_type =
+                                self.shards[right.index() as usize].tensor_type.clone();
+                            if use_interleaved {
+                                tensor_type.format.layout.memory_class =
+                                    crate::MemoryClass::Ipu21Interleaved;
+                            }
                             let copy = self.push_shard(LowShard {
                                 id: LowShardId(0),
                                 tile,
-                                tensor_type: self.shards[right.index() as usize]
-                                    .tensor_type
-                                    .clone(),
+                                tensor_type,
                                 extents: right_view.extents.clone(),
                                 definition,
                             })?;
@@ -784,6 +837,21 @@ impl LoweringState {
                     };
                     let output_view =
                         self.narrow_view(*output, &[(output_rank - 1, column_start, column_end)])?;
+                    let mut selected_kernel = if inner_start == 0 {
+                        initialize.clone()
+                    } else {
+                        accumulate.clone()
+                    };
+                    if self.shards[resident_right.shard.index() as usize]
+                        .tensor_type
+                        .format
+                        .layout
+                        .memory_class
+                        == crate::MemoryClass::Ipu21Interleaved
+                        && let TileKernelSpec::Gemm { weights, .. } = &mut selected_kernel
+                    {
+                        *weights = crate::GemmWeightLoad::Interleaved;
+                    }
                     runs.push((
                         tile,
                         KernelRun {
@@ -792,11 +860,7 @@ impl LoweringState {
                                 value: Some(*output_value),
                                 reason: WorkReason::OperatorKernel,
                             },
-                            kernel: TileKernel::Planned(if inner_start == 0 {
-                                initialize.clone()
-                            } else {
-                                accumulate.clone()
-                            }),
+                            kernel: TileKernel::Planned(selected_kernel),
                             inputs: vec![
                                 KernelOperand {
                                     views: vec![left_view],
@@ -1374,6 +1438,23 @@ mod tests {
             assert!(low.exchange_phases.iter().all(|phase| {
                 phase.provenance.operation.is_some() && phase.provenance.value.is_some()
             }));
+            if inner_blocks > 1 {
+                assert!(
+                    low.tiles.iter().flat_map(|tile| &tile.work).any(|work| {
+                        matches!(
+                            work,
+                            TileWork::Kernel(KernelRun {
+                                kernel: TileKernel::Planned(TileKernelSpec::Gemm {
+                                    weights: crate::GemmWeightLoad::Interleaved,
+                                    ..
+                                }),
+                                ..
+                            })
+                        )
+                    }),
+                    "case {case}"
+                );
+            }
 
             for tile in &low.tiles {
                 let gemms = tile

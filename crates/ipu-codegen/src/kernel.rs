@@ -1,9 +1,9 @@
 //! Machine-readable ABI contracts for tile-local kernel calls.
 
 use crate::{
-    AmpOrder, ComputeStep, ElementOrder, GemmKernelMode, KernelRequirements, KernelRun, LowProgram,
-    LowShard, LowShardId, Precision, StepProfile, StorageError, TileAddress, TileKernel,
-    TileKernelSpec, TileWork, TileWorkList, view_byte_spans,
+    AmpOrder, ComputeStep, ElementOrder, GemmKernelMode, GemmWeightLoad, KernelRequirements,
+    KernelRun, LowProgram, LowShard, LowShardId, Precision, StepProfile, StorageError, TileAddress,
+    TileKernel, TileKernelSpec, TileWork, TileWorkList, view_byte_spans,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -53,7 +53,7 @@ pub struct KernelCompilation {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KernelBuildPlan {
     pub compilations: Vec<KernelCompilation>,
-    gemm_rows: BTreeMap<Precision, Vec<u32>>,
+    gemm_rows: BTreeMap<(Precision, GemmWeightLoad), Vec<u32>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,13 +109,13 @@ impl KernelBuildPlan {
     /// Derives device objects from the finalized schedule, so row variants are
     /// compiler specializations rather than a fixed collection of binaries.
     pub fn from_program(program: &LowProgram) -> Result<Self, KernelAbiError> {
-        let mut rows = BTreeMap::<Precision, BTreeSet<u32>>::new();
+        let mut rows = BTreeMap::<(Precision, GemmWeightLoad), BTreeSet<u32>>::new();
         let mut gelu = false;
         for tile in &program.tiles {
             collect_kernels(tile, &mut rows, &mut gelu)?;
         }
         let mut plan = Self::default();
-        for (precision, values) in rows {
+        for ((precision, weights), values) in rows {
             let values = values.into_iter().collect::<Vec<_>>();
             if values.len() > 2 {
                 return Err(KernelAbiError::TooManyGemmRows {
@@ -130,11 +130,16 @@ impl KernelBuildPlan {
                 Precision::F32 => ("gemm_f32_64_amp.S", "f32"),
                 Precision::F8F143 { .. } => continue,
             };
+            let suffix = if weights == GemmWeightLoad::Interleaved {
+                "_interleaved"
+            } else {
+                ""
+            };
             let symbols = [
-                format!("ipu_stack_gemm_{prefix}_init_small_rows"),
-                format!("ipu_stack_gemm_{prefix}_init_large_rows"),
-                format!("ipu_stack_gemm_{prefix}_accumulate_small_rows"),
-                format!("ipu_stack_gemm_{prefix}_accumulate_large_rows"),
+                format!("ipu_stack_gemm_{prefix}_init_small_rows{suffix}"),
+                format!("ipu_stack_gemm_{prefix}_init_large_rows{suffix}"),
+                format!("ipu_stack_gemm_{prefix}_accumulate_small_rows{suffix}"),
+                format!("ipu_stack_gemm_{prefix}_accumulate_large_rows{suffix}"),
             ];
             let single_rows = values.len() == 1;
             let mut flags = vec![
@@ -144,6 +149,15 @@ impl KernelBuildPlan {
             if single_rows {
                 flags.push("-DGEMM_SINGLE_ROWS=1".into());
             }
+            if weights == GemmWeightLoad::Interleaved {
+                flags.extend([
+                    "-DGEMM_INTERLEAVED_WEIGHTS=1".into(),
+                    format!("-DGEMM_INIT_SMALL_SYMBOL={}", symbols[0]),
+                    format!("-DGEMM_INIT_LARGE_SYMBOL={}", symbols[1]),
+                    format!("-DGEMM_ACCUMULATE_SMALL_SYMBOL={}", symbols[2]),
+                    format!("-DGEMM_ACCUMULATE_LARGE_SYMBOL={}", symbols[3]),
+                ]);
+            }
             let retained_symbols = if single_rows {
                 vec![symbols[0].clone(), symbols[2].clone()]
             } else {
@@ -151,11 +165,11 @@ impl KernelBuildPlan {
             };
             plan.compilations.push(KernelCompilation {
                 source,
-                name: format!("gemm_{prefix}_r{small}_r{large}"),
+                name: format!("gemm_{prefix}{suffix}_r{small}_r{large}"),
                 flags,
                 retained_symbols,
             });
-            plan.gemm_rows.insert(precision, values);
+            plan.gemm_rows.insert((precision, weights), values);
         }
         if gelu {
             plan.compilations.push(KernelCompilation {
@@ -181,12 +195,14 @@ impl KernelBuildPlan {
             (KernelSymbols::Exact(symbol), _) => (*symbol).to_owned(),
             (
                 KernelSymbols::RowSpecialized { small, large },
-                TileKernelSpec::Gemm { multiply, .. },
+                TileKernelSpec::Gemm {
+                    multiply, weights, ..
+                },
             ) => {
                 let rows = gemm_rows(run)?;
                 let planned = self
                     .gemm_rows
-                    .get(multiply)
+                    .get(&(*multiply, *weights))
                     .ok_or(KernelAbiError::UnplannedGemmRows(rows))?;
                 if planned.first() == Some(&rows) {
                     (*small).to_owned()
@@ -296,7 +312,7 @@ fn add_address_offset(
 
 fn collect_kernels(
     tile: &TileWorkList,
-    rows: &mut BTreeMap<Precision, BTreeSet<u32>>,
+    rows: &mut BTreeMap<(Precision, GemmWeightLoad), BTreeSet<u32>>,
     gelu: &mut bool,
 ) -> Result<(), KernelAbiError> {
     for work in &tile.work {
@@ -307,8 +323,13 @@ fn collect_kernels(
                 if abi.availability != KernelAvailability::Implemented {
                     return Err(KernelAbiError::Unavailable(kernel.clone()));
                 }
-                if let TileKernelSpec::Gemm { multiply, .. } = kernel {
-                    rows.entry(*multiply).or_default().insert(gemm_rows(run)?);
+                if let TileKernelSpec::Gemm {
+                    multiply, weights, ..
+                } = kernel
+                {
+                    rows.entry((*multiply, *weights))
+                        .or_default()
+                        .insert(gemm_rows(run)?);
                 } else if matches!(kernel, TileKernelSpec::Gelu) {
                     *gelu = true;
                 }
@@ -365,11 +386,16 @@ pub fn tile_kernel_abi(
         KernelRequirements::Conversion { output, .. } => output.format.precision,
     };
     let (symbols, availability, inputs, scalars) = match kernel {
-        TileKernelSpec::Gemm { multiply, mode, .. } => {
+        TileKernelSpec::Gemm {
+            multiply,
+            mode,
+            weights,
+            ..
+        } => {
             if !matches!(requirements, KernelRequirements::Operator(_)) {
                 return Err(KernelAbiError::RequirementMismatch);
             }
-            let symbols = gemm_symbols(*multiply, *mode);
+            let symbols = gemm_symbols(*multiply, *mode, *weights);
             let scalars = if matches!(multiply, Precision::F8F143 { .. }) {
                 scalar_arguments(2, &["scale_exponent"])
             } else {
@@ -500,28 +526,48 @@ fn gelu_symbol(requirements: &KernelRequirements) -> Option<&'static str> {
     }
 }
 
-fn gemm_symbols(precision: Precision, mode: GemmKernelMode) -> (KernelSymbols, KernelAvailability) {
-    let symbols = match (precision, mode) {
-        (Precision::F16, GemmKernelMode::Initialize) => KernelSymbols::RowSpecialized {
-            small: "ipu_stack_gemm_f16_init_small_rows",
-            large: "ipu_stack_gemm_f16_init_large_rows",
-        },
-        (Precision::F16, GemmKernelMode::Accumulate) => KernelSymbols::RowSpecialized {
-            small: "ipu_stack_gemm_f16_accumulate_small_rows",
-            large: "ipu_stack_gemm_f16_accumulate_large_rows",
-        },
-        (Precision::F32, GemmKernelMode::Initialize) => KernelSymbols::RowSpecialized {
+fn gemm_symbols(
+    precision: Precision,
+    mode: GemmKernelMode,
+    weights: GemmWeightLoad,
+) -> (KernelSymbols, KernelAvailability) {
+    let symbols = match (precision, mode, weights) {
+        (Precision::F16, GemmKernelMode::Initialize, GemmWeightLoad::Interleaved) => {
+            KernelSymbols::RowSpecialized {
+                small: "ipu_stack_gemm_f16_init_small_rows_interleaved",
+                large: "ipu_stack_gemm_f16_init_large_rows_interleaved",
+            }
+        }
+        (Precision::F16, GemmKernelMode::Accumulate, GemmWeightLoad::Interleaved) => {
+            KernelSymbols::RowSpecialized {
+                small: "ipu_stack_gemm_f16_accumulate_small_rows_interleaved",
+                large: "ipu_stack_gemm_f16_accumulate_large_rows_interleaved",
+            }
+        }
+        (Precision::F16, GemmKernelMode::Initialize, GemmWeightLoad::Standard) => {
+            KernelSymbols::RowSpecialized {
+                small: "ipu_stack_gemm_f16_init_small_rows",
+                large: "ipu_stack_gemm_f16_init_large_rows",
+            }
+        }
+        (Precision::F16, GemmKernelMode::Accumulate, GemmWeightLoad::Standard) => {
+            KernelSymbols::RowSpecialized {
+                small: "ipu_stack_gemm_f16_accumulate_small_rows",
+                large: "ipu_stack_gemm_f16_accumulate_large_rows",
+            }
+        }
+        (Precision::F32, GemmKernelMode::Initialize, _) => KernelSymbols::RowSpecialized {
             small: "ipu_stack_gemm_f32_init_small_rows",
             large: "ipu_stack_gemm_f32_init_large_rows",
         },
-        (Precision::F32, GemmKernelMode::Accumulate) => KernelSymbols::RowSpecialized {
+        (Precision::F32, GemmKernelMode::Accumulate, _) => KernelSymbols::RowSpecialized {
             small: "ipu_stack_gemm_f32_accumulate_small_rows",
             large: "ipu_stack_gemm_f32_accumulate_large_rows",
         },
-        (Precision::F8F143 { .. }, GemmKernelMode::Initialize) => {
+        (Precision::F8F143 { .. }, GemmKernelMode::Initialize, _) => {
             KernelSymbols::Exact("ipu_stack_gemm_f8_init")
         }
-        (Precision::F8F143 { .. }, GemmKernelMode::Accumulate) => {
+        (Precision::F8F143 { .. }, GemmKernelMode::Accumulate, _) => {
             KernelSymbols::Exact("ipu_stack_gemm_f8_accumulate")
         }
     };
@@ -611,6 +657,7 @@ mod tests {
                     multiply: precision,
                     accumulate: AccumulationPrecision::F32,
                     mode,
+                    weights: GemmWeightLoad::Standard,
                 },
                 &requirements,
             )
