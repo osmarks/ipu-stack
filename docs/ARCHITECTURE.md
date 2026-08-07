@@ -44,6 +44,14 @@ operator format differs from its producer, lowering inserts `CastPrecision` and
 iterated value sequences are normalized once outside the body rather than
 causing the body to be unrolled.
 
+The selected `OperatorPlan` also contains an `OperatorDispatch`: a whole-device
+recipe for ordered data movement and tile-kernel calls. The retained GEMM plan
+uses 64-element inner and output-column blocks. Low lowering expands each
+output-column block into an initializing tile-kernel phase followed by zero or
+more accumulating phases, moving the applicable right-hand slice to every
+output-row tile before each call. Pointwise and head-sharded plans dispatch one
+local kernel per output shard.
+
 The toy choices describe the supported generic kernels: FP16 GEMM uses AMP
 A16/B16x16/C16 and FP32 uses A8/B8x16/C16. PACE operands require 32-byte
 alignment, the left stream includes its pipelined access tail, the output uses
@@ -52,12 +60,11 @@ distinct effective memory elements. This is an inspectable scaffold for a
 measured cost model or autotuner, not a claim that those choices are globally
 optimal.
 
-`low::lower_to_tiles` turns this into a logical per-tile work list. It assigns
+`low::lower_to_tiles` turns these plans into logical per-tile work lists. It assigns
 rectangular shards to logical tiles, preserves repeats as reusable tile-local
 bodies, inserts synchronized exchange phases, and emits kernel runs whose
-operand shards are resident on their execution tile. Its initial policy
-conservatively gathers every input shard to every output tile; the explicit
-schedule permits a later cost model to replace that policy.
+operand views are resident on their execution tile. Cast and rearrangement
+fallbacks remain conservative until they gain operator plans of their own.
 
 The logical schedule deliberately has no SRAM addresses, encoded exchange
 rows, or linked kernel symbols. Package construction remains completion-only

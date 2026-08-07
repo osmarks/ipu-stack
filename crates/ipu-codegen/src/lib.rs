@@ -19,15 +19,15 @@ pub use low::{
     ExchangePhase, ExchangePhaseId, KernelOperand, KernelRun, LogicalExchange, LowInput,
     LowLoweringConfig, LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId,
     LowValue, RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, ShardDefinition,
-    ShardExtent, TileKernel, TileWork, TileWorkList, lower_to_tiles,
+    ShardExtent, ShardView, TileKernel, TileWork, TileWorkList, lower_to_tiles,
 };
 pub use mid::{
-    AccumulationPrecision, AmpOrder, AxisTiling, CostModel, ElementOrder, Layout, LayoutError,
-    LoweringConfig, LoweringError, LoweringResult, MemoryClass, MemoryOperand, MemoryRelation,
-    MidGraph, MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat,
-    MidValue, MidValueId, OperandRequirement, OperatorCandidate, OperatorRequirements,
-    OutputAliasing, Padding, Precision, TensorAxis, TensorFormat, TensorTiling, TensorType,
-    ToyCostModel, lower,
+    AccumulationPrecision, AmpOrder, AxisTiling, CostModel, ElementOrder, GemmKernelMode, Layout,
+    LayoutError, LoweringConfig, LoweringError, LoweringResult, MemoryClass, MemoryOperand,
+    MemoryRelation, MidGraph, MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion,
+    MidRepeat, MidValue, MidValueId, OperandRequirement, OperatorCandidate, OperatorDispatch,
+    OperatorPlan, OperatorRequirements, OutputAliasing, Padding, Precision, TensorAxis,
+    TensorFormat, TensorTiling, TensorType, TileKernelSpec, ToyCostModel, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
 

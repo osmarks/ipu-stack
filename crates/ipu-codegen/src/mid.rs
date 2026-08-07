@@ -53,6 +53,42 @@ pub enum MidOperator {
     },
 }
 
+/// A tile-local callable selected by a whole-device operator plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileKernelSpec {
+    Gemm {
+        multiply: Precision,
+        accumulate: AccumulationPrecision,
+        mode: GemmKernelMode,
+    },
+    Gelu,
+    Add,
+    FlashAttention {
+        accumulate: AccumulationPrecision,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmKernelMode {
+    Initialize,
+    Accumulate,
+}
+
+/// Shape-independent recipe which expands into ordered device-wide exchange
+/// and tile-kernel phases after concrete shards are known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperatorDispatch {
+    Pointwise {
+        kernel: TileKernelSpec,
+    },
+    BlockedGemm {
+        initialize: TileKernelSpec,
+        accumulate: TileKernelSpec,
+        inner_block: u32,
+        output_column_block: u32,
+    },
+}
+
 /// AMP packing role. Block dimensions are recorded by [`AxisTiling`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AmpOrder {
@@ -194,7 +230,7 @@ impl Layout {
                 replicas: 1,
                 axes: vec![
                     AxisTiling::new(TensorAxis::FromEnd(2), 1, u32::from(inner), Padding::Zero),
-                    AxisTiling::new(TensorAxis::FromEnd(1), tile_count, 16, Padding::Zero),
+                    AxisTiling::new(TensorAxis::FromEnd(1), tile_count, 64, Padding::Zero),
                 ],
             },
             memory_class: MemoryClass::Ipu21Standard,
@@ -209,7 +245,7 @@ impl Layout {
                 replicas: 1,
                 axes: vec![
                     AxisTiling::new(TensorAxis::FromEnd(2), tile_count, 1, Padding::Reject),
-                    AxisTiling::new(TensorAxis::FromEnd(1), 1, 16, Padding::Zero),
+                    AxisTiling::new(TensorAxis::FromEnd(1), 1, 64, Padding::Zero),
                 ],
             },
             memory_class: MemoryClass::Ipu21Interleaved,
@@ -356,6 +392,7 @@ pub enum MemoryRelation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OperatorCandidate {
     pub operator: MidOperator,
+    pub dispatch: OperatorDispatch,
     pub inputs: Vec<OperandRequirement>,
     pub output: OperandRequirement,
     pub output_aliasing: OutputAliasing,
@@ -370,11 +407,17 @@ impl OperatorCandidate {
     ) -> Self {
         Self {
             operator,
+            dispatch: default_dispatch(operator),
             inputs: inputs.into_iter().collect(),
             output,
             output_aliasing: OutputAliasing::Fresh,
             memory_relations: Vec::new(),
         }
+    }
+
+    pub fn with_dispatch(mut self, dispatch: OperatorDispatch) -> Self {
+        self.dispatch = dispatch;
+        self
     }
 
     pub fn with_output_aliasing(mut self, aliasing: OutputAliasing) -> Self {
@@ -432,6 +475,37 @@ impl OperatorCandidate {
                         })
                 }
             })
+    }
+}
+
+fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
+    match operator {
+        MidOperator::Gemm {
+            multiply,
+            accumulate,
+        } => OperatorDispatch::BlockedGemm {
+            initialize: TileKernelSpec::Gemm {
+                multiply,
+                accumulate,
+                mode: GemmKernelMode::Initialize,
+            },
+            accumulate: TileKernelSpec::Gemm {
+                multiply,
+                accumulate,
+                mode: GemmKernelMode::Accumulate,
+            },
+            inner_block: 64,
+            output_column_block: 64,
+        },
+        MidOperator::Gelu => OperatorDispatch::Pointwise {
+            kernel: TileKernelSpec::Gelu,
+        },
+        MidOperator::Add => OperatorDispatch::Pointwise {
+            kernel: TileKernelSpec::Add,
+        },
+        MidOperator::FlashAttention { accumulate } => OperatorDispatch::Pointwise {
+            kernel: TileKernelSpec::FlashAttention { accumulate },
+        },
     }
 }
 
@@ -503,8 +577,8 @@ fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
         layout: Layout::head_sharded(tile_count),
     };
     vec![
-        amp_gemm_operator_candidate(Precision::F16, 16, 16, tile_count),
-        amp_gemm_operator_candidate(Precision::F32, 8, 32, tile_count),
+        amp_gemm_operator_candidate(Precision::F16, 64, 16, tile_count),
+        amp_gemm_operator_candidate(Precision::F32, 64, 32, tile_count),
         pointwise_operator_candidate(MidOperator::Gelu, [rows_f16.clone()], rows_f16.clone()),
         pointwise_operator_candidate(MidOperator::Gelu, [rows_f32.clone()], rows_f32.clone()),
         pointwise_operator_candidate(
@@ -622,7 +696,7 @@ pub struct MidOperation {
     pub inputs: Vec<MidValueId>,
     pub results: Vec<MidValueId>,
     pub kind: MidOperationKind,
-    pub operator_requirements: Option<OperatorRequirements>,
+    pub operator_plan: Option<OperatorPlan>,
     pub estimated_cost: u64,
 }
 
@@ -632,6 +706,13 @@ pub struct OperatorRequirements {
     pub output: OperandRequirement,
     pub output_aliasing: OutputAliasing,
     pub memory_relations: Vec<MemoryRelation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperatorPlan {
+    pub operator: MidOperator,
+    pub dispatch: OperatorDispatch,
+    pub requirements: OperatorRequirements,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -949,7 +1030,11 @@ fn lower_operations(
             inputs: converted,
             results: vec![result],
             kind: MidOperationKind::Operator(plan.operator),
-            operator_requirements: Some(plan.requirements),
+            operator_plan: Some(OperatorPlan {
+                operator: plan.operator,
+                dispatch: plan.dispatch,
+                requirements: plan.requirements,
+            }),
             estimated_cost: operator_cost,
         });
         values.insert(operation.results[0], result);
@@ -960,6 +1045,7 @@ fn lower_operations(
 #[derive(Clone)]
 struct Plan {
     operator: MidOperator,
+    dispatch: OperatorDispatch,
     requirements: OperatorRequirements,
 }
 
@@ -978,6 +1064,7 @@ fn plans(
         })
         .map(|candidate| Plan {
             operator: candidate.operator,
+            dispatch: candidate.dispatch.clone(),
             requirements: OperatorRequirements {
                 inputs: candidate.inputs.clone(),
                 output: candidate.output.clone(),
@@ -1101,7 +1188,7 @@ fn lower_repeat(
                 estimated_cost: body_cost,
             },
         }),
-        operator_requirements: None,
+        operator_plan: None,
         estimated_cost: body_cost.saturating_mul(u64::from(repeat.count)),
     });
     Ok(())
@@ -1129,7 +1216,7 @@ fn ensure_format(
                 from,
                 to: target.precision,
             },
-            operator_requirements: None,
+            operator_plan: None,
             estimated_cost: costs.cast_cost(&tensor_type.shape, from, target.precision),
         });
         value = result;
@@ -1148,7 +1235,7 @@ fn ensure_format(
                 from: from.clone(),
                 to: target.layout.clone(),
             },
-            operator_requirements: None,
+            operator_plan: None,
             estimated_cost: costs.rearrange_cost(
                 &tensor_type.shape,
                 tensor_type.format.precision,
@@ -1495,7 +1582,7 @@ mod tests {
                     MidOperationKind::Operator(MidOperator::Gemm { .. })
                 )
             }) {
-                let requirements = operation.operator_requirements.as_ref().unwrap();
+                let requirements = &operation.operator_plan.as_ref().unwrap().requirements;
                 assert!(
                     requirements
                         .inputs
@@ -1624,9 +1711,10 @@ mod tests {
             assert_operator_signature(&lowered, operators[0], &[gelu_input], gelu_output.clone());
             assert_eq!(
                 operators[0]
-                    .operator_requirements
+                    .operator_plan
                     .as_ref()
                     .unwrap()
+                    .requirements
                     .output_aliasing,
                 OutputAliasing::MayAliasInputs(vec![0])
             );
@@ -1637,9 +1725,10 @@ mod tests {
             assert_operator_signature(&lowered, operators[1], &[add_left, add_right], add_output);
             assert_eq!(
                 operators[1]
-                    .operator_requirements
+                    .operator_plan
                     .as_ref()
                     .unwrap()
+                    .requirements
                     .output_aliasing,
                 OutputAliasing::MayAliasInputs(vec![0])
             );
