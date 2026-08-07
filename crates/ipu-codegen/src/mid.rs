@@ -11,7 +11,7 @@ use crate::graph::{
     AddOptions, AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation,
     OperationId, OperationKind, Repeat, TensorShape, ValueId,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// In-memory representation of one tensor element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -160,6 +160,11 @@ pub struct AxisTiling {
     /// Required physical block multiple. One imposes no blocking constraint.
     pub block_size: u32,
     pub padding: Padding,
+    /// Optional physical-tile stride for this partition coordinate. When
+    /// absent, axes are packed after the replica coordinate and preceding
+    /// axes. Explicit strides allow operands of one operator to share a 2-D
+    /// tile grid while replicating along different grid dimensions.
+    pub tile_stride: Option<u16>,
 }
 
 impl AxisTiling {
@@ -169,7 +174,13 @@ impl AxisTiling {
             partitions,
             block_size,
             padding,
+            tile_stride: None,
         }
+    }
+
+    pub const fn with_tile_stride(mut self, tile_stride: u16) -> Self {
+        self.tile_stride = Some(tile_stride);
+        self
     }
 }
 
@@ -196,6 +207,23 @@ impl TensorTiling {
             replicas: 1,
             axes: vec![AxisTiling::new(axis, tile_count, 1, Padding::Reject)],
         }
+    }
+
+    pub(crate) fn axis_strides(&self) -> Result<Vec<u32>, LayoutError> {
+        let mut packed_stride = u32::from(self.replicas);
+        self.axes
+            .iter()
+            .map(|axis| {
+                let stride = axis.tile_stride.map_or(packed_stride, u32::from);
+                packed_stride = packed_stride
+                    .checked_mul(u32::from(axis.partitions))
+                    .ok_or(LayoutError::TileCountOverflow)?;
+                if stride == 0 {
+                    return Err(LayoutError::EmptyAxisTiling);
+                }
+                Ok(stride)
+            })
+            .collect()
     }
 }
 
@@ -270,6 +298,76 @@ impl Layout {
         }
     }
 
+    /// AMP left operand on a row-by-column tile grid. The row shard is
+    /// replicated across column groups so it is local to every output shard.
+    pub fn amp_left_grid(
+        inner: u16,
+        tile_count: u16,
+        row_partitions: u16,
+        column_partitions: u16,
+    ) -> Self {
+        if column_partitions == 1 && row_partitions == tile_count {
+            return Self::amp_left(inner, tile_count);
+        }
+        Self {
+            order: ElementOrder::Amp(AmpOrder::Left),
+            tiling: TensorTiling {
+                tile_count,
+                replicas: column_partitions,
+                axes: vec![
+                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
+                    AxisTiling::new(TensorAxis::FromEnd(1), 1, u32::from(inner), Padding::Zero),
+                ],
+            },
+            memory_class: MemoryClass::Ipu21Standard,
+        }
+    }
+
+    /// AMP right operand on a row-by-column tile grid. Each column shard is
+    /// replicated across row groups so it is local to every output shard.
+    pub fn amp_right_grid(
+        inner: u16,
+        tile_count: u16,
+        row_partitions: u16,
+        column_partitions: u16,
+    ) -> Self {
+        if row_partitions == 1 && column_partitions == tile_count {
+            return Self::amp_right(inner, tile_count);
+        }
+        Self {
+            order: ElementOrder::Amp(AmpOrder::Right),
+            tiling: TensorTiling {
+                tile_count,
+                replicas: row_partitions,
+                axes: vec![
+                    AxisTiling::new(TensorAxis::FromEnd(2), 1, u32::from(inner), Padding::Zero),
+                    AxisTiling::new(TensorAxis::FromEnd(1), column_partitions, 64, Padding::Zero)
+                        .with_tile_stride(1),
+                ],
+            },
+            memory_class: MemoryClass::Ipu21Standard,
+        }
+    }
+
+    /// AMP output distributed over both matrix axes on one tile grid.
+    pub fn amp_output_grid(tile_count: u16, row_partitions: u16, column_partitions: u16) -> Self {
+        if column_partitions == 1 && row_partitions == tile_count {
+            return Self::amp_output(tile_count);
+        }
+        Self {
+            order: ElementOrder::Amp(AmpOrder::Output),
+            tiling: TensorTiling {
+                tile_count,
+                replicas: 1,
+                axes: vec![
+                    AxisTiling::new(TensorAxis::FromEnd(1), column_partitions, 64, Padding::Zero),
+                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
+                ],
+            },
+            memory_class: MemoryClass::Ipu21Interleaved,
+        }
+    }
+
     /// Returns the physical extents after applying declared zero padding.
     pub fn padded_shape(&self, shape: &TensorShape) -> Result<TensorShape, LayoutError> {
         if self.tiling.tile_count == 0 || self.tiling.replicas == 0 {
@@ -315,6 +413,33 @@ impl Layout {
                 implied: used_tiles,
             });
         }
+        let strides = self.tiling.axis_strides()?;
+        let mut coordinates = BTreeMap::<Vec<u16>, u16>::new();
+        for tile in 0..self.tiling.tile_count {
+            let coordinate = self
+                .tiling
+                .axes
+                .iter()
+                .zip(&strides)
+                .map(|(axis, stride)| {
+                    ((u32::from(tile) / stride) % u32::from(axis.partitions)) as u16
+                })
+                .collect::<Vec<_>>();
+            *coordinates.entry(coordinate).or_default() += 1;
+        }
+        if coordinates.len()
+            != self
+                .tiling
+                .axes
+                .iter()
+                .map(|axis| usize::from(axis.partitions))
+                .product::<usize>()
+            || coordinates
+                .values()
+                .any(|copies| *copies != self.tiling.replicas)
+        {
+            return Err(LayoutError::InvalidTileMapping);
+        }
         Ok(TensorShape(dimensions))
     }
 }
@@ -341,6 +466,8 @@ pub enum LayoutError {
     ExtentOverflow(usize),
     #[error("layout declares {declared} tiles but its tiling implies {implied}")]
     TileCountMismatch { declared: u16, implied: u32 },
+    #[error("tile strides do not form the declared partition and replica mapping")]
+    InvalidTileMapping,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -594,6 +721,10 @@ pub struct PipelineConfig {
     pub target: HardwareTarget,
     pub tile_count: u16,
     pub inputs: BTreeMap<ValueId, TensorFormat>,
+    /// Graph-boundary tensors whose layout may be selected by their first
+    /// consumer. Precision remains fixed, while packaging exposes the chosen
+    /// physical layout directly through the host binding.
+    pub automatic_inputs: BTreeMap<ValueId, Precision>,
     /// Signatures available independently to each operation. Earlier entries
     /// of the appropriate operation kind win when costs are equal.
     pub operator_candidates: Vec<OperatorCandidate>,
@@ -622,6 +753,7 @@ impl PipelineConfig {
             target: HardwareTarget::Ipu21,
             tile_count,
             inputs: BTreeMap::new(),
+            automatic_inputs: BTreeMap::new(),
             operator_candidates: default_operator_candidates(tile_count),
             scheduling: SchedulingPolicy::OperatorPlans,
             profiling: ProfilingConfig::default(),
@@ -630,6 +762,13 @@ impl PipelineConfig {
 
     pub fn with_input(mut self, value: ValueId, format: TensorFormat) -> Self {
         self.inputs.insert(value, format);
+        self.automatic_inputs.remove(&value);
+        self
+    }
+
+    pub fn with_automatic_input(mut self, value: ValueId, precision: Precision) -> Self {
+        self.inputs.remove(&value);
+        self.automatic_inputs.insert(value, precision);
         self
     }
 }
@@ -659,7 +798,18 @@ fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
         precision: Precision::F32,
         layout: Layout::head_sharded(tile_count),
     };
-    vec![
+    let mut candidates = (1..=tile_count)
+        .rev()
+        .filter(|columns| tile_count.is_multiple_of(*columns))
+        .flat_map(|columns| {
+            let rows = tile_count / columns;
+            [
+                amp_grid_gemm_operator_candidate(Precision::F16, 64, 16, tile_count, rows, columns),
+                amp_grid_gemm_operator_candidate(Precision::F32, 64, 32, tile_count, rows, columns),
+            ]
+        })
+        .collect::<Vec<_>>();
+    candidates.extend([
         amp_gemm_operator_candidate(Precision::F16, 64, 16, tile_count),
         amp_gemm_operator_candidate(Precision::F32, 64, 32, tile_count),
         OperatorCandidate::new(
@@ -695,7 +845,8 @@ fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
             [heads_f32.clone(), heads_f32.clone(), heads_f32.clone()],
             heads_f32,
         ),
-    ]
+    ]);
+    candidates
 }
 
 fn pointwise_operator_candidate(
@@ -754,6 +905,61 @@ fn amp_gemm_operator_candidate(
             TensorFormat {
                 precision,
                 layout: Layout::amp_output(tile_count),
+            },
+            32,
+        ),
+    )
+    .with_memory_relation(MemoryRelation::DistinctElements(vec![
+        MemoryOperand::Output,
+        MemoryOperand::Input(0),
+    ]))
+}
+
+fn amp_grid_gemm_operator_candidate(
+    precision: Precision,
+    inner: u16,
+    left_tail: u32,
+    tile_count: u16,
+    row_partitions: u16,
+    column_partitions: u16,
+) -> OperatorCandidate {
+    OperatorCandidate::new(
+        MidOperator::Gemm {
+            options: GemmOptions::default(),
+            multiply: precision,
+            accumulate: AccumulationPrecision::F32,
+        },
+        [
+            OperandRequirement::new(
+                TensorFormat {
+                    precision,
+                    layout: Layout::amp_left_grid(
+                        inner,
+                        tile_count,
+                        row_partitions,
+                        column_partitions,
+                    ),
+                },
+                32,
+            )
+            .with_access_tail(left_tail),
+            OperandRequirement::new(
+                TensorFormat {
+                    precision,
+                    layout: Layout::amp_right_grid(
+                        inner,
+                        tile_count,
+                        row_partitions,
+                        column_partitions,
+                    ),
+                },
+                32,
+            ),
+        ],
+        OperandRequirement::new(
+            TensorFormat {
+                precision,
+                layout: Layout::amp_output_grid(tile_count, row_partitions, column_partitions),
             },
             32,
         ),
@@ -937,6 +1143,15 @@ impl OperatorPlan {
                     .layout
                     .padded_shape(&output.shape)
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
+                let grid_plan = left.format.layout.tiling.replicas > 1
+                    || right.format.layout.tiling.replicas > 1;
+                if grid_plan
+                    && (!layout_shards_are_even(left)
+                        || !layout_shards_are_even(right)
+                        || !layout_shards_are_even(output))
+                {
+                    return Err(OperatorPlanError::InvalidBlocking);
+                }
                 if !left_padded.0.last().unwrap().is_multiple_of(*inner_block)
                     || !output_padded
                         .0
@@ -976,6 +1191,19 @@ impl OperatorPlan {
             _ => Err(OperatorPlanError::DispatchMismatch),
         }
     }
+}
+
+fn layout_shards_are_even(tensor: &TensorType) -> bool {
+    let Ok(padded) = tensor.format.layout.padded_shape(&tensor.shape) else {
+        return false;
+    };
+    tensor.format.layout.tiling.axes.iter().all(|axis| {
+        axis.axis.resolve(padded.0.len()).is_ok_and(|index| {
+            let blocks = padded.0[index] / axis.block_size;
+            blocks >= u32::from(axis.partitions)
+                && blocks.is_multiple_of(u32::from(axis.partitions))
+        })
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1054,17 +1282,43 @@ impl CostModel for ToyCostModel {
                     .padded_shape(&inputs[0].shape)
                     .unwrap_or_else(|_| inputs[0].shape.clone());
                 let k = left_shape.0.last().copied().unwrap_or(1) as u64;
-                let throughput = match multiply {
+                let throughput: u64 = match multiply {
                     Precision::F8F143 { .. } => 128,
                     Precision::F16 => 64,
                     Precision::F32 => 16,
                 };
-                output
+                let arithmetic = output
                     .shape
                     .elements()
                     .saturating_mul(2)
                     .saturating_mul(k)
-                    .div_ceil(throughput)
+                    .div_ceil(
+                        throughput
+                            .saturating_mul(u64::from(output.format.layout.tiling.tile_count)),
+                    );
+                let working_set_bytes = inputs
+                    .iter()
+                    .map(maximum_shard_bytes)
+                    .chain(std::iter::once(maximum_shard_bytes(output)))
+                    .sum::<u64>();
+                let standard_operand_bytes = inputs
+                    .iter()
+                    .filter(|tensor| {
+                        tensor.format.layout.memory_class == MemoryClass::Ipu21Standard
+                    })
+                    .map(maximum_shard_bytes)
+                    .sum::<u64>();
+                let capacity_penalty = if standard_operand_bytes
+                    > u64::from(crate::memory::IPU21_STANDARD_DATA_BYTES)
+                {
+                    u64::MAX / 8
+                } else {
+                    0
+                };
+                arithmetic
+                    .saturating_add(working_set_bytes.div_ceil(16))
+                    .saturating_add(gemm_remote_bytes(inputs, output).div_ceil(16))
+                    .saturating_add(capacity_penalty)
             }
             MidOperator::FlashAttention { .. } => elements.saturating_mul(8).div_ceil(32),
             MidOperator::Gelu => elements.saturating_mul(6).div_ceil(16),
@@ -1097,6 +1351,103 @@ fn physical_elements(shape: &TensorShape, layout: &Layout) -> u64 {
     layout
         .padded_shape(shape)
         .map_or_else(|_| shape.elements(), |shape| shape.elements())
+        .saturating_mul(u64::from(layout.tiling.replicas))
+}
+
+fn maximum_shard_bytes(tensor: &TensorType) -> u64 {
+    let Ok(padded) = tensor.format.layout.padded_shape(&tensor.shape) else {
+        return u64::MAX;
+    };
+    padded
+        .0
+        .iter()
+        .enumerate()
+        .map(|(index, &extent)| {
+            tensor
+                .format
+                .layout
+                .tiling
+                .axes
+                .iter()
+                .find(|axis| axis.axis.resolve(padded.0.len()) == Ok(index))
+                .map_or(u64::from(extent), |axis| {
+                    let blocks = extent / axis.block_size;
+                    u64::from(blocks.div_ceil(u32::from(axis.partitions)) * axis.block_size)
+                })
+        })
+        .product::<u64>()
+        .saturating_mul(tensor.format.precision.bytes())
+}
+
+fn gemm_remote_bytes(inputs: &[TensorType], output: &TensorType) -> u64 {
+    let [left, right] = inputs else {
+        return u64::MAX;
+    };
+    if left.shape.0.len() < 2 || right.shape.0.len() < 2 || output.shape.0.len() < 2 {
+        return u64::MAX;
+    }
+    let tiles = output.format.layout.tiling.tile_count;
+    let output_row_axis = output.shape.0.len() - 2;
+    let output_column_axis = output.shape.0.len() - 1;
+    let left_row_axis = left.shape.0.len() - 2;
+    let right_column_axis = right.shape.0.len() - 1;
+    let k = left.shape.0[left.shape.0.len() - 1];
+    (0..tiles).fold(0u64, |total, tile| {
+        let Some(output_rows) = tile_axis_range(output, output_row_axis, tile) else {
+            return u64::MAX;
+        };
+        let Some(output_columns) = tile_axis_range(output, output_column_axis, tile) else {
+            return u64::MAX;
+        };
+        let Some(left_rows) = tile_axis_range(left, left_row_axis, tile) else {
+            return u64::MAX;
+        };
+        let Some(right_columns) = tile_axis_range(right, right_column_axis, tile) else {
+            return u64::MAX;
+        };
+        let left_remote = if left_rows.start > output_rows.start || left_rows.end < output_rows.end
+        {
+            u64::from(output_rows.end - output_rows.start)
+                .saturating_mul(u64::from(k))
+                .saturating_mul(left.format.precision.bytes())
+        } else {
+            0
+        };
+        let right_remote = if right_columns.start > output_columns.start
+            || right_columns.end < output_columns.end
+        {
+            u64::from(output_columns.end - output_columns.start)
+                .saturating_mul(u64::from(k))
+                .saturating_mul(right.format.precision.bytes())
+        } else {
+            0
+        };
+        total
+            .saturating_add(left_remote)
+            .saturating_add(right_remote)
+    })
+}
+
+fn tile_axis_range(tensor: &TensorType, axis: usize, tile: u16) -> Option<std::ops::Range<u32>> {
+    let layout = &tensor.format.layout;
+    let padded = layout.padded_shape(&tensor.shape).ok()?;
+    let Some((tiling, stride)) = layout
+        .tiling
+        .axes
+        .iter()
+        .zip(layout.tiling.axis_strides().ok()?)
+        .find(|(tiling, _)| tiling.axis.resolve(padded.0.len()) == Ok(axis))
+    else {
+        return Some(0..padded.0[axis]);
+    };
+    let blocks = padded.0[axis] / tiling.block_size;
+    let partitions = u32::from(tiling.partitions);
+    let coordinate = (u32::from(tile) / stride) % partitions;
+    let short = blocks / partitions;
+    let long = blocks % partitions;
+    let start_blocks = coordinate * short + coordinate.min(long);
+    let shard_blocks = short + u32::from(coordinate < long);
+    Some(start_blocks * tiling.block_size..(start_blocks + shard_blocks) * tiling.block_size)
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -1132,16 +1483,27 @@ pub fn lower(
     let mut values = BTreeMap::new();
     let mut inputs = Vec::with_capacity(graph.inputs().len());
     for input in graph.inputs() {
-        let format = config
-            .inputs
-            .get(&input.value)
-            .cloned()
-            .ok_or(LoweringError::MissingInputType(input.value))?;
+        let (format, automatic) = if let Some(format) = config.inputs.get(&input.value) {
+            (format.clone(), false)
+        } else if let Some(&precision) = config.automatic_inputs.get(&input.value) {
+            (
+                TensorFormat {
+                    precision,
+                    layout: Layout::row_sharded(config.tile_count),
+                },
+                true,
+            )
+        } else {
+            return Err(LoweringError::MissingInputType(input.value));
+        };
         let tensor_type = TensorType {
             shape: input.shape.clone(),
             format,
         };
         let value = state.value(input.value, tensor_type);
+        if automatic {
+            state.automatic_inputs.insert(value);
+        }
         values.insert(input.value, value);
         inputs.push(MidInput {
             name: input.name.clone(),
@@ -1185,6 +1547,7 @@ pub fn lower(
 #[derive(Default)]
 struct LoweringState {
     values: Vec<MidValue>,
+    automatic_inputs: BTreeSet<MidValueId>,
 }
 
 impl LoweringState {
@@ -1200,6 +1563,14 @@ impl LoweringState {
 
     fn get(&self, id: MidValueId) -> &MidValue {
         &self.values[id.0 as usize]
+    }
+
+    fn retarget_automatic_input(&mut self, id: MidValueId, layout: Layout) -> bool {
+        if !self.automatic_inputs.remove(&id) {
+            return false;
+        }
+        self.values[id.0 as usize].tensor_type.format.layout = layout;
+        true
     }
 }
 
@@ -1243,12 +1614,44 @@ fn lower_operations(
         let plans = plans(operation, &input_types, &output_shape, config);
         let plan = plans
             .into_iter()
+            .filter(|plan| {
+                let grid_plan = matches!(plan.operator, MidOperator::Gemm { .. })
+                    && plan
+                        .requirements
+                        .inputs
+                        .iter()
+                        .any(|input| input.format.layout.tiling.replicas > 1);
+                !grid_plan
+                    || input_ids
+                        .iter()
+                        .zip(&plan.requirements.inputs)
+                        .all(|(id, requirement)| {
+                            state.automatic_inputs.contains(id)
+                                || state.get(*id).tensor_type.format.layout
+                                    == requirement.format.layout
+                        })
+            })
             .enumerate()
             .map(|(order, plan)| {
                 let conversion = input_types
                     .iter()
+                    .zip(&input_ids)
                     .zip(&plan.requirements.inputs)
-                    .map(|(from, to)| conversion_cost(from, &to.format, costs))
+                    .map(|((from, id), to)| {
+                        if state.automatic_inputs.contains(id) {
+                            if from.format.precision != to.format.precision {
+                                costs.cast_cost(
+                                    &from.shape,
+                                    from.format.precision,
+                                    to.format.precision,
+                                )
+                            } else {
+                                0
+                            }
+                        } else {
+                            conversion_cost(from, &to.format, costs)
+                        }
+                    })
                     .sum::<u64>();
                 let output = TensorType {
                     shape: output_shape.clone(),
@@ -1507,6 +1910,11 @@ fn ensure_format(
     state: &mut LoweringState,
     operations: &mut Vec<MidOperation>,
 ) -> MidValueId {
+    if state.retarget_automatic_input(value, target.layout.clone())
+        && state.get(value).tensor_type.format.precision == target.precision
+    {
+        return value;
+    }
     let original = state.get(value).clone();
     if original.tensor_type.format.precision != target.precision {
         let mut tensor_type = original.tensor_type.clone();

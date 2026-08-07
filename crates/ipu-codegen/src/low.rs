@@ -802,8 +802,20 @@ impl LoweringState {
         let mut local_right_staging = BTreeMap::<(u16, u32), LowShardId>::new();
         for column_start in (0..column_extent).step_by(output_column_block as usize) {
             let column_end = column_start + output_column_block;
+            let column_outputs = output_shards
+                .iter()
+                .copied()
+                .filter(|output| {
+                    let extents = &self.shards[output.index() as usize].extents;
+                    let columns = extents[extents.len() - 1];
+                    columns.start <= column_start && columns.physical_end >= column_end
+                })
+                .collect::<Vec<_>>();
+            if column_outputs.is_empty() {
+                return Err(LowLoweringError::InvalidOperatorPlan);
+            }
             let use_interleaved_staging = self.use_uniform_interleaved_gemm_staging(
-                &output_shards,
+                &column_outputs,
                 &right_shards,
                 column_start..column_end,
                 0..inner_block,
@@ -813,8 +825,8 @@ impl LoweringState {
                 let inner_end = inner_start + inner_block;
                 let mut transfers = BTreeMap::<ShardView, Vec<LowShardId>>::new();
                 let mut local_copies = Vec::<(u16, LocalCopy)>::new();
-                let mut runs = Vec::with_capacity(output_shards.len());
-                for output in &output_shards {
+                let mut runs = Vec::with_capacity(column_outputs.len());
+                for output in &column_outputs {
                     let tile = self.shards[output.index() as usize].tile;
                     let left = self.local_shard(*left_value, tile)?;
                     let left_view =
@@ -1241,18 +1253,13 @@ fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<Vec<ShardExt
     let layout = &tensor_type.format.layout;
     let padded = layout.padded_shape(&tensor_type.shape)?;
     let rank = tensor_type.shape.0.len();
-    let mut stride = u32::from(layout.tiling.replicas);
+    let strides = layout.tiling.axis_strides()?;
     let axes = layout
         .tiling
         .axes
         .iter()
-        .map(|tiling| {
-            let result = (tiling.axis.resolve(rank)?, tiling, stride);
-            stride = stride
-                .checked_mul(u32::from(tiling.partitions))
-                .ok_or(LowLoweringError::IdOverflow)?;
-            Ok(result)
-        })
+        .zip(strides)
+        .map(|(tiling, stride)| Ok((tiling.axis.resolve(rank)?, tiling, stride)))
         .collect::<LowLoweringResult<Vec<_>>>()?;
     let mut all = Vec::with_capacity(usize::from(layout.tiling.tile_count));
     for tile in 0..layout.tiling.tile_count {
@@ -1523,9 +1530,19 @@ mod tests {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
+                let output = low.shards.iter().find(|shard| {
+                    shard.tile == tile.tile
+                        && shard.tensor_type.shape.0.last() == Some(&columns)
+                        && shard.tensor_type.format.layout.memory_class
+                            == crate::MemoryClass::Ipu21Interleaved
+                });
+                let local_column_blocks = output
+                    .and_then(|shard| shard.extents.last())
+                    .map(|extent| (extent.physical_end - extent.start) / 64)
+                    .unwrap_or(column_blocks);
                 assert_eq!(
                     gemms.len(),
-                    (inner_blocks * column_blocks) as usize,
+                    (inner_blocks * local_column_blocks) as usize,
                     "case {case}"
                 );
                 for (index, run) in gemms.into_iter().enumerate() {
@@ -1552,6 +1569,46 @@ mod tests {
                     let output_columns = run.output.extents.last().unwrap();
                     assert_eq!(output_columns.physical_end - output_columns.start, 64);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_automatic_gemms_choose_local_two_axis_grids() {
+        let mut random = fastrand::Rng::with_seed(0x6772_6964_6765_6d6d);
+        for case in 0..CASES {
+            let tiles = 1_u16 << random.u32(0..=3);
+            let rows = u32::from(tiles) * random.u32(1..=8);
+            let inner_blocks = random.u32(1..=4);
+            let inner = inner_blocks * 64;
+            let columns = u32::from(tiles) * 64;
+            let mut graph = ComputeGraph::new();
+            let left = graph.host_input("left", [rows, inner]).unwrap();
+            let right = graph.parameter("right", [inner, columns]).unwrap();
+            let output = graph.gemm(left, right).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let config = PipelineConfig::new(tiles)
+                .with_automatic_input(left, Precision::F16)
+                .with_automatic_input(right, Precision::F16);
+            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let low = lower_to_tiles(&mid, &config).unwrap();
+
+            assert!(low.exchange_phases.is_empty(), "case {case}");
+            for tile in &low.tiles {
+                let gemms = tile
+                    .work
+                    .iter()
+                    .filter(|work| {
+                        matches!(
+                            work,
+                            TileWork::Kernel(KernelRun {
+                                kernel: TileKernel::Planned(TileKernelSpec::Gemm { .. }),
+                                ..
+                            })
+                        )
+                    })
+                    .count();
+                assert_eq!(gemms, inner_blocks as usize, "case {case}");
             }
         }
     }

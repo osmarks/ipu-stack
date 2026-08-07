@@ -41,6 +41,10 @@ struct Arguments {
     gemm_benchmark: bool,
     #[arg(long, default_value_t = 256)]
     benchmark_rows_per_tile: u32,
+    /// Global row count. Overrides --benchmark-rows-per-tile and allows the
+    /// planner to distribute a smaller matrix over a multi-axis tile grid.
+    #[arg(long)]
+    benchmark_rows: Option<u32>,
     #[arg(long, default_value_t = 64)]
     benchmark_inner: u32,
     #[arg(long, default_value_t = 64)]
@@ -52,13 +56,21 @@ struct Arguments {
 fn main() -> Result<()> {
     ipu_runtime::init_tracing();
     let arguments = Arguments::parse();
+    let active_tiles = u16::try_from(arguments.tiles).context("tile count exceeds u16")?;
+    let benchmark_rows = arguments.benchmark_rows.map_or_else(
+        || {
+            u32::from(active_tiles)
+                .checked_mul(arguments.benchmark_rows_per_tile)
+                .context("benchmark row count overflow")
+        },
+        Ok,
+    )?;
     let runtime_source = arguments.runtime_source.unwrap_or_else(|| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/static_runtime.S")
     });
     let bootloader = arguments
         .bootloader
         .unwrap_or_else(|| arguments.sdk.join("bin/ipu/tile_bootloader_cc_ipu21.elf"));
-    let active_tiles = u16::try_from(arguments.tiles).context("tile count exceeds u16")?;
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
     if arguments.gemm_smoke {
@@ -104,14 +116,11 @@ fn main() -> Result<()> {
             .with_input(right1, right_format);
     } else if arguments.gemm_benchmark {
         validate_benchmark_shape(
-            arguments.benchmark_rows_per_tile,
+            benchmark_rows,
             arguments.benchmark_inner,
             arguments.benchmark_columns,
         )?;
-        let rows = u32::from(active_tiles)
-            .checked_mul(arguments.benchmark_rows_per_tile)
-            .context("benchmark row count overflow")?;
-        let left = graph.host_input("left", [rows, arguments.benchmark_inner])?;
+        let left = graph.host_input("left", [benchmark_rows, arguments.benchmark_inner])?;
         let right = graph.parameter(
             "right",
             [arguments.benchmark_inner, arguments.benchmark_columns],
@@ -120,20 +129,8 @@ fn main() -> Result<()> {
         graph.set_outputs([output])?;
         pipeline.profiling.enabled = true;
         pipeline = pipeline
-            .with_input(
-                left,
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout: Layout::amp_left(64, active_tiles),
-                },
-            )
-            .with_input(
-                right,
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout: Layout::amp_right(64, active_tiles),
-                },
-            );
+            .with_automatic_input(left, Precision::F16)
+            .with_automatic_input(right, Precision::F16);
     }
     let application = build_package(
         &graph,
@@ -184,7 +181,7 @@ fn main() -> Result<()> {
                 &runtime,
                 &application,
                 active_tiles,
-                arguments.benchmark_rows_per_tile,
+                benchmark_rows,
                 arguments.benchmark_inner,
                 arguments.benchmark_columns,
                 arguments.clock_hz,
@@ -313,13 +310,13 @@ fn run_gemm_benchmark(
     runtime: &Runtime,
     application: &Application,
     active_tiles: u16,
-    rows_per_tile: u32,
+    rows: u32,
     inner: u32,
     columns: u32,
     clock_hz: u64,
     timeout_seconds: u64,
 ) -> Result<()> {
-    validate_benchmark_shape(rows_per_tile, inner, columns)?;
+    validate_benchmark_shape(rows, inner, columns)?;
     if clock_hz == 0 {
         bail!("benchmark clock must be nonzero");
     }
@@ -364,7 +361,7 @@ fn run_gemm_benchmark(
     if cycles == 0 {
         bail!("benchmark cycle interval is zero");
     }
-    let rows = u64::from(active_tiles) * u64::from(rows_per_tile);
+    let rows = u64::from(rows);
     let flops = 2.0 * rows as f64 * f64::from(inner) * f64::from(columns);
     let seconds = f64::from(cycles) / clock_hz as f64;
     let tflops = flops / seconds / 1.0e12;
@@ -380,24 +377,14 @@ fn run_gemm_benchmark(
     Ok(())
 }
 
-fn validate_benchmark_shape(rows_per_tile: u32, inner: u32, columns: u32) -> Result<()> {
-    if rows_per_tile == 0
+fn validate_benchmark_shape(rows: u32, inner: u32, columns: u32) -> Result<()> {
+    if rows == 0
         || inner == 0
         || columns == 0
         || !inner.is_multiple_of(64)
         || !columns.is_multiple_of(64)
     {
         bail!("benchmark rows must be nonzero and inner/columns must be nonzero multiples of 64");
-    }
-    let output_bytes = rows_per_tile
-        .checked_mul(columns)
-        .and_then(|elements| elements.checked_mul(2))
-        .context("benchmark output byte count overflow")?;
-    if output_bytes > ipu_codegen::memory::IPU21_INTERLEAVED_BYTES {
-        bail!(
-            "benchmark output needs {output_bytes} interleaved bytes per tile, but IPU21 provides {}",
-            ipu_codegen::memory::IPU21_INTERLEAVED_BYTES
-        );
     }
     Ok(())
 }
@@ -733,11 +720,7 @@ mod tests {
             let rows = random.u32(1..=512);
             let inner = random.u32(1..=16) * 64;
             let columns = random.u32(1..=8) * 64;
-            let output_bytes = u64::from(rows) * u64::from(columns) * 2;
-            assert_eq!(
-                validate_benchmark_shape(rows, inner, columns).is_ok(),
-                output_bytes <= u64::from(ipu_codegen::memory::IPU21_INTERLEAVED_BYTES)
-            );
+            assert!(validate_benchmark_shape(rows, inner, columns).is_ok());
             assert!(validate_benchmark_shape(rows, inner + 1, columns).is_err());
             assert!(validate_benchmark_shape(rows, inner, columns + 1).is_err());
         }
