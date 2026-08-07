@@ -734,6 +734,16 @@ impl LoweringState {
             let column_end = column_start + output_column_block;
             for inner_start in (0..inner_extent).step_by(inner_block as usize) {
                 let inner_end = inner_start + inner_block;
+                let every_tile_has_local_right = output_shards.iter().all(|output| {
+                    let tile = self.shards[output.index() as usize].tile;
+                    right_shards.iter().copied().any(|shard| {
+                        let candidate = &self.shards[shard.index() as usize];
+                        let columns = candidate.extents[candidate.extents.len() - 1];
+                        candidate.tile == tile
+                            && columns.start <= column_start
+                            && columns.physical_end >= column_end
+                    })
+                });
                 let mut transfers = BTreeMap::<ShardView, Vec<LowShardId>>::new();
                 let mut local_copies = Vec::<(u16, LocalCopy)>::new();
                 let mut runs = Vec::with_capacity(output_shards.len());
@@ -745,10 +755,13 @@ impl LoweringState {
                     let right = right_shards
                         .iter()
                         .copied()
-                        .find(|shard| {
+                        .filter(|shard| {
                             let extents = &self.shards[shard.index() as usize].extents;
                             let columns = extents[extents.len() - 1];
                             columns.start <= column_start && columns.physical_end >= column_end
+                        })
+                        .min_by_key(|shard| {
+                            u8::from(self.shards[shard.index() as usize].tile != tile)
                         })
                         .ok_or(LowLoweringError::InvalidOperatorPlan)?;
                     let right_rank = self.shards[right.index() as usize].extents.len();
@@ -780,11 +793,12 @@ impl LoweringState {
                                     .memory_class
                                     == crate::MemoryClass::Ipu21Interleaved
                             } else {
-                                self.shards[right.index() as usize]
-                                    .tensor_type
-                                    .format
-                                    .precision
-                                    == crate::Precision::F16
+                                every_tile_has_local_right
+                                    && self.shards[right.index() as usize]
+                                        .tensor_type
+                                        .format
+                                        .precision
+                                        == crate::Precision::F16
                                     && self.can_allocate_interleaved(tile, packed_bytes)?
                             };
                             let definition = existing_staging
@@ -1438,23 +1452,25 @@ mod tests {
             assert!(low.exchange_phases.iter().all(|phase| {
                 phase.provenance.operation.is_some() && phase.provenance.value.is_some()
             }));
-            if inner_blocks > 1 {
-                assert!(
-                    low.tiles.iter().flat_map(|tile| &tile.work).any(|work| {
-                        matches!(
-                            work,
-                            TileWork::Kernel(KernelRun {
-                                kernel: TileKernel::Planned(TileKernelSpec::Gemm {
-                                    weights: crate::GemmWeightLoad::Interleaved,
-                                    ..
-                                }),
-                                ..
-                            })
-                        )
-                    }),
-                    "case {case}"
-                );
-            }
+            let weight_modes = |tile: &TileWorkList| {
+                tile.work
+                    .iter()
+                    .filter_map(|work| match work {
+                        TileWork::Kernel(KernelRun {
+                            kernel: TileKernel::Planned(TileKernelSpec::Gemm { weights, .. }),
+                            ..
+                        }) => Some(*weights),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let expected_weight_modes = weight_modes(&low.tiles[0]);
+            assert!(
+                low.tiles
+                    .iter()
+                    .all(|tile| weight_modes(tile) == expected_weight_modes),
+                "case {case}"
+            );
 
             for tile in &low.tiles {
                 let gemms = tile

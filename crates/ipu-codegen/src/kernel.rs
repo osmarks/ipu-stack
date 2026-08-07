@@ -637,6 +637,11 @@ mod tests {
             } else {
                 GemmKernelMode::Accumulate
             };
+            let weights = if precision == Precision::F16 && random.bool() {
+                GemmWeightLoad::Interleaved
+            } else {
+                GemmWeightLoad::Standard
+            };
             let format = TensorFormat {
                 precision,
                 layout: Layout {
@@ -657,7 +662,7 @@ mod tests {
                     multiply: precision,
                     accumulate: AccumulationPrecision::F32,
                     mode,
-                    weights: GemmWeightLoad::Standard,
+                    weights,
                 },
                 &requirements,
             )
