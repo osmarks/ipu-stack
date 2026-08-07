@@ -1,9 +1,9 @@
 //! Machine-readable ABI contracts for tile-local kernel calls.
 
 use crate::{
-    ComputeStep, GemmKernelMode, KernelRequirements, KernelRun, LowProgram, LowShard, LowShardId,
-    Precision, StepProfile, StorageError, TileAddress, TileKernel, TileKernelSpec, TileWork,
-    TileWorkList, view_byte_spans,
+    AmpOrder, ComputeStep, ElementOrder, GemmKernelMode, KernelRequirements, KernelRun, LowProgram,
+    LowShard, LowShardId, Precision, StepProfile, StorageError, TileAddress, TileKernel,
+    TileKernelSpec, TileWork, TileWorkList, view_byte_spans,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -83,6 +83,12 @@ pub enum KernelAbiError {
     ElementCountOverflow,
     #[error("GEMM row count {0} is not present in the compilation plan")]
     UnplannedGemmRows(u32),
+    #[error("kernel {symbol} requires an element count divisible by {divisor}, got {count}")]
+    UnsupportedElementCount {
+        symbol: &'static str,
+        count: u32,
+        divisor: u32,
+    },
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -104,8 +110,9 @@ impl KernelBuildPlan {
     /// compiler specializations rather than a fixed collection of binaries.
     pub fn from_program(program: &LowProgram) -> Result<Self, KernelAbiError> {
         let mut rows = BTreeMap::<Precision, BTreeSet<u32>>::new();
+        let mut gelu = false;
         for tile in &program.tiles {
-            collect_kernel_rows(tile, &mut rows)?;
+            collect_kernels(tile, &mut rows, &mut gelu)?;
         }
         let mut plan = Self::default();
         for (precision, values) in rows {
@@ -139,6 +146,17 @@ impl KernelBuildPlan {
                 retained_symbols: symbols.into_iter().collect(),
             });
             plan.gemm_rows.insert(precision, values);
+        }
+        if gelu {
+            plan.compilations.push(KernelCompilation {
+                source: "gelu_f16.S",
+                name: "gelu_f16".into(),
+                flags: Vec::new(),
+                retained_symbols: vec![
+                    "ipu_stack_gelu_exact_f16".into(),
+                    "ipu_stack_gelu_output_to_left_f16".into(),
+                ],
+            });
         }
         Ok(plan)
     }
@@ -263,9 +281,10 @@ fn add_address_offset(
     })
 }
 
-fn collect_kernel_rows(
+fn collect_kernels(
     tile: &TileWorkList,
     rows: &mut BTreeMap<Precision, BTreeSet<u32>>,
+    gelu: &mut bool,
 ) -> Result<(), KernelAbiError> {
     for work in &tile.work {
         match work {
@@ -277,9 +296,11 @@ fn collect_kernel_rows(
                 }
                 if let TileKernelSpec::Gemm { multiply, .. } = kernel {
                     rows.entry(*multiply).or_default().insert(gemm_rows(run)?);
+                } else if matches!(kernel, TileKernelSpec::Gelu) {
+                    *gelu = true;
                 }
             }
-            TileWork::Repeat(repeat) => collect_kernel_rows(&repeat.body, rows)?,
+            TileWork::Repeat(repeat) => collect_kernels(&repeat.body, rows, gelu)?,
             TileWork::Exchange(_) => {}
         }
     }
@@ -297,15 +318,7 @@ fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
 }
 
 fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbiError> {
-    let count = run
-        .output
-        .extents
-        .iter()
-        .try_fold(1u32, |product, extent| {
-            product
-                .checked_mul(extent.physical_end - extent.start)
-                .ok_or(KernelAbiError::ElementCountOverflow)
-        })?;
+    let count = element_count(run)?;
     abi.scalar_arguments
         .iter()
         .map(|argument| match argument.name {
@@ -320,6 +333,14 @@ fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbi
             _ => Err(KernelAbiError::RequirementMismatch),
         })
         .collect()
+}
+
+fn element_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
+    run.output.extents.iter().try_fold(1u32, |product, extent| {
+        product
+            .checked_mul(extent.physical_end - extent.start)
+            .ok_or(KernelAbiError::ElementCountOverflow)
+    })
 }
 
 pub fn tile_kernel_abi(
@@ -343,16 +364,19 @@ pub fn tile_kernel_abi(
             };
             (symbols.0, symbols.1, 2, scalars)
         }
-        TileKernelSpec::Gelu => (
-            exact_symbol(
-                precision,
-                "ipu_stack_gelu_exact_f16",
-                "ipu_stack_gelu_exact_f32",
-            ),
-            KernelAvailability::Required,
-            1,
-            scalar_arguments(1, &["element_count"]),
-        ),
+        TileKernelSpec::Gelu => {
+            let symbol = gelu_symbol(requirements).unwrap_or("ipu_stack_unsupported_gelu");
+            (
+                KernelSymbols::Exact(symbol),
+                if symbol == "ipu_stack_unsupported_gelu" {
+                    KernelAvailability::Required
+                } else {
+                    KernelAvailability::Implemented
+                },
+                1,
+                scalar_arguments(1, &["element_count"]),
+            )
+        }
         TileKernelSpec::Add => (
             exact_symbol(precision, "ipu_stack_add_f16", "ipu_stack_add_f32"),
             KernelAvailability::Required,
@@ -417,7 +441,50 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
     {
         return Err(KernelAbiError::FragmentedOperand(index));
     }
+    if matches!(kernel, TileKernelSpec::Gelu) {
+        let KernelSymbols::Exact(symbol) = abi.symbols else {
+            return Err(KernelAbiError::RequirementMismatch);
+        };
+        let divisor = if symbol == "ipu_stack_gelu_output_to_left_f16" {
+            16
+        } else {
+            2
+        };
+        let count = element_count(run)?;
+        if !count.is_multiple_of(divisor) {
+            return Err(KernelAbiError::UnsupportedElementCount {
+                symbol,
+                count,
+                divisor,
+            });
+        }
+    }
     Ok(abi)
+}
+
+fn gelu_symbol(requirements: &KernelRequirements) -> Option<&'static str> {
+    let KernelRequirements::Operator(requirements) = requirements else {
+        return None;
+    };
+    let [input] = requirements.inputs.as_slice() else {
+        return None;
+    };
+    if input.format.precision != Precision::F16
+        || requirements.output.format.precision != Precision::F16
+    {
+        return None;
+    }
+    let input_layout = &input.format.layout;
+    let output_layout = &requirements.output.format.layout;
+    if input_layout == output_layout {
+        Some("ipu_stack_gelu_exact_f16")
+    } else if matches!(input_layout.order, ElementOrder::Amp(AmpOrder::Output))
+        && matches!(output_layout.order, ElementOrder::Amp(AmpOrder::Left))
+    {
+        Some("ipu_stack_gelu_output_to_left_f16")
+    } else {
+        None
+    }
 }
 
 fn gemm_symbols(precision: Precision, mode: GemmKernelMode) -> (KernelSymbols, KernelAvailability) {
@@ -604,6 +671,52 @@ mod tests {
                 assert_eq!(compute.symbol, call.symbol);
                 assert_eq!(compute.input_addresses.len(), 2);
             }
+        }
+    }
+
+    #[test]
+    fn randomized_gelu_abis_select_supported_layout_paths() {
+        let mut random = fastrand::Rng::with_seed(0x6765_6c75);
+        for _ in 0..64 {
+            let tiles = 1_u16 << random.u32(0..=5);
+            let transition = random.bool();
+            let input_layout = if transition {
+                Layout::amp_output(tiles)
+            } else {
+                Layout::row_sharded(tiles)
+            };
+            let output_layout = if transition {
+                Layout::amp_left(64, tiles)
+            } else {
+                input_layout.clone()
+            };
+            let requirement = |layout| {
+                OperandRequirement::new(
+                    TensorFormat {
+                        precision: Precision::F16,
+                        layout,
+                    },
+                    8,
+                )
+            };
+            let requirements = KernelRequirements::Operator(OperatorRequirements {
+                inputs: vec![requirement(input_layout)],
+                output: requirement(output_layout),
+                output_aliasing: OutputAliasing::Fresh,
+                memory_relations: Vec::new(),
+            });
+            let abi = tile_kernel_abi(&TileKernelSpec::Gelu, &requirements).unwrap();
+            assert_eq!(abi.availability, KernelAvailability::Implemented);
+            assert_eq!(abi.input_registers, [3]);
+            assert_eq!(abi.scalar_arguments[0].register, 4);
+            assert_eq!(
+                abi.symbols,
+                KernelSymbols::Exact(if transition {
+                    "ipu_stack_gelu_output_to_left_f16"
+                } else {
+                    "ipu_stack_gelu_exact_f16"
+                })
+            );
         }
     }
 }

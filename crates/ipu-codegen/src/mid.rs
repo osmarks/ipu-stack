@@ -626,6 +626,14 @@ impl PipelineConfig {
 }
 
 fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
+    let amp_output_f16 = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::amp_output(tile_count),
+    };
+    let amp_left_f16 = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::amp_left(64, tile_count),
+    };
     let rows_f16 = TensorFormat {
         precision: Precision::F16,
         layout: Layout::row_sharded(tile_count),
@@ -645,6 +653,11 @@ fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
     vec![
         amp_gemm_operator_candidate(Precision::F16, 64, 16, tile_count),
         amp_gemm_operator_candidate(Precision::F32, 64, 32, tile_count),
+        OperatorCandidate::new(
+            MidOperator::Gelu,
+            [OperandRequirement::new(amp_output_f16, 8)],
+            OperandRequirement::new(amp_left_f16, 8),
+        ),
         pointwise_operator_candidate(MidOperator::Gelu, [rows_f16.clone()], rows_f16.clone()),
         pointwise_operator_candidate(MidOperator::Gelu, [rows_f32.clone()], rows_f32.clone()),
         pointwise_operator_candidate(

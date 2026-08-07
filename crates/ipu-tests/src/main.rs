@@ -31,8 +31,11 @@ struct Arguments {
     #[arg(long, default_value_t = 10)]
     timeout_seconds: u64,
     /// Execute one blocked F16 GEMM as a kernel/exchange smoke test.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "mlp_smoke")]
     gemm_smoke: bool,
+    /// Execute and numerically verify GEMM-GeLU-GEMM-GeLU.
+    #[arg(long, conflicts_with = "gemm_smoke")]
+    mlp_smoke: bool,
 }
 
 fn main() -> Result<()> {
@@ -67,6 +70,27 @@ fn main() -> Result<()> {
                     layout: Layout::amp_right(64, active_tiles),
                 },
             );
+    } else if arguments.mlp_smoke {
+        let left = graph.host_input("left", [u32::from(active_tiles), 64])?;
+        let right0 = graph.parameter("right.0", [64, 64])?;
+        let right1 = graph.parameter("right.1", [64, 64])?;
+        let hidden = graph.gemm(left, right0)?;
+        let hidden = graph.gelu(hidden)?;
+        let output = graph.gemm(hidden, right1)?;
+        let output = graph.gelu(output)?;
+        graph.set_outputs([output])?;
+        let left_format = TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::amp_left(64, active_tiles),
+        };
+        let right_format = TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::amp_right(64, active_tiles),
+        };
+        pipeline = pipeline
+            .with_input(left, left_format)
+            .with_input(right0, right_format.clone())
+            .with_input(right1, right_format);
     }
     let application = build_package(
         &graph,
@@ -92,18 +116,27 @@ fn main() -> Result<()> {
     let bootloader_bytes =
         fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
     let runtime = Runtime::open(&arguments.device, &configuration)?;
-    if arguments.gemm_smoke {
+    if arguments.gemm_smoke || arguments.mlp_smoke {
         runtime.load(
             &application,
             &bootloader_bytes,
             application.host_exchange.startup_mark,
         )?;
-        run_gemm(
-            &runtime,
-            &application,
-            active_tiles,
-            arguments.timeout_seconds,
-        )?;
+        if arguments.gemm_smoke {
+            run_gemm(
+                &runtime,
+                &application,
+                active_tiles,
+                arguments.timeout_seconds,
+            )?;
+        } else {
+            run_mlp_chain(
+                &runtime,
+                &application,
+                active_tiles,
+                arguments.timeout_seconds,
+            )?;
+        }
     } else {
         runtime.load(&application, &bootloader_bytes, 0)?;
         diagnose_completion(
@@ -167,6 +200,138 @@ fn run_gemm(
     verify_gemm_output(application, active_tiles, &output)
 }
 
+fn run_mlp_chain(
+    runtime: &Runtime,
+    application: &Application,
+    active_tiles: u16,
+    timeout_seconds: u64,
+) -> Result<()> {
+    let binding = |name: &str, bindings: &[Binding]| {
+        bindings
+            .iter()
+            .find(|binding| binding.name == name)
+            .cloned()
+            .with_context(|| format!("MLP package has no {name} binding"))
+    };
+    let left = binding("left", &application.inputs)?;
+    let right0 = binding("right.0", &application.weights)?;
+    let right1 = binding("right.1", &application.weights)?;
+    let left_bytes = packed_binding(&left, |tile, linear, elements| {
+        let (_, inner) =
+            amp_matrix_coordinates(AmpOrder::Left, Precision::F16, 1, elements, linear)?;
+        Ok(if u32::from(tile) == inner { 0x3c00 } else { 0 })
+    })?;
+    let right0_bytes = packed_binding(&right0, |tile, linear, elements| {
+        let (inner, column) =
+            amp_matrix_coordinates(AmpOrder::Right, Precision::F16, 64, elements / 64, linear)?;
+        let column = u32::from(tile) * 64 + column;
+        Ok(if column < 64 {
+            gemm_right_value(inner, column)
+        } else {
+            0
+        })
+    })?;
+    let right1_bytes = packed_binding(&right1, |tile, linear, elements| {
+        let (inner, column) =
+            amp_matrix_coordinates(AmpOrder::Right, Precision::F16, 64, elements / 64, linear)?;
+        let column = u32::from(tile) * 64 + column;
+        Ok(if inner == column { 0x3c00 } else { 0 })
+    })?;
+    let mut weights = Vec::with_capacity(right0_bytes.len() + right1_bytes.len());
+    weights.extend_from_slice(&right0_bytes);
+    weights.extend_from_slice(&right1_bytes);
+
+    let mut session = runtime.host_session(application)?;
+    session.start()?;
+    let initialized = session.invoke_streaming_deferred("initialize", &weights)?;
+    session.collect(&initialized)?;
+    let executed = session.invoke_streaming_deferred("run", &left_bytes)?;
+    runtime
+        .device()
+        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+    diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
+    let output = session.collect(&executed)?;
+    verify_mlp_output(application, active_tiles, &output)
+}
+
+fn verify_mlp_output(application: &Application, active_tiles: u16, bytes: &[u8]) -> Result<()> {
+    let output = application
+        .outputs
+        .iter()
+        .find(|binding| binding.name == "output.0")
+        .context("MLP package has no output binding")?;
+    let expected_bytes = output
+        .slices
+        .iter()
+        .map(|slice| slice.file_offset + slice.size)
+        .max()
+        .context("MLP output has no slices")?;
+    if bytes.len() != usize::try_from(expected_bytes)? {
+        bail!(
+            "MLP returned {} bytes, expected {expected_bytes}",
+            bytes.len()
+        );
+    }
+    let mut maximum_error = 0.0f32;
+    let mut mismatches = Vec::new();
+    let mut checked = 0usize;
+    for row in 0..active_tiles {
+        let slice = output
+            .slices
+            .iter()
+            .find(|slice| slice.tile == u32::from(row))
+            .with_context(|| format!("MLP output has no slice for tile {row}"))?;
+        let elements = u32::try_from(slice.size / 2)?;
+        for linear in 0..elements {
+            let (_, column) =
+                amp_matrix_coordinates(AmpOrder::Left, Precision::F16, 1, elements, linear)?;
+            if column >= 64 {
+                continue;
+            }
+            let offset = usize::try_from(slice.file_offset + u64::from(linear) * 2)?;
+            let actual = half_to_f32(u16::from_le_bytes(
+                bytes[offset..offset + 2].try_into().unwrap(),
+            ));
+            let input = half_to_f32(gemm_right_value(u32::from(row), column));
+            let expected = gelu_reference(gelu_reference(input));
+            let error = (actual - expected).abs();
+            maximum_error = maximum_error.max(error);
+            checked += 1;
+            if error > 0.02 && mismatches.len() < 16 {
+                mismatches.push((row, column, expected, actual, error));
+            }
+        }
+    }
+    if !mismatches.is_empty() {
+        bail!("MLP numerical verification failed after {checked} checks: {mismatches:?}");
+    }
+    println!(
+        "mlpNumericalChecks={checked} maximumAbsoluteError={maximum_error:.6} numericalTest=PASS"
+    );
+    Ok(())
+}
+
+fn gelu_reference(value: f32) -> f32 {
+    0.5 * value * (1.0 + (0.797_884_6 * (value + 0.044_715 * value.powi(3))).tanh())
+}
+
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = u32::from((bits >> 10) & 0x1f);
+    let fraction = u32::from(bits & 0x03ff);
+    let value = match exponent {
+        0 if fraction == 0 => sign,
+        0 => {
+            let shift = fraction.leading_zeros() - 21;
+            let normalized = fraction << shift;
+            sign | ((113 - shift) << 23) | ((normalized & 0x03ff) << 13)
+        }
+        0x1f => sign | 0x7f80_0000 | (fraction << 13),
+        _ => sign | ((exponent + 112) << 23) | (fraction << 13),
+    };
+    f32::from_bits(value)
+}
+
 fn packed_binding(
     binding: &Binding,
     mut value: impl FnMut(u16, u32, u32) -> Result<u16>,
@@ -179,7 +344,10 @@ fn packed_binding(
         .context("binding has no slices")?;
     let mut bytes = vec![0; usize::try_from(total)?];
     for slice in &binding.slices {
-        if slice.size == 0 || slice.size & 1 != 0 {
+        if slice.size == 0 {
+            continue;
+        }
+        if slice.size & 1 != 0 {
             bail!("binding {} has a non-F16 slice", binding.name);
         }
         let elements = u32::try_from(slice.size / 2)?;
