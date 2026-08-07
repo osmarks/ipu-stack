@@ -79,6 +79,18 @@ pub enum TensorAxis {
     FromEnd(u16),
 }
 
+impl TensorAxis {
+    pub fn resolve(self, rank: usize) -> Result<usize, LayoutError> {
+        match self {
+            Self::FromStart(axis) if usize::from(axis) < rank => Ok(usize::from(axis)),
+            Self::FromEnd(axis) if axis != 0 && usize::from(axis) <= rank => {
+                Ok(rank - usize::from(axis))
+            }
+            _ => Err(LayoutError::AxisOutOfRange { axis: self, rank }),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Padding {
     Reject,
@@ -219,7 +231,7 @@ impl Layout {
             used_tiles = used_tiles
                 .checked_mul(u32::from(tiling.partitions))
                 .ok_or(LayoutError::TileCountOverflow)?;
-            let axis = resolve_axis(tiling.axis, dimensions.len())?;
+            let axis = tiling.axis.resolve(dimensions.len())?;
             if used_axes.contains(&axis) {
                 return Err(LayoutError::DuplicateAxis(axis));
             }
@@ -250,16 +262,6 @@ impl Layout {
             });
         }
         Ok(TensorShape(dimensions))
-    }
-}
-
-fn resolve_axis(axis: TensorAxis, rank: usize) -> Result<usize, LayoutError> {
-    match axis {
-        TensorAxis::FromStart(axis) if usize::from(axis) < rank => Ok(usize::from(axis)),
-        TensorAxis::FromEnd(axis) if axis != 0 && usize::from(axis) <= rank => {
-            Ok(rank - usize::from(axis))
-        }
-        _ => Err(LayoutError::AxisOutOfRange { axis, rank }),
     }
 }
 

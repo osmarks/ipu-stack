@@ -7,12 +7,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub mod graph;
+pub mod low;
 pub mod mid;
 mod package;
 pub use graph::{
     ComputeGraph, GraphError, GraphInput, GraphInputKind, GraphResult, Operation, OperationId,
     OperationKind, Region, RegionBuilder, Repeat, RepeatArguments, TensorShape, ValueId,
     ValueSequence, ValueSequenceId,
+};
+pub use low::{
+    ExchangePhase, ExchangePhaseId, KernelOperand, KernelRun, LogicalExchange, LowInput, LowKernel,
+    LowLoweringConfig, LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId,
+    LowValue, RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, ShardDefinition,
+    ShardExtent, TileWork, TileWorkList, lower_to_tiles,
 };
 pub use mid::{
     AccumulationPrecision, AmpOrder, AxisTiling, CostModel, ElementOrder, KernelCandidate,

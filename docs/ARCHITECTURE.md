@@ -26,7 +26,7 @@ shape plus a `TensorFormat` containing:
 - axis tiling, where each axis records its block size, distributed partition
   count, and whether an indivisible extent is rejected or zero-padded;
 - replication and logical tile-group size;
-- an optional hardware memory class such as the IPU21 interleaved region.
+- a hardware memory class such as IPU21 standard or interleaved memory.
 
 This is deliberately less specific than placement: it records decisions that
 change a kernel or exchange plan, but not physical tile IDs, SRAM addresses,
@@ -52,8 +52,16 @@ distinct effective memory elements. This is an inspectable scaffold for a
 measured cost model or autotuner, not a claim that those choices are globally
 optimal.
 
-Package construction emits a completion-only tile program until mid-to-low
-scheduling and placement are implemented. `TileProgram` is the finalized
+`low::lower_to_tiles` turns this into a logical per-tile work list. It assigns
+rectangular shards to logical tiles, preserves repeats as reusable tile-local
+bodies, inserts synchronized exchange phases, and emits kernel runs whose
+operand shards are resident on their execution tile. Its initial policy
+conservatively gathers every input shard to every output tile; the explicit
+schedule permits a later cost model to replace that policy.
+
+The logical schedule deliberately has no SRAM addresses, encoded exchange
+rows, or linked kernel symbols. Package construction remains completion-only
+until placement resolves those details into `TileProgram`, the finalized
 representation consumed by code generation.
 
 ## Finalized tile programs

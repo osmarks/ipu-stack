@@ -28,8 +28,10 @@ of scope.
 `ipu-codegen::build_package` accepts a `ComputeGraph` and `PackageConfig`. The
 graph is shaped structured SSA. Its separate mid-level lowering selects
 precision and layout with a toy cost model and inserts explicit casts and
-rearrangements. Package construction produces completion-only tile programs
-until mid-to-low scheduling is implemented. The config
+rearrangements. Mid-to-low lowering then produces logical per-tile shard work,
+kernel runs, synchronized exchanges, and structured repeats. Package
+construction produces completion-only tile programs until SRAM placement,
+exchange encoding, and kernel-symbol selection are implemented. The config
 explicitly supplies the toolchain, static runtime source, build directory, and
 tile count.
 
