@@ -267,6 +267,7 @@ dependencies = [
  "ipu-package",
  "serde",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

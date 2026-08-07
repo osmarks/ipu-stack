@@ -9,7 +9,7 @@
 use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
     Layout, LayoutError, MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId,
-    OperatorDispatch, OperatorRequirements, Precision, TensorType, TileKernelSpec,
+    OperatorDispatch, OperatorRequirements, PipelineConfig, Precision, TensorType, TileKernelSpec,
 };
 use std::collections::BTreeMap;
 
@@ -87,7 +87,24 @@ pub struct LogicalExchange {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExchangePhase {
     pub id: ExchangePhaseId,
+    pub provenance: WorkProvenance,
     pub transfers: Vec<LogicalExchange>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkReason {
+    OperatorKernel,
+    OperatorInput { input: u16 },
+    PrecisionCast,
+    LayoutRearrangement,
+    Repeat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkProvenance {
+    pub operation: Option<OperationId>,
+    pub value: Option<MidValueId>,
+    pub reason: WorkReason,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,7 +122,7 @@ pub struct KernelOperand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelRun {
-    pub source: Option<OperationId>,
+    pub provenance: WorkProvenance,
     pub kernel: TileKernel,
     pub inputs: Vec<KernelOperand>,
     pub output: ShardView,
@@ -134,6 +151,7 @@ pub struct RepeatIterated {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepeatRun {
+    pub provenance: WorkProvenance,
     pub count: u32,
     pub carried: Vec<RepeatCarried>,
     pub invariants: Vec<RepeatInvariant>,
@@ -165,11 +183,6 @@ pub struct LowProgram {
     pub outputs: Vec<LowValue>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LowLoweringConfig {
-    pub tile_count: u16,
-}
-
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LowLoweringError {
     #[error("low-level lowering requires a nonzero tile count")]
@@ -198,18 +211,22 @@ pub enum LowLoweringError {
 
 pub type LowLoweringResult<T> = Result<T, LowLoweringError>;
 
-/// Produces a logical per-tile schedule. Its conservative residency policy
-/// gathers every shard of every operand onto each tile that runs an output
-/// shard. Later cost-driven scheduling can narrow transfers without changing
-/// the placement/code-generation boundary.
-pub fn lower_to_tiles(
-    graph: &MidGraph,
-    config: &LowLoweringConfig,
-) -> LowLoweringResult<LowProgram> {
+/// Produces a logical per-tile schedule by expanding selected operator plans.
+/// Conversions without plans still use a conservative gather fallback.
+#[tracing::instrument(
+    name = "ipu_codegen.low.lower_to_tiles",
+    skip(graph, config),
+    fields(
+        tile_count = config.tile_count,
+        operations = graph.operations.len(),
+        profiling = config.profiling.enabled
+    )
+)]
+pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringResult<LowProgram> {
     if config.tile_count == 0 {
         return Err(LowLoweringError::EmptyTileGroup);
     }
-    let mut state = LoweringState::new(graph, *config)?;
+    let mut state = LoweringState::new(graph, config.tile_count)?;
     let tiles = state.lower_region(&graph.operations)?;
     let inputs = graph
         .inputs
@@ -233,6 +250,11 @@ pub fn lower_to_tiles(
             })
         })
         .collect::<LowLoweringResult<_>>()?;
+    tracing::info!(
+        shards = state.shards.len(),
+        exchange_phases = state.phases.len(),
+        "built logical tile schedule"
+    );
     Ok(LowProgram {
         tile_count: config.tile_count,
         shards: state.shards,
@@ -244,30 +266,30 @@ pub fn lower_to_tiles(
 }
 
 struct LoweringState {
-    config: LowLoweringConfig,
+    tile_count: u16,
     shards: Vec<LowShard>,
     canonical: Vec<Vec<LowShardId>>,
     phases: Vec<ExchangePhase>,
 }
 
 impl LoweringState {
-    fn new(graph: &MidGraph, config: LowLoweringConfig) -> LowLoweringResult<Self> {
+    fn new(graph: &MidGraph, tile_count: u16) -> LowLoweringResult<Self> {
         let mut state = Self {
-            config,
+            tile_count,
             shards: Vec::new(),
             canonical: vec![Vec::new(); graph.values.len()],
             phases: Vec::new(),
         };
         for value in &graph.values {
-            if value.tensor_type.format.layout.tiling.tile_count != config.tile_count {
+            if value.tensor_type.format.layout.tiling.tile_count != tile_count {
                 return Err(LowLoweringError::TileCountMismatch {
                     value: value.id,
                     declared: value.tensor_type.format.layout.tiling.tile_count,
-                    scheduled: config.tile_count,
+                    scheduled: tile_count,
                 });
             }
             let extents = shard_extents(&value.tensor_type)?;
-            let mut value_shards = Vec::with_capacity(usize::from(config.tile_count));
+            let mut value_shards = Vec::with_capacity(usize::from(tile_count));
             for (tile, extents) in extents.into_iter().enumerate() {
                 let id = state.push_shard(LowShard {
                     id: LowShardId(0),
@@ -311,7 +333,7 @@ impl LoweringState {
         &mut self,
         operations: &[MidOperation],
     ) -> LowLoweringResult<Vec<TileWorkList>> {
-        let mut tiles = (0..self.config.tile_count)
+        let mut tiles = (0..self.tile_count)
             .map(|tile| TileWorkList {
                 tile,
                 work: Vec::new(),
@@ -366,7 +388,7 @@ impl LoweringState {
             runs.push((
                 tile,
                 KernelRun {
-                    source: operation.source,
+                    provenance: operation_provenance(operation, kind),
                     kernel: match kind {
                         MidOperationKind::CastPrecision { from, to } => TileKernel::Cast {
                             from: *from,
@@ -392,6 +414,7 @@ impl LoweringState {
             );
             self.phases.push(ExchangePhase {
                 id,
+                provenance: operation_provenance(operation, kind),
                 transfers: transfers
                     .into_iter()
                     .map(|(source, destinations)| LogicalExchange {
@@ -465,7 +488,11 @@ impl LoweringState {
             tiles[usize::from(tile)]
                 .work
                 .push(TileWork::Kernel(KernelRun {
-                    source: operation.source,
+                    provenance: WorkProvenance {
+                        operation: operation.source,
+                        value: operation.results.first().copied(),
+                        reason: WorkReason::OperatorKernel,
+                    },
                     kernel: TileKernel::Planned(kernel),
                     inputs,
                     output: self.full_view(*output),
@@ -563,7 +590,11 @@ impl LoweringState {
                     runs.push((
                         tile,
                         KernelRun {
-                            source: operation.source,
+                            provenance: WorkProvenance {
+                                operation: operation.source,
+                                value: Some(*output_value),
+                                reason: WorkReason::OperatorKernel,
+                            },
                             kernel: TileKernel::Planned(if inner_start == 0 {
                                 initialize
                             } else {
@@ -582,7 +613,15 @@ impl LoweringState {
                         },
                     ));
                 }
-                self.append_phase(transfers, tiles)?;
+                self.append_phase(
+                    transfers,
+                    WorkProvenance {
+                        operation: operation.source,
+                        value: Some(*right_value),
+                        reason: WorkReason::OperatorInput { input: 1 },
+                    },
+                    tiles,
+                )?;
                 for (tile, run) in runs {
                     tiles[usize::from(tile)].work.push(TileWork::Kernel(run));
                 }
@@ -594,6 +633,7 @@ impl LoweringState {
     fn append_phase(
         &mut self,
         transfers: BTreeMap<ShardView, Vec<LowShardId>>,
+        provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         if transfers.is_empty() {
@@ -604,6 +644,7 @@ impl LoweringState {
         );
         self.phases.push(ExchangePhase {
             id,
+            provenance,
             transfers: transfers
                 .into_iter()
                 .map(|(source, destinations)| LogicalExchange {
@@ -612,6 +653,13 @@ impl LoweringState {
                 })
                 .collect(),
         });
+        tracing::debug!(
+            phase = id.index(),
+            operation = ?provenance.operation.map(OperationId::index),
+            value = ?provenance.value.map(MidValueId::index),
+            reason = ?provenance.reason,
+            "scheduled exchange phase"
+        );
         for tile in tiles {
             tile.work.push(TileWork::Exchange(id));
         }
@@ -692,7 +740,7 @@ impl LoweringState {
             return Err(LowLoweringError::InvalidRepeat);
         }
         let body = self.lower_region(&repeat.body.operations)?;
-        for tile in 0..self.config.tile_count {
+        for tile in 0..self.tile_count {
             let carried = (0..repeat.carried_inputs)
                 .map(|index| {
                     Ok(RepeatCarried {
@@ -730,6 +778,11 @@ impl LoweringState {
             tiles[usize::from(tile)]
                 .work
                 .push(TileWork::Repeat(RepeatRun {
+                    provenance: WorkProvenance {
+                        operation: operation.source,
+                        value: operation.results.first().copied(),
+                        reason: WorkReason::Repeat,
+                    },
                     count: repeat.count,
                     carried,
                     invariants,
@@ -738,6 +791,19 @@ impl LoweringState {
                 }));
         }
         Ok(())
+    }
+}
+
+fn operation_provenance(operation: &MidOperation, kind: &MidOperationKind) -> WorkProvenance {
+    WorkProvenance {
+        operation: operation.source,
+        value: operation.results.first().copied(),
+        reason: match kind {
+            MidOperationKind::CastPrecision { .. } => WorkReason::PrecisionCast,
+            MidOperationKind::Rearrange { .. } => WorkReason::LayoutRearrangement,
+            MidOperationKind::Operator(_) => WorkReason::OperatorKernel,
+            MidOperationKind::Repeat(_) => WorkReason::Repeat,
+        },
     }
 }
 
@@ -793,7 +859,7 @@ fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<Vec<ShardExt
 mod tests {
     use super::*;
     use crate::{
-        AxisTiling, ComputeGraph, ElementOrder, Layout, LoweringConfig, MemoryClass, Padding,
+        AxisTiling, ComputeGraph, ElementOrder, Layout, MemoryClass, Padding, PipelineConfig,
         Precision, TensorAxis, TensorFormat, TensorTiling, ToyCostModel, lower,
     };
 
@@ -883,11 +949,11 @@ mod tests {
             let right = graph.host_input("right", [rows, columns]).unwrap();
             let output = graph.add(left, right).unwrap();
             graph.set_outputs([output]).unwrap();
-            let config = LoweringConfig::new(tiles)
+            let config = PipelineConfig::new(tiles)
                 .with_input(left, format(tiles))
                 .with_input(right, format(tiles));
             let mid = lower(&graph, &config, &ToyCostModel).unwrap();
-            let low = lower_to_tiles(&mid, &LowLoweringConfig { tile_count: tiles }).unwrap();
+            let low = lower_to_tiles(&mid, &config).unwrap();
 
             assert_eq!(low.tiles.len(), usize::from(tiles), "case {case}");
             for tile in &low.tiles {
@@ -935,11 +1001,15 @@ mod tests {
             let right = graph.parameter("right", [inner, columns]).unwrap();
             let output = graph.gemm(left, right).unwrap();
             graph.set_outputs([output]).unwrap();
-            let config = LoweringConfig::new(tiles)
+            let config = PipelineConfig::new(tiles)
                 .with_input(left, format(tiles))
                 .with_input(right, format(tiles));
             let mid = lower(&graph, &config, &ToyCostModel).unwrap();
-            let low = lower_to_tiles(&mid, &LowLoweringConfig { tile_count: tiles }).unwrap();
+            let low = lower_to_tiles(&mid, &config).unwrap();
+
+            assert!(low.exchange_phases.iter().all(|phase| {
+                phase.provenance.operation.is_some() && phase.provenance.value.is_some()
+            }));
 
             for tile in &low.tiles {
                 let gemms = tile
@@ -961,6 +1031,9 @@ mod tests {
                     "case {case}"
                 );
                 for (index, run) in gemms.into_iter().enumerate() {
+                    assert_eq!(run.provenance.reason, WorkReason::OperatorKernel);
+                    assert!(run.provenance.operation.is_some());
+                    assert!(run.provenance.value.is_some());
                     let TileKernel::Planned(TileKernelSpec::Gemm { mode, .. }) = run.kernel else {
                         unreachable!()
                     };
@@ -1007,12 +1080,12 @@ mod tests {
                 })
                 .unwrap()[0];
             graph.set_outputs([result]).unwrap();
-            let mut config = LoweringConfig::new(tiles).with_input(carried, format(tiles));
+            let mut config = PipelineConfig::new(tiles).with_input(carried, format(tiles));
             for parameter in parameters {
                 config.inputs.insert(parameter, format(tiles));
             }
             let mid = lower(&graph, &config, &ToyCostModel).unwrap();
-            let low = lower_to_tiles(&mid, &LowLoweringConfig { tile_count: tiles }).unwrap();
+            let low = lower_to_tiles(&mid, &config).unwrap();
 
             for tile in &low.tiles {
                 let repeats = tile

@@ -37,8 +37,8 @@ contains its block dimensions.
 Candidates record every input and output format, per-operand alignment and
 access tails, output aliasing permissions, memory-element relations, and
 operation-specific compute precision. They can therefore describe
-mixed-precision, alternative-layout, and in-place operator implementations. The initial toy
-model compares rough arithmetic throughput with bytes moved. When a chosen
+mixed-precision, alternative-layout, and in-place operator implementations.
+The initial toy model compares rough arithmetic throughput with bytes moved. When a chosen
 operator format differs from its producer, lowering inserts `CastPrecision` and
 `Rearrange` operations explicitly. Repeated regions stay structured; their
 iterated value sequences are normalized once outside the body rather than
@@ -60,11 +60,24 @@ distinct effective memory elements. This is an inspectable scaffold for a
 measured cost model or autotuner, not a claim that those choices are globally
 optimal.
 
-`low::lower_to_tiles` turns these plans into logical per-tile work lists. It assigns
-rectangular shards to logical tiles, preserves repeats as reusable tile-local
+`low::lower_to_tiles` turns these plans into logical per-tile work lists. It
+assigns rectangular shards to logical tiles, preserves repeats as reusable tile-local
 bodies, inserts synchronized exchange phases, and emits kernel runs whose
 operand views are resident on their execution tile. Cast and rearrangement
 fallbacks remain conservative until they gain operator plans of their own.
+
+`PipelineConfig` is shared by mid lowering, low scheduling, and package
+construction. It contains the hardware target, one tile count, graph-input
+formats, the operator catalog, scheduling policy, and profiling policy.
+`PackageConfig` adds only build-environment details such as the toolchain and
+runtime source.
+
+Kernel runs, exchange phases, and structured repeats retain `WorkProvenance`:
+the originating graph operation, affected mid-level value, and the reason for
+the work. These fields are intended to flow directly into placement diagnostics
+and profile metadata. The lowering and package passes also emit structured
+`tracing` spans and summary events; applications choose whether and how to
+install a subscriber.
 
 The logical schedule deliberately has no SRAM addresses, encoded exchange
 rows, or linked kernel symbols. Package construction remains completion-only

@@ -32,8 +32,9 @@ rearrangements. Mid-to-low lowering then produces logical per-tile shard work,
 kernel runs, synchronized exchanges, and structured repeats. Package
 construction produces completion-only tile programs until SRAM placement,
 exchange encoding, and kernel-symbol selection are implemented. The config
-explicitly supplies the toolchain, static runtime source, build directory, and
-tile count.
+uses one shared `PipelineConfig` for target, tile count, input formats, operator
+catalog, scheduling, and profiling. `PackageConfig` adds the toolchain, static
+runtime source, and build directory.
 
 `TileProgram` remains the finalized lower representation. Its exchange rows,
 addresses, kernel symbols, operands, arguments, and profile destinations are

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use ipu_codegen::{ComputeGraph, PackageConfig, build_package};
+use ipu_codegen::{ComputeGraph, PackageConfig, PipelineConfig, build_package};
 use ipu_elf::Toolchain;
 use ipu_package::Application;
 use ipu_runtime::Runtime;
@@ -44,7 +44,9 @@ fn main() -> Result<()> {
             toolchain: Toolchain::from_sdk(&arguments.sdk),
             runtime_source,
             build_directory: std::env::temp_dir().join("ipu-stack-package"),
-            tile_count: arguments.tiles,
+            pipeline: PipelineConfig::new(
+                u16::try_from(arguments.tiles).context("tile count exceeds u16")?,
+            ),
         },
     )?;
     write_package(&application, &arguments.package)?;

@@ -1,8 +1,10 @@
 use crate::graph::ComputeGraph;
+use crate::low::LowProgram;
+use crate::mid::{PipelineConfig, ToyCostModel};
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HostProgram, PRNG_SEED_SYMBOL,
     PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, TileProgram, WORKER_STACK_BASE_SYMBOL,
-    WORKER_SYNC_CONTEXT_SYMBOL, emit,
+    WORKER_SYNC_CONTEXT_SYMBOL, emit, lower, lower_to_tiles,
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
@@ -41,6 +43,10 @@ pub enum PackageBuildError {
     Integer(#[from] TryFromIntError),
     #[error("invalid package build: {0}")]
     Invalid(String),
+    #[error("mid-level lowering failed: {0}")]
+    Mid(#[from] crate::LoweringError),
+    #[error("tile scheduling failed: {0}")]
+    Low(#[from] crate::LowLoweringError),
 }
 
 pub type PackageBuildResult<T> = std::result::Result<T, PackageBuildError>;
@@ -50,16 +56,28 @@ pub struct PackageConfig {
     pub toolchain: Toolchain,
     pub runtime_source: PathBuf,
     pub build_directory: PathBuf,
-    pub tile_count: u32,
+    pub pipeline: PipelineConfig,
 }
 
 /// Compiles and packages a compute graph into a directly loadable IPU21
 /// application.
+#[tracing::instrument(
+    name = "ipu_codegen.package.build",
+    skip(graph, config),
+    fields(tile_count = config.pipeline.tile_count, operations = graph.operations().len())
+)]
 pub fn build_package(
     graph: &ComputeGraph,
     config: &PackageConfig,
 ) -> PackageBuildResult<Application> {
-    validate_tile_count(config.tile_count)?;
+    validate_tile_count(u32::from(config.pipeline.tile_count))?;
+    let mid = lower(graph, &config.pipeline, &ToyCostModel)?;
+    let low = lower_to_tiles(&mid, &config.pipeline)?;
+    tracing::info!(
+        logical_shards = low.shards.len(),
+        exchange_phases = low.exchange_phases.len(),
+        "lowered graph for package construction"
+    );
     let artifact = config.toolchain.compile(
         &config.runtime_source,
         &config.build_directory,
@@ -67,18 +85,18 @@ pub fn build_package(
         &[],
     )?;
     let object = fs::read(&artifact.object)?;
-    build_package_from_object(graph, config, &object)
+    build_package_from_object(&low, config, &object)
 }
 
 fn build_package_from_object(
-    graph: &ComputeGraph,
+    program: &LowProgram,
     config: &PackageConfig,
     runtime_object: &[u8],
 ) -> PackageBuildResult<Application> {
     let layout = link_runtime(runtime_object, runtime_symbols(0, 0)?)?;
     let code_address = align_up(linked_end(&layout)?, 4)?;
     let generated = emit(
-        &lower_graph(graph),
+        &lower_graph(program),
         &BTreeMap::from([(COMPLETE_SYMBOL.into(), symbol(&layout, COMPLETE_SYMBOL)?)]),
         &HostProgram::default(),
         &CodegenOptions {
@@ -94,7 +112,7 @@ fn build_package_from_object(
     }
 
     let mut application = Application::default();
-    for physical_tile in 0..config.tile_count {
+    for physical_tile in 0..u32::from(config.pipeline.tile_count) {
         application.tiles.push(build_tile(
             physical_tile,
             runtime_object,
@@ -244,6 +262,6 @@ fn invalid(message: impl Into<String>) -> PackageBuildError {
     PackageBuildError::Invalid(message.into())
 }
 
-fn lower_graph(_graph: &ComputeGraph) -> TileProgram {
+fn lower_graph(_program: &LowProgram) -> TileProgram {
     TileProgram::default()
 }

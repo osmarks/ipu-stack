@@ -11,6 +11,7 @@ ipu-elf = { path = "../ipu-elf" }
 ipu-package = { path = "../ipu-package" }
 serde.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 fastrand.workspace = true

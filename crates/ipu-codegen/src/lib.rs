@@ -17,17 +17,18 @@ pub use graph::{
 };
 pub use low::{
     ExchangePhase, ExchangePhaseId, KernelOperand, KernelRun, LogicalExchange, LowInput,
-    LowLoweringConfig, LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId,
-    LowValue, RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, ShardDefinition,
-    ShardExtent, ShardView, TileKernel, TileWork, TileWorkList, lower_to_tiles,
+    LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId, LowValue, RepeatCarried,
+    RepeatInvariant, RepeatIterated, RepeatRun, ShardDefinition, ShardExtent, ShardView,
+    TileKernel, TileWork, TileWorkList, WorkProvenance, WorkReason, lower_to_tiles,
 };
 pub use mid::{
-    AccumulationPrecision, AmpOrder, AxisTiling, CostModel, ElementOrder, GemmKernelMode, Layout,
-    LayoutError, LoweringConfig, LoweringError, LoweringResult, MemoryClass, MemoryOperand,
+    AccumulationPrecision, AmpOrder, AxisTiling, CostModel, ElementOrder, GemmKernelMode,
+    HardwareTarget, Layout, LayoutError, LoweringError, LoweringResult, MemoryClass, MemoryOperand,
     MemoryRelation, MidGraph, MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion,
     MidRepeat, MidValue, MidValueId, OperandRequirement, OperatorCandidate, OperatorDispatch,
-    OperatorPlan, OperatorRequirements, OutputAliasing, Padding, Precision, TensorAxis,
-    TensorFormat, TensorTiling, TensorType, TileKernelSpec, ToyCostModel, lower,
+    OperatorPlan, OperatorRequirements, OutputAliasing, Padding, PipelineConfig, Precision,
+    ProfilingConfig, SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType,
+    TileKernelSpec, ToyCostModel, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
 

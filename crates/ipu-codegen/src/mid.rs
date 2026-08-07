@@ -536,20 +536,41 @@ fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoweringConfig {
+pub struct PipelineConfig {
+    pub target: HardwareTarget,
     pub tile_count: u16,
     pub inputs: BTreeMap<ValueId, TensorFormat>,
     /// Signatures available independently to each operation. Earlier entries
     /// of the appropriate operation kind win when costs are equal.
     pub operator_candidates: Vec<OperatorCandidate>,
+    pub scheduling: SchedulingPolicy,
+    pub profiling: ProfilingConfig,
 }
 
-impl LoweringConfig {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HardwareTarget {
+    Ipu21,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchedulingPolicy {
+    OperatorPlans,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProfilingConfig {
+    pub enabled: bool,
+}
+
+impl PipelineConfig {
     pub fn new(tile_count: u16) -> Self {
         Self {
+            target: HardwareTarget::Ipu21,
             tile_count,
             inputs: BTreeMap::new(),
             operator_candidates: default_operator_candidates(tile_count),
+            scheduling: SchedulingPolicy::OperatorPlans,
+            profiling: ProfilingConfig::default(),
         }
     }
 
@@ -852,9 +873,14 @@ pub enum LoweringError {
 
 pub type LoweringResult<T> = std::result::Result<T, LoweringError>;
 
+#[tracing::instrument(
+    name = "ipu_codegen.mid.lower",
+    skip(graph, config, costs),
+    fields(tile_count = config.tile_count, operations = graph.operations().len())
+)]
 pub fn lower(
     graph: &ComputeGraph,
-    config: &LoweringConfig,
+    config: &PipelineConfig,
     costs: &impl CostModel,
 ) -> LoweringResult<MidGraph> {
     if config.tile_count == 0 {
@@ -899,6 +925,12 @@ pub fn lower(
         .iter()
         .map(|operation| operation.estimated_cost)
         .sum();
+    tracing::info!(
+        values = state.values.len(),
+        operations = operations.len(),
+        estimated_cost,
+        "selected operator plans"
+    );
     Ok(MidGraph {
         inputs,
         values: state.values,
@@ -934,7 +966,7 @@ fn lower_operations(
     values: &mut BTreeMap<ValueId, MidValueId>,
     shapes: &BTreeMap<ValueId, TensorShape>,
     graph: &ComputeGraph,
-    config: &LoweringConfig,
+    config: &PipelineConfig,
     costs: &impl CostModel,
     state: &mut LoweringState,
 ) -> LoweringResult<Vec<MidOperation>> {
@@ -995,6 +1027,11 @@ fn lower_operations(
             .min_by_key(|(cost, _)| *cost)
             .ok_or(LoweringError::NoCandidate(operation.id))?
             .1;
+        tracing::debug!(
+            operation = operation.id.index(),
+            operator = ?plan.operator,
+            "selected operator candidate"
+        );
         let converted = input_ids
             .into_iter()
             .zip(&plan.requirements.inputs)
@@ -1053,7 +1090,7 @@ fn plans(
     operation: &Operation,
     inputs: &[TensorType],
     output: &TensorShape,
-    config: &LoweringConfig,
+    config: &PipelineConfig,
 ) -> Vec<Plan> {
     config
         .operator_candidates
@@ -1094,7 +1131,7 @@ fn lower_repeat(
     repeat: &Repeat,
     values: &mut BTreeMap<ValueId, MidValueId>,
     graph: &ComputeGraph,
-    config: &LoweringConfig,
+    config: &PipelineConfig,
     costs: &impl CostModel,
     state: &mut LoweringState,
     operations: &mut Vec<MidOperation>,
@@ -1493,7 +1530,7 @@ mod tests {
             let product = graph.gemm(left, right).unwrap();
             graph.set_outputs([product]).unwrap();
             let linear = Layout::row_sharded(tiles);
-            let mut config = LoweringConfig::new(tiles)
+            let mut config = PipelineConfig::new(tiles)
                 .with_input(left, format(precision(&mut random), linear.clone()))
                 .with_input(right, format(precision(&mut random), linear));
             config.operator_candidates = vec![candidate.clone()];
@@ -1555,7 +1592,7 @@ mod tests {
             let odd = graph.gemm(left, odd_right).unwrap();
             graph.set_outputs([even, odd]).unwrap();
             let input_format = format(precision(&mut random), layout);
-            let config = LoweringConfig::new(tiles)
+            let config = PipelineConfig::new(tiles)
                 .with_input(left, input_format.clone())
                 .with_input(even_right, input_format.clone())
                 .with_input(odd_right, input_format);
@@ -1662,7 +1699,7 @@ mod tests {
             } else {
                 AccumulationPrecision::F32
             };
-            let mut config = LoweringConfig::new(tiles)
+            let mut config = PipelineConfig::new(tiles)
                 .with_input(activation, random_format(&mut random, tiles))
                 .with_input(residual, random_format(&mut random, tiles))
                 .with_input(query, random_format(&mut random, tiles))
@@ -1771,7 +1808,7 @@ mod tests {
                 })
                 .unwrap()[0];
             graph.set_outputs([output]).unwrap();
-            let mut config = LoweringConfig::new(tiles).with_input(carried, carried_format.clone());
+            let mut config = PipelineConfig::new(tiles).with_input(carried, carried_format.clone());
             for weight in weights {
                 config
                     .inputs
