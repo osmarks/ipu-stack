@@ -1,9 +1,9 @@
 //! Mid-level, layout-aware representation.
 //!
 //! This is the boundary between semantic graph operations and scheduling. It
-//! records tensor shapes, storage precision, AMP memory order, interleaving,
-//! and coarse tile sharding, but deliberately does not assign tile addresses
-//! or emit exchange rows. [`lower`] tries a small set of legal kernel formats,
+//! records tensor shapes, storage precision, element order, axis tiling, and
+//! memory-class requirements, but deliberately does not assign tile addresses
+//! or emit exchange rows. [`lower`] tries a set of legal kernel signatures,
 //! prices them with a [`CostModel`], and inserts explicit precision casts and
 //! layout rearrangements at format boundaries.
 
@@ -16,7 +16,10 @@ use std::collections::BTreeMap;
 /// In-memory representation of one tensor element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Precision {
-    F8F143 { scale: i8 },
+    /// F143 values scaled by a tensor-wide power of two.
+    F8F143 {
+        scale_exponent: i8,
+    },
     F16,
     F32,
 }
@@ -37,20 +40,25 @@ pub enum AccumulationPrecision {
     F32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Sharding {
-    Replicated,
-    Rows,
-    Columns,
-    Heads,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MidKernel {
+    Gemm {
+        multiply: Precision,
+        accumulate: AccumulationPrecision,
+    },
+    Gelu,
+    Add,
+    FlashAttention {
+        accumulate: AccumulationPrecision,
+    },
 }
 
-/// AMP operand order with configurable inner and column block dimensions.
+/// AMP packing role. Block dimensions are recorded by [`AxisTiling`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AmpOrder {
-    Left { inner: u16 },
-    Right { inner: u16, columns: u16 },
-    Output { columns: u16 },
+    Left,
+    Right,
+    Output,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -60,69 +68,226 @@ pub enum ElementOrder {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Storage {
-    Contiguous,
-    /// Adjacent grains are distributed between the tile's memory banks.
-    Interleaved {
-        grain_bytes: u16,
-    },
+pub enum MemoryClass {
+    Ipu21Standard,
+    Ipu21Interleaved,
 }
 
-/// Layout decisions which constrain kernels and exchange generation.
-///
-/// `tile_count` describes a logical tile group, not final physical placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TensorAxis {
+    FromStart(u16),
+    FromEnd(u16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Padding {
+    Reject,
+    Zero,
+}
+
+/// Blocking and distribution of one logical tensor axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AxisTiling {
+    pub axis: TensorAxis,
+    /// Number of contiguous partitions distributed across the tile group.
+    pub partitions: u16,
+    /// Required physical block multiple. One imposes no blocking constraint.
+    pub block_size: u32,
+    pub padding: Padding,
+}
+
+impl AxisTiling {
+    pub const fn new(axis: TensorAxis, partitions: u16, block_size: u32, padding: Padding) -> Self {
+        Self {
+            axis,
+            partitions,
+            block_size,
+            padding,
+        }
+    }
+}
+
+/// Logical tile group and the tensor axes distributed or blocked within it.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TensorTiling {
+    pub tile_count: u16,
+    pub replicas: u16,
+    pub axes: Vec<AxisTiling>,
+}
+
+impl TensorTiling {
+    pub fn replicated(tile_count: u16) -> Self {
+        Self {
+            tile_count,
+            replicas: tile_count,
+            axes: Vec::new(),
+        }
+    }
+
+    pub fn sharded(axis: TensorAxis, tile_count: u16) -> Self {
+        Self {
+            tile_count,
+            replicas: 1,
+            axes: vec![AxisTiling::new(axis, tile_count, 1, Padding::Reject)],
+        }
+    }
+}
+
+/// Layout decisions which constrain kernels and exchange generation without
+/// assigning physical tile identities or SRAM addresses.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Layout {
     pub order: ElementOrder,
-    pub sharding: Sharding,
-    pub tile_count: u16,
-    pub storage: Storage,
-    pub alignment: u16,
+    pub tiling: TensorTiling,
+    pub memory_class: MemoryClass,
 }
 
 impl Layout {
-    pub const fn row_major(sharding: Sharding, tile_count: u16) -> Self {
+    pub fn row_major(tiling: TensorTiling) -> Self {
         Self {
             order: ElementOrder::RowMajor,
-            sharding,
-            tile_count,
-            storage: Storage::Contiguous,
-            alignment: 8,
+            tiling,
+            memory_class: MemoryClass::Ipu21Standard,
         }
     }
 
-    pub const fn amp_left(inner: u16, tile_count: u16) -> Self {
+    pub fn row_sharded(tile_count: u16) -> Self {
+        Self::row_major(TensorTiling::sharded(TensorAxis::FromEnd(2), tile_count))
+    }
+
+    pub fn head_sharded(tile_count: u16) -> Self {
+        Self::row_major(TensorTiling::sharded(TensorAxis::FromEnd(3), tile_count))
+    }
+
+    pub fn amp_left(inner: u16, tile_count: u16) -> Self {
         Self {
-            order: ElementOrder::Amp(AmpOrder::Left { inner }),
-            sharding: Sharding::Rows,
-            tile_count,
-            storage: Storage::Contiguous,
-            alignment: 8,
+            order: ElementOrder::Amp(AmpOrder::Left),
+            tiling: TensorTiling {
+                tile_count,
+                replicas: 1,
+                axes: vec![
+                    AxisTiling::new(TensorAxis::FromEnd(2), tile_count, 1, Padding::Reject),
+                    AxisTiling::new(TensorAxis::FromEnd(1), 1, u32::from(inner), Padding::Zero),
+                ],
+            },
+            memory_class: MemoryClass::Ipu21Standard,
         }
     }
 
-    pub const fn amp_right(inner: u16, tile_count: u16) -> Self {
+    pub fn amp_right(inner: u16, tile_count: u16) -> Self {
         Self {
-            order: ElementOrder::Amp(AmpOrder::Right { inner, columns: 16 }),
-            sharding: Sharding::Columns,
-            tile_count,
-            storage: Storage::Interleaved { grain_bytes: 8 },
-            alignment: 8,
+            order: ElementOrder::Amp(AmpOrder::Right),
+            tiling: TensorTiling {
+                tile_count,
+                replicas: 1,
+                axes: vec![
+                    AxisTiling::new(TensorAxis::FromEnd(2), 1, u32::from(inner), Padding::Zero),
+                    AxisTiling::new(TensorAxis::FromEnd(1), tile_count, 16, Padding::Zero),
+                ],
+            },
+            memory_class: MemoryClass::Ipu21Standard,
         }
     }
 
-    pub const fn amp_output(tile_count: u16) -> Self {
+    pub fn amp_output(tile_count: u16) -> Self {
         Self {
-            order: ElementOrder::Amp(AmpOrder::Output { columns: 16 }),
-            sharding: Sharding::Rows,
-            tile_count,
-            storage: Storage::Contiguous,
-            alignment: 8,
+            order: ElementOrder::Amp(AmpOrder::Output),
+            tiling: TensorTiling {
+                tile_count,
+                replicas: 1,
+                axes: vec![
+                    AxisTiling::new(TensorAxis::FromEnd(2), tile_count, 1, Padding::Reject),
+                    AxisTiling::new(TensorAxis::FromEnd(1), 1, 16, Padding::Zero),
+                ],
+            },
+            memory_class: MemoryClass::Ipu21Interleaved,
         }
+    }
+
+    /// Returns the physical extents after applying declared zero padding.
+    pub fn padded_shape(&self, shape: &TensorShape) -> Result<TensorShape, LayoutError> {
+        if self.tiling.tile_count == 0 || self.tiling.replicas == 0 {
+            return Err(LayoutError::EmptyTileGroup);
+        }
+        let mut used_tiles = u32::from(self.tiling.replicas);
+        let mut dimensions = shape.0.clone();
+        let mut used_axes = Vec::with_capacity(self.tiling.axes.len());
+        for tiling in &self.tiling.axes {
+            if tiling.partitions == 0 || tiling.block_size == 0 {
+                return Err(LayoutError::EmptyAxisTiling);
+            }
+            used_tiles = used_tiles
+                .checked_mul(u32::from(tiling.partitions))
+                .ok_or(LayoutError::TileCountOverflow)?;
+            let axis = resolve_axis(tiling.axis, dimensions.len())?;
+            if used_axes.contains(&axis) {
+                return Err(LayoutError::DuplicateAxis(axis));
+            }
+            used_axes.push(axis);
+            let extent = dimensions[axis];
+            let remainder = extent % tiling.block_size;
+            if remainder != 0 {
+                match tiling.padding {
+                    Padding::Reject => {
+                        return Err(LayoutError::IndivisibleAxis {
+                            axis,
+                            extent,
+                            block_size: tiling.block_size,
+                        });
+                    }
+                    Padding::Zero => {
+                        dimensions[axis] = extent
+                            .checked_add(tiling.block_size - remainder)
+                            .ok_or(LayoutError::ExtentOverflow(axis))?;
+                    }
+                }
+            }
+        }
+        if used_tiles != u32::from(self.tiling.tile_count) {
+            return Err(LayoutError::TileCountMismatch {
+                declared: self.tiling.tile_count,
+                implied: used_tiles,
+            });
+        }
+        Ok(TensorShape(dimensions))
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+fn resolve_axis(axis: TensorAxis, rank: usize) -> Result<usize, LayoutError> {
+    match axis {
+        TensorAxis::FromStart(axis) if usize::from(axis) < rank => Ok(usize::from(axis)),
+        TensorAxis::FromEnd(axis) if axis != 0 && usize::from(axis) <= rank => {
+            Ok(rank - usize::from(axis))
+        }
+        _ => Err(LayoutError::AxisOutOfRange { axis, rank }),
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum LayoutError {
+    #[error("layout has an empty tile group")]
+    EmptyTileGroup,
+    #[error("axis tiling must have nonzero partitions and block size")]
+    EmptyAxisTiling,
+    #[error("tile count calculation overflowed")]
+    TileCountOverflow,
+    #[error("axis {axis:?} is outside rank {rank}")]
+    AxisOutOfRange { axis: TensorAxis, rank: usize },
+    #[error("axis {0} is tiled more than once")]
+    DuplicateAxis(usize),
+    #[error("axis {axis} extent {extent} is not divisible by block size {block_size}")]
+    IndivisibleAxis {
+        axis: usize,
+        extent: u32,
+        block_size: u32,
+    },
+    #[error("padded extent for axis {0} overflowed")]
+    ExtentOverflow(usize),
+    #[error("layout declares {declared} tiles but its tiling implies {implied}")]
+    TileCountMismatch { declared: u16, implied: u32 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TensorFormat {
     pub precision: Precision,
     pub layout: Layout,
@@ -143,118 +308,154 @@ impl TensorType {
     }
 }
 
-/// Information supplied for semantic graph inputs and parameters.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GemmCandidate {
-    pub left: TensorFormat,
-    pub right: TensorFormat,
-    pub output: TensorFormat,
-    pub multiply: Precision,
-    pub accumulate: AccumulationPrecision,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperandRequirement {
+    pub format: TensorFormat,
+    pub alignment: u32,
+    /// Bytes the kernel may access beyond the logical tensor payload.
+    pub access_tail_bytes: u32,
 }
 
-impl GemmCandidate {
-    pub const fn new(
-        left: TensorFormat,
-        right: TensorFormat,
-        output: TensorFormat,
-        multiply: Precision,
-        accumulate: AccumulationPrecision,
-    ) -> Self {
+impl OperandRequirement {
+    pub fn new(format: TensorFormat, alignment: u32) -> Self {
         Self {
-            left,
-            right,
-            output,
-            multiply,
-            accumulate,
+            format,
+            alignment,
+            access_tail_bytes: 0,
         }
     }
 
-    pub const fn amp_f16(tile_count: u16) -> Self {
-        Self::new(
-            TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::amp_left(16, tile_count),
-            },
-            TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::amp_right(16, tile_count),
-            },
-            TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::amp_output(tile_count),
-            },
-            Precision::F16,
-            AccumulationPrecision::F32,
-        )
-    }
-
-    pub const fn amp_f32(tile_count: u16) -> Self {
-        Self::new(
-            TensorFormat {
-                precision: Precision::F32,
-                layout: Layout::amp_left(8, tile_count),
-            },
-            TensorFormat {
-                precision: Precision::F32,
-                layout: Layout::amp_right(8, tile_count),
-            },
-            TensorFormat {
-                precision: Precision::F32,
-                layout: Layout::amp_output(tile_count),
-            },
-            Precision::F32,
-            AccumulationPrecision::F32,
-        )
+    pub fn with_access_tail(mut self, bytes: u32) -> Self {
+        self.access_tail_bytes = bytes;
+        self
     }
 }
 
-/// Complete format signature of one available kernel implementation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KernelCandidate {
-    Gemm(GemmCandidate),
-    Gelu {
-        input: TensorFormat,
-        output: TensorFormat,
-    },
-    Add {
-        left: TensorFormat,
-        right: TensorFormat,
-        output: TensorFormat,
-    },
-    FlashAttention {
-        query: TensorFormat,
-        key: TensorFormat,
-        value: TensorFormat,
-        output: TensorFormat,
-        accumulate: AccumulationPrecision,
-    },
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputAliasing {
+    Fresh,
+    MayAliasInputs(Vec<u16>),
+    MustAliasInput(u16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MemoryOperand {
+    Output,
+    Input(u16),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoryRelation {
+    /// Operand ranges must not occupy the same effective tile-memory element.
+    DistinctElements(Vec<MemoryOperand>),
+}
+
+/// Complete signature and placement requirements of one kernel implementation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelCandidate {
+    pub kernel: MidKernel,
+    pub inputs: Vec<OperandRequirement>,
+    pub output: OperandRequirement,
+    pub output_aliasing: OutputAliasing,
+    pub memory_relations: Vec<MemoryRelation>,
 }
 
 impl KernelCandidate {
-    pub const fn gelu(format: TensorFormat) -> Self {
-        Self::Gelu {
-            input: format,
-            output: format,
+    pub fn new(
+        kernel: MidKernel,
+        inputs: impl IntoIterator<Item = OperandRequirement>,
+        output: OperandRequirement,
+    ) -> Self {
+        Self {
+            kernel,
+            inputs: inputs.into_iter().collect(),
+            output,
+            output_aliasing: OutputAliasing::Fresh,
+            memory_relations: Vec::new(),
         }
     }
 
-    pub const fn add(format: TensorFormat) -> Self {
-        Self::Add {
-            left: format,
-            right: format,
-            output: format,
-        }
+    pub fn with_output_aliasing(mut self, aliasing: OutputAliasing) -> Self {
+        self.output_aliasing = aliasing;
+        self
     }
 
-    pub const fn flash_attention(format: TensorFormat, accumulate: AccumulationPrecision) -> Self {
-        Self::FlashAttention {
-            query: format,
-            key: format,
-            value: format,
-            output: format,
-            accumulate,
+    pub fn with_memory_relation(mut self, relation: MemoryRelation) -> Self {
+        self.memory_relations.push(relation);
+        self
+    }
+
+    fn supports(&self, inputs: &[TensorType], output: &TensorShape) -> bool {
+        if self.inputs.len() != inputs.len()
+            || !valid_requirement(&self.output, output)
+            || !self
+                .inputs
+                .iter()
+                .zip(inputs)
+                .all(|(requirement, input)| valid_requirement(requirement, &input.shape))
+        {
+            return false;
         }
+        let alias_valid = match &self.output_aliasing {
+            OutputAliasing::Fresh => true,
+            OutputAliasing::MayAliasInputs(indices) => {
+                !indices.is_empty()
+                    && indices.iter().all(|index| {
+                        alias_compatible(
+                            usize::from(*index),
+                            &self.inputs,
+                            inputs,
+                            &self.output,
+                            output,
+                        )
+                    })
+            }
+            OutputAliasing::MustAliasInput(index) => alias_compatible(
+                usize::from(*index),
+                &self.inputs,
+                inputs,
+                &self.output,
+                output,
+            ),
+        };
+        alias_valid
+            && self.memory_relations.iter().all(|relation| match relation {
+                MemoryRelation::DistinctElements(operands) => {
+                    operands.len() >= 2
+                        && operands
+                            .iter()
+                            .all(|operand| valid_memory_operand(*operand, inputs.len()))
+                        && operands.iter().enumerate().all(|(index, operand)| {
+                            !operands[..index].iter().any(|previous| previous == operand)
+                        })
+                }
+            })
+    }
+}
+
+fn alias_compatible(
+    index: usize,
+    requirements: &[OperandRequirement],
+    inputs: &[TensorType],
+    output_requirement: &OperandRequirement,
+    output_shape: &TensorShape,
+) -> bool {
+    requirements
+        .get(index)
+        .zip(inputs.get(index))
+        .is_some_and(|(requirement, input)| {
+            input.shape == *output_shape && requirement.format == output_requirement.format
+        })
+}
+
+fn valid_requirement(requirement: &OperandRequirement, shape: &TensorShape) -> bool {
+    requirement.alignment.is_power_of_two() && requirement.format.layout.padded_shape(shape).is_ok()
+}
+
+fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -> bool {
+    match operand {
+        MemoryOperand::Output => true,
+        MemoryOperand::Input(index) => usize::from(index) < input_count,
     }
 }
 
@@ -285,30 +486,106 @@ impl LoweringConfig {
 fn default_kernel_candidates(tile_count: u16) -> Vec<KernelCandidate> {
     let rows_f16 = TensorFormat {
         precision: Precision::F16,
-        layout: Layout::row_major(Sharding::Rows, tile_count),
+        layout: Layout::row_sharded(tile_count),
     };
     let rows_f32 = TensorFormat {
         precision: Precision::F32,
-        layout: Layout::row_major(Sharding::Rows, tile_count),
+        layout: Layout::row_sharded(tile_count),
     };
     let heads_f16 = TensorFormat {
         precision: Precision::F16,
-        layout: Layout::row_major(Sharding::Heads, tile_count),
+        layout: Layout::head_sharded(tile_count),
     };
     let heads_f32 = TensorFormat {
         precision: Precision::F32,
-        layout: Layout::row_major(Sharding::Heads, tile_count),
+        layout: Layout::head_sharded(tile_count),
     };
     vec![
-        KernelCandidate::Gemm(GemmCandidate::amp_f16(tile_count)),
-        KernelCandidate::Gemm(GemmCandidate::amp_f32(tile_count)),
-        KernelCandidate::gelu(rows_f16),
-        KernelCandidate::gelu(rows_f32),
-        KernelCandidate::add(rows_f16),
-        KernelCandidate::add(rows_f32),
-        KernelCandidate::flash_attention(heads_f16, AccumulationPrecision::F32),
-        KernelCandidate::flash_attention(heads_f32, AccumulationPrecision::F32),
+        amp_gemm_candidate(Precision::F16, 16, 16, tile_count),
+        amp_gemm_candidate(Precision::F32, 8, 32, tile_count),
+        pointwise_candidate(MidKernel::Gelu, [rows_f16.clone()], rows_f16.clone()),
+        pointwise_candidate(MidKernel::Gelu, [rows_f32.clone()], rows_f32.clone()),
+        pointwise_candidate(
+            MidKernel::Add,
+            [rows_f16.clone(), rows_f16.clone()],
+            rows_f16,
+        ),
+        pointwise_candidate(
+            MidKernel::Add,
+            [rows_f32.clone(), rows_f32.clone()],
+            rows_f32,
+        ),
+        pointwise_candidate(
+            MidKernel::FlashAttention {
+                accumulate: AccumulationPrecision::F32,
+            },
+            [heads_f16.clone(), heads_f16.clone(), heads_f16.clone()],
+            heads_f16,
+        ),
+        pointwise_candidate(
+            MidKernel::FlashAttention {
+                accumulate: AccumulationPrecision::F32,
+            },
+            [heads_f32.clone(), heads_f32.clone(), heads_f32.clone()],
+            heads_f32,
+        ),
     ]
+}
+
+fn pointwise_candidate(
+    kernel: MidKernel,
+    inputs: impl IntoIterator<Item = TensorFormat>,
+    output: TensorFormat,
+) -> KernelCandidate {
+    KernelCandidate::new(
+        kernel,
+        inputs
+            .into_iter()
+            .map(|format| OperandRequirement::new(format, 8)),
+        OperandRequirement::new(output, 8),
+    )
+}
+
+fn amp_gemm_candidate(
+    precision: Precision,
+    inner: u16,
+    left_tail: u32,
+    tile_count: u16,
+) -> KernelCandidate {
+    KernelCandidate::new(
+        MidKernel::Gemm {
+            multiply: precision,
+            accumulate: AccumulationPrecision::F32,
+        },
+        [
+            OperandRequirement::new(
+                TensorFormat {
+                    precision,
+                    layout: Layout::amp_left(inner, tile_count),
+                },
+                32,
+            )
+            .with_access_tail(left_tail),
+            OperandRequirement::new(
+                TensorFormat {
+                    precision,
+                    layout: Layout::amp_right(inner, tile_count),
+                },
+                32,
+            ),
+        ],
+        OperandRequirement::new(
+            TensorFormat {
+                precision,
+                layout: Layout::amp_output(tile_count),
+            },
+            32,
+        ),
+    )
+    .with_memory_relation(MemoryRelation::DistinctElements(vec![
+        MemoryOperand::Output,
+        MemoryOperand::Input(0),
+    ]))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -329,19 +606,6 @@ pub struct MidValue {
     pub origin: ValueId,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MidKernel {
-    Gemm {
-        multiply: Precision,
-        accumulate: AccumulationPrecision,
-    },
-    Gelu,
-    Add,
-    FlashAttention {
-        accumulate: AccumulationPrecision,
-    },
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidOperationKind {
     Kernel(MidKernel),
@@ -356,7 +620,16 @@ pub struct MidOperation {
     pub inputs: Vec<MidValueId>,
     pub results: Vec<MidValueId>,
     pub kind: MidOperationKind,
+    pub kernel_requirements: Option<KernelRequirements>,
     pub estimated_cost: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelRequirements {
+    pub inputs: Vec<OperandRequirement>,
+    pub output: OperandRequirement,
+    pub output_aliasing: OutputAliasing,
+    pub memory_relations: Vec<MemoryRelation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -403,8 +676,8 @@ pub trait CostModel {
         &self,
         shape: &TensorShape,
         precision: Precision,
-        from: Layout,
-        to: Layout,
+        from: &Layout,
+        to: &Layout,
     ) -> u64;
 }
 
@@ -416,10 +689,15 @@ pub struct ToyCostModel;
 
 impl CostModel for ToyCostModel {
     fn kernel_cost(&self, kernel: MidKernel, inputs: &[TensorType], output: &TensorType) -> u64 {
-        let elements = output.shape.elements();
+        let elements = physical_elements(&output.shape, &output.format.layout);
         match kernel {
             MidKernel::Gemm { multiply, .. } => {
-                let k = inputs[0].shape.0.last().copied().unwrap_or(1) as u64;
+                let left_shape = inputs[0]
+                    .format
+                    .layout
+                    .padded_shape(&inputs[0].shape)
+                    .unwrap_or_else(|_| inputs[0].shape.clone());
+                let k = left_shape.0.last().copied().unwrap_or(1) as u64;
                 let throughput = match multiply {
                     Precision::F8F143 { .. } => 128,
                     Precision::F16 => 64,
@@ -449,17 +727,20 @@ impl CostModel for ToyCostModel {
         &self,
         shape: &TensorShape,
         precision: Precision,
-        from: Layout,
-        to: Layout,
+        from: &Layout,
+        to: &Layout,
     ) -> u64 {
-        let bytes = shape
-            .elements()
-            .saturating_mul(precision.bytes())
-            .saturating_mul(2);
-        let exchange_penalty =
-            u64::from(from.sharding != to.sharding || from.tile_count != to.tile_count) + 1;
+        let elements = physical_elements(shape, from).max(physical_elements(shape, to));
+        let bytes = elements.saturating_mul(precision.bytes()).saturating_mul(2);
+        let exchange_penalty = u64::from(from.tiling != to.tiling) + 1;
         bytes.saturating_mul(exchange_penalty).div_ceil(16)
     }
+}
+
+fn physical_elements(shape: &TensorShape, layout: &Layout) -> u64 {
+    layout
+        .padded_shape(shape)
+        .map_or_else(|_| shape.elements(), |shape| shape.elements())
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -493,7 +774,7 @@ pub fn lower(
         let format = config
             .inputs
             .get(&input.value)
-            .copied()
+            .cloned()
             .ok_or(LoweringError::MissingInputType(input.value))?;
         let tensor_type = TensorType {
             shape: input.shape.clone(),
@@ -599,19 +880,19 @@ fn lower_operations(
             .map(|(order, plan)| {
                 let conversion = input_types
                     .iter()
-                    .zip(&plan.inputs)
-                    .map(|(from, to)| conversion_cost(from, *to, costs))
+                    .zip(&plan.requirements.inputs)
+                    .map(|(from, to)| conversion_cost(from, &to.format, costs))
                     .sum::<u64>();
                 let output = TensorType {
                     shape: output_shape.clone(),
-                    format: plan.output,
+                    format: plan.requirements.output.format.clone(),
                 };
                 let planned_inputs = input_types
                     .iter()
-                    .zip(&plan.inputs)
-                    .map(|(input, format)| TensorType {
+                    .zip(&plan.requirements.inputs)
+                    .map(|(input, requirement)| TensorType {
                         shape: input.shape.clone(),
-                        format: *format,
+                        format: requirement.format.clone(),
                     })
                     .collect::<Vec<_>>();
                 let cost = conversion + costs.kernel_cost(plan.kernel, &planned_inputs, &output);
@@ -622,16 +903,23 @@ fn lower_operations(
             .1;
         let converted = input_ids
             .into_iter()
-            .zip(plan.inputs)
-            .map(|(value, format)| {
-                ensure_format(value, format, operation.id, costs, state, &mut operations)
+            .zip(&plan.requirements.inputs)
+            .map(|(value, requirement)| {
+                ensure_format(
+                    value,
+                    requirement.format.clone(),
+                    operation.id,
+                    costs,
+                    state,
+                    &mut operations,
+                )
             })
             .collect::<Vec<_>>();
         let result = state.value(
             operation.results[0],
             TensorType {
                 shape: output_shape,
-                format: plan.output,
+                format: plan.requirements.output.format.clone(),
             },
         );
         let converted_types = converted
@@ -648,6 +936,7 @@ fn lower_operations(
             inputs: converted,
             results: vec![result],
             kind: MidOperationKind::Kernel(plan.kernel),
+            kernel_requirements: Some(plan.requirements),
             estimated_cost: kernel_cost,
         });
         values.insert(operation.results[0], result);
@@ -658,80 +947,44 @@ fn lower_operations(
 #[derive(Clone)]
 struct Plan {
     kernel: MidKernel,
-    inputs: Vec<TensorFormat>,
-    output: TensorFormat,
+    requirements: KernelRequirements,
 }
 
 fn plans(
     operation: &Operation,
-    _inputs: &[TensorType],
-    _output: &TensorShape,
+    inputs: &[TensorType],
+    output: &TensorShape,
     config: &LoweringConfig,
 ) -> Vec<Plan> {
-    match operation.kind {
-        OperationKind::Gemm => config
-            .kernel_candidates
-            .iter()
-            .filter_map(|candidate| match candidate {
-                KernelCandidate::Gemm(candidate) => Some(Plan {
-                    kernel: MidKernel::Gemm {
-                        multiply: candidate.multiply,
-                        accumulate: candidate.accumulate,
-                    },
-                    inputs: vec![candidate.left, candidate.right],
-                    output: candidate.output,
-                }),
-                _ => None,
-            })
-            .collect(),
-        OperationKind::Gelu => config
-            .kernel_candidates
-            .iter()
-            .filter_map(|candidate| match *candidate {
-                KernelCandidate::Gelu { input, output } => Some(Plan {
-                    kernel: MidKernel::Gelu,
-                    inputs: vec![input],
-                    output,
-                }),
-                _ => None,
-            })
-            .collect(),
-        OperationKind::Add => config
-            .kernel_candidates
-            .iter()
-            .filter_map(|candidate| match *candidate {
-                KernelCandidate::Add {
-                    left,
-                    right,
-                    output,
-                } => Some(Plan {
-                    kernel: MidKernel::Add,
-                    inputs: vec![left, right],
-                    output,
-                }),
-                _ => None,
-            })
-            .collect(),
-        OperationKind::FlashAttention => config
-            .kernel_candidates
-            .iter()
-            .filter_map(|candidate| match *candidate {
-                KernelCandidate::FlashAttention {
-                    query,
-                    key,
-                    value,
-                    output,
-                    accumulate,
-                } => Some(Plan {
-                    kernel: MidKernel::FlashAttention { accumulate },
-                    inputs: vec![query, key, value],
-                    output,
-                }),
-                _ => None,
-            })
-            .collect(),
-        OperationKind::Repeat(_) => unreachable!("repeat is lowered separately"),
-    }
+    config
+        .kernel_candidates
+        .iter()
+        .filter(|candidate| {
+            kernel_matches(&operation.kind, candidate.kernel) && candidate.supports(inputs, output)
+        })
+        .map(|candidate| Plan {
+            kernel: candidate.kernel,
+            requirements: KernelRequirements {
+                inputs: candidate.inputs.clone(),
+                output: candidate.output.clone(),
+                output_aliasing: candidate.output_aliasing.clone(),
+                memory_relations: candidate.memory_relations.clone(),
+            },
+        })
+        .collect()
+}
+
+fn kernel_matches(operation: &OperationKind, kernel: MidKernel) -> bool {
+    matches!(
+        (operation, kernel),
+        (OperationKind::Gemm, MidKernel::Gemm { .. })
+            | (OperationKind::Gelu, MidKernel::Gelu)
+            | (OperationKind::Add, MidKernel::Add)
+            | (
+                OperationKind::FlashAttention,
+                MidKernel::FlashAttention { .. }
+            )
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -768,7 +1021,7 @@ fn lower_repeat(
             .map(|value| {
                 ensure_format(
                     value,
-                    first_type.format,
+                    first_type.format.clone(),
                     operation.id,
                     costs,
                     state,
@@ -798,7 +1051,7 @@ fn lower_repeat(
     let mut yields = Vec::new();
     for (index, high_yield) in repeat.body.yields.iter().enumerate() {
         let value = lookup(&body_values, *high_yield)?;
-        let target = state.get(inputs[index]).tensor_type.format;
+        let target = state.get(inputs[index]).tensor_type.format.clone();
         yields.push(ensure_format(
             value,
             target,
@@ -834,6 +1087,7 @@ fn lower_repeat(
                 estimated_cost: body_cost,
             },
         }),
+        kernel_requirements: None,
         estimated_cost: body_cost.saturating_mul(u64::from(repeat.count)),
     });
     Ok(())
@@ -861,6 +1115,7 @@ fn ensure_format(
                 from,
                 to: target.precision,
             },
+            kernel_requirements: None,
             estimated_cost: costs.cast_cost(&tensor_type.shape, from, target.precision),
         });
         value = result;
@@ -868,22 +1123,23 @@ fn ensure_format(
     let current = state.get(value).clone();
     if current.tensor_type.format.layout != target.layout {
         let mut tensor_type = current.tensor_type.clone();
-        let from = tensor_type.format.layout;
-        tensor_type.format.layout = target.layout;
+        let from = tensor_type.format.layout.clone();
+        tensor_type.format.layout = target.layout.clone();
         let result = state.value(current.origin, tensor_type.clone());
         operations.push(MidOperation {
             source: Some(source),
             inputs: vec![value],
             results: vec![result],
             kind: MidOperationKind::Rearrange {
-                from,
-                to: target.layout,
+                from: from.clone(),
+                to: target.layout.clone(),
             },
+            kernel_requirements: None,
             estimated_cost: costs.rearrange_cost(
                 &tensor_type.shape,
                 tensor_type.format.precision,
-                from,
-                target.layout,
+                &from,
+                &target.layout,
             ),
         });
         value = result;
@@ -891,14 +1147,14 @@ fn ensure_format(
     value
 }
 
-fn conversion_cost(from: &TensorType, to: TensorFormat, costs: &impl CostModel) -> u64 {
+fn conversion_cost(from: &TensorType, to: &TensorFormat, costs: &impl CostModel) -> u64 {
     let cast = if from.format.precision != to.precision {
         costs.cast_cost(&from.shape, from.format.precision, to.precision)
     } else {
         0
     };
     let rearrange = if from.format.layout != to.layout {
-        costs.rearrange_cost(&from.shape, to.precision, from.format.layout, to.layout)
+        costs.rearrange_cost(&from.shape, to.precision, &from.format.layout, &to.layout)
     } else {
         0
     };
@@ -935,17 +1191,14 @@ mod tests {
     }
 
     fn random_format(random: &mut fastrand::Rng, tiles: u16) -> TensorFormat {
-        let sharding = match random.u8(0..4) {
-            0 => Sharding::Replicated,
-            1 => Sharding::Rows,
-            2 => Sharding::Columns,
-            _ => Sharding::Heads,
+        let tiling = if random.bool() {
+            TensorTiling::replicated(tiles)
+        } else {
+            TensorTiling::sharded(TensorAxis::FromEnd(2), tiles)
         };
-        let mut layout = Layout::row_major(sharding, tiles);
+        let mut layout = Layout::row_major(tiling);
         if random.bool() {
-            layout.storage = Storage::Interleaved {
-                grain_bytes: [4, 8, 16][random.usize(0..3)],
-            };
+            layout.memory_class = MemoryClass::Ipu21Interleaved;
         }
         format(precision(random), layout)
     }
@@ -964,16 +1217,16 @@ mod tests {
             };
             let before = &value(lowered, *input).tensor_type;
             let after = &value(lowered, *result).tensor_type;
-            match operation.kind {
+            match &operation.kind {
                 MidOperationKind::CastPrecision { from, to } => {
-                    assert_eq!(from, before.format.precision);
-                    assert_eq!(to, after.format.precision);
+                    assert_eq!(*from, before.format.precision);
+                    assert_eq!(*to, after.format.precision);
                     assert_eq!(before.shape, after.shape);
                     assert_eq!(before.format.layout, after.format.layout);
                 }
                 MidOperationKind::Rearrange { from, to } => {
-                    assert_eq!(from, before.format.layout);
-                    assert_eq!(to, after.format.layout);
+                    assert_eq!(from, &before.format.layout);
+                    assert_eq!(to, &after.format.layout);
                     assert_eq!(before.shape, after.shape);
                     assert_eq!(before.format.precision, after.format.precision);
                 }
@@ -989,8 +1242,8 @@ mod tests {
         output: TensorFormat,
     ) {
         assert_eq!(operation.inputs.len(), inputs.len());
-        for (&value_id, &expected) in operation.inputs.iter().zip(inputs) {
-            assert_eq!(value(lowered, value_id).tensor_type.format, expected);
+        for (&value_id, expected) in operation.inputs.iter().zip(inputs) {
+            assert_eq!(&value(lowered, value_id).tensor_type.format, expected);
         }
         assert_eq!(
             value(lowered, operation.results[0]).tensor_type.format,
@@ -1027,10 +1280,59 @@ mod tests {
             &self,
             _shape: &TensorShape,
             _precision: Precision,
-            _from: Layout,
-            _to: Layout,
+            _from: &Layout,
+            _to: &Layout,
         ) -> u64 {
             0
+        }
+    }
+
+    #[test]
+    fn randomized_axis_tiling_applies_or_rejects_padding() {
+        let mut random = fastrand::Rng::with_seed(0x7469_6c65);
+        for case in 0..RANDOM_CASES {
+            let rank = random.usize(1..=6);
+            let axis = random.usize(0..rank);
+            let extent = dimension(&mut random);
+            let block_size = random.u32(1..=32);
+            let partitions = random.u16(1..=16);
+            let replicas = random.u16(1..=4);
+            let padding = if random.bool() {
+                Padding::Reject
+            } else {
+                Padding::Zero
+            };
+            let mut shape = (0..rank)
+                .map(|_| dimension(&mut random))
+                .collect::<Vec<_>>();
+            shape[axis] = extent;
+            let layout = Layout::row_major(TensorTiling {
+                tile_count: partitions * replicas,
+                replicas,
+                axes: vec![AxisTiling::new(
+                    TensorAxis::FromStart(axis as u16),
+                    partitions,
+                    block_size,
+                    padding,
+                )],
+            });
+
+            let result = layout.padded_shape(&TensorShape(shape.clone()));
+            if padding == Padding::Reject && !extent.is_multiple_of(block_size) {
+                assert!(
+                    matches!(result, Err(LayoutError::IndivisibleAxis { .. })),
+                    "random case {case}"
+                );
+            } else {
+                let padded = result.unwrap();
+                let expected = extent.div_ceil(block_size) * block_size;
+                assert_eq!(padded.0[axis], expected, "random case {case}");
+                for (other, original) in shape.iter().enumerate() {
+                    if other != axis {
+                        assert_eq!(padded.0[other], *original, "random case {case}");
+                    }
+                }
+            }
         }
     }
 
@@ -1057,22 +1359,27 @@ mod tests {
                     precision(&mut random)
                 } else {
                     Precision::F8F143 {
-                        scale: random.i8(-16..=16),
+                        scale_exponent: random.i8(-16..=16),
                     }
                 },
                 Layout::amp_right([8, 16, 32][random.usize(0..3)], tiles),
             );
             let output_format = format(precision(&mut random), Layout::amp_output(tiles));
-            let candidate = GemmCandidate::new(
-                left_format,
-                right_format,
-                output_format,
-                multiply,
-                if random.bool() {
-                    AccumulationPrecision::F16
-                } else {
-                    AccumulationPrecision::F32
+            let accumulate = if random.bool() {
+                AccumulationPrecision::F16
+            } else {
+                AccumulationPrecision::F32
+            };
+            let candidate = KernelCandidate::new(
+                MidKernel::Gemm {
+                    multiply,
+                    accumulate,
                 },
+                [
+                    OperandRequirement::new(left_format.clone(), 32),
+                    OperandRequirement::new(right_format.clone(), 32),
+                ],
+                OperandRequirement::new(output_format.clone(), 32),
             );
             let mut left_shape = batches.clone();
             left_shape.extend([rows, inner]);
@@ -1084,11 +1391,11 @@ mod tests {
             let right = graph.parameter("right", right_shape).unwrap();
             let product = graph.gemm(left, right).unwrap();
             graph.set_outputs([product]).unwrap();
-            let linear = Layout::row_major(Sharding::Rows, tiles);
+            let linear = Layout::row_sharded(tiles);
             let mut config = LoweringConfig::new(tiles)
-                .with_input(left, format(precision(&mut random), linear))
+                .with_input(left, format(precision(&mut random), linear.clone()))
                 .with_input(right, format(precision(&mut random), linear));
-            config.kernel_candidates = vec![KernelCandidate::Gemm(candidate)];
+            config.kernel_candidates = vec![candidate.clone()];
 
             let lowered = lower(&graph, &config, &ToyCostModel).unwrap();
             let kernel = lowered
@@ -1097,22 +1404,22 @@ mod tests {
                 .find(|operation| matches!(operation.kind, MidOperationKind::Kernel(_)))
                 .unwrap();
             let MidOperationKind::Kernel(MidKernel::Gemm {
-                multiply,
-                accumulate,
+                multiply: selected_multiply,
+                accumulate: selected_accumulate,
             }) = kernel.kind
             else {
                 panic!("random case {case}: expected GEMM");
             };
-            assert_eq!(multiply, candidate.multiply, "random case {case}");
-            assert_eq!(accumulate, candidate.accumulate, "random case {case}");
+            assert_eq!(selected_multiply, multiply, "random case {case}");
+            assert_eq!(selected_accumulate, accumulate, "random case {case}");
             assert_eq!(
-                value(&lowered, kernel.inputs[0]).tensor_type.format,
-                candidate.left,
+                &value(&lowered, kernel.inputs[0]).tensor_type.format,
+                &candidate.inputs[0].format,
                 "random case {case}"
             );
             assert_eq!(
-                value(&lowered, kernel.inputs[1]).tensor_type.format,
-                candidate.right,
+                &value(&lowered, kernel.inputs[1]).tensor_type.format,
+                &candidate.inputs[1].format,
                 "random case {case}"
             );
             let output = value(&lowered, lowered.outputs[0]);
@@ -1122,7 +1429,7 @@ mod tests {
                 "random case {case}"
             );
             assert_eq!(
-                output.tensor_type.format, candidate.output,
+                &output.tensor_type.format, &candidate.output.format,
                 "random case {case}"
             );
             assert_conversions_are_explicit(&lowered, &lowered.operations);
@@ -1138,7 +1445,7 @@ mod tests {
             let even_columns = random.u32(1..=64) * 2;
             let odd_columns = random.u32(1..=64) * 2 - 1;
             let tiles = random.u16(1..=64);
-            let layout = Layout::row_major(Sharding::Rows, tiles);
+            let layout = Layout::row_sharded(tiles);
             let mut graph = ComputeGraph::new();
             let left = graph.host_input("left", [rows, inner]).unwrap();
             let even_right = graph.parameter("even", [inner, even_columns]).unwrap();
@@ -1148,8 +1455,8 @@ mod tests {
             graph.set_outputs([even, odd]).unwrap();
             let input_format = format(precision(&mut random), layout);
             let config = LoweringConfig::new(tiles)
-                .with_input(left, input_format)
-                .with_input(even_right, input_format)
+                .with_input(left, input_format.clone())
+                .with_input(even_right, input_format.clone())
                 .with_input(odd_right, input_format);
 
             let lowered = lower(&graph, &config, &ColumnParityCost).unwrap();
@@ -1166,6 +1473,44 @@ mod tests {
                 vec![Precision::F16, Precision::F32],
                 "random case {case}"
             );
+            for operation in lowered.operations.iter().filter(|operation| {
+                matches!(
+                    operation.kind,
+                    MidOperationKind::Kernel(MidKernel::Gemm { .. })
+                )
+            }) {
+                let requirements = operation.kernel_requirements.as_ref().unwrap();
+                assert!(
+                    requirements
+                        .inputs
+                        .iter()
+                        .chain([&requirements.output])
+                        .all(|requirement| requirement.alignment == 32)
+                );
+                assert_eq!(
+                    requirements.output.format.layout.memory_class,
+                    MemoryClass::Ipu21Interleaved
+                );
+                assert_eq!(
+                    requirements.memory_relations,
+                    [MemoryRelation::DistinctElements(vec![
+                        MemoryOperand::Output,
+                        MemoryOperand::Input(0),
+                    ])]
+                );
+                let expected_tail = match operation.kind {
+                    MidOperationKind::Kernel(MidKernel::Gemm {
+                        multiply: Precision::F16,
+                        ..
+                    }) => 16,
+                    MidOperationKind::Kernel(MidKernel::Gemm {
+                        multiply: Precision::F32,
+                        ..
+                    }) => 32,
+                    _ => unreachable!(),
+                };
+                assert_eq!(requirements.inputs[0].access_tail_bytes, expected_tail);
+            }
         }
     }
 
@@ -1201,10 +1546,10 @@ mod tests {
             graph.set_outputs([sum, attended]).unwrap();
 
             let gelu_input = random_format(&mut random, tiles);
-            let gelu_output = random_format(&mut random, tiles);
+            let gelu_output = gelu_input.clone();
             let add_left = random_format(&mut random, tiles);
             let add_right = random_format(&mut random, tiles);
-            let add_output = random_format(&mut random, tiles);
+            let add_output = add_left.clone();
             let attention_query = random_format(&mut random, tiles);
             let attention_key = random_format(&mut random, tiles);
             let attention_value_format = random_format(&mut random, tiles);
@@ -1221,22 +1566,32 @@ mod tests {
                 .with_input(key, random_format(&mut random, tiles))
                 .with_input(attention_value, random_format(&mut random, tiles));
             config.kernel_candidates = vec![
-                KernelCandidate::Gelu {
-                    input: gelu_input,
-                    output: gelu_output,
-                },
-                KernelCandidate::Add {
-                    left: add_left,
-                    right: add_right,
-                    output: add_output,
-                },
-                KernelCandidate::FlashAttention {
-                    query: attention_query,
-                    key: attention_key,
-                    value: attention_value_format,
-                    output: attention_output,
-                    accumulate: attention_accumulate,
-                },
+                KernelCandidate::new(
+                    MidKernel::Gelu,
+                    [OperandRequirement::new(gelu_input.clone(), 8)],
+                    OperandRequirement::new(gelu_output.clone(), 8),
+                )
+                .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
+                KernelCandidate::new(
+                    MidKernel::Add,
+                    [
+                        OperandRequirement::new(add_left.clone(), 8),
+                        OperandRequirement::new(add_right.clone(), 8),
+                    ],
+                    OperandRequirement::new(add_output.clone(), 8),
+                )
+                .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
+                KernelCandidate::new(
+                    MidKernel::FlashAttention {
+                        accumulate: attention_accumulate,
+                    },
+                    [
+                        OperandRequirement::new(attention_query.clone(), 8),
+                        OperandRequirement::new(attention_key.clone(), 8),
+                        OperandRequirement::new(attention_value_format.clone(), 8),
+                    ],
+                    OperandRequirement::new(attention_output.clone(), 8),
+                ),
             ];
 
             let lowered = lower(&graph, &config, &ToyCostModel).unwrap();
@@ -1250,12 +1605,28 @@ mod tests {
                 kernels[0].kind,
                 MidOperationKind::Kernel(MidKernel::Gelu)
             ));
-            assert_kernel_signature(&lowered, kernels[0], &[gelu_input], gelu_output);
+            assert_kernel_signature(&lowered, kernels[0], &[gelu_input], gelu_output.clone());
+            assert_eq!(
+                kernels[0]
+                    .kernel_requirements
+                    .as_ref()
+                    .unwrap()
+                    .output_aliasing,
+                OutputAliasing::MayAliasInputs(vec![0])
+            );
             assert!(matches!(
                 kernels[1].kind,
                 MidOperationKind::Kernel(MidKernel::Add)
             ));
             assert_kernel_signature(&lowered, kernels[1], &[add_left, add_right], add_output);
+            assert_eq!(
+                kernels[1]
+                    .kernel_requirements
+                    .as_ref()
+                    .unwrap()
+                    .output_aliasing,
+                OutputAliasing::MayAliasInputs(vec![0])
+            );
             assert!(matches!(
                 kernels[2].kind,
                 MidOperationKind::Kernel(MidKernel::FlashAttention { accumulate })
@@ -1278,8 +1649,8 @@ mod tests {
             let size = dimension(&mut random);
             let count = random.u32(1..=12);
             let tiles = random.u16(1..=64);
-            let layout = Layout::row_major(Sharding::Rows, tiles);
-            let carried_format = format(precision(&mut random), layout);
+            let layout = Layout::row_sharded(tiles);
+            let carried_format = format(precision(&mut random), layout.clone());
             let mut graph = ComputeGraph::new();
             let carried = graph.host_input("state", [size, size]).unwrap();
             let weights = (0..count)
@@ -1295,11 +1666,11 @@ mod tests {
                 })
                 .unwrap()[0];
             graph.set_outputs([output]).unwrap();
-            let mut config = LoweringConfig::new(tiles).with_input(carried, carried_format);
+            let mut config = LoweringConfig::new(tiles).with_input(carried, carried_format.clone());
             for weight in weights {
                 config
                     .inputs
-                    .insert(weight, format(precision(&mut random), layout));
+                    .insert(weight, format(precision(&mut random), layout.clone()));
             }
 
             let lowered = lower(&graph, &config, &ToyCostModel).unwrap();
@@ -1318,24 +1689,20 @@ mod tests {
                 count as usize,
                 "random case {case}"
             );
-            let sequence_format = value(&lowered, repeat.iterated_inputs[0][0])
+            let sequence_format = &value(&lowered, repeat.iterated_inputs[0][0])
                 .tensor_type
                 .format;
-            assert!(
-                repeat.iterated_inputs[0]
-                    .iter()
-                    .all(
-                        |value_id| value(&lowered, *value_id).tensor_type.format == sequence_format
-                    )
-            );
+            assert!(repeat.iterated_inputs[0].iter().all(|value_id| {
+                &value(&lowered, *value_id).tensor_type.format == sequence_format
+            }));
             assert_eq!(
-                value(&lowered, repeat.body.yields[0]).tensor_type.format,
-                carried_format,
+                &value(&lowered, repeat.body.yields[0]).tensor_type.format,
+                &carried_format,
                 "random case {case}"
             );
             assert_eq!(
-                value(&lowered, lowered.outputs[0]).tensor_type.format,
-                carried_format,
+                &value(&lowered, lowered.outputs[0]).tensor_type.format,
+                &carried_format,
                 "random case {case}"
             );
             assert_conversions_are_explicit(&lowered, &lowered.operations);

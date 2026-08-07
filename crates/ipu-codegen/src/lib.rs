@@ -15,10 +15,12 @@ pub use graph::{
     ValueSequence, ValueSequenceId,
 };
 pub use mid::{
-    AccumulationPrecision, AmpOrder, CostModel, ElementOrder, GemmCandidate, KernelCandidate,
-    Layout, LoweringConfig, LoweringError, LoweringResult, MidGraph, MidInput, MidKernel,
-    MidOperation, MidOperationKind, MidRegion, MidRepeat, MidValue, MidValueId, Precision,
-    Sharding, Storage, TensorFormat, TensorType, ToyCostModel, lower,
+    AccumulationPrecision, AmpOrder, AxisTiling, CostModel, ElementOrder, KernelCandidate,
+    KernelRequirements, Layout, LayoutError, LoweringConfig, LoweringError, LoweringResult,
+    MemoryClass, MemoryOperand, MemoryRelation, MidGraph, MidInput, MidKernel, MidOperation,
+    MidOperationKind, MidRegion, MidRepeat, MidValue, MidValueId, OperandRequirement,
+    OutputAliasing, Padding, Precision, TensorAxis, TensorFormat, TensorTiling, TensorType,
+    ToyCostModel, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
 
