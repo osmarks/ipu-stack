@@ -101,6 +101,14 @@ and profile metadata. The lowering and package passes also emit structured
 `tracing` spans and summary events; applications choose whether and how to
 install a subscriber.
 
+Repeat scheduling requires an in-place carried chain. Each body yield must be
+traceably aliasable to its corresponding body argument; the repeat result and
+argument then alias the initial carried buffer. Lowering returns an error for a
+fresh-only carried result. Each iterated input sequence is represented as
+equal, consecutively placed per-tile blocks with an aligned byte stride that
+includes the body consumer's access tail. Iteration therefore advances each
+input with a base-pointer increment rather than a pointer table lookup.
+
 The logical schedule deliberately has no SRAM addresses, encoded exchange
 rows, or linked kernel symbols. Package construction remains completion-only
 until placement resolves those details into `TileProgram`, the finalized

@@ -9,8 +9,8 @@
 use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
     ConversionDispatch, LayoutError, MidGraph, MidOperation, MidOperationKind, MidRepeat,
-    MidValueId, OperandRequirement, OperatorDispatch, OperatorRequirements, PipelineConfig,
-    TensorType, TileKernelSpec,
+    MidValueId, OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing,
+    PipelineConfig, TensorType, TileKernelSpec,
 };
 use std::collections::BTreeMap;
 
@@ -52,6 +52,7 @@ pub struct ShardView {
 pub enum ShardDefinition {
     Value(MidValueId),
     ExchangeCopy(LowShardId),
+    Alias(LowShardId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,6 +156,9 @@ pub struct RepeatInvariant {
 pub struct RepeatIterated {
     pub inputs: Vec<LowShardId>,
     pub argument: LowShardId,
+    /// Placement must assign entries consecutively at this byte stride.
+    pub stride_bytes: u32,
+    pub alignment: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,6 +219,10 @@ pub enum LowLoweringError {
     InvalidConversionPlan,
     #[error("repeat structure is inconsistent with its inputs, arguments, yields, or results")]
     InvalidRepeat,
+    #[error("repeat carried value {0} cannot alias its body argument")]
+    RepeatRequiresInPlace(usize),
+    #[error("repeat iterated input {0} cannot be represented as equal contiguous blocks")]
+    InvalidIteratedBlocks(usize),
     #[error("too many logical shards or exchange phases")]
     IdOverflow,
     #[error("invalid tensor layout: {0}")]
@@ -843,18 +851,46 @@ impl LoweringState {
         {
             return Err(LowLoweringError::InvalidRepeat);
         }
+        for index in 0..repeat.carried_inputs {
+            if !value_can_alias(
+                repeat.body.yields[index],
+                repeat.body.arguments[index],
+                &repeat.body.operations,
+            ) {
+                return Err(LowLoweringError::RepeatRequiresInPlace(index));
+            }
+        }
+        let iterated_requirements = repeat
+            .iterated_inputs
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                body_storage_requirement(
+                    repeat.body.arguments[expected_inputs + index],
+                    &repeat.body.operations,
+                )
+            })
+            .collect::<Vec<_>>();
         let body = self.lower_region(&repeat.body.operations)?;
         for tile in 0..self.tile_count {
-            let carried = (0..repeat.carried_inputs)
-                .map(|index| {
-                    Ok(RepeatCarried {
-                        initial: self.local_shard(operation.inputs[index], tile)?,
-                        argument: self.local_shard(repeat.body.arguments[index], tile)?,
-                        yielded: self.local_shard(repeat.body.yields[index], tile)?,
-                        result: self.local_shard(operation.results[index], tile)?,
-                    })
-                })
-                .collect::<LowLoweringResult<_>>()?;
+            let mut carried = Vec::with_capacity(repeat.carried_inputs);
+            for index in 0..repeat.carried_inputs {
+                let initial = self.local_shard(operation.inputs[index], tile)?;
+                let argument = self.local_shard(repeat.body.arguments[index], tile)?;
+                let yielded = self.local_shard(repeat.body.yields[index], tile)?;
+                let result = self.local_shard(operation.results[index], tile)?;
+                self.alias_shard(argument, initial);
+                if yielded != argument {
+                    self.alias_shard(yielded, argument);
+                }
+                self.alias_shard(result, initial);
+                carried.push(RepeatCarried {
+                    initial,
+                    argument,
+                    yielded,
+                    result,
+                });
+            }
             let invariants = (0..repeat.invariant_inputs)
                 .map(|index| {
                     let input_index = repeat.carried_inputs + index;
@@ -869,13 +905,27 @@ impl LoweringState {
                 .iter()
                 .enumerate()
                 .map(|(index, values)| {
+                    let inputs = values
+                        .iter()
+                        .map(|value| self.local_shard(*value, tile))
+                        .collect::<LowLoweringResult<Vec<_>>>()?;
+                    let (alignment, access_tail) = iterated_requirements[index];
+                    let strides = inputs
+                        .iter()
+                        .map(|shard| self.shard_stride(*shard, alignment, access_tail))
+                        .collect::<LowLoweringResult<Vec<_>>>()?;
+                    let Some(&stride_bytes) = strides.first() else {
+                        return Err(LowLoweringError::InvalidIteratedBlocks(index));
+                    };
+                    if strides.iter().any(|stride| *stride != stride_bytes) {
+                        return Err(LowLoweringError::InvalidIteratedBlocks(index));
+                    }
                     Ok(RepeatIterated {
-                        inputs: values
-                            .iter()
-                            .map(|value| self.local_shard(*value, tile))
-                            .collect::<LowLoweringResult<_>>()?,
+                        inputs,
                         argument: self
                             .local_shard(repeat.body.arguments[expected_inputs + index], tile)?,
+                        stride_bytes,
+                        alignment,
                     })
                 })
                 .collect::<LowLoweringResult<_>>()?;
@@ -896,6 +946,84 @@ impl LoweringState {
         }
         Ok(())
     }
+
+    fn alias_shard(&mut self, shard: LowShardId, target: LowShardId) {
+        self.shards[shard.index() as usize].definition = ShardDefinition::Alias(target);
+    }
+
+    fn shard_stride(
+        &self,
+        shard: LowShardId,
+        alignment: u32,
+        access_tail: u32,
+    ) -> LowLoweringResult<u32> {
+        let shard = &self.shards[shard.index() as usize];
+        let elements = shard
+            .extents
+            .iter()
+            .try_fold(1_u64, |elements, extent| {
+                elements.checked_mul(u64::from(extent.physical_end - extent.start))
+            })
+            .ok_or(LowLoweringError::IdOverflow)?;
+        let bytes = elements
+            .checked_mul(shard.tensor_type.format.precision.bytes())
+            .and_then(|bytes| bytes.checked_add(u64::from(access_tail)))
+            .ok_or(LowLoweringError::IdOverflow)?;
+        let alignment = u64::from(alignment.max(1));
+        let stride = bytes
+            .checked_add(alignment - 1)
+            .map(|bytes| bytes / alignment * alignment)
+            .ok_or(LowLoweringError::IdOverflow)?;
+        u32::try_from(stride).map_err(|_| LowLoweringError::IdOverflow)
+    }
+}
+
+fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOperation]) -> bool {
+    if value == target {
+        return true;
+    }
+    let Some(operation) = operations
+        .iter()
+        .find(|operation| operation.results.contains(&value))
+    else {
+        return false;
+    };
+    let Some(plan) = &operation.operator_plan else {
+        return false;
+    };
+    let indices = match &plan.requirements.output_aliasing {
+        OutputAliasing::Fresh => return false,
+        OutputAliasing::MayAliasInputs(indices) => indices.as_slice(),
+        OutputAliasing::MustAliasInput(index) => std::slice::from_ref(index),
+    };
+    indices.iter().any(|index| {
+        operation
+            .inputs
+            .get(usize::from(*index))
+            .is_some_and(|input| value_can_alias(*input, target, operations))
+    })
+}
+
+fn body_storage_requirement(value: MidValueId, operations: &[MidOperation]) -> (u32, u32) {
+    let mut alignment = 8;
+    let mut access_tail = 0;
+    for operation in operations {
+        for (index, input) in operation.inputs.iter().enumerate() {
+            if *input != value {
+                continue;
+            }
+            let requirement = operation
+                .operator_plan
+                .as_ref()
+                .and_then(|plan| plan.requirements.inputs.get(index))
+                .or_else(|| operation.conversion_plan.as_ref().map(|plan| &plan.input));
+            if let Some(requirement) = requirement {
+                alignment = alignment.max(requirement.alignment);
+                access_tail = access_tail.max(requirement.access_tail_bytes);
+            }
+        }
+    }
+    (alignment, access_tail)
 }
 
 fn operation_provenance(operation: &MidOperation, kind: &MidOperationKind) -> WorkProvenance {
@@ -1271,6 +1399,25 @@ mod tests {
                 assert_eq!(repeats.len(), 1, "case {case}");
                 assert_eq!(repeats[0].count, count);
                 assert_eq!(repeats[0].iterated[0].inputs.len(), count as usize);
+                assert!(repeats[0].iterated[0].stride_bytes > 0);
+                assert!(
+                    repeats[0].iterated[0]
+                        .stride_bytes
+                        .is_multiple_of(repeats[0].iterated[0].alignment)
+                );
+                let carried = &repeats[0].carried[0];
+                assert_eq!(
+                    low.shards[carried.argument.index() as usize].definition,
+                    ShardDefinition::Alias(carried.initial)
+                );
+                assert_eq!(
+                    low.shards[carried.yielded.index() as usize].definition,
+                    ShardDefinition::Alias(carried.argument)
+                );
+                assert_eq!(
+                    low.shards[carried.result.index() as usize].definition,
+                    ShardDefinition::Alias(carried.initial)
+                );
                 assert!(
                     repeats[0]
                         .body
@@ -1279,6 +1426,41 @@ mod tests {
                         .any(|work| matches!(work, TileWork::Kernel(_)))
                 );
             }
+        }
+    }
+
+    #[test]
+    fn randomized_repeats_reject_fresh_carried_results() {
+        let mut random = fastrand::Rng::with_seed(0x696e_706c);
+        for case in 0..CASES {
+            let tiles = 1_u16 << random.u32(0..=3);
+            let count = random.u32(1..=4);
+            let rows = u32::from(tiles) * random.u32(1..=4) * 8;
+            let mut graph = ComputeGraph::new();
+            let carried = graph.host_input("carried", [rows, 64]).unwrap();
+            let weights = (0..count)
+                .map(|index| graph.parameter(format!("weight.{index}"), [64, 64]))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let sequence = graph.value_sequence("weights", weights.clone()).unwrap();
+            let result = graph
+                .repeat(count, [carried], [], [sequence], |body, arguments| {
+                    Ok(vec![
+                        body.gemm(arguments.carried[0], arguments.iterated[0])?,
+                    ])
+                })
+                .unwrap()[0];
+            graph.set_outputs([result]).unwrap();
+            let mut config = PipelineConfig::new(tiles).with_input(carried, format(tiles));
+            for weight in weights {
+                config.inputs.insert(weight, format(tiles));
+            }
+            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            assert_eq!(
+                lower_to_tiles(&mid, &config),
+                Err(LowLoweringError::RepeatRequiresInPlace(0)),
+                "case {case}"
+            );
         }
     }
 

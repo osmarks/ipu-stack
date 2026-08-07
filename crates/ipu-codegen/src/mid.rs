@@ -456,7 +456,7 @@ impl OperatorCandidate {
             OutputAliasing::Fresh => true,
             OutputAliasing::MayAliasInputs(indices) => {
                 !indices.is_empty()
-                    && indices.iter().all(|index| {
+                    && indices.iter().any(|index| {
                         alias_compatible(
                             usize::from(*index),
                             &self.inputs,
@@ -681,13 +681,22 @@ fn pointwise_operator_candidate(
     inputs: impl IntoIterator<Item = TensorFormat>,
     output: TensorFormat,
 ) -> OperatorCandidate {
-    OperatorCandidate::new(
+    let candidate = OperatorCandidate::new(
         operator,
         inputs
             .into_iter()
             .map(|format| OperandRequirement::new(format, 8)),
         OperandRequirement::new(output, 8),
-    )
+    );
+    match operator {
+        MidOperator::Gelu => {
+            candidate.with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0]))
+        }
+        MidOperator::Add(_) => {
+            candidate.with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1]))
+        }
+        _ => candidate,
+    }
 }
 
 fn amp_gemm_operator_candidate(
@@ -1311,11 +1320,36 @@ fn plans(
             requirements: OperatorRequirements {
                 inputs: candidate.inputs.clone(),
                 output: candidate.output.clone(),
-                output_aliasing: candidate.output_aliasing.clone(),
+                output_aliasing: resolved_output_aliasing(candidate, inputs, output),
                 memory_relations: candidate.memory_relations.clone(),
             },
         })
         .collect()
+}
+
+fn resolved_output_aliasing(
+    candidate: &OperatorCandidate,
+    inputs: &[TensorType],
+    output: &TensorShape,
+) -> OutputAliasing {
+    match &candidate.output_aliasing {
+        OutputAliasing::MayAliasInputs(indices) => OutputAliasing::MayAliasInputs(
+            indices
+                .iter()
+                .copied()
+                .filter(|index| {
+                    alias_compatible(
+                        usize::from(*index),
+                        &candidate.inputs,
+                        inputs,
+                        &candidate.output,
+                        output,
+                    )
+                })
+                .collect(),
+        ),
+        aliasing => aliasing.clone(),
+    }
 }
 
 fn operator_matches(operation: &OperationKind, operator: MidOperator) -> bool {
