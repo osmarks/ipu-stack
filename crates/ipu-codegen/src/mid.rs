@@ -3,7 +3,7 @@
 //! This is the boundary between semantic graph operations and scheduling. It
 //! records tensor shapes, storage precision, element order, axis tiling, and
 //! memory-class requirements, but deliberately does not assign tile addresses
-//! or emit exchange rows. [`lower`] tries a set of legal kernel signatures,
+//! or emit exchange rows. [`lower`] tries a set of legal operator plans,
 //! prices them with a [`CostModel`], and inserts explicit precision casts and
 //! layout rearrangements at format boundaries.
 
@@ -41,7 +41,7 @@ pub enum AccumulationPrecision {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MidKernel {
+pub enum MidOperator {
     Gemm {
         multiply: Precision,
         accumulate: AccumulationPrecision,
@@ -145,7 +145,7 @@ impl TensorTiling {
     }
 }
 
-/// Layout decisions which constrain kernels and exchange generation without
+/// Layout decisions which constrain operators and exchange generation without
 /// assigning physical tile identities or SRAM addresses.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Layout {
@@ -352,24 +352,24 @@ pub enum MemoryRelation {
     DistinctElements(Vec<MemoryOperand>),
 }
 
-/// Complete signature and placement requirements of one kernel implementation.
+/// Complete formats and placement requirements of one whole-device operator plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KernelCandidate {
-    pub kernel: MidKernel,
+pub struct OperatorCandidate {
+    pub operator: MidOperator,
     pub inputs: Vec<OperandRequirement>,
     pub output: OperandRequirement,
     pub output_aliasing: OutputAliasing,
     pub memory_relations: Vec<MemoryRelation>,
 }
 
-impl KernelCandidate {
+impl OperatorCandidate {
     pub fn new(
-        kernel: MidKernel,
+        operator: MidOperator,
         inputs: impl IntoIterator<Item = OperandRequirement>,
         output: OperandRequirement,
     ) -> Self {
         Self {
-            kernel,
+            operator,
             inputs: inputs.into_iter().collect(),
             output,
             output_aliasing: OutputAliasing::Fresh,
@@ -467,7 +467,7 @@ pub struct LoweringConfig {
     pub inputs: BTreeMap<ValueId, TensorFormat>,
     /// Signatures available independently to each operation. Earlier entries
     /// of the appropriate operation kind win when costs are equal.
-    pub kernel_candidates: Vec<KernelCandidate>,
+    pub operator_candidates: Vec<OperatorCandidate>,
 }
 
 impl LoweringConfig {
@@ -475,7 +475,7 @@ impl LoweringConfig {
         Self {
             tile_count,
             inputs: BTreeMap::new(),
-            kernel_candidates: default_kernel_candidates(tile_count),
+            operator_candidates: default_operator_candidates(tile_count),
         }
     }
 
@@ -485,7 +485,7 @@ impl LoweringConfig {
     }
 }
 
-fn default_kernel_candidates(tile_count: u16) -> Vec<KernelCandidate> {
+fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
     let rows_f16 = TensorFormat {
         precision: Precision::F16,
         layout: Layout::row_sharded(tile_count),
@@ -503,29 +503,29 @@ fn default_kernel_candidates(tile_count: u16) -> Vec<KernelCandidate> {
         layout: Layout::head_sharded(tile_count),
     };
     vec![
-        amp_gemm_candidate(Precision::F16, 16, 16, tile_count),
-        amp_gemm_candidate(Precision::F32, 8, 32, tile_count),
-        pointwise_candidate(MidKernel::Gelu, [rows_f16.clone()], rows_f16.clone()),
-        pointwise_candidate(MidKernel::Gelu, [rows_f32.clone()], rows_f32.clone()),
-        pointwise_candidate(
-            MidKernel::Add,
+        amp_gemm_operator_candidate(Precision::F16, 16, 16, tile_count),
+        amp_gemm_operator_candidate(Precision::F32, 8, 32, tile_count),
+        pointwise_operator_candidate(MidOperator::Gelu, [rows_f16.clone()], rows_f16.clone()),
+        pointwise_operator_candidate(MidOperator::Gelu, [rows_f32.clone()], rows_f32.clone()),
+        pointwise_operator_candidate(
+            MidOperator::Add,
             [rows_f16.clone(), rows_f16.clone()],
             rows_f16,
         ),
-        pointwise_candidate(
-            MidKernel::Add,
+        pointwise_operator_candidate(
+            MidOperator::Add,
             [rows_f32.clone(), rows_f32.clone()],
             rows_f32,
         ),
-        pointwise_candidate(
-            MidKernel::FlashAttention {
+        pointwise_operator_candidate(
+            MidOperator::FlashAttention {
                 accumulate: AccumulationPrecision::F32,
             },
             [heads_f16.clone(), heads_f16.clone(), heads_f16.clone()],
             heads_f16,
         ),
-        pointwise_candidate(
-            MidKernel::FlashAttention {
+        pointwise_operator_candidate(
+            MidOperator::FlashAttention {
                 accumulate: AccumulationPrecision::F32,
             },
             [heads_f32.clone(), heads_f32.clone(), heads_f32.clone()],
@@ -534,13 +534,13 @@ fn default_kernel_candidates(tile_count: u16) -> Vec<KernelCandidate> {
     ]
 }
 
-fn pointwise_candidate(
-    kernel: MidKernel,
+fn pointwise_operator_candidate(
+    operator: MidOperator,
     inputs: impl IntoIterator<Item = TensorFormat>,
     output: TensorFormat,
-) -> KernelCandidate {
-    KernelCandidate::new(
-        kernel,
+) -> OperatorCandidate {
+    OperatorCandidate::new(
+        operator,
         inputs
             .into_iter()
             .map(|format| OperandRequirement::new(format, 8)),
@@ -548,14 +548,14 @@ fn pointwise_candidate(
     )
 }
 
-fn amp_gemm_candidate(
+fn amp_gemm_operator_candidate(
     precision: Precision,
     inner: u16,
     left_tail: u32,
     tile_count: u16,
-) -> KernelCandidate {
-    KernelCandidate::new(
-        MidKernel::Gemm {
+) -> OperatorCandidate {
+    OperatorCandidate::new(
+        MidOperator::Gemm {
             multiply: precision,
             accumulate: AccumulationPrecision::F32,
         },
@@ -610,7 +610,7 @@ pub struct MidValue {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidOperationKind {
-    Kernel(MidKernel),
+    Operator(MidOperator),
     CastPrecision { from: Precision, to: Precision },
     Rearrange { from: Layout, to: Layout },
     Repeat(MidRepeat),
@@ -622,12 +622,12 @@ pub struct MidOperation {
     pub inputs: Vec<MidValueId>,
     pub results: Vec<MidValueId>,
     pub kind: MidOperationKind,
-    pub kernel_requirements: Option<KernelRequirements>,
+    pub operator_requirements: Option<OperatorRequirements>,
     pub estimated_cost: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KernelRequirements {
+pub struct OperatorRequirements {
     pub inputs: Vec<OperandRequirement>,
     pub output: OperandRequirement,
     pub output_aliasing: OutputAliasing,
@@ -672,7 +672,12 @@ pub struct MidGraph {
 /// Deliberately small and replaceable cost interface. Units are arbitrary but
 /// must be comparable within one lowering run.
 pub trait CostModel {
-    fn kernel_cost(&self, kernel: MidKernel, inputs: &[TensorType], output: &TensorType) -> u64;
+    fn operator_cost(
+        &self,
+        operator: MidOperator,
+        inputs: &[TensorType],
+        output: &TensorType,
+    ) -> u64;
     fn cast_cost(&self, shape: &TensorShape, from: Precision, to: Precision) -> u64;
     fn rearrange_cost(
         &self,
@@ -690,10 +695,15 @@ pub trait CostModel {
 pub struct ToyCostModel;
 
 impl CostModel for ToyCostModel {
-    fn kernel_cost(&self, kernel: MidKernel, inputs: &[TensorType], output: &TensorType) -> u64 {
+    fn operator_cost(
+        &self,
+        operator: MidOperator,
+        inputs: &[TensorType],
+        output: &TensorType,
+    ) -> u64 {
         let elements = physical_elements(&output.shape, &output.format.layout);
-        match kernel {
-            MidKernel::Gemm { multiply, .. } => {
+        match operator {
+            MidOperator::Gemm { multiply, .. } => {
                 let left_shape = inputs[0]
                     .format
                     .layout
@@ -712,9 +722,9 @@ impl CostModel for ToyCostModel {
                     .saturating_mul(k)
                     .div_ceil(throughput)
             }
-            MidKernel::FlashAttention { .. } => elements.saturating_mul(8).div_ceil(32),
-            MidKernel::Gelu => elements.saturating_mul(6).div_ceil(16),
-            MidKernel::Add => elements.div_ceil(16),
+            MidOperator::FlashAttention { .. } => elements.saturating_mul(8).div_ceil(32),
+            MidOperator::Gelu => elements.saturating_mul(6).div_ceil(16),
+            MidOperator::Add => elements.div_ceil(16),
         }
     }
 
@@ -897,7 +907,8 @@ fn lower_operations(
                         format: requirement.format.clone(),
                     })
                     .collect::<Vec<_>>();
-                let cost = conversion + costs.kernel_cost(plan.kernel, &planned_inputs, &output);
+                let cost =
+                    conversion + costs.operator_cost(plan.operator, &planned_inputs, &output);
                 ((cost, order), plan)
             })
             .min_by_key(|(cost, _)| *cost)
@@ -928,8 +939,8 @@ fn lower_operations(
             .iter()
             .map(|value| state.get(*value).tensor_type.clone())
             .collect::<Vec<_>>();
-        let kernel_cost = costs.kernel_cost(
-            plan.kernel,
+        let operator_cost = costs.operator_cost(
+            plan.operator,
             &converted_types,
             &state.get(result).tensor_type,
         );
@@ -937,9 +948,9 @@ fn lower_operations(
             source: Some(operation.id),
             inputs: converted,
             results: vec![result],
-            kind: MidOperationKind::Kernel(plan.kernel),
-            kernel_requirements: Some(plan.requirements),
-            estimated_cost: kernel_cost,
+            kind: MidOperationKind::Operator(plan.operator),
+            operator_requirements: Some(plan.requirements),
+            estimated_cost: operator_cost,
         });
         values.insert(operation.results[0], result);
     }
@@ -948,8 +959,8 @@ fn lower_operations(
 
 #[derive(Clone)]
 struct Plan {
-    kernel: MidKernel,
-    requirements: KernelRequirements,
+    operator: MidOperator,
+    requirements: OperatorRequirements,
 }
 
 fn plans(
@@ -959,14 +970,15 @@ fn plans(
     config: &LoweringConfig,
 ) -> Vec<Plan> {
     config
-        .kernel_candidates
+        .operator_candidates
         .iter()
         .filter(|candidate| {
-            kernel_matches(&operation.kind, candidate.kernel) && candidate.supports(inputs, output)
+            operator_matches(&operation.kind, candidate.operator)
+                && candidate.supports(inputs, output)
         })
         .map(|candidate| Plan {
-            kernel: candidate.kernel,
-            requirements: KernelRequirements {
+            operator: candidate.operator,
+            requirements: OperatorRequirements {
                 inputs: candidate.inputs.clone(),
                 output: candidate.output.clone(),
                 output_aliasing: candidate.output_aliasing.clone(),
@@ -976,15 +988,15 @@ fn plans(
         .collect()
 }
 
-fn kernel_matches(operation: &OperationKind, kernel: MidKernel) -> bool {
+fn operator_matches(operation: &OperationKind, operator: MidOperator) -> bool {
     matches!(
-        (operation, kernel),
-        (OperationKind::Gemm, MidKernel::Gemm { .. })
-            | (OperationKind::Gelu, MidKernel::Gelu)
-            | (OperationKind::Add, MidKernel::Add)
+        (operation, operator),
+        (OperationKind::Gemm, MidOperator::Gemm { .. })
+            | (OperationKind::Gelu, MidOperator::Gelu)
+            | (OperationKind::Add, MidOperator::Add)
             | (
                 OperationKind::FlashAttention,
-                MidKernel::FlashAttention { .. }
+                MidOperator::FlashAttention { .. }
             )
     )
 }
@@ -1089,7 +1101,7 @@ fn lower_repeat(
                 estimated_cost: body_cost,
             },
         }),
-        kernel_requirements: None,
+        operator_requirements: None,
         estimated_cost: body_cost.saturating_mul(u64::from(repeat.count)),
     });
     Ok(())
@@ -1117,7 +1129,7 @@ fn ensure_format(
                 from,
                 to: target.precision,
             },
-            kernel_requirements: None,
+            operator_requirements: None,
             estimated_cost: costs.cast_cost(&tensor_type.shape, from, target.precision),
         });
         value = result;
@@ -1136,7 +1148,7 @@ fn ensure_format(
                 from: from.clone(),
                 to: target.layout.clone(),
             },
-            kernel_requirements: None,
+            operator_requirements: None,
             estimated_cost: costs.rearrange_cost(
                 &tensor_type.shape,
                 tensor_type.format.precision,
@@ -1232,12 +1244,12 @@ mod tests {
                     assert_eq!(before.shape, after.shape);
                     assert_eq!(before.format.precision, after.format.precision);
                 }
-                MidOperationKind::Kernel(_) | MidOperationKind::Repeat(_) => {}
+                MidOperationKind::Operator(_) | MidOperationKind::Repeat(_) => {}
             }
         }
     }
 
-    fn assert_kernel_signature(
+    fn assert_operator_signature(
         lowered: &MidGraph,
         operation: &MidOperation,
         inputs: &[TensorFormat],
@@ -1256,9 +1268,9 @@ mod tests {
     struct ColumnParityCost;
 
     impl CostModel for ColumnParityCost {
-        fn kernel_cost(
+        fn operator_cost(
             &self,
-            kernel: MidKernel,
+            operator: MidOperator,
             _inputs: &[TensorType],
             output: &TensorType,
         ) -> u64 {
@@ -1267,9 +1279,9 @@ mod tests {
             } else {
                 Precision::F32
             };
-            match kernel {
-                MidKernel::Gemm { multiply, .. } if multiply == preferred => 0,
-                MidKernel::Gemm { .. } => 1,
+            match operator {
+                MidOperator::Gemm { multiply, .. } if multiply == preferred => 0,
+                MidOperator::Gemm { .. } => 1,
                 _ => 0,
             }
         }
@@ -1372,8 +1384,8 @@ mod tests {
             } else {
                 AccumulationPrecision::F32
             };
-            let candidate = KernelCandidate::new(
-                MidKernel::Gemm {
+            let candidate = OperatorCandidate::new(
+                MidOperator::Gemm {
                     multiply,
                     accumulate,
                 },
@@ -1397,30 +1409,30 @@ mod tests {
             let mut config = LoweringConfig::new(tiles)
                 .with_input(left, format(precision(&mut random), linear.clone()))
                 .with_input(right, format(precision(&mut random), linear));
-            config.kernel_candidates = vec![candidate.clone()];
+            config.operator_candidates = vec![candidate.clone()];
 
             let lowered = lower(&graph, &config, &ToyCostModel).unwrap();
-            let kernel = lowered
+            let operator = lowered
                 .operations
                 .iter()
-                .find(|operation| matches!(operation.kind, MidOperationKind::Kernel(_)))
+                .find(|operation| matches!(operation.kind, MidOperationKind::Operator(_)))
                 .unwrap();
-            let MidOperationKind::Kernel(MidKernel::Gemm {
+            let MidOperationKind::Operator(MidOperator::Gemm {
                 multiply: selected_multiply,
                 accumulate: selected_accumulate,
-            }) = kernel.kind
+            }) = operator.kind
             else {
                 panic!("random case {case}: expected GEMM");
             };
             assert_eq!(selected_multiply, multiply, "random case {case}");
             assert_eq!(selected_accumulate, accumulate, "random case {case}");
             assert_eq!(
-                &value(&lowered, kernel.inputs[0]).tensor_type.format,
+                &value(&lowered, operator.inputs[0]).tensor_type.format,
                 &candidate.inputs[0].format,
                 "random case {case}"
             );
             assert_eq!(
-                &value(&lowered, kernel.inputs[1]).tensor_type.format,
+                &value(&lowered, operator.inputs[1]).tensor_type.format,
                 &candidate.inputs[1].format,
                 "random case {case}"
             );
@@ -1466,7 +1478,9 @@ mod tests {
                 .operations
                 .iter()
                 .filter_map(|operation| match operation.kind {
-                    MidOperationKind::Kernel(MidKernel::Gemm { multiply, .. }) => Some(multiply),
+                    MidOperationKind::Operator(MidOperator::Gemm { multiply, .. }) => {
+                        Some(multiply)
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -1478,10 +1492,10 @@ mod tests {
             for operation in lowered.operations.iter().filter(|operation| {
                 matches!(
                     operation.kind,
-                    MidOperationKind::Kernel(MidKernel::Gemm { .. })
+                    MidOperationKind::Operator(MidOperator::Gemm { .. })
                 )
             }) {
-                let requirements = operation.kernel_requirements.as_ref().unwrap();
+                let requirements = operation.operator_requirements.as_ref().unwrap();
                 assert!(
                     requirements
                         .inputs
@@ -1501,11 +1515,11 @@ mod tests {
                     ])]
                 );
                 let expected_tail = match operation.kind {
-                    MidOperationKind::Kernel(MidKernel::Gemm {
+                    MidOperationKind::Operator(MidOperator::Gemm {
                         multiply: Precision::F16,
                         ..
                     }) => 16,
-                    MidOperationKind::Kernel(MidKernel::Gemm {
+                    MidOperationKind::Operator(MidOperator::Gemm {
                         multiply: Precision::F32,
                         ..
                     }) => 32,
@@ -1517,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_non_gemm_lowering_honors_complete_kernel_signatures() {
+    fn randomized_non_gemm_lowering_honors_operator_plans() {
         let mut random = fastrand::Rng::with_seed(0x6164_642b);
         for case in 0..RANDOM_CASES {
             let tiles = random.u16(1..=64);
@@ -1567,15 +1581,15 @@ mod tests {
                 .with_input(query, random_format(&mut random, tiles))
                 .with_input(key, random_format(&mut random, tiles))
                 .with_input(attention_value, random_format(&mut random, tiles));
-            config.kernel_candidates = vec![
-                KernelCandidate::new(
-                    MidKernel::Gelu,
+            config.operator_candidates = vec![
+                OperatorCandidate::new(
+                    MidOperator::Gelu,
                     [OperandRequirement::new(gelu_input.clone(), 8)],
                     OperandRequirement::new(gelu_output.clone(), 8),
                 )
                 .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
-                KernelCandidate::new(
-                    MidKernel::Add,
+                OperatorCandidate::new(
+                    MidOperator::Add,
                     [
                         OperandRequirement::new(add_left.clone(), 8),
                         OperandRequirement::new(add_right.clone(), 8),
@@ -1583,8 +1597,8 @@ mod tests {
                     OperandRequirement::new(add_output.clone(), 8),
                 )
                 .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
-                KernelCandidate::new(
-                    MidKernel::FlashAttention {
+                OperatorCandidate::new(
+                    MidOperator::FlashAttention {
                         accumulate: attention_accumulate,
                     },
                     [
@@ -1597,46 +1611,46 @@ mod tests {
             ];
 
             let lowered = lower(&graph, &config, &ToyCostModel).unwrap();
-            let kernels = lowered
+            let operators = lowered
                 .operations
                 .iter()
-                .filter(|operation| matches!(operation.kind, MidOperationKind::Kernel(_)))
+                .filter(|operation| matches!(operation.kind, MidOperationKind::Operator(_)))
                 .collect::<Vec<_>>();
-            assert_eq!(kernels.len(), 3, "random case {case}");
+            assert_eq!(operators.len(), 3, "random case {case}");
             assert!(matches!(
-                kernels[0].kind,
-                MidOperationKind::Kernel(MidKernel::Gelu)
+                operators[0].kind,
+                MidOperationKind::Operator(MidOperator::Gelu)
             ));
-            assert_kernel_signature(&lowered, kernels[0], &[gelu_input], gelu_output.clone());
+            assert_operator_signature(&lowered, operators[0], &[gelu_input], gelu_output.clone());
             assert_eq!(
-                kernels[0]
-                    .kernel_requirements
+                operators[0]
+                    .operator_requirements
                     .as_ref()
                     .unwrap()
                     .output_aliasing,
                 OutputAliasing::MayAliasInputs(vec![0])
             );
             assert!(matches!(
-                kernels[1].kind,
-                MidOperationKind::Kernel(MidKernel::Add)
+                operators[1].kind,
+                MidOperationKind::Operator(MidOperator::Add)
             ));
-            assert_kernel_signature(&lowered, kernels[1], &[add_left, add_right], add_output);
+            assert_operator_signature(&lowered, operators[1], &[add_left, add_right], add_output);
             assert_eq!(
-                kernels[1]
-                    .kernel_requirements
+                operators[1]
+                    .operator_requirements
                     .as_ref()
                     .unwrap()
                     .output_aliasing,
                 OutputAliasing::MayAliasInputs(vec![0])
             );
             assert!(matches!(
-                kernels[2].kind,
-                MidOperationKind::Kernel(MidKernel::FlashAttention { accumulate })
+                operators[2].kind,
+                MidOperationKind::Operator(MidOperator::FlashAttention { accumulate })
                     if accumulate == attention_accumulate
             ));
-            assert_kernel_signature(
+            assert_operator_signature(
                 &lowered,
-                kernels[2],
+                operators[2],
                 &[attention_query, attention_key, attention_value_format],
                 attention_output,
             );

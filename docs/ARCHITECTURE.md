@@ -21,7 +21,7 @@ axes and broadcasts leading batch axes.
 shape plus a `TensorFormat` containing:
 
 - storage precision (`F8F143` with a tensor-wide power-of-two scale, `F16`, or
-  `F32`), with accumulation precision recorded separately on kernels;
+  `F32`), with accumulation precision recorded separately on operators;
 - element order (row-major or AMP left/right/output order);
 - axis tiling, where each axis records its block size, distributed partition
   count, and whether an indivisible extent is rejected or zero-padded;
@@ -29,17 +29,17 @@ shape plus a `TensorFormat` containing:
 - a hardware memory class such as IPU21 standard or interleaved memory.
 
 This is deliberately less specific than placement: it records decisions that
-change a kernel or exchange plan, but not physical tile IDs, SRAM addresses,
+change an operator plan, but not physical tile IDs, SRAM addresses,
 lifetimes, or exchange rows. AMP order selects the packing family; axis tiling
 contains its block dimensions.
 
-`mid::lower` considers complete kernel signatures for each semantic operation.
-Signatures record every input and output format, per-operand alignment and
+`mid::lower` considers complete operator candidates for each semantic operation.
+Candidates record every input and output format, per-operand alignment and
 access tails, output aliasing permissions, memory-element relations, and
 operation-specific compute precision. They can therefore describe
-mixed-precision, alternative-layout, and in-place kernels. The initial toy
+mixed-precision, alternative-layout, and in-place operator implementations. The initial toy
 model compares rough arithmetic throughput with bytes moved. When a chosen
-kernel format differs from its producer, lowering inserts `CastPrecision` and
+operator format differs from its producer, lowering inserts `CastPrecision` and
 `Rearrange` operations explicitly. Repeated regions stay structured; their
 iterated value sequences are normalized once outside the body rather than
 causing the body to be unrolled.

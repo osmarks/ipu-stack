@@ -16,16 +16,16 @@ pub use graph::{
     ValueSequence, ValueSequenceId,
 };
 pub use low::{
-    ExchangePhase, ExchangePhaseId, KernelOperand, KernelRun, LogicalExchange, LowInput, LowKernel,
+    ExchangePhase, ExchangePhaseId, KernelOperand, KernelRun, LogicalExchange, LowInput,
     LowLoweringConfig, LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId,
     LowValue, RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, ShardDefinition,
-    ShardExtent, TileWork, TileWorkList, lower_to_tiles,
+    ShardExtent, TileKernel, TileWork, TileWorkList, lower_to_tiles,
 };
 pub use mid::{
-    AccumulationPrecision, AmpOrder, AxisTiling, CostModel, ElementOrder, KernelCandidate,
-    KernelRequirements, Layout, LayoutError, LoweringConfig, LoweringError, LoweringResult,
-    MemoryClass, MemoryOperand, MemoryRelation, MidGraph, MidInput, MidKernel, MidOperation,
-    MidOperationKind, MidRegion, MidRepeat, MidValue, MidValueId, OperandRequirement,
+    AccumulationPrecision, AmpOrder, AxisTiling, CostModel, ElementOrder, Layout, LayoutError,
+    LoweringConfig, LoweringError, LoweringResult, MemoryClass, MemoryOperand, MemoryRelation,
+    MidGraph, MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat,
+    MidValue, MidValueId, OperandRequirement, OperatorCandidate, OperatorRequirements,
     OutputAliasing, Padding, Precision, TensorAxis, TensorFormat, TensorTiling, TensorType,
     ToyCostModel, lower,
 };

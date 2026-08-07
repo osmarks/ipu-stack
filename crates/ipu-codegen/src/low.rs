@@ -8,8 +8,8 @@
 
 use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
-    KernelRequirements, Layout, LayoutError, MidGraph, MidKernel, MidOperation, MidOperationKind,
-    MidRepeat, MidValueId, Precision, TensorType,
+    Layout, LayoutError, MidGraph, MidOperation, MidOperationKind, MidOperator, MidRepeat,
+    MidValueId, OperatorRequirements, Precision, TensorType,
 };
 use std::collections::BTreeMap;
 
@@ -85,8 +85,8 @@ pub struct ExchangePhase {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LowKernel {
-    Kernel(MidKernel),
+pub enum TileKernel {
+    OperatorPlaceholder(MidOperator),
     Cast { from: Precision, to: Precision },
     Rearrange { from: Layout, to: Layout },
 }
@@ -101,10 +101,10 @@ pub struct KernelOperand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelRun {
     pub source: Option<OperationId>,
-    pub kernel: LowKernel,
+    pub kernel: TileKernel,
     pub inputs: Vec<KernelOperand>,
     pub output: LowShardId,
-    pub requirements: Option<KernelRequirements>,
+    pub requirements: Option<OperatorRequirements>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -353,12 +353,14 @@ impl LoweringState {
                 KernelRun {
                     source: operation.source,
                     kernel: match kind {
-                        MidOperationKind::Kernel(kernel) => LowKernel::Kernel(*kernel),
-                        MidOperationKind::CastPrecision { from, to } => LowKernel::Cast {
+                        MidOperationKind::Operator(operator) => {
+                            TileKernel::OperatorPlaceholder(*operator)
+                        }
+                        MidOperationKind::CastPrecision { from, to } => TileKernel::Cast {
                             from: *from,
                             to: *to,
                         },
-                        MidOperationKind::Rearrange { from, to } => LowKernel::Rearrange {
+                        MidOperationKind::Rearrange { from, to } => TileKernel::Rearrange {
                             from: from.clone(),
                             to: to.clone(),
                         },
@@ -366,7 +368,7 @@ impl LoweringState {
                     },
                     inputs: operands,
                     output,
-                    requirements: operation.kernel_requirements.clone(),
+                    requirements: operation.operator_requirements.clone(),
                 },
             ));
         }
