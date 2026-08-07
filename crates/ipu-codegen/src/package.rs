@@ -384,7 +384,19 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
         symbols.push(crate::HOST_RUN_SYMBOL.into());
         symbols.push(crate::REPEAT_CALL_SYMBOL.into());
     }
+    if program.tiles.iter().any(tile_has_local_copy) {
+        symbols.push(crate::COPY_U32_SYMBOL.into());
+        symbols.push(crate::COPY_U64_SYMBOL.into());
+    }
     symbols
+}
+
+fn tile_has_local_copy(tile: &crate::TileWorkList) -> bool {
+    tile.work.iter().any(|work| match work {
+        crate::TileWork::LocalCopy(_) => true,
+        crate::TileWork::Repeat(repeat) => tile_has_local_copy(&repeat.body),
+        crate::TileWork::Exchange(_) | crate::TileWork::Kernel(_) => false,
+    })
 }
 
 fn input_binding(

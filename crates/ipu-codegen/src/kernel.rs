@@ -136,14 +136,24 @@ impl KernelBuildPlan {
                 format!("ipu_stack_gemm_{prefix}_accumulate_small_rows"),
                 format!("ipu_stack_gemm_{prefix}_accumulate_large_rows"),
             ];
+            let single_rows = values.len() == 1;
+            let mut flags = vec![
+                format!("-DGEMM_SMALL_ROWS={small}"),
+                format!("-DGEMM_LARGE_ROWS={large}"),
+            ];
+            if single_rows {
+                flags.push("-DGEMM_SINGLE_ROWS=1".into());
+            }
+            let retained_symbols = if single_rows {
+                vec![symbols[0].clone(), symbols[2].clone()]
+            } else {
+                symbols.into_iter().collect()
+            };
             plan.compilations.push(KernelCompilation {
                 source,
                 name: format!("gemm_{prefix}_r{small}_r{large}"),
-                flags: vec![
-                    format!("-DGEMM_SMALL_ROWS={small}"),
-                    format!("-DGEMM_LARGE_ROWS={large}"),
-                ],
-                retained_symbols: symbols.into_iter().collect(),
+                flags,
+                retained_symbols,
             });
             plan.gemm_rows.insert(precision, values);
         }
@@ -304,7 +314,7 @@ fn collect_kernels(
                 }
             }
             TileWork::Repeat(repeat) => collect_kernels(&repeat.body, rows, gelu)?,
-            TileWork::Exchange(_) => {}
+            TileWork::Exchange(_) | TileWork::LocalCopy(_) => {}
         }
     }
     Ok(())
@@ -655,6 +665,13 @@ mod tests {
                     .iter()
                     .any(|flag| flag == &format!("-DGEMM_SMALL_ROWS={rows_per_tile}"))
             );
+            assert!(
+                plan.compilations[0]
+                    .flags
+                    .iter()
+                    .any(|flag| flag == "-DGEMM_SINGLE_ROWS=1")
+            );
+            assert_eq!(plan.compilations[0].retained_symbols.len(), 2);
             for run in low
                 .tiles
                 .iter()

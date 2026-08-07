@@ -12,6 +12,7 @@ use crate::mid::{
     MidValueId, OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing,
     PipelineConfig, TensorType, TileKernelSpec,
 };
+use crate::storage::{StorageError, view_byte_spans};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -56,6 +57,7 @@ pub struct ShardView {
 pub enum ShardDefinition {
     Value(MidValueId),
     ExchangeCopy(LowShardId),
+    LocalCopy(LowShardId),
     Alias(LowShardId),
 }
 
@@ -143,6 +145,15 @@ pub struct KernelRun {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalCopy {
+    pub source: LowShardId,
+    pub source_offset: u32,
+    pub destination: LowShardId,
+    pub destination_offset: u32,
+    pub bytes: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepeatCarried {
     pub initial: LowShardId,
     pub argument: LowShardId,
@@ -179,6 +190,7 @@ pub struct RepeatRun {
 pub enum TileWork {
     /// All tiles encounter a phase marker, including tiles without transfers.
     Exchange(ExchangePhaseId),
+    LocalCopy(LocalCopy),
     Kernel(KernelRun),
     Repeat(RepeatRun),
 }
@@ -231,6 +243,8 @@ pub enum LowLoweringError {
     IdOverflow,
     #[error("invalid tensor layout: {0}")]
     Layout(#[from] LayoutError),
+    #[error("invalid tensor storage view: {0}")]
+    Storage(#[from] StorageError),
 }
 
 pub type LowLoweringResult<T> = Result<T, LowLoweringError>;
@@ -686,11 +700,13 @@ impl LoweringState {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
 
+        let mut local_right_staging = BTreeMap::<(u16, u32), LowShardId>::new();
         for column_start in (0..column_extent).step_by(output_column_block as usize) {
             let column_end = column_start + output_column_block;
             for inner_start in (0..inner_extent).step_by(inner_block as usize) {
                 let inner_end = inner_start + inner_block;
                 let mut transfers = BTreeMap::<ShardView, Vec<LowShardId>>::new();
+                let mut local_copies = Vec::<(u16, LocalCopy)>::new();
                 let mut runs = Vec::with_capacity(output_shards.len());
                 for output in &output_shards {
                     let tile = self.shards[output.index() as usize].tile;
@@ -715,7 +731,46 @@ impl LoweringState {
                         ],
                     )?;
                     let resident_right = if self.shards[right.index() as usize].tile == tile {
-                        right_view
+                        let spans =
+                            view_byte_spans(&self.shards[right.index() as usize], &right_view)?;
+                        if spans.len() == 1 {
+                            right_view
+                        } else {
+                            let definition = local_right_staging
+                                .get(&(tile, column_start))
+                                .copied()
+                                .map(ShardDefinition::Alias)
+                                .unwrap_or(ShardDefinition::LocalCopy(right));
+                            let copy = self.push_shard(LowShard {
+                                id: LowShardId(0),
+                                tile,
+                                tensor_type: self.shards[right.index() as usize]
+                                    .tensor_type
+                                    .clone(),
+                                extents: right_view.extents.clone(),
+                                definition,
+                            })?;
+                            local_right_staging
+                                .entry((tile, column_start))
+                                .or_insert(copy);
+                            let mut destination_offset = 0u32;
+                            for span in spans {
+                                local_copies.push((
+                                    tile,
+                                    LocalCopy {
+                                        source: right,
+                                        source_offset: span.offset,
+                                        destination: copy,
+                                        destination_offset,
+                                        bytes: span.bytes,
+                                    },
+                                ));
+                                destination_offset = destination_offset
+                                    .checked_add(span.bytes)
+                                    .ok_or(LowLoweringError::IdOverflow)?;
+                            }
+                            self.full_view(copy)
+                        }
                     } else {
                         let copy = self.push_shard(LowShard {
                             id: LowShardId(0),
@@ -764,6 +819,11 @@ impl LoweringState {
                     },
                     tiles,
                 )?;
+                for (tile, copy) in local_copies {
+                    tiles[usize::from(tile)]
+                        .work
+                        .push(TileWork::LocalCopy(copy));
+                }
                 for (tile, run) in runs {
                     tiles[usize::from(tile)].work.push(TileWork::Kernel(run));
                 }
@@ -1472,7 +1532,7 @@ mod tests {
         list.work.iter().any(|work| match work {
             TileWork::Exchange(candidate) => *candidate == phase,
             TileWork::Repeat(repeat) => contains_phase(&repeat.body, phase),
-            TileWork::Kernel(_) => false,
+            TileWork::Kernel(_) | TileWork::LocalCopy(_) => false,
         })
     }
 }

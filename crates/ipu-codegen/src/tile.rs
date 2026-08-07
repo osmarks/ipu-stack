@@ -31,6 +31,8 @@ pub enum TileLoweringError {
     InvalidRepeat,
     #[error("execution has {execution} tiles, fewer than the {scheduled} scheduled tiles")]
     MissingExecutionTiles { scheduled: u16, execution: u16 },
+    #[error("local copy addresses or size are invalid")]
+    InvalidLocalCopy,
 }
 
 pub fn lower_to_tile_programs(
@@ -141,9 +143,9 @@ fn lower_work(
     overrides: &BTreeMap<LowShardId, TileAddress>,
     inside_repeat: bool,
 ) -> Result<Vec<TileStep>, TileLoweringError> {
-    tile.work
-        .iter()
-        .map(|work| match work {
+    let mut steps = Vec::new();
+    for work in &tile.work {
+        let step = match work {
             TileWork::Exchange(id) => {
                 let phase = phases.get(id).ok_or(TileLoweringError::UnknownExchange)?;
                 if inside_repeat
@@ -154,7 +156,7 @@ fn lower_work(
                 {
                     return Err(TileLoweringError::IteratedExchange);
                 }
-                Ok(TileStep::Exchange(ExchangeStep {
+                TileStep::Exchange(ExchangeStep {
                     address: *phase_addresses
                         .get(id)
                         .ok_or(TileLoweringError::UnknownExchange)?,
@@ -164,24 +166,59 @@ fn lower_work(
                         .cloned()
                         .ok_or(TileLoweringError::MissingExchangeRow(tile.tile))?,
                     profile: StepProfile::default(),
-                }))
+                })
             }
-            TileWork::Kernel(run) => Ok(TileStep::Compute(materialize_kernel_run_with_addresses(
+            TileWork::LocalCopy(copy) => {
+                let source = placement
+                    .shard_addresses
+                    .get(&copy.source)
+                    .and_then(|address| address.checked_add(copy.source_offset))
+                    .ok_or(TileLoweringError::InvalidLocalCopy)?;
+                let destination = placement
+                    .shard_addresses
+                    .get(&copy.destination)
+                    .and_then(|address| address.checked_add(copy.destination_offset))
+                    .ok_or(TileLoweringError::InvalidLocalCopy)?;
+                let (symbol, arguments) = if copy.bytes != 0 && copy.bytes.is_multiple_of(8) {
+                    let words = copy.bytes / 8;
+                    (crate::COPY_U64_SYMBOL, vec![words / 6, words % 6])
+                } else if copy.bytes != 0 && copy.bytes.is_multiple_of(4) {
+                    (crate::COPY_U32_SYMBOL, vec![copy.bytes / 4])
+                } else {
+                    return Err(TileLoweringError::InvalidLocalCopy);
+                };
+                TileStep::Compute(crate::ComputeStep {
+                    symbol: symbol.into(),
+                    output_address: TileAddress::Absolute(destination),
+                    input_addresses: vec![TileAddress::Absolute(source)],
+                    arguments,
+                    profile: StepProfile::default(),
+                })
+            }
+            TileWork::Kernel(run) => TileStep::Compute(materialize_kernel_run_with_addresses(
                 run,
                 &program.shards,
                 &placement.shard_addresses,
                 kernels,
                 overrides,
-            )?)),
+            )?),
             TileWork::Repeat(repeat) => {
                 if inside_repeat {
                     return Err(TileLoweringError::NestedRepeat);
                 }
-                lower_repeat(program, repeat, placement, kernels, phases, phase_addresses)
-                    .map(TileStep::Repeat)
+                TileStep::Repeat(lower_repeat(
+                    program,
+                    repeat,
+                    placement,
+                    kernels,
+                    phases,
+                    phase_addresses,
+                )?)
             }
-        })
-        .collect()
+        };
+        steps.push(step);
+    }
+    Ok(steps)
 }
 
 fn lower_repeat(

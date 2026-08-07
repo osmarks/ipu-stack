@@ -33,10 +33,11 @@ pub use kernel::{
     validate_kernel_run,
 };
 pub use low::{
-    ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun, LogicalExchange,
-    LowInput, LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId, LowValue,
-    RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, ShardDefinition, ShardExtent,
-    ShardView, TileKernel, TileWork, TileWorkList, WorkProvenance, WorkReason, lower_to_tiles,
+    ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun, LocalCopy,
+    LogicalExchange, LowInput, LowLoweringError, LowLoweringResult, LowProgram, LowShard,
+    LowShardId, LowValue, RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun,
+    ShardDefinition, ShardExtent, ShardView, TileKernel, TileWork, TileWorkList, WorkProvenance,
+    WorkReason, lower_to_tiles,
 };
 pub use memory::IPU21_DATA_BASE;
 pub use mid::{
@@ -69,6 +70,8 @@ pub const COMPLETE_SYMBOL: &str = "ipu_stack_static_complete";
 pub const HOST_RUN_SYMBOL: &str = "ipu_stack_static_host_run";
 pub const REPEAT_CALL_SYMBOL: &str = "ipu_stack_static_repeat_call";
 pub const SAMPLE_CYCLE_SYMBOL: &str = "ipu_stack_static_sample_cycle";
+pub const COPY_U32_SYMBOL: &str = "ipu_stack_static_copy_u32";
+pub const COPY_U64_SYMBOL: &str = "ipu_stack_copy_u64";
 pub const RUNTIME_ENTRY_SYMBOL: &str = "ipu_stack_static_start";
 pub const PROGRAM_ADDRESS_SYMBOL: &str = "ipu_stack_static_program";
 pub const WORKER_SYNC_CONTEXT_SYMBOL: &str = "ipu_stack_static_worker_sync_context";

@@ -122,7 +122,7 @@ ipu_stack_static_copy_u32:
 	.size ipu_stack_static_copy_u32, .-ipu_stack_static_copy_u32
 
 	.section .text.ipu_stack_copy_u64,"ax",@progbits
-	// Runtime helper ABI: m2 destination, m3 source, m6 words/worker, m7
+	// Runtime helper ABI: m2 destination, m3 source, m4 words/worker, m5
 	// remainder workers, m10 return. This is not a layout-conversion kernel.
 	.globl ipu_stack_copy_u64
 	.p2align 2
@@ -132,8 +132,8 @@ ipu_stack_copy_u64:
 	add $m11, $m11, -16
 	st32 $m2, $m11, $m15, 0
 	st32 $m3, $m11, $m15, 1
-	st32 $m6, $m11, $m15, 2
-	st32 $m7, $m11, $m15, 3
+	st32 $m4, $m11, $m15, 2
+	st32 $m5, $m11, $m15, 3
 	setzi $m0, .Lcopy_u64_worker
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET

@@ -250,6 +250,14 @@ fn collect_requirements(tile: &TileWorkList, requirements: &mut [Requirement]) {
                 }
                 apply_requirement(&mut requirements[run.output.shard.index() as usize], output);
             }
+            TileWork::LocalCopy(copy) => {
+                requirements[copy.source.index() as usize].alignment =
+                    requirements[copy.source.index() as usize].alignment.max(8);
+                requirements[copy.destination.index() as usize].alignment = requirements
+                    [copy.destination.index() as usize]
+                    .alignment
+                    .max(8);
+            }
             TileWork::Repeat(repeat) => collect_requirements(&repeat.body, requirements),
             TileWork::Exchange(_) => {}
         }
