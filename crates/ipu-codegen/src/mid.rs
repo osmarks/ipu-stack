@@ -8,8 +8,8 @@
 //! layout rearrangements at format boundaries.
 
 use crate::graph::{
-    ComputeGraph, GraphInputKind, Operation, OperationId, OperationKind, Repeat, TensorShape,
-    ValueId,
+    AddOptions, AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation,
+    OperationId, OperationKind, Repeat, TensorShape, ValueId,
 };
 use std::collections::BTreeMap;
 
@@ -43,12 +43,14 @@ pub enum AccumulationPrecision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MidOperator {
     Gemm {
+        options: GemmOptions,
         multiply: Precision,
         accumulate: AccumulationPrecision,
     },
     Gelu,
-    Add,
+    Add(AddOptions),
     FlashAttention {
+        options: AttentionOptions,
         accumulate: AccumulationPrecision,
     },
 }
@@ -64,6 +66,7 @@ pub enum TileKernelSpec {
     Gelu,
     Add,
     FlashAttention {
+        options: AttentionOptions,
         accumulate: AccumulationPrecision,
     },
 }
@@ -463,7 +466,7 @@ impl OperatorCandidate {
                 output,
             ),
         };
-        alias_valid
+        let requirements_valid = alias_valid
             && self.memory_relations.iter().all(|relation| match relation {
                 MemoryRelation::DistinctElements(operands) => {
                     operands.len() >= 2
@@ -474,13 +477,41 @@ impl OperatorCandidate {
                             !operands[..index].iter().any(|previous| previous == operand)
                         })
                 }
+            });
+        if !requirements_valid {
+            return false;
+        }
+        let planned_inputs = inputs
+            .iter()
+            .zip(&self.inputs)
+            .map(|(input, requirement)| TensorType {
+                shape: input.shape.clone(),
+                format: requirement.format.clone(),
             })
+            .collect::<Vec<_>>();
+        let planned_output = TensorType {
+            shape: output.clone(),
+            format: self.output.format.clone(),
+        };
+        OperatorPlan {
+            operator: self.operator,
+            dispatch: self.dispatch.clone(),
+            requirements: OperatorRequirements {
+                inputs: self.inputs.clone(),
+                output: self.output.clone(),
+                output_aliasing: self.output_aliasing.clone(),
+                memory_relations: self.memory_relations.clone(),
+            },
+        }
+        .validate(&planned_inputs, &planned_output)
+        .is_ok()
     }
 }
 
 fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
     match operator {
         MidOperator::Gemm {
+            options: _,
             multiply,
             accumulate,
         } => OperatorDispatch::BlockedGemm {
@@ -500,11 +531,17 @@ fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
         MidOperator::Gelu => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Gelu,
         },
-        MidOperator::Add => OperatorDispatch::Pointwise {
+        MidOperator::Add(_) => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Add,
         },
-        MidOperator::FlashAttention { accumulate } => OperatorDispatch::Pointwise {
-            kernel: TileKernelSpec::FlashAttention { accumulate },
+        MidOperator::FlashAttention {
+            options,
+            accumulate,
+        } => OperatorDispatch::Pointwise {
+            kernel: TileKernelSpec::FlashAttention {
+                options,
+                accumulate,
+            },
         },
     }
 }
@@ -603,17 +640,18 @@ fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
         pointwise_operator_candidate(MidOperator::Gelu, [rows_f16.clone()], rows_f16.clone()),
         pointwise_operator_candidate(MidOperator::Gelu, [rows_f32.clone()], rows_f32.clone()),
         pointwise_operator_candidate(
-            MidOperator::Add,
+            MidOperator::Add(AddOptions::default()),
             [rows_f16.clone(), rows_f16.clone()],
             rows_f16,
         ),
         pointwise_operator_candidate(
-            MidOperator::Add,
+            MidOperator::Add(AddOptions::default()),
             [rows_f32.clone(), rows_f32.clone()],
             rows_f32,
         ),
         pointwise_operator_candidate(
             MidOperator::FlashAttention {
+                options: AttentionOptions::default(),
                 accumulate: AccumulationPrecision::F32,
             },
             [heads_f16.clone(), heads_f16.clone(), heads_f16.clone()],
@@ -621,6 +659,7 @@ fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
         ),
         pointwise_operator_candidate(
             MidOperator::FlashAttention {
+                options: AttentionOptions::default(),
                 accumulate: AccumulationPrecision::F32,
             },
             [heads_f32.clone(), heads_f32.clone(), heads_f32.clone()],
@@ -651,6 +690,7 @@ fn amp_gemm_operator_candidate(
 ) -> OperatorCandidate {
     OperatorCandidate::new(
         MidOperator::Gemm {
+            options: GemmOptions::default(),
             multiply: precision,
             accumulate: AccumulationPrecision::F32,
         },
@@ -734,6 +774,148 @@ pub struct OperatorPlan {
     pub operator: MidOperator,
     pub dispatch: OperatorDispatch,
     pub requirements: OperatorRequirements,
+}
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum OperatorPlanError {
+    #[error("operator plan operand arity does not match its requirements")]
+    OperandArity,
+    #[error("operator plan dispatch does not match the selected operator")]
+    DispatchMismatch,
+    #[error("operator plan uses zero or incompatible block dimensions")]
+    InvalidBlocking,
+    #[error("operator plan requires corresponding input and output tile groups")]
+    IncompatibleTileGroups,
+    #[error("blocked GEMM currently requires non-transposed AMP left/right/output formats")]
+    UnsupportedGemmLayout,
+}
+
+impl OperatorPlan {
+    pub fn validate(
+        &self,
+        inputs: &[TensorType],
+        output: &TensorType,
+    ) -> Result<(), OperatorPlanError> {
+        if inputs.len() != self.requirements.inputs.len() {
+            return Err(OperatorPlanError::OperandArity);
+        }
+        let output_tiles = output.format.layout.tiling.tile_count;
+        if inputs
+            .iter()
+            .any(|input| input.format.layout.tiling.tile_count != output_tiles)
+        {
+            return Err(OperatorPlanError::IncompatibleTileGroups);
+        }
+        match (&self.operator, &self.dispatch) {
+            (
+                MidOperator::Gemm { options, .. },
+                OperatorDispatch::BlockedGemm {
+                    initialize,
+                    accumulate,
+                    inner_block,
+                    output_column_block,
+                },
+            ) => {
+                let [left, right] = inputs else {
+                    return Err(OperatorPlanError::OperandArity);
+                };
+                if options.transpose_left
+                    || options.transpose_right
+                    || !matches!(left.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
+                    || !matches!(
+                        right.format.layout.order,
+                        ElementOrder::Amp(AmpOrder::Right)
+                    )
+                    || !matches!(
+                        output.format.layout.order,
+                        ElementOrder::Amp(AmpOrder::Output)
+                    )
+                {
+                    return Err(OperatorPlanError::UnsupportedGemmLayout);
+                }
+                let (
+                    TileKernelSpec::Gemm {
+                        multiply: init_multiply,
+                        accumulate: init_accumulate,
+                        mode: GemmKernelMode::Initialize,
+                    },
+                    TileKernelSpec::Gemm {
+                        multiply: next_multiply,
+                        accumulate: next_accumulate,
+                        mode: GemmKernelMode::Accumulate,
+                    },
+                    MidOperator::Gemm {
+                        multiply,
+                        accumulate,
+                        ..
+                    },
+                ) = (initialize, accumulate, &self.operator)
+                else {
+                    return Err(OperatorPlanError::DispatchMismatch);
+                };
+                if init_multiply != multiply
+                    || next_multiply != multiply
+                    || init_accumulate != accumulate
+                    || next_accumulate != accumulate
+                {
+                    return Err(OperatorPlanError::DispatchMismatch);
+                }
+                if *inner_block == 0
+                    || *output_column_block == 0
+                    || left.shape.0.len() < 2
+                    || output.shape.0.len() < 2
+                {
+                    return Err(OperatorPlanError::InvalidBlocking);
+                }
+                let left_padded = left
+                    .format
+                    .layout
+                    .padded_shape(&left.shape)
+                    .map_err(|_| OperatorPlanError::InvalidBlocking)?;
+                let output_padded = output
+                    .format
+                    .layout
+                    .padded_shape(&output.shape)
+                    .map_err(|_| OperatorPlanError::InvalidBlocking)?;
+                if !left_padded.0.last().unwrap().is_multiple_of(*inner_block)
+                    || !output_padded
+                        .0
+                        .last()
+                        .unwrap()
+                        .is_multiple_of(*output_column_block)
+                {
+                    return Err(OperatorPlanError::InvalidBlocking);
+                }
+                Ok(())
+            }
+            (
+                MidOperator::Gelu,
+                OperatorDispatch::Pointwise {
+                    kernel: TileKernelSpec::Gelu,
+                },
+            )
+            | (
+                MidOperator::Add(_),
+                OperatorDispatch::Pointwise {
+                    kernel: TileKernelSpec::Add,
+                },
+            ) => Ok(()),
+            (
+                MidOperator::FlashAttention {
+                    options,
+                    accumulate,
+                },
+                OperatorDispatch::Pointwise {
+                    kernel:
+                        TileKernelSpec::FlashAttention {
+                            options: kernel_options,
+                            accumulate: kernel_accumulate,
+                        },
+                },
+            ) if options == kernel_options && accumulate == kernel_accumulate => Ok(()),
+            _ => Err(OperatorPlanError::DispatchMismatch),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -826,7 +1008,7 @@ impl CostModel for ToyCostModel {
             }
             MidOperator::FlashAttention { .. } => elements.saturating_mul(8).div_ceil(32),
             MidOperator::Gelu => elements.saturating_mul(6).div_ceil(16),
-            MidOperator::Add => elements.div_ceil(16),
+            MidOperator::Add(_) => elements.div_ceil(16),
         }
     }
 
@@ -1113,16 +1295,15 @@ fn plans(
 }
 
 fn operator_matches(operation: &OperationKind, operator: MidOperator) -> bool {
-    matches!(
-        (operation, operator),
-        (OperationKind::Gemm, MidOperator::Gemm { .. })
-            | (OperationKind::Gelu, MidOperator::Gelu)
-            | (OperationKind::Add, MidOperator::Add)
-            | (
-                OperationKind::FlashAttention,
-                MidOperator::FlashAttention { .. }
-            )
-    )
+    match (operation, operator) {
+        (OperationKind::Gemm(expected), MidOperator::Gemm { options, .. }) => *expected == options,
+        (OperationKind::Gelu, MidOperator::Gelu) => true,
+        (OperationKind::Add(expected), MidOperator::Add(options)) => *expected == options,
+        (OperationKind::FlashAttention(expected), MidOperator::FlashAttention { options, .. }) => {
+            *expected == options
+        }
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1480,8 +1661,8 @@ mod tests {
         for case in 0..RANDOM_CASES {
             let (rows, inner, columns) = (
                 dimension(&mut random),
-                dimension(&mut random),
-                dimension(&mut random),
+                dimension(&mut random) * 64,
+                dimension(&mut random) * 64,
             );
             let batches = (0..random.usize(0..=3))
                 .map(|_| dimension(&mut random))
@@ -1510,6 +1691,7 @@ mod tests {
             };
             let candidate = OperatorCandidate::new(
                 MidOperator::Gemm {
+                    options: GemmOptions::default(),
                     multiply,
                     accumulate,
                 },
@@ -1544,6 +1726,7 @@ mod tests {
             let MidOperationKind::Operator(MidOperator::Gemm {
                 multiply: selected_multiply,
                 accumulate: selected_accumulate,
+                ..
             }) = operator.kind
             else {
                 panic!("random case {case}: expected GEMM");
@@ -1713,7 +1896,7 @@ mod tests {
                 )
                 .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
                 OperatorCandidate::new(
-                    MidOperator::Add,
+                    MidOperator::Add(AddOptions::default()),
                     [
                         OperandRequirement::new(add_left.clone(), 8),
                         OperandRequirement::new(add_right.clone(), 8),
@@ -1723,6 +1906,7 @@ mod tests {
                 .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
                 OperatorCandidate::new(
                     MidOperator::FlashAttention {
+                        options: AttentionOptions::default(),
                         accumulate: attention_accumulate,
                     },
                     [
@@ -1757,7 +1941,7 @@ mod tests {
             );
             assert!(matches!(
                 operators[1].kind,
-                MidOperationKind::Operator(MidOperator::Add)
+                MidOperationKind::Operator(MidOperator::Add(_))
             ));
             assert_operator_signature(&lowered, operators[1], &[add_left, add_right], add_output);
             assert_eq!(
@@ -1771,7 +1955,7 @@ mod tests {
             );
             assert!(matches!(
                 operators[2].kind,
-                MidOperationKind::Operator(MidOperator::FlashAttention { accumulate })
+                MidOperationKind::Operator(MidOperator::FlashAttention { accumulate, .. })
                     if accumulate == attention_accumulate
             ));
             assert_operator_signature(

@@ -11,9 +11,10 @@ pub mod low;
 pub mod mid;
 mod package;
 pub use graph::{
-    ComputeGraph, GraphError, GraphInput, GraphInputKind, GraphResult, Operation, OperationId,
-    OperationKind, Region, RegionBuilder, Repeat, RepeatArguments, TensorShape, ValueId,
-    ValueSequence, ValueSequenceId,
+    AddOptions, AttentionOptions, AttentionScale, BroadcastMode, ComputeGraph, GemmOptions,
+    GraphError, GraphInput, GraphInputKind, GraphResult, Operation, OperationId, OperationKind,
+    Region, RegionBuilder, Repeat, RepeatArguments, TensorShape, ValueId, ValueSequence,
+    ValueSequenceId,
 };
 pub use low::{
     ExchangePhase, ExchangePhaseId, KernelOperand, KernelRun, LogicalExchange, LowInput,
@@ -26,9 +27,9 @@ pub use mid::{
     HardwareTarget, Layout, LayoutError, LoweringError, LoweringResult, MemoryClass, MemoryOperand,
     MemoryRelation, MidGraph, MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion,
     MidRepeat, MidValue, MidValueId, OperandRequirement, OperatorCandidate, OperatorDispatch,
-    OperatorPlan, OperatorRequirements, OutputAliasing, Padding, PipelineConfig, Precision,
-    ProfilingConfig, SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType,
-    TileKernelSpec, ToyCostModel, lower,
+    OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, PipelineConfig,
+    Precision, ProfilingConfig, SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling,
+    TensorType, TileKernelSpec, ToyCostModel, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
 

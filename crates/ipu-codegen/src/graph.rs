@@ -113,11 +113,55 @@ pub struct Operation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperationKind {
-    Gemm,
+    Gemm(GemmOptions),
+    /// Exact Gaussian error linear unit.
     Gelu,
-    Add,
-    FlashAttention,
+    Add(AddOptions),
+    FlashAttention(AttentionOptions),
     Repeat(Repeat),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GemmOptions {
+    pub transpose_left: bool,
+    pub transpose_right: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BroadcastMode {
+    #[default]
+    Numpy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AddOptions {
+    pub broadcasting: BroadcastMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttentionScale {
+    #[default]
+    InverseSqrtQueryWidth,
+    ValueBits(u32),
+}
+
+impl AttentionScale {
+    pub fn value(scale: f32) -> Self {
+        Self::ValueBits(scale.to_bits())
+    }
+
+    pub fn as_value(self) -> Option<f32> {
+        match self {
+            Self::InverseSqrtQueryWidth => None,
+            Self::ValueBits(bits) => Some(f32::from_bits(bits)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AttentionOptions {
+    pub causal: bool,
+    pub scale: AttentionScale,
 }
 
 /// Structured repetition whose body is an ordered SSA operation list.
@@ -263,7 +307,16 @@ impl ComputeGraph {
     }
 
     pub fn gemm(&mut self, left: ValueId, right: ValueId) -> GraphResult<ValueId> {
-        self.inferred_result(OperationKind::Gemm, [left, right])
+        self.gemm_with_options(left, right, GemmOptions::default())
+    }
+
+    pub fn gemm_with_options(
+        &mut self,
+        left: ValueId,
+        right: ValueId,
+        options: GemmOptions,
+    ) -> GraphResult<ValueId> {
+        self.inferred_result(OperationKind::Gemm(options), [left, right])
     }
 
     pub fn gelu(&mut self, input: ValueId) -> GraphResult<ValueId> {
@@ -271,7 +324,7 @@ impl ComputeGraph {
     }
 
     pub fn add(&mut self, left: ValueId, right: ValueId) -> GraphResult<ValueId> {
-        self.inferred_result(OperationKind::Add, [left, right])
+        self.inferred_result(OperationKind::Add(AddOptions::default()), [left, right])
     }
 
     pub fn flash_attention(
@@ -280,7 +333,17 @@ impl ComputeGraph {
         key: ValueId,
         value: ValueId,
     ) -> GraphResult<ValueId> {
-        self.inferred_result(OperationKind::FlashAttention, [query, key, value])
+        self.flash_attention_with_options(query, key, value, AttentionOptions::default())
+    }
+
+    pub fn flash_attention_with_options(
+        &mut self,
+        query: ValueId,
+        key: ValueId,
+        value: ValueId,
+        options: AttentionOptions,
+    ) -> GraphResult<ValueId> {
+        self.inferred_result(OperationKind::FlashAttention(options), [query, key, value])
     }
 
     pub fn operation(
@@ -463,7 +526,16 @@ impl<'a> RegionBuilder<'a> {
     }
 
     pub fn gemm(&mut self, left: ValueId, right: ValueId) -> GraphResult<ValueId> {
-        self.inferred_result(OperationKind::Gemm, [left, right])
+        self.gemm_with_options(left, right, GemmOptions::default())
+    }
+
+    pub fn gemm_with_options(
+        &mut self,
+        left: ValueId,
+        right: ValueId,
+        options: GemmOptions,
+    ) -> GraphResult<ValueId> {
+        self.inferred_result(OperationKind::Gemm(options), [left, right])
     }
 
     pub fn gelu(&mut self, input: ValueId) -> GraphResult<ValueId> {
@@ -471,7 +543,7 @@ impl<'a> RegionBuilder<'a> {
     }
 
     pub fn add(&mut self, left: ValueId, right: ValueId) -> GraphResult<ValueId> {
-        self.inferred_result(OperationKind::Add, [left, right])
+        self.inferred_result(OperationKind::Add(AddOptions::default()), [left, right])
     }
 
     pub fn flash_attention(
@@ -480,7 +552,17 @@ impl<'a> RegionBuilder<'a> {
         key: ValueId,
         value: ValueId,
     ) -> GraphResult<ValueId> {
-        self.inferred_result(OperationKind::FlashAttention, [query, key, value])
+        self.flash_attention_with_options(query, key, value, AttentionOptions::default())
+    }
+
+    pub fn flash_attention_with_options(
+        &mut self,
+        query: ValueId,
+        key: ValueId,
+        value: ValueId,
+        options: AttentionOptions,
+    ) -> GraphResult<ValueId> {
+        self.inferred_result(OperationKind::FlashAttention(options), [query, key, value])
     }
 
     pub fn operation(
@@ -567,26 +649,32 @@ fn infer_shape(
             .ok_or_else(|| GraphError::InvalidShape("wrong input arity".into()))
     };
     match kind {
-        OperationKind::Gemm => {
+        OperationKind::Gemm(options) => {
             let (left, right) = (input(0)?, input(1)?);
             if left.0.len() < 2 || right.0.len() < 2 {
                 return Err(GraphError::InvalidShape(
                     "GEMM inputs must have rank at least two".into(),
                 ));
             }
-            if left.0[left.0.len() - 1] != right.0[right.0.len() - 2] {
+            let left_rows = left.0[left.0.len() - 2 + usize::from(options.transpose_left)];
+            let left_inner = left.0[left.0.len() - 1 - usize::from(options.transpose_left)];
+            let right_inner = right.0[right.0.len() - 2 + usize::from(options.transpose_right)];
+            let right_columns = right.0[right.0.len() - 1 - usize::from(options.transpose_right)];
+            if left_inner != right_inner {
                 return Err(GraphError::InvalidShape(
                     "GEMM inner dimensions do not match".into(),
                 ));
             }
             let mut output = broadcast(&left.0[..left.0.len() - 2], &right.0[..right.0.len() - 2])?;
-            output.push(left.0[left.0.len() - 2]);
-            output.push(right.0[right.0.len() - 1]);
+            output.push(left_rows);
+            output.push(right_columns);
             Ok(TensorShape(output))
         }
         OperationKind::Gelu => Ok(input(0)?.clone()),
-        OperationKind::Add => Ok(TensorShape(broadcast(&input(0)?.0, &input(1)?.0)?)),
-        OperationKind::FlashAttention => {
+        OperationKind::Add(AddOptions {
+            broadcasting: BroadcastMode::Numpy,
+        }) => Ok(TensorShape(broadcast(&input(0)?.0, &input(1)?.0)?)),
+        OperationKind::FlashAttention(options) => {
             let (query, key, value) = (input(0)?, input(1)?, input(2)?);
             if query.0.len() < 2 || key.0.len() < 2 || value.0.len() < 2 {
                 return Err(GraphError::InvalidShape(
@@ -598,6 +686,13 @@ fn infer_shape(
             {
                 return Err(GraphError::InvalidShape(
                     "FlashAttention head or sequence dimensions do not match".into(),
+                ));
+            }
+            if let Some(scale) = options.scale.as_value()
+                && (!scale.is_finite() || scale <= 0.0)
+            {
+                return Err(GraphError::InvalidShape(
+                    "attention scale must be finite and positive".into(),
                 ));
             }
             let q_batch = &query.0[..query.0.len() - 2];
@@ -703,14 +798,26 @@ mod tests {
                 dimension(&mut random),
                 dimension(&mut random),
             );
-            left_shape.extend([rows, inner]);
-            right_shape.extend([inner, columns]);
+            let options = GemmOptions {
+                transpose_left: random.bool(),
+                transpose_right: random.bool(),
+            };
+            left_shape.extend(if options.transpose_left {
+                [inner, rows]
+            } else {
+                [rows, inner]
+            });
+            right_shape.extend(if options.transpose_right {
+                [columns, inner]
+            } else {
+                [inner, columns]
+            });
             expected.extend([rows, columns]);
 
             let mut graph = ComputeGraph::new();
             let left = graph.host_input("left", left_shape).unwrap();
             let right = graph.parameter("right", right_shape).unwrap();
-            let output = graph.gemm(left, right).unwrap();
+            let output = graph.gemm_with_options(left, right, options).unwrap();
 
             assert_eq!(
                 graph.value_shape(output),
@@ -741,13 +848,50 @@ mod tests {
             let query = graph.host_input("q", query_shape).unwrap();
             let key = graph.host_input("k", key_shape).unwrap();
             let value = graph.host_input("v", value_shape).unwrap();
-            let output = graph.flash_attention(query, key, value).unwrap();
+            let options = AttentionOptions {
+                causal: random.bool(),
+                scale: if random.bool() {
+                    AttentionScale::InverseSqrtQueryWidth
+                } else {
+                    AttentionScale::value(random.f32() + 0.01)
+                },
+            };
+            let output = graph
+                .flash_attention_with_options(query, key, value, options)
+                .unwrap();
 
             assert_eq!(
                 graph.value_shape(output),
                 Some(&TensorShape(expected)),
                 "random case {case}"
             );
+        }
+    }
+
+    #[test]
+    fn randomized_attention_rejects_nonpositive_or_nonfinite_scales() {
+        let mut random = fastrand::Rng::with_seed(0x7363_616c);
+        for case in 0..RANDOM_CASES {
+            let scale = match random.u8(0..4) {
+                0 => 0.0,
+                1 => -random.f32(),
+                2 => f32::INFINITY,
+                _ => f32::NAN,
+            };
+            let mut graph = ComputeGraph::new();
+            let query = graph.host_input("q", [4, 8]).unwrap();
+            let key = graph.host_input("k", [4, 8]).unwrap();
+            let value = graph.host_input("v", [4, 8]).unwrap();
+            let result = graph.flash_attention_with_options(
+                query,
+                key,
+                value,
+                AttentionOptions {
+                    causal: random.bool(),
+                    scale: AttentionScale::value(scale),
+                },
+            );
+            assert!(result.is_err(), "random case {case}, scale {scale}");
         }
     }
 }

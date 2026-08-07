@@ -15,6 +15,11 @@ region with carried values, invariants, and per-iteration value sequences.
 Shapes are semantic and support arbitrary rank; GEMM operates on the final two
 axes and broadcasts leading batch axes.
 
+Operations retain semantics which affect planning: GEMM transpose flags, NumPy
+Add broadcasting, and attention causality and scaling. GeLU currently denotes
+the exact function. Attention intentionally has no general mask input; the
+supported form is either causal or unmasked.
+
 ## Mid-level IR
 
 `ipu_codegen::mid` is the layout-aware boundary. Every value has a logical
@@ -51,6 +56,12 @@ output-column block into an initializing tile-kernel phase followed by zero or
 more accumulating phases, moving the applicable right-hand slice to every
 output-row tile before each call. Pointwise and head-sharded plans dispatch one
 local kernel per output shard.
+
+Every candidate plan is validated against its concrete operand types before it
+can be selected. Validation checks dispatch/operator agreement, tile groups,
+block divisibility, tile-kernel modes and GEMM layout roles. The retained AMP
+GEMM plan currently rejects transposed operands rather than silently applying
+the non-transposed schedule.
 
 The toy choices describe the supported generic kernels: FP16 GEMM uses AMP
 A16/B16x16/C16 and FP32 uses A8/B8x16/C16. PACE operands require 32-byte
