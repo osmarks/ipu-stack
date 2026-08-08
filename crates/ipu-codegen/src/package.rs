@@ -231,14 +231,18 @@ fn build_package_from_objects(
             })
             .collect::<Result<Vec<_>, _>>()?)
     })?;
-    if generated.iter().any(|program| {
+    if let Some((tile, program)) = generated.iter().enumerate().find(|(_, program)| {
         code_address
             .checked_add(program.bytes.len() as u32)
             .is_none_or(|end| end > ipu_exchange::EXCHANGE_WINDOW_BASE)
     }) {
-        return Err(invalid(
-            "generated program does not fit below the exchange window",
-        ));
+        let available = ipu_exchange::EXCHANGE_WINDOW_BASE.saturating_sub(code_address);
+        let prefix_overflow = code_address.saturating_sub(ipu_exchange::EXCHANGE_WINDOW_BASE);
+        return Err(invalid(format!(
+            "tile {tile} generated program is {} bytes, but only {available} bytes are available from 0x{code_address:x} to the exchange window at 0x{:x} (linked exchange/support/host prefix already exceeds the window by {prefix_overflow} bytes)",
+            program.bytes.len(),
+            ipu_exchange::EXCHANGE_WINDOW_BASE,
+        )));
     }
 
     let tiles = build_phase("build_tile_images", || {

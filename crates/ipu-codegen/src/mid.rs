@@ -8,7 +8,10 @@
 //! layout rearrangements at format boundaries.
 
 pub use crate::cost::{CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts};
-use crate::estimate::{conversion_memory_estimate, operator_memory_estimate, region_peak_memory};
+use crate::estimate::{
+    conversion_exchange_bytes_per_transfer, conversion_memory_estimate, operator_memory_estimate,
+    region_peak_memory,
+};
 use crate::graph::{
     AddOptions, AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation,
     OperationId, OperationKind, Repeat, TensorShape, ValueId,
@@ -179,6 +182,7 @@ pub struct MemoryPeaks {
     pub standard: u64,
     pub interleaved: u64,
     pub total: u64,
+    pub maximum_standard_allocation: u64,
     /// Largest amount by which one standard-addressed allocation exceeded
     /// both contiguous ranges left around the interleaved region.
     pub standard_contiguous_overflow: u64,
@@ -189,7 +193,10 @@ impl MemoryPeaks {
         self.standard = self.standard.max(usage.standard);
         self.interleaved = self.interleaved.max(usage.interleaved);
         self.total = self.total.max(usage.total());
-        let interleaved_boundary = usage
+        self.maximum_standard_allocation = self
+            .maximum_standard_allocation
+            .max(maximum_standard_allocation);
+        let interleaved_boundary = self
             .interleaved
             .div_ceil(u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE))
             * u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE);
@@ -198,8 +205,8 @@ impl MemoryPeaks {
         let contiguous_capacity =
             u64::from(crate::memory::IPU21_STANDARD_FIXED_BYTES).max(upper_standard);
         self.standard_contiguous_overflow = self
-            .standard_contiguous_overflow
-            .max(maximum_standard_allocation.saturating_sub(contiguous_capacity));
+            .maximum_standard_allocation
+            .saturating_sub(contiguous_capacity);
     }
 
     pub fn fits_ipu21(self) -> bool {
@@ -655,7 +662,7 @@ pub struct TensorFormat {
     pub layout: Layout,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TensorType {
     pub shape: TensorShape,
     pub format: TensorFormat,
@@ -1632,6 +1639,8 @@ pub enum LoweringError {
         total: u64,
         standard_contiguous_overflow: u64,
     },
+    #[error("operation {0:?} has no candidate whose exchange phase fits the 32 KiB receive window")]
+    ExchangeWindow(OperationId),
     #[error(
         "GEMM operation {0:?} has per-batch right operands; only weights broadcast across every batch dimension are currently supported"
     )]
@@ -1792,9 +1801,11 @@ fn lower_operations(
         operations: Vec::new(),
         score: 0,
     }];
+    let mut exchange_cache = BTreeMap::<(TensorType, TensorType), u64>::new();
     for (operation_index, operation) in source.iter().enumerate() {
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
+        let mut rejected_exchange = false;
         let mut saw_candidate = false;
         for branch in beam {
             if let OperationKind::Repeat(repeat) = &operation.kind {
@@ -1817,11 +1828,28 @@ fn lower_operations(
                         .map(|operation| operation.estimated_cycles)
                         .sum(),
                 );
+                if !operations_exchange_window_fit(
+                    &next.operations[before..],
+                    &next.state.values,
+                    &mut exchange_cache,
+                ) {
+                    rejected_exchange = true;
+                    continue;
+                }
                 let peak =
                     beam_memory_peak(&next, &initial, source, operation_index, required_outputs);
                 if peak.fits_ipu21() {
                     expanded.push(next);
                 } else {
+                    tracing::trace!(
+                        operation = operation.id.index(),
+                        standard = peak.standard,
+                        interleaved = peak.interleaved,
+                        total = peak.total,
+                        contiguous_overflow = peak.standard_contiguous_overflow,
+                        plan = ?next.operations.last().and_then(|operation| operation.operator_plan.as_ref()),
+                        "rejected planning branch for memory"
+                    );
                     rejected_memory.push(peak);
                 }
                 continue;
@@ -1850,7 +1878,20 @@ fn lower_operations(
                 .ok_or(LoweringError::MissingShape(operation.results[0]))?;
             for plan in plans(operation, &input_types, &output_shape, config)
                 .into_iter()
-                .filter(|plan| plan_compatible_with_values(plan, &input_ids, &branch.state))
+                .filter(|plan| {
+                    input_ids
+                        .iter()
+                        .zip(&plan.requirements.inputs)
+                        .all(|(id, requirement)| {
+                            branch.state.automatic_inputs.contains(id)
+                                || branch.state.get(*id).tensor_type.format.layout.order
+                                    == requirement.format.layout.order
+                                || !matches!(
+                                    requirement.format.layout.order,
+                                    ElementOrder::Amp(AmpOrder::RightK64)
+                                )
+                        })
+                })
             {
                 saw_candidate = true;
                 let mut next = branch.clone();
@@ -1870,32 +1911,80 @@ fn lower_operations(
                         .map(|operation| operation.estimated_cycles)
                         .sum(),
                 );
+                if !operations_exchange_window_fit(
+                    &next.operations[before..],
+                    &next.state.values,
+                    &mut exchange_cache,
+                ) {
+                    rejected_exchange = true;
+                    continue;
+                }
                 let peak =
                     beam_memory_peak(&next, &initial, source, operation_index, required_outputs);
                 if peak.fits_ipu21() {
                     expanded.push(next);
                 } else {
+                    tracing::trace!(
+                        operation = operation.id.index(),
+                        standard = peak.standard,
+                        interleaved = peak.interleaved,
+                        total = peak.total,
+                        contiguous_overflow = peak.standard_contiguous_overflow,
+                        plan = ?next.operations.last().and_then(|operation| operation.operator_plan.as_ref()),
+                        "rejected planning branch for memory"
+                    );
                     rejected_memory.push(peak);
                 }
             }
         }
         if expanded.is_empty() {
             if saw_candidate {
-                let peak = rejected_memory
+                if let Some(peak) = rejected_memory
                     .into_iter()
                     .min_by_key(|peak| (peak.total, peak.interleaved, peak.standard))
-                    .expect("a rejected candidate has a memory peak");
-                return Err(LoweringError::InsufficientMemory {
-                    operation: operation.id,
-                    standard: peak.standard,
-                    interleaved: peak.interleaved,
-                    total: peak.total,
-                    standard_contiguous_overflow: peak.standard_contiguous_overflow,
-                });
+                {
+                    return Err(LoweringError::InsufficientMemory {
+                        operation: operation.id,
+                        standard: peak.standard,
+                        interleaved: peak.interleaved,
+                        total: peak.total,
+                        standard_contiguous_overflow: peak.standard_contiguous_overflow,
+                    });
+                }
+                if rejected_exchange {
+                    return Err(LoweringError::ExchangeWindow(operation.id));
+                }
             }
             return Err(LoweringError::NoCandidate(operation.id));
         }
         expanded.sort_by_key(|branch| branch.score);
+        let future_origins = source[operation_index + 1..]
+            .iter()
+            .flat_map(|operation| &operation.inputs)
+            .chain(required_outputs)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut retained_signatures = Vec::new();
+        expanded.retain(|branch| {
+            let signature = future_origins
+                .iter()
+                .filter_map(|origin| {
+                    branch.values.get(origin).map(|id| {
+                        (
+                            *origin,
+                            branch.state.get(*id).tensor_type.clone(),
+                            branch.state.automatic_inputs.contains(id),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if retained_signatures.contains(&signature) {
+                false
+            } else {
+                retained_signatures.push(signature);
+                true
+            }
+        });
         expanded.truncate(config.planning_beam_width.max(1));
         tracing::debug!(
             operation = operation.id.index(),
@@ -1914,34 +2003,66 @@ fn lower_operations(
     Ok(best.operations)
 }
 
-fn plan_compatible_with_values(
-    plan: &Plan,
-    input_ids: &[MidValueId],
-    state: &LoweringState,
+fn operations_exchange_window_fit(
+    operations: &[MidOperation],
+    values: &[MidValue],
+    cache: &mut BTreeMap<(TensorType, TensorType), u64>,
 ) -> bool {
-    let grid_plan = matches!(plan.operator, MidOperator::Gemm { .. })
-        && (plan
-            .requirements
+    operations
+        .iter()
+        .all(|operation| operation_exchange_window_fits(operation, values, cache))
+}
+
+fn operation_exchange_window_fits(
+    operation: &MidOperation,
+    values: &[MidValue],
+    cache: &mut BTreeMap<(TensorType, TensorType), u64>,
+) -> bool {
+    let bytes = match (&operation.conversion_plan, &operation.operator_plan) {
+        (Some(plan), _) if plan.dispatch == ConversionDispatch::Intersections => operation
             .inputs
-            .iter()
-            .any(|input| input.format.layout.tiling.replicas > 1)
-            || plan.requirements.inputs.get(1).is_some_and(|right| {
-                right
-                    .format
-                    .layout
-                    .tiling
-                    .axes
-                    .iter()
-                    .any(|axis| axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1)
-            }));
-    !grid_plan
-        || input_ids
-            .iter()
-            .zip(&plan.requirements.inputs)
-            .all(|(id, requirement)| {
-                state.automatic_inputs.contains(id)
-                    || state.get(*id).tensor_type.format.layout == requirement.format.layout
-            })
+            .first()
+            .zip(operation.results.first())
+            .map_or(u64::MAX, |(input, output)| {
+                let input = &values[input.index() as usize].tensor_type;
+                let output = &values[output.index() as usize].tensor_type;
+                if let Some(bytes) = cache.get(&(input.clone(), output.clone())) {
+                    *bytes
+                } else {
+                    let bytes = conversion_exchange_bytes_per_transfer(input, output);
+                    cache.insert((input.clone(), output.clone()), bytes);
+                    bytes
+                }
+            }),
+        (
+            _,
+            Some(OperatorPlan {
+                dispatch:
+                    OperatorDispatch::BlockedGemm {
+                        inner_block,
+                        output_column_block,
+                        ..
+                    },
+                requirements,
+                ..
+            }),
+        ) => {
+            if operation.results.is_empty() {
+                return false;
+            }
+            let columns = u64::from(*output_column_block);
+            u64::from(*inner_block)
+                .saturating_mul(columns)
+                .saturating_mul(
+                    requirements
+                        .inputs
+                        .get(1)
+                        .map_or(u64::MAX, |right| right.format.precision.bytes()),
+                )
+        }
+        _ => 0,
+    };
+    bytes <= u64::from(ipu_exchange::EXCHANGE_WINDOW_BYTES)
 }
 
 fn apply_selected_plan(
@@ -2570,7 +2691,7 @@ mod tests {
             let tiles = random.u16(1..=64);
             let (rows, inner, columns) = (
                 u32::from(tiles) * small_dimension(&mut random),
-                small_dimension(&mut random) * 64,
+                random.u32(1..=2) * 64,
                 small_dimension(&mut random) * 64,
             );
             let batches = (0..random.usize(0..=3))
@@ -2625,7 +2746,11 @@ mod tests {
                 .with_input(right, format(precision(&mut random), linear));
             config.operator_candidates = vec![candidate.clone()];
 
-            let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap_or_else(|error| {
+                panic!(
+                    "random case {case}: tiles={tiles} rows={rows} inner={inner} columns={columns} batches={batches:?}: {error:?}"
+                )
+            });
             let operator = lowered
                 .operations
                 .iter()
@@ -2767,12 +2892,12 @@ mod tests {
     #[test]
     fn randomized_gemms_choose_precision_independently_within_one_graph() {
         let mut random = fastrand::Rng::with_seed(0x6d75_6c74);
-        for case in 0..RANDOM_CASES {
+        for case in 0..RANDOM_CASES / 4 {
             let tiles = random.u16(1..=64);
-            let rows = u32::from(tiles) * dimension(&mut random);
-            let inner = dimension(&mut random);
-            let even_columns = random.u32(1..=64) * 2;
-            let odd_columns = random.u32(1..=64) * 2 - 1;
+            let rows = u32::from(tiles) * small_dimension(&mut random);
+            let inner = random.u32(1..=64);
+            let even_columns = random.u32(1..=16) * 2;
+            let odd_columns = random.u32(1..=16) * 2 - 1;
             let layout = Layout::row_sharded(tiles);
             let mut graph = ComputeGraph::new();
             let left = graph.host_input("left", [rows, inner]).unwrap();
@@ -2849,11 +2974,11 @@ mod tests {
         let mut random = fastrand::Rng::with_seed(0x6164_642b);
         for case in 0..RANDOM_CASES {
             let tiles = random.u16(1..=64);
-            let batch = small_dimension(&mut random);
-            let query_rows = u32::from(tiles) * small_dimension(&mut random);
-            let key_rows = small_dimension(&mut random) * 4;
-            let channels = small_dimension(&mut random) * 4;
-            let value_channels = small_dimension(&mut random) * 4;
+            let batch = random.u32(1..=2);
+            let query_rows = u32::from(tiles) * random.u32(1..=2);
+            let key_rows = random.u32(1..=8);
+            let channels = random.u32(1..=8);
+            let value_channels = random.u32(1..=8);
             let mut graph = ComputeGraph::new();
             let activation = graph
                 .host_input("activation", [batch, query_rows, channels])

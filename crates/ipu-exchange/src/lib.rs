@@ -4,6 +4,8 @@ use tracing::debug;
 
 pub const PLAN_WORDS: usize = 9;
 pub const MAX_TRANSFER_WORDS: u32 = 4148;
+/// Largest scheduled delay encodable by one exchange delay instruction.
+pub const MAX_PLAN_OFFSET_CYCLES: u32 = 0x8_0000;
 pub const EXCHANGE_WINDOW_BASE: u32 = 0x50000;
 pub const EXCHANGE_WINDOW_BYTES: u32 = 0x8000;
 pub const HOST_SHORT_MAX_BYTES: u32 = 60;
@@ -239,15 +241,30 @@ impl PlanProgramBuilder {
             self.event_cycles = plan_event_cycles(&self.words)?;
             return Ok(());
         }
-        let first_timed = body
-            .iter()
-            .position(|instruction| instruction_advance(*instruction) != 0)
-            .ok_or(ExchangeError::Schedule("exchange row has no timed event"))?;
-        let first_advance = instruction_advance(body[first_timed]);
-        if first_advance <= self.event_cycles {
+        let mut remaining = self.event_cycles;
+        let mut consumed_delays = Vec::new();
+        for (index, instruction) in body.iter_mut().enumerate() {
+            let advance = instruction_advance(*instruction);
+            if advance == 0 {
+                continue;
+            }
+            if remaining < advance {
+                set_instruction_advance(instruction, advance - remaining)?;
+                remaining = 0;
+                break;
+            }
+            if *instruction & DELAY_OPCODE_MASK != DELAY_OPCODE {
+                return Err(ExchangeError::Schedule("overlapping tile exchange roles"));
+            }
+            remaining -= advance;
+            consumed_delays.push(index);
+        }
+        if remaining != 0 {
             return Err(ExchangeError::Schedule("overlapping tile exchange roles"));
         }
-        set_instruction_advance(&mut body[first_timed], first_advance - self.event_cycles)?;
+        for index in consumed_delays.into_iter().rev() {
+            body.remove(index);
+        }
         self.words.extend(body);
         self.event_cycles = plan_event_cycles(&self.words)?;
         Ok(())
@@ -489,6 +506,10 @@ pub enum ExchangeError {
     ReceiverSet,
     #[error("exchange schedule is not encodable: {0}")]
     Schedule(&'static str),
+    #[error(
+        "exchange event offset {cycles} cycles from the phase-entry sync exceeds the encodable maximum of {maximum} cycles"
+    )]
+    PlanOffsetRange { cycles: u32, maximum: u32 },
     #[error("tile address 0x{0:x} is not encodable")]
     Address(u32),
     #[error("host exchange address or length is not encodable")]
@@ -1084,11 +1105,25 @@ pub fn offset_plan(row: &mut PlanRow, cycles: u32) -> Result<(), ExchangeError> 
         .iter()
         .position(|instruction| *instruction == RETURN_M10_INSTRUCTION)
         .ok_or(ExchangeError::Schedule("plan offset return"))?;
-    if end + 1 >= row.len() || cycles > 0x8_0000 {
-        return Err(ExchangeError::Schedule("plan offset range"));
+    let available = row.len().saturating_sub(end + 1);
+    let delay_count = usize::try_from(cycles.div_ceil(MAX_PLAN_OFFSET_CYCLES))
+        .map_err(|_| ExchangeError::Schedule("plan offset instruction count"))?;
+    if delay_count > available {
+        let maximum = u32::try_from(available)
+            .unwrap_or(u32::MAX)
+            .saturating_mul(MAX_PLAN_OFFSET_CYCLES);
+        return Err(ExchangeError::PlanOffsetRange { cycles, maximum });
     }
-    row.copy_within(1..=end, 2);
-    row[1] = delay(cycles - 1);
+    if delay_count == 0 {
+        return Err(ExchangeError::Schedule("plan offset instruction capacity"));
+    }
+    row.copy_within(1..=end, 1 + delay_count);
+    let mut remaining = cycles;
+    for instruction in &mut row[1..=delay_count] {
+        let chunk = remaining.min(MAX_PLAN_OFFSET_CYCLES);
+        *instruction = delay(chunk - 1);
+        remaining -= chunk;
+    }
     Ok(())
 }
 
@@ -1552,17 +1587,18 @@ mod tests {
         let mut plan = topology.multicast(0, &[1, 2], 4096, 0).unwrap();
         let sender_cycles = plan_event_cycles(&plan.sender).unwrap();
         let receiver_cycles = plan_event_cycles(&plan.receivers[0]).unwrap();
+        let offset = MAX_PLAN_OFFSET_CYCLES + 70;
 
-        offset_plan(&mut plan.sender, 5000).unwrap();
-        offset_plan(&mut plan.receivers[0], 5000).unwrap();
+        offset_plan(&mut plan.sender, offset).unwrap();
+        offset_plan(&mut plan.receivers[0], offset).unwrap();
 
         assert_eq!(
             plan_event_cycles(&plan.sender).unwrap(),
-            sender_cycles + 5000
+            sender_cycles + offset
         );
         assert_eq!(
             plan_event_cycles(&plan.receivers[0]).unwrap(),
-            receiver_cycles + 5000
+            receiver_cycles + offset
         );
     }
 

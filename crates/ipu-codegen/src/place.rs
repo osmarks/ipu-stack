@@ -586,18 +586,29 @@ fn allocate_tile_class(
     }
     requests.sort_by_key(|request| (request.lifetime.first, request.lifetime.last));
     for request in requests {
-        let base = arena
-            .allocate(
-                request.bytes,
-                request.alignment,
-                request.lifetime.first,
-                request.lifetime.last,
-            )
-            .ok_or(PlacementError::OutOfMemory {
+        let Some(base) = arena.allocate(
+            request.bytes,
+            request.alignment,
+            request.lifetime.first,
+            request.lifetime.last,
+        ) else {
+            let representative = &program.shards[members[&request.assignments[0].0][0]];
+            tracing::error!(
+                tile,
+                ?class,
+                bytes = request.bytes,
+                alignment = request.alignment,
+                first = request.lifetime.first,
+                last = request.lifetime.last,
+                tensor_type = ?representative.tensor_type,
+                "tile allocation does not fit"
+            );
+            return Err(PlacementError::OutOfMemory {
                 tile,
                 class,
                 bytes: request.bytes,
-            })?;
+            });
+        };
         for (root, offset) in request.assignments {
             let address = base.checked_add(offset).ok_or(PlacementError::Overflow)?;
             assign_members(addresses, &members[&root], address)?;
@@ -647,23 +658,29 @@ impl Arena {
             }
         }
         self.active = retained;
-        for index in 0..self.free.len() {
+        let candidate = self
+            .free
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &(base, limit))| {
+                let start = align_up(base, alignment).ok()?;
+                let end = start.checked_add(bytes)?;
+                (end <= limit).then(|| (limit - end, index, start, end))
+            })
+            .min_by_key(|candidate| (candidate.0, candidate.2));
+        if let Some((_, index, start, end)) = candidate {
             let (base, limit) = self.free[index];
-            let start = align_up(base, alignment).ok()?;
-            let end = start.checked_add(bytes)?;
-            if end <= limit {
-                self.free.remove(index);
-                if base < start {
-                    self.free.push((base, start));
-                }
-                if end < limit {
-                    self.free.push((end, limit));
-                }
-                self.free.sort_unstable();
-                self.active.push((last, start, bytes));
-                self.maximum = self.maximum.max(end);
-                return Some(start);
+            self.free.remove(index);
+            if base < start {
+                self.free.push((base, start));
             }
+            if end < limit {
+                self.free.push((end, limit));
+            }
+            self.free.sort_unstable();
+            self.active.push((last, start, bytes));
+            self.maximum = self.maximum.max(end);
+            return Some(start);
         }
         None
     }
