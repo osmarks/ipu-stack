@@ -381,7 +381,7 @@ impl LoweringState {
         Ok(used
             .checked_add(bytes)
             .and_then(|total| total.checked_add(access_tail))
-            .is_some_and(|total| total <= crate::memory::IPU21_INTERLEAVED_BYTES))
+            .is_some_and(|total| total <= crate::memory::IPU21_INTERLEAVED_REGION_BYTES))
     }
 
     fn right_shard_for_block(

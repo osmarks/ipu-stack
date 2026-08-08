@@ -118,6 +118,10 @@ pub enum AmpOrder {
     Output,
 }
 
+pub const AMP_INNER_BLOCK: u32 = 64;
+pub const AMP_OUTPUT_COLUMN_BLOCK: u32 = 64;
+pub const AMP_COLUMN_MICRO: u32 = 16;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ElementOrder {
     RowMajor,
@@ -468,9 +472,14 @@ impl Layout {
                 tile_count,
                 replicas: row_partitions,
                 axes: vec![
-                    AxisTiling::new(TensorAxis::FromEnd(2), 1, 64, Padding::Zero),
-                    AxisTiling::new(TensorAxis::FromEnd(1), column_partitions, 64, Padding::Zero)
-                        .with_tile_stride(1),
+                    AxisTiling::new(TensorAxis::FromEnd(2), 1, AMP_INNER_BLOCK, Padding::Zero),
+                    AxisTiling::new(
+                        TensorAxis::FromEnd(1),
+                        column_partitions,
+                        AMP_OUTPUT_COLUMN_BLOCK,
+                        Padding::Zero,
+                    )
+                    .with_tile_stride(1),
                 ],
             },
             memory_class: MemoryClass::Ipu21Interleaved,
@@ -797,8 +806,8 @@ fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
                 mode: GemmKernelMode::Accumulate,
                 weights: GemmWeightLoad::Standard,
             },
-            inner_block: 64,
-            output_column_block: 64,
+            inner_block: AMP_INNER_BLOCK,
+            output_column_block: AMP_OUTPUT_COLUMN_BLOCK,
         },
         MidOperator::Gelu => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Gelu,
@@ -991,7 +1000,13 @@ fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
             heads_f32,
         ),
     ]);
-    candidates
+    let mut unique = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
 }
 
 fn pointwise_operator_candidate(
