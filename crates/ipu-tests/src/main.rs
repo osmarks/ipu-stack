@@ -408,7 +408,7 @@ fn run_initialized_program(
 fn run_gemm_benchmark(
     runtime: &Runtime,
     application: &Application,
-    active_tiles: u16,
+    execution_tiles: u16,
     rows: u32,
     inner: u32,
     columns: u32,
@@ -439,14 +439,15 @@ fn run_gemm_benchmark(
         timeout_seconds,
     )?;
     let maximum_absolute_error = verify_benchmark_output(application, &output, inner)?;
-    let (cycles, minimum_cycles) = benchmark_cycles(application, &output, active_tiles)?;
+    let (cycles, minimum_cycles) = benchmark_cycles(application, &output, execution_tiles)?;
+    let active_tiles = binding_tile_count(application, "output.0")?;
     let rows = u64::from(rows);
     let flops = 2.0 * rows as f64 * f64::from(inner) * f64::from(columns);
     let seconds = f64::from(cycles) / clock_hz as f64;
     let tflops = flops / seconds / 1.0e12;
     let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
     println!(
-        "benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} tiles={active_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} tflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
+        "benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} activeTiles={active_tiles} executionTiles={execution_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} tflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
         left_bytes.len(),
         right_bytes.len(),
         seconds * 1.0e6,
@@ -459,7 +460,7 @@ fn run_gemm_benchmark(
 fn run_siglip_mlp_benchmark(
     runtime: &Runtime,
     application: &Application,
-    active_tiles: u16,
+    execution_tiles: u16,
     batch: u32,
     tokens: u32,
     dimension: u32,
@@ -499,14 +500,15 @@ fn run_siglip_mlp_benchmark(
     let first_dense = dimension as f32 / 128.0;
     let expected = gelu_reference(first_dense) * hidden_dimension as f32 / 128.0;
     let maximum_absolute_error = verify_constant_output(application, &output, expected)?;
-    let (cycles, minimum_cycles) = benchmark_cycles(application, &output, active_tiles)?;
+    let (cycles, minimum_cycles) = benchmark_cycles(application, &output, execution_tiles)?;
+    let active_tiles = binding_tile_count(application, "output.0")?;
     let rows = u64::from(batch) * u64::from(tokens);
     let flops = 4.0 * rows as f64 * f64::from(dimension) * f64::from(hidden_dimension);
     let seconds = f64::from(cycles) / clock_hz as f64;
     let tflops = flops / seconds / 1.0e12;
     let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
     println!(
-        "benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} rows={rows} dimension={dimension} hiddenDimension={hidden_dimension} biases=false tiles={active_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} effectiveGemmTflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
+        "benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} rows={rows} dimension={dimension} hiddenDimension={hidden_dimension} biases=false activeTiles={active_tiles} executionTiles={execution_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} effectiveGemmTflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
         left_bytes.len(),
         weights.len(),
         seconds * 1.0e6,
@@ -656,6 +658,17 @@ fn output_binding<'a>(application: &'a Application, name: &str) -> Result<(&'a B
             .context("host output binding offset overflow")?;
     }
     bail!("package has no {name} output binding")
+}
+
+fn binding_tile_count(application: &Application, name: &str) -> Result<u16> {
+    let (binding, _) = output_binding(application, name)?;
+    let tiles = binding
+        .slices
+        .iter()
+        .map(|slice| slice.tile)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    u16::try_from(tiles).context("binding tile count exceeds u16")
 }
 
 fn binding_size(binding: &Binding) -> u64 {

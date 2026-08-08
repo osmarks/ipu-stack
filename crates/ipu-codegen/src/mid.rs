@@ -1044,6 +1044,40 @@ impl PipelineConfig {
 }
 
 fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
+    let mut candidates = Vec::new();
+    for active_tiles in candidate_active_tile_counts(tile_count) {
+        candidates.extend(operator_candidates_for_tile_count(active_tiles));
+    }
+    let mut unique = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn candidate_active_tile_counts(capacity: u16) -> Vec<u16> {
+    if capacity == 0 {
+        return vec![0];
+    }
+    let mut counts = vec![capacity];
+    // A regular power-of-two subset avoids awkward prime factors without
+    // allowing plans which idle most of the configured machine.
+    let mut power = 1u16;
+    while let Some(next) = power.checked_mul(2) {
+        if next > capacity {
+            break;
+        }
+        power = next;
+    }
+    if !counts.contains(&power) {
+        counts.push(power);
+    }
+    counts
+}
+
+fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate> {
     let amp_output_f16 = TensorFormat {
         precision: Precision::F16,
         layout: Layout::amp_output(tile_count),
@@ -1728,6 +1762,16 @@ pub fn lower(
         values = state.values.len(),
         operations = operations.len(),
         estimated_cycles,
+        active_tile_counts = ?operations
+            .iter()
+            .filter_map(|operation| operation.results.first())
+            .map(|result| state.values[result.index() as usize]
+                .tensor_type
+                .format
+                .layout
+                .tiling
+                .tile_count)
+            .collect::<BTreeSet<_>>(),
         "selected operator plans"
     );
     Ok(MidGraph {

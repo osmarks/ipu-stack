@@ -312,7 +312,7 @@ impl LowProgram {
 pub enum LowLoweringError {
     #[error("low-level lowering requires a nonzero tile count")]
     EmptyTileGroup,
-    #[error("value {value:?} declares {declared} tiles, but the schedule uses {scheduled}")]
+    #[error("value {value:?} declares {declared} tiles, but the schedule capacity is {scheduled}")]
     TileCountMismatch {
         value: MidValueId,
         declared: u16,
@@ -427,10 +427,11 @@ impl LoweringState {
             kernel_metadata: Vec::new(),
         };
         for value in &graph.values {
-            if value.tensor_type.format.layout.tiling.tile_count != tile_count {
+            let declared_tiles = value.tensor_type.format.layout.tiling.tile_count;
+            if declared_tiles == 0 || declared_tiles > tile_count {
                 return Err(LowLoweringError::TileCountMismatch {
                     value: value.id,
-                    declared: value.tensor_type.format.layout.tiling.tile_count,
+                    declared: declared_tiles,
                     scheduled: tile_count,
                 });
             }
@@ -2357,6 +2358,48 @@ mod tests {
                     })
                     .count();
                 assert_eq!(gemms, inner_blocks as usize, "case {case}");
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_odd_capacities_use_regular_active_tile_subsets() {
+        let mut random = fastrand::Rng::with_seed(0x7375_6273_6574);
+        for case in 0..16 {
+            let active_tiles = 1_u16 << random.u32(2..=5);
+            let capacity = active_tiles + random.u16(1..active_tiles);
+            let rows = u32::from(active_tiles);
+            let mut graph = ComputeGraph::new();
+            let left = graph.host_input("left", [rows, 64]).unwrap();
+            let right = graph.parameter("right", [64, 64]).unwrap();
+            let output = graph.gemm(left, right).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let config = PipelineConfig::new(capacity)
+                .with_automatic_input(left, Precision::F16)
+                .with_automatic_input(right, Precision::F16);
+
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let result = mid.operations.last().unwrap().results[0];
+            assert_eq!(
+                mid.values[result.index() as usize]
+                    .tensor_type
+                    .format
+                    .layout
+                    .tiling
+                    .tile_count,
+                active_tiles,
+                "case {case}"
+            );
+
+            let low = lower_to_tiles(&mid, &config).unwrap();
+            assert_eq!(low.tile_count, capacity, "case {case}");
+            assert_eq!(low.outputs[0].shards.len(), usize::from(active_tiles));
+            for tile in &low.tiles[usize::from(active_tiles)..] {
+                assert!(
+                    low.work(tile)
+                        .all(|work| !matches!(work, TileWorkRef::Kernel(_))),
+                    "case {case}"
+                );
             }
         }
     }
