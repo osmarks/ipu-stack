@@ -956,7 +956,7 @@ impl LoweringState {
         }
 
         let mut local_right_staging = BTreeMap::<(u16, u32), LowShardId>::new();
-        let mut remote_right_staging = BTreeMap::<u16, LowShardId>::new();
+        let mut remote_right_staging = vec![None; usize::from(self.tile_count)];
         for column_start in (0..column_extent).step_by(output_column_block as usize) {
             let column_end = column_start + output_column_block;
             let column_outputs = output_shards
@@ -1052,7 +1052,8 @@ impl LoweringState {
                             self.full_view(copy)
                         }
                     } else {
-                        let copy = if let Some(copy) = remote_right_staging.get(&tile).copied() {
+                        let slot = &mut remote_right_staging[usize::from(tile)];
+                        let copy = if let Some(copy) = *slot {
                             copy
                         } else {
                             let copy = self.push_shard(LowShard {
@@ -1064,7 +1065,7 @@ impl LoweringState {
                                 extents: right_view.extents.clone(),
                                 definition: ShardDefinition::ExchangeStaging,
                             })?;
-                            remote_right_staging.insert(tile, copy);
+                            *slot = Some(copy);
                             copy
                         };
                         transfers.entry(right_view.clone()).or_default().push(copy);
