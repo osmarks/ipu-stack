@@ -22,7 +22,6 @@ struct Arguments {
 enum Command {
     KernelCompile {
         source: PathBuf,
-        output_directory: PathBuf,
         #[arg(long)]
         name: Option<String>,
         #[arg(long, env = "POPLAR_SDK_ENABLED")]
@@ -140,7 +139,6 @@ fn main() -> Result<()> {
     match Arguments::parse().command {
         Command::KernelCompile {
             source,
-            output_directory,
             name,
             sdk,
             flags,
@@ -152,8 +150,7 @@ fn main() -> Result<()> {
                     .to_string_lossy()
                     .into_owned()
             });
-            let artifact =
-                Toolchain::from_sdk(sdk).compile(&source, output_directory, &name, &flags)?;
+            let artifact = Toolchain::from_sdk(sdk).compile(&source, &name, &flags)?;
             let summary = artifact.inspect()?;
             println!("object={}", artifact.object.display());
             println!("metadata={}", artifact.metadata.display());

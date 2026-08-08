@@ -1279,8 +1279,8 @@ impl<'a> HostSession<'a> {
             phases = call.phases,
             "invoking streaming host exchange call"
         );
-        let input_batches = host_batch_ranges(&call.input_batch_ends, call.inputs.len());
-        let output_batches = host_batch_ranges(&call.output_batch_ends, call.outputs.len());
+        let input_batches = host_batch_ranges(&call.input_batch_ends);
+        let output_batches = host_batch_ranges(&call.output_batch_ends);
         for phase in 0..call.phases {
             self.device
                 .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
@@ -1415,10 +1415,7 @@ fn host_call_reuses_storage(call: &HostCall) -> bool {
     })
 }
 
-fn host_batch_ranges(ends: &[u32], slices: usize) -> Vec<std::ops::Range<usize>> {
-    if ends.is_empty() {
-        return (0..slices).map(|index| index..index + 1).collect();
-    }
+fn host_batch_ranges(ends: &[u32]) -> Vec<std::ops::Range<usize>> {
     let mut start = 0usize;
     ends.iter()
         .map(|&end| {
@@ -1638,9 +1635,9 @@ mod tests {
     }
 
     #[test]
-    fn host_batch_ranges_support_parallel_and_legacy_calls() {
-        assert_eq!(host_batch_ranges(&[2, 5], 5), vec![0..2, 2..5]);
-        assert_eq!(host_batch_ranges(&[], 3), vec![0..1, 1..2, 2..3]);
+    fn host_batch_ranges_follow_explicit_boundaries() {
+        assert_eq!(host_batch_ranges(&[2, 5]), vec![0..2, 2..5]);
+        assert!(host_batch_ranges(&[]).is_empty());
     }
 
     #[test]

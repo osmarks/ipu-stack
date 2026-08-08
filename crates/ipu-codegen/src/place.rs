@@ -879,6 +879,7 @@ mod tests {
                             &low.shards,
                             &placement.shard_addresses,
                             &kernels,
+                            &BTreeMap::new(),
                         )
                         .unwrap();
                         if let KernelRequirements::Operator(requirements) = &run.requirements {

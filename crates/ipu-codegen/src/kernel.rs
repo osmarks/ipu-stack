@@ -235,15 +235,6 @@ pub fn materialize_kernel_run(
     shards: &[LowShard],
     shard_addresses: &BTreeMap<LowShardId, u32>,
     plan: &KernelBuildPlan,
-) -> Result<ComputeStep, KernelMaterializationError> {
-    materialize_kernel_run_with_addresses(run, shards, shard_addresses, plan, &BTreeMap::new())
-}
-
-pub fn materialize_kernel_run_with_addresses(
-    run: &KernelRun,
-    shards: &[LowShard],
-    shard_addresses: &BTreeMap<LowShardId, u32>,
-    plan: &KernelBuildPlan,
     overrides: &BTreeMap<LowShardId, TileAddress>,
 ) -> Result<ComputeStep, KernelMaterializationError> {
     let call = plan.call(run)?;
@@ -746,7 +737,9 @@ mod tests {
                 let call = plan.call(run).unwrap();
                 assert!(plan.retained_symbols().any(|symbol| symbol == call.symbol));
                 assert!(call.arguments.is_empty());
-                let compute = materialize_kernel_run(run, &low.shards, &addresses, &plan).unwrap();
+                let compute =
+                    materialize_kernel_run(run, &low.shards, &addresses, &plan, &BTreeMap::new())
+                        .unwrap();
                 assert_eq!(compute.symbol, call.symbol);
                 assert_eq!(compute.input_addresses.len(), 2);
             }

@@ -59,7 +59,6 @@ impl Toolchain {
     pub fn compile(
         &self,
         source: impl AsRef<Path>,
-        output_dir: impl AsRef<Path>,
         name: &str,
         flags: &[String],
     ) -> Result<KernelArtifact, ElfError> {
@@ -79,10 +78,6 @@ impl Toolchain {
             target = %self.target,
             "compiling kernel"
         );
-        // Keep accepting an output directory for API compatibility and for
-        // callers that use it to group a compilation, but immutable artifacts
-        // live in the shared content-addressed cache.
-        fs::create_dir_all(output_dir.as_ref())?;
         fs::create_dir_all(cache.gp.parent().unwrap())?;
         let mut command = Command::new(&self.popc);
         command.arg("--target").arg(&self.target);

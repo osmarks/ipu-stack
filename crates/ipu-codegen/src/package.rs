@@ -68,7 +68,6 @@ pub struct PackageConfig {
     pub toolchain: Toolchain,
     pub runtime_source: PathBuf,
     pub kernel_source_directory: PathBuf,
-    pub build_directory: PathBuf,
     pub pipeline: PipelineConfig,
 }
 
@@ -96,12 +95,9 @@ pub fn build_package(
         "lowered graph for package construction"
     );
     let runtime_artifact = build_phase("compile_runtime", || {
-        Ok(config.toolchain.compile(
-            &config.runtime_source,
-            &config.build_directory,
-            "static_runtime",
-            &[],
-        )?)
+        Ok(config
+            .toolchain
+            .compile(&config.runtime_source, "static_runtime", &[])?)
     })?;
     let kernel_plan = build_phase("plan_kernels", || Ok(KernelBuildPlan::from_program(&low)?))?;
     let objects = build_phase("compile_kernels", || {
@@ -109,7 +105,6 @@ pub fn build_package(
         for compilation in &kernel_plan.compilations {
             let artifact = config.toolchain.compile(
                 config.kernel_source_directory.join(compilation.source),
-                &config.build_directory,
                 &compilation.name,
                 &compilation.flags,
             )?;

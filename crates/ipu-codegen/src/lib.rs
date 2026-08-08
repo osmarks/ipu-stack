@@ -31,8 +31,7 @@ pub use graph::{
 pub use kernel::{
     KernelAbi, KernelAbiError, KernelAvailability, KernelBuildPlan, KernelCompilation,
     KernelMaterializationError, KernelSymbols, PlannedKernelCall, ScalarArgument,
-    materialize_kernel_run, materialize_kernel_run_with_addresses, tile_kernel_abi,
-    validate_kernel_run,
+    materialize_kernel_run, tile_kernel_abi, validate_kernel_run,
 };
 pub use low::{
     ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun, KernelRunId,
@@ -62,10 +61,7 @@ pub use storage::{
     ByteSpan, StorageError, StorageResult, amp_matrix_coordinates, shard_storage_bytes,
     view_byte_spans,
 };
-pub use tile::{
-    TileLoweringError, TileProgramLowering, TilePrograms, lower_to_tile_programs,
-    lower_to_tile_programs_with_fill,
-};
+pub use tile::{TileLoweringError, TileProgramLowering};
 
 const INCOMING_DBASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;

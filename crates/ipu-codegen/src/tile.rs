@@ -3,15 +3,9 @@
 use crate::{
     ExchangePhaseId, ExchangeStep, KernelBuildPlan, LowProgram, LowShardId, PhysicalExchangePhase,
     Placement, RepeatPointer, RepeatRun, RepeatStep, StepProfile, TileAddress, TileProgram,
-    TileStep, TileWorkList, TileWorkRef, materialize_kernel_run_with_addresses,
+    TileStep, TileWorkList, TileWorkRef, materialize_kernel_run,
 };
 use std::collections::BTreeMap;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TilePrograms {
-    pub programs: Vec<TileProgram>,
-    pub exchange_code_end: u32,
-}
 
 /// Address-resolution context which finalizes one tile on demand.
 ///
@@ -57,48 +51,6 @@ pub enum TileLoweringError {
         destination_offset: u32,
         bytes: u32,
     },
-}
-
-pub fn lower_to_tile_programs(
-    program: &LowProgram,
-    placement: &Placement,
-    exchanges: &[PhysicalExchangePhase],
-    kernels: &KernelBuildPlan,
-    exchange_code_base: u32,
-) -> Result<TilePrograms, TileLoweringError> {
-    lower_to_tile_programs_with_fill(
-        program,
-        placement,
-        exchanges,
-        kernels,
-        exchange_code_base,
-        program.tile_count,
-    )
-}
-
-pub fn lower_to_tile_programs_with_fill(
-    program: &LowProgram,
-    placement: &Placement,
-    exchanges: &[PhysicalExchangePhase],
-    kernels: &KernelBuildPlan,
-    exchange_code_base: u32,
-    execution_tile_count: u16,
-) -> Result<TilePrograms, TileLoweringError> {
-    let lowering = TileProgramLowering::new(
-        program,
-        placement,
-        exchanges,
-        kernels,
-        exchange_code_base,
-        execution_tile_count,
-    )?;
-    let programs = (0..execution_tile_count)
-        .map(|tile| lowering.lower_tile(tile))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(TilePrograms {
-        programs,
-        exchange_code_end: lowering.exchange_code_end(),
-    })
 }
 
 impl<'a> TileProgramLowering<'a> {
@@ -263,7 +215,7 @@ fn lower_work(
                     profile: StepProfile::default(),
                 })
             }
-            TileWorkRef::Kernel(run) => TileStep::Compute(materialize_kernel_run_with_addresses(
+            TileWorkRef::Kernel(run) => TileStep::Compute(materialize_kernel_run(
                 run,
                 &program.shards,
                 &placement.shard_addresses,
@@ -396,7 +348,7 @@ mod tests {
             let kernels = KernelBuildPlan::from_program(&low).unwrap();
             let exchanges = lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
             let filler_tiles = random.u16(1..=4);
-            let finalized = lower_to_tile_programs_with_fill(
+            let lowering = TileProgramLowering::new(
                 &low,
                 &placement,
                 &exchanges,
@@ -405,24 +357,9 @@ mod tests {
                 tiles + filler_tiles,
             )
             .unwrap();
-            let lazy = TileProgramLowering::new(
-                &low,
-                &placement,
-                &exchanges,
-                &kernels,
-                0x4d000,
-                tiles + filler_tiles,
-            )
-            .unwrap();
-            assert_eq!(lazy.exchange_code_end(), finalized.exchange_code_end);
-            for tile in 0..tiles + filler_tiles {
-                assert_eq!(
-                    lazy.lower_tile(tile).unwrap(),
-                    finalized.programs[usize::from(tile)]
-                );
-            }
-            assert_eq!(finalized.programs.len(), usize::from(tiles + filler_tiles));
-            for program in &finalized.programs[..usize::from(tiles)] {
+            assert!(lowering.exchange_code_end() >= 0x4d000);
+            for tile in 0..tiles {
+                let program = lowering.lower_tile(tile).unwrap();
                 assert!(
                     program
                         .steps
@@ -435,7 +372,8 @@ mod tests {
                     }
                 }
             }
-            for program in &finalized.programs[usize::from(tiles)..] {
+            for tile in tiles..tiles + filler_tiles {
+                let program = lowering.lower_tile(tile).unwrap();
                 assert_eq!(program.steps.len(), exchanges.len());
                 assert!(program.steps.iter().all(|step| matches!(
                     step,

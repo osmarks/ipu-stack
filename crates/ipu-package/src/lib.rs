@@ -260,10 +260,8 @@ pub struct HostCall {
     pub outputs: Vec<HostSlice>,
     pub invocations: u32,
     /// Exclusive slice indices for each rolling-buffer input batch.
-    /// Empty metadata denotes the legacy one-slice-per-batch layout.
     pub input_batch_ends: Vec<u32>,
     /// Exclusive slice indices for each rolling-buffer output batch.
-    /// Empty metadata denotes the legacy one-slice-per-batch layout.
     pub output_batch_ends: Vec<u32>,
 }
 
@@ -588,9 +586,6 @@ fn validate_host_batch_ends(
     ends: &[u32],
     slice_count: usize,
 ) -> Result<(), PackageError> {
-    if ends.is_empty() {
-        return Ok(());
-    }
     let mut previous = 0usize;
     for &end in ends {
         let end = usize::try_from(end)
@@ -924,6 +919,23 @@ mod tests {
             },
         ];
         assert!(app.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_implicit_host_batches() {
+        let call = HostCall {
+            name: "explicit-batches".into(),
+            command: 0,
+            phases: 0,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            invocations: 1,
+            input_batch_ends: Vec::new(),
+            output_batch_ends: Vec::new(),
+        };
+        assert!(validate_host_batch_ends(&call, "input", &[], 1).is_err());
+        assert!(validate_host_batch_ends(&call, "output", &[], 1).is_err());
+        assert!(validate_host_batch_ends(&call, "input", &[], 0).is_ok());
     }
 
     #[test]

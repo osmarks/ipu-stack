@@ -188,7 +188,6 @@ fn main() -> Result<()> {
                 .expect("runtime source has no parent directory")
                 .to_owned(),
             runtime_source,
-            build_directory: std::env::temp_dir().join("ipu-stack-package"),
             pipeline,
         },
     )?;
