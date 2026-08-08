@@ -1407,10 +1407,11 @@ pub trait CostModel {
     fn operator_cost(
         &self,
         operator: MidOperator,
+        dispatch: &OperatorDispatch,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64;
-    fn cast_cost(&self, shape: &TensorShape, from: Precision, to: Precision) -> u64;
+    fn cast_cost(&self, input: &TensorType, to: Precision) -> u64;
     fn rearrange_cost(
         &self,
         shape: &TensorShape,
@@ -1420,9 +1421,11 @@ pub trait CostModel {
     ) -> u64;
 }
 
-/// A transparent placeholder model: arithmetic is priced by rough vector
-/// throughput and conversions by bytes moved. It is intended to be replaced
-/// by measurements without changing the IR.
+/// IPU21 analytical cycle model. Its structure follows the SDK planners:
+/// serial compute, exchange, and rearrangement phases are summed, while
+/// competing arithmetic and operand-feed limits within a kernel are maxed.
+/// Constants remain deliberately explicit so hardware measurements can refine
+/// them without changing the planning interface.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ToyCostModel;
 
@@ -1430,6 +1433,7 @@ impl CostModel for ToyCostModel {
     fn operator_cost(
         &self,
         operator: MidOperator,
+        dispatch: &OperatorDispatch,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
@@ -1442,34 +1446,71 @@ impl CostModel for ToyCostModel {
                     .padded_shape(&inputs[0].shape)
                     .unwrap_or_else(|_| inputs[0].shape.clone());
                 let k = left_shape.0.last().copied().unwrap_or(1) as u64;
-                let throughput: u64 = match multiply {
-                    Precision::F8F143 { .. } => 128,
-                    Precision::F16 => 64,
-                    Precision::F32 => 16,
+                let flops_per_cycle: u64 = match multiply {
+                    Precision::F8F143 { .. } => 256,
+                    Precision::F16 => 128,
+                    Precision::F32 => 32,
                 };
-                let arithmetic = output
-                    .shape
-                    .elements()
+                let output_elements_per_tile =
+                    maximum_shard_bytes(output).div_ceil(output.format.precision.bytes());
+                let output_columns_per_tile =
+                    maximum_axis_shard_extent(output, output.shape.0.len().saturating_sub(1));
+                let arithmetic = output_elements_per_tile
                     .saturating_mul(2)
                     .saturating_mul(k)
-                    .div_ceil(
-                        throughput
-                            .saturating_mul(u64::from(output.format.layout.tiling.tile_count)),
-                    );
-                let working_set_bytes = inputs
-                    .iter()
-                    .map(maximum_shard_bytes)
-                    .chain(std::iter::once(maximum_shard_bytes(output)))
-                    .sum::<u64>();
-                let memory = operator_memory_estimate(&default_dispatch(operator), inputs, output);
+                    .div_ceil(flops_per_cycle);
+                let right = inputs.get(1);
+                let right_bytes_consumed = right.map_or(u64::MAX, |right| {
+                    output_columns_per_tile
+                        .saturating_mul(k)
+                        .saturating_mul(right.format.precision.bytes())
+                });
+                let resident_interleaved_weights = right.is_some_and(|right| {
+                    right.format.layout.memory_class == MemoryClass::Ipu21Interleaved
+                });
+                let staged_weights = right.is_some_and(|right| {
+                    gemm_requires_staging(dispatch, right, output)
+                        && right.format.precision == Precision::F16
+                });
+                let weight_feed = right_bytes_consumed.div_ceil(
+                    if resident_interleaved_weights || staged_weights {
+                        IPU21_INTERLEAVED_LOAD_BYTES_PER_CYCLE
+                    } else {
+                        IPU21_STANDARD_LOAD_BYTES_PER_CYCLE
+                    },
+                );
+                let packing = if staged_weights {
+                    right_bytes_consumed
+                        .saturating_mul(2)
+                        .div_ceil(IPU21_LOCAL_COPY_BYTES_PER_CYCLE)
+                } else {
+                    0
+                };
+                let remote_bytes = gemm_remote_bytes_per_tile(inputs, output);
+                let exchange = remote_bytes.div_ceil(gemm_exchange_bytes_per_cycle(inputs));
+                let calls = match dispatch {
+                    OperatorDispatch::BlockedGemm {
+                        inner_block,
+                        output_column_block,
+                        ..
+                    } => k
+                        .div_ceil(u64::from(*inner_block))
+                        .saturating_mul(output_columns_per_tile)
+                        .div_ceil(u64::from(*output_column_block))
+                        .saturating_mul(IPU21_GEMM_CALL_OVERHEAD_CYCLES),
+                    OperatorDispatch::Pointwise { .. } => 0,
+                };
+                let memory = operator_memory_estimate(dispatch, inputs, output);
                 let capacity_penalty = if !memory.peak.fits_ipu21() {
                     u64::MAX / 8
                 } else {
                     0
                 };
                 arithmetic
-                    .saturating_add(working_set_bytes.div_ceil(16))
-                    .saturating_add(gemm_remote_bytes(inputs, output).div_ceil(16))
+                    .max(weight_feed)
+                    .saturating_add(packing)
+                    .saturating_add(exchange)
+                    .saturating_add(calls)
                     .saturating_add(capacity_penalty)
             }
             MidOperator::FlashAttention { .. } => elements.saturating_mul(8).div_ceil(32),
@@ -1478,11 +1519,14 @@ impl CostModel for ToyCostModel {
         }
     }
 
-    fn cast_cost(&self, shape: &TensorShape, from: Precision, to: Precision) -> u64 {
-        shape
-            .elements()
-            .saturating_mul(from.bytes() + to.bytes())
-            .div_ceil(16)
+    fn cast_cost(&self, input: &TensorType, to: Precision) -> u64 {
+        let input_bytes = maximum_shard_bytes(input);
+        let output_bytes = input_bytes
+            .div_ceil(input.format.precision.bytes())
+            .saturating_mul(to.bytes());
+        input_bytes
+            .saturating_add(output_bytes)
+            .div_ceil(IPU21_LOCAL_COPY_BYTES_PER_CYCLE)
     }
 
     fn rearrange_cost(
@@ -1492,12 +1536,26 @@ impl CostModel for ToyCostModel {
         from: &Layout,
         to: &Layout,
     ) -> u64 {
-        let elements = physical_elements(shape, from).max(physical_elements(shape, to));
-        let bytes = elements.saturating_mul(precision.bytes()).saturating_mul(2);
-        let exchange_penalty = u64::from(from.tiling != to.tiling) + 1;
-        bytes.saturating_mul(exchange_penalty).div_ceil(16)
+        let input = TensorType::new(shape.0.iter().copied(), precision, from.clone());
+        let output = TensorType::new(shape.0.iter().copied(), precision, to.clone());
+        let local_bytes = maximum_shard_bytes(&input)
+            .max(maximum_shard_bytes(&output))
+            .saturating_mul(2);
+        let local_cycles = local_bytes.div_ceil(IPU21_LOCAL_COPY_BYTES_PER_CYCLE);
+        let exchange_cycles = if from.tiling == to.tiling {
+            0
+        } else {
+            maximum_shard_bytes(&output).div_ceil(IPU21_EXCHANGE_BYTES_PER_CYCLE)
+        };
+        local_cycles.saturating_add(exchange_cycles)
     }
 }
+
+const IPU21_EXCHANGE_BYTES_PER_CYCLE: u64 = 8;
+const IPU21_STANDARD_LOAD_BYTES_PER_CYCLE: u64 = 8;
+const IPU21_INTERLEAVED_LOAD_BYTES_PER_CYCLE: u64 = 16;
+const IPU21_LOCAL_COPY_BYTES_PER_CYCLE: u64 = 8;
+const IPU21_GEMM_CALL_OVERHEAD_CYCLES: u64 = 48;
 
 fn physical_elements(shape: &TensorShape, layout: &Layout) -> u64 {
     layout
@@ -1531,6 +1589,14 @@ fn maximum_shard_bytes(tensor: &TensorType) -> u64 {
         .saturating_mul(tensor.format.precision.bytes())
 }
 
+fn maximum_axis_shard_extent(tensor: &TensorType, axis: usize) -> u64 {
+    (0..tensor.format.layout.tiling.tile_count)
+        .filter_map(|tile| tile_axis_range(tensor, axis, tile))
+        .map(|range| u64::from(range.end - range.start))
+        .max()
+        .unwrap_or(u64::MAX)
+}
+
 fn tensor_memory(tensor: &TensorType) -> MemoryUsage {
     let mut usage = MemoryUsage::default();
     usage.add_class(
@@ -1558,7 +1624,7 @@ fn operator_memory_estimate(
         Some(right),
     ) = (dispatch, inputs.get(1))
         && right.format.precision == Precision::F16
-        && right.format.layout.memory_class == MemoryClass::Ipu21Standard
+        && gemm_requires_staging(dispatch, right, output)
     {
         // One packed panel is reused across K phases. Exchange receive storage
         // is a separately reserved architectural window and is not counted as
@@ -1571,6 +1637,68 @@ fn operator_memory_estimate(
         live,
         temporary,
         peak: live.saturating_add(temporary),
+    }
+}
+
+fn gemm_requires_staging(
+    dispatch: &OperatorDispatch,
+    right: &TensorType,
+    output: &TensorType,
+) -> bool {
+    if right.format.layout.memory_class == MemoryClass::Ipu21Interleaved {
+        return false;
+    }
+    let OperatorDispatch::BlockedGemm {
+        inner_block,
+        output_column_block: _,
+        ..
+    } = dispatch
+    else {
+        return false;
+    };
+    let rank = right.shape.0.len();
+    let output_rank = output.shape.0.len();
+    if rank < 2 || output_rank < 2 {
+        return true;
+    }
+    let streamed = right
+        .format
+        .layout
+        .tiling
+        .axes
+        .iter()
+        .any(|axis| axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1);
+    let k = right.shape.0[rank - 2];
+    let columns = maximum_axis_shard_extent(output, output_rank - 1);
+    streamed || (k > *inner_block && columns > 16)
+}
+
+fn gemm_exchange_bytes_per_cycle(inputs: &[TensorType]) -> u64 {
+    let Some(right) = inputs.get(1) else {
+        return IPU21_EXCHANGE_BYTES_PER_CYCLE;
+    };
+    let inner_sharded = right
+        .format
+        .layout
+        .tiling
+        .axes
+        .iter()
+        .any(|axis| axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1);
+    let column_partitions = right
+        .format
+        .layout
+        .tiling
+        .axes
+        .iter()
+        .find(|axis| axis.axis == TensorAxis::FromEnd(1))
+        .map_or(1, |axis| axis.partitions);
+    // IPU21 pairs adjacent tiles on one shared exchange bus. With one output
+    // column partition, a streamed K panel is a full broadcast to consecutive
+    // tiles and both receivers can consume it in the same cycle.
+    if inner_sharded && column_partitions == 1 {
+        IPU21_EXCHANGE_BYTES_PER_CYCLE * 2
+    } else {
+        IPU21_EXCHANGE_BYTES_PER_CYCLE
     }
 }
 
@@ -1633,7 +1761,7 @@ fn region_peak_memory(
     peak.component_max(live)
 }
 
-fn gemm_remote_bytes(inputs: &[TensorType], output: &TensorType) -> u64 {
+fn gemm_remote_bytes_per_tile(inputs: &[TensorType], output: &TensorType) -> u64 {
     let [left, right] = inputs else {
         return u64::MAX;
     };
@@ -1647,7 +1775,7 @@ fn gemm_remote_bytes(inputs: &[TensorType], output: &TensorType) -> u64 {
     let right_column_axis = right.shape.0.len() - 1;
     let right_inner_axis = right.shape.0.len() - 2;
     let k = left.shape.0[left.shape.0.len() - 1];
-    (0..tiles).fold(0u64, |total, tile| {
+    (0..tiles).fold(0u64, |maximum, tile| {
         let Some(output_rows) = tile_axis_range(output, output_row_axis, tile) else {
             return u64::MAX;
         };
@@ -1682,9 +1810,7 @@ fn gemm_remote_bytes(inputs: &[TensorType], output: &TensorType) -> u64 {
         } else {
             0
         };
-        total
-            .saturating_add(left_remote)
-            .saturating_add(right_remote)
+        maximum.max(left_remote.saturating_add(right_remote))
     })
 }
 
@@ -1908,11 +2034,7 @@ fn lower_operations(
                     .map(|((from, id), to)| {
                         if state.automatic_inputs.contains(id) {
                             if from.format.precision != to.format.precision {
-                                costs.cast_cost(
-                                    &from.shape,
-                                    from.format.precision,
-                                    to.format.precision,
-                                )
+                                costs.cast_cost(from, to.format.precision)
                             } else {
                                 0
                             }
@@ -1933,8 +2055,8 @@ fn lower_operations(
                         format: requirement.format.clone(),
                     })
                     .collect::<Vec<_>>();
-                let cost =
-                    conversion + costs.operator_cost(plan.operator, &planned_inputs, &output);
+                let cost = conversion
+                    + costs.operator_cost(plan.operator, &plan.dispatch, &planned_inputs, &output);
                 ((cost, order), plan)
             })
             .min_by_key(|(cost, _)| *cost)
@@ -1972,6 +2094,7 @@ fn lower_operations(
             .collect::<Vec<_>>();
         let operator_cost = costs.operator_cost(
             plan.operator,
+            &plan.dispatch,
             &converted_types,
             &state.get(result).tensor_type,
         );
@@ -2221,7 +2344,7 @@ fn ensure_format(
                 output: OperandRequirement::new(tensor_type.format.clone(), 8),
                 dispatch: ConversionDispatch::Local,
             }),
-            estimated_cost: costs.cast_cost(&tensor_type.shape, from, target.precision),
+            estimated_cost: costs.cast_cost(&original.tensor_type, target.precision),
             memory,
         });
         value = result;
@@ -2266,7 +2389,7 @@ fn ensure_format(
 
 fn conversion_cost(from: &TensorType, to: &TensorFormat, costs: &impl CostModel) -> u64 {
     let cast = if from.format.precision != to.precision {
-        costs.cast_cost(&from.shape, from.format.precision, to.precision)
+        costs.cast_cost(from, to.precision)
     } else {
         0
     };
@@ -2341,6 +2464,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn randomized_cycle_model_rewards_direct_interleaved_weight_loads() {
+        let mut random = fastrand::Rng::with_seed(0x6379_636c);
+        for _ in 0..RANDOM_CASES {
+            let rows = 1_u16 << random.u32(0..=2);
+            let columns = 1_u16 << random.u32(0..=2);
+            let tiles = rows * columns;
+            let m = u32::from(rows) * random.u32(1..=4);
+            let k = 64 * random.u32(2..=4);
+            let n = u32::from(columns) * 64;
+            let left = TensorType::new(
+                [m, k],
+                Precision::F16,
+                Layout::amp_left_grid(64, tiles, rows, columns),
+            );
+            let mut standard_layout = Layout::amp_right_grid(64, tiles, rows, columns);
+            let mut direct_layout = standard_layout.clone();
+            direct_layout.memory_class = MemoryClass::Ipu21Interleaved;
+            standard_layout.memory_class = MemoryClass::Ipu21Standard;
+            let standard = TensorType::new([k, n], Precision::F16, standard_layout);
+            let direct = TensorType::new([k, n], Precision::F16, direct_layout);
+            let output = TensorType::new(
+                [m, n],
+                Precision::F16,
+                Layout::amp_output_grid(tiles, rows, columns),
+            );
+            let operator = MidOperator::Gemm {
+                options: GemmOptions::default(),
+                multiply: Precision::F16,
+                accumulate: AccumulationPrecision::F32,
+            };
+            let dispatch = default_dispatch(operator);
+            let standard_cost =
+                ToyCostModel.operator_cost(operator, &dispatch, &[left.clone(), standard], &output);
+            let direct_cost =
+                ToyCostModel.operator_cost(operator, &dispatch, &[left, direct], &output);
+            assert!(direct_cost < standard_cost);
+        }
+    }
+
     fn assert_conversions_are_explicit(lowered: &MidGraph, operations: &[MidOperation]) {
         for operation in operations {
             let [input] = operation.inputs.as_slice() else {
@@ -2391,6 +2554,7 @@ mod tests {
         fn operator_cost(
             &self,
             operator: MidOperator,
+            _dispatch: &OperatorDispatch,
             _inputs: &[TensorType],
             output: &TensorType,
         ) -> u64 {
@@ -2406,7 +2570,7 @@ mod tests {
             }
         }
 
-        fn cast_cost(&self, _shape: &TensorShape, _from: Precision, _to: Precision) -> u64 {
+        fn cast_cost(&self, _input: &TensorType, _to: Precision) -> u64 {
             0
         }
 
