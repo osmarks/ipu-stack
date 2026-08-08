@@ -309,24 +309,13 @@ fn run_gemm(
     {
         bail!("GEMM bindings do not cover every active tile");
     }
-    let mut session = runtime.host_session(application)?;
-    session.start()?;
-    let initialized = session.invoke_streaming_deferred("initialize", &right_bytes)?;
-    session.collect(&initialized)?;
-    let executed = session
-        .invoke_streaming_deferred("run", &left_bytes)
-        .map_err(|error| {
-            eprintln!(
-                "runFailureDiagnostics={}",
-                device_failure_diagnostics(runtime, application)
-            );
-            error
-        })?;
-    runtime
-        .device()
-        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
-    diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
-    let output = session.collect(&executed)?;
+    let output = run_initialized_program(
+        runtime,
+        application,
+        &right_bytes,
+        &left_bytes,
+        timeout_seconds,
+    )?;
     verify_gemm_output(application, active_tiles, batch, &output)
 }
 
@@ -371,12 +360,24 @@ fn run_mlp_chain(
     weights.extend_from_slice(&right0_bytes);
     weights.extend_from_slice(&right1_bytes);
 
+    let output =
+        run_initialized_program(runtime, application, &weights, &left_bytes, timeout_seconds)?;
+    verify_mlp_output(application, active_tiles, &output)
+}
+
+fn run_initialized_program(
+    runtime: &Runtime,
+    application: &Application,
+    weights: &[u8],
+    input: &[u8],
+    timeout_seconds: u64,
+) -> Result<Vec<u8>> {
     let mut session = runtime.host_session(application)?;
     session.start()?;
-    let initialized = session.invoke_streaming_deferred("initialize", &weights)?;
+    let initialized = session.invoke_streaming_deferred("initialize", weights)?;
     session.collect(&initialized)?;
     let executed = session
-        .invoke_streaming_deferred("run", &left_bytes)
+        .invoke_streaming_deferred("run", input)
         .map_err(|error| {
             eprintln!(
                 "runFailureDiagnostics={}",
@@ -388,8 +389,7 @@ fn run_mlp_chain(
         .device()
         .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
     diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
-    let output = session.collect(&executed)?;
-    verify_mlp_output(application, active_tiles, &output)
+    Ok(session.collect(&executed)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -419,16 +419,13 @@ fn run_gemm_benchmark(
         .context("benchmark package has no right binding")?;
     let left_bytes = filled_f16_binding(left, 0x3c00)?;
     let right_bytes = filled_f16_binding(right, 0x3400)?;
-    let mut session = runtime.host_session(application)?;
-    session.start()?;
-    let initialized = session.invoke_streaming_deferred("initialize", &right_bytes)?;
-    session.collect(&initialized)?;
-    let executed = session.invoke_streaming_deferred("run", &left_bytes)?;
-    runtime
-        .device()
-        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
-    diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
-    let output = session.collect(&executed)?;
+    let output = run_initialized_program(
+        runtime,
+        application,
+        &right_bytes,
+        &left_bytes,
+        timeout_seconds,
+    )?;
     let maximum_absolute_error = verify_benchmark_output(application, &output, inner)?;
     let (cycles, minimum_cycles) = benchmark_cycles(application, &output, active_tiles)?;
     let rows = u64::from(rows);
@@ -484,24 +481,8 @@ fn run_siglip_mlp_benchmark(
     weights.extend_from_slice(&right0_bytes);
     weights.extend_from_slice(&right1_bytes);
 
-    let mut session = runtime.host_session(application)?;
-    session.start()?;
-    let initialized = session.invoke_streaming_deferred("initialize", &weights)?;
-    session.collect(&initialized)?;
-    let executed = session
-        .invoke_streaming_deferred("run", &left_bytes)
-        .map_err(|error| {
-            eprintln!(
-                "runFailureDiagnostics={}",
-                device_failure_diagnostics(runtime, application)
-            );
-            error
-        })?;
-    runtime
-        .device()
-        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
-    diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
-    let output = session.collect(&executed)?;
+    let output =
+        run_initialized_program(runtime, application, &weights, &left_bytes, timeout_seconds)?;
 
     let first_dense = dimension as f32 / 128.0;
     let expected = gelu_reference(first_dense) * hidden_dimension as f32 / 128.0;
