@@ -1688,6 +1688,8 @@ pub fn lower(
         let value = state.value(input.value, tensor_type);
         if automatic {
             state.automatic_inputs.insert(value);
+        } else {
+            state.fixed_inputs.insert(value);
         }
         values.insert(input.value, value);
         inputs.push(MidInput {
@@ -1737,6 +1739,7 @@ pub fn lower(
 struct LoweringState {
     values: Vec<MidValue>,
     automatic_inputs: BTreeSet<MidValueId>,
+    fixed_inputs: BTreeSet<MidValueId>,
 }
 
 impl LoweringState {
@@ -1879,17 +1882,31 @@ fn lower_operations(
             for plan in plans(operation, &input_types, &output_shape, config)
                 .into_iter()
                 .filter(|plan| {
+                    let grid_plan = matches!(plan.operator, MidOperator::Gemm { .. })
+                        && (plan
+                            .requirements
+                            .inputs
+                            .iter()
+                            .any(|input| input.format.layout.tiling.replicas > 1)
+                            || plan.requirements.inputs.get(1).is_some_and(|right| {
+                                right.format.layout.tiling.axes.iter().any(|axis| {
+                                    axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1
+                                })
+                            }));
                     input_ids
                         .iter()
                         .zip(&plan.requirements.inputs)
                         .all(|(id, requirement)| {
+                            let current = &branch.state.get(*id).tensor_type.format.layout;
                             branch.state.automatic_inputs.contains(id)
-                                || branch.state.get(*id).tensor_type.format.layout.order
-                                    == requirement.format.layout.order
-                                || !matches!(
-                                    requirement.format.layout.order,
-                                    ElementOrder::Amp(AmpOrder::RightK64)
-                                )
+                                || (!grid_plan
+                                    || !branch.state.fixed_inputs.contains(id)
+                                    || current == &requirement.format.layout)
+                                    && (current.order == requirement.format.layout.order
+                                        || !matches!(
+                                            requirement.format.layout.order,
+                                            ElementOrder::Amp(AmpOrder::RightK64)
+                                        ))
                         })
                 })
             {
