@@ -58,7 +58,7 @@ pub fn lower_exchanges(
                     .iter()
                     .map(|id| {
                         let shard = &program.shards[id.index() as usize];
-                        if !matches!(shard.definition, ShardDefinition::ExchangeStaging) {
+                        if !matches!(shard.definition, ShardDefinition::ExchangeStaging { .. }) {
                             return Err(ExchangeLoweringError::InvalidDestination);
                         }
                         Ok((
