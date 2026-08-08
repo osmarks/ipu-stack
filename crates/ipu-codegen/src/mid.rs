@@ -1074,24 +1074,50 @@ fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
         .flat_map(|columns| {
             let rows = tile_count / columns;
             [
-                amp_grid_gemm_operator_candidate(Precision::F16, 64, 16, tile_count, rows, columns),
-                amp_resident_interleaved_gemm_operator_candidate(tile_count, rows, columns),
-                amp_grid_gemm_operator_candidate(Precision::F32, 64, 32, tile_count, rows, columns),
-                amp_streamed_gemm_operator_candidate(
+                amp_grid_gemm_operator_candidate(
                     Precision::F16,
                     64,
                     16,
                     tile_count,
                     rows,
                     columns,
+                    AmpWeightLayout::Resident,
                 ),
-                amp_streamed_gemm_operator_candidate(
+                amp_grid_gemm_operator_candidate(
+                    Precision::F16,
+                    64,
+                    16,
+                    tile_count,
+                    rows,
+                    columns,
+                    AmpWeightLayout::InterleavedK64,
+                ),
+                amp_grid_gemm_operator_candidate(
                     Precision::F32,
                     64,
                     32,
                     tile_count,
                     rows,
                     columns,
+                    AmpWeightLayout::Resident,
+                ),
+                amp_grid_gemm_operator_candidate(
+                    Precision::F16,
+                    64,
+                    16,
+                    tile_count,
+                    rows,
+                    columns,
+                    AmpWeightLayout::Streamed,
+                ),
+                amp_grid_gemm_operator_candidate(
+                    Precision::F32,
+                    64,
+                    32,
+                    tile_count,
+                    rows,
+                    columns,
+                    AmpWeightLayout::Streamed,
                 ),
                 amp_grid_gelu_operator_candidate(tile_count, rows, columns),
             ]
@@ -1244,7 +1270,20 @@ fn amp_grid_gemm_operator_candidate(
     tile_count: u16,
     row_partitions: u16,
     column_partitions: u16,
+    weight_layout: AmpWeightLayout,
 ) -> OperatorCandidate {
+    let right_layout = match weight_layout {
+        AmpWeightLayout::Resident => {
+            Layout::amp_right_grid(inner, tile_count, row_partitions, column_partitions)
+        }
+        AmpWeightLayout::Streamed => {
+            Layout::amp_right_streamed(inner, tile_count, row_partitions, column_partitions)
+        }
+        AmpWeightLayout::InterleavedK64 => {
+            debug_assert_eq!((precision, inner), (Precision::F16, 64));
+            Layout::amp_right_k64_interleaved_grid(tile_count, row_partitions, column_partitions)
+        }
+    };
     OperatorCandidate::new(
         MidOperator::Gemm {
             options: GemmOptions::default(),
@@ -1268,12 +1307,7 @@ fn amp_grid_gemm_operator_candidate(
             OperandRequirement::new(
                 TensorFormat {
                     precision,
-                    layout: Layout::amp_right_grid(
-                        inner,
-                        tile_count,
-                        row_partitions,
-                        column_partitions,
-                    ),
+                    layout: right_layout,
                 },
                 32,
             ),
@@ -1292,110 +1326,11 @@ fn amp_grid_gemm_operator_candidate(
     ]))
 }
 
-fn amp_streamed_gemm_operator_candidate(
-    precision: Precision,
-    inner: u16,
-    left_tail: u32,
-    tile_count: u16,
-    row_partitions: u16,
-    column_partitions: u16,
-) -> OperatorCandidate {
-    OperatorCandidate::new(
-        MidOperator::Gemm {
-            options: GemmOptions::default(),
-            multiply: precision,
-            accumulate: AccumulationPrecision::F32,
-        },
-        [
-            OperandRequirement::new(
-                TensorFormat {
-                    precision,
-                    layout: Layout::amp_left_grid(
-                        inner,
-                        tile_count,
-                        row_partitions,
-                        column_partitions,
-                    ),
-                },
-                32,
-            )
-            .with_access_tail(left_tail),
-            OperandRequirement::new(
-                TensorFormat {
-                    precision,
-                    layout: Layout::amp_right_streamed(
-                        inner,
-                        tile_count,
-                        row_partitions,
-                        column_partitions,
-                    ),
-                },
-                32,
-            ),
-        ],
-        OperandRequirement::new(
-            TensorFormat {
-                precision,
-                layout: Layout::amp_output_grid(tile_count, row_partitions, column_partitions),
-            },
-            32,
-        ),
-    )
-    .with_memory_relation(MemoryRelation::DistinctElements(vec![
-        MemoryOperand::Output,
-        MemoryOperand::Input(0),
-    ]))
-}
-
-fn amp_resident_interleaved_gemm_operator_candidate(
-    tile_count: u16,
-    row_partitions: u16,
-    column_partitions: u16,
-) -> OperatorCandidate {
-    OperatorCandidate::new(
-        MidOperator::Gemm {
-            options: GemmOptions::default(),
-            multiply: Precision::F16,
-            accumulate: AccumulationPrecision::F32,
-        },
-        [
-            OperandRequirement::new(
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout: Layout::amp_left_grid(
-                        64,
-                        tile_count,
-                        row_partitions,
-                        column_partitions,
-                    ),
-                },
-                32,
-            )
-            .with_access_tail(16),
-            OperandRequirement::new(
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout: Layout::amp_right_k64_interleaved_grid(
-                        tile_count,
-                        row_partitions,
-                        column_partitions,
-                    ),
-                },
-                32,
-            ),
-        ],
-        OperandRequirement::new(
-            TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::amp_output_grid(tile_count, row_partitions, column_partitions),
-            },
-            32,
-        ),
-    )
-    .with_memory_relation(MemoryRelation::DistinctElements(vec![
-        MemoryOperand::Output,
-        MemoryOperand::Input(0),
-    ]))
+#[derive(Clone, Copy)]
+enum AmpWeightLayout {
+    Resident,
+    Streamed,
+    InterleavedK64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
