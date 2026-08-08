@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::num::TryFromIntError;
 use std::path::PathBuf;
+use std::time::Instant;
 
 const ENTRY_BYTES: u32 = 8;
 const SUPPORT_START: u32 = APPLICATION_LOAD_BASE + ENTRY_BYTES;
@@ -83,30 +84,39 @@ pub fn build_package(
     config: &PackageConfig,
 ) -> PackageBuildResult<Application> {
     validate_tile_count(u32::from(config.pipeline.tile_count))?;
-    let mid = lower(graph, &config.pipeline, &Ipu21CostModel)?;
-    let low = lower_to_tiles(&mid, &config.pipeline)?;
+    let mid = build_phase("lower_mid", || {
+        Ok(lower(graph, &config.pipeline, &Ipu21CostModel)?)
+    })?;
+    let low = build_phase("lower_tiles", || {
+        Ok(lower_to_tiles(&mid, &config.pipeline)?)
+    })?;
     tracing::info!(
         logical_shards = low.shards.len(),
         exchange_phases = low.exchange_phases.len(),
         "lowered graph for package construction"
     );
-    let runtime_artifact = config.toolchain.compile(
-        &config.runtime_source,
-        &config.build_directory,
-        "static_runtime",
-        &[],
-    )?;
-    let mut objects = vec![fs::read(&runtime_artifact.object)?];
-    let kernel_plan = KernelBuildPlan::from_program(&low)?;
-    for compilation in &kernel_plan.compilations {
-        let artifact = config.toolchain.compile(
-            config.kernel_source_directory.join(compilation.source),
+    let runtime_artifact = build_phase("compile_runtime", || {
+        Ok(config.toolchain.compile(
+            &config.runtime_source,
             &config.build_directory,
-            &compilation.name,
-            &compilation.flags,
-        )?;
-        objects.push(fs::read(&artifact.object)?);
-    }
+            "static_runtime",
+            &[],
+        )?)
+    })?;
+    let kernel_plan = build_phase("plan_kernels", || Ok(KernelBuildPlan::from_program(&low)?))?;
+    let objects = build_phase("compile_kernels", || {
+        let mut objects = vec![fs::read(&runtime_artifact.object)?];
+        for compilation in &kernel_plan.compilations {
+            let artifact = config.toolchain.compile(
+                config.kernel_source_directory.join(compilation.source),
+                &config.build_directory,
+                &compilation.name,
+                &compilation.flags,
+            )?;
+            objects.push(fs::read(&artifact.object)?);
+        }
+        Ok(objects)
+    })?;
     build_package_from_objects(&low, config, &objects, &kernel_plan)
 }
 
@@ -117,24 +127,30 @@ fn build_package_from_objects(
     kernel_plan: &KernelBuildPlan,
 ) -> PackageBuildResult<Application> {
     let topology = active_topology(program.tile_count)?;
-    let placement = place(program)?;
-    let exchanges = lower_exchanges(program, &placement, &topology)?;
+    let placement = build_phase("place_storage", || Ok(place(program)?))?;
+    let exchanges = build_phase("lower_exchanges", || {
+        Ok(lower_exchanges(program, &placement, &topology)?)
+    })?;
     let retained_runtime = runtime_retained_symbols(program, config);
-    let layout = link_runtime(
-        objects,
-        runtime_symbols(0, 0, 0)?,
-        kernel_plan,
-        &retained_runtime,
-    )?;
+    let layout = build_phase("link_runtime", || {
+        link_runtime(
+            objects,
+            runtime_symbols(0, 0, 0)?,
+            kernel_plan,
+            &retained_runtime,
+        )
+    })?;
     let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
-    let finalized = lower_to_tile_programs_with_fill(
-        program,
-        &placement,
-        &exchanges,
-        kernel_plan,
-        linked_end(&layout)?,
-        execution_tile_count,
-    )?;
+    let finalized = build_phase("finalize_tile_programs", || {
+        Ok(lower_to_tile_programs_with_fill(
+            program,
+            &placement,
+            &exchanges,
+            kernel_plan,
+            linked_end(&layout)?,
+            execution_tile_count,
+        )?)
+    })?;
     let inputs = program
         .inputs
         .iter()
@@ -187,32 +203,34 @@ fn build_package_from_objects(
         .clone()
         .into_iter()
         .collect::<BTreeMap<_, _>>();
-    let generated = finalized
-        .programs
-        .iter()
-        .zip(&host.programs)
-        .map(|(program, host)| {
-            emit(
-                program,
-                &symbols,
-                host,
-                &CodegenOptions {
-                    code_address,
-                    initial_profile_address: config
-                        .pipeline
-                        .profiling
-                        .enabled
-                        .then_some(PROFILE_START_CYCLE),
-                    final_profile_address: config
-                        .pipeline
-                        .profiling
-                        .enabled
-                        .then_some(PROFILE_END_CYCLE),
-                    ..CodegenOptions::default()
-                },
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let generated = build_phase("emit_tile_code", || {
+        Ok(finalized
+            .programs
+            .iter()
+            .zip(&host.programs)
+            .map(|(program, host)| {
+                emit(
+                    program,
+                    &symbols,
+                    host,
+                    &CodegenOptions {
+                        code_address,
+                        initial_profile_address: config
+                            .pipeline
+                            .profiling
+                            .enabled
+                            .then_some(PROFILE_START_CYCLE),
+                        final_profile_address: config
+                            .pipeline
+                            .profiling
+                            .enabled
+                            .then_some(PROFILE_END_CYCLE),
+                        ..CodegenOptions::default()
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?)
+    })?;
     if generated.iter().any(|program| {
         code_address
             .checked_add(program.bytes.len() as u32)
@@ -223,21 +241,28 @@ fn build_package_from_objects(
         ));
     }
 
-    let mut application = Application::default();
-    for physical_tile in 0..execution_tile_count {
-        application.tiles.push(build_tile(
-            u32::from(physical_tile),
-            objects,
-            kernel_plan,
-            &retained_runtime,
-            code_address,
-            &generated[usize::from(physical_tile)],
-            (
-                &host.segments[usize::from(physical_tile)],
-                host.staging_address,
-            ),
-        )?);
-    }
+    let tiles = build_phase("build_tile_images", || {
+        (0..execution_tile_count)
+            .map(|physical_tile| {
+                build_tile(
+                    u32::from(physical_tile),
+                    objects,
+                    kernel_plan,
+                    &retained_runtime,
+                    code_address,
+                    &generated[usize::from(physical_tile)],
+                    (
+                        &host.segments[usize::from(physical_tile)],
+                        host.staging_address,
+                    ),
+                )
+            })
+            .collect::<PackageBuildResult<Vec<_>>>()
+    })?;
+    let mut application = Application {
+        tiles,
+        ..Application::default()
+    };
     application
         .tiles
         .sort_unstable_by_key(|tile| tile.physical_tile);
@@ -263,6 +288,23 @@ fn build_package_from_objects(
     application.host_exchange = host.protocol;
     application.validate()?;
     Ok(application)
+}
+
+fn build_phase<T>(
+    phase: &'static str,
+    build: impl FnOnce() -> PackageBuildResult<T>,
+) -> PackageBuildResult<T> {
+    let span = tracing::info_span!("ipu_codegen.package.phase", phase);
+    let _entered = span.enter();
+    let started = Instant::now();
+    let result = build();
+    tracing::info!(
+        phase,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        success = result.is_ok(),
+        "package build phase finished"
+    );
+    result
 }
 
 fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
