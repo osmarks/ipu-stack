@@ -288,7 +288,7 @@ fn run_gemm(
         .find(|binding| binding.name == "right")
         .cloned()
         .context("GEMM package has no right weight binding")?;
-    let left_bytes = packed_binding(&left, |tile, linear, elements| {
+    let left_bytes = packed_binding(&left, |logical_tile, linear, elements| {
         let (batch_index, inner) = amp_matrix_coordinates(
             AmpOrder::Left,
             Precision::F16,
@@ -296,13 +296,16 @@ fn run_gemm(
             elements / batch,
             linear,
         )?;
-        let selected_inner = (batch_index * 7 + u32::from(tile)) % 64;
+        let selected_inner = (batch_index * 7 + u32::from(logical_tile)) % 64;
         Ok(if selected_inner == inner { 0x3c00 } else { 0 })
     })?;
-    let right_bytes = packed_binding(&right, |tile, linear, elements| {
+    let right_bytes = packed_binding(&right, |logical_tile, linear, elements| {
         let (inner, column) =
             amp_matrix_coordinates(AmpOrder::Right, Precision::F16, 64, elements / 64, linear)?;
-        Ok(gemm_right_value(inner, u32::from(tile) * 64 + column))
+        Ok(gemm_right_value(
+            inner,
+            u32::from(logical_tile) * 64 + column,
+        ))
     })?;
     if left.slices.len() != usize::from(active_tiles)
         || right.slices.len() != usize::from(active_tiles)
@@ -335,25 +338,29 @@ fn run_mlp_chain(
     let left = binding("left", &application.inputs)?;
     let right0 = binding("right.0", &application.weights)?;
     let right1 = binding("right.1", &application.weights)?;
-    let left_bytes = packed_binding(&left, |tile, linear, elements| {
+    let left_bytes = packed_binding(&left, |logical_tile, linear, elements| {
         let (_, inner) =
             amp_matrix_coordinates(AmpOrder::Left, Precision::F16, 1, elements, linear)?;
-        Ok(if u32::from(tile) == inner { 0x3c00 } else { 0 })
+        Ok(if u32::from(logical_tile) == inner {
+            0x3c00
+        } else {
+            0
+        })
     })?;
-    let right0_bytes = packed_binding(&right0, |tile, linear, elements| {
+    let right0_bytes = packed_binding(&right0, |logical_tile, linear, elements| {
         let (inner, column) =
             amp_matrix_coordinates(AmpOrder::Right, Precision::F16, 64, elements / 64, linear)?;
-        let column = u32::from(tile) * 64 + column;
+        let column = u32::from(logical_tile) * 64 + column;
         Ok(if column < 64 {
             gemm_right_value(inner, column)
         } else {
             0
         })
     })?;
-    let right1_bytes = packed_binding(&right1, |tile, linear, elements| {
+    let right1_bytes = packed_binding(&right1, |logical_tile, linear, elements| {
         let (inner, column) =
             amp_matrix_coordinates(AmpOrder::Right, Precision::F16, 64, elements / 64, linear)?;
-        let column = u32::from(tile) * 64 + column;
+        let column = u32::from(logical_tile) * 64 + column;
         Ok(if inner == column { 0x3c00 } else { 0 })
     })?;
     let mut weights = Vec::with_capacity(right0_bytes.len() + right1_bytes.len());
@@ -373,7 +380,13 @@ fn run_initialized_program(
     timeout_seconds: u64,
 ) -> Result<Vec<u8>> {
     let mut session = runtime.host_session(application)?;
-    session.start()?;
+    session.start().map_err(|error| {
+        eprintln!(
+            "startFailureDiagnostics={}",
+            device_failure_diagnostics(runtime, application)
+        );
+        error
+    })?;
     let initialized = session.invoke_streaming_deferred("initialize", weights)?;
     session.collect(&initialized)?;
     let executed = session
@@ -694,12 +707,11 @@ fn verify_mlp_output(application: &Application, active_tiles: u16, bytes: &[u8])
     let mut maximum_error = 0.0f32;
     let mut mismatches = Vec::new();
     let mut checked = 0usize;
-    for row in 0..active_tiles {
-        let slice = output
-            .slices
-            .iter()
-            .find(|slice| slice.tile == u32::from(row))
-            .with_context(|| format!("MLP output has no slice for tile {row}"))?;
+    if output.slices.len() != usize::from(active_tiles) {
+        bail!("MLP output does not cover every logical tile");
+    }
+    for (row, slice) in output.slices.iter().enumerate() {
+        let row = u16::try_from(row)?;
         let elements = u32::try_from(slice.size / 2)?;
         for linear in 0..elements {
             let (_, column) =
@@ -762,7 +774,7 @@ fn packed_binding(
         .max()
         .context("binding has no slices")?;
     let mut bytes = vec![0; usize::try_from(total)?];
-    for slice in &binding.slices {
+    for (logical_tile, slice) in binding.slices.iter().enumerate() {
         if slice.size == 0 {
             continue;
         }
@@ -770,9 +782,9 @@ fn packed_binding(
             bail!("binding {} has a non-F16 slice", binding.name);
         }
         let elements = u32::try_from(slice.size / 2)?;
-        let tile = u16::try_from(slice.tile)?;
+        let logical_tile = u16::try_from(logical_tile)?;
         for linear in 0..elements {
-            let bits = value(tile, linear, elements)?;
+            let bits = value(logical_tile, linear, elements)?;
             let offset = usize::try_from(slice.file_offset + u64::from(linear) * 2)?;
             bytes[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
         }
@@ -805,12 +817,11 @@ fn verify_gemm_output(
     }
     let mut mismatches = Vec::new();
     let mut checked = 0usize;
-    for row in 0..active_tiles {
-        let slice = output
-            .slices
-            .iter()
-            .find(|slice| slice.tile == u32::from(row))
-            .with_context(|| format!("GEMM output has no slice for tile {row}"))?;
+    if output.slices.len() != usize::from(active_tiles) {
+        bail!("GEMM output does not cover every logical tile");
+    }
+    for (row, slice) in output.slices.iter().enumerate() {
+        let row = u16::try_from(row)?;
         let elements = u32::try_from(slice.size / 2)?;
         for linear in 0..elements {
             let (batch_index, column) = amp_matrix_coordinates(
@@ -956,5 +967,36 @@ mod tests {
             assert!(validate_mlp_benchmark_shape(batch, tokens, dimension + 1, hidden).is_err());
             assert!(validate_mlp_benchmark_shape(batch, tokens, dimension, hidden + 1).is_err());
         }
+    }
+
+    #[test]
+    fn randomized_binding_values_follow_logical_slice_order() -> Result<()> {
+        let mut random = fastrand::Rng::with_seed(0x6c6f_6769_6361_6c5f);
+        for _ in 0..256 {
+            let count = random.usize(1..=128);
+            let mut physical = (0..count as u32).collect::<Vec<_>>();
+            random.shuffle(&mut physical);
+            let binding = Binding {
+                name: "mapped".into(),
+                dtype: "f16".into(),
+                shape: vec![count as u32],
+                slices: physical
+                    .into_iter()
+                    .enumerate()
+                    .map(|(logical, tile)| ipu_package::RegionSlice {
+                        tile,
+                        tile_address: 0x10_0000,
+                        file_offset: (logical * 2) as u64,
+                        size: 2,
+                    })
+                    .collect(),
+            };
+
+            let bytes = packed_binding(&binding, |logical, _, _| Ok(logical))?;
+            for (logical, raw) in bytes.chunks_exact(2).enumerate() {
+                assert_eq!(u16::from_le_bytes(raw.try_into().unwrap()), logical as u16);
+            }
+        }
+        Ok(())
     }
 }
