@@ -237,12 +237,6 @@ pub fn emit(
     let invocation_start = code.address(options.code_address)?;
     emit_host_phases(&mut code, symbols, &host.inputs)?;
 
-    if program.steps.iter().any(active_exchange) {
-        code.put_special(INCOMING_SBASE, 15)?;
-        code.put_special(INCOMING_DBASE, 15)?;
-        code.setzi(8, 1)?;
-        code.put_special(INCOMING_DCOUNT, 8)?;
-    }
     if let Some(address) = options.initial_profile_address {
         emit_cycle_sample(&mut code, symbols, address)?;
     }
@@ -309,6 +303,10 @@ fn emit_steps(
                 let active = exchange.row[0] != SANS_INACTIVE_INSTRUCTION;
                 if active {
                     code.call(worker_barrier.expect("active exchange has barrier"), 7)?;
+                    code.put_special(INCOMING_SBASE, 15)?;
+                    code.put_special(INCOMING_DBASE, 15)?;
+                    code.setzi(8, 1)?;
+                    code.put_special(INCOMING_DCOUNT, 8)?;
                 }
                 code.call(exchange.address, 10)?;
                 if let Some(address) = exchange.profile.after {

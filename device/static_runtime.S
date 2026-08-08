@@ -158,6 +158,7 @@ ipu_stack_copy_u64:
 	add $m2, $m2, $m8
 	add $m3, $m3, $m8
 	add $m5, $m5, $m7
+	brz $m5, .Lcopy_u64_worker_done
 .Lcopy_u64_worker_loop:
 	ld64 $a0:1, $m3, $m15, 0
 	st64 $a0:1, $m2, $m15, 0
@@ -165,6 +166,7 @@ ipu_stack_copy_u64:
 	add $m2, $m2, 8
 	sub $m5, $m5, 1
 	brnz $m5, .Lcopy_u64_worker_loop
+.Lcopy_u64_worker_done:
 	exitz $m15
 
 	.section .text.ipu_stack_static_repeat_call,"ax",@progbits

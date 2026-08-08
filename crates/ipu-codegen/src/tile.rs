@@ -196,14 +196,7 @@ fn lower_work(
                     .get(&copy.destination)
                     .and_then(|address| address.checked_add(copy.destination_offset))
                     .ok_or_else(&invalid)?;
-                let (symbol, arguments) = if copy.bytes != 0 && copy.bytes.is_multiple_of(8) {
-                    let words = copy.bytes / 8;
-                    (crate::COPY_U64_SYMBOL, vec![words / 6, words % 6])
-                } else if copy.bytes != 0 && copy.bytes.is_multiple_of(4) {
-                    (crate::COPY_U32_SYMBOL, vec![copy.bytes / 4])
-                } else {
-                    return Err(invalid());
-                };
+                let (symbol, arguments) = local_copy_call(copy.bytes).ok_or_else(invalid)?;
                 TileStep::Compute(crate::ComputeStep {
                     symbol: symbol.into(),
                     output_address: TileAddress::Absolute(destination),
@@ -236,6 +229,17 @@ fn lower_work(
         steps.push(step);
     }
     Ok(steps)
+}
+
+fn local_copy_call(bytes: u32) -> Option<(&'static str, Vec<u32>)> {
+    if bytes >= 6 * 8 && bytes.is_multiple_of(8) {
+        let words = bytes / 8;
+        Some((crate::COPY_U64_SYMBOL, vec![words / 6, words % 6]))
+    } else if bytes != 0 && bytes.is_multiple_of(4) {
+        Some((crate::COPY_U32_SYMBOL, vec![bytes / 4]))
+    } else {
+        None
+    }
 }
 
 fn lower_repeat(
@@ -364,6 +368,24 @@ mod tests {
                     TileStep::Exchange(exchange)
                         if exchange.row[0] == ipu_exchange::SANS_INACTIVE_INSTRUCTION
                 )));
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_local_copy_calls_never_launch_zero_work_workers() {
+        let mut random = fastrand::Rng::with_seed(0x636f_7079);
+        for _ in 0..1_000 {
+            let words = random.u32(1..=4_096);
+            let bytes = words * 4;
+            let (symbol, arguments) = local_copy_call(bytes).unwrap();
+            if symbol == crate::COPY_U64_SYMBOL {
+                assert!(arguments[0] != 0);
+                assert_eq!((arguments[0] * 6 + arguments[1]) * 8, bytes);
+                assert!(arguments[1] < 6);
+            } else {
+                assert_eq!(symbol, crate::COPY_U32_SYMBOL);
+                assert_eq!(arguments, [words]);
             }
         }
     }

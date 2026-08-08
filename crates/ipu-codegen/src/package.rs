@@ -141,6 +141,7 @@ fn build_package_from_objects(
         )
     })?;
     let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
+    let execution_topology = Topology::c600();
     let finalized = build_phase("finalize_tile_programs", || {
         Ok(lower_to_tile_programs_with_fill(
             program,
@@ -151,6 +152,15 @@ fn build_package_from_objects(
             execution_tile_count,
         )?)
     })?;
+    let mut physical_programs = vec![None; usize::from(execution_tile_count)];
+    for program in &finalized.programs {
+        let physical = execution_topology.physical(program.tile)?;
+        physical_programs[usize::from(physical)] = Some(program.clone());
+    }
+    let physical_programs = physical_programs
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| invalid("execution topology does not cover every physical tile"))?;
     let inputs = program
         .inputs
         .iter()
@@ -174,11 +184,13 @@ fn build_package_from_objects(
             "profile.start-cycle",
             PROFILE_START_CYCLE,
             program.tile_count,
+            &topology,
         ));
         outputs.push(cycle_binding(
             "profile.end-cycle",
             PROFILE_END_CYCLE,
             program.tile_count,
+            &topology,
         ));
     }
     let host = host::plan(
@@ -187,15 +199,14 @@ fn build_package_from_objects(
         &outputs,
         execution_tile_count,
         finalized.exchange_code_end,
-        &(0..execution_tile_count)
-            .map(|tile| {
-                placement
-                    .tile_data_end
-                    .get(usize::from(tile))
-                    .copied()
-                    .unwrap_or(crate::IPU21_DATA_BASE)
-            })
-            .collect::<Vec<_>>(),
+        &{
+            let mut ends = vec![crate::IPU21_DATA_BASE; usize::from(execution_tile_count)];
+            for logical in 0..program.tile_count {
+                ends[usize::from(topology.physical(logical)?)] =
+                    placement.tile_data_end[usize::from(logical)];
+            }
+            ends
+        },
     )?;
     let code_address = align_up(host.end, 4)?;
     let symbols = layout
@@ -204,8 +215,7 @@ fn build_package_from_objects(
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let generated = build_phase("emit_tile_code", || {
-        Ok(finalized
-            .programs
+        Ok(physical_programs
             .iter()
             .zip(&host.programs)
             .map(|(program, host)| {
@@ -250,6 +260,7 @@ fn build_package_from_objects(
             .map(|physical_tile| {
                 build_tile(
                     u32::from(physical_tile),
+                    u32::from(physical_programs[usize::from(physical_tile)].tile),
                     objects,
                     kernel_plan,
                     &retained_runtime,
@@ -323,11 +334,16 @@ fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
 }
 
 fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
-    Ok(Topology::new((0..tile_count).collect())?)
+    Ok(Topology::new(
+        (0..tile_count)
+            .map(ipu_exchange::c600_logical_to_physical)
+            .collect(),
+    )?)
 }
 
 fn build_tile(
     physical_tile: u32,
+    logical_tile: u32,
     objects: &[Vec<u8>],
     kernel_plan: &KernelBuildPlan,
     retained_runtime: &[String],
@@ -338,7 +354,7 @@ fn build_tile(
     let (host_segments, host_staging_address) = host;
     let linked = link_runtime(
         objects,
-        runtime_symbols(physical_tile, code_address, host_staging_address)?,
+        runtime_symbols(logical_tile, code_address, host_staging_address)?,
         kernel_plan,
         retained_runtime,
     )?;
@@ -476,14 +492,18 @@ fn output_binding(
     )
 }
 
-fn cycle_binding(name: &str, address: u32, tile_count: u16) -> Binding {
+fn cycle_binding(name: &str, address: u32, tile_count: u16, topology: &Topology) -> Binding {
     Binding {
         name: name.into(),
         dtype: "u32".into(),
         shape: vec![u32::from(tile_count)],
         slices: (0..tile_count)
             .map(|tile| RegionSlice {
-                tile: u32::from(tile),
+                tile: u32::from(
+                    topology
+                        .physical(tile)
+                        .expect("active topology contains tile"),
+                ),
                 tile_address: address,
                 file_offset: u64::from(tile) * 4,
                 size: 4,

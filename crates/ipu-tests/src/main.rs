@@ -313,7 +313,15 @@ fn run_gemm(
     session.start()?;
     let initialized = session.invoke_streaming_deferred("initialize", &right_bytes)?;
     session.collect(&initialized)?;
-    let executed = session.invoke_streaming_deferred("run", &left_bytes)?;
+    let executed = session
+        .invoke_streaming_deferred("run", &left_bytes)
+        .map_err(|error| {
+            eprintln!(
+                "runFailureDiagnostics={}",
+                device_failure_diagnostics(runtime, application)
+            );
+            error
+        })?;
     runtime
         .device()
         .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
@@ -367,7 +375,15 @@ fn run_mlp_chain(
     session.start()?;
     let initialized = session.invoke_streaming_deferred("initialize", &weights)?;
     session.collect(&initialized)?;
-    let executed = session.invoke_streaming_deferred("run", &left_bytes)?;
+    let executed = session
+        .invoke_streaming_deferred("run", &left_bytes)
+        .map_err(|error| {
+            eprintln!(
+                "runFailureDiagnostics={}",
+                device_failure_diagnostics(runtime, application)
+            );
+            error
+        })?;
     runtime
         .device()
         .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
@@ -472,7 +488,15 @@ fn run_siglip_mlp_benchmark(
     session.start()?;
     let initialized = session.invoke_streaming_deferred("initialize", &weights)?;
     session.collect(&initialized)?;
-    let executed = session.invoke_streaming_deferred("run", &left_bytes)?;
+    let executed = session
+        .invoke_streaming_deferred("run", &left_bytes)
+        .map_err(|error| {
+            eprintln!(
+                "runFailureDiagnostics={}",
+                device_failure_diagnostics(runtime, application)
+            );
+            error
+        })?;
     runtime
         .device()
         .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
@@ -904,6 +928,21 @@ fn summarize_states(states: &[(u16, u32)]) -> String {
         }
     }
     format!("counts={counts:?} firstUnexpected={unexpected:?}")
+}
+
+fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> String {
+    let states = match supervisor_states(runtime, application) {
+        Ok(states) => states,
+        Err(error) => return format!("supervisor state read failed: {error}"),
+    };
+    let mut contexts = Vec::new();
+    for &(physical, state) in states.iter().filter(|(_, state)| *state != 0).take(16) {
+        let workers = (1..=6)
+            .map(|context| runtime.device().tile_context_state(physical, context))
+            .collect::<Result<Vec<_>, _>>();
+        contexts.push((physical, state, workers));
+    }
+    format!("{} contexts={contexts:?}", summarize_states(&states))
 }
 
 #[cfg(test)]

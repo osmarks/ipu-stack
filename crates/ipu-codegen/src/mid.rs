@@ -2076,6 +2076,15 @@ fn lower_operations(
         .into_iter()
         .min_by_key(|branch| branch.score)
         .ok_or_else(|| LoweringError::NoCandidate(source[0].id))?;
+    for operation in &best.operations {
+        tracing::debug!(
+            source = ?operation.source.map(OperationId::index),
+            kind = ?operation.kind,
+            inputs = ?operation.inputs.iter().map(|id| &best.state.get(*id).tensor_type).collect::<Vec<_>>(),
+            outputs = ?operation.results.iter().map(|id| &best.state.get(*id).tensor_type).collect::<Vec<_>>(),
+            "selected scheduled operation"
+        );
+    }
     *values = best.values;
     *state = best.state;
     Ok(best.operations)
