@@ -4,12 +4,12 @@ use crate::low::{
     KernelRequirements, LowProgram, LowShardId, ShardDefinition, TileWork, TileWorkList,
 };
 use crate::memory::IPU21_DATA_BASE;
-use crate::mid::{MemoryClass, OperandRequirement};
+use crate::mid::{MemoryClass, MemoryOperand, MemoryRelation, OperandRequirement};
 use crate::storage::{StorageError, shard_storage_bytes};
 use ipu_exchange::{EXCHANGE_WINDOW_BASE, EXCHANGE_WINDOW_BYTES};
 use ipu_package::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, IPU21_INTERLEAVED_REGION_LIMIT,
-    TILE_MEMORY_BASE, TILE_MEMORY_SIZE,
+    TILE_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE, TILE_MEMORY_SIZE,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,6 +47,7 @@ pub enum PlacementError {
 struct Requirement {
     alignment: u32,
     access_tail: u32,
+    distinct_element: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -98,6 +99,7 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
         let combined = root_requirements.entry(root).or_default();
         combined.alignment = combined.alignment.max(requirement.alignment);
         combined.access_tail = combined.access_tail.max(requirement.access_tail);
+        combined.distinct_element |= requirement.distinct_element;
     }
 
     let mut members = BTreeMap::<usize, Vec<usize>>::new();
@@ -345,8 +347,30 @@ fn collect_requirements(tile: &TileWorkList, requirements: &mut [Requirement]) {
         match work {
             TileWork::Kernel(run) => {
                 let (inputs, output) = match &run.requirements {
-                    KernelRequirements::Operator(requirements) => {
-                        (&requirements.inputs[..], &requirements.output)
+                    KernelRequirements::Operator(operator_requirements) => {
+                        for relation in &operator_requirements.memory_relations {
+                            let MemoryRelation::DistinctElements(operands) = relation;
+                            for operand in operands {
+                                match operand {
+                                    MemoryOperand::Output => {
+                                        requirements[run.output.shard.index() as usize]
+                                            .distinct_element = true;
+                                    }
+                                    MemoryOperand::Input(index) => {
+                                        if let Some(input) = run.inputs.get(usize::from(*index)) {
+                                            for view in &input.views {
+                                                requirements[view.shard.index() as usize]
+                                                    .distinct_element = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        (
+                            &operator_requirements.inputs[..],
+                            &operator_requirements.output,
+                        )
                     }
                     KernelRequirements::Conversion { input, output } => {
                         (std::slice::from_ref(input), output)
@@ -423,7 +447,7 @@ fn allocation_bytes(
     members: &[usize],
     requirement: Requirement,
 ) -> Result<u32, PlacementError> {
-    members
+    let bytes = members
         .iter()
         .map(|&index| {
             shard_storage_bytes(&program.shards[index])?
@@ -433,7 +457,34 @@ fn allocation_bytes(
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .max()
-        .ok_or(PlacementError::Overflow)
+        .ok_or(PlacementError::Overflow)?;
+    if requirement.distinct_element {
+        align_up(bytes, memory_element_size(program, members))
+    } else {
+        Ok(bytes)
+    }
+}
+
+fn memory_element_size(program: &LowProgram, members: &[usize]) -> u32 {
+    match program.shards[members[0]]
+        .tensor_type
+        .format
+        .layout
+        .memory_class
+    {
+        MemoryClass::Ipu21Standard => TILE_MEMORY_ELEMENT_SIZE,
+        MemoryClass::Ipu21Interleaved => IPU21_INTERLEAVED_ELEMENT_SIZE,
+    }
+}
+
+fn allocation_alignment(program: &LowProgram, members: &[usize], requirement: Requirement) -> u32 {
+    if requirement.distinct_element {
+        requirement
+            .alignment
+            .max(memory_element_size(program, members))
+    } else {
+        requirement.alignment
+    }
 }
 
 fn assign_members(
@@ -482,8 +533,7 @@ fn allocate_tile_class(
         let alignment = group.alignment.max(
             roots
                 .iter()
-                .filter_map(|root| root_requirements.get(root))
-                .map(|requirement| requirement.alignment)
+                .map(|root| allocation_alignment(program, &members[root], root_requirements[root]))
                 .max()
                 .unwrap_or(1),
         );
@@ -530,7 +580,7 @@ fn allocate_tile_class(
         requests.push(AllocationRequest {
             lifetime: root_lifetimes.get(&root).copied().unwrap_or_default(),
             bytes,
-            alignment: requirement.alignment.max(4),
+            alignment: allocation_alignment(program, root_members, requirement).max(4),
             assignments: vec![(root, 0)],
         });
     }
@@ -743,6 +793,43 @@ mod tests {
                             &kernels,
                         )
                         .unwrap();
+                        if let KernelRequirements::Operator(requirements) = &run.requirements {
+                            for relation in &requirements.memory_relations {
+                                let MemoryRelation::DistinctElements(operands) = relation;
+                                let mut ranges = Vec::new();
+                                for operand in operands {
+                                    let shards = match operand {
+                                        MemoryOperand::Output => vec![run.output.shard],
+                                        MemoryOperand::Input(index) => run.inputs
+                                            [usize::from(*index)]
+                                        .views
+                                        .iter()
+                                        .map(|view| view.shard)
+                                        .collect(),
+                                    };
+                                    for shard in shards {
+                                        let definition = &low.shards[shard.index() as usize];
+                                        let element =
+                                            memory_element_size(&low, &[shard.index() as usize]);
+                                        let address = placement.shard_addresses[&shard];
+                                        assert_eq!(address % element, 0);
+                                        let bytes = shard_storage_bytes(definition).unwrap();
+                                        ranges.push((
+                                            definition.tensor_type.format.layout.memory_class,
+                                            address / element,
+                                            address.saturating_add(bytes).div_ceil(element),
+                                        ));
+                                    }
+                                }
+                                for (index, left) in ranges.iter().enumerate() {
+                                    for right in &ranges[..index] {
+                                        if left.0 == right.0 {
+                                            assert!(left.2 <= right.1 || right.2 <= left.1);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
