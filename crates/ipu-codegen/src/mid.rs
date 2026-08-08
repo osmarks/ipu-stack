@@ -103,6 +103,7 @@ pub enum GemmWeightLoad {
 pub enum OperatorDispatch {
     Pointwise {
         kernel: TileKernelSpec,
+        input_mapping: PointwiseInputMapping,
     },
     BlockedGemm {
         initialize: TileKernelSpec,
@@ -110,6 +111,56 @@ pub enum OperatorDispatch {
         inner_block: u32,
         output_column_block: u32,
     },
+}
+
+/// How a pointwise kernel's input shards are selected for each output shard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointwiseInputMapping {
+    /// Each input view is selected by its logical overlap with the output and
+    /// singleton dimensions may be broadcast.
+    BroadcastToOutput,
+    /// Each input must already have a shard resident on the output tile.
+    TileLocal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmptyOutputShardPolicy {
+    Skip,
+    Reject,
+}
+
+impl OperatorDispatch {
+    fn empty_output_shard_policy(&self) -> EmptyOutputShardPolicy {
+        match self {
+            Self::Pointwise { .. } => EmptyOutputShardPolicy::Skip,
+            Self::BlockedGemm { .. } => EmptyOutputShardPolicy::Reject,
+        }
+    }
+
+    /// Whether distributed inputs are part of the executable dispatch contract
+    /// rather than formats that may be synthesized from a fixed package input.
+    /// Generic retile phases do not yet provide that contract for multi-axis
+    /// blocked GEMM dispatches.
+    fn requires_preplaced_distributed_inputs(&self, requirements: &OperatorRequirements) -> bool {
+        match self {
+            Self::Pointwise { .. } => false,
+            Self::BlockedGemm { .. } => {
+                requirements
+                    .inputs
+                    .iter()
+                    .any(|input| input.format.layout.tiling.replicas > 1)
+                    || requirements.inputs.get(1).is_some_and(|right| {
+                        right
+                            .format
+                            .layout
+                            .tiling
+                            .axes
+                            .iter()
+                            .any(|axis| axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1)
+                    })
+            }
+        }
+    }
 }
 
 /// AMP packing role. Block dimensions are recorded by [`AxisTiling`].
@@ -131,6 +182,16 @@ pub const AMP_COLUMN_MICRO: u32 = 16;
 pub enum ElementOrder {
     RowMajor,
     Amp(AmpOrder),
+}
+
+impl ElementOrder {
+    /// This packing is consumed as contiguous K-major panels, while a generic
+    /// intersection rearrangement produces rectangular tensor-coordinate
+    /// views. It must therefore be selected for an automatic input or produced
+    /// by a specialized operator/local staging path.
+    fn requires_direct_population(&self) -> bool {
+        matches!(self, Self::Amp(AmpOrder::RightK64))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -764,8 +825,6 @@ impl OperatorCandidate {
     fn supports(&self, inputs: &[TensorType], output: &TensorShape) -> bool {
         if self.inputs.len() != inputs.len()
             || !valid_requirement(&self.output, output)
-            || ((matches!(self.operator, MidOperator::Gemm { .. } | MidOperator::Gelu))
-                && layout_has_empty_shards(&self.output.format.layout, output))
             || !self
                 .inputs
                 .iter()
@@ -873,9 +932,11 @@ fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
         },
         MidOperator::Gelu => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Gelu,
+            input_mapping: PointwiseInputMapping::BroadcastToOutput,
         },
         MidOperator::Add(_) => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Add,
+            input_mapping: PointwiseInputMapping::BroadcastToOutput,
         },
         MidOperator::FlashAttention {
             options,
@@ -885,6 +946,7 @@ fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
                 options,
                 accumulate,
             },
+            input_mapping: PointwiseInputMapping::TileLocal,
         },
     }
 }
@@ -1417,6 +1479,8 @@ pub enum OperatorPlanError {
     InvalidBlocking,
     #[error("operator plan requires corresponding input and output tile groups")]
     IncompatibleTileGroups,
+    #[error("operator dispatch does not support empty output shards")]
+    EmptyOutputShard,
     #[error("blocked GEMM currently requires non-transposed AMP left/right/output formats")]
     UnsupportedGemmLayout,
 }
@@ -1436,6 +1500,11 @@ impl OperatorPlan {
             .any(|input| input.format.layout.tiling.tile_count != output_tiles)
         {
             return Err(OperatorPlanError::IncompatibleTileGroups);
+        }
+        if self.dispatch.empty_output_shard_policy() == EmptyOutputShardPolicy::Reject
+            && layout_has_empty_shards(&output.format.layout, &output.shape)
+        {
+            return Err(OperatorPlanError::EmptyOutputShard);
         }
         match (&self.operator, &self.dispatch) {
             (
@@ -1541,12 +1610,14 @@ impl OperatorPlan {
                 MidOperator::Gelu,
                 OperatorDispatch::Pointwise {
                     kernel: TileKernelSpec::Gelu,
+                    ..
                 },
             )
             | (
                 MidOperator::Add(_),
                 OperatorDispatch::Pointwise {
                     kernel: TileKernelSpec::Add,
+                    ..
                 },
             ) => Ok(()),
             (
@@ -1560,6 +1631,7 @@ impl OperatorPlan {
                             options: kernel_options,
                             accumulate: kernel_accumulate,
                         },
+                    ..
                 },
             ) if options == kernel_options && accumulate == kernel_accumulate => Ok(()),
             _ => Err(OperatorPlanError::DispatchMismatch),
@@ -1688,8 +1760,6 @@ pub fn lower(
         let value = state.value(input.value, tensor_type);
         if automatic {
             state.automatic_inputs.insert(value);
-        } else {
-            state.fixed_inputs.insert(value);
         }
         values.insert(input.value, value);
         inputs.push(MidInput {
@@ -1739,7 +1809,6 @@ pub fn lower(
 struct LoweringState {
     values: Vec<MidValue>,
     automatic_inputs: BTreeSet<MidValueId>,
-    fixed_inputs: BTreeSet<MidValueId>,
 }
 
 impl LoweringState {
@@ -1882,31 +1951,23 @@ fn lower_operations(
             for plan in plans(operation, &input_types, &output_shape, config)
                 .into_iter()
                 .filter(|plan| {
-                    let grid_plan = matches!(plan.operator, MidOperator::Gemm { .. })
-                        && (plan
-                            .requirements
-                            .inputs
-                            .iter()
-                            .any(|input| input.format.layout.tiling.replicas > 1)
-                            || plan.requirements.inputs.get(1).is_some_and(|right| {
-                                right.format.layout.tiling.axes.iter().any(|axis| {
-                                    axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1
-                                })
-                            }));
+                    let exact_distributed_inputs = plan
+                        .dispatch
+                        .requires_preplaced_distributed_inputs(&plan.requirements);
                     input_ids
                         .iter()
                         .zip(&plan.requirements.inputs)
                         .all(|(id, requirement)| {
                             let current = &branch.state.get(*id).tensor_type.format.layout;
                             branch.state.automatic_inputs.contains(id)
-                                || (!grid_plan
-                                    || !branch.state.fixed_inputs.contains(id)
+                                || (!exact_distributed_inputs
                                     || current == &requirement.format.layout)
                                     && (current.order == requirement.format.layout.order
-                                        || !matches!(
-                                            requirement.format.layout.order,
-                                            ElementOrder::Amp(AmpOrder::RightK64)
-                                        ))
+                                        || !requirement
+                                            .format
+                                            .layout
+                                            .order
+                                            .requires_direct_population())
                         })
                 })
             {

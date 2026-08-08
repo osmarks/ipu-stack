@@ -10,7 +10,7 @@ use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
     ConversionDispatch, LayoutError, MidGraph, MidOperation, MidOperationKind, MidRepeat,
     MidValueId, OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing,
-    PipelineConfig, TensorType, TileKernelSpec,
+    PipelineConfig, PointwiseInputMapping, TensorType, TileKernelSpec,
 };
 use crate::storage::{StorageError, shard_storage_bytes, view_byte_spans};
 use std::collections::BTreeMap;
@@ -568,10 +568,7 @@ impl LoweringState {
         };
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
-        let direct_retile = matches!(
-            kind,
-            MidOperationKind::Rearrange { from, to } if from.order == to.order
-        );
+        let direct_retile = plan.input.format.layout.order == plan.output.format.layout.order;
         let mut remote_items = Vec::<(
             ShardView,
             LowShardId,
@@ -743,9 +740,16 @@ impl LoweringState {
             .as_ref()
             .ok_or(LowLoweringError::MissingOperatorPlan)?;
         match &plan.dispatch {
-            OperatorDispatch::Pointwise { kernel } => {
-                self.lower_pointwise(operation, kernel.clone(), &plan.requirements, tiles)
-            }
+            OperatorDispatch::Pointwise {
+                kernel,
+                input_mapping,
+            } => self.lower_pointwise(
+                operation,
+                kernel.clone(),
+                *input_mapping,
+                &plan.requirements,
+                tiles,
+            ),
             OperatorDispatch::BlockedGemm {
                 initialize,
                 accumulate,
@@ -767,6 +771,7 @@ impl LoweringState {
         &mut self,
         operation: &MidOperation,
         kernel: TileKernelSpec,
+        input_mapping: PointwiseInputMapping,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
@@ -778,21 +783,29 @@ impl LoweringState {
             vec![BTreeMap::<ShardView, Vec<LowShardId>>::new(); operation.inputs.len()];
         let mut runs = Vec::with_capacity(outputs.len());
         for output in outputs {
+            if self.shards[output.index() as usize]
+                .extents
+                .iter()
+                .any(|extent| extent.start == extent.physical_end)
+            {
+                continue;
+            }
             let tile = self.shards[output.index() as usize].tile;
             let inputs = operation
                 .inputs
                 .iter()
                 .enumerate()
                 .map(|(index, input)| {
-                    let source_view =
-                        if matches!(&kernel, TileKernelSpec::Add | TileKernelSpec::Gelu) {
-                            self.value_shards(*input)?
-                                .iter()
-                                .find_map(|source| self.broadcast_view(*source, output))
-                                .ok_or(LowLoweringError::InvalidOperatorPlan)?
-                        } else {
+                    let source_view = match input_mapping {
+                        PointwiseInputMapping::BroadcastToOutput => self
+                            .value_shards(*input)?
+                            .iter()
+                            .find_map(|source| self.broadcast_view(*source, output))
+                            .ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                        PointwiseInputMapping::TileLocal => {
                             self.full_view(self.local_shard(*input, tile)?)
-                        };
+                        }
+                    };
                     let view = if self.shards[source_view.shard.index() as usize].tile == tile {
                         source_view
                     } else {
@@ -1722,8 +1735,9 @@ fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<Vec<ShardExt
 mod tests {
     use super::*;
     use crate::{
-        AxisTiling, ComputeGraph, ElementOrder, Ipu21CostModel, Layout, MemoryClass, Padding,
-        PipelineConfig, Precision, TensorAxis, TensorFormat, TensorTiling, lower,
+        AxisTiling, ComputeGraph, ElementOrder, Ipu21CostModel, Layout, MemoryClass, MidOperator,
+        OperandRequirement, OperatorCandidate, Padding, PipelineConfig, Precision, TensorAxis,
+        TensorFormat, TensorTiling, lower,
     };
 
     const CASES: usize = 32;
@@ -1732,6 +1746,46 @@ mod tests {
         TensorFormat {
             precision: Precision::F16,
             layout: Layout::row_sharded(tiles),
+        }
+    }
+
+    #[test]
+    fn randomized_pointwise_dispatch_skips_empty_output_shards() {
+        let mut random = fastrand::Rng::with_seed(0x656d_7074);
+        for case in 0..CASES {
+            let tiles = random.u16(2..=32);
+            let rows = random.u32(1..u32::from(tiles));
+            let columns = random.u32(1..=32) * 2;
+            let tensor_format = format(tiles);
+            let mut graph = ComputeGraph::new();
+            let input = graph.host_input("input", [rows, columns]).unwrap();
+            let output = graph.gelu(input).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let mut config = PipelineConfig::new(tiles).with_input(input, tensor_format.clone());
+            config.operator_candidates = vec![OperatorCandidate::new(
+                MidOperator::Gelu,
+                [OperandRequirement::new(tensor_format.clone(), 8)],
+                OperandRequirement::new(tensor_format, 8),
+            )];
+
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let low = lower_to_tiles(&mid, &config).unwrap();
+            let runs = low
+                .tiles
+                .iter()
+                .flat_map(|tile| &tile.work)
+                .filter_map(|work| match work {
+                    TileWork::Kernel(run) => Some(run),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(runs.len(), rows as usize, "random case {case}");
+            assert!(runs.iter().all(|run| {
+                run.output
+                    .extents
+                    .iter()
+                    .all(|extent| extent.start < extent.physical_end)
+            }));
         }
     }
 

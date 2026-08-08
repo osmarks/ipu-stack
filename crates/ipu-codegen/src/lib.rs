@@ -52,9 +52,9 @@ pub use mid::{
     MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidGraph,
     MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue,
     MidValueId, OperandRequirement, OperatorCandidate, OperatorDispatch, OperatorPlan,
-    OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, PipelineConfig, Precision,
-    ProfilingConfig, SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType,
-    TileKernelSpec, lower,
+    OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, PipelineConfig,
+    PointwiseInputMapping, Precision, ProfilingConfig, SchedulingPolicy, TensorAxis, TensorFormat,
+    TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
 pub use place::{Placement, PlacementError, place};
