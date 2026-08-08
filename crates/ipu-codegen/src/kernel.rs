@@ -3,7 +3,7 @@
 use crate::{
     AmpOrder, ComputeStep, ElementOrder, GemmKernelMode, GemmWeightLoad, KernelRequirements,
     KernelRun, LowProgram, LowShard, LowShardId, Precision, StepProfile, StorageError, TileAddress,
-    TileKernel, TileKernelSpec, TileWork, TileWorkList, view_byte_spans,
+    TileKernel, TileKernelSpec, TileWorkList, TileWorkRef, view_byte_spans,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -112,7 +112,7 @@ impl KernelBuildPlan {
         let mut rows = BTreeMap::<(Precision, GemmWeightLoad), BTreeSet<u32>>::new();
         let mut gelu = false;
         for tile in &program.tiles {
-            collect_kernels(tile, &mut rows, &mut gelu)?;
+            collect_kernels(program, tile, &mut rows, &mut gelu)?;
         }
         let mut plan = Self::default();
         for ((precision, weights), values) in rows {
@@ -311,13 +311,14 @@ fn add_address_offset(
 }
 
 fn collect_kernels(
+    program: &LowProgram,
     tile: &TileWorkList,
     rows: &mut BTreeMap<(Precision, GemmWeightLoad), BTreeSet<u32>>,
     gelu: &mut bool,
 ) -> Result<(), KernelAbiError> {
-    for work in &tile.work {
+    for work in program.work(tile) {
         match work {
-            TileWork::Kernel(run) => {
+            TileWorkRef::Kernel(run) => {
                 let abi = validate_kernel_run(run)?;
                 let TileKernel::Planned(kernel) = &run.kernel;
                 if abi.availability != KernelAvailability::Implemented {
@@ -334,8 +335,8 @@ fn collect_kernels(
                     *gelu = true;
                 }
             }
-            TileWork::Repeat(repeat) => collect_kernels(&repeat.body, rows, gelu)?,
-            TileWork::Exchange(_) | TileWork::LocalCopy(_) => {}
+            TileWorkRef::Repeat(repeat) => collect_kernels(program, &repeat.body, rows, gelu)?,
+            TileWorkRef::Exchange(_) | TileWorkRef::LocalCopy(_) => {}
         }
     }
     Ok(())
@@ -733,9 +734,9 @@ mod tests {
             for run in low
                 .tiles
                 .iter()
-                .flat_map(|tile| &tile.work)
+                .flat_map(|tile| low.work(tile))
                 .filter_map(|work| {
-                    if let TileWork::Kernel(run) = work {
+                    if let TileWorkRef::Kernel(run) = work {
                         Some(run)
                     } else {
                         None

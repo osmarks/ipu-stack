@@ -35,11 +35,11 @@ pub use kernel::{
     validate_kernel_run,
 };
 pub use low::{
-    ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun, LocalCopy,
-    LogicalExchange, LowInput, LowLoweringError, LowLoweringResult, LowProgram, LowShard,
-    LowShardId, LowValue, RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun,
-    ShardDefinition, ShardExtent, ShardView, TileKernel, TileWork, TileWorkList, WorkProvenance,
-    WorkReason, lower_to_tiles,
+    ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun, KernelRunId,
+    KernelRunMetadata, LocalCopy, LocalCopyId, LogicalExchange, LowInput, LowLoweringError,
+    LowLoweringResult, LowProgram, LowShard, LowShardId, LowValue, RepeatCarried, RepeatInvariant,
+    RepeatIterated, RepeatRun, RepeatRunId, ShardDefinition, ShardExtent, ShardView, TileKernel,
+    TileWork, TileWorkList, TileWorkRef, WorkProvenance, WorkReason, lower_to_tiles,
 };
 pub use memory::{
     IPU21_DATA_BASE, IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES,
@@ -63,7 +63,8 @@ pub use storage::{
     view_byte_spans,
 };
 pub use tile::{
-    TileLoweringError, TilePrograms, lower_to_tile_programs, lower_to_tile_programs_with_fill,
+    TileLoweringError, TileProgramLowering, TilePrograms, lower_to_tile_programs,
+    lower_to_tile_programs_with_fill,
 };
 
 const INCOMING_DBASE: u8 = 0xa4;

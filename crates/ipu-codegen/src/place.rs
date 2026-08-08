@@ -1,7 +1,7 @@
 //! Deterministic placement of logical shards in IPU21 tile SRAM.
 
 use crate::low::{
-    KernelRequirements, LowProgram, LowShardId, ShardDefinition, TileWork, TileWorkList,
+    KernelRequirements, LowProgram, LowShardId, ShardDefinition, TileWorkList, TileWorkRef,
 };
 use crate::memory::IPU21_DATA_BASE;
 use crate::mid::{MemoryClass, MemoryOperand, MemoryRelation, OperandRequirement};
@@ -93,7 +93,7 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
 
     let mut requirements = vec![Requirement::default(); program.shards.len()];
     for tile in &program.tiles {
-        collect_requirements(tile, &mut requirements);
+        collect_requirements(program, tile, &mut requirements);
     }
     let mut root_requirements = BTreeMap::<usize, Requirement>::new();
     for (index, requirement) in requirements.into_iter().enumerate() {
@@ -287,7 +287,7 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
     }
     for tile in &program.tiles {
         let mut event = 1u32;
-        for work in &tile.work {
+        for work in program.work(tile) {
             touch_work(program, work, tile.tile, event, &mut lifetimes);
             event = event.saturating_add(1);
         }
@@ -313,24 +313,24 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
 
 fn touch_work(
     program: &LowProgram,
-    work: &TileWork,
+    work: TileWorkRef<'_>,
     tile: u16,
     event: u32,
     lifetimes: &mut [Lifetime],
 ) {
     let mut touch = |shard: LowShardId| lifetimes[shard.index() as usize].touch(event);
     match work {
-        TileWork::Kernel(run) => {
+        TileWorkRef::Kernel(run) => {
             for view in run.inputs.iter().flat_map(|operand| &operand.views) {
                 touch(view.shard);
             }
             touch(run.output.shard);
         }
-        TileWork::LocalCopy(copy) => {
+        TileWorkRef::LocalCopy(copy) => {
             touch(copy.source);
             touch(copy.destination);
         }
-        TileWork::Exchange(id) => {
+        TileWorkRef::Exchange(id) => {
             for transfer in &program.exchange_phases[id.index() as usize].transfers {
                 if program.shards[transfer.source.shard.index() as usize].tile == tile {
                     touch(transfer.source.shard);
@@ -342,7 +342,7 @@ fn touch_work(
                 }
             }
         }
-        TileWork::Repeat(repeat) => {
+        TileWorkRef::Repeat(repeat) => {
             for carried in &repeat.carried {
                 touch(carried.initial);
                 touch(carried.argument);
@@ -359,7 +359,7 @@ fn touch_work(
                 }
                 touch(iterated.argument);
             }
-            for nested in &repeat.body.work {
+            for nested in program.work(&repeat.body) {
                 touch_work(program, nested, tile, event, lifetimes);
             }
         }
@@ -372,8 +372,8 @@ fn collect_repeat_constraints(
     sets: &mut DisjointSets,
     iterated: &mut Vec<IteratedGroup>,
 ) -> Result<(), PlacementError> {
-    for work in &tile.work {
-        let TileWork::Repeat(repeat) = work else {
+    for work in program.work(tile) {
+        let TileWorkRef::Repeat(repeat) = work else {
             continue;
         };
         for carried in &repeat.carried {
@@ -399,10 +399,14 @@ fn collect_repeat_constraints(
     Ok(())
 }
 
-fn collect_requirements(tile: &TileWorkList, requirements: &mut [Requirement]) {
-    for work in &tile.work {
+fn collect_requirements(
+    program: &LowProgram,
+    tile: &TileWorkList,
+    requirements: &mut [Requirement],
+) {
+    for work in program.work(tile) {
         match work {
-            TileWork::Kernel(run) => {
+            TileWorkRef::Kernel(run) => {
                 let (inputs, output) = match &run.requirements {
                     KernelRequirements::Operator(operator_requirements) => {
                         for relation in &operator_requirements.memory_relations {
@@ -443,7 +447,7 @@ fn collect_requirements(tile: &TileWorkList, requirements: &mut [Requirement]) {
                 }
                 apply_requirement(&mut requirements[run.output.shard.index() as usize], output);
             }
-            TileWork::LocalCopy(copy) => {
+            TileWorkRef::LocalCopy(copy) => {
                 requirements[copy.source.index() as usize].alignment =
                     requirements[copy.source.index() as usize].alignment.max(8);
                 requirements[copy.destination.index() as usize].alignment = requirements
@@ -451,8 +455,10 @@ fn collect_requirements(tile: &TileWorkList, requirements: &mut [Requirement]) {
                     .alignment
                     .max(8);
             }
-            TileWork::Repeat(repeat) => collect_requirements(&repeat.body, requirements),
-            TileWork::Exchange(_) => {}
+            TileWorkRef::Repeat(repeat) => {
+                collect_requirements(program, &repeat.body, requirements)
+            }
+            TileWorkRef::Exchange(_) => {}
         }
     }
 }
@@ -866,8 +872,8 @@ mod tests {
                 }
             }
             for tile in &low.tiles {
-                for work in &tile.work {
-                    if let TileWork::Kernel(run) = work {
+                for work in low.work(tile) {
+                    if let TileWorkRef::Kernel(run) = work {
                         materialize_kernel_run(
                             run,
                             &low.shards,

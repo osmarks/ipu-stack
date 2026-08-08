@@ -15,6 +15,7 @@ use crate::mid::{
 use crate::storage::{StorageError, shard_storage_bytes, view_byte_spans};
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LowShardId(u32);
@@ -33,6 +34,33 @@ impl LowShardId {
 pub struct ExchangePhaseId(u32);
 
 impl ExchangePhaseId {
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KernelRunId(u32);
+
+impl KernelRunId {
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LocalCopyId(u32);
+
+impl LocalCopyId {
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RepeatRunId(u32);
+
+impl RepeatRunId {
     pub const fn index(self) -> u32 {
         self.0
     }
@@ -143,12 +171,45 @@ pub struct KernelOperand {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KernelRun {
+pub struct KernelRunMetadata {
     pub provenance: WorkProvenance,
     pub kernel: TileKernel,
+    pub requirements: KernelRequirements,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelRun {
+    metadata: Arc<KernelRunMetadata>,
     pub inputs: Vec<KernelOperand>,
     pub output: ShardView,
-    pub requirements: KernelRequirements,
+}
+
+impl KernelRun {
+    pub fn new(
+        provenance: WorkProvenance,
+        kernel: TileKernel,
+        inputs: Vec<KernelOperand>,
+        output: ShardView,
+        requirements: KernelRequirements,
+    ) -> Self {
+        Self {
+            metadata: Arc::new(KernelRunMetadata {
+                provenance,
+                kernel,
+                requirements,
+            }),
+            inputs,
+            output,
+        }
+    }
+}
+
+impl std::ops::Deref for KernelRun {
+    type Target = KernelRunMetadata;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -197,9 +258,17 @@ pub struct RepeatRun {
 pub enum TileWork {
     /// All tiles encounter a phase marker, including tiles without transfers.
     Exchange(ExchangePhaseId),
-    LocalCopy(LocalCopy),
-    Kernel(KernelRun),
-    Repeat(RepeatRun),
+    LocalCopy(LocalCopyId),
+    Kernel(KernelRunId),
+    Repeat(RepeatRunId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileWorkRef<'a> {
+    Exchange(ExchangePhaseId),
+    LocalCopy(&'a LocalCopy),
+    Kernel(&'a KernelRun),
+    Repeat(&'a RepeatRun),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,8 +283,29 @@ pub struct LowProgram {
     pub shards: Vec<LowShard>,
     pub exchange_phases: Vec<ExchangePhase>,
     pub inputs: Vec<LowInput>,
+    /// Compact per-tile ordering. Non-exchange entries index the arenas below.
     pub tiles: Vec<TileWorkList>,
+    /// Tile-specific kernel operands and outputs, with shared call metadata.
+    pub kernel_runs: Vec<KernelRun>,
+    pub local_copies: Vec<LocalCopy>,
+    pub repeat_runs: Vec<RepeatRun>,
     pub outputs: Vec<LowValue>,
+}
+
+impl LowProgram {
+    /// Resolves compact schedule entries as they are consumed, without
+    /// constructing a second per-tile work list.
+    pub fn work<'a>(
+        &'a self,
+        tile: &'a TileWorkList,
+    ) -> impl Iterator<Item = TileWorkRef<'a>> + 'a {
+        tile.work.iter().map(|work| match *work {
+            TileWork::Exchange(id) => TileWorkRef::Exchange(id),
+            TileWork::LocalCopy(id) => TileWorkRef::LocalCopy(&self.local_copies[id.0 as usize]),
+            TileWork::Kernel(id) => TileWorkRef::Kernel(&self.kernel_runs[id.0 as usize]),
+            TileWork::Repeat(id) => TileWorkRef::Repeat(&self.repeat_runs[id.0 as usize]),
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -306,6 +396,9 @@ pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringR
         exchange_phases: state.phases,
         inputs,
         tiles,
+        kernel_runs: state.kernel_runs,
+        local_copies: state.local_copies,
+        repeat_runs: state.repeat_runs,
         outputs,
     })
 }
@@ -315,6 +408,10 @@ struct LoweringState {
     shards: Vec<LowShard>,
     canonical: Vec<Vec<LowShardId>>,
     phases: Vec<ExchangePhase>,
+    kernel_runs: Vec<KernelRun>,
+    local_copies: Vec<LocalCopy>,
+    repeat_runs: Vec<RepeatRun>,
+    kernel_metadata: Vec<Arc<KernelRunMetadata>>,
 }
 
 impl LoweringState {
@@ -324,6 +421,10 @@ impl LoweringState {
             shards: Vec::new(),
             canonical: vec![Vec::new(); graph.values.len()],
             phases: Vec::new(),
+            kernel_runs: Vec::new(),
+            local_copies: Vec::new(),
+            repeat_runs: Vec::new(),
+            kernel_metadata: Vec::new(),
         };
         for value in &graph.values {
             if value.tensor_type.format.layout.tiling.tile_count != tile_count {
@@ -524,7 +625,7 @@ impl LoweringState {
     }
 
     fn lower_local_conversion(
-        &self,
+        &mut self,
         operation: &MidOperation,
         kind: &MidOperationKind,
         plan: &crate::ConversionPlan,
@@ -536,23 +637,25 @@ impl LoweringState {
         let [result] = operation.results.as_slice() else {
             return Err(LowLoweringError::ResultArity);
         };
-        for output in self.value_shards(*result)? {
+        for output in self.value_shards(*result)?.to_vec() {
             let tile = self.shards[output.index() as usize].tile;
             let input = self.local_shard(*input, tile)?;
-            tiles[usize::from(tile)]
-                .work
-                .push(TileWork::Kernel(KernelRun {
-                    provenance: operation_provenance(operation, kind),
-                    kernel: TileKernel::Planned(plan.kernel.clone()),
-                    inputs: vec![KernelOperand {
+            self.append_kernel(
+                tiles,
+                tile,
+                KernelRun::new(
+                    operation_provenance(operation, kind),
+                    TileKernel::Planned(plan.kernel.clone()),
+                    vec![KernelOperand {
                         views: vec![self.full_view(input)],
                     }],
-                    output: self.full_view(*output),
-                    requirements: KernelRequirements::Conversion {
+                    self.full_view(output),
+                    KernelRequirements::Conversion {
                         input: plan.input.clone(),
                         output: plan.output.clone(),
                     },
-                }));
+                ),
+            )?;
         }
         Ok(())
     }
@@ -627,30 +730,28 @@ impl LoweringState {
                 } else {
                     (
                         Vec::new(),
-                        Some(KernelRun {
-                            provenance: operation_provenance(operation, kind),
-                            kernel: TileKernel::Planned(plan.kernel.clone()),
-                            inputs: vec![KernelOperand {
+                        Some(KernelRun::new(
+                            operation_provenance(operation, kind),
+                            TileKernel::Planned(plan.kernel.clone()),
+                            vec![KernelOperand {
                                 views: vec![resident],
                             }],
-                            output: output_view,
-                            requirements: KernelRequirements::Conversion {
+                            output_view,
+                            KernelRequirements::Conversion {
                                 input: plan.input.clone(),
                                 output: plan.output.clone(),
                             },
-                        }),
+                        )),
                     )
                 };
                 if let Some((source_view, copy, bytes)) = remote {
                     remote_items.push((source_view, copy, bytes, tile, local_copies, run));
                 } else {
                     for copy in local_copies {
-                        tiles[usize::from(tile)]
-                            .work
-                            .push(TileWork::LocalCopy(copy));
+                        self.append_local_copy(tiles, tile, copy)?;
                     }
                     if let Some(run) = run {
-                        tiles[usize::from(tile)].work.push(TileWork::Kernel(run));
+                        self.append_kernel(tiles, tile, run)?;
                     }
                 }
             }
@@ -725,12 +826,10 @@ impl LoweringState {
         self.append_phase(std::mem::take(transfers), provenance, tiles)?;
         for (tile, copies, run) in consumers.drain(..) {
             for copy in copies {
-                tiles[usize::from(tile)]
-                    .work
-                    .push(TileWork::LocalCopy(copy));
+                self.append_local_copy(tiles, tile, copy)?;
             }
             if let Some(run) = run {
-                tiles[usize::from(tile)].work.push(TileWork::Kernel(run));
+                self.append_kernel(tiles, tile, run)?;
             }
         }
         Ok(())
@@ -834,17 +933,17 @@ impl LoweringState {
                 .collect::<LowLoweringResult<_>>()?;
             runs.push((
                 tile,
-                KernelRun {
-                    provenance: WorkProvenance {
+                KernelRun::new(
+                    WorkProvenance {
                         operation: operation.source,
                         value: operation.results.first().copied(),
                         reason: WorkReason::OperatorKernel,
                     },
-                    kernel: TileKernel::Planned(kernel.clone()),
+                    TileKernel::Planned(kernel.clone()),
                     inputs,
-                    output: self.full_view(output),
-                    requirements: KernelRequirements::Operator(requirements.clone()),
-                },
+                    self.full_view(output),
+                    KernelRequirements::Operator(requirements.clone()),
+                ),
             ));
         }
         for (index, transfers) in transfers.into_iter().enumerate() {
@@ -861,7 +960,7 @@ impl LoweringState {
             )?;
         }
         for (tile, run) in runs {
-            tiles[usize::from(tile)].work.push(TileWork::Kernel(run));
+            self.append_kernel(tiles, tile, run)?;
         }
         Ok(())
     }
@@ -1141,14 +1240,14 @@ impl LoweringState {
                         }
                         runs.push((
                             tile,
-                            KernelRun {
-                                provenance: WorkProvenance {
+                            KernelRun::new(
+                                WorkProvenance {
                                     operation: operation.source,
                                     value: Some(*output_value),
                                     reason: WorkReason::OperatorKernel,
                                 },
-                                kernel: TileKernel::Planned(selected_kernel),
-                                inputs: vec![
+                                TileKernel::Planned(selected_kernel),
+                                vec![
                                     KernelOperand {
                                         views: vec![left_view],
                                     },
@@ -1156,9 +1255,9 @@ impl LoweringState {
                                         views: vec![resident_right],
                                     },
                                 ],
-                                output: output_view,
-                                requirements: KernelRequirements::Operator(requirements.clone()),
-                            },
+                                output_view,
+                                KernelRequirements::Operator(requirements.clone()),
+                            ),
                         ));
                     }
                 }
@@ -1172,12 +1271,10 @@ impl LoweringState {
                     tiles,
                 )?;
                 for (tile, copy) in local_copies {
-                    tiles[usize::from(tile)]
-                        .work
-                        .push(TileWork::LocalCopy(copy));
+                    self.append_local_copy(tiles, tile, copy)?;
                 }
                 for (tile, run) in runs {
-                    tiles[usize::from(tile)].work.push(TileWork::Kernel(run));
+                    self.append_kernel(tiles, tile, run)?;
                 }
             }
         }
@@ -1375,14 +1472,14 @@ impl LoweringState {
                         }
                         runs.push((
                             tile,
-                            KernelRun {
-                                provenance: WorkProvenance {
+                            KernelRun::new(
+                                WorkProvenance {
                                     operation: operation.source,
                                     value: Some(*output_value),
                                     reason: WorkReason::OperatorKernel,
                                 },
-                                kernel: TileKernel::Planned(kernel),
-                                inputs: vec![
+                                TileKernel::Planned(kernel),
+                                vec![
                                     KernelOperand {
                                         views: vec![left_view],
                                     },
@@ -1390,9 +1487,9 @@ impl LoweringState {
                                         views: vec![self.full_view(resident)],
                                     },
                                 ],
-                                output: output_view,
-                                requirements: KernelRequirements::Operator(requirements.clone()),
-                            },
+                                output_view,
+                                KernelRequirements::Operator(requirements.clone()),
+                            ),
                         ));
                     }
                 }
@@ -1406,12 +1503,10 @@ impl LoweringState {
                     tiles,
                 )?;
                 for (tile, copy) in local_copies {
-                    tiles[usize::from(tile)]
-                        .work
-                        .push(TileWork::LocalCopy(copy));
+                    self.append_local_copy(tiles, tile, copy)?;
                 }
                 for (tile, run) in runs {
-                    tiles[usize::from(tile)].work.push(TileWork::Kernel(run));
+                    self.append_kernel(tiles, tile, run)?;
                 }
             }
         }
@@ -1451,6 +1546,57 @@ impl LoweringState {
         for tile in tiles {
             tile.work.push(TileWork::Exchange(id));
         }
+        Ok(())
+    }
+
+    fn append_kernel(
+        &mut self,
+        tiles: &mut [TileWorkList],
+        tile: u16,
+        mut run: KernelRun,
+    ) -> LowLoweringResult<()> {
+        if let Some(metadata) = self
+            .kernel_metadata
+            .iter()
+            .find(|metadata| metadata.as_ref() == run.metadata.as_ref())
+        {
+            run.metadata = Arc::clone(metadata);
+        } else {
+            self.kernel_metadata.push(Arc::clone(&run.metadata));
+        }
+        let id = KernelRunId(
+            u32::try_from(self.kernel_runs.len()).map_err(|_| LowLoweringError::IdOverflow)?,
+        );
+        self.kernel_runs.push(run);
+        tiles[usize::from(tile)].work.push(TileWork::Kernel(id));
+        Ok(())
+    }
+
+    fn append_local_copy(
+        &mut self,
+        tiles: &mut [TileWorkList],
+        tile: u16,
+        copy: LocalCopy,
+    ) -> LowLoweringResult<()> {
+        let id = LocalCopyId(
+            u32::try_from(self.local_copies.len()).map_err(|_| LowLoweringError::IdOverflow)?,
+        );
+        self.local_copies.push(copy);
+        tiles[usize::from(tile)].work.push(TileWork::LocalCopy(id));
+        Ok(())
+    }
+
+    fn append_repeat(
+        &mut self,
+        tiles: &mut [TileWorkList],
+        tile: u16,
+        repeat: RepeatRun,
+    ) -> LowLoweringResult<()> {
+        let id = RepeatRunId(
+            u32::try_from(self.repeat_runs.len()).map_err(|_| LowLoweringError::IdOverflow)?,
+        );
+        self.repeat_runs.push(repeat);
+        tiles[usize::from(tile)].work.push(TileWork::Repeat(id));
         Ok(())
     }
 
@@ -1579,9 +1725,10 @@ impl LoweringState {
                     })
                 })
                 .collect::<LowLoweringResult<_>>()?;
-            tiles[usize::from(tile)]
-                .work
-                .push(TileWork::Repeat(RepeatRun {
+            self.append_repeat(
+                tiles,
+                tile,
+                RepeatRun {
                     provenance: WorkProvenance {
                         operation: operation.source,
                         value: operation.results.first().copied(),
@@ -1592,7 +1739,8 @@ impl LoweringState {
                     invariants,
                     iterated,
                     body: Box::new(body[usize::from(tile)].clone()),
-                }));
+                },
+            )?;
         }
         Ok(())
     }
@@ -1839,9 +1987,9 @@ mod tests {
             let runs = low
                 .tiles
                 .iter()
-                .flat_map(|tile| &tile.work)
+                .flat_map(|tile| low.work(tile))
                 .filter_map(|work| match work {
-                    TileWork::Kernel(run) => Some(run),
+                    TileWorkRef::Kernel(run) => Some(run),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -1940,8 +2088,8 @@ mod tests {
 
             assert_eq!(low.tiles.len(), usize::from(tiles), "case {case}");
             for tile in &low.tiles {
-                for work in &tile.work {
-                    if let TileWork::Kernel(run) = work {
+                for work in low.work(tile) {
+                    if let TileWorkRef::Kernel(run) = work {
                         crate::validate_kernel_run(run).unwrap();
                         assert_eq!(
                             low.shards[run.output.shard.index() as usize].tile,
@@ -1959,7 +2107,11 @@ mod tests {
                 }
             }
             for phase in &low.exchange_phases {
-                assert!(low.tiles.iter().all(|tile| contains_phase(tile, phase.id)));
+                assert!(
+                    low.tiles
+                        .iter()
+                        .all(|tile| contains_phase(&low, tile, phase.id))
+                );
                 for transfer in &phase.transfers {
                     assert!(transfer.destinations.iter().all(|destination| matches!(
                         low.shards[destination.index() as usize].definition,
@@ -1996,16 +2148,14 @@ mod tests {
                 "case {case}"
             );
             for tile in &low.tiles {
-                let add = tile
-                    .work
-                    .iter()
+                let add = low
+                    .work(tile)
                     .find_map(|work| match work {
-                        TileWork::Kernel(
-                            run @ KernelRun {
-                                kernel: TileKernel::Planned(TileKernelSpec::Add),
-                                ..
-                            },
-                        ) => Some(run),
+                        TileWorkRef::Kernel(run)
+                            if matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Add)) =>
+                        {
+                            Some(run)
+                        }
                         _ => None,
                     })
                     .unwrap();
@@ -2038,6 +2188,19 @@ mod tests {
                 .with_input(right, format(tiles));
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
+
+            assert!(std::mem::size_of::<TileWork>() <= 8);
+            let mut metadata = Vec::<&Arc<KernelRunMetadata>>::new();
+            for run in &low.kernel_runs {
+                if let Some(existing) = metadata
+                    .iter()
+                    .find(|existing| existing.as_ref() == run.metadata.as_ref())
+                {
+                    assert!(Arc::ptr_eq(existing, &run.metadata), "case {case}");
+                } else {
+                    metadata.push(&run.metadata);
+                }
+            }
 
             let gemm_destinations = low
                 .exchange_phases
@@ -2082,13 +2245,14 @@ mod tests {
                 phase.provenance.operation.is_some() && phase.provenance.value.is_some()
             }));
             let weight_modes = |tile: &TileWorkList| {
-                tile.work
-                    .iter()
+                low.work(tile)
                     .filter_map(|work| match work {
-                        TileWork::Kernel(KernelRun {
-                            kernel: TileKernel::Planned(TileKernelSpec::Gemm { weights, .. }),
-                            ..
-                        }) => Some(*weights),
+                        TileWorkRef::Kernel(run) => match &run.kernel {
+                            TileKernel::Planned(TileKernelSpec::Gemm { weights, .. }) => {
+                                Some(*weights)
+                            }
+                            _ => None,
+                        },
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -2102,16 +2266,17 @@ mod tests {
             );
 
             for tile in &low.tiles {
-                let gemms = tile
-                    .work
-                    .iter()
+                let gemms = low
+                    .work(tile)
                     .filter_map(|work| match work {
-                        TileWork::Kernel(
-                            run @ KernelRun {
-                                kernel: TileKernel::Planned(TileKernelSpec::Gemm { .. }),
-                                ..
-                            },
-                        ) => Some(run),
+                        TileWorkRef::Kernel(run)
+                            if matches!(
+                                run.kernel,
+                                TileKernel::Planned(TileKernelSpec::Gemm { .. })
+                            ) =>
+                        {
+                            Some(run)
+                        }
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -2181,16 +2346,13 @@ mod tests {
 
             assert!(low.exchange_phases.is_empty(), "case {case}");
             for tile in &low.tiles {
-                let gemms = tile
-                    .work
-                    .iter()
+                let gemms = low
+                    .work(tile)
                     .filter(|work| {
                         matches!(
                             work,
-                            TileWork::Kernel(KernelRun {
-                                kernel: TileKernel::Planned(TileKernelSpec::Gemm { .. }),
-                                ..
-                            })
+                            TileWorkRef::Kernel(run)
+                                if matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Gemm { .. }))
                         )
                     })
                     .count();
@@ -2227,21 +2389,25 @@ mod tests {
                 crate::ElementOrder::Amp(crate::AmpOrder::RightK64)
             ));
             let low = lower_to_tiles(&mid, &config).unwrap();
-            assert!(low.tiles.iter().all(|tile| tile.work.iter().all(|work| {
-                !matches!(work, TileWork::LocalCopy(_)) && !matches!(work, TileWork::Exchange(_))
+            assert!(low.tiles.iter().all(|tile| low.work(tile).all(|work| {
+                !matches!(work, TileWorkRef::LocalCopy(_))
+                    && !matches!(work, TileWorkRef::Exchange(_))
             })));
-            assert!(low.tiles.iter().flat_map(|tile| &tile.work).any(|work| {
-                matches!(
-                    work,
-                    TileWork::Kernel(KernelRun {
-                        kernel: TileKernel::Planned(TileKernelSpec::Gemm {
-                            weights: crate::GemmWeightLoad::Interleaved,
-                            ..
-                        }),
-                        ..
+            assert!(
+                low.tiles
+                    .iter()
+                    .flat_map(|tile| low.work(tile))
+                    .any(|work| {
+                        matches!(
+                            work,
+                            TileWorkRef::Kernel(run)
+                                if matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Gemm {
+                                    weights: crate::GemmWeightLoad::Interleaved,
+                                    ..
+                                }))
+                        )
                     })
-                )
-            }));
+            );
         }
     }
 
@@ -2298,9 +2464,8 @@ mod tests {
             );
             for tile in &low.tiles {
                 assert_eq!(
-                    tile.work
-                        .iter()
-                        .filter(|work| matches!(work, TileWork::Kernel(_)))
+                    low.work(tile)
+                        .filter(|work| matches!(work, TileWorkRef::Kernel(_)))
                         .count(),
                     inner_blocks as usize,
                     "case {case}"
@@ -2339,11 +2504,10 @@ mod tests {
             let low = lower_to_tiles(&mid, &config).unwrap();
 
             for tile in &low.tiles {
-                let repeats = tile
-                    .work
-                    .iter()
+                let repeats = low
+                    .work(tile)
                     .filter_map(|work| match work {
-                        TileWork::Repeat(repeat) => Some(repeat),
+                        TileWorkRef::Repeat(repeat) => Some(repeat),
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -2370,11 +2534,8 @@ mod tests {
                     ShardDefinition::Alias(carried.initial)
                 );
                 assert!(
-                    repeats[0]
-                        .body
-                        .work
-                        .iter()
-                        .any(|work| matches!(work, TileWork::Kernel(_)))
+                    low.work(&repeats[0].body)
+                        .any(|work| matches!(work, TileWorkRef::Kernel(_)))
                 );
             }
         }
@@ -2415,11 +2576,11 @@ mod tests {
         }
     }
 
-    fn contains_phase(list: &TileWorkList, phase: ExchangePhaseId) -> bool {
-        list.work.iter().any(|work| match work {
-            TileWork::Exchange(candidate) => *candidate == phase,
-            TileWork::Repeat(repeat) => contains_phase(&repeat.body, phase),
-            TileWork::Kernel(_) | TileWork::LocalCopy(_) => false,
+    fn contains_phase(program: &LowProgram, list: &TileWorkList, phase: ExchangePhaseId) -> bool {
+        program.work(list).any(|work| match work {
+            TileWorkRef::Exchange(candidate) => candidate == phase,
+            TileWorkRef::Repeat(repeat) => contains_phase(program, &repeat.body, phase),
+            TileWorkRef::Kernel(_) | TileWorkRef::LocalCopy(_) => false,
         })
     }
 }

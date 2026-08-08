@@ -8,9 +8,9 @@ use crate::memory::{
 use crate::mid::{Ipu21CostModel, PipelineConfig};
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, KernelBuildPlan, PRNG_SEED_SYMBOL,
-    PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL, WORKER_BARRIER_SYMBOL,
-    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower, lower_exchanges,
-    lower_to_tile_programs_with_fill, lower_to_tiles, place, shard_storage_bytes,
+    PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL, TileProgramLowering,
+    WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower,
+    lower_exchanges, lower_to_tiles, place, shard_storage_bytes,
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
@@ -142,22 +142,20 @@ fn build_package_from_objects(
     })?;
     let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
     let execution_topology = Topology::c600();
-    let finalized = build_phase("finalize_tile_programs", || {
-        Ok(lower_to_tile_programs_with_fill(
-            program,
-            &placement,
-            &exchanges,
-            kernel_plan,
-            linked_end(&layout)?,
-            execution_tile_count,
-        )?)
-    })?;
-    let mut physical_programs = vec![None; usize::from(execution_tile_count)];
-    for program in &finalized.programs {
-        let physical = execution_topology.physical(program.tile)?;
-        physical_programs[usize::from(physical)] = Some(program.clone());
+    let finalizer = TileProgramLowering::new(
+        program,
+        &placement,
+        &exchanges,
+        kernel_plan,
+        linked_end(&layout)?,
+        execution_tile_count,
+    )?;
+    let mut physical_to_logical = vec![None; usize::from(execution_tile_count)];
+    for logical in 0..execution_tile_count {
+        let physical = execution_topology.physical(logical)?;
+        physical_to_logical[usize::from(physical)] = Some(logical);
     }
-    let physical_programs = physical_programs
+    let physical_to_logical = physical_to_logical
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| invalid("execution topology does not cover every physical tile"))?;
@@ -198,7 +196,7 @@ fn build_package_from_objects(
         &inputs,
         &outputs,
         execution_tile_count,
-        finalized.exchange_code_end,
+        finalizer.exchange_code_end(),
         &{
             let mut ends = vec![crate::IPU21_DATA_BASE; usize::from(execution_tile_count)];
             for logical in 0..program.tile_count {
@@ -215,12 +213,13 @@ fn build_package_from_objects(
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let generated = build_phase("emit_tile_code", || {
-        Ok(physical_programs
+        Ok(physical_to_logical
             .iter()
             .zip(&host.programs)
-            .map(|(program, host)| {
-                emit(
-                    program,
+            .map(|(&logical, host)| -> PackageBuildResult<_> {
+                let program = finalizer.lower_tile(logical)?;
+                Ok(emit(
+                    &program,
                     &symbols,
                     host,
                     &CodegenOptions {
@@ -237,9 +236,9 @@ fn build_package_from_objects(
                             .then_some(PROFILE_END_CYCLE),
                         ..CodegenOptions::default()
                     },
-                )
+                )?)
             })
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<PackageBuildResult<Vec<_>>>()?)
     })?;
     if let Some((tile, program)) = generated.iter().enumerate().find(|(_, program)| {
         code_address
@@ -260,7 +259,7 @@ fn build_package_from_objects(
             .map(|physical_tile| {
                 build_tile(
                     u32::from(physical_tile),
-                    u32::from(physical_programs[usize::from(physical_tile)].tile),
+                    u32::from(physical_to_logical[usize::from(physical_tile)]),
                     objects,
                     kernel_plan,
                     &retained_runtime,
@@ -446,18 +445,22 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
         symbols.push(crate::HOST_RUN_SYMBOL.into());
         symbols.push(crate::REPEAT_CALL_SYMBOL.into());
     }
-    if program.tiles.iter().any(tile_has_local_copy) {
+    if program
+        .tiles
+        .iter()
+        .any(|tile| tile_has_local_copy(program, tile))
+    {
         symbols.push(crate::COPY_U32_SYMBOL.into());
         symbols.push(crate::COPY_U64_SYMBOL.into());
     }
     symbols
 }
 
-fn tile_has_local_copy(tile: &crate::TileWorkList) -> bool {
-    tile.work.iter().any(|work| match work {
-        crate::TileWork::LocalCopy(_) => true,
-        crate::TileWork::Repeat(repeat) => tile_has_local_copy(&repeat.body),
-        crate::TileWork::Exchange(_) | crate::TileWork::Kernel(_) => false,
+fn tile_has_local_copy(program: &LowProgram, tile: &crate::TileWorkList) -> bool {
+    program.work(tile).any(|work| match work {
+        crate::TileWorkRef::LocalCopy(_) => true,
+        crate::TileWorkRef::Repeat(repeat) => tile_has_local_copy(program, &repeat.body),
+        crate::TileWorkRef::Exchange(_) | crate::TileWorkRef::Kernel(_) => false,
     })
 }
 
