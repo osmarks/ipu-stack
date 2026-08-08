@@ -49,6 +49,33 @@ struct Requirement {
     access_tail: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct Lifetime {
+    first: u32,
+    last: u32,
+    seen: bool,
+}
+
+impl Lifetime {
+    fn touch(&mut self, event: u32) {
+        if self.seen {
+            self.first = self.first.min(event);
+            self.last = self.last.max(event);
+        } else {
+            self.first = event;
+            self.last = event;
+            self.seen = true;
+        }
+    }
+
+    fn include(&mut self, other: Self) {
+        if other.seen {
+            self.touch(other.first);
+            self.touch(other.last);
+        }
+    }
+}
+
 pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
     let mut sets = DisjointSets::new(program.shards.len());
     for shard in &program.shards {
@@ -74,10 +101,21 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
     }
 
     let mut members = BTreeMap::<usize, Vec<usize>>::new();
+    let mut root_of_member = vec![0usize; program.shards.len()];
     for index in 0..program.shards.len() {
-        members.entry(sets.find(index)).or_default().push(index);
+        let root = sets.find(index);
+        root_of_member[index] = root;
+        members.entry(root).or_default().push(index);
     }
     validate_alias_groups(program, &members)?;
+    let lifetimes = collect_lifetimes(program);
+    let mut root_lifetimes = BTreeMap::<usize, Lifetime>::new();
+    for (index, lifetime) in lifetimes.into_iter().enumerate() {
+        root_lifetimes
+            .entry(root_of_member[index])
+            .or_default()
+            .include(lifetime);
+    }
 
     let mut addresses = BTreeMap::new();
     let mut tile_data_end = vec![IPU21_DATA_BASE; usize::from(program.tile_count)];
@@ -108,7 +146,9 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
             &iterated,
             &grouped,
             &members,
+            &root_of_member,
             &root_requirements,
+            &root_lifetimes,
             &mut interleaved,
             &mut addresses,
         )?;
@@ -132,7 +172,9 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
             &iterated,
             &grouped,
             &members,
+            &root_of_member,
             &root_requirements,
+            &root_lifetimes,
             &mut standard,
             &mut addresses,
         )?;
@@ -175,6 +217,94 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
         shard_addresses: addresses,
         tile_data_end,
     })
+}
+
+fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
+    let mut lifetimes = vec![Lifetime::default(); program.shards.len()];
+    for input in &program.inputs {
+        for shard in &input.shards {
+            lifetimes[shard.index() as usize].touch(0);
+        }
+    }
+    for tile in &program.tiles {
+        let mut event = 1u32;
+        for work in &tile.work {
+            touch_work(program, work, tile.tile, event, &mut lifetimes);
+            event = event.saturating_add(1);
+        }
+        for output in &program.outputs {
+            if let Some(shard) = output.shards.get(usize::from(tile.tile)) {
+                lifetimes[shard.index() as usize].touch(event);
+            }
+        }
+    }
+    for (index, lifetime) in lifetimes.iter_mut().enumerate() {
+        if !lifetime.seen
+            && !matches!(
+                program.shards[index].definition,
+                ShardDefinition::ExchangeCopy(_)
+            )
+        {
+            // Unreferenced canonical values remain conservatively resident.
+            lifetime.touch(0);
+        }
+    }
+    lifetimes
+}
+
+fn touch_work(
+    program: &LowProgram,
+    work: &TileWork,
+    tile: u16,
+    event: u32,
+    lifetimes: &mut [Lifetime],
+) {
+    let mut touch = |shard: LowShardId| lifetimes[shard.index() as usize].touch(event);
+    match work {
+        TileWork::Kernel(run) => {
+            for view in run.inputs.iter().flat_map(|operand| &operand.views) {
+                touch(view.shard);
+            }
+            touch(run.output.shard);
+        }
+        TileWork::LocalCopy(copy) => {
+            touch(copy.source);
+            touch(copy.destination);
+        }
+        TileWork::Exchange(id) => {
+            for transfer in &program.exchange_phases[id.index() as usize].transfers {
+                if program.shards[transfer.source.shard.index() as usize].tile == tile {
+                    touch(transfer.source.shard);
+                }
+                for destination in &transfer.destinations {
+                    if program.shards[destination.index() as usize].tile == tile {
+                        touch(*destination);
+                    }
+                }
+            }
+        }
+        TileWork::Repeat(repeat) => {
+            for carried in &repeat.carried {
+                touch(carried.initial);
+                touch(carried.argument);
+                touch(carried.yielded);
+                touch(carried.result);
+            }
+            for invariant in &repeat.invariants {
+                touch(invariant.input);
+                touch(invariant.argument);
+            }
+            for iterated in &repeat.iterated {
+                for input in &iterated.inputs {
+                    touch(*input);
+                }
+                touch(iterated.argument);
+            }
+            for nested in &repeat.body.work {
+                touch_work(program, nested, tile, event, lifetimes);
+            }
+        }
+    }
 }
 
 fn collect_repeat_constraints(
@@ -328,21 +458,19 @@ fn allocate_tile_class(
     iterated: &[IteratedGroup],
     grouped: &BTreeSet<usize>,
     members: &BTreeMap<usize, Vec<usize>>,
+    root_of_member: &[usize],
     root_requirements: &BTreeMap<usize, Requirement>,
+    root_lifetimes: &BTreeMap<usize, Lifetime>,
     arena: &mut Arena,
     addresses: &mut BTreeMap<LowShardId, u32>,
 ) -> Result<(), PlacementError> {
+    let mut requests = Vec::<AllocationRequest>::new();
     for group in iterated.iter().filter(|group| group.tile == tile) {
         let roots = group
             .shards
             .iter()
-            .map(|shard| {
-                members.iter().find_map(|(&root, values)| {
-                    values.contains(&(shard.index() as usize)).then_some(root)
-                })
-            })
-            .collect::<Option<Vec<_>>>()
-            .ok_or(PlacementError::InvalidAlias(group.shards[0].index()))?;
+            .map(|shard| root_of_member[shard.index() as usize])
+            .collect::<Vec<_>>();
         let group_class = program.shards[group.shards[0].index() as usize]
             .tensor_type
             .format
@@ -369,20 +497,24 @@ fn allocate_tile_class(
             .stride
             .checked_mul(u32::try_from(roots.len()).map_err(|_| PlacementError::Overflow)?)
             .ok_or(PlacementError::Overflow)?;
-        let base = arena
-            .allocate(bytes, alignment)
-            .ok_or(PlacementError::OutOfMemory { tile, class, bytes })?;
+        let mut lifetime = Lifetime::default();
+        let mut assignments = Vec::with_capacity(roots.len());
         for (index, root) in roots.into_iter().enumerate() {
-            let address = base
-                .checked_add(
-                    group
-                        .stride
-                        .checked_mul(u32::try_from(index).map_err(|_| PlacementError::Overflow)?)
-                        .ok_or(PlacementError::Overflow)?,
-                )
-                .ok_or(PlacementError::Overflow)?;
-            assign_members(addresses, &members[&root], address)?;
+            lifetime.include(root_lifetimes[&root]);
+            assignments.push((
+                root,
+                group
+                    .stride
+                    .checked_mul(u32::try_from(index).map_err(|_| PlacementError::Overflow)?)
+                    .ok_or(PlacementError::Overflow)?,
+            ));
         }
+        requests.push(AllocationRequest {
+            lifetime,
+            bytes,
+            alignment,
+            assignments,
+        });
     }
     for (&root, root_members) in members {
         let representative = &program.shards[root_members[0]];
@@ -395,12 +527,40 @@ fn allocate_tile_class(
         }
         let requirement = root_requirements.get(&root).copied().unwrap_or_default();
         let bytes = allocation_bytes(program, root_members, requirement)?;
-        let address = arena
-            .allocate(bytes, requirement.alignment.max(4))
-            .ok_or(PlacementError::OutOfMemory { tile, class, bytes })?;
-        assign_members(addresses, root_members, address)?;
+        requests.push(AllocationRequest {
+            lifetime: root_lifetimes.get(&root).copied().unwrap_or_default(),
+            bytes,
+            alignment: requirement.alignment.max(4),
+            assignments: vec![(root, 0)],
+        });
+    }
+    requests.sort_by_key(|request| (request.lifetime.first, request.lifetime.last));
+    for request in requests {
+        let base = arena
+            .allocate(
+                request.bytes,
+                request.alignment,
+                request.lifetime.first,
+                request.lifetime.last,
+            )
+            .ok_or(PlacementError::OutOfMemory {
+                tile,
+                class,
+                bytes: request.bytes,
+            })?;
+        for (root, offset) in request.assignments {
+            let address = base.checked_add(offset).ok_or(PlacementError::Overflow)?;
+            assign_members(addresses, &members[&root], address)?;
+        }
     }
     Ok(())
+}
+
+struct AllocationRequest {
+    lifetime: Lifetime,
+    bytes: u32,
+    alignment: u32,
+    assignments: Vec<(usize, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -412,38 +572,67 @@ struct IteratedGroup {
 }
 
 struct Arena {
-    ranges: Vec<(u32, u32)>,
-    range: usize,
-    cursor: u32,
+    free: Vec<(u32, u32)>,
+    active: Vec<(u32, u32, u32)>,
+    maximum: u32,
 }
 
 impl Arena {
     fn new(ranges: &[(u32, u32)]) -> Self {
         Self {
-            ranges: ranges.to_vec(),
-            range: 0,
-            cursor: ranges[0].0,
+            free: ranges.to_vec(),
+            active: Vec::new(),
+            maximum: ranges[0].0,
         }
     }
 
-    fn allocate(&mut self, bytes: u32, alignment: u32) -> Option<u32> {
-        while self.range < self.ranges.len() {
-            let (base, limit) = self.ranges[self.range];
-            let start = align_up(self.cursor.max(base), alignment).ok()?;
-            if start.checked_add(bytes)? <= limit {
-                self.cursor = start + bytes;
-                return Some(start);
+    fn allocate(&mut self, bytes: u32, alignment: u32, first: u32, last: u32) -> Option<u32> {
+        let mut retained = Vec::with_capacity(self.active.len());
+        let active = std::mem::take(&mut self.active);
+        for (active_last, address, active_bytes) in active {
+            if active_last < first {
+                self.release(address, address.checked_add(active_bytes)?);
+            } else {
+                retained.push((active_last, address, active_bytes));
             }
-            self.range += 1;
-            if let Some((base, _)) = self.ranges.get(self.range) {
-                self.cursor = *base;
+        }
+        self.active = retained;
+        for index in 0..self.free.len() {
+            let (base, limit) = self.free[index];
+            let start = align_up(base, alignment).ok()?;
+            let end = start.checked_add(bytes)?;
+            if end <= limit {
+                self.free.remove(index);
+                if base < start {
+                    self.free.push((base, start));
+                }
+                if end < limit {
+                    self.free.push((end, limit));
+                }
+                self.free.sort_unstable();
+                self.active.push((last, start, bytes));
+                self.maximum = self.maximum.max(end);
+                return Some(start);
             }
         }
         None
     }
 
+    fn release(&mut self, base: u32, limit: u32) {
+        self.free.push((base, limit));
+        self.free.sort_unstable();
+        let mut merged = Vec::<(u32, u32)>::with_capacity(self.free.len());
+        for range in self.free.drain(..) {
+            match merged.last_mut() {
+                Some(previous) if previous.1 == range.0 => previous.1 = range.1,
+                _ => merged.push(range),
+            }
+        }
+        self.free = merged;
+    }
+
     fn maximum_cursor(&self) -> u32 {
-        self.cursor
+        self.maximum
     }
 }
 
@@ -556,6 +745,51 @@ mod tests {
                         .unwrap();
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_sequential_pointwise_values_reuse_dead_input_storage() {
+        let mut random = fastrand::Rng::with_seed(0x6c69_7665);
+        for _ in 0..48 {
+            let tiles = 1_u16 << random.u32(0..=3);
+            let rows = u32::from(tiles) * random.u32(1..=8);
+            let mut graph = ComputeGraph::new();
+            let left = graph.host_input("left", [rows, 64]).unwrap();
+            let right = graph.host_input("right", [rows, 64]).unwrap();
+            let sum = graph.add(left, right).unwrap();
+            let output = graph.gelu(sum).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let format = TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::row_sharded(tiles),
+            };
+            let config = PipelineConfig::new(tiles)
+                .with_input(left, format.clone())
+                .with_input(right, format);
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let sum = mid.operations[0].results[0];
+            let output = mid.operations[1].results[0];
+            let low = lower_to_tiles(&mid, &config).unwrap();
+            let placement = place(&low).unwrap();
+            for tile in 0..tiles {
+                let shard = |value| {
+                    low.shards
+                        .iter()
+                        .find(|shard| {
+                            shard.tile == tile && shard.definition == ShardDefinition::Value(value)
+                        })
+                        .unwrap()
+                        .id
+                };
+                let left_address = placement.shard_addresses[&shard(mid.inputs[0].value)];
+                let right_address = placement.shard_addresses[&shard(mid.inputs[1].value)];
+                let sum_address = placement.shard_addresses[&shard(sum)];
+                let output_address = placement.shard_addresses[&shard(output)];
+                assert_ne!(sum_address, left_address);
+                assert_ne!(sum_address, right_address);
+                assert_eq!(output_address, left_address.min(right_address));
             }
         }
     }
