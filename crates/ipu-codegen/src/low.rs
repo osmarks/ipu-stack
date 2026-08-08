@@ -138,6 +138,7 @@ pub struct ExchangePhase {
 pub enum WorkReason {
     OperatorKernel,
     OperatorInput { input: u16 },
+    OperatorInputs,
     PrecisionCast,
     LayoutRearrangement,
     Repeat,
@@ -330,6 +331,8 @@ pub enum LowLoweringError {
     MissingConversionPlan,
     #[error("conversion plan is incompatible with its input or output")]
     InvalidConversionPlan,
+    #[error("conversion view cannot be split to fit the exchange receive window")]
+    ExchangeViewTooLarge,
     #[error("repeat structure is inconsistent with its inputs, arguments, yields, or results")]
     InvalidRepeat,
     #[error("repeat carried value {0} cannot alias its body argument")]
@@ -677,9 +680,20 @@ impl LoweringState {
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
         let direct_retile = plan.input.format.layout.order == plan.output.format.layout.order;
+        let receive_alignment = if direct_retile {
+            8
+        } else {
+            plan.input.alignment.max(4)
+        };
+        let receive_access_tail = if direct_retile {
+            0
+        } else {
+            plan.input.access_tail_bytes
+        };
         let mut remote_items = Vec::<(
             ShardView,
             LowShardId,
+            u32,
             u32,
             u16,
             Vec<LocalCopy>,
@@ -701,58 +715,98 @@ impl LoweringState {
                 }
             }
             for (extents, source) in unique_intersections {
-                let source_view = ShardView {
-                    shard: source,
-                    extents: extents.clone(),
-                };
-                let (resident, remote) = if self.shards[source.index() as usize].tile == tile {
-                    (source_view.clone(), None)
+                let remote = self.shards[source.index() as usize].tile != tile;
+                let chunks = if remote {
+                    split_exchange_extents(
+                        &extents,
+                        self.shards[source.index() as usize]
+                            .tensor_type
+                            .format
+                            .precision
+                            .bytes(),
+                        receive_alignment,
+                        receive_access_tail,
+                        ipu_exchange::EXCHANGE_WINDOW_BYTES,
+                    )?
                 } else {
-                    let copy = self.push_shard(LowShard {
-                        id: LowShardId(0),
-                        tile,
-                        tensor_type: self.shards[source.index() as usize].tensor_type.clone(),
+                    vec![extents]
+                };
+                for extents in chunks {
+                    let source_view = ShardView {
+                        shard: source,
                         extents: extents.clone(),
-                        definition: ShardDefinition::ExchangeStaging {
-                            window_offset: None,
-                        },
-                    })?;
-                    let bytes = shard_storage_bytes(&self.shards[copy.index() as usize])?;
-                    (self.full_view(copy), Some((source_view, copy, bytes)))
-                };
-                let output_view = ShardView {
-                    shard: output,
-                    extents,
-                };
-                let (local_copies, run) = if direct_retile {
-                    let mut copies = Vec::new();
-                    append_span_copies(&self.shards, &resident, &output_view, tile, &mut copies)?;
-                    (copies.into_iter().map(|(_, copy)| copy).collect(), None)
-                } else {
-                    (
-                        Vec::new(),
-                        Some(KernelRun::new(
-                            operation_provenance(operation, kind),
-                            TileKernel::Planned(plan.kernel.clone()),
-                            vec![KernelOperand {
-                                views: vec![resident],
-                            }],
-                            output_view,
-                            KernelRequirements::Conversion {
-                                input: plan.input.clone(),
-                                output: plan.output.clone(),
+                    };
+                    let (resident, exchange) = if remote {
+                        let copy = self.push_shard(LowShard {
+                            id: LowShardId(0),
+                            tile,
+                            tensor_type: self.shards[source.index() as usize].tensor_type.clone(),
+                            extents: extents.clone(),
+                            definition: ShardDefinition::ExchangeStaging {
+                                window_offset: None,
                             },
-                        )),
-                    )
-                };
-                if let Some((source_view, copy, bytes)) = remote {
-                    remote_items.push((source_view, copy, bytes, tile, local_copies, run));
-                } else {
-                    for copy in local_copies {
-                        self.append_local_copy(tiles, tile, copy)?;
-                    }
-                    if let Some(run) = run {
-                        self.append_kernel(tiles, tile, run)?;
+                        })?;
+                        let bytes = shard_storage_bytes(&self.shards[copy.index() as usize])?;
+                        let reserved = exchange_allocation_bytes(
+                            bytes,
+                            receive_alignment,
+                            receive_access_tail,
+                        )?;
+                        (
+                            self.full_view(copy),
+                            Some((source_view, copy, bytes, reserved)),
+                        )
+                    } else {
+                        (source_view.clone(), None)
+                    };
+                    let output_view = ShardView {
+                        shard: output,
+                        extents,
+                    };
+                    let (local_copies, run) = if direct_retile {
+                        let mut copies = Vec::new();
+                        append_span_copies(
+                            &self.shards,
+                            &resident,
+                            &output_view,
+                            tile,
+                            &mut copies,
+                        )?;
+                        (copies.into_iter().map(|(_, copy)| copy).collect(), None)
+                    } else {
+                        (
+                            Vec::new(),
+                            Some(KernelRun::new(
+                                operation_provenance(operation, kind),
+                                TileKernel::Planned(plan.kernel.clone()),
+                                vec![KernelOperand {
+                                    views: vec![resident],
+                                }],
+                                output_view,
+                                KernelRequirements::Conversion {
+                                    input: plan.input.clone(),
+                                    output: plan.output.clone(),
+                                },
+                            )),
+                        )
+                    };
+                    if let Some((source_view, copy, bytes, reserved)) = exchange {
+                        remote_items.push((
+                            source_view,
+                            copy,
+                            bytes,
+                            reserved,
+                            tile,
+                            local_copies,
+                            run,
+                        ));
+                    } else {
+                        for copy in local_copies {
+                            self.append_local_copy(tiles, tile, copy)?;
+                        }
+                        if let Some(run) = run {
+                            self.append_kernel(tiles, tile, run)?;
+                        }
                     }
                 }
             }
@@ -762,12 +816,12 @@ impl LoweringState {
         let mut received = vec![0u32; tiles.len()];
         let mut sent = vec![0u32; tiles.len()];
         let mut sent_transfers = vec![0u16; tiles.len()];
-        for (source, copy, bytes, tile, copies, run) in remote_items {
+        for (source, copy, bytes, reserved, tile, copies, run) in remote_items {
             let source_tile = self.shards[source.shard.index() as usize].tile;
             let mut new_source_transfer = !transfers.contains_key(&source);
             let additional_sent = if new_source_transfer { bytes } else { 0 };
             let receive_overflow = received[usize::from(tile)]
-                .checked_add(bytes)
+                .checked_add(reserved)
                 .is_none_or(|sum| sum > ipu_exchange::EXCHANGE_WINDOW_BYTES);
             // `offset_plan` encodes event offsets from the phase-entry sync in
             // 19 bits. Bound each sender's serialized payload well below that
@@ -792,7 +846,7 @@ impl LoweringState {
                 new_source_transfer = true;
             }
             received[usize::from(tile)] = received[usize::from(tile)]
-                .checked_add(bytes)
+                .checked_add(reserved)
                 .ok_or(LowLoweringError::IdOverflow)?;
             if new_source_transfer {
                 sent[usize::from(source_tile)] = sent[usize::from(source_tile)]
@@ -885,9 +939,8 @@ impl LoweringState {
             return Err(LowLoweringError::ResultArity);
         };
         let outputs = self.value_shards(*result)?.to_vec();
-        let mut transfers =
-            vec![BTreeMap::<ShardView, Vec<LowShardId>>::new(); operation.inputs.len()];
-        let mut runs = Vec::with_capacity(outputs.len());
+        let mut wave_transfers = Vec::<BTreeMap<ShardView, Vec<LowShardId>>>::new();
+        let mut wave_runs = Vec::<Vec<(u16, KernelRun)>>::new();
         for output in outputs {
             if self.shards[output.index() as usize]
                 .extents
@@ -897,12 +950,11 @@ impl LoweringState {
                 continue;
             }
             let tile = self.shards[output.index() as usize].tile;
-            let inputs = operation
+            let sources = operation
                 .inputs
                 .iter()
-                .enumerate()
-                .map(|(index, input)| {
-                    let source_view = match input_mapping {
+                .map(|input| {
+                    Ok(match input_mapping {
                         PointwiseInputMapping::BroadcastToOutput => self
                             .value_shards(*input)?
                             .iter()
@@ -911,62 +963,103 @@ impl LoweringState {
                         PointwiseInputMapping::TileLocal => {
                             self.full_view(self.local_shard(*input, tile)?)
                         }
-                    };
-                    let view = if self.shards[source_view.shard.index() as usize].tile == tile {
-                        source_view
-                    } else {
-                        let copy = self.push_shard(LowShard {
-                            id: LowShardId(0),
-                            tile,
-                            tensor_type: self.shards[source_view.shard.index() as usize]
-                                .tensor_type
-                                .clone(),
-                            extents: source_view.extents.clone(),
-                            definition: ShardDefinition::ExchangeStaging {
-                                window_offset: None,
-                            },
-                        })?;
-                        transfers[index].entry(source_view).or_default().push(copy);
-                        self.full_view(copy)
-                    };
-                    Ok(KernelOperand { views: vec![view] })
+                    })
                 })
-                .collect::<LowLoweringResult<_>>()?;
-            runs.push((
+                .collect::<LowLoweringResult<Vec<_>>>()?;
+            let chunks = self.pointwise_output_chunks(
+                output,
+                &sources,
                 tile,
-                KernelRun::new(
-                    WorkProvenance {
-                        operation: operation.source,
-                        value: operation.results.first().copied(),
-                        reason: WorkReason::OperatorKernel,
-                    },
-                    TileKernel::Planned(kernel.clone()),
-                    inputs,
-                    self.full_view(output),
-                    KernelRequirements::Operator(requirements.clone()),
-                ),
-            ));
+                input_mapping,
+                &requirements.inputs,
+            )?;
+            for (wave, output_extents) in chunks.into_iter().enumerate() {
+                if wave_transfers.len() <= wave {
+                    wave_transfers.push(BTreeMap::new());
+                    wave_runs.push(Vec::new());
+                }
+                let inputs = sources
+                    .iter()
+                    .map(|source| {
+                        let source_view = match input_mapping {
+                            PointwiseInputMapping::BroadcastToOutput => self
+                                .broadcast_view_for_extents(source.shard, output, &output_extents)
+                                .ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                            PointwiseInputMapping::TileLocal => source.clone(),
+                        };
+                        let view = if self.shards[source_view.shard.index() as usize].tile == tile {
+                            source_view
+                        } else {
+                            let copy = self.push_shard(LowShard {
+                                id: LowShardId(0),
+                                tile,
+                                tensor_type: self.shards[source_view.shard.index() as usize]
+                                    .tensor_type
+                                    .clone(),
+                                extents: source_view.extents.clone(),
+                                definition: ShardDefinition::ExchangeStaging {
+                                    window_offset: None,
+                                },
+                            })?;
+                            wave_transfers[wave]
+                                .entry(source_view)
+                                .or_default()
+                                .push(copy);
+                            self.full_view(copy)
+                        };
+                        Ok(KernelOperand { views: vec![view] })
+                    })
+                    .collect::<LowLoweringResult<_>>()?;
+                wave_runs[wave].push((
+                    tile,
+                    KernelRun::new(
+                        WorkProvenance {
+                            operation: operation.source,
+                            value: operation.results.first().copied(),
+                            reason: WorkReason::OperatorKernel,
+                        },
+                        TileKernel::Planned(kernel.clone()),
+                        inputs,
+                        ShardView {
+                            shard: output,
+                            extents: output_extents,
+                        },
+                        KernelRequirements::Operator(requirements.clone()),
+                    ),
+                ));
+            }
         }
-        for (index, transfers) in transfers.into_iter().enumerate() {
+        for (transfers, runs) in wave_transfers.into_iter().zip(wave_runs) {
             self.append_phase(
                 transfers,
                 WorkProvenance {
                     operation: operation.source,
-                    value: operation.inputs.get(index).copied(),
-                    reason: WorkReason::OperatorInput {
-                        input: u16::try_from(index).map_err(|_| LowLoweringError::IdOverflow)?,
-                    },
+                    value: None,
+                    reason: WorkReason::OperatorInputs,
                 },
                 tiles,
             )?;
-        }
-        for (tile, run) in runs {
-            self.append_kernel(tiles, tile, run)?;
+            for (tile, run) in runs {
+                self.append_kernel(tiles, tile, run)?;
+            }
         }
         Ok(())
     }
 
     fn broadcast_view(&self, source: LowShardId, output: LowShardId) -> Option<ShardView> {
+        self.broadcast_view_for_extents(
+            source,
+            output,
+            &self.shards[output.index() as usize].extents,
+        )
+    }
+
+    fn broadcast_view_for_extents(
+        &self,
+        source: LowShardId,
+        output: LowShardId,
+        output_extents: &[ShardExtent],
+    ) -> Option<ShardView> {
         let source_shard = &self.shards[source.index() as usize];
         let output_shard = &self.shards[output.index() as usize];
         let source_rank = source_shard.extents.len();
@@ -986,7 +1079,7 @@ impl LoweringState {
                 extent.logical_end = 1;
                 extent.physical_end = 1;
             } else {
-                let required = output_shard.extents[offset + axis];
+                let required = output_extents[offset + axis];
                 if extent.start > required.start || extent.logical_end < required.logical_end {
                     return None;
                 }
@@ -999,6 +1092,74 @@ impl LoweringState {
             shard: source,
             extents,
         })
+    }
+
+    fn pointwise_output_chunks(
+        &self,
+        output: LowShardId,
+        sources: &[ShardView],
+        tile: u16,
+        input_mapping: PointwiseInputMapping,
+        requirements: &[crate::OperandRequirement],
+    ) -> LowLoweringResult<Vec<Vec<ShardExtent>>> {
+        let mut output_chunks = vec![self.shards[output.index() as usize].extents.clone()];
+        if input_mapping == PointwiseInputMapping::TileLocal {
+            return Ok(output_chunks);
+        }
+        let remote_inputs = sources
+            .iter()
+            .filter(|source| self.shards[source.shard.index() as usize].tile != tile)
+            .count();
+        let receive_budget = ipu_exchange::EXCHANGE_WINDOW_BYTES
+            / u32::try_from(remote_inputs.max(1)).map_err(|_| LowLoweringError::IdOverflow)?;
+        for (source, requirement) in sources.iter().zip(requirements) {
+            if self.shards[source.shard.index() as usize].tile == tile {
+                continue;
+            }
+            let source_rank = source.extents.len();
+            let output_rank = self.shards[output.index() as usize].extents.len();
+            let offset = output_rank
+                .checked_sub(source_rank)
+                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            let mut split_outputs = Vec::new();
+            for output_extents in output_chunks {
+                let source_view = self
+                    .broadcast_view_for_extents(source.shard, output, &output_extents)
+                    .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                let source_chunks = split_exchange_extents(
+                    &source_view.extents,
+                    self.shards[source.shard.index() as usize]
+                        .tensor_type
+                        .format
+                        .precision
+                        .bytes(),
+                    requirement.alignment.max(4),
+                    requirement.access_tail_bytes,
+                    receive_budget,
+                )?;
+                for source_chunk in source_chunks {
+                    let mut output_chunk = output_extents.clone();
+                    for (axis, extent) in source_chunk.into_iter().enumerate() {
+                        if self.shards[source.shard.index() as usize]
+                            .tensor_type
+                            .shape
+                            .0[axis]
+                            != 1
+                        {
+                            output_chunk[offset + axis] = ShardExtent {
+                                axis: output_chunk[offset + axis].axis,
+                                start: extent.start,
+                                logical_end: extent.logical_end,
+                                physical_end: extent.physical_end,
+                            };
+                        }
+                    }
+                    split_outputs.push(output_chunk);
+                }
+            }
+            output_chunks = split_outputs;
+        }
+        Ok(output_chunks)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1903,6 +2064,149 @@ fn intersect_extents(left: &[ShardExtent], right: &[ShardExtent]) -> Option<Vec<
         .collect()
 }
 
+fn exchange_allocation_bytes(
+    payload_bytes: u32,
+    alignment: u32,
+    access_tail_bytes: u32,
+) -> LowLoweringResult<u32> {
+    let alignment = alignment.max(1);
+    let bytes = payload_bytes
+        .checked_add(access_tail_bytes)
+        .ok_or(LowLoweringError::IdOverflow)?;
+    bytes
+        .checked_add(alignment - 1)
+        .map(|bytes| bytes / alignment * alignment)
+        .ok_or(LowLoweringError::IdOverflow)
+}
+
+/// Splits a rectangular semantic view into exchange-sized slabs. A slab stays
+/// rectangular so its receiver remains an ordinary shard view; transfer
+/// lowering may subsequently divide its physical byte spans into instructions.
+fn split_exchange_extents(
+    extents: &[ShardExtent],
+    element_bytes: u64,
+    alignment: u32,
+    access_tail_bytes: u32,
+    maximum_allocation_bytes: u32,
+) -> LowLoweringResult<Vec<Vec<ShardExtent>>> {
+    let mut chunks = Vec::new();
+    split_exchange_extents_recursive(
+        extents.to_vec(),
+        element_bytes,
+        alignment,
+        access_tail_bytes,
+        maximum_allocation_bytes,
+        &mut chunks,
+    )?;
+    Ok(chunks)
+}
+
+fn split_exchange_extents_recursive(
+    extents: Vec<ShardExtent>,
+    element_bytes: u64,
+    alignment: u32,
+    access_tail_bytes: u32,
+    maximum_allocation_bytes: u32,
+    chunks: &mut Vec<Vec<ShardExtent>>,
+) -> LowLoweringResult<()> {
+    let payload_bytes = extents.iter().try_fold(element_bytes, |bytes, extent| {
+        bytes
+            .checked_mul(u64::from(extent.physical_end - extent.start))
+            .ok_or(LowLoweringError::IdOverflow)
+    })?;
+    let payload_bytes = u32::try_from(payload_bytes).map_err(|_| LowLoweringError::IdOverflow)?;
+    if exchange_allocation_bytes(payload_bytes, alignment, access_tail_bytes)?
+        <= maximum_allocation_bytes
+    {
+        chunks.push(extents);
+        return Ok(());
+    }
+
+    let alignment = u64::from(alignment.max(1));
+    let aligned_window = u64::from(maximum_allocation_bytes) / alignment * alignment;
+    let payload_budget = aligned_window
+        .checked_sub(u64::from(access_tail_bytes))
+        .ok_or(LowLoweringError::ExchangeViewTooLarge)?;
+    let mut selected = None::<(usize, u32, u32)>;
+    for (axis, extent) in extents.iter().enumerate() {
+        let width = extent.physical_end - extent.start;
+        if width <= 1 {
+            continue;
+        }
+        let unit_bytes =
+            extents
+                .iter()
+                .enumerate()
+                .try_fold(element_bytes, |bytes, (other_axis, other)| {
+                    if other_axis == axis {
+                        Ok(bytes)
+                    } else {
+                        bytes
+                            .checked_mul(u64::from(other.physical_end - other.start))
+                            .ok_or(LowLoweringError::IdOverflow)
+                    }
+                })?;
+        let transfer_quantum = 4 / gcd_u64(unit_bytes, 4);
+        if u64::from(width) % transfer_quantum != 0 {
+            continue;
+        }
+        let quantum = u32::try_from(transfer_quantum).map_err(|_| LowLoweringError::IdOverflow)?;
+        if width < quantum.saturating_mul(2) {
+            continue;
+        }
+        let fitting_width = payload_budget / unit_bytes / transfer_quantum * transfer_quantum;
+        let split_width = if fitting_width > 0 && fitting_width < u64::from(width) {
+            u32::try_from(fitting_width).map_err(|_| LowLoweringError::IdOverflow)?
+        } else {
+            width / 2 / quantum * quantum
+        };
+        let largest_child = split_width.max(width - split_width);
+        if selected.is_none_or(|(_, _, best_largest)| largest_child < best_largest) {
+            selected = Some((axis, split_width, largest_child));
+        }
+    }
+    let Some((axis, split_width, _)) = selected else {
+        return Err(LowLoweringError::ExchangeViewTooLarge);
+    };
+
+    let extent = extents[axis];
+    let split = extent
+        .start
+        .checked_add(split_width)
+        .ok_or(LowLoweringError::IdOverflow)?;
+    let mut left = extents.clone();
+    left[axis].logical_end = extent.logical_end.min(split);
+    left[axis].physical_end = split;
+    let mut right = extents;
+    right[axis].start = split;
+    right[axis].logical_end = extent.logical_end.max(split);
+    split_exchange_extents_recursive(
+        left,
+        element_bytes,
+        alignment as u32,
+        access_tail_bytes,
+        maximum_allocation_bytes,
+        chunks,
+    )?;
+    split_exchange_extents_recursive(
+        right,
+        element_bytes,
+        alignment as u32,
+        access_tail_bytes,
+        maximum_allocation_bytes,
+        chunks,
+    )
+}
+
+const fn gcd_u64(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
 fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<Vec<ShardExtent>>> {
     let layout = &tensor_type.format.layout;
     let padded = layout.padded_shape(&tensor_type.shape)?;
@@ -2142,10 +2446,9 @@ mod tests {
             let low = lower_to_tiles(&mid, &config).unwrap();
 
             assert!(
-                low.exchange_phases.iter().any(|phase| matches!(
-                    phase.provenance.reason,
-                    WorkReason::OperatorInput { input: 0 }
-                )),
+                low.exchange_phases
+                    .iter()
+                    .any(|phase| matches!(phase.provenance.reason, WorkReason::OperatorInputs)),
                 "case {case}"
             );
             for tile in &low.tiles {
@@ -2616,6 +2919,82 @@ mod tests {
                 Err(LowLoweringError::RepeatRequiresInPlace(0)),
                 "case {case}"
             );
+        }
+    }
+
+    #[test]
+    fn randomized_exchange_views_split_into_window_sized_rectangles() {
+        let mut random = fastrand::Rng::with_seed(0x7370_6c69_745f_7863);
+        for case in 0..128 {
+            let rank = random.usize(2..=4);
+            let mut extents = (0..rank)
+                .map(|axis| {
+                    let width = 2 * random.u32(2..=16);
+                    ShardExtent {
+                        axis: axis as u16,
+                        start: random.u32(0..=16),
+                        logical_end: width,
+                        physical_end: width,
+                    }
+                })
+                .collect::<Vec<_>>();
+            for extent in &mut extents {
+                extent.logical_end += extent.start;
+                extent.physical_end += extent.start;
+            }
+            let element_bytes = if random.bool() { 2 } else { 4 };
+            let alignment = 1 << random.u32(2..=6);
+            let access_tail = 4 * random.u32(0..=8);
+            let original_elements = extents.iter().fold(1u64, |elements, extent| {
+                elements * u64::from(extent.physical_end - extent.start)
+            });
+            if original_elements * element_bytes <= u64::from(ipu_exchange::EXCHANGE_WINDOW_BYTES) {
+                let other_elements = extents[1..].iter().fold(1u64, |elements, extent| {
+                    elements * u64::from(extent.physical_end - extent.start)
+                });
+                let needed = u64::from(ipu_exchange::EXCHANGE_WINDOW_BYTES)
+                    / (other_elements * element_bytes)
+                    + 2;
+                let width = u32::try_from(needed.div_ceil(2) * 2).unwrap();
+                extents[0].logical_end = extents[0].start + width;
+                extents[0].physical_end = extents[0].start + width;
+            }
+
+            let chunks = split_exchange_extents(
+                &extents,
+                element_bytes,
+                alignment,
+                access_tail,
+                ipu_exchange::EXCHANGE_WINDOW_BYTES,
+            )
+            .unwrap();
+            assert!(chunks.len() > 1, "case {case}");
+            let mut chunk_elements = 0u64;
+            for chunk in &chunks {
+                assert_eq!(chunk.len(), extents.len(), "case {case}");
+                let elements =
+                    chunk
+                        .iter()
+                        .zip(&extents)
+                        .fold(1u64, |elements, (chunk, original)| {
+                            assert_eq!(chunk.axis, original.axis, "case {case}");
+                            assert!(chunk.start >= original.start, "case {case}");
+                            assert!(chunk.physical_end <= original.physical_end, "case {case}");
+                            elements * u64::from(chunk.physical_end - chunk.start)
+                        });
+                let payload = u32::try_from(elements * element_bytes).unwrap();
+                assert!(payload.is_multiple_of(4), "case {case}");
+                assert!(
+                    exchange_allocation_bytes(payload, alignment, access_tail).unwrap()
+                        <= ipu_exchange::EXCHANGE_WINDOW_BYTES,
+                    "case {case}"
+                );
+                chunk_elements += elements;
+            }
+            let expected_elements = extents.iter().fold(1u64, |elements, extent| {
+                elements * u64::from(extent.physical_end - extent.start)
+            });
+            assert_eq!(chunk_elements, expected_elements, "case {case}");
         }
     }
 

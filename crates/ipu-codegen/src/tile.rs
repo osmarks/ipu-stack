@@ -41,6 +41,10 @@ pub enum TileLoweringError {
     #[error("execution has {execution} tiles, fewer than the {scheduled} scheduled tiles")]
     MissingExecutionTiles { scheduled: u16, execution: u16 },
     #[error(
+        "exchange rows occupy 0x{start:x}..0x{end:x}, beyond the receive window boundary at 0x{limit:x}"
+    )]
+    ExchangeCodeWindow { start: u32, end: u32, limit: u32 },
+    #[error(
         "tile {tile} local copy {source_shard:?}+{source_offset} -> {destination_shard:?}+{destination_offset} has invalid addresses or byte count {bytes}"
     )]
     InvalidLocalCopy {
@@ -87,6 +91,13 @@ impl<'a> TileProgramLowering<'a> {
                         .ok_or(TileLoweringError::Overflow)?,
                 )
                 .ok_or(TileLoweringError::Overflow)?;
+        }
+        if cursor > ipu_exchange::EXCHANGE_WINDOW_BASE {
+            return Err(TileLoweringError::ExchangeCodeWindow {
+                start: exchange_code_base,
+                end: cursor,
+                limit: ipu_exchange::EXCHANGE_WINDOW_BASE,
+            });
         }
         let phases = exchanges
             .iter()

@@ -37,8 +37,10 @@ pub enum PlacementError {
         class: MemoryClass,
         bytes: u32,
     },
-    #[error("tile {tile} exchange phase needs more than the receive window")]
-    ExchangeWindow { tile: u16 },
+    #[error(
+        "tile {tile} exchange phase {phase} needs {bytes} bytes of the {EXCHANGE_WINDOW_BYTES}-byte receive window"
+    )]
+    ExchangeWindow { tile: u16, phase: u32, bytes: u32 },
     #[error("tile {tile} exchange staging slots overlap")]
     ExchangeStagingConflict { tile: u16 },
     #[error("placement arithmetic overflowed")]
@@ -188,7 +190,7 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
 
     // Exchange copies live only from their phase through the immediately
     // following consumer, so every phase can reuse the receive window.
-    for phase in &program.exchange_phases {
+    for (phase_index, phase) in program.exchange_phases.iter().enumerate() {
         let mut cursors = vec![EXCHANGE_WINDOW_BASE; usize::from(program.tile_count)];
         let mut fixed = vec![Vec::<(u32, u32)>::new(); usize::from(program.tile_count)];
         for transfer in &phase.transfers {
@@ -214,7 +216,24 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
                     allocation_bytes(program, &[destination.index() as usize], requirement)?;
                 let end = address.checked_add(bytes).ok_or(PlacementError::Overflow)?;
                 if end > EXCHANGE_WINDOW_BASE + EXCHANGE_WINDOW_BYTES {
-                    return Err(PlacementError::ExchangeWindow { tile: shard.tile });
+                    tracing::error!(
+                        tile = shard.tile,
+                        phase = phase_index,
+                        shard = destination.index(),
+                        payload_bytes = shard_storage_bytes(shard)?,
+                        allocation_bytes = bytes,
+                        alignment = requirement.alignment,
+                        access_tail_bytes = requirement.access_tail,
+                        distinct_element = requirement.distinct_element,
+                        window_offset,
+                        provenance = ?phase.provenance,
+                        "fixed exchange staging allocation exceeds receive window"
+                    );
+                    return Err(PlacementError::ExchangeWindow {
+                        tile: shard.tile,
+                        phase: u32::try_from(phase_index).map_err(|_| PlacementError::Overflow)?,
+                        bytes: end - EXCHANGE_WINDOW_BASE,
+                    });
                 }
                 if fixed[usize::from(shard.tile)]
                     .iter()
@@ -259,7 +278,24 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
                     allocation_bytes(program, &[destination.index() as usize], requirement)?;
                 let end = cursor.checked_add(bytes).ok_or(PlacementError::Overflow)?;
                 if end > EXCHANGE_WINDOW_BASE + EXCHANGE_WINDOW_BYTES {
-                    return Err(PlacementError::ExchangeWindow { tile: shard.tile });
+                    tracing::error!(
+                        tile = shard.tile,
+                        phase = phase_index,
+                        shard = destination.index(),
+                        payload_bytes = shard_storage_bytes(shard)?,
+                        allocation_bytes = bytes,
+                        alignment = requirement.alignment,
+                        access_tail_bytes = requirement.access_tail,
+                        distinct_element = requirement.distinct_element,
+                        cursor = *cursor,
+                        provenance = ?phase.provenance,
+                        "exchange phase allocations exceed receive window"
+                    );
+                    return Err(PlacementError::ExchangeWindow {
+                        tile: shard.tile,
+                        phase: u32::try_from(phase_index).map_err(|_| PlacementError::Overflow)?,
+                        bytes: end - EXCHANGE_WINDOW_BASE,
+                    });
                 }
                 if addresses
                     .insert(destination, *cursor)
