@@ -1531,6 +1531,10 @@ pub enum LoweringError {
     MissingShape(ValueId),
     #[error("operation {0:?} has no legal format candidate")]
     NoCandidate(OperationId),
+    #[error(
+        "GEMM operation {0:?} has per-batch right operands; only weights broadcast across every batch dimension are currently supported"
+    )]
+    UnsupportedGemmBatching(OperationId),
     #[error("internal lowering error: value {0:?} is unavailable")]
     UnknownValue(ValueId),
 }
@@ -1681,6 +1685,15 @@ fn lower_operations(
             .iter()
             .map(|value| state.get(*value).tensor_type.clone())
             .collect::<Vec<_>>();
+        if matches!(operation.kind, OperationKind::Gemm(_))
+            && input_types.get(1).is_some_and(|right| {
+                right.shape.0[..right.shape.0.len().saturating_sub(2)]
+                    .iter()
+                    .any(|&extent| extent != 1)
+            })
+        {
+            return Err(LoweringError::UnsupportedGemmBatching(operation.id));
+        }
         let output_shape = shapes
             .get(&operation.results[0])
             .cloned()
@@ -2401,7 +2414,7 @@ mod tests {
             );
             let mut left_shape = batches.clone();
             left_shape.extend([rows, inner]);
-            let mut right_shape = batches;
+            let mut right_shape = vec![1; batches.len()];
             right_shape.extend([inner, columns]);
 
             let mut graph = ComputeGraph::new();
@@ -2452,6 +2465,27 @@ mod tests {
                 "random case {case}"
             );
             assert_conversions_are_explicit(&lowered, &lowered.operations);
+        }
+    }
+
+    #[test]
+    fn randomized_gemm_lowering_rejects_per_batch_weights() {
+        let mut random = fastrand::Rng::with_seed(0x6261_7463);
+        for _ in 0..RANDOM_CASES {
+            let batch = random.u32(2..=8);
+            let rows = random.u32(1..=8);
+            let mut graph = ComputeGraph::new();
+            let left = graph.host_input("left", [batch, rows, 64]).unwrap();
+            let right = graph.parameter("right", [batch, 64, 64]).unwrap();
+            let output = graph.gemm(left, right).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let config = PipelineConfig::new(1)
+                .with_automatic_input(left, Precision::F16)
+                .with_automatic_input(right, Precision::F16);
+            assert!(matches!(
+                lower(&graph, &config, &Ipu21CostModel),
+                Err(LoweringError::UnsupportedGemmBatching(_))
+            ));
         }
     }
 

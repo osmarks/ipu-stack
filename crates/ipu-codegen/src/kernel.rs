@@ -343,10 +343,12 @@ fn collect_kernels(
 
 fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
     let rank = run.output.extents.len();
-    run.output
-        .extents
-        .get(rank.checked_sub(2).ok_or(KernelAbiError::MissingGemmRows)?)
-        .map(|extent| extent.physical_end - extent.start)
+    let matrix_column_axis = rank.checked_sub(1).ok_or(KernelAbiError::MissingGemmRows)?;
+    run.output.extents[..matrix_column_axis]
+        .iter()
+        .try_fold(1u32, |rows, extent| {
+            rows.checked_mul(extent.physical_end - extent.start)
+        })
         .filter(|&rows| rows != 0)
         .ok_or(KernelAbiError::MissingGemmRows)
 }
@@ -683,9 +685,10 @@ mod tests {
         for _ in 0..32 {
             let tiles = 1_u16 << random.u32(0..=3);
             let rows_per_tile = random.u32(1..=12);
+            let batch = random.u32(1..=4);
             let mut graph = ComputeGraph::new();
             let left = graph
-                .host_input("left", [u32::from(tiles) * rows_per_tile, 64])
+                .host_input("left", [batch, u32::from(tiles) * rows_per_tile, 64])
                 .unwrap();
             let right = graph.parameter("right", [64, 64]).unwrap();
             let result = graph.gemm(left, right).unwrap();
@@ -718,7 +721,7 @@ mod tests {
                 plan.compilations[0]
                     .flags
                     .iter()
-                    .any(|flag| flag == &format!("-DGEMM_SMALL_ROWS={rows_per_tile}"))
+                    .any(|flag| flag == &format!("-DGEMM_SMALL_ROWS={}", batch * rows_per_tile))
             );
             assert!(
                 plan.compilations[0]

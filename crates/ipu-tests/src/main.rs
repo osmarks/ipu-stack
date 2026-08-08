@@ -31,13 +31,16 @@ struct Arguments {
     #[arg(long, default_value_t = 10)]
     timeout_seconds: u64,
     /// Execute one blocked F16 GEMM as a kernel/exchange smoke test.
-    #[arg(long, conflicts_with_all = ["mlp_smoke", "gemm_benchmark"])]
+    #[arg(long, conflicts_with_all = ["batched_gemm_smoke", "mlp_smoke", "gemm_benchmark"])]
     gemm_smoke: bool,
+    /// Execute an F16 GEMM with a batched activation and broadcast weights.
+    #[arg(long, conflicts_with_all = ["gemm_smoke", "mlp_smoke", "gemm_benchmark"])]
+    batched_gemm_smoke: bool,
     /// Execute and numerically verify GEMM-GeLU-GEMM-GeLU.
-    #[arg(long, conflicts_with_all = ["gemm_smoke", "gemm_benchmark"])]
+    #[arg(long, conflicts_with_all = ["gemm_smoke", "batched_gemm_smoke", "gemm_benchmark"])]
     mlp_smoke: bool,
     /// Measure a compute-dense blocked F16 GEMM using device cycle counters.
-    #[arg(long, conflicts_with_all = ["gemm_smoke", "mlp_smoke"])]
+    #[arg(long, conflicts_with_all = ["gemm_smoke", "batched_gemm_smoke", "mlp_smoke"])]
     gemm_benchmark: bool,
     #[arg(long, default_value_t = 256)]
     benchmark_rows_per_tile: u32,
@@ -73,9 +76,10 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| arguments.sdk.join("bin/ipu/tile_bootloader_cc_ipu21.elf"));
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
-    if arguments.gemm_smoke {
-        let left = graph.host_input("left", [u32::from(active_tiles), 64])?;
-        let right = graph.parameter("right", [64, u32::from(active_tiles) * 64])?;
+    if arguments.gemm_smoke || arguments.batched_gemm_smoke {
+        let batch = if arguments.batched_gemm_smoke { 3 } else { 1 };
+        let left = graph.host_input("left", [batch, u32::from(active_tiles), 64])?;
+        let right = graph.parameter("right", [1, 64, u32::from(active_tiles) * 64])?;
         let output = graph.gemm(left, right)?;
         graph.set_outputs([output])?;
         pipeline = pipeline
@@ -156,17 +160,22 @@ fn main() -> Result<()> {
     let bootloader_bytes =
         fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
     let runtime = Runtime::open(&arguments.device, &configuration)?;
-    if arguments.gemm_smoke || arguments.mlp_smoke || arguments.gemm_benchmark {
+    if arguments.gemm_smoke
+        || arguments.batched_gemm_smoke
+        || arguments.mlp_smoke
+        || arguments.gemm_benchmark
+    {
         runtime.load(
             &application,
             &bootloader_bytes,
             application.host_exchange.startup_mark,
         )?;
-        if arguments.gemm_smoke {
+        if arguments.gemm_smoke || arguments.batched_gemm_smoke {
             run_gemm(
                 &runtime,
                 &application,
                 active_tiles,
+                if arguments.batched_gemm_smoke { 3 } else { 1 },
                 arguments.timeout_seconds,
             )?;
         } else if arguments.mlp_smoke {
@@ -208,6 +217,7 @@ fn run_gemm(
     runtime: &Runtime,
     application: &Application,
     active_tiles: u16,
+    batch: u32,
     timeout_seconds: u64,
 ) -> Result<()> {
     let left = application
@@ -223,10 +233,15 @@ fn run_gemm(
         .cloned()
         .context("GEMM package has no right weight binding")?;
     let left_bytes = packed_binding(&left, |tile, linear, elements| {
-        let (row, inner) =
-            amp_matrix_coordinates(AmpOrder::Left, Precision::F16, 1, elements, linear)?;
-        debug_assert_eq!(row, 0);
-        Ok(if u32::from(tile) == inner { 0x3c00 } else { 0 })
+        let (batch_index, inner) = amp_matrix_coordinates(
+            AmpOrder::Left,
+            Precision::F16,
+            batch,
+            elements / batch,
+            linear,
+        )?;
+        let selected_inner = (batch_index * 7 + u32::from(tile)) % 64;
+        Ok(if selected_inner == inner { 0x3c00 } else { 0 })
     })?;
     let right_bytes = packed_binding(&right, |tile, linear, elements| {
         let (inner, column) =
@@ -248,7 +263,7 @@ fn run_gemm(
         .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
     diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
     let output = session.collect(&executed)?;
-    verify_gemm_output(application, active_tiles, &output)
+    verify_gemm_output(application, active_tiles, batch, &output)
 }
 
 fn run_mlp_chain(
@@ -584,7 +599,12 @@ fn packed_binding(
     Ok(bytes)
 }
 
-fn verify_gemm_output(application: &Application, active_tiles: u16, bytes: &[u8]) -> Result<()> {
+fn verify_gemm_output(
+    application: &Application,
+    active_tiles: u16,
+    batch: u32,
+    bytes: &[u8],
+) -> Result<()> {
     let output = application
         .outputs
         .iter()
@@ -612,19 +632,20 @@ fn verify_gemm_output(application: &Application, active_tiles: u16, bytes: &[u8]
             .with_context(|| format!("GEMM output has no slice for tile {row}"))?;
         let elements = u32::try_from(slice.size / 2)?;
         for linear in 0..elements {
-            let (_, column) = amp_matrix_coordinates(
+            let (batch_index, column) = amp_matrix_coordinates(
                 AmpOrder::Output,
                 Precision::F16,
-                1,
+                batch,
                 u32::from(active_tiles) * 64,
                 linear,
             )?;
             let offset = usize::try_from(slice.file_offset + u64::from(linear) * 2)?;
             let actual = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
-            let expected = gemm_right_value(u32::from(row), column);
+            let selected_inner = (batch_index * 7 + u32::from(row)) % 64;
+            let expected = gemm_right_value(selected_inner, column);
             checked += 1;
             if actual != expected && mismatches.len() < 16 {
-                mismatches.push((row, column, expected, actual));
+                mismatches.push((row, batch_index, column, expected, actual));
             }
         }
     }

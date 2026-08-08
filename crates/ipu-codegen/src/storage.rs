@@ -45,9 +45,10 @@ pub fn shard_storage_bytes(shard: &LowShard) -> StorageResult<u32> {
 
 /// Converts a rectangular semantic view into coalesced physical byte spans.
 ///
-/// AMP permutations are applied independently to the final two axes. Earlier
-/// axes are conventional row-major outer dimensions, so batched tensors need
-/// no special case in exchange or placement code.
+/// AMP right operands are packed independently for each outer matrix. AMP left
+/// and output operands flatten their outer axes into the row dimension, which
+/// lets one tile-kernel invocation process activation batches with shared
+/// weights.
 pub fn view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageResult<Vec<ByteSpan>> {
     validate_view(shard, view)?;
     if let Some(spans) = right_k64_panel_spans(shard, view)? {
@@ -206,20 +207,44 @@ fn physical_coordinates(
             }
             let rows = widths[rank - 2];
             let columns = widths[rank - 1];
-            let matrix_elements = u64::from(rows) * u64::from(columns);
-            let outer = physical / matrix_elements;
-            decode_row_major(&widths[..rank - 2], outer, &mut coordinates[..rank - 2]);
-            let linear =
-                u32::try_from(physical % matrix_elements).map_err(|_| StorageError::Overflow)?;
-            let (row, column) = amp_matrix_coordinates(
-                role,
-                shard.tensor_type.format.precision,
-                rows,
-                columns,
-                linear,
-            )?;
-            coordinates[rank - 2] = row;
-            coordinates[rank - 1] = column;
+            if matches!(role, AmpOrder::Left | AmpOrder::Output) {
+                let outer_rows = widths[..rank - 2]
+                    .iter()
+                    .try_fold(rows, |product, &extent| {
+                        product.checked_mul(extent).ok_or(StorageError::Overflow)
+                    })?;
+                let linear = u32::try_from(physical).map_err(|_| StorageError::Overflow)?;
+                let (flat_row, column) = amp_matrix_coordinates(
+                    role,
+                    shard.tensor_type.format.precision,
+                    outer_rows,
+                    columns,
+                    linear,
+                )?;
+                let outer = flat_row / rows;
+                decode_row_major(
+                    &widths[..rank - 2],
+                    u64::from(outer),
+                    &mut coordinates[..rank - 2],
+                );
+                coordinates[rank - 2] = flat_row % rows;
+                coordinates[rank - 1] = column;
+            } else {
+                let matrix_elements = u64::from(rows) * u64::from(columns);
+                let outer = physical / matrix_elements;
+                decode_row_major(&widths[..rank - 2], outer, &mut coordinates[..rank - 2]);
+                let linear = u32::try_from(physical % matrix_elements)
+                    .map_err(|_| StorageError::Overflow)?;
+                let (row, column) = amp_matrix_coordinates(
+                    role,
+                    shard.tensor_type.format.precision,
+                    rows,
+                    columns,
+                    linear,
+                )?;
+                coordinates[rank - 2] = row;
+                coordinates[rank - 1] = column;
+            }
         }
     }
     Ok(coordinates)
