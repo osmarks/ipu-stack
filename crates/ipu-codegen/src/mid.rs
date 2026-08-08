@@ -507,6 +507,31 @@ impl Layout {
         }
     }
 
+    /// AMP output storage sharded by rows and replicated across the column
+    /// groups of a following GEMM. This is the gathered input form consumed
+    /// by the fused output-to-left GeLU kernel.
+    pub fn amp_output_replicated_grid(
+        tile_count: u16,
+        row_partitions: u16,
+        column_replicas: u16,
+    ) -> Self {
+        if column_replicas == 1 && row_partitions == tile_count {
+            return Self::amp_output(tile_count);
+        }
+        Self {
+            order: ElementOrder::Amp(AmpOrder::Output),
+            tiling: TensorTiling {
+                tile_count,
+                replicas: column_replicas,
+                axes: vec![
+                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
+                    AxisTiling::new(TensorAxis::FromEnd(1), 1, 64, Padding::Zero),
+                ],
+            },
+            memory_class: MemoryClass::Ipu21Interleaved,
+        }
+    }
+
     /// Returns the physical extents after applying declared zero padding.
     pub fn padded_shape(&self, shape: &TensorShape) -> Result<TensorShape, LayoutError> {
         if self.tiling.tile_count == 0 || self.tiling.replicas == 0 {
@@ -717,6 +742,8 @@ impl OperatorCandidate {
     fn supports(&self, inputs: &[TensorType], output: &TensorShape) -> bool {
         if self.inputs.len() != inputs.len()
             || !valid_requirement(&self.output, output)
+            || ((matches!(self.operator, MidOperator::Gemm { .. } | MidOperator::Gelu))
+                && layout_has_empty_shards(&self.output.format.layout, output))
             || !self
                 .inputs
                 .iter()
@@ -787,6 +814,17 @@ impl OperatorCandidate {
         .validate(&planned_inputs, &planned_output)
         .is_ok()
     }
+}
+
+fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> bool {
+    let Ok(padded) = layout.padded_shape(shape) else {
+        return true;
+    };
+    layout.tiling.axes.iter().any(|tiling| {
+        tiling.axis.resolve(padded.0.len()).map_or(true, |axis| {
+            padded.0[axis] / tiling.block_size < u32::from(tiling.partitions)
+        })
+    })
 }
 
 fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
@@ -962,6 +1000,7 @@ fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
                     rows,
                     columns,
                 ),
+                amp_grid_gelu_operator_candidate(tile_count, rows, columns),
             ]
         })
         .collect::<Vec<_>>();
@@ -1009,6 +1048,34 @@ fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
         }
     }
     unique
+}
+
+fn amp_grid_gelu_operator_candidate(
+    tile_count: u16,
+    row_partitions: u16,
+    column_partitions: u16,
+) -> OperatorCandidate {
+    OperatorCandidate::new(
+        MidOperator::Gelu,
+        [OperandRequirement::new(
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::amp_output_replicated_grid(
+                    tile_count,
+                    row_partitions,
+                    column_partitions,
+                ),
+            },
+            8,
+        )],
+        OperandRequirement::new(
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::amp_left_grid(64, tile_count, row_partitions, column_partitions),
+            },
+            8,
+        ),
+    )
 }
 
 fn pointwise_operator_candidate(
@@ -1662,7 +1729,7 @@ fn lower_operations(
     state: &mut LoweringState,
 ) -> LoweringResult<Vec<MidOperation>> {
     let mut operations = Vec::new();
-    for operation in source {
+    for (operation_index, operation) in source.iter().enumerate() {
         if let OperationKind::Repeat(repeat) = &operation.kind {
             lower_repeat(
                 operation,
@@ -1753,13 +1820,22 @@ fn lower_operations(
                         format: requirement.format.clone(),
                     })
                     .collect::<Vec<_>>();
+                let operator_cost =
+                    costs.operator_cycles(plan.operator, &plan.dispatch, &planned_inputs, &output);
+                let successor_cost = immediate_successor_cost(
+                    operation_index,
+                    operation,
+                    source,
+                    &output,
+                    values,
+                    shapes,
+                    config,
+                    costs,
+                    state,
+                );
                 let cost = conversion
-                    + costs.operator_cycles(
-                        plan.operator,
-                        &plan.dispatch,
-                        &planned_inputs,
-                        &output,
-                    );
+                    .saturating_add(operator_cost)
+                    .saturating_add(successor_cost);
                 ((cost, order), plan)
             })
             .min_by_key(|(cost, _)| *cost)
@@ -1768,6 +1844,8 @@ fn lower_operations(
         tracing::debug!(
             operation = operation.id.index(),
             operator = ?plan.operator,
+            input_layouts = ?plan.requirements.inputs.iter().map(|input| &input.format.layout).collect::<Vec<_>>(),
+            output_layout = ?plan.requirements.output.format.layout,
             "selected operator candidate"
         );
         let converted = input_ids
@@ -1823,6 +1901,94 @@ fn lower_operations(
         values.insert(operation.results[0], result);
     }
     Ok(operations)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn immediate_successor_cost(
+    operation_index: usize,
+    operation: &Operation,
+    source: &[Operation],
+    output: &TensorType,
+    values: &BTreeMap<ValueId, MidValueId>,
+    shapes: &BTreeMap<ValueId, TensorShape>,
+    config: &PipelineConfig,
+    costs: &impl CostModel,
+    state: &LoweringState,
+) -> u64 {
+    if !matches!(operation.kind, OperationKind::Gelu) {
+        return 0;
+    }
+    let Some(next) = source.get(operation_index + 1) else {
+        return 0;
+    };
+    if !matches!(next.kind, OperationKind::Gemm(_))
+        || next.inputs.first() != operation.results.first()
+    {
+        return 0;
+    }
+    let mut input_ids = Vec::with_capacity(next.inputs.len());
+    let mut input_types = Vec::with_capacity(next.inputs.len());
+    for input in &next.inputs {
+        if Some(input) == operation.results.first() {
+            input_ids.push(None);
+            input_types.push(output.clone());
+        } else {
+            let Some(&id) = values.get(input) else {
+                return u64::MAX / 4;
+            };
+            input_ids.push(Some(id));
+            input_types.push(state.get(id).tensor_type.clone());
+        }
+    }
+    let Some(output_shape) = next.results.first().and_then(|result| shapes.get(result)) else {
+        return u64::MAX / 4;
+    };
+    plans(next, &input_types, output_shape, config)
+        .into_iter()
+        .filter(|plan| {
+            plan.requirements
+                .inputs
+                .first()
+                .is_some_and(|input| input.format == output.format)
+        })
+        .map(|plan| {
+            let conversion = input_types
+                .iter()
+                .zip(&input_ids)
+                .zip(&plan.requirements.inputs)
+                .map(|((from, id), to)| match id {
+                    None => 0,
+                    Some(id) if state.automatic_inputs.contains(id) => {
+                        if from.format.precision != to.format.precision {
+                            costs.cast_cycles(from, to.format.precision)
+                        } else {
+                            0
+                        }
+                    }
+                    Some(_) => conversion_cycles(from, &to.format, costs),
+                })
+                .sum::<u64>();
+            let planned_inputs = input_types
+                .iter()
+                .zip(&plan.requirements.inputs)
+                .map(|(input, requirement)| TensorType {
+                    shape: input.shape.clone(),
+                    format: requirement.format.clone(),
+                })
+                .collect::<Vec<_>>();
+            let planned_output = TensorType {
+                shape: output_shape.clone(),
+                format: plan.requirements.output.format.clone(),
+            };
+            conversion.saturating_add(costs.operator_cycles(
+                plan.operator,
+                &plan.dispatch,
+                &planned_inputs,
+                &planned_output,
+            ))
+        })
+        .min()
+        .unwrap_or(u64::MAX / 4)
 }
 
 #[derive(Clone)]
@@ -2370,15 +2536,15 @@ mod tests {
     fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
         let mut random = fastrand::Rng::with_seed(0x6d69_6467);
         for case in 0..RANDOM_CASES {
+            let tiles = random.u16(1..=64);
             let (rows, inner, columns) = (
-                dimension(&mut random),
+                u32::from(tiles) * dimension(&mut random),
                 dimension(&mut random) * 64,
                 dimension(&mut random) * 64,
             );
             let batches = (0..random.usize(0..=3))
                 .map(|_| dimension(&mut random))
                 .collect::<Vec<_>>();
-            let tiles = random.u16(1..=64);
             let multiply = precision(&mut random);
             let left_format = format(
                 precision(&mut random),
@@ -2493,11 +2659,11 @@ mod tests {
     fn randomized_gemms_choose_precision_independently_within_one_graph() {
         let mut random = fastrand::Rng::with_seed(0x6d75_6c74);
         for case in 0..RANDOM_CASES {
-            let rows = dimension(&mut random);
+            let tiles = random.u16(1..=64);
+            let rows = u32::from(tiles) * dimension(&mut random);
             let inner = dimension(&mut random);
             let even_columns = random.u32(1..=64) * 2;
             let odd_columns = random.u32(1..=64) * 2 - 1;
-            let tiles = random.u16(1..=64);
             let layout = Layout::row_sharded(tiles);
             let mut graph = ComputeGraph::new();
             let left = graph.host_input("left", [rows, inner]).unwrap();
@@ -2575,7 +2741,7 @@ mod tests {
         for case in 0..RANDOM_CASES {
             let tiles = random.u16(1..=64);
             let batch = dimension(&mut random);
-            let query_rows = dimension(&mut random);
+            let query_rows = u32::from(tiles) * dimension(&mut random);
             let key_rows = dimension(&mut random);
             let channels = dimension(&mut random);
             let value_channels = dimension(&mut random);
@@ -2704,9 +2870,9 @@ mod tests {
     fn randomized_repeat_lowering_retains_sequences_without_unrolling() {
         let mut random = fastrand::Rng::with_seed(0x7265_7065);
         for case in 0..RANDOM_CASES {
-            let size = dimension(&mut random);
-            let count = random.u32(1..=12);
             let tiles = random.u16(1..=64);
+            let size = u32::from(tiles);
+            let count = random.u32(1..=12);
             let layout = Layout::row_sharded(tiles);
             let carried_format = format(precision(&mut random), layout.clone());
             let mut graph = ComputeGraph::new();

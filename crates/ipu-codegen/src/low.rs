@@ -8,9 +8,9 @@
 
 use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
-    ConversionDispatch, LayoutError, MidGraph, MidOperation, MidOperationKind, MidRepeat,
-    MidValueId, OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing,
-    PipelineConfig, TensorType, TileKernelSpec,
+    AmpOrder, ConversionDispatch, ElementOrder, LayoutError, MidGraph, MidOperation,
+    MidOperationKind, MidRepeat, MidValueId, OperandRequirement, OperatorDispatch,
+    OperatorRequirements, OutputAliasing, PipelineConfig, TensorType, TileKernelSpec,
 };
 use crate::storage::{StorageError, view_byte_spans};
 use std::collections::BTreeMap;
@@ -568,8 +568,15 @@ impl LoweringState {
         };
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
+        let direct_retile = matches!(
+            kind,
+            MidOperationKind::Rearrange { from, to }
+                if from.order == ElementOrder::Amp(AmpOrder::Output)
+                    && to.order == ElementOrder::Amp(AmpOrder::Output)
+        );
         let mut transfers = BTreeMap::<ShardView, Vec<LowShardId>>::new();
         let mut runs = Vec::new();
+        let mut local_copies = Vec::<(u16, LocalCopy)>::new();
         for output in outputs {
             let tile = self.shards[output.index() as usize].tile;
             for source in &inputs {
@@ -596,27 +603,43 @@ impl LoweringState {
                     transfers.entry(source_view).or_default().push(copy);
                     self.full_view(copy)
                 };
-                runs.push((
-                    tile,
-                    KernelRun {
-                        provenance: operation_provenance(operation, kind),
-                        kernel: TileKernel::Planned(plan.kernel.clone()),
-                        inputs: vec![KernelOperand {
-                            views: vec![resident],
-                        }],
-                        output: ShardView {
-                            shard: output,
-                            extents,
+                let output_view = ShardView {
+                    shard: output,
+                    extents,
+                };
+                if direct_retile {
+                    append_span_copies(
+                        &self.shards,
+                        &resident,
+                        &output_view,
+                        tile,
+                        &mut local_copies,
+                    )?;
+                } else {
+                    runs.push((
+                        tile,
+                        KernelRun {
+                            provenance: operation_provenance(operation, kind),
+                            kernel: TileKernel::Planned(plan.kernel.clone()),
+                            inputs: vec![KernelOperand {
+                                views: vec![resident],
+                            }],
+                            output: output_view,
+                            requirements: KernelRequirements::Conversion {
+                                input: plan.input.clone(),
+                                output: plan.output.clone(),
+                            },
                         },
-                        requirements: KernelRequirements::Conversion {
-                            input: plan.input.clone(),
-                            output: plan.output.clone(),
-                        },
-                    },
-                ));
+                    ));
+                }
             }
         }
         self.append_phase(transfers, operation_provenance(operation, kind), tiles)?;
+        for (tile, copy) in local_copies {
+            tiles[usize::from(tile)]
+                .work
+                .push(TileWork::LocalCopy(copy));
+        }
         for (tile, run) in runs {
             tiles[usize::from(tile)].work.push(TileWork::Kernel(run));
         }
@@ -1426,6 +1449,52 @@ impl LoweringState {
             .ok_or(LowLoweringError::IdOverflow)?;
         u32::try_from(stride).map_err(|_| LowLoweringError::IdOverflow)
     }
+}
+
+fn append_span_copies(
+    shards: &[LowShard],
+    source: &ShardView,
+    destination: &ShardView,
+    tile: u16,
+    copies: &mut Vec<(u16, LocalCopy)>,
+) -> LowLoweringResult<()> {
+    let source_spans = view_byte_spans(&shards[source.shard.index() as usize], source)?;
+    let destination_spans =
+        view_byte_spans(&shards[destination.shard.index() as usize], destination)?;
+    let mut source_index = 0usize;
+    let mut destination_index = 0usize;
+    let mut source_offset = 0u32;
+    let mut destination_offset = 0u32;
+    while source_index < source_spans.len() && destination_index < destination_spans.len() {
+        let source_span = source_spans[source_index];
+        let destination_span = destination_spans[destination_index];
+        let bytes =
+            (source_span.bytes - source_offset).min(destination_span.bytes - destination_offset);
+        copies.push((
+            tile,
+            LocalCopy {
+                source: source.shard,
+                source_offset: source_span.offset + source_offset,
+                destination: destination.shard,
+                destination_offset: destination_span.offset + destination_offset,
+                bytes,
+            },
+        ));
+        source_offset += bytes;
+        destination_offset += bytes;
+        if source_offset == source_span.bytes {
+            source_index += 1;
+            source_offset = 0;
+        }
+        if destination_offset == destination_span.bytes {
+            destination_index += 1;
+            destination_offset = 0;
+        }
+    }
+    if source_index != source_spans.len() || destination_index != destination_spans.len() {
+        return Err(LowLoweringError::InvalidConversionPlan);
+    }
+    Ok(())
 }
 
 fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOperation]) -> bool {
