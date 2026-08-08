@@ -8,8 +8,8 @@ use crate::mid::{MemoryClass, OperandRequirement};
 use crate::storage::{StorageError, shard_storage_bytes};
 use ipu_exchange::{EXCHANGE_WINDOW_BASE, EXCHANGE_WINDOW_BYTES};
 use ipu_package::{
-    IPU21_INTERLEAVED_MEMORY_BASE, IPU21_INTERLEAVED_MEMORY_LIMIT, TILE_MEMORY_BASE,
-    TILE_MEMORY_SIZE,
+    IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, IPU21_INTERLEAVED_REGION_LIMIT,
+    TILE_MEMORY_BASE, TILE_MEMORY_SIZE,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -82,17 +82,6 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
     let mut addresses = BTreeMap::new();
     let mut tile_data_end = vec![IPU21_DATA_BASE; usize::from(program.tile_count)];
     for tile in 0..program.tile_count {
-        let mut standard = Arena::new(&[
-            (IPU21_DATA_BASE, IPU21_INTERLEAVED_MEMORY_BASE),
-            (
-                IPU21_INTERLEAVED_MEMORY_LIMIT,
-                TILE_MEMORY_BASE + TILE_MEMORY_SIZE,
-            ),
-        ]);
-        let mut interleaved = Arena::new(&[(
-            IPU21_INTERLEAVED_MEMORY_BASE,
-            IPU21_INTERLEAVED_MEMORY_LIMIT,
-        )]);
         let mut grouped = BTreeSet::<usize>::new();
         for group in iterated.iter().filter(|group| group.tile == tile) {
             let roots = group
@@ -103,63 +92,50 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
             if roots.iter().any(|root| !grouped.insert(*root)) {
                 return Err(PlacementError::IteratedOverlap);
             }
-            let class = program.shards[group.shards[0].index() as usize]
-                .tensor_type
-                .format
-                .layout
-                .memory_class;
-            let alignment = group.alignment.max(
-                roots
-                    .iter()
-                    .filter_map(|root| root_requirements.get(root))
-                    .map(|requirement| requirement.alignment)
-                    .max()
-                    .unwrap_or(1),
-            );
-            for root in &roots {
-                let required = allocation_bytes(program, &members[root], root_requirements[root])?;
-                if required > group.stride {
-                    return Err(PlacementError::IteratedStride);
-                }
-            }
-            let bytes = group
-                .stride
-                .checked_mul(u32::try_from(roots.len()).map_err(|_| PlacementError::Overflow)?)
-                .ok_or(PlacementError::Overflow)?;
-            let base = arena(&mut standard, &mut interleaved, class)
-                .allocate(bytes, alignment)
-                .ok_or(PlacementError::OutOfMemory { tile, class, bytes })?;
-            for (index, root) in roots.into_iter().enumerate() {
-                let address = base
-                    .checked_add(
-                        group
-                            .stride
-                            .checked_mul(
-                                u32::try_from(index).map_err(|_| PlacementError::Overflow)?,
-                            )
-                            .ok_or(PlacementError::Overflow)?,
-                    )
-                    .ok_or(PlacementError::Overflow)?;
-                assign_members(&mut addresses, &members[&root], address)?;
-            }
         }
 
-        for (&root, root_members) in &members {
-            let representative = &program.shards[root_members[0]];
-            if representative.tile != tile
-                || matches!(representative.definition, ShardDefinition::ExchangeCopy(_))
-                || grouped.contains(&root)
-            {
-                continue;
-            }
-            let class = representative.tensor_type.format.layout.memory_class;
-            let requirement = root_requirements.get(&root).copied().unwrap_or_default();
-            let bytes = allocation_bytes(program, root_members, requirement)?;
-            let address = arena(&mut standard, &mut interleaved, class)
-                .allocate(bytes, requirement.alignment.max(4))
-                .ok_or(PlacementError::OutOfMemory { tile, class, bytes })?;
-            assign_members(&mut addresses, root_members, address)?;
+        // Region 1 is shared by ordinary and interleaved loads. Place the
+        // interleaved working set first, round its boundary to a paired memory
+        // element, then return every remaining byte to standard allocations.
+        let mut interleaved = Arena::new(&[(
+            IPU21_INTERLEAVED_MEMORY_BASE,
+            IPU21_INTERLEAVED_REGION_LIMIT,
+        )]);
+        allocate_tile_class(
+            program,
+            tile,
+            MemoryClass::Ipu21Interleaved,
+            &iterated,
+            &grouped,
+            &members,
+            &root_requirements,
+            &mut interleaved,
+            &mut addresses,
+        )?;
+        let interleaved_boundary =
+            align_up(interleaved.maximum_cursor(), IPU21_INTERLEAVED_ELEMENT_SIZE)?;
+        if interleaved_boundary > IPU21_INTERLEAVED_REGION_LIMIT {
+            return Err(PlacementError::OutOfMemory {
+                tile,
+                class: MemoryClass::Ipu21Interleaved,
+                bytes: interleaved_boundary - IPU21_INTERLEAVED_MEMORY_BASE,
+            });
         }
+        let mut standard = Arena::new(&[
+            (IPU21_DATA_BASE, IPU21_INTERLEAVED_MEMORY_BASE),
+            (interleaved_boundary, TILE_MEMORY_BASE + TILE_MEMORY_SIZE),
+        ]);
+        allocate_tile_class(
+            program,
+            tile,
+            MemoryClass::Ipu21Standard,
+            &iterated,
+            &grouped,
+            &members,
+            &root_requirements,
+            &mut standard,
+            &mut addresses,
+        )?;
         tile_data_end[usize::from(tile)] =
             standard.maximum_cursor().max(interleaved.maximum_cursor());
     }
@@ -344,15 +320,87 @@ fn assign_members(
     Ok(())
 }
 
-fn arena<'a>(
-    standard: &'a mut Arena,
-    interleaved: &'a mut Arena,
+#[allow(clippy::too_many_arguments)]
+fn allocate_tile_class(
+    program: &LowProgram,
+    tile: u16,
     class: MemoryClass,
-) -> &'a mut Arena {
-    match class {
-        MemoryClass::Ipu21Standard => standard,
-        MemoryClass::Ipu21Interleaved => interleaved,
+    iterated: &[IteratedGroup],
+    grouped: &BTreeSet<usize>,
+    members: &BTreeMap<usize, Vec<usize>>,
+    root_requirements: &BTreeMap<usize, Requirement>,
+    arena: &mut Arena,
+    addresses: &mut BTreeMap<LowShardId, u32>,
+) -> Result<(), PlacementError> {
+    for group in iterated.iter().filter(|group| group.tile == tile) {
+        let roots = group
+            .shards
+            .iter()
+            .map(|shard| {
+                members.iter().find_map(|(&root, values)| {
+                    values.contains(&(shard.index() as usize)).then_some(root)
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(PlacementError::InvalidAlias(group.shards[0].index()))?;
+        let group_class = program.shards[group.shards[0].index() as usize]
+            .tensor_type
+            .format
+            .layout
+            .memory_class;
+        if group_class != class {
+            continue;
+        }
+        let alignment = group.alignment.max(
+            roots
+                .iter()
+                .filter_map(|root| root_requirements.get(root))
+                .map(|requirement| requirement.alignment)
+                .max()
+                .unwrap_or(1),
+        );
+        for root in &roots {
+            let required = allocation_bytes(program, &members[root], root_requirements[root])?;
+            if required > group.stride {
+                return Err(PlacementError::IteratedStride);
+            }
+        }
+        let bytes = group
+            .stride
+            .checked_mul(u32::try_from(roots.len()).map_err(|_| PlacementError::Overflow)?)
+            .ok_or(PlacementError::Overflow)?;
+        let base = arena
+            .allocate(bytes, alignment)
+            .ok_or(PlacementError::OutOfMemory { tile, class, bytes })?;
+        for (index, root) in roots.into_iter().enumerate() {
+            let address = base
+                .checked_add(
+                    group
+                        .stride
+                        .checked_mul(u32::try_from(index).map_err(|_| PlacementError::Overflow)?)
+                        .ok_or(PlacementError::Overflow)?,
+                )
+                .ok_or(PlacementError::Overflow)?;
+            assign_members(addresses, &members[&root], address)?;
+        }
     }
+    for (&root, root_members) in members {
+        let representative = &program.shards[root_members[0]];
+        if representative.tile != tile
+            || representative.tensor_type.format.layout.memory_class != class
+            || matches!(representative.definition, ShardDefinition::ExchangeCopy(_))
+            || grouped.contains(&root)
+        {
+            continue;
+        }
+        let requirement = root_requirements.get(&root).copied().unwrap_or_default();
+        let bytes = allocation_bytes(program, root_members, requirement)?;
+        let address = arena
+            .allocate(bytes, requirement.alignment.max(4))
+            .ok_or(PlacementError::OutOfMemory { tile, class, bytes })?;
+        assign_members(addresses, root_members, address)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -489,7 +537,7 @@ mod tests {
                         == MemoryClass::Ipu21Interleaved =>
                     {
                         assert!(
-                            (IPU21_INTERLEAVED_MEMORY_BASE..IPU21_INTERLEAVED_MEMORY_LIMIT)
+                            (IPU21_INTERLEAVED_MEMORY_BASE..IPU21_INTERLEAVED_REGION_LIMIT)
                                 .contains(&address)
                         )
                     }

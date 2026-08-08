@@ -39,16 +39,19 @@ pub use low::{
     ShardDefinition, ShardExtent, ShardView, TileKernel, TileWork, TileWorkList, WorkProvenance,
     WorkReason, lower_to_tiles,
 };
-pub use memory::IPU21_DATA_BASE;
+pub use memory::{
+    IPU21_DATA_BASE, IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES,
+    IPU21_STANDARD_FIXED_BYTES,
+};
 pub use mid::{
     AccumulationPrecision, AmpOrder, AxisTiling, ConversionDispatch, ConversionPlan, CostModel,
     ElementOrder, GemmKernelMode, GemmWeightLoad, HardwareTarget, Layout, LayoutError,
-    LoweringError, LoweringResult, MemoryClass, MemoryOperand, MemoryRelation, MidGraph, MidInput,
-    MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId,
-    OperandRequirement, OperatorCandidate, OperatorDispatch, OperatorPlan, OperatorPlanError,
-    OperatorRequirements, OutputAliasing, Padding, PipelineConfig, Precision, ProfilingConfig,
-    SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec,
-    ToyCostModel, lower,
+    LoweringError, LoweringResult, MemoryClass, MemoryEstimate, MemoryOperand, MemoryRelation,
+    MemoryUsage, MidGraph, MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion,
+    MidRepeat, MidValue, MidValueId, OperandRequirement, OperatorCandidate, OperatorDispatch,
+    OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, PipelineConfig,
+    Precision, ProfilingConfig, SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling,
+    TensorType, TileKernelSpec, ToyCostModel, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
 pub use place::{Placement, PlacementError, place};

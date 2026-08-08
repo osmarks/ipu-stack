@@ -127,6 +127,57 @@ pub enum MemoryClass {
     Ipu21Interleaved,
 }
 
+/// Maximum per-tile bytes attributed to each address/load class. The classes
+/// share physical tile SRAM, so feasibility must check both the individual
+/// interleaved-region limit and their combined size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MemoryUsage {
+    pub standard: u64,
+    pub interleaved: u64,
+}
+
+impl MemoryUsage {
+    pub const fn total(self) -> u64 {
+        self.standard.saturating_add(self.interleaved)
+    }
+
+    fn add_class(&mut self, class: MemoryClass, bytes: u64) {
+        let target = match class {
+            MemoryClass::Ipu21Standard => &mut self.standard,
+            MemoryClass::Ipu21Interleaved => &mut self.interleaved,
+        };
+        *target = target.saturating_add(bytes);
+    }
+
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            standard: self.standard.saturating_add(other.standard),
+            interleaved: self.interleaved.saturating_add(other.interleaved),
+        }
+    }
+
+    fn component_max(self, other: Self) -> Self {
+        Self {
+            standard: self.standard.max(other.standard),
+            interleaved: self.interleaved.max(other.interleaved),
+        }
+    }
+
+    pub fn fits_ipu21(self) -> bool {
+        self.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+            && self.total() <= u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+    }
+}
+
+/// Storage visible at an operator boundary plus phase-local scratch. Peak is
+/// the simultaneous requirement used for candidate feasibility.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryEstimate {
+    pub live: MemoryUsage,
+    pub temporary: MemoryUsage,
+    pub peak: MemoryUsage,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TensorAxis {
     FromStart(u16),
@@ -1108,6 +1159,7 @@ pub struct MidOperation {
     pub operator_plan: Option<OperatorPlan>,
     pub conversion_plan: Option<ConversionPlan>,
     pub estimated_cost: u64,
+    pub memory: MemoryEstimate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1318,6 +1370,7 @@ pub struct MidRegion {
     pub operations: Vec<MidOperation>,
     pub yields: Vec<MidValueId>,
     pub estimated_cost: u64,
+    pub peak_memory: MemoryUsage,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1345,6 +1398,7 @@ pub struct MidGraph {
     pub operations: Vec<MidOperation>,
     pub outputs: Vec<MidValueId>,
     pub estimated_cost: u64,
+    pub peak_memory: MemoryUsage,
 }
 
 /// Deliberately small and replaceable cost interface. Units are arbitrary but
@@ -1407,16 +1461,8 @@ impl CostModel for ToyCostModel {
                     .map(maximum_shard_bytes)
                     .chain(std::iter::once(maximum_shard_bytes(output)))
                     .sum::<u64>();
-                let standard_operand_bytes = inputs
-                    .iter()
-                    .filter(|tensor| {
-                        tensor.format.layout.memory_class == MemoryClass::Ipu21Standard
-                    })
-                    .map(maximum_shard_bytes)
-                    .sum::<u64>();
-                let capacity_penalty = if standard_operand_bytes
-                    > u64::from(crate::memory::IPU21_STANDARD_DATA_BYTES)
-                {
+                let memory = operator_memory_estimate(&default_dispatch(operator), inputs, output);
+                let capacity_penalty = if !memory.peak.fits_ipu21() {
                     u64::MAX / 8
                 } else {
                     0
@@ -1483,6 +1529,108 @@ fn maximum_shard_bytes(tensor: &TensorType) -> u64 {
         })
         .product::<u64>()
         .saturating_mul(tensor.format.precision.bytes())
+}
+
+fn tensor_memory(tensor: &TensorType) -> MemoryUsage {
+    let mut usage = MemoryUsage::default();
+    usage.add_class(
+        tensor.format.layout.memory_class,
+        maximum_shard_bytes(tensor),
+    );
+    usage
+}
+
+fn operator_memory_estimate(
+    dispatch: &OperatorDispatch,
+    inputs: &[TensorType],
+    output: &TensorType,
+) -> MemoryEstimate {
+    let live = inputs.iter().fold(tensor_memory(output), |usage, input| {
+        usage.saturating_add(tensor_memory(input))
+    });
+    let mut temporary = MemoryUsage::default();
+    if let (
+        OperatorDispatch::BlockedGemm {
+            inner_block,
+            output_column_block,
+            ..
+        },
+        Some(right),
+    ) = (dispatch, inputs.get(1))
+        && right.format.precision == Precision::F16
+        && right.format.layout.memory_class == MemoryClass::Ipu21Standard
+    {
+        // One packed panel is reused across K phases. Exchange receive storage
+        // is a separately reserved architectural window and is not counted as
+        // planned data SRAM.
+        temporary.interleaved = u64::from(*inner_block)
+            .saturating_mul(u64::from(*output_column_block))
+            .saturating_mul(right.format.precision.bytes());
+    }
+    MemoryEstimate {
+        live,
+        temporary,
+        peak: live.saturating_add(temporary),
+    }
+}
+
+fn conversion_memory_estimate(input: &TensorType, output: &TensorType) -> MemoryEstimate {
+    let live = tensor_memory(input).saturating_add(tensor_memory(output));
+    MemoryEstimate {
+        live,
+        temporary: MemoryUsage::default(),
+        peak: live,
+    }
+}
+
+fn region_peak_memory(
+    initial: &[MidValueId],
+    operations: &[MidOperation],
+    outputs: &[MidValueId],
+    values: &[MidValue],
+) -> MemoryUsage {
+    let mut uses = BTreeMap::<MidValueId, u32>::new();
+    for input in operations.iter().flat_map(|operation| &operation.inputs) {
+        *uses.entry(*input).or_default() += 1;
+    }
+    for output in outputs {
+        *uses.entry(*output).or_default() += 1;
+    }
+    let mut live_values = BTreeSet::new();
+    let mut live = MemoryUsage::default();
+    for id in initial {
+        if live_values.insert(*id) {
+            live = live.saturating_add(tensor_memory(&values[id.index() as usize].tensor_type));
+        }
+    }
+    let mut peak = live;
+    for operation in operations {
+        let mut during = live.saturating_add(operation.memory.temporary);
+        for result in &operation.results {
+            if !live_values.contains(result) {
+                during = during
+                    .saturating_add(tensor_memory(&values[result.index() as usize].tensor_type));
+            }
+        }
+        peak = peak.component_max(during);
+        for input in &operation.inputs {
+            if let Some(remaining) = uses.get_mut(input) {
+                *remaining = remaining.saturating_sub(1);
+                if *remaining == 0 && live_values.remove(input) {
+                    let bytes = tensor_memory(&values[input.index() as usize].tensor_type);
+                    live.standard = live.standard.saturating_sub(bytes.standard);
+                    live.interleaved = live.interleaved.saturating_sub(bytes.interleaved);
+                }
+            }
+        }
+        for result in &operation.results {
+            if uses.get(result).copied().unwrap_or(0) != 0 && live_values.insert(*result) {
+                live = live
+                    .saturating_add(tensor_memory(&values[result.index() as usize].tensor_type));
+            }
+        }
+    }
+    peak.component_max(live)
 }
 
 fn gemm_remote_bytes(inputs: &[TensorType], output: &TensorType) -> u64 {
@@ -1641,6 +1789,8 @@ pub fn lower(
         .iter()
         .map(|operation| operation.estimated_cost)
         .sum();
+    let initial = inputs.iter().map(|input| input.value).collect::<Vec<_>>();
+    let peak_memory = region_peak_memory(&initial, &operations, &outputs, &state.values);
     tracing::info!(
         values = state.values.len(),
         operations = operations.len(),
@@ -1653,6 +1803,7 @@ pub fn lower(
         operations,
         outputs,
         estimated_cost,
+        peak_memory,
     })
 }
 
@@ -1824,6 +1975,11 @@ fn lower_operations(
             &converted_types,
             &state.get(result).tensor_type,
         );
+        let memory = operator_memory_estimate(
+            &plan.dispatch,
+            &converted_types,
+            &state.get(result).tensor_type,
+        );
         operations.push(MidOperation {
             source: Some(operation.id),
             inputs: converted,
@@ -1836,6 +1992,7 @@ fn lower_operations(
             }),
             conversion_plan: None,
             estimated_cost: operator_cost,
+            memory,
         });
         values.insert(operation.results[0], result);
     }
@@ -1990,6 +2147,7 @@ fn lower_repeat(
         .iter()
         .map(|operation| operation.estimated_cost)
         .sum();
+    let body_peak = region_peak_memory(&arguments, &body_operations, &yields, &state.values);
     let mut results = Vec::new();
     for (origin, input) in operation.results.iter().zip(&inputs) {
         let result = state.value(*origin, state.get(*input).tensor_type.clone());
@@ -2010,11 +2168,17 @@ fn lower_repeat(
                 operations: body_operations,
                 yields,
                 estimated_cost: body_cost,
+                peak_memory: body_peak,
             },
         }),
         operator_plan: None,
         conversion_plan: None,
         estimated_cost: body_cost.saturating_mul(u64::from(repeat.count)),
+        memory: MemoryEstimate {
+            live: body_peak,
+            temporary: MemoryUsage::default(),
+            peak: body_peak,
+        },
     });
     Ok(())
 }
@@ -2038,6 +2202,7 @@ fn ensure_format(
         let from = tensor_type.format.precision;
         tensor_type.format.precision = target.precision;
         let result = state.value(original.origin, tensor_type.clone());
+        let memory = conversion_memory_estimate(&original.tensor_type, &tensor_type);
         operations.push(MidOperation {
             source: Some(source),
             inputs: vec![value],
@@ -2057,6 +2222,7 @@ fn ensure_format(
                 dispatch: ConversionDispatch::Local,
             }),
             estimated_cost: costs.cast_cost(&tensor_type.shape, from, target.precision),
+            memory,
         });
         value = result;
     }
@@ -2066,6 +2232,7 @@ fn ensure_format(
         let from = tensor_type.format.layout.clone();
         tensor_type.format.layout = target.layout.clone();
         let result = state.value(current.origin, tensor_type.clone());
+        let memory = conversion_memory_estimate(&current.tensor_type, &tensor_type);
         operations.push(MidOperation {
             source: Some(source),
             inputs: vec![value],
@@ -2090,6 +2257,7 @@ fn ensure_format(
                 &from,
                 &target.layout,
             ),
+            memory,
         });
         value = result;
     }
@@ -2154,6 +2322,23 @@ mod tests {
 
     fn value(lowered: &MidGraph, id: MidValueId) -> &MidValue {
         &lowered.values[id.index() as usize]
+    }
+
+    #[test]
+    fn randomized_memory_usage_checks_coupled_ipu21_capacity() {
+        let mut random = fastrand::Rng::with_seed(0x6d65_6d32);
+        for _ in 0..RANDOM_CASES {
+            let usage = MemoryUsage {
+                standard: random.u64(0..=u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES) * 2),
+                interleaved: random
+                    .u64(0..=u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES) * 2),
+            };
+            assert_eq!(
+                usage.fits_ipu21(),
+                usage.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+                    && usage.total() <= u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+            );
+        }
     }
 
     fn assert_conversions_are_explicit(lowered: &MidGraph, operations: &[MidOperation]) {
