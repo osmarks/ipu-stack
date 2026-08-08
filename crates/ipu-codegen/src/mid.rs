@@ -159,16 +159,39 @@ impl MemoryUsage {
         }
     }
 
-    fn component_max(self, other: Self) -> Self {
-        Self {
-            standard: self.standard.max(other.standard),
-            interleaved: self.interleaved.max(other.interleaved),
-        }
+    pub fn fits_ipu21(self) -> bool {
+        self.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+            && self.total() <= u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+    }
+}
+
+/// Independent class maxima and the maximum simultaneous total. Keeping the
+/// total separately avoids adding standard and interleaved maxima which may
+/// occur in different execution phases.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryPeaks {
+    pub standard: u64,
+    pub interleaved: u64,
+    pub total: u64,
+}
+
+impl MemoryPeaks {
+    fn observe(&mut self, usage: MemoryUsage) {
+        self.standard = self.standard.max(usage.standard);
+        self.interleaved = self.interleaved.max(usage.interleaved);
+        self.total = self.total.max(usage.total());
     }
 
     pub fn fits_ipu21(self) -> bool {
         self.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
-            && self.total() <= u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+            && self.total <= u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+    }
+
+    fn conservative_usage(self) -> MemoryUsage {
+        MemoryUsage {
+            standard: self.standard,
+            interleaved: self.interleaved,
+        }
     }
 }
 
@@ -1448,7 +1471,7 @@ pub struct MidRegion {
     pub operations: Vec<MidOperation>,
     pub yields: Vec<MidValueId>,
     pub estimated_cycles: u64,
-    pub peak_memory: MemoryUsage,
+    pub peak_memory: MemoryPeaks,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1476,7 +1499,7 @@ pub struct MidGraph {
     pub operations: Vec<MidOperation>,
     pub outputs: Vec<MidValueId>,
     pub estimated_cycles: u64,
-    pub peak_memory: MemoryUsage,
+    pub peak_memory: MemoryPeaks,
 }
 
 /// Replaceable cycle-estimation interface used by operator planning.
@@ -1804,7 +1827,7 @@ fn region_peak_memory(
     operations: &[MidOperation],
     outputs: &[MidValueId],
     values: &[MidValue],
-) -> MemoryUsage {
+) -> MemoryPeaks {
     let mut uses = BTreeMap::<MidValueId, u32>::new();
     for input in operations.iter().flat_map(|operation| &operation.inputs) {
         *uses.entry(*input).or_default() += 1;
@@ -1819,7 +1842,8 @@ fn region_peak_memory(
             live = live.saturating_add(tensor_memory(&values[id.index() as usize].tensor_type));
         }
     }
-    let mut peak = live;
+    let mut peaks = MemoryPeaks::default();
+    peaks.observe(live);
     for operation in operations {
         let mut during = live.saturating_add(operation.memory.temporary);
         for result in &operation.results {
@@ -1828,7 +1852,7 @@ fn region_peak_memory(
                     .saturating_add(tensor_memory(&values[result.index() as usize].tensor_type));
             }
         }
-        peak = peak.component_max(during);
+        peaks.observe(during);
         for input in &operation.inputs {
             if let Some(remaining) = uses.get_mut(input) {
                 *remaining = remaining.saturating_sub(1);
@@ -1846,7 +1870,8 @@ fn region_peak_memory(
             }
         }
     }
-    peak.component_max(live)
+    peaks.observe(live);
+    peaks
 }
 
 fn gemm_remote_bytes_per_tile(inputs: &[TensorType], output: &TensorType) -> u64 {
@@ -2391,9 +2416,9 @@ fn lower_repeat(
         conversion_plan: None,
         estimated_cycles: body_cost.saturating_mul(u64::from(repeat.count)),
         memory: MemoryEstimate {
-            live: body_peak,
+            live: body_peak.conservative_usage(),
             temporary: MemoryUsage::default(),
-            peak: body_peak,
+            peak: body_peak.conservative_usage(),
         },
     });
     Ok(())
@@ -2553,6 +2578,31 @@ mod tests {
                 usage.fits_ipu21(),
                 usage.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
                     && usage.total() <= u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+            );
+        }
+    }
+
+    #[test]
+    fn randomized_memory_peaks_keep_simultaneous_total_separate() {
+        let mut random = fastrand::Rng::with_seed(0x7065_616b);
+        for _ in 0..RANDOM_CASES {
+            let standard_phase = MemoryUsage {
+                standard: random.u64(1..=u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)),
+                interleaved: 0,
+            };
+            let interleaved_phase = MemoryUsage {
+                standard: 0,
+                interleaved: random
+                    .u64(1..=u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)),
+            };
+            let mut peaks = MemoryPeaks::default();
+            peaks.observe(standard_phase);
+            peaks.observe(interleaved_phase);
+            assert_eq!(peaks.standard, standard_phase.standard);
+            assert_eq!(peaks.interleaved, interleaved_phase.interleaved);
+            assert_eq!(
+                peaks.total,
+                standard_phase.total().max(interleaved_phase.total())
             );
         }
     }
