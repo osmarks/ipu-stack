@@ -179,18 +179,33 @@ pub struct MemoryPeaks {
     pub standard: u64,
     pub interleaved: u64,
     pub total: u64,
+    /// Largest amount by which one standard-addressed allocation exceeded
+    /// both contiguous ranges left around the interleaved region.
+    pub standard_contiguous_overflow: u64,
 }
 
 impl MemoryPeaks {
-    pub(crate) fn observe(&mut self, usage: MemoryUsage) {
+    pub(crate) fn observe(&mut self, usage: MemoryUsage, maximum_standard_allocation: u64) {
         self.standard = self.standard.max(usage.standard);
         self.interleaved = self.interleaved.max(usage.interleaved);
         self.total = self.total.max(usage.total());
+        let interleaved_boundary = usage
+            .interleaved
+            .div_ceil(u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE))
+            * u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE);
+        let upper_standard = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+            .saturating_sub(interleaved_boundary);
+        let contiguous_capacity =
+            u64::from(crate::memory::IPU21_STANDARD_FIXED_BYTES).max(upper_standard);
+        self.standard_contiguous_overflow = self
+            .standard_contiguous_overflow
+            .max(maximum_standard_allocation.saturating_sub(contiguous_capacity));
     }
 
     pub fn fits_ipu21(self) -> bool {
         self.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
             && self.total <= u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+            && self.standard_contiguous_overflow == 0
     }
 
     fn conservative_usage(self) -> MemoryUsage {
@@ -905,6 +920,9 @@ pub struct PipelineConfig {
     /// Signatures available independently to each operation. Earlier entries
     /// of the appropriate operation kind win when costs are equal.
     pub operator_candidates: Vec<OperatorCandidate>,
+    /// Maximum number of partial format assignments retained after each
+    /// operation in a straight-line region.
+    pub planning_beam_width: usize,
     pub scheduling: SchedulingPolicy,
     pub profiling: ProfilingConfig,
 }
@@ -932,6 +950,7 @@ impl PipelineConfig {
             inputs: BTreeMap::new(),
             automatic_inputs: BTreeMap::new(),
             operator_candidates: default_operator_candidates(tile_count),
+            planning_beam_width: 16,
             scheduling: SchedulingPolicy::OperatorPlans,
             profiling: ProfilingConfig::default(),
         }
@@ -946,6 +965,11 @@ impl PipelineConfig {
     pub fn with_automatic_input(mut self, value: ValueId, precision: Precision) -> Self {
         self.inputs.remove(&value);
         self.automatic_inputs.insert(value, precision);
+        self
+    }
+
+    pub fn with_planning_beam_width(mut self, width: usize) -> Self {
+        self.planning_beam_width = width.max(1);
         self
     }
 }
@@ -1599,6 +1623,16 @@ pub enum LoweringError {
     #[error("operation {0:?} has no legal format candidate")]
     NoCandidate(OperationId),
     #[error(
+        "operation {operation:?} has no candidate within tile SRAM (smallest rejected peak: standard {standard} bytes, interleaved {interleaved} bytes, simultaneous total {total} bytes, contiguous-standard overflow {standard_contiguous_overflow} bytes)"
+    )]
+    InsufficientMemory {
+        operation: OperationId,
+        standard: u64,
+        interleaved: u64,
+        total: u64,
+        standard_contiguous_overflow: u64,
+    },
+    #[error(
         "GEMM operation {0:?} has per-batch right operands; only weights broadcast across every batch dimension are currently supported"
     )]
     UnsupportedGemmBatching(OperationId),
@@ -1655,6 +1689,7 @@ pub fn lower(
     }
     let operations = lower_operations(
         graph.operations(),
+        graph.outputs(),
         &mut values,
         graph.value_shapes(),
         graph,
@@ -1689,7 +1724,7 @@ pub fn lower(
     })
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LoweringState {
     values: Vec<MidValue>,
     automatic_inputs: BTreeSet<MidValueId>,
@@ -1719,8 +1754,18 @@ impl LoweringState {
     }
 }
 
+#[derive(Clone)]
+struct BeamBranch {
+    values: BTreeMap<ValueId, MidValueId>,
+    state: LoweringState,
+    operations: Vec<MidOperation>,
+    score: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn lower_operations(
     source: &[Operation],
+    required_outputs: &[ValueId],
     values: &mut BTreeMap<ValueId, MidValueId>,
     shapes: &BTreeMap<ValueId, TensorShape>,
     graph: &ComputeGraph,
@@ -1728,267 +1773,262 @@ fn lower_operations(
     costs: &impl CostModel,
     state: &mut LoweringState,
 ) -> LoweringResult<Vec<MidOperation>> {
-    let mut operations = Vec::new();
+    if source.is_empty() {
+        return Ok(Vec::new());
+    }
+    let relevant_origins = source
+        .iter()
+        .flat_map(|operation| &operation.inputs)
+        .chain(required_outputs)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let initial = relevant_origins
+        .iter()
+        .filter_map(|origin| values.get(origin).copied())
+        .collect::<Vec<_>>();
+    let mut beam = vec![BeamBranch {
+        values: values.clone(),
+        state: state.clone(),
+        operations: Vec::new(),
+        score: 0,
+    }];
     for (operation_index, operation) in source.iter().enumerate() {
-        if let OperationKind::Repeat(repeat) = &operation.kind {
-            lower_repeat(
-                operation,
-                repeat,
-                values,
-                graph,
-                config,
-                costs,
-                state,
-                &mut operations,
-            )?;
-            continue;
-        }
-        let input_ids = operation
-            .inputs
-            .iter()
-            .map(|value| lookup(values, *value))
-            .collect::<LoweringResult<Vec<_>>>()?;
-        let input_types = input_ids
-            .iter()
-            .map(|value| state.get(*value).tensor_type.clone())
-            .collect::<Vec<_>>();
-        if matches!(operation.kind, OperationKind::Gemm(_))
-            && input_types.get(1).is_some_and(|right| {
-                right.shape.0[..right.shape.0.len().saturating_sub(2)]
-                    .iter()
-                    .any(|&extent| extent != 1)
-            })
-        {
-            return Err(LoweringError::UnsupportedGemmBatching(operation.id));
-        }
-        let output_shape = shapes
-            .get(&operation.results[0])
-            .cloned()
-            .ok_or(LoweringError::MissingShape(operation.results[0]))?;
-        let plans = plans(operation, &input_types, &output_shape, config);
-        let plan = plans
-            .into_iter()
-            .filter(|plan| {
-                let grid_plan = matches!(plan.operator, MidOperator::Gemm { .. })
-                    && (plan
-                        .requirements
-                        .inputs
-                        .iter()
-                        .any(|input| input.format.layout.tiling.replicas > 1)
-                        || plan.requirements.inputs.get(1).is_some_and(|right| {
-                            right.format.layout.tiling.axes.iter().any(|axis| {
-                                axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1
-                            })
-                        }));
-                !grid_plan
-                    || input_ids
-                        .iter()
-                        .zip(&plan.requirements.inputs)
-                        .all(|(id, requirement)| {
-                            state.automatic_inputs.contains(id)
-                                || state.get(*id).tensor_type.format.layout
-                                    == requirement.format.layout
-                        })
-            })
-            .enumerate()
-            .map(|(order, plan)| {
-                let conversion = input_types
-                    .iter()
-                    .zip(&input_ids)
-                    .zip(&plan.requirements.inputs)
-                    .map(|((from, id), to)| {
-                        if state.automatic_inputs.contains(id) {
-                            if from.format.precision != to.format.precision {
-                                costs.cast_cycles(from, to.format.precision)
-                            } else {
-                                0
-                            }
-                        } else {
-                            conversion_cycles(from, &to.format, costs)
-                        }
-                    })
-                    .sum::<u64>();
-                let output = TensorType {
-                    shape: output_shape.clone(),
-                    format: plan.requirements.output.format.clone(),
-                };
-                let planned_inputs = input_types
-                    .iter()
-                    .zip(&plan.requirements.inputs)
-                    .map(|(input, requirement)| TensorType {
-                        shape: input.shape.clone(),
-                        format: requirement.format.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                let operator_cost =
-                    costs.operator_cycles(plan.operator, &plan.dispatch, &planned_inputs, &output);
-                let successor_cost = immediate_successor_cost(
-                    operation_index,
+        let mut expanded = Vec::new();
+        let mut rejected_memory = Vec::new();
+        let mut saw_candidate = false;
+        for branch in beam {
+            if let OperationKind::Repeat(repeat) = &operation.kind {
+                saw_candidate = true;
+                let mut next = branch.clone();
+                let before = next.operations.len();
+                lower_repeat(
                     operation,
-                    source,
-                    &output,
-                    values,
-                    shapes,
+                    repeat,
+                    &mut next.values,
+                    graph,
                     config,
                     costs,
-                    state,
+                    &mut next.state,
+                    &mut next.operations,
+                )?;
+                next.score = next.score.saturating_add(
+                    next.operations[before..]
+                        .iter()
+                        .map(|operation| operation.estimated_cycles)
+                        .sum(),
                 );
-                let cost = conversion
-                    .saturating_add(operator_cost)
-                    .saturating_add(successor_cost);
-                ((cost, order), plan)
-            })
-            .min_by_key(|(cost, _)| *cost)
-            .ok_or(LoweringError::NoCandidate(operation.id))?
-            .1;
+                let peak =
+                    beam_memory_peak(&next, &initial, source, operation_index, required_outputs);
+                if peak.fits_ipu21() {
+                    expanded.push(next);
+                } else {
+                    rejected_memory.push(peak);
+                }
+                continue;
+            }
+            let input_ids = operation
+                .inputs
+                .iter()
+                .map(|value| lookup(&branch.values, *value))
+                .collect::<LoweringResult<Vec<_>>>()?;
+            let input_types = input_ids
+                .iter()
+                .map(|value| branch.state.get(*value).tensor_type.clone())
+                .collect::<Vec<_>>();
+            if matches!(operation.kind, OperationKind::Gemm(_))
+                && input_types.get(1).is_some_and(|right| {
+                    right.shape.0[..right.shape.0.len().saturating_sub(2)]
+                        .iter()
+                        .any(|&extent| extent != 1)
+                })
+            {
+                return Err(LoweringError::UnsupportedGemmBatching(operation.id));
+            }
+            let output_shape = shapes
+                .get(&operation.results[0])
+                .cloned()
+                .ok_or(LoweringError::MissingShape(operation.results[0]))?;
+            for plan in plans(operation, &input_types, &output_shape, config)
+                .into_iter()
+                .filter(|plan| plan_compatible_with_values(plan, &input_ids, &branch.state))
+            {
+                saw_candidate = true;
+                let mut next = branch.clone();
+                let before = next.operations.len();
+                apply_selected_plan(
+                    operation,
+                    output_shape.clone(),
+                    plan,
+                    costs,
+                    &mut next.values,
+                    &mut next.state,
+                    &mut next.operations,
+                );
+                next.score = next.score.saturating_add(
+                    next.operations[before..]
+                        .iter()
+                        .map(|operation| operation.estimated_cycles)
+                        .sum(),
+                );
+                let peak =
+                    beam_memory_peak(&next, &initial, source, operation_index, required_outputs);
+                if peak.fits_ipu21() {
+                    expanded.push(next);
+                } else {
+                    rejected_memory.push(peak);
+                }
+            }
+        }
+        if expanded.is_empty() {
+            if saw_candidate {
+                let peak = rejected_memory
+                    .into_iter()
+                    .min_by_key(|peak| (peak.total, peak.interleaved, peak.standard))
+                    .expect("a rejected candidate has a memory peak");
+                return Err(LoweringError::InsufficientMemory {
+                    operation: operation.id,
+                    standard: peak.standard,
+                    interleaved: peak.interleaved,
+                    total: peak.total,
+                    standard_contiguous_overflow: peak.standard_contiguous_overflow,
+                });
+            }
+            return Err(LoweringError::NoCandidate(operation.id));
+        }
+        expanded.sort_by_key(|branch| branch.score);
+        expanded.truncate(config.planning_beam_width.max(1));
         tracing::debug!(
             operation = operation.id.index(),
-            operator = ?plan.operator,
-            input_layouts = ?plan.requirements.inputs.iter().map(|input| &input.format.layout).collect::<Vec<_>>(),
-            output_layout = ?plan.requirements.output.format.layout,
-            "selected operator candidate"
+            retained = expanded.len(),
+            best_cycles = expanded[0].score,
+            "retained planning beam"
         );
-        let converted = input_ids
-            .into_iter()
-            .zip(&plan.requirements.inputs)
-            .map(|(value, requirement)| {
-                ensure_format(
-                    value,
-                    requirement.format.clone(),
-                    operation.id,
-                    costs,
-                    state,
-                    &mut operations,
-                )
-            })
-            .collect::<Vec<_>>();
-        let result = state.value(
-            operation.results[0],
-            TensorType {
-                shape: output_shape,
-                format: plan.requirements.output.format.clone(),
-            },
-        );
-        let converted_types = converted
-            .iter()
-            .map(|value| state.get(*value).tensor_type.clone())
-            .collect::<Vec<_>>();
-        let operator_cycles = costs.operator_cycles(
-            plan.operator,
-            &plan.dispatch,
-            &converted_types,
-            &state.get(result).tensor_type,
-        );
-        let memory = operator_memory_estimate(
-            &plan.dispatch,
-            &converted_types,
-            &state.get(result).tensor_type,
-        );
-        operations.push(MidOperation {
-            source: Some(operation.id),
-            inputs: converted,
-            results: vec![result],
-            kind: MidOperationKind::Operator(plan.operator),
-            operator_plan: Some(OperatorPlan {
-                operator: plan.operator,
-                dispatch: plan.dispatch,
-                requirements: plan.requirements,
-            }),
-            conversion_plan: None,
-            estimated_cycles: operator_cycles,
-            memory,
-        });
-        values.insert(operation.results[0], result);
+        beam = expanded;
     }
-    Ok(operations)
+    let best = beam
+        .into_iter()
+        .min_by_key(|branch| branch.score)
+        .ok_or_else(|| LoweringError::NoCandidate(source[0].id))?;
+    *values = best.values;
+    *state = best.state;
+    Ok(best.operations)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn immediate_successor_cost(
-    operation_index: usize,
-    operation: &Operation,
-    source: &[Operation],
-    output: &TensorType,
-    values: &BTreeMap<ValueId, MidValueId>,
-    shapes: &BTreeMap<ValueId, TensorShape>,
-    config: &PipelineConfig,
-    costs: &impl CostModel,
+fn plan_compatible_with_values(
+    plan: &Plan,
+    input_ids: &[MidValueId],
     state: &LoweringState,
-) -> u64 {
-    if !matches!(operation.kind, OperationKind::Gelu) {
-        return 0;
-    }
-    let Some(next) = source.get(operation_index + 1) else {
-        return 0;
-    };
-    if !matches!(next.kind, OperationKind::Gemm(_))
-        || next.inputs.first() != operation.results.first()
-    {
-        return 0;
-    }
-    let mut input_ids = Vec::with_capacity(next.inputs.len());
-    let mut input_types = Vec::with_capacity(next.inputs.len());
-    for input in &next.inputs {
-        if Some(input) == operation.results.first() {
-            input_ids.push(None);
-            input_types.push(output.clone());
-        } else {
-            let Some(&id) = values.get(input) else {
-                return u64::MAX / 4;
-            };
-            input_ids.push(Some(id));
-            input_types.push(state.get(id).tensor_type.clone());
-        }
-    }
-    let Some(output_shape) = next.results.first().and_then(|result| shapes.get(result)) else {
-        return u64::MAX / 4;
-    };
-    plans(next, &input_types, output_shape, config)
+) -> bool {
+    let grid_plan = matches!(plan.operator, MidOperator::Gemm { .. })
+        && (plan
+            .requirements
+            .inputs
+            .iter()
+            .any(|input| input.format.layout.tiling.replicas > 1)
+            || plan.requirements.inputs.get(1).is_some_and(|right| {
+                right
+                    .format
+                    .layout
+                    .tiling
+                    .axes
+                    .iter()
+                    .any(|axis| axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1)
+            }));
+    !grid_plan
+        || input_ids
+            .iter()
+            .zip(&plan.requirements.inputs)
+            .all(|(id, requirement)| {
+                state.automatic_inputs.contains(id)
+                    || state.get(*id).tensor_type.format.layout == requirement.format.layout
+            })
+}
+
+fn apply_selected_plan(
+    operation: &Operation,
+    output_shape: TensorShape,
+    plan: Plan,
+    costs: &impl CostModel,
+    values: &mut BTreeMap<ValueId, MidValueId>,
+    state: &mut LoweringState,
+    operations: &mut Vec<MidOperation>,
+) {
+    let input_ids = operation
+        .inputs
+        .iter()
+        .map(|value| values[value])
+        .collect::<Vec<_>>();
+    let converted = input_ids
         .into_iter()
-        .filter(|plan| {
-            plan.requirements
-                .inputs
-                .first()
-                .is_some_and(|input| input.format == output.format)
+        .zip(&plan.requirements.inputs)
+        .map(|(value, requirement)| {
+            ensure_format(
+                value,
+                requirement.format.clone(),
+                operation.id,
+                costs,
+                state,
+                operations,
+            )
         })
-        .map(|plan| {
-            let conversion = input_types
-                .iter()
-                .zip(&input_ids)
-                .zip(&plan.requirements.inputs)
-                .map(|((from, id), to)| match id {
-                    None => 0,
-                    Some(id) if state.automatic_inputs.contains(id) => {
-                        if from.format.precision != to.format.precision {
-                            costs.cast_cycles(from, to.format.precision)
-                        } else {
-                            0
-                        }
-                    }
-                    Some(_) => conversion_cycles(from, &to.format, costs),
-                })
-                .sum::<u64>();
-            let planned_inputs = input_types
-                .iter()
-                .zip(&plan.requirements.inputs)
-                .map(|(input, requirement)| TensorType {
-                    shape: input.shape.clone(),
-                    format: requirement.format.clone(),
-                })
-                .collect::<Vec<_>>();
-            let planned_output = TensorType {
-                shape: output_shape.clone(),
-                format: plan.requirements.output.format.clone(),
-            };
-            conversion.saturating_add(costs.operator_cycles(
-                plan.operator,
-                &plan.dispatch,
-                &planned_inputs,
-                &planned_output,
-            ))
-        })
-        .min()
-        .unwrap_or(u64::MAX / 4)
+        .collect::<Vec<_>>();
+    let result = state.value(
+        operation.results[0],
+        TensorType {
+            shape: output_shape,
+            format: plan.requirements.output.format.clone(),
+        },
+    );
+    let converted_types = converted
+        .iter()
+        .map(|value| state.get(*value).tensor_type.clone())
+        .collect::<Vec<_>>();
+    let operator_cycles = costs.operator_cycles(
+        plan.operator,
+        &plan.dispatch,
+        &converted_types,
+        &state.get(result).tensor_type,
+    );
+    let memory = operator_memory_estimate(
+        &plan.dispatch,
+        &converted_types,
+        &state.get(result).tensor_type,
+    );
+    operations.push(MidOperation {
+        source: Some(operation.id),
+        inputs: converted,
+        results: vec![result],
+        kind: MidOperationKind::Operator(plan.operator),
+        operator_plan: Some(OperatorPlan {
+            operator: plan.operator,
+            dispatch: plan.dispatch,
+            requirements: plan.requirements,
+        }),
+        conversion_plan: None,
+        estimated_cycles: operator_cycles,
+        memory,
+    });
+    values.insert(operation.results[0], result);
+}
+
+fn beam_memory_peak(
+    branch: &BeamBranch,
+    initial: &[MidValueId],
+    source: &[Operation],
+    operation_index: usize,
+    required_outputs: &[ValueId],
+) -> MemoryPeaks {
+    let live_origins = source[operation_index + 1..]
+        .iter()
+        .flat_map(|operation| &operation.inputs)
+        .chain(required_outputs)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let live = live_origins
+        .iter()
+        .filter_map(|origin| branch.values.get(origin).copied())
+        .collect::<Vec<_>>();
+    region_peak_memory(initial, &branch.operations, &live, &branch.state.values)
 }
 
 #[derive(Clone)]
@@ -2115,6 +2155,7 @@ fn lower_repeat(
     }
     let mut body_operations = lower_operations(
         &repeat.body.operations,
+        &repeat.body.yields,
         &mut body_values,
         &repeat.body.value_shapes,
         graph,
@@ -2256,20 +2297,6 @@ fn ensure_format(
     value
 }
 
-fn conversion_cycles(from: &TensorType, to: &TensorFormat, costs: &impl CostModel) -> u64 {
-    let cast = if from.format.precision != to.precision {
-        costs.cast_cycles(from, to.precision)
-    } else {
-        0
-    };
-    let rearrange = if from.format.layout != to.layout {
-        costs.rearrange_cycles(&from.shape, to.precision, &from.format.layout, &to.layout)
-    } else {
-        0
-    };
-    cast.saturating_add(rearrange)
-}
-
 fn lookup(values: &BTreeMap<ValueId, MidValueId>, value: ValueId) -> LoweringResult<MidValueId> {
     values
         .get(&value)
@@ -2285,6 +2312,10 @@ mod tests {
 
     fn dimension(random: &mut fastrand::Rng) -> u32 {
         random.u32(1..=128)
+    }
+
+    fn small_dimension(random: &mut fastrand::Rng) -> u32 {
+        random.u32(1..=4)
     }
 
     fn precision(random: &mut fastrand::Rng) -> Precision {
@@ -2347,8 +2378,8 @@ mod tests {
                     .u64(1..=u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)),
             };
             let mut peaks = MemoryPeaks::default();
-            peaks.observe(standard_phase);
-            peaks.observe(interleaved_phase);
+            peaks.observe(standard_phase, standard_phase.standard);
+            peaks.observe(interleaved_phase, interleaved_phase.standard);
             assert_eq!(peaks.standard, standard_phase.standard);
             assert_eq!(peaks.interleaved, interleaved_phase.interleaved);
             assert_eq!(
@@ -2538,12 +2569,12 @@ mod tests {
         for case in 0..RANDOM_CASES {
             let tiles = random.u16(1..=64);
             let (rows, inner, columns) = (
-                u32::from(tiles) * dimension(&mut random),
-                dimension(&mut random) * 64,
-                dimension(&mut random) * 64,
+                u32::from(tiles) * small_dimension(&mut random),
+                small_dimension(&mut random) * 64,
+                small_dimension(&mut random) * 64,
             );
             let batches = (0..random.usize(0..=3))
-                .map(|_| dimension(&mut random))
+                .map(|_| random.u32(1..=2))
                 .collect::<Vec<_>>();
             let multiply = precision(&mut random);
             let left_format = format(
@@ -2631,6 +2662,84 @@ mod tests {
                 "random case {case}"
             );
             assert_conversions_are_explicit(&lowered, &lowered.operations);
+        }
+    }
+
+    #[test]
+    fn randomized_beam_search_preserves_formats_needed_by_later_operators() {
+        let mut random = fastrand::Rng::with_seed(0x6265_616d);
+        for case in 0..RANDOM_CASES {
+            let tiles = [1, 2, 4, 8][random.usize(0..4)];
+            let rows = u32::from(tiles) * random.u32(1..=8);
+            let inner = random.u32(1..=4) * 64;
+            let columns = random.u32(1..=4) * 64;
+            let row = format(Precision::F16, Layout::row_sharded(tiles));
+            let left = format(Precision::F16, Layout::amp_left(64, tiles));
+            let right = format(Precision::F16, Layout::amp_right(64, tiles));
+            let output = format(Precision::F16, Layout::amp_output(tiles));
+
+            let mut graph = ComputeGraph::new();
+            let activation = graph.host_input("activation", [rows, inner]).unwrap();
+            let weights = graph.parameter("weights", [inner, columns]).unwrap();
+            let activated = graph.gelu(activation).unwrap();
+            let product = graph.gemm(activated, weights).unwrap();
+            graph.set_outputs([product]).unwrap();
+
+            let candidates = vec![
+                OperatorCandidate::new(
+                    MidOperator::Gelu,
+                    [OperandRequirement::new(row.clone(), 8)],
+                    OperandRequirement::new(row.clone(), 8),
+                ),
+                OperatorCandidate::new(
+                    MidOperator::Gelu,
+                    [OperandRequirement::new(row.clone(), 8)],
+                    OperandRequirement::new(left.clone(), 8),
+                ),
+                OperatorCandidate::new(
+                    MidOperator::Gemm {
+                        options: GemmOptions::default(),
+                        multiply: Precision::F16,
+                        accumulate: AccumulationPrecision::F32,
+                    },
+                    [
+                        OperandRequirement::new(left.clone(), 32),
+                        OperandRequirement::new(right.clone(), 32),
+                    ],
+                    OperandRequirement::new(output, 32),
+                ),
+            ];
+            let make_config = |beam_width| {
+                let mut config = PipelineConfig::new(tiles)
+                    .with_input(activation, row.clone())
+                    .with_input(weights, right.clone())
+                    .with_planning_beam_width(beam_width);
+                config.operator_candidates = candidates.clone();
+                config
+            };
+            let greedy = lower(&graph, &make_config(1), &Ipu21CostModel).unwrap();
+            let searched = lower(&graph, &make_config(2), &Ipu21CostModel).unwrap();
+
+            assert!(
+                searched.estimated_cycles < greedy.estimated_cycles,
+                "random case {case}"
+            );
+            let gelu = searched
+                .operations
+                .iter()
+                .find(|operation| {
+                    matches!(
+                        operation.kind,
+                        MidOperationKind::Operator(MidOperator::Gelu)
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                value(&searched, gelu.results[0]).tensor_type.format,
+                left,
+                "random case {case}"
+            );
+            assert!(searched.peak_memory.fits_ipu21(), "random case {case}");
         }
     }
 
@@ -2740,11 +2849,11 @@ mod tests {
         let mut random = fastrand::Rng::with_seed(0x6164_642b);
         for case in 0..RANDOM_CASES {
             let tiles = random.u16(1..=64);
-            let batch = dimension(&mut random);
-            let query_rows = u32::from(tiles) * dimension(&mut random);
-            let key_rows = dimension(&mut random);
-            let channels = dimension(&mut random);
-            let value_channels = dimension(&mut random);
+            let batch = small_dimension(&mut random);
+            let query_rows = u32::from(tiles) * small_dimension(&mut random);
+            let key_rows = small_dimension(&mut random) * 4;
+            let channels = small_dimension(&mut random) * 4;
+            let value_channels = small_dimension(&mut random) * 4;
             let mut graph = ComputeGraph::new();
             let activation = graph
                 .host_input("activation", [batch, query_rows, channels])

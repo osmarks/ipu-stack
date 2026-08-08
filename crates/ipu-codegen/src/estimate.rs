@@ -3,8 +3,8 @@
 use crate::cost::IPU21_TARGET_COSTS;
 use crate::graph::TensorShape;
 use crate::mid::{
-    Layout, MemoryClass, MemoryEstimate, MemoryPeaks, MemoryUsage, MidOperation, MidValue,
-    MidValueId, OperatorDispatch, Precision, TensorAxis, TensorType,
+    Layout, MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage,
+    MidOperation, MidValue, MidValueId, OperatorDispatch, Precision, TensorAxis, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -48,13 +48,106 @@ pub(crate) fn maximum_axis_shard_extent(tensor: &TensorType, axis: usize) -> u64
         .unwrap_or(u64::MAX)
 }
 
-fn tensor_memory(tensor: &TensorType) -> MemoryUsage {
+pub(crate) fn tensor_memory(tensor: &TensorType) -> MemoryUsage {
     let mut usage = MemoryUsage::default();
     usage.add_class(
         tensor.format.layout.memory_class,
         maximum_shard_bytes(tensor),
     );
     usage
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AllocationRequirement {
+    access_tail: u64,
+    distinct_element: bool,
+}
+
+fn allocation_memory(tensor: &TensorType, requirement: AllocationRequirement) -> MemoryUsage {
+    let mut bytes = maximum_shard_bytes(tensor).saturating_add(requirement.access_tail);
+    if requirement.distinct_element {
+        let element = match tensor.format.layout.memory_class {
+            MemoryClass::Ipu21Standard => ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+            MemoryClass::Ipu21Interleaved => ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE,
+        };
+        bytes = bytes.div_ceil(u64::from(element)) * u64::from(element);
+    }
+    let mut usage = MemoryUsage::default();
+    usage.add_class(tensor.format.layout.memory_class, bytes);
+    usage
+}
+
+fn allocation_requirements(
+    operations: &[MidOperation],
+) -> BTreeMap<MidValueId, AllocationRequirement> {
+    let mut requirements = BTreeMap::<MidValueId, AllocationRequirement>::new();
+    for operation in operations {
+        if let Some(plan) = &operation.operator_plan {
+            for (&id, operand) in operation.inputs.iter().zip(&plan.requirements.inputs) {
+                let requirement = requirements.entry(id).or_default();
+                requirement.access_tail = requirement
+                    .access_tail
+                    .max(u64::from(operand.access_tail_bytes));
+            }
+            if let Some(&id) = operation.results.first() {
+                let requirement = requirements.entry(id).or_default();
+                requirement.access_tail = requirement
+                    .access_tail
+                    .max(u64::from(plan.requirements.output.access_tail_bytes));
+            }
+            for relation in &plan.requirements.memory_relations {
+                let MemoryRelation::DistinctElements(operands) = relation;
+                for operand in operands {
+                    let id = match operand {
+                        MemoryOperand::Output => operation.results.first().copied(),
+                        MemoryOperand::Input(index) => {
+                            operation.inputs.get(usize::from(*index)).copied()
+                        }
+                    };
+                    if let Some(id) = id {
+                        requirements.entry(id).or_default().distinct_element = true;
+                    }
+                }
+            }
+        }
+        if let Some(plan) = &operation.conversion_plan {
+            if let Some(&id) = operation.inputs.first() {
+                let requirement = requirements.entry(id).or_default();
+                requirement.access_tail = requirement
+                    .access_tail
+                    .max(u64::from(plan.input.access_tail_bytes));
+            }
+            if let Some(&id) = operation.results.first() {
+                let requirement = requirements.entry(id).or_default();
+                requirement.access_tail = requirement
+                    .access_tail
+                    .max(u64::from(plan.output.access_tail_bytes));
+            }
+        }
+    }
+    requirements
+}
+
+fn value_allocation(
+    id: MidValueId,
+    values: &[MidValue],
+    requirements: &BTreeMap<MidValueId, AllocationRequirement>,
+) -> MemoryUsage {
+    allocation_memory(
+        &values[id.index() as usize].tensor_type,
+        requirements.get(&id).copied().unwrap_or_default(),
+    )
+}
+
+fn maximum_standard_allocation(
+    ids: &BTreeSet<MidValueId>,
+    values: &[MidValue],
+    requirements: &BTreeMap<MidValueId, AllocationRequirement>,
+) -> u64 {
+    ids.iter()
+        .map(|&id| value_allocation(id, values, requirements).standard)
+        .max()
+        .unwrap_or(0)
 }
 
 pub(crate) fn operator_memory_estimate(
@@ -166,6 +259,7 @@ pub(crate) fn region_peak_memory(
     outputs: &[MidValueId],
     values: &[MidValue],
 ) -> MemoryPeaks {
+    let requirements = allocation_requirements(operations);
     let mut uses = BTreeMap::<MidValueId, u32>::new();
     for input in operations.iter().flat_map(|operation| &operation.inputs) {
         *uses.entry(*input).or_default() += 1;
@@ -177,25 +271,32 @@ pub(crate) fn region_peak_memory(
     let mut live = MemoryUsage::default();
     for id in initial {
         if live_values.insert(*id) {
-            live = live.saturating_add(tensor_memory(&values[id.index() as usize].tensor_type));
+            live = live.saturating_add(value_allocation(*id, values, &requirements));
         }
     }
     let mut peaks = MemoryPeaks::default();
-    peaks.observe(live);
+    peaks.observe(
+        live,
+        maximum_standard_allocation(&live_values, values, &requirements),
+    );
     for operation in operations {
         let mut during = live.saturating_add(operation.memory.temporary);
+        let mut during_values = live_values.clone();
         for result in &operation.results {
             if !live_values.contains(result) {
-                during = during
-                    .saturating_add(tensor_memory(&values[result.index() as usize].tensor_type));
+                during = during.saturating_add(value_allocation(*result, values, &requirements));
+                during_values.insert(*result);
             }
         }
-        peaks.observe(during);
+        peaks.observe(
+            during,
+            maximum_standard_allocation(&during_values, values, &requirements),
+        );
         for input in &operation.inputs {
             if let Some(remaining) = uses.get_mut(input) {
                 *remaining = remaining.saturating_sub(1);
                 if *remaining == 0 && live_values.remove(input) {
-                    let bytes = tensor_memory(&values[input.index() as usize].tensor_type);
+                    let bytes = value_allocation(*input, values, &requirements);
                     live.standard = live.standard.saturating_sub(bytes.standard);
                     live.interleaved = live.interleaved.saturating_sub(bytes.interleaved);
                 }
@@ -203,12 +304,14 @@ pub(crate) fn region_peak_memory(
         }
         for result in &operation.results {
             if uses.get(result).copied().unwrap_or(0) != 0 && live_values.insert(*result) {
-                live = live
-                    .saturating_add(tensor_memory(&values[result.index() as usize].tensor_type));
+                live = live.saturating_add(value_allocation(*result, values, &requirements));
             }
         }
     }
-    peaks.observe(live);
+    peaks.observe(
+        live,
+        maximum_standard_allocation(&live_values, values, &requirements),
+    );
     peaks
 }
 
