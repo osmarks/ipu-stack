@@ -31,17 +31,29 @@ struct Arguments {
     #[arg(long, default_value_t = 10)]
     timeout_seconds: u64,
     /// Execute one blocked F16 GEMM as a kernel/exchange smoke test.
-    #[arg(long, conflicts_with_all = ["batched_gemm_smoke", "mlp_smoke", "gemm_benchmark"])]
+    #[arg(long, conflicts_with_all = ["batched_gemm_smoke", "mlp_smoke", "gemm_benchmark", "siglip_mlp_benchmark"])]
     gemm_smoke: bool,
     /// Execute an F16 GEMM with a batched activation and broadcast weights.
-    #[arg(long, conflicts_with_all = ["gemm_smoke", "mlp_smoke", "gemm_benchmark"])]
+    #[arg(long, conflicts_with_all = ["gemm_smoke", "mlp_smoke", "gemm_benchmark", "siglip_mlp_benchmark"])]
     batched_gemm_smoke: bool,
     /// Execute and numerically verify GEMM-GeLU-GEMM-GeLU.
-    #[arg(long, conflicts_with_all = ["gemm_smoke", "batched_gemm_smoke", "gemm_benchmark"])]
+    #[arg(long, conflicts_with_all = ["gemm_smoke", "batched_gemm_smoke", "gemm_benchmark", "siglip_mlp_benchmark"])]
     mlp_smoke: bool,
     /// Measure a compute-dense blocked F16 GEMM using device cycle counters.
-    #[arg(long, conflicts_with_all = ["gemm_smoke", "batched_gemm_smoke", "mlp_smoke"])]
+    #[arg(long, conflicts_with_all = ["gemm_smoke", "batched_gemm_smoke", "mlp_smoke", "siglip_mlp_benchmark"])]
     gemm_benchmark: bool,
+    /// Benchmark batched Dense-GeLU-Dense with broadcast weights and no biases.
+    #[arg(long, conflicts_with_all = ["gemm_smoke", "batched_gemm_smoke", "mlp_smoke", "gemm_benchmark"])]
+    siglip_mlp_benchmark: bool,
+    #[arg(long, default_value_t = 4)]
+    mlp_batch: u32,
+    #[arg(long, default_value_t = 256)]
+    mlp_tokens: u32,
+    #[arg(long, default_value_t = 1024)]
+    mlp_dim: u32,
+    /// Defaults to four times --mlp-dim.
+    #[arg(long)]
+    mlp_hidden_dim: Option<u32>,
     #[arg(long, default_value_t = 256)]
     benchmark_rows_per_tile: u32,
     /// Global row count. Overrides --benchmark-rows-per-tile and allows the
@@ -65,6 +77,15 @@ fn main() -> Result<()> {
             u32::from(active_tiles)
                 .checked_mul(arguments.benchmark_rows_per_tile)
                 .context("benchmark row count overflow")
+        },
+        Ok,
+    )?;
+    let mlp_hidden_dim = arguments.mlp_hidden_dim.map_or_else(
+        || {
+            arguments
+                .mlp_dim
+                .checked_mul(4)
+                .context("MLP dimension overflow")
         },
         Ok,
     )?;
@@ -118,6 +139,28 @@ fn main() -> Result<()> {
             .with_input(left, left_format)
             .with_input(right0, right_format.clone())
             .with_input(right1, right_format);
+    } else if arguments.siglip_mlp_benchmark {
+        validate_mlp_benchmark_shape(
+            arguments.mlp_batch,
+            arguments.mlp_tokens,
+            arguments.mlp_dim,
+            mlp_hidden_dim,
+        )?;
+        let left = graph.host_input(
+            "left",
+            [arguments.mlp_batch, arguments.mlp_tokens, arguments.mlp_dim],
+        )?;
+        let right0 = graph.parameter("right.0", [1, arguments.mlp_dim, mlp_hidden_dim])?;
+        let right1 = graph.parameter("right.1", [1, mlp_hidden_dim, arguments.mlp_dim])?;
+        let hidden = graph.gemm(left, right0)?;
+        let hidden = graph.gelu(hidden)?;
+        let output = graph.gemm(hidden, right1)?;
+        graph.set_outputs([output])?;
+        pipeline.profiling.enabled = true;
+        pipeline = pipeline
+            .with_automatic_input(left, Precision::F16)
+            .with_automatic_input(right0, Precision::F16)
+            .with_automatic_input(right1, Precision::F16);
     } else if arguments.gemm_benchmark {
         validate_benchmark_shape(
             benchmark_rows,
@@ -163,6 +206,7 @@ fn main() -> Result<()> {
     if arguments.gemm_smoke
         || arguments.batched_gemm_smoke
         || arguments.mlp_smoke
+        || arguments.siglip_mlp_benchmark
         || arguments.gemm_benchmark
     {
         runtime.load(
@@ -183,6 +227,18 @@ fn main() -> Result<()> {
                 &runtime,
                 &application,
                 active_tiles,
+                arguments.timeout_seconds,
+            )?;
+        } else if arguments.siglip_mlp_benchmark {
+            run_siglip_mlp_benchmark(
+                &runtime,
+                &application,
+                active_tiles,
+                arguments.mlp_batch,
+                arguments.mlp_tokens,
+                arguments.mlp_dim,
+                mlp_hidden_dim,
+                arguments.clock_hz,
                 arguments.timeout_seconds,
             )?;
         } else {
@@ -358,8 +414,97 @@ fn run_gemm_benchmark(
     diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
     let output = session.collect(&executed)?;
     let maximum_absolute_error = verify_benchmark_output(application, &output, inner)?;
-    let starts = binding_u32_values(application, &output, "profile.start-cycle")?;
-    let ends = binding_u32_values(application, &output, "profile.end-cycle")?;
+    let (cycles, minimum_cycles) = benchmark_cycles(application, &output, active_tiles)?;
+    let rows = u64::from(rows);
+    let flops = 2.0 * rows as f64 * f64::from(inner) * f64::from(columns);
+    let seconds = f64::from(cycles) / clock_hz as f64;
+    let tflops = flops / seconds / 1.0e12;
+    let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
+    println!(
+        "benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} tiles={active_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} tflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
+        left_bytes.len(),
+        right_bytes.len(),
+        seconds * 1.0e6,
+        tflops / peak_tflops * 100.0,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_siglip_mlp_benchmark(
+    runtime: &Runtime,
+    application: &Application,
+    active_tiles: u16,
+    batch: u32,
+    tokens: u32,
+    dimension: u32,
+    hidden_dimension: u32,
+    clock_hz: u64,
+    timeout_seconds: u64,
+) -> Result<()> {
+    validate_mlp_benchmark_shape(batch, tokens, dimension, hidden_dimension)?;
+    if clock_hz == 0 {
+        bail!("benchmark clock must be nonzero");
+    }
+    let left = application
+        .inputs
+        .iter()
+        .find(|binding| binding.name == "left")
+        .context("MLP benchmark package has no left binding")?;
+    let right0 = application
+        .weights
+        .iter()
+        .find(|binding| binding.name == "right.0")
+        .context("MLP benchmark package has no first weight binding")?;
+    let right1 = application
+        .weights
+        .iter()
+        .find(|binding| binding.name == "right.1")
+        .context("MLP benchmark package has no second weight binding")?;
+    let left_bytes = filled_f16_binding(left, 0x3c00)?;
+    let right0_bytes = filled_f16_binding(right0, 0x2000)?;
+    let right1_bytes = filled_f16_binding(right1, 0x2000)?;
+    let mut weights = Vec::with_capacity(right0_bytes.len() + right1_bytes.len());
+    weights.extend_from_slice(&right0_bytes);
+    weights.extend_from_slice(&right1_bytes);
+
+    let mut session = runtime.host_session(application)?;
+    session.start()?;
+    let initialized = session.invoke_streaming_deferred("initialize", &weights)?;
+    session.collect(&initialized)?;
+    let executed = session.invoke_streaming_deferred("run", &left_bytes)?;
+    runtime
+        .device()
+        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+    diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
+    let output = session.collect(&executed)?;
+
+    let first_dense = dimension as f32 / 128.0;
+    let expected = gelu_reference(first_dense) * hidden_dimension as f32 / 128.0;
+    let maximum_absolute_error = verify_constant_output(application, &output, expected)?;
+    let (cycles, minimum_cycles) = benchmark_cycles(application, &output, active_tiles)?;
+    let rows = u64::from(batch) * u64::from(tokens);
+    let flops = 4.0 * rows as f64 * f64::from(dimension) * f64::from(hidden_dimension);
+    let seconds = f64::from(cycles) / clock_hz as f64;
+    let tflops = flops / seconds / 1.0e12;
+    let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
+    println!(
+        "benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} rows={rows} dimension={dimension} hiddenDimension={hidden_dimension} biases=false tiles={active_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} effectiveGemmTflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
+        left_bytes.len(),
+        weights.len(),
+        seconds * 1.0e6,
+        tflops / peak_tflops * 100.0,
+    );
+    Ok(())
+}
+
+fn benchmark_cycles(
+    application: &Application,
+    output: &[u8],
+    active_tiles: u16,
+) -> Result<(u32, u32)> {
+    let starts = binding_u32_values(application, output, "profile.start-cycle")?;
+    let ends = binding_u32_values(application, output, "profile.end-cycle")?;
     if starts.len() != usize::from(active_tiles) || ends.len() != starts.len() {
         bail!(
             "benchmark profile bindings have {} start and {} end samples for {active_tiles} tiles",
@@ -372,24 +517,11 @@ fn run_gemm_benchmark(
         .zip(ends)
         .map(|(start, end)| end.wrapping_sub(start))
         .collect::<Vec<_>>();
-    let cycles = durations.iter().copied().max().unwrap_or(0);
-    if cycles == 0 {
+    let maximum = durations.iter().copied().max().unwrap_or(0);
+    if maximum == 0 {
         bail!("benchmark cycle interval is zero");
     }
-    let rows = u64::from(rows);
-    let flops = 2.0 * rows as f64 * f64::from(inner) * f64::from(columns);
-    let seconds = f64::from(cycles) / clock_hz as f64;
-    let tflops = flops / seconds / 1.0e12;
-    let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
-    let minimum_cycles = durations.iter().copied().min().unwrap_or(cycles);
-    println!(
-        "benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} tiles={active_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} tflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
-        left_bytes.len(),
-        right_bytes.len(),
-        seconds * 1.0e6,
-        tflops / peak_tflops * 100.0,
-    );
-    Ok(())
+    Ok((maximum, durations.iter().copied().min().unwrap_or(maximum)))
 }
 
 fn validate_benchmark_shape(rows: u32, inner: u32, columns: u32) -> Result<()> {
@@ -400,6 +532,26 @@ fn validate_benchmark_shape(rows: u32, inner: u32, columns: u32) -> Result<()> {
         || !columns.is_multiple_of(64)
     {
         bail!("benchmark rows must be nonzero and inner/columns must be nonzero multiples of 64");
+    }
+    Ok(())
+}
+
+fn validate_mlp_benchmark_shape(
+    batch: u32,
+    tokens: u32,
+    dimension: u32,
+    hidden_dimension: u32,
+) -> Result<()> {
+    if batch == 0
+        || tokens == 0
+        || dimension == 0
+        || hidden_dimension == 0
+        || !dimension.is_multiple_of(64)
+        || !hidden_dimension.is_multiple_of(64)
+    {
+        bail!(
+            "MLP batch/tokens must be nonzero and feature dimensions must be nonzero multiples of 64"
+        );
     }
     Ok(())
 }
@@ -427,6 +579,30 @@ fn verify_benchmark_output(application: &Application, bytes: &[u8], inner: u32) 
     if maximum > expected.abs() * 0.002 + 0.01 {
         bail!(
             "benchmark numerical output differs from {expected}: maximum absolute error {maximum}"
+        );
+    }
+    Ok(maximum)
+}
+
+fn verify_constant_output(application: &Application, bytes: &[u8], expected: f32) -> Result<f32> {
+    let (binding, base) = output_binding(application, "output.0")?;
+    let size = binding_size(binding);
+    if size == 0 || !size.is_multiple_of(2) {
+        bail!("MLP benchmark output is not a nonempty F16 binding");
+    }
+    let start = usize::try_from(base)?;
+    let end = usize::try_from(base.checked_add(size).context("MLP output overflow")?)?;
+    let output = bytes
+        .get(start..end)
+        .context("MLP benchmark output exceeds host output")?;
+    let mut maximum = 0.0f32;
+    for raw in output.chunks_exact(2) {
+        let actual = half_to_f32(u16::from_le_bytes(raw.try_into().unwrap()));
+        maximum = maximum.max((actual - expected).abs());
+    }
+    if maximum > expected.abs() * 0.02 + 0.05 {
+        bail!(
+            "MLP benchmark numerical output differs from {expected}: maximum absolute error {maximum}"
         );
     }
     Ok(maximum)
@@ -744,6 +920,21 @@ mod tests {
             assert!(validate_benchmark_shape(rows, inner, columns).is_ok());
             assert!(validate_benchmark_shape(rows, inner + 1, columns).is_err());
             assert!(validate_benchmark_shape(rows, inner, columns + 1).is_err());
+        }
+    }
+
+    #[test]
+    fn randomized_mlp_benchmark_shapes_require_blocked_feature_dimensions() {
+        let mut random = fastrand::Rng::with_seed(0x6d6c_705f_7368_6170);
+        for _ in 0..512 {
+            let batch = random.u32(1..=8);
+            let tokens = random.u32(1..=512);
+            let dimension = random.u32(1..=32) * 64;
+            let hidden = random.u32(1..=128) * 64;
+            assert!(validate_mlp_benchmark_shape(batch, tokens, dimension, hidden).is_ok());
+            assert!(validate_mlp_benchmark_shape(0, tokens, dimension, hidden).is_err());
+            assert!(validate_mlp_benchmark_shape(batch, tokens, dimension + 1, hidden).is_err());
+            assert!(validate_mlp_benchmark_shape(batch, tokens, dimension, hidden + 1).is_err());
         }
     }
 }
