@@ -1873,6 +1873,52 @@ mod tests {
     }
 
     #[test]
+    fn randomized_resident_k64_weights_lower_without_panel_copies() {
+        let mut random = fastrand::Rng::with_seed(0x7265_7369);
+        for _ in 0..48 {
+            let tiles = 1_u16 << random.u32(0..=3);
+            let rows = u32::from(tiles) * random.u32(1..=4);
+            let inner = 64 * random.u32(2..=4);
+            let columns = 64 * random.u32(1..=4);
+            let mut graph = ComputeGraph::new();
+            let left = graph.host_input("left", [rows, inner]).unwrap();
+            let right = graph.parameter("right", [inner, columns]).unwrap();
+            let output = graph.gemm(left, right).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let config = PipelineConfig::new(tiles)
+                .with_automatic_input(left, Precision::F16)
+                .with_automatic_input(right, Precision::F16);
+            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let operation = mid
+                .operations
+                .iter()
+                .find(|operation| matches!(operation.kind, MidOperationKind::Operator(_)))
+                .unwrap();
+            let right_type = &mid.values[operation.inputs[1].index() as usize].tensor_type;
+            assert!(matches!(
+                right_type.format.layout.order,
+                crate::ElementOrder::Amp(crate::AmpOrder::RightK64)
+            ));
+            let low = lower_to_tiles(&mid, &config).unwrap();
+            assert!(low.tiles.iter().all(|tile| tile.work.iter().all(|work| {
+                !matches!(work, TileWork::LocalCopy(_)) && !matches!(work, TileWork::Exchange(_))
+            })));
+            assert!(low.tiles.iter().flat_map(|tile| &tile.work).any(|work| {
+                matches!(
+                    work,
+                    TileWork::Kernel(KernelRun {
+                        kernel: TileKernel::Planned(TileKernelSpec::Gemm {
+                            weights: crate::GemmWeightLoad::Interleaved,
+                            ..
+                        }),
+                        ..
+                    })
+                )
+            }));
+        }
+    }
+
+    #[test]
     fn randomized_streamed_weight_grids_share_one_phase_per_inner_block() {
         let mut random = fastrand::Rng::with_seed(0x7374_726d_6765_6d6d);
         for case in 0..32 {

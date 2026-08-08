@@ -112,6 +112,9 @@ pub enum OperatorDispatch {
 pub enum AmpOrder {
     Left,
     Right,
+    /// Right operand ordered by 64-row K block before output-column blocks so
+    /// one blocked GEMM invocation consumes a single contiguous span.
+    RightK64,
     Output,
 }
 
@@ -425,6 +428,29 @@ impl Layout {
                 ],
             },
             memory_class: MemoryClass::Ipu21Standard,
+        }
+    }
+
+    /// Resident AMP right operand with complete 64x64 kernel panels contiguous
+    /// in interleaved SRAM. This removes both the panel gather and the slower
+    /// standard-memory weight-load path when graph-wide memory permits it.
+    pub fn amp_right_k64_interleaved_grid(
+        tile_count: u16,
+        row_partitions: u16,
+        column_partitions: u16,
+    ) -> Self {
+        Self {
+            order: ElementOrder::Amp(AmpOrder::RightK64),
+            tiling: TensorTiling {
+                tile_count,
+                replicas: row_partitions,
+                axes: vec![
+                    AxisTiling::new(TensorAxis::FromEnd(2), 1, 64, Padding::Zero),
+                    AxisTiling::new(TensorAxis::FromEnd(1), column_partitions, 64, Padding::Zero)
+                        .with_tile_stride(1),
+                ],
+            },
+            memory_class: MemoryClass::Ipu21Interleaved,
         }
     }
 
@@ -884,6 +910,7 @@ fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
             let rows = tile_count / columns;
             [
                 amp_grid_gemm_operator_candidate(Precision::F16, 64, 16, tile_count, rows, columns),
+                amp_resident_interleaved_gemm_operator_candidate(tile_count, rows, columns),
                 amp_grid_gemm_operator_candidate(Precision::F32, 64, 32, tile_count, rows, columns),
                 amp_streamed_gemm_operator_candidate(
                     Precision::F16,
@@ -1120,6 +1147,57 @@ fn amp_streamed_gemm_operator_candidate(
     ]))
 }
 
+fn amp_resident_interleaved_gemm_operator_candidate(
+    tile_count: u16,
+    row_partitions: u16,
+    column_partitions: u16,
+) -> OperatorCandidate {
+    OperatorCandidate::new(
+        MidOperator::Gemm {
+            options: GemmOptions::default(),
+            multiply: Precision::F16,
+            accumulate: AccumulationPrecision::F32,
+        },
+        [
+            OperandRequirement::new(
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::amp_left_grid(
+                        64,
+                        tile_count,
+                        row_partitions,
+                        column_partitions,
+                    ),
+                },
+                32,
+            )
+            .with_access_tail(16),
+            OperandRequirement::new(
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::amp_right_k64_interleaved_grid(
+                        tile_count,
+                        row_partitions,
+                        column_partitions,
+                    ),
+                },
+                32,
+            ),
+        ],
+        OperandRequirement::new(
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::amp_output_grid(tile_count, row_partitions, column_partitions),
+            },
+            32,
+        ),
+    )
+    .with_memory_relation(MemoryRelation::DistinctElements(vec![
+        MemoryOperand::Output,
+        MemoryOperand::Input(0),
+    ]))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MidValueId(u32);
 
@@ -1239,7 +1317,7 @@ impl OperatorPlan {
                     || !matches!(left.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
                     || !matches!(
                         right.format.layout.order,
-                        ElementOrder::Amp(AmpOrder::Right)
+                        ElementOrder::Amp(AmpOrder::Right | AmpOrder::RightK64)
                     )
                     || !matches!(
                         output.format.layout.order,

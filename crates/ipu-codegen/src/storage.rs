@@ -48,6 +48,9 @@ pub fn shard_storage_bytes(shard: &LowShard) -> StorageResult<u32> {
 /// no special case in exchange or placement code.
 pub fn view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageResult<Vec<ByteSpan>> {
     validate_view(shard, view)?;
+    if let Some(span) = right_k64_panel_span(shard, view)? {
+        return Ok(vec![span]);
+    }
     let widths = shard
         .extents
         .iter()
@@ -90,6 +93,44 @@ pub fn view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageResult<Vec<
         }
     }
     Ok(spans)
+}
+
+fn right_k64_panel_span(shard: &LowShard, view: &ShardView) -> StorageResult<Option<ByteSpan>> {
+    if shard.extents.len() != 2
+        || shard.tensor_type.format.layout.order != ElementOrder::Amp(AmpOrder::RightK64)
+    {
+        return Ok(None);
+    }
+    let rows = shard.extents[0].physical_end - shard.extents[0].start;
+    let columns = shard.extents[1].physical_end - shard.extents[1].start;
+    let inner_start = view.extents[0].start - shard.extents[0].start;
+    let column_start = view.extents[1].start - shard.extents[1].start;
+    let inner_width = view.extents[0].physical_end - view.extents[0].start;
+    let column_width = view.extents[1].physical_end - view.extents[1].start;
+    if rows.is_multiple_of(64)
+        && columns.is_multiple_of(64)
+        && inner_width == 64
+        && column_width == 64
+        && inner_start.is_multiple_of(64)
+        && column_start.is_multiple_of(64)
+    {
+        let panel = inner_start
+            .checked_div(64)
+            .and_then(|inner| inner.checked_mul(columns / 64))
+            .and_then(|panel| panel.checked_add(column_start / 64))
+            .ok_or(StorageError::Overflow)?;
+        let bytes = 64u32
+            .checked_mul(64)
+            .and_then(|elements| {
+                elements.checked_mul(shard.tensor_type.format.precision.bytes() as u32)
+            })
+            .ok_or(StorageError::Overflow)?;
+        return Ok(Some(ByteSpan {
+            offset: panel.checked_mul(bytes).ok_or(StorageError::Overflow)?,
+            bytes,
+        }));
+    }
+    Ok(None)
 }
 
 fn validate_view(shard: &LowShard, view: &ShardView) -> StorageResult<()> {
@@ -195,6 +236,33 @@ pub fn amp_matrix_coordinates(
                 column_group * COLUMN_MICRO + logical_pair * 2 + load_channel % 2,
             ))
         }
+        AmpOrder::RightK64 => {
+            const INNER_BLOCK: u32 = 64;
+            let inner = amp_micro_dimension(precision);
+            if !rows.is_multiple_of(INNER_BLOCK)
+                || !columns.is_multiple_of(COLUMN_MICRO)
+                || !INNER_BLOCK.is_multiple_of(inner)
+            {
+                return Err(StorageError::AmpBlock { role });
+            }
+            let panel_elements = inner * COLUMN_MICRO;
+            let panel = linear / panel_elements;
+            let offset = linear % panel_elements;
+            let inner_groups_per_block = INNER_BLOCK / inner;
+            let column_groups = columns / COLUMN_MICRO;
+            let panels_per_inner_block = column_groups * inner_groups_per_block;
+            let inner_block = panel / panels_per_inner_block;
+            let within_block = panel % panels_per_inner_block;
+            let column_group = within_block / inner_groups_per_block;
+            let inner_group = within_block % inner_groups_per_block;
+            let load_channel = offset / inner;
+            let load_pair = load_channel / 2;
+            let logical_pair = (load_pair % 2) * 4 + load_pair / 2;
+            Ok((
+                inner_block * INNER_BLOCK + inner_group * inner + offset % inner,
+                column_group * COLUMN_MICRO + logical_pair * 2 + load_channel % 2,
+            ))
+        }
         AmpOrder::Output => {
             if !columns.is_multiple_of(COLUMN_MICRO) {
                 return Err(StorageError::AmpBlock { role });
@@ -259,6 +327,7 @@ mod tests {
             for (layout, physical_rows, columns) in [
                 (Layout::amp_left(64, 1), rows, 64),
                 (Layout::amp_right(64, 1), 32, 64),
+                (Layout::amp_right_k64_interleaved_grid(1, 1, 1), 64, 64),
                 (Layout::amp_output(1), rows, 64),
             ] {
                 let shard = shard(layout, &[batches, physical_rows, columns]);
@@ -291,6 +360,47 @@ mod tests {
                     selected
                 );
             }
+        }
+    }
+
+    #[test]
+    fn randomized_k64_right_panels_are_single_contiguous_spans() {
+        let mut random = fastrand::Rng::with_seed(0x6b36_3472);
+        for _ in 0..128 {
+            let inner_blocks = random.u32(1..=8);
+            let column_blocks = random.u32(1..=4);
+            let rows = inner_blocks * 64;
+            let columns = column_blocks * 64;
+            let shard = shard(
+                Layout::amp_right_k64_interleaved_grid(1, 1, 1),
+                &[rows, columns],
+            );
+            let inner = random.u32(0..inner_blocks) * 64;
+            let column = random.u32(0..column_blocks) * 64;
+            let view = ShardView {
+                shard: shard.id,
+                extents: vec![
+                    ShardExtent {
+                        axis: 0,
+                        start: inner,
+                        logical_end: inner + 64,
+                        physical_end: inner + 64,
+                    },
+                    ShardExtent {
+                        axis: 1,
+                        start: column,
+                        logical_end: column + 64,
+                        physical_end: column + 64,
+                    },
+                ],
+            };
+            assert_eq!(view_byte_spans(&shard, &view).unwrap().len(), 1);
+            let span = view_byte_spans(&shard, &view).unwrap()[0];
+            assert_eq!(span.bytes, 64 * 64 * 2);
+            assert_eq!(
+                span.offset,
+                ((inner / 64) * column_blocks + column / 64) * span.bytes
+            );
         }
     }
 }
