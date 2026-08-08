@@ -57,7 +57,8 @@ pub struct ShardView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShardDefinition {
     Value(MidValueId),
-    ExchangeCopy(LowShardId),
+    /// Reusable receive storage populated by one or more exchange phases.
+    ExchangeStaging,
     LocalCopy(LowShardId),
     /// Persistent scratch allocation populated by local copies or exchanges.
     Staging,
@@ -87,8 +88,9 @@ pub struct LowValue {
     pub shards: Vec<LowShardId>,
 }
 
-/// One source shard may be sent to several destinations by a later exchange
-/// implementation. Each destination is a distinct resident-copy shard.
+/// One source view may be sent into reusable receive staging on several tiles.
+/// Sequential phases can name the same destination because the consumer runs
+/// before the next phase overwrites it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalExchange {
     pub source: ShardView,
@@ -369,7 +371,7 @@ impl LoweringState {
                         == crate::MemoryClass::Ipu21Interleaved
                     && !matches!(
                         shard.definition,
-                        ShardDefinition::Alias(_) | ShardDefinition::ExchangeCopy(_)
+                        ShardDefinition::Alias(_) | ShardDefinition::ExchangeStaging
                     )
             })
             .try_fold(0u32, |total, shard| {
@@ -605,7 +607,7 @@ impl LoweringState {
                         tile,
                         tensor_type: self.shards[source.index() as usize].tensor_type.clone(),
                         extents: extents.clone(),
-                        definition: ShardDefinition::ExchangeCopy(source),
+                        definition: ShardDefinition::ExchangeStaging,
                     })?;
                     let bytes = shard_storage_bytes(&self.shards[copy.index() as usize])?;
                     (self.full_view(copy), Some((source_view, copy, bytes)))
@@ -816,7 +818,7 @@ impl LoweringState {
                                 .tensor_type
                                 .clone(),
                             extents: source_view.extents.clone(),
-                            definition: ShardDefinition::ExchangeCopy(source_view.shard),
+                            definition: ShardDefinition::ExchangeStaging,
                         })?;
                         transfers[index].entry(source_view).or_default().push(copy);
                         self.full_view(copy)
@@ -954,6 +956,7 @@ impl LoweringState {
         }
 
         let mut local_right_staging = BTreeMap::<(u16, u32), LowShardId>::new();
+        let mut remote_right_staging = BTreeMap::<u16, LowShardId>::new();
         for column_start in (0..column_extent).step_by(output_column_block as usize) {
             let column_end = column_start + output_column_block;
             let column_outputs = output_shards
@@ -1049,13 +1052,21 @@ impl LoweringState {
                             self.full_view(copy)
                         }
                     } else {
-                        let copy = self.push_shard(LowShard {
-                            id: LowShardId(0),
-                            tile,
-                            tensor_type: self.shards[right.index() as usize].tensor_type.clone(),
-                            extents: right_view.extents.clone(),
-                            definition: ShardDefinition::ExchangeCopy(right),
-                        })?;
+                        let copy = if let Some(copy) = remote_right_staging.get(&tile).copied() {
+                            copy
+                        } else {
+                            let copy = self.push_shard(LowShard {
+                                id: LowShardId(0),
+                                tile,
+                                tensor_type: self.shards[right.index() as usize]
+                                    .tensor_type
+                                    .clone(),
+                                extents: right_view.extents.clone(),
+                                definition: ShardDefinition::ExchangeStaging,
+                            })?;
+                            remote_right_staging.insert(tile, copy);
+                            copy
+                        };
                         transfers.entry(right_view.clone()).or_default().push(copy);
                         self.full_view(copy)
                     };
@@ -1247,7 +1258,7 @@ impl LoweringState {
                                         .tensor_type
                                         .clone(),
                                     extents: right_view.extents.clone(),
-                                    definition: ShardDefinition::ExchangeCopy(right),
+                                    definition: ShardDefinition::ExchangeStaging,
                                 })?;
                                 receive_staging.insert((tile, column_start), copy);
                                 copy
@@ -1897,7 +1908,7 @@ mod tests {
                 for transfer in &phase.transfers {
                     assert!(transfer.destinations.iter().all(|destination| matches!(
                         low.shards[destination.index() as usize].definition,
-                        ShardDefinition::ExchangeCopy(source) if source == transfer.source.shard
+                        ShardDefinition::ExchangeStaging
                     )));
                 }
             }
@@ -1973,6 +1984,33 @@ mod tests {
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
 
+            let gemm_destinations = low
+                .exchange_phases
+                .iter()
+                .filter(|phase| phase.provenance.reason == WorkReason::OperatorInput { input: 1 })
+                .flat_map(|phase| &phase.transfers)
+                .flat_map(|transfer| &transfer.destinations)
+                .copied()
+                .collect::<Vec<_>>();
+            let unique_gemm_staging = gemm_destinations
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(
+                unique_gemm_staging.len() <= usize::from(tiles),
+                "case {case}"
+            );
+            let gemm_phases = low
+                .exchange_phases
+                .iter()
+                .filter(|phase| phase.provenance.reason == WorkReason::OperatorInput { input: 1 })
+                .count();
+            if gemm_phases > 1 && !unique_gemm_staging.is_empty() {
+                assert!(
+                    gemm_destinations.len() > unique_gemm_staging.len(),
+                    "case {case}"
+                );
+            }
             assert!(low.exchange_phases.iter().all(|phase| {
                 phase.provenance.operation.is_some() && phase.provenance.value.is_some()
             }));

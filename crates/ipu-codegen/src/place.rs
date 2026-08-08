@@ -191,7 +191,7 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
         for transfer in &phase.transfers {
             for &destination in &transfer.destinations {
                 let shard = &program.shards[destination.index() as usize];
-                if !matches!(shard.definition, ShardDefinition::ExchangeCopy(_)) {
+                if !matches!(shard.definition, ShardDefinition::ExchangeStaging) {
                     if !addresses.contains_key(&destination) {
                         return Err(PlacementError::InvalidAlias(destination.index()));
                     }
@@ -244,7 +244,7 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
         if !lifetime.seen
             && !matches!(
                 program.shards[index].definition,
-                ShardDefinition::ExchangeCopy(_)
+                ShardDefinition::ExchangeStaging
             )
         {
             // Unreferenced canonical values remain conservatively resident.
@@ -570,7 +570,7 @@ fn allocate_tile_class(
         let representative = &program.shards[root_members[0]];
         if representative.tile != tile
             || representative.tensor_type.format.layout.memory_class != class
-            || matches!(representative.definition, ShardDefinition::ExchangeCopy(_))
+            || matches!(representative.definition, ShardDefinition::ExchangeStaging)
             || grouped.contains(&root)
         {
             continue;
@@ -785,7 +785,7 @@ mod tests {
             for shard in &low.shards {
                 let address = placement.shard_addresses[&shard.id];
                 match shard.definition {
-                    ShardDefinition::ExchangeCopy(_) => assert!(
+                    ShardDefinition::ExchangeStaging => assert!(
                         (EXCHANGE_WINDOW_BASE..EXCHANGE_WINDOW_BASE + EXCHANGE_WINDOW_BYTES)
                             .contains(&address)
                     ),
