@@ -6,6 +6,8 @@ use ipu_exchange::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+mod cost;
+mod estimate;
 pub mod exchange;
 pub mod graph;
 mod host;
