@@ -490,8 +490,8 @@ impl DisjointSets {
 mod tests {
     use super::*;
     use crate::{
-        ComputeGraph, KernelBuildPlan, Layout, PipelineConfig, Precision, TensorFormat,
-        ToyCostModel, lower, lower_to_tiles, materialize_kernel_run,
+        ComputeGraph, Ipu21CostModel, KernelBuildPlan, Layout, PipelineConfig, Precision,
+        TensorFormat, lower, lower_to_tiles, materialize_kernel_run,
     };
 
     #[test]
@@ -521,7 +521,7 @@ mod tests {
                         layout: Layout::amp_right(64, tiles),
                     },
                 );
-            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
             let placement = place(&low).unwrap();
             let kernels = KernelBuildPlan::from_program(&low).unwrap();

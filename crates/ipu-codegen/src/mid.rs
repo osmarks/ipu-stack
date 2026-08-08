@@ -1236,7 +1236,7 @@ pub struct MidOperation {
     pub kind: MidOperationKind,
     pub operator_plan: Option<OperatorPlan>,
     pub conversion_plan: Option<ConversionPlan>,
-    pub estimated_cost: u64,
+    pub estimated_cycles: u64,
     pub memory: MemoryEstimate,
 }
 
@@ -1447,7 +1447,7 @@ pub struct MidRegion {
     pub arguments: Vec<MidValueId>,
     pub operations: Vec<MidOperation>,
     pub yields: Vec<MidValueId>,
-    pub estimated_cost: u64,
+    pub estimated_cycles: u64,
     pub peak_memory: MemoryUsage,
 }
 
@@ -1475,22 +1475,21 @@ pub struct MidGraph {
     pub values: Vec<MidValue>,
     pub operations: Vec<MidOperation>,
     pub outputs: Vec<MidValueId>,
-    pub estimated_cost: u64,
+    pub estimated_cycles: u64,
     pub peak_memory: MemoryUsage,
 }
 
-/// Deliberately small and replaceable cost interface. Units are arbitrary but
-/// must be comparable within one lowering run.
+/// Replaceable cycle-estimation interface used by operator planning.
 pub trait CostModel {
-    fn operator_cost(
+    fn operator_cycles(
         &self,
         operator: MidOperator,
         dispatch: &OperatorDispatch,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64;
-    fn cast_cost(&self, input: &TensorType, to: Precision) -> u64;
-    fn rearrange_cost(
+    fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
+    fn rearrange_cycles(
         &self,
         shape: &TensorShape,
         precision: Precision,
@@ -1505,10 +1504,27 @@ pub trait CostModel {
 /// Constants remain deliberately explicit so hardware measurements can refine
 /// them without changing the planning interface.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ToyCostModel;
+pub struct Ipu21CostModel;
 
-impl CostModel for ToyCostModel {
-    fn operator_cost(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ipu21TargetCosts {
+    pub exchange_bytes_per_cycle: u64,
+    pub standard_load_bytes_per_cycle: u64,
+    pub interleaved_load_bytes_per_cycle: u64,
+    pub local_copy_bytes_per_cycle: u64,
+    pub gemm_call_overhead_cycles: u64,
+}
+
+pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
+    exchange_bytes_per_cycle: 8,
+    standard_load_bytes_per_cycle: 8,
+    interleaved_load_bytes_per_cycle: 16,
+    local_copy_bytes_per_cycle: 8,
+    gemm_call_overhead_cycles: 48,
+};
+
+impl CostModel for Ipu21CostModel {
+    fn operator_cycles(
         &self,
         operator: MidOperator,
         dispatch: &OperatorDispatch,
@@ -1552,15 +1568,15 @@ impl CostModel for ToyCostModel {
                 });
                 let weight_feed = right_bytes_consumed.div_ceil(
                     if resident_interleaved_weights || staged_weights {
-                        IPU21_INTERLEAVED_LOAD_BYTES_PER_CYCLE
+                        IPU21_TARGET_COSTS.interleaved_load_bytes_per_cycle
                     } else {
-                        IPU21_STANDARD_LOAD_BYTES_PER_CYCLE
+                        IPU21_TARGET_COSTS.standard_load_bytes_per_cycle
                     },
                 );
                 let packing = if staged_weights {
                     right_bytes_consumed
                         .saturating_mul(2)
-                        .div_ceil(IPU21_LOCAL_COPY_BYTES_PER_CYCLE)
+                        .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
                 } else {
                     0
                 };
@@ -1575,7 +1591,7 @@ impl CostModel for ToyCostModel {
                         .div_ceil(u64::from(*inner_block))
                         .saturating_mul(output_columns_per_tile)
                         .div_ceil(u64::from(*output_column_block))
-                        .saturating_mul(IPU21_GEMM_CALL_OVERHEAD_CYCLES),
+                        .saturating_mul(IPU21_TARGET_COSTS.gemm_call_overhead_cycles),
                     OperatorDispatch::Pointwise { .. } => 0,
                 };
                 let memory = operator_memory_estimate(dispatch, inputs, output);
@@ -1597,17 +1613,17 @@ impl CostModel for ToyCostModel {
         }
     }
 
-    fn cast_cost(&self, input: &TensorType, to: Precision) -> u64 {
+    fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
         let input_bytes = maximum_shard_bytes(input);
         let output_bytes = input_bytes
             .div_ceil(input.format.precision.bytes())
             .saturating_mul(to.bytes());
         input_bytes
             .saturating_add(output_bytes)
-            .div_ceil(IPU21_LOCAL_COPY_BYTES_PER_CYCLE)
+            .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
     }
 
-    fn rearrange_cost(
+    fn rearrange_cycles(
         &self,
         shape: &TensorShape,
         precision: Precision,
@@ -1619,21 +1635,15 @@ impl CostModel for ToyCostModel {
         let local_bytes = maximum_shard_bytes(&input)
             .max(maximum_shard_bytes(&output))
             .saturating_mul(2);
-        let local_cycles = local_bytes.div_ceil(IPU21_LOCAL_COPY_BYTES_PER_CYCLE);
+        let local_cycles = local_bytes.div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle);
         let exchange_cycles = if from.tiling == to.tiling {
             0
         } else {
-            maximum_shard_bytes(&output).div_ceil(IPU21_EXCHANGE_BYTES_PER_CYCLE)
+            maximum_shard_bytes(&output).div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
         };
         local_cycles.saturating_add(exchange_cycles)
     }
 }
-
-const IPU21_EXCHANGE_BYTES_PER_CYCLE: u64 = 8;
-const IPU21_STANDARD_LOAD_BYTES_PER_CYCLE: u64 = 8;
-const IPU21_INTERLEAVED_LOAD_BYTES_PER_CYCLE: u64 = 16;
-const IPU21_LOCAL_COPY_BYTES_PER_CYCLE: u64 = 8;
-const IPU21_GEMM_CALL_OVERHEAD_CYCLES: u64 = 48;
 
 fn physical_elements(shape: &TensorShape, layout: &Layout) -> u64 {
     layout
@@ -1753,7 +1763,7 @@ fn gemm_requires_staging(
 
 fn gemm_exchange_bytes_per_cycle(inputs: &[TensorType]) -> u64 {
     let Some(right) = inputs.get(1) else {
-        return IPU21_EXCHANGE_BYTES_PER_CYCLE;
+        return IPU21_TARGET_COSTS.exchange_bytes_per_cycle;
     };
     let inner_sharded = right
         .format
@@ -1774,9 +1784,9 @@ fn gemm_exchange_bytes_per_cycle(inputs: &[TensorType]) -> u64 {
     // column partition, a streamed K panel is a full broadcast to consecutive
     // tiles and both receivers can consume it in the same cycle.
     if inner_sharded && column_partitions == 1 {
-        IPU21_EXCHANGE_BYTES_PER_CYCLE * 2
+        IPU21_TARGET_COSTS.exchange_bytes_per_cycle * 2
     } else {
-        IPU21_EXCHANGE_BYTES_PER_CYCLE
+        IPU21_TARGET_COSTS.exchange_bytes_per_cycle
     }
 }
 
@@ -1989,16 +1999,16 @@ pub fn lower(
         .iter()
         .map(|value| lookup(&values, *value))
         .collect::<LoweringResult<Vec<_>>>()?;
-    let estimated_cost = operations
+    let estimated_cycles = operations
         .iter()
-        .map(|operation| operation.estimated_cost)
+        .map(|operation| operation.estimated_cycles)
         .sum();
     let initial = inputs.iter().map(|input| input.value).collect::<Vec<_>>();
     let peak_memory = region_peak_memory(&initial, &operations, &outputs, &state.values);
     tracing::info!(
         values = state.values.len(),
         operations = operations.len(),
-        estimated_cost,
+        estimated_cycles,
         "selected operator plans"
     );
     Ok(MidGraph {
@@ -2006,7 +2016,7 @@ pub fn lower(
         values: state.values,
         operations,
         outputs,
-        estimated_cost,
+        estimated_cycles,
         peak_memory,
     })
 }
@@ -2112,12 +2122,12 @@ fn lower_operations(
                     .map(|((from, id), to)| {
                         if state.automatic_inputs.contains(id) {
                             if from.format.precision != to.format.precision {
-                                costs.cast_cost(from, to.format.precision)
+                                costs.cast_cycles(from, to.format.precision)
                             } else {
                                 0
                             }
                         } else {
-                            conversion_cost(from, &to.format, costs)
+                            conversion_cycles(from, &to.format, costs)
                         }
                     })
                     .sum::<u64>();
@@ -2134,7 +2144,12 @@ fn lower_operations(
                     })
                     .collect::<Vec<_>>();
                 let cost = conversion
-                    + costs.operator_cost(plan.operator, &plan.dispatch, &planned_inputs, &output);
+                    + costs.operator_cycles(
+                        plan.operator,
+                        &plan.dispatch,
+                        &planned_inputs,
+                        &output,
+                    );
                 ((cost, order), plan)
             })
             .min_by_key(|(cost, _)| *cost)
@@ -2170,7 +2185,7 @@ fn lower_operations(
             .iter()
             .map(|value| state.get(*value).tensor_type.clone())
             .collect::<Vec<_>>();
-        let operator_cost = costs.operator_cost(
+        let operator_cycles = costs.operator_cycles(
             plan.operator,
             &plan.dispatch,
             &converted_types,
@@ -2192,7 +2207,7 @@ fn lower_operations(
                 requirements: plan.requirements,
             }),
             conversion_plan: None,
-            estimated_cost: operator_cost,
+            estimated_cycles: operator_cycles,
             memory,
         });
         values.insert(operation.results[0], result);
@@ -2346,7 +2361,7 @@ fn lower_repeat(
     }
     let body_cost = body_operations
         .iter()
-        .map(|operation| operation.estimated_cost)
+        .map(|operation| operation.estimated_cycles)
         .sum();
     let body_peak = region_peak_memory(&arguments, &body_operations, &yields, &state.values);
     let mut results = Vec::new();
@@ -2368,13 +2383,13 @@ fn lower_repeat(
                 arguments,
                 operations: body_operations,
                 yields,
-                estimated_cost: body_cost,
+                estimated_cycles: body_cost,
                 peak_memory: body_peak,
             },
         }),
         operator_plan: None,
         conversion_plan: None,
-        estimated_cost: body_cost.saturating_mul(u64::from(repeat.count)),
+        estimated_cycles: body_cost.saturating_mul(u64::from(repeat.count)),
         memory: MemoryEstimate {
             live: body_peak,
             temporary: MemoryUsage::default(),
@@ -2422,7 +2437,7 @@ fn ensure_format(
                 output: OperandRequirement::new(tensor_type.format.clone(), 8),
                 dispatch: ConversionDispatch::Local,
             }),
-            estimated_cost: costs.cast_cost(&original.tensor_type, target.precision),
+            estimated_cycles: costs.cast_cycles(&original.tensor_type, target.precision),
             memory,
         });
         value = result;
@@ -2452,7 +2467,7 @@ fn ensure_format(
                 output: OperandRequirement::new(tensor_type.format.clone(), 8),
                 dispatch: ConversionDispatch::Intersections,
             }),
-            estimated_cost: costs.rearrange_cost(
+            estimated_cycles: costs.rearrange_cycles(
                 &tensor_type.shape,
                 tensor_type.format.precision,
                 &from,
@@ -2465,14 +2480,14 @@ fn ensure_format(
     value
 }
 
-fn conversion_cost(from: &TensorType, to: &TensorFormat, costs: &impl CostModel) -> u64 {
+fn conversion_cycles(from: &TensorType, to: &TensorFormat, costs: &impl CostModel) -> u64 {
     let cast = if from.format.precision != to.precision {
-        costs.cast_cost(from, to.precision)
+        costs.cast_cycles(from, to.precision)
     } else {
         0
     };
     let rearrange = if from.format.layout != to.layout {
-        costs.rearrange_cost(&from.shape, to.precision, &from.format.layout, &to.layout)
+        costs.rearrange_cycles(&from.shape, to.precision, &from.format.layout, &to.layout)
     } else {
         0
     };
@@ -2574,10 +2589,14 @@ mod tests {
                 accumulate: AccumulationPrecision::F32,
             };
             let dispatch = default_dispatch(operator);
-            let standard_cost =
-                ToyCostModel.operator_cost(operator, &dispatch, &[left.clone(), standard], &output);
+            let standard_cost = Ipu21CostModel.operator_cycles(
+                operator,
+                &dispatch,
+                &[left.clone(), standard],
+                &output,
+            );
             let direct_cost =
-                ToyCostModel.operator_cost(operator, &dispatch, &[left, direct], &output);
+                Ipu21CostModel.operator_cycles(operator, &dispatch, &[left, direct], &output);
             assert!(direct_cost < standard_cost);
         }
     }
@@ -2629,7 +2648,7 @@ mod tests {
     struct ColumnParityCost;
 
     impl CostModel for ColumnParityCost {
-        fn operator_cost(
+        fn operator_cycles(
             &self,
             operator: MidOperator,
             _dispatch: &OperatorDispatch,
@@ -2648,11 +2667,11 @@ mod tests {
             }
         }
 
-        fn cast_cost(&self, _input: &TensorType, _to: Precision) -> u64 {
+        fn cast_cycles(&self, _input: &TensorType, _to: Precision) -> u64 {
             0
         }
 
-        fn rearrange_cost(
+        fn rearrange_cycles(
             &self,
             _shape: &TensorShape,
             _precision: Precision,
@@ -2774,7 +2793,7 @@ mod tests {
                 .with_input(right, format(precision(&mut random), linear));
             config.operator_candidates = vec![candidate.clone()];
 
-            let lowered = lower(&graph, &config, &ToyCostModel).unwrap();
+            let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let operator = lowered
                 .operations
                 .iter()
@@ -2975,7 +2994,7 @@ mod tests {
                 ),
             ];
 
-            let lowered = lower(&graph, &config, &ToyCostModel).unwrap();
+            let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let operators = lowered
                 .operations
                 .iter()
@@ -3056,7 +3075,7 @@ mod tests {
                     .insert(weight, format(precision(&mut random), layout.clone()));
             }
 
-            let lowered = lower(&graph, &config, &ToyCostModel).unwrap();
+            let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let repeat = lowered
                 .operations
                 .iter()

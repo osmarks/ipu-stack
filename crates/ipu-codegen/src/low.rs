@@ -1555,8 +1555,8 @@ fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<Vec<ShardExt
 mod tests {
     use super::*;
     use crate::{
-        AxisTiling, ComputeGraph, ElementOrder, Layout, MemoryClass, Padding, PipelineConfig,
-        Precision, TensorAxis, TensorFormat, TensorTiling, ToyCostModel, lower,
+        AxisTiling, ComputeGraph, ElementOrder, Ipu21CostModel, Layout, MemoryClass, Padding,
+        PipelineConfig, Precision, TensorAxis, TensorFormat, TensorTiling, lower,
     };
 
     const CASES: usize = 32;
@@ -1648,7 +1648,7 @@ mod tests {
             let config = PipelineConfig::new(tiles)
                 .with_input(left, format(tiles))
                 .with_input(right, format(tiles));
-            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
 
             assert_eq!(low.tiles.len(), usize::from(tiles), "case {case}");
@@ -1698,7 +1698,7 @@ mod tests {
             let config = PipelineConfig::new(tiles)
                 .with_input(bias, format(tiles))
                 .with_input(tensor, format(tiles));
-            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
 
             assert!(
@@ -1749,7 +1749,7 @@ mod tests {
             let config = PipelineConfig::new(tiles)
                 .with_input(left, format(tiles))
                 .with_input(right, format(tiles));
-            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
 
             assert!(low.exchange_phases.iter().all(|phase| {
@@ -1849,7 +1849,7 @@ mod tests {
             let config = PipelineConfig::new(tiles)
                 .with_automatic_input(left, Precision::F16)
                 .with_automatic_input(right, Precision::F16);
-            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
 
             assert!(low.exchange_phases.is_empty(), "case {case}");
@@ -1888,7 +1888,7 @@ mod tests {
             let config = PipelineConfig::new(tiles)
                 .with_automatic_input(left, Precision::F16)
                 .with_automatic_input(right, Precision::F16);
-            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let operation = mid
                 .operations
                 .iter()
@@ -1961,7 +1961,7 @@ mod tests {
                 ],
                 crate::OperandRequirement::new(output_format, 32),
             )];
-            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
 
             assert_eq!(
@@ -2008,7 +2008,7 @@ mod tests {
             for parameter in parameters {
                 config.inputs.insert(parameter, format(tiles));
             }
-            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
 
             for tile in &low.tiles {
@@ -2079,7 +2079,7 @@ mod tests {
             for weight in weights {
                 config.inputs.insert(weight, format(tiles));
             }
-            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             assert_eq!(
                 lower_to_tiles(&mid, &config),
                 Err(LowLoweringError::RepeatRequiresInPlace(0)),

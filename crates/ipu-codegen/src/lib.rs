@@ -45,13 +45,13 @@ pub use memory::{
 };
 pub use mid::{
     AccumulationPrecision, AmpOrder, AxisTiling, ConversionDispatch, ConversionPlan, CostModel,
-    ElementOrder, GemmKernelMode, GemmWeightLoad, HardwareTarget, Layout, LayoutError,
-    LoweringError, LoweringResult, MemoryClass, MemoryEstimate, MemoryOperand, MemoryRelation,
-    MemoryUsage, MidGraph, MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion,
-    MidRepeat, MidValue, MidValueId, OperandRequirement, OperatorCandidate, OperatorDispatch,
-    OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, PipelineConfig,
-    Precision, ProfilingConfig, SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling,
-    TensorType, TileKernelSpec, ToyCostModel, lower,
+    ElementOrder, GemmKernelMode, GemmWeightLoad, HardwareTarget, IPU21_TARGET_COSTS,
+    Ipu21CostModel, Ipu21TargetCosts, Layout, LayoutError, LoweringError, LoweringResult,
+    MemoryClass, MemoryEstimate, MemoryOperand, MemoryRelation, MemoryUsage, MidGraph, MidInput,
+    MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId,
+    OperandRequirement, OperatorCandidate, OperatorDispatch, OperatorPlan, OperatorPlanError,
+    OperatorRequirements, OutputAliasing, Padding, PipelineConfig, Precision, ProfilingConfig,
+    SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
 pub use place::{Placement, PlacementError, place};

@@ -5,7 +5,7 @@ use crate::memory::{
     PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE, RUNTIME_STATE_BYTES,
     WORKER_STACK_HEADROOM,
 };
-use crate::mid::{PipelineConfig, ToyCostModel};
+use crate::mid::{Ipu21CostModel, PipelineConfig};
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, KernelBuildPlan, PRNG_SEED_SYMBOL,
     PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL, WORKER_BARRIER_SYMBOL,
@@ -83,7 +83,7 @@ pub fn build_package(
     config: &PackageConfig,
 ) -> PackageBuildResult<Application> {
     validate_tile_count(u32::from(config.pipeline.tile_count))?;
-    let mid = lower(graph, &config.pipeline, &ToyCostModel)?;
+    let mid = lower(graph, &config.pipeline, &Ipu21CostModel)?;
     let low = lower_to_tiles(&mid, &config.pipeline)?;
     tracing::info!(
         logical_shards = low.shards.len(),

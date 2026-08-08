@@ -621,9 +621,9 @@ fn scalar_arguments(input_count: u8, names: &[&'static str]) -> Vec<ScalarArgume
 mod tests {
     use super::*;
     use crate::{
-        AccumulationPrecision, ComputeGraph, Layout, MemoryClass, OperandRequirement,
-        OperatorRequirements, OutputAliasing, PipelineConfig, TensorFormat, TensorTiling,
-        ToyCostModel, lower, lower_to_tiles,
+        AccumulationPrecision, ComputeGraph, Ipu21CostModel, Layout, MemoryClass,
+        OperandRequirement, OperatorRequirements, OutputAliasing, PipelineConfig, TensorFormat,
+        TensorTiling, lower, lower_to_tiles,
     };
 
     #[test]
@@ -705,7 +705,7 @@ mod tests {
                         layout: Layout::amp_right(64, tiles),
                     },
                 );
-            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
             let plan = KernelBuildPlan::from_program(&low).unwrap();
             let addresses = low

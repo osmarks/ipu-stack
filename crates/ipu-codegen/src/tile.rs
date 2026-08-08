@@ -296,7 +296,7 @@ fn align_up(value: u32, alignment: u32) -> Result<u32, TileLoweringError> {
 mod tests {
     use super::*;
     use crate::{
-        ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat, ToyCostModel, lower,
+        ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, Precision, TensorFormat, lower,
         lower_exchanges, lower_to_tiles, place,
     };
     use ipu_exchange::{RETURN_M10_INSTRUCTION, Topology};
@@ -328,7 +328,7 @@ mod tests {
                         layout: Layout::amp_right(64, tiles),
                     },
                 );
-            let mid = lower(&graph, &config, &ToyCostModel).unwrap();
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
             let placement = place(&low).unwrap();
             let kernels = KernelBuildPlan::from_program(&low).unwrap();
