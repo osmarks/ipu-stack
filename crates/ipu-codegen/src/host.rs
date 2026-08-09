@@ -59,10 +59,10 @@ pub(crate) fn plan(
     outputs: &[Binding],
     execution_tiles: u16,
     base: u32,
-    data_bases: &[u32],
+    data_ranges: &[Vec<(u32, u32)>],
 ) -> PackageBuildResult<HostPackagePlan> {
-    if data_bases.len() != usize::from(execution_tiles) {
-        return Err(invalid("host plan has no data base for every tile"));
+    if data_ranges.len() != usize::from(execution_tiles) {
+        return Err(invalid("host plan has no data ranges for every tile"));
     }
     if weights.is_empty() && inputs.is_empty() && outputs.is_empty() {
         return Ok(HostPackagePlan {
@@ -131,7 +131,7 @@ pub(crate) fn plan(
             physical_tile,
             &phases,
             base,
-            data_bases[usize::from(physical_tile)],
+            &data_ranges[usize::from(physical_tile)],
         )?;
         maximum_end = maximum_end.max(planned.end);
         let weight_end = weight_phases.len();
@@ -313,11 +313,11 @@ fn plan_tile(
     physical_tile: u16,
     phases: &[Phase],
     base: u32,
-    data_base: u32,
+    data_ranges: &[(u32, u32)],
 ) -> PackageBuildResult<PlannedTile> {
     let follower = align_up(base, 8)?;
     let mut cursor = follower + 12;
-    let mut data_cursor = align_up(data_base, 4)?;
+    let mut data_arena = DataArena::new(data_ranges);
     let mut segments = vec![segment(
         follower,
         words(&inactive_instructions()),
@@ -343,10 +343,9 @@ fn plan_tile(
         let packet_source = if let Some(&source) = packet_cache.get(&packet_words) {
             source
         } else {
-            let source = data_cursor;
-            let data = words(&packet_words);
-            data_cursor += u32::try_from(data.len())?;
-            segments.push(segment(source, data, SEGMENT_READ));
+            let packet_data = words(&packet_words);
+            let source = data_arena.allocate(u32::try_from(packet_data.len())?, 4)?;
+            segments.push(segment(source, packet_data, SEGMENT_READ));
             packet_cache.insert(packet_words.clone(), source);
             source
         };
@@ -360,10 +359,9 @@ fn plan_tile(
             words: u32::try_from(packet_words.len())?,
         };
         let descriptors = descriptor_words(physical_tile, phase, packet)?;
-        let table = data_cursor;
-        let data = words(&descriptors);
-        data_cursor += u32::try_from(data.len())?;
-        segments.push(segment(table, data, SEGMENT_READ));
+        let descriptor_data = words(&descriptors);
+        let table = data_arena.allocate(u32::try_from(descriptor_data.len())?, 4)?;
+        segments.push(segment(table, descriptor_data, SEGMENT_READ));
         calls.push(HostPhase {
             address,
             active: true,
@@ -375,6 +373,44 @@ fn plan_tile(
         segments,
         end: cursor,
     })
+}
+
+struct DataArena {
+    ranges: Vec<(u32, u32)>,
+}
+
+impl DataArena {
+    fn new(ranges: &[(u32, u32)]) -> Self {
+        Self {
+            ranges: ranges.to_vec(),
+        }
+    }
+
+    fn allocate(&mut self, bytes: u32, alignment: u32) -> PackageBuildResult<u32> {
+        let candidate = self
+            .ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &(base, limit))| {
+                let start = align_up(base, alignment).ok()?;
+                let end = start.checked_add(bytes)?;
+                (end <= limit).then_some((limit - end, index, start, end))
+            })
+            .min_by_key(|candidate| (candidate.0, candidate.2))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "insufficient tile SRAM for {bytes} host-data bytes"
+                ))
+            })?;
+        let (_, index, start, end) = candidate;
+        let (_, limit) = self.ranges[index];
+        if end == limit {
+            self.ranges.remove(index);
+        } else {
+            self.ranges[index].0 = end;
+        }
+        Ok(start)
+    }
 }
 
 fn phase_instructions(

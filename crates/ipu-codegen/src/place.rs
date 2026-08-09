@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placement {
     pub shard_addresses: BTreeMap<LowShardId, u32>,
-    pub tile_data_end: Vec<u32>,
+    pub tile_auxiliary_ranges: Vec<Vec<(u32, u32)>>,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -136,8 +136,7 @@ pub(crate) fn place_with_standard_ranges(
     }
 
     let mut addresses = BTreeMap::new();
-    let standard_start = standard_ranges[0].0;
-    let mut tile_data_end = vec![standard_start; usize::from(program.tile_count)];
+    let mut tile_auxiliary_ranges = vec![Vec::new(); usize::from(program.tile_count)];
     for tile in 0..program.tile_count {
         let mut grouped = BTreeSet::<usize>::new();
         for group in iterated.iter().filter(|group| group.tile == tile) {
@@ -196,13 +195,12 @@ pub(crate) fn place_with_standard_ranges(
             &mut standard,
             &mut addresses,
         )?;
-        tile_data_end[usize::from(tile)] =
-            standard.maximum_cursor().max(interleaved.maximum_cursor());
+        tile_auxiliary_ranges[usize::from(tile)] = standard.unused_ranges();
     }
 
     Ok(Placement {
         shard_addresses: addresses,
-        tile_data_end,
+        tile_auxiliary_ranges,
     })
 }
 
@@ -620,16 +618,20 @@ struct IteratedGroup {
 }
 
 struct Arena {
+    ranges: Vec<(u32, u32)>,
     free: Vec<(u32, u32)>,
     active: Vec<(u32, u32, u32)>,
+    occupied: Vec<(u32, u32)>,
     maximum: u32,
 }
 
 impl Arena {
     fn new(ranges: &[(u32, u32)]) -> Self {
         Self {
+            ranges: ranges.to_vec(),
             free: ranges.to_vec(),
             active: Vec::new(),
+            occupied: Vec::new(),
             maximum: ranges[0].0,
         }
     }
@@ -666,6 +668,7 @@ impl Arena {
             }
             self.free.sort_unstable();
             self.active.push((last, start, bytes));
+            self.occupied.push((start, end));
             self.maximum = self.maximum.max(end);
             return Some(start);
         }
@@ -687,6 +690,38 @@ impl Arena {
 
     fn maximum_cursor(&self) -> u32 {
         self.maximum
+    }
+
+    fn unused_ranges(&self) -> Vec<(u32, u32)> {
+        let mut occupied = self.occupied.clone();
+        occupied.sort_unstable();
+        let mut merged = Vec::<(u32, u32)>::new();
+        for range in occupied {
+            match merged.last_mut() {
+                Some(previous) if range.0 <= previous.1 => previous.1 = previous.1.max(range.1),
+                _ => merged.push(range),
+            }
+        }
+        let mut unused = Vec::new();
+        for &(base, limit) in &self.ranges {
+            let mut cursor = base;
+            for &(occupied_base, occupied_limit) in &merged {
+                if occupied_limit <= cursor || occupied_base >= limit {
+                    continue;
+                }
+                if cursor < occupied_base {
+                    unused.push((cursor, occupied_base.min(limit)));
+                }
+                cursor = cursor.max(occupied_limit);
+                if cursor >= limit {
+                    break;
+                }
+            }
+            if cursor < limit {
+                unused.push((cursor, limit));
+            }
+        }
+        unused
     }
 }
 

@@ -270,11 +270,16 @@ fn build_package_from_objects(
         4,
         "host programs",
     )?;
-    let mut provisional_tile_data_ends =
-        vec![crate::IPU21_DATA_BASE; usize::from(execution_tile_count)];
+    let mut provisional_auxiliary_ranges = vec![
+        vec![(
+            crate::IPU21_DATA_BASE,
+            TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        )];
+        usize::from(execution_tile_count)
+    ];
     for logical in 0..program.tile_count {
-        provisional_tile_data_ends[usize::from(topology.physical(logical)?)] =
-            provisional_placement.tile_data_end[usize::from(logical)];
+        provisional_auxiliary_ranges[usize::from(topology.physical(logical)?)] =
+            provisional_placement.tile_auxiliary_ranges[usize::from(logical)].clone();
     }
     let provisional_host = host::plan(
         &provisional_weights,
@@ -282,7 +287,7 @@ fn build_package_from_objects(
         &provisional_outputs,
         execution_tile_count,
         sizing_host_base,
-        &provisional_tile_data_ends,
+        &provisional_auxiliary_ranges,
     )?;
     let host_code_bytes = provisional_host
         .end
@@ -309,7 +314,7 @@ fn build_package_from_objects(
         &provisional_outputs,
         execution_tile_count,
         host_code_base,
-        &provisional_tile_data_ends,
+        &provisional_auxiliary_ranges,
     )?;
     let symbols = layout
         .symbols
@@ -434,10 +439,11 @@ fn build_package_from_objects(
             &topology,
         ));
     }
-    let auxiliary_data_base = standard_ranges
-        .first()
-        .map(|range| range.0)
-        .ok_or_else(|| invalid("no standard tile memory remains for host auxiliaries"))?;
+    let mut inactive_auxiliary_ranges = standard_ranges.clone();
+    inactive_auxiliary_ranges.push((
+        ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+        TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+    ));
     let host = host::plan(
         &weights,
         &inputs,
@@ -445,12 +451,13 @@ fn build_package_from_objects(
         execution_tile_count,
         host_code_base,
         &{
-            let mut ends = vec![auxiliary_data_base; usize::from(execution_tile_count)];
+            let mut ranges =
+                vec![inactive_auxiliary_ranges.clone(); usize::from(execution_tile_count)];
             for logical in 0..program.tile_count {
-                ends[usize::from(topology.physical(logical)?)] =
-                    placement.tile_data_end[usize::from(logical)];
+                ranges[usize::from(topology.physical(logical)?)] =
+                    placement.tile_auxiliary_ranges[usize::from(logical)].clone();
             }
-            ends
+            ranges
         },
     )?;
     if host.end.checked_sub(host_code_base) != Some(host_code_bytes) {

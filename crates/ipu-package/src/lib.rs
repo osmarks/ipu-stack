@@ -358,8 +358,12 @@ impl Application {
                     || segment.data.len() > segment.memory_size as usize
                 {
                     return Err(PackageError::Invalid(format!(
-                        "invalid segment on tile {}",
-                        tile.physical_tile
+                        "invalid segment on tile {}: address=0x{:x} end=0x{:x} memory_size={} data_size={}",
+                        tile.physical_tile,
+                        segment.address,
+                        end,
+                        segment.memory_size,
+                        segment.data.len(),
                     )));
                 }
             }
