@@ -10,7 +10,7 @@ use ipu_exchange::{
     offset_plan, patch_receiver_address, patch_sender_address, plan_event_cycles,
 };
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalExchangePhase {
@@ -242,7 +242,7 @@ pub fn lower_exchanges(
                     return Err(ExchangeLoweringError::SizeMismatch);
                 }
             }
-            let conflict_slots = conflict_slots(&pending, program.tile_count);
+            let conflict_slots = schedule_slots(&pending, program.tile_count);
             if let Some(diagnostics) = &mut diagnostics {
                 diagnostics.conflict_slots = conflict_slots.len();
             }
@@ -510,11 +510,10 @@ impl PendingTransfer {
     }
 }
 
-/// Colors multicast hyperedges into conflict-free slots without constructing
-/// their quadratic conflict graph. Per-tile bit sets and first-free cursors
-/// make finding the earliest common slot depend on endpoint pressure rather
-/// than the number of pairwise conflicts.
-fn conflict_slots(transfers: &[PendingTransfer], tile_count: u16) -> Vec<Vec<usize>> {
+/// Places multicast hyperedges into endpoint-disjoint scheduling layers.
+/// Independent ready transfers are pressure-prioritized, while overlapping
+/// tile-memory accesses impose program-order precedence between layers.
+fn schedule_slots(transfers: &[PendingTransfer], tile_count: u16) -> Vec<Vec<usize>> {
     let mut pressure = vec![0usize; usize::from(tile_count)];
     for transfer in transfers {
         for tile in transfer.tiles() {
@@ -522,32 +521,65 @@ fn conflict_slots(transfers: &[PendingTransfer], tile_count: u16) -> Vec<Vec<usi
         }
     }
 
-    let mut priority = (0..transfers.len()).collect::<Vec<_>>();
-    priority.sort_unstable_by_key(|&index| {
+    let priority = |index: usize| {
         let transfer = &transfers[index];
         let endpoint_pressure = transfer
             .tiles()
             .map(|tile| pressure[usize::from(tile)])
             .sum::<usize>();
         (
-            Reverse(endpoint_pressure),
-            Reverse(transfer.destinations.len()),
-            Reverse(transfer.words),
-            transfer.source,
-            index,
+            endpoint_pressure,
+            transfer.destinations.len(),
+            transfer.words,
+            Reverse(transfer.source),
+            Reverse(index),
         )
-    });
+    };
+
+    let dependencies = memory_dependencies(transfers, tile_count);
+    let mut dependents = vec![Vec::new(); transfers.len()];
+    let mut prerequisites = vec![Vec::new(); transfers.len()];
+    let mut indegrees = vec![0usize; transfers.len()];
+    for (before, after) in dependencies {
+        dependents[before].push(after);
+        prerequisites[after].push(before);
+        indegrees[after] += 1;
+    }
+    let mut ready = BinaryHeap::new();
+    for (index, &indegree) in indegrees.iter().enumerate() {
+        if indegree == 0 {
+            ready.push((priority(index), index));
+        }
+    }
+    let mut ordered = Vec::with_capacity(transfers.len());
+    while let Some((_, index)) = ready.pop() {
+        ordered.push(index);
+        for &dependent in &dependents[index] {
+            indegrees[dependent] -= 1;
+            if indegrees[dependent] == 0 {
+                ready.push((priority(dependent), dependent));
+            }
+        }
+    }
+    debug_assert_eq!(ordered.len(), transfers.len());
 
     let mut slots = Vec::<Vec<usize>>::new();
     let mut used_slots = vec![Vec::<u64>::new(); usize::from(tile_count)];
     let mut first_free = vec![0usize; usize::from(tile_count)];
-    for index in priority {
+    let mut assigned_slots = vec![usize::MAX; transfers.len()];
+    for index in ordered {
         let transfer = &transfers[index];
-        let mut slot = transfer
+        let endpoint_slot = transfer
             .tiles()
             .map(|tile| first_free[usize::from(tile)])
             .max()
             .unwrap_or(0);
+        let dependency_slot = prerequisites[index]
+            .iter()
+            .map(|&before| assigned_slots[before].saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        let mut slot = endpoint_slot.max(dependency_slot);
         while transfer.tiles().any(|tile| {
             let words = &used_slots[usize::from(tile)];
             words
@@ -581,8 +613,62 @@ fn conflict_slots(transfers: &[PendingTransfer], tile_count: u16) -> Vec<Vec<usi
             slots.resize_with(slot + 1, Vec::new);
         }
         slots[slot].push(index);
+        assigned_slots[index] = slot;
     }
     slots
+}
+
+#[derive(Clone, Copy)]
+struct TransferAccess {
+    transfer: usize,
+    start: u32,
+    end: u64,
+    write: bool,
+}
+
+/// Preserves the original order of overlapping accesses while allowing the
+/// scheduler to reorder transfers whose tile-memory effects are independent.
+fn memory_dependencies(transfers: &[PendingTransfer], tile_count: u16) -> BTreeSet<(usize, usize)> {
+    let mut accesses = vec![Vec::new(); usize::from(tile_count)];
+    for (index, transfer) in transfers.iter().enumerate() {
+        let bytes = u64::from(transfer.words) * 4;
+        accesses[usize::from(transfer.source)].push(TransferAccess {
+            transfer: index,
+            start: transfer.source_address,
+            end: u64::from(transfer.source_address) + bytes,
+            write: false,
+        });
+        for &(tile, address) in &transfer.destinations {
+            accesses[usize::from(tile)].push(TransferAccess {
+                transfer: index,
+                start: address,
+                end: u64::from(address) + bytes,
+                write: true,
+            });
+        }
+    }
+
+    let mut dependencies = BTreeSet::new();
+    for tile_accesses in &accesses {
+        for (position, left) in tile_accesses.iter().enumerate() {
+            for right in &tile_accesses[position + 1..] {
+                if left.transfer == right.transfer
+                    || (!left.write && !right.write)
+                    || u64::from(left.start) >= right.end
+                    || u64::from(right.start) >= left.end
+                {
+                    continue;
+                }
+                let (before, after) = if left.transfer < right.transfer {
+                    (left.transfer, right.transfer)
+                } else {
+                    (right.transfer, left.transfer)
+                };
+                dependencies.insert((before, after));
+            }
+        }
+    }
+    dependencies
 }
 
 struct ScheduledTransfer<'a> {
@@ -684,7 +770,7 @@ mod tests {
     };
 
     #[test]
-    fn randomized_conflict_slots_cover_transfers_without_endpoint_overlap() {
+    fn randomized_schedule_slots_preserve_hazards_without_endpoint_overlap() {
         let mut random = fastrand::Rng::with_seed(0x736c_6f74);
         for _ in 0..64 {
             let tile_count = random.u16(2..=32);
@@ -708,18 +794,23 @@ mod tests {
                     }
                 })
                 .collect::<Vec<_>>();
-            let slots = conflict_slots(&transfers, tile_count);
+            let slots = schedule_slots(&transfers, tile_count);
             let mut occurrences = vec![0u8; transfers.len()];
-            for slot in slots {
+            let mut assigned_slots = vec![usize::MAX; transfers.len()];
+            for (slot_index, slot) in slots.into_iter().enumerate() {
                 let mut used_tiles = vec![false; usize::from(tile_count)];
                 for index in slot {
                     occurrences[index] += 1;
+                    assigned_slots[index] = slot_index;
                     for tile in transfers[index].tiles() {
                         assert!(!std::mem::replace(&mut used_tiles[usize::from(tile)], true));
                     }
                 }
             }
             assert!(occurrences.into_iter().all(|count| count == 1));
+            for (before, after) in memory_dependencies(&transfers, tile_count) {
+                assert!(assigned_slots[before] < assigned_slots[after]);
+            }
         }
     }
 
