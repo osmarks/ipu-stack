@@ -25,8 +25,11 @@ struct Arguments {
     #[arg(long, default_value = "/tmp/ipu-trivial.ipuexe")]
     package: PathBuf,
     /// Write per-tile kernel and exchange cycle samples for benchmark runs.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_profile")]
     profile_output: Option<PathBuf>,
+    /// Build benchmark programs without cycle-counter or per-step profiling.
+    #[arg(long)]
+    no_profile: bool,
     #[arg(long, default_value_t = c600_tile_count())]
     tiles: u32,
     #[arg(long)]
@@ -159,7 +162,7 @@ fn main() -> Result<()> {
         let hidden = graph.gelu(hidden)?;
         let output = graph.gemm(hidden, right1)?;
         graph.set_outputs([output])?;
-        pipeline.profiling.enabled = true;
+        pipeline.profiling.enabled = !arguments.no_profile;
         pipeline = pipeline
             .with_automatic_input(left, Precision::F16)
             .with_automatic_input(right0, Precision::F16)
@@ -177,7 +180,7 @@ fn main() -> Result<()> {
         )?;
         let output = graph.gemm(left, right)?;
         graph.set_outputs([output])?;
-        pipeline.profiling.enabled = true;
+        pipeline.profiling.enabled = !arguments.no_profile;
         pipeline = pipeline
             .with_automatic_input(left, Precision::F16)
             .with_automatic_input(right, Precision::F16);
@@ -243,6 +246,7 @@ fn main() -> Result<()> {
                 arguments.clock_hz,
                 arguments.timeout_seconds,
                 arguments.profile_output.as_deref(),
+                !arguments.no_profile,
             )?;
         } else {
             run_gemm_benchmark(
@@ -255,6 +259,7 @@ fn main() -> Result<()> {
                 arguments.clock_hz,
                 arguments.timeout_seconds,
                 arguments.profile_output.as_deref(),
+                !arguments.no_profile,
             )?;
         }
     } else {
@@ -432,6 +437,7 @@ fn run_gemm_benchmark(
     clock_hz: u64,
     timeout_seconds: u64,
     profile_output: Option<&Path>,
+    profiling_enabled: bool,
 ) -> Result<()> {
     validate_benchmark_shape(rows, inner, columns)?;
     if clock_hz == 0 {
@@ -457,6 +463,12 @@ fn run_gemm_benchmark(
         timeout_seconds,
     )?;
     let maximum_absolute_error = verify_benchmark_output(application, &output, inner)?;
+    if !profiling_enabled {
+        println!(
+            "benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
+        );
+        return Ok(());
+    }
     let (cycles, minimum_cycles) = benchmark_cycles(application, &output, execution_tiles)?;
     write_profile(application, &output, clock_hz, profile_output)?;
     let active_tiles = binding_tile_count(application, "output.0")?;
@@ -487,6 +499,7 @@ fn run_siglip_mlp_benchmark(
     clock_hz: u64,
     timeout_seconds: u64,
     profile_output: Option<&Path>,
+    profiling_enabled: bool,
 ) -> Result<()> {
     validate_mlp_benchmark_shape(batch, tokens, dimension, hidden_dimension)?;
     if clock_hz == 0 {
@@ -520,6 +533,12 @@ fn run_siglip_mlp_benchmark(
     let first_dense = dimension as f32 / 128.0;
     let expected = gelu_reference(first_dense) * hidden_dimension as f32 / 128.0;
     let maximum_absolute_error = verify_constant_output(application, &output, expected)?;
+    if !profiling_enabled {
+        println!(
+            "benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} dimension={dimension} hiddenDimension={hidden_dimension} biases=false profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
+        );
+        return Ok(());
+    }
     let (cycles, minimum_cycles) = benchmark_cycles(application, &output, execution_tiles)?;
     write_profile(application, &output, clock_hz, profile_output)?;
     let active_tiles = binding_tile_count(application, "output.0")?;
