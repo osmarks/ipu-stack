@@ -54,6 +54,14 @@ enum Command {
     ProfileInspect {
         profile: PathBuf,
     },
+    ProfileExtract {
+        package: PathBuf,
+        device_output: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 1_500_000_000)]
+        clock_hz: u64,
+    },
     ProfileRender {
         profile: PathBuf,
         #[arg(short, long)]
@@ -217,6 +225,24 @@ fn main() -> Result<()> {
                 exchange.estimated_send_work_cycles,
                 exchange.estimated_receive_work_cycles,
                 exchange.estimated_idle_work_cycles,
+            );
+        }
+        Command::ProfileExtract {
+            package,
+            device_output,
+            output,
+            clock_hz,
+        } => {
+            let application = Application::read(fs::File::open(&package)?)?;
+            let device_output = fs::read(&device_output)?;
+            let report = application.profile_report(&device_output, clock_hz)?;
+            report.write(fs::File::create(&output)?)?;
+            println!(
+                "package={} deviceOutputBytes={} tiles={} profile={}",
+                package.display(),
+                device_output.len(),
+                report.tiles.len(),
+                output.display(),
             );
         }
         Command::ProfileRender { profile, output } => {
