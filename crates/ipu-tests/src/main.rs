@@ -24,6 +24,9 @@ struct Arguments {
     device: String,
     #[arg(long, default_value = "/tmp/ipu-trivial.ipuexe")]
     package: PathBuf,
+    /// Load an existing --package without rebuilding it.
+    #[arg(long)]
+    reuse_package: bool,
     /// Write per-tile kernel and exchange cycle samples for benchmark runs.
     #[arg(long, conflicts_with = "no_profile")]
     profile_output: Option<PathBuf>,
@@ -196,19 +199,21 @@ fn main() -> Result<()> {
             .with_automatic_input(left, Precision::F16)
             .with_automatic_input(right, Precision::F16);
     }
-    let application = build_package(
-        &graph,
-        &PackageConfig {
-            toolchain: Toolchain::from_sdk(&arguments.sdk),
-            kernel_source_directory: runtime_source
-                .parent()
-                .expect("runtime source has no parent directory")
-                .to_owned(),
-            runtime_source,
-            pipeline,
-        },
-    )?;
-    write_package(&application, &arguments.package)?;
+    if !arguments.reuse_package {
+        let application = build_package(
+            &graph,
+            &PackageConfig {
+                toolchain: Toolchain::from_sdk(&arguments.sdk),
+                kernel_source_directory: runtime_source
+                    .parent()
+                    .expect("runtime source has no parent directory")
+                    .to_owned(),
+                runtime_source,
+                pipeline,
+            },
+        )?;
+        write_package(&application, &arguments.package)?;
+    }
     let application = Application::read(
         fs::File::open(&arguments.package)
             .with_context(|| format!("open {}", arguments.package.display()))?,
