@@ -135,6 +135,7 @@ enum ProfileKind {
 }
 
 fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     init_tracing();
     match Arguments::parse().command {
         Command::KernelCompile {

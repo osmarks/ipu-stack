@@ -75,6 +75,7 @@ struct Arguments {
 }
 
 fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     ipu_runtime::init_tracing();
     let arguments = Arguments::parse();
     let active_tiles = u16::try_from(arguments.tiles).context("tile count exceeds u16")?;
