@@ -663,34 +663,74 @@ impl Layout {
             });
         }
         let strides = self.tiling.axis_strides()?;
-        let mut coordinates = BTreeMap::<Vec<u16>, u16>::new();
+        if has_regular_tile_mapping(&self.tiling, &strides) {
+            return Ok(TensorShape(dimensions));
+        }
+        let coordinate_count = self
+            .tiling
+            .axes
+            .iter()
+            .try_fold(1usize, |count, axis| {
+                count.checked_mul(usize::from(axis.partitions))
+            })
+            .ok_or(LayoutError::TileCountOverflow)?;
+        let mut coordinate_copies = vec![0u16; coordinate_count];
         for tile in 0..self.tiling.tile_count {
             let coordinate = self
                 .tiling
                 .axes
                 .iter()
                 .zip(&strides)
-                .map(|(axis, stride)| {
-                    ((u32::from(tile) / stride) % u32::from(axis.partitions)) as u16
+                .try_fold(0usize, |coordinate, (axis, stride)| {
+                    coordinate
+                        .checked_mul(usize::from(axis.partitions))
+                        .and_then(|coordinate| {
+                            coordinate.checked_add(
+                                ((u32::from(tile) / stride) % u32::from(axis.partitions)) as usize,
+                            )
+                        })
                 })
-                .collect::<Vec<_>>();
-            *coordinates.entry(coordinate).or_default() += 1;
+                .ok_or(LayoutError::TileCountOverflow)?;
+            coordinate_copies[coordinate] = coordinate_copies[coordinate]
+                .checked_add(1)
+                .ok_or(LayoutError::TileCountOverflow)?;
         }
-        if coordinates.len()
-            != self
-                .tiling
-                .axes
-                .iter()
-                .map(|axis| usize::from(axis.partitions))
-                .product::<usize>()
-            || coordinates
-                .values()
-                .any(|copies| *copies != self.tiling.replicas)
+        if coordinate_copies
+            .iter()
+            .any(|copies| *copies != self.tiling.replicas)
         {
             return Err(LayoutError::InvalidTileMapping);
         }
         Ok(TensorShape(dimensions))
     }
+}
+
+fn has_regular_tile_mapping(tiling: &TensorTiling, strides: &[u32]) -> bool {
+    let mut digits = tiling
+        .axes
+        .iter()
+        .zip(strides)
+        .filter(|(axis, _)| axis.partitions > 1)
+        .map(|(axis, &stride)| (stride, u32::from(axis.partitions)))
+        .collect::<Vec<_>>();
+    digits.sort_unstable();
+    let Some(&(base, _)) = digits.first() else {
+        return true;
+    };
+    if base == 0 || !u32::from(tiling.replicas).is_multiple_of(base) {
+        return false;
+    }
+    let mut expected_stride = base;
+    for (stride, partitions) in digits {
+        if stride != expected_stride {
+            return false;
+        }
+        let Some(next) = expected_stride.checked_mul(partitions) else {
+            return false;
+        };
+        expected_stride = next;
+    }
+    true
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
