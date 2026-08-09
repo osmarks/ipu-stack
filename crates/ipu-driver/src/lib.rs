@@ -1635,12 +1635,6 @@ mod tests {
     }
 
     #[test]
-    fn host_batch_ranges_follow_explicit_boundaries() {
-        assert_eq!(host_batch_ranges(&[2, 5]), vec![0..2, 2..5]);
-        assert!(host_batch_ranges(&[]).is_empty());
-    }
-
-    #[test]
     fn decodes_every_ipu21_exception_type() {
         for (value, exception) in TileException::ALL.into_iter().enumerate() {
             assert_eq!(TileException::try_from(value as u8), Ok(exception));

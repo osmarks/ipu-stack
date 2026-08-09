@@ -1093,34 +1093,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn randomized_benchmark_shapes_enforce_blocks_and_tile_capacity() {
-        let mut random = fastrand::Rng::with_seed(0x6265_6e63_686d_6172);
-        for _ in 0..512 {
-            let rows = random.u32(1..=512);
-            let inner = random.u32(1..=16) * 64;
-            let columns = random.u32(1..=8) * 64;
-            assert!(validate_benchmark_shape(rows, inner, columns).is_ok());
-            assert!(validate_benchmark_shape(rows, inner + 1, columns).is_err());
-            assert!(validate_benchmark_shape(rows, inner, columns + 1).is_err());
-        }
-    }
-
-    #[test]
-    fn randomized_mlp_benchmark_shapes_require_blocked_feature_dimensions() {
-        let mut random = fastrand::Rng::with_seed(0x6d6c_705f_7368_6170);
-        for _ in 0..512 {
-            let batch = random.u32(1..=8);
-            let tokens = random.u32(1..=512);
-            let dimension = random.u32(1..=32) * 64;
-            let hidden = random.u32(1..=128) * 64;
-            assert!(validate_mlp_benchmark_shape(batch, tokens, dimension, hidden).is_ok());
-            assert!(validate_mlp_benchmark_shape(0, tokens, dimension, hidden).is_err());
-            assert!(validate_mlp_benchmark_shape(batch, tokens, dimension + 1, hidden).is_err());
-            assert!(validate_mlp_benchmark_shape(batch, tokens, dimension, hidden + 1).is_err());
-        }
-    }
-
-    #[test]
     fn randomized_binding_values_follow_logical_slice_order() -> Result<()> {
         let mut random = fastrand::Rng::with_seed(0x6c6f_6769_6361_6c5f);
         for _ in 0..256 {

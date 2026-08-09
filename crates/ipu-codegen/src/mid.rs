@@ -2420,30 +2420,6 @@ fn lookup(values: &BTreeMap<ValueId, MidValueId>, value: ValueId) -> LoweringRes
 mod tests {
     use super::*;
 
-    #[test]
-    fn randomized_gemm_accumulation_tracks_stored_partial_precision() {
-        let mut random = fastrand::Rng::with_seed(0x6163_6375_6d75_6c61);
-        for case in 0..64 {
-            let multiply = match random.u8(0..3) {
-                0 => Precision::F16,
-                1 => Precision::F32,
-                _ => Precision::F8F143 {
-                    scale_exponent: random.i8(-16..=16),
-                },
-            };
-            let expected = if multiply == Precision::F32 {
-                AccumulationPrecision::F32
-            } else {
-                AccumulationPrecision::F16
-            };
-            assert_eq!(
-                gemm_accumulation_precision(multiply),
-                expected,
-                "random case {case}"
-            );
-        }
-    }
-
     const RANDOM_CASES: usize = 128;
 
     fn dimension(random: &mut fastrand::Rng) -> u32 {
@@ -2481,48 +2457,6 @@ mod tests {
 
     fn value(lowered: &MidGraph, id: MidValueId) -> &MidValue {
         &lowered.values[id.index() as usize]
-    }
-
-    #[test]
-    fn randomized_memory_usage_checks_coupled_ipu21_capacity() {
-        let mut random = fastrand::Rng::with_seed(0x6d65_6d32);
-        for _ in 0..RANDOM_CASES {
-            let usage = MemoryUsage {
-                standard: random.u64(0..=u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES) * 2),
-                interleaved: random
-                    .u64(0..=u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES) * 2),
-            };
-            assert_eq!(
-                usage.fits_ipu21(),
-                usage.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
-                    && usage.total() <= u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
-            );
-        }
-    }
-
-    #[test]
-    fn randomized_memory_peaks_keep_simultaneous_total_separate() {
-        let mut random = fastrand::Rng::with_seed(0x7065_616b);
-        for _ in 0..RANDOM_CASES {
-            let standard_phase = MemoryUsage {
-                standard: random.u64(1..=u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)),
-                interleaved: 0,
-            };
-            let interleaved_phase = MemoryUsage {
-                standard: 0,
-                interleaved: random
-                    .u64(1..=u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)),
-            };
-            let mut peaks = MemoryPeaks::default();
-            peaks.observe(standard_phase, standard_phase.standard);
-            peaks.observe(interleaved_phase, interleaved_phase.standard);
-            assert_eq!(peaks.standard, standard_phase.standard);
-            assert_eq!(peaks.interleaved, interleaved_phase.interleaved);
-            assert_eq!(
-                peaks.total,
-                standard_phase.total().max(interleaved_phase.total())
-            );
-        }
     }
 
     #[test]

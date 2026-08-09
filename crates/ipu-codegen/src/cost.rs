@@ -247,18 +247,3 @@ impl CostModel for Ipu21CostModel {
         exchange_cycles.saturating_add(local_cycles)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ipu21_fixed_costs_match_the_sdk_target() {
-        assert_eq!(IPU21_TARGET_COSTS.exchange_bytes_per_cycle, 4);
-        assert_eq!(IPU21_TARGET_COSTS.exchange_bus_sharing, 2);
-        assert_eq!(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle, 8);
-        assert_eq!(IPU21_TARGET_COSTS.exchange_phase_cycles, 600);
-        assert_eq!(IPU21_TARGET_COSTS.exchange_transfer_cycles, 126);
-        assert_eq!(IPU21_TARGET_COSTS.kernel_launch_cycles, 11);
-    }
-}

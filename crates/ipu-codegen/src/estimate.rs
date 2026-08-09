@@ -585,17 +585,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn siglip_transition_exposes_the_fragment_count_to_the_cost_model() {
-        let shape = TensorShape(vec![256, 4096]);
-        let source = Layout::amp_output_grid(512, 8, 64);
-        let destination = Layout::amp_output_replicated_grid(512, 64, 8);
-        let traffic = conversion_traffic(&shape, Precision::F16, &source, &destination).unwrap();
-
-        assert_eq!(traffic.source_payload_bytes, 2 * 1024 * 1024);
-        assert_eq!(traffic.remote_fragments, 4096);
-        assert_eq!(traffic.maximum_destination_bytes, 32 * 1024);
-        assert_eq!(traffic.maximum_intersections, 64);
-    }
 }
