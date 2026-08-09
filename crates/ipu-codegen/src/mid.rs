@@ -8,10 +8,7 @@
 //! layout rearrangements at format boundaries.
 
 pub use crate::cost::{CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts};
-use crate::estimate::{
-    conversion_exchange_bytes_per_transfer, conversion_memory_estimate, operator_memory_estimate,
-    region_peak_memory,
-};
+use crate::estimate::{conversion_memory_estimate, operator_memory_estimate, region_peak_memory};
 use crate::graph::{
     AddOptions, AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation,
     OperationId, OperationKind, Repeat, TensorShape, ValueId,
@@ -1680,8 +1677,6 @@ pub enum LoweringError {
         total: u64,
         standard_contiguous_overflow: u64,
     },
-    #[error("operation {0:?} has no candidate whose exchange phase fits the 32 KiB receive window")]
-    ExchangeWindow(OperationId),
     #[error(
         "GEMM operation {0:?} has per-batch right operands; only weights broadcast across every batch dimension are currently supported"
     )]
@@ -1852,11 +1847,9 @@ fn lower_operations(
         operations: Vec::new(),
         score: 0,
     }];
-    let mut exchange_cache = BTreeMap::<(TensorType, TensorType), u64>::new();
     for (operation_index, operation) in source.iter().enumerate() {
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
-        let mut rejected_exchange = false;
         let mut saw_candidate = false;
         for branch in beam {
             if let OperationKind::Repeat(repeat) = &operation.kind {
@@ -1879,14 +1872,6 @@ fn lower_operations(
                         .map(|operation| operation.estimated_cycles)
                         .sum(),
                 );
-                if !operations_exchange_window_fit(
-                    &next.operations[before..],
-                    &next.state.values,
-                    &mut exchange_cache,
-                ) {
-                    rejected_exchange = true;
-                    continue;
-                }
                 let peak =
                     beam_memory_peak(&next, &initial, source, operation_index, required_outputs);
                 if peak.fits_ipu21() {
@@ -1968,14 +1953,6 @@ fn lower_operations(
                         .map(|operation| operation.estimated_cycles)
                         .sum(),
                 );
-                if !operations_exchange_window_fit(
-                    &next.operations[before..],
-                    &next.state.values,
-                    &mut exchange_cache,
-                ) {
-                    rejected_exchange = true;
-                    continue;
-                }
                 let peak =
                     beam_memory_peak(&next, &initial, source, operation_index, required_outputs);
                 if peak.fits_ipu21() {
@@ -2007,9 +1984,6 @@ fn lower_operations(
                         total: peak.total,
                         standard_contiguous_overflow: peak.standard_contiguous_overflow,
                     });
-                }
-                if rejected_exchange {
-                    return Err(LoweringError::ExchangeWindow(operation.id));
                 }
             }
             return Err(LoweringError::NoCandidate(operation.id));
@@ -2058,68 +2032,6 @@ fn lower_operations(
     *values = best.values;
     *state = best.state;
     Ok(best.operations)
-}
-
-fn operations_exchange_window_fit(
-    operations: &[MidOperation],
-    values: &[MidValue],
-    cache: &mut BTreeMap<(TensorType, TensorType), u64>,
-) -> bool {
-    operations
-        .iter()
-        .all(|operation| operation_exchange_window_fits(operation, values, cache))
-}
-
-fn operation_exchange_window_fits(
-    operation: &MidOperation,
-    values: &[MidValue],
-    cache: &mut BTreeMap<(TensorType, TensorType), u64>,
-) -> bool {
-    let bytes = match (&operation.conversion_plan, &operation.operator_plan) {
-        (Some(plan), _) if plan.dispatch == ConversionDispatch::Intersections => operation
-            .inputs
-            .first()
-            .zip(operation.results.first())
-            .map_or(u64::MAX, |(input, output)| {
-                let input = &values[input.index() as usize].tensor_type;
-                let output = &values[output.index() as usize].tensor_type;
-                if let Some(bytes) = cache.get(&(input.clone(), output.clone())) {
-                    *bytes
-                } else {
-                    let bytes = conversion_exchange_bytes_per_transfer(input, output);
-                    cache.insert((input.clone(), output.clone()), bytes);
-                    bytes
-                }
-            }),
-        (
-            _,
-            Some(OperatorPlan {
-                dispatch:
-                    OperatorDispatch::BlockedGemm {
-                        inner_block,
-                        output_column_block,
-                        ..
-                    },
-                requirements,
-                ..
-            }),
-        ) => {
-            if operation.results.is_empty() {
-                return false;
-            }
-            let columns = u64::from(*output_column_block);
-            u64::from(*inner_block)
-                .saturating_mul(columns)
-                .saturating_mul(
-                    requirements
-                        .inputs
-                        .get(1)
-                        .map_or(u64::MAX, |right| right.format.precision.bytes()),
-                )
-        }
-        _ => 0,
-    };
-    bytes <= u64::from(ipu_exchange::EXCHANGE_WINDOW_BYTES)
 }
 
 fn apply_selected_plan(
