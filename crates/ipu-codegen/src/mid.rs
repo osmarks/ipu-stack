@@ -929,7 +929,7 @@ fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
         },
         MidOperator::Gelu => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Gelu,
-            input_mapping: PointwiseInputMapping::BroadcastToOutput,
+            input_mapping: PointwiseInputMapping::TileLocal,
         },
         MidOperator::Add(_) => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Add,

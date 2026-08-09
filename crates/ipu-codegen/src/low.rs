@@ -1971,6 +1971,59 @@ mod tests {
     }
 
     #[test]
+    fn randomized_tile_local_gelu_reorders_without_exchange() {
+        let mut random = fastrand::Rng::with_seed(0x6765_6c75);
+        for case in 0..CASES {
+            let row_partitions = 1_u16 << random.u32(0..=3);
+            let column_partitions = 1_u16 << random.u32(0..=3);
+            let tiles = row_partitions * column_partitions;
+            let rows = u32::from(row_partitions) * random.u32(1..=8);
+            let columns = u32::from(column_partitions) * 64 * random.u32(1..=4);
+            let input_format = TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::amp_output_replicated_grid(
+                    tiles,
+                    row_partitions,
+                    column_partitions,
+                ),
+            };
+            let output_format = TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::amp_left_grid(64, tiles, row_partitions, column_partitions),
+            };
+            let mut graph = ComputeGraph::new();
+            let input = graph.host_input("input", [rows, columns]).unwrap();
+            let output = graph.gelu(input).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let mut config = PipelineConfig::new(tiles).with_input(input, input_format.clone());
+            config.operator_candidates = vec![OperatorCandidate::new(
+                MidOperator::Gelu,
+                [OperandRequirement::new(input_format, 8)],
+                OperandRequirement::new(output_format, 8),
+            )];
+
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let low = lower_to_tiles(&mid, &config).unwrap();
+            assert!(low.exchange_phases.is_empty(), "random case {case}");
+            for tile in &low.tiles {
+                for work in low.work(tile) {
+                    let TileWorkRef::Kernel(run) = work else {
+                        continue;
+                    };
+                    assert_eq!(
+                        low.shards[run.inputs[0].views[0].shard.index() as usize].tile,
+                        tile.tile
+                    );
+                    assert_eq!(
+                        low.shards[run.output.shard.index() as usize].tile,
+                        tile.tile
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn randomized_multiaxis_shards_cover_padded_extents_in_whole_blocks() {
         let mut random = fastrand::Rng::with_seed(0x7368_6172);
         for case in 0..CASES {
