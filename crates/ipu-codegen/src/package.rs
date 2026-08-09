@@ -875,12 +875,10 @@ fn instrument_profile(
                 return Err(invalid("inactive tile contains non-exchange work"));
             };
             exchange.profile.before = Some(profile_address(address, index)?);
-            plans.push(profile_description(
+            plans.push(exchange_synchronization_description(
                 index,
                 0x8000_0000 | phase.id.index(),
                 &phase.provenance,
-                ProfileStepKind::Exchange,
-                "exchange",
             )?);
         }
     }
@@ -903,15 +901,23 @@ fn profile_step(
 ) -> PackageBuildResult<ProfileStep> {
     step_profile(step).before = Some(profile_address(base, index)?);
     match (work, step) {
-        (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(_)) => {
+        (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(exchange)) => {
             let phase = &program.exchange_phases[id.index() as usize];
-            profile_description(
-                index,
-                0x8000_0000 | id.index(),
-                &phase.provenance,
-                ProfileStepKind::Exchange,
-                "exchange",
-            )
+            if exchange.row.first() == Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION) {
+                exchange_synchronization_description(
+                    index,
+                    0x8000_0000 | id.index(),
+                    &phase.provenance,
+                )
+            } else {
+                profile_description(
+                    index,
+                    0x8000_0000 | id.index(),
+                    &phase.provenance,
+                    ProfileStepKind::Exchange,
+                    "exchange",
+                )
+            }
         }
         (crate::TileWorkRef::Kernel(run), crate::TileStep::Compute(compute)) => {
             profile_description(
@@ -959,6 +965,22 @@ fn profile_step(
             "tile profile work kind does not match finalized step",
         )),
     }
+}
+
+fn exchange_synchronization_description(
+    index: usize,
+    phase: u32,
+    provenance: &crate::WorkProvenance,
+) -> PackageBuildResult<ProfileStep> {
+    let mut description = profile_description(
+        index,
+        phase,
+        provenance,
+        ProfileStepKind::Synchronization,
+        "sync",
+    )?;
+    description.metadata[0].value = "ExchangeBarrier".into();
+    Ok(description)
 }
 
 fn profile_description(
