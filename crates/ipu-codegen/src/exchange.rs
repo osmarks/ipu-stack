@@ -24,7 +24,7 @@ pub enum ExchangeLoweringError {
     Storage(#[from] crate::StorageError),
     #[error("exchange refers to an unplaced shard")]
     UnplacedShard,
-    #[error("exchange destination is not an exchange-copy shard")]
+    #[error("exchange destination is not writable")]
     InvalidDestination,
     #[error("exchange payload is not a nonempty whole number of words")]
     UnalignedPayload,
@@ -56,94 +56,136 @@ pub fn lower_exchanges(
                 let destinations = transfer
                     .destinations
                     .iter()
-                    .map(|id| {
-                        let shard = &program.shards[id.index() as usize];
-                        if shard.definition != ShardDefinition::ExchangeStaging {
+                    .map(|view| {
+                        let shard = &program.shards[view.shard.index() as usize];
+                        if matches!(shard.definition, ShardDefinition::Alias(_)) {
                             return Err(ExchangeLoweringError::InvalidDestination);
                         }
                         Ok((
                             shard.tile,
                             placement
                                 .shard_addresses
-                                .get(id)
+                                .get(&view.shard)
                                 .copied()
                                 .ok_or(ExchangeLoweringError::UnplacedShard)?,
-                            crate::shard_storage_bytes(shard)?,
+                            view_byte_spans(shard, view)?,
                         ))
                     })
                     .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-                let expected = destinations
-                    .first()
-                    .map(|entry| entry.2)
-                    .ok_or(ExchangeLoweringError::SizeMismatch)?;
-                if destinations.iter().any(|entry| entry.2 != expected) {
+                if destinations.is_empty() {
                     return Err(ExchangeLoweringError::SizeMismatch);
                 }
-                let mut packed_offset = 0u32;
-                for span in view_byte_spans(source, &transfer.source)? {
-                    if span.bytes == 0 || span.bytes & 3 != 0 || span.offset & 3 != 0 {
+                let source_spans = view_byte_spans(source, &transfer.source)?;
+                let source_bytes = source_spans.iter().try_fold(0u32, |total, span| {
+                    total
+                        .checked_add(span.bytes)
+                        .ok_or(ExchangeLoweringError::Overflow)
+                })?;
+                for (_, _, spans) in &destinations {
+                    let destination_bytes = spans.iter().try_fold(0u32, |total, span| {
+                        total
+                            .checked_add(span.bytes)
+                            .ok_or(ExchangeLoweringError::Overflow)
+                    })?;
+                    if destination_bytes != source_bytes {
+                        return Err(ExchangeLoweringError::SizeMismatch);
+                    }
+                }
+                let mut source_index = 0usize;
+                let mut source_offset = 0u32;
+                let mut destination_positions = vec![(0usize, 0u32); destinations.len()];
+                while source_index < source_spans.len() {
+                    let source_span = source_spans[source_index];
+                    if source_span.bytes == 0 || source_span.offset & 3 != 0 {
                         return Err(ExchangeLoweringError::UnalignedPayload);
                     }
-                    let mut chunk_offset = 0u32;
-                    while chunk_offset < span.bytes {
-                        let chunk_bytes = (span.bytes - chunk_offset).min(
-                            MAX_TRANSFER_WORDS
-                                .checked_mul(4)
-                                .ok_or(ExchangeLoweringError::Overflow)?,
-                        );
-                        let source_address = source_base
-                            .checked_add(span.offset)
-                            .and_then(|address| address.checked_add(chunk_offset))
-                            .ok_or(ExchangeLoweringError::Overflow)?;
-                        let destination_entries = destinations
-                            .iter()
-                            .map(|(tile, base, _)| {
-                                Ok((
-                                    *tile,
-                                    base.checked_add(packed_offset)
-                                        .and_then(|address| address.checked_add(chunk_offset))
-                                        .ok_or(ExchangeLoweringError::Overflow)?,
-                                ))
-                            })
-                            .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-                        let schedule_offset = std::iter::once(source.tile)
-                            .chain(destination_entries.iter().map(|entry| entry.0))
-                            .map(|tile| tile_availability[usize::from(tile)])
-                            .max()
-                            .unwrap_or(0);
-                        let schedule_offset = if schedule_offset == 0 {
-                            0
-                        } else {
-                            schedule_offset
-                                .checked_add(1)
-                                .ok_or(ExchangeLoweringError::Overflow)?
-                        };
-                        let transfer_end = append_transfer(
-                            topology,
-                            ScheduledTransfer {
-                                source: source.tile,
-                                destinations: &destination_entries,
-                                source_address,
-                                words: chunk_bytes / 4,
-                                schedule_offset,
-                            },
-                            &mut horizon,
-                            &mut builders,
-                        )?;
-                        for tile in std::iter::once(source.tile)
-                            .chain(destination_entries.iter().map(|entry| entry.0))
-                        {
-                            tile_availability[usize::from(tile)] = transfer_end;
+                    let mut chunk_bytes = (source_span.bytes - source_offset).min(
+                        MAX_TRANSFER_WORDS
+                            .checked_mul(4)
+                            .ok_or(ExchangeLoweringError::Overflow)?,
+                    );
+                    for ((index, offset), (_, _, spans)) in
+                        destination_positions.iter().zip(&destinations)
+                    {
+                        let span = spans
+                            .get(*index)
+                            .ok_or(ExchangeLoweringError::SizeMismatch)?;
+                        if span.offset & 3 != 0 {
+                            return Err(ExchangeLoweringError::UnalignedPayload);
                         }
-                        chunk_offset = chunk_offset
-                            .checked_add(chunk_bytes)
-                            .ok_or(ExchangeLoweringError::Overflow)?;
+                        chunk_bytes = chunk_bytes.min(span.bytes - *offset);
                     }
-                    packed_offset = packed_offset
-                        .checked_add(span.bytes)
+                    if chunk_bytes == 0 || chunk_bytes & 3 != 0 {
+                        return Err(ExchangeLoweringError::UnalignedPayload);
+                    }
+                    let source_address = source_base
+                        .checked_add(source_span.offset)
+                        .and_then(|address| address.checked_add(source_offset))
                         .ok_or(ExchangeLoweringError::Overflow)?;
+                    let destination_entries = destinations
+                        .iter()
+                        .zip(&destination_positions)
+                        .map(|((tile, base, spans), (index, offset))| {
+                            let span = spans
+                                .get(*index)
+                                .ok_or(ExchangeLoweringError::SizeMismatch)?;
+                            Ok((
+                                *tile,
+                                base.checked_add(span.offset)
+                                    .and_then(|address| address.checked_add(*offset))
+                                    .ok_or(ExchangeLoweringError::Overflow)?,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
+                    let schedule_offset = std::iter::once(source.tile)
+                        .chain(destination_entries.iter().map(|entry| entry.0))
+                        .map(|tile| tile_availability[usize::from(tile)])
+                        .max()
+                        .unwrap_or(0);
+                    let schedule_offset = if schedule_offset == 0 {
+                        0
+                    } else {
+                        schedule_offset
+                            .checked_add(1)
+                            .ok_or(ExchangeLoweringError::Overflow)?
+                    };
+                    let transfer_end = append_transfer(
+                        topology,
+                        ScheduledTransfer {
+                            source: source.tile,
+                            destinations: &destination_entries,
+                            source_address,
+                            words: chunk_bytes / 4,
+                            schedule_offset,
+                        },
+                        &mut horizon,
+                        &mut builders,
+                    )?;
+                    for tile in std::iter::once(source.tile)
+                        .chain(destination_entries.iter().map(|entry| entry.0))
+                    {
+                        tile_availability[usize::from(tile)] = transfer_end;
+                    }
+                    source_offset += chunk_bytes;
+                    if source_offset == source_span.bytes {
+                        source_index += 1;
+                        source_offset = 0;
+                    }
+                    for ((index, offset), (_, _, spans)) in
+                        destination_positions.iter_mut().zip(&destinations)
+                    {
+                        *offset += chunk_bytes;
+                        if *offset == spans[*index].bytes {
+                            *index += 1;
+                            *offset = 0;
+                        }
+                    }
                 }
-                if packed_offset != expected {
+                if destination_positions
+                    .iter()
+                    .zip(&destinations)
+                    .any(|((index, offset), (_, _, spans))| *index != spans.len() || *offset != 0)
+                {
                     return Err(ExchangeLoweringError::SizeMismatch);
                 }
             }

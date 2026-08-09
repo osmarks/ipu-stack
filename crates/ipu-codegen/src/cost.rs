@@ -1,9 +1,9 @@
 //! Analytical IPU21 cycle estimation used during operator planning.
 
 use crate::estimate::{
-    gemm_exchange_bytes_per_cycle, gemm_remote_bytes_per_tile, gemm_requires_panel_repacking,
-    gemm_uses_panel_buffer, maximum_axis_shard_extent, maximum_shard_bytes,
-    operator_memory_estimate, physical_elements,
+    conversion_traffic, gemm_exchange_bytes_per_cycle, gemm_remote_bytes_per_tile,
+    gemm_requires_panel_repacking, gemm_uses_panel_buffer, maximum_axis_shard_extent,
+    maximum_shard_bytes, operator_memory_estimate, physical_elements,
 };
 use crate::graph::TensorShape;
 use crate::mid::{
@@ -38,6 +38,8 @@ pub struct Ipu21TargetCosts {
     pub standard_load_bytes_per_cycle: u64,
     pub interleaved_load_bytes_per_cycle: u64,
     pub local_copy_bytes_per_cycle: u64,
+    pub exchange_fragment_overhead_cycles: u64,
+    pub local_copy_call_overhead_cycles: u64,
     pub gemm_call_overhead_cycles: u64,
 }
 
@@ -46,6 +48,11 @@ pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
     standard_load_bytes_per_cycle: 8,
     interleaved_load_bytes_per_cycle: 16,
     local_copy_bytes_per_cycle: 8,
+    // Logical fragments carry route setup and synchronization costs in
+    // addition to their byte-transfer time.
+    exchange_fragment_overhead_cycles: 104,
+    // A local copy launches a worker kernel even for a short intersection.
+    local_copy_call_overhead_cycles: 512,
     gemm_call_overhead_cycles: 48,
 };
 
@@ -186,17 +193,34 @@ impl CostModel for Ipu21CostModel {
         from: &Layout,
         to: &Layout,
     ) -> u64 {
-        let input = TensorType::new(shape.0.iter().copied(), precision, from.clone());
-        let output = TensorType::new(shape.0.iter().copied(), precision, to.clone());
-        let local_bytes = maximum_shard_bytes(&input)
-            .max(maximum_shard_bytes(&output))
-            .saturating_mul(2);
-        let local_cycles = local_bytes.div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle);
-        let exchange_cycles = if from.tiling == to.tiling {
-            0
-        } else {
-            maximum_shard_bytes(&output).div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+        let Some(traffic) = conversion_traffic(shape, precision, from, to) else {
+            return u64::MAX / 8;
         };
-        local_cycles.saturating_add(exchange_cycles)
+        let direct_retile = from.order == to.order;
+        let exchange_cycles = traffic
+            .source_payload_bytes
+            .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+            .saturating_add(
+                traffic
+                    .remote_fragments
+                    .saturating_mul(IPU21_TARGET_COSTS.exchange_fragment_overhead_cycles),
+            );
+        let (local_bytes, local_calls) = if direct_retile {
+            (
+                traffic.maximum_local_bytes,
+                traffic.maximum_local_intersections,
+            )
+        } else {
+            (
+                traffic.maximum_destination_bytes.saturating_mul(2),
+                traffic.maximum_intersections,
+            )
+        };
+        let local_cycles = local_bytes
+            .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
+            .saturating_add(
+                local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_overhead_cycles),
+            );
+        exchange_cycles.saturating_add(local_cycles)
     }
 }

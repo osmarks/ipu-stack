@@ -116,13 +116,13 @@ pub struct LowValue {
     pub shards: Vec<LowShardId>,
 }
 
-/// One source view may be sent into reusable receive staging on several tiles.
-/// Sequential phases can name the same destination because the consumer runs
-/// before the next phase overwrites it.
+/// One source view may populate arbitrary corresponding views on several
+/// tiles. Sequential phases may reuse transient destinations after consumers
+/// have run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalExchange {
     pub source: ShardView,
-    pub destinations: Vec<LowShardId>,
+    pub destinations: Vec<ShardView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -676,13 +676,8 @@ impl LoweringState {
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
         let direct_retile = plan.input.format.layout.order == plan.output.format.layout.order;
-        let mut remote_items = Vec::<(
-            ShardView,
-            LowShardId,
-            u16,
-            Vec<LocalCopy>,
-            Option<KernelRun>,
-        )>::new();
+        let mut remote_items =
+            Vec::<(ShardView, ShardView, u16, Vec<LocalCopy>, Option<KernelRun>)>::new();
         for output in outputs {
             let tile = self.shards[output.index() as usize].tile;
             let mut unique_intersections = BTreeMap::<Vec<ShardExtent>, LowShardId>::new();
@@ -705,7 +700,11 @@ impl LoweringState {
                         shard: source,
                         extents: extents.clone(),
                     };
-                    let (resident, exchange) = if remote {
+                    let output_view = ShardView {
+                        shard: output,
+                        extents: extents.clone(),
+                    };
+                    let (resident, exchange) = if remote && !direct_retile {
                         let copy = self.push_shard(LowShard {
                             id: LowShardId(0),
                             tile,
@@ -713,24 +712,32 @@ impl LoweringState {
                             extents: extents.clone(),
                             definition: ShardDefinition::ExchangeStaging,
                         })?;
-                        (self.full_view(copy), Some((source_view, copy)))
+                        (
+                            self.full_view(copy),
+                            Some((source_view.clone(), self.full_view(copy))),
+                        )
+                    } else if remote {
+                        (
+                            output_view.clone(),
+                            Some((source_view.clone(), output_view.clone())),
+                        )
                     } else {
                         (source_view.clone(), None)
                     };
-                    let output_view = ShardView {
-                        shard: output,
-                        extents,
-                    };
                     let (local_copies, run) = if direct_retile {
-                        let mut copies = Vec::new();
-                        append_span_copies(
-                            &self.shards,
-                            &resident,
-                            &output_view,
-                            tile,
-                            &mut copies,
-                        )?;
-                        (copies.into_iter().map(|(_, copy)| copy).collect(), None)
+                        if remote {
+                            (Vec::new(), None)
+                        } else {
+                            let mut copies = Vec::new();
+                            append_span_copies(
+                                &self.shards,
+                                &resident,
+                                &output_view,
+                                tile,
+                                &mut copies,
+                            )?;
+                            (copies.into_iter().map(|(_, copy)| copy).collect(), None)
+                        }
                     } else {
                         (
                             Vec::new(),
@@ -748,8 +755,8 @@ impl LoweringState {
                             )),
                         )
                     };
-                    if let Some((source_view, copy)) = exchange {
-                        remote_items.push((source_view, copy, tile, local_copies, run));
+                    if let Some((source_view, destination_view)) = exchange {
+                        remote_items.push((source_view, destination_view, tile, local_copies, run));
                     } else {
                         for copy in local_copies {
                             self.append_local_copy(tiles, tile, copy)?;
@@ -761,10 +768,10 @@ impl LoweringState {
                 }
             }
         }
-        let mut transfers = BTreeMap::<ShardView, Vec<LowShardId>>::new();
+        let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
         let mut consumers = Vec::<(u16, Vec<LocalCopy>, Option<KernelRun>)>::new();
-        for (source, copy, tile, copies, run) in remote_items {
-            transfers.entry(source).or_default().push(copy);
+        for (source, destination, tile, copies, run) in remote_items {
+            transfers.entry(source).or_default().push(destination);
             consumers.push((tile, copies, run));
         }
         self.flush_conversion_phase(
@@ -778,7 +785,7 @@ impl LoweringState {
 
     fn flush_conversion_phase(
         &mut self,
-        transfers: &mut BTreeMap<ShardView, Vec<LowShardId>>,
+        transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
         consumers: &mut Vec<(u16, Vec<LocalCopy>, Option<KernelRun>)>,
         provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
@@ -847,7 +854,7 @@ impl LoweringState {
             return Err(LowLoweringError::ResultArity);
         };
         let outputs = self.value_shards(*result)?.to_vec();
-        let mut wave_transfers = Vec::<BTreeMap<ShardView, Vec<LowShardId>>>::new();
+        let mut wave_transfers = Vec::<BTreeMap<ShardView, Vec<ShardView>>>::new();
         let mut wave_runs = Vec::<Vec<(u16, KernelRun)>>::new();
         for output in outputs {
             if self.shards[output.index() as usize]
@@ -904,7 +911,7 @@ impl LoweringState {
                             wave_transfers[wave]
                                 .entry(source_view)
                                 .or_default()
-                                .push(copy);
+                                .push(self.full_view(copy));
                             self.full_view(copy)
                         };
                         Ok(KernelOperand { views: vec![view] })
@@ -1073,7 +1080,7 @@ impl LoweringState {
                 .min(column_extent);
             for inner_start in (0..inner_extent).step_by(inner_block as usize) {
                 let inner_end = inner_start + inner_block;
-                let mut transfers = BTreeMap::<ShardView, Vec<LowShardId>>::new();
+                let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
                 let mut local_copies = Vec::<(u16, LocalCopy)>::new();
                 let mut runs = Vec::new();
                 for column_start in
@@ -1187,7 +1194,10 @@ impl LoweringState {
                                 *slot = Some(copy);
                                 copy
                             };
-                            transfers.entry(right_view.clone()).or_default().push(copy);
+                            transfers
+                                .entry(right_view.clone())
+                                .or_default()
+                                .push(self.full_view(copy));
                             self.full_view(copy)
                         };
                         let output_view = self
@@ -1323,7 +1333,7 @@ impl LoweringState {
                 let phase_column_end = phase_column_start
                     .saturating_add(column_phase_width)
                     .min(column_extent);
-                let mut transfers = BTreeMap::<ShardView, Vec<LowShardId>>::new();
+                let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
                 let mut local_copies = Vec::<(u16, LocalCopy)>::new();
                 let mut runs = Vec::with_capacity(output_shards.len());
                 for column_start in
@@ -1423,7 +1433,7 @@ impl LoweringState {
                                     transfers
                                         .entry(right_view.clone())
                                         .or_default()
-                                        .push(resident);
+                                        .push(self.full_view(resident));
                                 }
                                 self.full_view(resident)
                             };
@@ -1489,7 +1499,7 @@ impl LoweringState {
 
     fn append_phase(
         &mut self,
-        transfers: BTreeMap<ShardView, Vec<LowShardId>>,
+        transfers: BTreeMap<ShardView, Vec<ShardView>>,
         provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
@@ -2032,6 +2042,83 @@ mod tests {
     }
 
     #[test]
+    fn randomized_same_order_retiles_exchange_into_final_values() {
+        let mut random = fastrand::Rng::with_seed(0x6469_7265_6374_7265);
+        for case in 0..CASES {
+            let source_rows = 1_u16 << random.u32(0..=3);
+            let source_columns = 1_u16 << random.u32(0..=3);
+            let tiles = source_rows * source_columns;
+            let rows = u32::from(source_rows.max(source_columns)) * random.u32(1..=4);
+            let columns = u32::from(source_rows.max(source_columns)) * random.u32(1..=4) * 4;
+            let layout = |row_partitions, column_partitions| Layout {
+                order: ElementOrder::RowMajor,
+                tiling: TensorTiling {
+                    tile_count: tiles,
+                    replicas: 1,
+                    axes: vec![
+                        AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
+                        AxisTiling::new(
+                            TensorAxis::FromEnd(1),
+                            column_partitions,
+                            4,
+                            Padding::Reject,
+                        ),
+                    ],
+                },
+                memory_class: MemoryClass::Ipu21Standard,
+            };
+            let input_format = TensorFormat {
+                precision: Precision::F16,
+                layout: layout(source_rows, source_columns),
+            };
+            let target_format = TensorFormat {
+                precision: Precision::F16,
+                layout: layout(source_columns, source_rows),
+            };
+            let mut graph = ComputeGraph::new();
+            let input = graph.host_input("input", [rows, columns]).unwrap();
+            let output = graph.gelu(input).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let mut config = PipelineConfig::new(tiles).with_input(input, input_format);
+            config.operator_candidates = vec![OperatorCandidate::new(
+                MidOperator::Gelu,
+                [OperandRequirement::new(target_format.clone(), 8)],
+                OperandRequirement::new(target_format, 8),
+            )];
+
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let low = lower_to_tiles(&mid, &config).unwrap();
+            let conversion_phases = low
+                .exchange_phases
+                .iter()
+                .filter(|phase| phase.provenance.reason == WorkReason::LayoutRearrangement)
+                .collect::<Vec<_>>();
+            for phase in conversion_phases {
+                for destination in phase
+                    .transfers
+                    .iter()
+                    .flat_map(|transfer| &transfer.destinations)
+                {
+                    assert!(matches!(
+                        low.shards[destination.shard.index() as usize].definition,
+                        ShardDefinition::Value(_)
+                    ));
+                }
+            }
+            assert!(
+                low.shards
+                    .iter()
+                    .all(|shard| !matches!(shard.definition, ShardDefinition::ExchangeStaging)),
+                "case {case}"
+            );
+            assert!(low.local_copies.iter().all(|copy| {
+                low.shards[copy.source.index() as usize].tile
+                    == low.shards[copy.destination.index() as usize].tile
+            }));
+        }
+    }
+
+    #[test]
     fn randomized_multiaxis_shards_cover_padded_extents_in_whole_blocks() {
         let mut random = fastrand::Rng::with_seed(0x7368_6172);
         for case in 0..CASES {
@@ -2142,8 +2229,11 @@ mod tests {
                 );
                 for transfer in &phase.transfers {
                     assert!(transfer.destinations.iter().all(|destination| matches!(
-                        low.shards[destination.index() as usize].definition,
-                        ShardDefinition::ExchangeStaging
+                        low.shards[destination.shard.index() as usize].definition,
+                        ShardDefinition::Value(_)
+                            | ShardDefinition::ExchangeStaging
+                            | ShardDefinition::LocalCopy(_)
+                            | ShardDefinition::Staging
                     )));
                 }
             }
@@ -2235,7 +2325,7 @@ mod tests {
                 .filter(|phase| phase.provenance.reason == WorkReason::OperatorInput { input: 1 })
                 .flat_map(|phase| &phase.transfers)
                 .flat_map(|transfer| &transfer.destinations)
-                .copied()
+                .map(|destination| destination.shard)
                 .collect::<Vec<_>>();
             let unique_gemm_staging = gemm_destinations
                 .iter()
@@ -2567,13 +2657,13 @@ mod tests {
                     .iter()
                     .flat_map(|transfer| &transfer.destinations)
                 {
-                    let shard = &low.shards[destination.index() as usize];
+                    let shard = &low.shards[destination.shard.index() as usize];
                     assert_eq!(shard.definition, ShardDefinition::ExchangeStaging);
                     assert!(low.kernel_runs.iter().any(|run| {
                         run.inputs
                             .iter()
                             .flat_map(|operand| &operand.views)
-                            .any(|view| view.shard == *destination)
+                            .any(|view| view.shard == destination.shard)
                     }));
                 }
             }

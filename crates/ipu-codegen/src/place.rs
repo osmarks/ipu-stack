@@ -259,8 +259,8 @@ fn touch_work(
                     touch(transfer.source.shard);
                 }
                 for destination in &transfer.destinations {
-                    if program.shards[destination.index() as usize].tile == tile {
-                        touch(*destination);
+                    if program.shards[destination.shard.index() as usize].tile == tile {
+                        touch(destination.shard);
                     }
                 }
             }

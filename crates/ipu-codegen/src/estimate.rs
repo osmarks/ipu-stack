@@ -9,6 +9,129 @@ use crate::mid::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ConversionTraffic {
+    pub source_payload_bytes: u64,
+    pub remote_fragments: u64,
+    pub maximum_destination_bytes: u64,
+    pub maximum_local_bytes: u64,
+    pub maximum_intersections: u64,
+    pub maximum_local_intersections: u64,
+}
+
+pub(crate) fn conversion_traffic(
+    shape: &TensorShape,
+    precision: Precision,
+    from: &Layout,
+    to: &Layout,
+) -> Option<ConversionTraffic> {
+    let sources = layout_extents(shape, from)?;
+    let destinations = layout_extents(shape, to)?;
+    let element_bytes = precision.bytes();
+    let mut remote = BTreeSet::<(u16, Vec<(u32, u32)>)>::new();
+    let mut traffic = ConversionTraffic::default();
+    for (destination_tile, destination) in destinations.iter().enumerate() {
+        let mut intersections = BTreeMap::<Vec<(u32, u32)>, u16>::new();
+        for (source_tile, source) in sources.iter().enumerate() {
+            let Some(extents) = intersect_ranges(source, destination) else {
+                continue;
+            };
+            let source_tile = u16::try_from(source_tile).ok()?;
+            let selected = intersections.entry(extents).or_insert(source_tile);
+            if usize::from(source_tile) == destination_tile {
+                *selected = source_tile;
+            }
+        }
+        let mut destination_bytes = 0u64;
+        let mut local_bytes = 0u64;
+        let mut local_intersections = 0u64;
+        for (extents, source_tile) in &intersections {
+            let bytes = range_elements(extents).saturating_mul(element_bytes);
+            destination_bytes = destination_bytes.saturating_add(bytes);
+            if usize::from(*source_tile) == destination_tile {
+                local_bytes = local_bytes.saturating_add(bytes);
+                local_intersections += 1;
+            } else {
+                remote.insert((*source_tile, extents.clone()));
+            }
+        }
+        traffic.maximum_destination_bytes =
+            traffic.maximum_destination_bytes.max(destination_bytes);
+        traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
+        traffic.maximum_intersections = traffic
+            .maximum_intersections
+            .max(intersections.len() as u64);
+        traffic.maximum_local_intersections =
+            traffic.maximum_local_intersections.max(local_intersections);
+    }
+    traffic.remote_fragments = remote.len() as u64;
+    traffic.source_payload_bytes = remote
+        .iter()
+        .map(|(_, extents)| range_elements(extents).saturating_mul(element_bytes))
+        .sum();
+    Some(traffic)
+}
+
+fn layout_extents(shape: &TensorShape, layout: &Layout) -> Option<Vec<Vec<(u32, u32)>>> {
+    let padded = layout.padded_shape(shape).ok()?;
+    let rank = shape.0.len();
+    let strides = layout.tiling.axis_strides().ok()?;
+    let axes = layout
+        .tiling
+        .axes
+        .iter()
+        .zip(strides)
+        .map(|(axis, stride)| Some((axis.axis.resolve(rank).ok()?, axis, stride)))
+        .collect::<Option<Vec<_>>>()?;
+    (0..layout.tiling.tile_count)
+        .map(|tile| {
+            (0..rank)
+                .map(|axis| {
+                    if let Some((_, tiling, stride)) =
+                        axes.iter().find(|(index, _, _)| *index == axis)
+                    {
+                        let coordinate = (u32::from(tile) / *stride) % u32::from(tiling.partitions);
+                        let blocks = padded.0[axis] / tiling.block_size;
+                        let partitions = u32::from(tiling.partitions);
+                        let short_size = blocks / partitions;
+                        let long_shards = blocks % partitions;
+                        let start_blocks = coordinate * short_size + coordinate.min(long_shards);
+                        let shard_blocks = short_size + u32::from(coordinate < long_shards);
+                        let start = start_blocks * tiling.block_size;
+                        let end = (start + shard_blocks * tiling.block_size)
+                            .min(shape.0[axis])
+                            .max(start);
+                        (start, end)
+                    } else {
+                        (0, shape.0[axis])
+                    }
+                })
+                .collect()
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn intersect_ranges(left: &[(u32, u32)], right: &[(u32, u32)]) -> Option<Vec<(u32, u32)>> {
+    if left.len() != right.len() {
+        return None;
+    }
+    left.iter()
+        .zip(right)
+        .map(|(&(left_start, left_end), &(right_start, right_end))| {
+            let start = left_start.max(right_start);
+            let end = left_end.min(right_end);
+            (start < end).then_some((start, end))
+        })
+        .collect()
+}
+
+fn range_elements(extents: &[(u32, u32)]) -> u64 {
+    extents.iter().fold(1u64, |elements, &(start, end)| {
+        elements.saturating_mul(u64::from(end - start))
+    })
+}
+
 pub(crate) fn physical_elements(shape: &TensorShape, layout: &Layout) -> u64 {
     layout
         .padded_shape(shape)
@@ -401,4 +524,58 @@ fn tile_axis_range(tensor: &TensorType, axis: usize, tile: u16) -> Option<std::o
     let start_blocks = coordinate * short + coordinate.min(long);
     let shard_blocks = short + u32::from(coordinate < long);
     Some(start_blocks * tiling.block_size..(start_blocks + shard_blocks) * tiling.block_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn randomized_conversion_traffic_counts_fragmented_multicasts() {
+        let mut random = fastrand::Rng::with_seed(0x6672_6167_6d65_6e74);
+        for case in 0..32 {
+            let row_partitions = 1_u16 << random.u32(1..=4);
+            let column_partitions = 1_u16 << random.u32(1..=4);
+            let tiles = row_partitions * column_partitions;
+            let rows = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4);
+            let columns = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4) * 64;
+            let shape = TensorShape(vec![rows, columns]);
+            let fragmented_source =
+                Layout::amp_output_grid(tiles, row_partitions, column_partitions);
+            let aligned_source = Layout::amp_output_grid(tiles, column_partitions, row_partitions);
+            let destination =
+                Layout::amp_output_replicated_grid(tiles, column_partitions, row_partitions);
+            let fragmented =
+                conversion_traffic(&shape, Precision::F16, &fragmented_source, &destination)
+                    .unwrap();
+            let aligned =
+                conversion_traffic(&shape, Precision::F16, &aligned_source, &destination).unwrap();
+
+            assert_eq!(
+                fragmented.maximum_destination_bytes, aligned.maximum_destination_bytes,
+                "case {case}"
+            );
+            assert!(
+                fragmented.remote_fragments >= aligned.remote_fragments,
+                "case {case}: {fragmented:?} {aligned:?}"
+            );
+            assert!(
+                fragmented.maximum_intersections >= aligned.maximum_intersections,
+                "case {case}: {fragmented:?} {aligned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn siglip_transition_exposes_the_fragment_count_to_the_cost_model() {
+        let shape = TensorShape(vec![256, 4096]);
+        let source = Layout::amp_output_grid(512, 8, 64);
+        let destination = Layout::amp_output_replicated_grid(512, 64, 8);
+        let traffic = conversion_traffic(&shape, Precision::F16, &source, &destination).unwrap();
+
+        assert_eq!(traffic.source_payload_bytes, 2 * 1024 * 1024);
+        assert_eq!(traffic.remote_fragments, 4096);
+        assert_eq!(traffic.maximum_destination_bytes, 32 * 1024);
+        assert_eq!(traffic.maximum_intersections, 64);
+    }
 }
