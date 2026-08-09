@@ -63,6 +63,88 @@ pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
     kernel_launch_cycles: 11,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AmpKernelCosts {
+    call_cycles: u64,
+    column_group_width: u64,
+    interleaved_column_group_cycles: u64,
+    standard_column_group_cycles: u64,
+}
+
+// Cycle counts of the generated IPU21 AMP kernel. A column group processes
+// sixteen output columns and one 64-element K block. The row term represents
+// AMP work; the remaining group cost is dominated by feeding its weights.
+const IPU21_AMP_KERNEL_COSTS: AmpKernelCosts = AmpKernelCosts {
+    call_cycles: 294,
+    column_group_width: 16,
+    interleaved_column_group_cycles: 1_157,
+    standard_column_group_cycles: 1_280,
+};
+
+fn amp_kernel_cycles(
+    multiply: Precision,
+    dispatch: &OperatorDispatch,
+    right: Option<&TensorType>,
+    output_elements_per_tile: u64,
+    output_columns_per_tile: u64,
+    k: u64,
+) -> Option<u64> {
+    let OperatorDispatch::BlockedGemm {
+        inner_block,
+        output_column_block,
+        ..
+    } = dispatch
+    else {
+        return None;
+    };
+    let inner_block = u64::from(*inner_block);
+    let output_column_block = u64::from(*output_column_block);
+    if inner_block == 0
+        || output_column_block == 0
+        || output_columns_per_tile == 0
+        || !inner_block.is_multiple_of(64)
+        || !output_column_block.is_multiple_of(IPU21_AMP_KERNEL_COSTS.column_group_width)
+    {
+        return None;
+    }
+    let rows = output_elements_per_tile.div_ceil(output_columns_per_tile);
+    let column_groups = output_column_block.div_ceil(IPU21_AMP_KERNEL_COSTS.column_group_width);
+    let interleaved = right
+        .is_some_and(|right| right.format.layout.memory_class == MemoryClass::Ipu21Interleaved);
+    let (row_cycles, group_cycles) = match multiply {
+        Precision::F16 => (
+            rows,
+            if interleaved {
+                IPU21_AMP_KERNEL_COSTS.interleaved_column_group_cycles
+            } else {
+                IPU21_AMP_KERNEL_COSTS.standard_column_group_cycles
+            },
+        ),
+        // F32 AMP issues one quarter as many operations per cycle and feeds
+        // twice as many weight bytes as F16 for the same matrix block.
+        Precision::F32 => (
+            rows.saturating_mul(4),
+            IPU21_AMP_KERNEL_COSTS
+                .standard_column_group_cycles
+                .saturating_mul(2),
+        ),
+        Precision::F8F143 { .. } => return None,
+    };
+    let inner_blocks_per_call = inner_block / 64;
+    let call_cycles = IPU21_AMP_KERNEL_COSTS.call_cycles.saturating_add(
+        inner_blocks_per_call.saturating_mul(
+            output_column_block
+                .saturating_mul(row_cycles)
+                .saturating_add(column_groups.saturating_mul(group_cycles)),
+        ),
+    );
+    Some(
+        k.div_ceil(inner_block)
+            .saturating_mul(output_columns_per_tile.div_ceil(output_column_block))
+            .saturating_mul(call_cycles),
+    )
+}
+
 impl CostModel for Ipu21CostModel {
     fn operator_cycles(
         &self,
@@ -168,17 +250,24 @@ impl CostModel for Ipu21CostModel {
                         .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
                     OperatorDispatch::Pointwise { .. } => 0,
                 };
+                let kernel = amp_kernel_cycles(
+                    multiply,
+                    dispatch,
+                    right,
+                    output_elements_per_tile,
+                    output_columns_per_tile,
+                    k,
+                )
+                .unwrap_or_else(|| arithmetic.max(weight_feed).saturating_add(calls));
                 let memory = operator_memory_estimate(dispatch, inputs, output);
                 let capacity_penalty = if memory.peak.fits_ipu21() {
                     0
                 } else {
                     u64::MAX / 8
                 };
-                arithmetic
-                    .max(weight_feed)
+                kernel
                     .saturating_add(packing)
                     .saturating_add(exchange)
-                    .saturating_add(calls)
                     .saturating_add(capacity_penalty)
             }
             MidOperator::FlashAttention { .. } => elements
