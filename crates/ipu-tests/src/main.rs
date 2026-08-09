@@ -33,6 +33,9 @@ struct Arguments {
     /// Log exchange scheduling lower bounds and critical dependency chains.
     #[arg(long)]
     exchange_diagnostics: bool,
+    /// Force eligible one-use layout conversions to stream into consumer slices.
+    #[arg(long)]
+    stream_conversions: bool,
     #[arg(long, default_value_t = c600_tile_count())]
     tiles: u32,
     #[arg(long)]
@@ -108,6 +111,9 @@ fn main() -> Result<()> {
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
     pipeline.exchange_diagnostics = arguments.exchange_diagnostics;
+    if arguments.stream_conversions {
+        pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Always;
+    }
     if arguments.gemm_smoke || arguments.batched_gemm_smoke {
         let batch = if arguments.batched_gemm_smoke { 3 } else { 1 };
         let left = graph.host_input("left", [batch, u32::from(active_tiles), 64])?;

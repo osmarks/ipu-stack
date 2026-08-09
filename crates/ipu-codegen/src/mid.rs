@@ -749,6 +749,9 @@ pub struct OperandRequirement {
     /// How a locally resident operand should be consumed when other tiles use
     /// an operator-local staging buffer for the same operand.
     pub local_staging: LocalOperandStaging,
+    /// Whether a dispatch may populate and consume bounded operand slices
+    /// instead of materializing the complete required format first.
+    pub materialization: OperandMaterialization,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -758,6 +761,13 @@ pub enum LocalOperandStaging {
     MatchRemote,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OperandMaterialization {
+    #[default]
+    Complete,
+    DispatchSlices,
+}
+
 impl OperandRequirement {
     pub fn new(format: TensorFormat, alignment: u32) -> Self {
         Self {
@@ -765,6 +775,7 @@ impl OperandRequirement {
             alignment,
             access_tail_bytes: 0,
             local_staging: LocalOperandStaging::Direct,
+            materialization: OperandMaterialization::Complete,
         }
     }
 
@@ -775,6 +786,11 @@ impl OperandRequirement {
 
     pub fn with_local_staging(mut self, staging: LocalOperandStaging) -> Self {
         self.local_staging = staging;
+        self
+    }
+
+    pub fn with_materialization(mut self, materialization: OperandMaterialization) -> Self {
+        self.materialization = materialization;
         self
     }
 }
@@ -1071,6 +1087,22 @@ pub struct PipelineConfig {
     /// Emit exchange-scheduler lower bounds, per-tile role pressure, and
     /// critical dependency chains while constructing the final package.
     pub exchange_diagnostics: bool,
+    /// Controls whether one-use layout conversions may be populated as
+    /// bounded slices immediately before their consuming dispatch.
+    pub conversion_streaming: ConversionStreamingPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConversionStreamingPolicy {
+    /// Require complete converted values.
+    Never,
+    /// Prefer complete values, retaining streaming when materialization does
+    /// not fit the target memory budget.
+    #[default]
+    WhenRequired,
+    /// Stream every eligible conversion, primarily for diagnostics and
+    /// memory-constrained deployment experiments.
+    Always,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1103,6 +1135,7 @@ impl PipelineConfig {
             scheduling: SchedulingPolicy::OperatorPlans,
             profiling: ProfilingConfig::default(),
             exchange_diagnostics: false,
+            conversion_streaming: ConversionStreamingPolicy::WhenRequired,
         }
     }
 
@@ -1332,7 +1365,8 @@ fn amp_gemm_operator_candidate(
                 },
                 32,
             )
-            .with_access_tail(left_tail),
+            .with_access_tail(left_tail)
+            .with_materialization(OperandMaterialization::DispatchSlices),
             OperandRequirement::new(
                 TensorFormat {
                     precision,
@@ -1407,7 +1441,8 @@ fn amp_grid_gemm_operator_candidate(
                 },
                 32,
             )
-            .with_access_tail(left_tail),
+            .with_access_tail(left_tail)
+            .with_materialization(OperandMaterialization::DispatchSlices),
             OperandRequirement::new(
                 TensorFormat {
                     precision,
@@ -2122,6 +2157,18 @@ fn lower_operations(
                         })
                 })
                 .collect::<Vec<_>>();
+            let candidate_plans = candidate_plans.into_iter().flat_map(|plan| {
+                let mut complete = plan.clone();
+                for requirement in &mut complete.requirements.inputs {
+                    requirement.materialization = OperandMaterialization::Complete;
+                }
+                match config.conversion_streaming {
+                    ConversionStreamingPolicy::Never => vec![complete],
+                    ConversionStreamingPolicy::Always => vec![plan],
+                    ConversionStreamingPolicy::WhenRequired if complete == plan => vec![complete],
+                    ConversionStreamingPolicy::WhenRequired => vec![complete, plan],
+                }
+            });
             for plan in candidate_plans {
                 saw_candidate = true;
                 let mut next = branch.clone();
@@ -2250,6 +2297,7 @@ fn apply_selected_plan(
             ensure_format(
                 value,
                 requirement.format.clone(),
+                requirement.materialization,
                 operation.id,
                 costs,
                 state,
@@ -2277,6 +2325,7 @@ fn apply_selected_plan(
     );
     let memory = operator_memory_estimate(
         &plan.dispatch,
+        &plan.requirements,
         &converted_types,
         &state.get(result).tensor_type,
     );
@@ -2459,6 +2508,7 @@ fn lower_repeat(
                 ensure_format(
                     value,
                     first_type.format.clone(),
+                    OperandMaterialization::Complete,
                     operation.id,
                     costs,
                     state,
@@ -2493,6 +2543,7 @@ fn lower_repeat(
         yields.push(ensure_format(
             value,
             target,
+            OperandMaterialization::Complete,
             operation.id,
             costs,
             state,
@@ -2542,6 +2593,7 @@ fn lower_repeat(
 fn ensure_format(
     mut value: MidValueId,
     target: TensorFormat,
+    materialization: OperandMaterialization,
     source: OperationId,
     costs: &impl CostModel,
     state: &mut LoweringState,
@@ -2604,7 +2656,8 @@ fn ensure_format(
                     to: target.layout.clone(),
                 },
                 input: OperandRequirement::new(current.tensor_type.format.clone(), 8),
-                output: OperandRequirement::new(tensor_type.format.clone(), 8),
+                output: OperandRequirement::new(tensor_type.format.clone(), 8)
+                    .with_materialization(materialization),
                 dispatch: ConversionDispatch::Intersections,
             }),
             estimated_cycles: costs.rearrange_cycles(

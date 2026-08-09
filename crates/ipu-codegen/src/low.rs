@@ -91,6 +91,8 @@ pub enum ShardDefinition {
     /// Persistent scratch allocation populated by local copies or exchanges.
     Staging,
     Alias(LowShardId),
+    /// Canonical format placeholder replaced by dispatch-local staging.
+    Unmaterialized,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -361,7 +363,7 @@ pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringR
         return Err(LowLoweringError::EmptyTileGroup);
     }
     let mut state = LoweringState::new(graph, config.tile_count)?;
-    let tiles = state.lower_region(&graph.operations)?;
+    let tiles = state.lower_region(&graph.operations, &graph.outputs)?;
     let inputs = graph
         .inputs
         .iter()
@@ -411,6 +413,7 @@ struct LoweringState {
     local_copies: Vec<LocalCopy>,
     repeat_runs: Vec<RepeatRun>,
     kernel_metadata: Vec<Arc<KernelRunMetadata>>,
+    deferred_conversions: BTreeMap<MidValueId, MidValueId>,
 }
 
 impl LoweringState {
@@ -424,6 +427,7 @@ impl LoweringState {
             local_copies: Vec::new(),
             repeat_runs: Vec::new(),
             kernel_metadata: Vec::new(),
+            deferred_conversions: BTreeMap::new(),
         };
         for value in &graph.values {
             let declared_tiles = value.tensor_type.format.layout.tiling.tile_count;
@@ -587,6 +591,7 @@ impl LoweringState {
     fn lower_region(
         &mut self,
         operations: &[MidOperation],
+        retained_values: &[MidValueId],
     ) -> LowLoweringResult<Vec<TileWorkList>> {
         let mut tiles = (0..self.tile_count)
             .map(|tile| TileWorkList {
@@ -594,7 +599,15 @@ impl LoweringState {
                 work: Vec::new(),
             })
             .collect::<Vec<_>>();
-        for operation in operations {
+        for (index, operation) in operations.iter().enumerate() {
+            if self.defer_conversion(
+                operation,
+                operations.get(index + 1),
+                operations,
+                retained_values,
+            )? {
+                continue;
+            }
             match &operation.kind {
                 MidOperationKind::Repeat(repeat) => {
                     self.lower_repeat(operation, repeat, &mut tiles)?;
@@ -604,6 +617,58 @@ impl LoweringState {
             }
         }
         Ok(tiles)
+    }
+
+    fn defer_conversion(
+        &mut self,
+        operation: &MidOperation,
+        next: Option<&MidOperation>,
+        operations: &[MidOperation],
+        retained_values: &[MidValueId],
+    ) -> LowLoweringResult<bool> {
+        let (MidOperationKind::Rearrange { .. }, Some(next)) = (&operation.kind, next) else {
+            return Ok(false);
+        };
+        let Some(plan) = &operation.conversion_plan else {
+            return Err(LowLoweringError::MissingConversionPlan);
+        };
+        if plan.dispatch != ConversionDispatch::Intersections {
+            return Ok(false);
+        }
+        if plan.output.materialization != crate::OperandMaterialization::DispatchSlices {
+            return Ok(false);
+        }
+        let ([source], [result]) = (operation.inputs.as_slice(), operation.results.as_slice())
+        else {
+            return Ok(false);
+        };
+        let uses = operations
+            .iter()
+            .flat_map(|operation| &operation.inputs)
+            .chain(retained_values)
+            .filter(|value| **value == *result)
+            .count();
+        if uses != 1 {
+            return Ok(false);
+        }
+        let Some(input_index) = next.inputs.iter().position(|input| input == result) else {
+            return Ok(false);
+        };
+        let streamable = next
+            .operator_plan
+            .as_ref()
+            .and_then(|plan| plan.requirements.inputs.get(input_index))
+            .is_some_and(|requirement| {
+                requirement.materialization == crate::OperandMaterialization::DispatchSlices
+            });
+        if !streamable {
+            return Ok(false);
+        }
+        self.deferred_conversions.insert(*result, *source);
+        for shard in self.value_shards(*result)?.to_vec() {
+            self.shards[shard.index() as usize].definition = ShardDefinition::Unmaterialized;
+        }
+        Ok(true)
     }
 
     fn lower_conversion(
@@ -981,6 +1046,70 @@ impl LoweringState {
         })
     }
 
+    fn dispatch_input_view(
+        &mut self,
+        value: MidValueId,
+        tile: u16,
+        ranges: &[(usize, u32, u32)],
+        transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
+        local_copies: &mut Vec<(u16, LocalCopy)>,
+    ) -> LowLoweringResult<ShardView> {
+        let target = self.local_shard(value, tile)?;
+        let target_view = self.narrow_view(target, ranges)?;
+        let Some(source_value) = self.deferred_conversions.get(&value).copied() else {
+            return Ok(target_view);
+        };
+
+        let staging = self.push_shard(LowShard {
+            id: LowShardId(0),
+            tile,
+            tensor_type: self.shards[target.index() as usize].tensor_type.clone(),
+            extents: target_view.extents.clone(),
+            definition: ShardDefinition::ExchangeStaging,
+        })?;
+        let mut intersections = BTreeMap::<Vec<ShardExtent>, LowShardId>::new();
+        for source in self.value_shards(source_value)?.to_vec() {
+            let Some(extents) = intersect_extents(
+                &self.shards[source.index() as usize].extents,
+                &target_view.extents,
+            ) else {
+                continue;
+            };
+            let selected = intersections.entry(extents).or_insert(source);
+            if self.shards[source.index() as usize].tile == tile {
+                *selected = source;
+            }
+        }
+        if intersections.is_empty() {
+            return Err(LowLoweringError::InvalidConversionPlan);
+        }
+        for (extents, source) in intersections {
+            let source_view = ShardView {
+                shard: source,
+                extents: extents.clone(),
+            };
+            let destination_view = ShardView {
+                shard: staging,
+                extents,
+            };
+            if self.shards[source.index() as usize].tile == tile {
+                append_logical_span_copies(
+                    &self.shards,
+                    &source_view,
+                    &destination_view,
+                    tile,
+                    local_copies,
+                )?;
+            } else {
+                transfers
+                    .entry(source_view)
+                    .or_default()
+                    .push(destination_view);
+            }
+        }
+        Ok(self.full_view(staging))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn lower_blocked_gemm(
         &mut self,
@@ -1063,6 +1192,7 @@ impl LoweringState {
                 let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
                 let mut local_copies = Vec::<(u16, LocalCopy)>::new();
                 let mut runs = Vec::new();
+                let mut left_views = BTreeMap::<u16, ShardView>::new();
                 for column_start in
                     (phase_column_start..phase_column_end).step_by(output_column_block as usize)
                 {
@@ -1091,9 +1221,19 @@ impl LoweringState {
                             .map_err(|_| LowLoweringError::IdOverflow)?;
                     for output in &column_outputs {
                         let tile = self.shards[output.index() as usize].tile;
-                        let left = self.local_shard(*left_value, tile)?;
-                        let left_view =
-                            self.narrow_view(left, &[(left_rank - 1, inner_start, inner_end)])?;
+                        let left_view = if let Some(view) = left_views.get(&tile) {
+                            view.clone()
+                        } else {
+                            let view = self.dispatch_input_view(
+                                *left_value,
+                                tile,
+                                &[(left_rank - 1, inner_start, inner_end)],
+                                &mut transfers,
+                                &mut local_copies,
+                            )?;
+                            left_views.insert(tile, view.clone());
+                            view
+                        };
                         let right = self
                             .right_shard_for_block(
                                 &right_shards,
@@ -1228,8 +1368,13 @@ impl LoweringState {
                     transfers,
                     WorkProvenance {
                         operation: operation.source,
-                        value: Some(*right_value),
-                        reason: WorkReason::OperatorInput { input: 1 },
+                        value: (!self.deferred_conversions.contains_key(left_value))
+                            .then_some(*right_value),
+                        reason: if self.deferred_conversions.contains_key(left_value) {
+                            WorkReason::OperatorInputs
+                        } else {
+                            WorkReason::OperatorInput { input: 1 }
+                        },
                     },
                     tiles,
                 )?;
@@ -1320,6 +1465,7 @@ impl LoweringState {
                 let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
                 let mut local_copies = Vec::<(u16, LocalCopy)>::new();
                 let mut runs = Vec::with_capacity(output_shards.len());
+                let mut left_views = BTreeMap::<u16, ShardView>::new();
                 for column_start in
                     (phase_column_start..phase_column_end).step_by(output_column_block as usize)
                 {
@@ -1335,9 +1481,19 @@ impl LoweringState {
                         .collect::<Vec<_>>();
                     for output in column_outputs {
                         let tile = self.shards[output.index() as usize].tile;
-                        let left = self.local_shard(*left_value, tile)?;
-                        let left_view =
-                            self.narrow_view(left, &[(left_rank - 1, inner_start, inner_end)])?;
+                        let left_view = if let Some(view) = left_views.get(&tile) {
+                            view.clone()
+                        } else {
+                            let view = self.dispatch_input_view(
+                                *left_value,
+                                tile,
+                                &[(left_rank - 1, inner_start, inner_end)],
+                                &mut transfers,
+                                &mut local_copies,
+                            )?;
+                            left_views.insert(tile, view.clone());
+                            view
+                        };
                         let right = self
                             .right_shard_for_block(
                                 &right_shards,
@@ -1469,8 +1625,13 @@ impl LoweringState {
                     transfers,
                     WorkProvenance {
                         operation: operation.source,
-                        value: Some(*right_value),
-                        reason: WorkReason::OperatorInput { input: 1 },
+                        value: (!self.deferred_conversions.contains_key(left_value))
+                            .then_some(*right_value),
+                        reason: if self.deferred_conversions.contains_key(left_value) {
+                            WorkReason::OperatorInputs
+                        } else {
+                            WorkReason::OperatorInput { input: 1 }
+                        },
                     },
                     tiles,
                 )?;
@@ -1639,7 +1800,7 @@ impl LoweringState {
                 )
             })
             .collect::<Vec<_>>();
-        let body = self.lower_region(&repeat.body.operations)?;
+        let body = self.lower_region(&repeat.body.operations, &repeat.body.yields)?;
         for tile in 0..self.tile_count {
             let mut carried = Vec::with_capacity(repeat.carried_inputs);
             for index in 0..repeat.carried_inputs {
@@ -2011,6 +2172,91 @@ mod tests {
                     .iter()
                     .all(|extent| extent.start < extent.physical_end)
             }));
+        }
+    }
+
+    #[test]
+    fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
+        let mut random = fastrand::Rng::with_seed(0x7374_7265_616d);
+        for case in 0..8 {
+            let batch = random.u32(1..=4);
+            let tokens = 16;
+            let mut graph = ComputeGraph::new();
+            let input = graph.host_input("input", [batch, tokens, 64]).unwrap();
+            let up = graph.parameter("up", [1, 64, 256]).unwrap();
+            let down = graph.parameter("down", [1, 256, 64]).unwrap();
+            let hidden = graph.gemm(input, up).unwrap();
+            let hidden = graph.gelu(hidden).unwrap();
+            let output = graph.gemm(hidden, down).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let mut config = PipelineConfig::new(16)
+                .with_automatic_input(input, Precision::F16)
+                .with_automatic_input(up, Precision::F16)
+                .with_automatic_input(down, Precision::F16);
+            config.conversion_streaming = crate::ConversionStreamingPolicy::Always;
+
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let deferred = mid
+                .operations
+                .iter()
+                .filter_map(|operation| {
+                    operation.conversion_plan.as_ref().and_then(|plan| {
+                        (plan.output.materialization
+                            == crate::OperandMaterialization::DispatchSlices)
+                            .then(|| operation.results[0])
+                    })
+                })
+                .collect::<BTreeSet<_>>();
+            assert!(!deferred.is_empty(), "case {case}");
+            let consumers = mid
+                .operations
+                .iter()
+                .filter(|operation| {
+                    operation
+                        .inputs
+                        .iter()
+                        .any(|input| deferred.contains(input))
+                })
+                .filter_map(|operation| operation.source)
+                .collect::<BTreeSet<_>>();
+
+            let low = lower_to_tiles(&mid, &config).unwrap();
+            assert!(
+                low.exchange_phases
+                    .iter()
+                    .all(|phase| phase.provenance.reason != WorkReason::LayoutRearrangement),
+                "case {case}"
+            );
+            assert!(
+                low.exchange_phases
+                    .iter()
+                    .any(|phase| phase.provenance.reason == WorkReason::OperatorInputs),
+                "case {case}"
+            );
+            assert!(
+                low.shards
+                    .iter()
+                    .filter(|shard| shard.definition == ShardDefinition::Unmaterialized)
+                    .count()
+                    >= 16 * deferred.len(),
+                "case {case}"
+            );
+            for run in &low.kernel_runs {
+                if run
+                    .provenance
+                    .operation
+                    .is_some_and(|operation| consumers.contains(&operation))
+                {
+                    let input = &run.inputs[0].views[0];
+                    assert_eq!(
+                        low.shards[input.shard.index() as usize].definition,
+                        ShardDefinition::ExchangeStaging,
+                        "case {case}"
+                    );
+                    let inner = input.extents.last().unwrap();
+                    assert!(inner.physical_end - inner.start <= 64, "case {case}");
+                }
+            }
         }
     }
 

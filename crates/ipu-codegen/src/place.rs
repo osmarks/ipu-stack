@@ -223,9 +223,13 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
             }
         }
     }
-    for lifetime in &mut lifetimes {
-        if !lifetime.seen {
-            // Unreferenced canonical values remain conservatively resident.
+    for (index, lifetime) in lifetimes.iter_mut().enumerate() {
+        if !lifetime.seen
+            && !matches!(
+                program.shards[index].definition,
+                ShardDefinition::Unmaterialized
+            )
+        {
             lifetime.touch(0);
         }
     }
@@ -552,16 +556,18 @@ fn allocate_tile_class(
     }
     for (&root, root_members) in members {
         let representative = &program.shards[root_members[0]];
+        let lifetime = root_lifetimes.get(&root).copied().unwrap_or_default();
         if representative.tile != tile
             || representative.tensor_type.format.layout.memory_class != class
             || grouped.contains(&root)
+            || !lifetime.seen
         {
             continue;
         }
         let requirement = root_requirements.get(&root).copied().unwrap_or_default();
         let bytes = allocation_bytes(program, root_members, requirement)?;
         requests.push(AllocationRequest {
-            lifetime: root_lifetimes.get(&root).copied().unwrap_or_default(),
+            lifetime,
             bytes,
             alignment: allocation_alignment(program, root_members, requirement).max(4),
             assignments: vec![(root, 0)],

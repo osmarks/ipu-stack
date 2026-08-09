@@ -286,7 +286,7 @@ impl CostModel for Ipu21CostModel {
                     k,
                 )
                 .unwrap_or_else(|| arithmetic.max(weight_feed).saturating_add(calls));
-                let memory = operator_memory_estimate(dispatch, inputs, output);
+                let memory = operator_memory_estimate(dispatch, requirements, inputs, output);
                 let capacity_penalty = if memory.peak.fits_ipu21() {
                     0
                 } else {

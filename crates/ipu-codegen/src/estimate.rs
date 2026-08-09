@@ -4,8 +4,8 @@ use crate::cost::IPU21_TARGET_COSTS;
 use crate::graph::TensorShape;
 use crate::mid::{
     AmpOrder, ElementOrder, Layout, MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks,
-    MemoryRelation, MemoryUsage, MidOperation, MidValue, MidValueId, OperatorDispatch, Precision,
-    TensorAxis, TensorType,
+    MemoryRelation, MemoryUsage, MidOperation, MidValue, MidValueId, OperandMaterialization,
+    OperatorDispatch, OperatorRequirements, Precision, TensorAxis, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -276,13 +276,32 @@ fn maximum_standard_allocation(
 
 pub(crate) fn operator_memory_estimate(
     dispatch: &OperatorDispatch,
+    requirements: &OperatorRequirements,
     inputs: &[TensorType],
     output: &TensorType,
 ) -> MemoryEstimate {
-    let live = inputs.iter().fold(tensor_memory(output), |usage, input| {
-        usage.saturating_add(tensor_memory(input))
-    });
+    let live = inputs.iter().zip(&requirements.inputs).fold(
+        tensor_memory(output),
+        |usage, (input, requirement)| {
+            if requirement.materialization == OperandMaterialization::DispatchSlices {
+                usage
+            } else {
+                usage.saturating_add(tensor_memory(input))
+            }
+        },
+    );
     let mut temporary = MemoryUsage::default();
+    if let (OperatorDispatch::BlockedGemm { inner_block, .. }, Some(left), Some(requirement)) =
+        (dispatch, inputs.first(), requirements.inputs.first())
+        && requirement.materialization == OperandMaterialization::DispatchSlices
+    {
+        let inner = left.shape.0.last().copied().map_or(1, u64::from).max(1);
+        let bytes = maximum_shard_bytes(left)
+            .div_ceil(inner)
+            .saturating_mul(u64::from(*inner_block))
+            .saturating_add(u64::from(requirement.access_tail_bytes));
+        temporary.add_class(left.format.layout.memory_class, bytes);
+    }
     if let (
         OperatorDispatch::BlockedGemm {
             inner_block,
@@ -419,6 +438,16 @@ pub(crate) fn region_peak_memory(
     values: &[MidValue],
 ) -> MemoryPeaks {
     let requirements = allocation_requirements(operations);
+    let streamed_aliases = operations
+        .iter()
+        .filter_map(|operation| {
+            let plan = operation.conversion_plan.as_ref()?;
+            if plan.output.materialization != OperandMaterialization::DispatchSlices {
+                return None;
+            }
+            Some((*operation.results.first()?, *operation.inputs.first()?))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut uses = BTreeMap::<MidValueId, u32>::new();
     for input in operations.iter().flat_map(|operation| &operation.inputs) {
         *uses.entry(*input).or_default() += 1;
@@ -427,51 +456,53 @@ pub(crate) fn region_peak_memory(
         *uses.entry(*output).or_default() += 1;
     }
     let mut live_values = BTreeSet::new();
-    let mut live = MemoryUsage::default();
     for id in initial {
-        if live_values.insert(*id) {
-            live = live.saturating_add(value_allocation(*id, values, &requirements));
-        }
+        live_values.insert(*id);
     }
     let mut peaks = MemoryPeaks::default();
-    peaks.observe(
-        live,
-        maximum_standard_allocation(&live_values, values, &requirements),
-    );
+    let observe = |peaks: &mut MemoryPeaks, ids: &BTreeSet<MidValueId>, temporary: MemoryUsage| {
+        let roots = ids
+            .iter()
+            .map(|id| allocation_root(*id, &streamed_aliases))
+            .collect::<BTreeSet<_>>();
+        let live = roots.iter().fold(MemoryUsage::default(), |usage, id| {
+            usage.saturating_add(value_allocation(*id, values, &requirements))
+        });
+        peaks.observe(
+            live.saturating_add(temporary),
+            maximum_standard_allocation(&roots, values, &requirements),
+        );
+    };
+    observe(&mut peaks, &live_values, MemoryUsage::default());
     for operation in operations {
-        let mut during = live.saturating_add(operation.memory.temporary);
         let mut during_values = live_values.clone();
         for result in &operation.results {
-            if !live_values.contains(result) {
-                during = during.saturating_add(value_allocation(*result, values, &requirements));
-                during_values.insert(*result);
-            }
+            during_values.insert(*result);
         }
-        peaks.observe(
-            during,
-            maximum_standard_allocation(&during_values, values, &requirements),
-        );
+        observe(&mut peaks, &during_values, operation.memory.temporary);
         for input in &operation.inputs {
             if let Some(remaining) = uses.get_mut(input) {
                 *remaining = remaining.saturating_sub(1);
-                if *remaining == 0 && live_values.remove(input) {
-                    let bytes = value_allocation(*input, values, &requirements);
-                    live.standard = live.standard.saturating_sub(bytes.standard);
-                    live.interleaved = live.interleaved.saturating_sub(bytes.interleaved);
+                if *remaining == 0 {
+                    live_values.remove(input);
                 }
             }
         }
         for result in &operation.results {
-            if uses.get(result).copied().unwrap_or(0) != 0 && live_values.insert(*result) {
-                live = live.saturating_add(value_allocation(*result, values, &requirements));
+            if uses.get(result).copied().unwrap_or(0) != 0 {
+                live_values.insert(*result);
             }
         }
     }
-    peaks.observe(
-        live,
-        maximum_standard_allocation(&live_values, values, &requirements),
-    );
+    observe(&mut peaks, &live_values, MemoryUsage::default());
     peaks
+}
+
+fn allocation_root(mut id: MidValueId, aliases: &BTreeMap<MidValueId, MidValueId>) -> MidValueId {
+    while let Some(source) = aliases.get(&id) {
+        id = *source;
+    }
+    id
 }
 
 pub(crate) fn gemm_remote_bytes_per_tile(inputs: &[TensorType], output: &TensorType) -> u64 {
