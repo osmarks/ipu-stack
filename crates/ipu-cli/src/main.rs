@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use ipu_driver::{Device, block_device_interrupt_signals};
 use ipu_elf::{LinkOptions, Toolchain, inspect_object, link};
-use ipu_package::{Application, ProfileReport, ProfileStepKind};
-use ipu_profile::{GroupBy, Query, SortBy, StepKind, query};
+use ipu_package::{Application, ProfileExchangeActivityKind, ProfileReport, ProfileStepKind};
+use ipu_profile::{GroupBy, Query, SortBy, StepKind, exchange_activity_summary, query};
 use ipu_runtime::Runtime;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -204,11 +204,19 @@ fn main() -> Result<()> {
         Command::ProfileInspect { profile } => {
             let report = ProfileReport::read(fs::File::open(&profile)?)?;
             let samples: usize = report.tiles.iter().map(|tile| tile.samples.len()).sum();
+            let exchange = exchange_activity_summary(&report);
             println!(
-                "clockHz={} tiles={} samples={}",
+                "clockHz={} tiles={} samples={} exchangeSamples={} describedExchangeSamples={} sendIntervals={} receiveIntervals={} estimatedSendWorkCycles={} estimatedReceiveWorkCycles={} estimatedExchangeIdleWorkCycles={}",
                 report.clock_hz,
                 report.tiles.len(),
-                samples
+                samples,
+                exchange.exchange_samples,
+                exchange.described_samples,
+                exchange.send_intervals,
+                exchange.receive_intervals,
+                exchange.estimated_send_work_cycles,
+                exchange.estimated_receive_work_cycles,
+                exchange.estimated_idle_work_cycles,
             );
         }
         Command::ProfileRender { profile, output } => {
@@ -447,6 +455,7 @@ fn render_profile_html(report: &ProfileReport) -> Result<String> {
         kernel: u32,
         metadata: u32,
         kind: u8,
+        exchange_event_cycles: u32,
     }
 
     fn intern_string(
@@ -467,6 +476,8 @@ fn render_profile_html(report: &ProfileReport) -> Result<String> {
     let mut string_indices = HashMap::new();
     let mut metadata_sets = Vec::<Vec<[u32; 2]>>::new();
     let mut metadata_indices = HashMap::<Vec<[u32; 2]>, u32>::new();
+    let mut activity_sets = Vec::<Vec<[u32; 3]>>::new();
+    let mut activity_indices = HashMap::<Vec<[u32; 3]>, u32>::new();
     let mut steps = Vec::<StepKey>::new();
     let mut step_indices = HashMap::<StepKey, u32>::new();
     let tiles = report
@@ -518,16 +529,41 @@ fn render_profile_html(report: &ProfileReport) -> Result<String> {
                             ProfileStepKind::Synchronization => 2,
                             ProfileStepKind::Idle => 3,
                         },
+                        exchange_event_cycles: sample.step.exchange_event_cycles,
                     };
                     let step = *step_indices.entry(step).or_insert_with(|| {
                         let index = steps.len() as u32;
                         steps.push(step);
                         index
                     });
+                    let activities = sample
+                        .step
+                        .exchange_activities
+                        .iter()
+                        .map(|activity| {
+                            [
+                                match activity.kind {
+                                    ProfileExchangeActivityKind::Send => 0,
+                                    ProfileExchangeActivityKind::Receive => 1,
+                                },
+                                activity.start_cycle,
+                                activity.end_cycle,
+                            ]
+                        })
+                        .collect::<Vec<_>>();
+                    let activities =
+                        *activity_indices
+                            .entry(activities.clone())
+                            .or_insert_with(|| {
+                                let index = activity_sets.len() as u32;
+                                activity_sets.push(activities);
+                                index
+                            });
                     serde_json::json!([
                         step,
                         sample.start_cycle.wrapping_sub(base_cycle),
                         sample.end_cycle.wrapping_sub(sample.start_cycle),
+                        activities,
                     ])
                 })
                 .collect::<Vec<_>>();
@@ -560,6 +596,7 @@ fn render_profile_html(report: &ProfileReport) -> Result<String> {
                 step.kernel,
                 step.metadata,
                 step.kind,
+                step.exchange_event_cycles,
             ])
         })
         .collect::<Vec<_>>();
@@ -570,6 +607,7 @@ fn render_profile_html(report: &ProfileReport) -> Result<String> {
         "strings": strings,
         "metadata": metadata,
         "metadataSets": metadata_sets,
+        "activitySets": activity_sets,
         "steps": steps,
         "tiles": tiles,
     });

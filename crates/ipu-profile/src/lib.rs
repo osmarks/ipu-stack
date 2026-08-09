@@ -1,4 +1,4 @@
-use ipu_package::{CycleSample, ProfileReport, ProfileStepKind};
+use ipu_package::{CycleSample, ProfileExchangeActivityKind, ProfileReport, ProfileStepKind};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -105,6 +105,69 @@ pub struct SampleRecord {
 pub struct MetadataEntry {
     pub name: String,
     pub value: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExchangeActivitySummary {
+    pub exchange_samples: usize,
+    pub described_samples: usize,
+    pub send_intervals: usize,
+    pub receive_intervals: usize,
+    pub estimated_send_work_cycles: u64,
+    pub estimated_receive_work_cycles: u64,
+    pub estimated_idle_work_cycles: u64,
+}
+
+/// Summarizes statically scheduled exchange roles after scaling each event
+/// timeline to the corresponding measured exchange duration.
+pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySummary {
+    let mut summary = ExchangeActivitySummary::default();
+    for sample in report
+        .tiles
+        .iter()
+        .flat_map(|tile| &tile.samples)
+        .filter(|sample| sample.step.kind == ProfileStepKind::Exchange)
+    {
+        summary.exchange_samples += 1;
+        let event_cycles = u64::from(sample.step.exchange_event_cycles);
+        if event_cycles == 0 {
+            continue;
+        }
+        if sample.step.exchange_activities.is_empty() {
+            continue;
+        }
+        summary.described_samples += 1;
+        let measured = u64::from(duration(sample));
+        let mut send_events = 0u64;
+        let mut receive_events = 0u64;
+        for activity in &sample.step.exchange_activities {
+            let cycles = u64::from(activity.end_cycle.saturating_sub(activity.start_cycle));
+            match activity.kind {
+                ProfileExchangeActivityKind::Send => {
+                    summary.send_intervals += 1;
+                    send_events += cycles;
+                }
+                ProfileExchangeActivityKind::Receive => {
+                    summary.receive_intervals += 1;
+                    receive_events += cycles;
+                }
+            }
+        }
+        let scale = |events: u64| {
+            u64::try_from(
+                (u128::from(events) * u128::from(measured) + u128::from(event_cycles / 2))
+                    / u128::from(event_cycles),
+            )
+            .unwrap_or(u64::MAX)
+        };
+        let send = scale(send_events);
+        let receive = scale(receive_events);
+        summary.estimated_send_work_cycles += send;
+        summary.estimated_receive_work_cycles += receive;
+        summary.estimated_idle_work_cycles += measured.saturating_sub(send.saturating_add(receive));
+    }
+    summary
 }
 
 #[derive(Default)]
@@ -443,6 +506,8 @@ mod tests {
                     name: "block".into(),
                     value: phase.to_string(),
                 }],
+                exchange_activities: Vec::new(),
+                exchange_event_cycles: 0,
             },
             start_cycle: start,
             end_cycle: end,

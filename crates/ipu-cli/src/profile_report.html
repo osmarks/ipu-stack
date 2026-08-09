@@ -68,6 +68,9 @@ section {
   border-bottom: 1px solid var(--line);
 }
 .section-title { font-weight: 700; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 12px; color: var(--muted); font-size: 11px; }
+.legend-item { display: inline-flex; align-items: center; gap: 5px; }
+.legend-swatch { width: 12px; height: 12px; border: 1px solid #000; }
 .svg-wrap, .timeline-wrap { overflow: auto; }
 .overview-wrap {
   border-bottom: 1px solid var(--line);
@@ -148,6 +151,13 @@ canvas {
   <section>
     <div class="section-head">
       <div class="section-title">Tilewise Timeline</div>
+      <div class="legend">
+        <span class="legend-item"><span class="legend-swatch" style="background:#b00020"></span>compute (kernel-tinted)</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#006b3f"></span>send</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#19766f"></span>receive</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#a8cec0"></span>exchange idle (estimated)</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#8a6500"></span>sync</span>
+      </div>
     </div>
     <div class="overview-wrap"><canvas id="overview"></canvas></div>
     <div class="timeline-wrap"><canvas id="timeline"></canvas></div>
@@ -164,8 +174,13 @@ const metadataSets = DATA.metadataSets.map(([start, count]) => {
   }
   return entries;
 });
+const activitySets = DATA.activitySets.map(activities => activities.map(([kind, start, end]) => ({
+  kind: kind === 0 ? "send" : "receive",
+  start,
+  end,
+})));
 const kindNames = ["exchange", "compute", "synchronization", "idle"];
-const steps = DATA.steps.map(([phase, epoch, operation, kernel, metadata, kind]) => {
+const steps = DATA.steps.map(([phase, epoch, operation, kernel, metadata, kind, exchangeEventCycles]) => {
   const entries = metadataSets[metadata];
   const reportedKind = kindNames[kind];
   const inactiveCompute = reportedKind === "compute"
@@ -177,13 +192,15 @@ const steps = DATA.steps.map(([phase, epoch, operation, kernel, metadata, kind])
     kernel: DATA.strings[kernel],
     metadata: entries,
     kind: inactiveCompute ? "idle" : reportedKind,
+    exchangeEventCycles,
   };
 });
 for (const tile of DATA.tiles) {
-  tile.samples = tile.samples.map(([step, offset, duration]) => ({
+  tile.samples = tile.samples.map(([step, offset, duration, activities]) => ({
     ...steps[step],
     offset,
     duration,
+    exchangeActivities: activitySets[activities],
   }));
 }
 const state = { query: "", kind: "all", focus: null, time: null, viewStart: 0, viewEnd: null };
@@ -192,7 +209,15 @@ const overview = document.getElementById("overview");
 const timeline = document.getElementById("timeline");
 const tooltip = document.getElementById("tooltip");
 const details = document.getElementById("details");
-const colors = { exchange: "#006b3f", compute: "#b00020", synchronization: "#8a6500", idle: "#ffffff" };
+const colors = {
+  exchange: "#006b3f",
+  send: "#006b3f",
+  receive: "#19766f",
+  exchangeIdle: "#a8cec0",
+  compute: "#b00020",
+  synchronization: "#8a6500",
+  idle: "#ffffff",
+};
 const textColor = { exchange: "#ffffff", compute: "#ffffff", synchronization: "#ffffff", idle: "#050505" };
 const tiles = DATA.tiles.slice().sort((a, b) => a.physicalTile - b.physicalTile);
 let timelineGeom = null;
@@ -229,6 +254,54 @@ function formatMetadata(sample) {
 }
 function sampleTitle(sample) {
   return sample.kernel || sample.operation;
+}
+function stableHash(text) {
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index++) {
+    hash = Math.imul(hash ^ text.charCodeAt(index), 16777619);
+  }
+  return hash >>> 0;
+}
+function sampleColor(sample, kind = sample.kind) {
+  if (kind !== "compute" || !sample.kernel) return colors[kind] || colors.exchange;
+  const hash = stableHash(sample.kernel);
+  const hue = 350 + (hash % 17) - 8;
+  const lightness = 34 + ((hash >>> 8) % 7) - 3;
+  return `hsl(${hue} 82% ${lightness}%)`;
+}
+function exchangeEventCycles(sample) {
+  const cycles = sample.exchangeEventCycles;
+  return Number.isFinite(cycles) && cycles > 0 ? cycles : 0;
+}
+function displaySegments(sample) {
+  const sampleEnd = sample.offset + sample.duration;
+  if (sample.kind !== "exchange" || !sample.exchangeActivities?.length) {
+    return [{ kind: sample.kind, start: sample.offset, end: sampleEnd }];
+  }
+  const eventCycles = exchangeEventCycles(sample);
+  if (!eventCycles) return [{ kind: "exchange", start: sample.offset, end: sampleEnd }];
+  const scale = sample.duration / eventCycles;
+  const activities = sample.exchangeActivities
+    .map(activity => ({
+      kind: activity.kind,
+      start: Math.max(sample.offset, Math.min(sampleEnd, sample.offset + activity.start * scale)),
+      end: Math.max(sample.offset, Math.min(sampleEnd, sample.offset + activity.end * scale)),
+    }))
+    .filter(activity => activity.end > activity.start)
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+  const segments = [];
+  let cursor = sample.offset;
+  for (const activity of activities) {
+    if (activity.start > cursor) segments.push({ kind: "exchangeIdle", start: cursor, end: activity.start });
+    segments.push(activity);
+    cursor = Math.max(cursor, activity.end);
+  }
+  if (cursor < sampleEnd) segments.push({ kind: "exchangeIdle", start: cursor, end: sampleEnd });
+  return segments;
+}
+function displayKindAt(sample, time) {
+  const segment = displaySegments(sample).find(segment => time >= segment.start && time < segment.end);
+  return segment?.kind || sample.kind;
 }
 function fullEnd() {
   return tiles.reduce((maxEnd, tile) => Math.max(maxEnd, ...tile.samples.map(sample => sample.offset + sample.duration)), 1);
@@ -387,7 +460,9 @@ function drawFlame() {
     const y = top + node.depth * rowH;
     const w = Math.max(1, node.w - 1);
     const h = rowH - 3;
-    ctx.fillStyle = node.kind ? colors[node.kind] : "#73808f";
+    ctx.fillStyle = node.kind
+      ? sampleColor({ kind: node.kind, kernel: node.focus?.kernel || "" })
+      : "#73808f";
     ctx.fillRect(x, y, w, h);
     ctx.strokeStyle = "#000000";
     ctx.lineWidth = 1;
@@ -430,33 +505,46 @@ function drawOverview() {
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, width, height);
-  const kinds = ["compute", "exchange", "synchronization", "idle"];
-  const deltas = Object.fromEntries(kinds.map(kind => [kind, new Int32Array(width + 1)]));
+  const kinds = ["compute", "send", "receive", "exchangeIdle", "exchange", "synchronization", "idle"];
+  const deltas = Object.fromEntries(kinds.map(kind => [kind, new Float64Array(width + 1)]));
+  const edges = Object.fromEntries(kinds.map(kind => [kind, new Float64Array(width)]));
   const scale = width / maxEnd;
+  const addCoverage = (kind, start, end) => {
+    const scaledStart = Math.max(0, Math.min(width, start * scale));
+    const scaledEnd = Math.max(scaledStart, Math.min(width, end * scale));
+    if (scaledEnd <= scaledStart) return;
+    const first = Math.min(width - 1, Math.floor(scaledStart));
+    const last = Math.min(width - 1, Math.ceil(scaledEnd) - 1);
+    if (first === last) {
+      edges[kind][first] += scaledEnd - scaledStart;
+      return;
+    }
+    edges[kind][first] += first + 1 - scaledStart;
+    edges[kind][last] += scaledEnd - last;
+    if (first + 1 < last) {
+      deltas[kind][first + 1] += 1;
+      deltas[kind][last] -= 1;
+    }
+  };
   for (const tile of tiles) {
     for (const sample of tile.samples) {
-      const start = Math.max(0, Math.floor(sample.offset * scale));
-      const end = Math.min(width - 1, Math.ceil((sample.offset + sample.duration) * scale));
-      const target = deltas[sample.kind];
-      target[start]++;
-      target[end + 1]--;
+      for (const segment of displaySegments(sample)) {
+        addCoverage(segment.kind, segment.start, segment.end);
+      }
     }
   }
   const denominator = Math.max(1, tiles.length);
   const active = Object.fromEntries(kinds.map(kind => [kind, 0]));
   for (let x = 0; x < width; x++) {
     for (const kind of kinds) active[kind] += deltas[kind][x];
-    const heights = Object.fromEntries(kinds.map(kind => [kind, Math.round((height - 2) * active[kind] / denominator)]));
-    const totalH = Math.min(height - 2, kinds.reduce((sum, kind) => sum + heights[kind], 0));
     let y = height - 1;
-    let remaining = totalH;
     for (const kind of kinds) {
-      const h = Math.min(heights[kind], remaining);
+      const coverage = active[kind] + edges[kind][x];
+      const h = (height - 2) * coverage / denominator;
       if (!h) continue;
       ctx.fillStyle = colors[kind];
       y -= h;
       ctx.fillRect(x, y, 1, h);
-      remaining -= h;
     }
   }
   const viewStart = Math.max(0, Math.min(state.viewStart, maxEnd));
@@ -504,16 +592,16 @@ function drawTimeline() {
   tiles.forEach((tile, index) => {
     const y = top + index * rowH;
     for (const sample of tile.samples) {
-      const sampleStart = sample.offset;
-      const sampleEnd = sample.offset + sample.duration;
-      if (sampleEnd < viewStart || sampleStart > viewEnd) continue;
-      const clippedStart = Math.max(sampleStart, viewStart);
-      const clippedEnd = Math.min(sampleEnd, viewEnd);
-      const x = left + plotW * (clippedStart - viewStart) / (viewEnd - viewStart);
-      const w = Math.max(1, plotW * (clippedEnd - clippedStart) / (viewEnd - viewStart));
       const selected = matches(sample);
-      ctx.fillStyle = selected ? colors[sample.kind] : "#9b9b9b";
-      ctx.fillRect(x, y, w, rowH);
+      for (const segment of displaySegments(sample)) {
+        if (segment.end < viewStart || segment.start > viewEnd) continue;
+        const clippedStart = Math.max(segment.start, viewStart);
+        const clippedEnd = Math.min(segment.end, viewEnd);
+        const x = left + plotW * (clippedStart - viewStart) / (viewEnd - viewStart);
+        const w = Math.max(1, plotW * (clippedEnd - clippedStart) / (viewEnd - viewStart));
+        ctx.fillStyle = selected ? sampleColor(sample, segment.kind) : "#9b9b9b";
+        ctx.fillRect(x, y, w, rowH);
+      }
     }
   });
   if (state.time !== null) {
@@ -554,7 +642,15 @@ function drawDetails() {
   ];
   if (state.time !== null) {
     let active = 0;
-    const activeKinds = { compute: 0, exchange: 0, synchronization: 0, idle: 0 };
+    const activeKinds = {
+      compute: 0,
+      send: 0,
+      receive: 0,
+      exchangeIdle: 0,
+      exchange: 0,
+      synchronization: 0,
+      idle: 0,
+    };
     const byOperation = new Map();
     const byKernel = new Map();
     const byMetadata = new Map();
@@ -562,7 +658,7 @@ function drawDetails() {
       for (const sample of tile.samples) {
         if (!activeAt(sample, state.time)) continue;
         active++;
-        activeKinds[sample.kind]++;
+        activeKinds[displayKindAt(sample, state.time)]++;
         byOperation.set(sample.operation, (byOperation.get(sample.operation) || 0) + 1);
         if (sample.kernel) byKernel.set(sample.kernel, (byKernel.get(sample.kernel) || 0) + 1);
         for (const entry of metadataEntries(sample)) {
@@ -623,7 +719,7 @@ function timelineHit(event) {
   const time = timelineGeom.viewStart
     + (x - timelineGeom.left) * (timelineGeom.viewEnd - timelineGeom.viewStart) / timelineGeom.plotW;
   const sample = tile.samples.find(candidate => activeAt(candidate, time));
-  if (sample) return { tile: tile.physicalTile, sample };
+  if (sample) return { tile: tile.physicalTile, sample, time, kind: displayKindAt(sample, time) };
   return null;
 }
 function flameHit(event) {
@@ -750,7 +846,7 @@ timeline.addEventListener("mousemove", event => {
   showTip(event, [
     `tile ${hit.tile}`,
     sampleTitle(hit.sample),
-    `${hit.sample.kind} phase ${hit.sample.phase} epoch ${hit.sample.epoch}`,
+    `${hit.kind} phase ${hit.sample.phase} epoch ${hit.sample.epoch}`,
     `range ${formatRange(hit.sample)}`,
     formatMetadata(hit.sample),
   ]);

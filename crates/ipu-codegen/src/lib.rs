@@ -20,8 +20,8 @@ pub mod place;
 pub mod storage;
 pub mod tile;
 pub use exchange::{
-    ExchangeLoweringError, ExchangeLoweringOptions, PhysicalExchangePhase, inactive_exchange_row,
-    lower_exchanges,
+    ExchangeActivity, ExchangeActivityKind, ExchangeLoweringError, ExchangeLoweringOptions,
+    PhysicalExchangePhase, inactive_exchange_row, lower_exchanges,
 };
 pub use graph::{
     AddOptions, AttentionOptions, AttentionScale, BroadcastMode, ComputeGraph, GemmOptions,

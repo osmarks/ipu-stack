@@ -25,6 +25,21 @@ pub enum ProfileStepKind {
     Idle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileExchangeActivityKind {
+    Send,
+    Receive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProfileExchangeActivity {
+    pub kind: ProfileExchangeActivityKind,
+    /// Estimated event-cycle offset within the exchange phase.
+    pub start_cycle: u32,
+    /// Estimated event-cycle offset within the exchange phase.
+    pub end_cycle: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileStep {
     pub local_index: u32,
@@ -34,6 +49,8 @@ pub struct ProfileStep {
     pub kind: ProfileStepKind,
     pub kernel: String,
     pub metadata: Vec<ProfileMetadata>,
+    pub exchange_activities: Vec<ProfileExchangeActivity>,
+    pub exchange_event_cycles: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,7 +82,7 @@ impl ProfileReport {
     pub fn write(&self, mut output: impl Write) -> Result<(), PackageError> {
         let mut message = message::Builder::new_default();
         let mut root = message.init_root::<profile_capnp::profile::Builder>();
-        root.set_schema_version(3);
+        root.set_schema_version(4);
         root.set_clock_hz(self.clock_hz);
         let mut tiles = root.reborrow().init_tiles(self.tiles.len() as u32);
         for (tile_index, tile) in self.tiles.iter().enumerate() {
@@ -90,6 +107,7 @@ impl ProfileReport {
                     ProfileStepKind::Idle => profile_capnp::StepKind::Idle,
                 });
                 step.set_kernel(&sample.step.kernel);
+                step.set_exchange_event_cycles(sample.step.exchange_event_cycles);
                 let mut metadata = step
                     .reborrow()
                     .init_metadata(sample.step.metadata.len() as u32);
@@ -97,6 +115,22 @@ impl ProfileReport {
                     let mut output_entry = metadata.reborrow().get(index as u32);
                     output_entry.set_name(&entry.name);
                     output_entry.set_value(&entry.value);
+                }
+                let mut activities = step
+                    .reborrow()
+                    .init_exchange_activities(sample.step.exchange_activities.len() as u32);
+                for (index, activity) in sample.step.exchange_activities.iter().enumerate() {
+                    let mut output_activity = activities.reborrow().get(index as u32);
+                    output_activity.set_kind(match activity.kind {
+                        ProfileExchangeActivityKind::Send => {
+                            profile_capnp::ExchangeActivityKind::Send
+                        }
+                        ProfileExchangeActivityKind::Receive => {
+                            profile_capnp::ExchangeActivityKind::Receive
+                        }
+                    });
+                    output_activity.set_start_cycle(activity.start_cycle);
+                    output_activity.set_end_cycle(activity.end_cycle);
                 }
             }
         }
@@ -107,7 +141,7 @@ impl ProfileReport {
     pub fn read(mut input: impl Read) -> Result<Self, PackageError> {
         let message = serialize::read_message(&mut input, capnp_reader_options())?;
         let root = message.get_root::<profile_capnp::profile::Reader>()?;
-        if !matches!(root.get_schema_version(), 1..=3) {
+        if !matches!(root.get_schema_version(), 1..=4) {
             return Err(PackageError::Invalid(format!(
                 "unsupported profile schema version {}",
                 root.get_schema_version()
@@ -147,6 +181,25 @@ impl ProfileReport {
                                         })
                                     })
                                     .collect::<Result<_, PackageError>>()?,
+                                exchange_activities: step
+                                    .get_exchange_activities()?
+                                    .iter()
+                                    .map(|activity| {
+                                        Ok(ProfileExchangeActivity {
+                                            kind: match activity.get_kind()? {
+                                                profile_capnp::ExchangeActivityKind::Send => {
+                                                    ProfileExchangeActivityKind::Send
+                                                }
+                                                profile_capnp::ExchangeActivityKind::Receive => {
+                                                    ProfileExchangeActivityKind::Receive
+                                                }
+                                            },
+                                            start_cycle: activity.get_start_cycle(),
+                                            end_cycle: activity.get_end_cycle(),
+                                        })
+                                    })
+                                    .collect::<Result<_, PackageError>>()?,
+                                exchange_event_cycles: step.get_exchange_event_cycles(),
                             },
                             start_cycle: sample.get_start_cycle(),
                             end_cycle: sample.get_end_cycle(),
@@ -842,6 +895,7 @@ fn write_profile_tiles(
                 ProfileStepKind::Idle => application_capnp::ProfileStepKind::Idle,
             });
             output_step.set_kernel(&step.kernel);
+            output_step.set_exchange_event_cycles(step.exchange_event_cycles);
             let mut metadata = output_step
                 .reborrow()
                 .init_metadata(step.metadata.len() as u32);
@@ -849,6 +903,22 @@ fn write_profile_tiles(
                 let mut output_entry = metadata.reborrow().get(metadata_index as u32);
                 output_entry.set_name(&entry.name);
                 output_entry.set_value(&entry.value);
+            }
+            let mut activities = output_step
+                .reborrow()
+                .init_exchange_activities(step.exchange_activities.len() as u32);
+            for (activity_index, activity) in step.exchange_activities.iter().enumerate() {
+                let mut output_activity = activities.reborrow().get(activity_index as u32);
+                output_activity.set_kind(match activity.kind {
+                    ProfileExchangeActivityKind::Send => {
+                        application_capnp::ProfileExchangeActivityKind::Send
+                    }
+                    ProfileExchangeActivityKind::Receive => {
+                        application_capnp::ProfileExchangeActivityKind::Receive
+                    }
+                });
+                output_activity.set_start_cycle(activity.start_cycle);
+                output_activity.set_end_cycle(activity.end_cycle);
             }
         }
     }
@@ -894,6 +964,25 @@ fn read_profile_tiles(
                                     })
                                 })
                                 .collect::<Result<_, PackageError>>()?,
+                            exchange_activities: step
+                                .get_exchange_activities()?
+                                .iter()
+                                .map(|activity| {
+                                    Ok(ProfileExchangeActivity {
+                                        kind: match activity.get_kind()? {
+                                            application_capnp::ProfileExchangeActivityKind::Send => {
+                                                ProfileExchangeActivityKind::Send
+                                            }
+                                            application_capnp::ProfileExchangeActivityKind::Receive => {
+                                                ProfileExchangeActivityKind::Receive
+                                            }
+                                        },
+                                        start_cycle: activity.get_start_cycle(),
+                                        end_cycle: activity.get_end_cycle(),
+                                    })
+                                })
+                                .collect::<Result<_, PackageError>>()?,
+                            exchange_event_cycles: step.get_exchange_event_cycles(),
                         })
                     })
                     .collect::<Result<_, PackageError>>()?,
@@ -1050,6 +1139,12 @@ mod tests {
                     name: "reason".into(),
                     value: "OperatorKernel".into(),
                 }],
+                exchange_activities: vec![ProfileExchangeActivity {
+                    kind: ProfileExchangeActivityKind::Receive,
+                    start_cycle: 3,
+                    end_cycle: 11,
+                }],
+                exchange_event_cycles: 13,
             }],
         });
         app.device_config_writes.push(DeviceConfigWrite {
@@ -1164,6 +1259,8 @@ mod tests {
                         },
                         kernel: format!("kernel.{index}"),
                         metadata: Vec::new(),
+                        exchange_activities: Vec::new(),
+                        exchange_event_cycles: 0,
                     })
                     .collect::<Vec<_>>();
                 expected.push((tile as u32, steps.clone(), bounds));
@@ -1262,6 +1359,15 @@ mod tests {
                             name: "innerBlock".into(),
                             value: "8".into(),
                         }],
+                        exchange_activities: (kind == ProfileStepKind::Exchange)
+                            .then_some(ProfileExchangeActivity {
+                                kind: ProfileExchangeActivityKind::Send,
+                                start_cycle: 2,
+                                end_cycle: 6,
+                            })
+                            .into_iter()
+                            .collect(),
+                        exchange_event_cycles: 9,
                     },
                     start_cycle: (u32::MAX - 10).wrapping_add(index as u32),
                     end_cycle: 7 + index as u32,

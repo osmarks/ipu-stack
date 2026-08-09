@@ -16,9 +16,10 @@ use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
 use ipu_exchange::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
 use ipu_package::{
-    Application, Binding, EntryPoint, PROFILE_CYCLES_BINDING, PackageError, ProfileMetadata,
-    ProfileStep, ProfileStepKind, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE,
-    Segment, TILE_MEMORY_BASE, TileImage, TileProfilePlan,
+    Application, Binding, EntryPoint, PROFILE_CYCLES_BINDING, PackageError,
+    ProfileExchangeActivity, ProfileExchangeActivityKind, ProfileMetadata, ProfileStep,
+    ProfileStepKind, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment,
+    TILE_MEMORY_BASE, TileImage, TileProfilePlan,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -349,6 +350,7 @@ fn build_package_from_objects(
             if let Some(storage) = &profile_storage {
                 instrument_profile(
                     program,
+                    &provisional_exchanges,
                     logical,
                     u32::try_from(physical)?,
                     &mut tile_program,
@@ -493,6 +495,7 @@ fn build_package_from_objects(
                 .map(|storage| {
                     instrument_profile(
                         program,
+                        &exchanges,
                         logical,
                         u32::try_from(physical_tile)?,
                         &mut tile_program,
@@ -864,6 +867,7 @@ fn profile_binding(
 
 fn instrument_profile(
     program: &LowProgram,
+    exchanges: &[crate::PhysicalExchangePhase],
     logical_tile: u16,
     physical_tile: u32,
     tile_program: &mut crate::TileProgram,
@@ -884,7 +888,14 @@ fn instrument_profile(
                 crate::TileWorkRef::Exchange(_) | crate::TileWorkRef::LocalCopy(_) => None,
             });
             plans.push(profile_step(
-                program, index, work, step, address, following,
+                program,
+                exchanges,
+                logical_tile,
+                index,
+                work,
+                step,
+                address,
+                following,
             )?);
         }
     } else {
@@ -921,6 +932,8 @@ fn instrument_profile(
 
 fn profile_step(
     program: &LowProgram,
+    exchanges: &[crate::PhysicalExchangePhase],
+    logical_tile: u16,
     index: usize,
     work: crate::TileWorkRef<'_>,
     step: &mut crate::TileStep,
@@ -938,13 +951,34 @@ fn profile_step(
                     &phase.provenance,
                 )
             } else {
-                profile_description(
+                let mut description = profile_description(
                     index,
                     0x8000_0000 | id.index(),
                     &phase.provenance,
                     ProfileStepKind::Exchange,
                     "exchange",
-                )
+                )?;
+                let physical = exchanges
+                    .get(id.index() as usize)
+                    .ok_or_else(|| invalid("profile exchange phase is missing"))?;
+                description.exchange_activities = physical
+                    .activities
+                    .get(usize::from(logical_tile))
+                    .ok_or_else(|| invalid("profile exchange tile is missing"))?
+                    .iter()
+                    .map(|activity| ProfileExchangeActivity {
+                        kind: match activity.kind {
+                            crate::ExchangeActivityKind::Send => ProfileExchangeActivityKind::Send,
+                            crate::ExchangeActivityKind::Receive => {
+                                ProfileExchangeActivityKind::Receive
+                            }
+                        },
+                        start_cycle: activity.start_cycle,
+                        end_cycle: activity.end_cycle,
+                    })
+                    .collect();
+                description.exchange_event_cycles = physical.event_cycles;
+                Ok(description)
             }
         }
         (crate::TileWorkRef::Kernel(run), crate::TileStep::Compute(compute)) => {
@@ -979,6 +1013,8 @@ fn profile_step(
                         name: "reason".into(),
                         value: "LocalCopy".into(),
                     }],
+                    exchange_activities: Vec::new(),
+                    exchange_event_cycles: 0,
                 })
             }
         }
@@ -1050,6 +1086,8 @@ fn profile_description(
         kind,
         kernel: kernel.into(),
         metadata,
+        exchange_activities: Vec::new(),
+        exchange_event_cycles: 0,
     })
 }
 

@@ -84,6 +84,17 @@ enum ProfileStepKind {
   idle @3;
 }
 
+enum ProfileExchangeActivityKind {
+  send @0;
+  receive @1;
+}
+
+struct ProfileExchangeActivity {
+  kind @0 :ProfileExchangeActivityKind;
+  startCycle @1 :UInt32;
+  endCycle @2 :UInt32;
+}
+
 struct ProfileStepPlan {
   localIndex @0 :UInt32;
   phase @1 :UInt32;
@@ -92,6 +103,8 @@ struct ProfileStepPlan {
   kind @4 :ProfileStepKind;
   kernel @5 :Text;
   metadata @6 :List(ProfileMetadata);
+  exchangeActivities @7 :List(ProfileExchangeActivity);
+  exchangeEventCycles @8 :UInt32;
 }
 
 struct TileProfilePlan {

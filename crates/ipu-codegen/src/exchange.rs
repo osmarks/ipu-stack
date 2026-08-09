@@ -18,6 +18,21 @@ pub struct PhysicalExchangePhase {
     /// Executable supervisor row indexed by logical tile.
     pub rows: Vec<Vec<u32>>,
     pub event_cycles: u32,
+    /// Static per-tile role intervals on the exchange event timeline.
+    pub activities: Vec<Vec<ExchangeActivity>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExchangeActivity {
+    pub kind: ExchangeActivityKind,
+    pub start_cycle: u32,
+    pub end_cycle: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExchangeActivityKind {
+    Send,
+    Receive,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -86,6 +101,7 @@ pub fn lower_exchanges(
             let mut builders = BTreeMap::<u16, PlanProgramBuilder>::new();
             let mut horizon = 0u32;
             let mut tile_availability = vec![0u32; usize::from(program.tile_count)];
+            let mut activities = vec![Vec::new(); usize::from(program.tile_count)];
             let mut diagnostics = options
                 .diagnostics
                 .then(|| PhaseDiagnostics::new(program.tile_count));
@@ -245,7 +261,7 @@ pub fn lower_exchanges(
                             .checked_add(1)
                             .ok_or(ExchangeLoweringError::Overflow)?
                     };
-                    let transfer_end = append_transfer(
+                    let timing = append_transfer(
                         topology,
                         ScheduledTransfer {
                             source: transfer.source,
@@ -257,18 +273,32 @@ pub fn lower_exchanges(
                         &mut horizon,
                         &mut builders,
                     )?;
+                    activities[usize::from(transfer.source)].push(ExchangeActivity {
+                        kind: ExchangeActivityKind::Send,
+                        start_cycle: schedule_offset,
+                        end_cycle: timing.sender_end,
+                    });
+                    for (&(tile, _), &end_cycle) in
+                        transfer.destinations.iter().zip(&timing.receiver_ends)
+                    {
+                        activities[usize::from(tile)].push(ExchangeActivity {
+                            kind: ExchangeActivityKind::Receive,
+                            start_cycle: schedule_offset,
+                            end_cycle,
+                        });
+                    }
                     if let Some(diagnostics) = &mut diagnostics {
                         diagnostics.record(
                             transfer.source,
                             transfer.destinations.iter().map(|entry| entry.0),
                             transfer.words,
                             schedule_offset,
-                            transfer_end,
+                            timing.end,
                             blocking_tile,
                         );
                     }
                     for tile in transfer.tiles() {
-                        tile_availability[usize::from(tile)] = transfer_end;
+                        tile_availability[usize::from(tile)] = timing.end;
                     }
                 }
             }
@@ -291,6 +321,7 @@ pub fn lower_exchanges(
                 id: phase.id,
                 rows,
                 event_cycles: horizon,
+                activities,
             })
         })
         .collect()
@@ -567,7 +598,7 @@ fn append_transfer(
     transfer: ScheduledTransfer<'_>,
     horizon: &mut u32,
     builders: &mut BTreeMap<u16, PlanProgramBuilder>,
-) -> Result<u32, ExchangeLoweringError> {
+) -> Result<ScheduledTransferTiming, ExchangeLoweringError> {
     let ScheduledTransfer {
         source,
         destinations,
@@ -610,15 +641,30 @@ fn append_transfer(
             .or_default()
             .append_scheduled_row(row)?;
     }
-    let transfer_end = std::iter::once(&plan.sender)
-        .chain(&plan.receivers)
+    let sender_end = plan_event_cycles(&plan.sender)?;
+    let receiver_ends = plan
+        .receivers
+        .iter()
         .map(|row| plan_event_cycles(row))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let transfer_end = receiver_ends
+        .iter()
+        .copied()
+        .chain(std::iter::once(sender_end))
         .max()
         .unwrap_or(schedule_offset);
     *horizon = (*horizon).max(transfer_end);
-    Ok(transfer_end)
+    Ok(ScheduledTransferTiming {
+        end: transfer_end,
+        sender_end,
+        receiver_ends,
+    })
+}
+
+struct ScheduledTransferTiming {
+    end: u32,
+    sender_end: u32,
+    receiver_ends: Vec<u32>,
 }
 
 pub fn inactive_exchange_row() -> Vec<u32> {
@@ -717,8 +763,19 @@ mod tests {
             assert_eq!(phases.len(), low.exchange_phases.len());
             for phase in phases {
                 assert_eq!(phase.rows.len(), usize::from(tiles));
+                assert_eq!(phase.activities.len(), usize::from(tiles));
                 assert!(phase.event_cycles != 0);
-                for row in phase.rows {
+                assert!(phase.activities.iter().flatten().next().is_some());
+                for activities in &phase.activities {
+                    for activity in activities {
+                        assert!(activity.start_cycle < activity.end_cycle);
+                        assert!(activity.end_cycle <= phase.event_cycles);
+                    }
+                    for pair in activities.windows(2) {
+                        assert!(pair[0].end_cycle < pair[1].start_cycle);
+                    }
+                }
+                for row in &phase.rows {
                     if row[0] == SANS_INACTIVE_INSTRUCTION {
                         assert_eq!(row[2], RETURN_M10_INSTRUCTION);
                     } else {
