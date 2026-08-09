@@ -245,9 +245,30 @@ impl MemoryPeaks {
     }
 
     pub fn fits_ipu21(self) -> bool {
+        self.fits_ipu21_with_standard_reservation(0)
+    }
+
+    pub fn fits_ipu21_with_standard_reservation(self, reserved_standard_bytes: u64) -> bool {
         self.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
-            && self.total <= u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
-            && self.standard_contiguous_overflow == 0
+            && self.total.saturating_add(reserved_standard_bytes)
+                <= u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+            && self.standard_contiguous_overflow_with_reservation(reserved_standard_bytes) == 0
+    }
+
+    pub fn standard_contiguous_overflow_with_reservation(
+        self,
+        reserved_standard_bytes: u64,
+    ) -> u64 {
+        let interleaved_boundary = self
+            .interleaved
+            .div_ceil(u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE))
+            * u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE);
+        let upper_standard = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+            .saturating_sub(interleaved_boundary);
+        let lower_standard = u64::from(crate::memory::IPU21_STANDARD_FIXED_BYTES)
+            .saturating_sub(reserved_standard_bytes);
+        self.maximum_standard_allocation
+            .saturating_sub(lower_standard.max(upper_standard))
     }
 
     fn conservative_usage(self) -> MemoryUsage {
@@ -1026,6 +1047,9 @@ pub struct PipelineConfig {
     /// Maximum number of partial format assignments retained after each
     /// operation in a straight-line region.
     pub planning_beam_width: usize,
+    /// Standard-addressed SRAM retained for exchange tables, profiling data,
+    /// host commands, and generated tile programs built after planning.
+    pub standard_memory_reservation_bytes: u64,
     pub scheduling: SchedulingPolicy,
     pub profiling: ProfilingConfig,
 }
@@ -1054,6 +1078,9 @@ impl PipelineConfig {
             automatic_inputs: BTreeMap::new(),
             operator_candidates: default_operator_candidates(tile_count),
             planning_beam_width: 16,
+            standard_memory_reservation_bytes: u64::from(
+                crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
+            ),
             scheduling: SchedulingPolicy::OperatorPlans,
             profiling: ProfilingConfig::default(),
         }
@@ -1073,6 +1100,11 @@ impl PipelineConfig {
 
     pub fn with_planning_beam_width(mut self, width: usize) -> Self {
         self.planning_beam_width = width.max(1);
+        self
+    }
+
+    pub fn with_standard_memory_reservation(mut self, bytes: u64) -> Self {
+        self.standard_memory_reservation_bytes = bytes;
         self
     }
 }
@@ -1737,11 +1769,12 @@ pub enum LoweringError {
     #[error("operation {0:?} has no legal format candidate")]
     NoCandidate(OperationId),
     #[error(
-        "operation {operation:?} has no candidate within tile SRAM (smallest rejected peak: standard {standard} bytes, interleaved {interleaved} bytes, simultaneous total {total} bytes, contiguous-standard overflow {standard_contiguous_overflow} bytes)"
+        "operation {operation:?} has no candidate within tile SRAM (smallest rejected peak: standard {standard} bytes plus {standard_reservation} bytes package support, interleaved {interleaved} bytes, simultaneous tensor total {total} bytes, contiguous-standard overflow {standard_contiguous_overflow} bytes)"
     )]
     InsufficientMemory {
         operation: OperationId,
         standard: u64,
+        standard_reservation: u64,
         interleaved: u64,
         total: u64,
         standard_contiguous_overflow: u64,
@@ -1943,7 +1976,9 @@ fn lower_operations(
                 );
                 let peak =
                     beam_memory_peak(&next, &initial, source, operation_index, required_outputs);
-                if peak.fits_ipu21() {
+                if peak
+                    .fits_ipu21_with_standard_reservation(config.standard_memory_reservation_bytes)
+                {
                     expanded.push(next);
                 } else {
                     tracing::trace!(
@@ -1951,7 +1986,9 @@ fn lower_operations(
                         standard = peak.standard,
                         interleaved = peak.interleaved,
                         total = peak.total,
-                        contiguous_overflow = peak.standard_contiguous_overflow,
+                        contiguous_overflow = peak.standard_contiguous_overflow_with_reservation(
+                            config.standard_memory_reservation_bytes,
+                        ),
                         plan = ?next.operations.last().and_then(|operation| operation.operator_plan.as_ref()),
                         "rejected planning branch for memory"
                     );
@@ -2016,7 +2053,9 @@ fn lower_operations(
                 );
                 let peak =
                     beam_memory_peak(&next, &initial, source, operation_index, required_outputs);
-                if peak.fits_ipu21() {
+                if peak
+                    .fits_ipu21_with_standard_reservation(config.standard_memory_reservation_bytes)
+                {
                     expanded.push(next);
                 } else {
                     tracing::trace!(
@@ -2024,7 +2063,9 @@ fn lower_operations(
                         standard = peak.standard,
                         interleaved = peak.interleaved,
                         total = peak.total,
-                        contiguous_overflow = peak.standard_contiguous_overflow,
+                        contiguous_overflow = peak.standard_contiguous_overflow_with_reservation(
+                            config.standard_memory_reservation_bytes,
+                        ),
                         plan = ?next.operations.last().and_then(|operation| operation.operator_plan.as_ref()),
                         "rejected planning branch for memory"
                     );
@@ -2041,9 +2082,13 @@ fn lower_operations(
                     return Err(LoweringError::InsufficientMemory {
                         operation: operation.id,
                         standard: peak.standard,
+                        standard_reservation: config.standard_memory_reservation_bytes,
                         interleaved: peak.interleaved,
                         total: peak.total,
-                        standard_contiguous_overflow: peak.standard_contiguous_overflow,
+                        standard_contiguous_overflow: peak
+                            .standard_contiguous_overflow_with_reservation(
+                                config.standard_memory_reservation_bytes,
+                            ),
                     });
                 }
             }
@@ -2868,7 +2913,8 @@ mod tests {
                 config
             };
             let greedy = lower(&graph, &make_config(1), &Ipu21CostModel).unwrap();
-            let searched = lower(&graph, &make_config(2), &Ipu21CostModel).unwrap();
+            let searched_config = make_config(2);
+            let searched = lower(&graph, &searched_config, &Ipu21CostModel).unwrap();
 
             assert!(
                 searched.estimated_cycles < greedy.estimated_cycles,
@@ -2889,7 +2935,12 @@ mod tests {
                 left,
                 "random case {case}"
             );
-            assert!(searched.peak_memory.fits_ipu21(), "random case {case}");
+            assert!(
+                searched.peak_memory.fits_ipu21_with_standard_reservation(
+                    searched_config.standard_memory_reservation_bytes,
+                ),
+                "random case {case}"
+            );
         }
     }
 

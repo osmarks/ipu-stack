@@ -21,6 +21,11 @@ pub const IPU21_STANDARD_FIXED_BYTES: u32 =
 /// Total tile SRAM available to planned values after permanent runtime state.
 pub const IPU21_PLANNED_DATA_BYTES: u32 =
     IPU21_STANDARD_FIXED_BYTES + IPU21_INTERLEAVED_REGION_BYTES;
+/// Baseline standard-memory budget for package support data that is only
+/// materialized after operator planning. Exchange tables are element-aligned,
+/// so reserving one standard memory element also covers the usual profiling,
+/// host-command, and generated-program data alongside them.
+pub const IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES: u32 = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemoryAllocation {

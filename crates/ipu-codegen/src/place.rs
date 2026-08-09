@@ -585,6 +585,8 @@ fn allocate_tile_class(
                 alignment = request.alignment,
                 first = request.lifetime.first,
                 last = request.lifetime.last,
+                free = ?arena.free,
+                active = ?arena.active,
                 tensor_type = ?representative.tensor_type,
                 "tile allocation does not fit"
             );
