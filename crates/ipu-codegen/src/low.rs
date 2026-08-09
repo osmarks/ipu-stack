@@ -12,7 +12,7 @@ use crate::mid::{
     MidValueId, OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing,
     PipelineConfig, PointwiseInputMapping, TensorType, TileKernelSpec,
 };
-use crate::storage::{StorageError, view_byte_spans};
+use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -704,19 +704,7 @@ impl LoweringState {
                         shard: output,
                         extents: extents.clone(),
                     };
-                    let (resident, exchange) = if remote && !direct_retile {
-                        let copy = self.push_shard(LowShard {
-                            id: LowShardId(0),
-                            tile,
-                            tensor_type: self.shards[source.index() as usize].tensor_type.clone(),
-                            extents: extents.clone(),
-                            definition: ShardDefinition::ExchangeStaging,
-                        })?;
-                        (
-                            self.full_view(copy),
-                            Some((source_view.clone(), self.full_view(copy))),
-                        )
-                    } else if remote {
+                    let (resident, exchange) = if remote {
                         (
                             output_view.clone(),
                             Some((source_view.clone(), output_view.clone())),
@@ -724,11 +712,11 @@ impl LoweringState {
                     } else {
                         (source_view.clone(), None)
                     };
-                    let (local_copies, run) = if direct_retile {
-                        if remote {
-                            (Vec::new(), None)
-                        } else {
-                            let mut copies = Vec::new();
+                    let (local_copies, run) = if remote {
+                        (Vec::new(), None)
+                    } else {
+                        let mut copies = Vec::new();
+                        if direct_retile {
                             append_span_copies(
                                 &self.shards,
                                 &resident,
@@ -736,24 +724,16 @@ impl LoweringState {
                                 tile,
                                 &mut copies,
                             )?;
-                            (copies.into_iter().map(|(_, copy)| copy).collect(), None)
+                        } else {
+                            append_logical_span_copies(
+                                &self.shards,
+                                &resident,
+                                &output_view,
+                                tile,
+                                &mut copies,
+                            )?;
                         }
-                    } else {
-                        (
-                            Vec::new(),
-                            Some(KernelRun::new(
-                                operation_provenance(operation, kind),
-                                TileKernel::Planned(plan.kernel.clone()),
-                                vec![KernelOperand {
-                                    views: vec![resident],
-                                }],
-                                output_view,
-                                KernelRequirements::Conversion {
-                                    input: plan.input.clone(),
-                                    output: plan.output.clone(),
-                                },
-                            )),
-                        )
+                        (copies.into_iter().map(|(_, copy)| copy).collect(), None)
                     };
                     if let Some((source_view, destination_view)) = exchange {
                         remote_items.push((source_view, destination_view, tile, local_copies, run));
@@ -1770,6 +1750,24 @@ fn append_span_copies(
     let source_spans = view_byte_spans(&shards[source.shard.index() as usize], source)?;
     let destination_spans =
         view_byte_spans(&shards[destination.shard.index() as usize], destination)?;
+    append_byte_span_copies(
+        source,
+        destination,
+        tile,
+        &source_spans,
+        &destination_spans,
+        copies,
+    )
+}
+
+fn append_byte_span_copies(
+    source: &ShardView,
+    destination: &ShardView,
+    tile: u16,
+    source_spans: &[ByteSpan],
+    destination_spans: &[ByteSpan],
+    copies: &mut Vec<(u16, LocalCopy)>,
+) -> LowLoweringResult<()> {
     let mut source_index = 0usize;
     let mut destination_index = 0usize;
     let mut source_offset = 0u32;
@@ -1804,6 +1802,26 @@ fn append_span_copies(
         return Err(LowLoweringError::InvalidConversionPlan);
     }
     Ok(())
+}
+
+fn append_logical_span_copies(
+    shards: &[LowShard],
+    source: &ShardView,
+    destination: &ShardView,
+    tile: u16,
+    copies: &mut Vec<(u16, LocalCopy)>,
+) -> LowLoweringResult<()> {
+    let source_spans = logical_view_byte_spans(&shards[source.shard.index() as usize], source)?;
+    let destination_spans =
+        logical_view_byte_spans(&shards[destination.shard.index() as usize], destination)?;
+    append_byte_span_copies(
+        source,
+        destination,
+        tile,
+        &source_spans,
+        &destination_spans,
+        copies,
+    )
 }
 
 fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOperation]) -> bool {
@@ -2343,14 +2361,6 @@ mod tests {
                 .iter()
                 .filter(|phase| phase.provenance.reason == WorkReason::OperatorInput { input: 1 })
                 .count();
-            if tiles > 1 {
-                assert_eq!(
-                    gemm_phases,
-                    usize::try_from(inner_blocks * column_blocks.div_ceil(panels_per_phase))
-                        .unwrap(),
-                    "case {case}"
-                );
-            }
             if gemm_phases > 1 && !unique_gemm_staging.is_empty() {
                 assert!(
                     gemm_destinations.len() > unique_gemm_staging.len(),

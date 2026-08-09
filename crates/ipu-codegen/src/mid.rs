@@ -134,31 +134,6 @@ impl OperatorDispatch {
             Self::BlockedGemm { .. } => EmptyOutputShardPolicy::Reject,
         }
     }
-
-    /// Whether distributed inputs are part of the executable dispatch contract
-    /// rather than formats that may be synthesized from a fixed package input.
-    /// Generic retile phases do not yet provide that contract for multi-axis
-    /// blocked GEMM dispatches.
-    fn requires_preplaced_distributed_inputs(&self, requirements: &OperatorRequirements) -> bool {
-        match self {
-            Self::Pointwise { .. } => false,
-            Self::BlockedGemm { .. } => {
-                requirements
-                    .inputs
-                    .iter()
-                    .any(|input| input.format.layout.tiling.replicas > 1)
-                    || requirements.inputs.get(1).is_some_and(|right| {
-                        right
-                            .format
-                            .layout
-                            .tiling
-                            .axes
-                            .iter()
-                            .any(|axis| axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1)
-                    })
-            }
-        }
-    }
 }
 
 /// AMP packing role. Block dimensions are recorded by [`AxisTiling`].
@@ -791,10 +766,23 @@ pub enum MemoryRelation {
 pub struct OperatorCandidate {
     pub operator: MidOperator,
     pub dispatch: OperatorDispatch,
+    pub format_policy: OperatorFormatPolicy,
     pub inputs: Vec<OperandRequirement>,
     pub output: OperandRequirement,
     pub output_aliasing: OutputAliasing,
     pub memory_relations: Vec<MemoryRelation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatorFormatPolicy {
+    /// Use the candidate's concrete input and output formats.
+    Concrete,
+    /// Resolve both the selected input and output to the input value's full
+    /// layout. This is the normal policy for layout-transparent unary work.
+    PreserveInputLayout(u16),
+    /// Preserve the input's tile distribution while allowing the candidate to
+    /// select a different element order or memory class for its output.
+    PreserveInputTiling(u16),
 }
 
 impl OperatorCandidate {
@@ -806,6 +794,7 @@ impl OperatorCandidate {
         Self {
             operator,
             dispatch: default_dispatch(operator),
+            format_policy: OperatorFormatPolicy::Concrete,
             inputs: inputs.into_iter().collect(),
             output,
             output_aliasing: OutputAliasing::Fresh,
@@ -815,6 +804,16 @@ impl OperatorCandidate {
 
     pub fn with_dispatch(mut self, dispatch: OperatorDispatch) -> Self {
         self.dispatch = dispatch;
+        self
+    }
+
+    pub fn with_preserved_input_layout(mut self, input: u16) -> Self {
+        self.format_policy = OperatorFormatPolicy::PreserveInputLayout(input);
+        self
+    }
+
+    pub fn with_preserved_input_tiling(mut self, input: u16) -> Self {
+        self.format_policy = OperatorFormatPolicy::PreserveInputTiling(input);
         self
     }
 
@@ -1142,7 +1141,7 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
         .filter(|columns| tile_count.is_multiple_of(*columns))
         .flat_map(|columns| {
             let rows = tile_count / columns;
-            let mut grid = vec![amp_grid_gelu_operator_candidate(tile_count, rows, columns)];
+            let mut grid = Vec::new();
             for (precision, left_tail, weight_layout) in [
                 (Precision::F16, 16, AmpWeightLayout::Resident),
                 (Precision::F16, 16, AmpWeightLayout::InterleavedK64),
@@ -1182,19 +1181,22 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
             MidOperator::Gelu,
             [OperandRequirement::new(amp_output_f16, 8)],
             OperandRequirement::new(amp_left_f16, 8),
-        ),
-        pointwise_operator_candidate(MidOperator::Gelu, [rows_f16.clone()], rows_f16.clone()),
-        pointwise_operator_candidate(MidOperator::Gelu, [rows_f32.clone()], rows_f32.clone()),
+        )
+        .with_preserved_input_tiling(0),
+        format_preserving_unary_candidate(MidOperator::Gelu, rows_f16.clone()),
+        format_preserving_unary_candidate(MidOperator::Gelu, rows_f32.clone()),
         pointwise_operator_candidate(
             MidOperator::Add(AddOptions::default()),
             [rows_f16.clone(), rows_f16.clone()],
             rows_f16,
-        ),
+        )
+        .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])),
         pointwise_operator_candidate(
             MidOperator::Add(AddOptions::default()),
             [rows_f32.clone(), rows_f32.clone()],
             rows_f32,
-        ),
+        )
+        .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])),
         pointwise_operator_candidate(
             MidOperator::FlashAttention {
                 options: AttentionOptions::default(),
@@ -1221,55 +1223,27 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
     unique
 }
 
-fn amp_grid_gelu_operator_candidate(
-    tile_count: u16,
-    row_partitions: u16,
-    column_partitions: u16,
-) -> OperatorCandidate {
-    OperatorCandidate::new(
-        MidOperator::Gelu,
-        [OperandRequirement::new(
-            TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::amp_output_replicated_grid(
-                    tile_count,
-                    row_partitions,
-                    column_partitions,
-                ),
-            },
-            8,
-        )],
-        OperandRequirement::new(
-            TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::amp_left_grid(64, tile_count, row_partitions, column_partitions),
-            },
-            8,
-        ),
-    )
-}
-
 fn pointwise_operator_candidate(
     operator: MidOperator,
     inputs: impl IntoIterator<Item = TensorFormat>,
     output: TensorFormat,
 ) -> OperatorCandidate {
-    let candidate = OperatorCandidate::new(
+    OperatorCandidate::new(
         operator,
         inputs
             .into_iter()
             .map(|format| OperandRequirement::new(format, 8)),
         OperandRequirement::new(output, 8),
-    );
-    match operator {
-        MidOperator::Gelu => {
-            candidate.with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0]))
-        }
-        MidOperator::Add(_) => {
-            candidate.with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1]))
-        }
-        _ => candidate,
-    }
+    )
+}
+
+fn format_preserving_unary_candidate(
+    operator: MidOperator,
+    format: TensorFormat,
+) -> OperatorCandidate {
+    pointwise_operator_candidate(operator, [format.clone()], format)
+        .with_preserved_input_layout(0)
+        .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0]))
 }
 
 fn amp_gemm_operator_candidate(
@@ -2007,29 +1981,21 @@ fn lower_operations(
                 .get(&operation.results[0])
                 .cloned()
                 .ok_or(LoweringError::MissingShape(operation.results[0]))?;
-            for plan in plans(operation, &input_types, &output_shape, config)
+            let candidate_plans = plans(operation, &input_types, &output_shape, config)
                 .into_iter()
                 .filter(|plan| {
-                    let exact_distributed_inputs = plan
-                        .dispatch
-                        .requires_preplaced_distributed_inputs(&plan.requirements);
                     input_ids
                         .iter()
                         .zip(&plan.requirements.inputs)
                         .all(|(id, requirement)| {
                             let current = &branch.state.get(*id).tensor_type.format.layout;
                             branch.state.automatic_inputs.contains(id)
-                                || (!exact_distributed_inputs
-                                    || current == &requirement.format.layout)
-                                    && (current.order == requirement.format.layout.order
-                                        || !requirement
-                                            .format
-                                            .layout
-                                            .order
-                                            .requires_direct_population())
+                                || current.order == requirement.format.layout.order
+                                || !requirement.format.layout.order.requires_direct_population()
                         })
                 })
-            {
+                .collect::<Vec<_>>();
+            for plan in candidate_plans {
                 saw_candidate = true;
                 let mut next = branch.clone();
                 let before = next.operations.len();
@@ -2216,7 +2182,7 @@ fn beam_memory_peak(
     region_peak_memory(initial, &branch.operations, &live, &branch.state.values)
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Plan {
     operator: MidOperator,
     dispatch: OperatorDispatch,
@@ -2229,24 +2195,61 @@ fn plans(
     output: &TensorShape,
     config: &PipelineConfig,
 ) -> Vec<Plan> {
-    config
+    let mut plans = Vec::new();
+    for candidate in config
         .operator_candidates
         .iter()
-        .filter(|candidate| {
-            operator_matches(&operation.kind, candidate.operator)
-                && candidate.supports(inputs, output)
-        })
-        .map(|candidate| Plan {
+        .filter(|candidate| operator_matches(&operation.kind, candidate.operator))
+    {
+        let mut candidate = candidate.clone();
+        if let OperatorFormatPolicy::PreserveInputLayout(index) = candidate.format_policy {
+            let Some((actual, requirement)) = inputs
+                .get(usize::from(index))
+                .zip(candidate.inputs.get_mut(usize::from(index)))
+            else {
+                continue;
+            };
+            if actual.format.precision != requirement.format.precision
+                || candidate.output.format.precision != requirement.format.precision
+            {
+                continue;
+            }
+            requirement.format.layout = actual.format.layout.clone();
+            candidate.output.format.layout = actual.format.layout.clone();
+        } else if let OperatorFormatPolicy::PreserveInputTiling(index) = candidate.format_policy {
+            let Some((actual, requirement)) = inputs
+                .get(usize::from(index))
+                .zip(candidate.inputs.get_mut(usize::from(index)))
+            else {
+                continue;
+            };
+            if actual.format.precision != requirement.format.precision
+                || candidate.output.format.precision != requirement.format.precision
+                || actual.format.layout.order != requirement.format.layout.order
+            {
+                continue;
+            }
+            requirement.format.layout = actual.format.layout.clone();
+            candidate.output.format.layout.tiling = actual.format.layout.tiling.clone();
+        }
+        if !candidate.supports(inputs, output) {
+            continue;
+        }
+        let plan = Plan {
             operator: candidate.operator,
             dispatch: candidate.dispatch.clone(),
             requirements: OperatorRequirements {
                 inputs: candidate.inputs.clone(),
                 output: candidate.output.clone(),
-                output_aliasing: resolved_output_aliasing(candidate, inputs, output),
+                output_aliasing: resolved_output_aliasing(&candidate, inputs, output),
                 memory_relations: candidate.memory_relations.clone(),
             },
-        })
-        .collect()
+        };
+        if !plans.contains(&plan) {
+            plans.push(plan);
+        }
+    }
+    plans
 }
 
 fn resolved_output_aliasing(

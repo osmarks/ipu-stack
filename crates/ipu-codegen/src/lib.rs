@@ -50,16 +50,16 @@ pub use mid::{
     Ipu21CostModel, Ipu21TargetCosts, Layout, LayoutError, LoweringError, LoweringResult,
     MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidGraph,
     MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue,
-    MidValueId, OperandRequirement, OperatorCandidate, OperatorDispatch, OperatorPlan,
-    OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, PipelineConfig,
+    MidValueId, OperandRequirement, OperatorCandidate, OperatorDispatch, OperatorFormatPolicy,
+    OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, PipelineConfig,
     PointwiseInputMapping, Precision, ProfilingConfig, SchedulingPolicy, TensorAxis, TensorFormat,
     TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
 pub use place::{Placement, PlacementError, place};
 pub use storage::{
-    ByteSpan, StorageError, StorageResult, amp_matrix_coordinates, shard_storage_bytes,
-    view_byte_spans,
+    ByteSpan, StorageError, StorageResult, amp_matrix_coordinates, logical_view_byte_spans,
+    shard_storage_bytes, view_byte_spans,
 };
 pub use tile::{TileLoweringError, TileProgramLowering};
 

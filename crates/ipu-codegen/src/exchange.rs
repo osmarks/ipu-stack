@@ -1,6 +1,9 @@
 //! Physical exchange programs generated from logical shard transfers.
 
-use crate::{ExchangePhaseId, LowProgram, Placement, ShardDefinition, view_byte_spans};
+use crate::{
+    ExchangePhaseId, LowProgram, Placement, ShardDefinition, logical_view_byte_spans,
+    view_byte_spans,
+};
 use ipu_exchange::{
     MAX_TRANSFER_WORDS, MulticastPlan, PLAN_WORDS, PlanProgramBuilder, RETURN_M10_INSTRUCTION,
     SANS_INACTIVE_INSTRUCTION, SYNC_ANS_INSTRUCTION, Topology, finalize_point_receiver,
@@ -48,6 +51,14 @@ pub fn lower_exchanges(
             let mut tile_availability = vec![0u32; usize::from(program.tile_count)];
             for transfer in &phase.transfers {
                 let source = &program.shards[transfer.source.shard.index() as usize];
+                let logical_order = transfer.destinations.iter().any(|view| {
+                    program.shards[view.shard.index() as usize]
+                        .tensor_type
+                        .format
+                        .layout
+                        .order
+                        != source.tensor_type.format.layout.order
+                });
                 let source_base = placement
                     .shard_addresses
                     .get(&source.id)
@@ -68,14 +79,22 @@ pub fn lower_exchanges(
                                 .get(&view.shard)
                                 .copied()
                                 .ok_or(ExchangeLoweringError::UnplacedShard)?,
-                            view_byte_spans(shard, view)?,
+                            if logical_order {
+                                logical_view_byte_spans(shard, view)?
+                            } else {
+                                view_byte_spans(shard, view)?
+                            },
                         ))
                     })
                     .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
                 if destinations.is_empty() {
                     return Err(ExchangeLoweringError::SizeMismatch);
                 }
-                let source_spans = view_byte_spans(source, &transfer.source)?;
+                let source_spans = if logical_order {
+                    logical_view_byte_spans(source, &transfer.source)?
+                } else {
+                    view_byte_spans(source, &transfer.source)?
+                };
                 let source_bytes = source_spans.iter().try_fold(0u32, |total, span| {
                     total
                         .checked_add(span.bytes)
