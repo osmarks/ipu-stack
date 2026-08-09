@@ -340,7 +340,7 @@ fn run_mlp_chain(
     let left_bytes = packed_binding(&left, |logical_tile, linear, elements| {
         let (_, inner) =
             amp_matrix_coordinates(AmpOrder::Left, Precision::F16, 1, elements, linear)?;
-        Ok(if u32::from(logical_tile) == inner {
+        Ok(if u32::from(logical_tile) % 64 == inner {
             0x3c00
         } else {
             0
@@ -735,7 +735,7 @@ fn verify_mlp_output(application: &Application, active_tiles: u16, bytes: &[u8])
             let actual = half_to_f32(u16::from_le_bytes(
                 bytes[offset..offset + 2].try_into().unwrap(),
             ));
-            let input = half_to_f32(gemm_right_value(u32::from(row), column));
+            let input = half_to_f32(gemm_right_value(u32::from(row) % 64, column));
             let expected = gelu_reference(gelu_reference(input));
             let error = (actual - expected).abs();
             maximum_error = maximum_error.max(error);
