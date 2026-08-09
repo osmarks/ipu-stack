@@ -316,9 +316,6 @@ pub(crate) fn gemm_uses_panel_buffer(
     right: &TensorType,
     output: &TensorType,
 ) -> bool {
-    if right.format.layout.memory_class == MemoryClass::Ipu21Interleaved {
-        return false;
-    }
     let OperatorDispatch::BlockedGemm { inner_block, .. } = dispatch else {
         return false;
     };
@@ -334,9 +331,15 @@ pub(crate) fn gemm_uses_panel_buffer(
         .axes
         .iter()
         .any(|axis| axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1);
+    if streamed {
+        return true;
+    }
+    if right.format.layout.memory_class == MemoryClass::Ipu21Interleaved {
+        return false;
+    }
     let k = right.shape.0[rank - 2];
     let columns = maximum_axis_shard_extent(output, output_rank - 1);
-    streamed || (k > *inner_block && columns > 16)
+    k > *inner_block && columns > 16
 }
 
 pub(crate) fn gemm_requires_panel_repacking(

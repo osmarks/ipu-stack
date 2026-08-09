@@ -1194,8 +1194,21 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
                 (Precision::F16, 16, AmpWeightLayout::Resident),
                 (Precision::F16, 16, AmpWeightLayout::InterleavedK64),
                 (Precision::F32, 32, AmpWeightLayout::Resident),
-                (Precision::F16, 16, AmpWeightLayout::Streamed),
-                (Precision::F32, 32, AmpWeightLayout::Streamed),
+                (
+                    Precision::F16,
+                    16,
+                    AmpWeightLayout::Streamed(MemoryClass::Ipu21Standard),
+                ),
+                (
+                    Precision::F16,
+                    16,
+                    AmpWeightLayout::Streamed(MemoryClass::Ipu21Interleaved),
+                ),
+                (
+                    Precision::F32,
+                    32,
+                    AmpWeightLayout::Streamed(MemoryClass::Ipu21Standard),
+                ),
             ] {
                 for &output_columns in amp_output_column_blocks(precision) {
                     let candidate = amp_grid_gemm_operator_candidate(
@@ -1210,7 +1223,7 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
                     );
                     grid.push(candidate.clone());
                     if precision == Precision::F16
-                        && weight_layout != AmpWeightLayout::InterleavedK64
+                        && weight_layout.source_memory_class() == MemoryClass::Ipu21Standard
                     {
                         let mut staged = candidate;
                         staged.inputs[1].local_staging = LocalOperandStaging::MatchRemote;
@@ -1362,11 +1375,11 @@ fn amp_grid_gemm_operator_candidate(
         AmpWeightLayout::Resident => {
             Layout::amp_right_grid(inner, tile_count, row_partitions, column_partitions)
         }
-        AmpWeightLayout::Streamed => Layout::amp_right_k64_streamed_grid(
+        AmpWeightLayout::Streamed(memory_class) => Layout::amp_right_k64_streamed_grid(
             tile_count,
             row_partitions,
             column_partitions,
-            MemoryClass::Ipu21Standard,
+            memory_class,
         ),
         AmpWeightLayout::InterleavedK64 => {
             debug_assert_eq!((precision, inner), (Precision::F16, 64));
@@ -1454,8 +1467,21 @@ fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> Operator
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AmpWeightLayout {
     Resident,
-    Streamed,
+    Streamed(MemoryClass),
     InterleavedK64,
+}
+
+impl AmpWeightLayout {
+    const fn source_memory_class(self) -> MemoryClass {
+        match self {
+            Self::Resident | Self::Streamed(MemoryClass::Ipu21Standard) => {
+                MemoryClass::Ipu21Standard
+            }
+            Self::InterleavedK64 | Self::Streamed(MemoryClass::Ipu21Interleaved) => {
+                MemoryClass::Ipu21Interleaved
+            }
+        }
+    }
 }
 
 fn amp_output_column_blocks(precision: Precision) -> &'static [u32] {
@@ -1895,6 +1921,23 @@ pub fn lower(
             .collect::<BTreeSet<_>>(),
         "selected operator plans"
     );
+    for (index, operation) in operations.iter().enumerate() {
+        tracing::debug!(
+            index,
+            source = operation.source.map(OperationId::index),
+            kind = ?operation.kind,
+            input_formats = ?operation.inputs.iter().map(|value| {
+                &state.values[value.index() as usize].tensor_type.format
+            }).collect::<Vec<_>>(),
+            output_formats = ?operation.results.iter().map(|value| {
+                &state.values[value.index() as usize].tensor_type.format
+            }).collect::<Vec<_>>(),
+            dispatch = ?operation.operator_plan.as_ref().map(|plan| &plan.dispatch),
+            estimated_cycles = operation.estimated_cycles,
+            memory = ?operation.memory,
+            "selected mid operation"
+        );
+    }
     Ok(MidGraph {
         inputs,
         values: state.values,
