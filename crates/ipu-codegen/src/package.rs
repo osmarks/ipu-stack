@@ -875,7 +875,7 @@ fn instrument_profile(
                 return Err(invalid("inactive tile contains non-exchange work"));
             };
             exchange.profile.before = Some(profile_address(address, index)?);
-            plans.push(exchange_synchronization_description(
+            plans.push(inactive_tile_description(
                 index,
                 0x8000_0000 | phase.id.index(),
                 &phase.provenance,
@@ -980,6 +980,17 @@ fn exchange_synchronization_description(
         "sync",
     )?;
     description.metadata[0].value = "ExchangeBarrier".into();
+    Ok(description)
+}
+
+fn inactive_tile_description(
+    index: usize,
+    phase: u32,
+    provenance: &crate::WorkProvenance,
+) -> PackageBuildResult<ProfileStep> {
+    let mut description =
+        profile_description(index, phase, provenance, ProfileStepKind::Idle, "idle")?;
+    description.metadata[0].value = "InactiveTile".into();
     Ok(description)
 }
 
