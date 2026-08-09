@@ -75,18 +75,23 @@ impl Lifetime {
 }
 
 pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
-    place_with_data_base(program, IPU21_DATA_BASE)
+    place_with_standard_ranges(program, &[(IPU21_DATA_BASE, IPU21_INTERLEAVED_MEMORY_BASE)])
 }
 
-pub(crate) fn place_with_data_base(
+pub(crate) fn place_with_standard_ranges(
     program: &LowProgram,
-    standard_data_base: u32,
+    standard_ranges: &[(u32, u32)],
 ) -> Result<Placement, PlacementError> {
-    if !(IPU21_DATA_BASE..=IPU21_INTERLEAVED_MEMORY_BASE).contains(&standard_data_base) {
+    if standard_ranges.is_empty()
+        || standard_ranges.iter().any(|&(start, end)| {
+            start < IPU21_DATA_BASE || end > IPU21_INTERLEAVED_MEMORY_BASE || start >= end
+        })
+        || standard_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0)
+    {
         return Err(PlacementError::OutOfMemory {
             tile: 0,
             class: MemoryClass::Ipu21Standard,
-            bytes: standard_data_base.saturating_sub(IPU21_DATA_BASE),
+            bytes: 0,
         });
     }
     let mut sets = DisjointSets::new(program.shards.len());
@@ -131,7 +136,8 @@ pub(crate) fn place_with_data_base(
     }
 
     let mut addresses = BTreeMap::new();
-    let mut tile_data_end = vec![standard_data_base; usize::from(program.tile_count)];
+    let standard_start = standard_ranges[0].0;
+    let mut tile_data_end = vec![standard_start; usize::from(program.tile_count)];
     for tile in 0..program.tile_count {
         let mut grouped = BTreeSet::<usize>::new();
         for group in iterated.iter().filter(|group| group.tile == tile) {
@@ -174,10 +180,9 @@ pub(crate) fn place_with_data_base(
                 bytes: interleaved_boundary - IPU21_INTERLEAVED_MEMORY_BASE,
             });
         }
-        let mut standard = Arena::new(&[
-            (standard_data_base, IPU21_INTERLEAVED_MEMORY_BASE),
-            (interleaved_boundary, TILE_MEMORY_BASE + TILE_MEMORY_SIZE),
-        ]);
+        let mut ranges = standard_ranges.to_vec();
+        ranges.push((interleaved_boundary, TILE_MEMORY_BASE + TILE_MEMORY_SIZE));
+        let mut standard = Arena::new(&ranges);
         allocate_tile_class(
             program,
             tile,

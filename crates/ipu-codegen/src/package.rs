@@ -2,8 +2,8 @@ use crate::graph::ComputeGraph;
 use crate::host;
 use crate::low::{LowProgram, LowValue};
 use crate::memory::{
-    PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE, RUNTIME_STATE_BYTES,
-    WORKER_STACK_HEADROOM,
+    MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE,
+    RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
 };
 use crate::mid::{Ipu21CostModel, PipelineConfig};
 use crate::{
@@ -59,6 +59,12 @@ pub enum PackageBuildError {
     TileLowering(#[from] crate::TileLoweringError),
     #[error("storage layout failed: {0}")]
     Storage(#[from] crate::StorageError),
+}
+
+impl From<MemoryLayoutError> for PackageBuildError {
+    fn from(error: MemoryLayoutError) -> Self {
+        Self::Invalid(error.to_string())
+    }
 }
 
 pub type PackageBuildResult<T> = std::result::Result<T, PackageBuildError>;
@@ -122,6 +128,31 @@ fn build_package_from_objects(
     kernel_plan: &KernelBuildPlan,
 ) -> PackageBuildResult<Application> {
     let topology = active_topology(program.tile_count)?;
+    let retained_runtime = runtime_retained_symbols(program, config);
+    let layout = build_phase("link_runtime", || {
+        link_runtime(
+            objects,
+            runtime_symbols(0, 0, 0)?,
+            kernel_plan,
+            &retained_runtime,
+        )
+    })?;
+    let linked_end = linked_end(&layout)?;
+    let mut memory = TileMemoryMap::new();
+    memory.reserve(
+        "linked runtime and kernels",
+        APPLICATION_LOAD_BASE..linked_end,
+    )?;
+    memory.reserve(
+        "host exchange aperture",
+        ipu_exchange::EXCHANGE_WINDOW_BASE
+            ..ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+    )?;
+    memory.reserve(
+        "runtime state",
+        RUNTIME_STATE_BASE..RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES,
+    )?;
+
     let provisional_placement = build_phase("plan_exchange_storage", || Ok(place(program)?))?;
     let provisional_exchanges = lower_exchanges(program, &provisional_placement, &topology)?;
     let exchange_table_bytes = provisional_exchanges
@@ -142,28 +173,31 @@ fn build_package_from_objects(
                 )
                 .ok_or_else(|| invalid("exchange row table size overflow"))
         })?;
-    let exchange_code_base = crate::IPU21_DATA_BASE;
-    let data_base = align_up(
-        exchange_code_base
-            .checked_add(exchange_table_bytes)
-            .and_then(|end| end.checked_add(ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD))
-            .ok_or_else(|| invalid("exchange row table address overflow"))?,
-        ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-    )?;
+    let exchange_rows = (exchange_table_bytes != 0)
+        .then(|| {
+            memory.allocate(MemoryRequest {
+                name: "exchange row tables",
+                bytes: exchange_table_bytes,
+                alignment: 4,
+                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+                guard_after: ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
+            })
+        })
+        .transpose()?;
+    let exchange_code_base = exchange_rows
+        .as_ref()
+        .map_or(crate::IPU21_DATA_BASE, |allocation| allocation.range.start);
+    let standard_ranges =
+        memory.free_ranges(crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE);
     let placement = build_phase("place_storage", || {
-        Ok(crate::place::place_with_data_base(program, data_base)?)
+        Ok(crate::place::place_with_standard_ranges(
+            program,
+            &standard_ranges,
+        )?)
     })?;
     let exchanges = build_phase("lower_exchanges", || {
         Ok(lower_exchanges(program, &placement, &topology)?)
-    })?;
-    let retained_runtime = runtime_retained_symbols(program, config);
-    let layout = build_phase("link_runtime", || {
-        link_runtime(
-            objects,
-            runtime_symbols(0, 0, 0)?,
-            kernel_plan,
-            &retained_runtime,
-        )
     })?;
     let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
     let execution_topology = Topology::c600();
@@ -208,14 +242,24 @@ fn build_package_from_objects(
             &topology,
         ));
     }
+    let host_code_base = memory.next_free(
+        linked_end,
+        TILE_MEMORY_BASE..ipu_exchange::EXCHANGE_WINDOW_BASE,
+        4,
+        "host programs",
+    )?;
+    let auxiliary_data_base = standard_ranges
+        .first()
+        .map(|range| range.0)
+        .ok_or_else(|| invalid("no standard tile memory remains for host auxiliaries"))?;
     let host = host::plan(
         &weights,
         &inputs,
         &outputs,
         execution_tile_count,
-        linked_end(&layout)?,
+        host_code_base,
         &{
-            let mut ends = vec![data_base; usize::from(execution_tile_count)];
+            let mut ends = vec![auxiliary_data_base; usize::from(execution_tile_count)];
             for logical in 0..program.tile_count {
                 ends[usize::from(topology.physical(logical)?)] =
                     placement.tile_data_end[usize::from(logical)];
@@ -223,6 +267,9 @@ fn build_package_from_objects(
             ends
         },
     )?;
+    if host.end > host_code_base {
+        memory.reserve("host programs", host_code_base..host.end)?;
+    }
     let finalizer = TileProgramLowering::new(
         program,
         &placement,
@@ -231,7 +278,12 @@ fn build_package_from_objects(
         exchange_code_base,
         execution_tile_count,
     )?;
-    let code_address = align_up(host.end, 4)?;
+    let code_address = memory.next_free(
+        host.end,
+        TILE_MEMORY_BASE..ipu_exchange::EXCHANGE_WINDOW_BASE,
+        4,
+        "generated tile programs",
+    )?;
     let symbols = layout
         .symbols
         .clone()
@@ -265,18 +317,14 @@ fn build_package_from_objects(
             })
             .collect::<PackageBuildResult<Vec<_>>>()?)
     })?;
-    if let Some((tile, program)) = generated.iter().enumerate().find(|(_, program)| {
-        code_address
-            .checked_add(program.bytes.len() as u32)
-            .is_none_or(|end| end > ipu_exchange::EXCHANGE_WINDOW_BASE)
-    }) {
-        let available = ipu_exchange::EXCHANGE_WINDOW_BASE.saturating_sub(code_address);
-        let prefix_overflow = code_address.saturating_sub(ipu_exchange::EXCHANGE_WINDOW_BASE);
-        return Err(invalid(format!(
-            "tile {tile} generated program is {} bytes, but only {available} bytes are available from 0x{code_address:x} to the exchange window at 0x{:x} (linked exchange/support/host prefix already exceeds the window by {prefix_overflow} bytes)",
-            program.bytes.len(),
-            ipu_exchange::EXCHANGE_WINDOW_BASE,
-        )));
+    let generated_code_bytes = generated.iter().try_fold(0u32, |maximum, program| {
+        Ok::<_, PackageBuildError>(maximum.max(u32::try_from(program.bytes.len())?))
+    })?;
+    if generated_code_bytes != 0 {
+        let end = code_address
+            .checked_add(generated_code_bytes)
+            .ok_or_else(|| invalid("generated tile program address overflow"))?;
+        memory.reserve("generated tile programs", code_address..end)?;
     }
 
     let tiles = build_phase("build_tile_images", || {
@@ -618,13 +666,6 @@ fn linked_end(linked: &LinkedImage) -> PackageBuildResult<u32> {
         .collect::<Option<Vec<_>>>()
         .and_then(|ends| ends.into_iter().max())
         .ok_or_else(|| invalid("linked runtime has no valid segments"))
-}
-
-fn align_up(value: u32, alignment: u32) -> PackageBuildResult<u32> {
-    value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
-        .ok_or_else(|| invalid("address alignment overflow"))
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> PackageBuildError {
