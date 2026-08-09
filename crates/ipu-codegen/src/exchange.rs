@@ -52,6 +52,7 @@ struct PhaseDiagnostics {
     destination_words: u64,
     multicast_chunks: usize,
     maximum_fanout: usize,
+    conflict_slots: usize,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -88,6 +89,7 @@ pub fn lower_exchanges(
             let mut diagnostics = options
                 .diagnostics
                 .then(|| PhaseDiagnostics::new(program.tile_count));
+            let mut pending = Vec::new();
             for transfer in &phase.transfers {
                 let source = &program.shards[transfer.source.shard.index() as usize];
                 let logical_order = transfer.destinations.iter().any(|view| {
@@ -195,45 +197,12 @@ pub fn lower_exchanges(
                             ))
                         })
                         .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-                    let (blocking_tile, latest_availability) = std::iter::once(source.tile)
-                        .chain(destination_entries.iter().map(|entry| entry.0))
-                        .map(|tile| (tile, tile_availability[usize::from(tile)]))
-                        .max_by_key(|&(tile, availability)| (availability, Reverse(tile)))
-                        .unwrap_or((source.tile, 0));
-                    let schedule_offset = if latest_availability == 0 {
-                        0
-                    } else {
-                        latest_availability
-                            .checked_add(1)
-                            .ok_or(ExchangeLoweringError::Overflow)?
-                    };
-                    let transfer_end = append_transfer(
-                        topology,
-                        ScheduledTransfer {
-                            source: source.tile,
-                            destinations: &destination_entries,
-                            source_address,
-                            words: chunk_bytes / 4,
-                            schedule_offset,
-                        },
-                        &mut horizon,
-                        &mut builders,
-                    )?;
-                    if let Some(diagnostics) = &mut diagnostics {
-                        diagnostics.record(
-                            source.tile,
-                            destination_entries.iter().map(|entry| entry.0),
-                            chunk_bytes / 4,
-                            schedule_offset,
-                            transfer_end,
-                            blocking_tile,
-                        );
-                    }
-                    for tile in std::iter::once(source.tile)
-                        .chain(destination_entries.iter().map(|entry| entry.0))
-                    {
-                        tile_availability[usize::from(tile)] = transfer_end;
-                    }
+                    pending.push(PendingTransfer {
+                        source: source.tile,
+                        destinations: destination_entries,
+                        source_address,
+                        words: chunk_bytes / 4,
+                    });
                     source_offset += chunk_bytes;
                     if source_offset == source_span.bytes {
                         source_index += 1;
@@ -255,6 +224,52 @@ pub fn lower_exchanges(
                     .any(|((index, offset), (_, _, spans))| *index != spans.len() || *offset != 0)
                 {
                     return Err(ExchangeLoweringError::SizeMismatch);
+                }
+            }
+            let conflict_slots = conflict_slots(&pending, program.tile_count);
+            if let Some(diagnostics) = &mut diagnostics {
+                diagnostics.conflict_slots = conflict_slots.len();
+            }
+            for slot in conflict_slots {
+                for index in slot {
+                    let transfer = &pending[index];
+                    let (blocking_tile, latest_availability) = transfer
+                        .tiles()
+                        .map(|tile| (tile, tile_availability[usize::from(tile)]))
+                        .max_by_key(|&(tile, availability)| (availability, Reverse(tile)))
+                        .unwrap_or((transfer.source, 0));
+                    let schedule_offset = if latest_availability == 0 {
+                        0
+                    } else {
+                        latest_availability
+                            .checked_add(1)
+                            .ok_or(ExchangeLoweringError::Overflow)?
+                    };
+                    let transfer_end = append_transfer(
+                        topology,
+                        ScheduledTransfer {
+                            source: transfer.source,
+                            destinations: &transfer.destinations,
+                            source_address: transfer.source_address,
+                            words: transfer.words,
+                            schedule_offset,
+                        },
+                        &mut horizon,
+                        &mut builders,
+                    )?;
+                    if let Some(diagnostics) = &mut diagnostics {
+                        diagnostics.record(
+                            transfer.source,
+                            transfer.destinations.iter().map(|entry| entry.0),
+                            transfer.words,
+                            schedule_offset,
+                            transfer_end,
+                            blocking_tile,
+                        );
+                    }
+                    for tile in transfer.tiles() {
+                        tile_availability[usize::from(tile)] = transfer_end;
+                    }
                 }
             }
             if let Some(diagnostics) = diagnostics {
@@ -290,6 +305,7 @@ impl PhaseDiagnostics {
             destination_words: 0,
             multicast_chunks: 0,
             maximum_fanout: 0,
+            conflict_slots: 0,
         }
     }
 
@@ -429,6 +445,7 @@ impl PhaseDiagnostics {
             scheduled_chunks = self.transfers.len(),
             multicast_chunks = self.multicast_chunks,
             maximum_fanout = self.maximum_fanout,
+            conflict_slots = self.conflict_slots,
             source_words = self.source_words,
             destination_words = self.destination_words,
             role_word_lower_bound_cycles = role_word_lower_bound,
@@ -447,6 +464,94 @@ impl PhaseDiagnostics {
             "exchange scheduler diagnostics"
         );
     }
+}
+
+struct PendingTransfer {
+    source: u16,
+    destinations: Vec<(u16, u32)>,
+    source_address: u32,
+    words: u32,
+}
+
+impl PendingTransfer {
+    fn tiles(&self) -> impl Iterator<Item = u16> + '_ {
+        std::iter::once(self.source).chain(self.destinations.iter().map(|entry| entry.0))
+    }
+}
+
+/// Colors multicast hyperedges into conflict-free slots without constructing
+/// their quadratic conflict graph. Per-tile bit sets and first-free cursors
+/// make finding the earliest common slot depend on endpoint pressure rather
+/// than the number of pairwise conflicts.
+fn conflict_slots(transfers: &[PendingTransfer], tile_count: u16) -> Vec<Vec<usize>> {
+    let mut pressure = vec![0usize; usize::from(tile_count)];
+    for transfer in transfers {
+        for tile in transfer.tiles() {
+            pressure[usize::from(tile)] += 1;
+        }
+    }
+
+    let mut priority = (0..transfers.len()).collect::<Vec<_>>();
+    priority.sort_unstable_by_key(|&index| {
+        let transfer = &transfers[index];
+        let endpoint_pressure = transfer
+            .tiles()
+            .map(|tile| pressure[usize::from(tile)])
+            .sum::<usize>();
+        (
+            Reverse(endpoint_pressure),
+            Reverse(transfer.destinations.len()),
+            Reverse(transfer.words),
+            transfer.source,
+            index,
+        )
+    });
+
+    let mut slots = Vec::<Vec<usize>>::new();
+    let mut used_slots = vec![Vec::<u64>::new(); usize::from(tile_count)];
+    let mut first_free = vec![0usize; usize::from(tile_count)];
+    for index in priority {
+        let transfer = &transfers[index];
+        let mut slot = transfer
+            .tiles()
+            .map(|tile| first_free[usize::from(tile)])
+            .max()
+            .unwrap_or(0);
+        while transfer.tiles().any(|tile| {
+            let words = &used_slots[usize::from(tile)];
+            words
+                .get(slot / u64::BITS as usize)
+                .is_some_and(|word| word & (1 << (slot % u64::BITS as usize)) != 0)
+        }) {
+            slot += 1;
+        }
+        for tile in transfer.tiles() {
+            let tile = usize::from(tile);
+            let word_index = slot / u64::BITS as usize;
+            if used_slots[tile].len() <= word_index {
+                used_slots[tile].resize(word_index + 1, 0);
+            }
+            used_slots[tile][word_index] |= 1 << (slot % u64::BITS as usize);
+            if first_free[tile] == slot {
+                loop {
+                    let candidate = first_free[tile];
+                    let word = used_slots[tile]
+                        .get(candidate / u64::BITS as usize)
+                        .copied()
+                        .unwrap_or(0);
+                    if word & (1 << (candidate % u64::BITS as usize)) == 0 {
+                        break;
+                    }
+                    first_free[tile] += 1;
+                }
+            }
+        }
+        if slots.len() <= slot {
+            slots.resize_with(slot + 1, Vec::new);
+        }
+        slots[slot].push(index);
+    }
+    slots
 }
 
 struct ScheduledTransfer<'a> {
@@ -531,6 +636,46 @@ mod tests {
         ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, Precision, TensorFormat, lower,
         lower_to_tiles, place,
     };
+
+    #[test]
+    fn randomized_conflict_slots_cover_transfers_without_endpoint_overlap() {
+        let mut random = fastrand::Rng::with_seed(0x736c_6f74);
+        for _ in 0..64 {
+            let tile_count = random.u16(2..=32);
+            let transfer_count = random.usize(1..=256);
+            let transfers = (0..transfer_count)
+                .map(|_| {
+                    let source = random.u16(0..tile_count);
+                    let receiver_count = random.usize(1..=usize::from(tile_count.min(8) - 1));
+                    let mut receivers = Vec::with_capacity(receiver_count);
+                    while receivers.len() != receiver_count {
+                        let tile = random.u16(0..tile_count);
+                        if tile != source && !receivers.contains(&tile) {
+                            receivers.push(tile);
+                        }
+                    }
+                    PendingTransfer {
+                        source,
+                        destinations: receivers.into_iter().map(|tile| (tile, 0)).collect(),
+                        source_address: 0,
+                        words: random.u32(1..=MAX_TRANSFER_WORDS),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let slots = conflict_slots(&transfers, tile_count);
+            let mut occurrences = vec![0u8; transfers.len()];
+            for slot in slots {
+                let mut used_tiles = vec![false; usize::from(tile_count)];
+                for index in slot {
+                    occurrences[index] += 1;
+                    for tile in transfers[index].tiles() {
+                        assert!(!std::mem::replace(&mut used_tiles[usize::from(tile)], true));
+                    }
+                }
+            }
+            assert!(occurrences.into_iter().all(|count| count == 1));
+        }
+    }
 
     #[test]
     fn randomized_gemm_exchanges_produce_one_executable_row_per_tile() {
