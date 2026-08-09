@@ -51,6 +51,12 @@ pub fn shard_storage_bytes(shard: &LowShard) -> StorageResult<u32> {
 /// weights.
 pub fn view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageResult<Vec<ByteSpan>> {
     validate_view(shard, view)?;
+    if shard.extents == view.extents {
+        return Ok(vec![ByteSpan {
+            offset: 0,
+            bytes: shard_storage_bytes(shard)?,
+        }]);
+    }
     if let Some(spans) = right_k64_panel_spans(shard, view)? {
         return Ok(spans);
     }
@@ -310,7 +316,7 @@ fn right_k64_panel_spans(
     if rows.is_multiple_of(AMP_INNER_BLOCK)
         && columns.is_multiple_of(AMP_OUTPUT_COLUMN_BLOCK)
         && inner_width == AMP_INNER_BLOCK
-        && column_width == AMP_OUTPUT_COLUMN_BLOCK
+        && column_width.is_multiple_of(AMP_OUTPUT_COLUMN_BLOCK)
         && inner_start.is_multiple_of(AMP_INNER_BLOCK)
         && column_start.is_multiple_of(AMP_OUTPUT_COLUMN_BLOCK)
     {
@@ -319,8 +325,14 @@ fn right_k64_panel_spans(
             .and_then(|inner| inner.checked_mul(columns / AMP_OUTPUT_COLUMN_BLOCK))
             .and_then(|panel| panel.checked_add(column_start / AMP_OUTPUT_COLUMN_BLOCK))
             .ok_or(StorageError::Overflow)?;
-        let bytes = AMP_INNER_BLOCK
+        let panel_bytes = AMP_INNER_BLOCK
             .checked_mul(AMP_OUTPUT_COLUMN_BLOCK)
+            .and_then(|elements| {
+                elements.checked_mul(shard.tensor_type.format.precision.bytes() as u32)
+            })
+            .ok_or(StorageError::Overflow)?;
+        let bytes = AMP_INNER_BLOCK
+            .checked_mul(column_width)
             .and_then(|elements| {
                 elements.checked_mul(shard.tensor_type.format.precision.bytes() as u32)
             })
@@ -338,7 +350,9 @@ fn right_k64_panel_spans(
                     .checked_mul(extent.physical_end - extent.start)
                     .ok_or(StorageError::Overflow)
             })?;
-        let panel_offset = panel.checked_mul(bytes).ok_or(StorageError::Overflow)?;
+        let panel_offset = panel
+            .checked_mul(panel_bytes)
+            .ok_or(StorageError::Overflow)?;
         let mut spans = Vec::<ByteSpan>::with_capacity(outer as usize);
         for matrix in 0..outer {
             let offset = matrix
@@ -657,7 +671,10 @@ mod tests {
                 &[batches, rows, columns],
             );
             let inner = random.u32(0..inner_blocks) * 64;
-            let column = random.u32(0..column_blocks) * 64;
+            let column_block = random.u32(0..column_blocks);
+            let view_column_blocks = random.u32(1..=column_blocks - column_block);
+            let column = column_block * 64;
+            let view_columns = view_column_blocks * 64;
             let view = ShardView {
                 shard: shard.id,
                 extents: vec![
@@ -676,15 +693,15 @@ mod tests {
                     ShardExtent {
                         axis: 2,
                         start: column,
-                        logical_end: column + 64,
-                        physical_end: column + 64,
+                        logical_end: column + view_columns,
+                        physical_end: column + view_columns,
                     },
                 ],
             };
             let spans = view_byte_spans(&shard, &view).unwrap();
             assert_eq!(
                 spans.iter().map(|span| span.bytes).sum::<u32>(),
-                batches * 64 * 64 * 2
+                batches * 64 * view_columns * 2
             );
             assert_eq!(
                 spans[0].offset,

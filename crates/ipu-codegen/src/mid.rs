@@ -7,6 +7,7 @@
 //! prices them with a [`CostModel`], and inserts explicit precision casts and
 //! layout rearrangements at format boundaries.
 
+use crate::cost::MemoizedCostModel;
 pub use crate::cost::{CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts};
 use crate::estimate::{conversion_memory_estimate, operator_memory_estimate, region_peak_memory};
 use crate::graph::{
@@ -1949,6 +1950,7 @@ pub fn lower(
         return Err(LoweringError::EmptyTileGroup);
     }
     let mut state = LoweringState::default();
+    let costs = MemoizedCostModel::new(costs);
     let mut values = BTreeMap::new();
     let mut inputs = Vec::with_capacity(graph.inputs().len());
     for input in graph.inputs() {
@@ -1987,7 +1989,7 @@ pub fn lower(
         graph.value_shapes(),
         graph,
         config,
-        costs,
+        &costs,
         &mut state,
     )?;
     let outputs = graph

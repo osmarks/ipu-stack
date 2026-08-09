@@ -16,6 +16,7 @@ use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LowShardId(u32);
@@ -404,6 +405,8 @@ pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringR
     })
 }
 
+type ShardIntersections = Vec<(Vec<ShardExtent>, Vec<LowShardId>)>;
+
 struct LoweringState {
     tile_count: u16,
     shards: Vec<LowShard>,
@@ -414,6 +417,7 @@ struct LoweringState {
     repeat_runs: Vec<RepeatRun>,
     kernel_metadata: Vec<Arc<KernelRunMetadata>>,
     deferred_conversions: BTreeMap<MidValueId, MidValueId>,
+    intersection_cache: BTreeMap<(MidValueId, Vec<ShardExtent>), ShardIntersections>,
 }
 
 impl LoweringState {
@@ -428,6 +432,7 @@ impl LoweringState {
             repeat_runs: Vec::new(),
             kernel_metadata: Vec::new(),
             deferred_conversions: BTreeMap::new(),
+            intersection_cache: BTreeMap::new(),
         };
         for value in &graph.values {
             let declared_tiles = value.tensor_type.format.layout.tiling.tile_count;
@@ -502,18 +507,39 @@ impl LoweringState {
         inner_start: u32,
         inner_end: u32,
     ) -> Option<LowShardId> {
-        right_shards
+        self.right_shards_for_block(
+            right_shards,
+            column_start,
+            column_end,
+            inner_start,
+            inner_end,
+        )
+        .min_by_key(|shard| u8::from(self.shards[shard.index() as usize].tile != tile))
+    }
+
+    fn right_shards_for_block<'a>(
+        &'a self,
+        right_shards: &'a [LowShardId],
+        column_start: u32,
+        column_end: u32,
+        inner_start: u32,
+        inner_end: u32,
+    ) -> impl Iterator<Item = LowShardId> + 'a {
+        right_shards.iter().copied().filter(move |shard| {
+            let extents = &self.shards[shard.index() as usize].extents;
+            let columns = extents[extents.len() - 1];
+            let inner = extents[extents.len() - 2];
+            columns.start <= column_start
+                && columns.physical_end >= column_end
+                && inner.start <= inner_start
+                && inner.physical_end >= inner_end
+        })
+    }
+
+    fn prefer_local_shard(&self, shards: &[LowShardId], tile: u16) -> Option<LowShardId> {
+        shards
             .iter()
             .copied()
-            .filter(|shard| {
-                let extents = &self.shards[shard.index() as usize].extents;
-                let columns = extents[extents.len() - 1];
-                let inner = extents[extents.len() - 2];
-                columns.start <= column_start
-                    && columns.physical_end >= column_end
-                    && inner.start <= inner_start
-                    && inner.physical_end >= inner_end
-            })
             .min_by_key(|shard| u8::from(self.shards[shard.index() as usize].tile != tile))
     }
 
@@ -581,11 +607,49 @@ impl LoweringState {
     }
 
     fn local_shard(&self, value: MidValueId, tile: u16) -> LowLoweringResult<LowShardId> {
-        self.value_shards(value)?
+        let shards = self.value_shards(value)?;
+        if let Some(&shard) = shards.get(usize::from(tile))
+            && self.shards[shard.index() as usize].tile == tile
+        {
+            return Ok(shard);
+        }
+        shards
             .iter()
             .copied()
             .find(|shard| self.shards[shard.index() as usize].tile == tile)
             .ok_or(LowLoweringError::UnknownValue(value))
+    }
+
+    fn intersecting_shards(
+        &mut self,
+        source: MidValueId,
+        target: &[ShardExtent],
+        local_tile: u16,
+    ) -> LowLoweringResult<Vec<(Vec<ShardExtent>, LowShardId)>> {
+        let key = (source, target.to_vec());
+        if !self.intersection_cache.contains_key(&key) {
+            let mut groups = BTreeMap::<Vec<ShardExtent>, Vec<LowShardId>>::new();
+            for shard in self.value_shards(source)?.to_vec() {
+                if let Some(extents) =
+                    intersect_extents(&self.shards[shard.index() as usize].extents, target)
+                {
+                    groups.entry(extents).or_default().push(shard);
+                }
+            }
+            self.intersection_cache
+                .insert(key.clone(), groups.into_iter().collect());
+        }
+        Ok(self.intersection_cache[&key]
+            .iter()
+            .map(|(extents, candidates)| {
+                let selected = candidates
+                    .iter()
+                    .copied()
+                    .find(|shard| self.shards[shard.index() as usize].tile == local_tile)
+                    .unwrap_or(candidates[0]);
+                (extents.clone(), selected)
+            })
+            .collect())
     }
 
     fn lower_region(
@@ -600,12 +664,19 @@ impl LoweringState {
             })
             .collect::<Vec<_>>();
         for (index, operation) in operations.iter().enumerate() {
+            let started = Instant::now();
             if self.defer_conversion(
                 operation,
                 operations.get(index + 1),
                 operations,
                 retained_values,
             )? {
+                tracing::info!(
+                    operation = index,
+                    source = ?operation.source.map(OperationId::index),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "deferred low-level conversion"
+                );
                 continue;
             }
             match &operation.kind {
@@ -615,6 +686,14 @@ impl LoweringState {
                 MidOperationKind::Operator(_) => self.lower_operator(operation, &mut tiles)?,
                 kind => self.lower_conversion(operation, kind, &mut tiles)?,
             }
+            tracing::info!(
+                operation = index,
+                source = ?operation.source.map(OperationId::index),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                shards = self.shards.len(),
+                exchange_phases = self.phases.len(),
+                "lowered mid operation to tile work"
+            );
         }
         Ok(tiles)
     }
@@ -1067,19 +1146,7 @@ impl LoweringState {
             extents: target_view.extents.clone(),
             definition: ShardDefinition::ExchangeStaging,
         })?;
-        let mut intersections = BTreeMap::<Vec<ShardExtent>, LowShardId>::new();
-        for source in self.value_shards(source_value)?.to_vec() {
-            let Some(extents) = intersect_extents(
-                &self.shards[source.index() as usize].extents,
-                &target_view.extents,
-            ) else {
-                continue;
-            };
-            let selected = intersections.entry(extents).or_insert(source);
-            if self.shards[source.index() as usize].tile == tile {
-                *selected = source;
-            }
-        }
+        let intersections = self.intersecting_shards(source_value, &target_view.extents, tile)?;
         if intersections.is_empty() {
             return Err(LowLoweringError::InvalidConversionPlan);
         }
@@ -1197,6 +1264,18 @@ impl LoweringState {
                     (phase_column_start..phase_column_end).step_by(output_column_block as usize)
                 {
                     let column_end = column_start + output_column_block;
+                    let right_candidates = self
+                        .right_shards_for_block(
+                            &right_shards,
+                            column_start,
+                            column_end,
+                            inner_start,
+                            inner_end,
+                        )
+                        .collect::<Vec<_>>();
+                    if right_candidates.is_empty() {
+                        return Err(LowLoweringError::InvalidOperatorPlan);
+                    }
                     let column_outputs = output_shards
                         .iter()
                         .copied()
@@ -1235,14 +1314,7 @@ impl LoweringState {
                             view
                         };
                         let right = self
-                            .right_shard_for_block(
-                                &right_shards,
-                                tile,
-                                column_start,
-                                column_end,
-                                inner_start,
-                                inner_end,
-                            )
+                            .prefer_local_shard(&right_candidates, tile)
                             .ok_or(LowLoweringError::InvalidOperatorPlan)?;
                         let right_rank = self.shards[right.index() as usize].extents.len();
                         let right_view = self.narrow_view(
@@ -1470,6 +1542,18 @@ impl LoweringState {
                     (phase_column_start..phase_column_end).step_by(output_column_block as usize)
                 {
                     let column_end = column_start + output_column_block;
+                    let right_candidates = self
+                        .right_shards_for_block(
+                            &right_shards,
+                            column_start,
+                            column_end,
+                            inner_start,
+                            inner_end,
+                        )
+                        .collect::<Vec<_>>();
+                    if right_candidates.is_empty() {
+                        return Err(LowLoweringError::InvalidOperatorPlan);
+                    }
                     let column_outputs = output_shards
                         .iter()
                         .copied()
@@ -1495,14 +1579,7 @@ impl LoweringState {
                             view
                         };
                         let right = self
-                            .right_shard_for_block(
-                                &right_shards,
-                                tile,
-                                column_start,
-                                column_end,
-                                inner_start,
-                                inner_end,
-                            )
+                            .prefer_local_shard(&right_candidates, tile)
                             .ok_or(LowLoweringError::InvalidOperatorPlan)?;
                         let right_rank = self.shards[right.index() as usize].extents.len();
                         let right_view = self.narrow_view(

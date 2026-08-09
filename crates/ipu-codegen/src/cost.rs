@@ -10,6 +10,8 @@ use crate::mid::{
     AmpOrder, ElementOrder, Layout, LocalOperandStaging, MemoryClass, MidOperator,
     OperatorDispatch, OperatorRequirements, Precision, TensorAxis, TensorType,
 };
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 
 pub trait CostModel {
     fn operator_cycles(
@@ -28,6 +30,54 @@ pub trait CostModel {
         from: &Layout,
         to: &Layout,
     ) -> u64;
+}
+
+pub(crate) struct MemoizedCostModel<'a, C> {
+    inner: &'a C,
+    rearrangements: RefCell<BTreeMap<(TensorShape, Precision, Layout, Layout), u64>>,
+}
+
+impl<'a, C> MemoizedCostModel<'a, C> {
+    pub(crate) fn new(inner: &'a C) -> Self {
+        Self {
+            inner,
+            rearrangements: RefCell::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
+    fn operator_cycles(
+        &self,
+        operator: MidOperator,
+        dispatch: &OperatorDispatch,
+        requirements: &OperatorRequirements,
+        inputs: &[TensorType],
+        output: &TensorType,
+    ) -> u64 {
+        self.inner
+            .operator_cycles(operator, dispatch, requirements, inputs, output)
+    }
+
+    fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
+        self.inner.cast_cycles(input, to)
+    }
+
+    fn rearrange_cycles(
+        &self,
+        shape: &TensorShape,
+        precision: Precision,
+        from: &Layout,
+        to: &Layout,
+    ) -> u64 {
+        let key = (shape.clone(), precision, from.clone(), to.clone());
+        if let Some(cycles) = self.rearrangements.borrow().get(&key) {
+            return *cycles;
+        }
+        let cycles = self.inner.rearrange_cycles(shape, precision, from, to);
+        self.rearrangements.borrow_mut().insert(key, cycles);
+        cycles
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
