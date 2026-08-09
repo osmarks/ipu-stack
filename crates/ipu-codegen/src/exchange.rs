@@ -9,6 +9,7 @@ use ipu_exchange::{
     SANS_INACTIVE_INSTRUCTION, SYNC_ANS_INSTRUCTION, Topology, finalize_point_receiver,
     offset_plan, patch_receiver_address, patch_sender_address, plan_event_cycles,
 };
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +18,40 @@ pub struct PhysicalExchangePhase {
     /// Executable supervisor row indexed by logical tile.
     pub rows: Vec<Vec<u32>>,
     pub event_cycles: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExchangeLoweringOptions {
+    pub diagnostics: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TilePressure {
+    send_roles: u32,
+    receive_roles: u32,
+    send_words: u64,
+    receive_words: u64,
+    last_transfer: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct ScheduledTransferDiagnostic {
+    source: u16,
+    receiver_count: usize,
+    words: u32,
+    start: u32,
+    end: u32,
+    blocking_tile: u16,
+    predecessor: Option<usize>,
+}
+
+struct PhaseDiagnostics {
+    tiles: Vec<TilePressure>,
+    transfers: Vec<ScheduledTransferDiagnostic>,
+    source_words: u64,
+    destination_words: u64,
+    multicast_chunks: usize,
+    maximum_fanout: usize,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -41,6 +76,7 @@ pub fn lower_exchanges(
     program: &LowProgram,
     placement: &Placement,
     topology: &Topology,
+    options: ExchangeLoweringOptions,
 ) -> Result<Vec<PhysicalExchangePhase>, ExchangeLoweringError> {
     program
         .exchange_phases
@@ -49,6 +85,9 @@ pub fn lower_exchanges(
             let mut builders = BTreeMap::<u16, PlanProgramBuilder>::new();
             let mut horizon = 0u32;
             let mut tile_availability = vec![0u32; usize::from(program.tile_count)];
+            let mut diagnostics = options
+                .diagnostics
+                .then(|| PhaseDiagnostics::new(program.tile_count));
             for transfer in &phase.transfers {
                 let source = &program.shards[transfer.source.shard.index() as usize];
                 let logical_order = transfer.destinations.iter().any(|view| {
@@ -156,15 +195,15 @@ pub fn lower_exchanges(
                             ))
                         })
                         .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-                    let schedule_offset = std::iter::once(source.tile)
+                    let (blocking_tile, latest_availability) = std::iter::once(source.tile)
                         .chain(destination_entries.iter().map(|entry| entry.0))
-                        .map(|tile| tile_availability[usize::from(tile)])
-                        .max()
-                        .unwrap_or(0);
-                    let schedule_offset = if schedule_offset == 0 {
+                        .map(|tile| (tile, tile_availability[usize::from(tile)]))
+                        .max_by_key(|&(tile, availability)| (availability, Reverse(tile)))
+                        .unwrap_or((source.tile, 0));
+                    let schedule_offset = if latest_availability == 0 {
                         0
                     } else {
-                        schedule_offset
+                        latest_availability
                             .checked_add(1)
                             .ok_or(ExchangeLoweringError::Overflow)?
                     };
@@ -180,6 +219,16 @@ pub fn lower_exchanges(
                         &mut horizon,
                         &mut builders,
                     )?;
+                    if let Some(diagnostics) = &mut diagnostics {
+                        diagnostics.record(
+                            source.tile,
+                            destination_entries.iter().map(|entry| entry.0),
+                            chunk_bytes / 4,
+                            schedule_offset,
+                            transfer_end,
+                            blocking_tile,
+                        );
+                    }
                     for tile in std::iter::once(source.tile)
                         .chain(destination_entries.iter().map(|entry| entry.0))
                     {
@@ -208,6 +257,15 @@ pub fn lower_exchanges(
                     return Err(ExchangeLoweringError::SizeMismatch);
                 }
             }
+            if let Some(diagnostics) = diagnostics {
+                diagnostics.emit(
+                    phase.id.index(),
+                    &phase.provenance,
+                    horizon,
+                    &tile_availability,
+                    &builders,
+                );
+            }
             let rows = (0..program.tile_count)
                 .map(|tile| match builders.remove(&tile) {
                     Some(builder) => Ok(builder.finish(horizon)?),
@@ -221,6 +279,174 @@ pub fn lower_exchanges(
             })
         })
         .collect()
+}
+
+impl PhaseDiagnostics {
+    fn new(tile_count: u16) -> Self {
+        Self {
+            tiles: vec![TilePressure::default(); usize::from(tile_count)],
+            transfers: Vec::new(),
+            source_words: 0,
+            destination_words: 0,
+            multicast_chunks: 0,
+            maximum_fanout: 0,
+        }
+    }
+
+    fn record(
+        &mut self,
+        source: u16,
+        destinations: impl Iterator<Item = u16>,
+        words: u32,
+        start: u32,
+        end: u32,
+        blocking_tile: u16,
+    ) {
+        let id = self.transfers.len();
+        let predecessor = self.tiles[usize::from(blocking_tile)].last_transfer;
+        let destinations = destinations.collect::<Vec<_>>();
+        let source_pressure = &mut self.tiles[usize::from(source)];
+        source_pressure.send_roles += 1;
+        source_pressure.send_words += u64::from(words);
+        source_pressure.last_transfer = Some(id);
+        for &tile in &destinations {
+            let pressure = &mut self.tiles[usize::from(tile)];
+            pressure.receive_roles += 1;
+            pressure.receive_words += u64::from(words);
+            pressure.last_transfer = Some(id);
+        }
+        self.source_words += u64::from(words);
+        self.destination_words += u64::from(words) * destinations.len() as u64;
+        self.multicast_chunks += usize::from(destinations.len() > 1);
+        self.maximum_fanout = self.maximum_fanout.max(destinations.len());
+        self.transfers.push(ScheduledTransferDiagnostic {
+            source,
+            receiver_count: destinations.len(),
+            words,
+            start,
+            end,
+            blocking_tile,
+            predecessor,
+        });
+    }
+
+    fn emit(
+        &self,
+        phase: u32,
+        provenance: &crate::WorkProvenance,
+        horizon: u32,
+        tile_availability: &[u32],
+        builders: &BTreeMap<u16, PlanProgramBuilder>,
+    ) {
+        let role_word_lower_bound = self
+            .tiles
+            .iter()
+            .map(|tile| tile.send_words + tile.receive_words)
+            .max()
+            .unwrap_or(0);
+        let mut busiest_tiles = self
+            .tiles
+            .iter()
+            .enumerate()
+            .filter(|(_, tile)| tile.send_roles != 0 || tile.receive_roles != 0)
+            .map(|(tile, pressure)| {
+                let encoded_end = builders
+                    .get(&(tile as u16))
+                    .map_or(0, PlanProgramBuilder::event_cycles);
+                (
+                    tile as u16,
+                    pressure.send_roles,
+                    pressure.receive_roles,
+                    pressure.send_words,
+                    pressure.receive_words,
+                    tile_availability[tile],
+                    encoded_end,
+                    horizon.saturating_sub(encoded_end),
+                )
+            })
+            .collect::<Vec<_>>();
+        busiest_tiles
+            .sort_unstable_by_key(|tile| (Reverse(tile.3 + tile.4), Reverse(tile.5), tile.0));
+        busiest_tiles.truncate(8);
+
+        let active_builders = builders.len() as u64;
+        let total_final_padding = builders
+            .values()
+            .map(|builder| u64::from(horizon.saturating_sub(builder.event_cycles())))
+            .sum::<u64>();
+        let maximum_final_padding = builders
+            .values()
+            .map(|builder| horizon.saturating_sub(builder.event_cycles()))
+            .max()
+            .unwrap_or(0);
+        let maximum_scheduled_wait = self
+            .tiles
+            .iter()
+            .enumerate()
+            .map(|(tile, pressure)| {
+                let payload = pressure.send_words + pressure.receive_words;
+                u64::from(tile_availability[tile]).saturating_sub(payload)
+            })
+            .max()
+            .unwrap_or(0);
+
+        let critical_transfer = self
+            .transfers
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, transfer)| transfer.end)
+            .map(|(id, _)| id);
+        let mut critical_chain = Vec::new();
+        let mut cursor = critical_transfer;
+        while let Some(id) = cursor {
+            critical_chain.push(id);
+            cursor = self.transfers[id].predecessor;
+        }
+        critical_chain.reverse();
+        let critical_chain_length = critical_chain.len();
+        let critical_chain_tail = critical_chain
+            .iter()
+            .rev()
+            .take(12)
+            .rev()
+            .map(|&id| {
+                let transfer = &self.transfers[id];
+                (
+                    id,
+                    transfer.source,
+                    transfer.receiver_count,
+                    transfer.words,
+                    transfer.start,
+                    transfer.end,
+                    transfer.blocking_tile,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        tracing::info!(
+            phase,
+            ?provenance,
+            scheduled_chunks = self.transfers.len(),
+            multicast_chunks = self.multicast_chunks,
+            maximum_fanout = self.maximum_fanout,
+            source_words = self.source_words,
+            destination_words = self.destination_words,
+            role_word_lower_bound_cycles = role_word_lower_bound,
+            scheduled_horizon_cycles = horizon,
+            scheduler_excess_cycles = u64::from(horizon).saturating_sub(role_word_lower_bound),
+            maximum_scheduled_wait_cycles = maximum_scheduled_wait,
+            mean_final_padding_cycles = if active_builders == 0 {
+                0
+            } else {
+                total_final_padding / active_builders
+            },
+            maximum_final_padding_cycles = maximum_final_padding,
+            critical_chain_length,
+            ?critical_chain_tail,
+            ?busiest_tiles,
+            "exchange scheduler diagnostics"
+        );
+    }
 }
 
 struct ScheduledTransfer<'a> {
@@ -336,7 +562,13 @@ mod tests {
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
             let placement = place(&low).unwrap();
-            let phases = lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
+            let phases = lower_exchanges(
+                &low,
+                &placement,
+                &Topology::c600(),
+                ExchangeLoweringOptions::default(),
+            )
+            .unwrap();
             assert_eq!(phases.len(), low.exchange_phases.len());
             for phase in phases {
                 assert_eq!(phase.rows.len(), usize::from(tiles));

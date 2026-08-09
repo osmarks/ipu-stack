@@ -30,6 +30,9 @@ struct Arguments {
     /// Build benchmark programs without cycle-counter or per-step profiling.
     #[arg(long)]
     no_profile: bool,
+    /// Log exchange scheduling lower bounds and critical dependency chains.
+    #[arg(long)]
+    exchange_diagnostics: bool,
     #[arg(long, default_value_t = c600_tile_count())]
     tiles: u32,
     #[arg(long)]
@@ -104,6 +107,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| arguments.sdk.join("bin/ipu/tile_bootloader_cc_ipu21.elf"));
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
+    pipeline.exchange_diagnostics = arguments.exchange_diagnostics;
     if arguments.gemm_smoke || arguments.batched_gemm_smoke {
         let batch = if arguments.batched_gemm_smoke { 3 } else { 1 };
         let left = graph.host_input("left", [batch, u32::from(active_tiles), 64])?;

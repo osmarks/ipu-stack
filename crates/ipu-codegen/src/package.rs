@@ -155,7 +155,12 @@ fn build_package_from_objects(
     )?;
 
     let provisional_placement = build_phase("plan_exchange_storage", || Ok(place(program)?))?;
-    let provisional_exchanges = lower_exchanges(program, &provisional_placement, &topology)?;
+    let provisional_exchanges = lower_exchanges(
+        program,
+        &provisional_placement,
+        &topology,
+        crate::ExchangeLoweringOptions::default(),
+    )?;
     let exchange_table_bytes = provisional_exchanges
         .iter()
         .try_fold(0u32, |bytes, phase| {
@@ -396,7 +401,14 @@ fn build_package_from_objects(
         )?)
     })?;
     let exchanges = build_phase("lower_exchanges", || {
-        Ok(lower_exchanges(program, &placement, &topology)?)
+        Ok(lower_exchanges(
+            program,
+            &placement,
+            &topology,
+            crate::ExchangeLoweringOptions {
+                diagnostics: config.pipeline.exchange_diagnostics,
+            },
+        )?)
     })?;
     let inputs = program
         .inputs

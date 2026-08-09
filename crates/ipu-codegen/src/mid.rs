@@ -1068,6 +1068,9 @@ pub struct PipelineConfig {
     pub standard_memory_reservation_bytes: u64,
     pub scheduling: SchedulingPolicy,
     pub profiling: ProfilingConfig,
+    /// Emit exchange-scheduler lower bounds, per-tile role pressure, and
+    /// critical dependency chains while constructing the final package.
+    pub exchange_diagnostics: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1099,6 +1102,7 @@ impl PipelineConfig {
             ),
             scheduling: SchedulingPolicy::OperatorPlans,
             profiling: ProfilingConfig::default(),
+            exchange_diagnostics: false,
         }
     }
 
