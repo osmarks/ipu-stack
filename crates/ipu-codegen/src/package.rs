@@ -16,8 +16,9 @@ use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
 use ipu_exchange::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
 use ipu_package::{
-    Application, Binding, EntryPoint, PackageError, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ,
-    SEGMENT_WRITE, Segment, TILE_MEMORY_BASE, TileImage,
+    Application, Binding, EntryPoint, PROFILE_CYCLES_BINDING, PackageError, ProfileMetadata,
+    ProfileStep, ProfileStepKind, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE,
+    Segment, TILE_MEMORY_BASE, TileImage, TileProfilePlan,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -188,17 +189,31 @@ fn build_package_from_objects(
     let exchange_code_base = exchange_rows
         .as_ref()
         .map_or(crate::IPU21_DATA_BASE, |allocation| allocation.range.start);
-    let standard_ranges =
-        memory.free_ranges(crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE);
-    let placement = build_phase("place_storage", || {
-        Ok(crate::place::place_with_standard_ranges(
-            program,
-            &standard_ranges,
-        )?)
-    })?;
-    let exchanges = build_phase("lower_exchanges", || {
-        Ok(lower_exchanges(program, &placement, &topology)?)
-    })?;
+    let profile_samples = config.pipeline.profiling.enabled.then(|| {
+        program
+            .tiles
+            .iter()
+            .map(|tile| tile.work.len())
+            .max()
+            .unwrap_or(0)
+            .max(program.exchange_phases.len())
+            + 1
+    });
+    let profile_storage = profile_samples
+        .map(|samples| -> PackageBuildResult<_> {
+            let bytes = u32::try_from(samples)?
+                .checked_mul(4)
+                .ok_or_else(|| invalid("profile storage size overflow"))?;
+            Ok(memory.allocate(MemoryRequest {
+                name: "cycle profile samples",
+                bytes,
+                alignment: 4,
+                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+                end_alignment: 4,
+                guard_after: 0,
+            })?)
+        })
+        .transpose()?;
     let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
     let execution_topology = Topology::c600();
     let mut physical_to_logical = vec![None; usize::from(execution_tile_count)];
@@ -210,6 +225,174 @@ fn build_package_from_objects(
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| invalid("execution topology does not cover every physical tile"))?;
+    let provisional_inputs = program
+        .inputs
+        .iter()
+        .filter(|input| input.kind == crate::GraphInputKind::Host)
+        .map(|input| input_binding(program, &provisional_placement, &topology, input))
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    let provisional_weights = program
+        .inputs
+        .iter()
+        .filter(|input| input.kind == crate::GraphInputKind::Parameter)
+        .map(|input| input_binding(program, &provisional_placement, &topology, input))
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    let mut provisional_outputs = program
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            output_binding(program, &provisional_placement, &topology, output, index)
+        })
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    if let Some(storage) = &profile_storage {
+        provisional_outputs.push(cycle_binding(
+            "profile.start-cycle",
+            PROFILE_START_CYCLE,
+            program.tile_count,
+            &topology,
+        ));
+        provisional_outputs.push(profile_binding(
+            program,
+            &physical_to_logical,
+            storage.range.start,
+        )?);
+        provisional_outputs.push(cycle_binding(
+            "profile.end-cycle",
+            PROFILE_END_CYCLE,
+            program.tile_count,
+            &topology,
+        ));
+    }
+    let sizing_host_base = memory.next_free(
+        linked_end,
+        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        4,
+        "host programs",
+    )?;
+    let mut provisional_tile_data_ends =
+        vec![crate::IPU21_DATA_BASE; usize::from(execution_tile_count)];
+    for logical in 0..program.tile_count {
+        provisional_tile_data_ends[usize::from(topology.physical(logical)?)] =
+            provisional_placement.tile_data_end[usize::from(logical)];
+    }
+    let provisional_host = host::plan(
+        &provisional_weights,
+        &provisional_inputs,
+        &provisional_outputs,
+        execution_tile_count,
+        sizing_host_base,
+        &provisional_tile_data_ends,
+    )?;
+    let host_code_bytes = provisional_host
+        .end
+        .checked_sub(sizing_host_base)
+        .ok_or_else(|| invalid("host program size underflow"))?;
+    let host_code = (host_code_bytes != 0)
+        .then(|| {
+            memory.allocate(MemoryRequest {
+                name: "host programs",
+                bytes: host_code_bytes,
+                alignment: 4,
+                bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                end_alignment: 4,
+                guard_after: 0,
+            })
+        })
+        .transpose()?;
+    let host_code_base = host_code
+        .as_ref()
+        .map_or(sizing_host_base, |code| code.range.start);
+    let provisional_host = host::plan(
+        &provisional_weights,
+        &provisional_inputs,
+        &provisional_outputs,
+        execution_tile_count,
+        host_code_base,
+        &provisional_tile_data_ends,
+    )?;
+    let symbols = layout
+        .symbols
+        .clone()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let provisional_finalizer = TileProgramLowering::new(
+        program,
+        &provisional_placement,
+        &provisional_exchanges,
+        kernel_plan,
+        exchange_code_base,
+        execution_tile_count,
+    )?;
+    let sizing_code_address = memory.next_free(
+        host_code_base + host_code_bytes,
+        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        4,
+        "generated tile programs",
+    )?;
+    let generated_code_bytes = physical_to_logical
+        .iter()
+        .zip(&provisional_host.programs)
+        .enumerate()
+        .try_fold(0u32, |maximum, (physical, (&logical, host))| {
+            let mut tile_program = provisional_finalizer.lower_tile(logical)?;
+            if let Some(storage) = &profile_storage {
+                instrument_profile(
+                    program,
+                    logical,
+                    u32::try_from(physical)?,
+                    &mut tile_program,
+                    storage.range.start,
+                )?;
+            }
+            let generated = emit(
+                &tile_program,
+                &symbols,
+                host,
+                &CodegenOptions {
+                    code_address: sizing_code_address,
+                    initial_profile_address: config
+                        .pipeline
+                        .profiling
+                        .enabled
+                        .then_some(PROFILE_START_CYCLE),
+                    final_profile_address: config
+                        .pipeline
+                        .profiling
+                        .enabled
+                        .then_some(PROFILE_END_CYCLE),
+                    ..CodegenOptions::default()
+                },
+            )?;
+            Ok::<_, PackageBuildError>(maximum.max(u32::try_from(generated.bytes.len())?))
+        })?;
+    let code_address = if generated_code_bytes == 0 {
+        sizing_code_address
+    } else {
+        memory
+            .allocate(MemoryRequest {
+                name: "generated tile programs",
+                bytes: generated_code_bytes,
+                alignment: 4,
+                bounds: (host_code_base + host_code_bytes)
+                    ..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                end_alignment: 4,
+                guard_after: 0,
+            })?
+            .range
+            .start
+    };
+    let standard_ranges =
+        memory.free_ranges(crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE);
+    let placement = build_phase("place_storage", || {
+        Ok(crate::place::place_with_standard_ranges(
+            program,
+            &standard_ranges,
+        )?)
+    })?;
+    let exchanges = build_phase("lower_exchanges", || {
+        Ok(lower_exchanges(program, &placement, &topology)?)
+    })?;
     let inputs = program
         .inputs
         .iter()
@@ -235,6 +418,15 @@ fn build_package_from_objects(
             program.tile_count,
             &topology,
         ));
+        outputs.push(profile_binding(
+            program,
+            &physical_to_logical,
+            profile_storage
+                .as_ref()
+                .expect("profiling storage is allocated when profiling is enabled")
+                .range
+                .start,
+        )?);
         outputs.push(cycle_binding(
             "profile.end-cycle",
             PROFILE_END_CYCLE,
@@ -242,12 +434,6 @@ fn build_package_from_objects(
             &topology,
         ));
     }
-    let host_code_base = memory.next_free(
-        linked_end,
-        TILE_MEMORY_BASE..ipu_exchange::EXCHANGE_WINDOW_BASE,
-        4,
-        "host programs",
-    )?;
     let auxiliary_data_base = standard_ranges
         .first()
         .map(|range| range.0)
@@ -267,8 +453,8 @@ fn build_package_from_objects(
             ends
         },
     )?;
-    if host.end > host_code_base {
-        memory.reserve("host programs", host_code_base..host.end)?;
+    if host.end.checked_sub(host_code_base) != Some(host_code_bytes) {
+        return Err(invalid("host program size changed after tensor placement"));
     }
     let finalizer = TileProgramLowering::new(
         program,
@@ -278,25 +464,33 @@ fn build_package_from_objects(
         exchange_code_base,
         execution_tile_count,
     )?;
-    let code_address = memory.next_free(
-        host.end,
-        TILE_MEMORY_BASE..ipu_exchange::EXCHANGE_WINDOW_BASE,
-        4,
-        "generated tile programs",
-    )?;
-    let symbols = layout
-        .symbols
-        .clone()
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    let generated = build_phase("emit_tile_code", || {
-        Ok(physical_to_logical
+    let prepared = physical_to_logical
+        .iter()
+        .enumerate()
+        .map(|(physical_tile, &logical)| -> PackageBuildResult<_> {
+            let mut tile_program = finalizer.lower_tile(logical)?;
+            let profile = profile_storage
+                .as_ref()
+                .map(|storage| {
+                    instrument_profile(
+                        program,
+                        logical,
+                        u32::try_from(physical_tile)?,
+                        &mut tile_program,
+                        storage.range.start,
+                    )
+                })
+                .transpose()?;
+            Ok((tile_program, profile))
+        })
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    let generate = || {
+        prepared
             .iter()
             .zip(&host.programs)
-            .map(|(&logical, host)| -> PackageBuildResult<_> {
-                let program = finalizer.lower_tile(logical)?;
+            .map(|((tile_program, _), host)| {
                 Ok(emit(
-                    &program,
+                    tile_program,
                     &symbols,
                     host,
                     &CodegenOptions {
@@ -315,17 +509,22 @@ fn build_package_from_objects(
                     },
                 )?)
             })
-            .collect::<PackageBuildResult<Vec<_>>>()?)
-    })?;
-    let generated_code_bytes = generated.iter().try_fold(0u32, |maximum, program| {
+            .collect::<PackageBuildResult<Vec<_>>>()
+    };
+    let generated = build_phase("emit_tile_code", generate)?;
+    let actual_code_bytes = generated.iter().try_fold(0u32, |maximum, program| {
         Ok::<_, PackageBuildError>(maximum.max(u32::try_from(program.bytes.len())?))
     })?;
-    if generated_code_bytes != 0 {
-        let end = code_address
-            .checked_add(generated_code_bytes)
-            .ok_or_else(|| invalid("generated tile program address overflow"))?;
-        memory.reserve("generated tile programs", code_address..end)?;
+    if actual_code_bytes > generated_code_bytes {
+        return Err(invalid(
+            "generated tile code exceeded its planned allocation",
+        ));
     }
+    let profile_tiles = prepared
+        .into_iter()
+        .filter_map(|(_, profile)| profile)
+        .filter(|tile| !tile.steps.is_empty())
+        .collect::<Vec<_>>();
 
     let tiles = build_phase("build_tile_images", || {
         (0..execution_tile_count)
@@ -356,6 +555,7 @@ fn build_package_from_objects(
     application.inputs = inputs;
     application.weights = weights;
     application.outputs = outputs;
+    application.profile_tiles = profile_tiles;
     application.outputs.push(Binding {
         name: "completion".into(),
         dtype: "u32".into(),
@@ -586,6 +786,227 @@ fn cycle_binding(name: &str, address: u32, tile_count: u16, topology: &Topology)
             })
             .collect(),
     }
+}
+
+fn profile_binding(
+    program: &LowProgram,
+    physical_to_logical: &[u16],
+    address: u32,
+) -> PackageBuildResult<Binding> {
+    let mut file_offset = 0u64;
+    let mut sample_count = 0u32;
+    let slices = physical_to_logical
+        .iter()
+        .enumerate()
+        .filter_map(|(physical, &logical)| {
+            let steps = if logical < program.tile_count {
+                program.tiles[usize::from(logical)].work.len()
+            } else {
+                program.exchange_phases.len()
+            };
+            (steps != 0).then_some((physical, steps))
+        })
+        .map(|(physical, steps)| {
+            let samples = u32::try_from(steps + 1)?;
+            let size = u64::from(samples)
+                .checked_mul(4)
+                .ok_or_else(|| invalid("profile binding size overflow"))?;
+            let slice = RegionSlice {
+                tile: u32::try_from(physical)?,
+                tile_address: address,
+                file_offset,
+                size,
+            };
+            file_offset = file_offset
+                .checked_add(size)
+                .ok_or_else(|| invalid("profile binding offset overflow"))?;
+            sample_count = sample_count
+                .checked_add(samples)
+                .ok_or_else(|| invalid("profile binding sample count overflow"))?;
+            Ok(slice)
+        })
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    Ok(Binding {
+        name: PROFILE_CYCLES_BINDING.into(),
+        dtype: "u32".into(),
+        shape: vec![sample_count],
+        slices,
+    })
+}
+
+fn instrument_profile(
+    program: &LowProgram,
+    logical_tile: u16,
+    physical_tile: u32,
+    tile_program: &mut crate::TileProgram,
+    address: u32,
+) -> PackageBuildResult<TileProfilePlan> {
+    let mut plans = Vec::with_capacity(tile_program.steps.len());
+    if logical_tile < program.tile_count {
+        let schedule = program
+            .work(&program.tiles[usize::from(logical_tile)])
+            .collect::<Vec<_>>();
+        if schedule.len() != tile_program.steps.len() {
+            return Err(invalid("tile profile work does not match finalized steps"));
+        }
+        for (index, (&work, step)) in schedule.iter().zip(&mut tile_program.steps).enumerate() {
+            let following = schedule[index + 1..].iter().find_map(|work| match work {
+                crate::TileWorkRef::Kernel(run) => Some(&run.provenance),
+                crate::TileWorkRef::Repeat(repeat) => Some(&repeat.provenance),
+                crate::TileWorkRef::Exchange(_) | crate::TileWorkRef::LocalCopy(_) => None,
+            });
+            plans.push(profile_step(
+                program, index, work, step, address, following,
+            )?);
+        }
+    } else {
+        if program.exchange_phases.len() != tile_program.steps.len() {
+            return Err(invalid(
+                "inactive tile profile does not match exchange phases",
+            ));
+        }
+        for (index, (phase, step)) in program
+            .exchange_phases
+            .iter()
+            .zip(&mut tile_program.steps)
+            .enumerate()
+        {
+            let crate::TileStep::Exchange(exchange) = step else {
+                return Err(invalid("inactive tile contains non-exchange work"));
+            };
+            exchange.profile.before = Some(profile_address(address, index)?);
+            plans.push(profile_description(
+                index,
+                0x8000_0000 | phase.id.index(),
+                &phase.provenance,
+                ProfileStepKind::Exchange,
+                "exchange",
+            )?);
+        }
+    }
+    if let Some(last) = tile_program.steps.last_mut() {
+        step_profile(last).after = Some(profile_address(address, plans.len())?);
+    }
+    Ok(TileProfilePlan {
+        physical_tile,
+        steps: plans,
+    })
+}
+
+fn profile_step(
+    program: &LowProgram,
+    index: usize,
+    work: crate::TileWorkRef<'_>,
+    step: &mut crate::TileStep,
+    base: u32,
+    following: Option<&crate::WorkProvenance>,
+) -> PackageBuildResult<ProfileStep> {
+    step_profile(step).before = Some(profile_address(base, index)?);
+    match (work, step) {
+        (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(_)) => {
+            let phase = &program.exchange_phases[id.index() as usize];
+            profile_description(
+                index,
+                0x8000_0000 | id.index(),
+                &phase.provenance,
+                ProfileStepKind::Exchange,
+                "exchange",
+            )
+        }
+        (crate::TileWorkRef::Kernel(run), crate::TileStep::Compute(compute)) => {
+            profile_description(
+                index,
+                u32::try_from(index)?,
+                &run.provenance,
+                ProfileStepKind::Compute,
+                &compute.symbol,
+            )
+        }
+        (crate::TileWorkRef::LocalCopy(_), crate::TileStep::Compute(compute)) => {
+            if let Some(provenance) = following {
+                let mut description = profile_description(
+                    index,
+                    u32::try_from(index)?,
+                    provenance,
+                    ProfileStepKind::Compute,
+                    &compute.symbol,
+                )?;
+                description.metadata[0].value = "LocalCopy".into();
+                Ok(description)
+            } else {
+                Ok(ProfileStep {
+                    local_index: u32::try_from(index)?,
+                    phase: u32::try_from(index)?,
+                    epoch: 0,
+                    operation: String::new(),
+                    kind: ProfileStepKind::Compute,
+                    kernel: compute.symbol.clone(),
+                    metadata: vec![ProfileMetadata {
+                        name: "reason".into(),
+                        value: "LocalCopy".into(),
+                    }],
+                })
+            }
+        }
+        (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(_)) => profile_description(
+            index,
+            u32::try_from(index)?,
+            &repeat.provenance,
+            ProfileStepKind::Compute,
+            "repeat",
+        ),
+        _ => Err(invalid(
+            "tile profile work kind does not match finalized step",
+        )),
+    }
+}
+
+fn profile_description(
+    index: usize,
+    phase: u32,
+    provenance: &crate::WorkProvenance,
+    kind: ProfileStepKind,
+    kernel: &str,
+) -> PackageBuildResult<ProfileStep> {
+    let mut metadata = vec![ProfileMetadata {
+        name: "reason".into(),
+        value: format!("{:?}", provenance.reason),
+    }];
+    if let Some(value) = provenance.value {
+        metadata.push(ProfileMetadata {
+            name: "value".into(),
+            value: value.index().to_string(),
+        });
+    }
+    Ok(ProfileStep {
+        local_index: u32::try_from(index)?,
+        phase,
+        epoch: 0,
+        operation: provenance
+            .operation
+            .map(|operation| format!("operation.{}", operation.index()))
+            .unwrap_or_default(),
+        kind,
+        kernel: kernel.into(),
+        metadata,
+    })
+}
+
+fn step_profile(step: &mut crate::TileStep) -> &mut crate::StepProfile {
+    match step {
+        crate::TileStep::Exchange(exchange) => &mut exchange.profile,
+        crate::TileStep::Compute(compute) => &mut compute.profile,
+        crate::TileStep::Repeat(repeat) => &mut repeat.profile,
+    }
+}
+
+fn profile_address(base: u32, index: usize) -> PackageBuildResult<u32> {
+    base.checked_add(
+        u32::try_from(index)?
+            .checked_mul(4)
+            .ok_or_else(|| invalid("profile address overflow"))?,
+    )
+    .ok_or_else(|| invalid("profile address overflow"))
 }
 
 fn binding(

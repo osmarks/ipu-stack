@@ -72,6 +72,33 @@ struct DeviceConfigWrite {
   value @1 :UInt32;
 }
 
+struct ProfileMetadata {
+  name @0 :Text;
+  value @1 :Text;
+}
+
+enum ProfileStepKind {
+  exchange @0;
+  compute @1;
+  synchronization @2;
+  idle @3;
+}
+
+struct ProfileStepPlan {
+  localIndex @0 :UInt32;
+  phase @1 :UInt32;
+  epoch @2 :UInt32;
+  operation @3 :Text;
+  kind @4 :ProfileStepKind;
+  kernel @5 :Text;
+  metadata @6 :List(ProfileMetadata);
+}
+
+struct TileProfilePlan {
+  physicalTile @0 :UInt32;
+  steps @1 :List(ProfileStepPlan);
+}
+
 struct Application {
   schemaVersion @0 :UInt32;
   compilerVersion @1 :Text;
@@ -85,4 +112,5 @@ struct Application {
   hostExchange @9 :HostExchange;
   entryPoints @10 :List(EntryPoint);
   deviceConfigWrites @11 :List(DeviceConfigWrite);
+  profileTiles @12 :List(TileProfilePlan);
 }

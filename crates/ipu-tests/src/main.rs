@@ -24,6 +24,9 @@ struct Arguments {
     device: String,
     #[arg(long, default_value = "/tmp/ipu-trivial.ipuexe")]
     package: PathBuf,
+    /// Write per-tile kernel and exchange cycle samples for benchmark runs.
+    #[arg(long)]
+    profile_output: Option<PathBuf>,
     #[arg(long, default_value_t = c600_tile_count())]
     tiles: u32,
     #[arg(long)]
@@ -239,6 +242,7 @@ fn main() -> Result<()> {
                 mlp_hidden_dim,
                 arguments.clock_hz,
                 arguments.timeout_seconds,
+                arguments.profile_output.as_deref(),
             )?;
         } else {
             run_gemm_benchmark(
@@ -250,6 +254,7 @@ fn main() -> Result<()> {
                 arguments.benchmark_columns,
                 arguments.clock_hz,
                 arguments.timeout_seconds,
+                arguments.profile_output.as_deref(),
             )?;
         }
     } else {
@@ -426,6 +431,7 @@ fn run_gemm_benchmark(
     columns: u32,
     clock_hz: u64,
     timeout_seconds: u64,
+    profile_output: Option<&Path>,
 ) -> Result<()> {
     validate_benchmark_shape(rows, inner, columns)?;
     if clock_hz == 0 {
@@ -452,6 +458,7 @@ fn run_gemm_benchmark(
     )?;
     let maximum_absolute_error = verify_benchmark_output(application, &output, inner)?;
     let (cycles, minimum_cycles) = benchmark_cycles(application, &output, execution_tiles)?;
+    write_profile(application, &output, clock_hz, profile_output)?;
     let active_tiles = binding_tile_count(application, "output.0")?;
     let rows = u64::from(rows);
     let flops = 2.0 * rows as f64 * f64::from(inner) * f64::from(columns);
@@ -479,6 +486,7 @@ fn run_siglip_mlp_benchmark(
     hidden_dimension: u32,
     clock_hz: u64,
     timeout_seconds: u64,
+    profile_output: Option<&Path>,
 ) -> Result<()> {
     validate_mlp_benchmark_shape(batch, tokens, dimension, hidden_dimension)?;
     if clock_hz == 0 {
@@ -513,6 +521,7 @@ fn run_siglip_mlp_benchmark(
     let expected = gelu_reference(first_dense) * hidden_dimension as f32 / 128.0;
     let maximum_absolute_error = verify_constant_output(application, &output, expected)?;
     let (cycles, minimum_cycles) = benchmark_cycles(application, &output, execution_tiles)?;
+    write_profile(application, &output, clock_hz, profile_output)?;
     let active_tiles = binding_tile_count(application, "output.0")?;
     let rows = u64::from(batch) * u64::from(tokens);
     let flops = 4.0 * rows as f64 * f64::from(dimension) * f64::from(hidden_dimension);
@@ -525,6 +534,30 @@ fn run_siglip_mlp_benchmark(
         weights.len(),
         seconds * 1.0e6,
         tflops / peak_tflops * 100.0,
+    );
+    Ok(())
+}
+
+fn write_profile(
+    application: &Application,
+    output: &[u8],
+    clock_hz: u64,
+    path: Option<&Path>,
+) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let report = application.profile_report(output, clock_hz)?;
+    report.write(fs::File::create(path).with_context(|| format!("create {}", path.display()))?)?;
+    println!(
+        "profile={} tiles={} samples={}",
+        path.display(),
+        report.tiles.len(),
+        report
+            .tiles
+            .iter()
+            .map(|tile| tile.samples.len())
+            .sum::<usize>()
     );
     Ok(())
 }

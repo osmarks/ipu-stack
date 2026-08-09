@@ -309,6 +309,7 @@ version = "0.1.0"
 dependencies = [
  "capnp",
  "capnpc",
+ "fastrand",
  "thiserror",
  "tracing",
 ]

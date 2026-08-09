@@ -189,6 +189,7 @@ pub const IPU21_INTERLEAVED_ELEMENT_SIZE: u32 = 2 * TILE_MEMORY_ELEMENT_SIZE;
 pub const SEGMENT_READ: u32 = 1;
 pub const SEGMENT_WRITE: u32 = 2;
 pub const SEGMENT_EXECUTE: u32 = 4;
+pub const PROFILE_CYCLES_BINDING: &str = "profile.cycles";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackageError {
@@ -290,6 +291,12 @@ pub struct DeviceConfigWrite {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileProfilePlan {
+    pub physical_tile: u32,
+    pub steps: Vec<ProfileStep>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Application {
     pub compiler_version: String,
     pub tiles: Vec<TileImage>,
@@ -299,6 +306,7 @@ pub struct Application {
     pub host_exchange: HostExchange,
     pub entry_points: Vec<EntryPoint>,
     pub device_config_writes: Vec<DeviceConfigWrite>,
+    pub profile_tiles: Vec<TileProfilePlan>,
 }
 
 impl Default for Application {
@@ -312,6 +320,7 @@ impl Default for Application {
             host_exchange: HostExchange::default(),
             entry_points: Vec::new(),
             device_config_writes: Vec::new(),
+            profile_tiles: Vec::new(),
         }
     }
 }
@@ -370,6 +379,19 @@ impl Application {
         }
         let tile_ids: std::collections::HashSet<_> =
             self.tiles.iter().map(|tile| tile.physical_tile).collect();
+        let mut profile_tile_ids = std::collections::HashSet::new();
+        for tile in &self.profile_tiles {
+            if !tile_ids.contains(&tile.physical_tile)
+                || !profile_tile_ids.insert(tile.physical_tile)
+                || tile
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .any(|(index, step)| step.local_index != index as u32)
+            {
+                return Err(PackageError::Invalid("invalid tile profile plan".into()));
+            }
+        }
         let mut binding_names = std::collections::HashSet::new();
         for binding in self.inputs.iter().chain(&self.outputs).chain(&self.weights) {
             if binding.name.is_empty() || !binding_names.insert(binding.name.as_str()) {
@@ -495,6 +517,11 @@ impl Application {
             item.set_offset(write.offset);
             item.set_value(write.value);
         }
+        write_profile_tiles(
+            root.reborrow()
+                .init_profile_tiles(self.profile_tiles.len() as u32),
+            &self.profile_tiles,
+        );
         serialize::write_message(&mut output, &message)?;
         info!("application package written");
         Ok(())
@@ -539,6 +566,7 @@ impl Application {
                 value: item.get_value(),
             })
             .collect();
+        app.profile_tiles = read_profile_tiles(root.get_profile_tiles()?)?;
         app.validate()?;
         info!(
             tiles = app.tiles.len(),
@@ -579,6 +607,89 @@ impl Application {
         }
         Ok(image)
     }
+
+    pub fn profile_report(
+        &self,
+        output: &[u8],
+        clock_hz: u64,
+    ) -> Result<ProfileReport, PackageError> {
+        let mut binding_base = 0u64;
+        let mut profile_binding = None;
+        for binding in &self.outputs {
+            if binding.name == PROFILE_CYCLES_BINDING {
+                profile_binding = Some(binding);
+                break;
+            }
+            binding_base = binding_base
+                .checked_add(binding_size(binding))
+                .ok_or_else(|| PackageError::Invalid("output binding size overflow".into()))?;
+        }
+        let binding = profile_binding.ok_or_else(|| {
+            PackageError::Invalid("application has no cycle profile binding".into())
+        })?;
+        let slices = binding
+            .slices
+            .iter()
+            .map(|slice| (slice.tile, slice))
+            .collect::<HashMap<_, _>>();
+        let mut tiles = Vec::with_capacity(self.profile_tiles.len());
+        for plan in &self.profile_tiles {
+            let slice = slices.get(&plan.physical_tile).ok_or_else(|| {
+                PackageError::Invalid(format!(
+                    "cycle profile has no slice for tile {}",
+                    plan.physical_tile
+                ))
+            })?;
+            let expected = u64::try_from(plan.steps.len() + 1)
+                .map_err(|_| PackageError::Invalid("profile sample count overflow".into()))?
+                .checked_mul(4)
+                .ok_or_else(|| PackageError::Invalid("profile sample size overflow".into()))?;
+            if slice.size != expected {
+                return Err(PackageError::Invalid(format!(
+                    "cycle profile slice for tile {} has size {}, expected {expected}",
+                    plan.physical_tile, slice.size
+                )));
+            }
+            let start = usize::try_from(binding_base + slice.file_offset)
+                .map_err(|_| PackageError::Invalid("profile output offset overflow".into()))?;
+            let end = start
+                .checked_add(usize::try_from(slice.size).map_err(|_| {
+                    PackageError::Invalid("profile output size exceeds usize".into())
+                })?)
+                .ok_or_else(|| PackageError::Invalid("profile output range overflow".into()))?;
+            let bytes = output.get(start..end).ok_or_else(|| {
+                PackageError::Invalid("profile binding exceeds runtime output".into())
+            })?;
+            let cycles = bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte chunk")))
+                .collect::<Vec<_>>();
+            tiles.push(TileProfile {
+                physical_tile: plan.physical_tile,
+                samples: plan
+                    .steps
+                    .iter()
+                    .cloned()
+                    .zip(cycles.windows(2))
+                    .map(|(step, bounds)| CycleSample {
+                        step,
+                        start_cycle: bounds[0],
+                        end_cycle: bounds[1],
+                    })
+                    .collect(),
+            });
+        }
+        Ok(ProfileReport { clock_hz, tiles })
+    }
+}
+
+fn binding_size(binding: &Binding) -> u64 {
+    binding
+        .slices
+        .iter()
+        .map(|slice| slice.file_offset.saturating_add(slice.size))
+        .max()
+        .unwrap_or(0)
 }
 fn validate_host_batch_ends(
     call: &HostCall,
@@ -699,6 +810,89 @@ fn read_bindings(
                         size: slice.get_size(),
                     })
                     .collect(),
+            })
+        })
+        .collect()
+}
+
+fn write_profile_tiles(
+    mut output: capnp::struct_list::Builder<'_, application_capnp::tile_profile_plan::Owned>,
+    tiles: &[TileProfilePlan],
+) {
+    for (tile_index, tile) in tiles.iter().enumerate() {
+        let mut output_tile = output.reborrow().get(tile_index as u32);
+        output_tile.set_physical_tile(tile.physical_tile);
+        let mut steps = output_tile.reborrow().init_steps(tile.steps.len() as u32);
+        for (step_index, step) in tile.steps.iter().enumerate() {
+            let mut output_step = steps.reborrow().get(step_index as u32);
+            output_step.set_local_index(step.local_index);
+            output_step.set_phase(step.phase);
+            output_step.set_epoch(step.epoch);
+            output_step.set_operation(&step.operation);
+            output_step.set_kind(match step.kind {
+                ProfileStepKind::Exchange => application_capnp::ProfileStepKind::Exchange,
+                ProfileStepKind::Compute => application_capnp::ProfileStepKind::Compute,
+                ProfileStepKind::Synchronization => {
+                    application_capnp::ProfileStepKind::Synchronization
+                }
+                ProfileStepKind::Idle => application_capnp::ProfileStepKind::Idle,
+            });
+            output_step.set_kernel(&step.kernel);
+            let mut metadata = output_step
+                .reborrow()
+                .init_metadata(step.metadata.len() as u32);
+            for (metadata_index, entry) in step.metadata.iter().enumerate() {
+                let mut output_entry = metadata.reborrow().get(metadata_index as u32);
+                output_entry.set_name(&entry.name);
+                output_entry.set_value(&entry.value);
+            }
+        }
+    }
+}
+
+fn read_profile_tiles(
+    input: capnp::struct_list::Reader<'_, application_capnp::tile_profile_plan::Owned>,
+) -> Result<Vec<TileProfilePlan>, PackageError> {
+    input
+        .iter()
+        .map(|tile| {
+            Ok(TileProfilePlan {
+                physical_tile: tile.get_physical_tile(),
+                steps: tile
+                    .get_steps()?
+                    .iter()
+                    .map(|step| {
+                        Ok(ProfileStep {
+                            local_index: step.get_local_index(),
+                            phase: step.get_phase(),
+                            epoch: step.get_epoch(),
+                            operation: step.get_operation()?.to_str()?.into(),
+                            kind: match step.get_kind()? {
+                                application_capnp::ProfileStepKind::Exchange => {
+                                    ProfileStepKind::Exchange
+                                }
+                                application_capnp::ProfileStepKind::Compute => {
+                                    ProfileStepKind::Compute
+                                }
+                                application_capnp::ProfileStepKind::Synchronization => {
+                                    ProfileStepKind::Synchronization
+                                }
+                                application_capnp::ProfileStepKind::Idle => ProfileStepKind::Idle,
+                            },
+                            kernel: step.get_kernel()?.to_str()?.into(),
+                            metadata: step
+                                .get_metadata()?
+                                .iter()
+                                .map(|entry| {
+                                    Ok(ProfileMetadata {
+                                        name: entry.get_name()?.to_str()?.into(),
+                                        value: entry.get_value()?.to_str()?.into(),
+                                    })
+                                })
+                                .collect::<Result<_, PackageError>>()?,
+                        })
+                    })
+                    .collect::<Result<_, PackageError>>()?,
             })
         })
         .collect()
@@ -839,6 +1033,21 @@ mod tests {
     #[test]
     fn round_trip_and_reconstruct() {
         let mut app = sample();
+        app.profile_tiles.push(TileProfilePlan {
+            physical_tile: 0,
+            steps: vec![ProfileStep {
+                local_index: 0,
+                phase: 7,
+                epoch: 0,
+                operation: "operation.0".into(),
+                kind: ProfileStepKind::Compute,
+                kernel: "kernel".into(),
+                metadata: vec![ProfileMetadata {
+                    name: "reason".into(),
+                    value: "OperatorKernel".into(),
+                }],
+            }],
+        });
         app.device_config_writes.push(DeviceConfigWrite {
             offset: 0x4018,
             value: 0xc000_000d,
@@ -895,6 +1104,91 @@ mod tests {
             &decoded.tile_image(0).unwrap()[..8],
             &[1, 2, 3, 4, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn randomized_profile_reports_use_adjacent_start_samples() {
+        let mut random = fastrand::Rng::with_seed(0x7072_6f66);
+        for case in 0..64 {
+            let tile_count = random.usize(1..=8);
+            let prefix_bytes = random.usize(0..=8) * 4;
+            let mut app = Application::default();
+            app.outputs.push(Binding {
+                name: "prefix".into(),
+                dtype: "u8".into(),
+                shape: vec![prefix_bytes as u32],
+                slices: (prefix_bytes != 0)
+                    .then_some(RegionSlice {
+                        tile: 0,
+                        tile_address: TILE_MEMORY_BASE,
+                        file_offset: 0,
+                        size: prefix_bytes as u64,
+                    })
+                    .into_iter()
+                    .collect(),
+            });
+            let mut output = vec![0xa5; prefix_bytes];
+            let mut slices = Vec::new();
+            let mut profile_offset = 0u64;
+            let mut expected = Vec::new();
+            for tile in 0..tile_count {
+                let step_count = random.usize(1..=16);
+                let mut cycle = random.u32(0..=u32::MAX / 2);
+                let mut bounds = vec![cycle];
+                for _ in 0..step_count {
+                    cycle = cycle.wrapping_add(random.u32(1..=10_000));
+                    bounds.push(cycle);
+                }
+                output.extend(bounds.iter().flat_map(|cycle| cycle.to_le_bytes()));
+                slices.push(RegionSlice {
+                    tile: tile as u32,
+                    tile_address: TILE_MEMORY_BASE + 0x100,
+                    file_offset: profile_offset,
+                    size: ((step_count + 1) * 4) as u64,
+                });
+                profile_offset += ((step_count + 1) * 4) as u64;
+                let steps = (0..step_count)
+                    .map(|index| ProfileStep {
+                        local_index: index as u32,
+                        phase: index as u32,
+                        epoch: 0,
+                        operation: format!("operation.{index}"),
+                        kind: if random.bool() {
+                            ProfileStepKind::Compute
+                        } else {
+                            ProfileStepKind::Exchange
+                        },
+                        kernel: format!("kernel.{index}"),
+                        metadata: Vec::new(),
+                    })
+                    .collect::<Vec<_>>();
+                expected.push((tile as u32, steps.clone(), bounds));
+                app.profile_tiles.push(TileProfilePlan {
+                    physical_tile: tile as u32,
+                    steps,
+                });
+            }
+            app.outputs.push(Binding {
+                name: PROFILE_CYCLES_BINDING.into(),
+                dtype: "u32".into(),
+                shape: vec![(profile_offset / 4) as u32],
+                slices,
+            });
+
+            let report = app.profile_report(&output, 1_500_000_000).unwrap();
+            assert_eq!(report.tiles.len(), tile_count, "random case {case}");
+            for (tile_index, (tile, (physical_tile, steps, bounds))) in
+                report.tiles.iter().zip(expected).enumerate()
+            {
+                assert_eq!(tile_index as u32, physical_tile, "random case {case}");
+                assert_eq!(tile.physical_tile, physical_tile);
+                for (index, sample) in tile.samples.iter().enumerate() {
+                    assert_eq!(sample.step, steps[index], "random case {case}");
+                    assert_eq!(sample.start_cycle, bounds[index], "random case {case}");
+                    assert_eq!(sample.end_cycle, bounds[index + 1], "random case {case}");
+                }
+            }
+        }
     }
 
     #[test]

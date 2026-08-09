@@ -12,3 +12,6 @@ tracing.workspace = true
 
 [build-dependencies]
 capnpc.workspace = true
+
+[dev-dependencies]
+fastrand.workspace = true
