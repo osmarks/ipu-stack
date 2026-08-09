@@ -41,9 +41,9 @@ pub enum TileLoweringError {
     #[error("execution has {execution} tiles, fewer than the {scheduled} scheduled tiles")]
     MissingExecutionTiles { scheduled: u16, execution: u16 },
     #[error(
-        "exchange rows occupy 0x{start:x}..0x{end:x}, beyond the receive window boundary at 0x{limit:x}"
+        "exchange rows occupy 0x{start:x}..0x{end:x}, beyond executable tile SRAM at 0x{limit:x}"
     )]
-    ExchangeCodeWindow { start: u32, end: u32, limit: u32 },
+    ExchangeCodeMemory { start: u32, end: u32, limit: u32 },
     #[error(
         "tile {tile} local copy {source_shard:?}+{source_offset} -> {destination_shard:?}+{destination_offset} has invalid addresses or byte count {bytes}"
     )]
@@ -92,11 +92,12 @@ impl<'a> TileProgramLowering<'a> {
                 )
                 .ok_or(TileLoweringError::Overflow)?;
         }
-        if cursor > ipu_exchange::EXCHANGE_WINDOW_BASE {
-            return Err(TileLoweringError::ExchangeCodeWindow {
+        let executable_memory_end = ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT;
+        if cursor > executable_memory_end {
+            return Err(TileLoweringError::ExchangeCodeMemory {
                 start: exchange_code_base,
                 end: cursor,
-                limit: ipu_exchange::EXCHANGE_WINDOW_BASE,
+                limit: executable_memory_end,
             });
         }
         let phases = exchanges

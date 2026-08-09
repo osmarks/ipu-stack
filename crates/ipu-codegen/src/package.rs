@@ -122,7 +122,37 @@ fn build_package_from_objects(
     kernel_plan: &KernelBuildPlan,
 ) -> PackageBuildResult<Application> {
     let topology = active_topology(program.tile_count)?;
-    let placement = build_phase("place_storage", || Ok(place(program)?))?;
+    let provisional_placement = build_phase("plan_exchange_storage", || Ok(place(program)?))?;
+    let provisional_exchanges = lower_exchanges(program, &provisional_placement, &topology)?;
+    let exchange_table_bytes = provisional_exchanges
+        .iter()
+        .try_fold(0u32, |bytes, phase| {
+            let words = phase
+                .rows
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(0)
+                .max(ipu_exchange::PLAN_WORDS);
+            bytes
+                .checked_add(
+                    u32::try_from(words)?
+                        .checked_mul(4)
+                        .ok_or_else(|| invalid("exchange row table size overflow"))?,
+                )
+                .ok_or_else(|| invalid("exchange row table size overflow"))
+        })?;
+    let exchange_code_base = crate::IPU21_DATA_BASE;
+    let data_base = align_up(
+        exchange_code_base
+            .checked_add(exchange_table_bytes)
+            .and_then(|end| end.checked_add(ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD))
+            .ok_or_else(|| invalid("exchange row table address overflow"))?,
+        ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+    )?;
+    let placement = build_phase("place_storage", || {
+        Ok(crate::place::place_with_data_base(program, data_base)?)
+    })?;
     let exchanges = build_phase("lower_exchanges", || {
         Ok(lower_exchanges(program, &placement, &topology)?)
     })?;
@@ -137,14 +167,6 @@ fn build_package_from_objects(
     })?;
     let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
     let execution_topology = Topology::c600();
-    let finalizer = TileProgramLowering::new(
-        program,
-        &placement,
-        &exchanges,
-        kernel_plan,
-        linked_end(&layout)?,
-        execution_tile_count,
-    )?;
     let mut physical_to_logical = vec![None; usize::from(execution_tile_count)];
     for logical in 0..execution_tile_count {
         let physical = execution_topology.physical(logical)?;
@@ -191,15 +213,23 @@ fn build_package_from_objects(
         &inputs,
         &outputs,
         execution_tile_count,
-        finalizer.exchange_code_end(),
+        linked_end(&layout)?,
         &{
-            let mut ends = vec![crate::IPU21_DATA_BASE; usize::from(execution_tile_count)];
+            let mut ends = vec![data_base; usize::from(execution_tile_count)];
             for logical in 0..program.tile_count {
                 ends[usize::from(topology.physical(logical)?)] =
                     placement.tile_data_end[usize::from(logical)];
             }
             ends
         },
+    )?;
+    let finalizer = TileProgramLowering::new(
+        program,
+        &placement,
+        &exchanges,
+        kernel_plan,
+        exchange_code_base,
+        execution_tile_count,
     )?;
     let code_address = align_up(host.end, 4)?;
     let symbols = layout

@@ -1054,26 +1054,7 @@ impl LoweringState {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
 
-        let staging_payload_bytes = inner_block
-            .checked_mul(output_column_block)
-            .and_then(|elements| {
-                elements.checked_mul(requirements.inputs[1].format.precision.bytes() as u32)
-            })
-            .ok_or(LowLoweringError::IdOverflow)?;
-        let staging_alignment = requirements.inputs[1].alignment.max(4);
-        if !staging_alignment.is_power_of_two() {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        let staging_stride = staging_payload_bytes
-            .checked_add(requirements.inputs[1].access_tail_bytes)
-            .and_then(|bytes| bytes.checked_add(staging_alignment - 1))
-            .map(|bytes| bytes & !(staging_alignment - 1))
-            .ok_or(LowLoweringError::IdOverflow)?;
-        let panels_per_phase = ipu_exchange::EXCHANGE_WINDOW_BYTES
-            .checked_div(staging_stride)
-            .filter(|&panels| panels != 0)
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?
-            .min(4);
+        let panels_per_phase = column_extent / output_column_block;
         let phase_column_width = output_column_block
             .checked_mul(panels_per_phase)
             .ok_or(LowLoweringError::IdOverflow)?;
@@ -1331,7 +1312,7 @@ impl LoweringState {
             })?;
         let mut staging = BTreeMap::<(u16, u32), LowShardId>::new();
         let mut receive_staging = BTreeMap::<(u16, u32), LowShardId>::new();
-        let columns_per_phase = (ipu_exchange::EXCHANGE_WINDOW_BYTES / staging_bytes).clamp(1, 4);
+        let columns_per_phase = column_extent / output_column_block;
         let column_phase_width = output_column_block
             .checked_mul(columns_per_phase)
             .ok_or(LowLoweringError::IdOverflow)?;
@@ -2199,8 +2180,7 @@ mod tests {
                 .iter()
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>();
-            let panels_per_phase =
-                (ipu_exchange::EXCHANGE_WINDOW_BYTES / (64 * 64 * 2)).clamp(1, 4);
+            let panels_per_phase = column_blocks;
             assert!(
                 unique_gemm_staging.len()
                     <= usize::from(tiles)

@@ -75,6 +75,20 @@ impl Lifetime {
 }
 
 pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
+    place_with_data_base(program, IPU21_DATA_BASE)
+}
+
+pub(crate) fn place_with_data_base(
+    program: &LowProgram,
+    standard_data_base: u32,
+) -> Result<Placement, PlacementError> {
+    if !(IPU21_DATA_BASE..=IPU21_INTERLEAVED_MEMORY_BASE).contains(&standard_data_base) {
+        return Err(PlacementError::OutOfMemory {
+            tile: 0,
+            class: MemoryClass::Ipu21Standard,
+            bytes: standard_data_base.saturating_sub(IPU21_DATA_BASE),
+        });
+    }
     let mut sets = DisjointSets::new(program.shards.len());
     for shard in &program.shards {
         if let ShardDefinition::Alias(target) = shard.definition {
@@ -117,7 +131,7 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
     }
 
     let mut addresses = BTreeMap::new();
-    let mut tile_data_end = vec![IPU21_DATA_BASE; usize::from(program.tile_count)];
+    let mut tile_data_end = vec![standard_data_base; usize::from(program.tile_count)];
     for tile in 0..program.tile_count {
         let mut grouped = BTreeSet::<usize>::new();
         for group in iterated.iter().filter(|group| group.tile == tile) {
@@ -161,7 +175,7 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
             });
         }
         let mut standard = Arena::new(&[
-            (IPU21_DATA_BASE, IPU21_INTERLEAVED_MEMORY_BASE),
+            (standard_data_base, IPU21_INTERLEAVED_MEMORY_BASE),
             (interleaved_boundary, TILE_MEMORY_BASE + TILE_MEMORY_SIZE),
         ]);
         allocate_tile_class(
