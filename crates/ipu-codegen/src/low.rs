@@ -1115,7 +1115,11 @@ impl LoweringState {
                         let resident_right = if self.shards[right.index() as usize].tile == tile {
                             let spans =
                                 view_byte_spans(&self.shards[right.index() as usize], &right_view)?;
-                            if spans.len() == 1 {
+                            if spans.len() == 1
+                                && (!use_interleaved_staging
+                                    || requirements.inputs[1].local_staging
+                                        == crate::LocalOperandStaging::Direct)
+                            {
                                 right_view
                             } else {
                                 let existing_staging =
@@ -1359,7 +1363,11 @@ impl LoweringState {
                             })
                             .transpose()?;
                         let resident_view =
-                            if local_spans.as_ref().is_some_and(|spans| spans.len() == 1) {
+                            if local_spans.as_ref().is_some_and(|spans| spans.len() == 1)
+                                && (!use_interleaved_staging
+                                    || requirements.inputs[1].local_staging
+                                        == crate::LocalOperandStaging::Direct)
+                            {
                                 right_view.clone()
                             } else {
                                 let selected_staging = if local {
@@ -2611,6 +2619,11 @@ mod tests {
             let inner_blocks = u32::from(row_partitions) * random.u32(1..=2);
             let inner = inner_blocks * 64;
             let columns = u32::from(column_partitions) * 64;
+            let local_staging = if random.bool() {
+                crate::LocalOperandStaging::Direct
+            } else {
+                crate::LocalOperandStaging::MatchRemote
+            };
             let mut graph = ComputeGraph::new();
             let left = graph.host_input("left", [rows, inner]).unwrap();
             let right = graph.parameter("right", [inner, columns]).unwrap();
@@ -2644,7 +2657,8 @@ mod tests {
                 },
                 [
                     crate::OperandRequirement::new(left_format, 32).with_access_tail(16),
-                    crate::OperandRequirement::new(right_format, 32),
+                    crate::OperandRequirement::new(right_format, 32)
+                        .with_local_staging(local_staging),
                 ],
                 crate::OperandRequirement::new(output_format, 32),
             )];
@@ -2665,7 +2679,11 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            assert!(copies.is_empty(), "case {case}: {copies:?}");
+            assert_eq!(
+                copies.is_empty(),
+                local_staging == crate::LocalOperandStaging::Direct,
+                "case {case}: {copies:?}"
+            );
             let weight_loads = low
                 .kernel_runs
                 .iter()
@@ -2674,14 +2692,16 @@ mod tests {
                     _ => None,
                 })
                 .collect::<BTreeSet<_>>();
-            assert_eq!(
-                weight_loads,
-                BTreeSet::from([
+            let expected_weight_loads = match local_staging {
+                crate::LocalOperandStaging::Direct => BTreeSet::from([
                     crate::GemmWeightLoad::Standard,
                     crate::GemmWeightLoad::Interleaved,
                 ]),
-                "case {case}"
-            );
+                crate::LocalOperandStaging::MatchRemote => {
+                    BTreeSet::from([crate::GemmWeightLoad::Interleaved])
+                }
+            };
+            assert_eq!(weight_loads, expected_weight_loads, "case {case}");
             for phase in &low.exchange_phases {
                 for destination in phase
                     .transfers

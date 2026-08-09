@@ -746,6 +746,16 @@ pub struct OperandRequirement {
     pub alignment: u32,
     /// Bytes the kernel may access beyond the logical tensor payload.
     pub access_tail_bytes: u32,
+    /// How a locally resident operand should be consumed when other tiles use
+    /// an operator-local staging buffer for the same operand.
+    pub local_staging: LocalOperandStaging,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LocalOperandStaging {
+    #[default]
+    Direct,
+    MatchRemote,
 }
 
 impl OperandRequirement {
@@ -754,11 +764,17 @@ impl OperandRequirement {
             format,
             alignment,
             access_tail_bytes: 0,
+            local_staging: LocalOperandStaging::Direct,
         }
     }
 
     pub fn with_access_tail(mut self, bytes: u32) -> Self {
         self.access_tail_bytes = bytes;
+        self
+    }
+
+    pub fn with_local_staging(mut self, staging: LocalOperandStaging) -> Self {
+        self.local_staging = staging;
         self
     }
 }
@@ -1182,7 +1198,7 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
                 (Precision::F32, 32, AmpWeightLayout::Streamed),
             ] {
                 for &output_columns in amp_output_column_blocks(precision) {
-                    grid.push(amp_grid_gemm_operator_candidate(
+                    let candidate = amp_grid_gemm_operator_candidate(
                         precision,
                         64,
                         left_tail,
@@ -1191,7 +1207,15 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
                         rows,
                         columns,
                         weight_layout,
-                    ));
+                    );
+                    grid.push(candidate.clone());
+                    if precision == Precision::F16
+                        && weight_layout != AmpWeightLayout::InterleavedK64
+                    {
+                        let mut staged = candidate;
+                        staged.inputs[1].local_staging = LocalOperandStaging::MatchRemote;
+                        grid.push(staged);
+                    }
                 }
             }
             grid
@@ -1427,7 +1451,7 @@ fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> Operator
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum AmpWeightLayout {
     Resident,
     Streamed,
@@ -2182,6 +2206,7 @@ fn apply_selected_plan(
     let operator_cycles = costs.operator_cycles(
         plan.operator,
         &plan.dispatch,
+        &plan.requirements,
         &converted_types,
         &state.get(result).tensor_type,
     );
@@ -2612,14 +2637,26 @@ mod tests {
                 accumulate: AccumulationPrecision::F32,
             };
             let dispatch = default_dispatch(operator);
+            let requirements = OperatorRequirements {
+                inputs: Vec::new(),
+                output: OperandRequirement::new(output.format.clone(), 8),
+                output_aliasing: OutputAliasing::Fresh,
+                memory_relations: Vec::new(),
+            };
             let standard_cost = Ipu21CostModel.operator_cycles(
                 operator,
                 &dispatch,
+                &requirements,
                 &[left.clone(), standard],
                 &output,
             );
-            let direct_cost =
-                Ipu21CostModel.operator_cycles(operator, &dispatch, &[left, direct], &output);
+            let direct_cost = Ipu21CostModel.operator_cycles(
+                operator,
+                &dispatch,
+                &requirements,
+                &[left, direct],
+                &output,
+            );
             assert!(direct_cost < standard_cost);
         }
     }
@@ -2675,6 +2712,7 @@ mod tests {
             &self,
             operator: MidOperator,
             _dispatch: &OperatorDispatch,
+            _requirements: &OperatorRequirements,
             _inputs: &[TensorType],
             output: &TensorType,
         ) -> u64 {

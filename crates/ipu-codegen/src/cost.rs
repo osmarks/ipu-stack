@@ -7,8 +7,8 @@ use crate::estimate::{
 };
 use crate::graph::TensorShape;
 use crate::mid::{
-    AmpOrder, ElementOrder, Layout, MemoryClass, MidOperator, OperatorDispatch, Precision,
-    TensorAxis, TensorType,
+    AmpOrder, ElementOrder, Layout, LocalOperandStaging, MemoryClass, MidOperator,
+    OperatorDispatch, OperatorRequirements, Precision, TensorAxis, TensorType,
 };
 
 pub trait CostModel {
@@ -16,6 +16,7 @@ pub trait CostModel {
         &self,
         operator: MidOperator,
         dispatch: &OperatorDispatch,
+        requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64;
@@ -85,6 +86,7 @@ fn amp_kernel_cycles(
     multiply: Precision,
     dispatch: &OperatorDispatch,
     right: Option<&TensorType>,
+    staged_local_weights: bool,
     output_elements_per_tile: u64,
     output_columns_per_tile: u64,
     k: u64,
@@ -109,8 +111,9 @@ fn amp_kernel_cycles(
     }
     let rows = output_elements_per_tile.div_ceil(output_columns_per_tile);
     let column_groups = output_column_block.div_ceil(IPU21_AMP_KERNEL_COSTS.column_group_width);
-    let interleaved = right
-        .is_some_and(|right| right.format.layout.memory_class == MemoryClass::Ipu21Interleaved);
+    let interleaved = staged_local_weights
+        || right
+            .is_some_and(|right| right.format.layout.memory_class == MemoryClass::Ipu21Interleaved);
     let (row_cycles, group_cycles) = match multiply {
         Precision::F16 => (
             rows,
@@ -145,11 +148,22 @@ fn amp_kernel_cycles(
     )
 }
 
+fn standard_to_interleaved_copy_cycles(bytes: u64) -> u64 {
+    // The current parallel helper shares one instruction issue pipeline across
+    // its worker contexts. Its load/store/address/control loop takes about
+    // 6,400 cycles for an 8 KiB panel; keep this separate from memcpy bandwidth.
+    bytes
+        .saturating_mul(25)
+        .div_ceil(32)
+        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
+}
+
 impl CostModel for Ipu21CostModel {
     fn operator_cycles(
         &self,
         operator: MidOperator,
         dispatch: &OperatorDispatch,
+        requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
@@ -188,6 +202,10 @@ impl CostModel for Ipu21CostModel {
                     gemm_uses_panel_buffer(dispatch, right, output)
                         && right.format.precision == Precision::F16
                 });
+                let staged_local_weights = staged_weights
+                    && requirements.inputs.get(1).is_some_and(|requirement| {
+                        requirement.local_staging == LocalOperandStaging::MatchRemote
+                    });
                 let streamed_k64_standard = right.filter(|right| {
                     staged_weights
                         && right.format.layout.memory_class == MemoryClass::Ipu21Standard
@@ -232,6 +250,15 @@ impl CostModel for Ipu21CostModel {
                 } else {
                     0
                 };
+                let local_staging = if staged_local_weights {
+                    // The source-owner role rotates with the streamed block,
+                    // but the critical-path tile performs one local population
+                    // for every block it computes rather than one divided share
+                    // of the operator's K traffic.
+                    standard_to_interleaved_copy_cycles(right_bytes_consumed)
+                } else {
+                    0
+                };
                 let exchange = gemm_remote_bytes_per_tile(inputs, output)
                     .div_ceil(gemm_exchange_bytes_per_cycle(inputs))
                     .saturating_add(
@@ -254,6 +281,7 @@ impl CostModel for Ipu21CostModel {
                     multiply,
                     dispatch,
                     right,
+                    staged_local_weights,
                     output_elements_per_tile,
                     output_columns_per_tile,
                     k,
@@ -267,6 +295,7 @@ impl CostModel for Ipu21CostModel {
                 };
                 kernel
                     .saturating_add(packing)
+                    .saturating_add(local_staging)
                     .saturating_add(exchange)
                     .saturating_add(capacity_penalty)
             }
