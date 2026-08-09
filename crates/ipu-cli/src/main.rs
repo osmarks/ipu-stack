@@ -438,32 +438,96 @@ fn parse_named_path(value: &str) -> Result<(String, PathBuf), String> {
 }
 
 fn render_profile_html(report: &ProfileReport) -> Result<String> {
+    #[derive(Clone, Copy, Hash, PartialEq, Eq)]
+    struct StepKey {
+        phase: u32,
+        epoch: u32,
+        operation: u32,
+        kernel: u32,
+        metadata: u32,
+        kind: u8,
+    }
+
+    fn intern_string(
+        values: &mut Vec<String>,
+        indices: &mut HashMap<String, u32>,
+        value: &str,
+    ) -> u32 {
+        if let Some(index) = indices.get(value) {
+            return *index;
+        }
+        let index = values.len() as u32;
+        values.push(value.into());
+        indices.insert(value.into(), index);
+        index
+    }
+
+    let mut strings = Vec::new();
+    let mut string_indices = HashMap::new();
+    let mut metadata_sets = Vec::<Vec<[u32; 2]>>::new();
+    let mut metadata_indices = HashMap::<Vec<[u32; 2]>, u32>::new();
+    let mut steps = Vec::<StepKey>::new();
+    let mut step_indices = HashMap::<StepKey, u32>::new();
     let tiles = report
         .tiles
         .iter()
         .map(|tile| {
-            let base = tile.samples.first().map_or(0, |sample| sample.start_cycle);
+            let base_cycle = tile
+                .samples
+                .first()
+                .map(|sample| sample.start_cycle)
+                .unwrap_or(0);
             let samples = tile
                 .samples
                 .iter()
                 .map(|sample| {
-                    serde_json::json!({
-                        "phase": sample.step.phase,
-                        "epoch": sample.step.epoch,
-                        "operation": sample.step.operation,
-                        "kernel": sample.step.kernel,
-                        "kind": match sample.step.kind {
-                            ProfileStepKind::Exchange => "exchange",
-                            ProfileStepKind::Compute => "compute",
-                            ProfileStepKind::Synchronization => "synchronization",
-                            ProfileStepKind::Idle => "idle",
+                    let metadata = sample
+                        .step
+                        .metadata
+                        .iter()
+                        .map(|entry| {
+                            [
+                                intern_string(&mut strings, &mut string_indices, &entry.name),
+                                intern_string(&mut strings, &mut string_indices, &entry.value),
+                            ]
+                        })
+                        .collect::<Vec<_>>();
+                    let metadata = *metadata_indices.entry(metadata.clone()).or_insert_with(|| {
+                        let index = metadata_sets.len() as u32;
+                        metadata_sets.push(metadata);
+                        index
+                    });
+                    let step = StepKey {
+                        phase: sample.step.phase,
+                        epoch: sample.step.epoch,
+                        operation: intern_string(
+                            &mut strings,
+                            &mut string_indices,
+                            &sample.step.operation,
+                        ),
+                        kernel: intern_string(
+                            &mut strings,
+                            &mut string_indices,
+                            &sample.step.kernel,
+                        ),
+                        metadata,
+                        kind: match sample.step.kind {
+                            ProfileStepKind::Exchange => 0,
+                            ProfileStepKind::Compute => 1,
+                            ProfileStepKind::Synchronization => 2,
+                            ProfileStepKind::Idle => 3,
                         },
-                        "metadata": sample.step.metadata.iter().map(|entry| {
-                            serde_json::json!({"name": entry.name, "value": entry.value})
-                        }).collect::<Vec<_>>(),
-                        "offset": sample.start_cycle.wrapping_sub(base),
-                        "duration": sample.end_cycle.wrapping_sub(sample.start_cycle),
-                    })
+                    };
+                    let step = *step_indices.entry(step).or_insert_with(|| {
+                        let index = steps.len() as u32;
+                        steps.push(step);
+                        index
+                    });
+                    serde_json::json!([
+                        step,
+                        sample.start_cycle.wrapping_sub(base_cycle),
+                        sample.end_cycle.wrapping_sub(sample.start_cycle),
+                    ])
                 })
                 .collect::<Vec<_>>();
             serde_json::json!({
@@ -472,21 +536,50 @@ fn render_profile_html(report: &ProfileReport) -> Result<String> {
             })
         })
         .collect::<Vec<_>>();
-    let sample_count: usize = report.tiles.iter().map(|tile| tile.samples.len()).sum();
+    let total_samples: usize = report.tiles.iter().map(|tile| tile.samples.len()).sum();
+    let mut metadata = Vec::new();
+    let metadata_sets = metadata_sets
+        .into_iter()
+        .map(|entries| {
+            let start = metadata.len() as u32;
+            let count = entries.len() as u32;
+            for [name, value] in entries {
+                metadata.extend([name, value]);
+            }
+            [start, count]
+        })
+        .collect::<Vec<_>>();
+    let steps = steps
+        .into_iter()
+        .map(|step| {
+            serde_json::json!([
+                step.phase,
+                step.epoch,
+                step.operation,
+                step.kernel,
+                step.metadata,
+                step.kind,
+            ])
+        })
+        .collect::<Vec<_>>();
     let payload = serde_json::json!({
         "clockHz": report.clock_hz,
         "tileCount": report.tiles.len(),
-        "sampleCount": sample_count,
+        "sampleCount": total_samples,
+        "strings": strings,
+        "metadata": metadata,
+        "metadataSets": metadata_sets,
+        "steps": steps,
         "tiles": tiles,
     });
     let payload = serde_json::to_string(&payload)?
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
         .replace('&', "\\u0026");
-    Ok(PROFILE_VIEWER.replace("__PROFILE_JSON__", &payload))
+    Ok(PROFILE_REPORT_HTML.replace("__PROFILE_JSON__", &payload))
 }
 
-const PROFILE_VIEWER: &str = include_str!("profile_viewer.html");
+const PROFILE_REPORT_HTML: &str = include_str!("profile_report.html");
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
