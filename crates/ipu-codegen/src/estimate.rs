@@ -371,10 +371,30 @@ pub(crate) fn gemm_exchange_bytes_per_cycle(inputs: &[TensorType]) -> u64 {
     // column partition, a streamed K panel is a full broadcast to consecutive
     // tiles and both receivers can consume it in the same cycle.
     if inner_sharded && column_partitions == 1 {
-        IPU21_TARGET_COSTS.exchange_bytes_per_cycle * 2
+        IPU21_TARGET_COSTS.exchange_bytes_per_cycle * IPU21_TARGET_COSTS.exchange_bus_sharing
     } else {
         IPU21_TARGET_COSTS.exchange_bytes_per_cycle
     }
+}
+
+pub(crate) fn gemm_exchange_phase_count(
+    dispatch: &OperatorDispatch,
+    inputs: &[TensorType],
+    output: &TensorType,
+) -> u64 {
+    if gemm_remote_bytes_per_tile(inputs, output) == 0 {
+        return 0;
+    }
+    let OperatorDispatch::BlockedGemm { inner_block, .. } = dispatch else {
+        return 0;
+    };
+    let Some(left) = inputs.first() else {
+        return 0;
+    };
+    let Some(&inner) = left.shape.0.last() else {
+        return 0;
+    };
+    u64::from(inner).div_ceil(u64::from(*inner_block))
 }
 
 pub(crate) fn conversion_memory_estimate(

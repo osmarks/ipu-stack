@@ -1,9 +1,9 @@
 //! Analytical IPU21 cycle estimation used during operator planning.
 
 use crate::estimate::{
-    conversion_traffic, gemm_exchange_bytes_per_cycle, gemm_remote_bytes_per_tile,
-    gemm_requires_panel_repacking, gemm_uses_panel_buffer, maximum_axis_shard_extent,
-    maximum_shard_bytes, operator_memory_estimate, physical_elements,
+    conversion_traffic, gemm_exchange_bytes_per_cycle, gemm_exchange_phase_count,
+    gemm_remote_bytes_per_tile, gemm_requires_panel_repacking, gemm_uses_panel_buffer,
+    maximum_axis_shard_extent, maximum_shard_bytes, operator_memory_estimate, physical_elements,
 };
 use crate::graph::TensorShape;
 use crate::mid::{
@@ -35,25 +35,32 @@ pub struct Ipu21CostModel;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ipu21TargetCosts {
     pub exchange_bytes_per_cycle: u64,
+    pub exchange_bus_sharing: u64,
     pub standard_load_bytes_per_cycle: u64,
     pub interleaved_load_bytes_per_cycle: u64,
     pub local_copy_bytes_per_cycle: u64,
-    pub exchange_fragment_overhead_cycles: u64,
-    pub local_copy_call_overhead_cycles: u64,
-    pub gemm_call_overhead_cycles: u64,
+    pub exchange_phase_cycles: u64,
+    pub exchange_transfer_cycles: u64,
+    pub kernel_launch_cycles: u64,
 }
 
+// Target::getExchangeBytesPerCycle and getTilesPerSharedExchangeBus.
 pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
-    exchange_bytes_per_cycle: 8,
+    exchange_bytes_per_cycle: 4,
+    exchange_bus_sharing: 2,
+    // Target::getMemcpyBytesPerCycle. Interleaved reads use both memory
+    // elements, while an ordinary read or local copy uses one data path.
     standard_load_bytes_per_cycle: 8,
     interleaved_load_bytes_per_cycle: 16,
     local_copy_bytes_per_cycle: 8,
-    // Logical fragments carry route setup and synchronization costs in
-    // addition to their byte-transfer time.
-    exchange_fragment_overhead_cycles: 104,
-    // A local copy launches a worker kernel even for a short intersection.
-    local_copy_call_overhead_cycles: 512,
-    gemm_call_overhead_cycles: 48,
+    // Target::getGlobalSyncCycles.
+    exchange_phase_cycles: 600,
+    // Each logical remote span becomes an independently routed transfer. The
+    // target's getMaxIPUSyncDelay is a conservative bound for its route/start
+    // latency until topology-aware scheduling moves into the search cost.
+    exchange_transfer_cycles: 126,
+    // popops::internal::basicOpSupervisorOverhead(false).
+    kernel_launch_cycles: 11,
 };
 
 impl CostModel for Ipu21CostModel {
@@ -144,7 +151,11 @@ impl CostModel for Ipu21CostModel {
                     0
                 };
                 let exchange = gemm_remote_bytes_per_tile(inputs, output)
-                    .div_ceil(gemm_exchange_bytes_per_cycle(inputs));
+                    .div_ceil(gemm_exchange_bytes_per_cycle(inputs))
+                    .saturating_add(
+                        gemm_exchange_phase_count(dispatch, inputs, output)
+                            .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles),
+                    );
                 let calls = match dispatch {
                     OperatorDispatch::BlockedGemm {
                         inner_block,
@@ -154,7 +165,7 @@ impl CostModel for Ipu21CostModel {
                         .div_ceil(u64::from(*inner_block))
                         .saturating_mul(output_columns_per_tile)
                         .div_ceil(u64::from(*output_column_block))
-                        .saturating_mul(IPU21_TARGET_COSTS.gemm_call_overhead_cycles),
+                        .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
                     OperatorDispatch::Pointwise { .. } => 0,
                 };
                 let memory = operator_memory_estimate(dispatch, inputs, output);
@@ -170,9 +181,17 @@ impl CostModel for Ipu21CostModel {
                     .saturating_add(calls)
                     .saturating_add(capacity_penalty)
             }
-            MidOperator::FlashAttention { .. } => elements.saturating_mul(8).div_ceil(32),
-            MidOperator::Gelu => elements.saturating_mul(6).div_ceil(16),
-            MidOperator::Add(_) => elements.div_ceil(16),
+            MidOperator::FlashAttention { .. } => elements
+                .saturating_mul(8)
+                .div_ceil(32)
+                .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
+            MidOperator::Gelu => elements
+                .saturating_mul(6)
+                .div_ceil(16)
+                .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
+            MidOperator::Add(_) => elements
+                .div_ceil(16)
+                .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
         }
     }
 
@@ -184,6 +203,7 @@ impl CostModel for Ipu21CostModel {
         input_bytes
             .saturating_add(output_bytes)
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
+            .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
     }
 
     fn rearrange_cycles(
@@ -203,8 +223,13 @@ impl CostModel for Ipu21CostModel {
             .saturating_add(
                 traffic
                     .remote_fragments
-                    .saturating_mul(IPU21_TARGET_COSTS.exchange_fragment_overhead_cycles),
-            );
+                    .saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles),
+            )
+            .saturating_add(if traffic.remote_fragments == 0 {
+                0
+            } else {
+                IPU21_TARGET_COSTS.exchange_phase_cycles
+            });
         let (local_bytes, local_calls) = if direct_retile {
             (
                 traffic.maximum_local_bytes,
@@ -218,9 +243,22 @@ impl CostModel for Ipu21CostModel {
         };
         let local_cycles = local_bytes
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
-            .saturating_add(
-                local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_overhead_cycles),
-            );
+            .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles));
         exchange_cycles.saturating_add(local_cycles)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipu21_fixed_costs_match_the_sdk_target() {
+        assert_eq!(IPU21_TARGET_COSTS.exchange_bytes_per_cycle, 4);
+        assert_eq!(IPU21_TARGET_COSTS.exchange_bus_sharing, 2);
+        assert_eq!(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle, 8);
+        assert_eq!(IPU21_TARGET_COSTS.exchange_phase_cycles, 600);
+        assert_eq!(IPU21_TARGET_COSTS.exchange_transfer_cycles, 126);
+        assert_eq!(IPU21_TARGET_COSTS.kernel_launch_cycles, 11);
     }
 }

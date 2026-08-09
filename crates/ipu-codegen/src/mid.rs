@@ -1268,7 +1268,7 @@ fn amp_gemm_operator_candidate(
         MidOperator::Gemm {
             options: GemmOptions::default(),
             multiply: precision,
-            accumulate: AccumulationPrecision::F32,
+            accumulate: gemm_accumulation_precision(precision),
         },
         [
             OperandRequirement::new(
@@ -1334,7 +1334,7 @@ fn amp_grid_gemm_operator_candidate(
         MidOperator::Gemm {
             options: GemmOptions::default(),
             multiply: precision,
-            accumulate: AccumulationPrecision::F32,
+            accumulate: gemm_accumulation_precision(precision),
         },
         [
             OperandRequirement::new(
@@ -1377,6 +1377,13 @@ enum AmpWeightLayout {
     Resident,
     Streamed,
     InterleavedK64,
+}
+
+const fn gemm_accumulation_precision(precision: Precision) -> AccumulationPrecision {
+    match precision {
+        Precision::F16 | Precision::F8F143 { .. } => AccumulationPrecision::F16,
+        Precision::F32 => AccumulationPrecision::F32,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2412,6 +2419,30 @@ fn lookup(values: &BTreeMap<ValueId, MidValueId>, value: ValueId) -> LoweringRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn randomized_gemm_accumulation_tracks_stored_partial_precision() {
+        let mut random = fastrand::Rng::with_seed(0x6163_6375_6d75_6c61);
+        for case in 0..64 {
+            let multiply = match random.u8(0..3) {
+                0 => Precision::F16,
+                1 => Precision::F32,
+                _ => Precision::F8F143 {
+                    scale_exponent: random.i8(-16..=16),
+                },
+            };
+            let expected = if multiply == Precision::F32 {
+                AccumulationPrecision::F32
+            } else {
+                AccumulationPrecision::F16
+            };
+            assert_eq!(
+                gemm_accumulation_precision(multiply),
+                expected,
+                "random case {case}"
+            );
+        }
+    }
 
     const RANDOM_CASES: usize = 128;
 
