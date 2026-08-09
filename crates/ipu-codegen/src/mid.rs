@@ -512,41 +512,48 @@ impl Layout {
         }
     }
 
-    /// AMP right operand distributed across both K and output columns. A
-    /// blocked GEMM streams each K panel to the other output-row groups that
-    /// share its column coordinate instead of retaining a full replica.
-    pub fn amp_right_streamed(
-        inner: u16,
+    /// AMP right operand distributed across both K and output columns, with
+    /// each complete 64x64 kernel panel contiguous in the selected memory
+    /// class. A blocked GEMM can consume the owner copy directly and stream
+    /// the same bytes into a destination panel on the other row groups.
+    pub fn amp_right_k64_streamed_grid(
         tile_count: u16,
         row_partitions: u16,
         column_partitions: u16,
+        memory_class: MemoryClass,
     ) -> Self {
         Self {
-            order: ElementOrder::Amp(AmpOrder::Right),
+            order: ElementOrder::Amp(AmpOrder::RightK64),
             tiling: TensorTiling {
                 tile_count,
                 replicas: 1,
                 axes: vec![
-                    AxisTiling::new(TensorAxis::FromEnd(1), column_partitions, 64, Padding::Zero),
+                    AxisTiling::new(
+                        TensorAxis::FromEnd(1),
+                        column_partitions,
+                        AMP_OUTPUT_COLUMN_BLOCK,
+                        Padding::Zero,
+                    ),
                     AxisTiling::new(
                         TensorAxis::FromEnd(2),
                         row_partitions,
-                        u32::from(inner),
+                        AMP_INNER_BLOCK,
                         Padding::Zero,
                     ),
                 ],
             },
-            memory_class: MemoryClass::Ipu21Standard,
+            memory_class,
         }
     }
 
     /// Resident AMP right operand with complete 64x64 kernel panels contiguous
-    /// in interleaved SRAM. This removes both the panel gather and the slower
-    /// standard-memory weight-load path when graph-wide memory permits it.
-    pub fn amp_right_k64_interleaved_grid(
+    /// in the selected memory class. Each column shard is replicated across
+    /// output-row groups so every consumer owns the full K range locally.
+    pub fn amp_right_k64_grid(
         tile_count: u16,
         row_partitions: u16,
         column_partitions: u16,
+        memory_class: MemoryClass,
     ) -> Self {
         Self {
             order: ElementOrder::Amp(AmpOrder::RightK64),
@@ -564,7 +571,7 @@ impl Layout {
                     .with_tile_stride(1),
                 ],
             },
-            memory_class: MemoryClass::Ipu21Interleaved,
+            memory_class,
         }
     }
 
@@ -1307,12 +1314,20 @@ fn amp_grid_gemm_operator_candidate(
         AmpWeightLayout::Resident => {
             Layout::amp_right_grid(inner, tile_count, row_partitions, column_partitions)
         }
-        AmpWeightLayout::Streamed => {
-            Layout::amp_right_streamed(inner, tile_count, row_partitions, column_partitions)
-        }
+        AmpWeightLayout::Streamed => Layout::amp_right_k64_streamed_grid(
+            tile_count,
+            row_partitions,
+            column_partitions,
+            MemoryClass::Ipu21Standard,
+        ),
         AmpWeightLayout::InterleavedK64 => {
             debug_assert_eq!((precision, inner), (Precision::F16, 64));
-            Layout::amp_right_k64_interleaved_grid(tile_count, row_partitions, column_partitions)
+            Layout::amp_right_k64_grid(
+                tile_count,
+                row_partitions,
+                column_partitions,
+                MemoryClass::Ipu21Interleaved,
+            )
         }
     };
     OperatorCandidate::new(

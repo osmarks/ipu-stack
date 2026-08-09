@@ -1311,7 +1311,7 @@ impl LoweringState {
                 )
             })?;
         let mut staging = BTreeMap::<(u16, u32), LowShardId>::new();
-        let mut receive_staging = BTreeMap::<(u16, u32), LowShardId>::new();
+        let mut local_staging = BTreeMap::<(u16, u32), LowShardId>::new();
         let columns_per_phase = column_extent / output_column_block;
         let column_phase_width = output_column_block
             .checked_mul(columns_per_phase)
@@ -1362,69 +1362,71 @@ impl LoweringState {
                                 (right_rank - 1, column_start, column_end),
                             ],
                         )?;
-                        let transport = if self.shards[right.index() as usize].tile == tile {
-                            right_view.clone()
-                        } else {
-                            let copy = if let Some(copy) =
-                                receive_staging.get(&(tile, column_start)).copied()
-                            {
-                                copy
+                        let local = self.shards[right.index() as usize].tile == tile;
+                        let local_spans = local
+                            .then(|| {
+                                view_byte_spans(&self.shards[right.index() as usize], &right_view)
+                            })
+                            .transpose()?;
+                        let resident_view =
+                            if local_spans.as_ref().is_some_and(|spans| spans.len() == 1) {
+                                right_view.clone()
                             } else {
-                                let copy = self.push_shard(LowShard {
-                                    id: LowShardId(0),
-                                    tile,
-                                    tensor_type: self.shards[right.index() as usize]
-                                        .tensor_type
-                                        .clone(),
-                                    extents: right_view.extents.clone(),
-                                    definition: ShardDefinition::ExchangeStaging,
-                                })?;
-                                receive_staging.insert((tile, column_start), copy);
-                                copy
-                            };
-                            transfers.entry(right_view.clone()).or_default().push(copy);
-                            self.full_view(copy)
-                        };
-                        let resident =
-                            if let Some(resident) = staging.get(&(tile, column_start)).copied() {
-                                resident
-                            } else {
-                                let mut tensor_type =
-                                    self.shards[right.index() as usize].tensor_type.clone();
-                                if use_interleaved_staging {
-                                    tensor_type.format.layout.memory_class =
-                                        crate::MemoryClass::Ipu21Interleaved;
+                                let selected_staging = if local {
+                                    &mut local_staging
+                                } else {
+                                    &mut staging
+                                };
+                                let resident = if let Some(resident) =
+                                    selected_staging.get(&(tile, column_start)).copied()
+                                {
+                                    resident
+                                } else {
+                                    let mut tensor_type =
+                                        self.shards[right.index() as usize].tensor_type.clone();
+                                    if use_interleaved_staging {
+                                        tensor_type.format.layout.memory_class =
+                                            crate::MemoryClass::Ipu21Interleaved;
+                                    }
+                                    let resident = self.push_shard(LowShard {
+                                        id: LowShardId(0),
+                                        tile,
+                                        tensor_type,
+                                        extents: right_view.extents.clone(),
+                                        definition: if local {
+                                            ShardDefinition::Staging
+                                        } else {
+                                            ShardDefinition::ExchangeStaging
+                                        },
+                                    })?;
+                                    selected_staging.insert((tile, column_start), resident);
+                                    resident
+                                };
+                                if let Some(spans) = local_spans {
+                                    let mut destination_offset = 0u32;
+                                    for span in spans {
+                                        local_copies.push((
+                                            tile,
+                                            LocalCopy {
+                                                source: right,
+                                                source_offset: span.offset,
+                                                destination: resident,
+                                                destination_offset,
+                                                bytes: span.bytes,
+                                            },
+                                        ));
+                                        destination_offset = destination_offset
+                                            .checked_add(span.bytes)
+                                            .ok_or(LowLoweringError::IdOverflow)?;
+                                    }
+                                } else {
+                                    transfers
+                                        .entry(right_view.clone())
+                                        .or_default()
+                                        .push(resident);
                                 }
-                                let resident = self.push_shard(LowShard {
-                                    id: LowShardId(0),
-                                    tile,
-                                    tensor_type,
-                                    extents: right_view.extents.clone(),
-                                    definition: ShardDefinition::Staging,
-                                })?;
-                                staging.insert((tile, column_start), resident);
-                                resident
+                                self.full_view(resident)
                             };
-                        let spans = view_byte_spans(
-                            &self.shards[transport.shard.index() as usize],
-                            &transport,
-                        )?;
-                        let mut destination_offset = 0u32;
-                        for span in spans {
-                            local_copies.push((
-                                tile,
-                                LocalCopy {
-                                    source: transport.shard,
-                                    source_offset: span.offset,
-                                    destination: resident,
-                                    destination_offset,
-                                    bytes: span.bytes,
-                                },
-                            ));
-                            destination_offset = destination_offset
-                                .checked_add(span.bytes)
-                                .ok_or(LowLoweringError::IdOverflow)?;
-                        }
                         let output_view = self
                             .narrow_view(output, &[(output_rank - 1, column_start, column_end)])?;
                         let mut kernel = if inner_start == 0 {
@@ -1432,7 +1434,12 @@ impl LoweringState {
                         } else {
                             accumulate.clone()
                         };
-                        if use_interleaved_staging
+                        if self.shards[resident_view.shard.index() as usize]
+                            .tensor_type
+                            .format
+                            .layout
+                            .memory_class
+                            == crate::MemoryClass::Ipu21Interleaved
                             && let TileKernelSpec::Gemm { weights, .. } = &mut kernel
                         {
                             *weights = crate::GemmWeightLoad::Interleaved;
@@ -1451,7 +1458,7 @@ impl LoweringState {
                                         views: vec![left_view],
                                     },
                                     KernelOperand {
-                                        views: vec![self.full_view(resident)],
+                                        views: vec![resident_view],
                                     },
                                 ],
                                 output_view,
@@ -1920,6 +1927,7 @@ mod tests {
         OperandRequirement, OperatorCandidate, Padding, PipelineConfig, Precision, TensorAxis,
         TensorFormat, TensorTiling, lower,
     };
+    use std::collections::BTreeSet;
 
     const CASES: usize = 32;
 
@@ -2493,7 +2501,12 @@ mod tests {
             };
             let right_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_right_streamed(64, tiles, row_partitions, column_partitions),
+                layout: Layout::amp_right_k64_streamed_grid(
+                    tiles,
+                    row_partitions,
+                    column_partitions,
+                    crate::MemoryClass::Ipu21Standard,
+                ),
             };
             let output_format = TensorFormat {
                 precision: Precision::F16,
@@ -2522,6 +2535,48 @@ mod tests {
                 inner_blocks as usize,
                 "case {case}"
             );
+            let copies = low
+                .tiles
+                .iter()
+                .flat_map(|tile| low.work(tile))
+                .filter_map(|work| match work {
+                    TileWorkRef::LocalCopy(copy) => Some(copy),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(copies.is_empty(), "case {case}: {copies:?}");
+            let weight_loads = low
+                .kernel_runs
+                .iter()
+                .filter_map(|run| match run.kernel {
+                    TileKernel::Planned(TileKernelSpec::Gemm { weights, .. }) => Some(weights),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                weight_loads,
+                BTreeSet::from([
+                    crate::GemmWeightLoad::Standard,
+                    crate::GemmWeightLoad::Interleaved,
+                ]),
+                "case {case}"
+            );
+            for phase in &low.exchange_phases {
+                for destination in phase
+                    .transfers
+                    .iter()
+                    .flat_map(|transfer| &transfer.destinations)
+                {
+                    let shard = &low.shards[destination.index() as usize];
+                    assert_eq!(shard.definition, ShardDefinition::ExchangeStaging);
+                    assert!(low.kernel_runs.iter().any(|run| {
+                        run.inputs
+                            .iter()
+                            .flat_map(|operand| &operand.views)
+                            .any(|view| view.shard == *destination)
+                    }));
+                }
+            }
             for tile in &low.tiles {
                 assert_eq!(
                     low.work(tile)

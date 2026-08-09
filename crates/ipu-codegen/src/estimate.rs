@@ -3,8 +3,9 @@
 use crate::cost::IPU21_TARGET_COSTS;
 use crate::graph::TensorShape;
 use crate::mid::{
-    Layout, MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage,
-    MidOperation, MidValue, MidValueId, OperatorDispatch, Precision, TensorAxis, TensorType,
+    AmpOrder, ElementOrder, Layout, MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks,
+    MemoryRelation, MemoryUsage, MidOperation, MidValue, MidValueId, OperatorDispatch, Precision,
+    TensorAxis, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -168,12 +169,15 @@ pub(crate) fn operator_memory_estimate(
         Some(right),
     ) = (dispatch, inputs.get(1))
         && right.format.precision == Precision::F16
-        && gemm_requires_staging(dispatch, right, output)
+        && gemm_uses_panel_buffer(dispatch, right, output)
     {
-        // One packed panel is reused across K phases. Exchange receive storage
-        // is a separately reserved architectural window and is not counted as
-        // planned data SRAM.
-        temporary.interleaved = u64::from(*inner_block)
+        // Each local output-column panel has one final kernel buffer reused
+        // across K phases. Remote bytes can be exchanged directly into it.
+        let output_columns =
+            maximum_axis_shard_extent(output, output.shape.0.len().saturating_sub(1));
+        let panels = output_columns.div_ceil(u64::from(*output_column_block));
+        temporary.interleaved = panels
+            .saturating_mul(u64::from(*inner_block))
             .saturating_mul(u64::from(*output_column_block))
             .saturating_mul(right.format.precision.bytes());
     }
@@ -184,7 +188,7 @@ pub(crate) fn operator_memory_estimate(
     }
 }
 
-pub(crate) fn gemm_requires_staging(
+pub(crate) fn gemm_uses_panel_buffer(
     dispatch: &OperatorDispatch,
     right: &TensorType,
     output: &TensorType,
@@ -210,6 +214,15 @@ pub(crate) fn gemm_requires_staging(
     let k = right.shape.0[rank - 2];
     let columns = maximum_axis_shard_extent(output, output_rank - 1);
     streamed || (k > *inner_block && columns > 16)
+}
+
+pub(crate) fn gemm_requires_panel_repacking(
+    dispatch: &OperatorDispatch,
+    right: &TensorType,
+    output: &TensorType,
+) -> bool {
+    gemm_uses_panel_buffer(dispatch, right, output)
+        && right.format.layout.order != ElementOrder::Amp(AmpOrder::RightK64)
 }
 
 pub(crate) fn gemm_exchange_bytes_per_cycle(inputs: &[TensorType]) -> u64 {

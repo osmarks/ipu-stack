@@ -1,11 +1,15 @@
 //! Analytical IPU21 cycle estimation used during operator planning.
 
 use crate::estimate::{
-    gemm_exchange_bytes_per_cycle, gemm_remote_bytes_per_tile, gemm_requires_staging,
-    maximum_axis_shard_extent, maximum_shard_bytes, operator_memory_estimate, physical_elements,
+    gemm_exchange_bytes_per_cycle, gemm_remote_bytes_per_tile, gemm_requires_panel_repacking,
+    gemm_uses_panel_buffer, maximum_axis_shard_extent, maximum_shard_bytes,
+    operator_memory_estimate, physical_elements,
 };
 use crate::graph::TensorShape;
-use crate::mid::{Layout, MemoryClass, MidOperator, OperatorDispatch, Precision, TensorType};
+use crate::mid::{
+    AmpOrder, ElementOrder, Layout, MemoryClass, MidOperator, OperatorDispatch, Precision,
+    TensorAxis, TensorType,
+};
 
 pub trait CostModel {
     fn operator_cycles(
@@ -85,17 +89,47 @@ impl CostModel for Ipu21CostModel {
                     right.format.layout.memory_class == MemoryClass::Ipu21Interleaved
                 });
                 let staged_weights = right.is_some_and(|right| {
-                    gemm_requires_staging(dispatch, right, output)
+                    gemm_uses_panel_buffer(dispatch, right, output)
                         && right.format.precision == Precision::F16
                 });
-                let weight_feed = right_bytes_consumed.div_ceil(
-                    if resident_interleaved_weights || staged_weights {
-                        IPU21_TARGET_COSTS.interleaved_load_bytes_per_cycle
-                    } else {
-                        IPU21_TARGET_COSTS.standard_load_bytes_per_cycle
+                let streamed_k64_standard = right.filter(|right| {
+                    staged_weights
+                        && right.format.layout.memory_class == MemoryClass::Ipu21Standard
+                        && right.format.layout.order == ElementOrder::Amp(AmpOrder::RightK64)
+                });
+                let weight_feed = streamed_k64_standard.map_or_else(
+                    || {
+                        right_bytes_consumed.div_ceil(
+                            if resident_interleaved_weights || staged_weights {
+                                IPU21_TARGET_COSTS.interleaved_load_bytes_per_cycle
+                            } else {
+                                IPU21_TARGET_COSTS.standard_load_bytes_per_cycle
+                            },
+                        )
+                    },
+                    |right| {
+                        let owners = right
+                            .format
+                            .layout
+                            .tiling
+                            .axes
+                            .iter()
+                            .find(|axis| axis.axis == TensorAxis::FromEnd(2))
+                            .map_or(1, |axis| u64::from(axis.partitions));
+                        let local = right_bytes_consumed.div_ceil(owners);
+                        let remote = right_bytes_consumed.saturating_sub(local);
+                        local
+                            .div_ceil(IPU21_TARGET_COSTS.standard_load_bytes_per_cycle)
+                            .saturating_add(
+                                remote
+                                    .div_ceil(IPU21_TARGET_COSTS.interleaved_load_bytes_per_cycle),
+                            )
                     },
                 );
-                let packing = if staged_weights {
+                let packing = if right.is_some_and(|right| {
+                    right.format.precision == Precision::F16
+                        && gemm_requires_panel_repacking(dispatch, right, output)
+                }) {
                     right_bytes_consumed
                         .saturating_mul(2)
                         .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)

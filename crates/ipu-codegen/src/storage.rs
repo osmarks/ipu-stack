@@ -356,7 +356,7 @@ fn amp_micro_dimension(precision: Precision) -> u32 {
 mod tests {
     use super::*;
     use crate::low::{LowShardId, ShardDefinition, ShardExtent};
-    use crate::mid::{Layout, Precision, TensorType};
+    use crate::mid::{Layout, MemoryClass, Precision, TensorType};
 
     fn shard(layout: Layout, dimensions: &[u32]) -> LowShard {
         LowShard {
@@ -388,7 +388,11 @@ mod tests {
             for (layout, physical_rows, columns) in [
                 (Layout::amp_left(64, 1), rows, 64),
                 (Layout::amp_right(64, 1), 32, 64),
-                (Layout::amp_right_k64_interleaved_grid(1, 1, 1), 64, 64),
+                (
+                    Layout::amp_right_k64_grid(1, 1, 1, MemoryClass::Ipu21Interleaved),
+                    64,
+                    64,
+                ),
                 (Layout::amp_output(1), rows, 64),
             ] {
                 let shard = shard(layout, &[batches, physical_rows, columns]);
@@ -434,7 +438,7 @@ mod tests {
             let columns = column_blocks * 64;
             let batches = random.u32(1..=4);
             let shard = shard(
-                Layout::amp_right_k64_interleaved_grid(1, 1, 1),
+                Layout::amp_right_k64_grid(1, 1, 1, MemoryClass::Ipu21Interleaved),
                 &[batches, rows, columns],
             );
             let inner = random.u32(0..inner_blocks) * 64;
