@@ -120,9 +120,9 @@ pub(crate) fn place_with_standard_ranges(
 
     let mut members = BTreeMap::<usize, Vec<usize>>::new();
     let mut root_of_member = vec![0usize; program.shards.len()];
-    for index in 0..program.shards.len() {
+    for (index, root_slot) in root_of_member.iter_mut().enumerate() {
         let root = sets.find(index);
-        root_of_member[index] = root;
+        *root_slot = root;
         members.entry(root).or_default().push(index);
     }
     validate_alias_groups(program, &members)?;

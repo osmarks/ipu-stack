@@ -1189,26 +1189,19 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
         .filter(|columns| tile_count.is_multiple_of(*columns))
         .flat_map(|columns| {
             let rows = tile_count / columns;
+            let grid_shape = AmpGridShape {
+                tile_count,
+                row_partitions: rows,
+                column_partitions: columns,
+            };
             let mut grid = Vec::new();
-            for (precision, left_tail, weight_layout) in [
-                (Precision::F16, 16, AmpWeightLayout::Resident),
-                (Precision::F16, 16, AmpWeightLayout::InterleavedK64),
-                (Precision::F32, 32, AmpWeightLayout::Resident),
-                (
-                    Precision::F16,
-                    16,
-                    AmpWeightLayout::Streamed(MemoryClass::Ipu21Standard),
-                ),
-                (
-                    Precision::F16,
-                    16,
-                    AmpWeightLayout::Streamed(MemoryClass::Ipu21Interleaved),
-                ),
-                (
-                    Precision::F32,
-                    32,
-                    AmpWeightLayout::Streamed(MemoryClass::Ipu21Standard),
-                ),
+            for (precision, left_tail, weights) in [
+                (Precision::F16, 16, AmpWeightPlacement::RESIDENT_STANDARD),
+                (Precision::F16, 16, AmpWeightPlacement::RESIDENT_INTERLEAVED),
+                (Precision::F32, 32, AmpWeightPlacement::RESIDENT_STANDARD),
+                (Precision::F16, 16, AmpWeightPlacement::SHARDED_STANDARD),
+                (Precision::F16, 16, AmpWeightPlacement::SHARDED_INTERLEAVED),
+                (Precision::F32, 32, AmpWeightPlacement::SHARDED_STANDARD),
             ] {
                 for &output_columns in amp_output_column_blocks(precision) {
                     let candidate = amp_grid_gemm_operator_candidate(
@@ -1216,14 +1209,12 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
                         64,
                         left_tail,
                         output_columns,
-                        tile_count,
-                        rows,
-                        columns,
-                        weight_layout,
+                        grid_shape,
+                        weights,
                     );
                     grid.push(candidate.clone());
                     if precision == Precision::F16
-                        && weight_layout.source_memory_class() == MemoryClass::Ipu21Standard
+                        && weights.memory_class == MemoryClass::Ipu21Standard
                     {
                         let mut staged = candidate;
                         staged.inputs[1].local_staging = LocalOperandStaging::MatchRemote;
@@ -1366,27 +1357,28 @@ fn amp_grid_gemm_operator_candidate(
     inner: u16,
     left_tail: u32,
     output_columns: u32,
-    tile_count: u16,
-    row_partitions: u16,
-    column_partitions: u16,
-    weight_layout: AmpWeightLayout,
+    grid: AmpGridShape,
+    weights: AmpWeightPlacement,
 ) -> OperatorCandidate {
-    let right_layout = match weight_layout {
-        AmpWeightLayout::Resident => {
-            Layout::amp_right_grid(inner, tile_count, row_partitions, column_partitions)
-        }
-        AmpWeightLayout::Streamed(memory_class) => Layout::amp_right_k64_streamed_grid(
-            tile_count,
-            row_partitions,
-            column_partitions,
+    let right_layout = match (weights.distribution, weights.memory_class) {
+        (AmpWeightDistribution::Resident, MemoryClass::Ipu21Standard) => Layout::amp_right_grid(
+            inner,
+            grid.tile_count,
+            grid.row_partitions,
+            grid.column_partitions,
+        ),
+        (AmpWeightDistribution::KSharded, memory_class) => Layout::amp_right_k64_streamed_grid(
+            grid.tile_count,
+            grid.row_partitions,
+            grid.column_partitions,
             memory_class,
         ),
-        AmpWeightLayout::InterleavedK64 => {
+        (AmpWeightDistribution::Resident, MemoryClass::Ipu21Interleaved) => {
             debug_assert_eq!((precision, inner), (Precision::F16, 64));
             Layout::amp_right_k64_grid(
-                tile_count,
-                row_partitions,
-                column_partitions,
+                grid.tile_count,
+                grid.row_partitions,
+                grid.column_partitions,
                 MemoryClass::Ipu21Interleaved,
             )
         }
@@ -1404,9 +1396,9 @@ fn amp_grid_gemm_operator_candidate(
                     precision,
                     layout: Layout::amp_left_grid(
                         inner,
-                        tile_count,
-                        row_partitions,
-                        column_partitions,
+                        grid.tile_count,
+                        grid.row_partitions,
+                        grid.column_partitions,
                     ),
                 },
                 32,
@@ -1423,7 +1415,11 @@ fn amp_grid_gemm_operator_candidate(
         OperandRequirement::new(
             TensorFormat {
                 precision,
-                layout: Layout::amp_output_grid(tile_count, row_partitions, column_partitions),
+                layout: Layout::amp_output_grid(
+                    grid.tile_count,
+                    grid.row_partitions,
+                    grid.column_partitions,
+                ),
             },
             32,
         ),
@@ -1464,22 +1460,43 @@ fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> Operator
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AmpWeightLayout {
-    Resident,
-    Streamed(MemoryClass),
-    InterleavedK64,
+#[derive(Clone, Copy)]
+struct AmpGridShape {
+    tile_count: u16,
+    row_partitions: u16,
+    column_partitions: u16,
 }
 
-impl AmpWeightLayout {
-    const fn source_memory_class(self) -> MemoryClass {
-        match self {
-            Self::Resident | Self::Streamed(MemoryClass::Ipu21Standard) => {
-                MemoryClass::Ipu21Standard
-            }
-            Self::InterleavedK64 | Self::Streamed(MemoryClass::Ipu21Interleaved) => {
-                MemoryClass::Ipu21Interleaved
-            }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AmpWeightDistribution {
+    Resident,
+    KSharded,
+}
+
+#[derive(Clone, Copy)]
+struct AmpWeightPlacement {
+    distribution: AmpWeightDistribution,
+    memory_class: MemoryClass,
+}
+
+impl AmpWeightPlacement {
+    const RESIDENT_STANDARD: Self =
+        Self::new(AmpWeightDistribution::Resident, MemoryClass::Ipu21Standard);
+    const RESIDENT_INTERLEAVED: Self = Self::new(
+        AmpWeightDistribution::Resident,
+        MemoryClass::Ipu21Interleaved,
+    );
+    const SHARDED_STANDARD: Self =
+        Self::new(AmpWeightDistribution::KSharded, MemoryClass::Ipu21Standard);
+    const SHARDED_INTERLEAVED: Self = Self::new(
+        AmpWeightDistribution::KSharded,
+        MemoryClass::Ipu21Interleaved,
+    );
+
+    const fn new(distribution: AmpWeightDistribution, memory_class: MemoryClass) -> Self {
+        Self {
+            distribution,
+            memory_class,
         }
     }
 }
@@ -1921,22 +1938,24 @@ pub fn lower(
             .collect::<BTreeSet<_>>(),
         "selected operator plans"
     );
-    for (index, operation) in operations.iter().enumerate() {
-        tracing::debug!(
-            index,
-            source = operation.source.map(OperationId::index),
-            kind = ?operation.kind,
-            input_formats = ?operation.inputs.iter().map(|value| {
-                &state.values[value.index() as usize].tensor_type.format
-            }).collect::<Vec<_>>(),
-            output_formats = ?operation.results.iter().map(|value| {
-                &state.values[value.index() as usize].tensor_type.format
-            }).collect::<Vec<_>>(),
-            dispatch = ?operation.operator_plan.as_ref().map(|plan| &plan.dispatch),
-            estimated_cycles = operation.estimated_cycles,
-            memory = ?operation.memory,
-            "selected mid operation"
-        );
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        for (index, operation) in operations.iter().enumerate() {
+            tracing::debug!(
+                index,
+                source = operation.source.map(OperationId::index),
+                kind = ?operation.kind,
+                input_formats = ?operation.inputs.iter().map(|value| {
+                    &state.values[value.index() as usize].tensor_type.format
+                }).collect::<Vec<_>>(),
+                output_formats = ?operation.results.iter().map(|value| {
+                    &state.values[value.index() as usize].tensor_type.format
+                }).collect::<Vec<_>>(),
+                dispatch = ?operation.operator_plan.as_ref().map(|plan| &plan.dispatch),
+                estimated_cycles = operation.estimated_cycles,
+                memory = ?operation.memory,
+                "selected mid operation"
+            );
+        }
     }
     Ok(MidGraph {
         inputs,
@@ -2141,23 +2160,22 @@ fn lower_operations(
             }
         }
         if expanded.is_empty() {
-            if saw_candidate {
-                if let Some(peak) = rejected_memory
+            if saw_candidate
+                && let Some(peak) = rejected_memory
                     .into_iter()
                     .min_by_key(|peak| (peak.total, peak.interleaved, peak.standard))
-                {
-                    return Err(LoweringError::InsufficientMemory {
-                        operation: operation.id,
-                        standard: peak.standard,
-                        standard_reservation: config.standard_memory_reservation_bytes,
-                        interleaved: peak.interleaved,
-                        total: peak.total,
-                        standard_contiguous_overflow: peak
-                            .standard_contiguous_overflow_with_reservation(
-                                config.standard_memory_reservation_bytes,
-                            ),
-                    });
-                }
+            {
+                return Err(LoweringError::InsufficientMemory {
+                    operation: operation.id,
+                    standard: peak.standard,
+                    standard_reservation: config.standard_memory_reservation_bytes,
+                    interleaved: peak.interleaved,
+                    total: peak.total,
+                    standard_contiguous_overflow: peak
+                        .standard_contiguous_overflow_with_reservation(
+                            config.standard_memory_reservation_bytes,
+                        ),
+                });
             }
             return Err(LoweringError::NoCandidate(operation.id));
         }

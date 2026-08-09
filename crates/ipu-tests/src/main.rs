@@ -402,23 +402,21 @@ fn run_initialized_program(
     timeout_seconds: u64,
 ) -> Result<Vec<u8>> {
     let mut session = runtime.host_session(application)?;
-    session.start().map_err(|error| {
+    session.start().inspect_err(|_| {
         eprintln!(
             "startFailureDiagnostics={}",
             device_failure_diagnostics(runtime, application)
         );
-        error
     })?;
     let initialized = session.invoke_streaming_deferred("initialize", weights)?;
     session.collect(&initialized)?;
     let executed = session
         .invoke_streaming_deferred("run", input)
-        .map_err(|error| {
+        .inspect_err(|_| {
             eprintln!(
                 "runFailureDiagnostics={}",
                 device_failure_diagnostics(runtime, application)
             );
-            error
         })?;
     runtime
         .device()

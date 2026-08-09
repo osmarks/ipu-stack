@@ -533,21 +533,22 @@ fn build_package_from_objects(
         .filter(|tile| !tile.steps.is_empty())
         .collect::<Vec<_>>();
 
+    let tile_build = TileBuildContext {
+        objects,
+        kernel_plan,
+        retained_runtime: &retained_runtime,
+        code_address,
+        host_staging_address: host.staging_address,
+    };
     let tiles = build_phase("build_tile_images", || {
         (0..execution_tile_count)
             .map(|physical_tile| {
                 build_tile(
                     u32::from(physical_tile),
                     u32::from(physical_to_logical[usize::from(physical_tile)]),
-                    objects,
-                    kernel_plan,
-                    &retained_runtime,
-                    code_address,
                     &generated[usize::from(physical_tile)],
-                    (
-                        &host.segments[usize::from(physical_tile)],
-                        host.staging_address,
-                    ),
+                    &host.segments[usize::from(physical_tile)],
+                    &tile_build,
                 )
             })
             .collect::<PackageBuildResult<Vec<_>>>()
@@ -620,22 +621,30 @@ fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
     )?)
 }
 
+struct TileBuildContext<'a> {
+    objects: &'a [Vec<u8>],
+    kernel_plan: &'a KernelBuildPlan,
+    retained_runtime: &'a [String],
+    code_address: u32,
+    host_staging_address: u32,
+}
+
 fn build_tile(
     physical_tile: u32,
     logical_tile: u32,
-    objects: &[Vec<u8>],
-    kernel_plan: &KernelBuildPlan,
-    retained_runtime: &[String],
-    code_address: u32,
     generated: &crate::GeneratedProgram,
-    host: (&[Segment], u32),
+    host_segments: &[Segment],
+    context: &TileBuildContext<'_>,
 ) -> PackageBuildResult<TileImage> {
-    let (host_segments, host_staging_address) = host;
     let linked = link_runtime(
-        objects,
-        runtime_symbols(logical_tile, code_address, host_staging_address)?,
-        kernel_plan,
-        retained_runtime,
+        context.objects,
+        runtime_symbols(
+            logical_tile,
+            context.code_address,
+            context.host_staging_address,
+        )?,
+        context.kernel_plan,
+        context.retained_runtime,
     )?;
     let mut entry = Vec::with_capacity(ENTRY_BYTES as usize);
     entry.extend_from_slice(&encode_setzi_m(0, linked.entry)?.to_le_bytes());
@@ -673,7 +682,7 @@ fn build_tile(
     }));
     segments.extend_from_slice(host_segments);
     segments.push(Segment {
-        address: code_address,
+        address: context.code_address,
         memory_size: generated.bytes.len() as u32,
         data: generated.bytes.clone(),
         flags: SEGMENT_READ | SEGMENT_EXECUTE,

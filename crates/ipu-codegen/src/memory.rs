@@ -68,11 +68,13 @@ pub(crate) enum MemoryLayoutError {
 
 impl TileMemoryMap {
     pub(crate) fn new() -> Self {
+        let free = std::iter::once(
+            ipu_package::TILE_MEMORY_BASE
+                ..ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        )
+        .collect();
         Self {
-            free: vec![
-                ipu_package::TILE_MEMORY_BASE
-                    ..ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-            ],
+            free,
             allocations: Vec::new(),
         }
     }

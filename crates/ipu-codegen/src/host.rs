@@ -403,12 +403,14 @@ impl DataArena {
                 ))
             })?;
         let (_, index, start, end) = candidate;
-        let (_, limit) = self.ranges[index];
-        if end == limit {
-            self.ranges.remove(index);
-        } else {
-            self.ranges[index].0 = end;
+        let (base, limit) = self.ranges.remove(index);
+        if base < start {
+            self.ranges.push((base, start));
         }
+        if end < limit {
+            self.ranges.push((end, limit));
+        }
+        self.ranges.sort_unstable();
         Ok(start)
     }
 }
