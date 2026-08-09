@@ -159,13 +159,39 @@ ipu_stack_copy_u64:
 	add $m3, $m3, $m8
 	add $m5, $m5, $m7
 	brz $m5, .Lcopy_u64_worker_done
-.Lcopy_u64_worker_loop:
-	ld64 $a0:1, $m3, $m15, 0
-	st64 $a0:1, $m2, $m15, 0
-	add $m3, $m3, 8
-	add $m2, $m2, 8
-	sub $m5, $m5, 1
-	brnz $m5, .Lcopy_u64_worker_loop
+	// Prime the load/store pipeline, then copy one 64-bit word per paced
+	// instruction. Worker contexts hide memory latency; PACE removes the scalar
+	// pointer and loop-control instructions which previously limited throughput.
+	ld64step $a0:1, $mzero, $m3+=, 1
+	tapack $m10:11, $m3, $m2, $m2
+	add $m6, $m5, -1
+	and $m7, $m6, 1
+	shr $m8, $m6, 1
+	brz $m8, .Lcopy_u64_worker_tail
+	add $m8, $m8, -1
+	.align 8
+	{
+		rpt $m8, 1
+		fnop
+	}
+	{
+		ldst64pace $a2:3, $a0:1, $m10:11+=, $mzero, 0b0000
+		fnop
+	}
+	{
+		ldst64pace $a0:1, $a2:3, $m10:11+=, $mzero, 0b0000
+		fnop
+	}
+.Lcopy_u64_worker_tail:
+	brz $m7, .Lcopy_u64_worker_final_even
+	{
+		ldst64pace $a2:3, $a0:1, $m10:11+=, $mzero, 0b0000
+		fnop
+	}
+	st64pace $a2:3, $m10:11+=, $mzero, 0b00
+	bri .Lcopy_u64_worker_done
+.Lcopy_u64_worker_final_even:
+	st64pace $a0:1, $m10:11+=, $mzero, 0b00
 .Lcopy_u64_worker_done:
 	exitz $m15
 

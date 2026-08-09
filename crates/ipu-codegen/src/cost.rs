@@ -149,12 +149,11 @@ fn amp_kernel_cycles(
 }
 
 fn standard_to_interleaved_copy_cycles(bytes: u64) -> u64 {
-    // The current parallel helper shares one instruction issue pipeline across
-    // its worker contexts. Its load/store/address/control loop takes about
-    // 6,400 cycles for an 8 KiB panel; keep this separate from memcpy bandwidth.
+    // The paced parallel helper sustains about six bytes per cycle including
+    // worker scheduling (1,308 measured cycles for an 8 KiB panel). Keep this
+    // separate from the target's ideal memcpy bandwidth.
     bytes
-        .saturating_mul(25)
-        .div_ceil(32)
+        .div_ceil(6)
         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
 }
 
