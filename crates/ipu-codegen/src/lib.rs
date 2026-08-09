@@ -17,7 +17,6 @@ pub mod memory;
 pub mod mid;
 mod package;
 pub mod place;
-mod shard_assignment;
 pub mod storage;
 pub mod tile;
 pub use exchange::{

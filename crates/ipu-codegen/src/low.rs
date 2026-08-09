@@ -343,8 +343,6 @@ pub enum LowLoweringError {
     Layout(#[from] LayoutError),
     #[error("invalid tensor storage view: {0}")]
     Storage(#[from] StorageError),
-    #[error("shard assignment exchange estimate failed: {0}")]
-    Exchange(#[from] ipu_exchange::ExchangeError),
 }
 
 pub type LowLoweringResult<T> = Result<T, LowLoweringError>;
@@ -454,7 +452,6 @@ impl LoweringState {
             }
             state.canonical[value.id.index() as usize] = value_shards;
         }
-        crate::shard_assignment::assign_shards(graph, &state.canonical, &mut state.shards)?;
         Ok(state)
     }
 
@@ -2057,10 +2054,7 @@ fn operation_provenance(operation: &MidOperation, kind: &MidOperationKind) -> Wo
     }
 }
 
-pub(crate) fn intersect_extents(
-    left: &[ShardExtent],
-    right: &[ShardExtent],
-) -> Option<Vec<ShardExtent>> {
+fn intersect_extents(left: &[ShardExtent], right: &[ShardExtent]) -> Option<Vec<ShardExtent>> {
     if left.len() != right.len() {
         return None;
     }
@@ -2079,7 +2073,7 @@ pub(crate) fn intersect_extents(
         .collect()
 }
 
-pub(crate) fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<Vec<ShardExtent>>> {
+fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<Vec<ShardExtent>>> {
     let layout = &tensor_type.format.layout;
     let padded = layout.padded_shape(&tensor_type.shape)?;
     let rank = tensor_type.shape.0.len();

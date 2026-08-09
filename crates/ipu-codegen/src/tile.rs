@@ -386,10 +386,7 @@ mod tests {
                 );
                 for step in &program.steps {
                     if let TileStep::Exchange(exchange) = step {
-                        assert!(
-                            exchange.row[0] == ipu_exchange::SANS_INACTIVE_INSTRUCTION
-                                || exchange.row.last() == Some(&RETURN_M10_INSTRUCTION)
-                        );
+                        assert_eq!(exchange.row.last(), Some(&RETURN_M10_INSTRUCTION));
                     }
                 }
             }
