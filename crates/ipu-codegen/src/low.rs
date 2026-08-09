@@ -2402,10 +2402,23 @@ mod tests {
                         && shard.tensor_type.format.layout.memory_class
                             == crate::MemoryClass::Ipu21Interleaved
                 });
-                let local_column_blocks = output
-                    .and_then(|shard| shard.extents.last())
-                    .map(|extent| (extent.physical_end - extent.start) / 64)
-                    .unwrap_or(column_blocks);
+                let local_column_blocks = match output {
+                    Some(shard) => {
+                        let output_columns = match gemms.first().map(|run| &run.kernel) {
+                            Some(TileKernel::Planned(TileKernelSpec::Gemm {
+                                output_columns,
+                                ..
+                            })) => *output_columns,
+                            _ => panic!("case {case}: output tile has no GEMM kernel"),
+                        };
+                        let extent = shard.extents.last().unwrap();
+                        (extent.physical_end - extent.start) / output_columns
+                    }
+                    None => {
+                        assert!(gemms.is_empty(), "case {case}");
+                        0
+                    }
+                };
                 assert_eq!(
                     gemms.len(),
                     (inner_blocks * local_column_blocks) as usize,
@@ -2416,7 +2429,12 @@ mod tests {
                     assert_eq!(run.provenance.reason, WorkReason::OperatorKernel);
                     assert!(run.provenance.operation.is_some());
                     assert!(run.provenance.value.is_some());
-                    let TileKernel::Planned(TileKernelSpec::Gemm { mode, .. }) = run.kernel else {
+                    let TileKernel::Planned(TileKernelSpec::Gemm {
+                        mode,
+                        output_columns: kernel_columns,
+                        ..
+                    }) = run.kernel
+                    else {
                         unreachable!()
                     };
                     let columns = run.output.extents.last().unwrap();
@@ -2434,7 +2452,10 @@ mod tests {
                     let left_inner = run.inputs[0].views[0].extents.last().unwrap();
                     assert_eq!(left_inner.physical_end - left_inner.start, 64);
                     let output_columns = run.output.extents.last().unwrap();
-                    assert_eq!(output_columns.physical_end - output_columns.start, 64);
+                    assert_eq!(
+                        output_columns.physical_end - output_columns.start,
+                        kernel_columns
+                    );
                 }
             }
         }

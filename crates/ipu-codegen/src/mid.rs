@@ -65,6 +65,7 @@ pub enum TileKernelSpec {
         accumulate: AccumulationPrecision,
         mode: GemmKernelMode,
         weights: GemmWeightLoad,
+        output_columns: u32,
     },
     Gelu,
     Add,
@@ -173,6 +174,7 @@ pub enum AmpOrder {
 
 pub const AMP_INNER_BLOCK: u32 = 64;
 pub const AMP_OUTPUT_COLUMN_BLOCK: u32 = 64;
+const AMP_WIDE_OUTPUT_COLUMN_BLOCK: u32 = 128;
 pub const AMP_COLUMN_MICRO: u32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -912,6 +914,33 @@ fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> bool {
     })
 }
 
+fn padded_axis_shard_extent(
+    tensor: &TensorType,
+    padded: &TensorShape,
+    axis: usize,
+) -> Result<u32, OperatorPlanError> {
+    let axis_tilings = tensor
+        .format
+        .layout
+        .tiling
+        .axes
+        .iter()
+        .filter(|tiling| tiling.axis.resolve(padded.0.len()).ok() == Some(axis))
+        .collect::<Vec<_>>();
+    let partitions = axis_tilings
+        .iter()
+        .try_fold(1_u32, |partitions, tiling| {
+            partitions.checked_mul(u32::from(tiling.partitions))
+        })
+        .ok_or(OperatorPlanError::InvalidBlocking)?;
+    let divided = padded.0[axis]
+        .checked_div(partitions)
+        .ok_or(OperatorPlanError::InvalidBlocking)?;
+    Ok(axis_tilings
+        .iter()
+        .fold(divided, |extent, tiling| extent.max(tiling.block_size)))
+}
+
 fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
     match operator {
         MidOperator::Gemm {
@@ -924,12 +953,14 @@ fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
                 accumulate,
                 mode: GemmKernelMode::Initialize,
                 weights: GemmWeightLoad::Standard,
+                output_columns: AMP_OUTPUT_COLUMN_BLOCK,
             },
             accumulate: TileKernelSpec::Gemm {
                 multiply,
                 accumulate,
                 mode: GemmKernelMode::Accumulate,
                 weights: GemmWeightLoad::Standard,
+                output_columns: AMP_OUTPUT_COLUMN_BLOCK,
             },
             inner_block: AMP_INNER_BLOCK,
             output_column_block: AMP_OUTPUT_COLUMN_BLOCK,
@@ -1111,59 +1142,42 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
         .filter(|columns| tile_count.is_multiple_of(*columns))
         .flat_map(|columns| {
             let rows = tile_count / columns;
-            [
-                amp_grid_gemm_operator_candidate(
-                    Precision::F16,
-                    64,
-                    16,
-                    tile_count,
-                    rows,
-                    columns,
-                    AmpWeightLayout::Resident,
-                ),
-                amp_grid_gemm_operator_candidate(
-                    Precision::F16,
-                    64,
-                    16,
-                    tile_count,
-                    rows,
-                    columns,
-                    AmpWeightLayout::InterleavedK64,
-                ),
-                amp_grid_gemm_operator_candidate(
-                    Precision::F32,
-                    64,
-                    32,
-                    tile_count,
-                    rows,
-                    columns,
-                    AmpWeightLayout::Resident,
-                ),
-                amp_grid_gemm_operator_candidate(
-                    Precision::F16,
-                    64,
-                    16,
-                    tile_count,
-                    rows,
-                    columns,
-                    AmpWeightLayout::Streamed,
-                ),
-                amp_grid_gemm_operator_candidate(
-                    Precision::F32,
-                    64,
-                    32,
-                    tile_count,
-                    rows,
-                    columns,
-                    AmpWeightLayout::Streamed,
-                ),
-                amp_grid_gelu_operator_candidate(tile_count, rows, columns),
-            ]
+            let mut grid = vec![amp_grid_gelu_operator_candidate(tile_count, rows, columns)];
+            for (precision, left_tail, weight_layout) in [
+                (Precision::F16, 16, AmpWeightLayout::Resident),
+                (Precision::F16, 16, AmpWeightLayout::InterleavedK64),
+                (Precision::F32, 32, AmpWeightLayout::Resident),
+                (Precision::F16, 16, AmpWeightLayout::Streamed),
+                (Precision::F32, 32, AmpWeightLayout::Streamed),
+            ] {
+                for &output_columns in amp_output_column_blocks(precision) {
+                    grid.push(amp_grid_gemm_operator_candidate(
+                        precision,
+                        64,
+                        left_tail,
+                        output_columns,
+                        tile_count,
+                        rows,
+                        columns,
+                        weight_layout,
+                    ));
+                }
+            }
+            grid
         })
         .collect::<Vec<_>>();
+    for (precision, left_tail) in [(Precision::F16, 16), (Precision::F32, 32)] {
+        for &output_columns in amp_output_column_blocks(precision) {
+            candidates.push(amp_gemm_operator_candidate(
+                precision,
+                64,
+                left_tail,
+                output_columns,
+                tile_count,
+            ));
+        }
+    }
     candidates.extend([
-        amp_gemm_operator_candidate(Precision::F16, 64, 16, tile_count),
-        amp_gemm_operator_candidate(Precision::F32, 64, 32, tile_count),
         OperatorCandidate::new(
             MidOperator::Gelu,
             [OperandRequirement::new(amp_output_f16, 8)],
@@ -1262,14 +1276,16 @@ fn amp_gemm_operator_candidate(
     precision: Precision,
     inner: u16,
     left_tail: u32,
+    output_columns: u32,
     tile_count: u16,
 ) -> OperatorCandidate {
+    let operator = MidOperator::Gemm {
+        options: GemmOptions::default(),
+        multiply: precision,
+        accumulate: gemm_accumulation_precision(precision),
+    };
     OperatorCandidate::new(
-        MidOperator::Gemm {
-            options: GemmOptions::default(),
-            multiply: precision,
-            accumulate: gemm_accumulation_precision(precision),
-        },
+        operator,
         [
             OperandRequirement::new(
                 TensorFormat {
@@ -1299,12 +1315,14 @@ fn amp_gemm_operator_candidate(
         MemoryOperand::Output,
         MemoryOperand::Input(0),
     ]))
+    .with_dispatch(blocked_gemm_dispatch(operator, output_columns))
 }
 
 fn amp_grid_gemm_operator_candidate(
     precision: Precision,
     inner: u16,
     left_tail: u32,
+    output_columns: u32,
     tile_count: u16,
     row_partitions: u16,
     column_partitions: u16,
@@ -1330,12 +1348,13 @@ fn amp_grid_gemm_operator_candidate(
             )
         }
     };
+    let operator = MidOperator::Gemm {
+        options: GemmOptions::default(),
+        multiply: precision,
+        accumulate: gemm_accumulation_precision(precision),
+    };
     OperatorCandidate::new(
-        MidOperator::Gemm {
-            options: GemmOptions::default(),
-            multiply: precision,
-            accumulate: gemm_accumulation_precision(precision),
-        },
+        operator,
         [
             OperandRequirement::new(
                 TensorFormat {
@@ -1370,6 +1389,36 @@ fn amp_grid_gemm_operator_candidate(
         MemoryOperand::Output,
         MemoryOperand::Input(0),
     ]))
+    .with_dispatch(blocked_gemm_dispatch(operator, output_columns))
+}
+
+fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> OperatorDispatch {
+    let MidOperator::Gemm {
+        multiply,
+        accumulate,
+        ..
+    } = operator
+    else {
+        unreachable!("blocked GEMM dispatch requires a GEMM operator")
+    };
+    OperatorDispatch::BlockedGemm {
+        initialize: TileKernelSpec::Gemm {
+            multiply,
+            accumulate,
+            mode: GemmKernelMode::Initialize,
+            weights: GemmWeightLoad::Standard,
+            output_columns,
+        },
+        accumulate: TileKernelSpec::Gemm {
+            multiply,
+            accumulate,
+            mode: GemmKernelMode::Accumulate,
+            weights: GemmWeightLoad::Standard,
+            output_columns,
+        },
+        inner_block: AMP_INNER_BLOCK,
+        output_column_block: output_columns,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1377,6 +1426,13 @@ enum AmpWeightLayout {
     Resident,
     Streamed,
     InterleavedK64,
+}
+
+fn amp_output_column_blocks(precision: Precision) -> &'static [u32] {
+    match precision {
+        Precision::F16 => &[AMP_OUTPUT_COLUMN_BLOCK, AMP_WIDE_OUTPUT_COLUMN_BLOCK],
+        Precision::F32 | Precision::F8F143 { .. } => &[AMP_OUTPUT_COLUMN_BLOCK],
+    }
 }
 
 const fn gemm_accumulation_precision(precision: Precision) -> AccumulationPrecision {
@@ -1526,12 +1582,14 @@ impl OperatorPlan {
                         multiply: init_multiply,
                         accumulate: init_accumulate,
                         mode: GemmKernelMode::Initialize,
+                        output_columns: init_output_columns,
                         ..
                     },
                     TileKernelSpec::Gemm {
                         multiply: next_multiply,
                         accumulate: next_accumulate,
                         mode: GemmKernelMode::Accumulate,
+                        output_columns: next_output_columns,
                         ..
                     },
                     MidOperator::Gemm {
@@ -1547,6 +1605,8 @@ impl OperatorPlan {
                     || next_multiply != multiply
                     || init_accumulate != accumulate
                     || next_accumulate != accumulate
+                    || init_output_columns != output_column_block
+                    || next_output_columns != output_column_block
                 {
                     return Err(OperatorPlanError::DispatchMismatch);
                 }
@@ -1567,6 +1627,17 @@ impl OperatorPlan {
                     .layout
                     .padded_shape(&output.shape)
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
+                let output_column_axis = output_padded.0.len() - 1;
+                let columns_per_output_shard =
+                    padded_axis_shard_extent(output, &output_padded, output_column_axis)?;
+                let right_padded = right
+                    .format
+                    .layout
+                    .padded_shape(&right.shape)
+                    .map_err(|_| OperatorPlanError::InvalidBlocking)?;
+                let right_column_axis = right_padded.0.len() - 1;
+                let columns_per_right_shard =
+                    padded_axis_shard_extent(right, &right_padded, right_column_axis)?;
                 let grid_plan = left.format.layout.tiling.replicas > 1
                     || right.format.layout.tiling.replicas > 1
                     || right
@@ -1589,6 +1660,8 @@ impl OperatorPlan {
                         .last()
                         .unwrap()
                         .is_multiple_of(*output_column_block)
+                    || !columns_per_output_shard.is_multiple_of(*output_column_block)
+                    || columns_per_right_shard < *output_column_block
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
                 }
