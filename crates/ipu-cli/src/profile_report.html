@@ -265,8 +265,8 @@ function stableHash(text) {
 function sampleColor(sample, kind = sample.kind) {
   if (kind !== "compute" || !sample.kernel) return colors[kind] || colors.exchange;
   const hash = stableHash(sample.kernel);
-  const hue = 350 + (hash % 17) - 8;
-  const lightness = 34 + ((hash >>> 8) % 7) - 3;
+  const hue = 350 + (hash % 31) - 15;
+  const lightness = 34 + ((hash >>> 8) % 11) - 5;
   return `hsl(${hue} 82% ${lightness}%)`;
 }
 function exchangeEventCycles(sample) {
