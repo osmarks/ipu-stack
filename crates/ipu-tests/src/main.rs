@@ -340,18 +340,22 @@ fn run_mlp_chain(
     let left_bytes = packed_binding(&left, |logical_tile, linear, elements| {
         let (_, inner) =
             amp_matrix_coordinates(AmpOrder::Left, Precision::F16, 1, elements, linear)?;
-        Ok(if u32::from(logical_tile) % 64 == inner {
-            0x3c00
-        } else {
-            0
-        })
+        Ok(mlp_smoke_value(
+            MLP_INPUT_SEED,
+            u64::from(logical_tile) * u64::from(MLP_SMOKE_WIDTH) + u64::from(inner),
+            MLP_INPUT_STANDARD_DEVIATION,
+        ))
     })?;
     let right0_bytes = packed_binding(&right0, |logical_tile, linear, elements| {
         let (inner, column) =
             amp_matrix_coordinates(AmpOrder::Right, Precision::F16, 64, elements / 64, linear)?;
         let column = u32::from(logical_tile) * 64 + column;
         Ok(if column < 64 {
-            gemm_right_value(inner, column)
+            mlp_smoke_value(
+                MLP_FIRST_WEIGHT_SEED,
+                u64::from(inner) * u64::from(MLP_SMOKE_WIDTH) + u64::from(column),
+                MLP_WEIGHT_STANDARD_DEVIATION,
+            )
         } else {
             0
         })
@@ -360,7 +364,15 @@ fn run_mlp_chain(
         let (inner, column) =
             amp_matrix_coordinates(AmpOrder::Right, Precision::F16, 64, elements / 64, linear)?;
         let column = u32::from(logical_tile) * 64 + column;
-        Ok(if inner == column { 0x3c00 } else { 0 })
+        Ok(if column < 64 {
+            mlp_smoke_value(
+                MLP_SECOND_WEIGHT_SEED,
+                u64::from(inner) * u64::from(MLP_SMOKE_WIDTH) + u64::from(column),
+                MLP_WEIGHT_STANDARD_DEVIATION,
+            )
+        } else {
+            0
+        })
     })?;
     let mut weights = Vec::with_capacity(right0_bytes.len() + right1_bytes.len());
     weights.extend_from_slice(&right0_bytes);
@@ -724,6 +736,7 @@ fn verify_mlp_output(application: &Application, active_tiles: u16, bytes: &[u8])
     }
     for (row, slice) in output.slices.iter().enumerate() {
         let row = u16::try_from(row)?;
+        let expected_row = mlp_smoke_reference(row);
         let elements = u32::try_from(slice.size / 2)?;
         for linear in 0..elements {
             let (_, column) =
@@ -735,8 +748,7 @@ fn verify_mlp_output(application: &Application, active_tiles: u16, bytes: &[u8])
             let actual = half_to_f32(u16::from_le_bytes(
                 bytes[offset..offset + 2].try_into().unwrap(),
             ));
-            let input = half_to_f32(gemm_right_value(u32::from(row) % 64, column));
-            let expected = gelu_reference(gelu_reference(input));
+            let expected = expected_row[column as usize];
             let error = (actual - expected).abs();
             maximum_error = maximum_error.max(error);
             checked += 1;
@@ -756,6 +768,100 @@ fn verify_mlp_output(application: &Application, active_tiles: u16, bytes: &[u8])
 
 fn gelu_reference(value: f32) -> f32 {
     0.5 * value * (1.0 + (0.797_884_6 * (value + 0.044_715 * value.powi(3))).tanh())
+}
+
+const MLP_SMOKE_WIDTH: u32 = 64;
+const MLP_INPUT_SEED: u64 = 0x6d6c_705f_696e_7075;
+const MLP_FIRST_WEIGHT_SEED: u64 = 0x6d6c_705f_7730_5f5f;
+const MLP_SECOND_WEIGHT_SEED: u64 = 0x6d6c_705f_7731_5f5f;
+const MLP_INPUT_STANDARD_DEVIATION: f32 = 0.5;
+const MLP_WEIGHT_STANDARD_DEVIATION: f32 = 0.125;
+
+fn mlp_smoke_value(seed: u64, index: u64, standard_deviation: f32) -> u16 {
+    f32_to_half(gaussian(seed, index) * standard_deviation)
+}
+
+fn mlp_smoke_reference(row: u16) -> [f32; MLP_SMOKE_WIDTH as usize] {
+    let mut hidden = [0.0; MLP_SMOKE_WIDTH as usize];
+    for column in 0..MLP_SMOKE_WIDTH {
+        let mut sum = 0.0;
+        for inner in 0..MLP_SMOKE_WIDTH {
+            let input = half_to_f32(mlp_smoke_value(
+                MLP_INPUT_SEED,
+                u64::from(row) * u64::from(MLP_SMOKE_WIDTH) + u64::from(inner),
+                MLP_INPUT_STANDARD_DEVIATION,
+            ));
+            let weight = half_to_f32(mlp_smoke_value(
+                MLP_FIRST_WEIGHT_SEED,
+                u64::from(inner) * u64::from(MLP_SMOKE_WIDTH) + u64::from(column),
+                MLP_WEIGHT_STANDARD_DEVIATION,
+            ));
+            sum += input * weight;
+        }
+        hidden[column as usize] = gelu_reference(half_to_f32(f32_to_half(sum)));
+    }
+    let mut output = [0.0; MLP_SMOKE_WIDTH as usize];
+    for column in 0..MLP_SMOKE_WIDTH {
+        let mut sum = 0.0;
+        for inner in 0..MLP_SMOKE_WIDTH {
+            let weight = half_to_f32(mlp_smoke_value(
+                MLP_SECOND_WEIGHT_SEED,
+                u64::from(inner) * u64::from(MLP_SMOKE_WIDTH) + u64::from(column),
+                MLP_WEIGHT_STANDARD_DEVIATION,
+            ));
+            sum += half_to_f32(f32_to_half(hidden[inner as usize])) * weight;
+        }
+        output[column as usize] = gelu_reference(half_to_f32(f32_to_half(sum)));
+    }
+    output
+}
+
+fn gaussian(seed: u64, index: u64) -> f32 {
+    let first = splitmix64(seed ^ index.wrapping_mul(2));
+    let second = splitmix64(seed ^ index.wrapping_mul(2).wrapping_add(1));
+    let unit = |bits: u64| ((bits >> 40) as f32 + 0.5) / 16_777_216.0;
+    let radius = (-2.0 * unit(first).ln()).sqrt();
+    radius * (std::f32::consts::TAU * unit(second)).cos()
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn f32_to_half(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let fraction = bits & 0x7f_ffff;
+    if exponent == 0xff {
+        return sign | 0x7c00 | u16::from(fraction != 0);
+    }
+    let half_exponent = exponent - 127 + 15;
+    if half_exponent >= 31 {
+        return sign | 0x7c00;
+    }
+    if half_exponent <= 0 {
+        if half_exponent < -10 {
+            return sign;
+        }
+        let mantissa = fraction | 0x80_0000;
+        let shift = u32::try_from(14 - half_exponent).unwrap();
+        let truncated = mantissa >> shift;
+        let remainder = mantissa & ((1 << shift) - 1);
+        let halfway = 1 << (shift - 1);
+        return sign
+            | (truncated
+                + u32::from(remainder > halfway || (remainder == halfway && truncated & 1 != 0)))
+                as u16;
+    }
+    let truncated = ((half_exponent as u32) << 10) | (fraction >> 13);
+    let remainder = fraction & 0x1fff;
+    sign | (truncated
+        + u32::from(remainder > 0x1000 || (remainder == 0x1000 && truncated & 1 != 0)))
+        as u16
 }
 
 fn half_to_f32(bits: u16) -> f32 {
