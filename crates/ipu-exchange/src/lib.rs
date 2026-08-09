@@ -23,8 +23,7 @@ const DELAY_OPCODE_MASK: u32 = 0xfff8_0000;
 const DELAY_OPCODE: u32 = 0x40a0_0000;
 const DELAY_PIC_OPCODE: u32 = 0x6000_0000;
 const DELAY_XPIC_OPCODE: u32 = 0x6400_0000;
-const PIC_ABSOLUTE_RECEIVE_BITS: u32 = (1 << 16) | (1 << 14);
-const PIC_RECEIVE_ADDRESS_MASK: u32 = 0x1fff;
+const PIC_RECEIVE_ADDRESS_MASK: u32 = 0x3ffff;
 const SEND_OPCODE: u32 = 0x7800_0000;
 const SEND_ADDRESS_MASK: u32 = 0x001f_fff8;
 const SEND_OFF_OPCODE: u32 = 0x7000_0000;
@@ -1076,20 +1075,14 @@ pub fn normalize_sender_instruction(row: &mut [u32]) -> Option<(usize, u32)> {
 }
 
 pub fn patch_receiver_address(row: &mut PlanRow, byte_address: u32) -> Result<(), ExchangeError> {
-    if byte_address < EXCHANGE_WINDOW_BASE || byte_address & 3 != 0 {
-        return Err(ExchangeError::Address(byte_address));
-    }
-    let window_word = (byte_address - EXCHANGE_WINDOW_BASE) >> 2;
-    if window_word > 0x1fff {
+    if byte_address & 3 != 0 || byte_address >> 2 > PIC_RECEIVE_ADDRESS_MASK {
         return Err(ExchangeError::Address(byte_address));
     }
     let instruction = row
         .iter_mut()
         .find(|word| **word & OPCODE_MASK == DELAY_PIC_OPCODE)
         .ok_or(ExchangeError::Address(byte_address))?;
-    *instruction = (*instruction & !(PIC_ABSOLUTE_RECEIVE_BITS | PIC_RECEIVE_ADDRESS_MASK))
-        | PIC_ABSOLUTE_RECEIVE_BITS
-        | window_word;
+    *instruction = (*instruction & !PIC_RECEIVE_ADDRESS_MASK) | (byte_address >> 2);
     Ok(())
 }
 
@@ -1494,7 +1487,14 @@ mod tests {
             plan.sender[2] & 0x001f_fff8,
             ((0x52040 >> 2) << 3) & 0x001f_fff8
         );
-        assert_eq!(plan.receivers[0][2] & 0x1fff, (0x53080 - 0x50000) >> 2);
+        assert_eq!(plan.receivers[0][2] & 0x3ffff, 0x53080 >> 2);
+
+        patch_receiver_address(&mut plan.receivers[0], 0x8f000).unwrap();
+        assert_eq!(plan.receivers[0][2] & 0x3ffff, 0x8f000 >> 2);
+        assert_eq!(
+            patch_receiver_address(&mut plan.receivers[0], 0x10_0000),
+            Err(ExchangeError::Address(0x10_0000))
+        );
     }
 
     #[test]

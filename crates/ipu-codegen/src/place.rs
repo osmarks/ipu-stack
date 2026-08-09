@@ -6,7 +6,6 @@ use crate::low::{
 use crate::memory::IPU21_DATA_BASE;
 use crate::mid::{MemoryClass, MemoryOperand, MemoryRelation, OperandRequirement};
 use crate::storage::{StorageError, shard_storage_bytes};
-use ipu_exchange::{EXCHANGE_WINDOW_BASE, EXCHANGE_WINDOW_BYTES};
 use ipu_package::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, IPU21_INTERLEAVED_REGION_LIMIT,
     TILE_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE, TILE_MEMORY_SIZE,
@@ -37,12 +36,6 @@ pub enum PlacementError {
         class: MemoryClass,
         bytes: u32,
     },
-    #[error(
-        "tile {tile} exchange phase {phase} needs {bytes} bytes of the {EXCHANGE_WINDOW_BYTES}-byte receive window"
-    )]
-    ExchangeWindow { tile: u16, phase: u32, bytes: u32 },
-    #[error("tile {tile} exchange staging slots overlap")]
-    ExchangeStagingConflict { tile: u16 },
     #[error("placement arithmetic overflowed")]
     Overflow,
 }
@@ -188,126 +181,6 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
             standard.maximum_cursor().max(interleaved.maximum_cursor());
     }
 
-    // Exchange copies live only from their phase through the immediately
-    // following consumer, so every phase can reuse the receive window.
-    for (phase_index, phase) in program.exchange_phases.iter().enumerate() {
-        let mut cursors = vec![EXCHANGE_WINDOW_BASE; usize::from(program.tile_count)];
-        let mut fixed = vec![Vec::<(u32, u32)>::new(); usize::from(program.tile_count)];
-        for transfer in &phase.transfers {
-            for &destination in &transfer.destinations {
-                let shard = &program.shards[destination.index() as usize];
-                let ShardDefinition::ExchangeStaging {
-                    window_offset: Some(window_offset),
-                } = shard.definition
-                else {
-                    continue;
-                };
-                let requirement = root_requirements
-                    .get(&sets.find(destination.index() as usize))
-                    .copied()
-                    .unwrap_or_default();
-                let address = EXCHANGE_WINDOW_BASE
-                    .checked_add(window_offset)
-                    .ok_or(PlacementError::Overflow)?;
-                if address != align_up(address, requirement.alignment.max(4))? {
-                    return Err(PlacementError::ExchangeStagingConflict { tile: shard.tile });
-                }
-                let bytes =
-                    allocation_bytes(program, &[destination.index() as usize], requirement)?;
-                let end = address.checked_add(bytes).ok_or(PlacementError::Overflow)?;
-                if end > EXCHANGE_WINDOW_BASE + EXCHANGE_WINDOW_BYTES {
-                    tracing::error!(
-                        tile = shard.tile,
-                        phase = phase_index,
-                        shard = destination.index(),
-                        payload_bytes = shard_storage_bytes(shard)?,
-                        allocation_bytes = bytes,
-                        alignment = requirement.alignment,
-                        access_tail_bytes = requirement.access_tail,
-                        distinct_element = requirement.distinct_element,
-                        window_offset,
-                        provenance = ?phase.provenance,
-                        "fixed exchange staging allocation exceeds receive window"
-                    );
-                    return Err(PlacementError::ExchangeWindow {
-                        tile: shard.tile,
-                        phase: u32::try_from(phase_index).map_err(|_| PlacementError::Overflow)?,
-                        bytes: end - EXCHANGE_WINDOW_BASE,
-                    });
-                }
-                if fixed[usize::from(shard.tile)]
-                    .iter()
-                    .any(|&(other_start, other_end)| address < other_end && other_start < end)
-                {
-                    return Err(PlacementError::ExchangeStagingConflict { tile: shard.tile });
-                }
-                if addresses
-                    .insert(destination, address)
-                    .is_some_and(|old| old != address)
-                {
-                    return Err(PlacementError::ExchangeStagingConflict { tile: shard.tile });
-                }
-                fixed[usize::from(shard.tile)].push((address, end));
-                cursors[usize::from(shard.tile)] = cursors[usize::from(shard.tile)].max(end);
-            }
-        }
-        for transfer in &phase.transfers {
-            for &destination in &transfer.destinations {
-                let shard = &program.shards[destination.index() as usize];
-                if !matches!(shard.definition, ShardDefinition::ExchangeStaging { .. }) {
-                    if !addresses.contains_key(&destination) {
-                        return Err(PlacementError::InvalidAlias(destination.index()));
-                    }
-                    continue;
-                }
-                if matches!(
-                    shard.definition,
-                    ShardDefinition::ExchangeStaging {
-                        window_offset: Some(_)
-                    }
-                ) {
-                    continue;
-                }
-                let requirement = root_requirements
-                    .get(&sets.find(destination.index() as usize))
-                    .copied()
-                    .unwrap_or_default();
-                let cursor = &mut cursors[usize::from(shard.tile)];
-                *cursor = align_up(*cursor, requirement.alignment.max(4))?;
-                let bytes =
-                    allocation_bytes(program, &[destination.index() as usize], requirement)?;
-                let end = cursor.checked_add(bytes).ok_or(PlacementError::Overflow)?;
-                if end > EXCHANGE_WINDOW_BASE + EXCHANGE_WINDOW_BYTES {
-                    tracing::error!(
-                        tile = shard.tile,
-                        phase = phase_index,
-                        shard = destination.index(),
-                        payload_bytes = shard_storage_bytes(shard)?,
-                        allocation_bytes = bytes,
-                        alignment = requirement.alignment,
-                        access_tail_bytes = requirement.access_tail,
-                        distinct_element = requirement.distinct_element,
-                        cursor = *cursor,
-                        provenance = ?phase.provenance,
-                        "exchange phase allocations exceed receive window"
-                    );
-                    return Err(PlacementError::ExchangeWindow {
-                        tile: shard.tile,
-                        phase: u32::try_from(phase_index).map_err(|_| PlacementError::Overflow)?,
-                        bytes: end - EXCHANGE_WINDOW_BASE,
-                    });
-                }
-                if addresses
-                    .insert(destination, *cursor)
-                    .is_some_and(|old| old != *cursor)
-                {
-                    return Err(PlacementError::ExchangeStagingConflict { tile: shard.tile });
-                }
-                *cursor = end;
-            }
-        }
-    }
-
     Ok(Placement {
         shard_addresses: addresses,
         tile_data_end,
@@ -333,13 +206,8 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
             }
         }
     }
-    for (index, lifetime) in lifetimes.iter_mut().enumerate() {
-        if !lifetime.seen
-            && !matches!(
-                program.shards[index].definition,
-                ShardDefinition::ExchangeStaging { .. }
-            )
-        {
+    for lifetime in &mut lifetimes {
+        if !lifetime.seen {
             // Unreferenced canonical values remain conservatively resident.
             lifetime.touch(0);
         }
@@ -669,10 +537,6 @@ fn allocate_tile_class(
         let representative = &program.shards[root_members[0]];
         if representative.tile != tile
             || representative.tensor_type.format.layout.memory_class != class
-            || matches!(
-                representative.definition,
-                ShardDefinition::ExchangeStaging { .. }
-            )
             || grouped.contains(&root)
         {
             continue;
@@ -853,7 +717,7 @@ mod tests {
     };
 
     #[test]
-    fn randomized_gemm_placement_respects_classes_exchange_window_and_kernel_views() {
+    fn randomized_gemm_placement_respects_classes_and_kernel_views() {
         let mut random = fastrand::Rng::with_seed(0x706c_6163);
         for _ in 0..48 {
             let tiles = 1_u16 << random.u32(0..=3);
@@ -886,25 +750,14 @@ mod tests {
             assert_eq!(placement.shard_addresses.len(), low.shards.len());
             for shard in &low.shards {
                 let address = placement.shard_addresses[&shard.id];
-                match shard.definition {
-                    ShardDefinition::ExchangeStaging {
-                        window_offset: Some(window_offset),
-                    } => assert_eq!(address, EXCHANGE_WINDOW_BASE + window_offset),
-                    ShardDefinition::ExchangeStaging {
-                        window_offset: None,
-                    } => assert!(
-                        (EXCHANGE_WINDOW_BASE..EXCHANGE_WINDOW_BASE + EXCHANGE_WINDOW_BYTES)
-                            .contains(&address)
-                    ),
-                    _ if shard.tensor_type.format.layout.memory_class
-                        == MemoryClass::Ipu21Interleaved =>
-                    {
+                match shard.tensor_type.format.layout.memory_class {
+                    MemoryClass::Ipu21Interleaved => {
                         assert!(
                             (IPU21_INTERLEAVED_MEMORY_BASE..IPU21_INTERLEAVED_REGION_LIMIT)
                                 .contains(&address)
                         )
                     }
-                    _ => assert!(address >= IPU21_DATA_BASE),
+                    MemoryClass::Ipu21Standard => assert!(address >= IPU21_DATA_BASE),
                 }
             }
             for tile in &low.tiles {

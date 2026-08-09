@@ -85,10 +85,8 @@ pub struct ShardView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShardDefinition {
     Value(MidValueId),
-    /// Reusable receive storage populated by one or more exchange phases.
-    ExchangeStaging {
-        window_offset: Option<u32>,
-    },
+    /// Transient storage populated by one or more exchange phases.
+    ExchangeStaging,
     LocalCopy(LowShardId),
     /// Persistent scratch allocation populated by local copies or exchanges.
     Staging,
@@ -478,7 +476,7 @@ impl LoweringState {
                         == crate::MemoryClass::Ipu21Interleaved
                     && !matches!(
                         shard.definition,
-                        ShardDefinition::Alias(_) | ShardDefinition::ExchangeStaging { .. }
+                        ShardDefinition::Alias(_) | ShardDefinition::ExchangeStaging
                     )
             })
             .try_fold(0u32, |total, shard| {
@@ -742,9 +740,7 @@ impl LoweringState {
                             tile,
                             tensor_type: self.shards[source.index() as usize].tensor_type.clone(),
                             extents: extents.clone(),
-                            definition: ShardDefinition::ExchangeStaging {
-                                window_offset: None,
-                            },
+                            definition: ShardDefinition::ExchangeStaging,
                         })?;
                         let bytes = shard_storage_bytes(&self.shards[copy.index() as usize])?;
                         let reserved = exchange_allocation_bytes(
@@ -997,9 +993,7 @@ impl LoweringState {
                                     .tensor_type
                                     .clone(),
                                 extents: source_view.extents.clone(),
-                                definition: ShardDefinition::ExchangeStaging {
-                                    window_offset: None,
-                                },
+                                definition: ShardDefinition::ExchangeStaging,
                             })?;
                             wave_transfers[wave]
                                 .entry(source_view)
@@ -1362,10 +1356,6 @@ impl LoweringState {
                             let copy = if let Some(copy) = *slot {
                                 copy
                             } else {
-                                let window_offset = u32::try_from(staging_slot)
-                                    .ok()
-                                    .and_then(|slot| slot.checked_mul(staging_stride))
-                                    .ok_or(LowLoweringError::IdOverflow)?;
                                 let copy = self.push_shard(LowShard {
                                     id: LowShardId(0),
                                     tile,
@@ -1373,9 +1363,7 @@ impl LoweringState {
                                         .tensor_type
                                         .clone(),
                                     extents: right_view.extents.clone(),
-                                    definition: ShardDefinition::ExchangeStaging {
-                                        window_offset: Some(window_offset),
-                                    },
+                                    definition: ShardDefinition::ExchangeStaging,
                                 })?;
                                 *slot = Some(copy);
                                 copy
@@ -1570,9 +1558,7 @@ impl LoweringState {
                                         .tensor_type
                                         .clone(),
                                     extents: right_view.extents.clone(),
-                                    definition: ShardDefinition::ExchangeStaging {
-                                        window_offset: None,
-                                    },
+                                    definition: ShardDefinition::ExchangeStaging,
                                 })?;
                                 receive_staging.insert((tile, column_start), copy);
                                 copy
@@ -2420,7 +2406,7 @@ mod tests {
                 for transfer in &phase.transfers {
                     assert!(transfer.destinations.iter().all(|destination| matches!(
                         low.shards[destination.index() as usize].definition,
-                        ShardDefinition::ExchangeStaging { .. }
+                        ShardDefinition::ExchangeStaging
                     )));
                 }
             }
