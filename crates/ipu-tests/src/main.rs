@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use ipu_codegen::{
     AmpOrder, ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision, TensorFormat,
     amp_matrix_coordinates, build_package,
@@ -45,57 +45,84 @@ struct Arguments {
     runtime_source: Option<PathBuf>,
     #[arg(long, default_value_t = 10)]
     timeout_seconds: u64,
-    /// Execute one blocked F16 GEMM as a kernel/exchange smoke test.
-    #[arg(long, conflicts_with_all = ["batched_gemm_smoke", "mlp_smoke", "gemm_benchmark", "siglip_mlp_benchmark"])]
-    gemm_smoke: bool,
-    /// Execute an F16 GEMM with a batched activation and broadcast weights.
-    #[arg(long, conflicts_with_all = ["gemm_smoke", "mlp_smoke", "gemm_benchmark", "siglip_mlp_benchmark"])]
-    batched_gemm_smoke: bool,
-    /// Execute and numerically verify GEMM-GeLU-GEMM-GeLU.
-    #[arg(long, conflicts_with_all = ["gemm_smoke", "batched_gemm_smoke", "gemm_benchmark", "siglip_mlp_benchmark"])]
-    mlp_smoke: bool,
-    /// Measure a compute-dense blocked F16 GEMM using device cycle counters.
-    #[arg(long, conflicts_with_all = ["gemm_smoke", "batched_gemm_smoke", "mlp_smoke", "siglip_mlp_benchmark"])]
-    gemm_benchmark: bool,
-    /// Benchmark batched Dense-GeLU-Dense with broadcast weights and no biases.
-    #[arg(long, conflicts_with_all = ["gemm_smoke", "batched_gemm_smoke", "mlp_smoke", "gemm_benchmark"])]
-    siglip_mlp_benchmark: bool,
-    #[arg(long, default_value_t = 4)]
+    /// Program and validation workload to build and run.
+    #[arg(long, value_enum, default_value_t = Workload::Diagnostic)]
+    workload: Workload,
+    #[arg(long, default_value_t = SIGLIP_MLP_BATCH)]
     mlp_batch: u32,
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = SIGLIP_MLP_TOKENS)]
     mlp_tokens: u32,
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = SIGLIP_MLP_DIMENSION)]
     mlp_dim: u32,
     /// Defaults to four times --mlp-dim.
     #[arg(long)]
     mlp_hidden_dim: Option<u32>,
-    #[arg(long, default_value_t = 256)]
-    benchmark_rows_per_tile: u32,
-    /// Global row count. Overrides --benchmark-rows-per-tile and allows the
-    /// planner to distribute a smaller matrix over a multi-axis tile grid.
-    #[arg(long)]
-    benchmark_rows: Option<u32>,
-    #[arg(long, default_value_t = 64)]
+    /// Global GEMM row count, independent of the configured tile count.
+    #[arg(long, default_value_t = GEMM_BENCHMARK_ROWS)]
+    benchmark_rows: u32,
+    #[arg(long, default_value_t = GEMM_BENCHMARK_INNER)]
     benchmark_inner: u32,
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = GEMM_BENCHMARK_COLUMNS)]
     benchmark_columns: u32,
     #[arg(long, default_value_t = 1_500_000_000)]
     clock_hz: u64,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Workload {
+    /// Load the minimal runtime and report tile completion diagnostics.
+    Diagnostic,
+    /// Numerically verify one blocked F16 GEMM.
+    GemmSmoke,
+    /// Numerically verify an F16 GEMM with batched activations.
+    BatchedGemmSmoke,
+    /// Numerically verify GEMM-GeLU-GEMM-GeLU with Gaussian data.
+    MlpSmoke,
+    /// Profile one compute-dense F16 GEMM.
+    GemmBenchmark,
+    /// Profile the canonical batched SigLIP Dense-GeLU-Dense workload.
+    SiglipMlpBenchmark,
+}
+
+impl Workload {
+    fn is_benchmark(self) -> bool {
+        matches!(self, Self::GemmBenchmark | Self::SiglipMlpBenchmark)
+    }
+}
+
+const SIGLIP_MLP_BATCH: u32 = 4;
+const SIGLIP_MLP_TOKENS: u32 = 256;
+const SIGLIP_MLP_DIMENSION: u32 = 1024;
+const GEMM_BENCHMARK_ROWS: u32 = 131_072;
+const GEMM_BENCHMARK_INNER: u32 = 64;
+const GEMM_BENCHMARK_COLUMNS: u32 = 64;
+
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     ipu_runtime::init_tracing();
     let arguments = Arguments::parse();
+    if !arguments.workload.is_benchmark()
+        && (arguments.profile_output.is_some() || arguments.no_profile)
+    {
+        bail!("--profile-output and --no-profile require a benchmark workload");
+    }
+    if !matches!(arguments.workload, Workload::SiglipMlpBenchmark)
+        && (arguments.mlp_batch != SIGLIP_MLP_BATCH
+            || arguments.mlp_tokens != SIGLIP_MLP_TOKENS
+            || arguments.mlp_dim != SIGLIP_MLP_DIMENSION
+            || arguments.mlp_hidden_dim.is_some())
+    {
+        bail!("--mlp-* shape options require --workload siglip-mlp-benchmark");
+    }
+    if !matches!(arguments.workload, Workload::GemmBenchmark)
+        && (arguments.benchmark_rows != GEMM_BENCHMARK_ROWS
+            || arguments.benchmark_inner != GEMM_BENCHMARK_INNER
+            || arguments.benchmark_columns != GEMM_BENCHMARK_COLUMNS)
+    {
+        bail!("--benchmark-* shape options require --workload gemm-benchmark");
+    }
     let active_tiles = u16::try_from(arguments.tiles).context("tile count exceeds u16")?;
-    let benchmark_rows = arguments.benchmark_rows.map_or_else(
-        || {
-            u32::from(active_tiles)
-                .checked_mul(arguments.benchmark_rows_per_tile)
-                .context("benchmark row count overflow")
-        },
-        Ok,
-    )?;
+    let benchmark_rows = arguments.benchmark_rows;
     let mlp_hidden_dim = arguments.mlp_hidden_dim.map_or_else(
         || {
             arguments
@@ -117,8 +144,15 @@ fn main() -> Result<()> {
     if arguments.stream_conversions {
         pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Always;
     }
-    if arguments.gemm_smoke || arguments.batched_gemm_smoke {
-        let batch = if arguments.batched_gemm_smoke { 3 } else { 1 };
+    if matches!(
+        arguments.workload,
+        Workload::GemmSmoke | Workload::BatchedGemmSmoke
+    ) {
+        let batch = if matches!(arguments.workload, Workload::BatchedGemmSmoke) {
+            3
+        } else {
+            1
+        };
         let left = graph.host_input("left", [batch, u32::from(active_tiles), 64])?;
         let right = graph.parameter("right", [1, 64, u32::from(active_tiles) * 64])?;
         let output = graph.gemm(left, right)?;
@@ -138,7 +172,7 @@ fn main() -> Result<()> {
                     layout: Layout::amp_right(64, active_tiles),
                 },
             );
-    } else if arguments.mlp_smoke {
+    } else if matches!(arguments.workload, Workload::MlpSmoke) {
         let left = graph.host_input("left", [u32::from(active_tiles), 64])?;
         let right0 = graph.parameter("right.0", [64, 64])?;
         let right1 = graph.parameter("right.1", [64, 64])?;
@@ -159,7 +193,7 @@ fn main() -> Result<()> {
             .with_input(left, left_format)
             .with_input(right0, right_format.clone())
             .with_input(right1, right_format);
-    } else if arguments.siglip_mlp_benchmark {
+    } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
         validate_mlp_benchmark_shape(
             arguments.mlp_batch,
             arguments.mlp_tokens,
@@ -181,7 +215,7 @@ fn main() -> Result<()> {
             .with_automatic_input(left, Precision::F16)
             .with_automatic_input(right0, Precision::F16)
             .with_automatic_input(right1, Precision::F16);
-    } else if arguments.gemm_benchmark {
+    } else if matches!(arguments.workload, Workload::GemmBenchmark) {
         validate_benchmark_shape(
             benchmark_rows,
             arguments.benchmark_inner,
@@ -224,33 +258,35 @@ fn main() -> Result<()> {
     let bootloader_bytes =
         fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
     let runtime = Runtime::open(&arguments.device, &configuration)?;
-    if arguments.gemm_smoke
-        || arguments.batched_gemm_smoke
-        || arguments.mlp_smoke
-        || arguments.siglip_mlp_benchmark
-        || arguments.gemm_benchmark
-    {
+    if !matches!(arguments.workload, Workload::Diagnostic) {
         runtime.load(
             &application,
             &bootloader_bytes,
             application.host_exchange.startup_mark,
         )?;
-        if arguments.gemm_smoke || arguments.batched_gemm_smoke {
+        if matches!(
+            arguments.workload,
+            Workload::GemmSmoke | Workload::BatchedGemmSmoke
+        ) {
             run_gemm(
                 &runtime,
                 &application,
                 active_tiles,
-                if arguments.batched_gemm_smoke { 3 } else { 1 },
+                if matches!(arguments.workload, Workload::BatchedGemmSmoke) {
+                    3
+                } else {
+                    1
+                },
                 arguments.timeout_seconds,
             )?;
-        } else if arguments.mlp_smoke {
+        } else if matches!(arguments.workload, Workload::MlpSmoke) {
             run_mlp_chain(
                 &runtime,
                 &application,
                 active_tiles,
                 arguments.timeout_seconds,
             )?;
-        } else if arguments.siglip_mlp_benchmark {
+        } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
             run_siglip_mlp_benchmark(
                 &runtime,
                 &application,
@@ -479,7 +515,7 @@ fn run_gemm_benchmark(
     let maximum_absolute_error = verify_benchmark_output(application, &output, inner)?;
     if !profiling_enabled {
         println!(
-            "benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
+            "workload=gemm-f16-r{rows}-k{inner}-c{columns} benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
         );
         return Ok(());
     }
@@ -492,7 +528,7 @@ fn run_gemm_benchmark(
     let tflops = flops / seconds / 1.0e12;
     let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
     println!(
-        "benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} activeTiles={active_tiles} executionTiles={execution_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} tflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
+        "workload=gemm-f16-r{rows}-k{inner}-c{columns} benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} activeTiles={active_tiles} executionTiles={execution_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} tflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
         left_bytes.len(),
         right_bytes.len(),
         seconds * 1.0e6,
@@ -549,7 +585,7 @@ fn run_siglip_mlp_benchmark(
     let maximum_absolute_error = verify_constant_output(application, &output, expected)?;
     if !profiling_enabled {
         println!(
-            "benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} dimension={dimension} hiddenDimension={hidden_dimension} biases=false profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
+            "workload=siglip-mlp-f16-b{batch}-t{tokens}-d{dimension}-h{hidden_dimension} benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} dimension={dimension} hiddenDimension={hidden_dimension} biases=false profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
         );
         return Ok(());
     }
@@ -562,7 +598,7 @@ fn run_siglip_mlp_benchmark(
     let tflops = flops / seconds / 1.0e12;
     let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
     println!(
-        "benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} rows={rows} dimension={dimension} hiddenDimension={hidden_dimension} biases=false activeTiles={active_tiles} executionTiles={execution_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} effectiveGemmTflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
+        "workload=siglip-mlp-f16-b{batch}-t{tokens}-d{dimension}-h{hidden_dimension} benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} rows={rows} dimension={dimension} hiddenDimension={hidden_dimension} biases=false activeTiles={active_tiles} executionTiles={execution_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} effectiveGemmTflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
         left_bytes.len(),
         weights.len(),
         seconds * 1.0e6,
