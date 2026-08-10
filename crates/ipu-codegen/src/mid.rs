@@ -1169,7 +1169,7 @@ impl PipelineConfig {
             inputs: BTreeMap::new(),
             automatic_inputs: BTreeMap::new(),
             operator_candidates: default_operator_candidates(tile_count),
-            planning_beam_width: 16,
+            planning_beam_width: 64,
             standard_memory_reservation_bytes: u64::from(
                 crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
             ),
@@ -1222,8 +1222,8 @@ fn candidate_active_tile_counts(capacity: u16) -> Vec<u16> {
         return vec![0];
     }
     let mut counts = vec![capacity];
-    // A regular power-of-two subset avoids awkward prime factors without
-    // allowing plans which idle most of the configured machine.
+    // Regular power-of-two subsets avoid awkward prime factors. Retaining
+    // only subsets at least half as large bounds the amount of idle hardware.
     let mut power = 1u16;
     while let Some(next) = power.checked_mul(2) {
         if next > capacity {
@@ -1233,6 +1233,9 @@ fn candidate_active_tile_counts(capacity: u16) -> Vec<u16> {
     }
     if !counts.contains(&power) {
         counts.push(power);
+    }
+    if power == capacity && power >= 512 {
+        counts.push(power / 2);
     }
     counts
 }
@@ -2279,7 +2282,7 @@ fn lower_operations(
             .chain(required_outputs)
             .copied()
             .collect::<BTreeSet<_>>();
-        let mut retained_signatures = Vec::new();
+        let mut retained_signatures = BTreeSet::new();
         expanded.retain(|branch| {
             let signature = future_origins
                 .iter()
@@ -2293,12 +2296,7 @@ fn lower_operations(
                     })
                 })
                 .collect::<Vec<_>>();
-            if retained_signatures.contains(&signature) {
-                false
-            } else {
-                retained_signatures.push(signature);
-                true
-            }
+            retained_signatures.insert(signature)
         });
         expanded.truncate(config.planning_beam_width.max(1));
         tracing::debug!(
@@ -2759,6 +2757,32 @@ mod tests {
             layout.memory_class = MemoryClass::Ipu21Interleaved;
         }
         format(precision(random), layout)
+    }
+
+    #[test]
+    fn randomized_active_tile_candidates_bound_idle_capacity() {
+        let mut random = fastrand::Rng::with_seed(0x7469_6c65);
+        for _ in 0..RANDOM_CASES {
+            let capacity = random.u16(1..=1472);
+            let counts = candidate_active_tile_counts(capacity);
+            assert_eq!(counts[0], capacity);
+            assert!(counts.windows(2).all(|pair| pair[0] > pair[1]));
+            assert!(counts.iter().all(|&count| {
+                count <= capacity && u32::from(count) * 2 >= u32::from(capacity)
+            }));
+            assert!(counts[1..].iter().all(|count| count.is_power_of_two()));
+        }
+        for exponent in 1..=8 {
+            let capacity = 1_u16 << exponent;
+            assert_eq!(candidate_active_tile_counts(capacity), [capacity]);
+        }
+        for exponent in 9..=10 {
+            let capacity = 1_u16 << exponent;
+            assert_eq!(
+                candidate_active_tile_counts(capacity),
+                [capacity, capacity / 2]
+            );
+        }
     }
 
     fn value(lowered: &MidGraph, id: MidValueId) -> &MidValue {
