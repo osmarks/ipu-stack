@@ -1690,6 +1690,10 @@ pub struct MidValue {
     /// Semantic value represented by this value; conversions retain the same
     /// origin. Region arguments also refer to their high-level argument ID.
     pub origin: ValueId,
+    /// Values in the same group use the same logical-to-physical tile mapping.
+    /// Structured iteration uses this to keep successive parameter blocks
+    /// addressable by a single advancing base pointer.
+    pub storage_group: MidValueId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2157,8 +2161,20 @@ impl LoweringState {
             id,
             tensor_type,
             origin,
+            storage_group: id,
         });
         id
+    }
+
+    fn value_in_storage_group(
+        &mut self,
+        origin: ValueId,
+        tensor_type: TensorType,
+        storage_group: MidValueId,
+    ) -> MidValueId {
+        let result = self.value(origin, tensor_type);
+        self.values[result.index() as usize].storage_group = storage_group;
+        result
     }
 
     fn get(&self, id: MidValueId) -> &MidValue {
@@ -2167,7 +2183,8 @@ impl LoweringState {
 
     fn derived_value(&mut self, source: MidValueId, tensor_type: TensorType) -> MidValueId {
         let origin = self.get(source).origin;
-        let result = self.value(origin, tensor_type);
+        let storage_group = self.get(source).storage_group;
+        let result = self.value_in_storage_group(origin, tensor_type, storage_group);
         if self.parameter_values.contains(&source) {
             self.parameter_values.insert(result);
         }
@@ -2845,6 +2862,10 @@ fn lower_repeat(
             .iter()
             .map(|value| lookup(values, *value))
             .collect::<LoweringResult<Vec<_>>>()?;
+        let storage_group = state.get(first).storage_group;
+        for &value in &sequence_values {
+            state.values[value.index() as usize].storage_group = storage_group;
+        }
         iterated_parameters.push(
             sequence_values
                 .iter()
@@ -2863,7 +2884,14 @@ fn lower_repeat(
     for (argument_index, (&origin, tensor_type)) in
         repeat.body.arguments.iter().zip(argument_types).enumerate()
     {
-        let value = state.value(origin, tensor_type);
+        let storage_group = if argument_index < inputs.len() {
+            state.get(inputs[argument_index]).storage_group
+        } else {
+            state
+                .get(raw_iterated_inputs[argument_index - inputs.len()][0])
+                .storage_group
+        };
+        let value = state.value_in_storage_group(origin, tensor_type, storage_group);
         if argument_index < inputs.len() {
             if state.automatic_inputs.contains(&inputs[argument_index]) {
                 state.automatic_inputs.insert(value);
@@ -2981,7 +3009,9 @@ fn lower_repeat(
     );
     let mut results = Vec::new();
     for (origin, input) in operation.results.iter().zip(&inputs) {
-        let result = state.value(*origin, state.get(*input).tensor_type.clone());
+        let tensor_type = state.get(*input).tensor_type.clone();
+        let storage_group = state.get(*input).storage_group;
+        let result = state.value_in_storage_group(*origin, tensor_type, storage_group);
         values.insert(*origin, result);
         results.push(result);
     }

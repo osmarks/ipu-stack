@@ -422,66 +422,6 @@ struct LoweringState {
     intersection_cache: BTreeMap<(MidValueId, Vec<ShardExtent>), ShardIntersections>,
 }
 
-fn repeat_placement_groups(graph: &MidGraph) -> Vec<usize> {
-    fn root(parents: &mut [usize], mut index: usize) -> usize {
-        while parents[index] != index {
-            parents[index] = parents[parents[index]];
-            index = parents[index];
-        }
-        index
-    }
-
-    fn join(parents: &mut [usize], left: MidValueId, right: MidValueId) {
-        let left = root(parents, left.index() as usize);
-        let right = root(parents, right.index() as usize);
-        if left != right {
-            parents[right] = left;
-        }
-    }
-
-    fn visit(operations: &[MidOperation], parents: &mut [usize]) {
-        for operation in operations {
-            let MidOperationKind::Repeat(repeat) = &operation.kind else {
-                continue;
-            };
-            for index in 0..repeat.carried_inputs {
-                let values = [
-                    operation.inputs[index],
-                    repeat.body.arguments[index],
-                    repeat.body.yields[index],
-                    operation.results[index],
-                ];
-                for pair in values.windows(2) {
-                    join(parents, pair[0], pair[1]);
-                }
-            }
-            for index in 0..repeat.invariant_inputs {
-                let input = repeat.carried_inputs + index;
-                join(
-                    parents,
-                    operation.inputs[input],
-                    repeat.body.arguments[input],
-                );
-            }
-            let argument_base = repeat.carried_inputs + repeat.invariant_inputs;
-            for (index, inputs) in repeat.iterated_inputs.iter().enumerate() {
-                let argument = repeat.body.arguments[argument_base + index];
-                for &input in inputs {
-                    join(parents, input, argument);
-                }
-            }
-            visit(&repeat.body.operations, parents);
-        }
-    }
-
-    let mut parents = (0..graph.values.len()).collect::<Vec<_>>();
-    visit(&graph.operations, &mut parents);
-    for index in 0..parents.len() {
-        parents[index] = root(&mut parents, index);
-    }
-    parents
-}
-
 impl LoweringState {
     fn new(graph: &MidGraph, tile_count: u16) -> LowLoweringResult<Self> {
         let mut state = Self {
@@ -508,13 +448,12 @@ impl LoweringState {
             .filter(|value| parameter_origins.contains(&value.origin))
             .map(|value| value.id)
             .collect::<BTreeSet<_>>();
-        let repeat_groups = repeat_placement_groups(graph);
         let parameter_groups = parameter_values
             .iter()
-            .map(|value| repeat_groups[value.index() as usize])
+            .map(|value| graph.values[value.index() as usize].storage_group)
             .collect::<BTreeSet<_>>();
         let mut parameter_bytes = vec![0u64; usize::from(tile_count)];
-        let mut parameter_offsets = BTreeMap::<usize, u16>::new();
+        let mut parameter_offsets = BTreeMap::<MidValueId, u16>::new();
         for value in &graph.values {
             let declared_tiles = value.tensor_type.format.layout.tiling.tile_count;
             if declared_tiles == 0 || declared_tiles > tile_count {
@@ -526,7 +465,7 @@ impl LoweringState {
             }
             let extents = shard_extents(&value.tensor_type)?;
             let is_parameter = parameter_values.contains(&value.id);
-            let placement_group = repeat_groups[value.id.index() as usize];
+            let placement_group = value.storage_group;
             let rotate_parameter = is_parameter || parameter_groups.contains(&placement_group);
             let parameter_shard_bytes = if rotate_parameter {
                 extents
