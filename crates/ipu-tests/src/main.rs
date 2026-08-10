@@ -1598,7 +1598,33 @@ fn exchange_csr_diff(runtime: &Runtime, application: &Application) -> Result<Str
             .filter(|(_, (before, after))| before != after)
             .map(|(index, (&before, &after))| (NAMES[index], before, after))
             .collect::<Vec<_>>();
-        tiles.push((physical, Ok((changed, before.to_vec(), after.to_vec()))));
+        let timeline = runtime
+            .device()
+            .read_tile_words_from_inactive_context(
+                physical,
+                1,
+                ipu_codegen::EXCHANGE_CTL_TIMELINE_BASE,
+                ipu_codegen::EXCHANGE_CTL_TIMELINE_BYTES / 4,
+            )
+            .map(|words| {
+                let mut phases = words
+                    .chunks_exact(2)
+                    .enumerate()
+                    .map(|(phase, pair)| (phase, pair[0], pair[1]))
+                    .collect::<Vec<_>>();
+                while phases
+                    .last()
+                    .is_some_and(|(_, entry, returned)| *entry == 0 && *returned == 0)
+                {
+                    phases.pop();
+                }
+                phases
+            })
+            .map_err(|error| error.to_string());
+        tiles.push((
+            physical,
+            Ok((changed, before.to_vec(), after.to_vec(), timeline)),
+        ));
     }
     Ok(format!("tiles={tiles:?}"))
 }

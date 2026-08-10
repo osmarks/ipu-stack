@@ -42,8 +42,10 @@ pub use low::{
     TileWork, TileWorkList, TileWorkRef, WorkProvenance, WorkReason, lower_to_tiles,
 };
 pub use memory::{
-    EXCHANGE_CSR_COUNT, EXCHANGE_CSR_SNAPSHOT_BASE, EXCHANGE_CSR_SNAPSHOT_BYTES, IPU21_DATA_BASE,
-    IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES, IPU21_STANDARD_FIXED_BYTES,
+    EXCHANGE_CSR_COUNT, EXCHANGE_CSR_SNAPSHOT_BASE, EXCHANGE_CSR_SNAPSHOT_BYTES,
+    EXCHANGE_CTL_TIMELINE_BASE, EXCHANGE_CTL_TIMELINE_BYTES, EXCHANGE_CTL_TIMELINE_MAX_PHASES,
+    IPU21_DATA_BASE, IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES,
+    IPU21_STANDARD_FIXED_BYTES,
 };
 pub use mid::{
     AccumulationPrecision, AmpOrder, AxisTiling, ConversionDispatch, ConversionPlan,
@@ -72,6 +74,7 @@ const INCOMING_BASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;
 const OUTGOING_BASE: u8 = 0xa7;
 const FIRST_EXCHANGE_CSR: u8 = 0xa0;
+const EXCHANGE_CTL: u8 = 0xa9;
 const FIRST_INPUT_REGISTER: u8 = 3;
 const LAST_VALUE_REGISTER: u8 = 9;
 
@@ -206,6 +209,8 @@ pub struct CodegenOptions {
     /// exchange phase. The destination contains twelve before words followed
     /// by twelve after words.
     pub exchange_csr_snapshot_address: Option<u32>,
+    /// Entry/return `EXCHANGE_CTL` pairs for each statically emitted phase.
+    pub exchange_ctl_timeline: Option<(u32, u32)>,
 }
 
 impl Default for CodegenOptions {
@@ -216,6 +221,7 @@ impl Default for CodegenOptions {
             initial_profile_address: None,
             final_profile_address: None,
             exchange_csr_snapshot_address: None,
+            exchange_ctl_timeline: None,
         }
     }
 }
@@ -277,6 +283,7 @@ pub fn emit(
         .transpose()?;
     let mut exchange_rows = Vec::new();
     let mut exchange_csr_snapshot_pending = options.exchange_csr_snapshot_address.is_some();
+    let mut exchange_ctl_phase_index = 0;
     emit_steps(
         &mut code,
         program.tile,
@@ -289,6 +296,8 @@ pub fn emit(
         options.code_address,
         options.exchange_csr_snapshot_address,
         &mut exchange_csr_snapshot_pending,
+        options.exchange_ctl_timeline,
+        &mut exchange_ctl_phase_index,
     )?;
 
     if let Some(address) = options.final_profile_address {
@@ -374,10 +383,23 @@ fn emit_steps(
     code_address: u32,
     exchange_csr_snapshot_address: Option<u32>,
     exchange_csr_snapshot_pending: &mut bool,
+    exchange_ctl_timeline: Option<(u32, u32)>,
+    exchange_ctl_phase_index: &mut u32,
 ) -> Result<()> {
     for step in steps {
         match step {
             TileStep::Exchange(exchange) => {
+                let ctl_samples = exchange_ctl_timeline
+                    .map(|(address, capacity)| {
+                        if *exchange_ctl_phase_index >= capacity {
+                            return Err(invalid("exchange control timeline capacity exceeded"));
+                        }
+                        Ok(address + *exchange_ctl_phase_index * 8)
+                    })
+                    .transpose()?;
+                if let Some(address) = ctl_samples {
+                    emit_exchange_ctl_sample(code, address)?;
+                }
                 let snapshot = exchange_csr_snapshot_pending
                     .then_some(exchange_csr_snapshot_address)
                     .flatten();
@@ -415,6 +437,10 @@ fn emit_steps(
                     code.instruction(ipu_exchange::SYNC_ANS_INSTRUCTION);
                 }
                 code.call(exchange.program.address, 10)?;
+                if let Some(address) = ctl_samples {
+                    emit_exchange_ctl_sample(code, address + 4)?;
+                    *exchange_ctl_phase_index += 1;
+                }
                 if let Some(address) = snapshot {
                     emit_exchange_csr_snapshot(code, address + memory::EXCHANGE_CSR_COUNT * 4)?;
                 }
@@ -447,6 +473,8 @@ fn emit_steps(
                     code_address,
                     exchange_csr_snapshot_address,
                     exchange_csr_snapshot_pending,
+                    exchange_ctl_timeline,
+                    exchange_ctl_phase_index,
                 )?;
                 if let Some(address) = repeat.profile.after {
                     emit_cycle_sample(code, symbols, address)?;
@@ -464,6 +492,12 @@ fn emit_exchange_csr_snapshot(code: &mut TileCode, address: u32) -> Result<()> {
         code.st32(0, 1, 15, offset as u16)?;
     }
     Ok(())
+}
+
+fn emit_exchange_ctl_sample(code: &mut TileCode, address: u32) -> Result<()> {
+    code.setzi(1, address)?;
+    code.get_special(0, EXCHANGE_CTL)?;
+    code.st32(0, 1, 15, 0)
 }
 
 fn validate(program: &TileProgram) -> Result<()> {
@@ -662,6 +696,8 @@ fn emit_repeat(
     code_address: u32,
     exchange_csr_snapshot_address: Option<u32>,
     exchange_csr_snapshot_pending: &mut bool,
+    exchange_ctl_timeline: Option<(u32, u32)>,
+    exchange_ctl_phase_index: &mut u32,
 ) -> Result<()> {
     let words = repeat
         .iterated_pointers
@@ -695,6 +731,8 @@ fn emit_repeat(
         code_address,
         exchange_csr_snapshot_address,
         exchange_csr_snapshot_pending,
+        exchange_ctl_timeline,
+        exchange_ctl_phase_index,
     )?;
     for (index, pointer) in repeat.iterated_pointers.iter().enumerate() {
         let slot = u16::try_from(index + 1).map_err(|_| invalid("too many repeat pointers"))?;
