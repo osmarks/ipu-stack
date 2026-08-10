@@ -305,6 +305,7 @@ dependencies = [
 name = "ipu-exchange"
 version = "0.1.0"
 dependencies = [
+ "fastrand",
  "serde",
  "thiserror",
  "tracing",

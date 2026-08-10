@@ -1009,7 +1009,7 @@ impl Topology {
         sender[cursor] = encode_send(count.min(64) - 1, send_direction, 0)?;
         cursor += 1;
         if count > 64 {
-            sender[cursor] = send_off(count - 65, 3, 0);
+            sender[cursor] = send_off(count - 65, send_direction, 0);
             cursor += 1;
         }
         let trailing_delay = 4 - sender_delay - count as i32;
@@ -1030,11 +1030,9 @@ impl Topology {
             let mut row = [0; PLAN_WORDS];
             row[0] = SYNC_SUPERVISOR_INSTRUCTION;
             row[1] = delay_xpic(receive_cycle as u32, 0, source_physical);
-            if count == 1 {
-                row[2] = delay_pic(51 + receiver_phase, 0, 0) | 0x0001_4000;
-                row[3] = delay(5);
-                row[4] = RETURN_M10_INSTRUCTION;
-            } else if count <= 51 {
+            if count <= 51 {
+                // The one-word case still needs this event: without it the
+                // tile remains connected to the source after the phase ends.
                 row[2] = delay_xpic(count - 1, 0, TILE_MUX_EXCHANGE);
                 row[3] = delay_pic(51 - count + receiver_phase, 0, 0) | 0x0001_4000;
                 row[4] = delay(count + 4);
@@ -1439,36 +1437,62 @@ mod tests {
     }
 
     #[test]
-    fn one_word_multicast_omits_zero_length_xpic_stage() {
+    fn single_receiver_uses_the_directional_route_for_every_payload_instruction() {
         let topology = Topology::c600();
-        let receivers = (1..topology.tile_count() as u16).collect::<Vec<_>>();
-        let plan = topology.multicast(0, &receivers, 1, 0).unwrap();
-        for mut receiver in plan.receivers {
-            assert_eq!(
-                receiver
-                    .iter()
-                    .filter(|instruction| **instruction & OPCODE_MASK == DELAY_XPIC_OPCODE)
-                    .count(),
-                1
+        let mut random = fastrand::Rng::with_seed(0x726f_7574_696e_67);
+        for _ in 0..128 {
+            let source = random.u16(0..topology.tile_count() as u16);
+            let mut destination = random.u16(0..topology.tile_count() as u16);
+            while destination == source {
+                destination = random.u16(0..topology.tile_count() as u16);
+            }
+            let words = random.u32(65..=MAX_TRANSFER_WORDS);
+            let expected_direction = direction(
+                u32::from(topology.physical(source).unwrap()),
+                u32::from(topology.physical(destination).unwrap()),
             );
-            let cycles = plan_event_cycles(&receiver).unwrap();
-            patch_receiver_address(&mut receiver, EXCHANGE_WINDOW_BASE).unwrap();
-            assert_eq!(plan_event_cycles(&receiver).unwrap(), cycles);
-            assert_eq!(
-                receiver.iter().rfind(|instruction| **instruction != 0),
-                Some(&RETURN_M10_INSTRUCTION)
-            );
+            let plan = topology
+                .multicast(source, &[destination], words, 0)
+                .unwrap();
+            let payload_directions = plan
+                .sender
+                .iter()
+                .filter(|instruction| {
+                    matches!(
+                        **instruction & LONG_OPCODE_MASK,
+                        SEND_OPCODE | SEND_OFF_OPCODE
+                    )
+                })
+                .map(|instruction| instruction & 7)
+                .collect::<Vec<_>>();
+            assert_eq!(payload_directions, [expected_direction, expected_direction]);
         }
     }
 
     #[test]
-    fn single_receiver_uses_the_directional_send_route() {
+    fn randomized_internal_receives_leave_the_neutral_mux_selected() {
         let topology = Topology::c600();
-        let unicast = topology.multicast(0, &[1], 16, 0).unwrap();
-        let fanout = topology.multicast(0, &[1, 2], 16, 0).unwrap();
-
-        assert_eq!(unicast.sender[2] & 7, 1);
-        assert_eq!(fanout.sender[2] & 7, 3);
+        let mut random = fastrand::Rng::with_seed(0x6e65_7574_7261_6c);
+        for _ in 0..128 {
+            let source = random.u16(0..topology.tile_count() as u16);
+            let receiver_count = random.usize(1..=4);
+            let mut receivers = Vec::with_capacity(receiver_count);
+            while receivers.len() < receiver_count {
+                let receiver = random.u16(0..topology.tile_count() as u16);
+                if receiver != source && !receivers.contains(&receiver) {
+                    receivers.push(receiver);
+                }
+            }
+            let plan = topology
+                .multicast(source, &receivers, random.u32(1..=MAX_TRANSFER_WORDS), 0)
+                .unwrap();
+            for receiver in plan.receivers {
+                assert!(receiver.iter().skip(2).any(|instruction| {
+                    instruction & OPCODE_MASK == DELAY_XPIC_OPCODE
+                        && instruction & 0x1fff == TILE_MUX_EXCHANGE
+                }));
+            }
+        }
     }
 
     #[test]
