@@ -670,7 +670,7 @@ mod tests {
                     accumulate: AccumulationPrecision::F32,
                     mode,
                     weights,
-                    output_columns: if random.bool() { 64 } else { 128 },
+                    output_columns: [32, 64, 128][random.usize(0..3)],
                 },
                 &requirements,
             )
@@ -721,11 +721,12 @@ mod tests {
                 .map(|shard| (shard.id, 0x60000 + shard.id.index() * 0x10000))
                 .collect::<BTreeMap<_, _>>();
             assert_eq!(plan.compilations.len(), 1);
+            let planned_rows = plan.gemm_rows.values().next().unwrap();
             assert!(
                 plan.compilations[0]
                     .flags
                     .iter()
-                    .any(|flag| flag == &format!("-DGEMM_SMALL_ROWS={}", batch * rows_per_tile))
+                    .any(|flag| flag == &format!("-DGEMM_SMALL_ROWS={}", planned_rows[0]))
             );
             assert!(
                 plan.compilations[0]

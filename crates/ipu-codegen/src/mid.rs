@@ -149,6 +149,7 @@ pub enum AmpOrder {
 }
 
 pub const AMP_INNER_BLOCK: u32 = 64;
+const AMP_NARROW_OUTPUT_COLUMN_BLOCK: u32 = 32;
 pub const AMP_OUTPUT_COLUMN_BLOCK: u32 = 64;
 const AMP_WIDE_OUTPUT_COLUMN_BLOCK: u32 = 128;
 pub const AMP_COLUMN_MICRO: u32 = 16;
@@ -489,11 +490,15 @@ impl Layout {
     /// replicated across row groups so it is local to every output shard.
     pub fn amp_right_grid(
         inner: u16,
+        output_column_block: u32,
         tile_count: u16,
         row_partitions: u16,
         column_partitions: u16,
     ) -> Self {
-        if row_partitions == 1 && column_partitions == tile_count {
+        if output_column_block == AMP_OUTPUT_COLUMN_BLOCK
+            && row_partitions == 1
+            && column_partitions == tile_count
+        {
             return Self::amp_right(inner, tile_count);
         }
         Self {
@@ -503,8 +508,13 @@ impl Layout {
                 replicas: row_partitions,
                 axes: vec![
                     AxisTiling::new(TensorAxis::FromEnd(2), 1, u32::from(inner), Padding::Zero),
-                    AxisTiling::new(TensorAxis::FromEnd(1), column_partitions, 64, Padding::Zero)
-                        .with_tile_stride(1),
+                    AxisTiling::new(
+                        TensorAxis::FromEnd(1),
+                        column_partitions,
+                        output_column_block,
+                        Padding::Zero,
+                    )
+                    .with_tile_stride(1),
                 ],
             },
             memory_class: MemoryClass::Ipu21Standard,
@@ -512,10 +522,11 @@ impl Layout {
     }
 
     /// AMP right operand distributed across both K and output columns, with
-    /// each complete 64x64 kernel panel contiguous in the selected memory
+    /// each complete 64-by-output-block kernel panel contiguous in the selected memory
     /// class. A blocked GEMM can consume the owner copy directly and stream
     /// the same bytes into a destination panel on the other row groups.
     pub fn amp_right_k64_streamed_grid(
+        output_column_block: u32,
         tile_count: u16,
         row_partitions: u16,
         column_partitions: u16,
@@ -530,7 +541,7 @@ impl Layout {
                     AxisTiling::new(
                         TensorAxis::FromEnd(1),
                         column_partitions,
-                        AMP_OUTPUT_COLUMN_BLOCK,
+                        output_column_block,
                         Padding::Zero,
                     ),
                     AxisTiling::new(
@@ -545,10 +556,11 @@ impl Layout {
         }
     }
 
-    /// Resident AMP right operand with complete 64x64 kernel panels contiguous
+    /// Resident AMP right operand with complete 64-by-output-block kernel panels contiguous
     /// in the selected memory class. Each column shard is replicated across
     /// output-row groups so every consumer owns the full K range locally.
     pub fn amp_right_k64_grid(
+        output_column_block: u32,
         tile_count: u16,
         row_partitions: u16,
         column_partitions: u16,
@@ -564,7 +576,7 @@ impl Layout {
                     AxisTiling::new(
                         TensorAxis::FromEnd(1),
                         column_partitions,
-                        AMP_OUTPUT_COLUMN_BLOCK,
+                        output_column_block,
                         Padding::Zero,
                     )
                     .with_tile_stride(1),
@@ -575,8 +587,16 @@ impl Layout {
     }
 
     /// AMP output distributed over both matrix axes on one tile grid.
-    pub fn amp_output_grid(tile_count: u16, row_partitions: u16, column_partitions: u16) -> Self {
-        if column_partitions == 1 && row_partitions == tile_count {
+    pub fn amp_output_grid(
+        output_column_block: u32,
+        tile_count: u16,
+        row_partitions: u16,
+        column_partitions: u16,
+    ) -> Self {
+        if output_column_block == AMP_OUTPUT_COLUMN_BLOCK
+            && column_partitions == 1
+            && row_partitions == tile_count
+        {
             return Self::amp_output(tile_count);
         }
         Self {
@@ -585,7 +605,12 @@ impl Layout {
                 tile_count,
                 replicas: 1,
                 axes: vec![
-                    AxisTiling::new(TensorAxis::FromEnd(1), column_partitions, 64, Padding::Zero),
+                    AxisTiling::new(
+                        TensorAxis::FromEnd(1),
+                        column_partitions,
+                        output_column_block,
+                        Padding::Zero,
+                    ),
                     AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
                 ],
             },
@@ -1305,6 +1330,15 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
                 (Precision::F32, 32, AmpWeightPlacement::SHARDED_STANDARD),
             ] {
                 for &output_columns in amp_output_column_blocks(precision) {
+                    // A narrow resident interleaved shard can avoid streaming
+                    // when a 64-column shard would exceed region capacity.
+                    // Narrow streamed panels increase multicast-role pressure
+                    // and are not offered until ownership is part of the cost.
+                    if output_columns < AMP_OUTPUT_COLUMN_BLOCK
+                        && weights != AmpWeightPlacement::RESIDENT_INTERLEAVED
+                    {
+                        continue;
+                    }
                     let candidate = amp_grid_gemm_operator_candidate(
                         precision,
                         64,
@@ -1327,7 +1361,10 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
         })
         .collect::<Vec<_>>();
     for (precision, left_tail) in [(Precision::F16, 16), (Precision::F32, 32)] {
-        for &output_columns in amp_output_column_blocks(precision) {
+        for &output_columns in amp_output_column_blocks(precision)
+            .iter()
+            .filter(|&&columns| columns >= AMP_OUTPUT_COLUMN_BLOCK)
+        {
             candidates.push(amp_gemm_operator_candidate(
                 precision,
                 64,
@@ -1465,11 +1502,13 @@ fn amp_grid_gemm_operator_candidate(
     let right_layout = match (weights.distribution, weights.memory_class) {
         (AmpWeightDistribution::Resident, MemoryClass::Ipu21Standard) => Layout::amp_right_grid(
             inner,
+            output_columns,
             grid.tile_count,
             grid.row_partitions,
             grid.column_partitions,
         ),
         (AmpWeightDistribution::KSharded, memory_class) => Layout::amp_right_k64_streamed_grid(
+            output_columns,
             grid.tile_count,
             grid.row_partitions,
             grid.column_partitions,
@@ -1478,6 +1517,7 @@ fn amp_grid_gemm_operator_candidate(
         (AmpWeightDistribution::Resident, MemoryClass::Ipu21Interleaved) => {
             debug_assert_eq!((precision, inner), (Precision::F16, 64));
             Layout::amp_right_k64_grid(
+                output_columns,
                 grid.tile_count,
                 grid.row_partitions,
                 grid.column_partitions,
@@ -1519,6 +1559,7 @@ fn amp_grid_gemm_operator_candidate(
             TensorFormat {
                 precision,
                 layout: Layout::amp_output_grid(
+                    output_columns,
                     grid.tile_count,
                     grid.row_partitions,
                     grid.column_partitions,
@@ -1576,7 +1617,7 @@ enum AmpWeightDistribution {
     KSharded,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct AmpWeightPlacement {
     distribution: AmpWeightDistribution,
     memory_class: MemoryClass,
@@ -1606,7 +1647,11 @@ impl AmpWeightPlacement {
 
 fn amp_output_column_blocks(precision: Precision) -> &'static [u32] {
     match precision {
-        Precision::F16 => &[AMP_OUTPUT_COLUMN_BLOCK, AMP_WIDE_OUTPUT_COLUMN_BLOCK],
+        Precision::F16 => &[
+            AMP_OUTPUT_COLUMN_BLOCK,
+            AMP_WIDE_OUTPUT_COLUMN_BLOCK,
+            AMP_NARROW_OUTPUT_COLUMN_BLOCK,
+        ],
         Precision::F32 | Precision::F8F143 { .. } => &[AMP_OUTPUT_COLUMN_BLOCK],
     }
 }
@@ -2816,7 +2861,7 @@ mod tests {
                 Precision::F16,
                 Layout::amp_left_grid(64, tiles, rows, columns),
             );
-            let mut standard_layout = Layout::amp_right_grid(64, tiles, rows, columns);
+            let mut standard_layout = Layout::amp_right_grid(64, 64, tiles, rows, columns);
             let mut direct_layout = standard_layout.clone();
             direct_layout.memory_class = MemoryClass::Ipu21Interleaved;
             standard_layout.memory_class = MemoryClass::Ipu21Standard;
@@ -2825,7 +2870,7 @@ mod tests {
             let output = TensorType::new(
                 [m, n],
                 Precision::F16,
-                Layout::amp_output_grid(tiles, rows, columns),
+                Layout::amp_output_grid(64, tiles, rows, columns),
             );
             let operator = MidOperator::Gemm {
                 options: GemmOptions::default(),

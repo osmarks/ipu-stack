@@ -1,9 +1,7 @@
 //! Conversion from logical shard views to physical byte ranges.
 
 use crate::low::{LowShard, ShardView};
-use crate::mid::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AmpOrder, ElementOrder, Precision,
-};
+use crate::mid::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, ElementOrder, Precision};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteSpan {
@@ -313,20 +311,33 @@ fn right_k64_panel_spans(
     let column_start = view.extents[rank - 1].start - shard.extents[rank - 1].start;
     let inner_width = view.extents[rank - 2].physical_end - view.extents[rank - 2].start;
     let column_width = view.extents[rank - 1].physical_end - view.extents[rank - 1].start;
+    let output_column_block = shard
+        .tensor_type
+        .format
+        .layout
+        .tiling
+        .axes
+        .iter()
+        .find(|axis| axis.axis == crate::TensorAxis::FromEnd(1))
+        .map(|axis| axis.block_size)
+        .filter(|block| *block != 0 && block.is_multiple_of(AMP_COLUMN_MICRO))
+        .ok_or(StorageError::AmpBlock {
+            role: AmpOrder::RightK64,
+        })?;
     if rows.is_multiple_of(AMP_INNER_BLOCK)
-        && columns.is_multiple_of(AMP_OUTPUT_COLUMN_BLOCK)
+        && columns.is_multiple_of(output_column_block)
         && inner_width == AMP_INNER_BLOCK
-        && column_width.is_multiple_of(AMP_OUTPUT_COLUMN_BLOCK)
+        && column_width.is_multiple_of(output_column_block)
         && inner_start.is_multiple_of(AMP_INNER_BLOCK)
-        && column_start.is_multiple_of(AMP_OUTPUT_COLUMN_BLOCK)
+        && column_start.is_multiple_of(output_column_block)
     {
         let panel = inner_start
             .checked_div(AMP_INNER_BLOCK)
-            .and_then(|inner| inner.checked_mul(columns / AMP_OUTPUT_COLUMN_BLOCK))
-            .and_then(|panel| panel.checked_add(column_start / AMP_OUTPUT_COLUMN_BLOCK))
+            .and_then(|inner| inner.checked_mul(columns / output_column_block))
+            .and_then(|panel| panel.checked_add(column_start / output_column_block))
             .ok_or(StorageError::Overflow)?;
         let panel_bytes = AMP_INNER_BLOCK
-            .checked_mul(AMP_OUTPUT_COLUMN_BLOCK)
+            .checked_mul(output_column_block)
             .and_then(|elements| {
                 elements.checked_mul(shard.tensor_type.format.precision.bytes() as u32)
             })
@@ -593,7 +604,7 @@ mod tests {
                 (Layout::amp_left(64, 1), rows, 64),
                 (Layout::amp_right(64, 1), 32, 64),
                 (
-                    Layout::amp_right_k64_grid(1, 1, 1, MemoryClass::Ipu21Interleaved),
+                    Layout::amp_right_k64_grid(64, 1, 1, 1, MemoryClass::Ipu21Interleaved),
                     64,
                     64,
                 ),
@@ -661,20 +672,27 @@ mod tests {
     fn randomized_k64_right_panels_are_single_contiguous_spans() {
         let mut random = fastrand::Rng::with_seed(0x6b36_3472);
         for _ in 0..128 {
+            let output_column_block = [32, 64, 128][random.usize(0..3)];
             let inner_blocks = random.u32(1..=8);
             let column_blocks = random.u32(1..=4);
             let rows = inner_blocks * 64;
-            let columns = column_blocks * 64;
+            let columns = column_blocks * output_column_block;
             let batches = random.u32(1..=4);
             let shard = shard(
-                Layout::amp_right_k64_grid(1, 1, 1, MemoryClass::Ipu21Interleaved),
+                Layout::amp_right_k64_grid(
+                    output_column_block,
+                    1,
+                    1,
+                    1,
+                    MemoryClass::Ipu21Interleaved,
+                ),
                 &[batches, rows, columns],
             );
             let inner = random.u32(0..inner_blocks) * 64;
             let column_block = random.u32(0..column_blocks);
             let view_column_blocks = random.u32(1..=column_blocks - column_block);
-            let column = column_block * 64;
-            let view_columns = view_column_blocks * 64;
+            let column = column_block * output_column_block;
+            let view_columns = view_column_blocks * output_column_block;
             let view = ShardView {
                 shard: shard.id,
                 extents: vec![
@@ -705,7 +723,10 @@ mod tests {
             );
             assert_eq!(
                 spans[0].offset,
-                ((inner / 64) * column_blocks + column / 64) * 64 * 64 * 2
+                ((inner / 64) * column_blocks + column / output_column_block)
+                    * 64
+                    * output_column_block
+                    * 2
             );
         }
     }

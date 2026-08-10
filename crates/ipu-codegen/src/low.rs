@@ -2962,6 +2962,7 @@ mod tests {
             let right_format = TensorFormat {
                 precision: Precision::F16,
                 layout: Layout::amp_right_k64_streamed_grid(
+                    64,
                     tiles,
                     row_partitions,
                     column_partitions,
@@ -2970,7 +2971,7 @@ mod tests {
             };
             let output_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_output_grid(tiles, row_partitions, column_partitions),
+                layout: Layout::amp_output_grid(64, tiles, row_partitions, column_partitions),
             };
             let mut config = PipelineConfig::new(tiles)
                 .with_input(left, left_format.clone())

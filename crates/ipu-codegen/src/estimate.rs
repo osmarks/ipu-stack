@@ -694,8 +694,9 @@ mod tests {
             let columns = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4) * 64;
             let shape = TensorShape(vec![rows, columns]);
             let fragmented_source =
-                Layout::amp_output_grid(tiles, row_partitions, column_partitions);
-            let aligned_source = Layout::amp_output_grid(tiles, column_partitions, row_partitions);
+                Layout::amp_output_grid(64, tiles, row_partitions, column_partitions);
+            let aligned_source =
+                Layout::amp_output_grid(64, tiles, column_partitions, row_partitions);
             let destination =
                 Layout::amp_output_replicated_grid(tiles, column_partitions, row_partitions);
             let fragmented =
