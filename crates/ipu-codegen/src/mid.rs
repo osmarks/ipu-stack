@@ -1180,7 +1180,7 @@ impl PipelineConfig {
             inputs: BTreeMap::new(),
             automatic_inputs: BTreeMap::new(),
             operator_candidates: default_operator_candidates(tile_count),
-            planning_beam_width: 256,
+            planning_beam_width: 64,
             standard_memory_reservation_bytes: u64::from(
                 crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
             ),
@@ -2085,8 +2085,7 @@ pub fn lower(
         config,
         &costs,
         &mut state,
-        &BTreeMap::new(),
-        &[],
+        &RegionPlanningConstraints::default(),
     )?;
     let outputs = graph
         .outputs()
@@ -2192,6 +2191,14 @@ struct BeamBranch {
     score: u64,
 }
 
+#[derive(Default)]
+struct RegionPlanningConstraints {
+    /// Number of simultaneously resident blocks represented by a region value.
+    allocation_copies: BTreeMap<ValueId, u32>,
+    /// Value pairs whose formats must agree at a structured-region boundary.
+    required_equal_formats: Vec<(ValueId, ValueId)>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_operations(
     source: &[Operation],
@@ -2202,8 +2209,7 @@ fn lower_operations(
     config: &PipelineConfig,
     costs: &impl CostModel,
     state: &mut LoweringState,
-    allocation_multiplicity: &BTreeMap<ValueId, u32>,
-    format_equalities: &[(ValueId, ValueId)],
+    constraints: &RegionPlanningConstraints,
 ) -> LoweringResult<Vec<MidOperation>> {
     if source.is_empty() {
         return Ok(Vec::new());
@@ -2212,7 +2218,12 @@ fn lower_operations(
         .iter()
         .flat_map(|operation| operation_graph_inputs(operation, graph))
         .chain(required_outputs.iter().copied())
-        .chain(format_equalities.iter().flat_map(|pair| [pair.0, pair.1]))
+        .chain(
+            constraints
+                .required_equal_formats
+                .iter()
+                .flat_map(|pair| [pair.0, pair.1]),
+        )
         .collect::<BTreeSet<_>>();
     let initial = relevant_origins
         .iter()
@@ -2256,7 +2267,7 @@ fn lower_operations(
                     operation_index,
                     required_outputs,
                     graph,
-                    allocation_multiplicity,
+                    &constraints.allocation_copies,
                 );
                 if peak.fits_ipu21_with_budget(
                     config.standard_memory_reservation_bytes,
@@ -2363,7 +2374,7 @@ fn lower_operations(
                     operation_index,
                     required_outputs,
                     graph,
-                    allocation_multiplicity,
+                    &constraints.allocation_copies,
                 );
                 if peak.fits_ipu21_with_budget(
                     config.standard_memory_reservation_bytes,
@@ -2409,8 +2420,7 @@ fn lower_operations(
         expanded.sort_by_cached_key(|branch| {
             branch.score.saturating_add(format_equality_cost(
                 branch,
-                format_equalities,
-                config,
+                &constraints.required_equal_formats,
                 costs,
             ))
         });
@@ -2418,7 +2428,12 @@ fn lower_operations(
             .iter()
             .flat_map(|operation| operation_graph_inputs(operation, graph))
             .chain(required_outputs.iter().copied())
-            .chain(format_equalities.iter().flat_map(|pair| [pair.0, pair.1]))
+            .chain(
+                constraints
+                    .required_equal_formats
+                    .iter()
+                    .flat_map(|pair| [pair.0, pair.1]),
+            )
             .collect::<BTreeSet<_>>();
         let mut retained_signatures = BTreeSet::new();
         expanded.retain(|branch| {
@@ -2450,8 +2465,7 @@ fn lower_operations(
         .min_by_key(|branch| {
             branch.score.saturating_add(format_equality_cost(
                 branch,
-                format_equalities,
-                config,
+                &constraints.required_equal_formats,
                 costs,
             ))
         })
@@ -2464,7 +2478,6 @@ fn lower_operations(
 fn format_equality_cost(
     branch: &BeamBranch,
     equalities: &[(ValueId, ValueId)],
-    config: &PipelineConfig,
     costs: &impl CostModel,
 ) -> u64 {
     equalities.iter().fold(0u64, |total, &(source, target)| {
@@ -2474,19 +2487,6 @@ fn format_equality_cost(
         };
         let source = &branch.state.get(source).tensor_type;
         let target = &branch.state.get(target).tensor_type;
-        let support_overflow = crate::estimate::conversion_traffic(
-            &source.shape,
-            target.format.precision,
-            &source.format.layout,
-            &target.format.layout,
-        )
-        .is_some_and(|traffic| {
-            traffic.maximum_routed_fragments.saturating_mul(4)
-                > config.standard_memory_reservation_bytes / 2
-        });
-        if support_overflow {
-            return total.saturating_add(u64::MAX / 8);
-        }
         let cast = (source.format.precision != target.format.precision)
             .then(|| costs.cast_cycles(source, target.format.precision))
             .unwrap_or(0);
@@ -2883,7 +2883,7 @@ fn lower_repeat(
         body_values.insert(origin, value);
         arguments.push(value);
     }
-    let body_allocation_multiplicity = repeat
+    let body_allocation_copies = repeat
         .body
         .arguments
         .iter()
@@ -2891,6 +2891,18 @@ fn lower_repeat(
         .copied()
         .map(|argument| (argument, repeat.count))
         .collect::<BTreeMap<_, _>>();
+    let required_equal_formats = repeat
+        .body
+        .yields
+        .iter()
+        .copied()
+        .zip(repeat.body.arguments.iter().copied())
+        .take(repeat.carried_inputs)
+        .collect();
+    let body_constraints = RegionPlanningConstraints {
+        allocation_copies: body_allocation_copies,
+        required_equal_formats,
+    };
     let mut body_operations = lower_operations(
         &repeat.body.operations,
         &repeat.body.yields,
@@ -2900,15 +2912,7 @@ fn lower_repeat(
         config,
         costs,
         state,
-        &body_allocation_multiplicity,
-        &repeat
-            .body
-            .yields
-            .iter()
-            .copied()
-            .zip(repeat.body.arguments.iter().copied())
-            .take(repeat.carried_inputs)
-            .collect::<Vec<_>>(),
+        &body_constraints,
     )?;
     for index in 0..repeat.carried_inputs {
         let body_layout = state
