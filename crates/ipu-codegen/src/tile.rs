@@ -2,8 +2,8 @@
 
 use crate::{
     ExchangePhaseId, ExchangeStep, KernelBuildPlan, LowProgram, LowShardId, PhysicalExchangePhase,
-    Placement, RepeatPointer, RepeatRun, RepeatStep, StepProfile, TileAddress, TileProgram,
-    TileStep, TileWorkList, TileWorkRef, materialize_kernel_run,
+    PlacedExchangeRow, Placement, RepeatPointer, RepeatRun, RepeatStep, StepProfile, TileAddress,
+    TileProgram, TileStep, TileWorkList, TileWorkRef, materialize_kernel_run,
 };
 use std::collections::BTreeMap;
 
@@ -17,7 +17,7 @@ pub struct TileProgramLowering<'a> {
     kernels: &'a KernelBuildPlan,
     exchanges: &'a [PhysicalExchangePhase],
     phases: BTreeMap<ExchangePhaseId, &'a PhysicalExchangePhase>,
-    phase_addresses: BTreeMap<ExchangePhaseId, u32>,
+    exchange_code_base: u32,
     exchange_code_end: u32,
     execution_tile_count: u16,
 }
@@ -72,26 +72,13 @@ impl<'a> TileProgramLowering<'a> {
                 execution: execution_tile_count,
             });
         }
-        let mut cursor = align_up(exchange_code_base, 4)?;
-        let mut phase_addresses = BTreeMap::<ExchangePhaseId, u32>::new();
-        for phase in exchanges {
-            phase_addresses.insert(phase.id, cursor);
-            let maximum_words = phase
-                .rows
-                .iter()
-                .map(Vec::len)
-                .max()
-                .unwrap_or(0)
-                .max(ipu_exchange::PLAN_WORDS);
-            cursor = cursor
-                .checked_add(
-                    u32::try_from(maximum_words)
-                        .map_err(|_| TileLoweringError::Overflow)?
-                        .checked_mul(4)
-                        .ok_or(TileLoweringError::Overflow)?,
-                )
-                .ok_or(TileLoweringError::Overflow)?;
-        }
+        let cursor = exchange_code_base
+            .checked_add(compact_exchange_table_bytes(
+                exchanges,
+                execution_tile_count,
+                program.tile_count,
+            )?)
+            .ok_or(TileLoweringError::Overflow)?;
         let executable_memory_end = ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT;
         if cursor > executable_memory_end {
             return Err(TileLoweringError::ExchangeCodeMemory {
@@ -110,7 +97,7 @@ impl<'a> TileProgramLowering<'a> {
             kernels,
             exchanges,
             phases,
-            phase_addresses,
+            exchange_code_base,
             exchange_code_end: cursor,
             execution_tile_count,
         })
@@ -129,6 +116,12 @@ impl<'a> TileProgramLowering<'a> {
         }
         if tile < self.program.tile_count {
             let work = &self.program.tiles[usize::from(tile)];
+            let (rows, _) = layout_exchange_rows(
+                self.exchanges,
+                tile,
+                self.program.tile_count,
+                self.exchange_code_base,
+            )?;
             return Ok(TileProgram {
                 tile,
                 steps: lower_work(
@@ -137,28 +130,21 @@ impl<'a> TileProgramLowering<'a> {
                     self.placement,
                     self.kernels,
                     &self.phases,
-                    &self.phase_addresses,
+                    &rows,
                     &BTreeMap::new(),
                     false,
                 )?,
             });
         }
+        let (rows, _) = layout_exchange_rows(
+            self.exchanges,
+            tile,
+            self.program.tile_count,
+            self.exchange_code_base,
+        )?;
         Ok(TileProgram {
             tile,
-            steps: self
-                .exchanges
-                .iter()
-                .map(|phase| {
-                    Ok(TileStep::Exchange(ExchangeStep {
-                        address: *self
-                            .phase_addresses
-                            .get(&phase.id)
-                            .ok_or(TileLoweringError::UnknownExchange)?,
-                        row: crate::inactive_exchange_row(),
-                        profile: StepProfile::default(),
-                    }))
-                })
-                .collect::<Result<Vec<_>, TileLoweringError>>()?,
+            steps: lower_inactive_work(self.program, &self.program.tiles[0], &rows)?,
         })
     }
 }
@@ -170,7 +156,7 @@ fn lower_work(
     placement: &Placement,
     kernels: &KernelBuildPlan,
     phases: &BTreeMap<ExchangePhaseId, &PhysicalExchangePhase>,
-    phase_addresses: &BTreeMap<ExchangePhaseId, u32>,
+    exchange_rows: &BTreeMap<ExchangePhaseId, Vec<PlacedExchangeRow>>,
     overrides: &BTreeMap<LowShardId, TileAddress>,
     inside_repeat: bool,
 ) -> Result<Vec<TileStep>, TileLoweringError> {
@@ -178,24 +164,19 @@ fn lower_work(
     for work in program.work(tile) {
         let step = match work {
             TileWorkRef::Exchange(id) => {
-                let phase = phases.get(&id).ok_or(TileLoweringError::UnknownExchange)?;
-                if inside_repeat
-                    && program.exchange_phases[id.index() as usize]
-                        .transfers
-                        .iter()
-                        .any(|transfer| overrides.contains_key(&transfer.source.shard))
-                {
-                    return Err(TileLoweringError::IteratedExchange);
-                }
+                phases.get(&id).ok_or(TileLoweringError::UnknownExchange)?;
+                let rows = exchange_rows
+                    .get(&id)
+                    .ok_or(TileLoweringError::UnknownExchange)?;
+                let first = rows.first().ok_or(TileLoweringError::UnknownExchange)?;
                 TileStep::Exchange(ExchangeStep {
-                    address: *phase_addresses
-                        .get(&id)
-                        .ok_or(TileLoweringError::UnknownExchange)?,
-                    row: phase
-                        .rows
-                        .get(usize::from(tile.tile))
-                        .cloned()
-                        .ok_or(TileLoweringError::MissingExchangeRow(tile.tile))?,
+                    address: first.address,
+                    row: first.words.clone(),
+                    repeat_variants: if inside_repeat {
+                        rows[1..].to_vec()
+                    } else {
+                        Vec::new()
+                    },
                     profile: StepProfile::default(),
                 })
             }
@@ -244,7 +225,7 @@ fn lower_work(
                     placement,
                     kernels,
                     phases,
-                    phase_addresses,
+                    exchange_rows,
                 )?)
             }
         };
@@ -270,45 +251,113 @@ fn lower_repeat(
     placement: &Placement,
     kernels: &KernelBuildPlan,
     phases: &BTreeMap<ExchangePhaseId, &PhysicalExchangePhase>,
-    phase_addresses: &BTreeMap<ExchangePhaseId, u32>,
+    exchange_rows: &BTreeMap<ExchangePhaseId, Vec<PlacedExchangeRow>>,
 ) -> Result<RepeatStep, TileLoweringError> {
     let mut overrides = BTreeMap::new();
     let mut pointers = Vec::with_capacity(repeat.iterated.len());
+    let mut staging = Vec::new();
     for (index, iterated) in repeat.iterated.iter().enumerate() {
-        let first = *iterated
+        let addresses = iterated
             .inputs
-            .first()
-            .ok_or(TileLoweringError::InvalidRepeat)?;
-        let initial_address = placement
+            .iter()
+            .map(|input| {
+                placement
+                    .shard_addresses
+                    .get(input)
+                    .copied()
+                    .ok_or(TileLoweringError::InvalidRepeat)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let index = u16::try_from(index).map_err(|_| TileLoweringError::Overflow)?;
+        let address = TileAddress::RepeatPointer { index, offset: 0 };
+        let staging_address = placement
             .shard_addresses
-            .get(&first)
+            .get(&iterated.argument)
             .copied()
             .ok_or(TileLoweringError::InvalidRepeat)?;
-        let index = u16::try_from(index).map_err(|_| TileLoweringError::Overflow)?;
-        overrides.insert(
-            iterated.argument,
-            TileAddress::RepeatPointer { index, offset: 0 },
-        );
+        if !iterated.stride_bytes.is_multiple_of(4) {
+            return Err(TileLoweringError::InvalidRepeat);
+        }
+        if repeat.count == 1 {
+            overrides.insert(iterated.argument, TileAddress::Absolute(addresses[0]));
+        } else if iterated.stride_bytes != 0 {
+            staging.push(TileStep::Compute(crate::ComputeStep {
+                symbol: crate::COPY_U32_SYMBOL.into(),
+                output_address: TileAddress::Absolute(staging_address),
+                input_addresses: vec![address],
+                arguments: vec![iterated.stride_bytes / 4],
+                profile: StepProfile::default(),
+            }));
+            overrides.insert(iterated.argument, TileAddress::Absolute(staging_address));
+        } else {
+            overrides.insert(iterated.argument, TileAddress::Absolute(staging_address));
+        }
         pointers.push(RepeatPointer {
-            initial_address,
+            addresses,
             stride_bytes: iterated.stride_bytes,
         });
+    }
+    let mut body = lower_work(
+        program,
+        &repeat.body,
+        placement,
+        kernels,
+        phases,
+        exchange_rows,
+        &overrides,
+        true,
+    )?;
+    if !staging.is_empty() {
+        for step in &mut body {
+            if let TileStep::Exchange(exchange) = step {
+                exchange.repeat_variants.clear();
+            }
+        }
+        staging.append(&mut body);
+        body = staging;
+    }
+    for step in &body {
+        let TileStep::Exchange(exchange) = step else {
+            continue;
+        };
+        if !exchange.repeat_variants.is_empty()
+            && exchange.repeat_variants.len() + 1 != repeat.count as usize
+        {
+            return Err(TileLoweringError::InvalidRepeat);
+        }
     }
     Ok(RepeatStep {
         count: repeat.count,
         iterated_pointers: pointers,
-        body: lower_work(
-            program,
-            &repeat.body,
-            placement,
-            kernels,
-            phases,
-            phase_addresses,
-            &overrides,
-            true,
-        )?,
+        body,
         profile: StepProfile::default(),
     })
+}
+
+fn lower_inactive_work(
+    program: &LowProgram,
+    work: &TileWorkList,
+    exchange_rows: &BTreeMap<ExchangePhaseId, Vec<PlacedExchangeRow>>,
+) -> Result<Vec<TileStep>, TileLoweringError> {
+    let mut steps = Vec::new();
+    for work in program.work(work) {
+        match work {
+            TileWorkRef::Exchange(id) => steps.push(TileStep::Exchange(ExchangeStep {
+                address: exchange_rows[&id][0].address,
+                row: exchange_rows[&id][0].words.clone(),
+                repeat_variants: Vec::new(),
+                profile: StepProfile::default(),
+            })),
+            TileWorkRef::Repeat(repeat) => steps.push(TileStep::Repeat(RepeatStep {
+                count: repeat.count,
+                iterated_pointers: Vec::new(),
+                body: lower_inactive_work(program, &repeat.body, exchange_rows)?,
+                profile: StepProfile::default(),
+            })),
+            TileWorkRef::Kernel(_) | TileWorkRef::LocalCopy(_) => {}
+        }
+    }
+    Ok(steps)
 }
 
 fn align_up(value: u32, alignment: u32) -> Result<u32, TileLoweringError> {
@@ -316,6 +365,86 @@ fn align_up(value: u32, alignment: u32) -> Result<u32, TileLoweringError> {
         .checked_add(alignment - 1)
         .map(|value| value & !(alignment - 1))
         .ok_or(TileLoweringError::Overflow)
+}
+
+pub fn compact_exchange_table_bytes(
+    exchanges: &[PhysicalExchangePhase],
+    execution_tile_count: u16,
+    scheduled_tile_count: u16,
+) -> Result<u32, TileLoweringError> {
+    let mut maximum = 0;
+    for tile in 0..execution_tile_count {
+        let mut bytes = 0u32;
+        for phase in exchanges {
+            let words = if tile < scheduled_tile_count {
+                phase
+                    .rows
+                    .get(usize::from(tile))
+                    .ok_or(TileLoweringError::MissingExchangeRow(tile))?
+                    .len()
+            } else {
+                crate::inactive_exchange_row().len()
+            };
+            let iterations = (tile < scheduled_tile_count)
+                .then(|| phase.repeat_patches.get(usize::from(tile)))
+                .flatten()
+                .and_then(|patches| patches.first())
+                .map_or(1, |patch| patch.values.len());
+            let row_bytes = u32::try_from(words)
+                .map_err(|_| TileLoweringError::Overflow)?
+                .checked_mul(4)
+                .ok_or(TileLoweringError::Overflow)?;
+            bytes = bytes
+                .checked_add(
+                    row_bytes
+                        .checked_mul(
+                            u32::try_from(iterations).map_err(|_| TileLoweringError::Overflow)?,
+                        )
+                        .ok_or(TileLoweringError::Overflow)?,
+                )
+                .ok_or(TileLoweringError::Overflow)?;
+        }
+        maximum = maximum.max(bytes);
+    }
+    Ok(maximum)
+}
+
+fn layout_exchange_rows(
+    exchanges: &[PhysicalExchangePhase],
+    tile: u16,
+    scheduled_tile_count: u16,
+    base: u32,
+) -> Result<(BTreeMap<ExchangePhaseId, Vec<PlacedExchangeRow>>, u32), TileLoweringError> {
+    let mut cursor = align_up(base, 4)?;
+    let mut result = BTreeMap::new();
+    for phase in exchanges {
+        let base_row = if tile < scheduled_tile_count {
+            phase
+                .rows
+                .get(usize::from(tile))
+                .cloned()
+                .ok_or(TileLoweringError::MissingExchangeRow(tile))?
+        } else {
+            crate::inactive_exchange_row()
+        };
+        let address = cursor;
+        cursor = cursor
+            .checked_add(
+                u32::try_from(base_row.len())
+                    .map_err(|_| TileLoweringError::Overflow)?
+                    .checked_mul(4)
+                    .ok_or(TileLoweringError::Overflow)?,
+            )
+            .ok_or(TileLoweringError::Overflow)?;
+        result.insert(
+            phase.id,
+            vec![PlacedExchangeRow {
+                address,
+                words: base_row,
+            }],
+        );
+    }
+    Ok((result, cursor))
 }
 
 #[cfg(test)]

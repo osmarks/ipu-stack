@@ -92,6 +92,8 @@ pub enum ShardDefinition {
     /// Persistent scratch allocation populated by local copies or exchanges.
     Staging,
     Alias(LowShardId),
+    /// Alias intentionally used as an in-place operation destination.
+    WritableAlias(LowShardId),
     /// Canonical format placeholder replaced by dispatch-local staging.
     Unmaterialized,
 }
@@ -420,6 +422,66 @@ struct LoweringState {
     intersection_cache: BTreeMap<(MidValueId, Vec<ShardExtent>), ShardIntersections>,
 }
 
+fn repeat_placement_groups(graph: &MidGraph) -> Vec<usize> {
+    fn root(parents: &mut [usize], mut index: usize) -> usize {
+        while parents[index] != index {
+            parents[index] = parents[parents[index]];
+            index = parents[index];
+        }
+        index
+    }
+
+    fn join(parents: &mut [usize], left: MidValueId, right: MidValueId) {
+        let left = root(parents, left.index() as usize);
+        let right = root(parents, right.index() as usize);
+        if left != right {
+            parents[right] = left;
+        }
+    }
+
+    fn visit(operations: &[MidOperation], parents: &mut [usize]) {
+        for operation in operations {
+            let MidOperationKind::Repeat(repeat) = &operation.kind else {
+                continue;
+            };
+            for index in 0..repeat.carried_inputs {
+                let values = [
+                    operation.inputs[index],
+                    repeat.body.arguments[index],
+                    repeat.body.yields[index],
+                    operation.results[index],
+                ];
+                for pair in values.windows(2) {
+                    join(parents, pair[0], pair[1]);
+                }
+            }
+            for index in 0..repeat.invariant_inputs {
+                let input = repeat.carried_inputs + index;
+                join(
+                    parents,
+                    operation.inputs[input],
+                    repeat.body.arguments[input],
+                );
+            }
+            let argument_base = repeat.carried_inputs + repeat.invariant_inputs;
+            for (index, inputs) in repeat.iterated_inputs.iter().enumerate() {
+                let argument = repeat.body.arguments[argument_base + index];
+                for &input in inputs {
+                    join(parents, input, argument);
+                }
+            }
+            visit(&repeat.body.operations, parents);
+        }
+    }
+
+    let mut parents = (0..graph.values.len()).collect::<Vec<_>>();
+    visit(&graph.operations, &mut parents);
+    for index in 0..parents.len() {
+        parents[index] = root(&mut parents, index);
+    }
+    parents
+}
+
 impl LoweringState {
     fn new(graph: &MidGraph, tile_count: u16) -> LowLoweringResult<Self> {
         let mut state = Self {
@@ -434,13 +496,25 @@ impl LoweringState {
             deferred_conversions: BTreeMap::new(),
             intersection_cache: BTreeMap::new(),
         };
-        let parameter_values = graph
+        let parameter_origins = graph
             .inputs
             .iter()
             .filter(|input| input.kind == GraphInputKind::Parameter)
-            .map(|input| input.value)
+            .map(|input| graph.values[input.value.index() as usize].origin)
+            .collect::<BTreeSet<_>>();
+        let parameter_values = graph
+            .values
+            .iter()
+            .filter(|value| parameter_origins.contains(&value.origin))
+            .map(|value| value.id)
+            .collect::<BTreeSet<_>>();
+        let repeat_groups = repeat_placement_groups(graph);
+        let parameter_groups = parameter_values
+            .iter()
+            .map(|value| repeat_groups[value.index() as usize])
             .collect::<BTreeSet<_>>();
         let mut parameter_bytes = vec![0u64; usize::from(tile_count)];
+        let mut parameter_offsets = BTreeMap::<usize, u16>::new();
         for value in &graph.values {
             let declared_tiles = value.tensor_type.format.layout.tiling.tile_count;
             if declared_tiles == 0 || declared_tiles > tile_count {
@@ -452,7 +526,9 @@ impl LoweringState {
             }
             let extents = shard_extents(&value.tensor_type)?;
             let is_parameter = parameter_values.contains(&value.id);
-            let parameter_shard_bytes = if is_parameter {
+            let placement_group = repeat_groups[value.id.index() as usize];
+            let rotate_parameter = is_parameter || parameter_groups.contains(&placement_group);
+            let parameter_shard_bytes = if rotate_parameter {
                 extents
                     .iter()
                     .map(|extents| {
@@ -470,17 +546,24 @@ impl LoweringState {
             } else {
                 Vec::new()
             };
-            let parameter_offset = if is_parameter {
-                (0..tile_count)
-                    .min_by_key(|&offset| {
-                        let mut loads = parameter_bytes.clone();
-                        for (logical, &bytes) in parameter_shard_bytes.iter().enumerate() {
-                            let tile = (logical + usize::from(offset)) % usize::from(tile_count);
-                            loads[tile] = loads[tile].saturating_add(bytes);
-                        }
-                        (loads.into_iter().max().unwrap_or(u64::MAX), offset)
-                    })
-                    .ok_or(LowLoweringError::EmptyTileGroup)?
+            let parameter_offset = if rotate_parameter {
+                if let Some(&offset) = parameter_offsets.get(&placement_group) {
+                    offset
+                } else {
+                    let offset = (0..tile_count)
+                        .min_by_key(|&offset| {
+                            let mut loads = parameter_bytes.clone();
+                            for (logical, &bytes) in parameter_shard_bytes.iter().enumerate() {
+                                let tile =
+                                    (logical + usize::from(offset)) % usize::from(tile_count);
+                                loads[tile] = loads[tile].saturating_add(bytes);
+                            }
+                            (loads.into_iter().max().unwrap_or(u64::MAX), offset)
+                        })
+                        .ok_or(LowLoweringError::EmptyTileGroup)?;
+                    parameter_offsets.insert(placement_group, offset);
+                    offset
+                }
             } else {
                 0
             };
@@ -493,7 +576,7 @@ impl LoweringState {
                     extents,
                     definition: ShardDefinition::Value(value.id),
                 };
-                shard.tile = if is_parameter {
+                shard.tile = if rotate_parameter {
                     let tile =
                         (logical_tile + usize::from(parameter_offset)) % usize::from(tile_count);
                     let bytes = parameter_shard_bytes[logical_tile];
@@ -535,7 +618,9 @@ impl LoweringState {
                         == crate::MemoryClass::Ipu21Interleaved
                     && !matches!(
                         shard.definition,
-                        ShardDefinition::Alias(_) | ShardDefinition::ExchangeStaging
+                        ShardDefinition::Alias(_)
+                            | ShardDefinition::WritableAlias(_)
+                            | ShardDefinition::ExchangeStaging
                     )
             })
             .try_fold(0u32, |total, shard| {
@@ -1910,7 +1995,7 @@ impl LoweringState {
             return Err(LowLoweringError::InvalidRepeat);
         }
         for index in 0..repeat.carried_inputs {
-            if !value_can_alias(
+            if !repeat_yield_can_alias(
                 repeat.body.yields[index],
                 repeat.body.arguments[index],
                 &repeat.body.operations,
@@ -1933,13 +2018,17 @@ impl LoweringState {
         for tile in 0..self.tile_count {
             let mut carried = Vec::with_capacity(repeat.carried_inputs);
             for index in 0..repeat.carried_inputs {
-                let initial = self.local_shard(operation.inputs[index], tile)?;
-                let argument = self.local_shard(repeat.body.arguments[index], tile)?;
-                let yielded = self.local_shard(repeat.body.yields[index], tile)?;
-                let result = self.local_shard(operation.results[index], tile)?;
+                let Some(argument) = self.find_local_shard(repeat.body.arguments[index], tile)?
+                else {
+                    continue;
+                };
+                let initial = self.corresponding_shard(operation.inputs[index], argument)?;
+                let yielded = self.corresponding_shard(repeat.body.yields[index], argument)?;
+                let result = self.corresponding_shard(operation.results[index], argument)?;
                 self.alias_shard(argument, initial);
                 if yielded != argument {
-                    self.alias_shard(yielded, argument);
+                    self.shards[yielded.index() as usize].definition =
+                        ShardDefinition::WritableAlias(argument);
                 }
                 self.alias_shard(result, initial);
                 carried.push(RepeatCarried {
@@ -1950,41 +2039,61 @@ impl LoweringState {
                 });
             }
             let invariants = (0..repeat.invariant_inputs)
-                .map(|index| {
+                .filter_map(|index| {
                     let input_index = repeat.carried_inputs + index;
-                    Ok(RepeatInvariant {
-                        input: self.local_shard(operation.inputs[input_index], tile)?,
-                        argument: self.local_shard(repeat.body.arguments[input_index], tile)?,
-                    })
+                    let argument =
+                        match self.find_local_shard(repeat.body.arguments[input_index], tile) {
+                            Ok(Some(argument)) => argument,
+                            Ok(None) => return None,
+                            Err(error) => return Some(Err(error)),
+                        };
+                    Some(
+                        self.corresponding_shard(operation.inputs[input_index], argument)
+                            .map(|input| RepeatInvariant { input, argument }),
+                    )
                 })
                 .collect::<LowLoweringResult<_>>()?;
             let iterated = repeat
                 .iterated_inputs
                 .iter()
                 .enumerate()
-                .map(|(index, values)| {
+                .filter_map(|(index, values)| {
+                    let argument = match self
+                        .find_local_shard(repeat.body.arguments[expected_inputs + index], tile)
+                    {
+                        Ok(Some(argument)) => argument,
+                        Ok(None) => return None,
+                        Err(error) => return Some(Err(error)),
+                    };
                     let inputs = values
                         .iter()
-                        .map(|value| self.local_shard(*value, tile))
-                        .collect::<LowLoweringResult<Vec<_>>>()?;
+                        .map(|value| self.corresponding_shard(*value, argument))
+                        .collect::<LowLoweringResult<Vec<_>>>();
+                    let inputs = match inputs {
+                        Ok(inputs) => inputs,
+                        Err(error) => return Some(Err(error)),
+                    };
                     let (alignment, access_tail) = iterated_requirements[index];
                     let strides = inputs
                         .iter()
                         .map(|shard| self.shard_stride(*shard, alignment, access_tail))
-                        .collect::<LowLoweringResult<Vec<_>>>()?;
+                        .collect::<LowLoweringResult<Vec<_>>>();
+                    let strides = match strides {
+                        Ok(strides) => strides,
+                        Err(error) => return Some(Err(error)),
+                    };
                     let Some(&stride_bytes) = strides.first() else {
-                        return Err(LowLoweringError::InvalidIteratedBlocks(index));
+                        return Some(Err(LowLoweringError::InvalidIteratedBlocks(index)));
                     };
                     if strides.iter().any(|stride| *stride != stride_bytes) {
-                        return Err(LowLoweringError::InvalidIteratedBlocks(index));
+                        return Some(Err(LowLoweringError::InvalidIteratedBlocks(index)));
                     }
-                    Ok(RepeatIterated {
+                    Some(Ok(RepeatIterated {
                         inputs,
-                        argument: self
-                            .local_shard(repeat.body.arguments[expected_inputs + index], tile)?,
+                        argument,
                         stride_bytes,
                         alignment,
-                    })
+                    }))
                 })
                 .collect::<LowLoweringResult<_>>()?;
             self.append_repeat(
@@ -2009,6 +2118,32 @@ impl LoweringState {
 
     fn alias_shard(&mut self, shard: LowShardId, target: LowShardId) {
         self.shards[shard.index() as usize].definition = ShardDefinition::Alias(target);
+    }
+
+    fn find_local_shard(
+        &self,
+        value: MidValueId,
+        tile: u16,
+    ) -> LowLoweringResult<Option<LowShardId>> {
+        Ok(self
+            .value_shards(value)?
+            .iter()
+            .copied()
+            .find(|shard| self.shards[shard.index() as usize].tile == tile))
+    }
+
+    fn corresponding_shard(
+        &self,
+        value: MidValueId,
+        target: LowShardId,
+    ) -> LowLoweringResult<LowShardId> {
+        let target = &self.shards[target.index() as usize];
+        self.value_shards(value)?
+            .iter()
+            .copied()
+            .filter(|shard| self.shards[shard.index() as usize].extents == target.extents)
+            .min_by_key(|shard| u8::from(self.shards[shard.index() as usize].tile != target.tile))
+            .ok_or(LowLoweringError::UnknownValue(value))
     }
 
     fn shard_stride(
@@ -2146,6 +2281,28 @@ fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOpera
             .get(usize::from(*index))
             .is_some_and(|input| value_can_alias(*input, target, operations))
     })
+}
+
+fn repeat_yield_can_alias(
+    value: MidValueId,
+    carried: MidValueId,
+    operations: &[MidOperation],
+) -> bool {
+    if value_can_alias(value, carried, operations) {
+        return true;
+    }
+    let Some(definition) = operations
+        .iter()
+        .position(|operation| operation.results.contains(&value))
+    else {
+        return false;
+    };
+    // A repeat reuses the carried allocation on its next iteration. A fresh
+    // yield may overwrite it when every read of the previous iteration's
+    // value has completed before the yielding operation begins.
+    !operations[definition..]
+        .iter()
+        .any(|operation| operation.inputs.contains(&carried))
 }
 
 fn body_storage_requirement(value: MidValueId, operations: &[MidOperation]) -> (u32, u32) {
@@ -3249,7 +3406,7 @@ mod tests {
                 );
                 assert_eq!(
                     low.shards[carried.yielded.index() as usize].definition,
-                    ShardDefinition::Alias(carried.argument)
+                    ShardDefinition::WritableAlias(carried.argument)
                 );
                 assert_eq!(
                     low.shards[carried.result.index() as usize].definition,
@@ -3264,7 +3421,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_repeats_reject_fresh_carried_results() {
+    fn randomized_repeats_alias_fresh_results_after_the_last_carried_use() {
         let mut random = fastrand::Rng::with_seed(0x696e_706c);
         for case in 0..CASES {
             let tiles = 1_u16 << random.u32(0..=3);
@@ -3290,11 +3447,21 @@ mod tests {
                 config.inputs.insert(weight, format(tiles));
             }
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-            assert_eq!(
-                lower_to_tiles(&mid, &config),
-                Err(LowLoweringError::RepeatRequiresInPlace(0)),
-                "case {case}"
-            );
+            let low = lower_to_tiles(&mid, &config).unwrap();
+            for tile in &low.tiles {
+                let repeat = low
+                    .work(tile)
+                    .find_map(|work| match work {
+                        TileWorkRef::Repeat(repeat) => Some(repeat),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    low.shards[repeat.carried[0].yielded.index() as usize].definition,
+                    ShardDefinition::WritableAlias(repeat.carried[0].argument),
+                    "case {case}"
+                );
+            }
         }
     }
 

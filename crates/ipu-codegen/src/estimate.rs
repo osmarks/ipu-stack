@@ -4,8 +4,9 @@ use crate::cost::IPU21_TARGET_COSTS;
 use crate::graph::TensorShape;
 use crate::mid::{
     AmpOrder, ElementOrder, Layout, MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks,
-    MemoryRelation, MemoryUsage, MidOperation, MidValue, MidValueId, OperandMaterialization,
-    OperatorDispatch, OperatorRequirements, Precision, TensorAxis, TensorType,
+    MemoryRelation, MemoryUsage, MidOperation, MidOperationKind, MidValue, MidValueId,
+    OperandMaterialization, OperatorDispatch, OperatorRequirements, Precision, TensorAxis,
+    TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -13,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 pub(crate) struct ConversionTraffic {
     pub source_payload_bytes: u64,
     pub remote_fragments: u64,
+    pub maximum_routed_fragments: u64,
     pub maximum_destination_bytes: u64,
     pub maximum_local_bytes: u64,
     pub maximum_intersections: u64,
@@ -82,6 +84,14 @@ pub(crate) fn conversion_traffic(
             traffic.maximum_local_intersections.max(local_intersections);
     }
     traffic.remote_fragments = remote.len() as u64;
+    traffic.maximum_routed_fragments = if from.order == to.order {
+        traffic.maximum_intersections
+    } else {
+        traffic
+            .maximum_destination_bytes
+            .saturating_sub(traffic.maximum_local_bytes)
+            .div_ceil(4)
+    };
     traffic.source_payload_bytes = remote
         .iter()
         .map(|(_, extents)| range_elements(extents).saturating_mul(element_bytes))
@@ -457,6 +467,16 @@ pub(crate) fn region_peak_memory(
     outputs: &[MidValueId],
     values: &[MidValue],
 ) -> MemoryPeaks {
+    region_peak_memory_with_multiplicity(initial, operations, outputs, values, &BTreeMap::new())
+}
+
+pub(crate) fn region_peak_memory_with_multiplicity(
+    initial: &[MidValueId],
+    operations: &[MidOperation],
+    outputs: &[MidValueId],
+    values: &[MidValue],
+    allocation_multiplicity: &BTreeMap<MidValueId, u32>,
+) -> MemoryPeaks {
     let requirements = allocation_requirements(operations);
     let streamed_aliases = operations
         .iter()
@@ -469,7 +489,7 @@ pub(crate) fn region_peak_memory(
         })
         .collect::<BTreeMap<_, _>>();
     let mut uses = BTreeMap::<MidValueId, u32>::new();
-    for input in operations.iter().flat_map(|operation| &operation.inputs) {
+    for input in operations.iter().flat_map(operation_value_inputs) {
         *uses.entry(*input).or_default() += 1;
     }
     for output in outputs {
@@ -486,7 +506,12 @@ pub(crate) fn region_peak_memory(
             .map(|id| allocation_root(*id, &streamed_aliases))
             .collect::<BTreeSet<_>>();
         let live = roots.iter().fold(MemoryUsage::default(), |usage, id| {
-            usage.saturating_add(value_allocation(*id, values, &requirements))
+            let allocation = value_allocation(*id, values, &requirements);
+            let copies = u64::from(allocation_multiplicity.get(id).copied().unwrap_or(1));
+            usage.saturating_add(MemoryUsage {
+                standard: allocation.standard.saturating_mul(copies),
+                interleaved: allocation.interleaved.saturating_mul(copies),
+            })
         });
         peaks.observe(
             live.saturating_add(temporary),
@@ -500,7 +525,7 @@ pub(crate) fn region_peak_memory(
             during_values.insert(*result);
         }
         observe(&mut peaks, &during_values, operation.memory.temporary);
-        for input in &operation.inputs {
+        for input in operation_value_inputs(operation) {
             if let Some(remaining) = uses.get_mut(input) {
                 *remaining = remaining.saturating_sub(1);
                 if *remaining == 0 {
@@ -516,6 +541,14 @@ pub(crate) fn region_peak_memory(
     }
     observe(&mut peaks, &live_values, MemoryUsage::default());
     peaks
+}
+
+fn operation_value_inputs(operation: &MidOperation) -> Vec<&MidValueId> {
+    let mut inputs = operation.inputs.iter().collect::<Vec<_>>();
+    if let MidOperationKind::Repeat(repeat) = &operation.kind {
+        inputs.extend(repeat.iterated_inputs.iter().flatten());
+    }
+    inputs
 }
 
 fn allocation_root(mut id: MidValueId, aliases: &BTreeMap<MidValueId, MidValueId>) -> MidValueId {
@@ -690,6 +723,14 @@ mod tests {
                 traffic.maximum_local_intersections.max(local_intersections);
         }
         traffic.remote_fragments = remote.len() as u64;
+        traffic.maximum_routed_fragments = if from.order == to.order {
+            traffic.maximum_intersections
+        } else {
+            traffic
+                .maximum_destination_bytes
+                .saturating_sub(traffic.maximum_local_bytes)
+                .div_ceil(4)
+        };
         traffic.source_payload_bytes = remote
             .iter()
             .map(|(_, extents)| range_elements(extents) * precision.bytes())

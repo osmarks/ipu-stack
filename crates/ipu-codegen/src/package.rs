@@ -156,30 +156,20 @@ fn build_package_from_objects(
     )?;
 
     let provisional_placement = build_phase("plan_exchange_storage", || Ok(place(program)?))?;
-    let provisional_exchanges = lower_exchanges(
-        program,
-        &provisional_placement,
-        &topology,
-        crate::ExchangeLoweringOptions::default(),
+    let provisional_exchanges = build_phase("lower_exchanges_provisional", || {
+        Ok(lower_exchanges(
+            program,
+            &provisional_placement,
+            &topology,
+            crate::ExchangeLoweringOptions::default(),
+        )?)
+    })?;
+    let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
+    let exchange_table_bytes = crate::tile::compact_exchange_table_bytes(
+        &provisional_exchanges,
+        execution_tile_count,
+        program.tile_count,
     )?;
-    let exchange_table_bytes = provisional_exchanges
-        .iter()
-        .try_fold(0u32, |bytes, phase| {
-            let words = phase
-                .rows
-                .iter()
-                .map(Vec::len)
-                .max()
-                .unwrap_or(0)
-                .max(ipu_exchange::PLAN_WORDS);
-            bytes
-                .checked_add(
-                    u32::try_from(words)?
-                        .checked_mul(4)
-                        .ok_or_else(|| invalid("exchange row table size overflow"))?,
-                )
-                .ok_or_else(|| invalid("exchange row table size overflow"))
-        })?;
     let exchange_rows = (exchange_table_bytes != 0)
         .then(|| {
             memory.allocate(MemoryRequest {
@@ -220,7 +210,6 @@ fn build_package_from_objects(
             })?)
         })
         .transpose()?;
-    let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
     let execution_topology = Topology::c600();
     let mut physical_to_logical = vec![None; usize::from(execution_tile_count)];
     for logical in 0..execution_tile_count {
@@ -341,43 +330,45 @@ fn build_package_from_objects(
         4,
         "generated tile programs",
     )?;
-    let generated_code_bytes = physical_to_logical
-        .iter()
-        .zip(&provisional_host.programs)
-        .enumerate()
-        .try_fold(0u32, |maximum, (physical, (&logical, host))| {
-            let mut tile_program = provisional_finalizer.lower_tile(logical)?;
-            if let Some(storage) = &profile_storage {
-                instrument_profile(
-                    program,
-                    &provisional_exchanges,
-                    logical,
-                    u32::try_from(physical)?,
-                    &mut tile_program,
-                    storage.range.start,
+    let generated_code_bytes = build_phase("size_tile_code", || {
+        physical_to_logical
+            .iter()
+            .zip(&provisional_host.programs)
+            .enumerate()
+            .try_fold(0u32, |maximum, (physical, (&logical, host))| {
+                let mut tile_program = provisional_finalizer.lower_tile(logical)?;
+                if let Some(storage) = &profile_storage {
+                    instrument_profile(
+                        program,
+                        &provisional_exchanges,
+                        logical,
+                        u32::try_from(physical)?,
+                        &mut tile_program,
+                        storage.range.start,
+                    )?;
+                }
+                let generated = emit(
+                    &tile_program,
+                    &symbols,
+                    host,
+                    &CodegenOptions {
+                        code_address: sizing_code_address,
+                        initial_profile_address: config
+                            .pipeline
+                            .profiling
+                            .enabled
+                            .then_some(PROFILE_START_CYCLE),
+                        final_profile_address: config
+                            .pipeline
+                            .profiling
+                            .enabled
+                            .then_some(PROFILE_END_CYCLE),
+                        ..CodegenOptions::default()
+                    },
                 )?;
-            }
-            let generated = emit(
-                &tile_program,
-                &symbols,
-                host,
-                &CodegenOptions {
-                    code_address: sizing_code_address,
-                    initial_profile_address: config
-                        .pipeline
-                        .profiling
-                        .enabled
-                        .then_some(PROFILE_START_CYCLE),
-                    final_profile_address: config
-                        .pipeline
-                        .profiling
-                        .enabled
-                        .then_some(PROFILE_END_CYCLE),
-                    ..CodegenOptions::default()
-                },
-            )?;
-            Ok::<_, PackageBuildError>(maximum.max(u32::try_from(generated.bytes.len())?))
-        })?;
+                Ok::<_, PackageBuildError>(maximum.max(u32::try_from(generated.bytes.len())?))
+            })
+    })?;
     let code_address = if generated_code_bytes == 0 {
         sizing_code_address
     } else {
@@ -485,6 +476,14 @@ fn build_package_from_objects(
         exchange_code_base,
         execution_tile_count,
     )?;
+    if exchange_rows
+        .as_ref()
+        .is_some_and(|storage| finalizer.exchange_code_end() > storage.range.end)
+    {
+        return Err(invalid(
+            "final exchange rows exceeded their planned allocation",
+        ));
+    }
     let prepared = physical_to_logical
         .iter()
         .enumerate()
@@ -930,6 +929,7 @@ fn instrument_profile(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn profile_step(
     program: &LowProgram,
     exchanges: &[crate::PhysicalExchangePhase],

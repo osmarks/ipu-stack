@@ -9,7 +9,10 @@
 
 use crate::cost::MemoizedCostModel;
 pub use crate::cost::{CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts};
-use crate::estimate::{conversion_memory_estimate, operator_memory_estimate, region_peak_memory};
+use crate::estimate::{
+    conversion_memory_estimate, operator_memory_estimate, region_peak_memory,
+    region_peak_memory_with_multiplicity,
+};
 use crate::graph::{
     AddOptions, AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation,
     OperationId, OperationKind, Repeat, TensorShape, ValueId,
@@ -1177,7 +1180,7 @@ impl PipelineConfig {
             inputs: BTreeMap::new(),
             automatic_inputs: BTreeMap::new(),
             operator_candidates: default_operator_candidates(tile_count),
-            planning_beam_width: 64,
+            planning_beam_width: 256,
             standard_memory_reservation_bytes: u64::from(
                 crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
             ),
@@ -2060,6 +2063,9 @@ pub fn lower(
             format,
         };
         let value = state.value(input.value, tensor_type);
+        if input.kind == GraphInputKind::Parameter {
+            state.parameter_values.insert(value);
+        }
         if automatic {
             state.automatic_inputs.insert(value);
         }
@@ -2079,6 +2085,8 @@ pub fn lower(
         config,
         &costs,
         &mut state,
+        &BTreeMap::new(),
+        &[],
     )?;
     let outputs = graph
         .outputs()
@@ -2140,6 +2148,7 @@ pub fn lower(
 struct LoweringState {
     values: Vec<MidValue>,
     automatic_inputs: BTreeSet<MidValueId>,
+    parameter_values: BTreeSet<MidValueId>,
 }
 
 impl LoweringState {
@@ -2155,6 +2164,15 @@ impl LoweringState {
 
     fn get(&self, id: MidValueId) -> &MidValue {
         &self.values[id.0 as usize]
+    }
+
+    fn derived_value(&mut self, source: MidValueId, tensor_type: TensorType) -> MidValueId {
+        let origin = self.get(source).origin;
+        let result = self.value(origin, tensor_type);
+        if self.parameter_values.contains(&source) {
+            self.parameter_values.insert(result);
+        }
+        result
     }
 
     fn retarget_automatic_input(&mut self, id: MidValueId, layout: Layout) -> bool {
@@ -2184,15 +2202,17 @@ fn lower_operations(
     config: &PipelineConfig,
     costs: &impl CostModel,
     state: &mut LoweringState,
+    allocation_multiplicity: &BTreeMap<ValueId, u32>,
+    format_equalities: &[(ValueId, ValueId)],
 ) -> LoweringResult<Vec<MidOperation>> {
     if source.is_empty() {
         return Ok(Vec::new());
     }
     let relevant_origins = source
         .iter()
-        .flat_map(|operation| &operation.inputs)
-        .chain(required_outputs)
-        .copied()
+        .flat_map(|operation| operation_graph_inputs(operation, graph))
+        .chain(required_outputs.iter().copied())
+        .chain(format_equalities.iter().flat_map(|pair| [pair.0, pair.1]))
         .collect::<BTreeSet<_>>();
     let initial = relevant_origins
         .iter()
@@ -2229,8 +2249,15 @@ fn lower_operations(
                         .map(|operation| operation.estimated_cycles)
                         .sum(),
                 );
-                let peak =
-                    beam_memory_peak(&next, &initial, source, operation_index, required_outputs);
+                let peak = beam_memory_peak(
+                    &next,
+                    &initial,
+                    source,
+                    operation_index,
+                    required_outputs,
+                    graph,
+                    allocation_multiplicity,
+                );
                 if peak.fits_ipu21_with_budget(
                     config.standard_memory_reservation_bytes,
                     config.tile_memory_budget_bytes,
@@ -2276,12 +2303,7 @@ fn lower_operations(
                 .ok_or(LoweringError::MissingShape(operation.results[0]))?;
             let parameter_inputs = input_ids
                 .iter()
-                .map(|id| {
-                    let origin = branch.state.get(*id).origin;
-                    graph.inputs().iter().any(|input| {
-                        input.value == origin && input.kind == GraphInputKind::Parameter
-                    })
-                })
+                .map(|id| branch.state.parameter_values.contains(id))
                 .collect::<Vec<_>>();
             let candidate_plans = plans(
                 operation,
@@ -2334,8 +2356,15 @@ fn lower_operations(
                         .map(|operation| operation.estimated_cycles)
                         .sum(),
                 );
-                let peak =
-                    beam_memory_peak(&next, &initial, source, operation_index, required_outputs);
+                let peak = beam_memory_peak(
+                    &next,
+                    &initial,
+                    source,
+                    operation_index,
+                    required_outputs,
+                    graph,
+                    allocation_multiplicity,
+                );
                 if peak.fits_ipu21_with_budget(
                     config.standard_memory_reservation_bytes,
                     config.tile_memory_budget_bytes,
@@ -2377,12 +2406,19 @@ fn lower_operations(
             }
             return Err(LoweringError::NoCandidate(operation.id));
         }
-        expanded.sort_by_key(|branch| branch.score);
+        expanded.sort_by_cached_key(|branch| {
+            branch.score.saturating_add(format_equality_cost(
+                branch,
+                format_equalities,
+                config,
+                costs,
+            ))
+        });
         let future_origins = source[operation_index + 1..]
             .iter()
-            .flat_map(|operation| &operation.inputs)
-            .chain(required_outputs)
-            .copied()
+            .flat_map(|operation| operation_graph_inputs(operation, graph))
+            .chain(required_outputs.iter().copied())
+            .chain(format_equalities.iter().flat_map(|pair| [pair.0, pair.1]))
             .collect::<BTreeSet<_>>();
         let mut retained_signatures = BTreeSet::new();
         expanded.retain(|branch| {
@@ -2411,11 +2447,71 @@ fn lower_operations(
     }
     let best = beam
         .into_iter()
-        .min_by_key(|branch| branch.score)
+        .min_by_key(|branch| {
+            branch.score.saturating_add(format_equality_cost(
+                branch,
+                format_equalities,
+                config,
+                costs,
+            ))
+        })
         .ok_or_else(|| LoweringError::NoCandidate(source[0].id))?;
     *values = best.values;
     *state = best.state;
     Ok(best.operations)
+}
+
+fn format_equality_cost(
+    branch: &BeamBranch,
+    equalities: &[(ValueId, ValueId)],
+    config: &PipelineConfig,
+    costs: &impl CostModel,
+) -> u64 {
+    equalities.iter().fold(0u64, |total, &(source, target)| {
+        let Some((&source, &target)) = branch.values.get(&source).zip(branch.values.get(&target))
+        else {
+            return total;
+        };
+        let source = &branch.state.get(source).tensor_type;
+        let target = &branch.state.get(target).tensor_type;
+        let support_overflow = crate::estimate::conversion_traffic(
+            &source.shape,
+            target.format.precision,
+            &source.format.layout,
+            &target.format.layout,
+        )
+        .is_some_and(|traffic| {
+            traffic.maximum_routed_fragments.saturating_mul(4)
+                > config.standard_memory_reservation_bytes / 2
+        });
+        if support_overflow {
+            return total.saturating_add(u64::MAX / 8);
+        }
+        let cast = (source.format.precision != target.format.precision)
+            .then(|| costs.cast_cycles(source, target.format.precision))
+            .unwrap_or(0);
+        let rearrange = (source.format.layout != target.format.layout)
+            .then(|| {
+                costs.rearrange_cycles(
+                    &source.shape,
+                    target.format.precision,
+                    &source.format.layout,
+                    &target.format.layout,
+                )
+            })
+            .unwrap_or(0);
+        total.saturating_add(cast).saturating_add(rearrange)
+    })
+}
+
+fn operation_graph_inputs(operation: &Operation, graph: &ComputeGraph) -> Vec<ValueId> {
+    let mut inputs = operation.inputs.clone();
+    if let OperationKind::Repeat(repeat) = &operation.kind {
+        for sequence in &repeat.iterated_inputs {
+            inputs.extend(&graph.sequences()[sequence.index() as usize].values);
+        }
+    }
+    inputs
 }
 
 fn apply_selected_plan(
@@ -2494,18 +2590,35 @@ fn beam_memory_peak(
     source: &[Operation],
     operation_index: usize,
     required_outputs: &[ValueId],
+    graph: &ComputeGraph,
+    allocation_multiplicity: &BTreeMap<ValueId, u32>,
 ) -> MemoryPeaks {
     let live_origins = source[operation_index + 1..]
         .iter()
-        .flat_map(|operation| &operation.inputs)
-        .chain(required_outputs)
-        .copied()
+        .flat_map(|operation| operation_graph_inputs(operation, graph))
+        .chain(required_outputs.iter().copied())
         .collect::<BTreeSet<_>>();
     let live = live_origins
         .iter()
         .filter_map(|origin| branch.values.get(origin).copied())
         .collect::<Vec<_>>();
-    region_peak_memory(initial, &branch.operations, &live, &branch.state.values)
+    let multiplicity = branch
+        .state
+        .values
+        .iter()
+        .filter_map(|value| {
+            allocation_multiplicity
+                .get(&value.origin)
+                .map(|copies| (value.id, *copies))
+        })
+        .collect::<BTreeMap<_, _>>();
+    region_peak_memory_with_multiplicity(
+        initial,
+        &branch.operations,
+        &live,
+        &branch.state.values,
+        &multiplicity,
+    )
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2720,39 +2833,64 @@ fn lower_repeat(
         .iter()
         .map(|value| state.get(*value).tensor_type.clone())
         .collect::<Vec<_>>();
-    let mut iterated_inputs = Vec::with_capacity(repeat.iterated_inputs.len());
+    let mut raw_iterated_inputs = Vec::with_capacity(repeat.iterated_inputs.len());
+    let mut iterated_parameters = Vec::with_capacity(repeat.iterated_inputs.len());
+    let mut iterated_automatic = Vec::with_capacity(repeat.iterated_inputs.len());
     for sequence_id in &repeat.iterated_inputs {
         let sequence = &graph.sequences()[sequence_id.index() as usize];
         let first = lookup(values, sequence.values[0])?;
         let first_type = state.get(first).tensor_type.clone();
-        let normalized = sequence
+        let sequence_values: Vec<_> = sequence
             .values
             .iter()
             .map(|value| lookup(values, *value))
-            .collect::<LoweringResult<Vec<_>>>()?
-            .into_iter()
-            .map(|value| {
-                ensure_format(
-                    value,
-                    first_type.format.clone(),
-                    OperandMaterialization::Complete,
-                    operation.id,
-                    costs,
-                    state,
-                    operations,
-                )
-            })
-            .collect();
-        iterated_inputs.push(normalized);
+            .collect::<LoweringResult<Vec<_>>>()?;
+        iterated_parameters.push(
+            sequence_values
+                .iter()
+                .all(|value| state.parameter_values.contains(value)),
+        );
+        iterated_automatic.push(
+            sequence_values
+                .iter()
+                .all(|value| state.automatic_inputs.contains(value)),
+        );
+        raw_iterated_inputs.push(sequence_values);
         argument_types.push(first_type);
     }
     let mut body_values = BTreeMap::new();
     let mut arguments = Vec::new();
-    for (&origin, tensor_type) in repeat.body.arguments.iter().zip(argument_types) {
+    for (argument_index, (&origin, tensor_type)) in
+        repeat.body.arguments.iter().zip(argument_types).enumerate()
+    {
         let value = state.value(origin, tensor_type);
+        if argument_index < inputs.len() {
+            if state.automatic_inputs.contains(&inputs[argument_index]) {
+                state.automatic_inputs.insert(value);
+            }
+            if state.parameter_values.contains(&inputs[argument_index]) {
+                state.parameter_values.insert(value);
+            }
+        } else {
+            let iterated_index = argument_index - inputs.len();
+            if iterated_automatic[iterated_index] {
+                state.automatic_inputs.insert(value);
+            }
+            if iterated_parameters[iterated_index] {
+                state.parameter_values.insert(value);
+            }
+        }
         body_values.insert(origin, value);
         arguments.push(value);
     }
+    let body_allocation_multiplicity = repeat
+        .body
+        .arguments
+        .iter()
+        .skip(inputs.len())
+        .copied()
+        .map(|argument| (argument, repeat.count))
+        .collect::<BTreeMap<_, _>>();
     let mut body_operations = lower_operations(
         &repeat.body.operations,
         &repeat.body.yields,
@@ -2762,7 +2900,50 @@ fn lower_repeat(
         config,
         costs,
         state,
+        &body_allocation_multiplicity,
+        &repeat
+            .body
+            .yields
+            .iter()
+            .copied()
+            .zip(repeat.body.arguments.iter().copied())
+            .take(repeat.carried_inputs)
+            .collect::<Vec<_>>(),
     )?;
+    for index in 0..repeat.carried_inputs {
+        let body_layout = state
+            .get(arguments[index])
+            .tensor_type
+            .format
+            .layout
+            .clone();
+        state.retarget_automatic_input(inputs[index], body_layout);
+    }
+    let iterated_inputs = raw_iterated_inputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, sequence)| {
+            let target = state
+                .get(arguments[inputs.len() + index])
+                .tensor_type
+                .format
+                .clone();
+            sequence
+                .into_iter()
+                .map(|value| {
+                    ensure_format(
+                        value,
+                        target.clone(),
+                        OperandMaterialization::Complete,
+                        operation.id,
+                        costs,
+                        state,
+                        operations,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let mut yields = Vec::new();
     for (index, high_yield) in repeat.body.yields.iter().enumerate() {
         let value = lookup(&body_values, *high_yield)?;
@@ -2781,7 +2962,19 @@ fn lower_repeat(
         .iter()
         .map(|operation| operation.estimated_cycles)
         .sum();
-    let body_peak = region_peak_memory(&arguments, &body_operations, &yields, &state.values);
+    let body_allocation_multiplicity = arguments
+        .iter()
+        .skip(inputs.len())
+        .copied()
+        .map(|argument| (argument, repeat.count))
+        .collect::<BTreeMap<_, _>>();
+    let body_peak = region_peak_memory_with_multiplicity(
+        &arguments,
+        &body_operations,
+        &yields,
+        &state.values,
+        &body_allocation_multiplicity,
+    );
     let mut results = Vec::new();
     for (origin, input) in operation.results.iter().zip(&inputs) {
         let result = state.value(*origin, state.get(*input).tensor_type.clone());
@@ -2836,7 +3029,7 @@ fn ensure_format(
         let mut tensor_type = original.tensor_type.clone();
         let from = tensor_type.format.precision;
         tensor_type.format.precision = target.precision;
-        let result = state.value(original.origin, tensor_type.clone());
+        let result = state.derived_value(value, tensor_type.clone());
         let memory = conversion_memory_estimate(&original.tensor_type, &tensor_type);
         operations.push(MidOperation {
             source: Some(source),
@@ -2866,7 +3059,7 @@ fn ensure_format(
         let mut tensor_type = current.tensor_type.clone();
         let from = tensor_type.format.layout.clone();
         tensor_type.format.layout = target.layout.clone();
-        let result = state.value(current.origin, tensor_type.clone());
+        let result = state.derived_value(value, tensor_type.clone());
         let memory = conversion_memory_estimate(&current.tensor_type, &tensor_type);
         operations.push(MidOperation {
             source: Some(source),

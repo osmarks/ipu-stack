@@ -390,6 +390,7 @@ impl CostModel for Ipu21CostModel {
             .saturating_add(
                 traffic
                     .remote_fragments
+                    .max(traffic.maximum_routed_fragments)
                     .saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles),
             )
             .saturating_add(if traffic.remote_fragments == 0 {

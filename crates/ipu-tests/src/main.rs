@@ -60,6 +60,9 @@ struct Arguments {
     /// Defaults to four times --mlp-dim.
     #[arg(long)]
     mlp_hidden_dim: Option<u32>,
+    /// Number of sequential MLP blocks, represented by one structured repeat.
+    #[arg(long, default_value_t = 1)]
+    mlp_blocks: u32,
     /// Global GEMM row count, independent of the configured tile count.
     #[arg(long, default_value_t = GEMM_BENCHMARK_ROWS)]
     benchmark_rows: u32,
@@ -100,6 +103,14 @@ const GEMM_BENCHMARK_ROWS: u32 = 131_072;
 const GEMM_BENCHMARK_INNER: u32 = 64;
 const GEMM_BENCHMARK_COLUMNS: u32 = 64;
 
+fn mlp_weight_name(blocks: u32, block: u32, projection: u32) -> String {
+    if blocks == 1 {
+        format!("right.{projection}")
+    } else {
+        format!("right.{block}.{projection}")
+    }
+}
+
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     ipu_runtime::init_tracing();
@@ -113,7 +124,8 @@ fn main() -> Result<()> {
         && (arguments.mlp_batch != SIGLIP_MLP_BATCH
             || arguments.mlp_tokens != SIGLIP_MLP_TOKENS
             || arguments.mlp_dim != SIGLIP_MLP_DIMENSION
-            || arguments.mlp_hidden_dim.is_some())
+            || arguments.mlp_hidden_dim.is_some()
+            || arguments.mlp_blocks != 1)
     {
         bail!("--mlp-* shape options require --workload siglip-mlp-benchmark");
     }
@@ -207,21 +219,44 @@ fn main() -> Result<()> {
             arguments.mlp_dim,
             mlp_hidden_dim,
         )?;
+        if arguments.mlp_blocks == 0 {
+            bail!("--mlp-blocks must be nonzero");
+        }
         let left = graph.host_input(
             "left",
             [arguments.mlp_batch, arguments.mlp_tokens, arguments.mlp_dim],
         )?;
-        let right0 = graph.parameter("right.0", [1, arguments.mlp_dim, mlp_hidden_dim])?;
-        let right1 = graph.parameter("right.1", [1, mlp_hidden_dim, arguments.mlp_dim])?;
-        let hidden = graph.gemm(left, right0)?;
-        let hidden = graph.gelu(hidden)?;
-        let output = graph.gemm(hidden, right1)?;
+        let mut right0 = Vec::with_capacity(arguments.mlp_blocks as usize);
+        let mut right1 = Vec::with_capacity(arguments.mlp_blocks as usize);
+        for block in 0..arguments.mlp_blocks {
+            right0.push(graph.parameter(
+                mlp_weight_name(arguments.mlp_blocks, block, 0),
+                [1, arguments.mlp_dim, mlp_hidden_dim],
+            )?);
+            right1.push(graph.parameter(
+                mlp_weight_name(arguments.mlp_blocks, block, 1),
+                [1, mlp_hidden_dim, arguments.mlp_dim],
+            )?);
+        }
+        let right0_sequence = graph.value_sequence("MLP up weights", right0.clone())?;
+        let right1_sequence = graph.value_sequence("MLP down weights", right1.clone())?;
+        let output = graph.repeat(
+            arguments.mlp_blocks,
+            [left],
+            [],
+            [right0_sequence, right1_sequence],
+            |body, arguments| {
+                let hidden = body.gemm(arguments.carried[0], arguments.iterated[0])?;
+                let hidden = body.gelu(hidden)?;
+                Ok(vec![body.gemm(hidden, arguments.iterated[1])?])
+            },
+        )?[0];
         graph.set_outputs([output])?;
         pipeline.profiling.enabled = !arguments.no_profile;
-        pipeline = pipeline
-            .with_automatic_input(left, Precision::F16)
-            .with_automatic_input(right0, Precision::F16)
-            .with_automatic_input(right1, Precision::F16);
+        pipeline = pipeline.with_automatic_input(left, Precision::F16);
+        for weight in right0.into_iter().chain(right1) {
+            pipeline = pipeline.with_automatic_input(weight, Precision::F16);
+        }
     } else if matches!(arguments.workload, Workload::GemmBenchmark) {
         validate_benchmark_shape(
             benchmark_rows,
@@ -302,6 +337,7 @@ fn main() -> Result<()> {
                 arguments.mlp_tokens,
                 arguments.mlp_dim,
                 mlp_hidden_dim,
+                arguments.mlp_blocks,
                 arguments.clock_hz,
                 arguments.timeout_seconds,
                 arguments.profile_output.as_deref(),
@@ -553,6 +589,7 @@ fn run_siglip_mlp_benchmark(
     tokens: u32,
     dimension: u32,
     hidden_dimension: u32,
+    blocks: u32,
     clock_hz: u64,
     timeout_seconds: u64,
     profile_output: Option<&Path>,
@@ -567,32 +604,30 @@ fn run_siglip_mlp_benchmark(
         .iter()
         .find(|binding| binding.name == "left")
         .context("MLP benchmark package has no left binding")?;
-    let right0 = application
-        .weights
-        .iter()
-        .find(|binding| binding.name == "right.0")
-        .context("MLP benchmark package has no first weight binding")?;
-    let right1 = application
-        .weights
-        .iter()
-        .find(|binding| binding.name == "right.1")
-        .context("MLP benchmark package has no second weight binding")?;
     let left_bytes = filled_f16_binding(left, 0x3c00)?;
-    let right0_bytes = filled_f16_binding(right0, 0x2000)?;
-    let right1_bytes = filled_f16_binding(right1, 0x2000)?;
-    let mut weights = Vec::with_capacity(right0_bytes.len() + right1_bytes.len());
-    weights.extend_from_slice(&right0_bytes);
-    weights.extend_from_slice(&right1_bytes);
+    let up_bits = f32_to_half(1.0 / dimension as f32);
+    let down_bits = f32_to_half(1.0 / hidden_dimension as f32);
+    let mut weights = Vec::new();
+    for block in 0..blocks {
+        for (projection, bits) in [(0, up_bits), (1, down_bits)] {
+            let name = mlp_weight_name(blocks, block, projection);
+            let binding = application
+                .weights
+                .iter()
+                .find(|binding| binding.name == name)
+                .with_context(|| format!("MLP benchmark package has no {name} binding"))?;
+            weights.extend_from_slice(&filled_f16_binding(binding, bits)?);
+        }
+    }
 
     let output =
         run_initialized_program(runtime, application, &weights, &left_bytes, timeout_seconds)?;
 
-    let first_dense = dimension as f32 / 128.0;
-    let expected = gelu_reference(first_dense) * hidden_dimension as f32 / 128.0;
+    let expected = (0..blocks).fold(1.0, |value, _| gelu_reference(value));
     let maximum_absolute_error = verify_constant_output(application, &output, expected)?;
     if !profiling_enabled {
         println!(
-            "workload=siglip-mlp-f16-b{batch}-t{tokens}-d{dimension}-h{hidden_dimension} benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} dimension={dimension} hiddenDimension={hidden_dimension} biases=false profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
+            "workload=siglip-mlp-f16-b{batch}-t{tokens}-d{dimension}-h{hidden_dimension}-n{blocks} benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} dimension={dimension} hiddenDimension={hidden_dimension} blocks={blocks} biases=false profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
         );
         return Ok(());
     }
@@ -600,12 +635,13 @@ fn run_siglip_mlp_benchmark(
     write_profile(application, &output, clock_hz, profile_output)?;
     let active_tiles = binding_tile_count(application, "output.0")?;
     let rows = u64::from(batch) * u64::from(tokens);
-    let flops = 4.0 * rows as f64 * f64::from(dimension) * f64::from(hidden_dimension);
+    let flops =
+        4.0 * rows as f64 * f64::from(dimension) * f64::from(hidden_dimension) * f64::from(blocks);
     let seconds = f64::from(cycles) / clock_hz as f64;
     let tflops = flops / seconds / 1.0e12;
     let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
     println!(
-        "workload=siglip-mlp-f16-b{batch}-t{tokens}-d{dimension}-h{hidden_dimension} benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} rows={rows} dimension={dimension} hiddenDimension={hidden_dimension} biases=false activeTiles={active_tiles} executionTiles={execution_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} effectiveGemmTflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
+        "workload=siglip-mlp-f16-b{batch}-t{tokens}-d{dimension}-h{hidden_dimension}-n{blocks} benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} rows={rows} dimension={dimension} hiddenDimension={hidden_dimension} blocks={blocks} biases=false activeTiles={active_tiles} executionTiles={execution_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} effectiveGemmTflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
         left_bytes.len(),
         weights.len(),
         seconds * 1.0e6,
@@ -736,13 +772,21 @@ fn verify_constant_output(application: &Application, bytes: &[u8], expected: f32
         .get(start..end)
         .context("MLP benchmark output exceeds host output")?;
     let mut maximum = 0.0f32;
+    let mut minimum_value = f32::INFINITY;
+    let mut maximum_value = f32::NEG_INFINITY;
+    let mut zero_values = 0usize;
+    let mut unchanged_values = 0usize;
     for raw in output.chunks_exact(2) {
         let actual = half_to_f32(u16::from_le_bytes(raw.try_into().unwrap()));
+        minimum_value = minimum_value.min(actual);
+        maximum_value = maximum_value.max(actual);
+        zero_values += usize::from(actual == 0.0);
+        unchanged_values += usize::from(actual == 1.0);
         maximum = maximum.max((actual - expected).abs());
     }
     if maximum > expected.abs() * 0.02 + 0.05 {
         bail!(
-            "MLP benchmark numerical output differs from {expected}: maximum absolute error {maximum}"
+            "MLP benchmark numerical output differs from {expected}: maximum absolute error {maximum}, observed range {minimum_value}..={maximum_value}, zeros={zero_values}, unchanged={unchanged_values}"
         );
     }
     Ok(maximum)
@@ -1156,10 +1200,37 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
     };
     let mut contexts = Vec::new();
     for &(physical, state) in states.iter().filter(|(_, state)| *state != 0).take(16) {
+        let program_counter = runtime.device().read_tile_program_counter(physical, 0);
+        let segment = program_counter.as_ref().ok().and_then(|&pc| {
+            application
+                .tiles
+                .iter()
+                .find(|tile| tile.physical_tile == u32::from(physical))?
+                .segments
+                .iter()
+                .find(|segment| {
+                    (segment.address..segment.address.saturating_add(segment.memory_size))
+                        .contains(&pc)
+                })
+                .map(|segment| {
+                    let offset = usize::try_from(pc - segment.address).ok()?;
+                    let start = offset.saturating_sub(8) & !3;
+                    let end = (offset + 12).min(segment.data.len()) & !3;
+                    let words = segment
+                        .data
+                        .get(start..end)?
+                        .chunks_exact(4)
+                        .map(|word| {
+                            u32::from_le_bytes(word.try_into().expect("four-byte instruction"))
+                        })
+                        .collect::<Vec<_>>();
+                    Some((segment.address, segment.memory_size, start, words))
+                })?
+        });
         let workers = (1..=6)
             .map(|context| runtime.device().tile_context_state(physical, context))
             .collect::<Result<Vec<_>, _>>();
-        contexts.push((physical, state, workers));
+        contexts.push((physical, state, program_counter, segment, workers));
     }
     format!("{} contexts={contexts:?}", summarize_states(&states))
 }

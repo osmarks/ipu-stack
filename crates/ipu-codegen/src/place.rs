@@ -96,7 +96,9 @@ pub(crate) fn place_with_standard_ranges(
     }
     let mut sets = DisjointSets::new(program.shards.len());
     for shard in &program.shards {
-        if let ShardDefinition::Alias(target) = shard.definition {
+        if let ShardDefinition::Alias(target) | ShardDefinition::WritableAlias(target) =
+            shard.definition
+        {
             checked_union(program, &mut sets, shard.id, target)?;
         }
     }
@@ -214,8 +216,7 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
     for tile in &program.tiles {
         let mut event = 1u32;
         for work in program.work(tile) {
-            touch_work(program, work, tile.tile, event, &mut lifetimes);
-            event = event.saturating_add(1);
+            touch_work(program, work, tile.tile, &mut event, &mut lifetimes);
         }
         for output in &program.outputs {
             if let Some(shard) = output.shards.get(usize::from(tile.tile)) {
@@ -240,10 +241,11 @@ fn touch_work(
     program: &LowProgram,
     work: TileWorkRef<'_>,
     tile: u16,
-    event: u32,
+    event: &mut u32,
     lifetimes: &mut [Lifetime],
 ) {
-    let mut touch = |shard: LowShardId| lifetimes[shard.index() as usize].touch(event);
+    let current = *event;
+    let mut touch = |shard: LowShardId| lifetimes[shard.index() as usize].touch(current);
     match work {
         TileWorkRef::Kernel(run) => {
             for view in run.inputs.iter().flat_map(|operand| &operand.views) {
@@ -284,11 +286,32 @@ fn touch_work(
                 }
                 touch(iterated.argument);
             }
+            *event = event.saturating_add(1);
             for nested in program.work(&repeat.body) {
                 touch_work(program, nested, tile, event, lifetimes);
             }
+            let end = *event;
+            for carried in &repeat.carried {
+                lifetimes[carried.initial.index() as usize].touch(end);
+                lifetimes[carried.argument.index() as usize].touch(end);
+                lifetimes[carried.yielded.index() as usize].touch(end);
+                lifetimes[carried.result.index() as usize].touch(end);
+            }
+            for invariant in &repeat.invariants {
+                lifetimes[invariant.input.index() as usize].touch(end);
+                lifetimes[invariant.argument.index() as usize].touch(end);
+            }
+            for iterated in &repeat.iterated {
+                for input in &iterated.inputs {
+                    lifetimes[input.index() as usize].touch(end);
+                }
+                lifetimes[iterated.argument.index() as usize].touch(end);
+            }
+            *event = event.saturating_add(1);
+            return;
         }
     }
+    *event = event.saturating_add(1);
 }
 
 fn collect_repeat_constraints(
