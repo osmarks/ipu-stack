@@ -338,6 +338,32 @@ ipu_stack_static_assert_equal_u32:
 	bri .Lassert_equal_u32_failed
 	.size ipu_stack_static_assert_equal_u32, .-ipu_stack_static_assert_equal_u32
 
+	.section .text.ipu_stack_static_worker_delay,"ax",@progbits
+	// Diagnostic compute phase: m4 is the per-worker loop count. The generic
+	// compute ABI's output and input pointers in m2/m3 are intentionally unused.
+	.globl ipu_stack_static_worker_delay
+	.p2align 2
+	.type ipu_stack_static_worker_delay,@function
+ipu_stack_static_worker_delay:
+	.supervisor
+	add $m11, $m11, -8
+	st32 $m4, $m11, $m15, 0
+	setzi $m0, .Lworker_delay
+	runall $m0, $m11, 0
+	.long OPCODE_SYNC | SYNC_COMPUTE_SET
+	add $m11, $m11, 8
+	br $m10
+	.size ipu_stack_static_worker_delay, .-ipu_stack_static_worker_delay
+
+	.worker
+	.p2align 2
+.Lworker_delay:
+	ld32 $m0, $mvertex_base, $m15, 0
+.Lworker_delay_next:
+	sub $m0, $m0, 1
+	brnz $m0, .Lworker_delay_next
+	exitz $m15
+
 	.section .text.ipu_stack_static_complete,"ax",@progbits
 	.globl ipu_stack_static_complete
 	.p2align 2

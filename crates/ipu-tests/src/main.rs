@@ -83,6 +83,9 @@ struct Arguments {
     /// Maximum words in one randomized transfer.
     #[arg(long, default_value_t = 256)]
     exchange_max_words: u32,
+    /// Maximum worker-loop iterations between randomized exchange epochs.
+    #[arg(long, default_value_t = 2048)]
+    exchange_compute_delay: u32,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -176,6 +179,7 @@ fn main() -> Result<()> {
             arguments.exchange_seed,
             arguments.exchange_cases,
             arguments.exchange_max_words,
+            arguments.exchange_compute_delay,
             &Toolchain::from_sdk(&arguments.sdk),
             &runtime_source,
         )?;

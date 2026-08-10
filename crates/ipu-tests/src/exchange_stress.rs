@@ -38,6 +38,7 @@ pub(crate) fn build(
     seed: u64,
     cases: u32,
     maximum_words: u32,
+    maximum_compute_delay: u32,
     toolchain: &Toolchain,
     runtime_source: &Path,
 ) -> Result<StressPackage> {
@@ -49,6 +50,9 @@ pub(crate) fn build(
             "--exchange-max-words must be in 1..={}",
             ipu_exchange::MAX_TRANSFER_WORDS
         );
+    }
+    if maximum_compute_delay == 0 {
+        bail!("--exchange-compute-delay must be nonzero");
     }
     let topology = Topology::c600();
     let mut rng = fastrand::Rng::with_seed(seed);
@@ -232,6 +236,15 @@ pub(crate) fn build(
                         profile: StepProfile::default(),
                     }));
             }
+            programs[usize::from(tile)]
+                .steps
+                .push(TileStep::Compute(ComputeStep {
+                    symbol: "ipu_stack_static_worker_delay".into(),
+                    output_address: TileAddress::Absolute(DATA_BASE),
+                    input_addresses: vec![TileAddress::Absolute(DATA_BASE)],
+                    arguments: vec![rng.u32(1..=maximum_compute_delay)],
+                    profile: StepProfile::default(),
+                }));
         }
     }
     let data = buffers
@@ -246,7 +259,7 @@ pub(crate) fn build(
         .collect::<Vec<_>>();
     let application = build_tile_program_package(&programs, &data, toolchain, runtime_source)?;
     eprintln!(
-        "exchangeStress seed={seed:#x} cases={cases} transfers={} activeTiles={ACTIVE_TILES} maxWords={maximum_words}",
+        "exchangeStress seed={seed:#x} cases={cases} transfers={} activeTiles={ACTIVE_TILES} maxWords={maximum_words} maxComputeDelay={maximum_compute_delay}",
         transfers.len()
     );
     Ok(StressPackage {
