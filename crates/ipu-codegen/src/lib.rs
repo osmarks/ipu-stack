@@ -70,6 +70,10 @@ pub use tile::{RepeatExchangeStrategy, TileLoweringError, TileProgramLowering};
 
 const INCOMING_BASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;
+// Recovered primitive PIC/XPIC plans arm A6 with one; their payload length is
+// encoded in the timed instructions rather than this external-stream counter.
+// Consolidated phases currently preserve that primitive-plan setting.
+const INTERNAL_EXCHANGE_DCOUNT: u32 = 1;
 const OUTGOING_BASE: u8 = 0xa7;
 const FIRST_EXCHANGE_CSR: u8 = 0xa0;
 const FIRST_INPUT_REGISTER: u8 = 3;
@@ -399,7 +403,7 @@ fn emit_steps(
                         worker_barrier.expect("active exchange phase has worker barrier"),
                         7,
                     )?;
-                    code.setzi(8, 1)?;
+                    code.setzi(8, INTERNAL_EXCHANGE_DCOUNT)?;
                     code.put_special(INCOMING_DCOUNT, 8)?;
                 }
                 if let Some(address) = snapshot {
