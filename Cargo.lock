@@ -354,6 +354,7 @@ dependencies = [
  "ipu-exchange",
  "ipu-package",
  "ipu-runtime",
+ "tracing",
 ]
 
 [[package]]

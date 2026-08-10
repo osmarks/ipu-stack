@@ -19,3 +19,4 @@ ipu-exchange = { path = "../ipu-exchange" }
 ipu-package = { path = "../ipu-package" }
 ipu-runtime = { path = "../ipu-runtime" }
 fastrand.workspace = true
+tracing.workspace = true

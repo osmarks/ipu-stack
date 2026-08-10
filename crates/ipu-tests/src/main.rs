@@ -4,11 +4,13 @@ use ipu_codegen::{
     AmpOrder, ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision, TensorFormat,
     amp_matrix_coordinates, build_package,
 };
+use ipu_driver::DriverError;
 use ipu_elf::Toolchain;
 use ipu_package::{Application, Binding};
-use ipu_runtime::Runtime;
+use ipu_runtime::{Runtime, RuntimeError};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod exchange_stress;
@@ -188,8 +190,14 @@ fn main() -> Result<()> {
             .with_context(|| format!("read {}", arguments.configuration.display()))?;
         let bootloader_bytes =
             fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
-        let runtime = Runtime::open(&arguments.device, &configuration)?;
-        runtime.load(&stress.application, &bootloader_bytes, 0)?;
+        let runtime = open_and_load(
+            &arguments.device,
+            &configuration,
+            &arguments.sdk,
+            &stress.application,
+            &bootloader_bytes,
+            0,
+        )?;
         diagnose_completion(
             &runtime,
             &stress.application,
@@ -356,13 +364,20 @@ fn main() -> Result<()> {
         .with_context(|| format!("read {}", arguments.configuration.display()))?;
     let bootloader_bytes =
         fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
-    let runtime = Runtime::open(&arguments.device, &configuration)?;
+    let startup_mark = if matches!(arguments.workload, Workload::Diagnostic) {
+        0
+    } else {
+        application.host_exchange.startup_mark
+    };
+    let runtime = open_and_load(
+        &arguments.device,
+        &configuration,
+        &arguments.sdk,
+        &application,
+        &bootloader_bytes,
+        startup_mark,
+    )?;
     if !matches!(arguments.workload, Workload::Diagnostic) {
-        runtime.load(
-            &application,
-            &bootloader_bytes,
-            application.host_exchange.startup_mark,
-        )?;
         if matches!(
             arguments.workload,
             Workload::GemmSmoke | Workload::BatchedGemmSmoke
@@ -415,7 +430,6 @@ fn main() -> Result<()> {
             )?;
         }
     } else {
-        runtime.load(&application, &bootloader_bytes, 0)?;
         diagnose_completion(
             &runtime,
             &application,
@@ -428,6 +442,37 @@ fn main() -> Result<()> {
         application.tiles.len()
     );
     Ok(())
+}
+
+fn open_and_load(
+    device: &str,
+    configuration: &[u8],
+    sdk: &Path,
+    application: &Application,
+    bootloader: &[u8],
+    final_mark: u32,
+) -> Result<Runtime> {
+    let attempt = || -> ipu_runtime::Result<Runtime> {
+        let runtime = Runtime::open(device, configuration)?;
+        runtime.load(application, bootloader, final_mark)?;
+        Ok(runtime)
+    };
+    match attempt() {
+        Ok(runtime) => Ok(runtime),
+        Err(RuntimeError::Driver(DriverError::Timeout(error))) => {
+            tracing::warn!(%error, "device timed out while loading; resetting and retrying once");
+            let reset = sdk.join("bin/gc-reset");
+            let status = Command::new(&reset)
+                .arg("-m")
+                .status()
+                .with_context(|| format!("run {} -m", reset.display()))?;
+            if !status.success() {
+                bail!("{} -m exited with {status}", reset.display());
+            }
+            attempt().context("application load failed after gc-reset -m")
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn run_gemm(
