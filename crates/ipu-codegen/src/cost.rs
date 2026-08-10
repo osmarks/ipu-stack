@@ -11,7 +11,7 @@ use crate::mid::{
     OperatorDispatch, OperatorRequirements, Precision, TensorAxis, TensorType,
 };
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 pub trait CostModel {
     fn operator_cycles(
@@ -34,14 +34,14 @@ pub trait CostModel {
 
 pub(crate) struct MemoizedCostModel<'a, C> {
     inner: &'a C,
-    rearrangements: RefCell<BTreeMap<(TensorShape, Precision, Layout, Layout), u64>>,
+    rearrangements: RefCell<HashMap<(TensorShape, Precision, Layout, Layout), u64>>,
 }
 
 impl<'a, C> MemoizedCostModel<'a, C> {
     pub(crate) fn new(inner: &'a C) -> Self {
         Self {
             inner,
-            rearrangements: RefCell::new(BTreeMap::new()),
+            rearrangements: RefCell::new(HashMap::new()),
         }
     }
 }
