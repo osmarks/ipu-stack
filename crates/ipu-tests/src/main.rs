@@ -7,7 +7,7 @@ use ipu_codegen::{
 use ipu_driver::DriverError;
 use ipu_elf::Toolchain;
 use ipu_package::{Application, Binding};
-use ipu_runtime::{Runtime, RuntimeError};
+use ipu_runtime::Runtime;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -190,20 +190,21 @@ fn main() -> Result<()> {
             .with_context(|| format!("read {}", arguments.configuration.display()))?;
         let bootloader_bytes =
             fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
-        let runtime = open_and_load(
-            &arguments.device,
-            &configuration,
-            &arguments.sdk,
-            &stress.application,
-            &bootloader_bytes,
-            0,
-        )?;
-        diagnose_completion(
-            &runtime,
-            &stress.application,
-            Duration::from_secs(arguments.timeout_seconds),
-        )
-        .with_context(|| stress.failure_context(&runtime))?;
+        retry_after_reset(&arguments.sdk, || {
+            let runtime = open_and_load_once(
+                &arguments.device,
+                &configuration,
+                &stress.application,
+                &bootloader_bytes,
+                0,
+            )?;
+            diagnose_completion(
+                &runtime,
+                &stress.application,
+                Duration::from_secs(arguments.timeout_seconds),
+            )
+            .with_context(|| stress.failure_context(&runtime))
+        })?;
         println!(
             "package={} seed={:#x} exchangeCases={} hardwareTest=PASS",
             arguments.package.display(),
@@ -369,73 +370,75 @@ fn main() -> Result<()> {
     } else {
         application.host_exchange.startup_mark
     };
-    let runtime = open_and_load(
-        &arguments.device,
-        &configuration,
-        &arguments.sdk,
-        &application,
-        &bootloader_bytes,
-        startup_mark,
-    )?;
-    if !matches!(arguments.workload, Workload::Diagnostic) {
-        if matches!(
-            arguments.workload,
-            Workload::GemmSmoke | Workload::BatchedGemmSmoke
-        ) {
-            run_gemm(
-                &runtime,
-                &application,
-                active_tiles,
-                if matches!(arguments.workload, Workload::BatchedGemmSmoke) {
-                    3
-                } else {
-                    1
-                },
-                arguments.timeout_seconds,
-            )?;
-        } else if matches!(arguments.workload, Workload::MlpSmoke) {
-            run_mlp_chain(
-                &runtime,
-                &application,
-                active_tiles,
-                arguments.timeout_seconds,
-            )?;
-        } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
-            run_siglip_mlp_benchmark(
-                &runtime,
-                &application,
-                active_tiles,
-                arguments.mlp_batch,
-                arguments.mlp_tokens,
-                arguments.mlp_dim,
-                mlp_hidden_dim,
-                arguments.mlp_blocks,
-                arguments.clock_hz,
-                arguments.timeout_seconds,
-                arguments.profile_output.as_deref(),
-                !arguments.no_profile,
-            )?;
+    retry_after_reset(&arguments.sdk, || {
+        let runtime = open_and_load_once(
+            &arguments.device,
+            &configuration,
+            &application,
+            &bootloader_bytes,
+            startup_mark,
+        )?;
+        if !matches!(arguments.workload, Workload::Diagnostic) {
+            if matches!(
+                arguments.workload,
+                Workload::GemmSmoke | Workload::BatchedGemmSmoke
+            ) {
+                run_gemm(
+                    &runtime,
+                    &application,
+                    active_tiles,
+                    if matches!(arguments.workload, Workload::BatchedGemmSmoke) {
+                        3
+                    } else {
+                        1
+                    },
+                    arguments.timeout_seconds,
+                )?;
+            } else if matches!(arguments.workload, Workload::MlpSmoke) {
+                run_mlp_chain(
+                    &runtime,
+                    &application,
+                    active_tiles,
+                    arguments.timeout_seconds,
+                )?;
+            } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
+                run_siglip_mlp_benchmark(
+                    &runtime,
+                    &application,
+                    active_tiles,
+                    arguments.mlp_batch,
+                    arguments.mlp_tokens,
+                    arguments.mlp_dim,
+                    mlp_hidden_dim,
+                    arguments.mlp_blocks,
+                    arguments.clock_hz,
+                    arguments.timeout_seconds,
+                    arguments.profile_output.as_deref(),
+                    !arguments.no_profile,
+                )?;
+            } else {
+                run_gemm_benchmark(
+                    &runtime,
+                    &application,
+                    active_tiles,
+                    benchmark_rows,
+                    arguments.benchmark_inner,
+                    arguments.benchmark_columns,
+                    arguments.clock_hz,
+                    arguments.timeout_seconds,
+                    arguments.profile_output.as_deref(),
+                    !arguments.no_profile,
+                )?;
+            }
         } else {
-            run_gemm_benchmark(
+            diagnose_completion(
                 &runtime,
                 &application,
-                active_tiles,
-                benchmark_rows,
-                arguments.benchmark_inner,
-                arguments.benchmark_columns,
-                arguments.clock_hz,
-                arguments.timeout_seconds,
-                arguments.profile_output.as_deref(),
-                !arguments.no_profile,
+                Duration::from_secs(arguments.timeout_seconds),
             )?;
         }
-    } else {
-        diagnose_completion(
-            &runtime,
-            &application,
-            Duration::from_secs(arguments.timeout_seconds),
-        )?;
-    }
+        Ok(())
+    })?;
     println!(
         "package={} tiles={} hardwareTest=PASS",
         arguments.package.display(),
@@ -444,23 +447,27 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn open_and_load(
+fn open_and_load_once(
     device: &str,
     configuration: &[u8],
-    sdk: &Path,
     application: &Application,
     bootloader: &[u8],
     final_mark: u32,
 ) -> Result<Runtime> {
-    let attempt = || -> ipu_runtime::Result<Runtime> {
-        let runtime = Runtime::open(device, configuration)?;
-        runtime.load(application, bootloader, final_mark)?;
-        Ok(runtime)
-    };
+    let runtime = Runtime::open(device, configuration)?;
+    runtime.load(application, bootloader, final_mark)?;
+    Ok(runtime)
+}
+
+fn retry_after_reset<T>(sdk: &Path, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
     match attempt() {
-        Ok(runtime) => Ok(runtime),
-        Err(RuntimeError::Driver(DriverError::Timeout(error))) => {
-            tracing::warn!(%error, "device timed out while loading; resetting and retrying once");
+        Ok(value) => Ok(value),
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| matches!(cause.downcast_ref(), Some(DriverError::Timeout(_)))) =>
+        {
+            tracing::warn!(%error, "device timed out; resetting and retrying once");
             let reset = sdk.join("bin/gc-reset");
             let status = Command::new(&reset)
                 .arg("-m")
@@ -469,9 +476,9 @@ fn open_and_load(
             if !status.success() {
                 bail!("{} -m exited with {status}", reset.display());
             }
-            attempt().context("application load failed after gc-reset -m")
+            attempt().context("hardware execution failed after gc-reset -m")
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
     }
 }
 
