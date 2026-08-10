@@ -289,19 +289,25 @@ fn main() -> Result<()> {
                 [1, mlp_hidden_dim, arguments.mlp_dim],
             )?);
         }
-        let right0_sequence = graph.value_sequence("MLP up weights", right0.clone())?;
-        let right1_sequence = graph.value_sequence("MLP down weights", right1.clone())?;
-        let output = graph.repeat(
-            arguments.mlp_blocks,
-            [left],
-            [],
-            [right0_sequence, right1_sequence],
-            |body, arguments| {
-                let hidden = body.gemm(arguments.carried[0], arguments.iterated[0])?;
-                let hidden = body.gelu(hidden)?;
-                Ok(vec![body.gemm(hidden, arguments.iterated[1])?])
-            },
-        )?[0];
+        let output = if arguments.mlp_blocks == 1 {
+            let hidden = graph.gemm(left, right0[0])?;
+            let hidden = graph.gelu(hidden)?;
+            graph.gemm(hidden, right1[0])?
+        } else {
+            let right0_sequence = graph.value_sequence("MLP up weights", right0.clone())?;
+            let right1_sequence = graph.value_sequence("MLP down weights", right1.clone())?;
+            graph.repeat(
+                arguments.mlp_blocks,
+                [left],
+                [],
+                [right0_sequence, right1_sequence],
+                |body, arguments| {
+                    let hidden = body.gemm(arguments.carried[0], arguments.iterated[0])?;
+                    let hidden = body.gelu(hidden)?;
+                    Ok(vec![body.gemm(hidden, arguments.iterated[1])?])
+                },
+            )?[0]
+        };
         graph.set_outputs([output])?;
         pipeline.profiling.enabled = !arguments.no_profile;
         pipeline = pipeline.with_automatic_input(left, Precision::F16);

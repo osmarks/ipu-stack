@@ -403,21 +403,6 @@ fn build_package_from_objects(
         execution_tile_count,
         program.tile_count,
     )?;
-    let exchange_rows = (exchange_table_bytes != 0)
-        .then(|| {
-            memory.allocate(MemoryRequest {
-                name: "exchange row tables",
-                bytes: exchange_table_bytes,
-                alignment: 4,
-                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-                end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                guard_after: ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
-            })
-        })
-        .transpose()?;
-    let exchange_code_base = exchange_rows
-        .as_ref()
-        .map_or(crate::IPU21_DATA_BASE, |allocation| allocation.range.start);
     let profile_samples = config.pipeline.profiling.enabled.then(|| {
         program
             .tiles
@@ -443,6 +428,21 @@ fn build_package_from_objects(
             })?)
         })
         .transpose()?;
+    let exchange_rows = (exchange_table_bytes != 0)
+        .then(|| {
+            memory.allocate(MemoryRequest {
+                name: "exchange row tables",
+                bytes: exchange_table_bytes,
+                alignment: 4,
+                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+                guard_after: ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
+            })
+        })
+        .transpose()?;
+    let exchange_code_base = exchange_rows
+        .as_ref()
+        .map_or(crate::IPU21_DATA_BASE, |allocation| allocation.range.start);
     let execution_topology = Topology::c600();
     let mut physical_to_logical = vec![None; usize::from(execution_tile_count)];
     for logical in 0..execution_tile_count {
@@ -1068,7 +1068,7 @@ fn profile_binding(
             let steps = if logical < program.tile_count {
                 program.tiles[usize::from(logical)].work.len()
             } else {
-                program.exchange_phases.len()
+                inactive_profile_work(program).len()
             };
             (steps != 0).then_some((physical, steps))
         })
@@ -1134,26 +1134,29 @@ fn instrument_profile(
             )?);
         }
     } else {
-        if program.exchange_phases.len() != tile_program.steps.len() {
+        let schedule = inactive_profile_work(program);
+        if schedule.len() != tile_program.steps.len() {
             return Err(invalid(
-                "inactive tile profile does not match exchange phases",
+                "inactive tile profile does not match finalized steps",
             ));
         }
-        for (index, (phase, step)) in program
-            .exchange_phases
-            .iter()
+        for (index, (work, step)) in schedule
+            .into_iter()
             .zip(&mut tile_program.steps)
             .enumerate()
         {
-            let crate::TileStep::Exchange(exchange) = step else {
-                return Err(invalid("inactive tile contains non-exchange work"));
+            let (phase, provenance) = match (work, &*step) {
+                (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(_)) => {
+                    let phase = &program.exchange_phases[id.index() as usize];
+                    (0x8000_0000 | id.index(), &phase.provenance)
+                }
+                (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(_)) => {
+                    (u32::try_from(index)?, &repeat.provenance)
+                }
+                _ => return Err(invalid("inactive tile contains executable work")),
             };
-            exchange.profile.before = Some(profile_address(address, index)?);
-            plans.push(inactive_tile_description(
-                index,
-                0x8000_0000 | phase.id.index(),
-                &phase.provenance,
-            )?);
+            step_profile(step).before = Some(profile_address(address, index)?);
+            plans.push(inactive_tile_description(index, phase, provenance)?);
         }
     }
     if let Some(last) = tile_program.steps.last_mut() {
@@ -1163,6 +1166,21 @@ fn instrument_profile(
         physical_tile,
         steps: plans,
     })
+}
+
+fn inactive_profile_work(program: &LowProgram) -> Vec<crate::TileWorkRef<'_>> {
+    program
+        .tiles
+        .first()
+        .into_iter()
+        .flat_map(|tile| program.work(tile))
+        .filter(|work| {
+            matches!(
+                work,
+                crate::TileWorkRef::Exchange(_) | crate::TileWorkRef::Repeat(_)
+            )
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
