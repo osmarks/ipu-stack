@@ -340,7 +340,10 @@ pub fn build_package(
         Ok(lower_to_tiles(&mid, &config.pipeline)?)
     })?;
     if config.pipeline.profiling.enabled
-        && config.repeat_exchanges == crate::RepeatExchangeStrategy::SeparateRows
+        && !matches!(
+            config.repeat_exchanges,
+            crate::RepeatExchangeStrategy::PatchInPlace
+        )
         && !low.repeat_runs.is_empty()
     {
         return Err(invalid(
@@ -1019,7 +1022,10 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
     if !program.exchange_phases.is_empty() {
         symbols.push(WORKER_BARRIER_SYMBOL.into());
         if !program.repeat_runs.is_empty()
-            && config.repeat_exchanges == crate::RepeatExchangeStrategy::PatchInPlace
+            && matches!(
+                config.repeat_exchanges,
+                crate::RepeatExchangeStrategy::PatchInPlace
+            )
         {
             symbols.push(crate::PATCH_WORD_SYMBOL.into());
         }

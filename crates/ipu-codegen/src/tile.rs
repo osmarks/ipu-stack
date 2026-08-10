@@ -13,6 +13,21 @@ pub enum RepeatExchangeStrategy {
     #[default]
     PatchInPlace,
     SeparateRows,
+    SingleIteration(u32),
+}
+
+impl RepeatExchangeStrategy {
+    fn iterations(self, count: u32) -> Result<Vec<u32>, TileLoweringError> {
+        match self {
+            Self::PatchInPlace | Self::SeparateRows => Ok((0..count).collect()),
+            Self::SingleIteration(iteration) if iteration < count => Ok(vec![iteration]),
+            Self::SingleIteration(_) => Err(TileLoweringError::InvalidRepeat),
+        }
+    }
+
+    const fn materializes_rows(self) -> bool {
+        !matches!(self, Self::PatchInPlace)
+    }
 }
 
 /// Address-resolution context which finalizes one tile on demand.
@@ -69,7 +84,7 @@ struct PlacedExchange {
     active: bool,
     program: PlacedExchangeRow,
     patches: Vec<ExchangePatch>,
-    iteration_programs: Vec<PlacedExchangeRow>,
+    iteration_programs: BTreeMap<u32, PlacedExchangeRow>,
 }
 
 impl<'a> TileProgramLowering<'a> {
@@ -205,7 +220,7 @@ fn lower_work(
                 TileStep::Exchange(ExchangeStep {
                     active: placed.active,
                     program: repeat_iteration
-                        .and_then(|iteration| placed.iteration_programs.get(iteration))
+                        .and_then(|iteration| placed.iteration_programs.get(&(iteration as u32)))
                         .unwrap_or(&placed.program)
                         .clone(),
                     patches: (inside_repeat
@@ -254,7 +269,7 @@ fn lower_work(
                 if inside_repeat {
                     return Err(TileLoweringError::NestedRepeat);
                 }
-                if repeat_exchanges == RepeatExchangeStrategy::SeparateRows {
+                if repeat_exchanges.materializes_rows() {
                     steps.extend(lower_repeat_separate_rows(
                         program,
                         repeat,
@@ -377,7 +392,7 @@ fn lower_repeat_separate_rows(
     repeat_exchanges: RepeatExchangeStrategy,
 ) -> Result<Vec<TileStep>, TileLoweringError> {
     let mut steps = Vec::new();
-    for iteration in 0..repeat.count {
+    for iteration in repeat_exchanges.iterations(repeat.count)? {
         let mut overrides = BTreeMap::new();
         for iterated in &repeat.iterated {
             let initial_address = iterated
@@ -433,20 +448,24 @@ fn lower_inactive_work(
             TileWorkRef::Exchange(id) => steps.push(TileStep::Exchange(ExchangeStep {
                 active: exchange_rows[&id].active,
                 program: repeat_iteration
-                    .and_then(|iteration| exchange_rows[&id].iteration_programs.get(iteration))
+                    .and_then(|iteration| {
+                        exchange_rows[&id]
+                            .iteration_programs
+                            .get(&(iteration as u32))
+                    })
                     .unwrap_or(&exchange_rows[&id].program)
                     .clone(),
                 patches: Vec::new(),
                 profile: StepProfile::default(),
             })),
             TileWorkRef::Repeat(repeat) => {
-                if repeat_exchanges == RepeatExchangeStrategy::SeparateRows {
-                    for iteration in 0..repeat.count as usize {
+                if repeat_exchanges.materializes_rows() {
+                    for iteration in repeat_exchanges.iterations(repeat.count)? {
                         steps.extend(lower_inactive_work(
                             program,
                             &repeat.body,
                             exchange_rows,
-                            Some(iteration),
+                            Some(iteration as usize),
                             repeat_exchanges,
                         )?);
                     }
@@ -524,6 +543,15 @@ pub fn compact_exchange_table_bytes(
                     .saturating_sub(1)
                     .checked_mul(row_bytes)
                     .ok_or(TileLoweringError::Overflow)?,
+                RepeatExchangeStrategy::SingleIteration(iteration) => {
+                    if repeat_counts
+                        .get(&phase.id)
+                        .is_some_and(|&count| iteration >= count)
+                    {
+                        return Err(TileLoweringError::InvalidRepeat);
+                    }
+                    0
+                }
                 RepeatExchangeStrategy::PatchInPlace => 0,
             };
             bytes = bytes
@@ -573,32 +601,36 @@ fn layout_exchange_rows(
             .then(|| &phase.repeat_patches[usize::from(tile)][..])
             .unwrap_or_default();
         let iteration_count = repeat_counts.get(&phase.id).copied();
-        let mut iteration_programs = Vec::new();
+        let mut iteration_programs = BTreeMap::new();
         let mut patches = Vec::new();
-        let program = if strategy == RepeatExchangeStrategy::SeparateRows
+        let program = if strategy.materializes_rows()
             && let Some(count) = iteration_count
         {
-            for iteration in 0..count as usize {
+            for iteration in strategy.iterations(count)? {
                 let mut words = base_program.clone();
                 for patch in source_patches {
                     let value = *patch
                         .values
-                        .get(iteration)
+                        .get(iteration as usize)
                         .ok_or(TileLoweringError::InvalidRepeat)?;
                     *words
                         .get_mut(patch.word_offset as usize)
                         .ok_or(TileLoweringError::InvalidRepeat)? = value;
                 }
-                iteration_programs.push(PlacedExchangeRow {
-                    address: cursor,
-                    words,
-                });
+                iteration_programs.insert(
+                    iteration,
+                    PlacedExchangeRow {
+                        address: cursor,
+                        words,
+                    },
+                );
                 cursor = cursor
                     .checked_add(row_bytes)
                     .ok_or(TileLoweringError::Overflow)?;
             }
             iteration_programs
-                .first()
+                .first_key_value()
+                .map(|(_, row)| row)
                 .cloned()
                 .ok_or(TileLoweringError::InvalidRepeat)?
         } else {

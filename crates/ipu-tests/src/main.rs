@@ -38,6 +38,9 @@ struct Arguments {
     /// Materialize one immutable exchange row per structured-repeat iteration.
     #[arg(long)]
     separate_repeat_exchange_rows: bool,
+    /// Execute only this structured-repeat iteration, using immutable rows.
+    #[arg(long, conflicts_with = "separate_repeat_exchange_rows")]
+    repeat_iteration: Option<u32>,
     /// Log exchange scheduling lower bounds and critical dependency chains.
     #[arg(long)]
     exchange_diagnostics: bool,
@@ -355,11 +358,16 @@ fn main() -> Result<()> {
                 } else {
                     TileComputePolicy::Execute
                 },
-                repeat_exchanges: if arguments.separate_repeat_exchange_rows {
-                    RepeatExchangeStrategy::SeparateRows
-                } else {
-                    RepeatExchangeStrategy::PatchInPlace
-                },
+                repeat_exchanges: arguments.repeat_iteration.map_or_else(
+                    || {
+                        if arguments.separate_repeat_exchange_rows {
+                            RepeatExchangeStrategy::SeparateRows
+                        } else {
+                            RepeatExchangeStrategy::PatchInPlace
+                        }
+                    },
+                    RepeatExchangeStrategy::SingleIteration,
+                ),
             },
         )?;
         write_package(&application, &arguments.package)?;
