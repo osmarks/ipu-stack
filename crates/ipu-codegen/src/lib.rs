@@ -57,7 +57,10 @@ pub use mid::{
     PointwiseInputMapping, Precision, ProfilingConfig, SchedulingPolicy, TensorAxis, TensorFormat,
     TensorTiling, TensorType, TileKernelSpec, lower,
 };
-pub use package::{PackageBuildError, PackageBuildResult, PackageConfig, build_package};
+pub use package::{
+    PackageBuildError, PackageBuildResult, PackageConfig, TileProgramData, build_package,
+    build_tile_program_package,
+};
 pub use place::{Placement, PlacementError, place};
 pub use storage::{
     ByteSpan, StorageError, StorageResult, amp_matrix_coordinates, logical_view_byte_spans,

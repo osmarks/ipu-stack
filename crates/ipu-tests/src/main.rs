@@ -11,6 +11,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod exchange_stress;
+
 #[derive(Parser)]
 #[command(version, about = "Build, load, and diagnose the trivial IPU21 package")]
 struct Arguments {
@@ -72,6 +74,15 @@ struct Arguments {
     benchmark_columns: u32,
     #[arg(long, default_value_t = 1_500_000_000)]
     clock_hz: u64,
+    /// Reproducible random seed for --workload exchange-stress.
+    #[arg(long, default_value_t = 0x4950_5532_3100_0001)]
+    exchange_seed: u64,
+    /// Number of randomized exchange epochs in one stress package.
+    #[arg(long, default_value_t = 128)]
+    exchange_cases: u32,
+    /// Maximum words in one randomized transfer.
+    #[arg(long, default_value_t = 256)]
+    exchange_max_words: u32,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -88,6 +99,8 @@ enum Workload {
     GemmBenchmark,
     /// Profile the canonical batched SigLIP Dense-GeLU-Dense workload.
     SiglipMlpBenchmark,
+    /// Run reproducible randomized small-group tile exchanges.
+    ExchangeStress,
 }
 
 impl Workload {
@@ -153,6 +166,40 @@ fn main() -> Result<()> {
     let bootloader = arguments
         .bootloader
         .unwrap_or_else(|| arguments.sdk.join("bin/ipu/tile_bootloader_cc_ipu21.elf"));
+    if matches!(arguments.workload, Workload::ExchangeStress) {
+        if arguments.reuse_package {
+            bail!(
+                "--reuse-package is not supported by exchange-stress because its manifest is generated with the package"
+            );
+        }
+        let stress = exchange_stress::build(
+            arguments.exchange_seed,
+            arguments.exchange_cases,
+            arguments.exchange_max_words,
+            &Toolchain::from_sdk(&arguments.sdk),
+            &runtime_source,
+        )?;
+        write_package(&stress.application, &arguments.package)?;
+        let configuration = fs::read(&arguments.configuration)
+            .with_context(|| format!("read {}", arguments.configuration.display()))?;
+        let bootloader_bytes =
+            fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
+        let runtime = Runtime::open(&arguments.device, &configuration)?;
+        runtime.load(&stress.application, &bootloader_bytes, 0)?;
+        diagnose_completion(
+            &runtime,
+            &stress.application,
+            Duration::from_secs(arguments.timeout_seconds),
+        )
+        .with_context(|| stress.failure_context(&runtime))?;
+        println!(
+            "package={} seed={:#x} exchangeCases={} hardwareTest=PASS",
+            arguments.package.display(),
+            arguments.exchange_seed,
+            arguments.exchange_cases
+        );
+        return Ok(());
+    }
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
     if let Some(kib) = arguments.tile_memory_budget_kib {

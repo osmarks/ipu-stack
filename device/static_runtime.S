@@ -316,6 +316,28 @@ ipu_stack_static_sample_cycle_worker:
 	exitz $m15
 	.size ipu_stack_static_sample_cycle_worker, .-ipu_stack_static_sample_cycle_worker
 
+	.section .text.ipu_stack_static_assert_equal_u32,"ax",@progbits
+	// Supervisor diagnostic helper: m3 actual, m4 expected, m5 word count.
+	// A mismatch intentionally remains observable as a device timeout.
+	.globl ipu_stack_static_assert_equal_u32
+	.p2align 2
+	.type ipu_stack_static_assert_equal_u32,@function
+ipu_stack_static_assert_equal_u32:
+	.supervisor
+.Lassert_equal_u32_next:
+	ld32 $m0, $m3, $m15, 0
+	ld32 $m1, $m4, $m15, 0
+	xor $m0, $m0, $m1
+	brnz $m0, .Lassert_equal_u32_failed
+	add $m3, $m3, 4
+	add $m4, $m4, 4
+	sub $m5, $m5, 1
+	brnz $m5, .Lassert_equal_u32_next
+	br $m10
+.Lassert_equal_u32_failed:
+	bri .Lassert_equal_u32_failed
+	.size ipu_stack_static_assert_equal_u32, .-ipu_stack_static_assert_equal_u32
+
 	.section .text.ipu_stack_static_complete,"ax",@progbits
 	.globl ipu_stack_static_complete
 	.p2align 2

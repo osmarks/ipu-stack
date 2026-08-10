@@ -8,9 +8,10 @@ use crate::memory::{
 use crate::mid::{Ipu21CostModel, PipelineConfig};
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, KernelBuildPlan, PRNG_SEED_SYMBOL,
-    PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL, TileProgramLowering,
-    WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower,
-    lower_exchanges, lower_to_tiles, place, shard_storage_bytes,
+    PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL, TileProgram,
+    TileProgramLowering, WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL,
+    WORKER_SYNC_CONTEXT_SYMBOL, emit, lower, lower_exchanges, lower_to_tiles, place,
+    shard_storage_bytes,
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
@@ -77,6 +78,238 @@ pub struct PackageConfig {
     pub runtime_source: PathBuf,
     pub kernel_source_directory: PathBuf,
     pub pipeline: PipelineConfig,
+}
+
+/// Data embedded in one logical tile image for a finalized tile-program package.
+#[derive(Clone, Debug)]
+pub struct TileProgramData {
+    pub tile: u16,
+    pub address: u32,
+    pub data: Vec<u8>,
+}
+
+/// Builds an application from address-resolved tile programs.
+///
+/// This is the low-level counterpart to [`build_package`]. It deliberately has
+/// no tensor bindings or host program: callers supply initialized tile data and
+/// inspect it through driver diagnostics after completion.
+pub fn build_tile_program_package(
+    programs: &[TileProgram],
+    data: &[TileProgramData],
+    toolchain: &Toolchain,
+    runtime_source: &std::path::Path,
+) -> PackageBuildResult<Application> {
+    let topology = Topology::c600();
+    let execution_tiles = u16::try_from(topology.tile_count())?;
+    if programs.len() != usize::from(execution_tiles)
+        || programs
+            .iter()
+            .enumerate()
+            .any(|(tile, program)| usize::from(program.tile) != tile)
+    {
+        return Err(invalid(
+            "finalized tile programs must cover every C600 logical tile in order",
+        ));
+    }
+    if data
+        .iter()
+        .any(|segment| segment.tile >= execution_tiles || segment.data.is_empty())
+    {
+        return Err(invalid(
+            "tile-program data has an invalid tile or empty payload",
+        ));
+    }
+
+    let runtime_artifact = toolchain.compile(runtime_source, "static_runtime", &[])?;
+    let objects = vec![fs::read(runtime_artifact.object)?];
+    let kernels = KernelBuildPlan::default();
+    let mut retained_runtime = vec![COMPLETE_SYMBOL.into(), WORKER_BARRIER_SYMBOL.into()];
+    for program in programs {
+        collect_compute_symbols(&mut retained_runtime, &program.steps);
+    }
+    retained_runtime.sort_unstable();
+    retained_runtime.dedup();
+    let layout = link_runtime(
+        &objects,
+        runtime_symbols(0, 0, 0)?,
+        &kernels,
+        &retained_runtime,
+    )?;
+    let symbols = layout
+        .symbols
+        .clone()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let linked_end = linked_end(&layout)?;
+    let mut memory = TileMemoryMap::new();
+    memory.reserve("linked runtime", APPLICATION_LOAD_BASE..linked_end)?;
+    memory.reserve(
+        "host exchange aperture",
+        ipu_exchange::EXCHANGE_WINDOW_BASE
+            ..ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+    )?;
+    memory.reserve(
+        "runtime state",
+        RUNTIME_STATE_BASE..RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES,
+    )?;
+    let mut reserved_data = Vec::new();
+    for segment in data {
+        let bytes = u32::try_from(segment.data.len())?;
+        let end = segment
+            .address
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("tile data range overflow"))?;
+        reserved_data.push((segment.address, end));
+    }
+    reserved_data.sort_unstable();
+    let mut merged_data = Vec::<(u32, u32)>::new();
+    for (start, end) in reserved_data {
+        if let Some((_, previous_end)) = merged_data.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged_data.push((start, end));
+        }
+    }
+    for (start, end) in merged_data {
+        memory.reserve("tile-program data", start..end)?;
+    }
+    let mut reserved_rows = BTreeMap::new();
+    for program in programs {
+        collect_exchange_rows(&mut reserved_rows, &program.steps)?;
+    }
+    for (start, end) in reserved_rows {
+        memory.reserve("exchange rows", start..end)?;
+    }
+
+    let sizing_address = memory.next_free(
+        linked_end,
+        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        4,
+        "generated tile programs",
+    )?;
+    let host = crate::HostProgram::default();
+    let maximum_bytes = programs.iter().try_fold(0u32, |maximum, program| {
+        let generated = emit(
+            program,
+            &symbols,
+            &host,
+            &CodegenOptions {
+                code_address: sizing_address,
+                ..CodegenOptions::default()
+            },
+        )?;
+        Ok::<_, PackageBuildError>(maximum.max(u32::try_from(generated.bytes.len())?))
+    })?;
+    let code_address = memory
+        .allocate(MemoryRequest {
+            name: "generated tile programs",
+            bytes: maximum_bytes,
+            alignment: 4,
+            bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+            end_alignment: 4,
+            guard_after: 0,
+        })?
+        .range
+        .start;
+    let generated = programs
+        .iter()
+        .map(|program| {
+            Ok(emit(
+                program,
+                &symbols,
+                &host,
+                &CodegenOptions {
+                    code_address,
+                    ..CodegenOptions::default()
+                },
+            )?)
+        })
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+
+    let mut segments = vec![Vec::new(); usize::from(execution_tiles)];
+    for segment in data {
+        let physical = topology.physical(segment.tile)?;
+        segments[usize::from(physical)].push(Segment {
+            address: segment.address,
+            memory_size: u32::try_from(segment.data.len())?,
+            data: segment.data.clone(),
+            flags: SEGMENT_READ | SEGMENT_WRITE,
+        });
+    }
+    let context = TileBuildContext {
+        objects: &objects,
+        kernel_plan: &kernels,
+        retained_runtime: &retained_runtime,
+        code_address,
+        host_staging_address: 0,
+    };
+    let mut tiles = Vec::with_capacity(usize::from(execution_tiles));
+    for logical in 0..execution_tiles {
+        let physical = topology.physical(logical)?;
+        tiles.push(build_tile(
+            u32::from(physical),
+            u32::from(logical),
+            &generated[usize::from(logical)],
+            &segments[usize::from(physical)],
+            &context,
+        )?);
+    }
+    tiles.sort_unstable_by_key(|tile| tile.physical_tile);
+    let mut application = Application {
+        tiles,
+        ..Application::default()
+    };
+    application.outputs.push(Binding {
+        name: "completion".into(),
+        dtype: "u32".into(),
+        shape: vec![1],
+        slices: vec![RegionSlice {
+            tile: 0,
+            tile_address: COMPLETION_ADDRESS,
+            file_offset: 0,
+            size: 4,
+        }],
+    });
+    application.validate()?;
+    Ok(application)
+}
+
+fn collect_exchange_rows(
+    rows: &mut BTreeMap<u32, u32>,
+    steps: &[crate::TileStep],
+) -> PackageBuildResult<()> {
+    for step in steps {
+        match step {
+            crate::TileStep::Exchange(exchange) => {
+                let bytes = u32::try_from(exchange.program.words.len())?
+                    .checked_mul(4)
+                    .ok_or_else(|| invalid("exchange row size overflow"))?;
+                let end = exchange
+                    .program
+                    .address
+                    .checked_add(bytes)
+                    .ok_or_else(|| invalid("exchange row range overflow"))?;
+                rows.entry(exchange.program.address)
+                    .and_modify(|existing| *existing = (*existing).max(end))
+                    .or_insert(end);
+            }
+            crate::TileStep::Repeat(repeat) => collect_exchange_rows(rows, &repeat.body)?,
+            crate::TileStep::Compute(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn collect_compute_symbols(symbols: &mut Vec<String>, steps: &[crate::TileStep]) {
+    for step in steps {
+        match step {
+            crate::TileStep::Compute(compute) => symbols.push(compute.symbol.clone()),
+            crate::TileStep::Repeat(repeat) => collect_compute_symbols(symbols, &repeat.body),
+            crate::TileStep::Exchange(_) => {}
+        }
+    }
 }
 
 /// Compiles and packages a compute graph into a directly loadable IPU21
