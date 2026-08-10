@@ -1207,12 +1207,21 @@ fn image_word(image: &TileImage, address: u32) -> Option<u32> {
 fn exchange_patch_readback(runtime: &Runtime, application: &Application) -> Result<String> {
     let mut counts = std::collections::BTreeMap::<Vec<usize>, usize>::new();
     let mut examples = Vec::new();
+    let mut segment_examples = Vec::new();
     let mut unreadable_examples = Vec::new();
     let mut readable = 0usize;
+    let mut readable_segments = 0usize;
+    let mut changed_segment_words = 0usize;
+    let mut unexpected_segment_words = 0usize;
     let mut descriptors = 0usize;
     let mut unreadable = 0usize;
     for image in &application.tiles {
         let physical = u16::try_from(image.physical_tile)?;
+        let patch_targets = image
+            .word_patches
+            .iter()
+            .map(|patch| patch.target_address)
+            .collect::<std::collections::BTreeSet<_>>();
         for patch in &image.word_patches {
             descriptors += 1;
             let expected = (0..patch.iterations)
@@ -1225,9 +1234,10 @@ fn exchange_patch_readback(runtime: &Runtime, application: &Application) -> Resu
                     .device()
                     .read_tile_word_from_inactive_context(physical, context, patch.target_address)
                     .map_err(|error| errors.push((context, error.to_string())))
+                    .map(|actual| (context, actual))
                     .ok()
             });
-            let Some(actual) = actual else {
+            let Some((context, actual)) = actual else {
                 unreadable += 1;
                 if unreadable_examples.len() < 8 {
                     let states = (0..=6)
@@ -1237,6 +1247,53 @@ fn exchange_patch_readback(runtime: &Runtime, application: &Application) -> Resu
                 }
                 continue;
             };
+            let segment = image
+                .segments
+                .iter()
+                .find(|segment| {
+                    (segment.address..segment.address.saturating_add(segment.data.len() as u32))
+                        .contains(&patch.target_address)
+                })
+                .context("patch target is outside the packaged tile image")?;
+            let expected_segment = segment
+                .data
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte word")))
+                .collect::<Vec<_>>();
+            let actual_segment = runtime.device().read_tile_words_from_inactive_context(
+                physical,
+                context,
+                segment.address,
+                u32::try_from(expected_segment.len())?,
+            )?;
+            let differences = expected_segment
+                .iter()
+                .zip(&actual_segment)
+                .enumerate()
+                .filter(|(_, (expected, actual))| expected != actual)
+                .map(|(word, (&expected, &actual))| {
+                    let address = segment.address + u32::try_from(word).expect("word offset") * 4;
+                    (address, expected, actual, patch_targets.contains(&address))
+                })
+                .collect::<Vec<_>>();
+            changed_segment_words += differences.len();
+            unexpected_segment_words += differences
+                .iter()
+                .filter(|(_, _, _, is_patch_target)| !is_patch_target)
+                .count();
+            readable_segments += 1;
+            if (!differences.is_empty() || segment_examples.len() < 4)
+                && segment_examples.len() < 32
+            {
+                segment_examples.push((
+                    physical,
+                    context,
+                    segment.address,
+                    segment.data.len(),
+                    patch.target_address,
+                    differences,
+                ));
+            }
             let matching_iterations = expected
                 .iter()
                 .enumerate()
@@ -1258,7 +1315,7 @@ fn exchange_patch_readback(runtime: &Runtime, application: &Application) -> Resu
         }
     }
     Ok(format!(
-        "descriptors={descriptors} readable={readable} unreadable={unreadable} matchingIterations={counts:?} examples={examples:?} unreadableExamples={unreadable_examples:?}"
+        "descriptors={descriptors} readable={readable} unreadable={unreadable} matchingIterations={counts:?} readableSegments={readable_segments} changedSegmentWords={changed_segment_words} unexpectedSegmentWords={unexpected_segment_words} examples={examples:?} segmentExamples={segment_examples:?} unreadableExamples={unreadable_examples:?}"
     ))
 }
 
