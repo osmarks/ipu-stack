@@ -1,7 +1,7 @@
 use ipu_exchange::{
     SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate, encode_br_m,
-    encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate, encode_put_special_m,
-    encode_setzi_m, encode_shl_m_immediate, encode_st32_m_immediate,
+    encode_brz_m_immediate, encode_call_m_immediate, encode_get_special_m, encode_ld32_m_immediate,
+    encode_put_special_m, encode_setzi_m, encode_shl_m_immediate, encode_st32_m_immediate,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -42,8 +42,8 @@ pub use low::{
     TileWork, TileWorkList, TileWorkRef, WorkProvenance, WorkReason, lower_to_tiles,
 };
 pub use memory::{
-    IPU21_DATA_BASE, IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES,
-    IPU21_STANDARD_FIXED_BYTES,
+    EXCHANGE_CSR_COUNT, EXCHANGE_CSR_SNAPSHOT_BASE, EXCHANGE_CSR_SNAPSHOT_BYTES, IPU21_DATA_BASE,
+    IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES, IPU21_STANDARD_FIXED_BYTES,
 };
 pub use mid::{
     AccumulationPrecision, AmpOrder, AxisTiling, ConversionDispatch, ConversionPlan,
@@ -71,6 +71,7 @@ pub use tile::{RepeatExchangeStrategy, TileLoweringError, TileProgramLowering};
 const INCOMING_BASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;
 const OUTGOING_BASE: u8 = 0xa7;
+const FIRST_EXCHANGE_CSR: u8 = 0xa0;
 const FIRST_INPUT_REGISTER: u8 = 3;
 const LAST_VALUE_REGISTER: u8 = 9;
 
@@ -201,6 +202,10 @@ pub struct CodegenOptions {
     pub invocations: u32,
     pub initial_profile_address: Option<u32>,
     pub final_profile_address: Option<u32>,
+    /// Capture all IPU21 exchange CSRs immediately around the first emitted
+    /// exchange phase. The destination contains twelve before words followed
+    /// by twelve after words.
+    pub exchange_csr_snapshot_address: Option<u32>,
 }
 
 impl Default for CodegenOptions {
@@ -210,6 +215,7 @@ impl Default for CodegenOptions {
             invocations: 1,
             initial_profile_address: None,
             final_profile_address: None,
+            exchange_csr_snapshot_address: None,
         }
     }
 }
@@ -270,6 +276,7 @@ pub fn emit(
         .then(|| symbol(symbols, WORKER_BARRIER_SYMBOL))
         .transpose()?;
     let mut exchange_rows = Vec::new();
+    let mut exchange_csr_snapshot_pending = options.exchange_csr_snapshot_address.is_some();
     emit_steps(
         &mut code,
         program.tile,
@@ -280,6 +287,8 @@ pub fn emit(
         None,
         None,
         options.code_address,
+        options.exchange_csr_snapshot_address,
+        &mut exchange_csr_snapshot_pending,
     )?;
 
     if let Some(address) = options.final_profile_address {
@@ -363,10 +372,18 @@ fn emit_steps(
     repeat_pointer_count: Option<usize>,
     repeat_count: Option<u32>,
     code_address: u32,
+    exchange_csr_snapshot_address: Option<u32>,
+    exchange_csr_snapshot_pending: &mut bool,
 ) -> Result<()> {
     for step in steps {
         match step {
             TileStep::Exchange(exchange) => {
+                let snapshot = exchange_csr_snapshot_pending
+                    .then_some(exchange_csr_snapshot_address)
+                    .flatten();
+                if snapshot.is_some() {
+                    *exchange_csr_snapshot_pending = false;
+                }
                 if !exchange.patches.is_empty() {
                     emit_exchange_patches(
                         code,
@@ -385,6 +402,9 @@ fn emit_steps(
                     code.setzi(8, 1)?;
                     code.put_special(INCOMING_DCOUNT, 8)?;
                 }
+                if let Some(address) = snapshot {
+                    emit_exchange_csr_snapshot(code, address)?;
+                }
                 if let Some(address) = exchange.profile.before {
                     emit_cycle_sample(code, symbols, address)?;
                 }
@@ -395,6 +415,9 @@ fn emit_steps(
                     code.instruction(ipu_exchange::SYNC_ANS_INSTRUCTION);
                 }
                 code.call(exchange.program.address, 10)?;
+                if let Some(address) = snapshot {
+                    emit_exchange_csr_snapshot(code, address + memory::EXCHANGE_CSR_COUNT * 4)?;
+                }
                 if let Some(address) = exchange.profile.after {
                     emit_cycle_sample(code, symbols, address)?;
                 }
@@ -422,12 +445,23 @@ fn emit_steps(
                     worker_barrier,
                     exchange_rows,
                     code_address,
+                    exchange_csr_snapshot_address,
+                    exchange_csr_snapshot_pending,
                 )?;
                 if let Some(address) = repeat.profile.after {
                     emit_cycle_sample(code, symbols, address)?;
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn emit_exchange_csr_snapshot(code: &mut TileCode, address: u32) -> Result<()> {
+    code.setzi(1, address)?;
+    for offset in 0..memory::EXCHANGE_CSR_COUNT {
+        code.get_special(0, FIRST_EXCHANGE_CSR + offset as u8)?;
+        code.st32(0, 1, 15, offset as u16)?;
     }
     Ok(())
 }
@@ -626,6 +660,8 @@ fn emit_repeat(
     worker_barrier: Option<u32>,
     exchange_rows: &mut Vec<PlacedExchangeRow>,
     code_address: u32,
+    exchange_csr_snapshot_address: Option<u32>,
+    exchange_csr_snapshot_pending: &mut bool,
 ) -> Result<()> {
     let words = repeat
         .iterated_pointers
@@ -657,6 +693,8 @@ fn emit_repeat(
         Some(repeat.iterated_pointers.len()),
         Some(repeat.count),
         code_address,
+        exchange_csr_snapshot_address,
+        exchange_csr_snapshot_pending,
     )?;
     for (index, pointer) in repeat.iterated_pointers.iter().enumerate() {
         let slot = u16::try_from(index + 1).map_err(|_| invalid("too many repeat pointers"))?;
@@ -818,6 +856,11 @@ impl TileCode {
 
     fn put_special(&mut self, special: u8, register: u8) -> Result<()> {
         self.words.push(encode_put_special_m(special, register)?);
+        Ok(())
+    }
+
+    fn get_special(&mut self, register: u8, special: u8) -> Result<()> {
+        self.words.push(encode_get_special_m(register, special)?);
         Ok(())
     }
 

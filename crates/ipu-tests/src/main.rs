@@ -47,6 +47,9 @@ struct Arguments {
     /// Log exchange scheduling lower bounds and critical dependency chains.
     #[arg(long)]
     exchange_diagnostics: bool,
+    /// Snapshot and diff all exchange CSRs around the first exchange phase.
+    #[arg(long, requires = "separate_repeat_exchange_rows")]
+    exchange_csr_diff: bool,
     /// Force eligible one-use layout conversions to stream into consumer slices.
     #[arg(long)]
     stream_conversions: bool,
@@ -373,6 +376,7 @@ fn main() -> Result<()> {
                     },
                     RepeatExchangeStrategy::SingleIteration,
                 ),
+                snapshot_first_exchange_csrs: arguments.exchange_csr_diff,
             },
         )?;
         write_package(&application, &arguments.package)?;
@@ -611,7 +615,14 @@ fn run_initialized_program(
     runtime
         .device()
         .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
-    diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))?;
+    diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds)).with_context(
+        || {
+            format!(
+                "deviceFailureDiagnostics={}",
+                device_failure_diagnostics(runtime, application)
+            )
+        },
+    )?;
     Ok(session.collect(&executed)?)
 }
 
@@ -1521,10 +1532,75 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
     }
     let patch_readback = exchange_patch_readback(runtime, application)
         .unwrap_or_else(|error| format!("failed: {error:#}"));
+    let exchange_csr_diff = exchange_csr_diff(runtime, application)
+        .unwrap_or_else(|error| format!("failed: {error:#}"));
     format!(
-        "{} patchReadback={patch_readback} contexts={contexts:?}",
+        "{} exchangeCsrDiff={exchange_csr_diff} patchReadback={patch_readback} contexts={contexts:?}",
         summarize_states(&states)
     )
+}
+
+fn exchange_csr_diff(runtime: &Runtime, application: &Application) -> Result<String> {
+    const NAMES: [&str; 12] = [
+        "INCOMING_MUX",
+        "INCOMING_MUXPAIR",
+        "INCOMING_DELTA",
+        "INCOMING_FORMAT",
+        "INCOMING_BASE",
+        "INCOMING_SINIT",
+        "INCOMING_DCOUNT",
+        "OUTGOING_BASE",
+        "OUTGOING_DELTA",
+        "EXCHANGE_CTL",
+        "ANS_DCOUNT",
+        "EXCHANGE_ADJ",
+    ];
+    let mut selected = Vec::new();
+    for tile in &application.tiles {
+        let physical = u16::try_from(tile.physical_tile)?;
+        if runtime.device().tile_exchange_receive_error(physical)?
+            != ipu_driver::TileExchangeReceiveError::None
+            && selected.len() < 8
+        {
+            selected.push(physical);
+        }
+    }
+    for tile in &application.tiles {
+        let physical = u16::try_from(tile.physical_tile)?;
+        if selected.len() >= 12 {
+            break;
+        }
+        if !selected.contains(&physical) {
+            selected.push(physical);
+        }
+    }
+
+    let mut tiles = Vec::new();
+    for physical in selected {
+        let words = match runtime.device().read_tile_words_from_inactive_context(
+            physical,
+            1,
+            ipu_codegen::EXCHANGE_CSR_SNAPSHOT_BASE,
+            ipu_codegen::EXCHANGE_CSR_SNAPSHOT_BYTES / 4,
+        ) {
+            Ok(words) => words,
+            Err(error) => {
+                tiles.push((physical, Err(error.to_string())));
+                continue;
+            }
+        };
+        let count = usize::try_from(ipu_codegen::EXCHANGE_CSR_COUNT)?;
+        let (before, after) = words.split_at(count);
+        let changed = before
+            .iter()
+            .zip(after)
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(index, (&before, &after))| (NAMES[index], before, after))
+            .collect::<Vec<_>>();
+        tiles.push((physical, Ok((changed, before.to_vec(), after.to_vec()))));
+    }
+    Ok(format!("tiles={tiles:?}"))
 }
 
 #[cfg(test)]

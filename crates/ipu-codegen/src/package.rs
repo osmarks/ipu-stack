@@ -80,6 +80,7 @@ pub struct PackageConfig {
     pub pipeline: PipelineConfig,
     pub tile_compute: TileComputePolicy,
     pub repeat_exchanges: crate::RepeatExchangeStrategy,
+    pub snapshot_first_exchange_csrs: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -332,6 +333,16 @@ pub fn build_package(
     graph: &ComputeGraph,
     config: &PackageConfig,
 ) -> PackageBuildResult<Application> {
+    if config.snapshot_first_exchange_csrs
+        && matches!(
+            config.repeat_exchanges,
+            crate::RepeatExchangeStrategy::PatchInPlace
+        )
+    {
+        return Err(invalid(
+            "exchange CSR snapshots require statically materialized repeat iterations",
+        ));
+    }
     validate_tile_count(u32::from(config.pipeline.tile_count))?;
     let mid = build_phase("lower_mid", || {
         Ok(lower(graph, &config.pipeline, &Ipu21CostModel)?)
@@ -619,6 +630,9 @@ fn build_package_from_objects(
                             .profiling
                             .enabled
                             .then_some(PROFILE_END_CYCLE),
+                        exchange_csr_snapshot_address: config
+                            .snapshot_first_exchange_csrs
+                            .then_some(crate::memory::EXCHANGE_CSR_SNAPSHOT_BASE),
                         ..CodegenOptions::default()
                     },
                 )?;
@@ -784,6 +798,9 @@ fn build_package_from_objects(
                             .profiling
                             .enabled
                             .then_some(PROFILE_END_CYCLE),
+                        exchange_csr_snapshot_address: config
+                            .snapshot_first_exchange_csrs
+                            .then_some(crate::memory::EXCHANGE_CSR_SNAPSHOT_BASE),
                         ..CodegenOptions::default()
                     },
                 )?)

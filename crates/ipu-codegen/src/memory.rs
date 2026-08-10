@@ -9,6 +9,10 @@ pub const WORKER_CONTEXTS: u32 = 6;
 pub const RUNTIME_STATE_BYTES: u32 = WORKER_STACK_HEADROOM + WORKER_CONTEXTS * WORKER_SYNC_STRIDE;
 pub const PROFILE_START_CYCLE: u32 = RUNTIME_STATE_BASE + 4;
 pub const PROFILE_END_CYCLE: u32 = RUNTIME_STATE_BASE + 8;
+/// Optional before/after snapshots of the twelve IPU21 exchange CSRs.
+pub const EXCHANGE_CSR_SNAPSHOT_BASE: u32 = RUNTIME_STATE_BASE + 0x10;
+pub const EXCHANGE_CSR_COUNT: u32 = 12;
+pub const EXCHANGE_CSR_SNAPSHOT_BYTES: u32 = EXCHANGE_CSR_COUNT * 2 * 4;
 
 /// First byte after the permanently reserved runtime state.
 pub const IPU21_DATA_BASE: u32 = RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES;
