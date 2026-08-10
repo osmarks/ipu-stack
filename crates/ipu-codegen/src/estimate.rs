@@ -357,6 +357,7 @@ pub(crate) fn operator_memory_estimate(
         live,
         temporary,
         peak: live.saturating_add(temporary),
+        exchange_row_bytes: 0,
     }
 }
 
@@ -458,6 +459,7 @@ pub(crate) fn conversion_memory_estimate(
         live,
         temporary: MemoryUsage::default(),
         peak: live,
+        exchange_row_bytes: 0,
     }
 }
 
@@ -540,6 +542,13 @@ pub(crate) fn region_peak_memory_with_multiplicity(
         }
     }
     observe(&mut peaks, &live_values, MemoryUsage::default());
+    let exchange_rows = operations
+        .iter()
+        .map(|operation| operation.memory.exchange_row_bytes)
+        .fold(0u64, u64::saturating_add);
+    peaks.exchange_rows = exchange_rows;
+    peaks.standard = peaks.standard.saturating_add(exchange_rows);
+    peaks.total = peaks.total.saturating_add(exchange_rows);
     peaks
 }
 

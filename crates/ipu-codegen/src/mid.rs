@@ -8,7 +8,9 @@
 //! layout rearrangements at format boundaries.
 
 use crate::cost::MemoizedCostModel;
-pub use crate::cost::{CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts};
+pub use crate::cost::{
+    CostModel, ExchangeFootprint, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts,
+};
 use crate::estimate::{
     conversion_memory_estimate, operator_memory_estimate, region_peak_memory,
     region_peak_memory_with_multiplicity,
@@ -18,6 +20,8 @@ use crate::graph::{
     OperationId, OperationKind, Repeat, TensorShape, ValueId,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+const EXCHANGE_ROW_FRAGMENT_AMORTIZATION: u64 = 16;
 
 /// In-memory representation of one tensor element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -222,6 +226,8 @@ pub struct MemoryPeaks {
     pub standard: u64,
     pub interleaved: u64,
     pub total: u64,
+    /// Persistent standard-memory estimate for generated exchange rows.
+    pub exchange_rows: u64,
     pub maximum_standard_allocation: u64,
     /// Largest amount by which one standard-addressed allocation exceeded
     /// both contiguous ranges left around the interleaved region.
@@ -275,14 +281,14 @@ impl MemoryPeaks {
         let upper_standard = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
             .saturating_sub(interleaved_boundary);
         let lower_standard = u64::from(crate::memory::IPU21_STANDARD_FIXED_BYTES)
-            .saturating_sub(reserved_standard_bytes);
+            .saturating_sub(reserved_standard_bytes.saturating_add(self.exchange_rows));
         self.maximum_standard_allocation
             .saturating_sub(lower_standard.max(upper_standard))
     }
 
-    fn conservative_usage(self) -> MemoryUsage {
+    fn conservative_tensor_usage(self) -> MemoryUsage {
         MemoryUsage {
-            standard: self.standard,
+            standard: self.standard.saturating_sub(self.exchange_rows),
             interleaved: self.interleaved,
         }
     }
@@ -295,6 +301,7 @@ pub struct MemoryEstimate {
     pub live: MemoryUsage,
     pub temporary: MemoryUsage,
     pub peak: MemoryUsage,
+    pub exchange_row_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -997,6 +1004,7 @@ impl OperatorCandidate {
                 output_aliasing: self.output_aliasing.clone(),
                 memory_relations: self.memory_relations.clone(),
             },
+            exchange: ExchangeFootprint::default(),
         }
         .validate(&planned_inputs, &planned_output)
         .is_ok()
@@ -1729,6 +1737,7 @@ pub struct OperatorPlan {
     pub operator: MidOperator,
     pub dispatch: OperatorDispatch,
     pub requirements: OperatorRequirements,
+    pub exchange: ExchangeFootprint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2106,6 +2115,7 @@ pub fn lower(
         values = state.values.len(),
         operations = operations.len(),
         estimated_cycles,
+        exchange_row_bytes = peak_memory.exchange_rows,
         active_tile_counts = ?operations
             .iter()
             .filter_map(|operation| operation.results.first())
@@ -2578,12 +2588,20 @@ fn apply_selected_plan(
         &converted_types,
         &state.get(result).tensor_type,
     );
-    let memory = operator_memory_estimate(
+    let exchange = costs.operator_exchange_footprint(
+        plan.operator,
         &plan.dispatch,
         &plan.requirements,
         &converted_types,
         &state.get(result).tensor_type,
     );
+    let mut memory = operator_memory_estimate(
+        &plan.dispatch,
+        &plan.requirements,
+        &converted_types,
+        &state.get(result).tensor_type,
+    );
+    memory.exchange_row_bytes = exchange.estimated_row_bytes();
     operations.push(MidOperation {
         source: Some(operation.id),
         inputs: converted,
@@ -2593,6 +2611,7 @@ fn apply_selected_plan(
             operator: plan.operator,
             dispatch: plan.dispatch,
             requirements: plan.requirements,
+            exchange,
         }),
         conversion_plan: None,
         estimated_cycles: operator_cycles,
@@ -3007,6 +3026,10 @@ fn lower_repeat(
         &state.values,
         &body_allocation_multiplicity,
     );
+    let body_exchange_row_bytes = body_operations
+        .iter()
+        .map(|operation| operation.memory.exchange_row_bytes)
+        .fold(0u64, u64::saturating_add);
     let mut results = Vec::new();
     for (origin, input) in operation.results.iter().zip(&inputs) {
         let tensor_type = state.get(*input).tensor_type.clone();
@@ -3036,9 +3059,10 @@ fn lower_repeat(
         conversion_plan: None,
         estimated_cycles: body_cost.saturating_mul(u64::from(repeat.count)),
         memory: MemoryEstimate {
-            live: body_peak.conservative_usage(),
+            live: body_peak.conservative_tensor_usage(),
             temporary: MemoryUsage::default(),
-            peak: body_peak.conservative_usage(),
+            peak: body_peak.conservative_tensor_usage(),
+            exchange_row_bytes: body_exchange_row_bytes,
         },
     });
     Ok(())
@@ -3094,7 +3118,21 @@ fn ensure_format(
         let from = tensor_type.format.layout.clone();
         tensor_type.format.layout = target.layout.clone();
         let result = state.derived_value(value, tensor_type.clone());
-        let memory = conversion_memory_estimate(&current.tensor_type, &tensor_type);
+        let rearrange_cycles = costs.rearrange_cycles(
+            &tensor_type.shape,
+            tensor_type.format.precision,
+            &from,
+            &target.layout,
+        );
+        let mut memory = conversion_memory_estimate(&current.tensor_type, &tensor_type);
+        if from.tiling != target.layout.tiling {
+            // Consolidated rows encode many related fragments compactly. Use
+            // the routed-transfer cycle estimate only as a small SRAM proxy.
+            let row_cycle_scale =
+                IPU21_TARGET_COSTS.exchange_transfer_cycles * EXCHANGE_ROW_FRAGMENT_AMORTIZATION;
+            memory.exchange_row_bytes =
+                rearrange_cycles.div_ceil(row_cycle_scale).saturating_mul(4);
+        }
         operations.push(MidOperation {
             source: Some(source),
             inputs: vec![value],
@@ -3114,12 +3152,7 @@ fn ensure_format(
                     .with_materialization(materialization),
                 dispatch: ConversionDispatch::Intersections,
             }),
-            estimated_cycles: costs.rearrange_cycles(
-                &tensor_type.shape,
-                tensor_type.format.precision,
-                &from,
-                &target.layout,
-            ),
+            estimated_cycles: rearrange_cycles,
             memory,
         });
         value = result;

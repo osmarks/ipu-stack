@@ -23,6 +23,16 @@ pub trait CostModel {
         output: &TensorType,
     ) -> u64;
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
+    fn operator_exchange_footprint(
+        &self,
+        _operator: MidOperator,
+        _dispatch: &OperatorDispatch,
+        _requirements: &OperatorRequirements,
+        _inputs: &[TensorType],
+        _output: &TensorType,
+    ) -> ExchangeFootprint {
+        ExchangeFootprint::default()
+    }
     fn rearrange_cycles(
         &self,
         shape: &TensorShape,
@@ -30,6 +40,20 @@ pub trait CostModel {
         from: &Layout,
         to: &Layout,
     ) -> u64;
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExchangeFootprint {
+    pub phases: u64,
+    pub maximum_transfers_per_tile: u64,
+}
+
+impl ExchangeFootprint {
+    pub const fn estimated_row_bytes(self) -> u64 {
+        self.phases
+            .saturating_add(self.maximum_transfers_per_tile)
+            .saturating_mul(4)
+    }
 }
 
 pub(crate) struct MemoizedCostModel<'a, C> {
@@ -61,6 +85,18 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
 
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
         self.inner.cast_cycles(input, to)
+    }
+
+    fn operator_exchange_footprint(
+        &self,
+        operator: MidOperator,
+        dispatch: &OperatorDispatch,
+        requirements: &OperatorRequirements,
+        inputs: &[TensorType],
+        output: &TensorType,
+    ) -> ExchangeFootprint {
+        self.inner
+            .operator_exchange_footprint(operator, dispatch, requirements, inputs, output)
     }
 
     fn rearrange_cycles(
@@ -359,6 +395,29 @@ impl CostModel for Ipu21CostModel {
             MidOperator::Add(_) => elements
                 .div_ceil(16)
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
+        }
+    }
+
+    fn operator_exchange_footprint(
+        &self,
+        _operator: MidOperator,
+        dispatch: &OperatorDispatch,
+        _requirements: &OperatorRequirements,
+        inputs: &[TensorType],
+        output: &TensorType,
+    ) -> ExchangeFootprint {
+        let phases = gemm_exchange_phase_count(dispatch, inputs, output);
+        if phases == 0 {
+            return ExchangeFootprint::default();
+        }
+        let remote_bytes = gemm_remote_bytes_per_tile(inputs, output);
+        if remote_bytes == u64::MAX {
+            return ExchangeFootprint::default();
+        }
+        let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
+        ExchangeFootprint {
+            phases,
+            maximum_transfers_per_tile: remote_bytes.div_ceil(transfer_bytes).max(phases),
         }
     }
 
