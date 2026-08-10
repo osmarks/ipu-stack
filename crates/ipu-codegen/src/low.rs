@@ -13,7 +13,7 @@ use crate::mid::{
     PipelineConfig, PointwiseInputMapping, TensorType, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
@@ -434,6 +434,13 @@ impl LoweringState {
             deferred_conversions: BTreeMap::new(),
             intersection_cache: BTreeMap::new(),
         };
+        let parameter_values = graph
+            .inputs
+            .iter()
+            .filter(|input| input.kind == GraphInputKind::Parameter)
+            .map(|input| input.value)
+            .collect::<BTreeSet<_>>();
+        let mut parameter_bytes = vec![0u64; usize::from(tile_count)];
         for value in &graph.values {
             let declared_tiles = value.tensor_type.format.layout.tiling.tile_count;
             if declared_tiles == 0 || declared_tiles > tile_count {
@@ -444,15 +451,60 @@ impl LoweringState {
                 });
             }
             let extents = shard_extents(&value.tensor_type)?;
-            let mut value_shards = Vec::with_capacity(usize::from(tile_count));
-            for (tile, extents) in extents.into_iter().enumerate() {
-                let id = state.push_shard(LowShard {
+            let is_parameter = parameter_values.contains(&value.id);
+            let parameter_shard_bytes = if is_parameter {
+                extents
+                    .iter()
+                    .map(|extents| {
+                        crate::shard_storage_bytes(&LowShard {
+                            id: LowShardId(0),
+                            tile: 0,
+                            tensor_type: value.tensor_type.clone(),
+                            extents: extents.clone(),
+                            definition: ShardDefinition::Value(value.id),
+                        })
+                        .map(u64::from)
+                        .map_err(LowLoweringError::from)
+                    })
+                    .collect::<LowLoweringResult<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+            let parameter_offset = if is_parameter {
+                (0..tile_count)
+                    .min_by_key(|&offset| {
+                        let mut loads = parameter_bytes.clone();
+                        for (logical, &bytes) in parameter_shard_bytes.iter().enumerate() {
+                            let tile = (logical + usize::from(offset)) % usize::from(tile_count);
+                            loads[tile] = loads[tile].saturating_add(bytes);
+                        }
+                        (loads.into_iter().max().unwrap_or(u64::MAX), offset)
+                    })
+                    .ok_or(LowLoweringError::EmptyTileGroup)?
+            } else {
+                0
+            };
+            let mut value_shards = Vec::with_capacity(extents.len());
+            for (logical_tile, extents) in extents.into_iter().enumerate() {
+                let mut shard = LowShard {
                     id: LowShardId(0),
-                    tile: u16::try_from(tile).map_err(|_| LowLoweringError::IdOverflow)?,
+                    tile: 0,
                     tensor_type: value.tensor_type.clone(),
                     extents,
                     definition: ShardDefinition::Value(value.id),
-                })?;
+                };
+                shard.tile = if is_parameter {
+                    let tile =
+                        (logical_tile + usize::from(parameter_offset)) % usize::from(tile_count);
+                    let bytes = parameter_shard_bytes[logical_tile];
+                    parameter_bytes[tile] = parameter_bytes[tile]
+                        .checked_add(bytes)
+                        .ok_or(LowLoweringError::IdOverflow)?;
+                    u16::try_from(tile).map_err(|_| LowLoweringError::IdOverflow)?
+                } else {
+                    u16::try_from(logical_tile).map_err(|_| LowLoweringError::IdOverflow)?
+                };
+                let id = state.push_shard(shard)?;
                 value_shards.push(id);
             }
             state.canonical[value.id.index() as usize] = value_shards;
@@ -2213,6 +2265,83 @@ mod tests {
     }
 
     #[test]
+    fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
+        let mut random = fastrand::Rng::with_seed(0x7061_7261_6d73);
+        for case in 0..CASES {
+            let owner_tiles = 1_u16 << random.u32(1..=3);
+            let compute_tiles = owner_tiles * 2;
+            let inner = u32::from(owner_tiles) * 64;
+            let rows = u32::from(compute_tiles) * random.u32(1..=4);
+            let mut graph = ComputeGraph::new();
+            let left = graph.host_input("left", [rows, inner]).unwrap();
+            let right0 = graph.parameter("right.0", [inner, 64]).unwrap();
+            let right1 = graph.parameter("right.1", [inner, 64]).unwrap();
+            let output0 = graph.gemm(left, right0).unwrap();
+            let output1 = graph.gemm(left, right1).unwrap();
+            graph.set_outputs([output0, output1]).unwrap();
+
+            let left_format = TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::amp_left(64, compute_tiles),
+            };
+            let right_format = TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::amp_right_k64_storage(
+                    64,
+                    1,
+                    owner_tiles,
+                    1,
+                    MemoryClass::Ipu21Standard,
+                ),
+            };
+            let output_format = TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::amp_output(compute_tiles),
+            };
+            let mut config = PipelineConfig::new(compute_tiles)
+                .with_input(left, left_format.clone())
+                .with_input(right0, right_format.clone())
+                .with_input(right1, right_format.clone());
+            config.operator_candidates = vec![OperatorCandidate::new(
+                MidOperator::Gemm {
+                    options: crate::GemmOptions::default(),
+                    multiply: Precision::F16,
+                    accumulate: crate::AccumulationPrecision::F16,
+                },
+                [
+                    OperandRequirement::new(left_format, 32).with_access_tail(16),
+                    OperandRequirement::new(right_format, 32),
+                ],
+                OperandRequirement::new(output_format, 32),
+            )];
+
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            assert!(mid.operations.iter().all(|operation| {
+                operation.operator_plan.as_ref().is_none_or(|plan| {
+                    plan.requirements.inputs[1].format.layout.tiling.tile_count == owner_tiles
+                        && plan.requirements.output.format.layout.tiling.tile_count == compute_tiles
+                })
+            }));
+            let low = lower_to_tiles(&mid, &config).unwrap();
+            let parameter_tiles = |name: &str| {
+                low.inputs
+                    .iter()
+                    .find(|input| input.name == name)
+                    .unwrap()
+                    .shards
+                    .iter()
+                    .map(|shard| low.shards[shard.index() as usize].tile)
+                    .collect::<BTreeSet<_>>()
+            };
+            let first = parameter_tiles("right.0");
+            let second = parameter_tiles("right.1");
+            assert_eq!(first.len(), usize::from(owner_tiles), "case {case}");
+            assert_eq!(second.len(), usize::from(owner_tiles), "case {case}");
+            assert!(first.is_disjoint(&second), "case {case}");
+        }
+    }
+
+    #[test]
     fn randomized_pointwise_dispatch_skips_empty_output_shards() {
         let mut random = fastrand::Rng::with_seed(0x656d_7074);
         for case in 0..CASES {
@@ -2962,12 +3091,11 @@ mod tests {
             };
             let right_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_right_k64_grid(
+                layout: Layout::amp_right_k64_storage(
                     64,
-                    tiles,
-                    row_partitions,
                     column_partitions,
                     inner_partitions,
+                    row_partitions / inner_partitions,
                     crate::MemoryClass::Ipu21Standard,
                 ),
             };

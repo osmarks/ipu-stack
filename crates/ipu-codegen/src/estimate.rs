@@ -578,8 +578,12 @@ pub(crate) fn gemm_remote_bytes_per_tile(inputs: &[TensorType], output: &TensorT
 
         let required_right_elements =
             u64::from(output_columns.end - output_columns.start).saturating_mul(u64::from(k));
-        let local_right_elements = u64::from(overlap_length(&output_columns, &right_columns))
-            .saturating_mul(u64::from(overlap_length(&(0..k), &right_inner)));
+        let local_right_elements = if tile < right.format.layout.tiling.tile_count {
+            u64::from(overlap_length(&output_columns, &right_columns))
+                .saturating_mul(u64::from(overlap_length(&(0..k), &right_inner)))
+        } else {
+            0
+        };
         let right_remote = required_right_elements
             .saturating_sub(local_right_elements)
             .saturating_mul(right.format.precision.bytes());

@@ -39,6 +39,9 @@ struct Arguments {
     /// Force eligible one-use layout conversions to stream into consumer slices.
     #[arg(long)]
     stream_conversions: bool,
+    /// Constrain planning as though only this much SRAM per tile were free.
+    #[arg(long, conflicts_with = "reuse_package")]
+    tile_memory_budget_kib: Option<u64>,
     #[arg(long, default_value_t = c600_tile_count())]
     tiles: u32,
     #[arg(long)]
@@ -140,6 +143,10 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| arguments.sdk.join("bin/ipu/tile_bootloader_cc_ipu21.elf"));
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
+    if let Some(kib) = arguments.tile_memory_budget_kib {
+        let bytes = kib.checked_mul(1024).context("tile SRAM budget overflow")?;
+        pipeline = pipeline.with_tile_memory_budget(bytes);
+    }
     pipeline.exchange_diagnostics = arguments.exchange_diagnostics;
     if arguments.stream_conversions {
         pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Always;

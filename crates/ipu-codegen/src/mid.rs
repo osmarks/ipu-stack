@@ -247,13 +247,17 @@ impl MemoryPeaks {
     }
 
     pub fn fits_ipu21(self) -> bool {
-        self.fits_ipu21_with_standard_reservation(0)
+        self.fits_ipu21_with_budget(0, u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
     }
 
-    pub fn fits_ipu21_with_standard_reservation(self, reserved_standard_bytes: u64) -> bool {
+    pub fn fits_ipu21_with_budget(
+        self,
+        reserved_standard_bytes: u64,
+        tile_memory_budget_bytes: u64,
+    ) -> bool {
         self.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
             && self.total.saturating_add(reserved_standard_bytes)
-                <= u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+                <= tile_memory_budget_bytes.min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
             && self.standard_contiguous_overflow_with_reservation(reserved_standard_bytes) == 0
     }
 
@@ -522,28 +526,25 @@ impl Layout {
     }
 
     /// AMP right operand with complete 64-by-output-block kernel panels
-    /// contiguous in the selected memory class. The K dimension is divided
-    /// among `inner_partitions`; each shard is replicated across the remaining
-    /// output-row groups. One inner partition is fully resident, while larger
-    /// counts trade replication for panel exchange.
-    pub fn amp_right_k64_grid(
+    /// contiguous in the selected memory class. Column and K sharding select
+    /// the owner set; `copies` controls persistent replication independently
+    /// of the eventual compute grid.
+    pub fn amp_right_k64_storage(
         output_column_block: u32,
-        tile_count: u16,
-        row_partitions: u16,
         column_partitions: u16,
         inner_partitions: u16,
+        copies: u16,
         memory_class: MemoryClass,
     ) -> Self {
-        let replicas = if inner_partitions != 0 && row_partitions.is_multiple_of(inner_partitions) {
-            row_partitions / inner_partitions
-        } else {
-            0
-        };
+        let tile_count = column_partitions
+            .checked_mul(inner_partitions)
+            .and_then(|tiles| tiles.checked_mul(copies))
+            .unwrap_or(0);
         Self {
             order: ElementOrder::Amp(AmpOrder::RightK64),
             tiling: TensorTiling {
                 tile_count,
-                replicas,
+                replicas: copies,
                 axes: vec![
                     AxisTiling::new(
                         TensorAxis::FromEnd(1),
@@ -1126,6 +1127,10 @@ pub struct PipelineConfig {
     /// Standard-addressed SRAM retained for exchange tables, profiling data,
     /// host commands, and generated tile programs built after planning.
     pub standard_memory_reservation_bytes: u64,
+    /// Maximum SRAM per tile available to planned values and the standard
+    /// reservation. Lower values emulate a model whose other persistent state
+    /// occupies the remainder of SRAM.
+    pub tile_memory_budget_bytes: u64,
     pub scheduling: SchedulingPolicy,
     pub profiling: ProfilingConfig,
     /// Emit exchange-scheduler lower bounds, per-tile role pressure, and
@@ -1176,6 +1181,7 @@ impl PipelineConfig {
             standard_memory_reservation_bytes: u64::from(
                 crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
             ),
+            tile_memory_budget_bytes: u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
             scheduling: SchedulingPolicy::OperatorPlans,
             profiling: ProfilingConfig::default(),
             exchange_diagnostics: false,
@@ -1218,6 +1224,11 @@ impl PipelineConfig {
 
     pub fn with_standard_memory_reservation(mut self, bytes: u64) -> Self {
         self.standard_memory_reservation_bytes = bytes;
+        self
+    }
+
+    pub fn with_tile_memory_budget(mut self, bytes: u64) -> Self {
+        self.tile_memory_budget_bytes = bytes;
         self
     }
 }
@@ -1525,12 +1536,11 @@ fn amp_grid_gemm_operator_candidate(
             grid.row_partitions,
             grid.column_partitions,
         ),
-        (inner_partitions, memory_class) => Layout::amp_right_k64_grid(
+        (inner_partitions, memory_class) => Layout::amp_right_k64_storage(
             output_columns,
-            grid.tile_count,
-            grid.row_partitions,
             grid.column_partitions,
             inner_partitions,
+            grid.row_partitions / inner_partitions,
             memory_class,
         ),
     };
@@ -1736,7 +1746,7 @@ pub enum OperatorPlanError {
     DispatchMismatch,
     #[error("operator plan uses zero or incompatible block dimensions")]
     InvalidBlocking,
-    #[error("operator plan requires corresponding input and output tile groups")]
+    #[error("operator plan requires corresponding activation and output tile groups")]
     IncompatibleTileGroups,
     #[error("operator dispatch does not support empty output shards")]
     EmptyOutputShard,
@@ -1752,13 +1762,6 @@ impl OperatorPlan {
     ) -> Result<(), OperatorPlanError> {
         if inputs.len() != self.requirements.inputs.len() {
             return Err(OperatorPlanError::OperandArity);
-        }
-        let output_tiles = output.format.layout.tiling.tile_count;
-        if inputs
-            .iter()
-            .any(|input| input.format.layout.tiling.tile_count != output_tiles)
-        {
-            return Err(OperatorPlanError::IncompatibleTileGroups);
         }
         if self.dispatch.empty_output_shard_policy() == EmptyOutputShardPolicy::Reject
             && layout_has_empty_shards(&output.format.layout, &output.shape)
@@ -1778,6 +1781,9 @@ impl OperatorPlan {
                 let [left, right] = inputs else {
                     return Err(OperatorPlanError::OperandArity);
                 };
+                if left.format.layout.tiling.tile_count != output.format.layout.tiling.tile_count {
+                    return Err(OperatorPlanError::IncompatibleTileGroups);
+                }
                 if options.transpose_left
                     || options.transpose_right
                     || !matches!(left.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
@@ -1895,7 +1901,17 @@ impl OperatorPlan {
                     kernel: TileKernelSpec::Add,
                     ..
                 },
-            ) => Ok(()),
+            ) => {
+                let output_tiles = output.format.layout.tiling.tile_count;
+                if inputs
+                    .iter()
+                    .any(|input| input.format.layout.tiling.tile_count != output_tiles)
+                {
+                    Err(OperatorPlanError::IncompatibleTileGroups)
+                } else {
+                    Ok(())
+                }
+            }
             (
                 MidOperator::FlashAttention {
                     options,
@@ -1909,7 +1925,17 @@ impl OperatorPlan {
                         },
                     ..
                 },
-            ) if options == kernel_options && accumulate == kernel_accumulate => Ok(()),
+            ) if options == kernel_options && accumulate == kernel_accumulate => {
+                let output_tiles = output.format.layout.tiling.tile_count;
+                if inputs
+                    .iter()
+                    .any(|input| input.format.layout.tiling.tile_count != output_tiles)
+                {
+                    Err(OperatorPlanError::IncompatibleTileGroups)
+                } else {
+                    Ok(())
+                }
+            }
             _ => Err(OperatorPlanError::DispatchMismatch),
         }
     }
@@ -2205,9 +2231,10 @@ fn lower_operations(
                 );
                 let peak =
                     beam_memory_peak(&next, &initial, source, operation_index, required_outputs);
-                if peak
-                    .fits_ipu21_with_standard_reservation(config.standard_memory_reservation_bytes)
-                {
+                if peak.fits_ipu21_with_budget(
+                    config.standard_memory_reservation_bytes,
+                    config.tile_memory_budget_bytes,
+                ) {
                     expanded.push(next);
                 } else {
                     tracing::trace!(
@@ -2247,20 +2274,35 @@ fn lower_operations(
                 .get(&operation.results[0])
                 .cloned()
                 .ok_or(LoweringError::MissingShape(operation.results[0]))?;
-            let candidate_plans = plans(operation, &input_types, &output_shape, config)
-                .into_iter()
-                .filter(|plan| {
-                    input_ids
-                        .iter()
-                        .zip(&plan.requirements.inputs)
-                        .all(|(id, requirement)| {
-                            let current = &branch.state.get(*id).tensor_type.format.layout;
-                            branch.state.automatic_inputs.contains(id)
-                                || current.order == requirement.format.layout.order
-                                || !requirement.format.layout.order.requires_direct_population()
-                        })
+            let parameter_inputs = input_ids
+                .iter()
+                .map(|id| {
+                    let origin = branch.state.get(*id).origin;
+                    graph.inputs().iter().any(|input| {
+                        input.value == origin && input.kind == GraphInputKind::Parameter
+                    })
                 })
                 .collect::<Vec<_>>();
+            let candidate_plans = plans(
+                operation,
+                &input_types,
+                &parameter_inputs,
+                &output_shape,
+                config,
+            )
+            .into_iter()
+            .filter(|plan| {
+                input_ids
+                    .iter()
+                    .zip(&plan.requirements.inputs)
+                    .all(|(id, requirement)| {
+                        let current = &branch.state.get(*id).tensor_type.format.layout;
+                        branch.state.automatic_inputs.contains(id)
+                            || current.order == requirement.format.layout.order
+                            || !requirement.format.layout.order.requires_direct_population()
+                    })
+            })
+            .collect::<Vec<_>>();
             let candidate_plans = candidate_plans.into_iter().flat_map(|plan| {
                 let mut complete = plan.clone();
                 for requirement in &mut complete.requirements.inputs {
@@ -2294,9 +2336,10 @@ fn lower_operations(
                 );
                 let peak =
                     beam_memory_peak(&next, &initial, source, operation_index, required_outputs);
-                if peak
-                    .fits_ipu21_with_standard_reservation(config.standard_memory_reservation_bytes)
-                {
+                if peak.fits_ipu21_with_budget(
+                    config.standard_memory_reservation_bytes,
+                    config.tile_memory_budget_bytes,
+                ) {
                     expanded.push(next);
                 } else {
                     tracing::trace!(
@@ -2475,6 +2518,7 @@ struct Plan {
 fn plans(
     operation: &Operation,
     inputs: &[TensorType],
+    parameter_inputs: &[bool],
     output: &TensorShape,
     config: &PipelineConfig,
 ) -> Vec<Plan> {
@@ -2515,24 +2559,108 @@ fn plans(
             requirement.format.layout = actual.format.layout.clone();
             candidate.output.format.layout.tiling = actual.format.layout.tiling.clone();
         }
-        if !candidate.supports(inputs, output) {
-            continue;
+        let mut variants = vec![candidate.clone()];
+        for (input_index, _) in parameter_inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, parameter)| **parameter)
+        {
+            let additions = variants
+                .iter()
+                .flat_map(|variant| {
+                    independent_parameter_storage(variant, inputs, input_index, config)
+                })
+                .filter(|independent| !variants.contains(independent))
+                .collect::<Vec<_>>();
+            variants.extend(additions);
         }
-        let plan = Plan {
-            operator: candidate.operator,
-            dispatch: candidate.dispatch.clone(),
-            requirements: OperatorRequirements {
-                inputs: candidate.inputs.clone(),
-                output: candidate.output.clone(),
-                output_aliasing: resolved_output_aliasing(&candidate, inputs, output),
-                memory_relations: candidate.memory_relations.clone(),
-            },
-        };
-        if !plans.contains(&plan) {
-            plans.push(plan);
+        for candidate in variants {
+            if !candidate.supports(inputs, output) {
+                continue;
+            }
+            let plan = Plan {
+                operator: candidate.operator,
+                dispatch: candidate.dispatch.clone(),
+                requirements: OperatorRequirements {
+                    inputs: candidate.inputs.clone(),
+                    output: candidate.output.clone(),
+                    output_aliasing: resolved_output_aliasing(&candidate, inputs, output),
+                    memory_relations: candidate.memory_relations.clone(),
+                },
+            };
+            if !plans.contains(&plan) {
+                plans.push(plan);
+            }
         }
     }
     plans
+}
+
+fn independent_parameter_storage(
+    candidate: &OperatorCandidate,
+    inputs: &[TensorType],
+    input_index: usize,
+    config: &PipelineConfig,
+) -> Vec<OperatorCandidate> {
+    let Some(requirement) = candidate.inputs.get(input_index) else {
+        return Vec::new();
+    };
+    if requirement.format.layout.order != ElementOrder::Amp(AmpOrder::RightK64) {
+        return Vec::new();
+    }
+    let Some(input) = inputs.get(input_index) else {
+        return Vec::new();
+    };
+    let rank = input.shape.0.len();
+    let Some(inner_axis) = rank.checked_sub(2) else {
+        return Vec::new();
+    };
+    let Some(&inner) = input.shape.0.get(inner_axis) else {
+        return Vec::new();
+    };
+    let inner_blocks = inner.div_ceil(AMP_INNER_BLOCK);
+    let Some(column_partitions) = requirement
+        .format
+        .layout
+        .tiling
+        .axes
+        .iter()
+        .find(|axis| axis.axis == TensorAxis::FromEnd(1))
+        .map(|axis| axis.partitions)
+    else {
+        return Vec::new();
+    };
+    let output_column_block = match candidate.dispatch {
+        OperatorDispatch::BlockedGemm {
+            output_column_block,
+            ..
+        } => output_column_block,
+        OperatorDispatch::Pointwise { .. } => return Vec::new(),
+    };
+    if output_column_block < AMP_OUTPUT_COLUMN_BLOCK {
+        return Vec::new();
+    }
+    [1, 2]
+        .into_iter()
+        .filter_map(|copies| {
+            let tiles_per_copy = config.tile_count / copies;
+            let maximum_inner_partitions = u32::from(tiles_per_copy / column_partitions)
+                .min(inner_blocks)
+                .min(u32::from(u16::MAX));
+            let inner_partitions = (1..=maximum_inner_partitions)
+                .rev()
+                .find(|partitions| inner_blocks.is_multiple_of(*partitions))?;
+            let mut independent = candidate.clone();
+            independent.inputs[input_index].format.layout = Layout::amp_right_k64_storage(
+                output_column_block,
+                column_partitions,
+                u16::try_from(inner_partitions).ok()?,
+                copies,
+                requirement.format.layout.memory_class,
+            );
+            Some(independent)
+        })
+        .collect()
 }
 
 fn resolved_output_aliasing(
@@ -2896,6 +3024,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn randomized_parameter_storage_copy_counts_are_independent_of_compute_grids() {
+        let mut random = fastrand::Rng::with_seed(0x6f77_6e65_7273);
+        for case in 0..RANDOM_CASES {
+            let row_partitions = 1_u16 << random.u32(1..=4);
+            let column_partitions = 1_u16 << random.u32(0..=4);
+            let tiles = row_partitions * column_partitions;
+            let inner_blocks = u32::from(row_partitions) * random.u32(1..=4);
+            let inner = inner_blocks * AMP_INNER_BLOCK;
+            let columns = u32::from(column_partitions) * AMP_OUTPUT_COLUMN_BLOCK;
+            let grid = AmpGridShape {
+                tile_count: tiles,
+                row_partitions,
+                column_partitions,
+            };
+            let candidate = amp_grid_gemm_operator_candidate(
+                Precision::F16,
+                64,
+                16,
+                AMP_OUTPUT_COLUMN_BLOCK,
+                grid,
+                AmpWeightPlacement::resident(MemoryClass::Ipu21Interleaved),
+            );
+            let inputs = [
+                TensorType::new(
+                    [u32::from(row_partitions), inner],
+                    Precision::F16,
+                    candidate.inputs[0].format.layout.clone(),
+                ),
+                TensorType::new(
+                    [inner, columns],
+                    Precision::F16,
+                    candidate.inputs[1].format.layout.clone(),
+                ),
+            ];
+            let variants =
+                independent_parameter_storage(&candidate, &inputs, 1, &PipelineConfig::new(tiles));
+            assert!(!variants.is_empty(), "case {case}");
+            for variant in variants {
+                let tiling = &variant.inputs[1].format.layout.tiling;
+                assert!(matches!(tiling.replicas, 1 | 2), "case {case}");
+                assert!(tiling.tile_count <= tiles, "case {case}");
+                assert_eq!(
+                    tiling.tile_count,
+                    tiling.replicas
+                        * tiling
+                            .axes
+                            .iter()
+                            .map(|axis| axis.partitions)
+                            .product::<u16>(),
+                    "case {case}"
+                );
+                assert!(
+                    variant.inputs[1]
+                        .format
+                        .layout
+                        .padded_shape(&inputs[1].shape)
+                        .is_ok(),
+                    "case {case}"
+                );
+            }
+        }
+    }
+
     fn assert_conversions_are_explicit(lowered: &MidGraph, operations: &[MidOperation]) {
         for operation in operations {
             let [input] = operation.inputs.as_slice() else {
@@ -3209,8 +3401,9 @@ mod tests {
                 "random case {case}"
             );
             assert!(
-                searched.peak_memory.fits_ipu21_with_standard_reservation(
+                searched.peak_memory.fits_ipu21_with_budget(
                     searched_config.standard_memory_reservation_bytes,
+                    searched_config.tile_memory_budget_bytes,
                 ),
                 "random case {case}"
             );

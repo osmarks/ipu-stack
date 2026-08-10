@@ -604,7 +604,7 @@ mod tests {
                 (Layout::amp_left(64, 1), rows, 64),
                 (Layout::amp_right(64, 1), 32, 64),
                 (
-                    Layout::amp_right_k64_grid(64, 1, 1, 1, 1, MemoryClass::Ipu21Interleaved),
+                    Layout::amp_right_k64_storage(64, 1, 1, 1, MemoryClass::Ipu21Interleaved),
                     64,
                     64,
                 ),
@@ -679,9 +679,8 @@ mod tests {
             let columns = column_blocks * output_column_block;
             let batches = random.u32(1..=4);
             let shard = shard(
-                Layout::amp_right_k64_grid(
+                Layout::amp_right_k64_storage(
                     output_column_block,
-                    1,
                     1,
                     1,
                     1,
