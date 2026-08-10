@@ -80,6 +80,8 @@ pub struct PackageConfig {
     pub pipeline: PipelineConfig,
     pub tile_compute: TileComputePolicy,
     pub repeat_exchanges: crate::RepeatExchangeStrategy,
+    /// Give every logical exchange transfer its own global synchronization.
+    pub isolate_exchange_transfers: bool,
     pub snapshot_first_exchange_csrs: bool,
 }
 
@@ -347,9 +349,14 @@ pub fn build_package(
     let mid = build_phase("lower_mid", || {
         Ok(lower(graph, &config.pipeline, &Ipu21CostModel)?)
     })?;
-    let low = build_phase("lower_tiles", || {
+    let mut low = build_phase("lower_tiles", || {
         Ok(lower_to_tiles(&mid, &config.pipeline)?)
     })?;
+    if config.isolate_exchange_transfers {
+        build_phase("isolate_exchange_transfers", || {
+            Ok(low.isolate_exchange_transfers()?)
+        })?;
+    }
     if config.pipeline.profiling.enabled
         && !matches!(
             config.repeat_exchanges,

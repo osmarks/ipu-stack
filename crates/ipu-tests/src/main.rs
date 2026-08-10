@@ -47,6 +47,9 @@ struct Arguments {
     /// Log exchange scheduling lower bounds and critical dependency chains.
     #[arg(long)]
     exchange_diagnostics: bool,
+    /// Put each logical exchange transfer behind its own global barrier.
+    #[arg(long)]
+    isolate_exchange_transfers: bool,
     /// Snapshot and diff all exchange CSRs around the first exchange phase.
     #[arg(long, requires = "separate_repeat_exchange_rows")]
     exchange_csr_diff: bool,
@@ -376,6 +379,7 @@ fn main() -> Result<()> {
                     },
                     RepeatExchangeStrategy::SingleIteration,
                 ),
+                isolate_exchange_transfers: arguments.isolate_exchange_transfers,
                 snapshot_first_exchange_csrs: arguments.exchange_csr_diff,
             },
         )?;

@@ -310,6 +310,51 @@ impl LowProgram {
             TileWork::Repeat(id) => TileWorkRef::Repeat(&self.repeat_runs[id.0 as usize]),
         })
     }
+
+    /// Replaces every multi-transfer exchange phase with one globally
+    /// synchronized phase per logical transfer.
+    pub fn isolate_exchange_transfers(&mut self) -> LowLoweringResult<()> {
+        let mut replacements = Vec::with_capacity(self.exchange_phases.len());
+        let mut isolated = Vec::new();
+        for phase in std::mem::take(&mut self.exchange_phases) {
+            let mut ids = Vec::with_capacity(phase.transfers.len());
+            for transfer in phase.transfers {
+                let id = ExchangePhaseId(
+                    u32::try_from(isolated.len()).map_err(|_| LowLoweringError::IdOverflow)?,
+                );
+                ids.push(id);
+                isolated.push(ExchangePhase {
+                    id,
+                    provenance: phase.provenance,
+                    transfers: vec![transfer],
+                });
+            }
+            replacements.push(ids);
+        }
+        for tile in &mut self.tiles {
+            expand_exchange_markers(tile, &replacements);
+        }
+        for repeat in &mut self.repeat_runs {
+            expand_exchange_markers(&mut repeat.body, &replacements);
+        }
+        self.exchange_phases = isolated;
+        Ok(())
+    }
+}
+
+fn expand_exchange_markers(work: &mut TileWorkList, replacements: &[Vec<ExchangePhaseId>]) {
+    let original = std::mem::take(&mut work.work);
+    for item in original {
+        match item {
+            TileWork::Exchange(id) => work.work.extend(
+                replacements[id.index() as usize]
+                    .iter()
+                    .copied()
+                    .map(TileWork::Exchange),
+            ),
+            item => work.work.push(item),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -3217,6 +3262,36 @@ mod tests {
             )];
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
+
+            let transfer_count = low
+                .exchange_phases
+                .iter()
+                .map(|phase| phase.transfers.len())
+                .sum::<usize>();
+            let mut isolated = low.clone();
+            isolated.isolate_exchange_transfers().unwrap();
+            assert_eq!(
+                isolated.exchange_phases.len(),
+                transfer_count,
+                "case {case}"
+            );
+            assert!(
+                isolated
+                    .exchange_phases
+                    .iter()
+                    .all(|phase| phase.transfers.len() == 1),
+                "case {case}"
+            );
+            for tile in &isolated.tiles {
+                assert_eq!(
+                    isolated
+                        .work(tile)
+                        .filter(|work| matches!(work, TileWorkRef::Exchange(_)))
+                        .count(),
+                    transfer_count,
+                    "case {case}"
+                );
+            }
 
             let expected_weight_bytes = inner
                 .div_ceil(u32::from(inner_partitions))
