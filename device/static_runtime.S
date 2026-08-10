@@ -123,6 +123,23 @@ ipu_stack_static_copy_u32:
 	br $m10
 	.size ipu_stack_static_copy_u32, .-ipu_stack_static_copy_u32
 
+	.section .text.ipu_stack_static_patch_word,"ax",@progbits
+	// Runtime helper ABI: m2 destination word, m3 value table, m4 remaining
+	// iterations, m5 total iterations, m9 return. Exchange plans are ordinary
+	// data consumed after this store; no instruction-cache maintenance is needed.
+	.globl ipu_stack_static_patch_word
+	.p2align 2
+	.type ipu_stack_static_patch_word,@function
+ipu_stack_static_patch_word:
+	.supervisor
+	sub $m5, $m5, $m4
+	shl $m5, $m5, 2
+	add $m3, $m3, $m5
+	ld32 $m0, $m3, $m15, 0
+	st32 $m0, $m2, $m15, 0
+	br $m9
+	.size ipu_stack_static_patch_word, .-ipu_stack_static_patch_word
+
 	.section .text.ipu_stack_copy_u64,"ax",@progbits
 	// Runtime helper ABI: m2 destination, m3 source, m4 words/worker, m5
 	// remainder workers, m10 return. This is not a layout-conversion kernel.

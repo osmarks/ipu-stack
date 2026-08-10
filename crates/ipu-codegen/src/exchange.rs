@@ -1,13 +1,14 @@
 //! Physical exchange programs generated from logical shard transfers.
 
 use crate::{
-    ExchangePhaseId, LowProgram, Placement, ShardDefinition, logical_view_byte_spans,
+    ExchangePhaseId, LowProgram, LowShardId, Placement, ShardDefinition, logical_view_byte_spans,
     view_byte_spans,
 };
 use ipu_exchange::{
     MAX_TRANSFER_WORDS, MulticastPlan, PLAN_WORDS, PlanProgramBuilder, RETURN_M10_INSTRUCTION,
     SANS_INACTIVE_INSTRUCTION, SYNC_ANS_INSTRUCTION, Topology, finalize_point_receiver,
-    patch_receiver_address, patch_sender_address, plan_event_cycles,
+    patch_receiver_address, patch_sender_address, patch_sender_instruction, plan_event_cycles,
+    sender_instruction_offsets,
 };
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -114,6 +115,22 @@ fn lower_static_exchanges(
     topology: &Topology,
     options: ExchangeLoweringOptions,
 ) -> Result<Vec<PhysicalExchangePhase>, ExchangeLoweringError> {
+    let mut repeat_inputs = BTreeMap::<LowShardId, Vec<LowShardId>>::new();
+    for repeat in &program.repeat_runs {
+        for iterated in &repeat.iterated {
+            match repeat_inputs.entry(iterated.argument) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(iterated.inputs.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get() != &iterated.inputs =>
+                {
+                    return Err(ExchangeLoweringError::IncompatibleRepeatRows);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
     program
         .exchange_phases
         .iter()
@@ -122,6 +139,7 @@ fn lower_static_exchanges(
             let mut horizon = 0u32;
             let mut tile_availability = vec![0u32; usize::from(program.tile_count)];
             let mut activities = vec![Vec::new(); usize::from(program.tile_count)];
+            let mut scheduled_sends = vec![Vec::new(); usize::from(program.tile_count)];
             let mut diagnostics = options
                 .diagnostics
                 .then(|| PhaseDiagnostics::new(program.tile_count));
@@ -235,6 +253,11 @@ fn lower_static_exchanges(
                         .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
                     pending.push(PendingTransfer {
                         source: source.tile,
+                        source_shard: source.id,
+                        source_offset: source_span
+                            .offset
+                            .checked_add(source_offset)
+                            .ok_or(ExchangeLoweringError::Overflow)?,
                         destinations: destination_entries,
                         source_address,
                         words: chunk_bytes / 4,
@@ -315,6 +338,8 @@ fn lower_static_exchanges(
                         &mut horizon,
                         &mut builders,
                     )?;
+                    scheduled_sends[usize::from(transfer.source)]
+                        .push((transfer.source_shard, transfer.source_offset));
                     activities[usize::from(transfer.source)].push(ExchangeActivity {
                         kind: ExchangeActivityKind::Send,
                         start_cycle: schedule_offset,
@@ -359,6 +384,47 @@ fn lower_static_exchanges(
                     None => Ok(inactive_exchange_row()),
                 })
                 .collect::<Result<Vec<_>, ipu_exchange::ExchangeError>>()?;
+            let repeat_patches = rows
+                .iter()
+                .enumerate()
+                .map(|(tile, row)| {
+                    let offsets = sender_instruction_offsets(row).collect::<Vec<_>>();
+                    if offsets.len() != scheduled_sends[tile].len() {
+                        return Err(ExchangeLoweringError::IncompatibleRepeatRows);
+                    }
+                    offsets
+                        .into_iter()
+                        .zip(&scheduled_sends[tile])
+                        .filter_map(|(word_offset, &(source_shard, source_offset))| {
+                            repeat_inputs.get(&source_shard).map(|inputs| {
+                                let values = inputs
+                                    .iter()
+                                    .map(|input| {
+                                        let address = placement
+                                            .shard_addresses
+                                            .get(input)
+                                            .copied()
+                                            .ok_or(ExchangeLoweringError::UnplacedShard)?
+                                            .checked_add(source_offset)
+                                            .ok_or(ExchangeLoweringError::Overflow)?;
+                                        let mut instruction = row[word_offset];
+                                        patch_sender_instruction(&mut instruction, address)?;
+                                        Ok(instruction)
+                                    })
+                                    .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
+                                if values.first() != Some(&row[word_offset]) {
+                                    return Err(ExchangeLoweringError::IncompatibleRepeatRows);
+                                }
+                                Ok(ExchangeRowPatch {
+                                    word_offset: u32::try_from(word_offset)
+                                        .map_err(|_| ExchangeLoweringError::Overflow)?,
+                                    values,
+                                })
+                            })
+                        })
+                        .collect::<Result<Vec<_>, ExchangeLoweringError>>()
+                })
+                .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
             if pending.len() > 1_000 {
                 let (tile, words) = rows
                     .iter()
@@ -379,7 +445,7 @@ fn lower_static_exchanges(
                 rows,
                 event_cycles: horizon,
                 activities,
-                repeat_patches: vec![Vec::new(); usize::from(program.tile_count)],
+                repeat_patches,
             })
         })
         .collect()
@@ -557,6 +623,8 @@ impl PhaseDiagnostics {
 
 struct PendingTransfer {
     source: u16,
+    source_shard: LowShardId,
+    source_offset: u32,
     destinations: Vec<(u16, u32)>,
     source_address: u32,
     words: u32,
@@ -578,6 +646,11 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
         let previous_bytes = previous.words * 4;
         let combined_words = previous.words.checked_add(transfer.words);
         let contiguous = previous.source == transfer.source
+            && previous.source_shard == transfer.source_shard
+            && previous
+                .source_offset
+                .checked_add(previous_bytes)
+                .is_some_and(|end| end == transfer.source_offset)
             && previous.destinations.len() == transfer.destinations.len()
             && previous
                 .source_address
@@ -905,6 +978,8 @@ mod tests {
                     }
                     PendingTransfer {
                         source,
+                        source_shard: LowShardId::from_index(u32::from(source)),
+                        source_offset: 0,
                         destinations: receivers.into_iter().map(|tile| (tile, 0)).collect(),
                         source_address: 0,
                         words: random.u32(1..=MAX_TRANSFER_WORDS),

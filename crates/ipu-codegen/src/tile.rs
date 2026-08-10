@@ -1,9 +1,10 @@
 //! Final lowering from logical per-tile work to address-resolved programs.
 
 use crate::{
-    ExchangePhaseId, ExchangeStep, KernelBuildPlan, LowProgram, LowShardId, PhysicalExchangePhase,
-    PlacedExchangeRow, Placement, RepeatPointer, RepeatRun, RepeatStep, StepProfile, TileAddress,
-    TileProgram, TileStep, TileWorkList, TileWorkRef, materialize_kernel_run,
+    ExchangePatch, ExchangePhaseId, ExchangeStep, KernelBuildPlan, LowProgram, LowShardId,
+    PhysicalExchangePhase, PlacedExchangeRow, Placement, RepeatPointer, RepeatRun, RepeatStep,
+    StepProfile, TileAddress, TileProgram, TileStep, TileWorkList, TileWorkRef,
+    materialize_kernel_run,
 };
 use std::collections::BTreeMap;
 
@@ -30,8 +31,6 @@ pub enum TileLoweringError {
     UnknownExchange,
     #[error("exchange phase has no row for tile {0}")]
     MissingExchangeRow(u16),
-    #[error("repeat contains an iterated exchange source; per-iteration row tables are required")]
-    IteratedExchange,
     #[error("nested finalized repeats are not yet supported")]
     NestedRepeat,
     #[error("tile-program address arithmetic overflowed")]
@@ -55,6 +54,11 @@ pub enum TileLoweringError {
         destination_offset: u32,
         bytes: u32,
     },
+}
+
+struct PlacedExchange {
+    row: PlacedExchangeRow,
+    patches: Vec<ExchangePatch>,
 }
 
 impl<'a> TileProgramLowering<'a> {
@@ -156,7 +160,7 @@ fn lower_work(
     placement: &Placement,
     kernels: &KernelBuildPlan,
     phases: &BTreeMap<ExchangePhaseId, &PhysicalExchangePhase>,
-    exchange_rows: &BTreeMap<ExchangePhaseId, Vec<PlacedExchangeRow>>,
+    exchange_rows: &BTreeMap<ExchangePhaseId, PlacedExchange>,
     overrides: &BTreeMap<LowShardId, TileAddress>,
     inside_repeat: bool,
 ) -> Result<Vec<TileStep>, TileLoweringError> {
@@ -165,18 +169,15 @@ fn lower_work(
         let step = match work {
             TileWorkRef::Exchange(id) => {
                 phases.get(&id).ok_or(TileLoweringError::UnknownExchange)?;
-                let rows = exchange_rows
+                let placed = exchange_rows
                     .get(&id)
                     .ok_or(TileLoweringError::UnknownExchange)?;
-                let first = rows.first().ok_or(TileLoweringError::UnknownExchange)?;
                 TileStep::Exchange(ExchangeStep {
-                    address: first.address,
-                    row: first.words.clone(),
-                    repeat_variants: if inside_repeat {
-                        rows[1..].to_vec()
-                    } else {
-                        Vec::new()
-                    },
+                    address: placed.row.address,
+                    row: placed.row.words.clone(),
+                    patches: inside_repeat
+                        .then(|| placed.patches.clone())
+                        .unwrap_or_default(),
                     profile: StepProfile::default(),
                 })
             }
@@ -251,53 +252,44 @@ fn lower_repeat(
     placement: &Placement,
     kernels: &KernelBuildPlan,
     phases: &BTreeMap<ExchangePhaseId, &PhysicalExchangePhase>,
-    exchange_rows: &BTreeMap<ExchangePhaseId, Vec<PlacedExchangeRow>>,
+    exchange_rows: &BTreeMap<ExchangePhaseId, PlacedExchange>,
 ) -> Result<RepeatStep, TileLoweringError> {
     let mut overrides = BTreeMap::new();
     let mut pointers = Vec::with_capacity(repeat.iterated.len());
-    let mut staging = Vec::new();
     for (index, iterated) in repeat.iterated.iter().enumerate() {
-        let addresses = iterated
+        let initial_address = iterated
             .inputs
-            .iter()
-            .map(|input| {
-                placement
-                    .shard_addresses
-                    .get(input)
-                    .copied()
-                    .ok_or(TileLoweringError::InvalidRepeat)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let index = u16::try_from(index).map_err(|_| TileLoweringError::Overflow)?;
-        let address = TileAddress::RepeatPointer { index, offset: 0 };
-        let staging_address = placement
-            .shard_addresses
-            .get(&iterated.argument)
+            .first()
+            .and_then(|input| placement.shard_addresses.get(input))
             .copied()
             .ok_or(TileLoweringError::InvalidRepeat)?;
+        for (iteration, input) in iterated.inputs.iter().enumerate() {
+            let expected = initial_address
+                .checked_add(
+                    iterated
+                        .stride_bytes
+                        .checked_mul(
+                            u32::try_from(iteration).map_err(|_| TileLoweringError::Overflow)?,
+                        )
+                        .ok_or(TileLoweringError::Overflow)?,
+                )
+                .ok_or(TileLoweringError::Overflow)?;
+            if placement.shard_addresses.get(input).copied() != Some(expected) {
+                return Err(TileLoweringError::InvalidRepeat);
+            }
+        }
+        let index = u16::try_from(index).map_err(|_| TileLoweringError::Overflow)?;
+        let address = TileAddress::RepeatPointer { index, offset: 0 };
         if !iterated.stride_bytes.is_multiple_of(4) {
             return Err(TileLoweringError::InvalidRepeat);
         }
-        if repeat.count == 1 {
-            overrides.insert(iterated.argument, TileAddress::Absolute(addresses[0]));
-        } else if iterated.stride_bytes != 0 {
-            staging.push(TileStep::Compute(crate::ComputeStep {
-                symbol: crate::COPY_U32_SYMBOL.into(),
-                output_address: TileAddress::Absolute(staging_address),
-                input_addresses: vec![address],
-                arguments: vec![iterated.stride_bytes / 4],
-                profile: StepProfile::default(),
-            }));
-            overrides.insert(iterated.argument, TileAddress::Absolute(staging_address));
-        } else {
-            overrides.insert(iterated.argument, TileAddress::Absolute(staging_address));
-        }
+        overrides.insert(iterated.argument, address);
         pointers.push(RepeatPointer {
-            addresses,
+            initial_address,
             stride_bytes: iterated.stride_bytes,
         });
     }
-    let mut body = lower_work(
+    let body = lower_work(
         program,
         &repeat.body,
         placement,
@@ -307,21 +299,14 @@ fn lower_repeat(
         &overrides,
         true,
     )?;
-    if !staging.is_empty() {
-        for step in &mut body {
-            if let TileStep::Exchange(exchange) = step {
-                exchange.repeat_variants.clear();
-            }
-        }
-        staging.append(&mut body);
-        body = staging;
-    }
     for step in &body {
         let TileStep::Exchange(exchange) = step else {
             continue;
         };
-        if !exchange.repeat_variants.is_empty()
-            && exchange.repeat_variants.len() + 1 != repeat.count as usize
+        if exchange
+            .patches
+            .iter()
+            .any(|patch| patch.values.words.len() != repeat.count as usize)
         {
             return Err(TileLoweringError::InvalidRepeat);
         }
@@ -337,15 +322,15 @@ fn lower_repeat(
 fn lower_inactive_work(
     program: &LowProgram,
     work: &TileWorkList,
-    exchange_rows: &BTreeMap<ExchangePhaseId, Vec<PlacedExchangeRow>>,
+    exchange_rows: &BTreeMap<ExchangePhaseId, PlacedExchange>,
 ) -> Result<Vec<TileStep>, TileLoweringError> {
     let mut steps = Vec::new();
     for work in program.work(work) {
         match work {
             TileWorkRef::Exchange(id) => steps.push(TileStep::Exchange(ExchangeStep {
-                address: exchange_rows[&id][0].address,
-                row: exchange_rows[&id][0].words.clone(),
-                repeat_variants: Vec::new(),
+                address: exchange_rows[&id].row.address,
+                row: exchange_rows[&id].row.words.clone(),
+                patches: Vec::new(),
                 profile: StepProfile::default(),
             })),
             TileWorkRef::Repeat(repeat) => steps.push(TileStep::Repeat(RepeatStep {
@@ -385,23 +370,29 @@ pub fn compact_exchange_table_bytes(
             } else {
                 crate::inactive_exchange_row().len()
             };
-            let iterations = (tile < scheduled_tile_count)
-                .then(|| phase.repeat_patches.get(usize::from(tile)))
-                .flatten()
-                .and_then(|patches| patches.first())
-                .map_or(1, |patch| patch.values.len());
             let row_bytes = u32::try_from(words)
                 .map_err(|_| TileLoweringError::Overflow)?
                 .checked_mul(4)
                 .ok_or(TileLoweringError::Overflow)?;
+            let patch_bytes = if tile < scheduled_tile_count {
+                phase.repeat_patches[usize::from(tile)]
+                    .iter()
+                    .try_fold(0u32, |total, patch| {
+                        total
+                            .checked_add(
+                                u32::try_from(patch.values.len())
+                                    .map_err(|_| TileLoweringError::Overflow)?
+                                    .checked_mul(4)
+                                    .ok_or(TileLoweringError::Overflow)?,
+                            )
+                            .ok_or(TileLoweringError::Overflow)
+                    })?
+            } else {
+                0
+            };
             bytes = bytes
-                .checked_add(
-                    row_bytes
-                        .checked_mul(
-                            u32::try_from(iterations).map_err(|_| TileLoweringError::Overflow)?,
-                        )
-                        .ok_or(TileLoweringError::Overflow)?,
-                )
+                .checked_add(row_bytes)
+                .and_then(|bytes| bytes.checked_add(patch_bytes))
                 .ok_or(TileLoweringError::Overflow)?;
         }
         maximum = maximum.max(bytes);
@@ -414,7 +405,7 @@ fn layout_exchange_rows(
     tile: u16,
     scheduled_tile_count: u16,
     base: u32,
-) -> Result<(BTreeMap<ExchangePhaseId, Vec<PlacedExchangeRow>>, u32), TileLoweringError> {
+) -> Result<(BTreeMap<ExchangePhaseId, PlacedExchange>, u32), TileLoweringError> {
     let mut cursor = align_up(base, 4)?;
     let mut result = BTreeMap::new();
     for phase in exchanges {
@@ -436,13 +427,32 @@ fn layout_exchange_rows(
                     .ok_or(TileLoweringError::Overflow)?,
             )
             .ok_or(TileLoweringError::Overflow)?;
-        result.insert(
-            phase.id,
-            vec![PlacedExchangeRow {
-                address,
-                words: base_row,
-            }],
-        );
+        let row = PlacedExchangeRow {
+            address,
+            words: base_row,
+        };
+        let mut patches = Vec::new();
+        if tile < scheduled_tile_count {
+            for patch in &phase.repeat_patches[usize::from(tile)] {
+                let address = cursor;
+                cursor = cursor
+                    .checked_add(
+                        u32::try_from(patch.values.len())
+                            .map_err(|_| TileLoweringError::Overflow)?
+                            .checked_mul(4)
+                            .ok_or(TileLoweringError::Overflow)?,
+                    )
+                    .ok_or(TileLoweringError::Overflow)?;
+                patches.push(ExchangePatch {
+                    word_offset: patch.word_offset,
+                    values: PlacedExchangeRow {
+                        address,
+                        words: patch.values.clone(),
+                    },
+                });
+            }
+        }
+        result.insert(phase.id, PlacedExchange { row, patches });
     }
     Ok((result, cursor))
 }

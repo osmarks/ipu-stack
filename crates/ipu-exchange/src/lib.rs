@@ -1068,18 +1068,27 @@ pub fn c600_logical_to_physical(logical: u16) -> u16 {
 }
 
 pub fn patch_sender_address(row: &mut PlanRow, byte_address: u32) -> Result<(), ExchangeError> {
+    let instruction = row
+        .iter_mut()
+        .find(|instruction| **instruction & LONG_OPCODE_MASK == SEND_OPCODE)
+        .ok_or(ExchangeError::Address(byte_address))?;
+    patch_sender_instruction(instruction, byte_address)
+}
+
+/// Replaces the address field of one tile-to-tile SEND instruction.
+pub fn patch_sender_instruction(
+    instruction: &mut u32,
+    byte_address: u32,
+) -> Result<(), ExchangeError> {
     if byte_address & 3 != 0 || byte_address >> 2 > 0x1f_ffff {
         return Err(ExchangeError::Address(byte_address));
     }
-    let word_address = byte_address >> 2;
-    for instruction in row {
-        if *instruction & 0xf800_0000 == 0x7800_0000 {
-            *instruction =
-                (*instruction & !SEND_ADDRESS_MASK) | ((word_address << 3) & SEND_ADDRESS_MASK);
-            return Ok(());
-        }
+    if *instruction & LONG_OPCODE_MASK != SEND_OPCODE {
+        return Err(ExchangeError::Address(byte_address));
     }
-    Err(ExchangeError::Address(byte_address))
+    let word_address = byte_address >> 2;
+    *instruction = (*instruction & !SEND_ADDRESS_MASK) | ((word_address << 3) & SEND_ADDRESS_MASK);
+    Ok(())
 }
 
 /// Clears the address field of a tile-to-tile SEND for structural plan deduplication.
@@ -1092,6 +1101,14 @@ pub fn normalize_sender_instruction(row: &mut [u32]) -> Option<(usize, u32)> {
     let original = *instruction;
     *instruction &= !SEND_ADDRESS_MASK;
     Some((index, original))
+}
+
+/// Returns every tile-to-tile SEND instruction offset in execution order.
+pub fn sender_instruction_offsets(row: &[u32]) -> impl Iterator<Item = usize> + '_ {
+    row.iter()
+        .enumerate()
+        .filter(|(_, instruction)| **instruction & LONG_OPCODE_MASK == SEND_OPCODE)
+        .map(|(index, _)| index)
 }
 
 pub fn patch_receiver_address(row: &mut PlanRow, byte_address: u32) -> Result<(), ExchangeError> {

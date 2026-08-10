@@ -740,6 +740,9 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
     let mut symbols = vec![COMPLETE_SYMBOL.into()];
     if !program.exchange_phases.is_empty() {
         symbols.push(WORKER_BARRIER_SYMBOL.into());
+        if !program.repeat_runs.is_empty() {
+            symbols.push(crate::PATCH_WORD_SYMBOL.into());
+        }
     }
     if config.pipeline.profiling.enabled {
         symbols.push(SAMPLE_CYCLE_SYMBOL.into());
