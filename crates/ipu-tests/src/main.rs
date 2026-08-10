@@ -1379,6 +1379,7 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
             .map(|register| runtime.device().read_tile_m_register(physical, 0, register))
             .collect::<Result<Vec<_>, _>>();
         let exchange_state = runtime.device().tile_exchange_state(physical);
+        let exchange_receive_error = runtime.device().tile_exchange_receive_error(physical);
         let workers = (1..=6)
             .map(|context| runtime.device().tile_context_state(physical, context))
             .collect::<Result<Vec<_>, _>>();
@@ -1390,6 +1391,7 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
             row_readback,
             supervisor_registers,
             exchange_state,
+            exchange_receive_error,
             workers,
         ));
     }

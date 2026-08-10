@@ -51,6 +51,8 @@ const TDI_STATUS: u32 = 8;
 const TDI_STATUS_CLEAR: u32 = 9;
 const TDI_INCOMING_DCOUNT: u32 = 10;
 const TDI_EXCHANGE_CONTROL: u32 = 11;
+const TDI_CONTEXT_EXCHANGE_RECEIVE_ERROR_SHIFT: u32 = 27;
+const TDI_CONTEXT_EXCHANGE_RECEIVE_ERROR_MASK: u32 = 7;
 
 mod tdi_instruction {
     // IPU21 diagnostic instructions, named by their Tile Vertex ISA assembly.
@@ -85,6 +87,52 @@ pub enum TileException {
     ExchangeError = 13,
     MemoryError = 14,
     InstructionBreak = 15,
+}
+
+/// IPU21 exchange-receive error reported in `TDI_CTXT_STS.ERERR`.
+///
+/// The architecture names and values are exposed by the SDK's
+/// `TileExchangeReceiveError` metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TileExchangeReceiveError {
+    None = 0,
+    InstructionClash = 1,
+    InstructionFetchClash = 2,
+    Address = 3,
+    Workers = 4,
+    DataBreak = 5,
+    Configuration = 6,
+    Modification = 7,
+}
+
+impl TileExchangeReceiveError {
+    pub const fn from_raw(value: u32) -> Option<Self> {
+        Some(match value {
+            0 => Self::None,
+            1 => Self::InstructionClash,
+            2 => Self::InstructionFetchClash,
+            3 => Self::Address,
+            4 => Self::Workers,
+            5 => Self::DataBreak,
+            6 => Self::Configuration,
+            7 => Self::Modification,
+            _ => return None,
+        })
+    }
+
+    pub const fn architecture_name(self) -> &'static str {
+        match self {
+            Self::None => "TEXCH_RERR_NONE",
+            Self::InstructionClash => "TEXCH_RERR_CLASH_INSTR",
+            Self::InstructionFetchClash => "TEXCH_RERR_CLASH_IFETCH",
+            Self::Address => "TEXCH_RERR_ADDR",
+            Self::Workers => "TEXCH_RERR_WORKERS",
+            Self::DataBreak => "TEXCH_RERR_DBRK",
+            Self::Configuration => "TEXCH_RERR_CONF",
+            Self::Modification => "TEXCH_RERR_MODI",
+        }
+    }
 }
 
 impl TileException {
@@ -651,6 +699,16 @@ impl Device {
 
     pub fn tile_context_state(&self, physical_tile: u16, context: u32) -> Result<u32, DriverError> {
         Ok((self.read_tile_debug(physical_tile, TDI_CONTEXT_STATUS)? >> (context * 2)) & 3)
+    }
+
+    pub fn tile_exchange_receive_error(
+        &self,
+        physical_tile: u16,
+    ) -> Result<TileExchangeReceiveError, DriverError> {
+        let status = self.read_tile_debug(physical_tile, TDI_CONTEXT_STATUS)?;
+        let raw = (status >> TDI_CONTEXT_EXCHANGE_RECEIVE_ERROR_SHIFT)
+            & TDI_CONTEXT_EXCHANGE_RECEIVE_ERROR_MASK;
+        Ok(TileExchangeReceiveError::from_raw(raw).expect("three-bit exchange receive error"))
     }
 
     /// Returns the live incoming-data count and exchange-control state exposed
