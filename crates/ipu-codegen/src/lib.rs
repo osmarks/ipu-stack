@@ -58,8 +58,8 @@ pub use mid::{
     TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{
-    PackageBuildError, PackageBuildResult, PackageConfig, TileProgramData, build_package,
-    build_tile_program_package,
+    PackageBuildError, PackageBuildResult, PackageConfig, TileComputePolicy, TileProgramData,
+    build_package, build_tile_program_package,
 };
 pub use place::{Placement, PlacementError, place};
 pub use storage::{

@@ -78,6 +78,14 @@ pub struct PackageConfig {
     pub runtime_source: PathBuf,
     pub kernel_source_directory: PathBuf,
     pub pipeline: PipelineConfig,
+    pub tile_compute: TileComputePolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TileComputePolicy {
+    #[default]
+    Execute,
+    Omit,
 }
 
 /// Data embedded in one logical tile image for a finalized tile-program package.
@@ -570,6 +578,7 @@ fn build_package_from_objects(
             .enumerate()
             .try_fold(0u32, |maximum, (physical, (&logical, host))| {
                 let mut tile_program = provisional_finalizer.lower_tile(logical)?;
+                apply_compute_policy(&mut tile_program.steps, config.tile_compute);
                 if let Some(storage) = &profile_storage {
                     instrument_profile(
                         program,
@@ -722,6 +731,7 @@ fn build_package_from_objects(
         .enumerate()
         .map(|(physical_tile, &logical)| -> PackageBuildResult<_> {
             let mut tile_program = finalizer.lower_tile(logical)?;
+            apply_compute_policy(&mut tile_program.steps, config.tile_compute);
             let profile = profile_storage
                 .as_ref()
                 .map(|storage| {
@@ -830,6 +840,20 @@ fn build_package_from_objects(
     application.host_exchange = host.protocol;
     application.validate()?;
     Ok(application)
+}
+
+fn apply_compute_policy(steps: &mut Vec<crate::TileStep>, policy: TileComputePolicy) {
+    if policy == TileComputePolicy::Execute {
+        return;
+    }
+    steps.retain_mut(|step| match step {
+        crate::TileStep::Compute(_) => false,
+        crate::TileStep::Repeat(repeat) => {
+            apply_compute_policy(&mut repeat.body, policy);
+            true
+        }
+        crate::TileStep::Exchange(_) => true,
+    });
 }
 
 fn build_phase<T>(

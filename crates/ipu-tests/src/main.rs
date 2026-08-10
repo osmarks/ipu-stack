@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use ipu_codegen::{
     AmpOrder, ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision, TensorFormat,
-    amp_matrix_coordinates, build_package,
+    TileComputePolicy, amp_matrix_coordinates, build_package,
 };
 use ipu_elf::Toolchain;
 use ipu_package::{Application, Binding, TileImage};
@@ -102,6 +102,8 @@ enum Workload {
     GemmBenchmark,
     /// Profile the canonical batched SigLIP Dense-GeLU-Dense workload.
     SiglipMlpBenchmark,
+    /// Run the canonical MLP exchange schedule without tile compute steps.
+    SiglipMlpExchange,
     /// Run reproducible randomized small-group tile exchanges.
     ExchangeStress,
 }
@@ -136,14 +138,18 @@ fn main() -> Result<()> {
     {
         bail!("--profile-output and --no-profile require a benchmark workload");
     }
-    if !matches!(arguments.workload, Workload::SiglipMlpBenchmark)
-        && (arguments.mlp_batch != SIGLIP_MLP_BATCH
-            || arguments.mlp_tokens != SIGLIP_MLP_TOKENS
-            || arguments.mlp_dim != SIGLIP_MLP_DIMENSION
-            || arguments.mlp_hidden_dim.is_some()
-            || arguments.mlp_blocks != 1)
+    if !matches!(
+        arguments.workload,
+        Workload::SiglipMlpBenchmark | Workload::SiglipMlpExchange
+    ) && (arguments.mlp_batch != SIGLIP_MLP_BATCH
+        || arguments.mlp_tokens != SIGLIP_MLP_TOKENS
+        || arguments.mlp_dim != SIGLIP_MLP_DIMENSION
+        || arguments.mlp_hidden_dim.is_some()
+        || arguments.mlp_blocks != 1)
     {
-        bail!("--mlp-* shape options require --workload siglip-mlp-benchmark");
+        bail!(
+            "--mlp-* shape options require --workload siglip-mlp-benchmark or siglip-mlp-exchange"
+        );
     }
     if !matches!(arguments.workload, Workload::GemmBenchmark)
         && (arguments.benchmark_rows != GEMM_BENCHMARK_ROWS
@@ -263,7 +269,10 @@ fn main() -> Result<()> {
             .with_input(left, left_format)
             .with_input(right0, right_format.clone())
             .with_input(right1, right_format);
-    } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
+    } else if matches!(
+        arguments.workload,
+        Workload::SiglipMlpBenchmark | Workload::SiglipMlpExchange
+    ) {
         validate_mlp_benchmark_shape(
             arguments.mlp_batch,
             arguments.mlp_tokens,
@@ -303,7 +312,8 @@ fn main() -> Result<()> {
             },
         )?[0];
         graph.set_outputs([output])?;
-        pipeline.profiling.enabled = !arguments.no_profile;
+        pipeline.profiling.enabled =
+            matches!(arguments.workload, Workload::SiglipMlpBenchmark) && !arguments.no_profile;
         pipeline = pipeline.with_automatic_input(left, Precision::F16);
         for weight in right0.into_iter().chain(right1) {
             pipeline = pipeline.with_automatic_input(weight, Precision::F16);
@@ -337,6 +347,11 @@ fn main() -> Result<()> {
                     .to_owned(),
                 runtime_source,
                 pipeline,
+                tile_compute: if matches!(arguments.workload, Workload::SiglipMlpExchange) {
+                    TileComputePolicy::Omit
+                } else {
+                    TileComputePolicy::Execute
+                },
             },
         )?;
         write_package(&application, &arguments.package)?;
@@ -377,6 +392,15 @@ fn main() -> Result<()> {
                 &runtime,
                 &application,
                 active_tiles,
+                arguments.timeout_seconds,
+            )?;
+        } else if matches!(arguments.workload, Workload::SiglipMlpExchange) {
+            run_siglip_mlp_exchange(
+                &runtime,
+                &application,
+                arguments.mlp_dim,
+                mlp_hidden_dim,
+                arguments.mlp_blocks,
                 arguments.timeout_seconds,
             )?;
         } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
@@ -650,26 +674,7 @@ fn run_siglip_mlp_benchmark(
     if clock_hz == 0 {
         bail!("benchmark clock must be nonzero");
     }
-    let left = application
-        .inputs
-        .iter()
-        .find(|binding| binding.name == "left")
-        .context("MLP benchmark package has no left binding")?;
-    let left_bytes = filled_f16_binding(left, 0x3c00)?;
-    let up_bits = f32_to_half(1.0 / dimension as f32);
-    let down_bits = f32_to_half(1.0 / hidden_dimension as f32);
-    let mut weights = Vec::new();
-    for block in 0..blocks {
-        for (projection, bits) in [(0, up_bits), (1, down_bits)] {
-            let name = mlp_weight_name(blocks, block, projection);
-            let binding = application
-                .weights
-                .iter()
-                .find(|binding| binding.name == name)
-                .with_context(|| format!("MLP benchmark package has no {name} binding"))?;
-            weights.extend_from_slice(&filled_f16_binding(binding, bits)?);
-        }
-    }
+    let (left_bytes, weights) = mlp_inputs(application, dimension, hidden_dimension, blocks)?;
 
     let output =
         run_initialized_program(runtime, application, &weights, &left_bytes, timeout_seconds)?;
@@ -699,6 +704,53 @@ fn run_siglip_mlp_benchmark(
         tflops / peak_tflops * 100.0,
     );
     Ok(())
+}
+
+fn run_siglip_mlp_exchange(
+    runtime: &Runtime,
+    application: &Application,
+    dimension: u32,
+    hidden_dimension: u32,
+    blocks: u32,
+    timeout_seconds: u64,
+) -> Result<()> {
+    let (left_bytes, weights) = mlp_inputs(application, dimension, hidden_dimension, blocks)?;
+    run_initialized_program(runtime, application, &weights, &left_bytes, timeout_seconds)?;
+    println!(
+        "workload=siglip-mlp-exchange dimension={dimension} hiddenDimension={hidden_dimension} blocks={blocks} inputBytes={} weightBytes={} hardwareTest=PASS",
+        left_bytes.len(),
+        weights.len(),
+    );
+    Ok(())
+}
+
+fn mlp_inputs(
+    application: &Application,
+    dimension: u32,
+    hidden_dimension: u32,
+    blocks: u32,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let left = application
+        .inputs
+        .iter()
+        .find(|binding| binding.name == "left")
+        .context("MLP package has no left binding")?;
+    let left_bytes = filled_f16_binding(left, 0x3c00)?;
+    let up_bits = f32_to_half(1.0 / dimension as f32);
+    let down_bits = f32_to_half(1.0 / hidden_dimension as f32);
+    let mut weights = Vec::new();
+    for block in 0..blocks {
+        for (projection, bits) in [(0, up_bits), (1, down_bits)] {
+            let name = mlp_weight_name(blocks, block, projection);
+            let binding = application
+                .weights
+                .iter()
+                .find(|binding| binding.name == name)
+                .with_context(|| format!("MLP package has no {name} binding"))?;
+            weights.extend_from_slice(&filled_f16_binding(binding, bits)?);
+        }
+    }
+    Ok((left_bytes, weights))
 }
 
 fn write_profile(
