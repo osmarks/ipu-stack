@@ -1,15 +1,13 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use ipu_codegen::{
-    AmpOrder, ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision,
-    RepeatExchangeStrategy, TensorFormat, TileComputePolicy, amp_matrix_coordinates, build_package,
+    AmpOrder, ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision, TensorFormat,
+    amp_matrix_coordinates, build_package,
 };
 use ipu_elf::Toolchain;
-use ipu_package::{Application, Binding, TileImage};
+use ipu_package::{Application, Binding};
 use ipu_runtime::Runtime;
-use std::collections::BTreeMap;
 use std::fs;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -37,24 +35,9 @@ struct Arguments {
     /// Build benchmark programs without cycle-counter or per-step profiling.
     #[arg(long)]
     no_profile: bool,
-    /// Materialize one immutable exchange row per structured-repeat iteration.
-    #[arg(long)]
-    separate_repeat_exchange_rows: bool,
-    /// Execute immutable structured-repeat rows in reverse iteration order.
-    #[arg(long, conflicts_with_all = ["separate_repeat_exchange_rows", "repeat_iteration"])]
-    reverse_repeat_iterations: bool,
-    /// Execute only this structured-repeat iteration, using immutable rows.
-    #[arg(long, conflicts_with = "separate_repeat_exchange_rows")]
-    repeat_iteration: Option<u32>,
     /// Log exchange scheduling lower bounds and critical dependency chains.
     #[arg(long)]
     exchange_diagnostics: bool,
-    /// PHASE=MAX logical transfers allowed behind one global exchange barrier.
-    #[arg(long, value_parser = parse_exchange_phase_transfer_limit)]
-    exchange_phase_transfer_limit: Vec<(usize, NonZeroUsize)>,
-    /// Snapshot and diff all exchange CSRs around the first exchange phase.
-    #[arg(long, requires = "separate_repeat_exchange_rows")]
-    exchange_csr_diff: bool,
     /// Force eligible one-use layout conversions to stream into consumer slices.
     #[arg(long)]
     stream_conversions: bool,
@@ -119,8 +102,6 @@ enum Workload {
     GemmBenchmark,
     /// Profile the canonical batched SigLIP Dense-GeLU-Dense workload.
     SiglipMlpBenchmark,
-    /// Run the canonical MLP exchange schedule without tile compute steps.
-    SiglipMlpExchange,
     /// Run reproducible randomized small-group tile exchanges.
     ExchangeStress,
 }
@@ -137,31 +118,6 @@ const SIGLIP_MLP_DIMENSION: u32 = 1024;
 const GEMM_BENCHMARK_ROWS: u32 = 131_072;
 const GEMM_BENCHMARK_INNER: u32 = 64;
 const GEMM_BENCHMARK_COLUMNS: u32 = 64;
-
-fn parse_exchange_phase_transfer_limit(value: &str) -> Result<(usize, NonZeroUsize), String> {
-    let (phase, maximum) = value
-        .split_once('=')
-        .ok_or_else(|| "expected PHASE=MAX".to_owned())?;
-    let phase = phase
-        .parse()
-        .map_err(|_| "exchange phase must be a nonnegative integer".to_owned())?;
-    let maximum = maximum
-        .parse()
-        .map_err(|_| "exchange phase maximum must be a positive integer".to_owned())?;
-    Ok((phase, maximum))
-}
-
-fn exchange_phase_transfer_limits(
-    entries: &[(usize, NonZeroUsize)],
-) -> Result<BTreeMap<usize, NonZeroUsize>> {
-    let mut limits = BTreeMap::new();
-    for &(phase, maximum) in entries {
-        if limits.insert(phase, maximum).is_some() {
-            bail!("exchange phase {phase} has more than one transfer limit");
-        }
-    }
-    Ok(limits)
-}
 
 fn mlp_weight_name(blocks: u32, block: u32, projection: u32) -> String {
     if blocks == 1 {
@@ -180,18 +136,14 @@ fn main() -> Result<()> {
     {
         bail!("--profile-output and --no-profile require a benchmark workload");
     }
-    if !matches!(
-        arguments.workload,
-        Workload::SiglipMlpBenchmark | Workload::SiglipMlpExchange
-    ) && (arguments.mlp_batch != SIGLIP_MLP_BATCH
-        || arguments.mlp_tokens != SIGLIP_MLP_TOKENS
-        || arguments.mlp_dim != SIGLIP_MLP_DIMENSION
-        || arguments.mlp_hidden_dim.is_some()
-        || arguments.mlp_blocks != 1)
+    if !matches!(arguments.workload, Workload::SiglipMlpBenchmark)
+        && (arguments.mlp_batch != SIGLIP_MLP_BATCH
+            || arguments.mlp_tokens != SIGLIP_MLP_TOKENS
+            || arguments.mlp_dim != SIGLIP_MLP_DIMENSION
+            || arguments.mlp_hidden_dim.is_some()
+            || arguments.mlp_blocks != 1)
     {
-        bail!(
-            "--mlp-* shape options require --workload siglip-mlp-benchmark or siglip-mlp-exchange"
-        );
+        bail!("--mlp-* shape options require --workload siglip-mlp-benchmark");
     }
     if !matches!(arguments.workload, Workload::GemmBenchmark)
         && (arguments.benchmark_rows != GEMM_BENCHMARK_ROWS
@@ -311,10 +263,7 @@ fn main() -> Result<()> {
             .with_input(left, left_format)
             .with_input(right0, right_format.clone())
             .with_input(right1, right_format);
-    } else if matches!(
-        arguments.workload,
-        Workload::SiglipMlpBenchmark | Workload::SiglipMlpExchange
-    ) {
+    } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
         validate_mlp_benchmark_shape(
             arguments.mlp_batch,
             arguments.mlp_tokens,
@@ -354,8 +303,7 @@ fn main() -> Result<()> {
             },
         )?[0];
         graph.set_outputs([output])?;
-        pipeline.profiling.enabled =
-            matches!(arguments.workload, Workload::SiglipMlpBenchmark) && !arguments.no_profile;
+        pipeline.profiling.enabled = !arguments.no_profile;
         pipeline = pipeline.with_automatic_input(left, Precision::F16);
         for weight in right0.into_iter().chain(right1) {
             pipeline = pipeline.with_automatic_input(weight, Precision::F16);
@@ -389,27 +337,6 @@ fn main() -> Result<()> {
                     .to_owned(),
                 runtime_source,
                 pipeline,
-                tile_compute: if matches!(arguments.workload, Workload::SiglipMlpExchange) {
-                    TileComputePolicy::Omit
-                } else {
-                    TileComputePolicy::Execute
-                },
-                repeat_exchanges: arguments.repeat_iteration.map_or_else(
-                    || {
-                        if arguments.reverse_repeat_iterations {
-                            RepeatExchangeStrategy::ReverseRows
-                        } else if arguments.separate_repeat_exchange_rows {
-                            RepeatExchangeStrategy::SeparateRows
-                        } else {
-                            RepeatExchangeStrategy::PatchInPlace
-                        }
-                    },
-                    RepeatExchangeStrategy::SingleIteration,
-                ),
-                exchange_phase_transfer_limits: exchange_phase_transfer_limits(
-                    &arguments.exchange_phase_transfer_limit,
-                )?,
-                snapshot_first_exchange_csrs: arguments.exchange_csr_diff,
             },
         )?;
         write_package(&application, &arguments.package)?;
@@ -450,15 +377,6 @@ fn main() -> Result<()> {
                 &runtime,
                 &application,
                 active_tiles,
-                arguments.timeout_seconds,
-            )?;
-        } else if matches!(arguments.workload, Workload::SiglipMlpExchange) {
-            run_siglip_mlp_exchange(
-                &runtime,
-                &application,
-                arguments.mlp_dim,
-                mlp_hidden_dim,
-                arguments.mlp_blocks,
                 arguments.timeout_seconds,
             )?;
         } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
@@ -739,7 +657,26 @@ fn run_siglip_mlp_benchmark(
     if clock_hz == 0 {
         bail!("benchmark clock must be nonzero");
     }
-    let (left_bytes, weights) = mlp_inputs(application, dimension, hidden_dimension, blocks)?;
+    let left = application
+        .inputs
+        .iter()
+        .find(|binding| binding.name == "left")
+        .context("MLP benchmark package has no left binding")?;
+    let left_bytes = filled_f16_binding(left, 0x3c00)?;
+    let up_bits = f32_to_half(1.0 / dimension as f32);
+    let down_bits = f32_to_half(1.0 / hidden_dimension as f32);
+    let mut weights = Vec::new();
+    for block in 0..blocks {
+        for (projection, bits) in [(0, up_bits), (1, down_bits)] {
+            let name = mlp_weight_name(blocks, block, projection);
+            let binding = application
+                .weights
+                .iter()
+                .find(|binding| binding.name == name)
+                .with_context(|| format!("MLP benchmark package has no {name} binding"))?;
+            weights.extend_from_slice(&filled_f16_binding(binding, bits)?);
+        }
+    }
 
     let output =
         run_initialized_program(runtime, application, &weights, &left_bytes, timeout_seconds)?;
@@ -769,53 +706,6 @@ fn run_siglip_mlp_benchmark(
         tflops / peak_tflops * 100.0,
     );
     Ok(())
-}
-
-fn run_siglip_mlp_exchange(
-    runtime: &Runtime,
-    application: &Application,
-    dimension: u32,
-    hidden_dimension: u32,
-    blocks: u32,
-    timeout_seconds: u64,
-) -> Result<()> {
-    let (left_bytes, weights) = mlp_inputs(application, dimension, hidden_dimension, blocks)?;
-    run_initialized_program(runtime, application, &weights, &left_bytes, timeout_seconds)?;
-    println!(
-        "workload=siglip-mlp-exchange dimension={dimension} hiddenDimension={hidden_dimension} blocks={blocks} inputBytes={} weightBytes={} hardwareTest=PASS",
-        left_bytes.len(),
-        weights.len(),
-    );
-    Ok(())
-}
-
-fn mlp_inputs(
-    application: &Application,
-    dimension: u32,
-    hidden_dimension: u32,
-    blocks: u32,
-) -> Result<(Vec<u8>, Vec<u8>)> {
-    let left = application
-        .inputs
-        .iter()
-        .find(|binding| binding.name == "left")
-        .context("MLP package has no left binding")?;
-    let left_bytes = filled_f16_binding(left, 0x3c00)?;
-    let up_bits = f32_to_half(1.0 / dimension as f32);
-    let down_bits = f32_to_half(1.0 / hidden_dimension as f32);
-    let mut weights = Vec::new();
-    for block in 0..blocks {
-        for (projection, bits) in [(0, up_bits), (1, down_bits)] {
-            let name = mlp_weight_name(blocks, block, projection);
-            let binding = application
-                .weights
-                .iter()
-                .find(|binding| binding.name == name)
-                .with_context(|| format!("MLP package has no {name} binding"))?;
-            weights.extend_from_slice(&filled_f16_binding(binding, bits)?);
-        }
-    }
-    Ok((left_bytes, weights))
 }
 
 fn write_profile(
@@ -1361,132 +1251,6 @@ fn summarize_states(states: &[(u16, u32)]) -> String {
     format!("counts={counts:?} firstUnexpected={unexpected:?}")
 }
 
-fn image_word(image: &TileImage, address: u32) -> Option<u32> {
-    let segment = image.segments.iter().find(|segment| {
-        (segment.address..segment.address.saturating_add(segment.data.len() as u32))
-            .contains(&address)
-    })?;
-    let offset = usize::try_from(address.checked_sub(segment.address)?).ok()?;
-    Some(u32::from_le_bytes(
-        segment.data.get(offset..offset + 4)?.try_into().ok()?,
-    ))
-}
-
-fn exchange_patch_readback(runtime: &Runtime, application: &Application) -> Result<String> {
-    let mut counts = std::collections::BTreeMap::<Vec<usize>, usize>::new();
-    let mut examples = Vec::new();
-    let mut segment_examples = Vec::new();
-    let mut unreadable_examples = Vec::new();
-    let mut readable = 0usize;
-    let mut readable_segments = 0usize;
-    let mut changed_segment_words = 0usize;
-    let mut unexpected_segment_words = 0usize;
-    let mut descriptors = 0usize;
-    let mut unreadable = 0usize;
-    for image in &application.tiles {
-        let physical = u16::try_from(image.physical_tile)?;
-        let patch_targets = image
-            .word_patches
-            .iter()
-            .map(|patch| patch.target_address)
-            .collect::<std::collections::BTreeSet<_>>();
-        for patch in &image.word_patches {
-            descriptors += 1;
-            let expected = (0..patch.iterations)
-                .map(|iteration| image_word(image, patch.values_address + iteration * 4))
-                .collect::<Option<Vec<_>>>()
-                .context("patch value table is outside the packaged tile image")?;
-            let mut errors = Vec::new();
-            let actual = (1..=6).find_map(|context| {
-                runtime
-                    .device()
-                    .read_tile_word_from_inactive_context(physical, context, patch.target_address)
-                    .map_err(|error| errors.push((context, error.to_string())))
-                    .map(|actual| (context, actual))
-                    .ok()
-            });
-            let Some((context, actual)) = actual else {
-                unreadable += 1;
-                if unreadable_examples.len() < 8 {
-                    let states = (0..=6)
-                        .map(|context| runtime.device().tile_context_state(physical, context))
-                        .collect::<Result<Vec<_>, _>>();
-                    unreadable_examples.push((physical, patch.target_address, states, errors));
-                }
-                continue;
-            };
-            let segment = image
-                .segments
-                .iter()
-                .find(|segment| {
-                    (segment.address..segment.address.saturating_add(segment.data.len() as u32))
-                        .contains(&patch.target_address)
-                })
-                .context("patch target is outside the packaged tile image")?;
-            let expected_segment = segment
-                .data
-                .chunks_exact(4)
-                .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte word")))
-                .collect::<Vec<_>>();
-            let actual_segment = runtime.device().read_tile_words_from_inactive_context(
-                physical,
-                context,
-                segment.address,
-                u32::try_from(expected_segment.len())?,
-            )?;
-            let differences = expected_segment
-                .iter()
-                .zip(&actual_segment)
-                .enumerate()
-                .filter(|(_, (expected, actual))| expected != actual)
-                .map(|(word, (&expected, &actual))| {
-                    let address = segment.address + u32::try_from(word).expect("word offset") * 4;
-                    (address, expected, actual, patch_targets.contains(&address))
-                })
-                .collect::<Vec<_>>();
-            changed_segment_words += differences.len();
-            unexpected_segment_words += differences
-                .iter()
-                .filter(|(_, _, _, is_patch_target)| !is_patch_target)
-                .count();
-            readable_segments += 1;
-            if (!differences.is_empty() || segment_examples.len() < 4)
-                && segment_examples.len() < 32
-            {
-                segment_examples.push((
-                    physical,
-                    context,
-                    segment.address,
-                    segment.data.len(),
-                    patch.target_address,
-                    differences,
-                ));
-            }
-            let matching_iterations = expected
-                .iter()
-                .enumerate()
-                .filter_map(|(iteration, value)| (*value == actual).then_some(iteration))
-                .collect::<Vec<_>>();
-            *counts.entry(matching_iterations.clone()).or_default() += 1;
-            if (matching_iterations.as_slice() != [1] || examples.len() < 4) && examples.len() < 32
-            {
-                examples.push((
-                    physical,
-                    patch.target_address,
-                    patch.values_address,
-                    actual,
-                    expected,
-                    matching_iterations,
-                ));
-            }
-            readable += 1;
-        }
-    }
-    Ok(format!(
-        "descriptors={descriptors} readable={readable} unreadable={unreadable} matchingIterations={counts:?} readableSegments={readable_segments} changedSegmentWords={changed_segment_words} unexpectedSegmentWords={unexpected_segment_words} examples={examples:?} segmentExamples={segment_examples:?} unreadableExamples={unreadable_examples:?}"
-    ))
-}
-
 fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> String {
     let states = match supervisor_states(runtime, application) {
         Ok(states) => states,
@@ -1563,77 +1327,7 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
             workers,
         ));
     }
-    let patch_readback = exchange_patch_readback(runtime, application)
-        .unwrap_or_else(|error| format!("failed: {error:#}"));
-    let exchange_csr_diff = exchange_csr_diff(runtime, application)
-        .unwrap_or_else(|error| format!("failed: {error:#}"));
-    format!(
-        "{} exchangeCsrDiff={exchange_csr_diff} patchReadback={patch_readback} contexts={contexts:?}",
-        summarize_states(&states)
-    )
-}
-
-fn exchange_csr_diff(runtime: &Runtime, application: &Application) -> Result<String> {
-    const NAMES: [&str; 12] = [
-        "INCOMING_MUX",
-        "INCOMING_MUXPAIR",
-        "INCOMING_DELTA",
-        "INCOMING_FORMAT",
-        "INCOMING_BASE",
-        "INCOMING_SINIT",
-        "INCOMING_DCOUNT",
-        "OUTGOING_BASE",
-        "OUTGOING_DELTA",
-        "EXCHANGE_CTL",
-        "ANS_DCOUNT",
-        "EXCHANGE_ADJ",
-    ];
-    let mut selected = Vec::new();
-    for tile in &application.tiles {
-        let physical = u16::try_from(tile.physical_tile)?;
-        if runtime.device().tile_exchange_receive_error(physical)?
-            != ipu_driver::TileExchangeReceiveError::None
-            && selected.len() < 8
-        {
-            selected.push(physical);
-        }
-    }
-    for tile in &application.tiles {
-        let physical = u16::try_from(tile.physical_tile)?;
-        if selected.len() >= 12 {
-            break;
-        }
-        if !selected.contains(&physical) {
-            selected.push(physical);
-        }
-    }
-
-    let mut tiles = Vec::new();
-    for physical in selected {
-        let words = match runtime.device().read_tile_words_from_inactive_context(
-            physical,
-            1,
-            ipu_codegen::EXCHANGE_CSR_SNAPSHOT_BASE,
-            ipu_codegen::EXCHANGE_CSR_SNAPSHOT_BYTES / 4,
-        ) {
-            Ok(words) => words,
-            Err(error) => {
-                tiles.push((physical, Err(error.to_string())));
-                continue;
-            }
-        };
-        let count = usize::try_from(ipu_codegen::EXCHANGE_CSR_COUNT)?;
-        let (before, after) = words.split_at(count);
-        let changed = before
-            .iter()
-            .zip(after)
-            .enumerate()
-            .filter(|(_, (before, after))| before != after)
-            .map(|(index, (&before, &after))| (NAMES[index], before, after))
-            .collect::<Vec<_>>();
-        tiles.push((physical, Ok((changed, before.to_vec(), after.to_vec()))));
-    }
-    Ok(format!("tiles={tiles:?}"))
+    format!("{} contexts={contexts:?}", summarize_states(&states))
 }
 
 #[cfg(test)]

@@ -32,7 +32,6 @@ const SANS_OPCODE: u32 = 0x40c0_0000;
 const BR_M_OPCODE: u32 = 0x4300_0000;
 const CALL_M_IMMEDIATE_OPCODE: u32 = 0x1800_0000;
 const SETZI_M_OPCODE: u32 = 0x1900_0000;
-const GET_SPECIAL_M_OPCODE: u32 = 0x4100_0000;
 const PUT_SPECIAL_M_OPCODE: u32 = 0x4300_8000;
 const LD32_M_IMMEDIATE_OPCODE: u32 = 0x0100_0000;
 const ST32_M_IMMEDIATE_OPCODE: u32 = 0x4f00_0000;
@@ -97,13 +96,6 @@ pub fn encode_put_special_m(special: u8, register: u8) -> Result<u32, ExchangeEr
         return Err(ExchangeError::Schedule("put source register"));
     }
     Ok(PUT_SPECIAL_M_OPCODE | (u32::from(register) << 20) | u32::from(special))
-}
-
-pub fn encode_get_special_m(register: u8, special: u8) -> Result<u32, ExchangeError> {
-    if register >= 16 {
-        return Err(ExchangeError::Schedule("get destination register"));
-    }
-    Ok(GET_SPECIAL_M_OPCODE | (u32::from(register) << 20) | u32::from(special))
 }
 
 pub fn encode_ld32_m_immediate(

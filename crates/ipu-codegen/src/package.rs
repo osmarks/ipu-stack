@@ -24,7 +24,6 @@ use ipu_package::{
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::num::NonZeroUsize;
 use std::num::TryFromIntError;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -79,18 +78,6 @@ pub struct PackageConfig {
     pub runtime_source: PathBuf,
     pub kernel_source_directory: PathBuf,
     pub pipeline: PipelineConfig,
-    pub tile_compute: TileComputePolicy,
-    pub repeat_exchanges: crate::RepeatExchangeStrategy,
-    /// Per-original-phase limits on logical transfers sharing one global sync.
-    pub exchange_phase_transfer_limits: BTreeMap<usize, NonZeroUsize>,
-    pub snapshot_first_exchange_csrs: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TileComputePolicy {
-    #[default]
-    Execute,
-    Omit,
 }
 
 /// Data embedded in one logical tile image for a finalized tile-program package.
@@ -336,48 +323,13 @@ pub fn build_package(
     graph: &ComputeGraph,
     config: &PackageConfig,
 ) -> PackageBuildResult<Application> {
-    if config.snapshot_first_exchange_csrs
-        && matches!(
-            config.repeat_exchanges,
-            crate::RepeatExchangeStrategy::PatchInPlace
-        )
-    {
-        return Err(invalid(
-            "exchange CSR snapshots require statically materialized repeat iterations",
-        ));
-    }
     validate_tile_count(u32::from(config.pipeline.tile_count))?;
     let mid = build_phase("lower_mid", || {
         Ok(lower(graph, &config.pipeline, &Ipu21CostModel)?)
     })?;
-    let mut low = build_phase("lower_tiles", || {
+    let low = build_phase("lower_tiles", || {
         Ok(lower_to_tiles(&mid, &config.pipeline)?)
     })?;
-    if !config.exchange_phase_transfer_limits.is_empty() {
-        tracing::info!(
-            limits = ?config.exchange_phase_transfer_limits,
-            phase_transfer_counts = ?low
-                .exchange_phases
-                .iter()
-                .map(|phase| phase.transfers.len())
-                .collect::<Vec<_>>(),
-            "limiting logical transfers per exchange phase"
-        );
-        build_phase("limit_exchange_phase_transfers", || {
-            Ok(low.limit_exchange_phase_transfers(&config.exchange_phase_transfer_limits)?)
-        })?;
-    }
-    if config.pipeline.profiling.enabled
-        && !matches!(
-            config.repeat_exchanges,
-            crate::RepeatExchangeStrategy::PatchInPlace
-        )
-        && !low.repeat_runs.is_empty()
-    {
-        return Err(invalid(
-            "profiling structured repeats with separate exchange rows is not supported",
-        ));
-    }
     tracing::info!(
         logical_shards = low.shards.len(),
         exchange_phases = low.exchange_phases.len(),
@@ -447,10 +399,9 @@ fn build_package_from_objects(
     })?;
     let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
     let exchange_table_bytes = crate::tile::compact_exchange_table_bytes(
-        program,
         &provisional_exchanges,
         execution_tile_count,
-        config.repeat_exchanges,
+        program.tile_count,
     )?;
     let exchange_rows = (exchange_table_bytes != 0)
         .then(|| {
@@ -605,7 +556,6 @@ fn build_package_from_objects(
         kernel_plan,
         exchange_code_base,
         execution_tile_count,
-        config.repeat_exchanges,
     )?;
     let sizing_code_address = memory.next_free(
         host_code_base + host_code_bytes,
@@ -620,7 +570,6 @@ fn build_package_from_objects(
             .enumerate()
             .try_fold(0u32, |maximum, (physical, (&logical, host))| {
                 let mut tile_program = provisional_finalizer.lower_tile(logical)?;
-                apply_compute_policy(&mut tile_program.steps, config.tile_compute);
                 if let Some(storage) = &profile_storage {
                     instrument_profile(
                         program,
@@ -647,9 +596,6 @@ fn build_package_from_objects(
                             .profiling
                             .enabled
                             .then_some(PROFILE_END_CYCLE),
-                        exchange_csr_snapshot_address: config
-                            .snapshot_first_exchange_csrs
-                            .then_some(crate::memory::EXCHANGE_CSR_SNAPSHOT_BASE),
                         ..CodegenOptions::default()
                     },
                 )?;
@@ -762,7 +708,6 @@ fn build_package_from_objects(
         kernel_plan,
         exchange_code_base,
         execution_tile_count,
-        config.repeat_exchanges,
     )?;
     if exchange_rows
         .as_ref()
@@ -777,7 +722,6 @@ fn build_package_from_objects(
         .enumerate()
         .map(|(physical_tile, &logical)| -> PackageBuildResult<_> {
             let mut tile_program = finalizer.lower_tile(logical)?;
-            apply_compute_policy(&mut tile_program.steps, config.tile_compute);
             let profile = profile_storage
                 .as_ref()
                 .map(|storage| {
@@ -815,9 +759,6 @@ fn build_package_from_objects(
                             .profiling
                             .enabled
                             .then_some(PROFILE_END_CYCLE),
-                        exchange_csr_snapshot_address: config
-                            .snapshot_first_exchange_csrs
-                            .then_some(crate::memory::EXCHANGE_CSR_SNAPSHOT_BASE),
                         ..CodegenOptions::default()
                     },
                 )?)
@@ -889,20 +830,6 @@ fn build_package_from_objects(
     application.host_exchange = host.protocol;
     application.validate()?;
     Ok(application)
-}
-
-fn apply_compute_policy(steps: &mut Vec<crate::TileStep>, policy: TileComputePolicy) {
-    if policy == TileComputePolicy::Execute {
-        return;
-    }
-    steps.retain_mut(|step| match step {
-        crate::TileStep::Compute(_) => false,
-        crate::TileStep::Repeat(repeat) => {
-            apply_compute_policy(&mut repeat.body, policy);
-            true
-        }
-        crate::TileStep::Exchange(_) => true,
-    });
 }
 
 fn build_phase<T>(
@@ -1019,15 +946,6 @@ fn build_tile(
         command_address: 0,
         diagnostic_address: COMPLETION_ADDRESS,
         segments,
-        word_patches: generated
-            .exchange_patches
-            .iter()
-            .map(|patch| ipu_package::TileWordPatch {
-                target_address: patch.target_address,
-                values_address: patch.values_address,
-                iterations: patch.iterations,
-            })
-            .collect(),
     })
 }
 
@@ -1055,12 +973,7 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
     let mut symbols = vec![COMPLETE_SYMBOL.into()];
     if !program.exchange_phases.is_empty() {
         symbols.push(WORKER_BARRIER_SYMBOL.into());
-        if !program.repeat_runs.is_empty()
-            && matches!(
-                config.repeat_exchanges,
-                crate::RepeatExchangeStrategy::PatchInPlace
-            )
-        {
+        if !program.repeat_runs.is_empty() {
             symbols.push(crate::PATCH_WORD_SYMBOL.into());
         }
     }

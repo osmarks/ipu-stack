@@ -8,30 +8,6 @@ use crate::{
 };
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RepeatExchangeStrategy {
-    #[default]
-    PatchInPlace,
-    SeparateRows,
-    ReverseRows,
-    SingleIteration(u32),
-}
-
-impl RepeatExchangeStrategy {
-    fn iterations(self, count: u32) -> Result<Vec<u32>, TileLoweringError> {
-        match self {
-            Self::PatchInPlace | Self::SeparateRows => Ok((0..count).collect()),
-            Self::ReverseRows => Ok((0..count).rev().collect()),
-            Self::SingleIteration(iteration) if iteration < count => Ok(vec![iteration]),
-            Self::SingleIteration(_) => Err(TileLoweringError::InvalidRepeat),
-        }
-    }
-
-    const fn materializes_rows(self) -> bool {
-        !matches!(self, Self::PatchInPlace)
-    }
-}
-
 /// Address-resolution context which finalizes one tile on demand.
 ///
 /// Package generation uses this to emit and discard each logical tile program
@@ -45,8 +21,6 @@ pub struct TileProgramLowering<'a> {
     exchange_code_base: u32,
     exchange_code_end: u32,
     execution_tile_count: u16,
-    repeat_exchanges: RepeatExchangeStrategy,
-    repeat_phase_counts: BTreeMap<ExchangePhaseId, u32>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -86,7 +60,6 @@ struct PlacedExchange {
     active: bool,
     program: PlacedExchangeRow,
     patches: Vec<ExchangePatch>,
-    iteration_programs: BTreeMap<u32, PlacedExchangeRow>,
 }
 
 impl<'a> TileProgramLowering<'a> {
@@ -97,7 +70,6 @@ impl<'a> TileProgramLowering<'a> {
         kernels: &'a KernelBuildPlan,
         exchange_code_base: u32,
         execution_tile_count: u16,
-        repeat_exchanges: RepeatExchangeStrategy,
     ) -> Result<Self, TileLoweringError> {
         if execution_tile_count < program.tile_count {
             return Err(TileLoweringError::MissingExecutionTiles {
@@ -105,13 +77,11 @@ impl<'a> TileProgramLowering<'a> {
                 execution: execution_tile_count,
             });
         }
-        let repeat_phase_counts = repeat_phase_counts(program)?;
         let cursor = exchange_code_base
             .checked_add(compact_exchange_table_bytes(
-                program,
                 exchanges,
                 execution_tile_count,
-                repeat_exchanges,
+                program.tile_count,
             )?)
             .ok_or(TileLoweringError::Overflow)?;
         let executable_memory_end = ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT;
@@ -135,8 +105,6 @@ impl<'a> TileProgramLowering<'a> {
             exchange_code_base,
             exchange_code_end: cursor,
             execution_tile_count,
-            repeat_exchanges,
-            repeat_phase_counts,
         })
     }
 
@@ -158,8 +126,6 @@ impl<'a> TileProgramLowering<'a> {
                 tile,
                 self.program.tile_count,
                 self.exchange_code_base,
-                &self.repeat_phase_counts,
-                self.repeat_exchanges,
             )?;
             return Ok(TileProgram {
                 tile,
@@ -172,8 +138,6 @@ impl<'a> TileProgramLowering<'a> {
                     &rows,
                     &BTreeMap::new(),
                     false,
-                    None,
-                    self.repeat_exchanges,
                 )?,
             });
         }
@@ -182,18 +146,10 @@ impl<'a> TileProgramLowering<'a> {
             tile,
             self.program.tile_count,
             self.exchange_code_base,
-            &self.repeat_phase_counts,
-            self.repeat_exchanges,
         )?;
         Ok(TileProgram {
             tile,
-            steps: lower_inactive_work(
-                self.program,
-                &self.program.tiles[0],
-                &rows,
-                None,
-                self.repeat_exchanges,
-            )?,
+            steps: lower_inactive_work(self.program, &self.program.tiles[0], &rows)?,
         })
     }
 }
@@ -208,8 +164,6 @@ fn lower_work(
     exchange_rows: &BTreeMap<ExchangePhaseId, PlacedExchange>,
     overrides: &BTreeMap<LowShardId, TileAddress>,
     inside_repeat: bool,
-    repeat_iteration: Option<usize>,
-    repeat_exchanges: RepeatExchangeStrategy,
 ) -> Result<Vec<TileStep>, TileLoweringError> {
     let mut steps = Vec::new();
     for work in program.work(tile) {
@@ -221,12 +175,8 @@ fn lower_work(
                     .ok_or(TileLoweringError::UnknownExchange)?;
                 TileStep::Exchange(ExchangeStep {
                     active: placed.active,
-                    program: repeat_iteration
-                        .and_then(|iteration| placed.iteration_programs.get(&(iteration as u32)))
-                        .unwrap_or(&placed.program)
-                        .clone(),
-                    patches: (inside_repeat
-                        && repeat_exchanges == RepeatExchangeStrategy::PatchInPlace)
+                    program: placed.program.clone(),
+                    patches: inside_repeat
                         .then(|| placed.patches.clone())
                         .unwrap_or_default(),
                     profile: StepProfile::default(),
@@ -270,18 +220,6 @@ fn lower_work(
             TileWorkRef::Repeat(repeat) => {
                 if inside_repeat {
                     return Err(TileLoweringError::NestedRepeat);
-                }
-                if repeat_exchanges.materializes_rows() {
-                    steps.extend(lower_repeat_separate_rows(
-                        program,
-                        repeat,
-                        placement,
-                        kernels,
-                        phases,
-                        exchange_rows,
-                        repeat_exchanges,
-                    )?);
-                    continue;
                 }
                 TileStep::Repeat(lower_repeat(
                     program,
@@ -361,8 +299,6 @@ fn lower_repeat(
         exchange_rows,
         &overrides,
         true,
-        None,
-        RepeatExchangeStrategy::PatchInPlace,
     )?;
     for step in &body {
         let TileStep::Exchange(exchange) = step else {
@@ -384,108 +320,26 @@ fn lower_repeat(
     })
 }
 
-fn lower_repeat_separate_rows(
-    program: &LowProgram,
-    repeat: &RepeatRun,
-    placement: &Placement,
-    kernels: &KernelBuildPlan,
-    phases: &BTreeMap<ExchangePhaseId, &PhysicalExchangePhase>,
-    exchange_rows: &BTreeMap<ExchangePhaseId, PlacedExchange>,
-    repeat_exchanges: RepeatExchangeStrategy,
-) -> Result<Vec<TileStep>, TileLoweringError> {
-    let mut steps = Vec::new();
-    for iteration in repeat_exchanges.iterations(repeat.count)? {
-        let mut overrides = BTreeMap::new();
-        for iterated in &repeat.iterated {
-            let initial_address = iterated
-                .inputs
-                .first()
-                .and_then(|input| placement.shard_addresses.get(input))
-                .copied()
-                .ok_or(TileLoweringError::InvalidRepeat)?;
-            let address = initial_address
-                .checked_add(
-                    iterated
-                        .stride_bytes
-                        .checked_mul(iteration)
-                        .ok_or(TileLoweringError::Overflow)?,
-                )
-                .ok_or(TileLoweringError::Overflow)?;
-            if placement
-                .shard_addresses
-                .get(&iterated.inputs[iteration as usize])
-                .copied()
-                != Some(address)
-            {
-                return Err(TileLoweringError::InvalidRepeat);
-            }
-            overrides.insert(iterated.argument, TileAddress::Absolute(address));
-        }
-        steps.extend(lower_work(
-            program,
-            &repeat.body,
-            placement,
-            kernels,
-            phases,
-            exchange_rows,
-            &overrides,
-            true,
-            Some(iteration as usize),
-            repeat_exchanges,
-        )?);
-    }
-    Ok(steps)
-}
-
 fn lower_inactive_work(
     program: &LowProgram,
     work: &TileWorkList,
     exchange_rows: &BTreeMap<ExchangePhaseId, PlacedExchange>,
-    repeat_iteration: Option<usize>,
-    repeat_exchanges: RepeatExchangeStrategy,
 ) -> Result<Vec<TileStep>, TileLoweringError> {
     let mut steps = Vec::new();
     for work in program.work(work) {
         match work {
             TileWorkRef::Exchange(id) => steps.push(TileStep::Exchange(ExchangeStep {
                 active: exchange_rows[&id].active,
-                program: repeat_iteration
-                    .and_then(|iteration| {
-                        exchange_rows[&id]
-                            .iteration_programs
-                            .get(&(iteration as u32))
-                    })
-                    .unwrap_or(&exchange_rows[&id].program)
-                    .clone(),
+                program: exchange_rows[&id].program.clone(),
                 patches: Vec::new(),
                 profile: StepProfile::default(),
             })),
-            TileWorkRef::Repeat(repeat) => {
-                if repeat_exchanges.materializes_rows() {
-                    for iteration in repeat_exchanges.iterations(repeat.count)? {
-                        steps.extend(lower_inactive_work(
-                            program,
-                            &repeat.body,
-                            exchange_rows,
-                            Some(iteration as usize),
-                            repeat_exchanges,
-                        )?);
-                    }
-                } else {
-                    steps.push(TileStep::Repeat(RepeatStep {
-                        count: repeat.count,
-                        iterated_pointers: Vec::new(),
-                        body: lower_inactive_work(
-                            program,
-                            &repeat.body,
-                            exchange_rows,
-                            None,
-                            repeat_exchanges,
-                        )?,
-                        profile: StepProfile::default(),
-                    }));
-                }
-            }
+            TileWorkRef::Repeat(repeat) => steps.push(TileStep::Repeat(RepeatStep {
+                count: repeat.count,
+                iterated_pointers: Vec::new(),
+                body: lower_inactive_work(program, &repeat.body, exchange_rows)?,
+                profile: StepProfile::default(),
+            })),
             TileWorkRef::Kernel(_) | TileWorkRef::LocalCopy(_) => {}
         }
     }
@@ -500,13 +354,10 @@ fn align_up(value: u32, alignment: u32) -> Result<u32, TileLoweringError> {
 }
 
 pub fn compact_exchange_table_bytes(
-    program: &LowProgram,
     exchanges: &[PhysicalExchangePhase],
     execution_tile_count: u16,
-    strategy: RepeatExchangeStrategy,
+    scheduled_tile_count: u16,
 ) -> Result<u32, TileLoweringError> {
-    let scheduled_tile_count = program.tile_count;
-    let repeat_counts = repeat_phase_counts(program)?;
     let mut maximum = 0;
     for tile in 0..execution_tile_count {
         let mut bytes = 0u32;
@@ -524,43 +375,25 @@ pub fn compact_exchange_table_bytes(
                 .map_err(|_| TileLoweringError::Overflow)?
                 .checked_mul(4)
                 .ok_or(TileLoweringError::Overflow)?;
-            let extra_bytes = match strategy {
-                RepeatExchangeStrategy::PatchInPlace if tile < scheduled_tile_count => phase
-                    .repeat_patches[usize::from(tile)]
-                .iter()
-                .try_fold(0u32, |total, patch| {
-                    total
-                        .checked_add(
-                            u32::try_from(patch.values.len())
-                                .map_err(|_| TileLoweringError::Overflow)?
-                                .checked_mul(4)
-                                .ok_or(TileLoweringError::Overflow)?,
-                        )
-                        .ok_or(TileLoweringError::Overflow)
-                })?,
-                RepeatExchangeStrategy::SeparateRows | RepeatExchangeStrategy::ReverseRows => {
-                    repeat_counts
-                        .get(&phase.id)
-                        .copied()
-                        .unwrap_or(1)
-                        .saturating_sub(1)
-                        .checked_mul(row_bytes)
-                        .ok_or(TileLoweringError::Overflow)?
-                }
-                RepeatExchangeStrategy::SingleIteration(iteration) => {
-                    if repeat_counts
-                        .get(&phase.id)
-                        .is_some_and(|&count| iteration >= count)
-                    {
-                        return Err(TileLoweringError::InvalidRepeat);
-                    }
-                    0
-                }
-                RepeatExchangeStrategy::PatchInPlace => 0,
+            let patch_bytes = if tile < scheduled_tile_count {
+                phase.repeat_patches[usize::from(tile)]
+                    .iter()
+                    .try_fold(0u32, |total, patch| {
+                        total
+                            .checked_add(
+                                u32::try_from(patch.values.len())
+                                    .map_err(|_| TileLoweringError::Overflow)?
+                                    .checked_mul(4)
+                                    .ok_or(TileLoweringError::Overflow)?,
+                            )
+                            .ok_or(TileLoweringError::Overflow)
+                    })?
+            } else {
+                0
             };
             bytes = bytes
                 .checked_add(row_bytes)
-                .and_then(|bytes| bytes.checked_add(extra_bytes))
+                .and_then(|bytes| bytes.checked_add(patch_bytes))
                 .ok_or(TileLoweringError::Overflow)?;
         }
         maximum = maximum.max(bytes);
@@ -573,8 +406,6 @@ fn layout_exchange_rows(
     tile: u16,
     scheduled_tile_count: u16,
     base: u32,
-    repeat_counts: &BTreeMap<ExchangePhaseId, u32>,
-    strategy: RepeatExchangeStrategy,
 ) -> Result<(BTreeMap<ExchangePhaseId, PlacedExchange>, u32), TileLoweringError> {
     let mut cursor = align_up(base, 4)?;
     let mut result = BTreeMap::new();
@@ -597,55 +428,22 @@ fn layout_exchange_rows(
         } else {
             (false, crate::inactive_exchange_program())
         };
-        let row_bytes = u32::try_from(base_program.len())
-            .map_err(|_| TileLoweringError::Overflow)?
-            .checked_mul(4)
+        let address = cursor;
+        cursor = cursor
+            .checked_add(
+                u32::try_from(base_program.len())
+                    .map_err(|_| TileLoweringError::Overflow)?
+                    .checked_mul(4)
+                    .ok_or(TileLoweringError::Overflow)?,
+            )
             .ok_or(TileLoweringError::Overflow)?;
-        let source_patches = (tile < scheduled_tile_count)
-            .then(|| &phase.repeat_patches[usize::from(tile)][..])
-            .unwrap_or_default();
-        let iteration_count = repeat_counts.get(&phase.id).copied();
-        let mut iteration_programs = BTreeMap::new();
+        let program = PlacedExchangeRow {
+            address,
+            words: base_program,
+        };
         let mut patches = Vec::new();
-        let program = if strategy.materializes_rows()
-            && let Some(count) = iteration_count
-        {
-            for iteration in strategy.iterations(count)? {
-                let mut words = base_program.clone();
-                for patch in source_patches {
-                    let value = *patch
-                        .values
-                        .get(iteration as usize)
-                        .ok_or(TileLoweringError::InvalidRepeat)?;
-                    *words
-                        .get_mut(patch.word_offset as usize)
-                        .ok_or(TileLoweringError::InvalidRepeat)? = value;
-                }
-                iteration_programs.insert(
-                    iteration,
-                    PlacedExchangeRow {
-                        address: cursor,
-                        words,
-                    },
-                );
-                cursor = cursor
-                    .checked_add(row_bytes)
-                    .ok_or(TileLoweringError::Overflow)?;
-            }
-            iteration_programs
-                .first_key_value()
-                .map(|(_, row)| row)
-                .cloned()
-                .ok_or(TileLoweringError::InvalidRepeat)?
-        } else {
-            let program = PlacedExchangeRow {
-                address: cursor,
-                words: base_program,
-            };
-            cursor = cursor
-                .checked_add(row_bytes)
-                .ok_or(TileLoweringError::Overflow)?;
-            for patch in source_patches {
+        if tile < scheduled_tile_count {
+            for patch in &phase.repeat_patches[usize::from(tile)] {
                 let address = cursor;
                 cursor = cursor
                     .checked_add(
@@ -663,39 +461,17 @@ fn layout_exchange_rows(
                     },
                 });
             }
-            program
-        };
+        }
         result.insert(
             phase.id,
             PlacedExchange {
                 active,
                 program,
                 patches,
-                iteration_programs,
             },
         );
     }
     Ok((result, cursor))
-}
-
-fn repeat_phase_counts(
-    program: &LowProgram,
-) -> Result<BTreeMap<ExchangePhaseId, u32>, TileLoweringError> {
-    let mut counts = BTreeMap::new();
-    for repeat in &program.repeat_runs {
-        for work in program.work(&repeat.body) {
-            let TileWorkRef::Exchange(phase) = work else {
-                continue;
-            };
-            if counts
-                .insert(phase, repeat.count)
-                .is_some_and(|count| count != repeat.count)
-            {
-                return Err(TileLoweringError::InvalidRepeat);
-            }
-        }
-    }
-    Ok(counts)
 }
 
 #[cfg(test)]
@@ -754,7 +530,6 @@ mod tests {
                 &kernels,
                 0x4d000,
                 tiles + filler_tiles,
-                RepeatExchangeStrategy::PatchInPlace,
             )
             .unwrap();
             assert!(lowering.exchange_code_end() >= 0x4d000);

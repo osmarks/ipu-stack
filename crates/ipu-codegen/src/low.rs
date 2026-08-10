@@ -14,7 +14,6 @@ use crate::mid::{
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
@@ -311,80 +310,12 @@ impl LowProgram {
             TileWork::Repeat(id) => TileWorkRef::Repeat(&self.repeat_runs[id.0 as usize]),
         })
     }
-
-    /// Splits exchange phases so each global synchronization covers at most
-    /// the configured number of logical transfers. Keys are original phase
-    /// indices; phases absent from the map remain intact.
-    pub fn limit_exchange_phase_transfers(
-        &mut self,
-        limits: &BTreeMap<usize, NonZeroUsize>,
-    ) -> LowLoweringResult<()> {
-        if limits
-            .keys()
-            .any(|&phase| phase >= self.exchange_phases.len())
-        {
-            return Err(LowLoweringError::UnknownExchangePhaseLimit);
-        }
-        let mut replacements = Vec::with_capacity(self.exchange_phases.len());
-        let mut isolated = Vec::new();
-        for (original_index, phase) in std::mem::take(&mut self.exchange_phases)
-            .into_iter()
-            .enumerate()
-        {
-            let maximum = limits
-                .get(&original_index)
-                .map_or(phase.transfers.len(), |maximum| maximum.get());
-            let mut ids = Vec::with_capacity(phase.transfers.len().div_ceil(maximum));
-            let mut transfers = phase.transfers.into_iter();
-            loop {
-                let chunk = transfers.by_ref().take(maximum).collect::<Vec<_>>();
-                if chunk.is_empty() {
-                    break;
-                }
-                let id = ExchangePhaseId(
-                    u32::try_from(isolated.len()).map_err(|_| LowLoweringError::IdOverflow)?,
-                );
-                ids.push(id);
-                isolated.push(ExchangePhase {
-                    id,
-                    provenance: phase.provenance,
-                    transfers: chunk,
-                });
-            }
-            replacements.push(ids);
-        }
-        for tile in &mut self.tiles {
-            expand_exchange_markers(tile, &replacements);
-        }
-        for repeat in &mut self.repeat_runs {
-            expand_exchange_markers(&mut repeat.body, &replacements);
-        }
-        self.exchange_phases = isolated;
-        Ok(())
-    }
-}
-
-fn expand_exchange_markers(work: &mut TileWorkList, replacements: &[Vec<ExchangePhaseId>]) {
-    let original = std::mem::take(&mut work.work);
-    for item in original {
-        match item {
-            TileWork::Exchange(id) => work.work.extend(
-                replacements[id.index() as usize]
-                    .iter()
-                    .copied()
-                    .map(TileWork::Exchange),
-            ),
-            item => work.work.push(item),
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LowLoweringError {
     #[error("low-level lowering requires a nonzero tile count")]
     EmptyTileGroup,
-    #[error("exchange transfer limit refers to an unknown phase")]
-    UnknownExchangePhaseLimit,
     #[error("value {value:?} declares {declared} tiles, but the schedule capacity is {scheduled}")]
     TileCountMismatch {
         value: MidValueId,
@@ -3286,48 +3217,6 @@ mod tests {
             )];
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
-
-            let transfer_count = low
-                .exchange_phases
-                .iter()
-                .map(|phase| phase.transfers.len())
-                .sum::<usize>();
-            let mut isolated = low.clone();
-            let maximum = NonZeroUsize::new(random.usize(1..=4)).unwrap();
-            let limits = isolated
-                .exchange_phases
-                .iter()
-                .enumerate()
-                .map(|(phase, _)| (phase, maximum))
-                .collect();
-            isolated.limit_exchange_phase_transfers(&limits).unwrap();
-            assert!(
-                isolated
-                    .exchange_phases
-                    .iter()
-                    .all(|phase| !phase.transfers.is_empty()
-                        && phase.transfers.len() <= maximum.get()),
-                "case {case}"
-            );
-            for tile in &isolated.tiles {
-                assert_eq!(
-                    isolated
-                        .work(tile)
-                        .filter(|work| matches!(work, TileWorkRef::Exchange(_)))
-                        .count(),
-                    isolated.exchange_phases.len(),
-                    "case {case}"
-                );
-            }
-            assert_eq!(
-                isolated
-                    .exchange_phases
-                    .iter()
-                    .map(|phase| phase.transfers.len())
-                    .sum::<usize>(),
-                transfer_count,
-                "case {case}"
-            );
 
             let expected_weight_bytes = inner
                 .div_ceil(u32::from(inner_partitions))
