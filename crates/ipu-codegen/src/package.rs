@@ -24,6 +24,7 @@ use ipu_package::{
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::num::NonZeroUsize;
 use std::num::TryFromIntError;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -80,8 +81,8 @@ pub struct PackageConfig {
     pub pipeline: PipelineConfig,
     pub tile_compute: TileComputePolicy,
     pub repeat_exchanges: crate::RepeatExchangeStrategy,
-    /// Give every logical exchange transfer its own global synchronization.
-    pub isolate_exchange_transfers: bool,
+    /// Maximum logical transfers sharing one globally synchronized phase.
+    pub maximum_exchange_phase_transfers: Option<NonZeroUsize>,
     pub snapshot_first_exchange_csrs: bool,
 }
 
@@ -352,9 +353,18 @@ pub fn build_package(
     let mut low = build_phase("lower_tiles", || {
         Ok(lower_to_tiles(&mid, &config.pipeline)?)
     })?;
-    if config.isolate_exchange_transfers {
-        build_phase("isolate_exchange_transfers", || {
-            Ok(low.isolate_exchange_transfers()?)
+    if let Some(maximum) = config.maximum_exchange_phase_transfers {
+        tracing::info!(
+            maximum = maximum.get(),
+            phase_transfer_counts = ?low
+                .exchange_phases
+                .iter()
+                .map(|phase| phase.transfers.len())
+                .collect::<Vec<_>>(),
+            "limiting logical transfers per exchange phase"
+        );
+        build_phase("limit_exchange_phase_transfers", || {
+            Ok(low.limit_exchange_phase_transfers(maximum)?)
         })?;
     }
     if config.pipeline.profiling.enabled

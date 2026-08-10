@@ -14,6 +14,7 @@ use crate::mid::{
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
@@ -311,14 +312,22 @@ impl LowProgram {
         })
     }
 
-    /// Replaces every multi-transfer exchange phase with one globally
-    /// synchronized phase per logical transfer.
-    pub fn isolate_exchange_transfers(&mut self) -> LowLoweringResult<()> {
+    /// Splits exchange phases so each global synchronization covers at most
+    /// `maximum` logical transfers.
+    pub fn limit_exchange_phase_transfers(
+        &mut self,
+        maximum: NonZeroUsize,
+    ) -> LowLoweringResult<()> {
         let mut replacements = Vec::with_capacity(self.exchange_phases.len());
         let mut isolated = Vec::new();
         for phase in std::mem::take(&mut self.exchange_phases) {
-            let mut ids = Vec::with_capacity(phase.transfers.len());
-            for transfer in phase.transfers {
+            let mut ids = Vec::with_capacity(phase.transfers.len().div_ceil(maximum.get()));
+            let mut transfers = phase.transfers.into_iter();
+            loop {
+                let chunk = transfers.by_ref().take(maximum.get()).collect::<Vec<_>>();
+                if chunk.is_empty() {
+                    break;
+                }
                 let id = ExchangePhaseId(
                     u32::try_from(isolated.len()).map_err(|_| LowLoweringError::IdOverflow)?,
                 );
@@ -326,7 +335,7 @@ impl LowProgram {
                 isolated.push(ExchangePhase {
                     id,
                     provenance: phase.provenance,
-                    transfers: vec![transfer],
+                    transfers: chunk,
                 });
             }
             replacements.push(ids);
@@ -3269,17 +3278,14 @@ mod tests {
                 .map(|phase| phase.transfers.len())
                 .sum::<usize>();
             let mut isolated = low.clone();
-            isolated.isolate_exchange_transfers().unwrap();
-            assert_eq!(
-                isolated.exchange_phases.len(),
-                transfer_count,
-                "case {case}"
-            );
+            let maximum = NonZeroUsize::new(random.usize(1..=4)).unwrap();
+            isolated.limit_exchange_phase_transfers(maximum).unwrap();
             assert!(
                 isolated
                     .exchange_phases
                     .iter()
-                    .all(|phase| phase.transfers.len() == 1),
+                    .all(|phase| !phase.transfers.is_empty()
+                        && phase.transfers.len() <= maximum.get()),
                 "case {case}"
             );
             for tile in &isolated.tiles {
@@ -3288,10 +3294,19 @@ mod tests {
                         .work(tile)
                         .filter(|work| matches!(work, TileWorkRef::Exchange(_)))
                         .count(),
-                    transfer_count,
+                    isolated.exchange_phases.len(),
                     "case {case}"
                 );
             }
+            assert_eq!(
+                isolated
+                    .exchange_phases
+                    .iter()
+                    .map(|phase| phase.transfers.len())
+                    .sum::<usize>(),
+                transfer_count,
+                "case {case}"
+            );
 
             let expected_weight_bytes = inner
                 .div_ceil(u32::from(inner_partitions))
