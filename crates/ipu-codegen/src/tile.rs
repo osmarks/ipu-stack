@@ -57,7 +57,8 @@ pub enum TileLoweringError {
 }
 
 struct PlacedExchange {
-    row: PlacedExchangeRow,
+    active: bool,
+    program: PlacedExchangeRow,
     patches: Vec<ExchangePatch>,
 }
 
@@ -173,8 +174,8 @@ fn lower_work(
                     .get(&id)
                     .ok_or(TileLoweringError::UnknownExchange)?;
                 TileStep::Exchange(ExchangeStep {
-                    address: placed.row.address,
-                    row: placed.row.words.clone(),
+                    active: placed.active,
+                    program: placed.program.clone(),
                     patches: inside_repeat
                         .then(|| placed.patches.clone())
                         .unwrap_or_default(),
@@ -328,8 +329,8 @@ fn lower_inactive_work(
     for work in program.work(work) {
         match work {
             TileWorkRef::Exchange(id) => steps.push(TileStep::Exchange(ExchangeStep {
-                address: exchange_rows[&id].row.address,
-                row: exchange_rows[&id].row.words.clone(),
+                active: exchange_rows[&id].active,
+                program: exchange_rows[&id].program.clone(),
                 patches: Vec::new(),
                 profile: StepProfile::default(),
             })),
@@ -363,12 +364,12 @@ pub fn compact_exchange_table_bytes(
         for phase in exchanges {
             let words = if tile < scheduled_tile_count {
                 phase
-                    .rows
+                    .programs
                     .get(usize::from(tile))
                     .ok_or(TileLoweringError::MissingExchangeRow(tile))?
                     .len()
             } else {
-                crate::inactive_exchange_row().len()
+                crate::inactive_exchange_program().len()
             };
             let row_bytes = u32::try_from(words)
                 .map_err(|_| TileLoweringError::Overflow)?
@@ -408,28 +409,37 @@ fn layout_exchange_rows(
 ) -> Result<(BTreeMap<ExchangePhaseId, PlacedExchange>, u32), TileLoweringError> {
     let mut cursor = align_up(base, 4)?;
     let mut result = BTreeMap::new();
+    if exchanges.is_empty() {
+        return Ok((result, cursor));
+    }
     for phase in exchanges {
-        let base_row = if tile < scheduled_tile_count {
+        let (active, base_program) = if tile < scheduled_tile_count {
+            let index = usize::from(tile);
+            let active = *phase
+                .active
+                .get(index)
+                .ok_or(TileLoweringError::MissingExchangeRow(tile))?;
             phase
-                .rows
-                .get(usize::from(tile))
+                .programs
+                .get(index)
                 .cloned()
+                .map(|program| (active, program))
                 .ok_or(TileLoweringError::MissingExchangeRow(tile))?
         } else {
-            crate::inactive_exchange_row()
+            (false, crate::inactive_exchange_program())
         };
         let address = cursor;
         cursor = cursor
             .checked_add(
-                u32::try_from(base_row.len())
+                u32::try_from(base_program.len())
                     .map_err(|_| TileLoweringError::Overflow)?
                     .checked_mul(4)
                     .ok_or(TileLoweringError::Overflow)?,
             )
             .ok_or(TileLoweringError::Overflow)?;
-        let row = PlacedExchangeRow {
+        let program = PlacedExchangeRow {
             address,
-            words: base_row,
+            words: base_program,
         };
         let mut patches = Vec::new();
         if tile < scheduled_tile_count {
@@ -452,7 +462,14 @@ fn layout_exchange_rows(
                 });
             }
         }
-        result.insert(phase.id, PlacedExchange { row, patches });
+        result.insert(
+            phase.id,
+            PlacedExchange {
+                active,
+                program,
+                patches,
+            },
+        );
     }
     Ok((result, cursor))
 }
@@ -526,7 +543,7 @@ mod tests {
                 );
                 for step in &program.steps {
                     if let TileStep::Exchange(exchange) = step {
-                        assert_eq!(exchange.row.last(), Some(&RETURN_M10_INSTRUCTION));
+                        assert_eq!(exchange.program.words.last(), Some(&RETURN_M10_INSTRUCTION));
                     }
                 }
             }
@@ -536,7 +553,7 @@ mod tests {
                 assert!(program.steps.iter().all(|step| matches!(
                     step,
                     TileStep::Exchange(exchange)
-                        if exchange.row[0] == ipu_exchange::SANS_INACTIVE_INSTRUCTION
+                        if !exchange.active
                 )));
             }
         }

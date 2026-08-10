@@ -947,7 +947,7 @@ fn profile_step(
     match (work, step) {
         (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(exchange)) => {
             let phase = &program.exchange_phases[id.index() as usize];
-            if exchange.row.first() == Some(&ipu_exchange::SANS_INACTIVE_INSTRUCTION) {
+            if !exchange.active {
                 exchange_synchronization_description(
                     index,
                     0x8000_0000 | id.index(),

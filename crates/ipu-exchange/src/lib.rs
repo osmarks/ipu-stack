@@ -215,7 +215,7 @@ pub struct PlanProgramBuilder {
 impl Default for PlanProgramBuilder {
     fn default() -> Self {
         Self {
-            words: vec![SYNC_SUPERVISOR_INSTRUCTION],
+            words: Vec::new(),
             event_cycles: 0,
         }
     }
@@ -1507,14 +1507,13 @@ mod tests {
         relay.append_scheduled_row(&second.sender).unwrap();
         let relay = relay.finish(horizon).unwrap();
 
-        assert_eq!(relay.first(), Some(&SYNC_SUPERVISOR_INSTRUCTION));
         assert_eq!(relay.last(), Some(&RETURN_M10_INSTRUCTION));
         assert_eq!(
             relay
                 .iter()
                 .filter(|instruction| **instruction == SYNC_SUPERVISOR_INSTRUCTION)
                 .count(),
-            1
+            0
         );
         assert_eq!(plan_event_cycles(&relay).unwrap(), horizon);
     }

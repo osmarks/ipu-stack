@@ -5,10 +5,9 @@ use crate::{
     view_byte_spans,
 };
 use ipu_exchange::{
-    MAX_TRANSFER_WORDS, MulticastPlan, PLAN_WORDS, PlanProgramBuilder, RETURN_M10_INSTRUCTION,
-    SANS_INACTIVE_INSTRUCTION, SYNC_ANS_INSTRUCTION, Topology, finalize_point_receiver,
-    patch_receiver_address, patch_sender_address, patch_sender_instruction, plan_event_cycles,
-    sender_instruction_offsets,
+    MAX_TRANSFER_WORDS, MulticastPlan, PlanProgramBuilder, RETURN_M10_INSTRUCTION, Topology,
+    finalize_point_receiver, patch_receiver_address, patch_sender_address,
+    patch_sender_instruction, plan_event_cycles, sender_instruction_offsets,
 };
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -16,8 +15,10 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalExchangePhase {
     pub id: ExchangePhaseId,
-    /// Executable supervisor row indexed by logical tile.
-    pub rows: Vec<Vec<u32>>,
+    /// Whether each logical tile participates in this phase's timed program.
+    pub active: Vec<bool>,
+    /// Synchronization-free timed supervisor program indexed by logical tile.
+    pub programs: Vec<Vec<u32>>,
     pub event_cycles: u32,
     /// Static per-tile role intervals on the exchange event timeline.
     pub activities: Vec<Vec<ExchangeActivity>>,
@@ -378,17 +379,24 @@ fn lower_static_exchanges(
                     &builders,
                 );
             }
-            let rows = (0..program.tile_count)
+            let mut active = Vec::with_capacity(usize::from(program.tile_count));
+            let programs = (0..program.tile_count)
                 .map(|tile| match builders.remove(&tile) {
-                    Some(builder) => Ok(builder.finish(horizon)?),
-                    None => Ok(inactive_exchange_row()),
+                    Some(builder) => {
+                        active.push(true);
+                        Ok(builder.finish(horizon)?)
+                    }
+                    None => {
+                        active.push(false);
+                        Ok(inactive_exchange_program())
+                    }
                 })
                 .collect::<Result<Vec<_>, ipu_exchange::ExchangeError>>()?;
-            let repeat_patches = rows
+            let repeat_patches = programs
                 .iter()
                 .enumerate()
-                .map(|(tile, row)| {
-                    let offsets = sender_instruction_offsets(row).collect::<Vec<_>>();
+                .map(|(tile, program)| {
+                    let offsets = sender_instruction_offsets(program).collect::<Vec<_>>();
                     if offsets.len() != scheduled_sends[tile].len() {
                         return Err(ExchangeLoweringError::IncompatibleRepeatRows);
                     }
@@ -407,12 +415,12 @@ fn lower_static_exchanges(
                                             .ok_or(ExchangeLoweringError::UnplacedShard)?
                                             .checked_add(source_offset)
                                             .ok_or(ExchangeLoweringError::Overflow)?;
-                                        let mut instruction = row[word_offset];
+                                        let mut instruction = program[word_offset];
                                         patch_sender_instruction(&mut instruction, address)?;
                                         Ok(instruction)
                                     })
                                     .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-                                if values.first() != Some(&row[word_offset]) {
+                                if values.first() != Some(&program[word_offset]) {
                                     return Err(ExchangeLoweringError::IncompatibleRepeatRows);
                                 }
                                 Ok(ExchangeRowPatch {
@@ -426,7 +434,7 @@ fn lower_static_exchanges(
                 })
                 .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
             if pending.len() > 1_000 {
-                let (tile, words) = rows
+                let (tile, words) = programs
                     .iter()
                     .enumerate()
                     .map(|(tile, row)| (tile, row.len()))
@@ -442,7 +450,8 @@ fn lower_static_exchanges(
             }
             Ok(PhysicalExchangePhase {
                 id: phase.id,
-                rows,
+                active,
+                programs,
                 event_cycles: horizon,
                 activities,
                 repeat_patches,
@@ -943,12 +952,8 @@ struct ScheduledTransferTiming {
     receiver_ends: Vec<u32>,
 }
 
-pub fn inactive_exchange_row() -> Vec<u32> {
-    let mut row = vec![0; PLAN_WORDS];
-    row[0] = SANS_INACTIVE_INSTRUCTION;
-    row[1] = SYNC_ANS_INSTRUCTION;
-    row[2] = RETURN_M10_INSTRUCTION;
-    row
+pub fn inactive_exchange_program() -> Vec<u32> {
+    vec![RETURN_M10_INSTRUCTION]
 }
 
 #[cfg(test)]
@@ -1045,7 +1050,8 @@ mod tests {
             .unwrap();
             assert_eq!(phases.len(), low.exchange_phases.len());
             for phase in phases {
-                assert_eq!(phase.rows.len(), usize::from(tiles));
+                assert_eq!(phase.programs.len(), usize::from(tiles));
+                assert_eq!(phase.active.len(), usize::from(tiles));
                 assert_eq!(phase.activities.len(), usize::from(tiles));
                 assert!(phase.event_cycles != 0);
                 assert!(phase.activities.iter().flatten().next().is_some());
@@ -1058,13 +1064,10 @@ mod tests {
                         assert!(pair[0].end_cycle < pair[1].start_cycle);
                     }
                 }
-                for row in &phase.rows {
-                    if row[0] == SANS_INACTIVE_INSTRUCTION {
-                        assert_eq!(row[2], RETURN_M10_INSTRUCTION);
-                    } else {
-                        assert_eq!(row[0], ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
-                        assert_eq!(row.last(), Some(&RETURN_M10_INSTRUCTION));
-                    }
+                for (active, program) in phase.active.iter().zip(&phase.programs) {
+                    assert_eq!(program.last(), Some(&RETURN_M10_INSTRUCTION));
+                    assert_eq!(*active, program.len() > 1);
+                    assert!(!program.contains(&ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION));
                 }
             }
         }
