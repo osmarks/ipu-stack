@@ -1227,10 +1227,45 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
                     Some((segment.address, segment.memory_size, start, words))
                 })?
         });
+        let row_readback =
+            segment
+                .as_ref()
+                .and_then(|&(address, memory_size, byte_offset, ref expected)| {
+                    let words = memory_size / 4;
+                    let actual = runtime
+                        .device()
+                        .read_tile_words_from_inactive_context(physical, 1, address, words)
+                        .ok()?;
+                    let actual_near =
+                        actual.get(byte_offset / 4..byte_offset / 4 + expected.len())?;
+                    let differences = expected
+                        .iter()
+                        .zip(actual_near)
+                        .enumerate()
+                        .filter(|(_, (expected, actual))| expected != actual)
+                        .map(|(offset, (&expected, &actual))| {
+                            (byte_offset / 4 + offset, expected, actual)
+                        })
+                        .collect::<Vec<_>>();
+                    Some((actual, differences))
+                });
+        let supervisor_registers = (0..16)
+            .map(|register| runtime.device().read_tile_m_register(physical, 0, register))
+            .collect::<Result<Vec<_>, _>>();
+        let exchange_state = runtime.device().tile_exchange_state(physical);
         let workers = (1..=6)
             .map(|context| runtime.device().tile_context_state(physical, context))
             .collect::<Result<Vec<_>, _>>();
-        contexts.push((physical, state, program_counter, segment, workers));
+        contexts.push((
+            physical,
+            state,
+            program_counter,
+            segment,
+            row_readback,
+            supervisor_registers,
+            exchange_state,
+            workers,
+        ));
     }
     format!("{} contexts={contexts:?}", summarize_states(&states))
 }

@@ -49,6 +49,8 @@ const TDI_EXCEPTION_CLEAR: u32 = 6;
 const TDI_DATA: u32 = 7;
 const TDI_STATUS: u32 = 8;
 const TDI_STATUS_CLEAR: u32 = 9;
+const TDI_INCOMING_DCOUNT: u32 = 10;
+const TDI_EXCHANGE_CONTROL: u32 = 11;
 
 mod tdi_instruction {
     // IPU21 diagnostic instructions, named by their Tile Vertex ISA assembly.
@@ -649,6 +651,15 @@ impl Device {
 
     pub fn tile_context_state(&self, physical_tile: u16, context: u32) -> Result<u32, DriverError> {
         Ok((self.read_tile_debug(physical_tile, TDI_CONTEXT_STATUS)? >> (context * 2)) & 3)
+    }
+
+    /// Returns the live incoming-data count and exchange-control state exposed
+    /// by the IPU21 tile debug interface.
+    pub fn tile_exchange_state(&self, physical_tile: u16) -> Result<(u32, u32), DriverError> {
+        Ok((
+            self.read_tile_debug(physical_tile, TDI_INCOMING_DCOUNT)?,
+            self.read_tile_debug(physical_tile, TDI_EXCHANGE_CONTROL)?,
+        ))
     }
 
     fn read_tile_debug(&self, physical_tile: u16, register: u32) -> Result<u32, DriverError> {

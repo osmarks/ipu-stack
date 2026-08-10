@@ -65,9 +65,9 @@ pub use storage::{
 };
 pub use tile::{TileLoweringError, TileProgramLowering};
 
-const INCOMING_DBASE: u8 = 0xa4;
+const INCOMING_BASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;
-const INCOMING_SBASE: u8 = 0xa7;
+const OUTGOING_BASE: u8 = 0xa7;
 const FIRST_INPUT_REGISTER: u8 = 3;
 const LAST_VALUE_REGISTER: u8 = 9;
 
@@ -331,8 +331,8 @@ fn emit_steps(
                         symbols,
                     )?;
                 }
-                code.put_special(INCOMING_SBASE, 15)?;
-                code.put_special(INCOMING_DBASE, 15)?;
+                code.put_special(INCOMING_BASE, 15)?;
+                code.put_special(OUTGOING_BASE, 15)?;
                 code.setzi(8, 1)?;
                 code.put_special(INCOMING_DCOUNT, 8)?;
                 code.instruction(SYNC_SUPERVISOR_INSTRUCTION);
