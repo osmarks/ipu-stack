@@ -5,7 +5,7 @@ use ipu_codegen::{
     amp_matrix_coordinates, build_package,
 };
 use ipu_elf::Toolchain;
-use ipu_package::{Application, Binding};
+use ipu_package::{Application, Binding, TileImage};
 use ipu_runtime::Runtime;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1193,6 +1193,75 @@ fn summarize_states(states: &[(u16, u32)]) -> String {
     format!("counts={counts:?} firstUnexpected={unexpected:?}")
 }
 
+fn image_word(image: &TileImage, address: u32) -> Option<u32> {
+    let segment = image.segments.iter().find(|segment| {
+        (segment.address..segment.address.saturating_add(segment.data.len() as u32))
+            .contains(&address)
+    })?;
+    let offset = usize::try_from(address.checked_sub(segment.address)?).ok()?;
+    Some(u32::from_le_bytes(
+        segment.data.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn exchange_patch_readback(runtime: &Runtime, application: &Application) -> Result<String> {
+    let mut counts = std::collections::BTreeMap::<Vec<usize>, usize>::new();
+    let mut examples = Vec::new();
+    let mut unreadable_examples = Vec::new();
+    let mut readable = 0usize;
+    let mut descriptors = 0usize;
+    let mut unreadable = 0usize;
+    for image in &application.tiles {
+        let physical = u16::try_from(image.physical_tile)?;
+        for patch in &image.word_patches {
+            descriptors += 1;
+            let expected = (0..patch.iterations)
+                .map(|iteration| image_word(image, patch.values_address + iteration * 4))
+                .collect::<Option<Vec<_>>>()
+                .context("patch value table is outside the packaged tile image")?;
+            let mut errors = Vec::new();
+            let actual = (1..=6).find_map(|context| {
+                runtime
+                    .device()
+                    .read_tile_word_from_inactive_context(physical, context, patch.target_address)
+                    .map_err(|error| errors.push((context, error.to_string())))
+                    .ok()
+            });
+            let Some(actual) = actual else {
+                unreadable += 1;
+                if unreadable_examples.len() < 8 {
+                    let states = (0..=6)
+                        .map(|context| runtime.device().tile_context_state(physical, context))
+                        .collect::<Result<Vec<_>, _>>();
+                    unreadable_examples.push((physical, patch.target_address, states, errors));
+                }
+                continue;
+            };
+            let matching_iterations = expected
+                .iter()
+                .enumerate()
+                .filter_map(|(iteration, value)| (*value == actual).then_some(iteration))
+                .collect::<Vec<_>>();
+            *counts.entry(matching_iterations.clone()).or_default() += 1;
+            if (matching_iterations.as_slice() != [1] || examples.len() < 4) && examples.len() < 32
+            {
+                examples.push((
+                    physical,
+                    patch.target_address,
+                    patch.values_address,
+                    actual,
+                    expected,
+                    matching_iterations,
+                ));
+            }
+            readable += 1;
+        }
+    }
+    Ok(format!(
+        "descriptors={descriptors} readable={readable} unreadable={unreadable} matchingIterations={counts:?} examples={examples:?} unreadableExamples={unreadable_examples:?}"
+    ))
+}
+
 fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> String {
     let states = match supervisor_states(runtime, application) {
         Ok(states) => states,
@@ -1267,7 +1336,12 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
             workers,
         ));
     }
-    format!("{} contexts={contexts:?}", summarize_states(&states))
+    let patch_readback = exchange_patch_readback(runtime, application)
+        .unwrap_or_else(|error| format!("failed: {error:#}"));
+    format!(
+        "{} patchReadback={patch_readback} contexts={contexts:?}",
+        summarize_states(&states)
+    )
 }
 
 #[cfg(test)]

@@ -713,6 +713,15 @@ fn build_tile(
         command_address: 0,
         diagnostic_address: COMPLETION_ADDRESS,
         segments,
+        word_patches: generated
+            .exchange_patches
+            .iter()
+            .map(|patch| ipu_package::TileWordPatch {
+                target_address: patch.target_address,
+                values_address: patch.values_address,
+                iterations: patch.iterations,
+            })
+            .collect(),
     })
 }
 

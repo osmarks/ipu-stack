@@ -216,6 +216,15 @@ pub struct GeneratedProgram {
     pub bytes: Vec<u8>,
     /// Exchange data retained verbatim for explicit package placement.
     pub exchange_rows: Vec<PlacedExchangeRow>,
+    /// Runtime-mutated exchange words and their packaged value tables.
+    pub exchange_patches: Vec<PlacedExchangePatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacedExchangePatch {
+    pub target_address: u32,
+    pub values_address: u32,
+    pub iterations: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,13 +305,48 @@ pub fn emit(
             return Err(invalid("different exchange rows share an address"));
         }
     }
+    let mut exchange_patches = Vec::new();
+    collect_exchange_patches(&program.steps, &mut exchange_patches)?;
     Ok(GeneratedProgram {
         bytes: code.words.into_iter().flat_map(u32::to_le_bytes).collect(),
         exchange_rows: unique_exchange_rows
             .into_iter()
             .map(|(address, words)| PlacedExchangeRow { address, words })
             .collect(),
+        exchange_patches,
     })
+}
+
+fn collect_exchange_patches(
+    steps: &[TileStep],
+    patches: &mut Vec<PlacedExchangePatch>,
+) -> Result<()> {
+    for step in steps {
+        match step {
+            TileStep::Exchange(exchange) => {
+                for patch in &exchange.patches {
+                    patches.push(PlacedExchangePatch {
+                        target_address: exchange
+                            .program
+                            .address
+                            .checked_add(
+                                patch
+                                    .word_offset
+                                    .checked_mul(4)
+                                    .ok_or_else(|| invalid("exchange patch offset overflow"))?,
+                            )
+                            .ok_or_else(|| invalid("exchange patch address overflow"))?,
+                        values_address: patch.values.address,
+                        iterations: u32::try_from(patch.values.words.len())
+                            .map_err(|_| invalid("exchange patch table is too large"))?,
+                    });
+                }
+            }
+            TileStep::Repeat(repeat) => collect_exchange_patches(&repeat.body, patches)?,
+            TileStep::Compute(_) => {}
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -320,7 +364,6 @@ fn emit_steps(
     for step in steps {
         match step {
             TileStep::Exchange(exchange) => {
-                emit_exchange_phase_boundary(code);
                 if !exchange.patches.is_empty() {
                     emit_exchange_patches(
                         code,
@@ -482,13 +525,6 @@ fn active_exchange(step: &TileStep) -> bool {
         TileStep::Repeat(repeat) => repeat.body.iter().any(active_exchange),
         TileStep::Compute(_) => false,
     }
-}
-
-/// Closes the preceding device phase before any local preparation for the
-/// next timed exchange program. Every supervisor participates, independently
-/// of whether its tile sends or receives in the next exchange.
-fn emit_exchange_phase_boundary(code: &mut TileCode) {
-    code.instruction(SYNC_SUPERVISOR_INSTRUCTION);
 }
 
 fn emit_exchange_patches(
@@ -939,7 +975,7 @@ mod tests {
                     .iter()
                     .filter(|word| **word == SYNC_SUPERVISOR_INSTRUCTION)
                     .count(),
-                2
+                1
             );
             assert_eq!(
                 *code_bytes.get_or_insert(generated.bytes.len()),

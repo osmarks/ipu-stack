@@ -219,7 +219,7 @@ impl ProfileReport {
     }
 }
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 pub const TARGET_IPU21: &str = "ipu21";
 pub const TILE_MEMORY_BASE: u32 = 0x4c000;
 pub const TILE_MEMORY_SIZE: u32 = 624 * 1024;
@@ -273,6 +273,14 @@ pub struct TileImage {
     pub command_address: u32,
     pub diagnostic_address: u32,
     pub segments: Vec<Segment>,
+    pub word_patches: Vec<TileWordPatch>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileWordPatch {
+    pub target_address: u32,
+    pub values_address: u32,
+    pub iterations: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -432,6 +440,33 @@ impl Application {
                     "overlapping segments on tile {}: 0x{:x}..0x{:x} and 0x{:x}..0x{:x}",
                     tile.physical_tile, pair[0].0, pair[0].1, pair[1].0, pair[1].1
                 )));
+            }
+            for patch in &tile.word_patches {
+                let values_bytes = patch.iterations.checked_mul(4).ok_or_else(|| {
+                    PackageError::Invalid("word-patch value-table size overflow".into())
+                })?;
+                let contains_loaded = |address: u32, bytes: u32| {
+                    tile.segments.iter().any(|segment| {
+                        address >= segment.address
+                            && address.checked_add(bytes).is_some_and(|end| {
+                                end <= segment.address + segment.data.len() as u32
+                            })
+                    })
+                };
+                if patch.target_address & 3 != 0
+                    || patch.values_address & 3 != 0
+                    || patch.iterations == 0
+                    || !contains_loaded(patch.target_address, 4)
+                    || !contains_loaded(patch.values_address, values_bytes)
+                {
+                    return Err(PackageError::Invalid(format!(
+                        "invalid word patch on tile {}: target=0x{:x} values=0x{:x} iterations={}",
+                        tile.physical_tile,
+                        patch.target_address,
+                        patch.values_address,
+                        patch.iterations,
+                    )));
+                }
             }
         }
         let tile_ids: std::collections::HashSet<_> =
@@ -785,6 +820,15 @@ fn write_tiles(
         item.set_entry_point(tile.entry_point);
         item.set_command_address(tile.command_address);
         item.set_diagnostic_address(tile.diagnostic_address);
+        let mut patches = item
+            .reborrow()
+            .init_word_patches(tile.word_patches.len() as u32);
+        for (patch_index, patch) in tile.word_patches.iter().enumerate() {
+            let mut out = patches.reborrow().get(patch_index as u32);
+            out.set_target_address(patch.target_address);
+            out.set_values_address(patch.values_address);
+            out.set_iterations(patch.iterations);
+        }
         let mut segments = item.reborrow().init_segments(tile.segments.len() as u32);
         for (segment_index, segment) in tile.segments.iter().enumerate() {
             let mut out = segments.reborrow().get(segment_index as u32);
@@ -807,6 +851,15 @@ fn read_tiles(
                 entry_point: item.get_entry_point(),
                 command_address: item.get_command_address(),
                 diagnostic_address: item.get_diagnostic_address(),
+                word_patches: item
+                    .get_word_patches()?
+                    .iter()
+                    .map(|patch| TileWordPatch {
+                        target_address: patch.get_target_address(),
+                        values_address: patch.get_values_address(),
+                        iterations: patch.get_iterations(),
+                    })
+                    .collect(),
                 segments: item
                     .get_segments()?
                     .iter()
@@ -1118,6 +1171,11 @@ mod tests {
                 memory_size: 8,
                 data: vec![1, 2, 3, 4],
                 flags: SEGMENT_READ | SEGMENT_EXECUTE,
+            }],
+            word_patches: vec![TileWordPatch {
+                target_address: TILE_MEMORY_BASE,
+                values_address: TILE_MEMORY_BASE,
+                iterations: 1,
             }],
         });
         app

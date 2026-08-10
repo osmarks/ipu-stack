@@ -13,6 +13,13 @@ struct TileImage {
   segments @2 :List(Segment);
   commandAddress @3 :UInt32;
   diagnosticAddress @4 :UInt32;
+  wordPatches @5 :List(TileWordPatch);
+}
+
+struct TileWordPatch {
+  targetAddress @0 :UInt32;
+  valuesAddress @1 :UInt32;
+  iterations @2 :UInt32;
 }
 
 struct RegionSlice {
