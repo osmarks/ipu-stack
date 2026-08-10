@@ -313,18 +313,31 @@ impl LowProgram {
     }
 
     /// Splits exchange phases so each global synchronization covers at most
-    /// `maximum` logical transfers.
+    /// the configured number of logical transfers. Keys are original phase
+    /// indices; phases absent from the map remain intact.
     pub fn limit_exchange_phase_transfers(
         &mut self,
-        maximum: NonZeroUsize,
+        limits: &BTreeMap<usize, NonZeroUsize>,
     ) -> LowLoweringResult<()> {
+        if limits
+            .keys()
+            .any(|&phase| phase >= self.exchange_phases.len())
+        {
+            return Err(LowLoweringError::UnknownExchangePhaseLimit);
+        }
         let mut replacements = Vec::with_capacity(self.exchange_phases.len());
         let mut isolated = Vec::new();
-        for phase in std::mem::take(&mut self.exchange_phases) {
-            let mut ids = Vec::with_capacity(phase.transfers.len().div_ceil(maximum.get()));
+        for (original_index, phase) in std::mem::take(&mut self.exchange_phases)
+            .into_iter()
+            .enumerate()
+        {
+            let maximum = limits
+                .get(&original_index)
+                .map_or(phase.transfers.len(), |maximum| maximum.get());
+            let mut ids = Vec::with_capacity(phase.transfers.len().div_ceil(maximum));
             let mut transfers = phase.transfers.into_iter();
             loop {
-                let chunk = transfers.by_ref().take(maximum.get()).collect::<Vec<_>>();
+                let chunk = transfers.by_ref().take(maximum).collect::<Vec<_>>();
                 if chunk.is_empty() {
                     break;
                 }
@@ -370,6 +383,8 @@ fn expand_exchange_markers(work: &mut TileWorkList, replacements: &[Vec<Exchange
 pub enum LowLoweringError {
     #[error("low-level lowering requires a nonzero tile count")]
     EmptyTileGroup,
+    #[error("exchange transfer limit refers to an unknown phase")]
+    UnknownExchangePhaseLimit,
     #[error("value {value:?} declares {declared} tiles, but the schedule capacity is {scheduled}")]
     TileCountMismatch {
         value: MidValueId,
@@ -3279,7 +3294,13 @@ mod tests {
                 .sum::<usize>();
             let mut isolated = low.clone();
             let maximum = NonZeroUsize::new(random.usize(1..=4)).unwrap();
-            isolated.limit_exchange_phase_transfers(maximum).unwrap();
+            let limits = isolated
+                .exchange_phases
+                .iter()
+                .enumerate()
+                .map(|(phase, _)| (phase, maximum))
+                .collect();
+            isolated.limit_exchange_phase_transfers(&limits).unwrap();
             assert!(
                 isolated
                     .exchange_phases

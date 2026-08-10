@@ -7,6 +7,7 @@ use ipu_codegen::{
 use ipu_elf::Toolchain;
 use ipu_package::{Application, Binding, TileImage};
 use ipu_runtime::Runtime;
+use std::collections::BTreeMap;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -48,9 +49,9 @@ struct Arguments {
     /// Log exchange scheduling lower bounds and critical dependency chains.
     #[arg(long)]
     exchange_diagnostics: bool,
-    /// Maximum logical transfers allowed behind one global exchange barrier.
-    #[arg(long)]
-    maximum_exchange_phase_transfers: Option<NonZeroUsize>,
+    /// PHASE=MAX logical transfers allowed behind one global exchange barrier.
+    #[arg(long, value_parser = parse_exchange_phase_transfer_limit)]
+    exchange_phase_transfer_limit: Vec<(usize, NonZeroUsize)>,
     /// Snapshot and diff all exchange CSRs around the first exchange phase.
     #[arg(long, requires = "separate_repeat_exchange_rows")]
     exchange_csr_diff: bool,
@@ -136,6 +137,31 @@ const SIGLIP_MLP_DIMENSION: u32 = 1024;
 const GEMM_BENCHMARK_ROWS: u32 = 131_072;
 const GEMM_BENCHMARK_INNER: u32 = 64;
 const GEMM_BENCHMARK_COLUMNS: u32 = 64;
+
+fn parse_exchange_phase_transfer_limit(value: &str) -> Result<(usize, NonZeroUsize), String> {
+    let (phase, maximum) = value
+        .split_once('=')
+        .ok_or_else(|| "expected PHASE=MAX".to_owned())?;
+    let phase = phase
+        .parse()
+        .map_err(|_| "exchange phase must be a nonnegative integer".to_owned())?;
+    let maximum = maximum
+        .parse()
+        .map_err(|_| "exchange phase maximum must be a positive integer".to_owned())?;
+    Ok((phase, maximum))
+}
+
+fn exchange_phase_transfer_limits(
+    entries: &[(usize, NonZeroUsize)],
+) -> Result<BTreeMap<usize, NonZeroUsize>> {
+    let mut limits = BTreeMap::new();
+    for &(phase, maximum) in entries {
+        if limits.insert(phase, maximum).is_some() {
+            bail!("exchange phase {phase} has more than one transfer limit");
+        }
+    }
+    Ok(limits)
+}
 
 fn mlp_weight_name(blocks: u32, block: u32, projection: u32) -> String {
     if blocks == 1 {
@@ -380,7 +406,9 @@ fn main() -> Result<()> {
                     },
                     RepeatExchangeStrategy::SingleIteration,
                 ),
-                maximum_exchange_phase_transfers: arguments.maximum_exchange_phase_transfers,
+                exchange_phase_transfer_limits: exchange_phase_transfer_limits(
+                    &arguments.exchange_phase_transfer_limit,
+                )?,
                 snapshot_first_exchange_csrs: arguments.exchange_csr_diff,
             },
         )?;

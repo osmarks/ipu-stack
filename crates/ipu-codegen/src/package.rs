@@ -81,8 +81,8 @@ pub struct PackageConfig {
     pub pipeline: PipelineConfig,
     pub tile_compute: TileComputePolicy,
     pub repeat_exchanges: crate::RepeatExchangeStrategy,
-    /// Maximum logical transfers sharing one globally synchronized phase.
-    pub maximum_exchange_phase_transfers: Option<NonZeroUsize>,
+    /// Per-original-phase limits on logical transfers sharing one global sync.
+    pub exchange_phase_transfer_limits: BTreeMap<usize, NonZeroUsize>,
     pub snapshot_first_exchange_csrs: bool,
 }
 
@@ -353,9 +353,9 @@ pub fn build_package(
     let mut low = build_phase("lower_tiles", || {
         Ok(lower_to_tiles(&mid, &config.pipeline)?)
     })?;
-    if let Some(maximum) = config.maximum_exchange_phase_transfers {
+    if !config.exchange_phase_transfer_limits.is_empty() {
         tracing::info!(
-            maximum = maximum.get(),
+            limits = ?config.exchange_phase_transfer_limits,
             phase_transfer_counts = ?low
                 .exchange_phases
                 .iter()
@@ -364,7 +364,7 @@ pub fn build_package(
             "limiting logical transfers per exchange phase"
         );
         build_phase("limit_exchange_phase_transfers", || {
-            Ok(low.limit_exchange_phase_transfers(maximum)?)
+            Ok(low.limit_exchange_phase_transfers(&config.exchange_phase_transfer_limits)?)
         })?;
     }
     if config.pipeline.profiling.enabled
