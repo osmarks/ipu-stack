@@ -633,10 +633,6 @@ fn build_package_from_objects(
                         exchange_csr_snapshot_address: config
                             .snapshot_first_exchange_csrs
                             .then_some(crate::memory::EXCHANGE_CSR_SNAPSHOT_BASE),
-                        exchange_ctl_timeline: config.snapshot_first_exchange_csrs.then_some((
-                            crate::memory::EXCHANGE_CTL_TIMELINE_BASE,
-                            crate::memory::EXCHANGE_CTL_TIMELINE_MAX_PHASES,
-                        )),
                         ..CodegenOptions::default()
                     },
                 )?;
@@ -805,10 +801,6 @@ fn build_package_from_objects(
                         exchange_csr_snapshot_address: config
                             .snapshot_first_exchange_csrs
                             .then_some(crate::memory::EXCHANGE_CSR_SNAPSHOT_BASE),
-                        exchange_ctl_timeline: config.snapshot_first_exchange_csrs.then_some((
-                            crate::memory::EXCHANGE_CTL_TIMELINE_BASE,
-                            crate::memory::EXCHANGE_CTL_TIMELINE_MAX_PHASES,
-                        )),
                         ..CodegenOptions::default()
                     },
                 )?)

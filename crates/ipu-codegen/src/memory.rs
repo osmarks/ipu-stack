@@ -13,12 +13,6 @@ pub const PROFILE_END_CYCLE: u32 = RUNTIME_STATE_BASE + 8;
 pub const EXCHANGE_CSR_SNAPSHOT_BASE: u32 = RUNTIME_STATE_BASE + 0x10;
 pub const EXCHANGE_CSR_COUNT: u32 = 12;
 pub const EXCHANGE_CSR_SNAPSHOT_BYTES: u32 = EXCHANGE_CSR_COUNT * 2 * 4;
-/// Entry/return samples of `EXCHANGE_CTL` for statically emitted phases. This
-/// consumes the remainder of the supervisor stack headroom before worker state.
-pub const EXCHANGE_CTL_TIMELINE_BASE: u32 =
-    EXCHANGE_CSR_SNAPSHOT_BASE + EXCHANGE_CSR_SNAPSHOT_BYTES;
-pub const EXCHANGE_CTL_TIMELINE_MAX_PHASES: u32 = 14;
-pub const EXCHANGE_CTL_TIMELINE_BYTES: u32 = EXCHANGE_CTL_TIMELINE_MAX_PHASES * 2 * 4;
 
 /// First byte after the permanently reserved runtime state.
 pub const IPU21_DATA_BASE: u32 = RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES;
