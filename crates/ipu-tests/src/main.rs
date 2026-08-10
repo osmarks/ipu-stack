@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use ipu_codegen::{
-    AmpOrder, ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision, TensorFormat,
-    TileComputePolicy, amp_matrix_coordinates, build_package,
+    AmpOrder, ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision,
+    RepeatExchangeStrategy, TensorFormat, TileComputePolicy, amp_matrix_coordinates, build_package,
 };
 use ipu_elf::Toolchain;
 use ipu_package::{Application, Binding, TileImage};
@@ -35,6 +35,9 @@ struct Arguments {
     /// Build benchmark programs without cycle-counter or per-step profiling.
     #[arg(long)]
     no_profile: bool,
+    /// Materialize one immutable exchange row per structured-repeat iteration.
+    #[arg(long)]
+    separate_repeat_exchange_rows: bool,
     /// Log exchange scheduling lower bounds and critical dependency chains.
     #[arg(long)]
     exchange_diagnostics: bool,
@@ -351,6 +354,11 @@ fn main() -> Result<()> {
                     TileComputePolicy::Omit
                 } else {
                     TileComputePolicy::Execute
+                },
+                repeat_exchanges: if arguments.separate_repeat_exchange_rows {
+                    RepeatExchangeStrategy::SeparateRows
+                } else {
+                    RepeatExchangeStrategy::PatchInPlace
                 },
             },
         )?;

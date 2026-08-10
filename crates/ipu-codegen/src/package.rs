@@ -79,6 +79,7 @@ pub struct PackageConfig {
     pub kernel_source_directory: PathBuf,
     pub pipeline: PipelineConfig,
     pub tile_compute: TileComputePolicy,
+    pub repeat_exchanges: crate::RepeatExchangeStrategy,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -338,6 +339,14 @@ pub fn build_package(
     let low = build_phase("lower_tiles", || {
         Ok(lower_to_tiles(&mid, &config.pipeline)?)
     })?;
+    if config.pipeline.profiling.enabled
+        && config.repeat_exchanges == crate::RepeatExchangeStrategy::SeparateRows
+        && !low.repeat_runs.is_empty()
+    {
+        return Err(invalid(
+            "profiling structured repeats with separate exchange rows is not supported",
+        ));
+    }
     tracing::info!(
         logical_shards = low.shards.len(),
         exchange_phases = low.exchange_phases.len(),
@@ -407,9 +416,10 @@ fn build_package_from_objects(
     })?;
     let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
     let exchange_table_bytes = crate::tile::compact_exchange_table_bytes(
+        program,
         &provisional_exchanges,
         execution_tile_count,
-        program.tile_count,
+        config.repeat_exchanges,
     )?;
     let exchange_rows = (exchange_table_bytes != 0)
         .then(|| {
@@ -564,6 +574,7 @@ fn build_package_from_objects(
         kernel_plan,
         exchange_code_base,
         execution_tile_count,
+        config.repeat_exchanges,
     )?;
     let sizing_code_address = memory.next_free(
         host_code_base + host_code_bytes,
@@ -717,6 +728,7 @@ fn build_package_from_objects(
         kernel_plan,
         exchange_code_base,
         execution_tile_count,
+        config.repeat_exchanges,
     )?;
     if exchange_rows
         .as_ref()
@@ -1006,7 +1018,9 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
     let mut symbols = vec![COMPLETE_SYMBOL.into()];
     if !program.exchange_phases.is_empty() {
         symbols.push(WORKER_BARRIER_SYMBOL.into());
-        if !program.repeat_runs.is_empty() {
+        if !program.repeat_runs.is_empty()
+            && config.repeat_exchanges == crate::RepeatExchangeStrategy::PatchInPlace
+        {
             symbols.push(crate::PATCH_WORD_SYMBOL.into());
         }
     }

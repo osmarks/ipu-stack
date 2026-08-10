@@ -66,7 +66,7 @@ pub use storage::{
     ByteSpan, StorageError, StorageResult, amp_matrix_coordinates, logical_view_byte_spans,
     shard_storage_bytes, view_byte_spans,
 };
-pub use tile::{TileLoweringError, TileProgramLowering};
+pub use tile::{RepeatExchangeStrategy, TileLoweringError, TileProgramLowering};
 
 const INCOMING_BASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;
