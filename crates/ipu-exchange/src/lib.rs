@@ -293,6 +293,7 @@ impl PlanProgramBuilder {
         if horizon < self.event_cycles {
             return Err(ExchangeError::Schedule("plan horizon precedes tile events"));
         }
+        self.coalesce_one_event_mux_teardowns()?;
         let padding = horizon - self.event_cycles;
         if padding != 0 {
             self.words.push(delay(padding - 1));
@@ -300,6 +301,40 @@ impl PlanProgramBuilder {
         self.words.push(RETURN_M10_INSTRUCTION);
         Ok(self.words)
     }
+
+    fn coalesce_one_event_mux_teardowns(&mut self) -> Result<(), ExchangeError> {
+        let last_teardown = self
+            .words
+            .iter()
+            .rposition(|instruction| is_neutral_mux_teardown(*instruction));
+        let Some(last_teardown) = last_teardown else {
+            return Ok(());
+        };
+        let redundant = self
+            .words
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instruction)| {
+                (index != last_teardown
+                    && is_neutral_mux_teardown(*instruction)
+                    && instruction_advance(*instruction) == 1)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for index in redundant.into_iter().rev() {
+            let following = self
+                .words
+                .get_mut(index + 1)
+                .ok_or(ExchangeError::Schedule("terminal mux teardown"))?;
+            set_instruction_advance(following, instruction_advance(*following) + 1)?;
+            self.words.remove(index);
+        }
+        Ok(())
+    }
+}
+
+fn is_neutral_mux_teardown(instruction: u32) -> bool {
+    instruction & OPCODE_MASK == DELAY_XPIC_OPCODE && instruction & 0x1fff == TILE_MUX_EXCHANGE
 }
 
 fn instruction_advance(instruction: u32) -> u32 {
@@ -1484,6 +1519,37 @@ mod tests {
                         && instruction & 0x1fff == TILE_MUX_EXCHANGE
                 }));
             }
+        }
+    }
+
+    #[test]
+    fn randomized_consolidated_one_word_receives_share_the_final_mux_teardown() {
+        let topology = Topology::c600();
+        let mut random = fastrand::Rng::with_seed(0x636f_616c_6573_6365);
+        for _ in 0..64 {
+            let source = random.u16(0..topology.tile_count() as u16);
+            let receiver = (0..topology.tile_count() as u16)
+                .find(|receiver| *receiver != source)
+                .unwrap();
+            let row = topology
+                .multicast(source, &[receiver], 1, 0)
+                .unwrap()
+                .receivers[0];
+            let rows = random.u32(2..=32);
+            let mut builder = PlanProgramBuilder::default();
+            for index in 0..rows {
+                builder.append_scheduled_row_at(&row, index * 256).unwrap();
+            }
+            let horizon = builder.event_cycles();
+            let program = builder.finish(horizon).unwrap();
+            assert_eq!(plan_event_cycles(&program).unwrap(), horizon);
+            assert_eq!(
+                program
+                    .iter()
+                    .filter(|instruction| is_neutral_mux_teardown(**instruction))
+                    .count(),
+                1
+            );
         }
     }
 
