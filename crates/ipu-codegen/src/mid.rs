@@ -1197,6 +1197,22 @@ impl PipelineConfig {
         self
     }
 
+    /// Restrict default operator planning to explicit active tile counts.
+    /// This is useful when evaluating a fixed occupancy rather than allowing
+    /// the planner to trade occupancy against communication and memory use.
+    pub fn with_active_tile_counts(mut self, counts: impl IntoIterator<Item = u16>) -> Self {
+        let mut candidates = Vec::new();
+        for count in counts {
+            if count == 0 || count > self.tile_count {
+                continue;
+            }
+            candidates.extend(operator_candidates_for_tile_count(count));
+        }
+        candidates.dedup();
+        self.operator_candidates = candidates;
+        self
+    }
+
     pub fn with_standard_memory_reservation(mut self, bytes: u64) -> Self {
         self.standard_memory_reservation_bytes = bytes;
         self
@@ -1222,8 +1238,9 @@ fn candidate_active_tile_counts(capacity: u16) -> Vec<u16> {
         return vec![0];
     }
     let mut counts = vec![capacity];
-    // Regular power-of-two subsets avoid awkward prime factors. Retaining
-    // only subsets at least half as large bounds the amount of idle hardware.
+    // Regular power-of-two subsets avoid awkward prime factors and let the
+    // cost model decide when reduced exchange or memory pressure outweighs
+    // lower device occupancy.
     let mut power = 1u16;
     while let Some(next) = power.checked_mul(2) {
         if next > capacity {
@@ -1231,11 +1248,14 @@ fn candidate_active_tile_counts(capacity: u16) -> Vec<u16> {
         }
         power = next;
     }
-    if !counts.contains(&power) {
-        counts.push(power);
-    }
-    if power == capacity && power >= 512 {
-        counts.push(power / 2);
+    loop {
+        if !counts.contains(&power) {
+            counts.push(power);
+        }
+        if power == 1 {
+            break;
+        }
+        power /= 2;
     }
     counts
 }
@@ -2767,21 +2787,13 @@ mod tests {
             let counts = candidate_active_tile_counts(capacity);
             assert_eq!(counts[0], capacity);
             assert!(counts.windows(2).all(|pair| pair[0] > pair[1]));
-            assert!(counts.iter().all(|&count| {
-                count <= capacity && u32::from(count) * 2 >= u32::from(capacity)
-            }));
+            assert!(counts.iter().all(|&count| count <= capacity));
             assert!(counts[1..].iter().all(|count| count.is_power_of_two()));
+            assert_eq!(counts.last(), Some(&1));
         }
-        for exponent in 1..=8 {
+        for exponent in 1..=10 {
             let capacity = 1_u16 << exponent;
-            assert_eq!(candidate_active_tile_counts(capacity), [capacity]);
-        }
-        for exponent in 9..=10 {
-            let capacity = 1_u16 << exponent;
-            assert_eq!(
-                candidate_active_tile_counts(capacity),
-                [capacity, capacity / 2]
-            );
+            assert_eq!(candidate_active_tile_counts(capacity).len(), exponent + 1);
         }
     }
 

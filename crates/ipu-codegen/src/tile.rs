@@ -340,6 +340,7 @@ mod tests {
             let output = graph.gemm(left, right).unwrap();
             graph.set_outputs([output]).unwrap();
             let config = PipelineConfig::new(tiles)
+                .with_active_tile_counts([tiles])
                 .with_input(
                     left,
                     TensorFormat {

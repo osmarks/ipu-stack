@@ -2267,6 +2267,7 @@ mod tests {
             let output = graph.gemm(hidden, down).unwrap();
             graph.set_outputs([output]).unwrap();
             let mut config = PipelineConfig::new(16)
+                .with_active_tile_counts([16])
                 .with_automatic_input(input, Precision::F16)
                 .with_automatic_input(up, Precision::F16)
                 .with_automatic_input(down, Precision::F16);
@@ -2545,6 +2546,7 @@ mod tests {
             let output = graph.add(left, right).unwrap();
             graph.set_outputs([output]).unwrap();
             let config = PipelineConfig::new(tiles)
+                .with_active_tile_counts([tiles])
                 .with_input(left, format(tiles))
                 .with_input(right, format(tiles));
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
@@ -2650,6 +2652,7 @@ mod tests {
             let output = graph.gemm(left, right).unwrap();
             graph.set_outputs([output]).unwrap();
             let config = PipelineConfig::new(tiles)
+                .with_active_tile_counts([tiles])
                 .with_input(left, format(tiles))
                 .with_input(right, format(tiles));
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
