@@ -1,7 +1,8 @@
 use ipu_exchange::{
-    SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate, encode_br_m,
-    encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate, encode_put_special_m,
-    encode_setzi_m, encode_shl_m_immediate, encode_st32_m_immediate,
+    MAX_PLAN_OFFSET_CYCLES, SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION,
+    encode_add_m_immediate, encode_br_m, encode_brz_m_immediate, encode_call_m_immediate,
+    encode_delay_m, encode_ld32_m_immediate, encode_put_special_m, encode_setzi_m,
+    encode_shl_m_immediate, encode_st32_m_immediate,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -150,6 +151,8 @@ pub struct ExchangeStep {
     pub active: bool,
     /// Synchronization-free timed exchange program.
     pub program: PlacedExchangeRow,
+    /// Local wait after returning from the exchange row, preserving the phase horizon.
+    pub wait_cycles: u32,
     /// Words rewritten before the timed program is invoked inside a structured repeat.
     #[serde(default)]
     pub patches: Vec<ExchangePatch>,
@@ -355,6 +358,7 @@ fn emit_steps(
                     code.instruction(ipu_exchange::SYNC_ANS_INSTRUCTION);
                 }
                 code.call(exchange.program.address, 10)?;
+                code.delay(exchange.wait_cycles)?;
                 if let Some(address) = exchange.profile.after {
                     emit_cycle_sample(code, symbols, address)?;
                 }
@@ -749,6 +753,15 @@ impl TileCode {
         self.words.push(instruction);
     }
 
+    fn delay(&mut self, mut cycles: u32) -> Result<()> {
+        while cycles != 0 {
+            let chunk = cycles.min(MAX_PLAN_OFFSET_CYCLES);
+            self.words.push(encode_delay_m(chunk)?);
+            cycles -= chunk;
+        }
+        Ok(())
+    }
+
     fn ld32(&mut self, destination: u8, base: u8, delta: u8, offset: u16) -> Result<()> {
         self.words
             .push(encode_ld32_m_immediate(destination, base, delta, offset)?);
@@ -828,6 +841,7 @@ mod tests {
                         address: 0x60000,
                         words: inactive_exchange_program(),
                     },
+                    wait_cycles: 0,
                     patches: Vec::new(),
                     profile: StepProfile::default(),
                 }),
@@ -868,6 +882,7 @@ mod tests {
                     address: 3,
                     words: Vec::new(),
                 },
+                wait_cycles: 0,
                 patches: Vec::new(),
                 profile: StepProfile::default(),
             })],
@@ -904,6 +919,7 @@ mod tests {
                             address: 0x60000,
                             words: vec![0, ipu_exchange::RETURN_M10_INSTRUCTION],
                         },
+                        wait_cycles: 0,
                         patches: vec![ExchangePatch {
                             word_offset: 0,
                             values: PlacedExchangeRow {

@@ -181,6 +181,14 @@ pub fn encode_brz_m_immediate(register: u8, target_address: u32) -> Result<u32, 
     Ok(BRZ_M_IMMEDIATE_OPCODE | (u32::from(register) << 20) | (target_address >> 2))
 }
 
+/// Encodes a processor delay of `cycles` cycles.
+pub fn encode_delay_m(cycles: u32) -> Result<u32, ExchangeError> {
+    if !(1..=MAX_PLAN_OFFSET_CYCLES).contains(&cycles) {
+        return Err(ExchangeError::Schedule("processor delay range"));
+    }
+    Ok(delay(cycles - 1))
+}
+
 const fn setzi_m(register: u8, immediate: u32) -> u32 {
     SETZI_M_OPCODE | ((register as u32) << 20) | immediate
 }
@@ -289,15 +297,8 @@ impl PlanProgramBuilder {
         Ok(())
     }
 
-    pub fn finish(mut self, horizon: u32) -> Result<Vec<u32>, ExchangeError> {
-        if horizon < self.event_cycles {
-            return Err(ExchangeError::Schedule("plan horizon precedes tile events"));
-        }
+    pub fn finish(mut self) -> Result<Vec<u32>, ExchangeError> {
         self.coalesce_one_event_mux_teardowns()?;
-        let padding = horizon - self.event_cycles;
-        if padding != 0 {
-            self.words.push(delay(padding - 1));
-        }
         self.words.push(RETURN_M10_INSTRUCTION);
         Ok(self.words)
     }
@@ -1541,7 +1542,7 @@ mod tests {
                 builder.append_scheduled_row_at(&row, index * 256).unwrap();
             }
             let horizon = builder.event_cycles();
-            let program = builder.finish(horizon).unwrap();
+            let program = builder.finish().unwrap();
             assert_eq!(plan_event_cycles(&program).unwrap(), horizon);
             assert_eq!(
                 program
@@ -1595,7 +1596,8 @@ mod tests {
         let mut relay = PlanProgramBuilder::default();
         relay.append_scheduled_row(&first.receivers[0]).unwrap();
         relay.append_scheduled_row(&second.sender).unwrap();
-        let relay = relay.finish(horizon).unwrap();
+        let relay_horizon = relay.event_cycles();
+        let relay = relay.finish().unwrap();
 
         assert_eq!(relay.last(), Some(&RETURN_M10_INSTRUCTION));
         assert_eq!(
@@ -1605,7 +1607,8 @@ mod tests {
                 .count(),
             0
         );
-        assert_eq!(plan_event_cycles(&relay).unwrap(), horizon);
+        assert_eq!(plan_event_cycles(&relay).unwrap(), relay_horizon);
+        assert!(relay_horizon <= horizon);
     }
 
     #[test]

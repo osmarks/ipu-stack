@@ -31,6 +31,8 @@ pub enum TileLoweringError {
     UnknownExchange,
     #[error("exchange phase has no row for tile {0}")]
     MissingExchangeRow(u16),
+    #[error("exchange row for tile {0} exceeds its phase horizon")]
+    InvalidExchangeTiming(u16),
     #[error("nested finalized repeats are not yet supported")]
     NestedRepeat,
     #[error("tile-program address arithmetic overflowed")]
@@ -59,6 +61,7 @@ pub enum TileLoweringError {
 struct PlacedExchange {
     active: bool,
     program: PlacedExchangeRow,
+    wait_cycles: u32,
     patches: Vec<ExchangePatch>,
 }
 
@@ -176,6 +179,7 @@ fn lower_work(
                 TileStep::Exchange(ExchangeStep {
                     active: placed.active,
                     program: placed.program.clone(),
+                    wait_cycles: placed.wait_cycles,
                     patches: inside_repeat
                         .then(|| placed.patches.clone())
                         .unwrap_or_default(),
@@ -331,6 +335,7 @@ fn lower_inactive_work(
             TileWorkRef::Exchange(id) => steps.push(TileStep::Exchange(ExchangeStep {
                 active: exchange_rows[&id].active,
                 program: exchange_rows[&id].program.clone(),
+                wait_cycles: exchange_rows[&id].wait_cycles,
                 patches: Vec::new(),
                 profile: StepProfile::default(),
             })),
@@ -413,20 +418,28 @@ fn layout_exchange_rows(
         return Ok((result, cursor));
     }
     for phase in exchanges {
-        let (active, base_program) = if tile < scheduled_tile_count {
+        let (active, base_program, wait_cycles) = if tile < scheduled_tile_count {
             let index = usize::from(tile);
             let active = *phase
                 .active
                 .get(index)
                 .ok_or(TileLoweringError::MissingExchangeRow(tile))?;
-            phase
+            let program = phase
                 .programs
                 .get(index)
                 .cloned()
-                .map(|program| (active, program))
-                .ok_or(TileLoweringError::MissingExchangeRow(tile))?
+                .ok_or(TileLoweringError::MissingExchangeRow(tile))?;
+            let wait_cycles = if active {
+                phase
+                    .event_cycles
+                    .checked_sub(phase.tile_event_cycles[index])
+                    .ok_or(TileLoweringError::InvalidExchangeTiming(tile))?
+            } else {
+                0
+            };
+            (active, program, wait_cycles)
         } else {
-            (false, crate::inactive_exchange_program())
+            (false, crate::inactive_exchange_program(), 0)
         };
         let address = cursor;
         cursor = cursor
@@ -467,6 +480,7 @@ fn layout_exchange_rows(
             PlacedExchange {
                 active,
                 program,
+                wait_cycles,
                 patches,
             },
         );

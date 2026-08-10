@@ -19,6 +19,8 @@ pub struct PhysicalExchangePhase {
     pub active: Vec<bool>,
     /// Synchronization-free timed supervisor program indexed by logical tile.
     pub programs: Vec<Vec<u32>>,
+    /// Final local exchange event indexed by logical tile. Inactive tiles use zero.
+    pub tile_event_cycles: Vec<u32>,
     pub event_cycles: u32,
     /// Static per-tile role intervals on the exchange event timeline.
     pub activities: Vec<Vec<ExchangeActivity>>,
@@ -380,14 +382,17 @@ fn lower_static_exchanges(
                 );
             }
             let mut active = Vec::with_capacity(usize::from(program.tile_count));
+            let mut tile_event_cycles = Vec::with_capacity(usize::from(program.tile_count));
             let programs = (0..program.tile_count)
                 .map(|tile| match builders.remove(&tile) {
                     Some(builder) => {
                         active.push(true);
-                        Ok(builder.finish(horizon)?)
+                        tile_event_cycles.push(builder.event_cycles());
+                        Ok(builder.finish()?)
                     }
                     None => {
                         active.push(false);
+                        tile_event_cycles.push(0);
                         Ok(inactive_exchange_program())
                     }
                 })
@@ -452,6 +457,7 @@ fn lower_static_exchanges(
                 id: phase.id,
                 active,
                 programs,
+                tile_event_cycles,
                 event_cycles: horizon,
                 activities,
                 repeat_patches,
@@ -1052,6 +1058,7 @@ mod tests {
             for phase in phases {
                 assert_eq!(phase.programs.len(), usize::from(tiles));
                 assert_eq!(phase.active.len(), usize::from(tiles));
+                assert_eq!(phase.tile_event_cycles.len(), usize::from(tiles));
                 assert_eq!(phase.activities.len(), usize::from(tiles));
                 assert!(phase.event_cycles != 0);
                 assert!(phase.activities.iter().flatten().next().is_some());
@@ -1064,9 +1071,17 @@ mod tests {
                         assert!(pair[0].end_cycle < pair[1].start_cycle);
                     }
                 }
-                for (active, program) in phase.active.iter().zip(&phase.programs) {
+                for ((active, program), local_cycles) in phase
+                    .active
+                    .iter()
+                    .zip(&phase.programs)
+                    .zip(&phase.tile_event_cycles)
+                {
                     assert_eq!(program.last(), Some(&RETURN_M10_INSTRUCTION));
                     assert_eq!(*active, program.len() > 1);
+                    assert_eq!(*active, *local_cycles != 0);
+                    assert_eq!(plan_event_cycles(program).unwrap(), *local_cycles);
+                    assert!(*local_cycles <= phase.event_cycles);
                     assert!(!program.contains(&ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION));
                 }
             }
