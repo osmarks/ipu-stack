@@ -13,6 +13,7 @@ pub enum RepeatExchangeStrategy {
     #[default]
     PatchInPlace,
     SeparateRows,
+    ReverseRows,
     SingleIteration(u32),
 }
 
@@ -20,6 +21,7 @@ impl RepeatExchangeStrategy {
     fn iterations(self, count: u32) -> Result<Vec<u32>, TileLoweringError> {
         match self {
             Self::PatchInPlace | Self::SeparateRows => Ok((0..count).collect()),
+            Self::ReverseRows => Ok((0..count).rev().collect()),
             Self::SingleIteration(iteration) if iteration < count => Ok(vec![iteration]),
             Self::SingleIteration(_) => Err(TileLoweringError::InvalidRepeat),
         }
@@ -536,13 +538,15 @@ pub fn compact_exchange_table_bytes(
                         )
                         .ok_or(TileLoweringError::Overflow)
                 })?,
-                RepeatExchangeStrategy::SeparateRows => repeat_counts
-                    .get(&phase.id)
-                    .copied()
-                    .unwrap_or(1)
-                    .saturating_sub(1)
-                    .checked_mul(row_bytes)
-                    .ok_or(TileLoweringError::Overflow)?,
+                RepeatExchangeStrategy::SeparateRows | RepeatExchangeStrategy::ReverseRows => {
+                    repeat_counts
+                        .get(&phase.id)
+                        .copied()
+                        .unwrap_or(1)
+                        .saturating_sub(1)
+                        .checked_mul(row_bytes)
+                        .ok_or(TileLoweringError::Overflow)?
+                }
                 RepeatExchangeStrategy::SingleIteration(iteration) => {
                     if repeat_counts
                         .get(&phase.id)

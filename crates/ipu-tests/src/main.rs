@@ -38,6 +38,9 @@ struct Arguments {
     /// Materialize one immutable exchange row per structured-repeat iteration.
     #[arg(long)]
     separate_repeat_exchange_rows: bool,
+    /// Execute immutable structured-repeat rows in reverse iteration order.
+    #[arg(long, conflicts_with_all = ["separate_repeat_exchange_rows", "repeat_iteration"])]
+    reverse_repeat_iterations: bool,
     /// Execute only this structured-repeat iteration, using immutable rows.
     #[arg(long, conflicts_with = "separate_repeat_exchange_rows")]
     repeat_iteration: Option<u32>,
@@ -360,7 +363,9 @@ fn main() -> Result<()> {
                 },
                 repeat_exchanges: arguments.repeat_iteration.map_or_else(
                     || {
-                        if arguments.separate_repeat_exchange_rows {
+                        if arguments.reverse_repeat_iterations {
+                            RepeatExchangeStrategy::ReverseRows
+                        } else if arguments.separate_repeat_exchange_rows {
                             RepeatExchangeStrategy::SeparateRows
                         } else {
                             RepeatExchangeStrategy::PatchInPlace
