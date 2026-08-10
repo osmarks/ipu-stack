@@ -7,7 +7,7 @@ use crate::{
 use ipu_exchange::{
     MAX_TRANSFER_WORDS, MulticastPlan, PLAN_WORDS, PlanProgramBuilder, RETURN_M10_INSTRUCTION,
     SANS_INACTIVE_INSTRUCTION, SYNC_ANS_INSTRUCTION, Topology, finalize_point_receiver,
-    offset_plan, patch_receiver_address, patch_sender_address, plan_event_cycles,
+    patch_receiver_address, patch_sender_address, plan_event_cycles,
 };
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -20,6 +20,15 @@ pub struct PhysicalExchangePhase {
     pub event_cycles: u32,
     /// Static per-tile role intervals on the exchange event timeline.
     pub activities: Vec<Vec<ExchangeActivity>>,
+    /// Per-tile replacement words which specialize a reusable row for each
+    /// structured-repeat iteration.
+    pub repeat_patches: Vec<Vec<ExchangeRowPatch>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExchangeRowPatch {
+    pub word_offset: u32,
+    pub values: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,9 +95,20 @@ pub enum ExchangeLoweringError {
     SizeMismatch,
     #[error("exchange address arithmetic overflowed")]
     Overflow,
+    #[error("structured-repeat exchange rows have incompatible shapes")]
+    IncompatibleRepeatRows,
 }
 
 pub fn lower_exchanges(
+    program: &LowProgram,
+    placement: &Placement,
+    topology: &Topology,
+    options: ExchangeLoweringOptions,
+) -> Result<Vec<PhysicalExchangePhase>, ExchangeLoweringError> {
+    lower_static_exchanges(program, placement, topology, options)
+}
+
+fn lower_static_exchanges(
     program: &LowProgram,
     placement: &Placement,
     topology: &Topology,
@@ -242,6 +262,28 @@ pub fn lower_exchanges(
                     return Err(ExchangeLoweringError::SizeMismatch);
                 }
             }
+            let pending = coalesce_pending_transfers(pending);
+            let mut destination_multiplicity = BTreeMap::new();
+            for transfer in &pending {
+                for &(tile, address) in &transfer.destinations {
+                    *destination_multiplicity
+                        .entry((tile, address, transfer.words))
+                        .or_insert(0usize) += 1;
+                }
+            }
+            let maximum_identical_destinations = destination_multiplicity
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0);
+            if pending.len() > 1_000 || maximum_identical_destinations > 1 {
+                tracing::info!(
+                    phase = phase.id.index(),
+                    transfers = pending.len(),
+                    maximum_identical_destinations,
+                    "prepared large physical exchange phase"
+                );
+            }
             let conflict_slots = schedule_slots(&pending, program.tile_count);
             if let Some(diagnostics) = &mut diagnostics {
                 diagnostics.conflict_slots = conflict_slots.len();
@@ -317,11 +359,27 @@ pub fn lower_exchanges(
                     None => Ok(inactive_exchange_row()),
                 })
                 .collect::<Result<Vec<_>, ipu_exchange::ExchangeError>>()?;
+            if pending.len() > 1_000 {
+                let (tile, words) = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(tile, row)| (tile, row.len()))
+                    .max_by_key(|entry| entry.1)
+                    .unwrap_or((0, 0));
+                tracing::info!(
+                    phase = phase.id.index(),
+                    tile,
+                    row_words = words,
+                    horizon,
+                    "finished large physical exchange phase"
+                );
+            }
             Ok(PhysicalExchangePhase {
                 id: phase.id,
                 rows,
                 event_cycles: horizon,
                 activities,
+                repeat_patches: vec![Vec::new(); usize::from(program.tile_count)],
             })
         })
         .collect()
@@ -510,6 +568,42 @@ impl PendingTransfer {
     }
 }
 
+fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTransfer> {
+    let mut merged = Vec::<PendingTransfer>::with_capacity(transfers.len());
+    for transfer in transfers {
+        let Some(previous) = merged.last_mut() else {
+            merged.push(transfer);
+            continue;
+        };
+        let previous_bytes = previous.words * 4;
+        let combined_words = previous.words.checked_add(transfer.words);
+        let contiguous = previous.source == transfer.source
+            && previous.destinations.len() == transfer.destinations.len()
+            && previous
+                .source_address
+                .checked_add(previous_bytes)
+                .is_some_and(|end| end == transfer.source_address)
+            && previous
+                .destinations
+                .iter()
+                .zip(&transfer.destinations)
+                .all(
+                    |(&(left_tile, left_address), &(right_tile, right_address))| {
+                        left_tile == right_tile
+                            && left_address
+                                .checked_add(previous_bytes)
+                                .is_some_and(|end| end == right_address)
+                    },
+                );
+        if contiguous && combined_words.is_some_and(|words| words <= MAX_TRANSFER_WORDS) {
+            previous.words = combined_words.expect("checked above");
+        } else {
+            merged.push(transfer);
+        }
+    }
+    merged
+}
+
 /// Places multicast hyperedges into endpoint-disjoint scheduling layers.
 /// Independent ready transfers are pressure-prioritized, while overlapping
 /// tile-memory accesses impose program-order precedence between layers.
@@ -621,9 +715,15 @@ fn schedule_slots(transfers: &[PendingTransfer], tile_count: u16) -> Vec<Vec<usi
 #[derive(Clone, Copy)]
 struct TransferAccess {
     transfer: usize,
-    start: u32,
+    start: u64,
     end: u64,
     write: bool,
+}
+
+#[derive(Clone, Default)]
+struct AccessFrontier {
+    last_write: Option<usize>,
+    reads: Vec<usize>,
 }
 
 /// Preserves the original order of overlapping accesses while allowing the
@@ -634,14 +734,14 @@ fn memory_dependencies(transfers: &[PendingTransfer], tile_count: u16) -> BTreeS
         let bytes = u64::from(transfer.words) * 4;
         accesses[usize::from(transfer.source)].push(TransferAccess {
             transfer: index,
-            start: transfer.source_address,
+            start: u64::from(transfer.source_address),
             end: u64::from(transfer.source_address) + bytes,
             write: false,
         });
         for &(tile, address) in &transfer.destinations {
             accesses[usize::from(tile)].push(TransferAccess {
                 transfer: index,
-                start: address,
+                start: u64::from(address),
                 end: u64::from(address) + bytes,
                 write: true,
             });
@@ -650,21 +750,37 @@ fn memory_dependencies(transfers: &[PendingTransfer], tile_count: u16) -> BTreeS
 
     let mut dependencies = BTreeSet::new();
     for tile_accesses in &accesses {
-        for (position, left) in tile_accesses.iter().enumerate() {
-            for right in &tile_accesses[position + 1..] {
-                if left.transfer == right.transfer
-                    || (!left.write && !right.write)
-                    || u64::from(left.start) >= right.end
-                    || u64::from(right.start) >= left.end
+        let mut boundaries = tile_accesses
+            .iter()
+            .flat_map(|access| [access.start, access.end])
+            .collect::<Vec<_>>();
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let mut frontier = vec![AccessFrontier::default(); boundaries.len().saturating_sub(1)];
+        for access in tile_accesses {
+            let start = boundaries
+                .binary_search(&access.start)
+                .expect("access start is a boundary");
+            let end = boundaries
+                .binary_search(&access.end)
+                .expect("access end is a boundary");
+            for state in &mut frontier[start..end] {
+                if let Some(previous) = state.last_write
+                    && previous != access.transfer
                 {
-                    continue;
+                    dependencies.insert((previous, access.transfer));
                 }
-                let (before, after) = if left.transfer < right.transfer {
-                    (left.transfer, right.transfer)
-                } else {
-                    (right.transfer, left.transfer)
-                };
-                dependencies.insert((before, after));
+                if access.write {
+                    for &previous in &state.reads {
+                        if previous != access.transfer {
+                            dependencies.insert((previous, access.transfer));
+                        }
+                    }
+                    state.reads.clear();
+                    state.last_write = Some(access.transfer);
+                } else if state.reads.last() != Some(&access.transfer) {
+                    state.reads.push(access.transfer);
+                }
             }
         }
     }
@@ -706,12 +822,7 @@ fn append_transfer(
             )?],
         }
     } else {
-        let mut plan = topology.multicast(source, &tiles, words, 0)?;
-        offset_plan(&mut plan.sender, schedule_offset)?;
-        for receiver in &mut plan.receivers {
-            offset_plan(receiver, schedule_offset)?;
-        }
-        plan
+        topology.multicast(source, &tiles, words, 0)?
     };
     patch_sender_address(&mut plan.sender, source_address)?;
     for (row, (_, address)) in plan.receivers.iter_mut().zip(destinations) {
@@ -720,18 +831,24 @@ fn append_transfer(
     builders
         .entry(source)
         .or_default()
-        .append_scheduled_row(&plan.sender)?;
+        .append_scheduled_row_at(&plan.sender, schedule_offset)?;
     for (&tile, row) in tiles.iter().zip(&plan.receivers) {
         builders
             .entry(tile)
             .or_default()
-            .append_scheduled_row(row)?;
+            .append_scheduled_row_at(row, schedule_offset)?;
     }
-    let sender_end = plan_event_cycles(&plan.sender)?;
+    let sender_end = plan_event_cycles(&plan.sender)?
+        .checked_add(schedule_offset)
+        .ok_or(ExchangeLoweringError::Overflow)?;
     let receiver_ends = plan
         .receivers
         .iter()
-        .map(|row| plan_event_cycles(row))
+        .map(|row| {
+            plan_event_cycles(row)?.checked_add(schedule_offset).ok_or(
+                ipu_exchange::ExchangeError::Schedule("exchange row offset overflow"),
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let transfer_end = receiver_ends
         .iter()

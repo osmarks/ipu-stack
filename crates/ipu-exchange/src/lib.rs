@@ -227,6 +227,16 @@ impl PlanProgramBuilder {
     }
 
     pub fn append_scheduled_row(&mut self, row: &PlanRow) -> Result<(), ExchangeError> {
+        self.append_scheduled_row_at(row, 0)
+    }
+
+    /// Appends a primitive row at an arbitrary absolute phase offset without
+    /// requiring that offset to fit in the primitive row's spare words.
+    pub fn append_scheduled_row_at(
+        &mut self,
+        row: &PlanRow,
+        schedule_offset: u32,
+    ) -> Result<(), ExchangeError> {
         if row[0] != SYNC_SUPERVISOR_INSTRUCTION {
             return Err(ExchangeError::Schedule("exchange row entry"));
         }
@@ -234,10 +244,20 @@ impl PlanProgramBuilder {
             .iter()
             .position(|instruction| *instruction == RETURN_M10_INSTRUCTION)
             .ok_or(ExchangeError::Schedule("exchange row return"))?;
-        let mut body = row[1..end].to_vec();
+        let row_event_cycles = plan_event_cycles(row)?
+            .checked_add(schedule_offset)
+            .ok_or(ExchangeError::Schedule("exchange row offset overflow"))?;
+        let mut body = Vec::new();
+        let mut remaining_offset = schedule_offset;
+        while remaining_offset != 0 {
+            let chunk = remaining_offset.min(MAX_PLAN_OFFSET_CYCLES);
+            body.push(delay(chunk - 1));
+            remaining_offset -= chunk;
+        }
+        body.extend_from_slice(&row[1..end]);
         if self.event_cycles == 0 {
             self.words.extend(body);
-            self.event_cycles = plan_event_cycles(&self.words)?;
+            self.event_cycles = row_event_cycles;
             return Ok(());
         }
         let mut remaining = self.event_cycles;
@@ -265,7 +285,7 @@ impl PlanProgramBuilder {
             body.remove(index);
         }
         self.words.extend(body);
-        self.event_cycles = plan_event_cycles(&self.words)?;
+        self.event_cycles = row_event_cycles;
         Ok(())
     }
 
@@ -1359,8 +1379,21 @@ mod tests {
         ];
         for (sender, receiver, count, expected_sender, expected_receiver) in cases {
             let plan = topology.point_to_point(sender, receiver, count).unwrap();
-            assert_eq!(plan.sender, expected_sender);
-            assert_eq!(plan.receiver, expected_receiver);
+            assert_eq!(&plan.sender[..expected_sender.len()], &expected_sender);
+            assert_eq!(
+                &plan.receiver[..expected_receiver.len()],
+                &expected_receiver
+            );
+            assert!(
+                plan.sender[expected_sender.len()..]
+                    .iter()
+                    .all(|word| *word == 0)
+            );
+            assert!(
+                plan.receiver[expected_receiver.len()..]
+                    .iter()
+                    .all(|word| *word == 0)
+            );
         }
     }
 
