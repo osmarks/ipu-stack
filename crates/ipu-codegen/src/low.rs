@@ -2935,10 +2935,11 @@ mod tests {
     }
 
     #[test]
-    fn randomized_streamed_weight_grids_share_one_phase_per_inner_block() {
+    fn randomized_partially_sharded_weight_grids_share_one_phase_per_inner_block() {
         let mut random = fastrand::Rng::with_seed(0x7374_726d_6765_6d6d);
         for case in 0..32 {
             let row_partitions = 1_u16 << random.u32(1..=2);
+            let inner_partitions = 1_u16 << random.u32(1..=row_partitions.ilog2());
             let column_partitions = 1_u16 << random.u32(0..=2);
             let tiles = row_partitions * column_partitions;
             let rows = u32::from(row_partitions) * random.u32(1..=4);
@@ -2961,11 +2962,12 @@ mod tests {
             };
             let right_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_right_k64_streamed_grid(
+                layout: Layout::amp_right_k64_grid(
                     64,
                     tiles,
                     row_partitions,
                     column_partitions,
+                    inner_partitions,
                     crate::MemoryClass::Ipu21Standard,
                 ),
             };
@@ -2991,6 +2993,15 @@ mod tests {
             )];
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
+
+            let expected_weight_bytes = inner
+                .div_ceil(u32::from(inner_partitions))
+                .saturating_mul(columns.div_ceil(u32::from(column_partitions)))
+                .saturating_mul(2);
+            assert!(low.inputs[1].shards.iter().all(|shard| {
+                crate::shard_storage_bytes(&low.shards[shard.index() as usize])
+                    == Ok(expected_weight_bytes)
+            }));
 
             assert_eq!(
                 low.exchange_phases.len(),

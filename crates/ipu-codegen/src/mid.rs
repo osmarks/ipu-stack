@@ -521,58 +521,30 @@ impl Layout {
         }
     }
 
-    /// AMP right operand distributed across both K and output columns, with
-    /// each complete 64-by-output-block kernel panel contiguous in the selected memory
-    /// class. A blocked GEMM can consume the owner copy directly and stream
-    /// the same bytes into a destination panel on the other row groups.
-    pub fn amp_right_k64_streamed_grid(
-        output_column_block: u32,
-        tile_count: u16,
-        row_partitions: u16,
-        column_partitions: u16,
-        memory_class: MemoryClass,
-    ) -> Self {
-        Self {
-            order: ElementOrder::Amp(AmpOrder::RightK64),
-            tiling: TensorTiling {
-                tile_count,
-                replicas: 1,
-                axes: vec![
-                    AxisTiling::new(
-                        TensorAxis::FromEnd(1),
-                        column_partitions,
-                        output_column_block,
-                        Padding::Zero,
-                    ),
-                    AxisTiling::new(
-                        TensorAxis::FromEnd(2),
-                        row_partitions,
-                        AMP_INNER_BLOCK,
-                        Padding::Zero,
-                    ),
-                ],
-            },
-            memory_class,
-        }
-    }
-
-    /// Resident AMP right operand with complete 64-by-output-block kernel panels contiguous
-    /// in the selected memory class. Each column shard is replicated across
-    /// output-row groups so every consumer owns the full K range locally.
+    /// AMP right operand with complete 64-by-output-block kernel panels
+    /// contiguous in the selected memory class. The K dimension is divided
+    /// among `inner_partitions`; each shard is replicated across the remaining
+    /// output-row groups. One inner partition is fully resident, while larger
+    /// counts trade replication for panel exchange.
     pub fn amp_right_k64_grid(
         output_column_block: u32,
         tile_count: u16,
         row_partitions: u16,
         column_partitions: u16,
+        inner_partitions: u16,
         memory_class: MemoryClass,
     ) -> Self {
+        let replicas = if inner_partitions != 0 && row_partitions.is_multiple_of(inner_partitions) {
+            row_partitions / inner_partitions
+        } else {
+            0
+        };
         Self {
             order: ElementOrder::Amp(AmpOrder::RightK64),
             tiling: TensorTiling {
                 tile_count,
-                replicas: row_partitions,
+                replicas,
                 axes: vec![
-                    AxisTiling::new(TensorAxis::FromEnd(2), 1, AMP_INNER_BLOCK, Padding::Zero),
                     AxisTiling::new(
                         TensorAxis::FromEnd(1),
                         column_partitions,
@@ -580,6 +552,12 @@ impl Layout {
                         Padding::Zero,
                     )
                     .with_tile_stride(1),
+                    AxisTiling::new(
+                        TensorAxis::FromEnd(2),
+                        inner_partitions,
+                        AMP_INNER_BLOCK,
+                        Padding::Zero,
+                    ),
                 ],
             },
             memory_class,
@@ -1321,21 +1299,61 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
                 column_partitions: columns,
             };
             let mut grid = Vec::new();
-            for (precision, left_tail, weights) in [
-                (Precision::F16, 16, AmpWeightPlacement::RESIDENT_STANDARD),
-                (Precision::F16, 16, AmpWeightPlacement::RESIDENT_INTERLEAVED),
-                (Precision::F32, 32, AmpWeightPlacement::RESIDENT_STANDARD),
-                (Precision::F16, 16, AmpWeightPlacement::SHARDED_STANDARD),
-                (Precision::F16, 16, AmpWeightPlacement::SHARDED_INTERLEAVED),
-                (Precision::F32, 32, AmpWeightPlacement::SHARDED_STANDARD),
-            ] {
+            let mut placements = vec![
+                (
+                    Precision::F16,
+                    16,
+                    AmpWeightPlacement::resident(MemoryClass::Ipu21Standard),
+                ),
+                (
+                    Precision::F16,
+                    16,
+                    AmpWeightPlacement::resident(MemoryClass::Ipu21Interleaved),
+                ),
+                (
+                    Precision::F32,
+                    32,
+                    AmpWeightPlacement::resident(MemoryClass::Ipu21Standard),
+                ),
+            ];
+            if rows > 1 {
+                placements.extend([
+                    (
+                        Precision::F16,
+                        16,
+                        AmpWeightPlacement::sharded(rows, MemoryClass::Ipu21Standard),
+                    ),
+                    (
+                        Precision::F16,
+                        16,
+                        AmpWeightPlacement::sharded(rows, MemoryClass::Ipu21Interleaved),
+                    ),
+                    (
+                        Precision::F32,
+                        32,
+                        AmpWeightPlacement::sharded(rows, MemoryClass::Ipu21Standard),
+                    ),
+                ]);
+            }
+            // Two-way F16 interleaving lets each peer retain half of a full
+            // kernel-width column shard. Keep the automatic search bounded;
+            // explicit layouts may use any divisor of the row grid.
+            if rows > 2 && rows.is_multiple_of(2) {
+                placements.push((
+                    Precision::F16,
+                    16,
+                    AmpWeightPlacement::sharded(2, MemoryClass::Ipu21Interleaved),
+                ));
+            }
+            for (precision, left_tail, weights) in placements {
                 for &output_columns in amp_output_column_blocks(precision) {
                     // A narrow resident interleaved shard can avoid streaming
                     // when a 64-column shard would exceed region capacity.
                     // Narrow streamed panels increase multicast-role pressure
                     // and are not offered until ownership is part of the cost.
                     if output_columns < AMP_OUTPUT_COLUMN_BLOCK
-                        && weights != AmpWeightPlacement::RESIDENT_INTERLEAVED
+                        && !(weights.inner_partitions == 1
+                            && weights.memory_class == MemoryClass::Ipu21Interleaved)
                     {
                         continue;
                     }
@@ -1499,31 +1517,22 @@ fn amp_grid_gemm_operator_candidate(
     grid: AmpGridShape,
     weights: AmpWeightPlacement,
 ) -> OperatorCandidate {
-    let right_layout = match (weights.distribution, weights.memory_class) {
-        (AmpWeightDistribution::Resident, MemoryClass::Ipu21Standard) => Layout::amp_right_grid(
+    let right_layout = match (weights.inner_partitions, weights.memory_class) {
+        (1, MemoryClass::Ipu21Standard) => Layout::amp_right_grid(
             inner,
             output_columns,
             grid.tile_count,
             grid.row_partitions,
             grid.column_partitions,
         ),
-        (AmpWeightDistribution::KSharded, memory_class) => Layout::amp_right_k64_streamed_grid(
+        (inner_partitions, memory_class) => Layout::amp_right_k64_grid(
             output_columns,
             grid.tile_count,
             grid.row_partitions,
             grid.column_partitions,
+            inner_partitions,
             memory_class,
         ),
-        (AmpWeightDistribution::Resident, MemoryClass::Ipu21Interleaved) => {
-            debug_assert_eq!((precision, inner), (Precision::F16, 64));
-            Layout::amp_right_k64_grid(
-                output_columns,
-                grid.tile_count,
-                grid.row_partitions,
-                grid.column_partitions,
-                MemoryClass::Ipu21Interleaved,
-            )
-        }
     };
     let operator = MidOperator::Gemm {
         options: GemmOptions::default(),
@@ -1612,34 +1621,19 @@ struct AmpGridShape {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AmpWeightDistribution {
-    Resident,
-    KSharded,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
 struct AmpWeightPlacement {
-    distribution: AmpWeightDistribution,
+    inner_partitions: u16,
     memory_class: MemoryClass,
 }
 
 impl AmpWeightPlacement {
-    const RESIDENT_STANDARD: Self =
-        Self::new(AmpWeightDistribution::Resident, MemoryClass::Ipu21Standard);
-    const RESIDENT_INTERLEAVED: Self = Self::new(
-        AmpWeightDistribution::Resident,
-        MemoryClass::Ipu21Interleaved,
-    );
-    const SHARDED_STANDARD: Self =
-        Self::new(AmpWeightDistribution::KSharded, MemoryClass::Ipu21Standard);
-    const SHARDED_INTERLEAVED: Self = Self::new(
-        AmpWeightDistribution::KSharded,
-        MemoryClass::Ipu21Interleaved,
-    );
+    const fn resident(memory_class: MemoryClass) -> Self {
+        Self::sharded(1, memory_class)
+    }
 
-    const fn new(distribution: AmpWeightDistribution, memory_class: MemoryClass) -> Self {
+    const fn sharded(inner_partitions: u16, memory_class: MemoryClass) -> Self {
         Self {
-            distribution,
+            inner_partitions,
             memory_class,
         }
     }

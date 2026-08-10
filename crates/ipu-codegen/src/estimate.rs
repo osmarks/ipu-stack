@@ -554,33 +554,43 @@ pub(crate) fn gemm_remote_bytes_per_tile(inputs: &[TensorType], output: &TensorT
     let Some(right_inner) = tile_axis_plan(right, right_inner_axis) else {
         return u64::MAX;
     };
+    let outer_rows = output.shape.0[..output_row_axis]
+        .iter()
+        .fold(1u64, |elements, &extent| {
+            elements.saturating_mul(u64::from(extent))
+        });
     (0..tiles).fold(0u64, |maximum, tile| {
         let output_rows = output_rows.range(tile);
         let output_columns = output_columns.range(tile);
         let left_rows = left_rows.range(tile);
         let right_columns = right_columns.range(tile);
         let right_inner = right_inner.range(tile);
-        let left_remote = if left_rows.start > output_rows.start || left_rows.end < output_rows.end
-        {
-            u64::from(output_rows.end - output_rows.start)
-                .saturating_mul(u64::from(k))
-                .saturating_mul(left.format.precision.bytes())
-        } else {
-            0
-        };
-        let right_remote = if right_columns.start > output_columns.start
-            || right_columns.end < output_columns.end
-            || right_inner.start != 0
-            || right_inner.end < k
-        {
-            u64::from(output_columns.end - output_columns.start)
-                .saturating_mul(u64::from(k))
-                .saturating_mul(right.format.precision.bytes())
-        } else {
-            0
-        };
+        let required_left_elements = outer_rows
+            .saturating_mul(u64::from(output_rows.end - output_rows.start))
+            .saturating_mul(u64::from(k));
+        let local_left_rows = overlap_length(&output_rows, &left_rows);
+        let local_left_elements = outer_rows
+            .saturating_mul(u64::from(local_left_rows))
+            .saturating_mul(u64::from(k));
+        let left_remote = required_left_elements
+            .saturating_sub(local_left_elements)
+            .saturating_mul(left.format.precision.bytes());
+
+        let required_right_elements =
+            u64::from(output_columns.end - output_columns.start).saturating_mul(u64::from(k));
+        let local_right_elements = u64::from(overlap_length(&output_columns, &right_columns))
+            .saturating_mul(u64::from(overlap_length(&(0..k), &right_inner)));
+        let right_remote = required_right_elements
+            .saturating_sub(local_right_elements)
+            .saturating_mul(right.format.precision.bytes());
         maximum.max(left_remote.saturating_add(right_remote))
     })
+}
+
+fn overlap_length(left: &std::ops::Range<u32>, right: &std::ops::Range<u32>) -> u32 {
+    left.end
+        .min(right.end)
+        .saturating_sub(left.start.max(right.start))
 }
 
 #[derive(Clone, Copy)]

@@ -604,7 +604,7 @@ mod tests {
                 (Layout::amp_left(64, 1), rows, 64),
                 (Layout::amp_right(64, 1), 32, 64),
                 (
-                    Layout::amp_right_k64_grid(64, 1, 1, 1, MemoryClass::Ipu21Interleaved),
+                    Layout::amp_right_k64_grid(64, 1, 1, 1, 1, MemoryClass::Ipu21Interleaved),
                     64,
                     64,
                 ),
@@ -681,6 +681,7 @@ mod tests {
             let shard = shard(
                 Layout::amp_right_k64_grid(
                     output_column_block,
+                    1,
                     1,
                     1,
                     1,
