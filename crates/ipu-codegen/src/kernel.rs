@@ -15,6 +15,7 @@ pub const RETURN_REGISTER: u8 = 10;
 pub enum KernelSymbols {
     Exact(&'static str),
     RowSpecialized { small: String, large: String },
+    AttentionSpecialized,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +53,17 @@ pub struct KernelBuildPlan {
     pub compilations: Vec<KernelCompilation>,
     gemm_rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32), Vec<u32>>,
     gemm_symbols: BTreeMap<(Precision, GemmWeightLoad, u32, u32, GemmKernelMode, u32), String>,
+    attention_symbols: BTreeMap<AttentionKernelShape, String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AttentionKernelShape {
+    matrices: u32,
+    query_rows: u32,
+    key_rows: u32,
+    query_dimension: u32,
+    value_dimension: u32,
+    scale_bits: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,8 +136,16 @@ impl KernelBuildPlan {
         let mut rows = BTreeMap::<(Precision, GemmWeightLoad, u32, u32), BTreeSet<u32>>::new();
         let mut gelu = false;
         let mut reduction_add = false;
+        let mut attention = BTreeSet::new();
         for tile in &program.tiles {
-            collect_kernels(program, tile, &mut rows, &mut gelu, &mut reduction_add)?;
+            collect_kernels(
+                program,
+                tile,
+                &mut rows,
+                &mut gelu,
+                &mut reduction_add,
+                &mut attention,
+            )?;
         }
         let mut plan = Self::default();
         for ((precision, weights, inner_block, output_columns), values) in rows {
@@ -229,6 +249,54 @@ impl KernelBuildPlan {
                 retained_symbols: vec!["ipu_stack_reduce_add_f16".into()],
             });
         }
+        if !attention.is_empty() {
+            plan.compilations.push(KernelCompilation {
+                source: "worker_support.S",
+                name: "worker_support".into(),
+                flags: Vec::new(),
+                retained_symbols: Vec::new(),
+            });
+        }
+        for shape in attention {
+            let suffix = format!(
+                "m{}_q{}_k{}_d{}_v{}_{:08x}",
+                shape.matrices,
+                shape.query_rows,
+                shape.key_rows,
+                shape.query_dimension,
+                shape.value_dimension,
+                shape.scale_bits,
+            );
+            let call_symbol = format!("ipu_stack_flash_attention_online_f16_{suffix}");
+            let vertex = format!("FlashAttentionOnlineF16_{suffix}");
+            let codelet = format!("__runCodelet_{vertex}");
+            let common_flags = vec![
+                format!("-DATTENTION_MATRICES={}", shape.matrices),
+                format!("-DATTENTION_QUERY_ROWS={}", shape.query_rows),
+                format!("-DATTENTION_KEY_ROWS={}", shape.key_rows),
+                format!("-DATTENTION_QUERY_DIMENSION={}", shape.query_dimension),
+                format!("-DATTENTION_VALUE_DIMENSION={}", shape.value_dimension),
+                format!("-DATTENTION_SCALE={}", f32::from_bits(shape.scale_bits)),
+            ];
+            let mut codelet_flags = common_flags;
+            codelet_flags.push(format!("-DATTENTION_VERTEX_NAME={vertex}"));
+            plan.compilations.push(KernelCompilation {
+                source: "flash_attention_online_f16.cpp",
+                name: format!("flash_attention_codelet_{suffix}"),
+                flags: codelet_flags,
+                retained_symbols: Vec::new(),
+            });
+            plan.compilations.push(KernelCompilation {
+                source: "flash_attention_online_f16.S",
+                name: format!("flash_attention_wrapper_{suffix}"),
+                flags: vec![
+                    format!("-DATTENTION_CALL_SYMBOL={call_symbol}"),
+                    format!("-DATTENTION_CODELET_SYMBOL={codelet}"),
+                ],
+                retained_symbols: vec![call_symbol.clone()],
+            });
+            plan.attention_symbols.insert(shape, call_symbol);
+        }
         Ok(plan)
     }
 
@@ -271,6 +339,11 @@ impl KernelBuildPlan {
                     .cloned()
                     .ok_or(KernelAbiError::UnplannedGemmRows(rows))?
             }
+            (KernelSymbols::AttentionSpecialized, TileKernelSpec::FlashAttention { .. }) => self
+                .attention_symbols
+                .get(&attention_shape(run)?)
+                .cloned()
+                .ok_or(KernelAbiError::RequirementMismatch)?,
             _ => return Err(KernelAbiError::RequirementMismatch),
         };
         Ok(PlannedKernelCall {
@@ -366,6 +439,7 @@ fn collect_kernels(
     rows: &mut BTreeMap<(Precision, GemmWeightLoad, u32, u32), BTreeSet<u32>>,
     gelu: &mut bool,
     reduction_add: &mut bool,
+    attention: &mut BTreeSet<AttentionKernelShape>,
 ) -> Result<(), KernelAbiError> {
     for work in program.work(tile) {
         match work {
@@ -390,15 +464,74 @@ fn collect_kernels(
                     *gelu = true;
                 } else if matches!(kernel, TileKernelSpec::ReductionAdd) {
                     *reduction_add = true;
+                } else if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
+                    attention.insert(attention_shape(run)?);
                 }
             }
             TileWorkRef::Repeat(repeat) => {
-                collect_kernels(program, &repeat.body, rows, gelu, reduction_add)?
+                collect_kernels(program, &repeat.body, rows, gelu, reduction_add, attention)?
             }
             TileWorkRef::Exchange(_) | TileWorkRef::LocalCopy(_) => {}
         }
     }
     Ok(())
+}
+
+fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, KernelAbiError> {
+    let TileKernel::Planned(TileKernelSpec::FlashAttention {
+        options,
+        accumulate,
+    }) = &run.kernel
+    else {
+        return Err(KernelAbiError::RequirementMismatch);
+    };
+    if options.causal || *accumulate != crate::AccumulationPrecision::F32 {
+        return Err(KernelAbiError::RequirementMismatch);
+    }
+    let [query, key, value] = run.inputs.as_slice() else {
+        return Err(KernelAbiError::RequirementMismatch);
+    };
+    let extents = |operand: &crate::KernelOperand| {
+        let [view] = operand.views.as_slice() else {
+            return None;
+        };
+        Some(
+            view.extents
+                .iter()
+                .map(|extent| extent.physical_end - extent.start)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let query = extents(query).ok_or(KernelAbiError::RequirementMismatch)?;
+    let key = extents(key).ok_or(KernelAbiError::RequirementMismatch)?;
+    let value = extents(value).ok_or(KernelAbiError::RequirementMismatch)?;
+    if query.len() < 2 || query.len() != key.len() || query.len() != value.len() {
+        return Err(KernelAbiError::RequirementMismatch);
+    }
+    let rank = query.len();
+    if query[..rank - 2] != key[..rank - 2]
+        || query[..rank - 2] != value[..rank - 2]
+        || query[rank - 1] != key[rank - 1]
+        || key[rank - 2] != value[rank - 2]
+    {
+        return Err(KernelAbiError::RequirementMismatch);
+    }
+    let matrices = query[..rank - 2]
+        .iter()
+        .try_fold(1u32, |product, &extent| product.checked_mul(extent))
+        .ok_or(KernelAbiError::ElementCountOverflow)?;
+    let scale = options
+        .scale
+        .as_value()
+        .unwrap_or_else(|| 1.0 / (query[rank - 1] as f32).sqrt());
+    Ok(AttentionKernelShape {
+        matrices,
+        query_rows: query[rank - 2],
+        key_rows: key[rank - 2],
+        query_dimension: query[rank - 1],
+        value_dimension: value[rank - 1],
+        scale_bits: scale.to_bits(),
+    })
 }
 
 fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
@@ -507,14 +640,17 @@ pub fn tile_kernel_abi(
             ),
         ),
         TileKernelSpec::FlashAttention { .. } => (
-            exact_symbol(
-                precision,
-                "ipu_stack_flash_attention_f16",
-                "ipu_stack_flash_attention_f32",
-            ),
-            KernelAvailability::Required,
+            KernelSymbols::AttentionSpecialized,
+            if matches!(requirements, KernelRequirements::Operator(requirements)
+                if requirements.output.format.precision == Precision::F32
+                    && requirements.inputs.iter().all(|input| input.format.precision == Precision::F16))
+            {
+                KernelAvailability::Implemented
+            } else {
+                KernelAvailability::Required
+            },
             3,
-            scalar_arguments(3, &["descriptor_address"]),
+            Vec::new(),
         ),
         TileKernelSpec::Cast { from, to } => (
             KernelSymbols::Exact(cast_symbol(*from, *to)),

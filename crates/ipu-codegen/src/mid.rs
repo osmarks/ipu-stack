@@ -1508,14 +1508,6 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
                 accumulate: AccumulationPrecision::F32,
             },
             [heads_f16.clone(), heads_f16.clone(), heads_f16.clone()],
-            heads_f16,
-        ),
-        pointwise_operator_candidate(
-            MidOperator::FlashAttention {
-                options: AttentionOptions::default(),
-                accumulate: AccumulationPrecision::F32,
-            },
-            [heads_f32.clone(), heads_f32.clone(), heads_f32.clone()],
             heads_f32,
         ),
     ]);

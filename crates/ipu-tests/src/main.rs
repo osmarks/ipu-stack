@@ -100,6 +100,8 @@ enum Workload {
     BatchedGemmSmoke,
     /// Numerically verify GEMM-GeLU-GEMM-GeLU with Gaussian data.
     MlpSmoke,
+    /// Numerically verify exact non-causal FP16 FlashAttention.
+    AttentionSmoke,
     /// Profile one compute-dense F16 GEMM.
     GemmBenchmark,
     /// Profile the canonical batched SigLIP Dense-GeLU-Dense workload.
@@ -272,6 +274,43 @@ fn main() -> Result<()> {
             .with_input(left, left_format)
             .with_input(right0, right_format.clone())
             .with_input(right1, right_format);
+    } else if matches!(arguments.workload, Workload::AttentionSmoke) {
+        const HEADS: u32 = 4;
+        const QUERY_ROWS: u32 = 17;
+        const KEY_ROWS: u32 = 19;
+        const QUERY_DIMENSION: u32 = 16;
+        const VALUE_DIMENSION: u32 = 12;
+        if active_tiles < HEADS as u16 {
+            bail!("attention-smoke requires at least {HEADS} tiles");
+        }
+        let query = graph.host_input("query", [HEADS, QUERY_ROWS, QUERY_DIMENSION])?;
+        let key = graph.host_input("key", [HEADS, KEY_ROWS, QUERY_DIMENSION])?;
+        let value = graph.host_input("value", [HEADS, KEY_ROWS, VALUE_DIMENSION])?;
+        let output = graph.flash_attention(query, key, value)?;
+        graph.set_outputs([output])?;
+        let layout = Layout::head_sharded(HEADS as u16);
+        pipeline = pipeline
+            .with_input(
+                query,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: layout.clone(),
+                },
+            )
+            .with_input(
+                key,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: layout.clone(),
+                },
+            )
+            .with_input(
+                value,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout,
+                },
+            );
     } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
         validate_mlp_benchmark_shape(
             arguments.mlp_batch,
@@ -401,6 +440,8 @@ fn main() -> Result<()> {
                     active_tiles,
                     arguments.timeout_seconds,
                 )?;
+            } else if matches!(arguments.workload, Workload::AttentionSmoke) {
+                run_attention_smoke(&runtime, &application, arguments.timeout_seconds)?;
             } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
                 run_siglip_mlp_benchmark(
                     &runtime,
@@ -597,6 +638,123 @@ fn run_mlp_chain(
     verify_mlp_output(application, active_tiles, &output)
 }
 
+fn run_attention_smoke(
+    runtime: &Runtime,
+    application: &Application,
+    timeout_seconds: u64,
+) -> Result<()> {
+    const HEADS: u32 = 4;
+    const QUERY_ROWS: u32 = 17;
+    const KEY_ROWS: u32 = 19;
+    const QUERY_DIMENSION: u32 = 16;
+    const VALUE_DIMENSION: u32 = 12;
+    const QUERY_SEED: u64 = 0x6174_746e_5f71;
+    const KEY_SEED: u64 = 0x6174_746e_5f6b;
+    const VALUE_SEED: u64 = 0x6174_746e_5f76;
+    const STANDARD_DEVIATION: f32 = 0.25;
+
+    let binding = |name: &str, bindings: &[Binding]| {
+        bindings
+            .iter()
+            .find(|binding| binding.name == name)
+            .cloned()
+            .with_context(|| format!("attention package has no {name} binding"))
+    };
+    let query_binding = binding("query", &application.inputs)?;
+    let key_binding = binding("key", &application.inputs)?;
+    let value_binding = binding("value", &application.inputs)?;
+    let query_bytes = packed_binding(&query_binding, |head, linear, _| {
+        Ok(mlp_smoke_value(
+            QUERY_SEED,
+            u64::from(head) * u64::from(QUERY_ROWS * QUERY_DIMENSION) + u64::from(linear),
+            STANDARD_DEVIATION,
+        ))
+    })?;
+    let key_bytes = packed_binding(&key_binding, |head, linear, _| {
+        Ok(mlp_smoke_value(
+            KEY_SEED,
+            u64::from(head) * u64::from(KEY_ROWS * QUERY_DIMENSION) + u64::from(linear),
+            STANDARD_DEVIATION,
+        ))
+    })?;
+    let value_bytes = packed_binding(&value_binding, |head, linear, _| {
+        Ok(mlp_smoke_value(
+            VALUE_SEED,
+            u64::from(head) * u64::from(KEY_ROWS * VALUE_DIMENSION) + u64::from(linear),
+            STANDARD_DEVIATION,
+        ))
+    })?;
+    let mut inputs = Vec::with_capacity(query_bytes.len() + key_bytes.len() + value_bytes.len());
+    inputs.extend_from_slice(&query_bytes);
+    inputs.extend_from_slice(&key_bytes);
+    inputs.extend_from_slice(&value_bytes);
+    let actual = run_initialized_program(runtime, application, &[], &inputs, timeout_seconds)?;
+    let output = binding("output.0", &application.outputs)?;
+    if output.slices.len() < HEADS as usize {
+        bail!("attention output has fewer than {HEADS} head shards");
+    }
+
+    let sample = |seed, index, width| half_to_f32(mlp_smoke_value(seed, index, width));
+    let scale = 1.0 / (QUERY_DIMENSION as f32).sqrt();
+    let mut maximum_error = 0.0f32;
+    let mut squared_error = 0.0f64;
+    let mut checks = 0usize;
+    for head in 0..HEADS {
+        let slice = &output.slices[head as usize];
+        for query_row in 0..QUERY_ROWS {
+            let mut scores = vec![0.0f32; KEY_ROWS as usize];
+            for key_row in 0..KEY_ROWS {
+                let mut dot = 0.0f32;
+                for column in 0..QUERY_DIMENSION {
+                    let query_index = u64::from(
+                        head * QUERY_ROWS * QUERY_DIMENSION + query_row * QUERY_DIMENSION + column,
+                    );
+                    let key_index = u64::from(
+                        head * KEY_ROWS * QUERY_DIMENSION + key_row * QUERY_DIMENSION + column,
+                    );
+                    dot += sample(QUERY_SEED, query_index, STANDARD_DEVIATION)
+                        * sample(KEY_SEED, key_index, STANDARD_DEVIATION);
+                }
+                scores[key_row as usize] = dot * scale;
+            }
+            let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let denominator: f32 = scores.iter().map(|score| (*score - maximum).exp()).sum();
+            for column in 0..VALUE_DIMENSION {
+                let expected = scores
+                    .iter()
+                    .enumerate()
+                    .map(|(key_row, score)| {
+                        let value_index = u64::from(
+                            head * KEY_ROWS * VALUE_DIMENSION
+                                + key_row as u32 * VALUE_DIMENSION
+                                + column,
+                        );
+                        ((*score - maximum).exp() / denominator)
+                            * sample(VALUE_SEED, value_index, STANDARD_DEVIATION)
+                    })
+                    .sum::<f32>();
+                let linear = u64::from(query_row * VALUE_DIMENSION + column);
+                let offset = usize::try_from(slice.file_offset + linear * 4)?;
+                let observed = f32::from_le_bytes(actual[offset..offset + 4].try_into().unwrap());
+                let error = (observed - expected).abs();
+                maximum_error = maximum_error.max(error);
+                squared_error += f64::from(error) * f64::from(error);
+                checks += 1;
+            }
+        }
+    }
+    let rms_error = (squared_error / checks as f64).sqrt();
+    if maximum_error > 0.012 || rms_error > 0.003 {
+        bail!(
+            "FlashAttention numerical verification failed: checks={checks} maxError={maximum_error:.6} rmsError={rms_error:.6}"
+        );
+    }
+    println!(
+        "attentionNumericalChecks={checks} maxError={maximum_error:.6} rmsError={rms_error:.6} numericalTest=PASS"
+    );
+    Ok(())
+}
+
 fn run_initialized_program(
     runtime: &Runtime,
     application: &Application,
@@ -611,8 +769,10 @@ fn run_initialized_program(
             device_failure_diagnostics(runtime, application)
         );
     })?;
-    let initialized = session.invoke_streaming_deferred("initialize", weights)?;
-    session.collect(&initialized)?;
+    if !application.weights.is_empty() {
+        let initialized = session.invoke_streaming_deferred("initialize", weights)?;
+        session.collect(&initialized)?;
+    }
     let executed = session
         .invoke_streaming_deferred("run", input)
         .inspect_err(|_| {
