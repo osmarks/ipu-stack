@@ -334,6 +334,9 @@ fn emit_steps(
     for step in steps {
         match step {
             TileStep::Exchange(exchange) => {
+                if let Some(address) = exchange.profile.before {
+                    emit_cycle_sample(code, symbols, address)?;
+                }
                 if let Some(patch) = &exchange.setup_patch {
                     emit_exchange_setup_patch(code, exchange, patch, symbols)?;
                 }
@@ -354,9 +357,6 @@ fn emit_steps(
                     )?;
                     code.setzi(8, INTERNAL_EXCHANGE_DCOUNT)?;
                     code.put_special(INCOMING_DCOUNT, 8)?;
-                }
-                if let Some(address) = exchange.profile.before {
-                    emit_cycle_sample(code, symbols, address)?;
                 }
                 if exchange.active {
                     code.instruction(SYNC_SUPERVISOR_INSTRUCTION);
