@@ -74,7 +74,6 @@ pub enum TileKernelSpec {
         output_columns: u32,
     },
     Gelu,
-    ReductionAdd,
     Add,
     FlashAttention {
         options: AttentionOptions,
@@ -115,18 +114,7 @@ pub enum OperatorDispatch {
         accumulate: TileKernelSpec,
         inner_block: u32,
         output_column_block: u32,
-        distribution: GemmDistribution,
     },
-}
-
-/// Which operand remains resident while a blocked whole-device GEMM is run.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum GemmDistribution {
-    #[default]
-    OutputStationary,
-    /// Compute K-partial outputs beside sharded activations, then reduce them
-    /// onto the canonical output owners.
-    ActivationStationaryReduction { inner_partitions: u16 },
 }
 
 /// How a pointwise kernel's input shards are selected for each output shard.
@@ -504,34 +492,6 @@ impl Layout {
                 axes: vec![
                     AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
                     AxisTiling::new(TensorAxis::FromEnd(1), 1, u32::from(inner), Padding::Zero),
-                ],
-            },
-            memory_class: MemoryClass::Ipu21Standard,
-        }
-    }
-
-    /// AMP left operand split independently over matrix rows and K. This
-    /// stores one activation shard, rather than a replica, on each tile.
-    pub fn amp_left_partitioned_grid(
-        inner: u16,
-        tile_count: u16,
-        row_partitions: u16,
-        inner_partitions: u16,
-    ) -> Self {
-        Self {
-            order: ElementOrder::Amp(AmpOrder::Left),
-            tiling: TensorTiling {
-                tile_count,
-                replicas: 1,
-                axes: vec![
-                    AxisTiling::new(
-                        TensorAxis::FromEnd(1),
-                        inner_partitions,
-                        u32::from(inner),
-                        Padding::Zero,
-                    )
-                    .with_tile_stride(1),
-                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
                 ],
             },
             memory_class: MemoryClass::Ipu21Standard,
@@ -1110,7 +1070,6 @@ fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
             },
             inner_block: AMP_INNER_BLOCK,
             output_column_block: AMP_OUTPUT_COLUMN_BLOCK,
-            distribution: GemmDistribution::OutputStationary,
         },
         MidOperator::Gelu => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Gelu,
@@ -1691,7 +1650,6 @@ fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> Operator
         },
         inner_block: AMP_INNER_BLOCK,
         output_column_block: output_columns,
-        distribution: GemmDistribution::OutputStationary,
     }
 }
 
@@ -1853,7 +1811,6 @@ impl OperatorPlan {
                     accumulate,
                     inner_block,
                     output_column_block,
-                    distribution: _,
                 },
             ) => {
                 let [left, right] = inputs else {
@@ -2808,9 +2765,6 @@ fn plans(
             candidate.output.format.layout.tiling = actual.format.layout.tiling.clone();
         }
         let mut variants = vec![candidate.clone()];
-        if let Some(partial) = activation_stationary_reduction_candidate(&candidate, inputs) {
-            variants.push(partial);
-        }
         for (input_index, _) in parameter_inputs
             .iter()
             .enumerate()
@@ -2853,15 +2807,6 @@ fn independent_parameter_storage(
     input_index: usize,
     config: &PipelineConfig,
 ) -> Vec<OperatorCandidate> {
-    if !matches!(
-        candidate.dispatch,
-        OperatorDispatch::BlockedGemm {
-            distribution: GemmDistribution::OutputStationary,
-            ..
-        }
-    ) {
-        return Vec::new();
-    }
     let Some(requirement) = candidate.inputs.get(input_index) else {
         return Vec::new();
     };
@@ -2921,84 +2866,6 @@ fn independent_parameter_storage(
             Some(independent)
         })
         .collect()
-}
-
-fn activation_stationary_reduction_candidate(
-    candidate: &OperatorCandidate,
-    inputs: &[TensorType],
-) -> Option<OperatorCandidate> {
-    let OperatorDispatch::BlockedGemm {
-        output_column_block,
-        distribution: GemmDistribution::OutputStationary,
-        ..
-    } = candidate.dispatch
-    else {
-        return None;
-    };
-    if !matches!(
-        candidate.operator,
-        MidOperator::Gemm {
-            multiply: Precision::F16,
-            ..
-        }
-    ) || output_column_block != AMP_OUTPUT_COLUMN_BLOCK
-    {
-        return None;
-    }
-    let [left, right] = inputs else { return None };
-    let rank = left.shape.0.len();
-    if rank < 2 || right.shape.0.len() < 2 {
-        return None;
-    }
-    let inner = *left.shape.0.last()?;
-    let columns = *right.shape.0.last()?;
-    if !inner.is_multiple_of(AMP_INNER_BLOCK) || !columns.is_multiple_of(output_column_block) {
-        return None;
-    }
-    let layout = &candidate.output.format.layout;
-    let column_partitions = layout
-        .tiling
-        .axes
-        .iter()
-        .find(|axis| axis.axis == TensorAxis::FromEnd(1))?
-        .partitions;
-    let row_partitions = layout
-        .tiling
-        .axes
-        .iter()
-        .find(|axis| axis.axis == TensorAxis::FromEnd(2))?
-        .partitions;
-    if u32::from(column_partitions) != columns / output_column_block
-        || column_partitions < 2
-        || row_partitions.checked_mul(column_partitions)? != layout.tiling.tile_count
-        || !(inner / AMP_INNER_BLOCK).is_multiple_of(u32::from(column_partitions))
-    {
-        return None;
-    }
-    let inner_blocks = u16::try_from(inner / AMP_INNER_BLOCK).ok()?;
-    if column_partitions.checked_mul(inner_blocks)? > layout.tiling.tile_count {
-        return None;
-    }
-    let mut partial = candidate.clone();
-    partial.inputs[0].format.layout = Layout::amp_left_partitioned_grid(
-        AMP_INNER_BLOCK as u16,
-        layout.tiling.tile_count,
-        row_partitions,
-        column_partitions,
-    );
-    partial.inputs[1].format.layout = Layout::amp_right_k64_storage(
-        output_column_block,
-        column_partitions,
-        inner_blocks,
-        1,
-        MemoryClass::Ipu21Interleaved,
-    );
-    if let OperatorDispatch::BlockedGemm { distribution, .. } = &mut partial.dispatch {
-        *distribution = GemmDistribution::ActivationStationaryReduction {
-            inner_partitions: column_partitions,
-        };
-    }
-    Some(partial)
 }
 
 fn resolved_output_aliasing(
@@ -3430,50 +3297,6 @@ mod tests {
 
     fn value(lowered: &MidGraph, id: MidValueId) -> &MidValue {
         &lowered.values[id.index() as usize]
-    }
-
-    #[test]
-    fn randomized_activation_stationary_candidates_partition_k_without_replication() {
-        let mut random = fastrand::Rng::with_seed(0x7061_7274_6961_6c73);
-        for _ in 0..RANDOM_CASES {
-            let inner_partitions = random.u16(2..=4);
-            let multiplier = random.u16(1..=8 / inner_partitions);
-            let inner_blocks = inner_partitions * multiplier;
-            let row_partitions = random.u16(inner_blocks..=8);
-            let tiles = row_partitions * inner_partitions;
-            let k = u32::from(inner_blocks) * 64;
-            let n = u32::from(inner_partitions) * 64;
-            let m = u32::from(row_partitions) * random.u32(1..=8);
-            let base = amp_grid_gemm_operator_candidate(
-                Precision::F16,
-                64,
-                16,
-                64,
-                AmpGridShape {
-                    tile_count: tiles,
-                    row_partitions,
-                    column_partitions: inner_partitions,
-                },
-                AmpWeightPlacement::resident(MemoryClass::Ipu21Interleaved),
-            );
-            let inputs = [
-                TensorType::new([m, k], Precision::F16, Layout::row_sharded(tiles)),
-                TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
-            ];
-            let candidate = activation_stationary_reduction_candidate(&base, &inputs)
-                .expect("compatible grid should produce a reduction candidate");
-            assert!(candidate.supports(&inputs, &TensorShape(vec![m, n])));
-            assert_eq!(candidate.inputs[0].format.layout.tiling.replicas, 1);
-            assert!(matches!(
-                candidate.dispatch,
-                OperatorDispatch::BlockedGemm {
-                    distribution: GemmDistribution::ActivationStationaryReduction {
-                        inner_partitions: actual
-                    },
-                    ..
-                } if actual == inner_partitions
-            ));
-        }
     }
 
     #[test]

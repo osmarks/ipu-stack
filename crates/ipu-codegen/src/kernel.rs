@@ -122,9 +122,8 @@ impl KernelBuildPlan {
     pub fn from_program(program: &LowProgram) -> Result<Self, KernelAbiError> {
         let mut rows = BTreeMap::<(Precision, GemmWeightLoad, u32), BTreeSet<u32>>::new();
         let mut gelu = false;
-        let mut reduction_add = false;
         for tile in &program.tiles {
-            collect_kernels(program, tile, &mut rows, &mut gelu, &mut reduction_add)?;
+            collect_kernels(program, tile, &mut rows, &mut gelu)?;
         }
         let mut plan = Self::default();
         for ((precision, weights, output_columns), values) in rows {
@@ -216,14 +215,6 @@ impl KernelBuildPlan {
                     "ipu_stack_gelu_exact_f16".into(),
                     "ipu_stack_gelu_output_to_left_f16".into(),
                 ],
-            });
-        }
-        if reduction_add {
-            plan.compilations.push(KernelCompilation {
-                source: "reduce_add_f16.S",
-                name: "reduce_add_f16".into(),
-                flags: Vec::new(),
-                retained_symbols: vec!["ipu_stack_reduce_add_f16".into()],
             });
         }
         Ok(plan)
@@ -354,7 +345,6 @@ fn collect_kernels(
     tile: &TileWorkList,
     rows: &mut BTreeMap<(Precision, GemmWeightLoad, u32), BTreeSet<u32>>,
     gelu: &mut bool,
-    reduction_add: &mut bool,
 ) -> Result<(), KernelAbiError> {
     for work in program.work(tile) {
         match work {
@@ -376,13 +366,9 @@ fn collect_kernels(
                         .insert(gemm_rows(run)?);
                 } else if matches!(kernel, TileKernelSpec::Gelu) {
                     *gelu = true;
-                } else if matches!(kernel, TileKernelSpec::ReductionAdd) {
-                    *reduction_add = true;
                 }
             }
-            TileWorkRef::Repeat(repeat) => {
-                collect_kernels(program, &repeat.body, rows, gelu, reduction_add)?
-            }
+            TileWorkRef::Repeat(repeat) => collect_kernels(program, &repeat.body, rows, gelu)?,
             TileWorkRef::Exchange(_) | TileWorkRef::LocalCopy(_) => {}
         }
     }
@@ -468,17 +454,6 @@ pub fn tile_kernel_abi(
                 },
                 1,
                 scalar_arguments(1, &["element_count"]),
-            )
-        }
-        TileKernelSpec::ReductionAdd => {
-            if precision != Precision::F16 {
-                return Err(KernelAbiError::RequirementMismatch);
-            }
-            (
-                KernelSymbols::Exact("ipu_stack_reduce_add_f16"),
-                KernelAvailability::Implemented,
-                2,
-                scalar_arguments(2, &["element_count"]),
             )
         }
         TileKernelSpec::Add => (
