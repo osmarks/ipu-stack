@@ -74,13 +74,20 @@ pub trait CostModel {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExchangeFootprint {
     pub phases: u64,
-    pub maximum_transfers_per_tile: u64,
+    pub maximum_transfer_chunks_per_tile: u64,
 }
 
 impl ExchangeFootprint {
     pub const fn estimated_row_bytes(self) -> u64 {
+        // A primitive plan contributes its synchronization-free body to the
+        // consolidated per-phase row. The entry sync and terminal return are
+        // shared by the caller and consolidated row respectively.
+        let words_per_chunk = (ipu_exchange::PLAN_WORDS - 2) as u64;
         self.phases
-            .saturating_add(self.maximum_transfers_per_tile)
+            .saturating_add(
+                self.maximum_transfer_chunks_per_tile
+                    .saturating_mul(words_per_chunk),
+            )
             .saturating_mul(4)
     }
 }
@@ -449,7 +456,7 @@ impl CostModel for Ipu21CostModel {
         let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
         ExchangeFootprint {
             phases,
-            maximum_transfers_per_tile: remote_bytes.div_ceil(transfer_bytes).max(phases),
+            maximum_transfer_chunks_per_tile: remote_bytes.div_ceil(transfer_bytes).max(phases),
         }
     }
 
