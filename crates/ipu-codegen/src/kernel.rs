@@ -563,6 +563,16 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             });
         }
     }
+    if matches!(kernel, TileKernelSpec::ReductionAdd) {
+        let count = element_count(run)?;
+        if !count.is_multiple_of(8) {
+            return Err(KernelAbiError::UnsupportedElementCount {
+                symbol: "ipu_stack_reduce_add_f16",
+                count,
+                divisor: 8,
+            });
+        }
+    }
     Ok(abi)
 }
 
