@@ -191,6 +191,15 @@ pub(crate) fn maximum_shard_bytes(tensor: &TensorType) -> u64 {
         .saturating_mul(tensor.format.precision.bytes())
 }
 
+/// Mean physical storage assigned to one active spatial tile. Replicated
+/// layouts include each replica in both the total storage and tile count.
+pub(crate) fn average_shard_bytes(tensor: &TensorType) -> u64 {
+    let tiles = u64::from(tensor.format.layout.tiling.tile_count).max(1);
+    physical_elements(&tensor.shape, &tensor.format.layout)
+        .saturating_mul(tensor.format.precision.bytes())
+        .div_ceil(tiles)
+}
+
 pub(crate) fn maximum_axis_shard_extent(tensor: &TensorType, axis: usize) -> u64 {
     let Some(plan) = tile_axis_plan(tensor, axis) else {
         return u64::MAX;
@@ -686,6 +695,31 @@ fn tile_axis_plan(tensor: &TensorType, axis: usize) -> Option<TileAxisPlan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn randomized_average_shard_storage_covers_spatial_work() {
+        let mut random = fastrand::Rng::with_seed(0x7370_6174_6961_6c77);
+        for case in 0..32 {
+            let row_partitions = 1_u16 << random.u32(0..=4);
+            let column_partitions = 1_u16 << random.u32(0..=4);
+            let tiles = row_partitions * column_partitions;
+            let rows = u32::from(row_partitions) * random.u32(1..=8);
+            let columns = u32::from(column_partitions) * 64 * random.u32(1..=4);
+            let tensor = TensorType::new(
+                [rows, columns],
+                Precision::F16,
+                Layout::amp_output_grid(64, tiles, row_partitions, column_partitions),
+            );
+            let total = physical_elements(&tensor.shape, &tensor.format.layout)
+                .saturating_mul(tensor.format.precision.bytes());
+            let average = average_shard_bytes(&tensor);
+            assert!(
+                average.saturating_mul(u64::from(tiles)) >= total,
+                "case {case}"
+            );
+            assert!(average <= maximum_shard_bytes(&tensor), "case {case}");
+        }
+    }
 
     fn conversion_traffic_reference(
         shape: &TensorShape,

@@ -1,9 +1,10 @@
 //! Analytical IPU21 cycle estimation used during operator planning.
 
 use crate::estimate::{
-    conversion_traffic, gemm_exchange_bytes_per_cycle, gemm_exchange_phase_count,
-    gemm_remote_bytes_per_tile, gemm_requires_panel_repacking, gemm_uses_panel_buffer,
-    maximum_axis_shard_extent, maximum_shard_bytes, operator_memory_estimate, physical_elements,
+    average_shard_bytes, conversion_traffic, gemm_exchange_bytes_per_cycle,
+    gemm_exchange_phase_count, gemm_remote_bytes_per_tile, gemm_requires_panel_repacking,
+    gemm_uses_panel_buffer, maximum_axis_shard_extent, maximum_shard_bytes,
+    operator_memory_estimate, physical_elements,
 };
 use crate::graph::TensorShape;
 use crate::mid::{
@@ -75,6 +76,30 @@ pub trait CostModel {
 pub struct ExchangeFootprint {
     pub phases: u64,
     pub maximum_transfer_chunks_per_tile: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SpatialOccupancy {
+    average_work: u64,
+    critical_work: u64,
+}
+
+impl SpatialOccupancy {
+    fn for_output(output: &TensorType) -> Self {
+        let bytes = output.format.precision.bytes();
+        Self {
+            average_work: average_shard_bytes(output).div_ceil(bytes),
+            critical_work: maximum_shard_bytes(output).div_ceil(bytes),
+        }
+    }
+
+    const fn latency_work(self) -> u64 {
+        // Device-wide dependencies make the longest spatial shard determine
+        // latency. Keeping the mean alongside it makes the imbalance explicit
+        // without incorrectly scoring latency as mean work.
+        debug_assert!(self.average_work <= self.critical_work);
+        self.critical_work
+    }
 }
 
 impl ExchangeFootprint {
@@ -168,6 +193,7 @@ pub struct Ipu21TargetCosts {
     pub standard_load_bytes_per_cycle: u64,
     pub interleaved_load_bytes_per_cycle: u64,
     pub local_copy_bytes_per_cycle: u64,
+    pub local_copy_call_cycles: u64,
     pub exchange_phase_cycles: u64,
     pub exchange_transfer_cycles: u64,
     pub kernel_launch_cycles: u64,
@@ -182,6 +208,9 @@ pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
     standard_load_bytes_per_cycle: 8,
     interleaved_load_bytes_per_cycle: 16,
     local_copy_bytes_per_cycle: 8,
+    // A finalized six-worker local-copy invocation, including supervisor and
+    // worker rendezvous overhead, takes 288 tile cycles on IPU21.
+    local_copy_call_cycles: 288,
     // Target::getGlobalSyncCycles.
     exchange_phase_cycles: 600,
     // Each logical remote span becomes an independently routed transfer. The
@@ -295,8 +324,8 @@ impl CostModel for Ipu21CostModel {
         output: &TensorType,
     ) -> u64 {
         let elements = physical_elements(&output.shape, &output.format.layout);
-        let elements_per_tile =
-            maximum_shard_bytes(output).div_ceil(output.format.precision.bytes());
+        let spatial_occupancy = SpatialOccupancy::for_output(output);
+        let spatial_occupancy_adjusted_elements = spatial_occupancy.latency_work();
         match operator {
             MidOperator::Gemm { multiply, .. } => {
                 let left_shape = inputs[0]
@@ -310,8 +339,7 @@ impl CostModel for Ipu21CostModel {
                     Precision::F16 => 128,
                     Precision::F32 => 32,
                 };
-                let output_elements_per_tile =
-                    maximum_shard_bytes(output).div_ceil(output.format.precision.bytes());
+                let output_elements_per_tile = spatial_occupancy_adjusted_elements;
                 let output_columns_per_tile =
                     maximum_axis_shard_extent(output, output.shape.0.len().saturating_sub(1));
                 let arithmetic = output_elements_per_tile
@@ -434,10 +462,10 @@ impl CostModel for Ipu21CostModel {
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
             // The exact scalar implementation is compute-bound at roughly
             // ten tile cycles per element across the six workers.
-            MidOperator::Gelu => elements_per_tile
+            MidOperator::Gelu => spatial_occupancy_adjusted_elements
                 .saturating_mul(10)
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
-            MidOperator::Add(_) => elements_per_tile
+            MidOperator::Add(_) => spatial_occupancy_adjusted_elements
                 .div_ceil(16)
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
         }
@@ -515,7 +543,7 @@ impl CostModel for Ipu21CostModel {
         };
         let local_cycles = local_bytes
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
-            .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles));
+            .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles));
         exchange_cycles.saturating_add(local_cycles)
     }
 }
@@ -547,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_pointwise_costs_track_critical_tile_work() {
+    fn randomized_pointwise_costs_track_spatial_work_per_tile() {
         let mut random = fastrand::Rng::with_seed(0x706f_696e_7477_6973);
         for case in 0..CASES {
             let tiles = 1_u16 << random.u32(1..=6);
@@ -577,6 +605,31 @@ mod tests {
                 );
                 assert!(sharded_cycles <= unsharded_cycles, "case {case}");
             }
+        }
+    }
+
+    #[test]
+    fn randomized_conversion_duty_penalizes_fragmented_spatial_work() {
+        let mut random = fastrand::Rng::with_seed(0x6475_7479_6672_6167);
+        for case in 0..CASES {
+            let row_partitions = 1_u16 << random.u32(1..=4);
+            let column_partitions = 1_u16 << random.u32(1..=4);
+            let tiles = row_partitions * column_partitions;
+            let rows = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4);
+            let columns = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4) * 64;
+            let shape = TensorShape(vec![rows, columns]);
+            let fragmented = Layout::amp_output_grid(64, tiles, row_partitions, column_partitions);
+            let aligned = Layout::amp_output_grid(64, tiles, column_partitions, row_partitions);
+            let destination =
+                Layout::amp_output_replicated_grid(tiles, column_partitions, row_partitions);
+            let fragmented_cycles =
+                Ipu21CostModel.rearrange_cycles(&shape, Precision::F16, &fragmented, &destination);
+            let aligned_cycles =
+                Ipu21CostModel.rearrange_cycles(&shape, Precision::F16, &aligned, &destination);
+            assert!(
+                fragmented_cycles >= aligned_cycles,
+                "case {case}: fragmented={fragmented_cycles} aligned={aligned_cycles}"
+            );
         }
     }
 }
