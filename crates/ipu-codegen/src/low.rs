@@ -1733,10 +1733,7 @@ impl LoweringState {
                     let weight_view = if local_weights {
                         source_view
                     } else {
-                        self.narrow_view(
-                            weights,
-                            &[(weight_rank - 2, inner_start, inner_end)],
-                        )?
+                        self.narrow_view(weights, &[(weight_rank - 2, inner_start, inner_end)])?
                     };
                     let run = KernelRun::new(
                         WorkProvenance {
