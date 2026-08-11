@@ -1145,6 +1145,23 @@ pub fn sender_instruction_offsets(row: &[u32]) -> impl Iterator<Item = usize> + 
         .map(|(index, _)| index)
 }
 
+/// Removes tile-memory address fields while retaining exchange roles, routes,
+/// transfer sizes, and event timing. Rows with the same result can share one
+/// executable slot and restore their addresses before invocation.
+pub fn normalized_exchange_address_words(row: &[u32]) -> Vec<u32> {
+    row.iter()
+        .map(|&instruction| {
+            if instruction & LONG_OPCODE_MASK == SEND_OPCODE {
+                instruction & !SEND_ADDRESS_MASK
+            } else if instruction & OPCODE_MASK == DELAY_PIC_OPCODE {
+                instruction & !PIC_RECEIVE_ADDRESS_MASK
+            } else {
+                instruction
+            }
+        })
+        .collect()
+}
+
 pub fn patch_receiver_address(row: &mut PlanRow, byte_address: u32) -> Result<(), ExchangeError> {
     if byte_address & 3 != 0 || byte_address >> 2 > PIC_RECEIVE_ADDRESS_MASK {
         return Err(ExchangeError::Address(byte_address));

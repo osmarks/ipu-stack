@@ -62,7 +62,8 @@ struct PlacedExchange {
     active: bool,
     program: PlacedExchangeRow,
     wait_cycles: u32,
-    patches: Vec<ExchangePatch>,
+    setup_patch: Option<PlacedExchangeRow>,
+    repeat_patches: Vec<ExchangePatch>,
 }
 
 impl<'a> TileProgramLowering<'a> {
@@ -180,8 +181,9 @@ fn lower_work(
                     active: placed.active,
                     program: placed.program.clone(),
                     wait_cycles: placed.wait_cycles,
-                    patches: inside_repeat
-                        .then(|| placed.patches.clone())
+                    setup_patch: placed.setup_patch.clone(),
+                    repeat_patches: inside_repeat
+                        .then(|| placed.repeat_patches.clone())
                         .unwrap_or_default(),
                     profile: StepProfile::default(),
                 })
@@ -309,7 +311,7 @@ fn lower_repeat(
             continue;
         };
         if exchange
-            .patches
+            .repeat_patches
             .iter()
             .any(|patch| patch.values.words.len() != repeat.count as usize)
         {
@@ -336,7 +338,8 @@ fn lower_inactive_work(
                 active: exchange_rows[&id].active,
                 program: exchange_rows[&id].program.clone(),
                 wait_cycles: exchange_rows[&id].wait_cycles,
-                patches: Vec::new(),
+                setup_patch: exchange_rows[&id].setup_patch.clone(),
+                repeat_patches: Vec::new(),
                 profile: StepProfile::default(),
             })),
             TileWorkRef::Repeat(repeat) => steps.push(TileStep::Repeat(RepeatStep {
@@ -365,43 +368,8 @@ pub fn compact_exchange_table_bytes(
 ) -> Result<u32, TileLoweringError> {
     let mut maximum = 0;
     for tile in 0..execution_tile_count {
-        let mut bytes = 0u32;
-        for phase in exchanges {
-            let words = if tile < scheduled_tile_count {
-                phase
-                    .programs
-                    .get(usize::from(tile))
-                    .ok_or(TileLoweringError::MissingExchangeRow(tile))?
-                    .len()
-            } else {
-                crate::inactive_exchange_program().len()
-            };
-            let row_bytes = u32::try_from(words)
-                .map_err(|_| TileLoweringError::Overflow)?
-                .checked_mul(4)
-                .ok_or(TileLoweringError::Overflow)?;
-            let patch_bytes = if tile < scheduled_tile_count {
-                phase.repeat_patches[usize::from(tile)]
-                    .iter()
-                    .try_fold(0u32, |total, patch| {
-                        total
-                            .checked_add(
-                                u32::try_from(patch.values.len())
-                                    .map_err(|_| TileLoweringError::Overflow)?
-                                    .checked_mul(4)
-                                    .ok_or(TileLoweringError::Overflow)?,
-                            )
-                            .ok_or(TileLoweringError::Overflow)
-                    })?
-            } else {
-                0
-            };
-            bytes = bytes
-                .checked_add(row_bytes)
-                .and_then(|bytes| bytes.checked_add(patch_bytes))
-                .ok_or(TileLoweringError::Overflow)?;
-        }
-        maximum = maximum.max(bytes);
+        let (_, end) = layout_exchange_rows(exchanges, tile, scheduled_tile_count, 0)?;
+        maximum = maximum.max(end);
     }
     Ok(maximum)
 }
@@ -417,6 +385,28 @@ fn layout_exchange_rows(
     if exchanges.is_empty() {
         return Ok((result, cursor));
     }
+    struct SharedRow {
+        program: PlacedExchangeRow,
+    }
+
+    let mut key_counts = BTreeMap::<(Vec<u32>, Option<u32>), usize>::new();
+    for phase in exchanges {
+        let program = if tile < scheduled_tile_count {
+            phase
+                .programs
+                .get(usize::from(tile))
+                .ok_or(TileLoweringError::MissingExchangeRow(tile))?
+        } else {
+            continue;
+        };
+        let has_repeat_patches = !phase.repeat_patches[usize::from(tile)].is_empty();
+        let key = (
+            ipu_exchange::normalized_exchange_address_words(program),
+            has_repeat_patches.then_some(phase.id.index()),
+        );
+        *key_counts.entry(key).or_default() += 1;
+    }
+    let mut shared = BTreeMap::<(Vec<u32>, Option<u32>), SharedRow>::new();
     for phase in exchanges {
         let (active, base_program, wait_cycles) = if tile < scheduled_tile_count {
             let index = usize::from(tile);
@@ -441,20 +431,77 @@ fn layout_exchange_rows(
         } else {
             (false, crate::inactive_exchange_program(), 0)
         };
-        let address = cursor;
-        cursor = cursor
-            .checked_add(
-                u32::try_from(base_program.len())
-                    .map_err(|_| TileLoweringError::Overflow)?
-                    .checked_mul(4)
-                    .ok_or(TileLoweringError::Overflow)?,
-            )
-            .ok_or(TileLoweringError::Overflow)?;
-        let program = PlacedExchangeRow {
-            address,
-            words: base_program,
+        let has_repeat_patches =
+            tile < scheduled_tile_count && !phase.repeat_patches[usize::from(tile)].is_empty();
+        let key = (
+            ipu_exchange::normalized_exchange_address_words(&base_program),
+            has_repeat_patches.then_some(phase.id.index()),
+        );
+        let shared_count = key_counts.get(&key).copied().unwrap_or(1);
+        let setup_words = (shared_count > 1)
+            .then(|| {
+                key.0
+                    .iter()
+                    .zip(&base_program)
+                    .enumerate()
+                    .filter_map(|(offset, (&normalized, &target))| {
+                        (normalized != target).then_some((offset, target))
+                    })
+                    .try_fold(Vec::new(), |mut words, (offset, target)| {
+                        words.push(
+                            u32::try_from(offset)
+                                .map_err(|_| TileLoweringError::Overflow)?
+                                .checked_mul(4)
+                                .ok_or(TileLoweringError::Overflow)?,
+                        );
+                        words.push(target);
+                        Ok::<_, TileLoweringError>(words)
+                    })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let program = if let Some(shared) = shared.get(&key) {
+            shared.program.clone()
+        } else {
+            let address = cursor;
+            cursor = cursor
+                .checked_add(
+                    u32::try_from(base_program.len())
+                        .map_err(|_| TileLoweringError::Overflow)?
+                        .checked_mul(4)
+                        .ok_or(TileLoweringError::Overflow)?,
+                )
+                .ok_or(TileLoweringError::Overflow)?;
+            let program = PlacedExchangeRow {
+                address,
+                words: base_program,
+            };
+            shared.insert(
+                key,
+                SharedRow {
+                    program: program.clone(),
+                },
+            );
+            program
         };
-        let mut patches = Vec::new();
+        let setup_patch = if setup_words.is_empty() {
+            None
+        } else {
+            let address = cursor;
+            cursor = cursor
+                .checked_add(
+                    u32::try_from(setup_words.len())
+                        .map_err(|_| TileLoweringError::Overflow)?
+                        .checked_mul(4)
+                        .ok_or(TileLoweringError::Overflow)?,
+                )
+                .ok_or(TileLoweringError::Overflow)?;
+            Some(PlacedExchangeRow {
+                address,
+                words: setup_words,
+            })
+        };
+        let mut repeat_patches = Vec::new();
         if tile < scheduled_tile_count {
             for patch in &phase.repeat_patches[usize::from(tile)] {
                 let address = cursor;
@@ -466,7 +513,7 @@ fn layout_exchange_rows(
                             .ok_or(TileLoweringError::Overflow)?,
                     )
                     .ok_or(TileLoweringError::Overflow)?;
-                patches.push(ExchangePatch {
+                repeat_patches.push(ExchangePatch {
                     word_offset: patch.word_offset,
                     values: PlacedExchangeRow {
                         address,
@@ -481,7 +528,8 @@ fn layout_exchange_rows(
                 active,
                 program,
                 wait_cycles,
-                patches,
+                setup_patch,
+                repeat_patches,
             },
         );
     }

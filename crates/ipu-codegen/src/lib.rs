@@ -87,6 +87,7 @@ pub const SAMPLE_CYCLE_SYMBOL: &str = "ipu_stack_static_sample_cycle";
 pub const COPY_U32_SYMBOL: &str = "ipu_stack_static_copy_u32";
 pub const COPY_U64_SYMBOL: &str = "ipu_stack_copy_u64";
 pub const PATCH_WORD_SYMBOL: &str = "ipu_stack_static_patch_word";
+pub const PATCH_ROW_SYMBOL: &str = "ipu_stack_static_patch_row";
 pub const RUNTIME_ENTRY_SYMBOL: &str = "ipu_stack_static_start";
 pub const PROGRAM_ADDRESS_SYMBOL: &str = "ipu_stack_static_program";
 pub const WORKER_SYNC_CONTEXT_SYMBOL: &str = "ipu_stack_static_worker_sync_context";
@@ -153,9 +154,12 @@ pub struct ExchangeStep {
     pub program: PlacedExchangeRow,
     /// Local wait after returning from the exchange row, preserving the phase horizon.
     pub wait_cycles: u32,
+    /// Offset/value pairs applied before invoking a structurally shared row.
+    #[serde(default)]
+    pub setup_patch: Option<PlacedExchangeRow>,
     /// Words rewritten before the timed program is invoked inside a structured repeat.
     #[serde(default)]
-    pub patches: Vec<ExchangePatch>,
+    pub repeat_patches: Vec<ExchangePatch>,
     #[serde(default)]
     pub profile: StepProfile,
 }
@@ -330,7 +334,10 @@ fn emit_steps(
     for step in steps {
         match step {
             TileStep::Exchange(exchange) => {
-                if !exchange.patches.is_empty() {
+                if let Some(patch) = &exchange.setup_patch {
+                    emit_exchange_setup_patch(code, exchange, patch, symbols)?;
+                }
+                if !exchange.repeat_patches.is_empty() {
                     emit_exchange_patches(
                         code,
                         exchange,
@@ -363,7 +370,13 @@ fn emit_steps(
                     emit_cycle_sample(code, symbols, address)?;
                 }
                 exchange_rows.push(exchange.program.clone());
-                exchange_rows.extend(exchange.patches.iter().map(|patch| patch.values.clone()));
+                exchange_rows.extend(exchange.setup_patch.iter().cloned());
+                exchange_rows.extend(
+                    exchange
+                        .repeat_patches
+                        .iter()
+                        .map(|patch| patch.values.clone()),
+                );
             }
             TileStep::Compute(compute) => {
                 if let Some(address) = compute.profile.before {
@@ -409,7 +422,14 @@ fn validate_steps(
         match step {
             TileStep::Exchange(exchange) => {
                 validate_exchange_program(exchange)?;
-                for patch in &exchange.patches {
+                if exchange
+                    .setup_patch
+                    .as_ref()
+                    .is_some_and(|patch| patch.words.len() % 2 != 0)
+                {
+                    return Err(invalid("exchange setup patch has an invalid shape"));
+                }
+                for patch in &exchange.repeat_patches {
                     if repeat_count.is_none_or(|count| patch.values.words.len() != count as usize)
                         || patch.word_offset as usize >= exchange.program.words.len()
                         || patch.values.address & 3 != 0
@@ -501,7 +521,7 @@ fn emit_exchange_patches(
     symbols: &BTreeMap<String, u32>,
 ) -> Result<()> {
     let helper = symbol(symbols, PATCH_WORD_SYMBOL)?;
-    for patch in &exchange.patches {
+    for patch in &exchange.repeat_patches {
         let byte_offset = patch
             .word_offset
             .checked_mul(4)
@@ -520,6 +540,22 @@ fn emit_exchange_patches(
         code.call(helper, 9)?;
     }
     Ok(())
+}
+
+fn emit_exchange_setup_patch(
+    code: &mut TileCode,
+    exchange: &ExchangeStep,
+    patch: &PlacedExchangeRow,
+    symbols: &BTreeMap<String, u32>,
+) -> Result<()> {
+    code.setzi(2, exchange.program.address)?;
+    code.setzi(3, patch.address)?;
+    code.setzi(
+        4,
+        u32::try_from(patch.words.len() / 2)
+            .map_err(|_| invalid("exchange setup patch is too large"))?,
+    )?;
+    code.call(symbol(symbols, PATCH_ROW_SYMBOL)?, 9)
 }
 
 fn emit_compute(
@@ -842,7 +878,8 @@ mod tests {
                         words: inactive_exchange_program(),
                     },
                     wait_cycles: 0,
-                    patches: Vec::new(),
+                    setup_patch: None,
+                    repeat_patches: Vec::new(),
                     profile: StepProfile::default(),
                 }),
                 TileStep::Compute(ComputeStep {
@@ -883,7 +920,8 @@ mod tests {
                     words: Vec::new(),
                 },
                 wait_cycles: 0,
-                patches: Vec::new(),
+                setup_patch: None,
+                repeat_patches: Vec::new(),
                 profile: StepProfile::default(),
             })],
         };
@@ -920,7 +958,8 @@ mod tests {
                             words: vec![0, ipu_exchange::RETURN_M10_INSTRUCTION],
                         },
                         wait_cycles: 0,
-                        patches: vec![ExchangePatch {
+                        setup_patch: None,
+                        repeat_patches: vec![ExchangePatch {
                             word_offset: 0,
                             values: PlacedExchangeRow {
                                 address: 0x61000,

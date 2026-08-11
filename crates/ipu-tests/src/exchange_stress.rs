@@ -225,7 +225,8 @@ pub(crate) fn build(
                         words: row,
                     },
                     wait_cycles: horizon - local_horizon,
-                    patches: Vec::new(),
+                    setup_patch: None,
+                    repeat_patches: Vec::new(),
                     profile: StepProfile::default(),
                 }));
             for &(actual, expected, words) in validators.get(&tile).into_iter().flatten() {

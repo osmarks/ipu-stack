@@ -140,6 +140,27 @@ ipu_stack_static_patch_word:
 	br $m9
 	.size ipu_stack_static_patch_word, .-ipu_stack_static_patch_word
 
+	.section .text.ipu_stack_static_patch_row,"ax",@progbits
+	// Runtime helper ABI: m2 row base, m3 offset/value pairs, m4 pair count,
+	// m9 return. Patching occurs before the exchange synchronization boundary.
+	.globl ipu_stack_static_patch_row
+	.p2align 2
+	.type ipu_stack_static_patch_row,@function
+ipu_stack_static_patch_row:
+	.supervisor
+	brz $m4, .Lpatch_row_done
+.Lpatch_row_next:
+	ld32 $m5, $m3, $m15, 0
+	ld32 $m0, $m3, $m15, 1
+	add $m5, $m5, $m2
+	st32 $m0, $m5, $m15, 0
+	add $m3, $m3, 8
+	sub $m4, $m4, 1
+	brnz $m4, .Lpatch_row_next
+.Lpatch_row_done:
+	br $m9
+	.size ipu_stack_static_patch_row, .-ipu_stack_static_patch_row
+
 	.section .text.ipu_stack_copy_u64,"ax",@progbits
 	// Runtime helper ABI: m2 destination, m3 source, m4 words/worker, m5
 	// remainder workers, m10 return. This is not a layout-conversion kernel.
