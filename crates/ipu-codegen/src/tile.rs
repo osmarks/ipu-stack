@@ -205,7 +205,17 @@ fn lower_work(
                     .get(&copy.destination)
                     .and_then(|address| address.checked_add(copy.destination_offset))
                     .ok_or_else(&invalid)?;
-                let (symbol, arguments) = local_copy_call(copy.bytes).ok_or_else(invalid)?;
+                let source_shard = &program.shards[copy.source.index() as usize];
+                let destination_shard = &program.shards[copy.destination.index() as usize];
+                let wide_safe = interleaved_copy_elements_are_distinct(
+                    source_shard.tensor_type.format.layout.memory_class,
+                    destination_shard.tensor_type.format.layout.memory_class,
+                    source,
+                    destination,
+                    copy.bytes,
+                );
+                let (symbol, arguments) =
+                    local_copy_call(copy.bytes, wide_safe).ok_or_else(invalid)?;
                 TileStep::Compute(crate::ComputeStep {
                     symbol: symbol.into(),
                     output_address: TileAddress::Absolute(destination),
@@ -240,8 +250,27 @@ fn lower_work(
     Ok(steps)
 }
 
-fn local_copy_call(bytes: u32) -> Option<(&'static str, Vec<u32>)> {
-    if bytes >= 6 * 8 && bytes.is_multiple_of(8) {
+fn interleaved_copy_elements_are_distinct(
+    source_class: crate::MemoryClass,
+    destination_class: crate::MemoryClass,
+    source: u32,
+    destination: u32,
+    bytes: u32,
+) -> bool {
+    if source_class != crate::MemoryClass::Ipu21Interleaved
+        || destination_class != crate::MemoryClass::Ipu21Interleaved
+        || bytes == 0
+    {
+        return true;
+    }
+    let element = ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE;
+    let source_last = source.saturating_add(bytes - 1);
+    let destination_last = destination.saturating_add(bytes - 1);
+    source / element > destination_last / element || destination / element > source_last / element
+}
+
+fn local_copy_call(bytes: u32, wide_safe: bool) -> Option<(&'static str, Vec<u32>)> {
+    if wide_safe && bytes >= 6 * 8 && bytes.is_multiple_of(8) {
         let words = bytes / 8;
         Some((crate::COPY_U64_SYMBOL, vec![words / 6, words % 6]))
     } else if bytes != 0 && bytes.is_multiple_of(4) {
@@ -647,7 +676,7 @@ mod tests {
         for _ in 0..1_000 {
             let words = random.u32(1..=4_096);
             let bytes = words * 4;
-            let (symbol, arguments) = local_copy_call(bytes).unwrap();
+            let (symbol, arguments) = local_copy_call(bytes, true).unwrap();
             if symbol == crate::COPY_U64_SYMBOL {
                 assert!(arguments[0] != 0);
                 assert_eq!((arguments[0] * 6 + arguments[1]) * 8, bytes);
