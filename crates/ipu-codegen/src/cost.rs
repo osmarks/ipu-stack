@@ -416,6 +416,28 @@ impl CostModel for Ipu21CostModel {
                             )
                     },
                 );
+                let standard_source_owner_penalty = streamed_k64_standard.map_or(0, |right| {
+                    let owners = right
+                        .format
+                        .layout
+                        .tiling
+                        .axes
+                        .iter()
+                        .find(|axis| axis.axis == TensorAxis::FromEnd(2))
+                        .map_or(1, |axis| u64::from(axis.partitions));
+                    let local_panel_bytes = right_bytes_consumed.div_ceil(owners);
+                    let per_phase_penalty = local_panel_bytes
+                        .div_ceil(IPU21_TARGET_COSTS.standard_load_bytes_per_cycle)
+                        .saturating_sub(
+                            local_panel_bytes
+                                .div_ceil(IPU21_TARGET_COSTS.interleaved_load_bytes_per_cycle),
+                        );
+                    // The source owner changes between phases. Device latency
+                    // follows that phase-local critical role rather than the
+                    // accumulated work of any one physical tile.
+                    per_phase_penalty
+                        .saturating_mul(gemm_exchange_phase_count(dispatch, inputs, output))
+                });
                 let packing = if right.is_some_and(|right| {
                     right.format.precision == Precision::F16
                         && gemm_requires_panel_repacking(dispatch, right, output)
@@ -470,6 +492,7 @@ impl CostModel for Ipu21CostModel {
                     u64::MAX / 8
                 };
                 kernel
+                    .saturating_add(standard_source_owner_penalty)
                     .saturating_add(packing)
                     .saturating_add(local_staging)
                     .saturating_add(exchange)
