@@ -214,7 +214,7 @@ fn main() -> Result<()> {
             let samples: usize = report.tiles.iter().map(|tile| tile.samples.len()).sum();
             let exchange = exchange_activity_summary(&report);
             println!(
-                "clockHz={} tiles={} samples={} exchangeSamples={} describedExchangeSamples={} sendIntervals={} receiveIntervals={} estimatedSendWorkCycles={} estimatedReceiveWorkCycles={} estimatedExchangeIdleWorkCycles={}",
+                "clockHz={} tiles={} samples={} exchangeSamples={} describedExchangeSamples={} sendIntervals={} receiveIntervals={} estimatedSendWorkCycles={} estimatedReceiveWorkCycles={} estimatedExchangeIdleWorkCycles={} measuredExchangePhaseCycles={} scheduledExchangeEventCycles={} exchangeSetupAndBoundaryCycles={}",
                 report.clock_hz,
                 report.tiles.len(),
                 samples,
@@ -225,6 +225,9 @@ fn main() -> Result<()> {
                 exchange.estimated_send_work_cycles,
                 exchange.estimated_receive_work_cycles,
                 exchange.estimated_idle_work_cycles,
+                exchange.measured_phase_cycles,
+                exchange.scheduled_event_cycles,
+                exchange.setup_and_boundary_cycles,
             );
         }
         Command::ProfileExtract {

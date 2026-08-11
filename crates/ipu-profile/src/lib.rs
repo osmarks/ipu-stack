@@ -117,12 +117,16 @@ pub struct ExchangeActivitySummary {
     pub estimated_send_work_cycles: u64,
     pub estimated_receive_work_cycles: u64,
     pub estimated_idle_work_cycles: u64,
+    pub measured_phase_cycles: u64,
+    pub scheduled_event_cycles: u64,
+    pub setup_and_boundary_cycles: u64,
 }
 
 /// Summarizes statically scheduled exchange roles after scaling each event
 /// timeline to the corresponding measured exchange duration.
 pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySummary {
     let mut summary = ExchangeActivitySummary::default();
+    let mut phases = BTreeMap::<(u32, u32), (u32, u32)>::new();
     for sample in report
         .tiles
         .iter()
@@ -131,6 +135,12 @@ pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySumm
     {
         summary.exchange_samples += 1;
         let event_cycles = u64::from(sample.step.exchange_event_cycles);
+        let measured = duration(sample);
+        let phase = phases
+            .entry((sample.step.epoch, sample.step.phase))
+            .or_default();
+        phase.0 = phase.0.max(measured);
+        phase.1 = phase.1.max(sample.step.exchange_event_cycles);
         if event_cycles == 0 {
             continue;
         }
@@ -138,7 +148,7 @@ pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySumm
             continue;
         }
         summary.described_samples += 1;
-        let measured = u64::from(duration(sample));
+        let measured = u64::from(measured);
         let mut send_events = 0u64;
         let mut receive_events = 0u64;
         for activity in &sample.step.exchange_activities {
@@ -166,6 +176,11 @@ pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySumm
         summary.estimated_send_work_cycles += send;
         summary.estimated_receive_work_cycles += receive;
         summary.estimated_idle_work_cycles += measured.saturating_sub(send.saturating_add(receive));
+    }
+    for (measured, scheduled) in phases.into_values() {
+        summary.measured_phase_cycles += u64::from(measured);
+        summary.scheduled_event_cycles += u64::from(scheduled);
+        summary.setup_and_boundary_cycles += u64::from(measured.saturating_sub(scheduled));
     }
     summary
 }
