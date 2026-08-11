@@ -220,6 +220,25 @@ const colors = {
 };
 const textColor = { exchange: "#ffffff", compute: "#ffffff", synchronization: "#ffffff", idle: "#050505" };
 const tiles = DATA.tiles.slice().sort((a, b) => a.physicalTile - b.physicalTile);
+const exchangePhaseBounds = new Map();
+for (const tile of tiles) {
+  for (const sample of tile.samples) {
+    if (sample.kind !== "exchange" || !exchangeEventCycles(sample)) continue;
+    const key = `${sample.epoch}:${sample.phase}`;
+    const phase = exchangePhaseBounds.get(key) || { starts: [], ends: [], eventCycles: 0 };
+    phase.starts.push(sample.offset);
+    phase.ends.push(sample.offset + sample.duration);
+    phase.eventCycles = Math.max(phase.eventCycles, exchangeEventCycles(sample));
+    exchangePhaseBounds.set(key, phase);
+  }
+}
+for (const phase of exchangePhaseBounds.values()) {
+  phase.start = Math.max(...phase.starts);
+  phase.end = Math.max(...phase.ends);
+  phase.eventStart = phase.end - phase.eventCycles;
+  delete phase.starts;
+  delete phase.ends;
+}
 let timelineGeom = null;
 let flameHits = [];
 let drag = null;
@@ -273,6 +292,43 @@ function exchangeEventCycles(sample) {
   const cycles = sample.exchangeEventCycles;
   return Number.isFinite(cycles) && cycles > 0 ? cycles : 0;
 }
+function scheduledExchangeBounds(sample) {
+  return exchangePhaseBounds.get(`${sample.epoch}:${sample.phase}`) || null;
+}
+function accountingSamples(sample) {
+  if (sample.kind !== "exchange") return [sample];
+  const bounds = scheduledExchangeBounds(sample);
+  if (!bounds) return [sample];
+  const sampleEnd = sample.offset + sample.duration;
+  const result = [];
+  const beforeEnd = Math.max(sample.offset, Math.min(sampleEnd, bounds.start));
+  if (beforeEnd > sample.offset) {
+    result.push({
+      ...sample,
+      kind: "synchronization",
+      kernel: "exchange boundary wait",
+      duration: beforeEnd - sample.offset,
+      exchangeActivities: [],
+    });
+  }
+  const exchangeStart = Math.max(sample.offset, bounds.start);
+  const exchangeEnd = Math.min(sampleEnd, bounds.end);
+  if (exchangeEnd > exchangeStart) {
+    result.push({ ...sample, offset: exchangeStart, duration: exchangeEnd - exchangeStart });
+  }
+  const afterStart = Math.max(sample.offset, bounds.end);
+  if (sampleEnd > afterStart) {
+    result.push({
+      ...sample,
+      kind: "synchronization",
+      kernel: "exchange boundary sampling",
+      offset: afterStart,
+      duration: sampleEnd - afterStart,
+      exchangeActivities: [],
+    });
+  }
+  return result.length ? result : [sample];
+}
 function displaySegments(sample) {
   const sampleEnd = sample.offset + sample.duration;
   if (sample.kind !== "exchange" || !sample.exchangeActivities?.length) {
@@ -280,23 +336,31 @@ function displaySegments(sample) {
   }
   const eventCycles = exchangeEventCycles(sample);
   if (!eventCycles) return [{ kind: "exchange", start: sample.offset, end: sampleEnd }];
-  const scale = sample.duration / eventCycles;
+  const bounds = scheduledExchangeBounds(sample);
+  const exchangeStart = Math.max(sample.offset, bounds?.start ?? sample.offset);
+  const exchangeEnd = Math.min(sampleEnd, bounds?.end ?? sampleEnd);
+  const segments = [];
+  if (sample.offset < exchangeStart) {
+    segments.push({ kind: "synchronization", start: sample.offset, end: exchangeStart });
+  }
   const activities = sample.exchangeActivities
     .map(activity => ({
       kind: activity.kind,
-      start: Math.max(sample.offset, Math.min(sampleEnd, sample.offset + activity.start * scale)),
-      end: Math.max(sample.offset, Math.min(sampleEnd, sample.offset + activity.end * scale)),
+      start: Math.max(exchangeStart, Math.min(exchangeEnd, (bounds?.eventStart ?? sample.offset) + activity.start)),
+      end: Math.max(exchangeStart, Math.min(exchangeEnd, (bounds?.eventStart ?? sample.offset) + activity.end)),
     }))
     .filter(activity => activity.end > activity.start)
     .sort((a, b) => a.start - b.start || a.end - b.end);
-  const segments = [];
-  let cursor = sample.offset;
+  let cursor = exchangeStart;
   for (const activity of activities) {
     if (activity.start > cursor) segments.push({ kind: "exchangeIdle", start: cursor, end: activity.start });
     segments.push(activity);
     cursor = Math.max(cursor, activity.end);
   }
-  if (cursor < sampleEnd) segments.push({ kind: "exchangeIdle", start: cursor, end: sampleEnd });
+  if (cursor < exchangeEnd) segments.push({ kind: "exchangeIdle", start: cursor, end: exchangeEnd });
+  if (exchangeEnd < sampleEnd) {
+    segments.push({ kind: "synchronization", start: exchangeEnd, end: sampleEnd });
+  }
   return segments;
 }
 function displayKindAt(sample, time) {
@@ -417,10 +481,12 @@ function drawFlame() {
   const root = { name: focusLabel(state.focus), value: 0, depth: 0, children: new Map() };
   for (const tile of tiles) {
     for (const sample of tile.samples) {
-      if (state.kind !== "all" && sample.kind !== state.kind) continue;
-      if (state.query && !sample.operation.toLowerCase().includes(state.query)) continue;
-      if (!sampleMatchesFocus(sample, state.focus)) continue;
-      appendFlameSample(root, sample);
+      for (const accounted of accountingSamples(sample)) {
+        if (state.kind !== "all" && accounted.kind !== state.kind) continue;
+        if (state.query && !accounted.operation.toLowerCase().includes(state.query)) continue;
+        if (!sampleMatchesFocus(accounted, state.focus)) continue;
+        appendFlameSample(root, accounted);
+      }
     }
   }
   flameTotal = root.value;
@@ -623,13 +689,15 @@ function drawDetails() {
   const operations = new Set();
   for (const tile of tiles) {
     for (const sample of tile.samples) {
-      if (!matches(sample)) continue;
-      selected++;
-      total += sample.duration;
-      operations.add(sample.operation);
-      if (!longest || sample.duration > longest.duration) {
-        longest = sample;
-        longestTile = tile.physicalTile;
+      for (const accounted of accountingSamples(sample)) {
+        if (!matches(accounted)) continue;
+        selected++;
+        total += accounted.duration;
+        operations.add(accounted.operation);
+        if (!longest || accounted.duration > longest.duration) {
+          longest = accounted;
+          longestTile = tile.physicalTile;
+        }
       }
     }
   }
@@ -656,14 +724,16 @@ function drawDetails() {
     const byMetadata = new Map();
     for (const tile of tiles) {
       for (const sample of tile.samples) {
-        if (!activeAt(sample, state.time)) continue;
-        active++;
-        activeKinds[displayKindAt(sample, state.time)]++;
-        byOperation.set(sample.operation, (byOperation.get(sample.operation) || 0) + 1);
-        if (sample.kernel) byKernel.set(sample.kernel, (byKernel.get(sample.kernel) || 0) + 1);
-        for (const entry of metadataEntries(sample)) {
-          const key = `${entry.name}: ${entry.value}`;
-          byMetadata.set(key, (byMetadata.get(key) || 0) + 1);
+        for (const accounted of accountingSamples(sample)) {
+          if (!activeAt(accounted, state.time)) continue;
+          active++;
+          activeKinds[displayKindAt(accounted, state.time)]++;
+          byOperation.set(accounted.operation, (byOperation.get(accounted.operation) || 0) + 1);
+          if (accounted.kernel) byKernel.set(accounted.kernel, (byKernel.get(accounted.kernel) || 0) + 1);
+          for (const entry of metadataEntries(accounted)) {
+            const key = `${entry.name}: ${entry.value}`;
+            byMetadata.set(key, (byMetadata.get(key) || 0) + 1);
+          }
         }
       }
     }
@@ -718,7 +788,9 @@ function timelineHit(event) {
   if (!tile) return null;
   const time = timelineGeom.viewStart
     + (x - timelineGeom.left) * (timelineGeom.viewEnd - timelineGeom.viewStart) / timelineGeom.plotW;
-  const sample = tile.samples.find(candidate => activeAt(candidate, time));
+  const sample = tile.samples
+    .flatMap(accountingSamples)
+    .find(candidate => activeAt(candidate, time));
   if (sample) return { tile: tile.physicalTile, sample, time, kind: displayKindAt(sample, time) };
   return null;
 }
