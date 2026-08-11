@@ -152,6 +152,7 @@ canvas {
     <div class="section-head">
       <div class="section-title">Tilewise Timeline</div>
       <div class="legend">
+        <label>Row height <select id="timelineRowHeight"><option value="1">compact</option><option value="2">2 px</option><option value="4">4 px</option><option value="8">8 px</option></select></label>
         <span class="legend-item"><span class="legend-swatch" style="background:#b00020"></span>compute (kernel-tinted)</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#006b3f"></span>send</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#19766f"></span>receive</span>
@@ -203,7 +204,7 @@ for (const tile of DATA.tiles) {
     exchangeActivities: activitySets[activities],
   }));
 }
-const state = { query: "", kind: "all", focus: null, time: null, viewStart: 0, viewEnd: null };
+const state = { query: "", kind: "all", focus: null, time: null, viewStart: 0, viewEnd: null, timelineRowHeight: 1 };
 const flame = document.getElementById("flame");
 const overview = document.getElementById("overview");
 const timeline = document.getElementById("timeline");
@@ -627,7 +628,7 @@ function drawOverview() {
 function drawTimeline() {
   const ctx = timeline.getContext("2d");
   const ratio = 1;
-  const left = 0, top = 0, right = 0, rowH = 1;
+  const left = 0, top = 0, right = 0, rowH = state.timelineRowHeight;
   const maxEnd = fullEnd();
   const viewStart = Math.max(0, Math.min(state.viewStart, maxEnd));
   const viewEnd = Math.max(viewStart + 1, Math.min(state.viewEnd || maxEnd, maxEnd));
@@ -666,7 +667,7 @@ function drawTimeline() {
         const x = left + plotW * (clippedStart - viewStart) / (viewEnd - viewStart);
         const w = Math.max(1, plotW * (clippedEnd - clippedStart) / (viewEnd - viewStart));
         ctx.fillStyle = selected ? sampleColor(sample, segment.kind) : "#9b9b9b";
-        ctx.fillRect(x, y, w, rowH);
+        ctx.fillRect(x, y, w, rowH === 1 ? 1 : rowH - 1);
       }
     }
   });
@@ -772,6 +773,7 @@ function drawDetails() {
 function render() {
   state.query = document.getElementById("search").value.trim().toLowerCase();
   state.kind = document.getElementById("kind").value;
+  state.timelineRowHeight = Number(document.getElementById("timelineRowHeight").value);
   drawFlame();
   drawOverview();
   drawTimeline();
@@ -901,6 +903,7 @@ function zoomToRange(start, end) {
 }
 document.getElementById("search").addEventListener("input", () => { state.focus = null; render(); });
 document.getElementById("kind").addEventListener("change", () => { state.focus = null; render(); });
+document.getElementById("timelineRowHeight").addEventListener("change", render);
 document.getElementById("zoomIn").addEventListener("click", () => zoomView(1.35));
 document.getElementById("zoomOut").addEventListener("click", () => zoomView(1 / 1.35));
 document.getElementById("reset").addEventListener("click", resetView);
