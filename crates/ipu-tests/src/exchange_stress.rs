@@ -216,6 +216,7 @@ pub(crate) fn build(
                 .steps
                 .push(TileStep::Exchange(ExchangeStep {
                     active,
+                    incoming_base: 0,
                     program: PlacedExchangeRow {
                         address,
                         words: row,

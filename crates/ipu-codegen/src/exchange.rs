@@ -19,6 +19,8 @@ pub struct PhysicalExchangePhase {
     pub active: Vec<bool>,
     /// Synchronization-free timed supervisor program indexed by logical tile.
     pub programs: Vec<Vec<u32>>,
+    /// Per-tile base used by point-to-point receive rows in this phase.
+    pub incoming_bases: Vec<u32>,
     /// Final local exchange event indexed by logical tile. Inactive tiles use zero.
     pub tile_event_cycles: Vec<u32>,
     pub event_cycles: u32,
@@ -289,6 +291,16 @@ fn lower_static_exchanges(
                 }
             }
             let pending = coalesce_pending_transfers(pending);
+            let mut incoming_bases = vec![None::<u32>; usize::from(program.tile_count)];
+            for transfer in &pending {
+                if let [(tile, address)] = transfer.destinations.as_slice() {
+                    incoming_bases[usize::from(*tile)].get_or_insert(*address);
+                }
+            }
+            let incoming_bases = incoming_bases
+                .into_iter()
+                .map(|base| base.unwrap_or(0))
+                .collect::<Vec<_>>();
             let mut destination_multiplicity = BTreeMap::new();
             for transfer in &pending {
                 for &(tile, address) in &transfer.destinations {
@@ -331,6 +343,7 @@ fn lower_static_exchanges(
                     };
                     let timing = append_transfer(
                         topology,
+                        &incoming_bases,
                         ScheduledTransfer {
                             source: transfer.source,
                             destinations: &transfer.destinations,
@@ -457,6 +470,7 @@ fn lower_static_exchanges(
                 id: phase.id,
                 active,
                 programs,
+                incoming_bases,
                 tile_event_cycles,
                 event_cycles: horizon,
                 activities,
@@ -885,6 +899,7 @@ struct ScheduledTransfer<'a> {
 
 fn append_transfer(
     topology: &Topology,
+    incoming_bases: &[u32],
     transfer: ScheduledTransfer<'_>,
     horizon: &mut u32,
     builders: &mut BTreeMap<u16, PlanProgramBuilder>,
@@ -900,7 +915,10 @@ fn append_transfer(
         return Err(ExchangeLoweringError::UnalignedPayload);
     }
     let tiles = destinations.iter().map(|entry| entry.0).collect::<Vec<_>>();
-    let mut plan = if tiles.len() == 1 && schedule_offset == 0 {
+    let point_receiver = destinations.first().is_some_and(|&(tile, address)| {
+        destinations.len() == 1 && incoming_bases[usize::from(tile)] == address
+    });
+    let mut plan = if point_receiver {
         let point = topology.point_to_point(source, tiles[0], words)?;
         MulticastPlan {
             sender: point.sender,
@@ -913,8 +931,10 @@ fn append_transfer(
         topology.multicast(source, &tiles, words, 0)?
     };
     patch_sender_address(&mut plan.sender, source_address)?;
-    for (row, (_, address)) in plan.receivers.iter_mut().zip(destinations) {
-        patch_receiver_address(row, *address)?;
+    if !point_receiver {
+        for (row, (_, address)) in plan.receivers.iter_mut().zip(destinations) {
+            patch_receiver_address(row, *address)?;
+        }
     }
     builders
         .entry(source)

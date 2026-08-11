@@ -58,6 +58,7 @@ pub enum TileLoweringError {
 
 struct PlacedExchange {
     active: bool,
+    incoming_base: u32,
     program: PlacedExchangeRow,
     setup_patch: Option<ExchangeSetupPatch>,
     repeat_patches: Vec<ExchangePatch>,
@@ -176,6 +177,7 @@ fn lower_work(
                     .ok_or(TileLoweringError::UnknownExchange)?;
                 TileStep::Exchange(ExchangeStep {
                     active: placed.active,
+                    incoming_base: placed.incoming_base,
                     program: placed.program.clone(),
                     setup_patch: placed.setup_patch.clone(),
                     repeat_patches: inside_repeat
@@ -332,6 +334,7 @@ fn lower_inactive_work(
         match work {
             TileWorkRef::Exchange(id) => steps.push(TileStep::Exchange(ExchangeStep {
                 active: exchange_rows[&id].active,
+                incoming_base: exchange_rows[&id].incoming_base,
                 program: exchange_rows[&id].program.clone(),
                 setup_patch: exchange_rows[&id].setup_patch.clone(),
                 repeat_patches: Vec::new(),
@@ -539,6 +542,11 @@ fn layout_exchange_rows(
             phase.id,
             PlacedExchange {
                 active,
+                incoming_base: if tile < scheduled_tile_count {
+                    phase.incoming_bases[usize::from(tile)]
+                } else {
+                    0
+                },
                 program,
                 setup_patch,
                 repeat_patches,

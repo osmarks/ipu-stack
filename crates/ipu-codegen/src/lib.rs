@@ -149,6 +149,8 @@ pub enum TileAddress {
 pub struct ExchangeStep {
     /// Whether this tile executes a timed send/receive program after the boundary.
     pub active: bool,
+    /// Base address used by point-to-point receive rows.
+    pub incoming_base: u32,
     /// Synchronization-free timed exchange program.
     pub program: PlacedExchangeRow,
     /// Address words applied before invoking a structurally shared row.
@@ -353,7 +355,8 @@ fn emit_steps(
                         symbols,
                     )?;
                 }
-                code.put_special(INCOMING_BASE, 15)?;
+                code.setzi(8, exchange.incoming_base)?;
+                code.put_special(INCOMING_BASE, 8)?;
                 code.put_special(OUTGOING_BASE, 15)?;
                 if exchange.active {
                     code.call(
@@ -871,6 +874,7 @@ mod tests {
             steps: vec![
                 TileStep::Exchange(ExchangeStep {
                     active: false,
+                    incoming_base: 0,
                     program: PlacedExchangeRow {
                         address: 0x60000,
                         words: inactive_exchange_program(),
@@ -912,6 +916,7 @@ mod tests {
             tile: 0,
             steps: vec![TileStep::Exchange(ExchangeStep {
                 active: false,
+                incoming_base: 0,
                 program: PlacedExchangeRow {
                     address: 3,
                     words: Vec::new(),
@@ -949,6 +954,7 @@ mod tests {
                     }],
                     body: vec![TileStep::Exchange(ExchangeStep {
                         active: true,
+                        incoming_base: 0x70000,
                         program: PlacedExchangeRow {
                             address: 0x60000,
                             words: vec![0, ipu_exchange::RETURN_M10_INSTRUCTION],
