@@ -26,8 +26,8 @@ pub use exchange::{
 pub use graph::{
     AddOptions, AttentionOptions, AttentionScale, BroadcastMode, ComputeGraph, GemmOptions,
     GraphError, GraphInput, GraphInputKind, GraphResult, Operation, OperationId, OperationKind,
-    Region, RegionBuilder, Repeat, RepeatArguments, TensorShape, ValueId, ValueSequence,
-    ValueSequenceId,
+    Region, RegionBuilder, Repeat, RepeatArguments, SplitHeadsOptions, TensorShape, ValueId,
+    ValueSequence, ValueSequenceId,
 };
 pub use kernel::{
     KernelAbi, KernelAbiError, KernelAvailability, KernelBuildPlan, KernelCompilation,
@@ -83,6 +83,7 @@ pub const COMPLETE_SYMBOL: &str = "ipu_stack_static_complete";
 pub const HOST_RUN_SYMBOL: &str = "ipu_stack_static_host_run";
 pub const REPEAT_CALL_SYMBOL: &str = "ipu_stack_static_repeat_call";
 pub const SAMPLE_CYCLE_SYMBOL: &str = "ipu_stack_static_sample_cycle";
+pub const COPY_U16_SYMBOL: &str = "ipu_stack_static_copy_u16";
 pub const COPY_U32_SYMBOL: &str = "ipu_stack_static_copy_u32";
 pub const COPY_U64_SYMBOL: &str = "ipu_stack_copy_u64";
 pub const PATCH_WORD_SYMBOL: &str = "ipu_stack_static_patch_word";
@@ -338,7 +339,53 @@ fn emit_steps(
     repeat_count: Option<u32>,
     code_address: u32,
 ) -> Result<()> {
-    for step in steps {
+    let mut index = 0;
+    while index < steps.len() {
+        let step = &steps[index];
+        if let TileStep::Compute(compute) = step
+            && compute.symbol == COPY_U16_SYMBOL
+            && let Some((source, destination)) = absolute_u16_copy(compute)
+        {
+            if let Some(address) = compute.profile.before {
+                emit_cycle_sample(code, symbols, address)?;
+            }
+            let mut copies = vec![(source, destination)];
+            let mut end = index + 1;
+            while end < steps.len()
+                && step_compute_profile(&steps[end - 1])
+                    .is_none_or(|profile| profile.after.is_none())
+            {
+                let TileStep::Compute(next) = &steps[end] else {
+                    break;
+                };
+                if next.symbol != COPY_U16_SYMBOL || next.profile.before.is_some() {
+                    break;
+                }
+                let Some(copy) = absolute_u16_copy(next) else {
+                    break;
+                };
+                copies.push(copy);
+                end += 1;
+                if next.profile.after.is_some() {
+                    break;
+                }
+            }
+            code.setzi(
+                4,
+                u32::try_from(copies.len())
+                    .map_err(|_| invalid("halfword copy table is too large"))?,
+            )?;
+            code.call(symbol(symbols, COPY_U16_SYMBOL)?, 10)?;
+            for (source, destination) in copies {
+                code.instruction(source);
+                code.instruction(destination);
+            }
+            if let Some(address) = step_compute_profile(&steps[end - 1]).and_then(|p| p.after) {
+                emit_cycle_sample(code, symbols, address)?;
+            }
+            index = end;
+            continue;
+        }
         match step {
             TileStep::Exchange(exchange) => {
                 if let Some(address) = exchange.profile.before {
@@ -415,8 +462,26 @@ fn emit_steps(
                 }
             }
         }
+        index += 1;
     }
     Ok(())
+}
+
+fn absolute_u16_copy(compute: &ComputeStep) -> Option<(u32, u32)> {
+    let [TileAddress::Absolute(source)] = compute.input_addresses.as_slice() else {
+        return None;
+    };
+    let TileAddress::Absolute(destination) = compute.output_address else {
+        return None;
+    };
+    (compute.arguments.as_slice() == [1]).then_some((*source, destination))
+}
+
+fn step_compute_profile(step: &TileStep) -> Option<&StepProfile> {
+    match step {
+        TileStep::Compute(compute) => Some(&compute.profile),
+        TileStep::Exchange(_) | TileStep::Repeat(_) => None,
+    }
 }
 
 fn validate(program: &TileProgram) -> Result<()> {
@@ -441,7 +506,7 @@ fn validate_steps(
                 for patch in &exchange.repeat_patches {
                     if repeat_count.is_none_or(|count| patch.values.words.len() != count as usize)
                         || patch.word_offset as usize >= exchange.program.words.len()
-                        || patch.values.address & 3 != 0
+                        || patch.values.address & 0b11 != 0
                     {
                         return Err(invalid("exchange patch has invalid shape or address"));
                     }
@@ -483,7 +548,7 @@ fn validate_steps(
 }
 
 fn validate_exchange_program(exchange: &ExchangeStep) -> Result<()> {
-    if exchange.program.address & 3 != 0
+    if exchange.program.address & 0b11 != 0
         || exchange.program.words.last() != Some(&ipu_exchange::RETURN_M10_INSTRUCTION)
         || exchange.program.words.iter().any(|word| {
             matches!(

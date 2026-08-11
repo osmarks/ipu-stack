@@ -123,6 +123,54 @@ ipu_stack_static_copy_u32:
 	br $m10
 	.size ipu_stack_static_copy_u32, .-ipu_stack_static_copy_u32
 
+	.section .text.ipu_stack_static_copy_u16,"ax",@progbits
+	// Runtime helper ABI: m4 entry count and m10 points to inline
+	// (source address, destination address) pairs. It returns past the table.
+	.globl ipu_stack_static_copy_u16
+	.p2align 2
+	.type ipu_stack_static_copy_u16,@function
+ipu_stack_static_copy_u16:
+	.supervisor
+	brz $m4, .Lcopy_u16_done
+.Lcopy_u16:
+	ld32 $m3, $m10, $m15, 0
+	ld32 $m2, $m10, $m15, 1
+	add $m10, $m10, 8
+	mov $m6, $m3
+	shr $m6, $m6, 2
+	shl $m6, $m6, 2
+	ld32 $m0, $m6, $m15, 0
+	setzi $m5, 2
+	and $m6, $m3, $m5
+	brz $m6, .Lcopy_u16_source_low
+	shr $m0, $m0, 16
+.Lcopy_u16_source_low:
+	setzi $m5, 65535
+	and $m0, $m0, $m5
+	mov $m6, $m2
+	shr $m6, $m6, 2
+	shl $m6, $m6, 2
+	ld32 $m1, $m6, $m15, 0
+	setzi $m5, 2
+	and $m7, $m2, $m5
+	brz $m7, .Lcopy_u16_destination_low
+	shl $m0, $m0, 16
+	setzi $m5, 65535
+	and $m1, $m1, $m5
+	bri .Lcopy_u16_store
+.Lcopy_u16_destination_low:
+	setzi $m5, 65535
+	shl $m5, $m5, 16
+	and $m1, $m1, $m5
+.Lcopy_u16_store:
+	or $m0, $m0, $m1
+	st32 $m0, $m6, $m15, 0
+	sub $m4, $m4, 1
+	brnz $m4, .Lcopy_u16
+.Lcopy_u16_done:
+	br $m10
+	.size ipu_stack_static_copy_u16, .-ipu_stack_static_copy_u16
+
 	.section .text.ipu_stack_static_patch_word,"ax",@progbits
 	// Runtime helper ABI: m2 destination word, m3 value table, m4 remaining
 	// iterations, m5 total iterations, m9 return. Exchange plans are ordinary

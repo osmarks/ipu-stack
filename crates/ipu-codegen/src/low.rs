@@ -897,8 +897,7 @@ impl LoweringState {
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
         let direct_retile = plan.input.format.layout.order == plan.output.format.layout.order;
-        let mut remote_items =
-            Vec::<(ShardView, ShardView, u16, Vec<LocalCopy>, Option<KernelRun>)>::new();
+        let mut mappings = Vec::new();
         for output in outputs {
             let tile = self.shards[output.index() as usize].tile;
             let mut unique_intersections = BTreeMap::<Vec<ShardExtent>, LowShardId>::new();
@@ -915,95 +914,203 @@ impl LoweringState {
                 }
             }
             for (extents, source) in unique_intersections {
-                let remote = self.shards[source.index() as usize].tile != tile;
-                for extents in [extents] {
-                    let source_view = ShardView {
+                mappings.push((
+                    ShardView {
                         shard: source,
                         extents: extents.clone(),
-                    };
-                    let output_view = ShardView {
+                    },
+                    ShardView {
                         shard: output,
-                        extents: extents.clone(),
-                    };
-                    let (resident, exchange) = if remote {
-                        (
-                            output_view.clone(),
-                            Some((source_view.clone(), output_view.clone())),
-                        )
-                    } else {
-                        (source_view.clone(), None)
-                    };
-                    let (local_copies, run) = if remote {
-                        (Vec::new(), None)
-                    } else {
-                        let mut copies = Vec::new();
-                        if direct_retile {
-                            append_span_copies(
-                                &self.shards,
-                                &resident,
-                                &output_view,
-                                tile,
-                                &mut copies,
-                            )?;
-                        } else {
-                            append_logical_span_copies(
-                                &self.shards,
-                                &resident,
-                                &output_view,
-                                tile,
-                                &mut copies,
-                            )?;
-                        }
-                        (copies.into_iter().map(|(_, copy)| copy).collect(), None)
-                    };
-                    if let Some((source_view, destination_view)) = exchange {
-                        remote_items.push((source_view, destination_view, tile, local_copies, run));
-                    } else {
-                        for copy in local_copies {
-                            self.append_local_copy(tiles, tile, copy)?;
-                        }
-                        if let Some(run) = run {
-                            self.append_kernel(tiles, tile, run)?;
-                        }
-                    }
-                }
+                        extents,
+                    },
+                ));
             }
         }
-        let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
-        let mut consumers = Vec::<(u16, Vec<LocalCopy>, Option<KernelRun>)>::new();
-        for (source, destination, tile, copies, run) in remote_items {
-            transfers.entry(source).or_default().push(destination);
-            consumers.push((tile, copies, run));
-        }
-        self.flush_conversion_phase(
-            &mut transfers,
-            &mut consumers,
+        self.lower_mapped_views(
+            mappings,
+            !direct_retile,
             operation_provenance(operation, kind),
             tiles,
-        )?;
-        Ok(())
+        )
     }
 
-    fn flush_conversion_phase(
+    fn lower_mapped_views(
         &mut self,
-        transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
-        consumers: &mut Vec<(u16, Vec<LocalCopy>, Option<KernelRun>)>,
+        mappings: Vec<(ShardView, ShardView)>,
+        logical_order: bool,
         provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        if transfers.is_empty() {
-            return Ok(());
+        let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+        let mut before_exchange = Vec::new();
+        let mut after_exchange = Vec::new();
+        let mut after_exchange_kernels = Vec::new();
+        let mut grouped = BTreeMap::<LowShardId, Vec<(ShardView, ShardView)>>::new();
+        for mapping in mappings {
+            grouped.entry(mapping.1.shard).or_default().push(mapping);
         }
-        self.append_phase(std::mem::take(transfers), provenance, tiles)?;
-        for (tile, copies, run) in consumers.drain(..) {
-            for copy in copies {
-                self.append_local_copy(tiles, tile, copy)?;
+        for (destination_shard, mut mappings) in grouped {
+            let destination_format = &self.shards[destination_shard.index() as usize]
+                .tensor_type
+                .format;
+            let mut stage_destination = logical_order
+                && mappings.iter().any(|(source, _)| {
+                    self.shards[source.shard.index() as usize]
+                        .tensor_type
+                        .format
+                        .layout
+                        .order
+                        != destination_format.layout.order
+                });
+            if logical_order {
+                for (_, destination) in &mappings {
+                    let spans = logical_view_byte_spans(
+                        &self.shards[destination.shard.index() as usize],
+                        destination,
+                    )?;
+                    stage_destination |= spans
+                        .iter()
+                        .any(|span| span.offset & 0b11 != 0 || span.bytes & 0b11 != 0);
+                }
             }
-            if let Some(run) = run {
-                self.append_kernel(tiles, tile, run)?;
+            let staging = if stage_destination {
+                Some(self.push_conversion_staging(destination_shard)?)
+            } else {
+                None
+            };
+            for (source, mut destination) in mappings.drain(..) {
+                if let Some(staging) = staging {
+                    destination.shard = staging;
+                }
+                let source_tile = self.shards[source.shard.index() as usize].tile;
+                let destination_tile = self.shards[destination.shard.index() as usize].tile;
+                if source_tile == destination_tile {
+                    let copies = if staging.is_some() {
+                        &mut before_exchange
+                    } else {
+                        &mut after_exchange
+                    };
+                    if logical_order {
+                        append_logical_span_copies(
+                            &self.shards,
+                            &source,
+                            &destination,
+                            destination_tile,
+                            copies,
+                        )?;
+                    } else {
+                        append_span_copies(
+                            &self.shards,
+                            &source,
+                            &destination,
+                            destination_tile,
+                            copies,
+                        )?;
+                    }
+                } else {
+                    transfers.entry(source).or_default().push(destination);
+                }
             }
+            if let Some(staging) = staging {
+                let destination = self.logical_view(destination_shard);
+                let staging = self.full_view(staging);
+                let source_format = self.shards[staging.shard.index() as usize]
+                    .tensor_type
+                    .format
+                    .clone();
+                let destination_format = self.shards[destination_shard.index() as usize]
+                    .tensor_type
+                    .format
+                    .clone();
+                let tile = self.shards[destination_shard.index() as usize].tile;
+                if source_format.precision == crate::Precision::F16
+                    && source_format.layout.order == ElementOrder::RowMajor
+                    && matches!(
+                        destination_format.layout.order,
+                        ElementOrder::Amp(
+                            AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightK64
+                        )
+                    )
+                {
+                    after_exchange_kernels.push((
+                        tile,
+                        KernelRun::new(
+                            provenance.clone(),
+                            TileKernel::Planned(TileKernelSpec::Rearrange {
+                                from: source_format.layout.clone(),
+                                to: destination_format.layout.clone(),
+                            }),
+                            vec![KernelOperand {
+                                views: vec![staging],
+                            }],
+                            self.full_view(destination_shard),
+                            KernelRequirements::Conversion {
+                                input: OperandRequirement::new(source_format, 2),
+                                output: OperandRequirement::new(destination_format, 2),
+                            },
+                        ),
+                    ));
+                } else {
+                    append_logical_span_copies(
+                        &self.shards,
+                        &staging,
+                        &destination,
+                        tile,
+                        &mut after_exchange,
+                    )?;
+                }
+            }
+        }
+        for (tile, copy) in before_exchange {
+            self.append_local_copy(tiles, tile, copy)?;
+        }
+        self.append_phase(transfers, provenance, tiles)?;
+        for (tile, copy) in after_exchange {
+            self.append_local_copy(tiles, tile, copy)?;
+        }
+        for (tile, run) in after_exchange_kernels {
+            self.append_kernel(tiles, tile, run)?;
         }
         Ok(())
+    }
+
+    fn push_conversion_staging(
+        &mut self,
+        destination: LowShardId,
+    ) -> LowLoweringResult<LowShardId> {
+        let destination = &self.shards[destination.index() as usize];
+        let mut extents = destination.extents.clone();
+        let tile = destination.tile;
+        let shape = destination.tensor_type.shape.clone();
+        let precision = destination.tensor_type.format.precision;
+        for extent in &mut extents {
+            extent.physical_end = extent.logical_end;
+        }
+        self.push_shard(LowShard {
+            id: LowShardId(0),
+            tile,
+            tensor_type: TensorType {
+                shape,
+                format: crate::TensorFormat {
+                    precision,
+                    layout: Layout {
+                        order: ElementOrder::RowMajor,
+                        tiling: TensorTiling::replicated(1),
+                        memory_class: MemoryClass::Ipu21Standard,
+                    },
+                },
+            },
+            extents,
+            definition: ShardDefinition::Staging,
+        })
+    }
+
+    fn logical_view(&self, shard: LowShardId) -> ShardView {
+        let mut view = self.full_view(shard);
+        for extent in &mut view.extents {
+            extent.physical_end = extent.logical_end;
+        }
+        view
     }
 
     fn lower_operator(
@@ -1060,7 +1167,83 @@ impl LoweringState {
                 &plan.requirements,
                 tiles,
             ),
+            OperatorDispatch::SplitHeads => {
+                self.lower_split_heads(operation, &plan.operator, tiles)
+            }
         }
+    }
+
+    fn lower_split_heads(
+        &mut self,
+        operation: &MidOperation,
+        operator: &crate::MidOperator,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<()> {
+        let crate::MidOperator::SplitHeads(options) = operator else {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        };
+        let [input] = operation.inputs.as_slice() else {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        };
+        let [result] = operation.results.as_slice() else {
+            return Err(LowLoweringError::ResultArity);
+        };
+        let input_type = &self
+            .value_shards(*input)?
+            .first()
+            .map(|shard| &self.shards[shard.index() as usize].tensor_type)
+            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+        if input_type.shape.0.len() != 3 || options.heads == 0 {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let head_width = input_type.shape.0[2] / options.heads;
+        if head_width == 0 || head_width * options.heads != input_type.shape.0[2] {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+
+        let mut mappings = Vec::new();
+        for output in self.value_shards(*result)?.to_vec() {
+            let output_extents = self.shards[output.index() as usize].extents.clone();
+            let tile = self.shards[output.index() as usize].tile;
+            if output_extents.len() != 3
+                || output_extents[0].logical_end - output_extents[0].start != 1
+            {
+                return Err(LowLoweringError::InvalidOperatorPlan);
+            }
+            let (target, column_base) =
+                split_head_source_extents(&output_extents, options.heads, head_width)?;
+            for (source_extents, source) in self.intersecting_shards(*input, &target, tile)? {
+                let destination_extents = vec![
+                    output_extents[0],
+                    source_extents[1],
+                    ShardExtent {
+                        axis: 2,
+                        start: source_extents[2].start - column_base,
+                        logical_end: source_extents[2].logical_end - column_base,
+                        physical_end: source_extents[2].logical_end - column_base,
+                    },
+                ];
+                let source_view = ShardView {
+                    shard: source,
+                    extents: source_extents,
+                };
+                let destination_view = ShardView {
+                    shard: output,
+                    extents: destination_extents,
+                };
+                mappings.push((source_view, destination_view));
+            }
+        }
+        self.lower_mapped_views(
+            mappings,
+            true,
+            WorkProvenance {
+                operation: operation.source,
+                value: Some(*result),
+                reason: WorkReason::OperatorInputs,
+            },
+            tiles,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3105,6 +3288,49 @@ fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<Vec<ShardExt
     Ok(all)
 }
 
+fn split_head_source_extents(
+    output: &[ShardExtent],
+    heads: u32,
+    head_width: u32,
+) -> LowLoweringResult<(Vec<ShardExtent>, u32)> {
+    if output.len() != 3
+        || heads == 0
+        || output[0].logical_end - output[0].start != 1
+        || output[2].logical_end > head_width
+    {
+        return Err(LowLoweringError::InvalidOperatorPlan);
+    }
+    let stream = output[0].start;
+    let batch = stream / heads;
+    let head = stream % heads;
+    let column_base = head
+        .checked_mul(head_width)
+        .ok_or(LowLoweringError::IdOverflow)?;
+    Ok((
+        vec![
+            ShardExtent {
+                axis: 0,
+                start: batch,
+                logical_end: batch + 1,
+                physical_end: batch + 1,
+            },
+            ShardExtent {
+                axis: 1,
+                start: output[1].start,
+                logical_end: output[1].logical_end,
+                physical_end: output[1].logical_end,
+            },
+            ShardExtent {
+                axis: 2,
+                start: column_base + output[2].start,
+                logical_end: column_base + output[2].logical_end,
+                physical_end: column_base + output[2].logical_end,
+            },
+        ],
+        column_base,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3646,6 +3872,58 @@ mod tests {
                 }
                 assert_eq!(cursor, padded.0[axis], "case {case}");
             }
+        }
+    }
+
+    #[test]
+    fn randomized_split_head_mappings_are_bijective_rectangles() {
+        let mut random = fastrand::Rng::with_seed(0x6d61_7070_6564_5f68);
+        for _ in 0..CASES * 8 {
+            let batch = random.u32(1..=8);
+            let heads = random.u32(1..=32);
+            let rows = random.u32(1..=256);
+            let width = random.u32(1..=128);
+            let stream = random.u32(0..batch * heads);
+            let row_start = random.u32(0..rows);
+            let row_end = random.u32(row_start + 1..=rows);
+            let column_start = random.u32(0..width);
+            let column_end = random.u32(column_start + 1..=width);
+            let output = vec![
+                ShardExtent {
+                    axis: 0,
+                    start: stream,
+                    logical_end: stream + 1,
+                    physical_end: stream + 1,
+                },
+                ShardExtent {
+                    axis: 1,
+                    start: row_start,
+                    logical_end: row_end,
+                    physical_end: row_end,
+                },
+                ShardExtent {
+                    axis: 2,
+                    start: column_start,
+                    logical_end: column_end,
+                    physical_end: column_end,
+                },
+            ];
+            let (source, base) = split_head_source_extents(&output, heads, width).unwrap();
+
+            assert_eq!(source[0].start, stream / heads);
+            assert_eq!(source[1], output[1]);
+            assert_eq!(source[2].start, base + column_start);
+            assert_eq!(source[2].logical_end, base + column_end);
+            assert_eq!(
+                source
+                    .iter()
+                    .map(|extent| extent.logical_end - extent.start)
+                    .product::<u32>(),
+                output
+                    .iter()
+                    .map(|extent| extent.logical_end - extent.start)
+                    .product::<u32>()
+            );
         }
     }
 

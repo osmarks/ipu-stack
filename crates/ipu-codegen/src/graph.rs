@@ -117,6 +117,7 @@ pub enum OperationKind {
     /// Exact Gaussian error linear unit.
     Gelu,
     Add(AddOptions),
+    SplitHeads(SplitHeadsOptions),
     FlashAttention(AttentionOptions),
     Repeat(Repeat),
 }
@@ -136,6 +137,11 @@ pub enum BroadcastMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AddOptions {
     pub broadcasting: BroadcastMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplitHeadsOptions {
+    pub heads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -325,6 +331,15 @@ impl ComputeGraph {
 
     pub fn add(&mut self, left: ValueId, right: ValueId) -> GraphResult<ValueId> {
         self.inferred_result(OperationKind::Add(AddOptions::default()), [left, right])
+    }
+
+    /// Converts `[batch, rows, heads * channels]` projection output into
+    /// `[batch * heads, rows, channels]` attention streams.
+    pub fn split_heads(&mut self, input: ValueId, heads: u32) -> GraphResult<ValueId> {
+        self.inferred_result(
+            OperationKind::SplitHeads(SplitHeadsOptions { heads }),
+            [input],
+        )
     }
 
     pub fn flash_attention(
@@ -546,6 +561,13 @@ impl<'a> RegionBuilder<'a> {
         self.inferred_result(OperationKind::Add(AddOptions::default()), [left, right])
     }
 
+    pub fn split_heads(&mut self, input: ValueId, heads: u32) -> GraphResult<ValueId> {
+        self.inferred_result(
+            OperationKind::SplitHeads(SplitHeadsOptions { heads }),
+            [input],
+        )
+    }
+
     pub fn flash_attention(
         &mut self,
         query: ValueId,
@@ -674,6 +696,28 @@ fn infer_shape(
         OperationKind::Add(AddOptions {
             broadcasting: BroadcastMode::Numpy,
         }) => Ok(TensorShape(broadcast(&input(0)?.0, &input(1)?.0)?)),
+        OperationKind::SplitHeads(options) => {
+            let input = input(0)?;
+            if input.0.len() != 3 || options.heads == 0 {
+                return Err(GraphError::InvalidShape(
+                    "split_heads requires nonzero heads and [batch, rows, channels] input".into(),
+                ));
+            }
+            let channels = input.0[2];
+            if !channels.is_multiple_of(options.heads) {
+                return Err(GraphError::InvalidShape(
+                    "split_heads channels must be divisible by heads".into(),
+                ));
+            }
+            let streams = input.0[0].checked_mul(options.heads).ok_or_else(|| {
+                GraphError::InvalidShape("split_heads stream count overflow".into())
+            })?;
+            Ok(TensorShape(vec![
+                streams,
+                input.0[1],
+                channels / options.heads,
+            ]))
+        }
         OperationKind::FlashAttention(options) => {
             let (query, key, value) = (input(0)?, input(1)?, input(2)?);
             if query.0.len() < 2 || key.0.len() < 2 || value.0.len() < 2 {
@@ -864,6 +908,32 @@ mod tests {
                 graph.value_shape(output),
                 Some(&TensorShape(expected)),
                 "random case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn randomized_split_heads_preserves_every_projection_element() {
+        let mut random = fastrand::Rng::with_seed(0x7370_6c69_745f_6864);
+        for _ in 0..RANDOM_CASES {
+            let batch = random.u32(1..=8);
+            let rows = random.u32(1..=256);
+            let heads = random.u32(1..=32);
+            let head_width = random.u32(1..=128);
+            let mut graph = ComputeGraph::new();
+            let input = graph
+                .host_input("projection", [batch, rows, heads * head_width])
+                .unwrap();
+            let output = graph.split_heads(input, heads).unwrap();
+            let output_shape = graph.value_shape(output).unwrap();
+
+            assert_eq!(
+                output_shape,
+                &TensorShape(vec![batch * heads, rows, head_width])
+            );
+            assert_eq!(
+                output_shape.elements(),
+                graph.value_shape(input).unwrap().elements()
             );
         }
     }

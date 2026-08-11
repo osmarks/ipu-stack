@@ -311,6 +311,8 @@ fn local_copy_call(bytes: u32, wide_safe: bool) -> Option<(&'static str, Vec<u32
         Some((crate::COPY_U64_SYMBOL, vec![words / 6, words % 6]))
     } else if bytes != 0 && bytes.is_multiple_of(4) {
         Some((crate::COPY_U32_SYMBOL, vec![bytes / 4]))
+    } else if bytes != 0 && bytes.is_multiple_of(2) {
+        Some((crate::COPY_U16_SYMBOL, vec![bytes / 2]))
     } else {
         None
     }

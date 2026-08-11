@@ -560,6 +560,7 @@ impl CostModel for Ipu21CostModel {
                         .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
                     OperatorDispatch::Pointwise { .. } => 0,
                     OperatorDispatch::BlockedAttention { .. } => 0,
+                    OperatorDispatch::SplitHeads => 0,
                 };
                 let kernel = amp_kernel_cycles(
                     multiply,
@@ -632,6 +633,12 @@ impl CostModel for Ipu21CostModel {
             MidOperator::Add(_) => spatial_occupancy_adjusted_elements
                 .div_ceil(16)
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
+            MidOperator::SplitHeads(_) => {
+                let bytes = elements.saturating_mul(output.format.precision.bytes());
+                bytes
+                    .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+                    .saturating_add(IPU21_TARGET_COSTS.exchange_phase_cycles)
+            }
         }
     }
 
@@ -643,7 +650,11 @@ impl CostModel for Ipu21CostModel {
         inputs: &[TensorType],
         output: &TensorType,
     ) -> ExchangeFootprint {
-        let phases = gemm_exchange_phase_count(dispatch, inputs, output);
+        let phases = if matches!(dispatch, OperatorDispatch::SplitHeads) {
+            1
+        } else {
+            gemm_exchange_phase_count(dispatch, inputs, output)
+        };
         let phases = match dispatch {
             OperatorDispatch::BlockedGemm {
                 output_column_block,

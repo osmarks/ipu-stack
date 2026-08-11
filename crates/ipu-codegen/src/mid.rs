@@ -17,7 +17,7 @@ use crate::estimate::{
 };
 use crate::graph::{
     AddOptions, AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation,
-    OperationId, OperationKind, Repeat, TensorShape, ValueId,
+    OperationId, OperationKind, Repeat, SplitHeadsOptions, TensorShape, ValueId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -57,6 +57,7 @@ pub enum MidOperator {
     },
     Gelu,
     Add(AddOptions),
+    SplitHeads(SplitHeadsOptions),
     FlashAttention {
         options: AttentionOptions,
         accumulate: AccumulationPrecision,
@@ -137,6 +138,10 @@ pub enum OperatorDispatch {
         padded_query_dimension: u32,
         padded_value_dimension: u32,
     },
+    /// Redistribute packed projection columns into independent attention
+    /// streams. The byte mapping is performed directly by local copies and
+    /// exchanges, without a tile kernel.
+    SplitHeads,
 }
 
 /// Which operand remains resident while a blocked whole-device GEMM is run.
@@ -173,6 +178,7 @@ impl OperatorDispatch {
     fn empty_output_shard_policy(&self) -> EmptyOutputShardPolicy {
         match self {
             Self::Pointwise { .. } => EmptyOutputShardPolicy::Skip,
+            Self::SplitHeads => EmptyOutputShardPolicy::Reject,
             Self::BlockedGemm { .. } | Self::BlockedAttention { .. } => {
                 EmptyOutputShardPolicy::Reject
             }
@@ -1216,6 +1222,7 @@ fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
             kernel: TileKernelSpec::Add,
             input_mapping: PointwiseInputMapping::BroadcastToOutput,
         },
+        MidOperator::SplitHeads(_) => OperatorDispatch::SplitHeads,
         MidOperator::FlashAttention {
             options,
             accumulate,
@@ -2152,6 +2159,19 @@ impl OperatorPlan {
                     Ok(())
                 }
             }
+            (MidOperator::SplitHeads(_), OperatorDispatch::SplitHeads) => {
+                let [input] = inputs else {
+                    return Err(OperatorPlanError::OperandArity);
+                };
+                if input.shape.0.len() != 3
+                    || output.shape.0.len() != 3
+                    || input.format.precision != output.format.precision
+                {
+                    Err(OperatorPlanError::InvalidBlocking)
+                } else {
+                    Ok(())
+                }
+            }
             _ => Err(OperatorPlanError::DispatchMismatch),
         }
     }
@@ -2920,6 +2940,46 @@ fn plans(
     config: &PipelineConfig,
 ) -> Vec<Plan> {
     let mut plans = Vec::new();
+    if let OperationKind::SplitHeads(options) = operation.kind
+        && let [input] = inputs
+        && output.0.len() == 3
+        && let (Ok(streams), Ok(rows)) = (u16::try_from(output.0[0]), u16::try_from(output.0[1]))
+        && streams != 0
+    {
+        let query_partitions = rows.min(config.tile_count / streams);
+        let key_partitions = u16::try_from(output.0[1].div_ceil(AMP_INNER_BLOCK))
+            .unwrap_or(u16::MAX)
+            .min(config.tile_count / streams);
+        let layouts = [
+            (query_partitions != 0).then(|| Layout::attention_query(streams, query_partitions)),
+            (key_partitions != 0).then(|| {
+                Layout::attention_key_value(AmpOrder::TransposedRight, streams, key_partitions)
+            }),
+            (key_partitions != 0)
+                .then(|| Layout::attention_key_value(AmpOrder::RightK64, streams, key_partitions)),
+        ];
+        for layout in layouts.into_iter().flatten() {
+            let plan = Plan {
+                operator: MidOperator::SplitHeads(options),
+                dispatch: OperatorDispatch::SplitHeads,
+                requirements: OperatorRequirements {
+                    inputs: vec![OperandRequirement::new(input.format.clone(), 8)],
+                    output: OperandRequirement::new(
+                        TensorFormat {
+                            precision: input.format.precision,
+                            layout,
+                        },
+                        8,
+                    ),
+                    output_aliasing: OutputAliasing::Fresh,
+                    memory_relations: Vec::new(),
+                },
+            };
+            if !plans.contains(&plan) {
+                plans.push(plan);
+            }
+        }
+    }
     if let OperationKind::FlashAttention(options) = operation.kind
         && !options.causal
         && let [query, key, value] = inputs
@@ -3129,7 +3189,9 @@ fn independent_parameter_storage(
             output_column_block,
             ..
         } => output_column_block,
-        OperatorDispatch::Pointwise { .. } | OperatorDispatch::BlockedAttention { .. } => {
+        OperatorDispatch::Pointwise { .. }
+        | OperatorDispatch::BlockedAttention { .. }
+        | OperatorDispatch::SplitHeads => {
             return Vec::new();
         }
     };
@@ -3403,6 +3465,9 @@ fn operator_matches(operation: &OperationKind, operator: MidOperator) -> bool {
         (OperationKind::Gemm(expected), MidOperator::Gemm { options, .. }) => *expected == options,
         (OperationKind::Gelu, MidOperator::Gelu) => true,
         (OperationKind::Add(expected), MidOperator::Add(options)) => *expected == options,
+        (OperationKind::SplitHeads(expected), MidOperator::SplitHeads(options)) => {
+            *expected == options
+        }
         (OperationKind::FlashAttention(expected), MidOperator::FlashAttention { options, .. }) => {
             *expected == options
         }

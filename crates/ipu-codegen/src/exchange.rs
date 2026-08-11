@@ -215,7 +215,7 @@ fn lower_static_exchanges(
                 let mut destination_positions = vec![(0usize, 0u32); destinations.len()];
                 while source_index < source_spans.len() {
                     let source_span = source_spans[source_index];
-                    if source_span.bytes == 0 || source_span.offset & 3 != 0 {
+                    if source_span.bytes == 0 || source_span.offset & 0b11 != 0 {
                         return Err(ExchangeLoweringError::UnalignedPayload);
                     }
                     let mut chunk_bytes = (source_span.bytes - source_offset).min(
@@ -229,12 +229,12 @@ fn lower_static_exchanges(
                         let span = spans
                             .get(*index)
                             .ok_or(ExchangeLoweringError::SizeMismatch)?;
-                        if span.offset & 3 != 0 {
+                        if span.offset & 0b11 != 0 {
                             return Err(ExchangeLoweringError::UnalignedPayload);
                         }
                         chunk_bytes = chunk_bytes.min(span.bytes - *offset);
                     }
-                    if chunk_bytes == 0 || chunk_bytes & 3 != 0 {
+                    if chunk_bytes == 0 || chunk_bytes & 0b11 != 0 {
                         return Err(ExchangeLoweringError::UnalignedPayload);
                     }
                     let source_address = source_base

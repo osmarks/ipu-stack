@@ -306,31 +306,53 @@ fn main() -> Result<()> {
         arguments.workload,
         Workload::AttentionSmoke | Workload::SiglipAttentionBenchmark
     ) {
-        let (heads, query_rows, key_rows, query_dimension, value_dimension) =
-            if matches!(arguments.workload, Workload::SiglipAttentionBenchmark) {
-                (
-                    attention_streams,
+        if matches!(arguments.workload, Workload::SiglipAttentionBenchmark) {
+            let model_width = arguments
+                .attention_heads
+                .checked_mul(SIGLIP_ATTENTION_HEAD_DIMENSION)
+                .context("attention model width overflow")?;
+            let input = graph.host_input(
+                "input",
+                [
+                    arguments.attention_batch,
                     SIGLIP_ATTENTION_TOKENS,
-                    SIGLIP_ATTENTION_TOKENS,
-                    SIGLIP_ATTENTION_HEAD_DIMENSION,
-                    SIGLIP_ATTENTION_HEAD_DIMENSION,
-                )
-            } else {
-                (4, 17, 19, 16, 12)
-            };
-        if active_tiles < heads as u16 {
-            bail!("attention workload requires at least {heads} tiles");
+                    model_width,
+                ],
+            )?;
+            let query_weights = graph.parameter("query.weight", [model_width, model_width])?;
+            let key_weights = graph.parameter("key.weight", [model_width, model_width])?;
+            let value_weights = graph.parameter("value.weight", [model_width, model_width])?;
+            let query_projection = graph.gemm(input, query_weights)?;
+            let key_projection = graph.gemm(input, key_weights)?;
+            let value_projection = graph.gemm(input, value_weights)?;
+            let query = graph.split_heads(query_projection, arguments.attention_heads)?;
+            let key = graph.split_heads(key_projection, arguments.attention_heads)?;
+            let value = graph.split_heads(value_projection, arguments.attention_heads)?;
+            let output = graph.flash_attention(query, key, value)?;
+            graph.set_outputs([output])?;
+            pipeline = pipeline
+                .with_automatic_input(input, Precision::F16)
+                .with_automatic_input(query_weights, Precision::F16)
+                .with_automatic_input(key_weights, Precision::F16)
+                .with_automatic_input(value_weights, Precision::F16);
+            pipeline.profiling.enabled = !arguments.no_profile;
+        } else {
+            let (heads, query_rows, key_rows, query_dimension, value_dimension) =
+                (4, 17, 19, 16, 12);
+            if active_tiles < heads as u16 {
+                bail!("attention workload requires at least {heads} tiles");
+            }
+            let query = graph.host_input("query", [heads, query_rows, query_dimension])?;
+            let key = graph.host_input("key", [heads, key_rows, query_dimension])?;
+            let value = graph.host_input("value", [heads, key_rows, value_dimension])?;
+            let output = graph.flash_attention(query, key, value)?;
+            graph.set_outputs([output])?;
+            pipeline = pipeline
+                .with_automatic_input(query, Precision::F16)
+                .with_automatic_input(key, Precision::F16)
+                .with_automatic_input(value, Precision::F16);
+            pipeline.profiling.enabled = !arguments.no_profile;
         }
-        let query = graph.host_input("query", [heads, query_rows, query_dimension])?;
-        let key = graph.host_input("key", [heads, key_rows, query_dimension])?;
-        let value = graph.host_input("value", [heads, key_rows, value_dimension])?;
-        let output = graph.flash_attention(query, key, value)?;
-        graph.set_outputs([output])?;
-        pipeline = pipeline
-            .with_automatic_input(query, Precision::F16)
-            .with_automatic_input(key, Precision::F16)
-            .with_automatic_input(value, Precision::F16);
-        pipeline.profiling.enabled = !arguments.no_profile;
     } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
         validate_mlp_benchmark_shape(
             arguments.mlp_batch,
@@ -460,23 +482,19 @@ fn main() -> Result<()> {
                     active_tiles,
                     arguments.timeout_seconds,
                 )?;
-            } else if matches!(
-                arguments.workload,
-                Workload::AttentionSmoke | Workload::SiglipAttentionBenchmark
-            ) {
+            } else if matches!(arguments.workload, Workload::SiglipAttentionBenchmark) {
+                run_projected_attention_benchmark(
+                    &runtime,
+                    &application,
+                    arguments.attention_batch,
+                    arguments.attention_heads,
+                    arguments.clock_hz,
+                    arguments.timeout_seconds,
+                    arguments.profile_output.as_deref(),
+                )?;
+            } else if matches!(arguments.workload, Workload::AttentionSmoke) {
                 let (heads, query_rows, key_rows, query_dimension, value_dimension, checked_rows) =
-                    if matches!(arguments.workload, Workload::SiglipAttentionBenchmark) {
-                        (
-                            attention_streams,
-                            SIGLIP_ATTENTION_TOKENS,
-                            SIGLIP_ATTENTION_TOKENS,
-                            SIGLIP_ATTENTION_HEAD_DIMENSION,
-                            SIGLIP_ATTENTION_HEAD_DIMENSION,
-                            2,
-                        )
-                    } else {
-                        (4, 17, 19, 16, 12, 17)
-                    };
+                    (4, 17, 19, 16, 12, 17);
                 run_attention_smoke(
                     &runtime,
                     &application,
@@ -684,6 +702,109 @@ fn run_mlp_chain(
     let output =
         run_initialized_program(runtime, application, &weights, &left_bytes, timeout_seconds)?;
     verify_mlp_output(application, active_tiles, &output)
+}
+
+fn run_projected_attention_benchmark(
+    runtime: &Runtime,
+    application: &Application,
+    batch: u32,
+    heads: u32,
+    clock_hz: u64,
+    timeout_seconds: u64,
+    profile_output: Option<&Path>,
+) -> Result<()> {
+    let streams = batch
+        .checked_mul(heads)
+        .context("attention stream overflow")?;
+    let model_width = heads
+        .checked_mul(SIGLIP_ATTENTION_HEAD_DIMENSION)
+        .context("attention model width overflow")?;
+    let input = application
+        .inputs
+        .iter()
+        .find(|binding| binding.name == "input")
+        .context("projected attention package has no input binding")?;
+    let input_bytes = filled_f16_binding(input, f32_to_half(1.0))?;
+    let weight_bits = f32_to_half(1.0 / model_width as f32);
+    let mut weights = Vec::new();
+    for name in ["query.weight", "key.weight", "value.weight"] {
+        let binding = application
+            .weights
+            .iter()
+            .find(|binding| binding.name == name)
+            .with_context(|| format!("projected attention package has no {name} binding"))?;
+        weights.extend_from_slice(&filled_f16_binding(binding, weight_bits)?);
+    }
+    let actual = run_initialized_program(
+        runtime,
+        application,
+        &weights,
+        &input_bytes,
+        timeout_seconds,
+    )?;
+    write_profile(application, &actual, clock_hz, profile_output)?;
+
+    let output = application
+        .outputs
+        .iter()
+        .find(|binding| binding.name == "output.0")
+        .context("projected attention package has no output binding")?;
+    let populated = output.slices.iter().filter(|slice| slice.size != 0).count();
+    let query_partitions = u32::try_from(populated)? / streams;
+    if query_partitions == 0 {
+        bail!("projected attention output has no populated shards");
+    }
+    let expected = expected_projection_value(model_width);
+    let padded_width = padded_attention_width();
+    let mut maximum_error = 0.0f32;
+    let mut checks = 0usize;
+    let mut first_mismatch = None;
+    let mut mismatches = 0usize;
+    let mut mismatches_by_column = vec![0usize; SIGLIP_ATTENTION_HEAD_DIMENSION as usize];
+    for stream in 0..streams {
+        for partition in 0..query_partitions {
+            let tile = partition * streams + stream;
+            let slice = &output.slices[usize::try_from(tile)?];
+            let (_, rows) = balanced_range(SIGLIP_ATTENTION_TOKENS, query_partitions, partition);
+            for row in 0..rows {
+                for column in 0..SIGLIP_ATTENTION_HEAD_DIMENSION {
+                    let linear = u64::from(row * padded_width + column);
+                    let offset = usize::try_from(slice.file_offset + linear * 4)?;
+                    let observed = f32::from_le_bytes(
+                        actual
+                            .get(offset..offset + 4)
+                            .context("projected attention output exceeds host data")?
+                            .try_into()
+                            .unwrap(),
+                    );
+                    maximum_error = maximum_error.max((observed - expected).abs());
+                    if (observed - expected).abs() > 0.02 {
+                        mismatches += 1;
+                        mismatches_by_column[column as usize] += 1;
+                        first_mismatch.get_or_insert((stream, partition, row, column, observed));
+                    }
+                    checks += 1;
+                }
+            }
+        }
+    }
+    if maximum_error > 0.02 {
+        bail!(
+            "projected attention numerical verification failed: checks={checks} mismatches={mismatches} expected={expected:.6} maximumError={maximum_error:.6} firstMismatch={first_mismatch:?} mismatchesByColumn={mismatches_by_column:?}"
+        );
+    }
+    println!(
+        "attentionNumericalChecks={checks} expected={expected:.6} maxError={maximum_error:.6} numericalTest=PASS"
+    );
+    Ok(())
+}
+
+fn expected_projection_value(model_width: u32) -> f32 {
+    half_to_f32(f32_to_half(1.0 / model_width as f32)) * model_width as f32
+}
+
+fn padded_attention_width() -> u32 {
+    SIGLIP_ATTENTION_HEAD_DIMENSION.div_ceil(16) * 16
 }
 
 fn run_attention_smoke(

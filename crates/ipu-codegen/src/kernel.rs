@@ -18,6 +18,7 @@ pub enum KernelSymbols {
     RowSpecialized { small: String, large: String },
     AttentionSpecialized,
     AttentionStageSpecialized,
+    RearrangeSpecialized,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +58,7 @@ pub struct KernelBuildPlan {
     gemm_symbols: BTreeMap<(Precision, GemmWeightLoad, u32, u32, GemmKernelMode, u32), String>,
     attention_symbols: BTreeMap<AttentionKernelShape, String>,
     attention_stage_symbols: Vec<(TileKernelSpec, u32, String)>,
+    rearrange_symbols: BTreeMap<(AmpOrder, u32, u32), String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -139,6 +141,7 @@ impl KernelBuildPlan {
         let mut rows = BTreeMap::<(Precision, GemmWeightLoad, u32, u32), BTreeSet<u32>>::new();
         let mut gelu = false;
         let mut reduction_add = false;
+        let mut rearrangements = BTreeSet::new();
         let mut attention = BTreeSet::new();
         let mut attention_stages = Vec::new();
         for tile in &program.tiles {
@@ -148,6 +151,7 @@ impl KernelBuildPlan {
                 &mut rows,
                 &mut gelu,
                 &mut reduction_add,
+                &mut rearrangements,
                 &mut attention,
                 &mut attention_stages,
             )?;
@@ -254,7 +258,45 @@ impl KernelBuildPlan {
                 retained_symbols: vec!["ipu_stack_reduce_add_f16".into()],
             });
         }
-        if !attention.is_empty() || !attention_stages.is_empty() {
+        let has_rearrange_codelets = !rearrangements.is_empty();
+        let mut rearrangement_shapes = BTreeMap::<(u32, u32), Vec<AmpOrder>>::new();
+        for (order, logical_columns, physical_columns) in rearrangements {
+            rearrangement_shapes
+                .entry((logical_columns, physical_columns))
+                .or_default()
+                .push(order);
+        }
+        for ((logical_columns, physical_columns), orders) in rearrangement_shapes {
+            let suffix = format!("c{logical_columns}_p{physical_columns}");
+            let vertex = format!("RearrangeRowMajorToAmpF16_{suffix}");
+            let codelet = format!("__runCodelet_{vertex}");
+            let call = format!("ipu_stack_rearrange_row_major_to_amp_f16_{suffix}");
+            plan.compilations.push(KernelCompilation {
+                source: "rearrange_f16.cpp",
+                name: format!("rearrange_f16_codelet_{suffix}"),
+                flags: vec![
+                    "-Os".into(),
+                    format!("-DREARRANGE_LOGICAL_COLUMNS={logical_columns}"),
+                    format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
+                    format!("-DREARRANGE_VERTEX_NAME={vertex}"),
+                ],
+                retained_symbols: Vec::new(),
+            });
+            plan.compilations.push(KernelCompilation {
+                source: "rearrange_f16.S",
+                name: format!("rearrange_f16_wrapper_{suffix}"),
+                flags: vec![
+                    format!("-DREARRANGE_CALL_SYMBOL={call}"),
+                    format!("-DREARRANGE_CODELET_SYMBOL={codelet}"),
+                ],
+                retained_symbols: vec![call.clone()],
+            });
+            for order in orders {
+                plan.rearrange_symbols
+                    .insert((order, logical_columns, physical_columns), call.clone());
+            }
+        }
+        if has_rearrange_codelets || !attention.is_empty() || !attention_stages.is_empty() {
             plan.compilations.push(KernelCompilation {
                 source: "worker_support.S",
                 name: "worker_support".into(),
@@ -358,6 +400,7 @@ impl KernelBuildPlan {
                     "flash_attention_blocks_q{small_query}_q{large_query}_d{head_dimension}_v{value_dimension}"
                 ),
                 flags: vec![
+                    "-Os".into(),
                     format!("-DATTENTION_HEAD_DIMENSION={head_dimension}"),
                     format!(
                         "-DATTENTION_PADDED_HEAD_DIMENSION={}",
@@ -391,18 +434,8 @@ impl KernelBuildPlan {
                         };
                         format!("ipu_stack_attention_softmax_{size}_query_{key_size}_key_f16")
                     }
-                    TileKernelSpec::AttentionMerge {
-                        initial,
-                        final_block,
-                        ..
-                    } => {
-                        let role = match (*initial, *final_block) {
-                            (true, true) => "single",
-                            (true, false) => "initial",
-                            (false, true) => "final",
-                            (false, false) => "middle",
-                        };
-                        format!("ipu_stack_attention_merge_{size}_query_{role}_block_f16")
+                    TileKernelSpec::AttentionMerge { .. } => {
+                        format!("ipu_stack_attention_merge_{size}_query_f16")
                     }
                     _ => return Err(KernelAbiError::RequirementMismatch),
                 };
@@ -473,6 +506,25 @@ impl KernelBuildPlan {
                     .map(|(_, _, symbol)| symbol.clone())
                     .ok_or(KernelAbiError::RequirementMismatch)?
             }
+            (KernelSymbols::RearrangeSpecialized, TileKernelSpec::Rearrange { .. }) => self
+                .rearrange_symbols
+                .get(&(
+                    match kernel {
+                        TileKernelSpec::Rearrange {
+                            to:
+                                crate::Layout {
+                                    order: ElementOrder::Amp(order),
+                                    ..
+                                },
+                            ..
+                        } => *order,
+                        _ => return Err(KernelAbiError::RequirementMismatch),
+                    },
+                    matrix_extent(run, true, true)?,
+                    matrix_extent(run, false, true)?,
+                ))
+                .cloned()
+                .ok_or(KernelAbiError::RequirementMismatch)?,
             _ => return Err(KernelAbiError::RequirementMismatch),
         };
         Ok(PlannedKernelCall {
@@ -568,6 +620,7 @@ fn collect_kernels(
     rows: &mut BTreeMap<(Precision, GemmWeightLoad, u32, u32), BTreeSet<u32>>,
     gelu: &mut bool,
     reduction_add: &mut bool,
+    rearrangements: &mut BTreeSet<(AmpOrder, u32, u32)>,
     attention: &mut BTreeSet<AttentionKernelShape>,
     attention_stages: &mut Vec<(TileKernelSpec, u32)>,
 ) -> Result<(), KernelAbiError> {
@@ -594,6 +647,28 @@ fn collect_kernels(
                     *gelu = true;
                 } else if matches!(kernel, TileKernelSpec::ReductionAdd) {
                     *reduction_add = true;
+                } else if let TileKernelSpec::Rearrange {
+                    from:
+                        crate::Layout {
+                            order: ElementOrder::RowMajor,
+                            ..
+                        },
+                    to:
+                        crate::Layout {
+                            order: ElementOrder::Amp(order),
+                            ..
+                        },
+                } = kernel
+                    && matches!(
+                        order,
+                        AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightK64
+                    )
+                {
+                    rearrangements.insert((
+                        *order,
+                        matrix_extent(run, true, true)?,
+                        matrix_extent(run, false, true)?,
+                    ));
                 } else if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
                     attention.insert(attention_shape(run)?);
                 } else if matches!(
@@ -612,6 +687,7 @@ fn collect_kernels(
                 rows,
                 gelu,
                 reduction_add,
+                rearrangements,
                 attention,
                 attention_stages,
             )?,
@@ -690,6 +766,19 @@ fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
         .ok_or(KernelAbiError::MissingGemmRows)
 }
 
+fn matrix_extent(run: &KernelRun, logical: bool, columns: bool) -> Result<u32, KernelAbiError> {
+    let rank = run.output.extents.len();
+    let axis = rank
+        .checked_sub(if columns { 1 } else { 2 })
+        .ok_or(KernelAbiError::RequirementMismatch)?;
+    let extent = &run.output.extents[axis];
+    Ok(if logical {
+        extent.logical_end - extent.start
+    } else {
+        extent.physical_end - extent.start
+    })
+}
+
 fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbiError> {
     let count = element_count(run)?;
     abi.scalar_arguments
@@ -701,6 +790,36 @@ fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbi
                     multiply: Precision::F8F143 { scale_exponent },
                     ..
                 }) => Ok(u32::from_ne_bytes(i32::from(*scale_exponent).to_ne_bytes())),
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
+            "initial_block" => match &run.kernel {
+                TileKernel::Planned(TileKernelSpec::AttentionMerge { initial, .. }) => {
+                    Ok(u32::from(*initial))
+                }
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
+            "final_block" => match &run.kernel {
+                TileKernel::Planned(TileKernelSpec::AttentionMerge { final_block, .. }) => {
+                    Ok(u32::from(*final_block))
+                }
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
+            "logical_rows" => matrix_extent(run, true, false),
+            "physical_rows" => matrix_extent(run, false, false),
+            "target_order" => match &run.kernel {
+                TileKernel::Planned(TileKernelSpec::Rearrange {
+                    to:
+                        crate::Layout {
+                            order: ElementOrder::Amp(order),
+                            ..
+                        },
+                    ..
+                }) => match order {
+                    AmpOrder::Left => Ok(0),
+                    AmpOrder::TransposedRight => Ok(1),
+                    AmpOrder::RightK64 => Ok(2),
+                    _ => Err(KernelAbiError::RequirementMismatch),
+                },
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             _ => Err(KernelAbiError::RequirementMismatch),
@@ -806,7 +925,7 @@ pub fn tile_kernel_abi(
             KernelSymbols::AttentionStageSpecialized,
             KernelAvailability::Implemented,
             2,
-            Vec::new(),
+            scalar_arguments(2, &["initial_block", "final_block"]),
         ),
         TileKernelSpec::Cast { from, to } => (
             KernelSymbols::Exact(cast_symbol(*from, *to)),
@@ -814,11 +933,28 @@ pub fn tile_kernel_abi(
             1,
             scalar_arguments(1, &["element_count"]),
         ),
+        TileKernelSpec::Rearrange { from, to }
+            if precision == Precision::F16
+                && from.order == ElementOrder::RowMajor
+                && matches!(
+                    to.order,
+                    ElementOrder::Amp(
+                        AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightK64
+                    )
+                ) =>
+        {
+            (
+                KernelSymbols::RearrangeSpecialized,
+                KernelAvailability::Implemented,
+                1,
+                scalar_arguments(1, &["logical_rows", "physical_rows", "target_order"]),
+            )
+        }
         TileKernelSpec::Rearrange { .. } => (
             KernelSymbols::Exact("ipu_stack_rearrange"),
             KernelAvailability::Required,
             1,
-            scalar_arguments(1, &["descriptor_address"]),
+            Vec::new(),
         ),
     };
     Ok(KernelAbi {

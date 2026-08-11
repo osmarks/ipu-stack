@@ -1050,10 +1050,25 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
         .iter()
         .any(|tile| tile_has_local_copy(program, tile))
     {
+        if program
+            .tiles
+            .iter()
+            .any(|tile| tile_has_halfword_copy(program, tile))
+        {
+            symbols.push(crate::COPY_U16_SYMBOL.into());
+        }
         symbols.push(crate::COPY_U32_SYMBOL.into());
         symbols.push(crate::COPY_U64_SYMBOL.into());
     }
     symbols
+}
+
+fn tile_has_halfword_copy(program: &LowProgram, tile: &crate::TileWorkList) -> bool {
+    program.work(tile).any(|work| match work {
+        crate::TileWorkRef::LocalCopy(copy) => !copy.bytes.is_multiple_of(4),
+        crate::TileWorkRef::Repeat(repeat) => tile_has_halfword_copy(program, &repeat.body),
+        crate::TileWorkRef::Exchange(_) | crate::TileWorkRef::Kernel(_) => false,
+    })
 }
 
 fn tile_has_local_copy(program: &LowProgram, tile: &crate::TileWorkList) -> bool {
@@ -1269,6 +1284,12 @@ fn profile_work_can_merge(
         (previous, current),
         (crate::TileWorkRef::Kernel(previous), crate::TileWorkRef::Kernel(current))
             if previous.kernel == current.kernel && previous.provenance == current.provenance
+    ) || matches!(
+        (previous, current),
+        (
+            crate::TileWorkRef::LocalCopy(_),
+            crate::TileWorkRef::LocalCopy(_)
+        )
     )
 }
 
