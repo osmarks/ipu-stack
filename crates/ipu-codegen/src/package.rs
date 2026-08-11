@@ -407,7 +407,7 @@ fn build_package_from_objects(
         program
             .tiles
             .iter()
-            .map(|tile| tile.work.len())
+            .map(|tile| profile_step_count(program, tile))
             .max()
             .unwrap_or(0)
             .max(program.exchange_phases.len())
@@ -1067,7 +1067,7 @@ fn profile_binding(
         .enumerate()
         .filter_map(|(physical, &logical)| {
             let steps = if logical < program.tile_count {
-                program.tiles[usize::from(logical)].work.len()
+                profile_step_count(program, &program.tiles[usize::from(logical)])
             } else {
                 inactive_profile_work(program).len()
             };
@@ -1118,11 +1118,15 @@ fn instrument_profile(
             return Err(invalid("tile profile work does not match finalized steps"));
         }
         for (index, (&work, step)) in schedule.iter().zip(&mut tile_program.steps).enumerate() {
+            if index != 0 && profile_work_can_merge(schedule[index - 1], work) {
+                continue;
+            }
             let following = schedule[index + 1..].iter().find_map(|work| match work {
                 crate::TileWorkRef::Kernel(run) => Some(&run.provenance),
                 crate::TileWorkRef::Repeat(repeat) => Some(&repeat.provenance),
                 crate::TileWorkRef::Exchange(_) | crate::TileWorkRef::LocalCopy(_) => None,
             });
+            step_profile(step).before = Some(profile_address(address, plans.len())?);
             plans.push(profile_step(
                 program,
                 exchanges,
@@ -1130,7 +1134,6 @@ fn instrument_profile(
                 index,
                 work,
                 step,
-                address,
                 following,
             )?);
         }
@@ -1184,6 +1187,29 @@ fn inactive_profile_work(program: &LowProgram) -> Vec<crate::TileWorkRef<'_>> {
         .collect()
 }
 
+fn profile_step_count(program: &LowProgram, tile: &crate::TileWorkList) -> usize {
+    let mut previous = None;
+    let mut count = 0;
+    for work in program.work(tile) {
+        if previous.is_none_or(|previous| !profile_work_can_merge(previous, work)) {
+            count += 1;
+        }
+        previous = Some(work);
+    }
+    count
+}
+
+fn profile_work_can_merge(
+    previous: crate::TileWorkRef<'_>,
+    current: crate::TileWorkRef<'_>,
+) -> bool {
+    matches!(
+        (previous, current),
+        (crate::TileWorkRef::Kernel(previous), crate::TileWorkRef::Kernel(current))
+            if previous.kernel == current.kernel && previous.provenance == current.provenance
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn profile_step(
     program: &LowProgram,
@@ -1192,10 +1218,8 @@ fn profile_step(
     index: usize,
     work: crate::TileWorkRef<'_>,
     step: &mut crate::TileStep,
-    base: u32,
     following: Option<&crate::WorkProvenance>,
 ) -> PackageBuildResult<ProfileStep> {
-    step_profile(step).before = Some(profile_address(base, index)?);
     match (work, step) {
         (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(exchange)) => {
             let phase = &program.exchange_phases[id.index() as usize];
