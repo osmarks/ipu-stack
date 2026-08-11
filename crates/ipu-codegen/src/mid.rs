@@ -2555,21 +2555,36 @@ fn apply_selected_plan(
         .iter()
         .map(|value| values[value])
         .collect::<Vec<_>>();
-    let converted = input_ids
-        .into_iter()
-        .zip(&plan.requirements.inputs)
-        .map(|(value, requirement)| {
-            ensure_format(
-                value,
-                requirement.format.clone(),
-                requirement.materialization,
-                operation.id,
-                costs,
-                state,
-                operations,
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut source_types = Vec::with_capacity(input_ids.len());
+    let mut converted = Vec::with_capacity(input_ids.len());
+    for (value, requirement) in input_ids.into_iter().zip(&plan.requirements.inputs) {
+        let conversion_start = operations.len();
+        let converted_value = ensure_format(
+            value,
+            requirement.format.clone(),
+            requirement.materialization,
+            operation.id,
+            costs,
+            state,
+            operations,
+        );
+        let streamed_source = operations[conversion_start..]
+            .last_mut()
+            .and_then(|conversion| {
+                let streamed = conversion.conversion_plan.as_ref().is_some_and(|plan| {
+                    plan.output.materialization == OperandMaterialization::DispatchSlices
+                });
+                if streamed {
+                    conversion.estimated_cycles = 0;
+                    conversion.inputs.first().copied()
+                } else {
+                    None
+                }
+            });
+        let source_value = streamed_source.unwrap_or(converted_value);
+        source_types.push(state.get(source_value).tensor_type.clone());
+        converted.push(converted_value);
+    }
     let result = state.value(
         operation.results[0],
         TensorType {
@@ -2581,10 +2596,11 @@ fn apply_selected_plan(
         .iter()
         .map(|value| state.get(*value).tensor_type.clone())
         .collect::<Vec<_>>();
-    let operator_cycles = costs.operator_cycles(
+    let operator_cycles = costs.operator_transition_cycles(
         plan.operator,
         &plan.dispatch,
         &plan.requirements,
+        &source_types,
         &converted_types,
         &state.get(result).tensor_type,
     );

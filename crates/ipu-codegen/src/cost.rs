@@ -23,6 +23,35 @@ pub trait CostModel {
         output: &TensorType,
     ) -> u64;
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
+    fn operator_transition_cycles(
+        &self,
+        operator: MidOperator,
+        dispatch: &OperatorDispatch,
+        requirements: &OperatorRequirements,
+        source_inputs: &[TensorType],
+        inputs: &[TensorType],
+        output: &TensorType,
+    ) -> u64 {
+        source_inputs
+            .iter()
+            .zip(inputs)
+            .zip(&requirements.inputs)
+            .filter(|((source, input), requirement)| {
+                requirement.materialization == crate::OperandMaterialization::DispatchSlices
+                    && source.format.layout != input.format.layout
+            })
+            .fold(
+                self.operator_cycles(operator, dispatch, requirements, inputs, output),
+                |cycles, ((source, input), _)| {
+                    cycles.saturating_add(self.rearrange_cycles(
+                        &input.shape,
+                        input.format.precision,
+                        &source.format.layout,
+                        &input.format.layout,
+                    ))
+                },
+            )
+    }
     fn operator_exchange_footprint(
         &self,
         _operator: MidOperator,
@@ -253,6 +282,8 @@ impl CostModel for Ipu21CostModel {
         output: &TensorType,
     ) -> u64 {
         let elements = physical_elements(&output.shape, &output.format.layout);
+        let elements_per_tile =
+            maximum_shard_bytes(output).div_ceil(output.format.precision.bytes());
         match operator {
             MidOperator::Gemm { multiply, .. } => {
                 let left_shape = inputs[0]
@@ -388,11 +419,12 @@ impl CostModel for Ipu21CostModel {
                 .saturating_mul(8)
                 .div_ceil(32)
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
-            MidOperator::Gelu => elements
-                .saturating_mul(6)
-                .div_ceil(16)
+            // The exact scalar implementation is compute-bound at roughly
+            // ten tile cycles per element across the six workers.
+            MidOperator::Gelu => elements_per_tile
+                .saturating_mul(10)
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
-            MidOperator::Add(_) => elements
+            MidOperator::Add(_) => elements_per_tile
                 .div_ceil(16)
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
         }
@@ -472,5 +504,66 @@ impl CostModel for Ipu21CostModel {
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
             .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles));
         exchange_cycles.saturating_add(local_cycles)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        OperandRequirement, OperatorRequirements, OutputAliasing, PointwiseInputMapping,
+        TensorFormat, TileKernelSpec,
+    };
+
+    const CASES: usize = 32;
+
+    fn pointwise_dispatch() -> OperatorDispatch {
+        OperatorDispatch::Pointwise {
+            kernel: TileKernelSpec::Gelu,
+            input_mapping: PointwiseInputMapping::TileLocal,
+        }
+    }
+
+    fn pointwise_requirements(format: TensorFormat) -> OperatorRequirements {
+        OperatorRequirements {
+            inputs: vec![OperandRequirement::new(format.clone(), 8)],
+            output: OperandRequirement::new(format, 8),
+            output_aliasing: OutputAliasing::Fresh,
+            memory_relations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn randomized_pointwise_costs_track_critical_tile_work() {
+        let mut random = fastrand::Rng::with_seed(0x706f_696e_7477_6973);
+        for case in 0..CASES {
+            let tiles = 1_u16 << random.u32(1..=6);
+            let rows = u32::from(tiles) * random.u32(1..=8);
+            let columns = 16 * random.u32(1..=16);
+            let sharded =
+                TensorType::new([rows, columns], Precision::F16, Layout::row_sharded(tiles));
+            let unsharded =
+                TensorType::new([rows, columns], Precision::F16, Layout::row_sharded(1));
+            for operator in [
+                MidOperator::Gelu,
+                MidOperator::Add(crate::AddOptions::default()),
+            ] {
+                let sharded_cycles = Ipu21CostModel.operator_cycles(
+                    operator,
+                    &pointwise_dispatch(),
+                    &pointwise_requirements(sharded.format.clone()),
+                    std::slice::from_ref(&sharded),
+                    &sharded,
+                );
+                let unsharded_cycles = Ipu21CostModel.operator_cycles(
+                    operator,
+                    &pointwise_dispatch(),
+                    &pointwise_requirements(unsharded.format.clone()),
+                    std::slice::from_ref(&unsharded),
+                    &unsharded,
+                );
+                assert!(sharded_cycles <= unsharded_cycles, "case {case}");
+            }
+        }
     }
 }
