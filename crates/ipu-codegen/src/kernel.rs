@@ -50,8 +50,8 @@ pub struct KernelCompilation {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KernelBuildPlan {
     pub compilations: Vec<KernelCompilation>,
-    gemm_rows: BTreeMap<(Precision, GemmWeightLoad, u32), Vec<u32>>,
-    gemm_symbols: BTreeMap<(Precision, GemmWeightLoad, u32, GemmKernelMode, u32), String>,
+    gemm_rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32), Vec<u32>>,
+    gemm_symbols: BTreeMap<(Precision, GemmWeightLoad, u32, u32, GemmKernelMode, u32), String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +102,7 @@ fn specialized_gemm_symbol(
     prefix: &str,
     mode: GemmKernelMode,
     weight_suffix: &str,
+    inner_block: u32,
     output_columns: u32,
     size: &str,
     small_rows: u32,
@@ -112,7 +113,7 @@ fn specialized_gemm_symbol(
         GemmKernelMode::Accumulate => "accumulate",
     };
     format!(
-        "ipu_stack_gemm_{prefix}_{operation}_{size}_rows{weight_suffix}_c{output_columns}_r{small_rows}_r{large_rows}"
+        "ipu_stack_gemm_{prefix}_{operation}_{size}_rows{weight_suffix}_k{inner_block}_c{output_columns}_r{small_rows}_r{large_rows}"
     )
 }
 
@@ -120,14 +121,14 @@ impl KernelBuildPlan {
     /// Derives device objects from the finalized schedule, so row variants are
     /// compiler specializations rather than a fixed collection of binaries.
     pub fn from_program(program: &LowProgram) -> Result<Self, KernelAbiError> {
-        let mut rows = BTreeMap::<(Precision, GemmWeightLoad, u32), BTreeSet<u32>>::new();
+        let mut rows = BTreeMap::<(Precision, GemmWeightLoad, u32, u32), BTreeSet<u32>>::new();
         let mut gelu = false;
         let mut reduction_add = false;
         for tile in &program.tiles {
             collect_kernels(program, tile, &mut rows, &mut gelu, &mut reduction_add)?;
         }
         let mut plan = Self::default();
-        for ((precision, weights, output_columns), values) in rows {
+        for ((precision, weights, inner_block, output_columns), values) in rows {
             let values = values.into_iter().collect::<Vec<_>>();
             let (source, prefix) = match precision {
                 Precision::F16 => ("gemm_f16_64_amp.S", "f16"),
@@ -153,6 +154,7 @@ impl KernelBuildPlan {
                         prefix,
                         mode,
                         weight_suffix,
+                        inner_block,
                         output_columns,
                         size,
                         small,
@@ -164,12 +166,12 @@ impl KernelBuildPlan {
                     (GemmKernelMode::Accumulate, 2usize),
                 ] {
                     plan.gemm_symbols.insert(
-                        (precision, weights, output_columns, mode, small),
+                        (precision, weights, inner_block, output_columns, mode, small),
                         symbols[row_index].clone(),
                     );
                     if pair.len() == 2 {
                         plan.gemm_symbols.insert(
-                            (precision, weights, output_columns, mode, large),
+                            (precision, weights, inner_block, output_columns, mode, large),
                             symbols[row_index + 1].clone(),
                         );
                     }
@@ -179,6 +181,7 @@ impl KernelBuildPlan {
                     format!("-DGEMM_SMALL_ROWS={small}"),
                     format!("-DGEMM_LARGE_ROWS={large}"),
                     format!("-DGEMM_OUTPUT_COLUMNS={output_columns}"),
+                    format!("-DGEMM_INNER_BLOCK_DIMENSION={inner_block}"),
                     format!("-DGEMM_INIT_SMALL_SYMBOL={}", symbols[0]),
                     format!("-DGEMM_INIT_LARGE_SYMBOL={}", symbols[1]),
                     format!("-DGEMM_ACCUMULATE_SMALL_SYMBOL={}", symbols[2]),
@@ -198,14 +201,14 @@ impl KernelBuildPlan {
                 plan.compilations.push(KernelCompilation {
                     source,
                     name: format!(
-                        "gemm_{prefix}{weight_suffix}_c{output_columns}_r{small}_r{large}"
+                        "gemm_{prefix}{weight_suffix}_k{inner_block}_c{output_columns}_r{small}_r{large}"
                     ),
                     flags,
                     retained_symbols,
                 });
             }
             plan.gemm_rows
-                .insert((precision, weights, output_columns), values);
+                .insert((precision, weights, inner_block, output_columns), values);
         }
         if gelu {
             plan.compilations.push(KernelCompilation {
@@ -243,6 +246,7 @@ impl KernelBuildPlan {
                     multiply,
                     mode,
                     weights,
+                    inner_block,
                     output_columns,
                     ..
                 },
@@ -250,13 +254,20 @@ impl KernelBuildPlan {
                 let rows = gemm_rows(run)?;
                 let planned = self
                     .gemm_rows
-                    .get(&(*multiply, *weights, *output_columns))
+                    .get(&(*multiply, *weights, *inner_block, *output_columns))
                     .ok_or(KernelAbiError::UnplannedGemmRows(rows))?;
                 if !planned.contains(&rows) {
                     return Err(KernelAbiError::UnplannedGemmRows(rows));
                 }
                 self.gemm_symbols
-                    .get(&(*multiply, *weights, *output_columns, *mode, rows))
+                    .get(&(
+                        *multiply,
+                        *weights,
+                        *inner_block,
+                        *output_columns,
+                        *mode,
+                        rows,
+                    ))
                     .cloned()
                     .ok_or(KernelAbiError::UnplannedGemmRows(rows))?
             }
@@ -352,7 +363,7 @@ fn add_address_offset(
 fn collect_kernels(
     program: &LowProgram,
     tile: &TileWorkList,
-    rows: &mut BTreeMap<(Precision, GemmWeightLoad, u32), BTreeSet<u32>>,
+    rows: &mut BTreeMap<(Precision, GemmWeightLoad, u32, u32), BTreeSet<u32>>,
     gelu: &mut bool,
     reduction_add: &mut bool,
 ) -> Result<(), KernelAbiError> {
@@ -367,11 +378,12 @@ fn collect_kernels(
                 if let TileKernelSpec::Gemm {
                     multiply,
                     weights,
+                    inner_block,
                     output_columns,
                     ..
                 } = kernel
                 {
-                    rows.entry((*multiply, *weights, *output_columns))
+                    rows.entry((*multiply, *weights, *inner_block, *output_columns))
                         .or_default()
                         .insert(gemm_rows(run)?);
                 } else if matches!(kernel, TileKernelSpec::Gelu) {
@@ -739,6 +751,7 @@ mod tests {
                     accumulate: AccumulationPrecision::F32,
                     mode,
                     weights,
+                    inner_block: 64,
                     output_columns: [32, 64, 128][random.usize(0..3)],
                 },
                 &requirements,

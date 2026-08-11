@@ -8,9 +8,10 @@
 
 use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
-    ConversionDispatch, GemmDistribution, LayoutError, MidGraph, MidOperation, MidOperationKind,
-    MidRepeat, MidValueId, OperandRequirement, OperatorDispatch, OperatorRequirements,
-    OutputAliasing, PipelineConfig, PointwiseInputMapping, TensorType, TileKernelSpec,
+    AMP_INNER_BLOCK, ConversionDispatch, GemmDistribution, LayoutError, MidGraph, MidOperation,
+    MidOperationKind, MidRepeat, MidValueId, OperandRequirement, OperatorDispatch,
+    OperatorRequirements, OutputAliasing, PipelineConfig, PointwiseInputMapping, TensorType,
+    TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1659,7 +1660,7 @@ impl LoweringState {
                         column_start,
                         column_end,
                         inner.start,
-                        inner.start + inner_block,
+                        inner.start + AMP_INNER_BLOCK,
                     )
                     .next()
                     .ok_or(LowLoweringError::InvalidOperatorPlan)?;
@@ -1685,38 +1686,112 @@ impl LoweringState {
                     .enumerate()
                 {
                     let inner_end = inner_start + inner_block;
-                    let source = self
-                        .right_shards_for_block(
-                            &right_shards,
-                            column_start,
-                            column_end,
-                            inner_start,
-                            inner_end,
-                        )
-                        .next()
-                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-                    let source_rank = self.shards[source.index() as usize].extents.len();
-                    let source_view = self.narrow_view(
-                        source,
-                        &[
-                            (source_rank - 2, inner_start, inner_end),
-                            (source_rank - 1, column_start, column_end),
-                        ],
-                    )?;
-                    let destination_view = self.narrow_view(
-                        weights,
-                        &[
-                            (weight_rank - 2, inner_start, inner_end),
-                            (weight_rank - 1, column_start, column_end),
-                        ],
-                    )?;
-                    let local_weights =
-                        self.shards[source.index() as usize].tile == left_shard.tile;
-                    if !local_weights {
-                        transfers
-                            .entry(source_view.clone())
-                            .or_default()
-                            .push(destination_view);
+                    let mut sources = Vec::new();
+                    for panel_start in (inner_start..inner_end).step_by(AMP_INNER_BLOCK as usize) {
+                        let panel_end = panel_start + AMP_INNER_BLOCK;
+                        let source = self
+                            .right_shards_for_block(
+                                &right_shards,
+                                column_start,
+                                column_end,
+                                panel_start,
+                                panel_end,
+                            )
+                            .next()
+                            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                        let source_rank = self.shards[source.index() as usize].extents.len();
+                        let source_view = self.narrow_view(
+                            source,
+                            &[
+                                (source_rank - 2, panel_start, panel_end),
+                                (source_rank - 1, column_start, column_end),
+                            ],
+                        )?;
+                        let destination_view = self.narrow_view(
+                            weights,
+                            &[
+                                (weight_rank - 2, panel_start, panel_end),
+                                (weight_rank - 1, column_start, column_end),
+                            ],
+                        )?;
+                        let local = self.shards[source.index() as usize].tile == left_shard.tile;
+                        if !local {
+                            transfers
+                                .entry(source_view.clone())
+                                .or_default()
+                                .push(destination_view);
+                        }
+                        sources.push((source_view, local));
+                    }
+
+                    if sources.len() > 1 && sources.iter().any(|(_, local)| *local) {
+                        for (panel_index, (source_view, local)) in sources.into_iter().enumerate() {
+                            let panel_start = inner_start
+                                + u32::try_from(panel_index)
+                                    .map_err(|_| LowLoweringError::IdOverflow)?
+                                    * AMP_INNER_BLOCK;
+                            let panel_end = panel_start + AMP_INNER_BLOCK;
+                            let left_view = self
+                                .narrow_view(left, &[(left_inner_axis, panel_start, panel_end)])?;
+                            let mut kernel = if block_index == 0 && panel_index == 0 {
+                                initialize.clone()
+                            } else {
+                                accumulate.clone()
+                            };
+                            if let TileKernelSpec::Gemm {
+                                weights: load,
+                                inner_block: kernel_inner_block,
+                                ..
+                            } = &mut kernel
+                            {
+                                *kernel_inner_block = AMP_INNER_BLOCK;
+                                *load = if local
+                                    && self.shards[source_view.shard.index() as usize]
+                                        .tensor_type
+                                        .format
+                                        .layout
+                                        .memory_class
+                                        == crate::MemoryClass::Ipu21Standard
+                                {
+                                    crate::GemmWeightLoad::Standard
+                                } else {
+                                    crate::GemmWeightLoad::Interleaved
+                                };
+                            }
+                            let weight_view = if local {
+                                source_view
+                            } else {
+                                self.narrow_view(
+                                    weights,
+                                    &[
+                                        (weight_rank - 2, panel_start, panel_end),
+                                        (weight_rank - 1, column_start, column_end),
+                                    ],
+                                )?
+                            };
+                            gemm_runs.push((
+                                left_shard.tile,
+                                KernelRun::new(
+                                    WorkProvenance {
+                                        operation: operation.source,
+                                        value: Some(*output_value),
+                                        reason: WorkReason::OperatorKernel,
+                                    },
+                                    TileKernel::Planned(kernel),
+                                    vec![
+                                        KernelOperand {
+                                            views: vec![left_view],
+                                        },
+                                        KernelOperand {
+                                            views: vec![weight_view],
+                                        },
+                                    ],
+                                    self.full_view(partial),
+                                    KernelRequirements::Operator(requirements.clone()),
+                                ),
+                            ));
+                        }
+                        continue;
                     }
 
                     let left_view =
@@ -1726,9 +1801,16 @@ impl LoweringState {
                     } else {
                         accumulate.clone()
                     };
-                    if let TileKernelSpec::Gemm { weights, .. } = &mut kernel {
-                        *weights = if local_weights
-                            && self.shards[source.index() as usize]
+                    if let TileKernelSpec::Gemm {
+                        weights: load,
+                        inner_block: kernel_inner_block,
+                        ..
+                    } = &mut kernel
+                    {
+                        *kernel_inner_block = inner_block;
+                        *load = if sources.len() == 1
+                            && sources[0].1
+                            && self.shards[sources[0].0.shard.index() as usize]
                                 .tensor_type
                                 .format
                                 .layout
@@ -1740,10 +1822,16 @@ impl LoweringState {
                             crate::GemmWeightLoad::Interleaved
                         };
                     }
-                    let weight_view = if local_weights {
-                        source_view
+                    let weight_view = if sources.len() == 1 && sources[0].1 {
+                        sources.pop().expect("one source").0
                     } else {
-                        self.narrow_view(weights, &[(weight_rank - 2, inner_start, inner_end)])?
+                        self.narrow_view(
+                            weights,
+                            &[
+                                (weight_rank - 2, inner_start, inner_end),
+                                (weight_rank - 1, column_start, column_end),
+                            ],
+                        )?
                     };
                     let run = KernelRun::new(
                         WorkProvenance {
@@ -2709,6 +2797,7 @@ mod tests {
                 accumulate: AccumulationPrecision::F32,
                 mode,
                 weights: GemmWeightLoad::Interleaved,
+                inner_block: 64,
                 output_columns,
             };
             let left_format = TensorFormat {

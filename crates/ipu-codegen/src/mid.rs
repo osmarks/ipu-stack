@@ -71,6 +71,7 @@ pub enum TileKernelSpec {
         accumulate: AccumulationPrecision,
         mode: GemmKernelMode,
         weights: GemmWeightLoad,
+        inner_block: u32,
         output_columns: u32,
     },
     Gelu,
@@ -1102,6 +1103,7 @@ fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
                 accumulate,
                 mode: GemmKernelMode::Initialize,
                 weights: GemmWeightLoad::Standard,
+                inner_block: AMP_INNER_BLOCK,
                 output_columns: AMP_OUTPUT_COLUMN_BLOCK,
             },
             accumulate: TileKernelSpec::Gemm {
@@ -1109,6 +1111,7 @@ fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
                 accumulate,
                 mode: GemmKernelMode::Accumulate,
                 weights: GemmWeightLoad::Standard,
+                inner_block: AMP_INNER_BLOCK,
                 output_columns: AMP_OUTPUT_COLUMN_BLOCK,
             },
             inner_block: AMP_INNER_BLOCK,
@@ -1683,6 +1686,7 @@ fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> Operator
             accumulate,
             mode: GemmKernelMode::Initialize,
             weights: GemmWeightLoad::Standard,
+            inner_block: AMP_INNER_BLOCK,
             output_columns,
         },
         accumulate: TileKernelSpec::Gemm {
@@ -1690,6 +1694,7 @@ fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> Operator
             accumulate,
             mode: GemmKernelMode::Accumulate,
             weights: GemmWeightLoad::Standard,
+            inner_block: AMP_INNER_BLOCK,
             output_columns,
         },
         inner_block: AMP_INNER_BLOCK,
@@ -1884,6 +1889,7 @@ impl OperatorPlan {
                         multiply: init_multiply,
                         accumulate: init_accumulate,
                         mode: GemmKernelMode::Initialize,
+                        inner_block: init_inner_block,
                         output_columns: init_output_columns,
                         ..
                     },
@@ -1891,6 +1897,7 @@ impl OperatorPlan {
                         multiply: next_multiply,
                         accumulate: next_accumulate,
                         mode: GemmKernelMode::Accumulate,
+                        inner_block: next_inner_block,
                         output_columns: next_output_columns,
                         ..
                     },
@@ -1907,6 +1914,8 @@ impl OperatorPlan {
                     || next_multiply != multiply
                     || init_accumulate != accumulate
                     || next_accumulate != accumulate
+                    || init_inner_block != inner_block
+                    || next_inner_block != inner_block
                     || init_output_columns != output_column_block
                     || next_output_columns != output_column_block
                 {
@@ -3015,12 +3024,45 @@ fn activation_stationary_reduction_candidates(
         1,
         MemoryClass::Ipu21Interleaved,
     );
-    [2, 3, 4]
+    let inner_per_partition = inner / u32::from(column_partitions);
+    [AMP_INNER_BLOCK, AMP_INNER_BLOCK * 2, AMP_INNER_BLOCK * 4]
         .into_iter()
-        .filter(|&fan_in| fan_in <= column_partitions)
-        .map(|reduction_fan_in| {
+        .filter(|block| {
+            inner_per_partition.is_multiple_of(*block)
+                && block.saturating_mul(output_column_block).saturating_mul(2)
+                    < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
+        })
+        .flat_map(|inner_block| {
+            [2, 3, 4]
+                .into_iter()
+                .filter(move |&fan_in| fan_in <= column_partitions)
+                .map(move |reduction_fan_in| (inner_block, reduction_fan_in))
+        })
+        .map(|(inner_block, reduction_fan_in)| {
             let mut variant = partial.clone();
-            if let OperatorDispatch::BlockedGemm { distribution, .. } = &mut variant.dispatch {
+            if let OperatorDispatch::BlockedGemm {
+                initialize,
+                accumulate,
+                inner_block: dispatch_inner_block,
+                distribution,
+                ..
+            } = &mut variant.dispatch
+            {
+                *dispatch_inner_block = inner_block;
+                if let TileKernelSpec::Gemm {
+                    inner_block: kernel_inner_block,
+                    ..
+                } = initialize
+                {
+                    *kernel_inner_block = inner_block;
+                }
+                if let TileKernelSpec::Gemm {
+                    inner_block: kernel_inner_block,
+                    ..
+                } = accumulate
+                {
+                    *kernel_inner_block = inner_block;
+                }
                 *distribution = GemmDistribution::ActivationStationaryReduction {
                     inner_partitions: column_partitions,
                     reduction_fan_in,
@@ -3493,13 +3535,26 @@ mod tests {
                 TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
             ];
             let candidates = activation_stationary_reduction_candidates(&base, &inputs);
-            assert_eq!(candidates.len(), usize::from(inner_partitions.min(4) - 1));
+            let inner_per_partition = k / u32::from(inner_partitions);
+            let fused_widths = [64, 128, 256]
+                .into_iter()
+                .filter(|width| {
+                    inner_per_partition.is_multiple_of(*width)
+                        && width.saturating_mul(output_columns).saturating_mul(2)
+                            < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
+                })
+                .count();
+            assert_eq!(
+                candidates.len(),
+                fused_widths * usize::from(inner_partitions.min(4) - 1)
+            );
             for candidate in candidates {
                 assert!(candidate.supports(&inputs, &TensorShape(vec![m, n])));
                 assert_eq!(candidate.inputs[0].format.layout.tiling.replicas, 1);
                 assert!(matches!(
                     candidate.dispatch,
                     OperatorDispatch::BlockedGemm {
+                        inner_block,
                         output_column_block: actual_columns,
                         distribution: GemmDistribution::ActivationStationaryReduction {
                             inner_partitions: actual,
@@ -3508,6 +3563,10 @@ mod tests {
                         ..
                     } if actual == inner_partitions
                         && actual_columns == output_columns
+                        && matches!(inner_block, 64 | 128 | 256)
+                        && inner_per_partition.is_multiple_of(inner_block)
+                        && inner_block * output_columns * 2
+                            < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
                         && (2..=inner_partitions.min(4)).contains(&reduction_fan_in)
                 ));
             }
