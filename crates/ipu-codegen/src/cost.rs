@@ -81,12 +81,17 @@ impl ExchangeFootprint {
     pub const fn estimated_row_bytes(self) -> u64 {
         // A primitive plan contributes its synchronization-free body to the
         // consolidated per-phase row. The entry sync and terminal return are
-        // shared by the caller and consolidated row respectively.
+        // shared by the caller and consolidated row respectively. Mid-level
+        // byte volume cannot see where independently tiled source and
+        // destination spans meet, so reserve a second encoded chunk for a
+        // boundary split discovered during final exchange lowering.
         let words_per_chunk = (ipu_exchange::PLAN_WORDS - 2) as u64;
+        let fragments_per_chunk = 2;
         self.phases
             .saturating_add(
                 self.maximum_transfer_chunks_per_tile
-                    .saturating_mul(words_per_chunk),
+                    .saturating_mul(words_per_chunk)
+                    .saturating_mul(fragments_per_chunk),
             )
             .saturating_mul(4)
     }
