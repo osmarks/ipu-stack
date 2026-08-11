@@ -119,68 +119,67 @@ pub struct ExchangeActivitySummary {
     pub estimated_idle_work_cycles: u64,
     pub measured_phase_cycles: u64,
     pub scheduled_event_cycles: u64,
-    pub setup_and_boundary_cycles: u64,
+    pub arrival_wait_cycles: u64,
+    pub phase_boundary_cycles: u64,
 }
 
-/// Summarizes statically scheduled exchange roles after scaling each event
-/// timeline to the corresponding measured exchange duration.
+/// Summarizes statically scheduled exchange roles, counting a device-wide
+/// exchange phase from the last participating tile's entry.
 pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySummary {
     let mut summary = ExchangeActivitySummary::default();
-    let mut phases = BTreeMap::<(u32, u32), (u32, u32)>::new();
-    for sample in report
-        .tiles
-        .iter()
-        .flat_map(|tile| &tile.samples)
-        .filter(|sample| sample.step.kind == ProfileStepKind::Exchange)
-    {
-        summary.exchange_samples += 1;
-        let event_cycles = u64::from(sample.step.exchange_event_cycles);
-        let measured = duration(sample);
-        let phase = phases
-            .entry((sample.step.epoch, sample.step.phase))
-            .or_default();
-        phase.0 = phase.0.max(measured);
-        phase.1 = phase.1.max(sample.step.exchange_event_cycles);
-        if event_cycles == 0 {
-            continue;
-        }
-        if sample.step.exchange_activities.is_empty() {
-            continue;
-        }
-        summary.described_samples += 1;
-        let measured = u64::from(measured);
-        let mut send_events = 0u64;
-        let mut receive_events = 0u64;
-        for activity in &sample.step.exchange_activities {
-            let cycles = u64::from(activity.end_cycle.saturating_sub(activity.start_cycle));
-            match activity.kind {
-                ProfileExchangeActivityKind::Send => {
-                    summary.send_intervals += 1;
-                    send_events += cycles;
-                }
-                ProfileExchangeActivityKind::Receive => {
-                    summary.receive_intervals += 1;
-                    receive_events += cycles;
+    let mut phases = BTreeMap::<(u32, u32), (u64, u64, u64, u64)>::new();
+    for tile in &report.tiles {
+        let base = tile.samples.first().map_or(0, |sample| sample.start_cycle);
+        for sample in tile
+            .samples
+            .iter()
+            .filter(|sample| sample.step.kind == ProfileStepKind::Exchange)
+        {
+            summary.exchange_samples += 1;
+            let event_cycles = u64::from(sample.step.exchange_event_cycles);
+            if event_cycles == 0 {
+                continue;
+            }
+            let start = u64::from(sample.start_cycle.wrapping_sub(base));
+            let end = start + u64::from(duration(sample));
+            let phase = phases
+                .entry((sample.step.epoch, sample.step.phase))
+                .or_insert((start, start, end, event_cycles));
+            phase.0 = phase.0.min(start);
+            phase.1 = phase.1.max(start);
+            phase.2 = phase.2.max(end);
+            phase.3 = phase.3.max(event_cycles);
+            if sample.step.exchange_activities.is_empty() {
+                continue;
+            }
+            summary.described_samples += 1;
+            let mut send_events = 0u64;
+            let mut receive_events = 0u64;
+            for activity in &sample.step.exchange_activities {
+                let cycles = u64::from(activity.end_cycle.saturating_sub(activity.start_cycle));
+                match activity.kind {
+                    ProfileExchangeActivityKind::Send => {
+                        summary.send_intervals += 1;
+                        send_events += cycles;
+                    }
+                    ProfileExchangeActivityKind::Receive => {
+                        summary.receive_intervals += 1;
+                        receive_events += cycles;
+                    }
                 }
             }
+            summary.estimated_send_work_cycles += send_events;
+            summary.estimated_receive_work_cycles += receive_events;
+            summary.estimated_idle_work_cycles +=
+                event_cycles.saturating_sub(send_events.saturating_add(receive_events));
         }
-        let scale = |events: u64| {
-            u64::try_from(
-                (u128::from(events) * u128::from(measured) + u128::from(event_cycles / 2))
-                    / u128::from(event_cycles),
-            )
-            .unwrap_or(u64::MAX)
-        };
-        let send = scale(send_events);
-        let receive = scale(receive_events);
-        summary.estimated_send_work_cycles += send;
-        summary.estimated_receive_work_cycles += receive;
-        summary.estimated_idle_work_cycles += measured.saturating_sub(send.saturating_add(receive));
     }
-    for (measured, scheduled) in phases.into_values() {
-        summary.measured_phase_cycles += u64::from(measured);
-        summary.scheduled_event_cycles += u64::from(scheduled);
-        summary.setup_and_boundary_cycles += u64::from(measured.saturating_sub(scheduled));
+    for (minimum_start, maximum_start, maximum_end, scheduled) in phases.into_values() {
+        let measured = maximum_end.saturating_sub(maximum_start);
+        summary.measured_phase_cycles += measured;
+        summary.scheduled_event_cycles += scheduled;
+        summary.arrival_wait_cycles += maximum_start.saturating_sub(minimum_start);
+        summary.phase_boundary_cycles += measured.saturating_sub(scheduled);
     }
     summary
 }
