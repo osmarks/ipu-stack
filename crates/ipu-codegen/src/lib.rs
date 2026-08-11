@@ -154,14 +154,22 @@ pub struct ExchangeStep {
     pub program: PlacedExchangeRow,
     /// Local wait after returning from the exchange row, preserving the phase horizon.
     pub wait_cycles: u32,
-    /// Offset/value pairs applied before invoking a structurally shared row.
+    /// Address words applied before invoking a structurally shared row.
     #[serde(default)]
-    pub setup_patch: Option<PlacedExchangeRow>,
+    pub setup_patch: Option<ExchangeSetupPatch>,
     /// Words rewritten before the timed program is invoked inside a structured repeat.
     #[serde(default)]
     pub repeat_patches: Vec<ExchangePatch>,
     #[serde(default)]
     pub profile: StepProfile,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeSetupPatch {
+    /// Byte offsets into the shared executable row, reused by its structural shape.
+    pub offsets: PlacedExchangeRow,
+    /// Replacement instruction words for this use of the row.
+    pub values: PlacedExchangeRow,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,7 +378,10 @@ fn emit_steps(
                     emit_cycle_sample(code, symbols, address)?;
                 }
                 exchange_rows.push(exchange.program.clone());
-                exchange_rows.extend(exchange.setup_patch.iter().cloned());
+                if let Some(patch) = &exchange.setup_patch {
+                    exchange_rows.push(patch.offsets.clone());
+                    exchange_rows.push(patch.values.clone());
+                }
                 exchange_rows.extend(
                     exchange
                         .repeat_patches
@@ -422,11 +433,10 @@ fn validate_steps(
         match step {
             TileStep::Exchange(exchange) => {
                 validate_exchange_program(exchange)?;
-                if exchange
-                    .setup_patch
-                    .as_ref()
-                    .is_some_and(|patch| patch.words.len() % 2 != 0)
-                {
+                if exchange.setup_patch.as_ref().is_some_and(|patch| {
+                    patch.offsets.words.is_empty()
+                        || patch.offsets.words.len() != patch.values.words.len()
+                }) {
                     return Err(invalid("exchange setup patch has an invalid shape"));
                 }
                 for patch in &exchange.repeat_patches {
@@ -545,14 +555,15 @@ fn emit_exchange_patches(
 fn emit_exchange_setup_patch(
     code: &mut TileCode,
     exchange: &ExchangeStep,
-    patch: &PlacedExchangeRow,
+    patch: &ExchangeSetupPatch,
     symbols: &BTreeMap<String, u32>,
 ) -> Result<()> {
     code.setzi(2, exchange.program.address)?;
-    code.setzi(3, patch.address)?;
+    code.setzi(3, patch.offsets.address)?;
+    code.setzi(4, patch.values.address)?;
     code.setzi(
-        4,
-        u32::try_from(patch.words.len() / 2)
+        5,
+        u32::try_from(patch.values.words.len())
             .map_err(|_| invalid("exchange setup patch is too large"))?,
     )?;
     code.call(symbol(symbols, PATCH_ROW_SYMBOL)?, 9)

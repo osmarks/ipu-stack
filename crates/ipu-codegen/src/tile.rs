@@ -1,9 +1,9 @@
 //! Final lowering from logical per-tile work to address-resolved programs.
 
 use crate::{
-    ExchangePatch, ExchangePhaseId, ExchangeStep, KernelBuildPlan, LowProgram, LowShardId,
-    PhysicalExchangePhase, PlacedExchangeRow, Placement, RepeatPointer, RepeatRun, RepeatStep,
-    StepProfile, TileAddress, TileProgram, TileStep, TileWorkList, TileWorkRef,
+    ExchangePatch, ExchangePhaseId, ExchangeSetupPatch, ExchangeStep, KernelBuildPlan, LowProgram,
+    LowShardId, PhysicalExchangePhase, PlacedExchangeRow, Placement, RepeatPointer, RepeatRun,
+    RepeatStep, StepProfile, TileAddress, TileProgram, TileStep, TileWorkList, TileWorkRef,
     materialize_kernel_run,
 };
 use std::collections::BTreeMap;
@@ -62,7 +62,7 @@ struct PlacedExchange {
     active: bool,
     program: PlacedExchangeRow,
     wait_cycles: u32,
-    setup_patch: Option<PlacedExchangeRow>,
+    setup_patch: Option<ExchangeSetupPatch>,
     repeat_patches: Vec<ExchangePatch>,
 }
 
@@ -387,6 +387,7 @@ fn layout_exchange_rows(
     }
     struct SharedRow {
         program: PlacedExchangeRow,
+        offsets: Option<PlacedExchangeRow>,
     }
 
     let mut key_counts = BTreeMap::<(Vec<u32>, Option<u32>), usize>::new();
@@ -438,7 +439,7 @@ fn layout_exchange_rows(
             has_repeat_patches.then_some(phase.id.index()),
         );
         let shared_count = key_counts.get(&key).copied().unwrap_or(1);
-        let setup_words = (shared_count > 1)
+        let setup_entries = (shared_count > 1)
             .then(|| {
                 key.0
                     .iter()
@@ -447,58 +448,83 @@ fn layout_exchange_rows(
                     .filter_map(|(offset, (&normalized, &target))| {
                         (normalized != target).then_some((offset, target))
                     })
-                    .try_fold(Vec::new(), |mut words, (offset, target)| {
-                        words.push(
+                    .map(|(offset, target)| {
+                        Ok((
                             u32::try_from(offset)
                                 .map_err(|_| TileLoweringError::Overflow)?
                                 .checked_mul(4)
                                 .ok_or(TileLoweringError::Overflow)?,
-                        );
-                        words.push(target);
-                        Ok::<_, TileLoweringError>(words)
+                            target,
+                        ))
                     })
+                    .collect::<Result<Vec<_>, TileLoweringError>>()
             })
             .transpose()?
             .unwrap_or_default();
-        let program = if let Some(shared) = shared.get(&key) {
-            shared.program.clone()
+        let (program, offsets) = if let Some(shared) = shared.get(&key) {
+            (shared.program.clone(), shared.offsets.clone())
         } else {
             let address = cursor;
+            let words = if shared_count > 1 {
+                key.0.clone()
+            } else {
+                base_program.clone()
+            };
             cursor = cursor
                 .checked_add(
-                    u32::try_from(base_program.len())
+                    u32::try_from(words.len())
                         .map_err(|_| TileLoweringError::Overflow)?
                         .checked_mul(4)
                         .ok_or(TileLoweringError::Overflow)?,
                 )
                 .ok_or(TileLoweringError::Overflow)?;
-            let program = PlacedExchangeRow {
-                address,
-                words: base_program,
+            let program = PlacedExchangeRow { address, words };
+            let offsets = if setup_entries.is_empty() {
+                None
+            } else {
+                let words = setup_entries
+                    .iter()
+                    .map(|&(offset, _)| offset)
+                    .collect::<Vec<_>>();
+                let address = cursor;
+                cursor = cursor
+                    .checked_add(
+                        u32::try_from(words.len())
+                            .map_err(|_| TileLoweringError::Overflow)?
+                            .checked_mul(4)
+                            .ok_or(TileLoweringError::Overflow)?,
+                    )
+                    .ok_or(TileLoweringError::Overflow)?;
+                Some(PlacedExchangeRow { address, words })
             };
             shared.insert(
-                key,
+                key.clone(),
                 SharedRow {
                     program: program.clone(),
+                    offsets: offsets.clone(),
                 },
             );
-            program
+            (program, offsets)
         };
-        let setup_patch = if setup_words.is_empty() {
+        let setup_patch = if setup_entries.is_empty() {
             None
         } else {
+            let words = setup_entries
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>();
             let address = cursor;
             cursor = cursor
                 .checked_add(
-                    u32::try_from(setup_words.len())
+                    u32::try_from(words.len())
                         .map_err(|_| TileLoweringError::Overflow)?
                         .checked_mul(4)
                         .ok_or(TileLoweringError::Overflow)?,
                 )
                 .ok_or(TileLoweringError::Overflow)?;
-            Some(PlacedExchangeRow {
-                address,
-                words: setup_words,
+            Some(ExchangeSetupPatch {
+                offsets: offsets.expect("a shared exchange row has patch offsets"),
+                values: PlacedExchangeRow { address, words },
             })
         };
         let mut repeat_patches = Vec::new();

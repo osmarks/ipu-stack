@@ -620,6 +620,18 @@ fn build_package_from_objects(
     };
     let standard_ranges =
         memory.free_ranges(crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE);
+    tracing::info!(
+        linked_end,
+        profile_bytes = profile_storage
+            .as_ref()
+            .map_or(0, |allocation| allocation.range.len()),
+        exchange_table_bytes,
+        host_code_bytes,
+        generated_code_bytes,
+        code_address,
+        ?standard_ranges,
+        "allocated package support memory"
+    );
     let placement = build_phase("place_storage", || {
         Ok(crate::place::place_with_standard_ranges(
             program,
@@ -1127,7 +1139,7 @@ fn instrument_profile(
                 crate::TileWorkRef::Exchange(_) | crate::TileWorkRef::LocalCopy(_) => None,
             });
             step_profile(step).before = Some(profile_address(address, plans.len())?);
-            plans.push(profile_step(
+            let mut description = profile_step(
                 program,
                 exchanges,
                 logical_tile,
@@ -1135,7 +1147,9 @@ fn instrument_profile(
                 work,
                 step,
                 following,
-            )?);
+            )?;
+            description.local_index = u32::try_from(plans.len())?;
+            plans.push(description);
         }
     } else {
         let schedule = inactive_profile_work(program);
