@@ -13,9 +13,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConversionTraffic {
     pub source_payload_bytes: u64,
+    pub maximum_source_payload_bytes: u64,
     pub remote_fragments: u64,
+    pub maximum_source_fragments: u64,
     pub maximum_routed_fragments: u64,
     pub maximum_destination_bytes: u64,
+    pub maximum_remote_destination_bytes: u64,
     pub maximum_local_bytes: u64,
     pub maximum_intersections: u64,
     pub maximum_local_intersections: u64,
@@ -76,6 +79,9 @@ pub(crate) fn conversion_traffic(
         }
         traffic.maximum_destination_bytes =
             traffic.maximum_destination_bytes.max(destination_bytes);
+        traffic.maximum_remote_destination_bytes = traffic
+            .maximum_remote_destination_bytes
+            .max(destination_bytes.saturating_sub(local_bytes));
         traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
         traffic.maximum_intersections = traffic
             .maximum_intersections
@@ -96,6 +102,18 @@ pub(crate) fn conversion_traffic(
         .iter()
         .map(|(_, extents)| range_elements(extents).saturating_mul(element_bytes))
         .sum();
+    let mut source_roles = HashMap::<u16, (u64, u64)>::new();
+    for (source, extents) in &remote {
+        let role = source_roles.entry(*source).or_default();
+        role.0 = role
+            .0
+            .saturating_add(range_elements(extents).saturating_mul(element_bytes));
+        role.1 = role.1.saturating_add(1);
+    }
+    for (bytes, fragments) in source_roles.into_values() {
+        traffic.maximum_source_payload_bytes = traffic.maximum_source_payload_bytes.max(bytes);
+        traffic.maximum_source_fragments = traffic.maximum_source_fragments.max(fragments);
+    }
     Some(traffic)
 }
 
@@ -758,6 +776,9 @@ mod tests {
             }
             traffic.maximum_destination_bytes =
                 traffic.maximum_destination_bytes.max(destination_bytes);
+            traffic.maximum_remote_destination_bytes = traffic
+                .maximum_remote_destination_bytes
+                .max(destination_bytes.saturating_sub(local_bytes));
             traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
             traffic.maximum_intersections = traffic
                 .maximum_intersections
@@ -778,6 +799,16 @@ mod tests {
             .iter()
             .map(|(_, extents)| range_elements(extents) * precision.bytes())
             .sum();
+        let mut source_roles = BTreeMap::<u16, (u64, u64)>::new();
+        for (source, extents) in &remote {
+            let role = source_roles.entry(*source).or_default();
+            role.0 += range_elements(extents) * precision.bytes();
+            role.1 += 1;
+        }
+        for (bytes, fragments) in source_roles.into_values() {
+            traffic.maximum_source_payload_bytes = traffic.maximum_source_payload_bytes.max(bytes);
+            traffic.maximum_source_fragments = traffic.maximum_source_fragments.max(fragments);
+        }
         traffic
     }
 

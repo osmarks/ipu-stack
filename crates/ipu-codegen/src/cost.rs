@@ -44,12 +44,15 @@ pub trait CostModel {
             .fold(
                 self.operator_cycles(operator, dispatch, requirements, inputs, output),
                 |cycles, ((source, input), _)| {
-                    cycles.saturating_add(self.rearrange_cycles(
-                        &input.shape,
-                        input.format.precision,
-                        &source.format.layout,
-                        &input.format.layout,
-                    ))
+                    cycles.saturating_add(
+                        self.rearrangement_cost(
+                            &input.shape,
+                            input.format.precision,
+                            &source.format.layout,
+                            &input.format.layout,
+                        )
+                        .cycles,
+                    )
                 },
             )
     }
@@ -63,13 +66,19 @@ pub trait CostModel {
     ) -> ExchangeFootprint {
         ExchangeFootprint::default()
     }
-    fn rearrange_cycles(
+    fn rearrangement_cost(
         &self,
         shape: &TensorShape,
         precision: Precision,
         from: &Layout,
         to: &Layout,
-    ) -> u64;
+    ) -> RearrangementCost;
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RearrangementCost {
+    pub cycles: u64,
+    pub exchange_row_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -125,13 +134,15 @@ impl ExchangeFootprint {
 
 pub(crate) struct MemoizedCostModel<'a, C> {
     inner: &'a C,
-    rearrangements: RefCell<HashMap<(TensorShape, Precision, Layout, Layout), u64>>,
+    spatial_capacity: u16,
+    rearrangements: RefCell<HashMap<(TensorShape, Precision, Layout, Layout), RearrangementCost>>,
 }
 
 impl<'a, C> MemoizedCostModel<'a, C> {
-    pub(crate) fn new(inner: &'a C) -> Self {
+    pub(crate) fn new(inner: &'a C, spatial_capacity: u16) -> Self {
         Self {
             inner,
+            spatial_capacity,
             rearrangements: RefCell::new(HashMap::new()),
         }
     }
@@ -166,20 +177,28 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
             .operator_exchange_footprint(operator, dispatch, requirements, inputs, output)
     }
 
-    fn rearrange_cycles(
+    fn rearrangement_cost(
         &self,
         shape: &TensorShape,
         precision: Precision,
         from: &Layout,
         to: &Layout,
-    ) -> u64 {
+    ) -> RearrangementCost {
         let key = (shape.clone(), precision, from.clone(), to.clone());
-        if let Some(cycles) = self.rearrangements.borrow().get(&key) {
-            return *cycles;
+        if let Some(cost) = self.rearrangements.borrow().get(&key) {
+            return *cost;
         }
-        let cycles = self.inner.rearrange_cycles(shape, precision, from, to);
-        self.rearrangements.borrow_mut().insert(key, cycles);
-        cycles
+        let mut cost = self.inner.rearrangement_cost(shape, precision, from, to);
+        let active_tiles = from.tiling.tile_count.max(to.tiling.tile_count);
+        // The inner model reports occupied work. Reduced-grid conversions
+        // leave spatial issue slots idle, so convert that work into a phase
+        // horizon using the occupancy of this particular planning target.
+        cost.cycles = cost
+            .cycles
+            .saturating_mul(u64::from(self.spatial_capacity))
+            .div_ceil(u64::from(active_tiles));
+        self.rearrangements.borrow_mut().insert(key, cost);
+        cost
     }
 }
 
@@ -505,27 +524,40 @@ impl CostModel for Ipu21CostModel {
             .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
     }
 
-    fn rearrange_cycles(
+    fn rearrangement_cost(
         &self,
         shape: &TensorShape,
         precision: Precision,
         from: &Layout,
         to: &Layout,
-    ) -> u64 {
+    ) -> RearrangementCost {
         let Some(traffic) = conversion_traffic(shape, precision, from, to) else {
-            return u64::MAX / 8;
+            return RearrangementCost {
+                cycles: u64::MAX / 8,
+                exchange_row_bytes: u64::MAX / 8,
+            };
         };
         let direct_retile = from.order == to.order;
-        let exchange_cycles = traffic
+        // Independent source/destination roles execute spatially, but adjacent
+        // IPU21 tiles share an exchange bus. Treat at most one paired role as
+        // concurrent; the per-role maxima retain skew from uneven layouts.
+        let spatial_payload = traffic
             .source_payload_bytes
+            .div_ceil(IPU21_TARGET_COSTS.exchange_bus_sharing)
+            .max(traffic.maximum_source_payload_bytes)
+            .max(traffic.maximum_remote_destination_bytes);
+        let spatial_fragments = traffic
+            .remote_fragments
+            .div_ceil(IPU21_TARGET_COSTS.exchange_bus_sharing)
+            .max(traffic.maximum_source_fragments)
+            .max(traffic.maximum_routed_fragments);
+        let occupied_exchange_cycles = spatial_payload
             .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
             .saturating_add(
-                traffic
-                    .remote_fragments
-                    .max(traffic.maximum_routed_fragments)
-                    .saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles),
-            )
-            .saturating_add(if traffic.remote_fragments == 0 {
+                spatial_fragments.saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles),
+            );
+        let exchange_cycles =
+            occupied_exchange_cycles.saturating_add(if traffic.remote_fragments == 0 {
                 0
             } else {
                 IPU21_TARGET_COSTS.exchange_phase_cycles
@@ -544,7 +576,33 @@ impl CostModel for Ipu21CostModel {
         let local_cycles = local_bytes
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
             .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles));
-        exchange_cycles.saturating_add(local_cycles)
+        // Runtime latency benefits from spatially concurrent roles, whereas
+        // every global fragment still contributes encoded row storage.
+        let encoded_work = traffic
+            .source_payload_bytes
+            .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+            .saturating_add(
+                traffic
+                    .remote_fragments
+                    .max(traffic.maximum_routed_fragments)
+                    .saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles),
+            )
+            .saturating_add(if traffic.remote_fragments == 0 {
+                0
+            } else {
+                IPU21_TARGET_COSTS.exchange_phase_cycles
+            });
+        let cycles_per_word = IPU21_TARGET_COSTS
+            .exchange_transfer_cycles
+            .saturating_mul(16);
+        RearrangementCost {
+            cycles: exchange_cycles.saturating_add(local_cycles),
+            exchange_row_bytes: if from.tiling == to.tiling {
+                0
+            } else {
+                encoded_work.div_ceil(cycles_per_word).saturating_mul(4)
+            },
+        }
     }
 }
 
@@ -622,10 +680,12 @@ mod tests {
             let aligned = Layout::amp_output_grid(64, tiles, column_partitions, row_partitions);
             let destination =
                 Layout::amp_output_replicated_grid(tiles, column_partitions, row_partitions);
-            let fragmented_cycles =
-                Ipu21CostModel.rearrange_cycles(&shape, Precision::F16, &fragmented, &destination);
-            let aligned_cycles =
-                Ipu21CostModel.rearrange_cycles(&shape, Precision::F16, &aligned, &destination);
+            let fragmented_cycles = Ipu21CostModel
+                .rearrangement_cost(&shape, Precision::F16, &fragmented, &destination)
+                .cycles;
+            let aligned_cycles = Ipu21CostModel
+                .rearrangement_cost(&shape, Precision::F16, &aligned, &destination)
+                .cycles;
             assert!(
                 fragmented_cycles >= aligned_cycles,
                 "case {case}: fragmented={fragmented_cycles} aligned={aligned_cycles}"

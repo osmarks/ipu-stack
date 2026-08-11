@@ -21,8 +21,6 @@ use crate::graph::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-const EXCHANGE_ROW_FRAGMENT_AMORTIZATION: u64 = 16;
-
 /// In-memory representation of one tensor element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Precision {
@@ -2094,7 +2092,7 @@ pub fn lower(
     });
     let config = resolved_config.as_ref().unwrap_or(config);
     let mut state = LoweringState::default();
-    let costs = MemoizedCostModel::new(costs);
+    let costs = MemoizedCostModel::new(costs, config.tile_count);
     let mut values = BTreeMap::new();
     let mut inputs = Vec::with_capacity(graph.inputs().len());
     for input in graph.inputs() {
@@ -2559,12 +2557,14 @@ fn format_equality_cost(
             .unwrap_or(0);
         let rearrange = (source.format.layout != target.format.layout)
             .then(|| {
-                costs.rearrange_cycles(
-                    &source.shape,
-                    target.format.precision,
-                    &source.format.layout,
-                    &target.format.layout,
-                )
+                costs
+                    .rearrangement_cost(
+                        &source.shape,
+                        target.format.precision,
+                        &source.format.layout,
+                        &target.format.layout,
+                    )
+                    .cycles
             })
             .unwrap_or(0);
         total.saturating_add(cast).saturating_add(rearrange)
@@ -3174,7 +3174,7 @@ fn ensure_format(
         let from = tensor_type.format.layout.clone();
         tensor_type.format.layout = target.layout.clone();
         let result = state.derived_value(value, tensor_type.clone());
-        let rearrange_cycles = costs.rearrange_cycles(
+        let rearrangement = costs.rearrangement_cost(
             &tensor_type.shape,
             tensor_type.format.precision,
             &from,
@@ -3182,12 +3182,7 @@ fn ensure_format(
         );
         let mut memory = conversion_memory_estimate(&current.tensor_type, &tensor_type);
         if from.tiling != target.layout.tiling {
-            // Consolidated rows encode many related fragments compactly. Use
-            // the routed-transfer cycle estimate only as a small SRAM proxy.
-            let row_cycle_scale =
-                IPU21_TARGET_COSTS.exchange_transfer_cycles * EXCHANGE_ROW_FRAGMENT_AMORTIZATION;
-            memory.exchange_row_bytes =
-                rearrange_cycles.div_ceil(row_cycle_scale).saturating_mul(4);
+            memory.exchange_row_bytes = rearrangement.exchange_row_bytes;
         }
         operations.push(MidOperation {
             source: Some(source),
@@ -3208,7 +3203,7 @@ fn ensure_format(
                     .with_materialization(materialization),
                 dispatch: ConversionDispatch::Intersections,
             }),
-            estimated_cycles: rearrange_cycles,
+            estimated_cycles: rearrangement.cycles,
             memory,
         });
         value = result;
@@ -3495,14 +3490,14 @@ mod tests {
             0
         }
 
-        fn rearrange_cycles(
+        fn rearrangement_cost(
             &self,
             _shape: &TensorShape,
             _precision: Precision,
             _from: &Layout,
             _to: &Layout,
-        ) -> u64 {
-            0
+        ) -> crate::cost::RearrangementCost {
+            crate::cost::RearrangementCost::default()
         }
     }
 
