@@ -186,7 +186,7 @@ pub fn build_tile_program_package(
     let sizing_address = memory.next_free(
         linked_end,
         TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-        4,
+        8,
         "generated tile programs",
     )?;
     let host = crate::HostProgram::default();
@@ -208,7 +208,11 @@ pub fn build_tile_program_package(
             bytes: maximum_bytes,
             alignment: 4,
             bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-            end_alignment: 4,
+            // Supervisor instruction fetch and exchange/paired memory access
+            // cannot safely use the same standard-memory element. Reserve the
+            // rest of the element so subsequently placed tensor data cannot
+            // become the source of an exchange while code executes from it.
+            end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
             guard_after: 0,
         })?
         .range
@@ -525,9 +529,9 @@ fn build_package_from_objects(
             memory.allocate(MemoryRequest {
                 name: "host programs",
                 bytes: host_code_bytes,
-                alignment: 4,
+                alignment: 8,
                 bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-                end_alignment: 4,
+                end_alignment: 8,
                 guard_after: 0,
             })
         })
@@ -611,7 +615,10 @@ fn build_package_from_objects(
                 alignment: 4,
                 bounds: (host_code_base + host_code_bytes)
                     ..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-                end_alignment: 4,
+                // Host programs and generated tile code form one contiguous
+                // executable region. Keep planned standard-memory values out
+                // of its final memory element.
+                end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
                 guard_after: 0,
             })?
             .range
@@ -709,8 +716,14 @@ fn build_package_from_objects(
             ranges
         },
     )?;
-    if host.end.checked_sub(host_code_base) != Some(host_code_bytes) {
-        return Err(invalid("host program size changed after tensor placement"));
+    let final_host_code_bytes = host
+        .end
+        .checked_sub(host_code_base)
+        .ok_or_else(|| invalid("host program end precedes its base"))?;
+    if final_host_code_bytes > host_code_bytes {
+        return Err(invalid(format!(
+            "host program grew after tensor placement: reserved {host_code_bytes}, requires {final_host_code_bytes} bytes"
+        )));
     }
     let finalizer = TileProgramLowering::new(
         program,

@@ -41,7 +41,10 @@ const SHL_M_IMMEDIATE_OPCODE: u32 = 0x4200_a000;
 const BRZ_M_IMMEDIATE_OPCODE: u32 = 0x1300_0000;
 const INCOMING_MUX_REGISTER: u8 = 0xa0;
 const INCOMING_DCOUNT_REGISTER: u8 = 0xa6;
-const TILE_TO_HOST_CLOSE_DELAY_ADVANCE: u32 = 2;
+// The host hierarchy reserves eighteen exchange events for each tile-to-host
+// payload. Short payloads must be padded before the next packet header (or the
+// closing zero-byte read); longer payloads provide the interval themselves.
+const TILE_TO_HOST_MIN_PAYLOAD_EVENTS: u32 = 18;
 const HOST_TO_TILE_STREAM_END_BITS: u32 = 0x0c00_0000;
 // Time reserved by the SDK supervisor schedule between receiving a host
 // command and injecting that command into the device-side dispatch path.
@@ -711,8 +714,11 @@ fn tile_to_host_target_instructions(
             3,
             chunk.tile_address >> 2,
         )?);
+        let payload_events = chunk.bytes / 4;
+        if payload_events < TILE_TO_HOST_MIN_PAYLOAD_EVENTS {
+            instructions.push(delay(TILE_TO_HOST_MIN_PAYLOAD_EVENTS - payload_events - 1));
+        }
     }
-    instructions.push(delay(TILE_TO_HOST_CLOSE_DELAY_ADVANCE - 1));
     instructions.push(encode_send(1, 3, close_address >> 2)?);
     instructions.push(SYNC_RECEIVE_INSTRUCTION);
     instructions.push(RETURN_M10_INSTRUCTION);
@@ -1795,8 +1801,46 @@ mod tests {
         assert_eq!(close, payload + 2);
         assert_eq!(
             plan.instructions[payload + 1],
-            delay(TILE_TO_HOST_CLOSE_DELAY_ADVANCE - 1)
+            delay(TILE_TO_HOST_MIN_PAYLOAD_EVENTS - 64 / 4 - 1)
         );
+    }
+
+    #[test]
+    fn randomized_tile_to_host_packets_observe_the_payload_interval() {
+        let mut random = fastrand::Rng::with_seed(0x686f_7374_5f70_6164);
+        for _ in 0..256 {
+            let host_offset = random.u32(0..256) * 4;
+            let bytes = random.u32(1..=1024) * 4;
+            let chunks = plan_tile_to_host(2, 0x52000, host_offset, bytes).unwrap();
+            let target = assemble_tile_to_host_target_program(
+                2,
+                0x52000,
+                host_offset,
+                bytes,
+                0x50160,
+                0x501a0,
+            )
+            .unwrap();
+
+            let mut cursor = 2;
+            for _ in 0..chunks.len() {
+                cursor += 1; // packet header
+                let payload_events = instruction_advance(target.instructions[cursor]);
+                cursor += 1;
+                let padding_events = if payload_events < TILE_TO_HOST_MIN_PAYLOAD_EVENTS {
+                    let events = instruction_advance(target.instructions[cursor]);
+                    cursor += 1;
+                    events
+                } else {
+                    0
+                };
+                assert_eq!(
+                    payload_events + padding_events,
+                    payload_events.max(TILE_TO_HOST_MIN_PAYLOAD_EVENTS)
+                );
+            }
+            assert_eq!(cursor + 3, target.instructions.len());
+        }
     }
 
     #[test]
