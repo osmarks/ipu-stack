@@ -3,8 +3,8 @@
 use crate::cost::IPU21_TARGET_COSTS;
 use crate::graph::TensorShape;
 use crate::mid::{
-    AmpOrder, ElementOrder, Layout, MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks,
-    MemoryRelation, MemoryUsage, MidOperation, MidOperationKind, MidValue, MidValueId,
+    AmpOrder, ElementOrder, GemmDistribution, Layout, MemoryClass, MemoryEstimate, MemoryOperand,
+    MemoryPeaks, MemoryRelation, MemoryUsage, MidOperation, MidOperationKind, MidValue, MidValueId,
     OperandMaterialization, OperatorDispatch, OperatorRequirements, Precision, TensorAxis,
     TensorType,
 };
@@ -348,6 +348,25 @@ pub(crate) fn operator_memory_estimate(
         },
     );
     let mut temporary = MemoryUsage::default();
+    if let (
+        OperatorDispatch::BlockedGemm {
+            output_column_block,
+            distribution: GemmDistribution::ActivationStationaryReduction { .. },
+            ..
+        },
+        Some(left),
+        Some(right),
+    ) = (dispatch, inputs.first(), inputs.get(1))
+    {
+        let inner_axis = left.shape.0.len().saturating_sub(1);
+        let inner = maximum_axis_shard_extent(left, inner_axis);
+        temporary.interleaved = inner
+            .saturating_mul(u64::from(*output_column_block))
+            .saturating_mul(right.format.precision.bytes());
+        // One local partial and one receive buffer suffice at every level of
+        // the reduction tree; the canonical root output occupies live memory.
+        temporary.standard = maximum_shard_bytes(output).saturating_mul(2);
+    }
     if let (OperatorDispatch::BlockedGemm { inner_block, .. }, Some(left), Some(requirement)) =
         (dispatch, inputs.first(), requirements.inputs.first())
         && requirement.materialization == OperandMaterialization::DispatchSlices
@@ -368,6 +387,13 @@ pub(crate) fn operator_memory_estimate(
         Some(right),
     ) = (dispatch, inputs.get(1))
         && right.format.precision == Precision::F16
+        && !matches!(
+            dispatch,
+            OperatorDispatch::BlockedGemm {
+                distribution: GemmDistribution::ActivationStationaryReduction { .. },
+                ..
+            }
+        )
         && gemm_uses_panel_buffer(dispatch, right, output)
     {
         // Each local output-column panel has one final kernel buffer reused
