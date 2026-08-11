@@ -667,7 +667,7 @@ function drawTimeline() {
         const x = left + plotW * (clippedStart - viewStart) / (viewEnd - viewStart);
         const w = Math.max(1, plotW * (clippedEnd - clippedStart) / (viewEnd - viewStart));
         ctx.fillStyle = selected ? sampleColor(sample, segment.kind) : "#9b9b9b";
-        ctx.fillRect(x, y, w, rowH === 1 ? 1 : rowH - 1);
+        ctx.fillRect(x, y, w, rowH);
       }
     }
   });
