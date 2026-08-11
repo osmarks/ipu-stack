@@ -12,9 +12,9 @@
   --ink: #050505;
   --muted: #303030;
   --line: #000000;
-  --exchange: #00a84f;
-  --compute: #ef3340;
-  --synchronization: #ffb000;
+  --exchange: #17854c;
+  --compute: #cf3f4a;
+  --synchronization: #c58b24;
   --idle: #ffffff;
   --selected: #0057ff;
 }
@@ -153,11 +153,11 @@ canvas {
       <div class="section-title">Tilewise Timeline</div>
       <div class="legend">
         <label>Row height <select id="timelineRowHeight"><option value="1">compact</option><option value="2">2 px</option><option value="4">4 px</option><option value="8">8 px</option><option value="16">16 px</option></select></label>
-        <span class="legend-item"><span class="legend-swatch" style="background:#ef3340"></span>compute (kernel-tinted)</span>
-        <span class="legend-item"><span class="legend-swatch" style="background:#00a84f"></span>send</span>
-        <span class="legend-item"><span class="legend-swatch" style="background:#008cff"></span>receive</span>
-        <span class="legend-item"><span class="legend-swatch" style="background:#70d6c5"></span>exchange idle (estimated)</span>
-        <span class="legend-item"><span class="legend-swatch" style="background:#ffb000"></span>sync</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#cf3f4a"></span>compute (kernel-tinted)</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#17854c"></span>send</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#287db2"></span>receive</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#8ebeb4"></span>exchange idle (estimated)</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#c58b24"></span>sync</span>
       </div>
     </div>
     <div class="overview-wrap"><canvas id="overview"></canvas></div>
@@ -211,12 +211,12 @@ const timeline = document.getElementById("timeline");
 const tooltip = document.getElementById("tooltip");
 const details = document.getElementById("details");
 const colors = {
-  exchange: "#00a84f",
-  send: "#00a84f",
-  receive: "#008cff",
-  exchangeIdle: "#70d6c5",
-  compute: "#ef3340",
-  synchronization: "#ffb000",
+  exchange: "#17854c",
+  send: "#17854c",
+  receive: "#287db2",
+  exchangeIdle: "#8ebeb4",
+  compute: "#cf3f4a",
+  synchronization: "#c58b24",
   idle: "#ffffff",
 };
 const textColor = { exchange: "#ffffff", compute: "#ffffff", synchronization: "#ffffff", idle: "#050505" };
@@ -286,8 +286,8 @@ function sampleColor(sample, kind = sample.kind) {
   if (kind !== "compute" || !sample.kernel) return colors[kind] || colors.exchange;
   const hash = stableHash(sample.kernel);
   const hue = 350 + (hash % 41) - 20;
-  const lightness = 50 + ((hash >>> 8) % 13) - 6;
-  return `hsl(${hue} 92% ${lightness}%)`;
+  const lightness = 43 + ((hash >>> 8) % 11) - 5;
+  return `hsl(${hue} 76% ${lightness}%)`;
 }
 function exchangeEventCycles(sample) {
   const cycles = sample.exchangeEventCycles;
