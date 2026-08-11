@@ -1267,7 +1267,11 @@ impl LoweringState {
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        if let GemmDistribution::ActivationStationaryReduction { inner_partitions } = distribution {
+        if let GemmDistribution::ActivationStationaryReduction {
+            inner_partitions,
+            reduction_fan_in,
+        } = distribution
+        {
             return self.lower_activation_stationary_gemm(
                 operation,
                 initialize,
@@ -1275,6 +1279,7 @@ impl LoweringState {
                 inner_block,
                 output_column_block,
                 inner_partitions,
+                reduction_fan_in,
                 requirements,
                 tiles,
             );
@@ -1561,6 +1566,7 @@ impl LoweringState {
         inner_block: u32,
         output_column_block: u32,
         inner_partitions: u16,
+        reduction_fan_in: u16,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
@@ -1570,7 +1576,11 @@ impl LoweringState {
         let [output_value] = operation.results.as_slice() else {
             return Err(LowLoweringError::ResultArity);
         };
-        if inner_block == 0 || output_column_block == 0 || inner_partitions < 2 {
+        if inner_block == 0
+            || output_column_block == 0
+            || inner_partitions < 2
+            || reduction_fan_in < 2
+        {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
         let left_shards = self.value_shards(*left_value)?.to_vec();
@@ -1785,10 +1795,11 @@ impl LoweringState {
                 let mut reduction_transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
                 let mut reduction_runs = Vec::new();
                 for row_partials in partials.values_mut() {
-                    let mut next = Vec::with_capacity(row_partials.len().div_ceil(2));
-                    for pair in row_partials.chunks(2) {
-                        let receiver = pair[0];
-                        if let Some(sender) = pair.get(1).copied() {
+                    let fan_in = usize::from(reduction_fan_in);
+                    let mut next = Vec::with_capacity(row_partials.len().div_ceil(fan_in));
+                    for group in row_partials.chunks(fan_in) {
+                        let receiver = group[0];
+                        for sender in group[1..].iter().copied() {
                             let incoming = self.push_shard(LowShard {
                                 id: LowShardId(0),
                                 tile: receiver.0,
@@ -2673,14 +2684,16 @@ mod tests {
     fn randomized_activation_stationary_gemms_lower_to_tree_reductions() {
         let mut random = fastrand::Rng::with_seed(0x7472_6565_5f6b_7370);
         for case in 0..CASES {
+            let output_columns = [64, 128][random.usize(0..2)];
             let inner_partitions = random.u16(2..=4);
+            let reduction_fan_in = random.u16(2..=inner_partitions.min(4));
             let row_partitions = random.u16(inner_partitions..=8);
             let tiles = inner_partitions * row_partitions;
             let rows = u32::from(row_partitions) * random.u32(1..=4);
             let inner = u32::from(inner_partitions)
                 * 64
                 * random.u32(1..=u32::from(row_partitions / inner_partitions));
-            let columns = u32::from(inner_partitions) * 64;
+            let columns = u32::from(inner_partitions) * output_columns;
             let mut graph = ComputeGraph::new();
             let left = graph.host_input("left", [1, rows, inner]).unwrap();
             let right = graph.parameter("right", [1, inner, columns]).unwrap();
@@ -2696,7 +2709,7 @@ mod tests {
                 accumulate: AccumulationPrecision::F32,
                 mode,
                 weights: GemmWeightLoad::Interleaved,
-                output_columns: 64,
+                output_columns,
             };
             let left_format = TensorFormat {
                 precision: Precision::F16,
@@ -2710,7 +2723,7 @@ mod tests {
             let right_format = TensorFormat {
                 precision: Precision::F16,
                 layout: Layout::amp_right_k64_storage(
-                    64,
+                    output_columns,
                     inner_partitions,
                     u16::try_from(inner / 64).unwrap(),
                     1,
@@ -2719,7 +2732,12 @@ mod tests {
             };
             let output_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_output_grid(64, tiles, row_partitions, inner_partitions),
+                layout: Layout::amp_output_grid(
+                    output_columns,
+                    tiles,
+                    row_partitions,
+                    inner_partitions,
+                ),
             };
             let candidate = OperatorCandidate::new(
                 operator,
@@ -2733,8 +2751,11 @@ mod tests {
                 initialize: kernel(GemmKernelMode::Initialize),
                 accumulate: kernel(GemmKernelMode::Accumulate),
                 inner_block: 64,
-                output_column_block: 64,
-                distribution: GemmDistribution::ActivationStationaryReduction { inner_partitions },
+                output_column_block: output_columns,
+                distribution: GemmDistribution::ActivationStationaryReduction {
+                    inner_partitions,
+                    reduction_fan_in,
+                },
             });
             let mut config = PipelineConfig::new(tiles)
                 .with_input(left, left_format)

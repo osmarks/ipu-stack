@@ -126,7 +126,10 @@ pub enum GemmDistribution {
     OutputStationary,
     /// Compute K-partial outputs beside sharded activations, then reduce them
     /// onto the canonical output owners.
-    ActivationStationaryReduction { inner_partitions: u16 },
+    ActivationStationaryReduction {
+        inner_partitions: u16,
+        reduction_fan_in: u16,
+    },
 }
 
 /// How a pointwise kernel's input shards are selected for each output shard.
@@ -2808,9 +2811,9 @@ fn plans(
             candidate.output.format.layout.tiling = actual.format.layout.tiling.clone();
         }
         let mut variants = vec![candidate.clone()];
-        if let Some(partial) = activation_stationary_reduction_candidate(&candidate, inputs) {
-            variants.push(partial);
-        }
+        variants.extend(activation_stationary_reduction_candidates(
+            &candidate, inputs,
+        ));
         for (input_index, _) in parameter_inputs
             .iter()
             .enumerate()
@@ -2923,17 +2926,17 @@ fn independent_parameter_storage(
         .collect()
 }
 
-fn activation_stationary_reduction_candidate(
+fn activation_stationary_reduction_candidates(
     candidate: &OperatorCandidate,
     inputs: &[TensorType],
-) -> Option<OperatorCandidate> {
+) -> Vec<OperatorCandidate> {
     let OperatorDispatch::BlockedGemm {
         output_column_block,
         distribution: GemmDistribution::OutputStationary,
         ..
     } = candidate.dispatch
     else {
-        return None;
+        return Vec::new();
     };
     if !matches!(
         candidate.operator,
@@ -2941,43 +2944,62 @@ fn activation_stationary_reduction_candidate(
             multiply: Precision::F16,
             ..
         }
-    ) || output_column_block != AMP_OUTPUT_COLUMN_BLOCK
-    {
-        return None;
+    ) || !matches!(
+        output_column_block,
+        AMP_OUTPUT_COLUMN_BLOCK | AMP_WIDE_OUTPUT_COLUMN_BLOCK
+    ) {
+        return Vec::new();
     }
-    let [left, right] = inputs else { return None };
+    let [left, right] = inputs else {
+        return Vec::new();
+    };
     let rank = left.shape.0.len();
     if rank < 2 || right.shape.0.len() < 2 {
-        return None;
+        return Vec::new();
     }
-    let inner = *left.shape.0.last()?;
-    let columns = *right.shape.0.last()?;
+    let Some(&inner) = left.shape.0.last() else {
+        return Vec::new();
+    };
+    let Some(&columns) = right.shape.0.last() else {
+        return Vec::new();
+    };
     if !inner.is_multiple_of(AMP_INNER_BLOCK) || !columns.is_multiple_of(output_column_block) {
-        return None;
+        return Vec::new();
     }
     let layout = &candidate.output.format.layout;
-    let column_partitions = layout
+    let Some(column_partitions) = layout
         .tiling
         .axes
         .iter()
-        .find(|axis| axis.axis == TensorAxis::FromEnd(1))?
-        .partitions;
-    let row_partitions = layout
+        .find(|axis| axis.axis == TensorAxis::FromEnd(1))
+        .map(|axis| axis.partitions)
+    else {
+        return Vec::new();
+    };
+    let Some(row_partitions) = layout
         .tiling
         .axes
         .iter()
-        .find(|axis| axis.axis == TensorAxis::FromEnd(2))?
-        .partitions;
+        .find(|axis| axis.axis == TensorAxis::FromEnd(2))
+        .map(|axis| axis.partitions)
+    else {
+        return Vec::new();
+    };
     if u32::from(column_partitions) != columns / output_column_block
         || column_partitions < 2
-        || row_partitions.checked_mul(column_partitions)? != layout.tiling.tile_count
+        || row_partitions.checked_mul(column_partitions) != Some(layout.tiling.tile_count)
         || !(inner / AMP_INNER_BLOCK).is_multiple_of(u32::from(column_partitions))
     {
-        return None;
+        return Vec::new();
     }
-    let inner_blocks = u16::try_from(inner / AMP_INNER_BLOCK).ok()?;
-    if column_partitions.checked_mul(inner_blocks)? > layout.tiling.tile_count {
-        return None;
+    let Ok(inner_blocks) = u16::try_from(inner / AMP_INNER_BLOCK) else {
+        return Vec::new();
+    };
+    if column_partitions
+        .checked_mul(inner_blocks)
+        .is_none_or(|tiles| tiles > layout.tiling.tile_count)
+    {
+        return Vec::new();
     }
     let mut partial = candidate.clone();
     partial.inputs[0].format.layout = Layout::amp_left_partitioned_grid(
@@ -2993,12 +3015,20 @@ fn activation_stationary_reduction_candidate(
         1,
         MemoryClass::Ipu21Interleaved,
     );
-    if let OperatorDispatch::BlockedGemm { distribution, .. } = &mut partial.dispatch {
-        *distribution = GemmDistribution::ActivationStationaryReduction {
-            inner_partitions: column_partitions,
-        };
-    }
-    Some(partial)
+    [2, 3, 4]
+        .into_iter()
+        .filter(|&fan_in| fan_in <= column_partitions)
+        .map(|reduction_fan_in| {
+            let mut variant = partial.clone();
+            if let OperatorDispatch::BlockedGemm { distribution, .. } = &mut variant.dispatch {
+                *distribution = GemmDistribution::ActivationStationaryReduction {
+                    inner_partitions: column_partitions,
+                    reduction_fan_in,
+                };
+            }
+            variant
+        })
+        .collect()
 }
 
 fn resolved_output_aliasing(
@@ -3436,19 +3466,21 @@ mod tests {
     fn randomized_activation_stationary_candidates_partition_k_without_replication() {
         let mut random = fastrand::Rng::with_seed(0x7061_7274_6961_6c73);
         for _ in 0..RANDOM_CASES {
+            let output_columns =
+                [AMP_OUTPUT_COLUMN_BLOCK, AMP_WIDE_OUTPUT_COLUMN_BLOCK][random.usize(0..2)];
             let inner_partitions = random.u16(2..=4);
             let multiplier = random.u16(1..=8 / inner_partitions);
             let inner_blocks = inner_partitions * multiplier;
             let row_partitions = random.u16(inner_blocks..=8);
             let tiles = row_partitions * inner_partitions;
             let k = u32::from(inner_blocks) * 64;
-            let n = u32::from(inner_partitions) * 64;
+            let n = u32::from(inner_partitions) * output_columns;
             let m = u32::from(row_partitions) * random.u32(1..=8);
             let base = amp_grid_gemm_operator_candidate(
                 Precision::F16,
                 64,
                 16,
-                64,
+                output_columns,
                 AmpGridShape {
                     tile_count: tiles,
                     row_partitions,
@@ -3460,19 +3492,25 @@ mod tests {
                 TensorType::new([m, k], Precision::F16, Layout::row_sharded(tiles)),
                 TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
             ];
-            let candidate = activation_stationary_reduction_candidate(&base, &inputs)
-                .expect("compatible grid should produce a reduction candidate");
-            assert!(candidate.supports(&inputs, &TensorShape(vec![m, n])));
-            assert_eq!(candidate.inputs[0].format.layout.tiling.replicas, 1);
-            assert!(matches!(
-                candidate.dispatch,
-                OperatorDispatch::BlockedGemm {
-                    distribution: GemmDistribution::ActivationStationaryReduction {
-                        inner_partitions: actual
-                    },
-                    ..
-                } if actual == inner_partitions
-            ));
+            let candidates = activation_stationary_reduction_candidates(&base, &inputs);
+            assert_eq!(candidates.len(), usize::from(inner_partitions.min(4) - 1));
+            for candidate in candidates {
+                assert!(candidate.supports(&inputs, &TensorShape(vec![m, n])));
+                assert_eq!(candidate.inputs[0].format.layout.tiling.replicas, 1);
+                assert!(matches!(
+                    candidate.dispatch,
+                    OperatorDispatch::BlockedGemm {
+                        output_column_block: actual_columns,
+                        distribution: GemmDistribution::ActivationStationaryReduction {
+                            inner_partitions: actual,
+                            reduction_fan_in,
+                        },
+                        ..
+                    } if actual == inner_partitions
+                        && actual_columns == output_columns
+                        && (2..=inner_partitions.min(4)).contains(&reduction_fan_in)
+                ));
+            }
         }
     }
 

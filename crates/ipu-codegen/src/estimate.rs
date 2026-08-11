@@ -351,7 +351,10 @@ pub(crate) fn operator_memory_estimate(
     if let (
         OperatorDispatch::BlockedGemm {
             output_column_block,
-            distribution: GemmDistribution::ActivationStationaryReduction { .. },
+            distribution:
+                GemmDistribution::ActivationStationaryReduction {
+                    reduction_fan_in, ..
+                },
             ..
         },
         Some(left),
@@ -363,9 +366,11 @@ pub(crate) fn operator_memory_estimate(
         temporary.interleaved = inner
             .saturating_mul(u64::from(*output_column_block))
             .saturating_mul(right.format.precision.bytes());
-        // One local partial and one receive buffer suffice at every level of
-        // the reduction tree; the canonical root output occupies live memory.
-        temporary.standard = maximum_shard_bytes(output).saturating_mul(2);
+        // Non-root tiles retain one local partial and one buffer for every
+        // additional input collected by a reduction group. Root output storage
+        // is already included in live memory.
+        temporary.standard =
+            maximum_shard_bytes(output).saturating_mul(u64::from(*reduction_fan_in));
     }
     if let (OperatorDispatch::BlockedGemm { inner_block, .. }, Some(left), Some(requirement)) =
         (dispatch, inputs.first(), requirements.inputs.first())
