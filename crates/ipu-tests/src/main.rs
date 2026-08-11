@@ -61,6 +61,11 @@ struct Arguments {
     mlp_tokens: u32,
     #[arg(long, default_value_t = SIGLIP_MLP_DIMENSION)]
     mlp_dim: u32,
+    /// Independent attention batches, flattened into the head axis.
+    #[arg(long, default_value_t = 1)]
+    attention_batch: u32,
+    #[arg(long, default_value_t = SIGLIP_ATTENTION_HEADS)]
+    attention_heads: u32,
     /// Defaults to four times --mlp-dim.
     #[arg(long)]
     mlp_hidden_dim: Option<u32>,
@@ -167,7 +172,19 @@ fn main() -> Result<()> {
     {
         bail!("--benchmark-* shape options require --workload gemm-benchmark");
     }
+    if !matches!(arguments.workload, Workload::SiglipAttentionBenchmark)
+        && (arguments.attention_batch != 1 || arguments.attention_heads != SIGLIP_ATTENTION_HEADS)
+    {
+        bail!("--attention-* shape options require --workload siglip-attention-benchmark");
+    }
     let active_tiles = u16::try_from(arguments.tiles).context("tile count exceeds u16")?;
+    let attention_streams = arguments
+        .attention_batch
+        .checked_mul(arguments.attention_heads)
+        .context("attention batch/head count overflow")?;
+    if attention_streams == 0 {
+        bail!("--attention-batch and --attention-heads must be nonzero");
+    }
     let benchmark_rows = arguments.benchmark_rows;
     let mlp_hidden_dim = arguments.mlp_hidden_dim.map_or_else(
         || {
@@ -292,7 +309,7 @@ fn main() -> Result<()> {
         let (heads, query_rows, key_rows, query_dimension, value_dimension) =
             if matches!(arguments.workload, Workload::SiglipAttentionBenchmark) {
                 (
-                    SIGLIP_ATTENTION_HEADS,
+                    attention_streams,
                     SIGLIP_ATTENTION_TOKENS,
                     SIGLIP_ATTENTION_TOKENS,
                     SIGLIP_ATTENTION_HEAD_DIMENSION,
@@ -450,7 +467,7 @@ fn main() -> Result<()> {
                 let (heads, query_rows, key_rows, query_dimension, value_dimension, checked_rows) =
                     if matches!(arguments.workload, Workload::SiglipAttentionBenchmark) {
                         (
-                            SIGLIP_ATTENTION_HEADS,
+                            attention_streams,
                             SIGLIP_ATTENTION_TOKENS,
                             SIGLIP_ATTENTION_TOKENS,
                             SIGLIP_ATTENTION_HEAD_DIMENSION,
