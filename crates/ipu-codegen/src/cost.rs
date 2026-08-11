@@ -8,8 +8,8 @@ use crate::estimate::{
 };
 use crate::graph::TensorShape;
 use crate::mid::{
-    AmpOrder, ElementOrder, Layout, LocalOperandStaging, MemoryClass, MidOperator,
-    OperatorDispatch, OperatorRequirements, Precision, TensorAxis, TensorType,
+    AmpOrder, ElementOrder, GemmDistribution, Layout, LocalOperandStaging, MemoryClass,
+    MidOperator, OperatorDispatch, OperatorRequirements, Precision, TensorAxis, TensorType,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -463,6 +463,45 @@ impl CostModel for Ipu21CostModel {
                         gemm_exchange_phase_count(dispatch, inputs, output)
                             .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles),
                     );
+                let exchange = match dispatch {
+                    OperatorDispatch::BlockedGemm {
+                        output_column_block,
+                        distribution:
+                            GemmDistribution::ActivationStationaryReduction { inner_partitions },
+                        ..
+                    } => {
+                        let partitions = u64::from(*inner_partitions);
+                        let columns = output.shape.0.last().copied().map_or(1, u64::from);
+                        let column_groups = columns.div_ceil(u64::from(*output_column_block));
+                        let local_k = k.div_ceil(partitions);
+                        let weight_bytes = local_k
+                            .saturating_mul(columns)
+                            .saturating_mul(inputs[1].format.precision.bytes());
+                        let rounds = u64::from(u16::BITS - (inner_partitions - 1).leading_zeros());
+                        let partial_bytes = maximum_shard_bytes(output);
+                        weight_bytes
+                            .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+                            .saturating_add(
+                                column_groups
+                                    .saturating_mul(rounds)
+                                    .saturating_mul(partial_bytes)
+                                    .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle),
+                            )
+                            .saturating_add(
+                                column_groups
+                                    .saturating_mul(rounds.saturating_add(1))
+                                    .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles),
+                            )
+                            .saturating_add(
+                                column_groups.saturating_mul(rounds).saturating_mul(
+                                    partial_bytes
+                                        .div_ceil(12)
+                                        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
+                                ),
+                            )
+                    }
+                    _ => exchange,
+                };
                 let calls = match dispatch {
                     OperatorDispatch::BlockedGemm {
                         inner_block,
@@ -522,6 +561,19 @@ impl CostModel for Ipu21CostModel {
         output: &TensorType,
     ) -> ExchangeFootprint {
         let phases = gemm_exchange_phase_count(dispatch, inputs, output);
+        let phases = match dispatch {
+            OperatorDispatch::BlockedGemm {
+                output_column_block,
+                distribution: GemmDistribution::ActivationStationaryReduction { inner_partitions },
+                ..
+            } => {
+                let columns = output.shape.0.last().copied().map_or(1, u64::from);
+                let groups = columns.div_ceil(u64::from(*output_column_block));
+                let rounds = u64::from(u16::BITS - (inner_partitions - 1).leading_zeros());
+                groups.saturating_mul(rounds.saturating_add(1))
+            }
+            _ => phases,
+        };
         if phases == 0 {
             return ExchangeFootprint::default();
         }
