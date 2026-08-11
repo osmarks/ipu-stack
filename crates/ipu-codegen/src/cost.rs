@@ -583,10 +583,34 @@ impl CostModel for Ipu21CostModel {
                     .saturating_add(exchange)
                     .saturating_add(capacity_penalty)
             }
-            MidOperator::FlashAttention { .. } => elements
-                .saturating_mul(8)
-                .div_ceil(32)
-                .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
+            MidOperator::FlashAttention { .. } => {
+                let query = inputs.first().map(|input| &input.shape.0);
+                let key = inputs.get(1).map(|input| &input.shape.0);
+                let value = inputs.get(2).map(|input| &input.shape.0);
+                let key_rows = key
+                    .and_then(|shape| shape.get(shape.len().saturating_sub(2)))
+                    .copied()
+                    .map_or(1, u64::from);
+                let query_dimension = query
+                    .and_then(|shape| shape.last())
+                    .copied()
+                    .map_or(1, u64::from);
+                let value_dimension = value
+                    .and_then(|shape| shape.last())
+                    .copied()
+                    .map_or(1, u64::from);
+                // The exact baseline computes one QK dot and one online
+                // accumulator update per key row. Six workers partition query
+                // rows; include scalar conversion, exp, and memory issue cost.
+                let output_values_per_query = value_dimension.max(1);
+                elements
+                    .div_ceil(output_values_per_query)
+                    .saturating_mul(key_rows)
+                    .saturating_mul(query_dimension.saturating_add(value_dimension))
+                    .saturating_mul(4)
+                    .div_ceil(6)
+                    .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
+            }
             // The exact scalar implementation is compute-bound at roughly
             // ten tile cycles per element across the six workers.
             MidOperator::Gelu => spatial_occupancy_adjusted_elements
