@@ -309,29 +309,10 @@ fn main() -> Result<()> {
         let value = graph.host_input("value", [heads, key_rows, value_dimension])?;
         let output = graph.flash_attention(query, key, value)?;
         graph.set_outputs([output])?;
-        let layout = Layout::head_sharded(heads as u16);
         pipeline = pipeline
-            .with_input(
-                query,
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout: layout.clone(),
-                },
-            )
-            .with_input(
-                key,
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout: layout.clone(),
-                },
-            )
-            .with_input(
-                value,
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout,
-                },
-            );
+            .with_automatic_input(query, Precision::F16)
+            .with_automatic_input(key, Precision::F16)
+            .with_automatic_input(value, Precision::F16);
         pipeline.profiling.enabled = !arguments.no_profile;
     } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
         validate_mlp_benchmark_shape(
@@ -716,26 +697,84 @@ fn run_attention_smoke(
     let query_binding = binding("query", &application.inputs)?;
     let key_binding = binding("key", &application.inputs)?;
     let value_binding = binding("value", &application.inputs)?;
-    let query_bytes = packed_binding(&query_binding, |head, linear, _| {
-        Ok(mlp_smoke_value(
-            QUERY_SEED,
-            u64::from(head) * u64::from(query_rows * query_dimension) + u64::from(linear),
-            STANDARD_DEVIATION,
-        ))
+    let populated = query_binding
+        .slices
+        .iter()
+        .filter(|slice| slice.size != 0)
+        .count();
+    let query_partitions = u32::try_from(populated)? / heads;
+    if query_partitions == 0 {
+        bail!("attention query has no populated shards");
+    }
+    let padded_query_dimension = query_dimension.div_ceil(16) * 16;
+    let padded_value_dimension = value_dimension.div_ceil(16) * 16;
+    let query_bytes = packed_binding(&query_binding, |logical_tile, linear, _elements| {
+        let tile = u32::from(logical_tile);
+        let head = tile % heads;
+        let partition = tile / heads;
+        let (_, local_rows) = balanced_range(query_rows, query_partitions, partition);
+        let (local_row, column) = amp_matrix_coordinates(
+            AmpOrder::Left,
+            Precision::F16,
+            local_rows,
+            padded_query_dimension,
+            linear,
+        )?;
+        let (row_start, _) = balanced_range(query_rows, query_partitions, partition);
+        Ok(if column < query_dimension {
+            mlp_smoke_value(
+                QUERY_SEED,
+                u64::from(head * query_rows * query_dimension)
+                    + u64::from((row_start + local_row) * query_dimension + column),
+                STANDARD_DEVIATION,
+            )
+        } else {
+            0
+        })
     })?;
-    let key_bytes = packed_binding(&key_binding, |head, linear, _| {
-        Ok(mlp_smoke_value(
-            KEY_SEED,
-            u64::from(head) * u64::from(key_rows * query_dimension) + u64::from(linear),
-            STANDARD_DEVIATION,
-        ))
+    let key_bytes = packed_binding(&key_binding, |logical_tile, linear, _| {
+        let tile = u32::from(logical_tile);
+        let head = tile % heads;
+        let partition = tile / heads;
+        let (local_row, column) = amp_matrix_coordinates(
+            AmpOrder::TransposedRight,
+            Precision::F16,
+            64,
+            padded_query_dimension,
+            linear,
+        )?;
+        let row = partition * 64 + local_row;
+        Ok(if row < key_rows && column < query_dimension {
+            mlp_smoke_value(
+                KEY_SEED,
+                u64::from(head * key_rows * query_dimension + row * query_dimension + column),
+                STANDARD_DEVIATION,
+            )
+        } else {
+            0
+        })
     })?;
-    let value_bytes = packed_binding(&value_binding, |head, linear, _| {
-        Ok(mlp_smoke_value(
-            VALUE_SEED,
-            u64::from(head) * u64::from(key_rows * value_dimension) + u64::from(linear),
-            STANDARD_DEVIATION,
-        ))
+    let value_bytes = packed_binding(&value_binding, |logical_tile, linear, _| {
+        let tile = u32::from(logical_tile);
+        let head = tile % heads;
+        let partition = tile / heads;
+        let (local_row, column) = amp_matrix_coordinates(
+            AmpOrder::RightK64,
+            Precision::F16,
+            64,
+            padded_value_dimension,
+            linear,
+        )?;
+        let row = partition * 64 + local_row;
+        Ok(if row < key_rows && column < value_dimension {
+            mlp_smoke_value(
+                VALUE_SEED,
+                u64::from(head * key_rows * value_dimension + row * value_dimension + column),
+                STANDARD_DEVIATION,
+            )
+        } else {
+            0
+        })
     })?;
     let mut inputs = Vec::with_capacity(query_bytes.len() + key_bytes.len() + value_bytes.len());
     inputs.extend_from_slice(&query_bytes);
@@ -744,8 +783,8 @@ fn run_attention_smoke(
     let actual = run_initialized_program(runtime, application, &[], &inputs, timeout_seconds)?;
     write_profile(application, &actual, clock_hz, profile_output)?;
     let output = binding("output.0", &application.outputs)?;
-    if output.slices.len() < heads as usize {
-        bail!("attention output has fewer than {heads} head shards");
+    if output.slices.len() < usize::try_from(heads * query_partitions)? {
+        bail!("attention output has fewer shards than its query tiling");
     }
 
     let sample = |seed, index, width| half_to_f32(mlp_smoke_value(seed, index, width));
@@ -754,7 +793,6 @@ fn run_attention_smoke(
     let mut squared_error = 0.0f64;
     let mut checks = 0usize;
     for head in 0..heads {
-        let slice = &output.slices[head as usize];
         for query_row in 0..checked_query_rows.min(query_rows) {
             let mut scores = vec![0.0f32; key_rows as usize];
             for key_row in 0..key_rows {
@@ -787,7 +825,11 @@ fn run_attention_smoke(
                             * sample(VALUE_SEED, value_index, STANDARD_DEVIATION)
                     })
                     .sum::<f32>();
-                let linear = u64::from(query_row * value_dimension + column);
+                let partition = partition_for_index(query_rows, query_partitions, query_row);
+                let (row_start, _) = balanced_range(query_rows, query_partitions, partition);
+                let tile = partition * heads + head;
+                let slice = &output.slices[tile as usize];
+                let linear = u64::from((query_row - row_start) * padded_value_dimension + column);
                 let offset = usize::try_from(slice.file_offset + linear * 4)?;
                 let observed = f32::from_le_bytes(actual[offset..offset + 4].try_into().unwrap());
                 let error = (observed - expected).abs();
@@ -807,6 +849,22 @@ fn run_attention_smoke(
         "attentionNumericalChecks={checks} maxError={maximum_error:.6} rmsError={rms_error:.6} numericalTest=PASS"
     );
     Ok(())
+}
+
+fn balanced_range(extent: u32, partitions: u32, partition: u32) -> (u32, u32) {
+    let base = extent / partitions;
+    let remainder = extent % partitions;
+    let start = partition * base + partition.min(remainder);
+    (start, base + u32::from(partition < remainder))
+}
+
+fn partition_for_index(extent: u32, partitions: u32, index: u32) -> u32 {
+    (0..partitions)
+        .find(|&partition| {
+            let (start, size) = balanced_range(extent, partitions, partition);
+            index >= start && index < start + size
+        })
+        .expect("index belongs to one balanced partition")
 }
 
 fn run_initialized_program(

@@ -1,5 +1,6 @@
 //! Machine-readable ABI contracts for tile-local kernel calls.
 
+use crate::mid::AMP_INNER_BLOCK;
 use crate::{
     AmpOrder, ComputeStep, ElementOrder, GemmKernelMode, GemmWeightLoad, KernelRequirements,
     KernelRun, LowProgram, LowShard, LowShardId, Precision, StepProfile, StorageError, TileAddress,
@@ -16,6 +17,7 @@ pub enum KernelSymbols {
     Exact(&'static str),
     RowSpecialized { small: String, large: String },
     AttentionSpecialized,
+    AttentionStageSpecialized,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +56,7 @@ pub struct KernelBuildPlan {
     gemm_rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32), Vec<u32>>,
     gemm_symbols: BTreeMap<(Precision, GemmWeightLoad, u32, u32, GemmKernelMode, u32), String>,
     attention_symbols: BTreeMap<AttentionKernelShape, String>,
+    attention_stage_symbols: Vec<(TileKernelSpec, u32, String)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -137,6 +140,7 @@ impl KernelBuildPlan {
         let mut gelu = false;
         let mut reduction_add = false;
         let mut attention = BTreeSet::new();
+        let mut attention_stages = Vec::new();
         for tile in &program.tiles {
             collect_kernels(
                 program,
@@ -145,6 +149,7 @@ impl KernelBuildPlan {
                 &mut gelu,
                 &mut reduction_add,
                 &mut attention,
+                &mut attention_stages,
             )?;
         }
         let mut plan = Self::default();
@@ -249,7 +254,7 @@ impl KernelBuildPlan {
                 retained_symbols: vec!["ipu_stack_reduce_add_f16".into()],
             });
         }
-        if !attention.is_empty() {
+        if !attention.is_empty() || !attention_stages.is_empty() {
             plan.compilations.push(KernelCompilation {
                 source: "worker_support.S",
                 name: "worker_support".into(),
@@ -296,6 +301,122 @@ impl KernelBuildPlan {
                 retained_symbols: vec![call_symbol.clone()],
             });
             plan.attention_symbols.insert(shape, call_symbol);
+        }
+        if !attention_stages.is_empty() {
+            let mut query_rows = attention_stages
+                .iter()
+                .map(|(_, rows)| *rows)
+                .collect::<BTreeSet<_>>();
+            let small_query = query_rows
+                .pop_first()
+                .ok_or(KernelAbiError::RequirementMismatch)?;
+            let large_query = query_rows.pop_last().unwrap_or(small_query);
+            let mut key_rows = attention_stages
+                .iter()
+                .filter_map(|(kernel, _)| match kernel {
+                    TileKernelSpec::AttentionSoftmax {
+                        key_block_columns, ..
+                    } => Some(*key_block_columns),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            let small_key = key_rows
+                .pop_first()
+                .ok_or(KernelAbiError::RequirementMismatch)?;
+            let large_key = key_rows.pop_last().unwrap_or(small_key);
+            let configuration: Option<(u32, u32, u32, u32)> =
+                attention_stages
+                    .iter()
+                    .fold(None, |configuration, (kernel, _)| match kernel {
+                        TileKernelSpec::AttentionSoftmax { head_dimension, .. } => {
+                            Some(configuration.unwrap_or((*head_dimension, 0, 0, AMP_INNER_BLOCK)))
+                        }
+                        TileKernelSpec::AttentionMerge {
+                            value_dimension,
+                            padded_value_dimension,
+                            key_block_columns,
+                            ..
+                        } => {
+                            let mut value = configuration.unwrap_or((
+                                0,
+                                *value_dimension,
+                                *padded_value_dimension,
+                                *key_block_columns,
+                            ));
+                            value.1 = *value_dimension;
+                            value.2 = *padded_value_dimension;
+                            value.3 = *key_block_columns;
+                            Some(value)
+                        }
+                        _ => configuration,
+                    });
+            let (head_dimension, value_dimension, padded_value_dimension, key_block_columns) =
+                configuration.ok_or(KernelAbiError::RequirementMismatch)?;
+            plan.compilations.push(KernelCompilation {
+                source: "flash_attention_f16.cpp",
+                name: format!(
+                    "flash_attention_blocks_q{small_query}_q{large_query}_d{head_dimension}_v{value_dimension}"
+                ),
+                flags: vec![
+                    format!("-DATTENTION_HEAD_DIMENSION={head_dimension}"),
+                    format!(
+                        "-DATTENTION_PADDED_HEAD_DIMENSION={}",
+                        head_dimension.div_ceil(16) * 16
+                    ),
+                    format!("-DATTENTION_VALUE_DIMENSION={value_dimension}"),
+                    format!("-DATTENTION_PADDED_VALUE_DIMENSION={padded_value_dimension}"),
+                    format!("-DATTENTION_KEY_BLOCK_COLUMNS={key_block_columns}"),
+                    format!("-DATTENTION_SMALL_QUERY_ROWS={small_query}"),
+                    format!("-DATTENTION_LARGE_QUERY_ROWS={large_query}"),
+                    format!("-DATTENTION_SMALL_KEY_ROWS={small_key}"),
+                    format!("-DATTENTION_LARGE_KEY_ROWS={large_key}"),
+                ],
+                retained_symbols: Vec::new(),
+            });
+            let mut retained_symbols = Vec::new();
+            for (kernel, rows) in attention_stages {
+                let size = if rows == small_query {
+                    "small"
+                } else {
+                    "large"
+                };
+                let symbol = match &kernel {
+                    TileKernelSpec::AttentionSoftmax {
+                        key_block_columns, ..
+                    } => {
+                        let key_size = if *key_block_columns == small_key {
+                            "small"
+                        } else {
+                            "large"
+                        };
+                        format!("ipu_stack_attention_softmax_{size}_query_{key_size}_key_f16")
+                    }
+                    TileKernelSpec::AttentionMerge {
+                        initial,
+                        final_block,
+                        ..
+                    } => {
+                        let role = match (*initial, *final_block) {
+                            (true, true) => "single",
+                            (true, false) => "initial",
+                            (false, true) => "final",
+                            (false, false) => "middle",
+                        };
+                        format!("ipu_stack_attention_merge_{size}_query_{role}_block_f16")
+                    }
+                    _ => return Err(KernelAbiError::RequirementMismatch),
+                };
+                if !retained_symbols.contains(&symbol) {
+                    retained_symbols.push(symbol.clone());
+                }
+                plan.attention_stage_symbols.push((kernel, rows, symbol));
+            }
+            plan.compilations.push(KernelCompilation {
+                source: "flash_attention_f16.S",
+                name: "flash_attention_blocks_wrapper".into(),
+                flags: Vec::new(),
+                retained_symbols,
+            });
         }
         Ok(plan)
     }
@@ -344,6 +465,14 @@ impl KernelBuildPlan {
                 .get(&attention_shape(run)?)
                 .cloned()
                 .ok_or(KernelAbiError::RequirementMismatch)?,
+            (KernelSymbols::AttentionStageSpecialized, _) => {
+                let rows = gemm_rows(run)?;
+                self.attention_stage_symbols
+                    .iter()
+                    .find(|(planned, planned_rows, _)| planned == kernel && *planned_rows == rows)
+                    .map(|(_, _, symbol)| symbol.clone())
+                    .ok_or(KernelAbiError::RequirementMismatch)?
+            }
             _ => return Err(KernelAbiError::RequirementMismatch),
         };
         Ok(PlannedKernelCall {
@@ -440,6 +569,7 @@ fn collect_kernels(
     gelu: &mut bool,
     reduction_add: &mut bool,
     attention: &mut BTreeSet<AttentionKernelShape>,
+    attention_stages: &mut Vec<(TileKernelSpec, u32)>,
 ) -> Result<(), KernelAbiError> {
     for work in program.work(tile) {
         match work {
@@ -466,11 +596,25 @@ fn collect_kernels(
                     *reduction_add = true;
                 } else if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
                     attention.insert(attention_shape(run)?);
+                } else if matches!(
+                    kernel,
+                    TileKernelSpec::AttentionSoftmax { .. } | TileKernelSpec::AttentionMerge { .. }
+                ) {
+                    let stage = (kernel.clone(), gemm_rows(run)?);
+                    if !attention_stages.contains(&stage) {
+                        attention_stages.push(stage);
+                    }
                 }
             }
-            TileWorkRef::Repeat(repeat) => {
-                collect_kernels(program, &repeat.body, rows, gelu, reduction_add, attention)?
-            }
+            TileWorkRef::Repeat(repeat) => collect_kernels(
+                program,
+                &repeat.body,
+                rows,
+                gelu,
+                reduction_add,
+                attention,
+                attention_stages,
+            )?,
             TileWorkRef::Exchange(_) | TileWorkRef::LocalCopy(_) => {}
         }
     }
@@ -650,6 +794,18 @@ pub fn tile_kernel_abi(
                 KernelAvailability::Required
             },
             3,
+            Vec::new(),
+        ),
+        TileKernelSpec::AttentionSoftmax { .. } => (
+            KernelSymbols::AttentionStageSpecialized,
+            KernelAvailability::Implemented,
+            1,
+            Vec::new(),
+        ),
+        TileKernelSpec::AttentionMerge { .. } => (
+            KernelSymbols::AttentionStageSpecialized,
+            KernelAvailability::Implemented,
+            2,
             Vec::new(),
         ),
         TileKernelSpec::Cast { from, to } => (

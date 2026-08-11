@@ -170,7 +170,21 @@ fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> Stor
             let outer = encode_row_major(&widths[..rank - 2], &coordinates[..rank - 2])?;
             let row = coordinates[rank - 2];
             let column = coordinates[rank - 1];
-            if matches!(role, AmpOrder::Left | AmpOrder::Output) {
+            if role == AmpOrder::TransposedRight {
+                let matrix_elements = u64::from(rows) * u64::from(columns);
+                let within = amp_matrix_index(
+                    AmpOrder::Right,
+                    shard.tensor_type.format.precision,
+                    columns,
+                    rows,
+                    column,
+                    row,
+                )?;
+                outer
+                    .checked_mul(matrix_elements)
+                    .and_then(|base| base.checked_add(u64::from(within)))
+                    .ok_or(StorageError::Overflow)
+            } else if matches!(role, AmpOrder::Left | AmpOrder::Output) {
                 let flat_rows = widths[..rank - 2].iter().try_fold(rows, |rows, &extent| {
                     rows.checked_mul(extent).ok_or(StorageError::Overflow)
                 })?;
@@ -276,6 +290,9 @@ fn amp_matrix_index(
                 .checked_mul(inner * COLUMN_MICRO)
                 .and_then(|base| base.checked_add(load_channel * inner + row % inner))
                 .ok_or(StorageError::Overflow)
+        }
+        AmpOrder::TransposedRight => {
+            amp_matrix_index(AmpOrder::Right, precision, columns, rows, column, row)
         }
         AmpOrder::Output => {
             if !columns.is_multiple_of(COLUMN_MICRO) {
@@ -511,6 +528,10 @@ pub fn amp_matrix_coordinates(
                 inner_group * inner + offset % inner,
                 column_group * COLUMN_MICRO + logical_pair * 2 + load_channel % 2,
             ))
+        }
+        AmpOrder::TransposedRight => {
+            amp_matrix_coordinates(AmpOrder::Right, precision, columns, rows, linear)
+                .map(|(column, row)| (row, column))
         }
         AmpOrder::RightK64 => {
             const INNER_BLOCK: u32 = AMP_INNER_BLOCK;

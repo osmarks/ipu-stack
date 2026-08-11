@@ -559,6 +559,7 @@ impl CostModel for Ipu21CostModel {
                         .div_ceil(u64::from(*output_column_block))
                         .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
                     OperatorDispatch::Pointwise { .. } => 0,
+                    OperatorDispatch::BlockedAttention { .. } => 0,
                 };
                 let kernel = amp_kernel_cycles(
                     multiply,
@@ -599,17 +600,29 @@ impl CostModel for Ipu21CostModel {
                     .and_then(|shape| shape.last())
                     .copied()
                     .map_or(1, u64::from);
-                // The exact baseline computes one QK dot and one online
-                // accumulator update per key row. Six workers partition query
-                // rows; include scalar conversion, exp, and memory issue cost.
                 let output_values_per_query = value_dimension.max(1);
-                elements
-                    .div_ceil(output_values_per_query)
-                    .saturating_mul(key_rows)
-                    .saturating_mul(query_dimension.saturating_add(value_dimension))
-                    .saturating_mul(4)
-                    .div_ceil(6)
-                    .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
+                let query_rows = elements.div_ceil(output_values_per_query);
+                match dispatch {
+                    OperatorDispatch::BlockedAttention { key_block_rows, .. } => {
+                        let arithmetic = query_rows
+                            .saturating_mul(key_rows)
+                            .saturating_mul(query_dimension.saturating_add(value_dimension))
+                            .saturating_mul(2)
+                            .div_ceil(128);
+                        let blocks = key_rows.div_ceil(u64::from(*key_block_rows));
+                        arithmetic.saturating_add(
+                            blocks
+                                .saturating_mul(4)
+                                .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
+                        )
+                    }
+                    _ => query_rows
+                        .saturating_mul(key_rows)
+                        .saturating_mul(query_dimension.saturating_add(value_dimension))
+                        .saturating_mul(4)
+                        .div_ceil(6)
+                        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
+                }
             }
             // The exact scalar implementation is compute-bound at roughly
             // ten tile cycles per element across the six workers.

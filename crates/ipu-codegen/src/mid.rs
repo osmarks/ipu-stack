@@ -81,6 +81,17 @@ pub enum TileKernelSpec {
         options: AttentionOptions,
         accumulate: AccumulationPrecision,
     },
+    AttentionSoftmax {
+        head_dimension: u32,
+        key_block_columns: u32,
+    },
+    AttentionMerge {
+        value_dimension: u32,
+        padded_value_dimension: u32,
+        key_block_columns: u32,
+        initial: bool,
+        final_block: bool,
+    },
     Cast {
         from: Precision,
         to: Precision,
@@ -118,6 +129,14 @@ pub enum OperatorDispatch {
         output_column_block: u32,
         distribution: GemmDistribution,
     },
+    BlockedAttention {
+        query_key: TileKernelSpec,
+        probability_value: TileKernelSpec,
+        query_block_rows: u32,
+        key_block_rows: u32,
+        padded_query_dimension: u32,
+        padded_value_dimension: u32,
+    },
 }
 
 /// Which operand remains resident while a blocked whole-device GEMM is run.
@@ -154,7 +173,9 @@ impl OperatorDispatch {
     fn empty_output_shard_policy(&self) -> EmptyOutputShardPolicy {
         match self {
             Self::Pointwise { .. } => EmptyOutputShardPolicy::Skip,
-            Self::BlockedGemm { .. } => EmptyOutputShardPolicy::Reject,
+            Self::BlockedGemm { .. } | Self::BlockedAttention { .. } => {
+                EmptyOutputShardPolicy::Reject
+            }
         }
     }
 }
@@ -164,6 +185,9 @@ impl OperatorDispatch {
 pub enum AmpOrder {
     Left,
     Right,
+    /// Semantic `[key, channel]` storage packed as the right operand of
+    /// `query * key.transpose()`.
+    TransposedRight,
     /// Right operand ordered by 64-row K block before output-column blocks so
     /// one blocked GEMM invocation consumes a single contiguous span.
     RightK64,
@@ -188,7 +212,10 @@ impl ElementOrder {
     /// views. It must therefore be selected for an automatic input or produced
     /// by a specialized operator/local staging path.
     fn requires_direct_population(&self) -> bool {
-        matches!(self, Self::Amp(AmpOrder::RightK64))
+        matches!(
+            self,
+            Self::Amp(AmpOrder::RightK64 | AmpOrder::TransposedRight)
+        )
     }
 }
 
@@ -443,6 +470,68 @@ impl Layout {
 
     pub fn head_sharded(tile_count: u16) -> Self {
         Self::row_major(TensorTiling::sharded(TensorAxis::FromEnd(3), tile_count))
+    }
+
+    fn attention_tiling(heads: u16, query_partitions: u16) -> TensorTiling {
+        TensorTiling {
+            tile_count: heads.saturating_mul(query_partitions),
+            replicas: 1,
+            axes: vec![
+                AxisTiling::new(TensorAxis::FromEnd(2), query_partitions, 1, Padding::Reject)
+                    .with_tile_stride(heads),
+                AxisTiling::new(TensorAxis::FromEnd(3), heads, 1, Padding::Reject)
+                    .with_tile_stride(1),
+            ],
+        }
+    }
+
+    pub fn attention_query(heads: u16, query_partitions: u16) -> Self {
+        let mut tiling = Self::attention_tiling(heads, query_partitions);
+        tiling.axes.push(AxisTiling::new(
+            TensorAxis::FromEnd(1),
+            1,
+            AMP_COLUMN_MICRO,
+            Padding::Zero,
+        ));
+        Self {
+            order: ElementOrder::Amp(AmpOrder::Left),
+            tiling,
+            memory_class: MemoryClass::Ipu21Standard,
+        }
+    }
+
+    pub fn attention_key_value(order: AmpOrder, heads: u16, key_partitions: u16) -> Self {
+        let axes = vec![
+            AxisTiling::new(TensorAxis::FromEnd(3), heads, 1, Padding::Reject).with_tile_stride(1),
+            AxisTiling::new(
+                TensorAxis::FromEnd(2),
+                key_partitions,
+                AMP_INNER_BLOCK,
+                Padding::Zero,
+            )
+            .with_tile_stride(heads),
+            AxisTiling::new(TensorAxis::FromEnd(1), 1, AMP_COLUMN_MICRO, Padding::Zero),
+        ];
+        Self {
+            order: ElementOrder::Amp(order),
+            tiling: TensorTiling {
+                tile_count: heads.saturating_mul(key_partitions),
+                replicas: 1,
+                axes,
+            },
+            memory_class: MemoryClass::Ipu21Standard,
+        }
+    }
+
+    pub fn attention_output(heads: u16, query_partitions: u16) -> Self {
+        let mut tiling = Self::attention_tiling(heads, query_partitions);
+        tiling.axes.push(AxisTiling::new(
+            TensorAxis::FromEnd(1),
+            1,
+            AMP_COLUMN_MICRO,
+            Padding::Zero,
+        ));
+        Self::row_major(tiling)
     }
 
     pub fn amp_left(inner: u16, tile_count: u16) -> Self {
@@ -2000,6 +2089,50 @@ impl OperatorPlan {
                     options,
                     accumulate,
                 },
+                OperatorDispatch::BlockedAttention {
+                    query_key,
+                    probability_value,
+                    query_block_rows,
+                    key_block_rows,
+                    padded_query_dimension,
+                    padded_value_dimension,
+                },
+            ) => {
+                let [query, key, value] = inputs else {
+                    return Err(OperatorPlanError::OperandArity);
+                };
+                if options.causal
+                    || *accumulate != AccumulationPrecision::F32
+                    || *query_block_rows == 0
+                    || *key_block_rows != AMP_INNER_BLOCK
+                    || *padded_query_dimension == 0
+                    || *padded_value_dimension == 0
+                    || !matches!(query.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
+                    || !matches!(
+                        key.format.layout.order,
+                        ElementOrder::Amp(AmpOrder::TransposedRight)
+                    )
+                    || !matches!(
+                        value.format.layout.order,
+                        ElementOrder::Amp(AmpOrder::RightK64)
+                    )
+                    || output.format.layout.order != ElementOrder::RowMajor
+                    || query.format.layout.tiling.tile_count
+                        != output.format.layout.tiling.tile_count
+                    || key.format.layout.tiling.tile_count != value.format.layout.tiling.tile_count
+                    || !matches!(query_key, TileKernelSpec::Gemm { .. })
+                    || !matches!(probability_value, TileKernelSpec::Gemm { .. })
+                {
+                    Err(OperatorPlanError::InvalidBlocking)
+                } else {
+                    Ok(())
+                }
+            }
+            (
+                MidOperator::FlashAttention {
+                    options,
+                    accumulate,
+                },
                 OperatorDispatch::Pointwise {
                     kernel:
                         TileKernelSpec::FlashAttention {
@@ -2787,6 +2920,91 @@ fn plans(
     config: &PipelineConfig,
 ) -> Vec<Plan> {
     let mut plans = Vec::new();
+    if let OperationKind::FlashAttention(options) = operation.kind
+        && !options.causal
+        && let [query, key, value] = inputs
+        && query.shape.0.len() == 3
+        && key.shape.0.len() == 3
+        && value.shape.0.len() == 3
+        && query.shape.0[0] == key.shape.0[0]
+        && query.shape.0[0] == value.shape.0[0]
+        && let Ok(heads) = u16::try_from(query.shape.0[0])
+        && heads != 0
+    {
+        let query_rows = query.shape.0[1];
+        let query_partitions = u16::try_from(query_rows)
+            .unwrap_or(u16::MAX)
+            .min(config.tile_count / heads);
+        if query_partitions != 0 {
+            let key_partitions =
+                u16::try_from(key.shape.0[1].div_ceil(AMP_INNER_BLOCK)).unwrap_or(u16::MAX);
+            if key_partitions == 0 || heads.saturating_mul(key_partitions) > config.tile_count {
+                return plans;
+            }
+            let padded_query_dimension =
+                query.shape.0[2].div_ceil(AMP_COLUMN_MICRO) * AMP_COLUMN_MICRO;
+            let padded_value_dimension =
+                value.shape.0[2].div_ceil(AMP_COLUMN_MICRO) * AMP_COLUMN_MICRO;
+            let query_format = TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::attention_query(heads, query_partitions),
+            };
+            let key_format = TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::attention_key_value(
+                    AmpOrder::TransposedRight,
+                    heads,
+                    key_partitions,
+                ),
+            };
+            let value_format = TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::attention_key_value(AmpOrder::RightK64, heads, key_partitions),
+            };
+            let output_format = TensorFormat {
+                precision: Precision::F32,
+                layout: Layout::attention_output(heads, query_partitions),
+            };
+            plans.push(Plan {
+                operator: MidOperator::FlashAttention {
+                    options,
+                    accumulate: AccumulationPrecision::F32,
+                },
+                dispatch: OperatorDispatch::BlockedAttention {
+                    query_key: TileKernelSpec::Gemm {
+                        multiply: Precision::F16,
+                        accumulate: AccumulationPrecision::F32,
+                        mode: GemmKernelMode::Initialize,
+                        weights: GemmWeightLoad::Standard,
+                        inner_block: padded_query_dimension,
+                        output_columns: AMP_INNER_BLOCK,
+                    },
+                    probability_value: TileKernelSpec::Gemm {
+                        multiply: Precision::F16,
+                        accumulate: AccumulationPrecision::F32,
+                        mode: GemmKernelMode::Initialize,
+                        weights: GemmWeightLoad::Standard,
+                        inner_block: AMP_INNER_BLOCK,
+                        output_columns: padded_value_dimension,
+                    },
+                    query_block_rows: query_rows.div_ceil(u32::from(query_partitions)),
+                    key_block_rows: AMP_INNER_BLOCK,
+                    padded_query_dimension,
+                    padded_value_dimension,
+                },
+                requirements: OperatorRequirements {
+                    inputs: vec![
+                        OperandRequirement::new(query_format, 8),
+                        OperandRequirement::new(key_format, 8),
+                        OperandRequirement::new(value_format, 8),
+                    ],
+                    output: OperandRequirement::new(output_format, 8),
+                    output_aliasing: OutputAliasing::Fresh,
+                    memory_relations: Vec::new(),
+                },
+            });
+        }
+    }
     for candidate in config
         .operator_candidates
         .iter()
@@ -2911,7 +3129,9 @@ fn independent_parameter_storage(
             output_column_block,
             ..
         } => output_column_block,
-        OperatorDispatch::Pointwise { .. } => return Vec::new(),
+        OperatorDispatch::Pointwise { .. } | OperatorDispatch::BlockedAttention { .. } => {
+            return Vec::new();
+        }
     };
     if output_column_block < AMP_OUTPUT_COLUMN_BLOCK {
         return Vec::new();
