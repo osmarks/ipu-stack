@@ -1601,7 +1601,6 @@ impl LoweringState {
 
         for (column_start, column_end) in columns {
             let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
-            let mut local_copies = Vec::<(u16, LocalCopy)>::new();
             let mut gemm_runs = Vec::<(u16, KernelRun)>::new();
             let mut partials = BTreeMap::<(u32, u32), Vec<(u16, LowShardId)>>::new();
             let column_outputs = output_shards
@@ -1701,29 +1700,11 @@ impl LoweringState {
                             (weight_rank - 1, column_start, column_end),
                         ],
                     )?;
-                    if self.shards[source.index() as usize].tile == left_shard.tile {
-                        let source_spans =
-                            view_byte_spans(&self.shards[source.index() as usize], &source_view)?;
-                        let destination_spans = view_byte_spans(
-                            &self.shards[weights.index() as usize],
-                            &destination_view,
-                        )?;
-                        if source_spans.len() != 1 || destination_spans.len() != 1 {
-                            return Err(LowLoweringError::InvalidOperatorPlan);
-                        }
-                        local_copies.push((
-                            left_shard.tile,
-                            LocalCopy {
-                                source,
-                                source_offset: source_spans[0].offset,
-                                destination: weights,
-                                destination_offset: destination_spans[0].offset,
-                                bytes: source_spans[0].bytes,
-                            },
-                        ));
-                    } else {
+                    let local_weights =
+                        self.shards[source.index() as usize].tile == left_shard.tile;
+                    if !local_weights {
                         transfers
-                            .entry(source_view)
+                            .entry(source_view.clone())
                             .or_default()
                             .push(destination_view);
                     }
@@ -1736,10 +1717,27 @@ impl LoweringState {
                         accumulate.clone()
                     };
                     if let TileKernelSpec::Gemm { weights, .. } = &mut kernel {
-                        *weights = crate::GemmWeightLoad::Interleaved;
+                        *weights = if local_weights
+                            && self.shards[source.index() as usize]
+                                .tensor_type
+                                .format
+                                .layout
+                                .memory_class
+                                == crate::MemoryClass::Ipu21Standard
+                        {
+                            crate::GemmWeightLoad::Standard
+                        } else {
+                            crate::GemmWeightLoad::Interleaved
+                        };
                     }
-                    let weight_view =
-                        self.narrow_view(weights, &[(weight_rank - 2, inner_start, inner_end)])?;
+                    let weight_view = if local_weights {
+                        source_view
+                    } else {
+                        self.narrow_view(
+                            weights,
+                            &[(weight_rank - 2, inner_start, inner_end)],
+                        )?
+                    };
                     let run = KernelRun::new(
                         WorkProvenance {
                             operation: operation.source,
@@ -1770,9 +1768,6 @@ impl LoweringState {
                 },
                 tiles,
             )?;
-            for (tile, copy) in local_copies {
-                self.append_local_copy(tiles, tile, copy)?;
-            }
             for (tile, run) in gemm_runs {
                 self.append_kernel(tiles, tile, run)?;
             }
@@ -2767,6 +2762,27 @@ mod tests {
                 low.exchange_phases.len() >= usize::from(inner_partitions),
                 "case {case}"
             );
+            let parameter_shards = low
+                .inputs
+                .iter()
+                .find(|input| input.kind == crate::GraphInputKind::Parameter)
+                .unwrap()
+                .shards
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let direct_parameter_runs = low
+                .kernel_runs
+                .iter()
+                .filter(|run| {
+                    matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Gemm { .. }))
+                        && run.inputs[1]
+                            .views
+                            .iter()
+                            .any(|view| parameter_shards.contains(&view.shard))
+                })
+                .count();
+            assert!(direct_parameter_runs > 0, "case {case}");
         }
     }
 

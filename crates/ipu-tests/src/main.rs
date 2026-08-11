@@ -901,8 +901,43 @@ fn verify_constant_output(application: &Application, bytes: &[u8], expected: f32
         maximum = maximum.max((actual - expected).abs());
     }
     if maximum > expected.abs() * 0.02 + 0.05 {
+        let mut address_ranges = std::collections::BTreeMap::<u32, (usize, f32)>::new();
+        let mut slice_ranges = binding
+            .slices
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slice)| {
+                let start = usize::try_from(base.checked_add(slice.file_offset)?).ok()?;
+                let end = start.checked_add(usize::try_from(slice.size).ok()?)?;
+                let mut minimum = f32::INFINITY;
+                let mut maximum = f32::NEG_INFINITY;
+                for raw in bytes.get(start..end)?.chunks_exact(2) {
+                    let value = half_to_f32(u16::from_le_bytes(raw.try_into().ok()?));
+                    minimum = minimum.min(value);
+                    maximum = maximum.max(value);
+                }
+                let address = address_ranges.entry(slice.tile_address).or_default();
+                address.0 += 1;
+                address.1 = address.1.max((maximum - expected).abs());
+                Some((
+                    index,
+                    slice.tile,
+                    slice.tile_address,
+                    minimum,
+                    maximum,
+                    (maximum - expected).abs(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let bad_slices = slice_ranges
+            .iter()
+            .filter(|entry| entry.5 > expected.abs() * 0.02 + 0.05)
+            .map(|entry| entry.0)
+            .collect::<Vec<_>>();
+        slice_ranges.sort_by(|left, right| right.5.total_cmp(&left.5));
+        slice_ranges.truncate(8);
         bail!(
-            "MLP benchmark numerical output differs from {expected}: maximum absolute error {maximum}, observed range {minimum_value}..={maximum_value}, zeros={zero_values}, unchanged={unchanged_values}"
+            "MLP benchmark numerical output differs from {expected}: maximum absolute error {maximum}, observed range {minimum_value}..={maximum_value}, zeros={zero_values}, unchanged={unchanged_values}, badSlices={bad_slices:?}, addressRanges={address_ranges:?}, worstSlices={slice_ranges:?}"
         );
     }
     Ok(maximum)
