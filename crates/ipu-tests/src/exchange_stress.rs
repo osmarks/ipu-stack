@@ -195,7 +195,7 @@ pub(crate) fn build(
             bail!("{cases} stress cases exceed the exchange-row test region");
         }
         row_ranges.push((row_address, row_end));
-        phase_rows.push((row_address, rows, validators, horizon));
+        phase_rows.push((row_address, rows, validators));
         row_address = (row_end + 3) & !3;
     }
 
@@ -206,16 +206,12 @@ pub(crate) fn build(
             steps: Vec::with_capacity(cases as usize),
         })
         .collect::<Vec<_>>();
-    for (address, rows, validators, horizon) in phase_rows {
+    for (address, rows, validators) in phase_rows {
         for tile in 0..execution_tiles {
             let row = rows[usize::from(tile)]
                 .clone()
                 .unwrap_or_else(inactive_exchange_program);
             let active = rows[usize::from(tile)].is_some();
-            let local_horizon = active
-                .then(|| plan_event_cycles(&row))
-                .transpose()?
-                .unwrap_or(horizon);
             programs[usize::from(tile)]
                 .steps
                 .push(TileStep::Exchange(ExchangeStep {
@@ -224,7 +220,6 @@ pub(crate) fn build(
                         address,
                         words: row,
                     },
-                    wait_cycles: horizon - local_horizon,
                     setup_patch: None,
                     repeat_patches: Vec::new(),
                     profile: StepProfile::default(),
