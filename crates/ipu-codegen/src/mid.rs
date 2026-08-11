@@ -130,6 +130,7 @@ pub enum GemmDistribution {
     ActivationStationaryReduction {
         inner_partitions: u16,
         reduction_fan_in: u16,
+        staged_output_panels: u16,
     },
 }
 
@@ -3051,18 +3052,31 @@ fn activation_stationary_reduction_candidates(
                     [2, 3, 4]
                         .into_iter()
                         .filter(move |&fan_in| fan_in <= inner_partitions)
-                        .map(move |reduction_fan_in| {
-                            (
-                                inner_partitions,
-                                inner_block,
-                                reduction_fan_in,
-                                partial.clone(),
-                            )
+                        .flat_map(move |reduction_fan_in| {
+                            let partial = partial.clone();
+                            [1, 2, 4]
+                                .into_iter()
+                                .filter(move |panels| *panels <= output_blocks)
+                                .map(move |staged_output_panels| {
+                                    (
+                                        inner_partitions,
+                                        inner_block,
+                                        reduction_fan_in,
+                                        staged_output_panels,
+                                        partial.clone(),
+                                    )
+                                })
                         })
                 })
         })
         .map(
-            |(inner_partitions, inner_block, reduction_fan_in, mut variant)| {
+            |(
+                inner_partitions,
+                inner_block,
+                reduction_fan_in,
+                staged_output_panels,
+                mut variant,
+            )| {
                 if let OperatorDispatch::BlockedGemm {
                     initialize,
                     accumulate,
@@ -3089,6 +3103,7 @@ fn activation_stationary_reduction_candidates(
                     *distribution = GemmDistribution::ActivationStationaryReduction {
                         inner_partitions,
                         reduction_fan_in,
+                        staged_output_panels,
                     };
                 }
                 variant
@@ -3602,7 +3617,11 @@ mod tests {
                                     < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
                         })
                         .count();
-                    fused_widths * usize::from(partitions.min(4) - 1)
+                    let panel_counts = [1, 2, 4]
+                        .into_iter()
+                        .filter(|panels| *panels <= inner_partitions)
+                        .count();
+                    fused_widths * usize::from(partitions.min(4) - 1) * panel_counts
                 })
                 .sum::<usize>();
             assert_eq!(candidates.len(), expected);
@@ -3617,6 +3636,7 @@ mod tests {
                         distribution: GemmDistribution::ActivationStationaryReduction {
                             inner_partitions: actual,
                             reduction_fan_in,
+                            staged_output_panels,
                         },
                         ..
                     } if actual_columns == output_columns
@@ -3629,6 +3649,8 @@ mod tests {
                         && inner_block * output_columns * 2
                             < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
                         && (2..=actual.min(4)).contains(&reduction_fan_in)
+                        && matches!(staged_output_panels, 1 | 2 | 4)
+                        && staged_output_panels <= inner_partitions
                 ));
             }
         }

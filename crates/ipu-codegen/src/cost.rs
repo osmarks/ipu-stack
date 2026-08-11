@@ -507,12 +507,15 @@ impl CostModel for Ipu21CostModel {
                                 GemmDistribution::ActivationStationaryReduction {
                                     inner_partitions,
                                     reduction_fan_in,
+                                    staged_output_panels,
                                 },
                             ..
                         } => {
                             let partitions = u64::from(*inner_partitions);
                             let columns = output.shape.0.last().copied().map_or(1, u64::from);
                             let column_groups = columns.div_ceil(u64::from(*output_column_block));
+                            let exchange_epochs =
+                                column_groups.div_ceil(u64::from(*staged_output_panels));
                             let local_k = k.div_ceil(partitions);
                             let weight_bytes = local_k
                                 .saturating_mul(columns)
@@ -531,7 +534,7 @@ impl CostModel for Ipu21CostModel {
                                         .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle),
                                 )
                                 .saturating_add(
-                                    column_groups
+                                    exchange_epochs
                                         .saturating_mul(rounds.saturating_add(1))
                                         .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles),
                                 )
@@ -611,14 +614,16 @@ impl CostModel for Ipu21CostModel {
                     GemmDistribution::ActivationStationaryReduction {
                         inner_partitions,
                         reduction_fan_in,
+                        staged_output_panels,
                     },
                 ..
             } => {
                 let columns = output.shape.0.last().copied().map_or(1, u64::from);
                 let groups = columns.div_ceil(u64::from(*output_column_block));
+                let epochs = groups.div_ceil(u64::from(*staged_output_panels));
                 let (rounds, _) =
                     reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
-                groups.saturating_mul(rounds.saturating_add(1))
+                epochs.saturating_mul(rounds.saturating_add(1))
             }
             _ => phases,
         };
