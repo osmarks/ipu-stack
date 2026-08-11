@@ -123,13 +123,33 @@ pub struct ExchangeActivitySummary {
     pub phase_boundary_cycles: u64,
 }
 
+/// Returns a common device-cycle origin while preserving short offsets across
+/// the wrapping 32-bit cycle counter.
+pub fn cycle_origin(report: &ProfileReport) -> u32 {
+    let Some(reference) = report
+        .tiles
+        .iter()
+        .find_map(|tile| tile.samples.first().map(|sample| sample.start_cycle))
+    else {
+        return 0;
+    };
+    let minimum_delta = report
+        .tiles
+        .iter()
+        .filter_map(|tile| tile.samples.first())
+        .map(|sample| sample.start_cycle.wrapping_sub(reference) as i32)
+        .min()
+        .unwrap_or(0);
+    reference.wrapping_add_signed(minimum_delta)
+}
+
 /// Summarizes statically scheduled exchange roles, counting a device-wide
 /// exchange phase from the last participating tile's entry.
 pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySummary {
     let mut summary = ExchangeActivitySummary::default();
+    let base = cycle_origin(report);
     let mut phases = BTreeMap::<(u32, u32), (u64, u64, u64, u64)>::new();
     for tile in &report.tiles {
-        let base = tile.samples.first().map_or(0, |sample| sample.start_cycle);
         for sample in tile
             .samples
             .iter()
@@ -204,11 +224,12 @@ struct Candidate<'a> {
 
 pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
     let sample_count = report.tiles.iter().map(|tile| tile.samples.len()).sum();
+    let base = cycle_origin(report);
     let profile_span_cycles = report
         .tiles
         .iter()
         .filter_map(|tile| {
-            let base = tile.samples.first()?.start_cycle;
+            tile.samples.first()?;
             tile.samples
                 .iter()
                 .map(|sample| {
@@ -223,7 +244,6 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
     let mut matched_sample_count = 0;
 
     for tile in &report.tiles {
-        let base = tile.samples.first().map_or(0, |sample| sample.start_cycle);
         for sample in &tile.samples {
             let offset = u64::from(sample.start_cycle.wrapping_sub(base));
             let sample_duration = duration(sample);
@@ -539,7 +559,7 @@ mod tests {
                 },
                 TileProfile {
                     physical_tile: 3,
-                    samples: vec![sample(0, ProfileStepKind::Compute, "add", 200, 230)],
+                    samples: vec![sample(0, ProfileStepKind::Compute, "add", 100, 130)],
                 },
             ],
         };
@@ -567,8 +587,8 @@ mod tests {
                 TileProfile {
                     physical_tile: 3,
                     samples: vec![
-                        sample(0, ProfileStepKind::Compute, "gemm", 200, 208),
-                        sample(0, ProfileStepKind::Compute, "gemm", 208, 216),
+                        sample(0, ProfileStepKind::Compute, "gemm", 100, 108),
+                        sample(0, ProfileStepKind::Compute, "gemm", 108, 116),
                     ],
                 },
             ],
@@ -578,6 +598,41 @@ mod tests {
         assert_eq!(result.groups[0].phase_cycles, 20);
         assert_eq!(result.groups[0].work_cycles, 36);
         assert_eq!(result.groups[0].average_active_tiles, 1.8);
+    }
+
+    #[test]
+    fn common_origin_does_not_turn_first_exchange_skew_into_later_skew() {
+        let report = ProfileReport {
+            clock_hz: 1_000_000_000,
+            tiles: vec![
+                TileProfile {
+                    physical_tile: 2,
+                    samples: vec![
+                        sample(0, ProfileStepKind::Exchange, "", 100, 150),
+                        sample(1, ProfileStepKind::Compute, "gemm", 150, 160),
+                    ],
+                },
+                TileProfile {
+                    physical_tile: 3,
+                    samples: vec![
+                        sample(0, ProfileStepKind::Exchange, "", 120, 150),
+                        sample(1, ProfileStepKind::Compute, "gemm", 150, 160),
+                    ],
+                },
+            ],
+        };
+        let result = query(
+            &report,
+            &Query {
+                kind: Some(StepKind::Compute),
+                sample_limit: 2,
+                ..Query::default()
+            },
+        );
+
+        assert_eq!(result.samples.len(), 2);
+        assert!(result.samples.iter().all(|sample| sample.offset == 50));
+        assert_eq!(result.groups[0].phase_cycles, 10);
     }
 
     #[test]

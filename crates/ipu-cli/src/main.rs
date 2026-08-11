@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use ipu_driver::{Device, block_device_interrupt_signals};
 use ipu_elf::{LinkOptions, Toolchain, inspect_object, link};
 use ipu_package::{Application, ProfileExchangeActivityKind, ProfileReport, ProfileStepKind};
-use ipu_profile::{GroupBy, Query, SortBy, StepKind, exchange_activity_summary, query};
+use ipu_profile::{
+    GroupBy, Query, SortBy, StepKind, cycle_origin, exchange_activity_summary, query,
+};
 use ipu_runtime::Runtime;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -510,15 +512,11 @@ fn render_profile_html(report: &ProfileReport) -> Result<String> {
     let mut activity_indices = HashMap::<Vec<[u32; 3]>, u32>::new();
     let mut steps = Vec::<StepKey>::new();
     let mut step_indices = HashMap::<StepKey, u32>::new();
+    let base_cycle = cycle_origin(report);
     let tiles = report
         .tiles
         .iter()
         .map(|tile| {
-            let base_cycle = tile
-                .samples
-                .first()
-                .map(|sample| sample.start_cycle)
-                .unwrap_or(0);
             let samples = tile
                 .samples
                 .iter()
