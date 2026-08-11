@@ -23,9 +23,10 @@ pub const IPU21_PLANNED_DATA_BYTES: u32 =
     IPU21_STANDARD_FIXED_BYTES + IPU21_INTERLEAVED_REGION_BYTES;
 /// Baseline standard-memory budget for package support data that is only
 /// materialized after operator planning. Exchange tables are element-aligned,
-/// so two standard memory elements cover the usual host-command and
-/// generated-program data alongside them.
-pub const IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES: u32 = 2 * ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+/// so three standard memory elements preserve one contiguous allocation once
+/// host-command and generated-program data are placed around the interleaved
+/// region.
+pub const IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES: u32 = 3 * ipu_package::TILE_MEMORY_ELEMENT_SIZE;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemoryAllocation {

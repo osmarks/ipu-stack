@@ -324,12 +324,7 @@ pub fn build_package(
     config: &PackageConfig,
 ) -> PackageBuildResult<Application> {
     validate_tile_count(u32::from(config.pipeline.tile_count))?;
-    let mut planning = config.pipeline.clone();
-    if planning.profiling.enabled {
-        planning.standard_memory_reservation_bytes = planning
-            .standard_memory_reservation_bytes
-            .saturating_add(u64::from(ipu_package::TILE_MEMORY_ELEMENT_SIZE));
-    }
+    let planning = config.pipeline.clone();
     let mid = build_phase("lower_mid", || {
         Ok(lower(graph, &planning, &Ipu21CostModel)?)
     })?;
