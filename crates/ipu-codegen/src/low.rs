@@ -1094,6 +1094,7 @@ impl LoweringState {
         struct AttentionTask {
             tile: u16,
             head: u32,
+            query_dimension: u32,
             value_dimension: u32,
             query: LowShardId,
             output: LowShardId,
@@ -1121,6 +1122,12 @@ impl LoweringState {
                 return Err(LowLoweringError::InvalidOperatorPlan);
             }
             let query = self.local_shard(*query, tile)?;
+            let query_dimension = *self.shards[query.index() as usize]
+                .tensor_type
+                .shape
+                .0
+                .last()
+                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
             let scratch_columns = padded_value_dimension.max(key_block_rows);
             let scratch = self.push_attention_scratch(
                 tile,
@@ -1161,6 +1168,7 @@ impl LoweringState {
             tasks.push(AttentionTask {
                 tile,
                 head: self.shards[output.index() as usize].extents[rank - 3].start,
+                query_dimension,
                 value_dimension,
                 query,
                 output,
@@ -1256,7 +1264,7 @@ impl LoweringState {
                     KernelRun::new(
                         kernel_provenance,
                         TileKernel::Planned(TileKernelSpec::AttentionSoftmax {
-                            head_dimension: padded_query_dimension,
+                            head_dimension: task.query_dimension,
                             key_block_columns: valid_key_rows,
                         }),
                         vec![KernelOperand {
