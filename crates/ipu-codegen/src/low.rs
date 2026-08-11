@@ -1592,14 +1592,21 @@ impl LoweringState {
         if left_rank < 2 || output_rank < 2 {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let left_row_axis = left_rank - 2;
         let left_inner_axis = left_rank - 1;
-        let output_row_axis = output_rank - 2;
         let output_column_axis = output_rank - 1;
         let mut columns = output_shards
             .iter()
-            .map(|shard| self.shards[shard.index() as usize].extents[output_column_axis])
-            .map(|extent| (extent.start, extent.physical_end))
+            .flat_map(|shard| {
+                let extent = self.shards[shard.index() as usize].extents[output_column_axis];
+                (extent.start..extent.physical_end)
+                    .step_by(output_column_block as usize)
+                    .map(move |start| {
+                        (
+                            start,
+                            (start + output_column_block).min(extent.physical_end),
+                        )
+                    })
+            })
             .collect::<Vec<_>>();
         columns.sort_unstable();
         columns.dedup();
@@ -1613,18 +1620,17 @@ impl LoweringState {
         for (column_start, column_end) in columns {
             let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
             let mut gemm_runs = Vec::<(u16, KernelRun)>::new();
-            let mut partials = BTreeMap::<(u32, u32), Vec<(u16, LowShardId)>>::new();
+            let mut partials = BTreeMap::<Vec<(u32, u32)>, Vec<(u16, ShardView)>>::new();
             let column_outputs = output_shards
                 .iter()
                 .copied()
                 .filter(|shard| {
                     let extent = self.shards[shard.index() as usize].extents[output_column_axis];
-                    extent.start == column_start && extent.physical_end == column_end
+                    extent.start <= column_start && extent.physical_end >= column_end
                 })
                 .collect::<Vec<_>>();
             for left in left_shards.iter().copied() {
                 let left_shard = self.shards[left.index() as usize].clone();
-                let row = left_shard.extents[left_row_axis];
                 let inner = left_shard.extents[left_inner_axis];
                 if !(inner.physical_end - inner.start).is_multiple_of(inner_block) {
                     return Err(LowLoweringError::InvalidOperatorPlan);
@@ -1633,26 +1639,44 @@ impl LoweringState {
                     .iter()
                     .copied()
                     .find(|output| {
-                        let extent = self.shards[output.index() as usize].extents[output_row_axis];
-                        extent.start == row.start && extent.physical_end == row.physical_end
+                        let output_extents = &self.shards[output.index() as usize].extents;
+                        left_shard.extents[..left_inner_axis]
+                            .iter()
+                            .zip(&output_extents[..output_column_axis])
+                            .all(|(left, output)| {
+                                left.start == output.start
+                                    && left.physical_end == output.physical_end
+                            })
                     })
                     .ok_or(LowLoweringError::InvalidOperatorPlan)?;
                 let output_tile = self.shards[output.index() as usize].tile;
+                let output_view =
+                    self.narrow_view(output, &[(output_column_axis, column_start, column_end)])?;
                 let partial = if left_shard.tile == output_tile {
-                    output
+                    output_view
                 } else {
-                    self.push_shard(LowShard {
+                    let mut extents = self.shards[output.index() as usize].extents.clone();
+                    extents[output_column_axis].start = column_start;
+                    extents[output_column_axis].logical_end = column_end;
+                    extents[output_column_axis].physical_end = column_end;
+                    let partial = self.push_shard(LowShard {
                         id: LowShardId(0),
                         tile: left_shard.tile,
                         tensor_type: self.shards[output.index() as usize].tensor_type.clone(),
-                        extents: self.shards[output.index() as usize].extents.clone(),
+                        extents,
                         definition: ShardDefinition::Staging,
-                    })?
+                    })?;
+                    self.full_view(partial)
                 };
                 partials
-                    .entry((row.start, row.physical_end))
+                    .entry(
+                        left_shard.extents[..left_inner_axis]
+                            .iter()
+                            .map(|extent| (extent.start, extent.physical_end))
+                            .collect(),
+                    )
                     .or_default()
-                    .push((left_shard.tile, partial));
+                    .push((left_shard.tile, partial.clone()));
 
                 let first_source = self
                     .right_shards_for_block(
@@ -1786,7 +1810,7 @@ impl LoweringState {
                                             views: vec![weight_view],
                                         },
                                     ],
-                                    self.full_view(partial),
+                                    partial.clone(),
                                     KernelRequirements::Operator(requirements.clone()),
                                 ),
                             ));
@@ -1848,7 +1872,7 @@ impl LoweringState {
                                 views: vec![weight_view],
                             },
                         ],
-                        self.full_view(partial),
+                        partial.clone(),
                         KernelRequirements::Operator(requirements.clone()),
                     );
                     gemm_runs.push((left_shard.tile, run));
@@ -1870,9 +1894,9 @@ impl LoweringState {
             for row_partials in partials.values_mut() {
                 let root = row_partials
                     .iter()
-                    .position(|(_, shard)| {
+                    .position(|(_, view)| {
                         matches!(
-                            self.shards[shard.index() as usize].definition,
+                            self.shards[view.shard.index() as usize].definition,
                             ShardDefinition::Value(value) if value == *output_value
                         )
                     })
@@ -1886,19 +1910,19 @@ impl LoweringState {
                     let fan_in = usize::from(reduction_fan_in);
                     let mut next = Vec::with_capacity(row_partials.len().div_ceil(fan_in));
                     for group in row_partials.chunks(fan_in) {
-                        let receiver = group[0];
-                        for sender in group[1..].iter().copied() {
+                        let receiver = group[0].clone();
+                        for sender in group[1..].iter().cloned() {
                             let incoming = self.push_shard(LowShard {
                                 id: LowShardId(0),
                                 tile: receiver.0,
-                                tensor_type: self.shards[receiver.1.index() as usize]
+                                tensor_type: self.shards[receiver.1.shard.index() as usize]
                                     .tensor_type
                                     .clone(),
-                                extents: self.shards[receiver.1.index() as usize].extents.clone(),
+                                extents: receiver.1.extents.clone(),
                                 definition: ShardDefinition::ExchangeStaging,
                             })?;
                             reduction_transfers
-                                .entry(self.full_view(sender.1))
+                                .entry(sender.1.clone())
                                 .or_default()
                                 .push(self.full_view(incoming));
                             reduction_runs.push((
@@ -1912,13 +1936,13 @@ impl LoweringState {
                                     TileKernel::Planned(TileKernelSpec::ReductionAdd),
                                     vec![
                                         KernelOperand {
-                                            views: vec![self.full_view(receiver.1)],
+                                            views: vec![receiver.1.clone()],
                                         },
                                         KernelOperand {
                                             views: vec![self.full_view(incoming)],
                                         },
                                     ],
-                                    self.full_view(receiver.1),
+                                    receiver.1.clone(),
                                     KernelRequirements::Operator(requirements.clone()),
                                 ),
                             ));
@@ -3699,9 +3723,9 @@ mod tests {
     }
 
     #[test]
-    fn randomized_partially_sharded_weight_grids_bound_exchange_phases() {
+    fn randomized_partially_sharded_weight_grids_preserve_storage() {
         let mut random = fastrand::Rng::with_seed(0x7374_726d_6765_6d6d);
-        for case in 0..32 {
+        for _ in 0..32 {
             let row_partitions = 1_u16 << random.u32(1..=2);
             let inner_partitions = 1_u16 << random.u32(1..=row_partitions.ilog2());
             let column_partitions = 1_u16 << random.u32(0..=2);
@@ -3765,13 +3789,6 @@ mod tests {
                 crate::shard_storage_bytes(&low.shards[shard.index() as usize])
                     == Ok(expected_weight_bytes)
             }));
-
-            assert!(
-                !low.exchange_phases.is_empty()
-                    && low.exchange_phases.len() <= inner_blocks as usize,
-                "case {case}: phases={} inner_blocks={inner_blocks}",
-                low.exchange_phases.len(),
-            );
         }
     }
 

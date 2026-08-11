@@ -368,6 +368,16 @@ impl CostModel for Ipu21CostModel {
                     .padded_shape(&inputs[0].shape)
                     .unwrap_or_else(|_| inputs[0].shape.clone());
                 let k = left_shape.0.last().copied().unwrap_or(1) as u64;
+                let compute_k = match dispatch {
+                    OperatorDispatch::BlockedGemm {
+                        distribution:
+                            GemmDistribution::ActivationStationaryReduction {
+                                inner_partitions, ..
+                            },
+                        ..
+                    } => k.div_ceil(u64::from(*inner_partitions)),
+                    _ => k,
+                };
                 let flops_per_cycle: u64 = match multiply {
                     Precision::F8F143 { .. } => 256,
                     Precision::F16 => 128,
@@ -376,14 +386,25 @@ impl CostModel for Ipu21CostModel {
                 let output_elements_per_tile = spatial_occupancy_adjusted_elements;
                 let output_columns_per_tile =
                     maximum_axis_shard_extent(output, output.shape.0.len().saturating_sub(1));
-                let arithmetic = output_elements_per_tile
+                let (kernel_output_elements, kernel_output_columns) = match dispatch {
+                    OperatorDispatch::BlockedGemm {
+                        distribution: GemmDistribution::ActivationStationaryReduction { .. },
+                        ..
+                    } => {
+                        let columns = output.shape.0.last().copied().map_or(1, u64::from);
+                        let rows = output_elements_per_tile.div_ceil(output_columns_per_tile);
+                        (rows.saturating_mul(columns), columns)
+                    }
+                    _ => (output_elements_per_tile, output_columns_per_tile),
+                };
+                let arithmetic = kernel_output_elements
                     .saturating_mul(2)
-                    .saturating_mul(k)
+                    .saturating_mul(compute_k)
                     .div_ceil(flops_per_cycle);
                 let right = inputs.get(1);
                 let right_bytes_consumed = right.map_or(u64::MAX, |right| {
-                    output_columns_per_tile
-                        .saturating_mul(k)
+                    kernel_output_columns
+                        .saturating_mul(compute_k)
                         .saturating_mul(right.format.precision.bytes())
                 });
                 let resident_interleaved_weights = right.is_some_and(|right| {
@@ -498,7 +519,9 @@ impl CostModel for Ipu21CostModel {
                                 .saturating_mul(inputs[1].format.precision.bytes());
                             let (rounds, reduction_additions) =
                                 reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
-                            let partial_bytes = maximum_shard_bytes(output);
+                            let partial_bytes = maximum_shard_bytes(output)
+                                .saturating_mul(u64::from(*output_column_block))
+                                .div_ceil(output_columns_per_tile);
                             weight_bytes
                                 .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
                                 .saturating_add(
@@ -527,9 +550,9 @@ impl CostModel for Ipu21CostModel {
                         inner_block,
                         output_column_block,
                         ..
-                    } => k
+                    } => compute_k
                         .div_ceil(u64::from(*inner_block))
-                        .saturating_mul(output_columns_per_tile)
+                        .saturating_mul(kernel_output_columns)
                         .div_ceil(u64::from(*output_column_block))
                         .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
                     OperatorDispatch::Pointwise { .. } => 0,
@@ -539,9 +562,9 @@ impl CostModel for Ipu21CostModel {
                     dispatch,
                     right,
                     staged_local_weights,
-                    output_elements_per_tile,
-                    output_columns_per_tile,
-                    k,
+                    kernel_output_elements,
+                    kernel_output_columns,
+                    compute_k,
                 )
                 .unwrap_or_else(|| arithmetic.max(weight_feed).saturating_add(calls));
                 let memory = operator_memory_estimate(dispatch, requirements, inputs, output);

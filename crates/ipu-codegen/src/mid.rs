@@ -2699,6 +2699,17 @@ fn apply_selected_plan(
         &converted_types,
         &state.get(result).tensor_type,
     );
+    tracing::trace!(
+        source = operation.id.index(),
+        cycles = operator_cycles,
+        dispatch = ?plan.dispatch,
+        input_layouts = ?converted_types
+            .iter()
+            .map(|input| &input.format.layout)
+            .collect::<Vec<_>>(),
+        output_layout = ?state.get(result).tensor_type.format.layout,
+        "costed operator plan"
+    );
     let exchange = costs.operator_exchange_footprint(
         plan.operator,
         &plan.dispatch,
@@ -2975,102 +2986,141 @@ fn activation_stationary_reduction_candidates(
     if !inner.is_multiple_of(AMP_INNER_BLOCK) || !columns.is_multiple_of(output_column_block) {
         return Vec::new();
     }
-    let layout = &candidate.output.format.layout;
-    let Some(column_partitions) = layout
-        .tiling
-        .axes
-        .iter()
-        .find(|axis| axis.axis == TensorAxis::FromEnd(1))
-        .map(|axis| axis.partitions)
-    else {
-        return Vec::new();
-    };
-    let Some(row_partitions) = layout
-        .tiling
-        .axes
-        .iter()
-        .find(|axis| axis.axis == TensorAxis::FromEnd(2))
-        .map(|axis| axis.partitions)
-    else {
-        return Vec::new();
-    };
-    if u32::from(column_partitions) != columns / output_column_block
-        || column_partitions < 2
-        || row_partitions.checked_mul(column_partitions) != Some(layout.tiling.tile_count)
-        || !(inner / AMP_INNER_BLOCK).is_multiple_of(u32::from(column_partitions))
-    {
-        return Vec::new();
-    }
+    let tile_count = candidate.output.format.layout.tiling.tile_count;
+    let output_blocks = columns / output_column_block;
     let Ok(inner_blocks) = u16::try_from(inner / AMP_INNER_BLOCK) else {
         return Vec::new();
     };
-    if column_partitions
+    let Ok(output_blocks) = u16::try_from(output_blocks) else {
+        return Vec::new();
+    };
+    if output_blocks
         .checked_mul(inner_blocks)
-        .is_none_or(|tiles| tiles > layout.tiling.tile_count)
+        .is_none_or(|tiles| tiles > tile_count)
     {
         return Vec::new();
     }
-    let mut partial = candidate.clone();
-    partial.inputs[0].format.layout = Layout::amp_left_partitioned_grid(
-        AMP_INNER_BLOCK as u16,
-        layout.tiling.tile_count,
-        row_partitions,
-        column_partitions,
-    );
-    partial.inputs[1].format.layout = Layout::amp_right_k64_storage(
-        output_column_block,
-        column_partitions,
-        inner_blocks,
-        1,
-        MemoryClass::Ipu21Interleaved,
-    );
-    let inner_per_partition = inner / u32::from(column_partitions);
-    [AMP_INNER_BLOCK, AMP_INNER_BLOCK * 2, AMP_INNER_BLOCK * 4]
-        .into_iter()
-        .filter(|block| {
-            inner_per_partition.is_multiple_of(*block)
-                && block.saturating_mul(output_column_block).saturating_mul(2)
-                    < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
+    (2..=output_blocks.min(inner_blocks).min(tile_count))
+        .filter(|partitions| {
+            output_blocks.is_multiple_of(*partitions)
+                && inner_blocks.is_multiple_of(*partitions)
+                && tile_count.is_multiple_of(*partitions)
         })
-        .flat_map(|inner_block| {
-            [2, 3, 4]
+        .filter_map(|inner_partitions| {
+            let row_partitions = tile_count / inner_partitions;
+            let row_axes = flattened_row_partition_axes(&left.shape, row_partitions)?;
+            let mut partial = candidate.clone();
+            let mut left_layout = Layout::amp_left_partitioned_grid(
+                AMP_INNER_BLOCK as u16,
+                tile_count,
+                row_partitions,
+                inner_partitions,
+            );
+            left_layout.tiling.axes.truncate(1);
+            left_layout.tiling.axes.extend(row_axes.iter().copied());
+            partial.inputs[0].format.layout = left_layout;
+            partial.inputs[1].format.layout = Layout::amp_right_k64_storage(
+                output_column_block,
+                output_blocks,
+                inner_blocks,
+                1,
+                MemoryClass::Ipu21Interleaved,
+            );
+            let mut output_layout = Layout::amp_output_grid(
+                output_column_block,
+                tile_count,
+                row_partitions,
+                inner_partitions,
+            );
+            output_layout.tiling.axes.truncate(1);
+            output_layout.tiling.axes.extend(row_axes);
+            partial.output.format.layout = output_layout;
+            Some((inner_partitions, partial))
+        })
+        .flat_map(|(inner_partitions, partial)| {
+            let inner_per_partition = inner / u32::from(inner_partitions);
+            [AMP_INNER_BLOCK, AMP_INNER_BLOCK * 2, AMP_INNER_BLOCK * 4]
                 .into_iter()
-                .filter(move |&fan_in| fan_in <= column_partitions)
-                .map(move |reduction_fan_in| (inner_block, reduction_fan_in))
+                .filter(move |block| {
+                    inner_per_partition.is_multiple_of(*block)
+                        && block.saturating_mul(output_column_block).saturating_mul(2)
+                            < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
+                })
+                .flat_map(move |inner_block| {
+                    let partial = partial.clone();
+                    [2, 3, 4]
+                        .into_iter()
+                        .filter(move |&fan_in| fan_in <= inner_partitions)
+                        .map(move |reduction_fan_in| {
+                            (
+                                inner_partitions,
+                                inner_block,
+                                reduction_fan_in,
+                                partial.clone(),
+                            )
+                        })
+                })
         })
-        .map(|(inner_block, reduction_fan_in)| {
-            let mut variant = partial.clone();
-            if let OperatorDispatch::BlockedGemm {
-                initialize,
-                accumulate,
-                inner_block: dispatch_inner_block,
-                distribution,
-                ..
-            } = &mut variant.dispatch
-            {
-                *dispatch_inner_block = inner_block;
-                if let TileKernelSpec::Gemm {
-                    inner_block: kernel_inner_block,
+        .map(
+            |(inner_partitions, inner_block, reduction_fan_in, mut variant)| {
+                if let OperatorDispatch::BlockedGemm {
+                    initialize,
+                    accumulate,
+                    inner_block: dispatch_inner_block,
+                    distribution,
                     ..
-                } = initialize
+                } = &mut variant.dispatch
                 {
-                    *kernel_inner_block = inner_block;
+                    *dispatch_inner_block = inner_block;
+                    if let TileKernelSpec::Gemm {
+                        inner_block: kernel_inner_block,
+                        ..
+                    } = initialize
+                    {
+                        *kernel_inner_block = inner_block;
+                    }
+                    if let TileKernelSpec::Gemm {
+                        inner_block: kernel_inner_block,
+                        ..
+                    } = accumulate
+                    {
+                        *kernel_inner_block = inner_block;
+                    }
+                    *distribution = GemmDistribution::ActivationStationaryReduction {
+                        inner_partitions,
+                        reduction_fan_in,
+                    };
                 }
-                if let TileKernelSpec::Gemm {
-                    inner_block: kernel_inner_block,
-                    ..
-                } = accumulate
-                {
-                    *kernel_inner_block = inner_block;
-                }
-                *distribution = GemmDistribution::ActivationStationaryReduction {
-                    inner_partitions: column_partitions,
-                    reduction_fan_in,
-                };
-            }
-            variant
-        })
+                variant
+            },
+        )
         .collect()
+}
+
+fn flattened_row_partition_axes(shape: &TensorShape, partitions: u16) -> Option<Vec<AxisTiling>> {
+    let mut remaining = u32::from(partitions);
+    let mut axes = Vec::new();
+    for from_end in 2..=shape.0.len() {
+        let dimension = shape.0[shape.0.len() - from_end];
+        let factor = greatest_common_divisor(remaining, dimension);
+        if factor > 1 {
+            axes.push(AxisTiling::new(
+                TensorAxis::FromEnd(u16::try_from(from_end).ok()?),
+                u16::try_from(factor).ok()?,
+                1,
+                Padding::Reject,
+            ));
+            remaining /= factor;
+        }
+    }
+    (remaining == 1).then_some(axes)
+}
+
+fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
 }
 
 fn resolved_output_aliasing(
@@ -3535,19 +3585,27 @@ mod tests {
                 TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
             ];
             let candidates = activation_stationary_reduction_candidates(&base, &inputs);
-            let inner_per_partition = k / u32::from(inner_partitions);
-            let fused_widths = [64, 128, 256]
-                .into_iter()
-                .filter(|width| {
-                    inner_per_partition.is_multiple_of(*width)
-                        && width.saturating_mul(output_columns).saturating_mul(2)
-                            < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
+            let expected = (2..=inner_partitions.min(inner_blocks).min(tiles))
+                .filter(|partitions| {
+                    inner_partitions.is_multiple_of(*partitions)
+                        && inner_blocks.is_multiple_of(*partitions)
+                        && tiles.is_multiple_of(*partitions)
+                        && m.is_multiple_of(u32::from(tiles / partitions))
                 })
-                .count();
-            assert_eq!(
-                candidates.len(),
-                fused_widths * usize::from(inner_partitions.min(4) - 1)
-            );
+                .map(|partitions| {
+                    let inner_per_partition = k / u32::from(partitions);
+                    let fused_widths = [64, 128, 256]
+                        .into_iter()
+                        .filter(|width| {
+                            inner_per_partition.is_multiple_of(*width)
+                                && width.saturating_mul(output_columns).saturating_mul(2)
+                                    < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
+                        })
+                        .count();
+                    fused_widths * usize::from(partitions.min(4) - 1)
+                })
+                .sum::<usize>();
+            assert_eq!(candidates.len(), expected);
             for candidate in candidates {
                 assert!(candidate.supports(&inputs, &TensorShape(vec![m, n])));
                 assert_eq!(candidate.inputs[0].format.layout.tiling.replicas, 1);
@@ -3561,13 +3619,16 @@ mod tests {
                             reduction_fan_in,
                         },
                         ..
-                    } if actual == inner_partitions
-                        && actual_columns == output_columns
+                    } if actual_columns == output_columns
+                        && inner_partitions.is_multiple_of(actual)
+                        && inner_blocks.is_multiple_of(actual)
+                        && tiles.is_multiple_of(actual)
+                        && m.is_multiple_of(u32::from(tiles / actual))
                         && matches!(inner_block, 64 | 128 | 256)
-                        && inner_per_partition.is_multiple_of(inner_block)
+                        && (k / u32::from(actual)).is_multiple_of(inner_block)
                         && inner_block * output_columns * 2
                             < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
-                        && (2..=inner_partitions.min(4)).contains(&reduction_fan_in)
+                        && (2..=actual.min(4)).contains(&reduction_fan_in)
                 ));
             }
         }
