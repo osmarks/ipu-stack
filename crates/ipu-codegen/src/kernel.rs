@@ -51,6 +51,7 @@ pub struct KernelCompilation {
 pub struct KernelBuildPlan {
     pub compilations: Vec<KernelCompilation>,
     gemm_rows: BTreeMap<(Precision, GemmWeightLoad, u32), Vec<u32>>,
+    gemm_symbols: BTreeMap<(Precision, GemmWeightLoad, u32, GemmKernelMode, u32), String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,11 +72,6 @@ pub enum KernelAbiError {
     Unavailable(TileKernelSpec),
     #[error("GEMM output view does not have a matrix row axis")]
     MissingGemmRows,
-    #[error("GEMM precision {precision:?} needs more than two row specializations: {rows:?}")]
-    TooManyGemmRows {
-        precision: Precision,
-        rows: Vec<u32>,
-    },
     #[error("kernel element count overflowed")]
     ElementCountOverflow,
     #[error("GEMM row count {0} is not present in the compilation plan")]
@@ -102,6 +98,24 @@ pub enum KernelMaterializationError {
     AddressOverflow,
 }
 
+fn specialized_gemm_symbol(
+    prefix: &str,
+    mode: GemmKernelMode,
+    weight_suffix: &str,
+    output_columns: u32,
+    size: &str,
+    small_rows: u32,
+    large_rows: u32,
+) -> String {
+    let operation = match mode {
+        GemmKernelMode::Initialize => "init",
+        GemmKernelMode::Accumulate => "accumulate",
+    };
+    format!(
+        "ipu_stack_gemm_{prefix}_{operation}_{size}_rows{weight_suffix}_c{output_columns}_r{small_rows}_r{large_rows}"
+    )
+}
+
 impl KernelBuildPlan {
     /// Derives device objects from the finalized schedule, so row variants are
     /// compiler specializations rather than a fixed collection of binaries.
@@ -114,14 +128,6 @@ impl KernelBuildPlan {
         let mut plan = Self::default();
         for ((precision, weights, output_columns), values) in rows {
             let values = values.into_iter().collect::<Vec<_>>();
-            if values.len() > 2 {
-                return Err(KernelAbiError::TooManyGemmRows {
-                    precision,
-                    rows: values,
-                });
-            }
-            let small = values[0];
-            let large = *values.last().expect("nonempty GEMM row set");
             let (source, prefix) = match precision {
                 Precision::F16 => ("gemm_f16_64_amp.S", "f16"),
                 Precision::F32 => ("gemm_f32_64_amp.S", "f32"),
@@ -132,44 +138,71 @@ impl KernelBuildPlan {
             } else {
                 ""
             };
-            let width_suffix = format!("_c{output_columns}");
-            let symbols = [
-                format!("ipu_stack_gemm_{prefix}_init_small_rows{weight_suffix}{width_suffix}"),
-                format!("ipu_stack_gemm_{prefix}_init_large_rows{weight_suffix}{width_suffix}"),
-                format!(
-                    "ipu_stack_gemm_{prefix}_accumulate_small_rows{weight_suffix}{width_suffix}"
-                ),
-                format!(
-                    "ipu_stack_gemm_{prefix}_accumulate_large_rows{weight_suffix}{width_suffix}"
-                ),
-            ];
-            let single_rows = values.len() == 1;
-            let mut flags = vec![
-                format!("-DGEMM_SMALL_ROWS={small}"),
-                format!("-DGEMM_LARGE_ROWS={large}"),
-                format!("-DGEMM_OUTPUT_COLUMNS={output_columns}"),
-                format!("-DGEMM_INIT_SMALL_SYMBOL={}", symbols[0]),
-                format!("-DGEMM_INIT_LARGE_SYMBOL={}", symbols[1]),
-                format!("-DGEMM_ACCUMULATE_SMALL_SYMBOL={}", symbols[2]),
-                format!("-DGEMM_ACCUMULATE_LARGE_SYMBOL={}", symbols[3]),
-            ];
-            if single_rows {
-                flags.push("-DGEMM_SINGLE_ROWS=1".into());
+            for pair in values.chunks(2) {
+                let small = pair[0];
+                let large = *pair.last().expect("nonempty GEMM row pair");
+                let symbols = [
+                    (GemmKernelMode::Initialize, "small", small),
+                    (GemmKernelMode::Initialize, "large", large),
+                    (GemmKernelMode::Accumulate, "small", small),
+                    (GemmKernelMode::Accumulate, "large", large),
+                ]
+                .map(|(mode, size, _)| {
+                    specialized_gemm_symbol(
+                        prefix,
+                        mode,
+                        weight_suffix,
+                        output_columns,
+                        size,
+                        small,
+                        large,
+                    )
+                });
+                for (mode, row_index) in [
+                    (GemmKernelMode::Initialize, 0usize),
+                    (GemmKernelMode::Accumulate, 2usize),
+                ] {
+                    plan.gemm_symbols.insert(
+                        (precision, weights, output_columns, mode, small),
+                        symbols[row_index].clone(),
+                    );
+                    if pair.len() == 2 {
+                        plan.gemm_symbols.insert(
+                            (precision, weights, output_columns, mode, large),
+                            symbols[row_index + 1].clone(),
+                        );
+                    }
+                }
+                let single_rows = pair.len() == 1;
+                let mut flags = vec![
+                    format!("-DGEMM_SMALL_ROWS={small}"),
+                    format!("-DGEMM_LARGE_ROWS={large}"),
+                    format!("-DGEMM_OUTPUT_COLUMNS={output_columns}"),
+                    format!("-DGEMM_INIT_SMALL_SYMBOL={}", symbols[0]),
+                    format!("-DGEMM_INIT_LARGE_SYMBOL={}", symbols[1]),
+                    format!("-DGEMM_ACCUMULATE_SMALL_SYMBOL={}", symbols[2]),
+                    format!("-DGEMM_ACCUMULATE_LARGE_SYMBOL={}", symbols[3]),
+                ];
+                if single_rows {
+                    flags.push("-DGEMM_SINGLE_ROWS=1".into());
+                }
+                if weights == GemmWeightLoad::Interleaved {
+                    flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into());
+                }
+                let retained_symbols = if single_rows {
+                    vec![symbols[0].clone(), symbols[2].clone()]
+                } else {
+                    symbols.into_iter().collect()
+                };
+                plan.compilations.push(KernelCompilation {
+                    source,
+                    name: format!(
+                        "gemm_{prefix}{weight_suffix}_c{output_columns}_r{small}_r{large}"
+                    ),
+                    flags,
+                    retained_symbols,
+                });
             }
-            if weights == GemmWeightLoad::Interleaved {
-                flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into());
-            }
-            let retained_symbols = if single_rows {
-                vec![symbols[0].clone(), symbols[2].clone()]
-            } else {
-                symbols.into_iter().collect()
-            };
-            plan.compilations.push(KernelCompilation {
-                source,
-                name: format!("gemm_{prefix}{weight_suffix}{width_suffix}_r{small}_r{large}"),
-                flags,
-                retained_symbols,
-            });
             plan.gemm_rows
                 .insert((precision, weights, output_columns), values);
         }
@@ -196,9 +229,10 @@ impl KernelBuildPlan {
         let symbol = match (&abi.symbols, kernel) {
             (KernelSymbols::Exact(symbol), _) => (*symbol).to_owned(),
             (
-                KernelSymbols::RowSpecialized { small, large },
+                KernelSymbols::RowSpecialized { .. },
                 TileKernelSpec::Gemm {
                     multiply,
+                    mode,
                     weights,
                     output_columns,
                     ..
@@ -209,13 +243,13 @@ impl KernelBuildPlan {
                     .gemm_rows
                     .get(&(*multiply, *weights, *output_columns))
                     .ok_or(KernelAbiError::UnplannedGemmRows(rows))?;
-                if planned.first() == Some(&rows) {
-                    small.clone()
-                } else if planned.last() == Some(&rows) {
-                    large.clone()
-                } else {
+                if !planned.contains(&rows) {
                     return Err(KernelAbiError::UnplannedGemmRows(rows));
                 }
+                self.gemm_symbols
+                    .get(&(*multiply, *weights, *output_columns, *mode, rows))
+                    .cloned()
+                    .ok_or(KernelAbiError::UnplannedGemmRows(rows))?
             }
             _ => return Err(KernelAbiError::RequirementMismatch),
         };

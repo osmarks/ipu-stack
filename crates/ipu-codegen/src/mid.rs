@@ -91,7 +91,7 @@ pub enum TileKernelSpec {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GemmKernelMode {
     Initialize,
     Accumulate,
@@ -1132,6 +1132,8 @@ pub struct PipelineConfig {
     /// Signatures available independently to each operation. Earlier entries
     /// of the appropriate operation kind win when costs are equal.
     pub operator_candidates: Vec<OperatorCandidate>,
+    /// Add near-capacity tile counts derived from graph tensor extents.
+    pub shape_aware_active_tile_counts: bool,
     /// Maximum number of partial format assignments retained after each
     /// operation in a straight-line region.
     pub planning_beam_width: usize,
@@ -1188,6 +1190,7 @@ impl PipelineConfig {
             inputs: BTreeMap::new(),
             automatic_inputs: BTreeMap::new(),
             operator_candidates: default_operator_candidates(tile_count),
+            shape_aware_active_tile_counts: true,
             planning_beam_width: 64,
             standard_memory_reservation_bytes: u64::from(
                 crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
@@ -1230,6 +1233,7 @@ impl PipelineConfig {
         }
         candidates.dedup();
         self.operator_candidates = candidates;
+        self.shape_aware_active_tile_counts = false;
         self
     }
 
@@ -1263,9 +1267,7 @@ fn candidate_active_tile_counts(capacity: u16) -> Vec<u16> {
         return vec![0];
     }
     let mut counts = vec![capacity];
-    // Regular power-of-two subsets avoid awkward prime factors and let the
-    // cost model decide when reduced exchange or memory pressure outweighs
-    // lower device occupancy.
+    // Power-of-two subsets provide progressively smaller fallback grids.
     let mut power = 1u16;
     while let Some(next) = power.checked_mul(2) {
         if next > capacity {
@@ -1282,6 +1284,25 @@ fn candidate_active_tile_counts(capacity: u16) -> Vec<u16> {
         }
         power /= 2;
     }
+    counts
+}
+
+fn shape_aware_active_tile_counts<'a>(
+    capacity: u16,
+    shapes: impl IntoIterator<Item = &'a TensorShape>,
+) -> Vec<u16> {
+    let minimum = capacity.div_ceil(2);
+    let mut counts = shapes
+        .into_iter()
+        .flat_map(|shape| shape.0.iter().copied())
+        .filter_map(|extent| {
+            let extent = u16::try_from(extent).ok()?;
+            (extent > 1 && extent <= capacity).then(|| capacity / extent * extent)
+        })
+        .filter(|&count| count >= minimum && count < capacity)
+        .collect::<Vec<_>>();
+    counts.sort_unstable_by(|left, right| right.cmp(left));
+    counts.dedup();
     counts
 }
 
@@ -1885,9 +1906,9 @@ impl OperatorPlan {
                         .iter()
                         .any(|axis| axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1);
                 if grid_plan
-                    && (!layout_shards_are_even(left)
-                        || !layout_shards_are_even(right)
-                        || !layout_shards_are_even(output))
+                    && [left, right, output]
+                        .into_iter()
+                        .any(|tensor| !layout_shards_are_nonempty(tensor))
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
                 }
@@ -1957,16 +1978,14 @@ impl OperatorPlan {
     }
 }
 
-fn layout_shards_are_even(tensor: &TensorType) -> bool {
+fn layout_shards_are_nonempty(tensor: &TensorType) -> bool {
     let Ok(padded) = tensor.format.layout.padded_shape(&tensor.shape) else {
         return false;
     };
     tensor.format.layout.tiling.axes.iter().all(|axis| {
-        axis.axis.resolve(padded.0.len()).is_ok_and(|index| {
-            let blocks = padded.0[index] / axis.block_size;
-            blocks >= u32::from(axis.partitions)
-                && blocks.is_multiple_of(u32::from(axis.partitions))
-        })
+        axis.axis
+            .resolve(padded.0.len())
+            .is_ok_and(|index| padded.0[index] / axis.block_size >= u32::from(axis.partitions))
     })
 }
 
@@ -2053,6 +2072,27 @@ pub fn lower(
     if config.tile_count == 0 {
         return Err(LoweringError::EmptyTileGroup);
     }
+    let use_shape_aware_counts = config.shape_aware_active_tile_counts
+        && config.operator_candidates == default_operator_candidates(config.tile_count);
+    let resolved_config = use_shape_aware_counts.then(|| {
+        let mut resolved = config.clone();
+        for tile_count in
+            shape_aware_active_tile_counts(config.tile_count, graph.value_shapes().values())
+        {
+            resolved
+                .operator_candidates
+                .extend(operator_candidates_for_tile_count(tile_count));
+        }
+        let mut unique = Vec::with_capacity(resolved.operator_candidates.len());
+        for candidate in resolved.operator_candidates {
+            if !unique.contains(&candidate) {
+                unique.push(candidate);
+            }
+        }
+        resolved.operator_candidates = unique;
+        resolved
+    });
+    let config = resolved_config.as_ref().unwrap_or(config);
     let mut state = LoweringState::default();
     let costs = MemoizedCostModel::new(costs);
     let mut values = BTreeMap::new();
@@ -3237,6 +3277,26 @@ mod tests {
         for exponent in 1..=10 {
             let capacity = 1_u16 << exponent;
             assert_eq!(candidate_active_tile_counts(capacity).len(), exponent + 1);
+        }
+    }
+
+    #[test]
+    fn randomized_shape_aware_tile_candidates_follow_graph_extents() {
+        let mut random = fastrand::Rng::with_seed(0x7368_6170_655f_6772);
+        for case in 0..RANDOM_CASES {
+            let capacity = random.u16(16..=1472);
+            let extent = random.u16(2..=capacity);
+            let shape = TensorShape(vec![u32::from(extent), random.u32(1..=4096)]);
+            let counts = shape_aware_active_tile_counts(capacity, [&shape]);
+            let expected = capacity / extent * extent;
+            if expected >= capacity.div_ceil(2) && expected < capacity {
+                assert!(counts.contains(&expected), "case {case}");
+            }
+            assert!(counts.iter().all(|&count| {
+                count < capacity
+                    && count >= capacity.div_ceil(2)
+                    && shape.0.iter().any(|&axis| u32::from(count) % axis == 0)
+            }));
         }
     }
 

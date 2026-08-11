@@ -3068,7 +3068,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_odd_capacities_use_regular_active_tile_subsets() {
+    fn randomized_odd_capacities_use_nonempty_active_tile_subsets() {
         let mut random = fastrand::Rng::with_seed(0x7375_6273_6574);
         for case in 0..16 {
             let active_tiles = 1_u16 << random.u32(2..=5);
@@ -3085,21 +3085,27 @@ mod tests {
 
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let result = mid.operations.last().unwrap().results[0];
-            assert_eq!(
-                mid.values[result.index() as usize]
-                    .tensor_type
-                    .format
-                    .layout
-                    .tiling
-                    .tile_count,
-                active_tiles,
-                "case {case}"
-            );
+            let selected_tiles = mid.values[result.index() as usize]
+                .tensor_type
+                .format
+                .layout
+                .tiling
+                .tile_count;
+            assert!(selected_tiles <= capacity, "case {case}");
 
             let low = lower_to_tiles(&mid, &config).unwrap();
             assert_eq!(low.tile_count, capacity, "case {case}");
-            assert_eq!(low.outputs[0].shards.len(), usize::from(active_tiles));
-            for tile in &low.tiles[usize::from(active_tiles)..] {
+            assert_eq!(low.outputs[0].shards.len(), usize::from(selected_tiles));
+            for &shard in &low.outputs[0].shards {
+                assert!(
+                    low.shards[shard.index() as usize]
+                        .extents
+                        .iter()
+                        .all(|extent| extent.start < extent.logical_end),
+                    "case {case}"
+                );
+            }
+            for tile in &low.tiles[usize::from(selected_tiles)..] {
                 assert!(
                     low.work(tile)
                         .all(|work| !matches!(work, TileWorkRef::Kernel(_))),
