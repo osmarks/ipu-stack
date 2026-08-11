@@ -291,10 +291,18 @@ fn lower_static_exchanges(
                 }
             }
             let pending = coalesce_pending_transfers(pending);
+            let mut receive_counts = vec![0usize; usize::from(program.tile_count)];
+            for transfer in &pending {
+                for &(tile, _) in &transfer.destinations {
+                    receive_counts[usize::from(tile)] += 1;
+                }
+            }
             let mut incoming_bases = vec![None::<u32>; usize::from(program.tile_count)];
             for transfer in &pending {
                 if let [(tile, address)] = transfer.destinations.as_slice() {
-                    incoming_bases[usize::from(*tile)].get_or_insert(*address);
+                    if receive_counts[usize::from(*tile)] == 1 {
+                        incoming_bases[usize::from(*tile)] = Some(*address);
+                    }
                 }
             }
             let incoming_bases = incoming_bases
@@ -344,6 +352,7 @@ fn lower_static_exchanges(
                     let timing = append_transfer(
                         topology,
                         &incoming_bases,
+                        &receive_counts,
                         ScheduledTransfer {
                             source: transfer.source,
                             destinations: &transfer.destinations,
@@ -900,6 +909,7 @@ struct ScheduledTransfer<'a> {
 fn append_transfer(
     topology: &Topology,
     incoming_bases: &[u32],
+    receive_counts: &[usize],
     transfer: ScheduledTransfer<'_>,
     horizon: &mut u32,
     builders: &mut BTreeMap<u16, PlanProgramBuilder>,
@@ -916,7 +926,9 @@ fn append_transfer(
     }
     let tiles = destinations.iter().map(|entry| entry.0).collect::<Vec<_>>();
     let point_receiver = destinations.first().is_some_and(|&(tile, address)| {
-        destinations.len() == 1 && incoming_bases[usize::from(tile)] == address
+        destinations.len() == 1
+            && receive_counts[usize::from(tile)] == 1
+            && incoming_bases[usize::from(tile)] == address
     });
     let mut plan = if point_receiver {
         let point = topology.point_to_point(source, tiles[0], words)?;
