@@ -22,6 +22,9 @@
 #ifndef ATTENTION_SCALE
 #define ATTENTION_SCALE (1.0f / __builtin_sqrtf(float(ATTENTION_QUERY_DIMENSION)))
 #endif
+#ifndef ATTENTION_KEY_BLOCK_ROWS
+#define ATTENTION_KEY_BLOCK_ROWS 32
+#endif
 
 using namespace poplar;
 
@@ -30,6 +33,27 @@ static_assert(ATTENTION_QUERY_ROWS > 0);
 static_assert(ATTENTION_KEY_ROWS > 0);
 static_assert(ATTENTION_QUERY_DIMENSION > 0);
 static_assert(ATTENTION_VALUE_DIMENSION > 0);
+static_assert(ATTENTION_KEY_BLOCK_ROWS > 0);
+
+static __attribute__((always_inline)) float attentionDot(const half *query,
+                                                         const half *key) {
+  constexpr unsigned dimension = ATTENTION_QUERY_DIMENSION;
+  float score = 0.0f;
+#if ATTENTION_QUERY_DIMENSION % 2 == 0
+  for (unsigned column = 0; column < dimension; column += 2) {
+    const half2 packedQuery =
+        *reinterpret_cast<const half2 *>(&query[column]);
+    const half2 packedKey = *reinterpret_cast<const half2 *>(&key[column]);
+    const float2 queryPair = __builtin_convertvector(packedQuery, float2);
+    const float2 keyPair = __builtin_convertvector(packedKey, float2);
+    score += queryPair[0] * keyPair[0] + queryPair[1] * keyPair[1];
+  }
+#else
+  for (unsigned column = 0; column < dimension; ++column)
+    score += float(query[column]) * float(key[column]);
+#endif
+  return score;
+}
 
 // Exact, non-causal online softmax attention. Each worker owns complete query
 // rows, so the running maximum, denominator, and output vector never need to
@@ -65,23 +89,48 @@ public:
 
       float maximum = -__builtin_inff();
       float denominator = 0.0f;
-      for (unsigned keyRow = 0; keyRow < keyRows; ++keyRow) {
-        float score = 0.0f;
-        const half *keyVector = &keys[keyRow * queryDimension];
-        for (unsigned column = 0; column < queryDimension; ++column)
-          score += float(queryVector[column]) * float(keyVector[column]);
-        score *= scale;
+      for (unsigned keyStart = 0; keyStart < keyRows;
+           keyStart += ATTENTION_KEY_BLOCK_ROWS) {
+        const unsigned remainingRows = keyRows - keyStart;
+        const unsigned blockRows = remainingRows < ATTENTION_KEY_BLOCK_ROWS
+                                       ? remainingRows
+                                       : ATTENTION_KEY_BLOCK_ROWS;
+        alignas(8) float scores[ATTENTION_KEY_BLOCK_ROWS];
+        float blockMaximum = -__builtin_inff();
+        for (unsigned blockRow = 0; blockRow < blockRows; ++blockRow) {
+          const unsigned keyRow = keyStart + blockRow;
+          scores[blockRow] =
+              attentionDot(queryVector, &keys[keyRow * queryDimension]) * scale;
+          blockMaximum = __builtin_fmaxf(blockMaximum, scores[blockRow]);
+        }
 
-        const float nextMaximum = __builtin_fmaxf(maximum, score);
-        const float previousScale =
-            maximum == -__builtin_inff() ? 0.0f
-                                         : __builtin_expf(maximum - nextMaximum);
-        const float weight = __builtin_expf(score - nextMaximum);
-        denominator = denominator * previousScale + weight;
-        const half *valueVector = &values[keyRow * valueDimension];
-        for (unsigned column = 0; column < valueDimension; ++column) {
-          destination[column] = destination[column] * previousScale +
-                                weight * float(valueVector[column]);
+        const float nextMaximum = __builtin_fmaxf(maximum, blockMaximum);
+        const float previousScale = maximum == -__builtin_inff()
+                                        ? 0.0f
+                                        : __builtin_expf(maximum - nextMaximum);
+        denominator *= previousScale;
+        for (unsigned column = 0; column < valueDimension; ++column)
+          destination[column] *= previousScale;
+
+        for (unsigned blockRow = 0; blockRow < blockRows; ++blockRow) {
+          const unsigned keyRow = keyStart + blockRow;
+          const float weight = __builtin_expf(scores[blockRow] - nextMaximum);
+          denominator += weight;
+          const half *valueVector = &values[keyRow * valueDimension];
+#if ATTENTION_VALUE_DIMENSION % 2 == 0
+          for (unsigned column = 0; column < valueDimension; column += 2) {
+            const half2 packedValue =
+                *reinterpret_cast<const half2 *>(&valueVector[column]);
+            const float2 valuePair =
+                __builtin_convertvector(packedValue, float2);
+            volatile float2 *destinationPair =
+                reinterpret_cast<volatile float2 *>(&destination[column]);
+            *destinationPair = *destinationPair + valuePair * weight;
+          }
+#else
+          for (unsigned column = 0; column < valueDimension; ++column)
+            destination[column] += weight * float(valueVector[column]);
+#endif
         }
         maximum = nextMaximum;
       }

@@ -106,19 +106,30 @@ enum Workload {
     GemmBenchmark,
     /// Profile the canonical batched SigLIP Dense-GeLU-Dense workload.
     SiglipMlpBenchmark,
+    /// Profile SigLIP self-attention (16 heads, 729 tokens, width 72).
+    SiglipAttentionBenchmark,
     /// Run reproducible randomized small-group tile exchanges.
     ExchangeStress,
 }
 
 impl Workload {
     fn is_benchmark(self) -> bool {
-        matches!(self, Self::GemmBenchmark | Self::SiglipMlpBenchmark)
+        matches!(
+            self,
+            Self::GemmBenchmark
+                | Self::SiglipMlpBenchmark
+                | Self::SiglipAttentionBenchmark
+                | Self::AttentionSmoke
+        )
     }
 }
 
 const SIGLIP_MLP_BATCH: u32 = 4;
 const SIGLIP_MLP_TOKENS: u32 = 729;
 const SIGLIP_MLP_DIMENSION: u32 = 1152;
+const SIGLIP_ATTENTION_HEADS: u32 = 16;
+const SIGLIP_ATTENTION_TOKENS: u32 = 729;
+const SIGLIP_ATTENTION_HEAD_DIMENSION: u32 = 72;
 const GEMM_BENCHMARK_ROWS: u32 = 131_072;
 const GEMM_BENCHMARK_INNER: u32 = 64;
 const GEMM_BENCHMARK_COLUMNS: u32 = 64;
@@ -274,21 +285,31 @@ fn main() -> Result<()> {
             .with_input(left, left_format)
             .with_input(right0, right_format.clone())
             .with_input(right1, right_format);
-    } else if matches!(arguments.workload, Workload::AttentionSmoke) {
-        const HEADS: u32 = 4;
-        const QUERY_ROWS: u32 = 17;
-        const KEY_ROWS: u32 = 19;
-        const QUERY_DIMENSION: u32 = 16;
-        const VALUE_DIMENSION: u32 = 12;
-        if active_tiles < HEADS as u16 {
-            bail!("attention-smoke requires at least {HEADS} tiles");
+    } else if matches!(
+        arguments.workload,
+        Workload::AttentionSmoke | Workload::SiglipAttentionBenchmark
+    ) {
+        let (heads, query_rows, key_rows, query_dimension, value_dimension) =
+            if matches!(arguments.workload, Workload::SiglipAttentionBenchmark) {
+                (
+                    SIGLIP_ATTENTION_HEADS,
+                    SIGLIP_ATTENTION_TOKENS,
+                    SIGLIP_ATTENTION_TOKENS,
+                    SIGLIP_ATTENTION_HEAD_DIMENSION,
+                    SIGLIP_ATTENTION_HEAD_DIMENSION,
+                )
+            } else {
+                (4, 17, 19, 16, 12)
+            };
+        if active_tiles < heads as u16 {
+            bail!("attention workload requires at least {heads} tiles");
         }
-        let query = graph.host_input("query", [HEADS, QUERY_ROWS, QUERY_DIMENSION])?;
-        let key = graph.host_input("key", [HEADS, KEY_ROWS, QUERY_DIMENSION])?;
-        let value = graph.host_input("value", [HEADS, KEY_ROWS, VALUE_DIMENSION])?;
+        let query = graph.host_input("query", [heads, query_rows, query_dimension])?;
+        let key = graph.host_input("key", [heads, key_rows, query_dimension])?;
+        let value = graph.host_input("value", [heads, key_rows, value_dimension])?;
         let output = graph.flash_attention(query, key, value)?;
         graph.set_outputs([output])?;
-        let layout = Layout::head_sharded(HEADS as u16);
+        let layout = Layout::head_sharded(heads as u16);
         pipeline = pipeline
             .with_input(
                 query,
@@ -311,6 +332,7 @@ fn main() -> Result<()> {
                     layout,
                 },
             );
+        pipeline.profiling.enabled = !arguments.no_profile;
     } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
         validate_mlp_benchmark_shape(
             arguments.mlp_batch,
@@ -440,8 +462,36 @@ fn main() -> Result<()> {
                     active_tiles,
                     arguments.timeout_seconds,
                 )?;
-            } else if matches!(arguments.workload, Workload::AttentionSmoke) {
-                run_attention_smoke(&runtime, &application, arguments.timeout_seconds)?;
+            } else if matches!(
+                arguments.workload,
+                Workload::AttentionSmoke | Workload::SiglipAttentionBenchmark
+            ) {
+                let (heads, query_rows, key_rows, query_dimension, value_dimension, checked_rows) =
+                    if matches!(arguments.workload, Workload::SiglipAttentionBenchmark) {
+                        (
+                            SIGLIP_ATTENTION_HEADS,
+                            SIGLIP_ATTENTION_TOKENS,
+                            SIGLIP_ATTENTION_TOKENS,
+                            SIGLIP_ATTENTION_HEAD_DIMENSION,
+                            SIGLIP_ATTENTION_HEAD_DIMENSION,
+                            2,
+                        )
+                    } else {
+                        (4, 17, 19, 16, 12, 17)
+                    };
+                run_attention_smoke(
+                    &runtime,
+                    &application,
+                    heads,
+                    query_rows,
+                    key_rows,
+                    query_dimension,
+                    value_dimension,
+                    checked_rows,
+                    arguments.clock_hz,
+                    arguments.timeout_seconds,
+                    arguments.profile_output.as_deref(),
+                )?;
             } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
                 run_siglip_mlp_benchmark(
                     &runtime,
@@ -641,13 +691,16 @@ fn run_mlp_chain(
 fn run_attention_smoke(
     runtime: &Runtime,
     application: &Application,
+    heads: u32,
+    query_rows: u32,
+    key_rows: u32,
+    query_dimension: u32,
+    value_dimension: u32,
+    checked_query_rows: u32,
+    clock_hz: u64,
     timeout_seconds: u64,
+    profile_output: Option<&Path>,
 ) -> Result<()> {
-    const HEADS: u32 = 4;
-    const QUERY_ROWS: u32 = 17;
-    const KEY_ROWS: u32 = 19;
-    const QUERY_DIMENSION: u32 = 16;
-    const VALUE_DIMENSION: u32 = 12;
     const QUERY_SEED: u64 = 0x6174_746e_5f71;
     const KEY_SEED: u64 = 0x6174_746e_5f6b;
     const VALUE_SEED: u64 = 0x6174_746e_5f76;
@@ -666,21 +719,21 @@ fn run_attention_smoke(
     let query_bytes = packed_binding(&query_binding, |head, linear, _| {
         Ok(mlp_smoke_value(
             QUERY_SEED,
-            u64::from(head) * u64::from(QUERY_ROWS * QUERY_DIMENSION) + u64::from(linear),
+            u64::from(head) * u64::from(query_rows * query_dimension) + u64::from(linear),
             STANDARD_DEVIATION,
         ))
     })?;
     let key_bytes = packed_binding(&key_binding, |head, linear, _| {
         Ok(mlp_smoke_value(
             KEY_SEED,
-            u64::from(head) * u64::from(KEY_ROWS * QUERY_DIMENSION) + u64::from(linear),
+            u64::from(head) * u64::from(key_rows * query_dimension) + u64::from(linear),
             STANDARD_DEVIATION,
         ))
     })?;
     let value_bytes = packed_binding(&value_binding, |head, linear, _| {
         Ok(mlp_smoke_value(
             VALUE_SEED,
-            u64::from(head) * u64::from(KEY_ROWS * VALUE_DIMENSION) + u64::from(linear),
+            u64::from(head) * u64::from(key_rows * value_dimension) + u64::from(linear),
             STANDARD_DEVIATION,
         ))
     })?;
@@ -689,28 +742,29 @@ fn run_attention_smoke(
     inputs.extend_from_slice(&key_bytes);
     inputs.extend_from_slice(&value_bytes);
     let actual = run_initialized_program(runtime, application, &[], &inputs, timeout_seconds)?;
+    write_profile(application, &actual, clock_hz, profile_output)?;
     let output = binding("output.0", &application.outputs)?;
-    if output.slices.len() < HEADS as usize {
-        bail!("attention output has fewer than {HEADS} head shards");
+    if output.slices.len() < heads as usize {
+        bail!("attention output has fewer than {heads} head shards");
     }
 
     let sample = |seed, index, width| half_to_f32(mlp_smoke_value(seed, index, width));
-    let scale = 1.0 / (QUERY_DIMENSION as f32).sqrt();
+    let scale = 1.0 / (query_dimension as f32).sqrt();
     let mut maximum_error = 0.0f32;
     let mut squared_error = 0.0f64;
     let mut checks = 0usize;
-    for head in 0..HEADS {
+    for head in 0..heads {
         let slice = &output.slices[head as usize];
-        for query_row in 0..QUERY_ROWS {
-            let mut scores = vec![0.0f32; KEY_ROWS as usize];
-            for key_row in 0..KEY_ROWS {
+        for query_row in 0..checked_query_rows.min(query_rows) {
+            let mut scores = vec![0.0f32; key_rows as usize];
+            for key_row in 0..key_rows {
                 let mut dot = 0.0f32;
-                for column in 0..QUERY_DIMENSION {
+                for column in 0..query_dimension {
                     let query_index = u64::from(
-                        head * QUERY_ROWS * QUERY_DIMENSION + query_row * QUERY_DIMENSION + column,
+                        head * query_rows * query_dimension + query_row * query_dimension + column,
                     );
                     let key_index = u64::from(
-                        head * KEY_ROWS * QUERY_DIMENSION + key_row * QUERY_DIMENSION + column,
+                        head * key_rows * query_dimension + key_row * query_dimension + column,
                     );
                     dot += sample(QUERY_SEED, query_index, STANDARD_DEVIATION)
                         * sample(KEY_SEED, key_index, STANDARD_DEVIATION);
@@ -719,21 +773,21 @@ fn run_attention_smoke(
             }
             let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let denominator: f32 = scores.iter().map(|score| (*score - maximum).exp()).sum();
-            for column in 0..VALUE_DIMENSION {
+            for column in 0..value_dimension {
                 let expected = scores
                     .iter()
                     .enumerate()
                     .map(|(key_row, score)| {
                         let value_index = u64::from(
-                            head * KEY_ROWS * VALUE_DIMENSION
-                                + key_row as u32 * VALUE_DIMENSION
+                            head * key_rows * value_dimension
+                                + key_row as u32 * value_dimension
                                 + column,
                         );
                         ((*score - maximum).exp() / denominator)
                             * sample(VALUE_SEED, value_index, STANDARD_DEVIATION)
                     })
                     .sum::<f32>();
-                let linear = u64::from(query_row * VALUE_DIMENSION + column);
+                let linear = u64::from(query_row * value_dimension + column);
                 let offset = usize::try_from(slice.file_offset + linear * 4)?;
                 let observed = f32::from_le_bytes(actual[offset..offset + 4].try_into().unwrap());
                 let error = (observed - expected).abs();
