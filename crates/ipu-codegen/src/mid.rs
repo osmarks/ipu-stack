@@ -2995,6 +2995,29 @@ fn activation_stationary_reduction_candidates(
     let Ok(output_blocks) = u16::try_from(output_blocks) else {
         return Vec::new();
     };
+    let output_seed_partitions = candidate
+        .output
+        .format
+        .layout
+        .tiling
+        .axes
+        .iter()
+        .find(|axis| axis.axis == TensorAxis::FromEnd(1))
+        .map(|axis| axis.partitions);
+    let right_seed = &candidate.inputs[1].format.layout;
+    let right_seed_inner_partitions = right_seed
+        .tiling
+        .axes
+        .iter()
+        .find(|axis| axis.axis == TensorAxis::FromEnd(2))
+        .map(|axis| axis.partitions);
+    if output_seed_partitions != Some(output_blocks)
+        || right_seed.order != ElementOrder::Amp(AmpOrder::RightK64)
+        || right_seed.memory_class != MemoryClass::Ipu21Interleaved
+        || right_seed_inner_partitions != Some(1)
+    {
+        return Vec::new();
+    }
     if output_blocks
         .checked_mul(inner_blocks)
         .is_none_or(|tiles| tiles > tile_count)
