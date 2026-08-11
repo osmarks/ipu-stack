@@ -83,15 +83,16 @@ impl ExchangeFootprint {
         // consolidated per-phase row. The entry sync and terminal return are
         // shared by the caller and consolidated row respectively. Mid-level
         // byte volume cannot see where independently tiled source and
-        // destination spans meet, so reserve a second encoded chunk for a
-        // boundary split discovered during final exchange lowering.
+        // destination spans meet, or the address tables needed by shared
+        // executable rows. Six encoded chunks per logical chunk tracks the
+        // combined executable, offset, and per-use value storage on IPU21.
         let words_per_chunk = (ipu_exchange::PLAN_WORDS - 2) as u64;
-        let fragments_per_chunk = 2;
+        let encoded_chunks_per_logical_chunk = 6;
         self.phases
             .saturating_add(
                 self.maximum_transfer_chunks_per_tile
                     .saturating_mul(words_per_chunk)
-                    .saturating_mul(fragments_per_chunk),
+                    .saturating_mul(encoded_chunks_per_logical_chunk),
             )
             .saturating_mul(4)
     }

@@ -324,12 +324,16 @@ pub fn build_package(
     config: &PackageConfig,
 ) -> PackageBuildResult<Application> {
     validate_tile_count(u32::from(config.pipeline.tile_count))?;
+    let mut planning = config.pipeline.clone();
+    if planning.profiling.enabled {
+        planning.standard_memory_reservation_bytes = planning
+            .standard_memory_reservation_bytes
+            .saturating_add(u64::from(ipu_package::TILE_MEMORY_ELEMENT_SIZE));
+    }
     let mid = build_phase("lower_mid", || {
-        Ok(lower(graph, &config.pipeline, &Ipu21CostModel)?)
+        Ok(lower(graph, &planning, &Ipu21CostModel)?)
     })?;
-    let low = build_phase("lower_tiles", || {
-        Ok(lower_to_tiles(&mid, &config.pipeline)?)
-    })?;
+    let low = build_phase("lower_tiles", || Ok(lower_to_tiles(&mid, &planning)?))?;
     tracing::info!(
         logical_shards = low.shards.len(),
         exchange_phases = low.exchange_phases.len(),
