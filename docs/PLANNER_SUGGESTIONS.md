@@ -197,6 +197,24 @@ diagnostics should record both the estimated phase horizon and the finalized
 one. A persistent systematic error for one order is evidence to improve the
 model or measure an additional effect.
 
+### C600 calibration result
+
+The canonical 1,472-tile SigLIP MLP provides a direct comparison because its
+streamed up-projection can use either grid order without changing arithmetic.
+The finalized exchange scheduler closely predicts the measured device phases:
+
+| Grid order | Scheduled exchange cycles | Measured exchange cycles | Error |
+|---|---:|---:|---:|
+| Columns-fast | 472,282 | 484,530 | 2.59% |
+| Rows-fast | 728,710 | 741,414 | 1.74% |
+
+Rows-fast increases the up-projection exchange timeline from 159,852 to 452,958
+cycles and the whole MLP from 1.269 to 1.439 milliseconds. The paired receivers
+do not compensate for the additional physical route pressure. Consequently,
+rows-fast remains represented and lowerable, but is not part of the default
+candidate set. It should be enabled only after a cheap mid-level topology model
+can reproduce the ordering produced by the finalized exchange scheduler.
+
 ### What not to search initially
 
 Do not initially search:
