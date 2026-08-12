@@ -78,7 +78,8 @@ struct Arguments {
     attention_batch: u32,
     #[arg(long, default_value_t = SIGLIP_ATTENTION_HEADS)]
     attention_heads: u32,
-    /// Defaults to four times --mlp-dim.
+    /// Defaults to SigLIP's 4304-wide intermediate for the canonical 1152D
+    /// benchmark, and otherwise to four times --mlp-dim.
     #[arg(long)]
     mlp_hidden_dim: Option<u32>,
     /// Number of sequential MLP blocks, represented by one structured repeat.
@@ -144,6 +145,7 @@ impl Workload {
 const SIGLIP_MLP_BATCH: u32 = 4;
 const SIGLIP_MLP_TOKENS: u32 = 729;
 const SIGLIP_MLP_DIMENSION: u32 = 1152;
+const SIGLIP_MLP_HIDDEN_DIMENSION: u32 = 4304;
 const SIGLIP_ATTENTION_HEADS: u32 = 16;
 const SIGLIP_ATTENTION_TOKENS: u32 = 729;
 const SIGLIP_ATTENTION_HEAD_DIMENSION: u32 = 72;
@@ -209,6 +211,9 @@ fn main() -> Result<()> {
     let benchmark_rows = arguments.benchmark_rows;
     let mlp_hidden_dim = arguments.mlp_hidden_dim.map_or_else(
         || {
+            if arguments.mlp_dim == SIGLIP_MLP_DIMENSION {
+                return Ok(SIGLIP_MLP_HIDDEN_DIMENSION);
+            }
             arguments
                 .mlp_dim
                 .checked_mul(4)
@@ -1285,10 +1290,9 @@ fn validate_mlp_benchmark_shape(
         || dimension == 0
         || hidden_dimension == 0
         || !dimension.is_multiple_of(64)
-        || !hidden_dimension.is_multiple_of(64)
     {
         bail!(
-            "MLP batch/tokens must be nonzero and feature dimensions must be nonzero multiples of 64"
+            "MLP batch/tokens and hidden dimension must be nonzero, and model dimension must be a nonzero multiple of 64"
         );
     }
     Ok(())
