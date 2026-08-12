@@ -161,7 +161,7 @@ pub enum OperatorDispatch {
 /// independent of either producer or consumer operator kinds, so additional
 /// view-like operators can participate without adding pairs of dispatch
 /// special cases.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeferredTransform {
     /// Split the final input axis into `parts` equal-width slices and fold the
     /// new part axis into the leading output axis.
@@ -228,7 +228,7 @@ pub struct DeferredSliceMapping {
     pub destination_source_axes: Vec<usize>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DeferredOutputPlan {
     pub source_input: usize,
     pub transform: DeferredTransform,
@@ -2597,6 +2597,35 @@ struct BeamBranch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FutureValueState {
+    origin: ValueId,
+    tensor_type: TensorType,
+    automatic_input: bool,
+    parameter: bool,
+    allocation_copies: u32,
+    storage_class: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FutureDeferredState {
+    origin: ValueId,
+    source_type: TensorType,
+    source_automatic_input: bool,
+    source_parameter: bool,
+    source_storage_class: u32,
+    transform: DeferredTransform,
+    unfused_cycles: u64,
+    claimed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FutureBeamState {
+    values: Vec<FutureValueState>,
+    deferred: Vec<FutureDeferredState>,
+    equal_formats_satisfied: Vec<(ValueId, ValueId, bool)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct PlanCacheKey {
     input_shapes: Vec<TensorShape>,
     parameter_inputs: Vec<bool>,
@@ -2636,6 +2665,7 @@ fn lower_operations(
                 .iter()
                 .flat_map(|pair| [pair.0, pair.1]),
         )
+        .chain(constraints.allocation_copies.keys().copied())
         .collect::<BTreeSet<_>>();
     let initial = relevant_origins
         .iter()
@@ -2879,6 +2909,7 @@ fn lower_operations(
                     .iter()
                     .flat_map(|pair| [pair.0, pair.1]),
             )
+            .chain(constraints.allocation_copies.keys().copied())
             .collect::<BTreeSet<_>>();
         expanded.sort_by_cached_key(|branch| {
             deferred_aware_branch_score(branch, &future_origins).saturating_add(
@@ -2887,18 +2918,7 @@ fn lower_operations(
         });
         let mut retained_signatures = BTreeSet::new();
         expanded.retain(|branch| {
-            let signature = future_origins
-                .iter()
-                .filter_map(|origin| {
-                    branch.values.get(origin).map(|id| {
-                        (
-                            *origin,
-                            branch.state.get(*id).tensor_type.clone(),
-                            branch.state.automatic_inputs.contains(id),
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
+            let signature = future_beam_state(branch, &future_origins, constraints);
             retained_signatures.insert(signature)
         });
         expanded.truncate(config.planning_beam_width.max(1));
@@ -2924,6 +2944,93 @@ fn lower_operations(
     *values = best.values;
     *state = best.state;
     Ok(best.operations)
+}
+
+fn future_beam_state(
+    branch: &BeamBranch,
+    future_origins: &BTreeSet<ValueId>,
+    constraints: &RegionPlanningConstraints,
+) -> FutureBeamState {
+    let claims = deferred_claims(&branch.operations);
+    let mut storage_classes = BTreeMap::<MidValueId, u32>::new();
+    let mut next_storage_class = 0u32;
+    let mut storage_class = |id: MidValueId| {
+        let group = branch.state.get(id).storage_group;
+        *storage_classes.entry(group).or_insert_with(|| {
+            let class = next_storage_class;
+            next_storage_class += 1;
+            class
+        })
+    };
+    let mut values = Vec::new();
+    let mut deferred_sources = Vec::new();
+    for &origin in future_origins {
+        let Some(&id) = branch.values.get(&origin) else {
+            continue;
+        };
+        values.push(FutureValueState {
+            origin,
+            tensor_type: branch.state.get(id).tensor_type.clone(),
+            automatic_input: branch.state.automatic_inputs.contains(&id),
+            parameter: branch.state.parameter_values.contains(&id),
+            allocation_copies: constraints
+                .allocation_copies
+                .get(&origin)
+                .copied()
+                .unwrap_or(1),
+            storage_class: storage_class(id),
+        });
+        let offer =
+            branch.operations.iter().rev().find_map(|operation| {
+                (operation.results.first() == Some(&id)).then_some(operation)
+            });
+        let Some((operation, offer)) = offer.and_then(|operation| {
+            operation
+                .operator_plan
+                .as_ref()
+                .and_then(|plan| plan.deferred_output)
+                .map(|offer| (operation, offer))
+        }) else {
+            continue;
+        };
+        let Some(&source) = operation.inputs.get(offer.source_input) else {
+            continue;
+        };
+        deferred_sources.push((origin, id, source, offer));
+    }
+    let deferred = deferred_sources
+        .into_iter()
+        .map(|(origin, result, source, offer)| FutureDeferredState {
+            origin,
+            source_type: branch.state.get(source).tensor_type.clone(),
+            source_automatic_input: branch.state.automatic_inputs.contains(&source),
+            source_parameter: branch.state.parameter_values.contains(&source),
+            source_storage_class: storage_class(source),
+            transform: offer.transform,
+            unfused_cycles: offer.unfused_cycles,
+            claimed: claims.contains(&result),
+        })
+        .collect();
+    let equal_formats_satisfied = constraints
+        .required_equal_formats
+        .iter()
+        .map(|&(left, right)| {
+            let satisfied = branch
+                .values
+                .get(&left)
+                .zip(branch.values.get(&right))
+                .is_some_and(|(&left, &right)| {
+                    branch.state.get(left).tensor_type.format
+                        == branch.state.get(right).tensor_type.format
+                });
+            (left, right, satisfied)
+        })
+        .collect();
+    FutureBeamState {
+        values,
+        deferred,
+        equal_formats_satisfied,
+    }
 }
 
 fn deferred_claims(operations: &[MidOperation]) -> BTreeSet<MidValueId> {
@@ -4185,6 +4292,62 @@ mod tests {
             layout.memory_class = MemoryClass::Ipu21Interleaved;
         }
         format(precision(random), layout)
+    }
+
+    #[test]
+    fn randomized_future_state_is_id_independent_but_preserves_aliasing() {
+        let mut random = fastrand::Rng::with_seed(0x616c_6961_7365_7321);
+        for _ in 0..RANDOM_CASES {
+            let mut graph = ComputeGraph::new();
+            let first = graph.host_input("first", [1]).unwrap();
+            let second = graph.host_input("second", [1]).unwrap();
+            let dummy = graph.host_input("dummy", [1]).unwrap();
+            let tiles = random.u16(1..=64);
+            let tensor_type = TensorType {
+                shape: TensorShape::new([random.u32(1..=128)]),
+                format: random_format(&mut random, tiles),
+            };
+            let aliases = random.bool();
+            let automatic = random.bool();
+            let parameter = random.bool();
+
+            let make_branch = |prepend_dummy: bool, aliases: bool| {
+                let mut state = LoweringState::default();
+                if prepend_dummy {
+                    state.value(dummy, tensor_type.clone());
+                }
+                let first_id = state.value(first, tensor_type.clone());
+                let second_id = if aliases {
+                    state.value_in_storage_group(second, tensor_type.clone(), first_id)
+                } else {
+                    state.value(second, tensor_type.clone())
+                };
+                if automatic {
+                    state.automatic_inputs.extend([first_id, second_id]);
+                }
+                if parameter {
+                    state.parameter_values.extend([first_id, second_id]);
+                }
+                BeamBranch {
+                    values: [(first, first_id), (second, second_id)]
+                        .into_iter()
+                        .collect(),
+                    state,
+                    operations: Vec::new(),
+                }
+            };
+            let future = [first, second].into_iter().collect();
+            let constraints = RegionPlanningConstraints {
+                allocation_copies: [(first, random.u32(1..=8))].into_iter().collect(),
+                required_equal_formats: vec![(first, second)],
+            };
+            let baseline = future_beam_state(&make_branch(false, aliases), &future, &constraints);
+            let renumbered = future_beam_state(&make_branch(true, aliases), &future, &constraints);
+            let changed_aliasing =
+                future_beam_state(&make_branch(true, !aliases), &future, &constraints);
+            assert_eq!(baseline, renumbered);
+            assert_ne!(baseline, changed_aliasing);
+        }
     }
 
     #[test]
