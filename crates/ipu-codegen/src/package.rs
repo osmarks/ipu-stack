@@ -31,6 +31,9 @@ use std::time::Instant;
 const ENTRY_BYTES: u32 = 8;
 const SUPPORT_START: u32 = APPLICATION_LOAD_BASE + ENTRY_BYTES;
 const COMPLETION_ADDRESS: u32 = RUNTIME_STATE_BASE;
+const RUNTIME_EXECUTABLE_START: u32 =
+    (RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES + ipu_package::TILE_MEMORY_ELEMENT_SIZE - 1)
+        & !(ipu_package::TILE_MEMORY_ELEMENT_SIZE - 1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackageBuildError {
@@ -150,7 +153,7 @@ pub fn build_tile_program_package(
     )?;
     memory.reserve(
         "runtime state",
-        RUNTIME_STATE_BASE..RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES,
+        RUNTIME_STATE_BASE..RUNTIME_EXECUTABLE_START,
     )?;
     let mut reserved_data = Vec::new();
     for segment in data {
@@ -385,7 +388,7 @@ fn build_package_from_objects(
     )?;
     memory.reserve(
         "runtime state",
-        RUNTIME_STATE_BASE..RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES,
+        RUNTIME_STATE_BASE..RUNTIME_EXECUTABLE_START,
     )?;
 
     let provisional_placement = build_phase("plan_exchange_storage", || Ok(place(program)?))?;
@@ -1021,7 +1024,7 @@ fn link_runtime(
             regions: vec![
                 (SUPPORT_START, ipu_exchange::EXCHANGE_WINDOW_BASE),
                 (
-                    RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES,
+                    RUNTIME_EXECUTABLE_START,
                     ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
                 ),
             ],

@@ -1783,6 +1783,26 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
         let workers = (1..=6)
             .map(|context| runtime.device().tile_context_state(physical, context))
             .collect::<Result<Vec<_>, _>>();
+        let worker_program_counters = workers
+            .as_ref()
+            .ok()
+            .map(|states| {
+                states
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, state)| **state != 0)
+                    .map(|(worker, _)| {
+                        let context = u32::try_from(worker + 1).expect("worker context fits u32");
+                        (
+                            context,
+                            runtime
+                                .device()
+                                .read_tile_program_counter(physical, context),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         contexts.push((
             physical,
             state,
@@ -1793,6 +1813,7 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
             exchange_state,
             exchange_receive_error,
             workers,
+            worker_program_counters,
         ));
     }
     format!("{} contexts={contexts:?}", summarize_states(&states))

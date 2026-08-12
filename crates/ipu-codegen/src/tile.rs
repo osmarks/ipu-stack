@@ -98,24 +98,6 @@ impl<'a> TileProgramLowering<'a> {
             .iter()
             .map(|phase| (phase.id, phase))
             .collect::<BTreeMap<_, _>>();
-        let (slow_copy_count, slow_copy_bytes) =
-            program
-                .local_copies
-                .iter()
-                .try_fold((0usize, 0u64), |mut total, copy| {
-                    if !placed_local_copy(program, placement, copy)?.2 {
-                        total.0 += 1;
-                        total.1 = total.1.saturating_add(u64::from(copy.bytes));
-                    }
-                    Ok::<_, TileLoweringError>(total)
-                })?;
-        if slow_copy_count != 0 {
-            tracing::warn!(
-                copies = slow_copy_count,
-                bytes = slow_copy_bytes,
-                "interleaved local copies share a memory element; using the safe scalar copy path"
-            );
-        }
         Ok(Self {
             program,
             placement,
@@ -178,9 +160,8 @@ fn placed_local_copy(
     program: &LowProgram,
     placement: &Placement,
     copy: &crate::LocalCopy,
-) -> Result<(u32, u32, bool), TileLoweringError> {
+) -> Result<(u32, u32), TileLoweringError> {
     let source_shard = &program.shards[copy.source.index() as usize];
-    let destination_shard = &program.shards[copy.destination.index() as usize];
     let invalid = || TileLoweringError::InvalidLocalCopy {
         tile: source_shard.tile,
         source_shard: copy.source,
@@ -199,14 +180,7 @@ fn placed_local_copy(
         .get(&copy.destination)
         .and_then(|address| address.checked_add(copy.destination_offset))
         .ok_or_else(&invalid)?;
-    let wide_safe = interleaved_copy_elements_are_distinct(
-        source_shard.tensor_type.format.layout.memory_class,
-        destination_shard.tensor_type.format.layout.memory_class,
-        source,
-        destination,
-        copy.bytes,
-    );
-    Ok((source, destination, wide_safe))
+    Ok((source, destination))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -240,18 +214,17 @@ fn lower_work(
                 })
             }
             TileWorkRef::LocalCopy(copy) => {
-                let (source, destination, wide_safe) = placed_local_copy(program, placement, copy)?;
-                let (symbol, arguments) =
-                    local_copy_call(copy.bytes, wide_safe).ok_or_else(|| {
-                        TileLoweringError::InvalidLocalCopy {
-                            tile: tile.tile,
-                            source_shard: copy.source,
-                            source_offset: copy.source_offset,
-                            destination_shard: copy.destination,
-                            destination_offset: copy.destination_offset,
-                            bytes: copy.bytes,
-                        }
-                    })?;
+                let (source, destination) = placed_local_copy(program, placement, copy)?;
+                let (symbol, arguments) = local_copy_call(copy.bytes).ok_or_else(|| {
+                    TileLoweringError::InvalidLocalCopy {
+                        tile: tile.tile,
+                        source_shard: copy.source,
+                        source_offset: copy.source_offset,
+                        destination_shard: copy.destination,
+                        destination_offset: copy.destination_offset,
+                        bytes: copy.bytes,
+                    }
+                })?;
                 TileStep::Compute(crate::ComputeStep {
                     symbol: symbol.into(),
                     output_address: TileAddress::Absolute(destination),
@@ -286,27 +259,8 @@ fn lower_work(
     Ok(steps)
 }
 
-fn interleaved_copy_elements_are_distinct(
-    source_class: crate::MemoryClass,
-    destination_class: crate::MemoryClass,
-    source: u32,
-    destination: u32,
-    bytes: u32,
-) -> bool {
-    if source_class != crate::MemoryClass::Ipu21Interleaved
-        || destination_class != crate::MemoryClass::Ipu21Interleaved
-        || bytes == 0
-    {
-        return true;
-    }
-    let element = ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE;
-    let source_last = source.saturating_add(bytes - 1);
-    let destination_last = destination.saturating_add(bytes - 1);
-    source / element > destination_last / element || destination / element > source_last / element
-}
-
-fn local_copy_call(bytes: u32, wide_safe: bool) -> Option<(&'static str, Vec<u32>)> {
-    if wide_safe && bytes >= 6 * 8 && bytes.is_multiple_of(8) {
+fn local_copy_call(bytes: u32) -> Option<(&'static str, Vec<u32>)> {
+    if bytes >= 6 * 8 && bytes.is_multiple_of(8) {
         let words = bytes / 8;
         Some((crate::COPY_U64_SYMBOL, vec![words / 6, words % 6]))
     } else if bytes != 0 && bytes.is_multiple_of(4) {
@@ -714,7 +668,7 @@ mod tests {
         for _ in 0..1_000 {
             let words = random.u32(1..=4_096);
             let bytes = words * 4;
-            let (symbol, arguments) = local_copy_call(bytes, true).unwrap();
+            let (symbol, arguments) = local_copy_call(bytes).unwrap();
             if symbol == crate::COPY_U64_SYMBOL {
                 assert!(arguments[0] != 0);
                 assert_eq!((arguments[0] * 6 + arguments[1]) * 8, bytes);
