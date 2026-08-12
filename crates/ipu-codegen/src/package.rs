@@ -1021,6 +1021,11 @@ fn diagnostic_tensor(
         low_value
             .shards
             .iter()
+            .filter(|id| {
+                low.shards
+                    .get(id.index() as usize)
+                    .is_some_and(|shard| shard.definition != crate::ShardDefinition::Unmaterialized)
+            })
             .map(|id| {
                 let storage = low
                     .shards
