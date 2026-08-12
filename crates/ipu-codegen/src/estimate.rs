@@ -348,14 +348,13 @@ pub(crate) fn operator_memory_estimate(
         },
     );
     let mut temporary = MemoryUsage::default();
+    let mut maximum_standard_temporary_allocation = 0u64;
     if let (
         OperatorDispatch::BlockedGemm {
-            output_column_block,
+            output_column_block: _,
             distribution:
-                GemmDistribution::ActivationStationaryReduction {
-                    reduction_fan_in,
-                    staged_output_panels,
-                    ..
+                GemmDistribution::ParallelReduction {
+                    reduction_fan_in, ..
                 },
             ..
         },
@@ -363,27 +362,36 @@ pub(crate) fn operator_memory_estimate(
         Some(right),
     ) = (dispatch, inputs.first(), inputs.get(1))
     {
-        let inner_axis = left.shape.0.len().saturating_sub(1);
-        let inner = maximum_axis_shard_extent(left, inner_axis);
-        temporary.interleaved = inner
-            .saturating_mul(u64::from(*output_column_block))
-            .saturating_mul(u64::from(*staged_output_panels))
-            .saturating_mul(right.format.precision.bytes());
+        let right_staging = maximum_shard_bytes(right);
+        temporary.add_class(MemoryClass::Ipu21Interleaved, right_staging);
+        if requirements.inputs.first().is_some_and(|requirement| {
+            requirement.materialization == OperandMaterialization::DispatchSlices
+        }) {
+            let left_staging = maximum_shard_bytes(left);
+            temporary.add_class(left.format.layout.memory_class, left_staging);
+            if left.format.layout.memory_class == MemoryClass::Ipu21Standard {
+                maximum_standard_temporary_allocation =
+                    maximum_standard_temporary_allocation.max(left_staging);
+            }
+        }
         // Non-root tiles retain one local partial and one buffer for every
         // additional input collected by a reduction group. Root output storage
         // is already included in live memory.
-        let output_columns =
-            maximum_axis_shard_extent(output, output.shape.0.len().saturating_sub(1));
-        let partial_bytes = maximum_shard_bytes(output)
-            .saturating_mul(u64::from(*output_column_block))
-            .div_ceil(output_columns);
-        temporary.standard = partial_bytes
-            .saturating_mul(u64::from(*staged_output_panels))
-            .saturating_mul(u64::from(*reduction_fan_in));
+        let partial_bytes = maximum_shard_bytes(output);
+        temporary.interleaved = temporary.interleaved.saturating_add(
+            partial_bytes.saturating_mul(u64::from(reduction_fan_in.saturating_sub(1))),
+        );
     }
     if let (OperatorDispatch::BlockedGemm { inner_block, .. }, Some(left), Some(requirement)) =
         (dispatch, inputs.first(), requirements.inputs.first())
         && requirement.materialization == OperandMaterialization::DispatchSlices
+        && !matches!(
+            dispatch,
+            OperatorDispatch::BlockedGemm {
+                distribution: GemmDistribution::ParallelReduction { .. },
+                ..
+            }
+        )
     {
         let inner = left.shape.0.last().copied().map_or(1, u64::from).max(1);
         let bytes = maximum_shard_bytes(left)
@@ -404,7 +412,7 @@ pub(crate) fn operator_memory_estimate(
         && !matches!(
             dispatch,
             OperatorDispatch::BlockedGemm {
-                distribution: GemmDistribution::ActivationStationaryReduction { .. },
+                distribution: GemmDistribution::ParallelReduction { .. },
                 ..
             }
         )
@@ -488,6 +496,7 @@ pub(crate) fn operator_memory_estimate(
         temporary,
         peak: live.saturating_add(temporary),
         exchange_row_bytes: 0,
+        maximum_standard_temporary_allocation,
     }
 }
 
@@ -590,6 +599,7 @@ pub(crate) fn conversion_memory_estimate(
         temporary: MemoryUsage::default(),
         peak: live,
         exchange_row_bytes: 0,
+        maximum_standard_temporary_allocation: 0,
     }
 }
 
@@ -656,7 +666,23 @@ pub(crate) fn region_peak_memory_with_multiplicity(
         for result in &operation.results {
             during_values.insert(*result);
         }
-        observe(&mut peaks, &during_values, operation.memory.temporary);
+        let roots = during_values
+            .iter()
+            .map(|id| allocation_root(*id, &streamed_aliases))
+            .collect::<BTreeSet<_>>();
+        let live = roots.iter().fold(MemoryUsage::default(), |usage, id| {
+            let allocation = value_allocation(*id, values, &requirements);
+            let copies = u64::from(allocation_multiplicity.get(id).copied().unwrap_or(1));
+            usage.saturating_add(MemoryUsage {
+                standard: allocation.standard.saturating_mul(copies),
+                interleaved: allocation.interleaved.saturating_mul(copies),
+            })
+        });
+        peaks.observe(
+            live.saturating_add(operation.memory.temporary),
+            maximum_standard_allocation(&roots, values, &requirements)
+                .max(operation.memory.maximum_standard_temporary_allocation),
+        );
         for input in operation_value_inputs(operation) {
             if let Some(remaining) = uses.get_mut(input) {
                 *remaining = remaining.saturating_sub(1);

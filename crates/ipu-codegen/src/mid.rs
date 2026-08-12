@@ -248,12 +248,14 @@ pub struct DeferredInputPlan {
 pub enum GemmDistribution {
     #[default]
     OutputStationary,
-    /// Compute K-partial outputs beside sharded activations, then reduce them
-    /// onto the canonical output owners.
-    ActivationStationaryReduction {
+    /// Distribute independent row, output-column, and K block ranges. Each
+    /// row/K activation shard is replicated over the column groups, computes
+    /// one local partial, and is reduced over K onto the output owner.
+    ParallelReduction {
+        row_partitions: u16,
+        column_partitions: u16,
         inner_partitions: u16,
         reduction_fan_in: u16,
-        staged_output_panels: u16,
     },
 }
 
@@ -449,6 +451,9 @@ pub struct MemoryEstimate {
     pub temporary: MemoryUsage,
     pub peak: MemoryUsage,
     pub exchange_row_bytes: u64,
+    /// Largest phase-local standard-addressed buffer which must fit in one
+    /// contiguous standard-memory range.
+    pub maximum_standard_temporary_allocation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -714,36 +719,29 @@ impl Layout {
         }
     }
 
-    /// AMP left operand split independently over matrix rows and K. This
-    /// stores one activation shard, rather than a replica, on each tile.
-    pub fn amp_left_partitioned_grid(
+    /// AMP left operand for a row-by-column-by-K dispatch grid. K and rows
+    /// are true shards; the column coordinate is a replica because the same
+    /// activation range is consumed by each output-column group.
+    pub fn amp_left_parallel_grid(
         inner: u16,
         tile_count: u16,
         row_partitions: u16,
+        column_partitions: u16,
         inner_partitions: u16,
-        grid_order: GridOrder,
     ) -> Self {
         Self {
             order: ElementOrder::Amp(AmpOrder::Left),
             tiling: TensorTiling {
                 tile_count,
-                replicas: 1,
+                replicas: column_partitions,
                 axes: vec![
                     AxisTiling::new(
                         TensorAxis::FromEnd(1),
                         inner_partitions,
                         u32::from(inner),
                         Padding::Zero,
-                    )
-                    .with_tile_stride(match grid_order {
-                        GridOrder::ColumnsFast => 1,
-                        GridOrder::RowsFast => row_partitions,
-                    }),
-                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject)
-                        .with_tile_stride(match grid_order {
-                            GridOrder::ColumnsFast => inner_partitions,
-                            GridOrder::RowsFast => 1,
-                        }),
+                    ),
+                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
                 ],
             },
             memory_class: MemoryClass::Ipu21Standard,
@@ -1312,6 +1310,27 @@ fn padded_axis_shard_extent(
     Ok(axis_tilings
         .iter()
         .fold(divided, |extent, tiling| extent.max(tiling.block_size)))
+}
+
+fn maximum_padded_axis_shard_extent(
+    tensor: &TensorType,
+    padded: &TensorShape,
+    axis: usize,
+) -> Result<u32, OperatorPlanError> {
+    let Some(tiling) = tensor
+        .format
+        .layout
+        .tiling
+        .axes
+        .iter()
+        .find(|tiling| tiling.axis.resolve(padded.0.len()).ok() == Some(axis))
+    else {
+        return Ok(padded.0[axis]);
+    };
+    let blocks = padded.0[axis] / tiling.block_size;
+    Ok(blocks
+        .div_ceil(u32::from(tiling.partitions))
+        .saturating_mul(tiling.block_size))
 }
 
 fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
@@ -2090,13 +2109,16 @@ impl OperatorPlan {
                     accumulate,
                     inner_block,
                     output_column_block,
-                    distribution: _,
+                    distribution,
                 },
             ) => {
                 let [left, right] = inputs else {
                     return Err(OperatorPlanError::OperandArity);
                 };
-                if left.format.layout.tiling.tile_count != output.format.layout.tiling.tile_count {
+                if matches!(distribution, GemmDistribution::OutputStationary)
+                    && left.format.layout.tiling.tile_count
+                        != output.format.layout.tiling.tile_count
+                {
                     return Err(OperatorPlanError::IncompatibleTileGroups);
                 }
                 if options.transpose_left
@@ -2169,7 +2191,15 @@ impl OperatorPlan {
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
                 let output_column_axis = output_padded.0.len() - 1;
                 let columns_per_output_shard =
-                    padded_axis_shard_extent(output, &output_padded, output_column_axis)?;
+                    if matches!(distribution, GemmDistribution::ParallelReduction { .. }) {
+                        maximum_padded_axis_shard_extent(
+                            output,
+                            &output_padded,
+                            output_column_axis,
+                        )?
+                    } else {
+                        padded_axis_shard_extent(output, &output_padded, output_column_axis)?
+                    };
                 let right_padded = right
                     .format
                     .layout
@@ -2177,7 +2207,11 @@ impl OperatorPlan {
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
                 let right_column_axis = right_padded.0.len() - 1;
                 let columns_per_right_shard =
-                    padded_axis_shard_extent(right, &right_padded, right_column_axis)?;
+                    if matches!(distribution, GemmDistribution::ParallelReduction { .. }) {
+                        maximum_padded_axis_shard_extent(right, &right_padded, right_column_axis)?
+                    } else {
+                        padded_axis_shard_extent(right, &right_padded, right_column_axis)?
+                    };
                 let grid_plan = left.format.layout.tiling.replicas > 1
                     || right.format.layout.tiling.replicas > 1
                     || right
@@ -3708,9 +3742,7 @@ fn plans(
             candidate.output.format.layout.tiling = actual.format.layout.tiling.clone();
         }
         let mut variants = vec![candidate.clone()];
-        variants.extend(activation_stationary_reduction_candidates(
-            &candidate, inputs,
-        ));
+        variants.extend(parallel_reduction_candidates(&candidate, inputs));
         for (input_index, _) in parameter_inputs
             .iter()
             .enumerate()
@@ -3835,7 +3867,7 @@ fn independent_parameter_storage(
         .collect()
 }
 
-fn activation_stationary_reduction_candidates(
+fn parallel_reduction_candidates(
     candidate: &OperatorCandidate,
     inputs: &[TensorType],
 ) -> Vec<OperatorCandidate> {
@@ -3872,12 +3904,12 @@ fn activation_stationary_reduction_candidates(
     let Some(&columns) = right.shape.0.last() else {
         return Vec::new();
     };
-    if !inner.is_multiple_of(AMP_INNER_BLOCK) || !columns.is_multiple_of(output_column_block) {
-        return Vec::new();
-    }
+    // Generate this family once for each kernel width. The ordinary grid
+    // candidates include this all-columns seed even when it is not itself a
+    // legal plan for the concrete tensor.
     let tile_count = candidate.output.format.layout.tiling.tile_count;
-    let output_blocks = columns / output_column_block;
-    let Ok(inner_blocks) = u16::try_from(inner / AMP_INNER_BLOCK) else {
+    let output_blocks = columns.div_ceil(output_column_block);
+    let Ok(inner_blocks) = u16::try_from(inner.div_ceil(AMP_INNER_BLOCK)) else {
         return Vec::new();
     };
     let Ok(output_blocks) = u16::try_from(output_blocks) else {
@@ -3892,163 +3924,144 @@ fn activation_stationary_reduction_candidates(
         .iter()
         .find(|axis| axis.axis == TensorAxis::FromEnd(1))
         .map(|axis| axis.partitions);
-    let right_seed = &candidate.inputs[1].format.layout;
-    let right_seed_inner_partitions = right_seed
-        .tiling
-        .axes
+    if output_seed_partitions != Some(tile_count)
+        || candidate.inputs[1].format.layout.memory_class != MemoryClass::Ipu21Standard
+        || candidate.inputs[1].local_staging != LocalOperandStaging::Direct
+    {
+        return Vec::new();
+    }
+    let rows = left.shape.0[left.shape.0.len() - 2];
+    let outer_rows = left.shape.0[..left.shape.0.len() - 2]
         .iter()
-        .find(|axis| axis.axis == TensorAxis::FromEnd(2))
-        .map(|axis| axis.partitions);
-    if output_seed_partitions != Some(output_blocks)
-        || right_seed.order != ElementOrder::Amp(AmpOrder::RightK64)
-        || right_seed.memory_class != MemoryClass::Ipu21Interleaved
-        || right_seed_inner_partitions != Some(1)
-    {
-        return Vec::new();
+        .copied()
+        .fold(1u64, |product, extent| {
+            product.saturating_mul(u64::from(extent))
+        });
+    let mut grids = Vec::new();
+    for inner_partitions in 2..=inner_blocks.min(tile_count) {
+        if !tile_count.is_multiple_of(inner_partitions) {
+            continue;
+        }
+        let remaining = tile_count / inner_partitions;
+        for column_partitions in 1..=output_blocks.min(remaining) {
+            if !remaining.is_multiple_of(column_partitions) {
+                continue;
+            }
+            let row_partitions = remaining / column_partitions;
+            if u32::from(row_partitions) > rows {
+                continue;
+            }
+            let local_rows = rows.div_ceil(u32::from(row_partitions));
+            let local_columns = u32::from(output_blocks).div_ceil(u32::from(column_partitions));
+            let local_inner = u32::from(inner_blocks).div_ceil(u32::from(inner_partitions));
+            let compute = u64::from(local_rows)
+                .saturating_mul(u64::from(local_columns))
+                .saturating_mul(u64::from(local_inner));
+            let communication = u64::from(local_columns)
+                .saturating_mul(u64::from(local_inner))
+                .saturating_add(u64::from(local_rows).saturating_mul(u64::from(local_inner)))
+                .saturating_add(
+                    u64::from(local_rows)
+                        .saturating_mul(u64::from(local_columns))
+                        .saturating_mul(u64::from(inner_partitions - 1)),
+                );
+            let left_bytes = outer_rows
+                .saturating_mul(u64::from(local_rows))
+                .saturating_mul(u64::from(local_inner))
+                .saturating_mul(u64::from(AMP_INNER_BLOCK))
+                .saturating_mul(candidate.inputs[0].format.precision.bytes());
+            let right_bytes = u64::from(local_columns)
+                .saturating_mul(u64::from(output_column_block))
+                .saturating_mul(u64::from(local_inner))
+                .saturating_mul(u64::from(AMP_INNER_BLOCK))
+                .saturating_mul(candidate.inputs[1].format.precision.bytes());
+            let partial_bytes = outer_rows
+                .saturating_mul(u64::from(local_rows))
+                .saturating_mul(u64::from(local_columns))
+                .saturating_mul(u64::from(output_column_block))
+                .saturating_mul(candidate.output.format.precision.bytes());
+            let reduction_fan_in = inner_partitions.min(4);
+            let temporary_bytes = left_bytes
+                .saturating_add(right_bytes)
+                .saturating_add(partial_bytes.saturating_mul(u64::from(reduction_fan_in - 1)));
+            if temporary_bytes > u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES) {
+                continue;
+            }
+            if right_bytes.saturating_add(partial_bytes.saturating_mul(u64::from(reduction_fan_in)))
+                > u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+            {
+                continue;
+            }
+            grids.push((
+                compute,
+                communication,
+                temporary_bytes,
+                row_partitions,
+                column_partitions,
+                inner_partitions,
+            ));
+        }
     }
-    if output_blocks
-        .checked_mul(inner_blocks)
-        .is_none_or(|tiles| tiles > tile_count)
-    {
-        return Vec::new();
-    }
-    (2..=output_blocks.min(inner_blocks).min(tile_count))
-        .filter(|partitions| {
-            output_blocks.is_multiple_of(*partitions)
-                && inner_blocks.is_multiple_of(*partitions)
-                && tile_count.is_multiple_of(*partitions)
-        })
-        .filter_map(|inner_partitions| {
-            let row_partitions = tile_count / inner_partitions;
-            let row_axes = flattened_row_partition_axes(&left.shape, row_partitions)?;
-            let mut partial = candidate.clone();
-            let mut left_layout = Layout::amp_left_partitioned_grid(
+    grids.sort_unstable();
+    grids.truncate(1);
+    let mut variants = Vec::new();
+    for (_, _, _, row_partitions, column_partitions, inner_partitions) in grids {
+        let reduction_fan_in = inner_partitions.min(4);
+        for memory_class in [MemoryClass::Ipu21Standard, MemoryClass::Ipu21Interleaved] {
+            let mut variant = candidate.clone();
+            variant.inputs[0].format.layout = Layout::amp_left_parallel_grid(
                 AMP_INNER_BLOCK as u16,
                 tile_count,
                 row_partitions,
+                column_partitions,
                 inner_partitions,
-                GridOrder::ColumnsFast,
             );
-            left_layout.tiling.axes.truncate(1);
-            left_layout.tiling.axes.extend(row_axes.iter().copied());
-            partial.inputs[0].format.layout = left_layout;
-            partial.inputs[1].format.layout = Layout::amp_right_k64_storage(
+            variant.inputs[1].format.layout = Layout::amp_right_k64_storage(
                 output_column_block,
-                output_blocks,
-                inner_blocks,
+                column_partitions,
+                inner_partitions,
                 1,
-                MemoryClass::Ipu21Interleaved,
+                memory_class,
             );
-            let mut output_layout = Layout::amp_output_grid(
+            variant.output.format.layout = Layout::amp_output_grid(
                 output_column_block,
-                tile_count,
+                row_partitions.saturating_mul(column_partitions),
                 row_partitions,
-                inner_partitions,
+                column_partitions,
                 GridOrder::ColumnsFast,
             );
-            output_layout.tiling.axes.truncate(1);
-            output_layout.tiling.axes.extend(row_axes);
-            partial.output.format.layout = output_layout;
-            Some((inner_partitions, partial))
-        })
-        .flat_map(|(inner_partitions, partial)| {
-            let inner_per_partition = inner / u32::from(inner_partitions);
-            [AMP_INNER_BLOCK, AMP_INNER_BLOCK * 2, AMP_INNER_BLOCK * 4]
-                .into_iter()
-                .filter(move |block| {
-                    inner_per_partition.is_multiple_of(*block)
-                        && block.saturating_mul(output_column_block).saturating_mul(2)
-                            < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
-                })
-                .flat_map(move |inner_block| {
-                    let partial = partial.clone();
-                    [2, 3, 4]
-                        .into_iter()
-                        .filter(move |&fan_in| fan_in <= inner_partitions)
-                        .flat_map(move |reduction_fan_in| {
-                            let partial = partial.clone();
-                            [1, 2, 4]
-                                .into_iter()
-                                .filter(move |panels| *panels <= output_blocks)
-                                .map(move |staged_output_panels| {
-                                    (
-                                        inner_partitions,
-                                        inner_block,
-                                        reduction_fan_in,
-                                        staged_output_panels,
-                                        partial.clone(),
-                                    )
-                                })
-                        })
-                })
-        })
-        .map(
-            |(
-                inner_partitions,
-                inner_block,
-                reduction_fan_in,
-                staged_output_panels,
-                mut variant,
-            )| {
-                if let OperatorDispatch::BlockedGemm {
-                    initialize,
-                    accumulate,
-                    inner_block: dispatch_inner_block,
-                    distribution,
-                    ..
-                } = &mut variant.dispatch
-                {
-                    *dispatch_inner_block = inner_block;
-                    if let TileKernelSpec::Gemm {
-                        inner_block: kernel_inner_block,
-                        ..
-                    } = initialize
-                    {
-                        *kernel_inner_block = inner_block;
-                    }
-                    if let TileKernelSpec::Gemm {
-                        inner_block: kernel_inner_block,
-                        ..
-                    } = accumulate
-                    {
-                        *kernel_inner_block = inner_block;
-                    }
-                    *distribution = GemmDistribution::ActivationStationaryReduction {
-                        inner_partitions,
-                        reduction_fan_in,
-                        staged_output_panels,
+            if let OperatorDispatch::BlockedGemm {
+                initialize,
+                accumulate,
+                distribution,
+                ..
+            } = &mut variant.dispatch
+            {
+                if let TileKernelSpec::Gemm { weights, .. } = initialize {
+                    *weights = if memory_class == MemoryClass::Ipu21Interleaved {
+                        GemmWeightLoad::Interleaved
+                    } else {
+                        GemmWeightLoad::Standard
                     };
                 }
-                variant
-            },
-        )
-        .collect()
-}
-
-fn flattened_row_partition_axes(shape: &TensorShape, partitions: u16) -> Option<Vec<AxisTiling>> {
-    let mut remaining = u32::from(partitions);
-    let mut axes = Vec::new();
-    for from_end in 2..=shape.0.len() {
-        let dimension = shape.0[shape.0.len() - from_end];
-        let factor = greatest_common_divisor(remaining, dimension);
-        if factor > 1 {
-            axes.push(AxisTiling::new(
-                TensorAxis::FromEnd(u16::try_from(from_end).ok()?),
-                u16::try_from(factor).ok()?,
-                1,
-                Padding::Reject,
-            ));
-            remaining /= factor;
+                if let TileKernelSpec::Gemm { weights, .. } = accumulate {
+                    *weights = if memory_class == MemoryClass::Ipu21Interleaved {
+                        GemmWeightLoad::Interleaved
+                    } else {
+                        GemmWeightLoad::Standard
+                    };
+                }
+                *distribution = GemmDistribution::ParallelReduction {
+                    row_partitions,
+                    column_partitions,
+                    inner_partitions,
+                    reduction_fan_in,
+                };
+            }
+            variants.push(variant);
         }
     }
-    (remaining == 1).then_some(axes)
-}
-
-fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
-    while right != 0 {
-        (left, right) = (right, left % right);
-    }
-    left
+    variants
 }
 
 fn resolved_output_aliasing(
@@ -4305,6 +4318,7 @@ fn lower_repeat(
             temporary: MemoryUsage::default(),
             peak: body_peak.conservative_tensor_usage(),
             exchange_row_bytes: body_exchange_row_bytes,
+            maximum_standard_temporary_allocation: 0,
         },
     });
     Ok(())
@@ -4543,19 +4557,18 @@ mod tests {
     }
 
     #[test]
-    fn randomized_activation_stationary_candidates_partition_k_without_replication() {
+    fn randomized_parallel_reduction_candidates_cover_uneven_three_axis_grids() {
         let mut random = fastrand::Rng::with_seed(0x7061_7274_6961_6c73);
         for _ in 0..RANDOM_CASES {
             let output_columns =
                 [AMP_OUTPUT_COLUMN_BLOCK, AMP_WIDE_OUTPUT_COLUMN_BLOCK][random.usize(0..2)];
             let inner_partitions = random.u16(2..=4);
-            let multiplier = random.u16(1..=8 / inner_partitions);
-            let inner_blocks = inner_partitions * multiplier;
-            let row_partitions = random.u16(inner_blocks..=8);
-            let tiles = row_partitions * inner_partitions;
-            let k = u32::from(inner_blocks) * 64;
-            let n = u32::from(inner_partitions) * output_columns;
-            let m = u32::from(row_partitions) * random.u32(1..=8);
+            let column_partitions = random.u16(1..=4);
+            let row_partitions = random.u16(1..=8);
+            let tiles = row_partitions * column_partitions * inner_partitions;
+            let k = u32::from(inner_partitions) * 64 + random.u32(0..64);
+            let n = u32::from(column_partitions) * output_columns + random.u32(0..output_columns);
+            let m = u32::from(row_partitions) + random.u32(0..=16);
             let base = amp_grid_gemm_operator_candidate(
                 Precision::F16,
                 64,
@@ -4563,68 +4576,38 @@ mod tests {
                 output_columns,
                 AmpGridShape {
                     tile_count: tiles,
-                    row_partitions,
-                    column_partitions: inner_partitions,
+                    row_partitions: 1,
+                    column_partitions: tiles,
                     order: GridOrder::ColumnsFast,
                 },
-                AmpWeightPlacement::resident(MemoryClass::Ipu21Interleaved),
+                AmpWeightPlacement::resident(MemoryClass::Ipu21Standard),
             );
             let inputs = [
                 TensorType::new([m, k], Precision::F16, Layout::row_sharded(tiles)),
                 TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
             ];
-            let candidates = activation_stationary_reduction_candidates(&base, &inputs);
-            let expected = (2..=inner_partitions.min(inner_blocks).min(tiles))
-                .filter(|partitions| {
-                    inner_partitions.is_multiple_of(*partitions)
-                        && inner_blocks.is_multiple_of(*partitions)
-                        && tiles.is_multiple_of(*partitions)
-                        && m.is_multiple_of(u32::from(tiles / partitions))
-                })
-                .map(|partitions| {
-                    let inner_per_partition = k / u32::from(partitions);
-                    let fused_widths = [64, 128, 256]
-                        .into_iter()
-                        .filter(|width| {
-                            inner_per_partition.is_multiple_of(*width)
-                                && width.saturating_mul(output_columns).saturating_mul(2)
-                                    < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
-                        })
-                        .count();
-                    let panel_counts = [1, 2, 4]
-                        .into_iter()
-                        .filter(|panels| *panels <= inner_partitions)
-                        .count();
-                    fused_widths * usize::from(partitions.min(4) - 1) * panel_counts
-                })
-                .sum::<usize>();
-            assert_eq!(candidates.len(), expected);
+            let candidates = parallel_reduction_candidates(&base, &inputs);
+            assert!(!candidates.is_empty());
+            assert!(candidates.len() <= 16);
             for candidate in candidates {
-                assert!(candidate.supports(&inputs, &TensorShape(vec![m, n])));
-                assert_eq!(candidate.inputs[0].format.layout.tiling.replicas, 1);
+                assert!(
+                    candidate.supports(&inputs, &TensorShape(vec![m, n])),
+                    "unsupported candidate: {candidate:?}; shape={m}x{k}x{n}"
+                );
                 assert!(matches!(
                     candidate.dispatch,
                     OperatorDispatch::BlockedGemm {
-                        inner_block,
-                        output_column_block: actual_columns,
-                        distribution: GemmDistribution::ActivationStationaryReduction {
+                        distribution: GemmDistribution::ParallelReduction {
+                            row_partitions: actual_rows,
+                            column_partitions: actual_columns,
                             inner_partitions: actual,
-                            reduction_fan_in,
-                            staged_output_panels,
+                            ..
                         },
                         ..
-                    } if actual_columns == output_columns
-                        && inner_partitions.is_multiple_of(actual)
-                        && inner_blocks.is_multiple_of(actual)
-                        && tiles.is_multiple_of(actual)
-                        && m.is_multiple_of(u32::from(tiles / actual))
-                        && matches!(inner_block, 64 | 128 | 256)
-                        && (k / u32::from(actual)).is_multiple_of(inner_block)
-                        && inner_block * output_columns * 2
-                            < ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
-                        && (2..=actual.min(4)).contains(&reduction_fan_in)
-                        && matches!(staged_output_panels, 1 | 2 | 4)
-                        && staged_output_panels <= inner_partitions
+                    } if actual_rows * actual_columns * actual == tiles
+                        && u32::from(actual_rows) <= m
+                        && u32::from(actual_columns) <= n.div_ceil(output_columns)
+                        && u32::from(actual) <= k.div_ceil(AMP_INNER_BLOCK)
                 ));
             }
         }

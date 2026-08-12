@@ -405,7 +405,7 @@ impl CostModel for Ipu21CostModel {
                 let compute_k = match dispatch {
                     OperatorDispatch::BlockedGemm {
                         distribution:
-                            GemmDistribution::ActivationStationaryReduction {
+                            GemmDistribution::ParallelReduction {
                                 inner_partitions, ..
                             },
                         ..
@@ -420,17 +420,8 @@ impl CostModel for Ipu21CostModel {
                 let output_elements_per_tile = spatial_occupancy_adjusted_elements;
                 let output_columns_per_tile =
                     maximum_axis_shard_extent(output, output.shape.0.len().saturating_sub(1));
-                let (kernel_output_elements, kernel_output_columns) = match dispatch {
-                    OperatorDispatch::BlockedGemm {
-                        distribution: GemmDistribution::ActivationStationaryReduction { .. },
-                        ..
-                    } => {
-                        let columns = output.shape.0.last().copied().map_or(1, u64::from);
-                        let rows = output_elements_per_tile.div_ceil(output_columns_per_tile);
-                        (rows.saturating_mul(columns), columns)
-                    }
-                    _ => (output_elements_per_tile, output_columns_per_tile),
-                };
+                let kernel_output_elements = output_elements_per_tile;
+                let kernel_output_columns = output_columns_per_tile;
                 let arithmetic = kernel_output_elements
                     .saturating_mul(2)
                     .saturating_mul(compute_k)
@@ -533,55 +524,52 @@ impl CostModel for Ipu21CostModel {
                         gemm_exchange_phase_count(dispatch, inputs, output)
                             .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles),
                     );
-                let exchange =
-                    match dispatch {
-                        OperatorDispatch::BlockedGemm {
-                            output_column_block,
-                            distribution:
-                                GemmDistribution::ActivationStationaryReduction {
-                                    inner_partitions,
-                                    reduction_fan_in,
-                                    staged_output_panels,
-                                },
-                            ..
-                        } => {
-                            let partitions = u64::from(*inner_partitions);
-                            let columns = output.shape.0.last().copied().map_or(1, u64::from);
-                            let column_groups = columns.div_ceil(u64::from(*output_column_block));
-                            let exchange_epochs =
-                                column_groups.div_ceil(u64::from(*staged_output_panels));
-                            let local_k = k.div_ceil(partitions);
-                            let weight_bytes = local_k
-                                .saturating_mul(columns)
-                                .saturating_mul(inputs[1].format.precision.bytes());
-                            let (rounds, reduction_additions) =
-                                reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
-                            let partial_bytes = maximum_shard_bytes(output)
-                                .saturating_mul(u64::from(*output_column_block))
-                                .div_ceil(output_columns_per_tile);
-                            weight_bytes
-                                .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
-                                .saturating_add(
-                                    column_groups
-                                        .saturating_mul(reduction_additions)
-                                        .saturating_mul(partial_bytes)
-                                        .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle),
-                                )
-                                .saturating_add(
-                                    exchange_epochs
-                                        .saturating_mul(rounds.saturating_add(1))
-                                        .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles),
-                                )
-                                .saturating_add(
-                                    column_groups
-                                        .saturating_mul(reduction_additions)
-                                        .saturating_mul(partial_bytes.div_ceil(12).saturating_add(
-                                            IPU21_TARGET_COSTS.kernel_launch_cycles,
-                                        )),
-                                )
-                        }
-                        _ => exchange,
-                    };
+                let exchange = match dispatch {
+                    OperatorDispatch::BlockedGemm {
+                        output_column_block: _,
+                        distribution:
+                            GemmDistribution::ParallelReduction {
+                                column_partitions,
+                                inner_partitions,
+                                reduction_fan_in,
+                                ..
+                            },
+                        ..
+                    } => {
+                        let partitions = u64::from(*inner_partitions);
+                        let columns = output.shape.0.last().copied().map_or(1, u64::from);
+                        let exchange_epochs = 1u64;
+                        let local_k = k.div_ceil(partitions);
+                        let weight_bytes = local_k
+                            .saturating_mul(columns.div_ceil(u64::from(*column_partitions)))
+                            .saturating_mul(inputs[1].format.precision.bytes());
+                        let activation_bytes = maximum_shard_bytes(&inputs[0]);
+                        let (rounds, reduction_additions) =
+                            reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
+                        let partial_bytes = maximum_shard_bytes(output);
+                        weight_bytes
+                            .saturating_add(activation_bytes)
+                            .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+                            .saturating_add(
+                                reduction_additions
+                                    .saturating_mul(partial_bytes)
+                                    .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle),
+                            )
+                            .saturating_add(
+                                exchange_epochs
+                                    .saturating_mul(rounds.saturating_add(1))
+                                    .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles),
+                            )
+                            .saturating_add(
+                                reduction_additions.saturating_mul(
+                                    partial_bytes
+                                        .div_ceil(12)
+                                        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
+                                ),
+                            )
+                    }
+                    _ => exchange,
+                };
                 let calls = match dispatch {
                     OperatorDispatch::BlockedGemm {
                         inner_block,
@@ -760,18 +748,16 @@ impl CostModel for Ipu21CostModel {
         };
         let phases = match dispatch {
             OperatorDispatch::BlockedGemm {
-                output_column_block,
+                output_column_block: _,
                 distribution:
-                    GemmDistribution::ActivationStationaryReduction {
+                    GemmDistribution::ParallelReduction {
                         inner_partitions,
                         reduction_fan_in,
-                        staged_output_panels,
+                        ..
                     },
                 ..
             } => {
-                let columns = output.shape.0.last().copied().map_or(1, u64::from);
-                let groups = columns.div_ceil(u64::from(*output_column_block));
-                let epochs = groups.div_ceil(u64::from(*staged_output_panels));
+                let epochs = 1u64;
                 let (rounds, _) =
                     reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
                 epochs.saturating_mul(rounds.saturating_add(1))

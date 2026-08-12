@@ -2432,21 +2432,23 @@ impl LoweringState {
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        if let GemmDistribution::ActivationStationaryReduction {
+        if let GemmDistribution::ParallelReduction {
+            row_partitions,
+            column_partitions,
             inner_partitions,
             reduction_fan_in,
-            staged_output_panels,
         } = distribution
         {
-            return self.lower_activation_stationary_gemm(
+            return self.lower_parallel_reduction_gemm(
                 operation,
                 initialize,
                 accumulate,
                 inner_block,
                 output_column_block,
+                row_partitions,
+                column_partitions,
                 inner_partitions,
                 reduction_fan_in,
-                staged_output_panels,
                 requirements,
                 tiles,
             );
@@ -2726,16 +2728,17 @@ impl LoweringState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn lower_activation_stationary_gemm(
+    fn lower_parallel_reduction_gemm(
         &mut self,
         operation: &MidOperation,
         initialize: TileKernelSpec,
         accumulate: TileKernelSpec,
         inner_block: u32,
         output_column_block: u32,
+        row_partitions: u16,
+        column_partitions: u16,
         inner_partitions: u16,
         reduction_fan_in: u16,
-        staged_output_panels: u16,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
@@ -2747,9 +2750,10 @@ impl LoweringState {
         };
         if inner_block == 0
             || output_column_block == 0
+            || row_partitions == 0
+            || column_partitions == 0
             || inner_partitions < 2
             || reduction_fan_in < 2
-            || staged_output_panels == 0
         {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
@@ -2786,11 +2790,46 @@ impl LoweringState {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
 
-        for column_group in columns.chunks(usize::from(staged_output_panels)) {
+        let mut replica_groups = BTreeMap::<Vec<(u32, u32)>, Vec<LowShardId>>::new();
+        for left in left_shards.iter().copied() {
+            let key = self.shards[left.index() as usize]
+                .extents
+                .iter()
+                .map(|extent| (extent.start, extent.physical_end))
+                .collect::<Vec<_>>();
+            replica_groups.entry(key).or_default().push(left);
+        }
+        let mut replica_columns = BTreeMap::<LowShardId, u16>::new();
+        for replicas in replica_groups.values_mut() {
+            replicas.sort_unstable_by_key(|shard| self.shards[shard.index() as usize].tile);
+            if replicas.len() != usize::from(column_partitions) {
+                return Err(LowLoweringError::InvalidOperatorPlan);
+            }
+            for (column, shard) in replicas.iter().copied().enumerate() {
+                replica_columns.insert(
+                    shard,
+                    u16::try_from(column).map_err(|_| LowLoweringError::IdOverflow)?,
+                );
+            }
+        }
+        let mut column_shard_starts = output_shards
+            .iter()
+            .map(|shard| self.shards[shard.index() as usize].extents[output_column_axis].start)
+            .collect::<Vec<_>>();
+        column_shard_starts.sort_unstable();
+        column_shard_starts.dedup();
+        if column_shard_starts.len() != usize::from(column_partitions) {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+
+        {
             let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+            let mut local_copies = Vec::<(u16, LocalCopy)>::new();
             let mut gemm_runs = Vec::<(u16, KernelRun)>::new();
             let mut partials = BTreeMap::<Vec<(u32, u32)>, Vec<(u16, ShardView)>>::new();
-            for &(column_start, column_end) in column_group {
+            let mut resident_lefts = BTreeMap::<LowShardId, ShardView>::new();
+            let mut weight_staging = BTreeMap::<(u16, LowShardId), LowShardId>::new();
+            for &(column_start, column_end) in &columns {
                 let column_outputs = output_shards
                     .iter()
                     .copied()
@@ -2802,6 +2841,25 @@ impl LoweringState {
                     .collect::<Vec<_>>();
                 for left in left_shards.iter().copied() {
                     let left_shard = self.shards[left.index() as usize].clone();
+                    let resident_left = if let Some(view) = resident_lefts.get(&left) {
+                        view.clone()
+                    } else {
+                        let restrictions = left_shard
+                            .extents
+                            .iter()
+                            .enumerate()
+                            .map(|(axis, extent)| (axis, extent.start, extent.physical_end))
+                            .collect::<Vec<_>>();
+                        let view = self.dispatch_input_view(
+                            *left_value,
+                            left_shard.tile,
+                            &restrictions,
+                            &mut transfers,
+                            &mut local_copies,
+                        )?;
+                        resident_lefts.insert(left, view.clone());
+                        view
+                    };
                     let inner = left_shard.extents[left_inner_axis];
                     if !(inner.physical_end - inner.start).is_multiple_of(inner_block) {
                         return Err(LowLoweringError::InvalidOperatorPlan);
@@ -2820,6 +2878,14 @@ impl LoweringState {
                                 })
                         })
                         .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                    let output_column = column_shard_starts
+                        .binary_search(
+                            &self.shards[output.index() as usize].extents[output_column_axis].start,
+                        )
+                        .map_err(|_| LowLoweringError::InvalidOperatorPlan)?;
+                    if replica_columns.get(&left).copied().map(usize::from) != Some(output_column) {
+                        continue;
+                    }
                     let output_tile = self.shards[output.index() as usize].tile;
                     let output_view = self
                         .narrow_view(output, &[(output_column_axis, column_start, column_end)])?;
@@ -2869,13 +2935,25 @@ impl LoweringState {
                     weight_extents[weight_rank - 2].start = inner.start;
                     weight_extents[weight_rank - 2].logical_end = inner.logical_end;
                     weight_extents[weight_rank - 2].physical_end = inner.physical_end;
-                    let weights = self.push_shard(LowShard {
-                        id: LowShardId(0),
-                        tile: left_shard.tile,
-                        tensor_type: weight_type,
-                        extents: weight_extents,
-                        definition: ShardDefinition::ExchangeStaging,
-                    })?;
+                    let weights =
+                        if self.shards[first_source.index() as usize].tile == left_shard.tile {
+                            None
+                        } else {
+                            let key = (left_shard.tile, first_source);
+                            if let Some(staging) = weight_staging.get(&key).copied() {
+                                Some(staging)
+                            } else {
+                                let staging = self.push_shard(LowShard {
+                                    id: LowShardId(0),
+                                    tile: left_shard.tile,
+                                    tensor_type: weight_type,
+                                    extents: weight_extents,
+                                    definition: ShardDefinition::ExchangeStaging,
+                                })?;
+                                weight_staging.insert(key, staging);
+                                Some(staging)
+                            }
+                        };
 
                     for (block_index, inner_start) in (inner.start..inner.physical_end)
                         .step_by(inner_block as usize)
@@ -2905,16 +2983,16 @@ impl LoweringState {
                                     (source_rank - 1, column_start, column_end),
                                 ],
                             )?;
-                            let destination_view = self.narrow_view(
-                                weights,
-                                &[
-                                    (weight_rank - 2, panel_start, panel_end),
-                                    (weight_rank - 1, column_start, column_end),
-                                ],
-                            )?;
                             let local =
                                 self.shards[source.index() as usize].tile == left_shard.tile;
                             if !local {
+                                let destination_view = self.narrow_view(
+                                    weights.ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                                    &[
+                                        (weight_rank - 2, panel_start, panel_end),
+                                        (weight_rank - 1, column_start, column_end),
+                                    ],
+                                )?;
                                 transfers
                                     .entry(source_view.clone())
                                     .or_default()
@@ -2933,7 +3011,7 @@ impl LoweringState {
                                         * AMP_INNER_BLOCK;
                                 let panel_end = panel_start + AMP_INNER_BLOCK;
                                 let left_view = self.narrow_view(
-                                    left,
+                                    resident_left.shard,
                                     &[(left_inner_axis, panel_start, panel_end)],
                                 )?;
                                 let mut kernel = if block_index == 0 && panel_index == 0 {
@@ -2948,13 +3026,17 @@ impl LoweringState {
                                 } = &mut kernel
                                 {
                                     *kernel_inner_block = AMP_INNER_BLOCK;
-                                    *load = if local
-                                        && self.shards[source_view.shard.index() as usize]
-                                            .tensor_type
-                                            .format
-                                            .layout
-                                            .memory_class
-                                            == crate::MemoryClass::Ipu21Standard
+                                    let selected = if local {
+                                        source_view.shard
+                                    } else {
+                                        weights.ok_or(LowLoweringError::InvalidOperatorPlan)?
+                                    };
+                                    *load = if self.shards[selected.index() as usize]
+                                        .tensor_type
+                                        .format
+                                        .layout
+                                        .memory_class
+                                        == crate::MemoryClass::Ipu21Standard
                                     {
                                         crate::GemmWeightLoad::Standard
                                     } else {
@@ -2965,7 +3047,7 @@ impl LoweringState {
                                     source_view
                                 } else {
                                     self.narrow_view(
-                                        weights,
+                                        weights.ok_or(LowLoweringError::InvalidOperatorPlan)?,
                                         &[
                                             (weight_rank - 2, panel_start, panel_end),
                                             (weight_rank - 1, column_start, column_end),
@@ -2997,8 +3079,10 @@ impl LoweringState {
                             continue;
                         }
 
-                        let left_view =
-                            self.narrow_view(left, &[(left_inner_axis, inner_start, inner_end)])?;
+                        let left_view = self.narrow_view(
+                            resident_left.shard,
+                            &[(left_inner_axis, inner_start, inner_end)],
+                        )?;
                         let mut kernel = if block_index == 0 {
                             initialize.clone()
                         } else {
@@ -3011,14 +3095,17 @@ impl LoweringState {
                         } = &mut kernel
                         {
                             *kernel_inner_block = inner_block;
-                            *load = if sources.len() == 1
-                                && sources[0].1
-                                && self.shards[sources[0].0.shard.index() as usize]
-                                    .tensor_type
-                                    .format
-                                    .layout
-                                    .memory_class
-                                    == crate::MemoryClass::Ipu21Standard
+                            let selected = if sources.len() == 1 && sources[0].1 {
+                                sources[0].0.shard
+                            } else {
+                                weights.ok_or(LowLoweringError::InvalidOperatorPlan)?
+                            };
+                            *load = if self.shards[selected.index() as usize]
+                                .tensor_type
+                                .format
+                                .layout
+                                .memory_class
+                                == crate::MemoryClass::Ipu21Standard
                             {
                                 crate::GemmWeightLoad::Standard
                             } else {
@@ -3029,7 +3116,7 @@ impl LoweringState {
                             sources.pop().expect("one source").0
                         } else {
                             self.narrow_view(
-                                weights,
+                                weights.ok_or(LowLoweringError::InvalidOperatorPlan)?,
                                 &[
                                     (weight_rank - 2, inner_start, inner_end),
                                     (weight_rank - 1, column_start, column_end),
@@ -3067,21 +3154,22 @@ impl LoweringState {
                 },
                 tiles,
             )?;
+            for (tile, copy) in local_copies {
+                self.append_local_copy(tiles, tile, copy)?;
+            }
             for (tile, run) in gemm_runs {
                 self.append_kernel(tiles, tile, run)?;
             }
 
             for row_partials in partials.values_mut() {
-                let root = row_partials
-                    .iter()
-                    .position(|(_, view)| {
-                        matches!(
-                            self.shards[view.shard.index() as usize].definition,
-                            ShardDefinition::Value(value) if value == *output_value
-                        )
-                    })
-                    .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-                row_partials.swap(0, root);
+                if let Some(root) = row_partials.iter().position(|(_, view)| {
+                    matches!(
+                        self.shards[view.shard.index() as usize].definition,
+                        ShardDefinition::Value(value) if value == *output_value
+                    )
+                }) {
+                    row_partials.swap(0, root);
+                }
             }
             while partials.values().any(|partials| partials.len() > 1) {
                 let mut reduction_transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
@@ -3144,6 +3232,49 @@ impl LoweringState {
                     self.append_kernel(tiles, tile, run)?;
                 }
             }
+            let mut result_transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+            for row_partials in partials.values() {
+                let [(_, result)] = row_partials.as_slice() else {
+                    return Err(LowLoweringError::InvalidOperatorPlan);
+                };
+                if matches!(
+                    self.shards[result.shard.index() as usize].definition,
+                    ShardDefinition::Value(value) if value == *output_value
+                ) {
+                    continue;
+                }
+                let output = output_shards
+                    .iter()
+                    .copied()
+                    .find(|output| {
+                        self.shards[output.index() as usize]
+                            .extents
+                            .iter()
+                            .zip(&result.extents)
+                            .all(|(owner, extent)| {
+                                owner.start <= extent.start
+                                    && owner.physical_end >= extent.physical_end
+                            })
+                    })
+                    .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                let destination = ShardView {
+                    shard: output,
+                    extents: result.extents.clone(),
+                };
+                result_transfers
+                    .entry(result.clone())
+                    .or_default()
+                    .push(destination);
+            }
+            self.append_phase(
+                result_transfers,
+                WorkProvenance {
+                    operation: operation.source,
+                    value: Some(*output_value),
+                    reason: WorkReason::OperatorInputs,
+                },
+                tiles,
+            )?;
         }
         Ok(())
     }
@@ -4096,19 +4227,20 @@ mod tests {
     }
 
     #[test]
-    fn randomized_activation_stationary_gemms_lower_to_tree_reductions() {
+    fn randomized_parallel_reduction_gemms_lower_to_bulk_exchange_and_tree_reductions() {
         let mut random = fastrand::Rng::with_seed(0x7472_6565_5f6b_7370);
         for case in 0..CASES {
             let output_columns = [64, 128][random.usize(0..2)];
             let inner_partitions = random.u16(2..=4);
+            let column_partitions = random.u16(1..=3);
             let reduction_fan_in = random.u16(2..=inner_partitions.min(4));
             let row_partitions = random.u16(inner_partitions..=8);
-            let tiles = inner_partitions * row_partitions;
+            let tiles = inner_partitions * column_partitions * row_partitions;
             let rows = u32::from(row_partitions) * random.u32(1..=4);
             let inner = u32::from(inner_partitions)
                 * 64
                 * random.u32(1..=u32::from(row_partitions / inner_partitions));
-            let columns = u32::from(inner_partitions) * output_columns;
+            let columns = u32::from(column_partitions) * output_columns;
             let mut graph = ComputeGraph::new();
             let left = graph.host_input("left", [1, rows, inner]).unwrap();
             let right = graph.parameter("right", [1, inner, columns]).unwrap();
@@ -4129,20 +4261,20 @@ mod tests {
             };
             let left_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_left_partitioned_grid(
+                layout: Layout::amp_left_parallel_grid(
                     64,
                     tiles,
                     row_partitions,
+                    column_partitions,
                     inner_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
                 ),
             };
             let right_format = TensorFormat {
                 precision: Precision::F16,
                 layout: Layout::amp_right_k64_storage(
                     output_columns,
+                    column_partitions,
                     inner_partitions,
-                    u16::try_from(inner / 64).unwrap(),
                     1,
                     MemoryClass::Ipu21Interleaved,
                 ),
@@ -4151,9 +4283,9 @@ mod tests {
                 precision: Precision::F16,
                 layout: Layout::amp_output_grid(
                     output_columns,
-                    tiles,
+                    row_partitions * column_partitions,
                     row_partitions,
-                    inner_partitions,
+                    column_partitions,
                     crate::mid::GridOrder::ColumnsFast,
                 ),
             };
@@ -4170,10 +4302,11 @@ mod tests {
                 accumulate: kernel(GemmKernelMode::Accumulate),
                 inner_block: 64,
                 output_column_block: output_columns,
-                distribution: GemmDistribution::ActivationStationaryReduction {
+                distribution: GemmDistribution::ParallelReduction {
+                    row_partitions,
+                    column_partitions,
                     inner_partitions,
                     reduction_fan_in,
-                    staged_output_panels: 1,
                 },
             });
             let mut config = PipelineConfig::new(tiles)
@@ -4183,7 +4316,11 @@ mod tests {
             let mid = lower(&graph, &config, &Ipu21CostModel)
                 .unwrap_or_else(|error| panic!("case {case}: {error}"));
             let low = lower_to_tiles(&mid, &config)
-                .unwrap_or_else(|error| panic!("case {case}: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "case {case}: {error}; rows={rows} inner={inner} columns={columns} grid={row_partitions}x{column_partitions}x{inner_partitions}"
+                    )
+                });
             let reduction_runs = low
                 .kernel_runs
                 .iter()
@@ -4196,7 +4333,7 @@ mod tests {
                 .count();
             assert!(reduction_runs > 0, "case {case}");
             assert!(
-                low.exchange_phases.len() >= usize::from(inner_partitions),
+                low.exchange_phases.len() <= usize::from(inner_partitions).saturating_add(1),
                 "case {case}"
             );
             let parameter_shards = low
@@ -4414,9 +4551,9 @@ mod tests {
                     .is_some_and(|operation| consumers.contains(&operation))
                 {
                     let input = &run.inputs[0].views[0];
-                    assert_eq!(
+                    assert_ne!(
                         low.shards[input.shard.index() as usize].definition,
-                        ShardDefinition::ExchangeStaging,
+                        ShardDefinition::Unmaterialized,
                         "case {case}"
                     );
                     let inner = input.extents.last().unwrap();
@@ -5097,9 +5234,23 @@ mod tests {
             let right = graph.parameter("right", [inner, columns]).unwrap();
             let output = graph.gemm(left, right).unwrap();
             graph.set_outputs([output]).unwrap();
-            let config = PipelineConfig::new(tiles)
+            let mut config = PipelineConfig::new(tiles)
                 .with_automatic_input(left, Precision::F16)
                 .with_automatic_input(right, Precision::F16);
+            config.operator_candidates.retain(|candidate| {
+                matches!(
+                    candidate.dispatch,
+                    OperatorDispatch::BlockedGemm {
+                        distribution: GemmDistribution::OutputStationary,
+                        ..
+                    }
+                ) && candidate.inputs.get(1).is_some_and(|requirement| {
+                    requirement.format.layout.order
+                        == crate::ElementOrder::Amp(crate::AmpOrder::RightK64)
+                        && requirement.format.layout.tiling.tile_count == tiles
+                        && requirement.format.layout.memory_class == MemoryClass::Ipu21Interleaved
+                })
+            });
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let operation = mid
                 .operations
