@@ -59,7 +59,7 @@ pub struct KernelBuildPlan {
     gemm_symbols: BTreeMap<(Precision, GemmWeightLoad, u32, u32, GemmKernelMode, u32), String>,
     attention_symbols: BTreeMap<AttentionKernelShape, String>,
     attention_stage_symbols: Vec<(TileKernelSpec, u32, String)>,
-    rearrange_symbols: BTreeMap<(AmpOrder, u32, u32), String>,
+    rearrange_symbols: BTreeMap<(AmpOrder, u32, u32, u32, u32), String>,
     unpack_output_symbols: BTreeMap<u32, String>,
 }
 
@@ -289,15 +289,18 @@ impl KernelBuildPlan {
             });
         }
         let has_rearrange_codelets = !rearrangements.is_empty();
-        let mut rearrangement_shapes = BTreeMap::<(u32, u32), Vec<AmpOrder>>::new();
-        for (order, logical_columns, physical_columns) in rearrangements {
-            rearrangement_shapes
-                .entry((logical_columns, physical_columns))
-                .or_default()
-                .push(order);
-        }
-        for ((logical_columns, physical_columns), orders) in rearrangement_shapes {
-            let suffix = format!("c{logical_columns}_p{physical_columns}");
+        for (order, logical_rows, physical_rows, logical_columns, physical_columns) in
+            rearrangements
+        {
+            let order_index = match order {
+                AmpOrder::Left => 0,
+                AmpOrder::TransposedRight => 1,
+                AmpOrder::RightK64 => 2,
+                _ => return Err(KernelAbiError::RequirementMismatch),
+            };
+            let suffix = format!(
+                "o{order_index}_r{logical_rows}_p{physical_rows}_c{logical_columns}_p{physical_columns}"
+            );
             let vertex = format!("RearrangeRowMajorToAmpF16_{suffix}");
             let codelet = format!("__runCodelet_{vertex}");
             let call = format!("ipu_stack_rearrange_row_major_to_amp_f16_{suffix}");
@@ -305,7 +308,10 @@ impl KernelBuildPlan {
                 source: "rearrange_f16.cpp",
                 name: format!("rearrange_f16_codelet_{suffix}"),
                 flags: vec![
-                    "-Os".into(),
+                    "-O2".into(),
+                    format!("-DREARRANGE_TARGET_ORDER={order_index}"),
+                    format!("-DREARRANGE_LOGICAL_ROWS={logical_rows}"),
+                    format!("-DREARRANGE_PHYSICAL_ROWS={physical_rows}"),
                     format!("-DREARRANGE_LOGICAL_COLUMNS={logical_columns}"),
                     format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
                     format!("-DREARRANGE_INNER_DIMENSION={AMP_COLUMN_MICRO}"),
@@ -322,10 +328,16 @@ impl KernelBuildPlan {
                 ],
                 retained_symbols: vec![call.clone()],
             });
-            for order in orders {
-                plan.rearrange_symbols
-                    .insert((order, logical_columns, physical_columns), call.clone());
-            }
+            plan.rearrange_symbols.insert(
+                (
+                    order,
+                    logical_rows,
+                    physical_rows,
+                    logical_columns,
+                    physical_columns,
+                ),
+                call,
+            );
         }
         if has_rearrange_codelets || !attention.is_empty() || !attention_stages.is_empty() {
             plan.compilations.push(KernelCompilation {
@@ -551,6 +563,8 @@ impl KernelBuildPlan {
                         } => *order,
                         _ => return Err(KernelAbiError::RequirementMismatch),
                     },
+                    matrix_extent(run, true, false)?,
+                    matrix_extent(run, false, false)?,
                     matrix_extent(run, true, true)?,
                     matrix_extent(run, false, true)?,
                 ))
@@ -657,7 +671,7 @@ fn collect_kernels(
     rows: &mut BTreeMap<(Precision, GemmWeightLoad, u32, u32), BTreeSet<u32>>,
     gelu: &mut bool,
     reduction_add: &mut bool,
-    rearrangements: &mut BTreeSet<(AmpOrder, u32, u32)>,
+    rearrangements: &mut BTreeSet<(AmpOrder, u32, u32, u32, u32)>,
     unpack_output_columns: &mut BTreeSet<u32>,
     attention: &mut BTreeSet<AttentionKernelShape>,
     attention_stages: &mut Vec<(TileKernelSpec, u32)>,
@@ -704,6 +718,8 @@ fn collect_kernels(
                 {
                     rearrangements.insert((
                         *order,
+                        matrix_extent(run, true, false)?,
+                        matrix_extent(run, false, false)?,
                         matrix_extent(run, true, true)?,
                         matrix_extent(run, false, true)?,
                     ));
