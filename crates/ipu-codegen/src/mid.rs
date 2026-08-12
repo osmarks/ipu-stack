@@ -2596,6 +2596,13 @@ struct BeamBranch {
     operations: Vec<MidOperation>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PlanCacheKey {
+    input_shapes: Vec<TensorShape>,
+    parameter_inputs: Vec<bool>,
+    format_sensitive_inputs: Vec<(usize, TensorFormat)>,
+}
+
 #[derive(Default)]
 struct RegionPlanningConstraints {
     /// Number of simultaneously resident blocks represented by a region value.
@@ -2651,6 +2658,23 @@ fn lower_operations(
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
         let mut saw_candidate = false;
+        let format_sensitive_indices = if matches!(operation.kind, OperationKind::SplitHeads(_)) {
+            (0..operation.inputs.len()).collect::<BTreeSet<_>>()
+        } else {
+            config
+                .operator_candidates
+                .iter()
+                .filter(|candidate| operator_matches(&operation.kind, candidate.operator))
+                .filter_map(|candidate| match candidate.format_policy {
+                    OperatorFormatPolicy::Concrete => None,
+                    OperatorFormatPolicy::PreserveInputLayout(index)
+                    | OperatorFormatPolicy::PreserveInputTiling(index) => Some(usize::from(index)),
+                })
+                .collect()
+        };
+        let mut plan_cache = BTreeMap::<PlanCacheKey, Vec<Plan>>::new();
+        let mut plan_cache_hits = 0usize;
+        let mut generated_plan_sets = 0usize;
         for branch in beam {
             if let OperationKind::Repeat(repeat) = &operation.kind {
                 saw_candidate = true;
@@ -2721,26 +2745,51 @@ fn lower_operations(
                 .iter()
                 .map(|id| branch.state.parameter_values.contains(id))
                 .collect::<Vec<_>>();
-            let candidate_plans = plans(
-                operation,
-                &input_types,
-                &parameter_inputs,
-                &output_shape,
-                config,
-            )
-            .into_iter()
-            .filter(|plan| {
-                input_ids
+            let cache_key = PlanCacheKey {
+                input_shapes: input_types
                     .iter()
-                    .zip(&plan.requirements.inputs)
-                    .all(|(id, requirement)| {
-                        let current = &branch.state.get(*id).tensor_type.format.layout;
-                        branch.state.automatic_inputs.contains(id)
-                            || current.order == requirement.format.layout.order
-                            || !requirement.format.layout.order.requires_direct_population()
+                    .map(|input| input.shape.clone())
+                    .collect(),
+                parameter_inputs: parameter_inputs.clone(),
+                format_sensitive_inputs: format_sensitive_indices
+                    .iter()
+                    .filter_map(|&index| {
+                        input_types
+                            .get(index)
+                            .map(|input| (index, input.format.clone()))
                     })
-            })
-            .collect::<Vec<_>>();
+                    .collect(),
+            };
+            let cached = if let Some(cached) = plan_cache.get(&cache_key) {
+                plan_cache_hits += 1;
+                cached
+            } else {
+                generated_plan_sets += 1;
+                let generated = plans(
+                    operation,
+                    &input_types,
+                    &parameter_inputs,
+                    &output_shape,
+                    config,
+                );
+                plan_cache.entry(cache_key).or_insert(generated)
+            };
+            let candidate_plans = cached
+                .iter()
+                .cloned()
+                .into_iter()
+                .filter(|plan| {
+                    input_ids
+                        .iter()
+                        .zip(&plan.requirements.inputs)
+                        .all(|(id, requirement)| {
+                            let current = &branch.state.get(*id).tensor_type.format.layout;
+                            branch.state.automatic_inputs.contains(id)
+                                || current.order == requirement.format.layout.order
+                                || !requirement.format.layout.order.requires_direct_population()
+                        })
+                })
+                .collect::<Vec<_>>();
             let candidate_plans = candidate_plans.into_iter().flat_map(|plan| {
                 let mut complete = plan.clone();
                 for requirement in &mut complete.requirements.inputs {
@@ -2857,6 +2906,8 @@ fn lower_operations(
             operation = operation.id.index(),
             retained = expanded.len(),
             best_cycles = deferred_aware_branch_score(&expanded[0], &future_origins),
+            generated_plan_sets,
+            plan_cache_hits,
             "retained planning beam"
         );
         beam = expanded;
@@ -3186,6 +3237,40 @@ struct Plan {
     deferred_output: Option<DeferredOutputPlan>,
 }
 
+fn plan_fits_operator_memory(
+    plan: &Plan,
+    inputs: &[TensorType],
+    output: &TensorShape,
+    config: &PipelineConfig,
+) -> bool {
+    let planned_inputs = inputs
+        .iter()
+        .zip(&plan.requirements.inputs)
+        .map(|(input, requirement)| TensorType {
+            shape: input.shape.clone(),
+            format: requirement.format.clone(),
+        })
+        .collect::<Vec<_>>();
+    let planned_output = TensorType {
+        shape: output.clone(),
+        format: plan.requirements.output.format.clone(),
+    };
+    let peak = operator_memory_estimate(
+        &plan.dispatch,
+        &plan.requirements,
+        &planned_inputs,
+        &planned_output,
+    )
+    .peak;
+    peak.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+        && peak
+            .total()
+            .saturating_add(config.standard_memory_reservation_bytes)
+            <= config
+                .tile_memory_budget_bytes
+                .min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
+}
+
 fn plans(
     operation: &Operation,
     inputs: &[TensorType],
@@ -3404,6 +3489,7 @@ fn plans(
             }
         }
     }
+    plans.retain(|plan| plan_fits_operator_memory(plan, inputs, output, config));
     plans
 }
 
