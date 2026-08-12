@@ -258,6 +258,66 @@ ipu_stack_copy_u64:
 .Lcopy_u64_worker_done:
 	exitz $m15
 
+	.section .text.ipu_stack_copy_strided_u64,"ax",@progbits
+	// Runtime helper ABI: m2 destination, m3 source, m4 words/row, m5 rows,
+	// m6 source stride, m7 destination stride, m10 return. One call replaces
+	// the supervisor launch and return overhead of many short row copies.
+	.globl ipu_stack_copy_strided_u64
+	.p2align 2
+	.type ipu_stack_copy_strided_u64,@function
+ipu_stack_copy_strided_u64:
+	.supervisor
+	add $m11, $m11, -24
+	st32 $m2, $m11, $m15, 0
+	st32 $m3, $m11, $m15, 1
+	st32 $m4, $m11, $m15, 2
+	st32 $m5, $m11, $m15, 3
+	st32 $m6, $m11, $m15, 4
+	st32 $m7, $m11, $m15, 5
+	setzi $m0, .Lcopy_strided_u64_worker
+	runall $m0, $m11, 0
+	sync SYNC_COMPUTE_SET
+	add $m11, $m11, 24
+	br $m10
+	.size ipu_stack_copy_strided_u64, .-ipu_stack_copy_strided_u64
+
+	.worker
+	.p2align 2
+.Lcopy_strided_u64_worker:
+	ld32 $m2, $mvertex_base, $m15, 0
+	ld32 $m3, $mvertex_base, $m15, 1
+	ld32 $m5, $mvertex_base, $m15, 2
+	ld32 $m6, $mvertex_base, $m15, 3
+	ld32 $m7, $mvertex_base, $m15, 4
+	ld32 $m8, $mvertex_base, $m15, 5
+	get $m4, $WSR
+	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
+	cmpult $m9, $m4, $m6
+	brz $m9, .Lcopy_strided_u64_done
+	mul $m9, $m4, $m7
+	add $m3, $m3, $m9
+	mul $m9, $m4, $m8
+	add $m2, $m2, $m9
+	shl $m1, $m5, 3
+	sub $m0, $m7, $m1
+	sub $m1, $m8, $m1
+.Lcopy_strided_u64_row:
+	add $m9, $m5, 0
+.Lcopy_strided_u64_word:
+	ld64 $a0:1, $m3, $m15, 0
+	st64 $a0:1, $m2, $m15, 0
+	add $m3, $m3, 8
+	add $m2, $m2, 8
+	sub $m9, $m9, 1
+	brnz $m9, .Lcopy_strided_u64_word
+	add $m3, $m3, $m0
+	add $m2, $m2, $m1
+	add $m4, $m4, 6
+	cmpult $m9, $m4, $m6
+	brnz $m9, .Lcopy_strided_u64_row
+.Lcopy_strided_u64_done:
+	exitz $m15
+
 	.section .text.ipu_stack_static_repeat_call,"ax",@progbits
 	// Compact call loop used by static host schedules. ABI: m2 iteration count,
 	// m3 body address, and m9 caller return address; the body returns in m10 and

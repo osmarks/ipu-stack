@@ -215,16 +215,15 @@ fn lower_work(
             }
             TileWorkRef::LocalCopy(copy) => {
                 let (source, destination) = placed_local_copy(program, placement, copy)?;
-                let (symbol, arguments) = local_copy_call(copy.bytes).ok_or_else(|| {
-                    TileLoweringError::InvalidLocalCopy {
+                let (symbol, arguments) =
+                    local_copy_call(copy).ok_or_else(|| TileLoweringError::InvalidLocalCopy {
                         tile: tile.tile,
                         source_shard: copy.source,
                         source_offset: copy.source_offset,
                         destination_shard: copy.destination,
                         destination_offset: copy.destination_offset,
                         bytes: copy.bytes,
-                    }
-                })?;
+                    })?;
                 TileStep::Compute(crate::ComputeStep {
                     symbol: symbol.into(),
                     output_address: TileAddress::Absolute(destination),
@@ -266,7 +265,26 @@ fn lower_work(
     Ok(steps)
 }
 
-fn local_copy_call(bytes: u32) -> Option<(&'static str, Vec<u32>)> {
+fn local_copy_call(copy: &crate::LocalCopy) -> Option<(&'static str, Vec<u32>)> {
+    let bytes = copy.bytes;
+    if let crate::LocalCopyPattern::Strided {
+        rows,
+        row_bytes,
+        source_stride,
+        destination_stride,
+    } = copy.pattern
+    {
+        return (rows >= 2
+            && row_bytes != 0
+            && row_bytes.is_multiple_of(8)
+            && row_bytes.checked_mul(rows) == Some(bytes))
+        .then(|| {
+            (
+                crate::COPY_STRIDED_U64_SYMBOL,
+                vec![row_bytes / 8, rows, source_stride, destination_stride],
+            )
+        });
+    }
     if bytes >= 6 * 8 && bytes.is_multiple_of(8) {
         let words = bytes / 8;
         Some((crate::COPY_U64_SYMBOL, vec![words / 6, words % 6]))
@@ -682,7 +700,15 @@ mod tests {
         for _ in 0..1_000 {
             let words = random.u32(1..=4_096);
             let bytes = words * 4;
-            let (symbol, arguments) = local_copy_call(bytes).unwrap();
+            let copy = crate::LocalCopy {
+                source: crate::LowShardId::from_index(0),
+                source_offset: 0,
+                destination: crate::LowShardId::from_index(1),
+                destination_offset: 0,
+                bytes,
+                pattern: crate::LocalCopyPattern::Contiguous,
+            };
+            let (symbol, arguments) = local_copy_call(&copy).unwrap();
             if symbol == crate::COPY_U64_SYMBOL {
                 assert!(arguments[0] != 0);
                 assert_eq!((arguments[0] * 6 + arguments[1]) * 8, bytes);

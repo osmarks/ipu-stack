@@ -163,25 +163,13 @@ impl KernelBuildPlan {
         let mut plan = Self::default();
         for columns in unpack_output_columns {
             let suffix = format!("c{columns}");
-            let vertex = format!("RearrangeAmpOutputToRowMajorF16_{suffix}");
-            let codelet = format!("__runCodelet_{vertex}");
             let call = format!("ipu_stack_rearrange_amp_output_to_row_major_f16_{suffix}");
-            plan.compilations.push(KernelCompilation {
-                source: "unpack_amp_output_f16.cpp",
-                name: format!("unpack_amp_output_f16_codelet_{suffix}"),
-                flags: vec![
-                    "-Oz".into(),
-                    format!("-DUNPACK_COLUMNS={columns}"),
-                    format!("-DUNPACK_VERTEX_NAME={vertex}"),
-                ],
-                retained_symbols: Vec::new(),
-            });
             plan.compilations.push(KernelCompilation {
                 source: "unpack_amp_output_f16.S",
                 name: format!("unpack_amp_output_f16_wrapper_{suffix}"),
                 flags: vec![
                     format!("-DUNPACK_CALL_SYMBOL={call}"),
-                    format!("-DUNPACK_CODELET_SYMBOL={codelet}"),
+                    format!("-DUNPACK_COLUMNS={columns}"),
                 ],
                 retained_symbols: vec![call.clone()],
             });
@@ -304,6 +292,30 @@ impl KernelBuildPlan {
             let vertex = format!("RearrangeRowMajorToAmpF16_{suffix}");
             let codelet = format!("__runCodelet_{vertex}");
             let call = format!("ipu_stack_rearrange_row_major_to_amp_f16_{suffix}");
+            if order == AmpOrder::TransposedRight
+                && logical_rows == 64
+                && physical_rows == 64
+                && logical_columns == 16
+                && physical_columns == 16
+            {
+                plan.compilations.push(KernelCompilation {
+                    source: "rearrange_transposed_right_f16.S",
+                    name: format!("rearrange_transposed_right_f16_{suffix}"),
+                    flags: vec![format!("-DREARRANGE_CALL_SYMBOL={call}")],
+                    retained_symbols: vec![call.clone()],
+                });
+                plan.rearrange_symbols.insert(
+                    (
+                        order,
+                        logical_rows,
+                        physical_rows,
+                        logical_columns,
+                        physical_columns,
+                    ),
+                    call,
+                );
+                continue;
+            }
             plan.compilations.push(KernelCompilation {
                 source: "rearrange_f16.cpp",
                 name: format!("rearrange_f16_codelet_{suffix}"),

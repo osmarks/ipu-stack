@@ -1328,13 +1328,17 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
         }
         symbols.push(crate::COPY_U32_SYMBOL.into());
         symbols.push(crate::COPY_U64_SYMBOL.into());
+        symbols.push(crate::COPY_STRIDED_U64_SYMBOL.into());
     }
     symbols
 }
 
 fn tile_has_halfword_copy(program: &LowProgram, tile: &crate::TileWorkList) -> bool {
     program.work(tile).any(|work| match work {
-        crate::TileWorkRef::LocalCopy(copy) => !copy.bytes.is_multiple_of(4),
+        crate::TileWorkRef::LocalCopy(copy) => match copy.pattern {
+            crate::LocalCopyPattern::Contiguous => !copy.bytes.is_multiple_of(4),
+            crate::LocalCopyPattern::Strided { row_bytes, .. } => !row_bytes.is_multiple_of(4),
+        },
         crate::TileWorkRef::Repeat(repeat) => tile_has_halfword_copy(program, &repeat.body),
         crate::TileWorkRef::Exchange(_)
         | crate::TileWorkRef::Kernel(_)
