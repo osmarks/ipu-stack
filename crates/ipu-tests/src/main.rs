@@ -1136,7 +1136,7 @@ fn run_gemm_benchmark(
     let flops = 2.0 * rows as f64 * f64::from(inner) * f64::from(columns);
     let seconds = f64::from(cycles) / clock_hz as f64;
     let tflops = flops / seconds / 1.0e12;
-    let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
+    let peak_tflops = clock_hz as f64 * f64::from(execution_tiles) * 128.0 / 1.0e12;
     println!(
         "workload=gemm-f16-r{rows}-k{inner}-c{columns} benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} activeTiles={active_tiles} executionTiles={execution_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} tflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
         left_bytes.len(),
@@ -1206,7 +1206,7 @@ fn run_siglip_mlp_benchmark(
         4.0 * rows as f64 * f64::from(dimension) * f64::from(hidden_dimension) * f64::from(blocks);
     let seconds = f64::from(cycles) / clock_hz as f64;
     let tflops = flops / seconds / 1.0e12;
-    let peak_tflops = clock_hz as f64 * f64::from(active_tiles) * 128.0 / 1.0e12;
+    let peak_tflops = clock_hz as f64 * f64::from(execution_tiles) * 128.0 / 1.0e12;
     println!(
         "workload=siglip-mlp-f16-b{batch}-t{tokens}-d{dimension}-h{hidden_dimension}-n{blocks} benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} rows={rows} dimension={dimension} hiddenDimension={hidden_dimension} blocks={blocks} biases=false activeTiles={active_tiles} executionTiles={execution_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} effectiveGemmTflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
         left_bytes.len(),
