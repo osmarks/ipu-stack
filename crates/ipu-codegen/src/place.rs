@@ -155,10 +155,13 @@ pub(crate) fn place_with_standard_ranges(
         // Region 1 is shared by ordinary and interleaved loads. Place the
         // interleaved working set first, round its boundary to a paired memory
         // element, then return every remaining byte to standard allocations.
-        let mut interleaved = Arena::new(&[(
-            IPU21_INTERLEAVED_MEMORY_BASE,
-            IPU21_INTERLEAVED_REGION_LIMIT,
-        )]);
+        let mut interleaved = Arena::new(
+            &[(
+                IPU21_INTERLEAVED_MEMORY_BASE,
+                IPU21_INTERLEAVED_REGION_LIMIT,
+            )],
+            true,
+        );
         allocate_tile_class(
             program,
             tile,
@@ -183,7 +186,7 @@ pub(crate) fn place_with_standard_ranges(
         }
         let mut ranges = standard_ranges.to_vec();
         ranges.push((interleaved_boundary, TILE_MEMORY_BASE + TILE_MEMORY_SIZE));
-        let mut standard = Arena::new(&ranges);
+        let mut standard = Arena::new(&ranges, false);
         allocate_tile_class(
             program,
             tile,
@@ -653,16 +656,18 @@ struct Arena {
     active: Vec<(u32, u32, u32)>,
     occupied: Vec<(u32, u32)>,
     maximum: u32,
+    compact_low: bool,
 }
 
 impl Arena {
-    fn new(ranges: &[(u32, u32)]) -> Self {
+    fn new(ranges: &[(u32, u32)], compact_low: bool) -> Self {
         Self {
             ranges: ranges.to_vec(),
             free: ranges.to_vec(),
             active: Vec::new(),
             occupied: Vec::new(),
             maximum: ranges[0].0,
+            compact_low,
         }
     }
 
@@ -684,9 +689,16 @@ impl Arena {
             .filter_map(|(index, &(base, limit))| {
                 let start = align_up(base, alignment).ok()?;
                 let end = start.checked_add(bytes)?;
-                (end <= limit).then(|| (limit - end, index, start, end))
+                (end <= limit).then(|| {
+                    let key = if self.compact_low {
+                        (start, limit - end)
+                    } else {
+                        (limit - end, start)
+                    };
+                    (key, index, start, end)
+                })
             })
-            .min_by_key(|candidate| (candidate.0, candidate.2));
+            .min_by_key(|candidate| (candidate.0, candidate.1));
         if let Some((_, index, start, end)) = candidate {
             let (base, limit) = self.free[index];
             self.free.remove(index);
@@ -942,6 +954,29 @@ mod tests {
                 assert_ne!(sum_address, right_address);
                 assert_eq!(output_address, left_address.min(right_address));
             }
+        }
+    }
+
+    #[test]
+    fn randomized_compact_arenas_keep_sequential_phases_below_their_peak_span() {
+        let mut random = fastrand::Rng::with_seed(0x636f_6d70_6163_7421);
+        for _ in 0..128 {
+            let limit = 1 << 20;
+            let persistent = random.u32(1..=4096);
+            let mut arena = Arena::new(&[(0, limit)], true);
+            arena.allocate(persistent, 4, 0, u32::MAX).unwrap();
+            let mut bound = persistent;
+            for phase in 1..=random.u32(2..=16) {
+                let mut cursor = persistent;
+                for _ in 0..random.u32(1..=8) {
+                    let alignment = 1 << random.u32(2..=10);
+                    let bytes = random.u32(1..=16 * 1024);
+                    cursor = align_up(cursor, alignment).unwrap() + bytes;
+                    arena.allocate(bytes, alignment, phase, phase).unwrap();
+                }
+                bound = bound.max(cursor);
+            }
+            assert!(arena.maximum_cursor() <= bound);
         }
     }
 }

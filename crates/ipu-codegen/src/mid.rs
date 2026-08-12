@@ -2529,6 +2529,10 @@ pub fn lower(
         operations = operations.len(),
         estimated_cycles,
         exchange_row_bytes = peak_memory.exchange_rows,
+        peak_standard_bytes = peak_memory.standard,
+        peak_interleaved_bytes = peak_memory.interleaved,
+        peak_total_bytes = peak_memory.total,
+        maximum_standard_allocation_bytes = peak_memory.maximum_standard_allocation,
         active_tile_counts = ?operations
             .iter()
             .filter_map(|operation| operation.results.first())
@@ -3008,6 +3012,29 @@ fn lower_operations(
         );
         beam = expanded;
     }
+    let final_operation = source.len().saturating_sub(1);
+    let beam = beam
+        .into_iter()
+        .filter_map(|mut branch| {
+            let peak = beam_memory_peak(
+                &branch,
+                &initial,
+                source,
+                final_operation,
+                required_outputs,
+                graph,
+                &constraints.allocation_copies,
+            );
+            peak.fits_ipu21_with_budget(
+                config.standard_memory_reservation_bytes,
+                config.tile_memory_budget_bytes,
+            )
+            .then(|| {
+                branch.peak_memory = peak;
+                branch
+            })
+        })
+        .collect::<Vec<_>>();
     let mut best = beam
         .into_iter()
         .min_by_key(|branch| {
@@ -3742,7 +3769,7 @@ fn plans(
             candidate.output.format.layout.tiling = actual.format.layout.tiling.clone();
         }
         let mut variants = vec![candidate.clone()];
-        variants.extend(parallel_reduction_candidates(&candidate, inputs));
+        variants.extend(parallel_reduction_candidates(&candidate, inputs, config));
         for (input_index, _) in parameter_inputs
             .iter()
             .enumerate()
@@ -3787,13 +3814,7 @@ fn independent_parameter_storage(
     input_index: usize,
     config: &PipelineConfig,
 ) -> Vec<OperatorCandidate> {
-    if !matches!(
-        candidate.dispatch,
-        OperatorDispatch::BlockedGemm {
-            distribution: GemmDistribution::OutputStationary,
-            ..
-        }
-    ) {
+    if !matches!(candidate.dispatch, OperatorDispatch::BlockedGemm { .. }) {
         return Vec::new();
     }
     let Some(requirement) = candidate.inputs.get(input_index) else {
@@ -3812,18 +3833,10 @@ fn independent_parameter_storage(
     let Some(&inner) = input.shape.0.get(inner_axis) else {
         return Vec::new();
     };
-    let inner_blocks = inner.div_ceil(AMP_INNER_BLOCK);
-    let Some(column_partitions) = requirement
-        .format
-        .layout
-        .tiling
-        .axes
-        .iter()
-        .find(|axis| axis.axis == TensorAxis::FromEnd(1))
-        .map(|axis| axis.partitions)
-    else {
+    let Some(&columns) = input.shape.0.last() else {
         return Vec::new();
     };
+    let inner_blocks = inner.div_ceil(AMP_INNER_BLOCK);
     let output_column_block = match candidate.dispatch {
         OperatorDispatch::BlockedGemm {
             output_column_block,
@@ -3838,31 +3851,46 @@ fn independent_parameter_storage(
     if output_column_block < AMP_OUTPUT_COLUMN_BLOCK {
         return Vec::new();
     }
-    [1, 2]
-        .into_iter()
-        .filter_map(|copies| {
-            let tiles_per_copy = config.tile_count / copies;
-            let maximum_inner_partitions = u32::from(tiles_per_copy / column_partitions)
-                .min(inner_blocks)
+    let column_blocks = columns.div_ceil(output_column_block);
+    let mut storage_grids = (1..=inner_blocks.min(u32::from(config.tile_count)))
+        .flat_map(|inner_partitions| {
+            let maximum_columns = (u32::from(config.tile_count) / inner_partitions)
+                .min(column_blocks)
                 .min(u32::from(u16::MAX));
-            let Some(inner_partitions) = (1..=maximum_inner_partitions)
-                .rev()
-                .find(|partitions| inner_blocks.is_multiple_of(*partitions))
-            else {
-                return None;
-            };
-            let Ok(inner_partitions) = u16::try_from(inner_partitions) else {
-                return None;
-            };
+            (1..=maximum_columns).map(move |column_partitions| {
+                let panels_per_shard = inner_blocks
+                    .div_ceil(inner_partitions)
+                    .saturating_mul(column_blocks.div_ceil(column_partitions));
+                let used = inner_partitions.saturating_mul(column_partitions);
+                (
+                    panels_per_shard,
+                    u32::MAX - used,
+                    column_partitions,
+                    inner_partitions,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    storage_grids.sort_unstable();
+    storage_grids
+        .first()
+        .and_then(|&(_, _, column_partitions, inner_partitions)| {
+            Some((
+                u16::try_from(column_partitions).ok()?,
+                u16::try_from(inner_partitions).ok()?,
+            ))
+        })
+        .into_iter()
+        .map(|(column_partitions, inner_partitions)| {
             let mut independent = candidate.clone();
             independent.inputs[input_index].format.layout = Layout::amp_right_k64_storage(
                 output_column_block,
                 column_partitions,
                 inner_partitions,
-                copies,
+                1,
                 requirement.format.layout.memory_class,
             );
-            Some(independent)
+            independent
         })
         .collect()
 }
@@ -3870,6 +3898,7 @@ fn independent_parameter_storage(
 fn parallel_reduction_candidates(
     candidate: &OperatorCandidate,
     inputs: &[TensorType],
+    config: &PipelineConfig,
 ) -> Vec<OperatorCandidate> {
     let OperatorDispatch::BlockedGemm {
         output_column_block,
@@ -3887,7 +3916,7 @@ fn parallel_reduction_candidates(
         }
     ) || !matches!(
         output_column_block,
-        AMP_OUTPUT_COLUMN_BLOCK | AMP_WIDE_OUTPUT_COLUMN_BLOCK
+        AMP_NARROW_OUTPUT_COLUMN_BLOCK | AMP_OUTPUT_COLUMN_BLOCK | AMP_WIDE_OUTPUT_COLUMN_BLOCK
     ) {
         return Vec::new();
     }
@@ -3939,15 +3968,16 @@ fn parallel_reduction_candidates(
         });
     let mut grids = Vec::new();
     for inner_partitions in 2..=inner_blocks.min(tile_count) {
-        if !tile_count.is_multiple_of(inner_partitions) {
-            continue;
-        }
-        let remaining = tile_count / inner_partitions;
-        for column_partitions in 1..=output_blocks.min(remaining) {
-            if !remaining.is_multiple_of(column_partitions) {
+        let maximum_columns = output_blocks.min(tile_count / inner_partitions);
+        for column_partitions in 1..=maximum_columns {
+            let row_partitions = (tile_count / inner_partitions / column_partitions)
+                .min(u16::try_from(rows).unwrap_or(u16::MAX));
+            let used_tiles = row_partitions
+                .saturating_mul(column_partitions)
+                .saturating_mul(inner_partitions);
+            if used_tiles < tile_count.div_ceil(2) {
                 continue;
             }
-            let row_partitions = remaining / column_partitions;
             if u32::from(row_partitions) > rows {
                 continue;
             }
@@ -3981,9 +4011,15 @@ fn parallel_reduction_candidates(
                 .saturating_mul(u64::from(output_column_block))
                 .saturating_mul(candidate.output.format.precision.bytes());
             let reduction_fan_in = inner_partitions.min(4);
-            let temporary_bytes = left_bytes
+            // Staging and the local partial coexist during convolution. The
+            // reduction reuses staging storage after convolution and needs at
+            // most `fan_in` partial buffers instead. This follows the same
+            // max-of-phases accounting used by Poplin's convolution model.
+            let convolution_bytes = left_bytes
                 .saturating_add(right_bytes)
-                .saturating_add(partial_bytes.saturating_mul(u64::from(reduction_fan_in - 1)));
+                .saturating_add(partial_bytes);
+            let reduction_bytes = partial_bytes.saturating_mul(u64::from(reduction_fan_in));
+            let temporary_bytes = convolution_bytes.max(reduction_bytes);
             if temporary_bytes > u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES) {
                 continue;
             }
@@ -3996,6 +4032,7 @@ fn parallel_reduction_candidates(
                 compute,
                 communication,
                 temporary_bytes,
+                u64::from(tile_count - used_tiles),
                 row_partitions,
                 column_partitions,
                 inner_partitions,
@@ -4003,15 +4040,18 @@ fn parallel_reduction_candidates(
         }
     }
     grids.sort_unstable();
-    grids.truncate(1);
+    grids.truncate(config.planning_beam_width.max(1));
     let mut variants = Vec::new();
-    for (_, _, _, row_partitions, column_partitions, inner_partitions) in grids {
+    for (_, _, _, _, row_partitions, column_partitions, inner_partitions) in grids {
         let reduction_fan_in = inner_partitions.min(4);
+        let used_tiles = row_partitions
+            .saturating_mul(column_partitions)
+            .saturating_mul(inner_partitions);
         for memory_class in [MemoryClass::Ipu21Standard, MemoryClass::Ipu21Interleaved] {
             let mut variant = candidate.clone();
             variant.inputs[0].format.layout = Layout::amp_left_parallel_grid(
                 AMP_INNER_BLOCK as u16,
-                tile_count,
+                used_tiles,
                 row_partitions,
                 column_partitions,
                 inner_partitions,
@@ -4560,8 +4600,11 @@ mod tests {
     fn randomized_parallel_reduction_candidates_cover_uneven_three_axis_grids() {
         let mut random = fastrand::Rng::with_seed(0x7061_7274_6961_6c73);
         for _ in 0..RANDOM_CASES {
-            let output_columns =
-                [AMP_OUTPUT_COLUMN_BLOCK, AMP_WIDE_OUTPUT_COLUMN_BLOCK][random.usize(0..2)];
+            let output_columns = [
+                AMP_NARROW_OUTPUT_COLUMN_BLOCK,
+                AMP_OUTPUT_COLUMN_BLOCK,
+                AMP_WIDE_OUTPUT_COLUMN_BLOCK,
+            ][random.usize(0..3)];
             let inner_partitions = random.u16(2..=4);
             let column_partitions = random.u16(1..=4);
             let row_partitions = random.u16(1..=8);
@@ -4586,9 +4629,10 @@ mod tests {
                 TensorType::new([m, k], Precision::F16, Layout::row_sharded(tiles)),
                 TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
             ];
-            let candidates = parallel_reduction_candidates(&base, &inputs);
+            let config = PipelineConfig::new(tiles).with_planning_beam_width(16);
+            let candidates = parallel_reduction_candidates(&base, &inputs, &config);
             assert!(!candidates.is_empty());
-            assert!(candidates.len() <= 16);
+            assert!(candidates.len() <= config.planning_beam_width * 2);
             for candidate in candidates {
                 assert!(
                     candidate.supports(&inputs, &TensorShape(vec![m, n])),
@@ -4604,7 +4648,8 @@ mod tests {
                             ..
                         },
                         ..
-                    } if actual_rows * actual_columns * actual == tiles
+                    } if actual_rows * actual_columns * actual <= tiles
+                        && actual_rows * actual_columns * actual >= tiles.div_ceil(2)
                         && u32::from(actual_rows) <= m
                         && u32::from(actual_columns) <= n.div_ceil(output_columns)
                         && u32::from(actual) <= k.div_ceil(AMP_INNER_BLOCK)
@@ -4671,7 +4716,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_parameter_storage_copy_counts_are_independent_of_compute_grids() {
+    fn randomized_parameter_storage_balances_one_copy_independently_of_compute_grids() {
         let mut random = fastrand::Rng::with_seed(0x6f77_6e65_7273);
         for case in 0..RANDOM_CASES {
             let row_partitions = 1_u16 << random.u32(1..=4);
@@ -4711,7 +4756,7 @@ mod tests {
             assert!(!variants.is_empty(), "case {case}");
             for variant in variants {
                 let tiling = &variant.inputs[1].format.layout.tiling;
-                assert!(matches!(tiling.replicas, 1 | 2), "case {case}");
+                assert_eq!(tiling.replicas, 1, "case {case}");
                 assert!(tiling.tile_count <= tiles, "case {case}");
                 assert_eq!(
                     tiling.tile_count,

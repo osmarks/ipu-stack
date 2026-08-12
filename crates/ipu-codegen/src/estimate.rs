@@ -3,9 +3,9 @@
 use crate::cost::IPU21_TARGET_COSTS;
 use crate::graph::TensorShape;
 use crate::mid::{
-    AMP_COLUMN_MICRO, AmpOrder, ElementOrder, GemmDistribution, Layout, MemoryClass,
-    MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidOperation,
-    MidOperationKind, MidValue, MidValueId, OperandMaterialization, OperatorDispatch,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, ElementOrder, GemmDistribution, Layout,
+    MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage,
+    MidOperation, MidOperationKind, MidValue, MidValueId, OperandMaterialization, OperatorDispatch,
     OperatorRequirements, Precision, TensorAxis, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -351,36 +351,68 @@ pub(crate) fn operator_memory_estimate(
     let mut maximum_standard_temporary_allocation = 0u64;
     if let (
         OperatorDispatch::BlockedGemm {
-            output_column_block: _,
             distribution:
                 GemmDistribution::ParallelReduction {
-                    reduction_fan_in, ..
+                    column_partitions,
+                    inner_partitions,
+                    reduction_fan_in,
+                    ..
                 },
+            output_column_block,
             ..
         },
         Some(left),
         Some(right),
     ) = (dispatch, inputs.first(), inputs.get(1))
     {
-        let right_staging = maximum_shard_bytes(right);
-        temporary.add_class(MemoryClass::Ipu21Interleaved, right_staging);
+        let right_rank = right.shape.0.len();
+        let inner_blocks = right.shape.0[right_rank - 2].div_ceil(AMP_INNER_BLOCK);
+        let column_blocks = right.shape.0[right_rank - 1].div_ceil(*output_column_block);
+        let right_staging = u64::from(inner_blocks.div_ceil(u32::from(*inner_partitions)))
+            .saturating_mul(u64::from(AMP_INNER_BLOCK))
+            .saturating_mul(u64::from(
+                column_blocks.div_ceil(u32::from(*column_partitions)),
+            ))
+            .saturating_mul(u64::from(*output_column_block))
+            .saturating_mul(right.format.precision.bytes());
+        let mut convolution = MemoryUsage::default();
+        convolution.add_class(MemoryClass::Ipu21Interleaved, right_staging);
         if requirements.inputs.first().is_some_and(|requirement| {
             requirement.materialization == OperandMaterialization::DispatchSlices
         }) {
-            let left_staging = maximum_shard_bytes(left);
-            temporary.add_class(left.format.layout.memory_class, left_staging);
+            let requirement = &requirements.inputs[0];
+            let mut left_staging =
+                maximum_shard_bytes(left).saturating_add(u64::from(requirement.access_tail_bytes));
+            let left_must_be_distinct = requirements.memory_relations.iter().any(|relation| {
+                let MemoryRelation::DistinctElements(operands) = relation;
+                operands.contains(&MemoryOperand::Input(0))
+            });
+            if left_must_be_distinct {
+                left_staging = left_staging
+                    .div_ceil(u64::from(ipu_package::TILE_MEMORY_ELEMENT_SIZE))
+                    .saturating_mul(u64::from(ipu_package::TILE_MEMORY_ELEMENT_SIZE));
+            }
+            convolution.add_class(left.format.layout.memory_class, left_staging);
             if left.format.layout.memory_class == MemoryClass::Ipu21Standard {
                 maximum_standard_temporary_allocation =
                     maximum_standard_temporary_allocation.max(left_staging);
             }
         }
-        // Non-root tiles retain one local partial and one buffer for every
-        // additional input collected by a reduction group. Root output storage
-        // is already included in live memory.
+        // Convolution retains one local partial alongside operand staging.
+        // Reduction happens later, after operand staging is dead, and retains
+        // one local partial plus the incoming members of one reduction group.
+        // Model the larger phase instead of summing mutually exclusive scratch.
         let partial_bytes = maximum_shard_bytes(output);
-        temporary.interleaved = temporary.interleaved.saturating_add(
-            partial_bytes.saturating_mul(u64::from(reduction_fan_in.saturating_sub(1))),
-        );
+        convolution.interleaved = convolution.interleaved.saturating_add(partial_bytes);
+        let reduction = MemoryUsage {
+            standard: 0,
+            interleaved: partial_bytes.saturating_mul(u64::from(*reduction_fan_in)),
+        };
+        temporary = if convolution.total() >= reduction.total() {
+            convolution
+        } else {
+            reduction
+        };
     }
     if let (OperatorDispatch::BlockedGemm { inner_block, .. }, Some(left), Some(requirement)) =
         (dispatch, inputs.first(), requirements.inputs.first())

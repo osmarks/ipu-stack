@@ -2935,25 +2935,31 @@ impl LoweringState {
                     weight_extents[weight_rank - 2].start = inner.start;
                     weight_extents[weight_rank - 2].logical_end = inner.logical_end;
                     weight_extents[weight_rank - 2].physical_end = inner.physical_end;
-                    let weights =
-                        if self.shards[first_source.index() as usize].tile == left_shard.tile {
-                            None
+                    let source_inner =
+                        self.shards[first_source.index() as usize].extents[weight_rank - 2];
+                    let source_covers_compute_inner = source_inner.start <= inner.start
+                        && source_inner.physical_end >= inner.physical_end;
+                    let weights = if self.shards[first_source.index() as usize].tile
+                        == left_shard.tile
+                        && source_covers_compute_inner
+                    {
+                        None
+                    } else {
+                        let key = (left_shard.tile, first_source);
+                        if let Some(staging) = weight_staging.get(&key).copied() {
+                            Some(staging)
                         } else {
-                            let key = (left_shard.tile, first_source);
-                            if let Some(staging) = weight_staging.get(&key).copied() {
-                                Some(staging)
-                            } else {
-                                let staging = self.push_shard(LowShard {
-                                    id: LowShardId(0),
-                                    tile: left_shard.tile,
-                                    tensor_type: weight_type,
-                                    extents: weight_extents,
-                                    definition: ShardDefinition::ExchangeStaging,
-                                })?;
-                                weight_staging.insert(key, staging);
-                                Some(staging)
-                            }
-                        };
+                            let staging = self.push_shard(LowShard {
+                                id: LowShardId(0),
+                                tile: left_shard.tile,
+                                tensor_type: weight_type,
+                                extents: weight_extents,
+                                definition: ShardDefinition::ExchangeStaging,
+                            })?;
+                            weight_staging.insert(key, staging);
+                            Some(staging)
+                        }
+                    };
 
                     for (block_index, inner_start) in (inner.start..inner.physical_end)
                         .step_by(inner_block as usize)
