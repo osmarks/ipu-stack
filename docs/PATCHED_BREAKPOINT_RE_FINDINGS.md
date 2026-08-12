@@ -87,9 +87,28 @@ breakpoint afterward. It is not implemented inside `insertPatchedBreakpoint`.
 
 ## Hardware results
 
-Memory-resident, correctly encoded `trap 0` retired under both
-`tile_bootloader_cc_ipu21.elf` and `tile_bootloader_cc_dbg_ipu21.elf` in the
-independent loader. Thus the debug bootloader variant is not the enable.
+An SDK `SupervisorVertex` containing `trap 0` stops in debug-excepted state
+with `TEXCPT_PBRK0`, PC at the trap, and `$SSR = 0x20`. At that point `ANS` is
+clear. `DBG_CTL`, `DBG_ECSR`, and `TDI_CTL` are zero and `DBG_RBRK` has only
+`ATOV` set, confirming that a separate breakpoint-enable flag is not required.
+
+The same instruction emitted inline in an ipu-stack tile program, immediately
+after the selected device work and before host output exchange, stops all 1472
+supervisors in debug-excepted state. Their PCs identify the trap in the
+generated-code debug range, SRAM readback matches the package image, and
+`$SSR = 0x20`, exactly matching the SDK case.
+
+A trap reached after the final host-output exchange is not durable: execution
+continues into normal supervisor completion. This placement must not be used
+for checkpoints. SDK-generated code also places ordinary vertex calls after
+an internal-exchange dispatch boundary rather than directly after its external
+host exchange. Operator checkpoints naturally occur before host output and do
+not require recreating that transition.
+
+The complete 0x80000-byte device-configuration BAR was also compared after SDK
+and ipu-stack loads and was identical. The behavior is therefore determined by
+the instruction's runtime placement, not by `ipucfg`, bootloader selection, or
+a hidden device configuration write.
 
 The following did not make PBRK durable:
 
@@ -117,8 +136,9 @@ otherwise be protected as atomic; it is not a global exception-enable bit.
 Clearing ATOV while requesting RBRK made no difference to the unresolved
 post-load stop behavior, nor did preserving it.
 
-This establishes that the normal bootloader and current `ipucfg` permit a
-durable TDI retirement-break exception. The remaining problem is specific to
-the PBRK/fault path or to when that exception is observed: a verified call to a
-correctly encoded, memory-resident `trap 0` still retired. The temporary loader
-and test probes used for this experiment have been removed.
+This establishes that the normal bootloader and current `ipucfg` permit durable
+TDI retirement-break and patched-breakpoint exceptions. Static checkpoints
+should use an inline `trap 0` before host output exchange, wait for supervisor
+state 2, verify `$SSR.ETYPE == TEXCPT_PBRK0`, and read tile SRAM through an
+inactive worker context. The temporary SDK oracle and runtime probes used for
+these experiments have been removed.
