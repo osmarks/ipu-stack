@@ -12,6 +12,9 @@ using namespace poplar;
 #ifndef REARRANGE_VERTEX_NAME
 #define REARRANGE_VERTEX_NAME RearrangeRowMajorToAmpF16
 #endif
+#ifndef REARRANGE_INNER_DIMENSION
+#define REARRANGE_INNER_DIMENSION 16
+#endif
 
 static_assert(REARRANGE_LOGICAL_COLUMNS % 2 == 0);
 
@@ -24,7 +27,7 @@ public:
   unsigned targetOrder;
 
   bool compute(unsigned worker) {
-    constexpr unsigned inner = 8;
+    constexpr unsigned inner = REARRANGE_INNER_DIMENSION;
     constexpr unsigned innerBlock = 64;
     constexpr unsigned columnBlock = 16;
     const unsigned *sourceWords = reinterpret_cast<const unsigned *>(&source[0]);

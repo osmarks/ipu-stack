@@ -1,6 +1,6 @@
 //! Machine-readable ABI contracts for tile-local kernel calls.
 
-use crate::mid::AMP_INNER_BLOCK;
+use crate::mid::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
     AmpOrder, ComputeStep, ElementOrder, GemmKernelMode, GemmWeightLoad, KernelRequirements,
     KernelRun, LowProgram, LowShard, LowShardId, Precision, StepProfile, StorageError, TileAddress,
@@ -308,6 +308,7 @@ impl KernelBuildPlan {
                     "-Os".into(),
                     format!("-DREARRANGE_LOGICAL_COLUMNS={logical_columns}"),
                     format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
+                    format!("-DREARRANGE_INNER_DIMENSION={AMP_COLUMN_MICRO}"),
                     format!("-DREARRANGE_VERTEX_NAME={vertex}"),
                 ],
                 retained_symbols: Vec::new(),

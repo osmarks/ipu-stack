@@ -31,8 +31,8 @@ public:
         const unsigned logicalPair = logicalColumn % 16 / 2;
         const unsigned physicalPair = logicalPair % 4 * 2 + logicalPair / 4;
         const unsigned physicalColumn = physicalPair * 2 + logicalColumn % 2;
-        const unsigned sourceElement =
-            row * UNPACK_COLUMNS + logicalColumn / 16 * 16 + physicalColumn;
+        const unsigned sourceElement = logicalColumn / 16 * rows * 16 +
+                                       row * 16 + physicalColumn;
         const unsigned value =
             (sourceWords[sourceElement / 2] >> ((sourceElement & 1) * 16)) & 0xffff;
         packed |= value << (halfIndex * 16);
