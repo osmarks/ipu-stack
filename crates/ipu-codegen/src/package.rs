@@ -17,10 +17,10 @@ use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
 use ipu_exchange::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
 use ipu_package::{
-    Application, Binding, EntryPoint, PROFILE_CYCLES_BINDING, PackageError,
-    ProfileExchangeActivity, ProfileExchangeActivityKind, ProfileMetadata, ProfileStep,
-    ProfileStepKind, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment,
-    TILE_MEMORY_BASE, TileImage, TileProfilePlan,
+    Application, Binding, DEBUG_ALL_TILES, DebugRegion, DebugSymbol, EntryPoint,
+    PROFILE_CYCLES_BINDING, PackageError, ProfileExchangeActivity, ProfileExchangeActivityKind,
+    ProfileMetadata, ProfileStep, ProfileStepKind, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ,
+    SEGMENT_WRITE, Segment, TILE_MEMORY_BASE, TileImage, TileProfilePlan,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -268,6 +268,11 @@ pub fn build_tile_program_package(
         tiles,
         ..Application::default()
     };
+    add_linked_debug_map(&mut application, &layout)?;
+    for (logical, program) in generated.iter().enumerate() {
+        let physical = u32::from(topology.physical(u16::try_from(logical)?)?);
+        add_generated_debug_map(&mut application, physical, code_address, program)?;
+    }
     application.outputs.push(Binding {
         name: "completion".into(),
         dtype: "u32".into(),
@@ -826,6 +831,25 @@ fn build_package_from_objects(
         tiles,
         ..Application::default()
     };
+    add_linked_debug_map(&mut application, &layout)?;
+    for (physical, program) in generated.iter().enumerate() {
+        add_generated_debug_map(
+            &mut application,
+            u32::try_from(physical)?,
+            code_address,
+            program,
+        )?;
+        for segment in &host.segments[physical] {
+            if segment.flags & SEGMENT_EXECUTE != 0 && segment.memory_size != 0 {
+                application.debug_regions.push(DebugRegion {
+                    physical_tile: u32::try_from(physical)?,
+                    address: segment.address,
+                    size: segment.memory_size,
+                    name: "host exchange program".into(),
+                });
+            }
+        }
+    }
     application
         .tiles
         .sort_unstable_by_key(|tile| tile.physical_tile);
@@ -852,6 +876,68 @@ fn build_package_from_objects(
     application.host_exchange = host.protocol;
     application.validate()?;
     Ok(application)
+}
+
+fn add_linked_debug_map(
+    application: &mut Application,
+    linked: &LinkedImage,
+) -> PackageBuildResult<()> {
+    for segment in &linked.segments {
+        application.debug_regions.push(DebugRegion {
+            physical_tile: DEBUG_ALL_TILES,
+            address: segment.address,
+            size: u32::try_from(segment.size)?,
+            name: "linked executable".into(),
+        });
+    }
+    application.debug_symbols.extend(
+        linked
+            .symbols
+            .iter()
+            .filter(|(_, address)| {
+                linked.segments.iter().any(|segment| {
+                    (segment.address..segment.address.saturating_add(segment.size as u32))
+                        .contains(address)
+                })
+            })
+            .map(|(name, &address)| DebugSymbol {
+                name: name.clone(),
+                address,
+            }),
+    );
+    application
+        .debug_symbols
+        .sort_unstable_by_key(|symbol| symbol.address);
+    Ok(())
+}
+
+fn add_generated_debug_map(
+    application: &mut Application,
+    physical_tile: u32,
+    code_address: u32,
+    generated: &crate::GeneratedProgram,
+) -> PackageBuildResult<()> {
+    if !generated.bytes.is_empty() {
+        application.debug_regions.push(DebugRegion {
+            physical_tile,
+            address: code_address,
+            size: u32::try_from(generated.bytes.len())?,
+            name: "generated tile program".into(),
+        });
+    }
+    for row in &generated.exchange_rows {
+        if !row.words.is_empty() {
+            application.debug_regions.push(DebugRegion {
+                physical_tile,
+                address: row.address,
+                size: u32::try_from(row.words.len())?
+                    .checked_mul(4)
+                    .ok_or_else(|| invalid("exchange debug range overflow"))?,
+                name: "exchange row".into(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn build_phase<T>(

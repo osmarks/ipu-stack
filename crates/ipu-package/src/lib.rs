@@ -219,7 +219,7 @@ impl ProfileReport {
     }
 }
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 pub const TARGET_IPU21: &str = "ipu21";
 pub const TILE_MEMORY_BASE: u32 = 0x4c000;
 pub const TILE_MEMORY_SIZE: u32 = 624 * 1024;
@@ -349,6 +349,22 @@ pub struct TileProfilePlan {
     pub steps: Vec<ProfileStep>,
 }
 
+pub const DEBUG_ALL_TILES: u32 = u32::MAX;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugSymbol {
+    pub name: String,
+    pub address: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugRegion {
+    pub physical_tile: u32,
+    pub address: u32,
+    pub size: u32,
+    pub name: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Application {
     pub compiler_version: String,
@@ -360,6 +376,8 @@ pub struct Application {
     pub entry_points: Vec<EntryPoint>,
     pub device_config_writes: Vec<DeviceConfigWrite>,
     pub profile_tiles: Vec<TileProfilePlan>,
+    pub debug_symbols: Vec<DebugSymbol>,
+    pub debug_regions: Vec<DebugRegion>,
 }
 
 impl Default for Application {
@@ -374,6 +392,8 @@ impl Default for Application {
             entry_points: Vec::new(),
             device_config_writes: Vec::new(),
             profile_tiles: Vec::new(),
+            debug_symbols: Vec::new(),
+            debug_regions: Vec::new(),
         }
     }
 }
@@ -448,6 +468,20 @@ impl Application {
             {
                 return Err(PackageError::Invalid("invalid tile profile plan".into()));
             }
+        }
+        if self
+            .debug_symbols
+            .iter()
+            .any(|symbol| symbol.name.is_empty())
+            || self.debug_regions.iter().any(|region| {
+                region.name.is_empty()
+                    || region.size == 0
+                    || region.address.checked_add(region.size).is_none()
+                    || (region.physical_tile != DEBUG_ALL_TILES
+                        && !tile_ids.contains(&region.physical_tile))
+            })
+        {
+            return Err(PackageError::Invalid("invalid package debug map".into()));
         }
         let mut binding_names = std::collections::HashSet::new();
         for binding in self.inputs.iter().chain(&self.outputs).chain(&self.weights) {
@@ -579,6 +613,24 @@ impl Application {
                 .init_profile_tiles(self.profile_tiles.len() as u32),
             &self.profile_tiles,
         );
+        let mut debug_symbols = root
+            .reborrow()
+            .init_debug_symbols(self.debug_symbols.len() as u32);
+        for (index, symbol) in self.debug_symbols.iter().enumerate() {
+            let mut item = debug_symbols.reborrow().get(index as u32);
+            item.set_name(&symbol.name);
+            item.set_address(symbol.address);
+        }
+        let mut debug_regions = root
+            .reborrow()
+            .init_debug_regions(self.debug_regions.len() as u32);
+        for (index, region) in self.debug_regions.iter().enumerate() {
+            let mut item = debug_regions.reborrow().get(index as u32);
+            item.set_physical_tile(region.physical_tile);
+            item.set_address(region.address);
+            item.set_size(region.size);
+            item.set_name(&region.name);
+        }
         serialize::write_message(&mut output, &message)?;
         info!("application package written");
         Ok(())
@@ -624,6 +676,28 @@ impl Application {
             })
             .collect();
         app.profile_tiles = read_profile_tiles(root.get_profile_tiles()?)?;
+        app.debug_symbols = root
+            .get_debug_symbols()?
+            .iter()
+            .map(|item| {
+                Ok(DebugSymbol {
+                    name: item.get_name()?.to_str()?.into(),
+                    address: item.get_address(),
+                })
+            })
+            .collect::<Result<_, PackageError>>()?;
+        app.debug_regions = root
+            .get_debug_regions()?
+            .iter()
+            .map(|item| {
+                Ok(DebugRegion {
+                    physical_tile: item.get_physical_tile(),
+                    address: item.get_address(),
+                    size: item.get_size(),
+                    name: item.get_name()?.to_str()?.into(),
+                })
+            })
+            .collect::<Result<_, PackageError>>()?;
         app.validate()?;
         info!(
             tiles = app.tiles.len(),
@@ -631,6 +705,24 @@ impl Application {
             "application package read"
         );
         Ok(app)
+    }
+
+    pub fn symbolize_pc(&self, physical_tile: u32, pc: u32) -> Option<String> {
+        let region = self.debug_regions.iter().find(|region| {
+            (region.physical_tile == DEBUG_ALL_TILES || region.physical_tile == physical_tile)
+                && (region.address..region.address.saturating_add(region.size)).contains(&pc)
+        })?;
+        if region.physical_tile == DEBUG_ALL_TILES {
+            if let Some(symbol) = self
+                .debug_symbols
+                .iter()
+                .filter(|symbol| symbol.address <= pc)
+                .max_by_key(|symbol| symbol.address)
+            {
+                return Some(format!("{}+0x{:x}", symbol.name, pc - symbol.address));
+            }
+        }
+        Some(format!("{}+0x{:x}", region.name, pc - region.address))
     }
 
     pub fn tile_image(&self, physical_tile: u32) -> Result<Vec<u8>, PackageError> {
@@ -1150,6 +1242,16 @@ mod tests {
         app.device_config_writes.push(DeviceConfigWrite {
             offset: 0x4018,
             value: 0xc000_000d,
+        });
+        app.debug_symbols.push(DebugSymbol {
+            name: "kernel".into(),
+            address: TILE_MEMORY_BASE,
+        });
+        app.debug_regions.push(DebugRegion {
+            physical_tile: DEBUG_ALL_TILES,
+            address: TILE_MEMORY_BASE,
+            size: 8,
+            name: "linked executable".into(),
         });
         app.host_exchange = HostExchange {
             startup_mark: 1,

@@ -112,6 +112,18 @@ struct TileProfilePlan {
   steps @1 :List(ProfileStepPlan);
 }
 
+struct DebugSymbol {
+  name @0 :Text;
+  address @1 :UInt32;
+}
+
+struct DebugRegion {
+  physicalTile @0 :UInt32;
+  address @1 :UInt32;
+  size @2 :UInt32;
+  name @3 :Text;
+}
+
 struct Application {
   schemaVersion @0 :UInt32;
   compilerVersion @1 :Text;
@@ -126,4 +138,6 @@ struct Application {
   entryPoints @10 :List(EntryPoint);
   deviceConfigWrites @11 :List(DeviceConfigWrite);
   profileTiles @12 :List(TileProfilePlan);
+  debugSymbols @13 :List(DebugSymbol);
+  debugRegions @14 :List(DebugRegion);
 }

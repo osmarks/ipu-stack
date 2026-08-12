@@ -1727,6 +1727,10 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
     let mut contexts = Vec::new();
     for &(physical, state) in states.iter().filter(|(_, state)| *state != 0).take(16) {
         let program_counter = runtime.device().read_tile_program_counter(physical, 0);
+        let program_counter_symbol = program_counter
+            .as_ref()
+            .ok()
+            .and_then(|&pc| application.symbolize_pc(u32::from(physical), pc));
         let segment = program_counter.as_ref().ok().and_then(|&pc| {
             application
                 .tiles
@@ -1797,7 +1801,8 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
                             context,
                             runtime
                                 .device()
-                                .read_tile_program_counter(physical, context),
+                                .read_tile_program_counter(physical, context)
+                                .map(|pc| (pc, application.symbolize_pc(u32::from(physical), pc))),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1807,6 +1812,7 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
             physical,
             state,
             program_counter,
+            program_counter_symbol,
             segment,
             row_readback,
             supervisor_registers,
