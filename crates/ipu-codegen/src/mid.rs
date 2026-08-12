@@ -2594,6 +2594,7 @@ struct BeamBranch {
     values: BTreeMap<ValueId, MidValueId>,
     state: LoweringState,
     operations: Vec<MidOperation>,
+    peak_memory: MemoryPeaks,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2623,6 +2624,43 @@ struct FutureBeamState {
     values: Vec<FutureValueState>,
     deferred: Vec<FutureDeferredState>,
     equal_formats_satisfied: Vec<(ValueId, ValueId, bool)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BeamObjective {
+    cycles: u64,
+    standard: u64,
+    interleaved: u64,
+    total: u64,
+    maximum_standard_allocation: u64,
+    standard_contiguous_overflow: u64,
+    exchange_rows: u64,
+}
+
+impl BeamObjective {
+    fn dominates(self, other: Self) -> bool {
+        let no_worse = self.cycles <= other.cycles
+            && self.standard <= other.standard
+            && self.interleaved <= other.interleaved
+            && self.total <= other.total
+            && self.maximum_standard_allocation <= other.maximum_standard_allocation
+            && self.standard_contiguous_overflow <= other.standard_contiguous_overflow
+            && self.exchange_rows <= other.exchange_rows;
+        let strictly_better = self.cycles < other.cycles
+            || self.standard < other.standard
+            || self.interleaved < other.interleaved
+            || self.total < other.total
+            || self.maximum_standard_allocation < other.maximum_standard_allocation
+            || self.standard_contiguous_overflow < other.standard_contiguous_overflow
+            || self.exchange_rows < other.exchange_rows;
+        no_worse && strictly_better
+    }
+}
+
+struct RankedBeamBranch {
+    branch: BeamBranch,
+    objective: BeamObjective,
+    order: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2683,6 +2721,7 @@ fn lower_operations(
         values: values.clone(),
         state: state.clone(),
         operations: Vec::new(),
+        peak_memory: MemoryPeaks::default(),
     }];
     for (operation_index, operation) in source.iter().enumerate() {
         let mut expanded = Vec::new();
@@ -2732,6 +2771,7 @@ fn lower_operations(
                     config.standard_memory_reservation_bytes,
                     config.tile_memory_budget_bytes,
                 ) {
+                    next.peak_memory = peak;
                     expanded.push(next);
                 } else {
                     tracing::trace!(
@@ -2862,6 +2902,7 @@ fn lower_operations(
                     config.standard_memory_reservation_bytes,
                     config.tile_memory_budget_bytes,
                 ) {
+                    next.peak_memory = peak;
                     expanded.push(next);
                 } else {
                     tracing::trace!(
@@ -2911,20 +2952,21 @@ fn lower_operations(
             )
             .chain(constraints.allocation_copies.keys().copied())
             .collect::<BTreeSet<_>>();
-        expanded.sort_by_cached_key(|branch| {
-            deferred_aware_branch_score(branch, &future_origins).saturating_add(
-                format_equality_cost(branch, &constraints.required_equal_formats, costs),
-            )
-        });
-        let mut retained_signatures = BTreeSet::new();
-        expanded.retain(|branch| {
-            let signature = future_beam_state(branch, &future_origins, constraints);
-            retained_signatures.insert(signature)
-        });
-        expanded.truncate(config.planning_beam_width.max(1));
+        let expanded_count = expanded.len();
+        let (expanded, dominated, equivalent, diversity) = retain_pareto_beam(
+            expanded,
+            &future_origins,
+            constraints,
+            costs,
+            config.planning_beam_width.max(1),
+        );
         tracing::debug!(
             operation = operation.id.index(),
             retained = expanded.len(),
+            expanded = expanded_count,
+            pareto_dominated = dominated,
+            equivalent,
+            diversity_representatives = diversity,
             best_cycles = deferred_aware_branch_score(&expanded[0], &future_origins),
             generated_plan_sets,
             plan_cache_hits,
@@ -2944,6 +2986,113 @@ fn lower_operations(
     *values = best.values;
     *state = best.state;
     Ok(best.operations)
+}
+
+fn retain_pareto_beam(
+    branches: Vec<BeamBranch>,
+    future_origins: &BTreeSet<ValueId>,
+    constraints: &RegionPlanningConstraints,
+    costs: &impl CostModel,
+    width: usize,
+) -> (Vec<BeamBranch>, usize, usize, usize) {
+    let mut groups = BTreeMap::<FutureBeamState, Vec<RankedBeamBranch>>::new();
+    for (order, branch) in branches.into_iter().enumerate() {
+        let signature = future_beam_state(&branch, future_origins, constraints);
+        let objective = BeamObjective {
+            cycles: deferred_aware_branch_score(&branch, future_origins).saturating_add(
+                format_equality_cost(&branch, &constraints.required_equal_formats, costs),
+            ),
+            standard: branch.peak_memory.standard,
+            interleaved: branch.peak_memory.interleaved,
+            total: branch.peak_memory.total,
+            maximum_standard_allocation: branch.peak_memory.maximum_standard_allocation,
+            standard_contiguous_overflow: branch.peak_memory.standard_contiguous_overflow,
+            exchange_rows: branch.peak_memory.exchange_rows,
+        };
+        groups.entry(signature).or_default().push(RankedBeamBranch {
+            branch,
+            objective,
+            order,
+        });
+    }
+
+    let mut frontier = Vec::new();
+    let mut dominated = 0usize;
+    let mut equivalent = 0usize;
+    for (_, candidates) in groups {
+        let mut group_frontier = Vec::<RankedBeamBranch>::new();
+        for candidate in candidates {
+            if group_frontier
+                .iter()
+                .any(|kept| kept.objective == candidate.objective)
+            {
+                equivalent += 1;
+                continue;
+            }
+            if group_frontier
+                .iter()
+                .any(|kept| kept.objective.dominates(candidate.objective))
+            {
+                dominated += 1;
+                continue;
+            }
+            let before = group_frontier.len();
+            group_frontier.retain(|kept| !candidate.objective.dominates(kept.objective));
+            dominated += before - group_frontier.len();
+            group_frontier.push(candidate);
+        }
+        frontier.extend(group_frontier);
+    }
+    frontier.sort_by_key(|candidate| (candidate.objective.cycles, candidate.order));
+
+    let mut selected = BTreeSet::new();
+    let mut diversity = 0usize;
+    if frontier.len() > width {
+        let objectives: [fn(&RankedBeamBranch) -> u64; 6] = [
+            |entry: &RankedBeamBranch| entry.objective.standard,
+            |entry: &RankedBeamBranch| entry.objective.interleaved,
+            |entry: &RankedBeamBranch| entry.objective.total,
+            |entry: &RankedBeamBranch| entry.objective.maximum_standard_allocation,
+            |entry: &RankedBeamBranch| entry.objective.standard_contiguous_overflow,
+            |entry: &RankedBeamBranch| entry.objective.exchange_rows,
+        ];
+        selected.insert(0);
+        for objective in objectives {
+            if selected.len() == width {
+                break;
+            }
+            let index = frontier
+                .iter()
+                .enumerate()
+                .min_by_key(|(index, entry)| (objective(entry), entry.objective.cycles, *index))
+                .map(|(index, _)| index)
+                .unwrap();
+            if selected.insert(index) {
+                diversity += 1;
+            }
+        }
+        for index in 0..frontier.len() {
+            if selected.len() == width {
+                break;
+            }
+            selected.insert(index);
+        }
+    } else {
+        selected.extend(0..frontier.len());
+    }
+    let mut retained = frontier
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, entry)| selected.contains(&index).then_some(entry.branch))
+        .collect::<Vec<_>>();
+    retained.sort_by_cached_key(|branch| {
+        deferred_aware_branch_score(branch, future_origins).saturating_add(format_equality_cost(
+            branch,
+            &constraints.required_equal_formats,
+            costs,
+        ))
+    });
+    (retained, dominated, equivalent, diversity)
 }
 
 fn future_beam_state(
@@ -4334,6 +4483,7 @@ mod tests {
                         .collect(),
                     state,
                     operations: Vec::new(),
+                    peak_memory: MemoryPeaks::default(),
                 }
             };
             let future = [first, second].into_iter().collect();
