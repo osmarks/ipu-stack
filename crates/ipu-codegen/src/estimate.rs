@@ -3,10 +3,10 @@
 use crate::cost::IPU21_TARGET_COSTS;
 use crate::graph::TensorShape;
 use crate::mid::{
-    AmpOrder, ElementOrder, GemmDistribution, Layout, MemoryClass, MemoryEstimate, MemoryOperand,
-    MemoryPeaks, MemoryRelation, MemoryUsage, MidOperation, MidOperationKind, MidValue, MidValueId,
-    OperandMaterialization, OperatorDispatch, OperatorRequirements, Precision, TensorAxis,
-    TensorType,
+    AMP_COLUMN_MICRO, AmpOrder, ElementOrder, GemmDistribution, Layout, MemoryClass,
+    MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidOperation,
+    MidOperationKind, MidValue, MidValueId, OperandMaterialization, OperatorDispatch,
+    OperatorRequirements, Precision, TensorAxis, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -419,6 +419,69 @@ pub(crate) fn operator_memory_estimate(
             .saturating_mul(u64::from(*inner_block))
             .saturating_mul(u64::from(*output_column_block))
             .saturating_mul(right.format.precision.bytes());
+    }
+    if let OperatorDispatch::BlockedAttention {
+        query_block_rows,
+        key_block_rows,
+        padded_query_dimension,
+        padded_value_dimension,
+        ..
+    } = dispatch
+    {
+        let element_bytes = inputs.first().map_or(Precision::F16.bytes(), |input| {
+            input.format.precision.bytes()
+        });
+        let key_rows = inputs
+            .get(1)
+            .and_then(|key| key.shape.0.get(key.shape.0.len().saturating_sub(2)))
+            .copied()
+            .map_or(1, u64::from);
+        let blocks = key_rows.div_ceil(u64::from(*key_block_rows).max(1));
+        let panels_per_block = u64::from(
+            padded_query_dimension
+                .div_ceil(AMP_COLUMN_MICRO)
+                .saturating_add(padded_value_dimension.div_ceil(AMP_COLUMN_MICRO)),
+        );
+        let query_rows = output
+            .shape
+            .0
+            .get(output.shape.0.len().saturating_sub(2))
+            .copied()
+            .map_or(1, u64::from);
+        let query_partitions = query_rows
+            .div_ceil(u64::from(*query_block_rows).max(1))
+            .max(1);
+        let prepared_panels_per_owner = blocks
+            .saturating_mul(panels_per_block)
+            .div_ceil(query_partitions);
+        let panel_bytes = u64::from(*key_block_rows)
+            .saturating_mul(u64::from(AMP_COLUMN_MICRO))
+            .saturating_mul(element_bytes);
+        // Every attention tile retains the current K and V panels. Prepared
+        // panels are spread over query-tile owners; each needs both its
+        // row-major gather buffer and its packed source until consumption.
+        temporary.standard = temporary.standard.saturating_add(
+            u64::from(*key_block_rows)
+                .saturating_mul(u64::from(
+                    padded_query_dimension.saturating_add(*padded_value_dimension),
+                ))
+                .saturating_mul(element_bytes)
+                .saturating_add(
+                    prepared_panels_per_owner
+                        .saturating_mul(panel_bytes)
+                        .saturating_mul(2),
+                )
+                .saturating_add(
+                    u64::from(*query_block_rows)
+                        .saturating_mul(u64::from(key_block_rows.saturating_add(16)))
+                        .saturating_mul(element_bytes),
+                ),
+        );
+        temporary.interleaved = temporary.interleaved.saturating_add(
+            u64::from(*query_block_rows)
+                .saturating_mul(u64::from((*padded_value_dimension).max(*key_block_rows)))
+                .saturating_mul(Precision::F32.bytes()),
+        );
     }
     MemoryEstimate {
         live,

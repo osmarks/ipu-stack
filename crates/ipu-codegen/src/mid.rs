@@ -4988,6 +4988,14 @@ mod tests {
             let claims = &consumer.operator_plan.as_ref().unwrap().deferred_inputs;
             assert_eq!(claims.len(), split.len(), "random case {case}");
             assert!(claims.iter().all(Option::is_some), "random case {case}");
+            assert!(
+                consumer.operator_plan.as_ref().unwrap().exchange.phases >= 2,
+                "random case {case}"
+            );
+            assert!(
+                consumer.memory.exchange_row_bytes != 0,
+                "random case {case}"
+            );
             assert_eq!(
                 lowered.estimated_cycles,
                 lowered
@@ -4997,7 +5005,16 @@ mod tests {
                     .sum::<u64>(),
                 "random case {case}"
             );
-            crate::low::lower_to_tiles(&lowered, &config).unwrap();
+            let tiled = crate::low::lower_to_tiles(&lowered, &config).unwrap();
+            let attention_phases = tiled
+                .exchange_phases
+                .iter()
+                .filter(|phase| phase.provenance.operation == consumer.source)
+                .count();
+            assert!(
+                attention_phases <= tokens.div_ceil(AMP_INNER_BLOCK) as usize + 2,
+                "random case {case}: {attention_phases} attention exchange phases"
+            );
         }
     }
 

@@ -747,10 +747,16 @@ impl CostModel for Ipu21CostModel {
         inputs: &[TensorType],
         output: &TensorType,
     ) -> ExchangeFootprint {
-        let phases = if matches!(dispatch, OperatorDispatch::SplitHeads) {
-            1
-        } else {
-            gemm_exchange_phase_count(dispatch, inputs, output)
+        let phases = match dispatch {
+            OperatorDispatch::SplitHeads => 1,
+            OperatorDispatch::BlockedAttention { key_block_rows, .. } => inputs
+                .get(1)
+                .and_then(|key| key.shape.0.get(key.shape.0.len().saturating_sub(2)))
+                .copied()
+                .map_or(0, u64::from)
+                .div_ceil(u64::from(*key_block_rows).max(1))
+                .saturating_add(2),
+            _ => gemm_exchange_phase_count(dispatch, inputs, output),
         };
         let phases = match dispatch {
             OperatorDispatch::BlockedGemm {
@@ -774,6 +780,34 @@ impl CostModel for Ipu21CostModel {
         };
         if phases == 0 {
             return ExchangeFootprint::default();
+        }
+        if let OperatorDispatch::BlockedAttention {
+            key_block_rows,
+            padded_query_dimension,
+            padded_value_dimension,
+            ..
+        } = dispatch
+        {
+            let key_rows = inputs
+                .get(1)
+                .and_then(|key| key.shape.0.get(key.shape.0.len().saturating_sub(2)))
+                .copied()
+                .map_or(0, u64::from);
+            let blocks = key_rows.div_ceil(u64::from(*key_block_rows).max(1));
+            let panels = u64::from(
+                padded_query_dimension
+                    .saturating_add(*padded_value_dimension)
+                    .div_ceil(crate::mid::AMP_COLUMN_MICRO),
+            );
+            // Prepared K/V owners receive several independently sharded
+            // source fragments in the common gather epoch. Ownership is
+            // rotated, so roughly half the panels contribute to the busiest
+            // row; retaining this estimate prevents the planner from treating
+            // the consolidated exchange program as free SRAM.
+            return ExchangeFootprint {
+                phases,
+                maximum_transfer_chunks_per_tile: blocks.saturating_mul(panels.div_ceil(2)),
+            };
         }
         let remote_bytes = gemm_remote_bytes_per_tile(inputs, output);
         if remote_bytes == u64::MAX {
