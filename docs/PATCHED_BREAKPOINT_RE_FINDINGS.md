@@ -105,6 +105,16 @@ an internal-exchange dispatch boundary rather than directly after its external
 host exchange. Operator checkpoints naturally occur before host output and do
 not require recreating that transition.
 
+An inline checkpoint resumes by applying the ordinary software-breakpoint
+step-over rule. PBRK leaves the saved PC at the trap: clearing `DBG_ECLR`
+without replacing the instruction immediately traps again. Injecting
+`put $PC, $m0` changes neither the saved exception PC nor its readback. The
+working sequence is to replace the dedicated trap word with IPU21 `nop`
+(`0x19e00000`) through an injected SRAM store, then clear the exception. A
+single-invocation diagnostic package reaches each checkpoint once, so it does
+not need to restore that trap before continuing. Alternating PBRK0 and PBRK1
+provides an additional unambiguous checkpoint-generation marker to the host.
+
 The complete 0x80000-byte device-configuration BAR was also compared after SDK
 and ipu-stack loads and was identical. The behavior is therefore determined by
 the instruction's runtime placement, not by `ipucfg`, bootloader selection, or

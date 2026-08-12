@@ -1,11 +1,11 @@
-use crate::graph::ComputeGraph;
+use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
 use crate::low::{LowProgram, LowValue};
 use crate::memory::{
     MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE,
     RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
 };
-use crate::mid::{Ipu21CostModel, PipelineConfig};
+use crate::mid::{Ipu21CostModel, MidGraph, MidOperationKind, PipelineConfig, Precision};
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, KernelBuildPlan, PRNG_SEED_SYMBOL,
     PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL, TileProgram,
@@ -89,6 +89,43 @@ pub struct TileProgramData {
     pub tile: u16,
     pub address: u32,
     pub data: Vec<u8>,
+}
+
+/// A loadable package plus the exact device storage visible at each semantic
+/// operator checkpoint.
+#[derive(Clone, Debug)]
+pub struct DiagnosticPackage {
+    pub application: Application,
+    pub inputs: Vec<DiagnosticTensor>,
+    pub checkpoints: Vec<DiagnosticCheckpoint>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiagnosticCheckpoint {
+    pub operation: OperationId,
+    pub breakpoint: u8,
+    pub tensors: Vec<DiagnosticTensor>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiagnosticTensor {
+    pub name: Option<String>,
+    pub value: ValueId,
+    pub shape: crate::TensorShape,
+    pub precision: Precision,
+    pub shards: Vec<DiagnosticShard>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiagnosticShard {
+    pub physical_tile: u16,
+    pub address: u32,
+    pub storage: crate::LowShard,
+}
+
+struct BuiltApplication {
+    application: Application,
+    placement: crate::Placement,
 }
 
 /// Builds an application from address-resolved tile programs.
@@ -308,7 +345,7 @@ fn collect_exchange_rows(
                     .or_insert(end);
             }
             crate::TileStep::Repeat(repeat) => collect_exchange_rows(rows, &repeat.body)?,
-            crate::TileStep::Compute(_) => {}
+            crate::TileStep::Compute(_) | crate::TileStep::Checkpoint(_) => {}
         }
     }
     Ok(())
@@ -319,7 +356,7 @@ fn collect_compute_symbols(symbols: &mut Vec<String>, steps: &[crate::TileStep])
         match step {
             crate::TileStep::Compute(compute) => symbols.push(compute.symbol.clone()),
             crate::TileStep::Repeat(repeat) => collect_compute_symbols(symbols, &repeat.body),
-            crate::TileStep::Exchange(_) => {}
+            crate::TileStep::Exchange(_) | crate::TileStep::Checkpoint(_) => {}
         }
     }
 }
@@ -335,8 +372,91 @@ pub fn build_package(
     graph: &ComputeGraph,
     config: &PackageConfig,
 ) -> PackageBuildResult<Application> {
+    Ok(build_package_artifacts(graph, config, false)?.0.application)
+}
+
+/// Builds an ordinary optimized package with resumable PBRK0 traps after each
+/// top-level operator and returns the storage map needed for non-invasive
+/// numerical inspection.
+pub fn build_diagnostic_package(
+    graph: &ComputeGraph,
+    config: &PackageConfig,
+) -> PackageBuildResult<DiagnosticPackage> {
+    let (built, mid, low) = build_package_artifacts(graph, config, true)?;
+    let topology = active_topology(low.tile_count)?;
+    let inputs = low
+        .inputs
+        .iter()
+        .map(|input| {
+            diagnostic_tensor(
+                &mid,
+                &low,
+                &built.placement,
+                &topology,
+                input.value,
+                Some(input.name.clone()),
+            )
+        })
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    let mut checkpoints = Vec::new();
+    for operation in &mid.operations {
+        if !matches!(
+            operation.kind,
+            MidOperationKind::Operator(_) | MidOperationKind::Repeat(_)
+        ) {
+            continue;
+        }
+        let Some(source) = operation.source else {
+            continue;
+        };
+        let tensors = operation
+            .results
+            .iter()
+            .map(|&value| diagnostic_tensor(&mid, &low, &built.placement, &topology, value, None))
+            .collect::<PackageBuildResult<Vec<_>>>()?;
+        // A fully deferred view operation has no device work or independently
+        // materialized boundary to stop at; its consumer's checkpoint covers
+        // the fused mapping instead.
+        if tensors.iter().all(|tensor| tensor.shards.is_empty()) {
+            continue;
+        }
+        for tensor in &tensors {
+            tracing::debug!(
+                operation = source.index(),
+                value = tensor.value.index(),
+                shape = ?tensor.shape.0,
+                precision = ?tensor.precision,
+                shards = tensor.shards.len(),
+                order = ?tensor.shards.first().map(|shard| &shard.storage.tensor_type.format.layout.order),
+                memory_class = ?tensor.shards.first().map(|shard| shard.storage.tensor_type.format.layout.memory_class),
+                first_extents = ?tensor.shards.first().map(|shard| &shard.storage.extents),
+                "recorded diagnostic tensor"
+            );
+        }
+        checkpoints.push(DiagnosticCheckpoint {
+            operation: source,
+            breakpoint: (checkpoints.len() & 1) as u8,
+            tensors,
+        });
+    }
+    Ok(DiagnosticPackage {
+        application: built.application,
+        inputs,
+        checkpoints,
+    })
+}
+
+fn build_package_artifacts(
+    graph: &ComputeGraph,
+    config: &PackageConfig,
+    diagnostic_checkpoints: bool,
+) -> PackageBuildResult<(BuiltApplication, MidGraph, LowProgram)> {
     validate_tile_count(u32::from(config.pipeline.tile_count))?;
-    let planning = config.pipeline.clone();
+    let mut planning = config.pipeline.clone();
+    planning.diagnostic_checkpoints = diagnostic_checkpoints;
+    if diagnostic_checkpoints {
+        planning.profiling.enabled = false;
+    }
     let mid = build_phase("lower_mid", || {
         Ok(lower(graph, &planning, &Ipu21CostModel)?)
     })?;
@@ -364,7 +484,10 @@ pub fn build_package(
         }
         Ok(objects)
     })?;
-    build_package_from_objects(&low, config, &objects, &kernel_plan)
+    let mut package_config = config.clone();
+    package_config.pipeline = planning;
+    let built = build_package_from_objects(&low, &package_config, &objects, &kernel_plan)?;
+    Ok((built, mid, low))
 }
 
 fn build_package_from_objects(
@@ -372,7 +495,7 @@ fn build_package_from_objects(
     config: &PackageConfig,
     objects: &[Vec<u8>],
     kernel_plan: &KernelBuildPlan,
-) -> PackageBuildResult<Application> {
+) -> PackageBuildResult<BuiltApplication> {
     let topology = active_topology(program.tile_count)?;
     let retained_runtime = runtime_retained_symbols(program, config);
     let layout = build_phase("link_runtime", || {
@@ -875,7 +998,56 @@ fn build_package_from_objects(
     });
     application.host_exchange = host.protocol;
     application.validate()?;
-    Ok(application)
+    Ok(BuiltApplication {
+        application,
+        placement,
+    })
+}
+
+fn diagnostic_tensor(
+    mid: &MidGraph,
+    low: &LowProgram,
+    placement: &crate::Placement,
+    topology: &Topology,
+    value: crate::MidValueId,
+    name: Option<String>,
+) -> PackageBuildResult<DiagnosticTensor> {
+    let mid_value = mid
+        .values
+        .get(value.index() as usize)
+        .ok_or_else(|| invalid("diagnostic mid-level value is missing"))?;
+    let low_value = low.values.iter().find(|candidate| candidate.value == value);
+    let shards = if let Some(low_value) = low_value {
+        low_value
+            .shards
+            .iter()
+            .map(|id| {
+                let storage = low
+                    .shards
+                    .get(id.index() as usize)
+                    .ok_or_else(|| invalid("diagnostic low-level shard is missing"))?;
+                let address = placement
+                    .shard_addresses
+                    .get(id)
+                    .copied()
+                    .ok_or_else(|| invalid("diagnostic shard placement is missing"))?;
+                Ok(DiagnosticShard {
+                    physical_tile: topology.physical(storage.tile)?,
+                    address,
+                    storage: storage.clone(),
+                })
+            })
+            .collect::<PackageBuildResult<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    Ok(DiagnosticTensor {
+        name,
+        value: mid_value.origin,
+        shape: mid_value.tensor_type.shape.clone(),
+        precision: mid_value.tensor_type.format.precision,
+        shards,
+    })
 }
 
 fn add_linked_debug_map(
@@ -1159,7 +1331,9 @@ fn tile_has_halfword_copy(program: &LowProgram, tile: &crate::TileWorkList) -> b
     program.work(tile).any(|work| match work {
         crate::TileWorkRef::LocalCopy(copy) => !copy.bytes.is_multiple_of(4),
         crate::TileWorkRef::Repeat(repeat) => tile_has_halfword_copy(program, &repeat.body),
-        crate::TileWorkRef::Exchange(_) | crate::TileWorkRef::Kernel(_) => false,
+        crate::TileWorkRef::Exchange(_)
+        | crate::TileWorkRef::Kernel(_)
+        | crate::TileWorkRef::Checkpoint(..) => false,
     })
 }
 
@@ -1167,7 +1341,9 @@ fn tile_has_local_copy(program: &LowProgram, tile: &crate::TileWorkList) -> bool
     program.work(tile).any(|work| match work {
         crate::TileWorkRef::LocalCopy(_) => true,
         crate::TileWorkRef::Repeat(repeat) => tile_has_local_copy(program, &repeat.body),
-        crate::TileWorkRef::Exchange(_) | crate::TileWorkRef::Kernel(_) => false,
+        crate::TileWorkRef::Exchange(_)
+        | crate::TileWorkRef::Kernel(_)
+        | crate::TileWorkRef::Checkpoint(..) => false,
     })
 }
 
@@ -1291,7 +1467,9 @@ fn instrument_profile(
             let following = schedule[index + 1..].iter().find_map(|work| match work {
                 crate::TileWorkRef::Kernel(run) => Some(&run.provenance),
                 crate::TileWorkRef::Repeat(repeat) => Some(&repeat.provenance),
-                crate::TileWorkRef::Exchange(_) | crate::TileWorkRef::LocalCopy(_) => None,
+                crate::TileWorkRef::Exchange(_)
+                | crate::TileWorkRef::LocalCopy(_)
+                | crate::TileWorkRef::Checkpoint(..) => None,
             });
             step_profile(step).before = Some(profile_address(address, plans.len())?);
             let mut description = profile_step(
@@ -1318,6 +1496,23 @@ fn instrument_profile(
             .zip(&mut tile_program.steps)
             .enumerate()
         {
+            if let (crate::TileWorkRef::Checkpoint(operation, _), crate::TileStep::Checkpoint(_)) =
+                (work, &*step)
+            {
+                step_profile(step).before = Some(profile_address(address, index)?);
+                plans.push(ProfileStep {
+                    local_index: u32::try_from(index)?,
+                    phase: u32::try_from(index)?,
+                    epoch: 0,
+                    operation: format!("operation.{}", operation.index()),
+                    kind: ProfileStepKind::Idle,
+                    kernel: "diagnostic-checkpoint".into(),
+                    metadata: Vec::new(),
+                    exchange_activities: Vec::new(),
+                    exchange_event_cycles: 0,
+                });
+                continue;
+            }
             let (phase, provenance) = match (work, &*step) {
                 (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(_)) => {
                     let phase = &program.exchange_phases[id.index() as usize];
@@ -1350,7 +1545,9 @@ fn inactive_profile_work(program: &LowProgram) -> Vec<crate::TileWorkRef<'_>> {
         .filter(|work| {
             matches!(
                 work,
-                crate::TileWorkRef::Exchange(_) | crate::TileWorkRef::Repeat(_)
+                crate::TileWorkRef::Exchange(_)
+                    | crate::TileWorkRef::Repeat(_)
+                    | crate::TileWorkRef::Checkpoint(..)
             )
         })
         .collect()
@@ -1479,6 +1676,19 @@ fn profile_step(
             ProfileStepKind::Compute,
             "repeat",
         ),
+        (crate::TileWorkRef::Checkpoint(operation, _), crate::TileStep::Checkpoint(_)) => {
+            Ok(ProfileStep {
+                local_index: u32::try_from(index)?,
+                phase: u32::try_from(index)?,
+                epoch: 0,
+                operation: format!("operation.{}", operation.index()),
+                kind: ProfileStepKind::Synchronization,
+                kernel: "diagnostic-checkpoint".into(),
+                metadata: Vec::new(),
+                exchange_activities: Vec::new(),
+                exchange_event_cycles: 0,
+            })
+        }
         _ => Err(invalid(
             "tile profile work kind does not match finalized step",
         )),
@@ -1550,6 +1760,7 @@ fn step_profile(step: &mut crate::TileStep) -> &mut crate::StepProfile {
         crate::TileStep::Exchange(exchange) => &mut exchange.profile,
         crate::TileStep::Compute(compute) => &mut compute.profile,
         crate::TileStep::Repeat(repeat) => &mut repeat.profile,
+        crate::TileStep::Checkpoint(checkpoint) => &mut checkpoint.profile,
     }
 }
 

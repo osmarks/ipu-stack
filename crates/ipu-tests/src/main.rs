@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use ipu_codegen::{
     AmpOrder, ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision, TensorFormat,
-    amp_matrix_coordinates, build_package,
+    amp_matrix_coordinates, build_diagnostic_package, build_package,
 };
 use ipu_driver::DriverError;
 use ipu_elf::Toolchain;
@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+mod diagnostic;
 mod exchange_stress;
 
 #[derive(Parser)]
@@ -31,6 +32,17 @@ struct Arguments {
     /// Load an existing --package without rebuilding it.
     #[arg(long)]
     reuse_package: bool,
+    /// Stop after each semantic operator, sample its optimized device tensor,
+    /// and compare it with a host reference before resuming.
+    #[arg(long, conflicts_with = "reuse_package")]
+    diagnostic_run: bool,
+    /// Maximum number of logical elements checked per operator result.
+    #[arg(long, default_value_t = 256)]
+    diagnostic_samples: usize,
+    #[arg(long, default_value_t = 0.03)]
+    diagnostic_atol: f32,
+    #[arg(long, default_value_t = 0.03)]
+    diagnostic_rtol: f32,
     /// Write per-tile kernel and exchange cycle samples for benchmark runs.
     #[arg(long, conflicts_with = "no_profile")]
     profile_output: Option<PathBuf>,
@@ -151,6 +163,15 @@ fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     ipu_runtime::init_tracing();
     let arguments = Arguments::parse();
+    if arguments.diagnostic_run && matches!(arguments.workload, Workload::Diagnostic) {
+        bail!("--diagnostic-run requires a computational workload");
+    }
+    if arguments.diagnostic_run && arguments.diagnostic_samples == 0 {
+        bail!("--diagnostic-samples must be nonzero");
+    }
+    if arguments.diagnostic_run && arguments.profile_output.is_some() {
+        bail!("--diagnostic-run cannot be combined with --profile-output");
+    }
     if !arguments.workload.is_benchmark()
         && (arguments.profile_output.is_some() || arguments.no_profile)
     {
@@ -422,21 +443,26 @@ fn main() -> Result<()> {
             .with_automatic_input(left, Precision::F16)
             .with_automatic_input(right, Precision::F16);
     }
-    if !arguments.reuse_package {
-        let application = build_package(
-            &graph,
-            &PackageConfig {
-                toolchain: Toolchain::from_sdk(&arguments.sdk),
-                kernel_source_directory: runtime_source
-                    .parent()
-                    .expect("runtime source has no parent directory")
-                    .to_owned(),
-                runtime_source,
-                pipeline,
-            },
-        )?;
-        write_package(&application, &arguments.package)?;
-    }
+    let package_config = PackageConfig {
+        toolchain: Toolchain::from_sdk(&arguments.sdk),
+        kernel_source_directory: runtime_source
+            .parent()
+            .expect("runtime source has no parent directory")
+            .to_owned(),
+        runtime_source,
+        pipeline,
+    };
+    let diagnostic_package = if arguments.diagnostic_run {
+        let package = build_diagnostic_package(&graph, &package_config)?;
+        write_package(&package.application, &arguments.package)?;
+        Some(package)
+    } else {
+        if !arguments.reuse_package {
+            let application = build_package(&graph, &package_config)?;
+            write_package(&application, &arguments.package)?;
+        }
+        None
+    };
     let application = Application::read(
         fs::File::open(&arguments.package)
             .with_context(|| format!("open {}", arguments.package.display()))?,
@@ -459,7 +485,17 @@ fn main() -> Result<()> {
             &bootloader_bytes,
             startup_mark,
         )?;
-        if !matches!(arguments.workload, Workload::Diagnostic) {
+        if let Some(package) = &diagnostic_package {
+            diagnostic::run(
+                &runtime,
+                &graph,
+                package,
+                arguments.diagnostic_samples,
+                arguments.diagnostic_atol,
+                arguments.diagnostic_rtol,
+                Duration::from_secs(arguments.timeout_seconds),
+            )?;
+        } else if !matches!(arguments.workload, Workload::Diagnostic) {
             if matches!(
                 arguments.workload,
                 Workload::GemmSmoke | Workload::BatchedGemmSmoke

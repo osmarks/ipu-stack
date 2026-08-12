@@ -310,6 +310,7 @@ fn touch_work(
             *event = event.saturating_add(1);
             return;
         }
+        TileWorkRef::Checkpoint(..) => {}
     }
     *event = event.saturating_add(1);
 }
@@ -406,7 +407,7 @@ fn collect_requirements(
             TileWorkRef::Repeat(repeat) => {
                 collect_requirements(program, &repeat.body, requirements)
             }
-            TileWorkRef::Exchange(_) => {}
+            TileWorkRef::Exchange(_) | TileWorkRef::Checkpoint(..) => {}
         }
     }
 }

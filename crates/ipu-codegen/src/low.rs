@@ -267,6 +267,7 @@ pub enum TileWork {
     LocalCopy(LocalCopyId),
     Kernel(KernelRunId),
     Repeat(RepeatRunId),
+    Checkpoint(OperationId, u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,6 +276,7 @@ pub enum TileWorkRef<'a> {
     LocalCopy(&'a LocalCopy),
     Kernel(&'a KernelRun),
     Repeat(&'a RepeatRun),
+    Checkpoint(OperationId, u8),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,6 +297,9 @@ pub struct LowProgram {
     pub kernel_runs: Vec<KernelRun>,
     pub local_copies: Vec<LocalCopy>,
     pub repeat_runs: Vec<RepeatRun>,
+    /// Canonical materialization of every mid-level value that reaches tile
+    /// lowering. Diagnostic metadata uses this without adding device copies.
+    pub values: Vec<LowValue>,
     pub outputs: Vec<LowValue>,
 }
 
@@ -310,6 +315,9 @@ impl LowProgram {
             TileWork::LocalCopy(id) => TileWorkRef::LocalCopy(&self.local_copies[id.0 as usize]),
             TileWork::Kernel(id) => TileWorkRef::Kernel(&self.kernel_runs[id.0 as usize]),
             TileWork::Repeat(id) => TileWorkRef::Repeat(&self.repeat_runs[id.0 as usize]),
+            TileWork::Checkpoint(operation, breakpoint) => {
+                TileWorkRef::Checkpoint(operation, breakpoint)
+            }
         })
     }
 }
@@ -352,6 +360,12 @@ pub enum LowLoweringError {
 
 pub type LowLoweringResult<T> = Result<T, LowLoweringError>;
 
+fn append_checkpoint(tiles: &mut [TileWorkList], operation: OperationId, breakpoint: u8) {
+    for tile in tiles {
+        tile.work.push(TileWork::Checkpoint(operation, breakpoint));
+    }
+}
+
 /// Produces a logical per-tile schedule by expanding selected operator plans.
 /// Conversions without plans still use a conservative gather fallback.
 #[tracing::instrument(
@@ -368,7 +382,11 @@ pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringR
         return Err(LowLoweringError::EmptyTileGroup);
     }
     let mut state = LoweringState::new(graph, config.tile_count)?;
-    let tiles = state.lower_region(&graph.operations, &graph.outputs)?;
+    let tiles = state.lower_region(
+        &graph.operations,
+        &graph.outputs,
+        config.diagnostic_checkpoints,
+    )?;
     let inputs = graph
         .inputs
         .iter()
@@ -391,6 +409,17 @@ pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringR
             })
         })
         .collect::<LowLoweringResult<_>>()?;
+    let values = graph
+        .values
+        .iter()
+        .filter_map(|value| {
+            let shards = &state.canonical[value.id.index() as usize];
+            (!shards.is_empty()).then(|| LowValue {
+                value: value.id,
+                shards: shards.clone(),
+            })
+        })
+        .collect();
     tracing::info!(
         shards = state.shards.len(),
         exchange_phases = state.phases.len(),
@@ -405,6 +434,7 @@ pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringR
         kernel_runs: state.kernel_runs,
         local_copies: state.local_copies,
         repeat_runs: state.repeat_runs,
+        values,
         outputs,
     })
 }
@@ -741,6 +771,7 @@ impl LoweringState {
         &mut self,
         operations: &[MidOperation],
         retained_values: &[MidValueId],
+        checkpoints: bool,
     ) -> LowLoweringResult<Vec<TileWorkList>> {
         let mut tiles = (0..self.tile_count)
             .map(|tile| TileWorkList {
@@ -748,6 +779,7 @@ impl LoweringState {
                 work: Vec::new(),
             })
             .collect::<Vec<_>>();
+        let mut checkpoint = 0u8;
         for (index, operation) in operations.iter().enumerate() {
             let started = Instant::now();
             if self.defer_split_heads(operation, operations, retained_values, &mut tiles)? {
@@ -779,6 +811,16 @@ impl LoweringState {
                 }
                 MidOperationKind::Operator(_) => self.lower_operator(operation, &mut tiles)?,
                 kind => self.lower_conversion(operation, kind, &mut tiles)?,
+            }
+            if checkpoints
+                && matches!(
+                    operation.kind,
+                    MidOperationKind::Operator(_) | MidOperationKind::Repeat(_)
+                )
+                && let Some(source) = operation.source
+            {
+                append_checkpoint(&mut tiles, source, checkpoint);
+                checkpoint ^= 1;
             }
             tracing::info!(
                 operation = index,
@@ -3386,7 +3428,7 @@ impl LoweringState {
                 )
             })
             .collect::<Vec<_>>();
-        let body = self.lower_region(&repeat.body.operations, &repeat.body.yields)?;
+        let body = self.lower_region(&repeat.body.operations, &repeat.body.yields, false)?;
         for tile in 0..self.tile_count {
             let mut carried = Vec::with_capacity(repeat.carried_inputs);
             for index in 0..repeat.carried_inputs {
@@ -5006,7 +5048,9 @@ mod tests {
         program.work(list).any(|work| match work {
             TileWorkRef::Exchange(candidate) => candidate == phase,
             TileWorkRef::Repeat(repeat) => contains_phase(program, &repeat.body, phase),
-            TileWorkRef::Kernel(_) | TileWorkRef::LocalCopy(_) => false,
+            TileWorkRef::Kernel(_) | TileWorkRef::LocalCopy(_) | TileWorkRef::Checkpoint(..) => {
+                false
+            }
         })
     }
 }

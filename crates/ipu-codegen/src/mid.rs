@@ -1288,6 +1288,8 @@ pub struct PipelineConfig {
     pub tile_memory_budget_bytes: u64,
     pub scheduling: SchedulingPolicy,
     pub profiling: ProfilingConfig,
+    /// Insert all-tile patched-breakpoint stops after semantic operators.
+    pub diagnostic_checkpoints: bool,
     /// Emit exchange-scheduler lower bounds, per-tile role pressure, and
     /// critical dependency chains while constructing the final package.
     pub exchange_diagnostics: bool,
@@ -1340,6 +1342,7 @@ impl PipelineConfig {
             tile_memory_budget_bytes: u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
             scheduling: SchedulingPolicy::OperatorPlans,
             profiling: ProfilingConfig::default(),
+            diagnostic_checkpoints: false,
             exchange_diagnostics: false,
             conversion_streaming: ConversionStreamingPolicy::WhenRequired,
         }

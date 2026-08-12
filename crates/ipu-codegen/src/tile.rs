@@ -253,6 +253,13 @@ fn lower_work(
                     exchange_rows,
                 )?)
             }
+            TileWorkRef::Checkpoint(operation, breakpoint) => {
+                TileStep::Checkpoint(crate::CheckpointStep {
+                    operation: operation.index(),
+                    breakpoint,
+                    profile: StepProfile::default(),
+                })
+            }
         };
         steps.push(step);
     }
@@ -368,6 +375,13 @@ fn lower_inactive_work(
                 profile: StepProfile::default(),
             })),
             TileWorkRef::Kernel(_) | TileWorkRef::LocalCopy(_) => {}
+            TileWorkRef::Checkpoint(operation, breakpoint) => {
+                steps.push(TileStep::Checkpoint(crate::CheckpointStep {
+                    operation: operation.index(),
+                    breakpoint,
+                    profile: StepProfile::default(),
+                }))
+            }
         }
     }
     Ok(steps)

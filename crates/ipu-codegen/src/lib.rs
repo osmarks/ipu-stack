@@ -58,7 +58,8 @@ pub use mid::{
     TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{
-    PackageBuildError, PackageBuildResult, PackageConfig, TileProgramData, build_package,
+    DiagnosticCheckpoint, DiagnosticPackage, DiagnosticShard, DiagnosticTensor, PackageBuildError,
+    PackageBuildResult, PackageConfig, TileProgramData, build_diagnostic_package, build_package,
     build_tile_program_package,
 };
 pub use place::{Placement, PlacementError, place};
@@ -95,6 +96,7 @@ pub const WORKER_STACK_BASE_SYMBOL: &str = "ipu_stack_static_worker_stack_base";
 pub const PRNG_SEED_SYMBOL: &str = "ipu_stack_static_prng_seed";
 pub const HOST_STAGING_SYMBOL: &str = "ipu_stack_static_host_staging";
 pub const COMPLETION_ADDRESS_SYMBOL: &str = "ipu_stack_static_completion";
+const PATCHED_BREAKPOINT_TRAP_BASE: u32 = 0x4180_1000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodegenError {
@@ -118,6 +120,16 @@ pub enum TileStep {
     Exchange(ExchangeStep),
     Compute(ComputeStep),
     Repeat(RepeatStep),
+    Checkpoint(CheckpointStep),
+}
+
+/// A debugger-visible operator boundary using alternating PBRK0/PBRK1 traps.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointStep {
+    pub operation: u32,
+    pub breakpoint: u8,
+    #[serde(default)]
+    pub profile: StepProfile,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +473,9 @@ fn emit_steps(
                     emit_cycle_sample(code, symbols, address)?;
                 }
             }
+            TileStep::Checkpoint(checkpoint) => {
+                code.instruction(PATCHED_BREAKPOINT_TRAP_BASE | u32::from(checkpoint.breakpoint))
+            }
         }
         index += 1;
     }
@@ -480,7 +495,7 @@ fn absolute_u16_copy(compute: &ComputeStep) -> Option<(u32, u32)> {
 fn step_compute_profile(step: &TileStep) -> Option<&StepProfile> {
     match step {
         TileStep::Compute(compute) => Some(&compute.profile),
-        TileStep::Exchange(_) | TileStep::Repeat(_) => None,
+        TileStep::Exchange(_) | TileStep::Repeat(_) | TileStep::Checkpoint(_) => None,
     }
 }
 
@@ -542,6 +557,11 @@ fn validate_steps(
                     Some(repeat.count),
                 )?;
             }
+            TileStep::Checkpoint(checkpoint) => {
+                if checkpoint.breakpoint > 1 {
+                    return Err(invalid("checkpoint breakpoint must be zero or one"));
+                }
+            }
         }
     }
     Ok(())
@@ -584,7 +604,7 @@ fn active_exchange(step: &TileStep) -> bool {
     match step {
         TileStep::Exchange(exchange) => exchange.active,
         TileStep::Repeat(repeat) => repeat.body.iter().any(active_exchange),
-        TileStep::Compute(_) => false,
+        TileStep::Compute(_) | TileStep::Checkpoint(_) => false,
     }
 }
 

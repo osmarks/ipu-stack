@@ -58,8 +58,10 @@ mod tdi_instruction {
     // IPU21 diagnostic instructions, named by their Tile Vertex ISA assembly.
     pub const GET_M0_PC: u32 = 0x4100_0000;
     pub const GET_M0_WSR: u32 = 0x4100_0001;
+    pub const GET_M0_DEBUG_DATA: u32 = 0x4100_0070;
     pub const GET_M1_DEBUG_DATA: u32 = 0x4101_0070;
     pub const LOAD_M0_FROM_M1: u32 = 0x01f0_1000;
+    pub const STORE_M0_AT_M1: u32 = 0x4f10_f000;
     pub const PUT_DEBUG_DATA_M0: u32 = 0x4300_8070;
 
     pub fn put_debug_data_m(register: u32) -> Option<u32> {
@@ -434,6 +436,18 @@ impl Device {
         expected: u32,
         timeout: Duration,
     ) -> Result<(), DriverError> {
+        self.wait_mark_with(register, expected, timeout, |_| Ok(()))
+    }
+
+    /// Waits for an HSP mark while allowing a debugger to service stopped
+    /// tile contexts. The callback runs only while the expected mark is absent.
+    pub fn wait_mark_with(
+        &self,
+        register: u32,
+        expected: u32,
+        timeout: Duration,
+        mut poll: impl FnMut(&Device) -> Result<(), DriverError>,
+    ) -> Result<(), DriverError> {
         trace!(
             register = format_args!("0x{register:x}"),
             expected,
@@ -450,6 +464,7 @@ impl Device {
                 );
                 return Ok(());
             }
+            poll(self)?;
             if Instant::now() >= deadline {
                 return Err(DriverError::Timeout(format!(
                     "HSP register 0x{register:x}: expected {expected}, observed {observed}"
@@ -584,15 +599,24 @@ impl Device {
         context: u32,
         address: u32,
     ) -> Result<u32, DriverError> {
+        let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
+        let original_m1 = self.read_tile_m_register_in_context(physical_tile, context, 1)?;
         self.write_tile_debug(physical_tile, TDI_DATA, address)?;
-        for instruction in [
-            tdi_instruction::GET_M1_DEBUG_DATA,
-            tdi_instruction::LOAD_M0_FROM_M1,
-            tdi_instruction::PUT_DEBUG_DATA_M0,
-        ] {
-            self.execute_tile_instruction(physical_tile, context, instruction)?;
+        let read = (|| {
+            for instruction in [
+                tdi_instruction::GET_M1_DEBUG_DATA,
+                tdi_instruction::LOAD_M0_FROM_M1,
+                tdi_instruction::PUT_DEBUG_DATA_M0,
+            ] {
+                self.execute_tile_instruction(physical_tile, context, instruction)?;
+            }
+            self.read_tile_debug(physical_tile, TDI_DATA)
+        })();
+        let restore = self.restore_tile_m01(physical_tile, context, original_m0, original_m1);
+        match (read, restore) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
         }
-        self.read_tile_debug(physical_tile, TDI_DATA)
     }
 
     pub fn read_tile_program_counter(
@@ -601,13 +625,58 @@ impl Device {
         context: u32,
     ) -> Result<u32, DriverError> {
         self.with_stopped_tile_context(physical_tile, context, || {
+            let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
             self.execute_tile_instruction(physical_tile, context, tdi_instruction::GET_M0_PC)?;
             self.execute_tile_instruction(
                 physical_tile,
                 context,
                 tdi_instruction::PUT_DEBUG_DATA_M0,
             )?;
-            self.read_tile_debug(physical_tile, TDI_DATA)
+            let pc = self.read_tile_debug(physical_tile, TDI_DATA);
+            self.write_tile_debug(physical_tile, TDI_DATA, original_m0)?;
+            self.execute_tile_instruction(
+                physical_tile,
+                context,
+                tdi_instruction::GET_M0_DEBUG_DATA,
+            )?;
+            pc
+        })
+    }
+
+    /// Writes one SRAM word through an excepted or inactive context while
+    /// preserving the debugger scratch registers used by the injected store.
+    pub fn write_tile_word_from_stopped_context(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        address: u32,
+        value: u32,
+    ) -> Result<(), DriverError> {
+        if address & 0b11 != 0
+            || !(TILE_MEMORY_BASE..=TILE_MEMORY_BASE + TILE_MEMORY_SIZE as u32 - 4)
+                .contains(&address)
+        {
+            return Err(DriverError::Invalid(
+                "tile memory write address is invalid".into(),
+            ));
+        }
+        self.with_stopped_tile_context(physical_tile, context, || {
+            let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
+            let original_m1 = self.read_tile_m_register_in_context(physical_tile, context, 1)?;
+            self.write_tile_debug(physical_tile, TDI_DATA, address)?;
+            self.execute_tile_instruction(
+                physical_tile,
+                context,
+                tdi_instruction::GET_M1_DEBUG_DATA,
+            )?;
+            self.write_tile_debug(physical_tile, TDI_DATA, value)?;
+            self.execute_tile_instruction(
+                physical_tile,
+                context,
+                tdi_instruction::GET_M0_DEBUG_DATA,
+            )?;
+            self.execute_tile_instruction(physical_tile, context, tdi_instruction::STORE_M0_AT_M1)?;
+            self.restore_tile_m01(physical_tile, context, original_m0, original_m1)
         })
     }
 
@@ -633,13 +702,21 @@ impl Device {
             return Err(DriverError::Invalid("tile context out of range".into()));
         }
         self.with_stopped_tile_context(physical_tile, context, || {
+            let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
             self.execute_tile_instruction(physical_tile, context, tdi_instruction::GET_M0_WSR)?;
             self.execute_tile_instruction(
                 physical_tile,
                 context,
                 tdi_instruction::PUT_DEBUG_DATA_M0,
             )?;
-            self.read_tile_debug(physical_tile, TDI_DATA)
+            let status = self.read_tile_debug(physical_tile, TDI_DATA);
+            self.write_tile_debug(physical_tile, TDI_DATA, original_m0)?;
+            self.execute_tile_instruction(
+                physical_tile,
+                context,
+                tdi_instruction::GET_M0_DEBUG_DATA,
+            )?;
+            status
         })
     }
 
@@ -649,12 +726,34 @@ impl Device {
         context: u32,
         register: u32,
     ) -> Result<u32, DriverError> {
+        self.with_stopped_tile_context(physical_tile, context, || {
+            self.read_tile_m_register_in_context(physical_tile, context, register)
+        })
+    }
+
+    fn read_tile_m_register_in_context(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        register: u32,
+    ) -> Result<u32, DriverError> {
         let instruction = tdi_instruction::put_debug_data_m(register)
             .ok_or_else(|| DriverError::Invalid("M register index out of range".into()))?;
-        self.with_stopped_tile_context(physical_tile, context, || {
-            self.execute_tile_instruction(physical_tile, context, instruction)?;
-            self.read_tile_debug(physical_tile, TDI_DATA)
-        })
+        self.execute_tile_instruction(physical_tile, context, instruction)?;
+        self.read_tile_debug(physical_tile, TDI_DATA)
+    }
+
+    fn restore_tile_m01(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        m0: u32,
+        m1: u32,
+    ) -> Result<(), DriverError> {
+        self.write_tile_debug(physical_tile, TDI_DATA, m1)?;
+        self.execute_tile_instruction(physical_tile, context, tdi_instruction::GET_M1_DEBUG_DATA)?;
+        self.write_tile_debug(physical_tile, TDI_DATA, m0)?;
+        self.execute_tile_instruction(physical_tile, context, tdi_instruction::GET_M0_DEBUG_DATA)
     }
 
     fn with_stopped_tile_context<T>(
@@ -1311,6 +1410,17 @@ impl<'a> HostSession<'a> {
         name: &str,
         input: &[u8],
     ) -> Result<HostCall, DriverError> {
+        self.invoke_streaming_deferred_with_poll(name, input, |_| Ok(()))
+    }
+
+    /// Streaming invocation variant used by diagnostic runs to inspect and
+    /// resume PBRK0 checkpoints while the ordinary host protocol is waiting.
+    pub fn invoke_streaming_deferred_with_poll(
+        &mut self,
+        name: &str,
+        input: &[u8],
+        mut poll: impl FnMut(&Device) -> Result<(), DriverError>,
+    ) -> Result<HostCall, DriverError> {
         if self.attached_pages.len() != self.protocol.attach_order.len() {
             return Err(DriverError::Invalid("host session not attached".into()));
         }
@@ -1351,8 +1461,12 @@ impl<'a> HostSession<'a> {
         let input_batches = host_batch_ranges(&call.input_batch_ends);
         let output_batches = host_batch_ranges(&call.output_batch_ends);
         for phase in 0..call.phases {
-            self.device
-                .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
+            self.device.wait_mark_with(
+                pci::HSP_GS2_CONTROL,
+                0,
+                Duration::from_secs(10),
+                &mut poll,
+            )?;
             if phase & 1 == 0 {
                 let batch = usize::try_from(phase / 2).unwrap();
                 if let Some(range) = input_batches.get(batch) {
@@ -1376,7 +1490,7 @@ impl<'a> HostSession<'a> {
             }
             self.acknowledge_device()?;
             self.device
-                .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))
+                .wait_mark_with(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10), &mut poll)
                 .map_err(|error| {
                     DriverError::Timeout(format!(
                         "host call {} phase {phase}/{}: {error}",

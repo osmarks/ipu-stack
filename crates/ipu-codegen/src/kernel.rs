@@ -735,7 +735,7 @@ fn collect_kernels(
                 attention,
                 attention_stages,
             )?,
-            TileWorkRef::Exchange(_) | TileWorkRef::LocalCopy(_) => {}
+            TileWorkRef::Exchange(_) | TileWorkRef::LocalCopy(_) | TileWorkRef::Checkpoint(..) => {}
         }
     }
     Ok(())
