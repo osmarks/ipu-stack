@@ -144,6 +144,93 @@ pub enum OperatorDispatch {
     SplitHeads,
 }
 
+/// A logical value transformation whose physical materialization may be
+/// deferred until a consumer requests bounded slices.  The transform is
+/// independent of either producer or consumer operator kinds, so additional
+/// view-like operators can participate without adding pairs of dispatch
+/// special cases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredTransform {
+    /// Split the final input axis into `parts` equal-width slices and fold the
+    /// new part axis into the leading output axis.
+    SplitLastAxisIntoLeading { parts: u32 },
+}
+
+impl DeferredTransform {
+    /// Map one rectangular output slice back to a rectangular producer slice.
+    /// Returning `None` means that the requested slice crosses a transform
+    /// discontinuity and must be divided before dispatch.
+    pub fn map_slice(
+        self,
+        source_shape: &TensorShape,
+        output_shape: &TensorShape,
+        output: &[(u32, u32)],
+    ) -> Option<DeferredSliceMapping> {
+        match self {
+            Self::SplitLastAxisIntoLeading { parts } => {
+                let [source_batch, source_rows, source_columns] = source_shape.0.as_slice() else {
+                    return None;
+                };
+                let [output_streams, output_rows, output_columns] = output_shape.0.as_slice()
+                else {
+                    return None;
+                };
+                let [(stream_start, stream_end), rows, columns] = output else {
+                    return None;
+                };
+                if parts == 0
+                    || *stream_end != stream_start.checked_add(1)?
+                    || *output_streams != source_batch.checked_mul(parts)?
+                    || output_rows != source_rows
+                    || source_columns != &output_columns.checked_mul(parts)?
+                    || *stream_end > *output_streams
+                    || rows.1 > *output_rows
+                    || columns.1 > *output_columns
+                {
+                    return None;
+                }
+                let batch = stream_start / parts;
+                let part = stream_start % parts;
+                let column_base = part.checked_mul(*output_columns)?;
+                Some(DeferredSliceMapping {
+                    source_ranges: vec![
+                        (batch, batch.checked_add(1)?),
+                        *rows,
+                        (
+                            column_base.checked_add(columns.0)?,
+                            column_base.checked_add(columns.1)?,
+                        ),
+                    ],
+                    destination_source_axes: vec![1, 2],
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredSliceMapping {
+    pub source_ranges: Vec<(u32, u32)>,
+    /// Source axes retained, in destination-axis order. Removed axes select a
+    /// slice but do not occupy storage in the consumer's dispatch buffer.
+    pub destination_source_axes: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeferredOutputPlan {
+    pub source_input: usize,
+    pub transform: DeferredTransform,
+    /// Cost restored if no later consumer claims this offer.
+    pub unfused_cycles: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeferredInputPlan {
+    pub producer: MidValueId,
+    pub source: MidValueId,
+    pub transform: DeferredTransform,
+}
+
 /// Which operand remains resident while a blocked whole-device GEMM is run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GemmDistribution {
@@ -1143,6 +1230,8 @@ impl OperatorCandidate {
                 memory_relations: self.memory_relations.clone(),
             },
             exchange: ExchangeFootprint::default(),
+            deferred_output: None,
+            deferred_inputs: vec![None; self.inputs.len()],
         }
         .validate(&planned_inputs, &planned_output)
         .is_ok()
@@ -1899,6 +1988,11 @@ pub struct OperatorPlan {
     pub dispatch: OperatorDispatch,
     pub requirements: OperatorRequirements,
     pub exchange: ExchangeFootprint,
+    /// A view transformation offered by this plan. It is materialized normally
+    /// unless a later plan records a matching entry in `deferred_inputs`.
+    pub deferred_output: Option<DeferredOutputPlan>,
+    /// Deferred producer results claimed by each input operand.
+    pub deferred_inputs: Vec<Option<DeferredInputPlan>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2457,7 +2551,6 @@ struct BeamBranch {
     values: BTreeMap<ValueId, MidValueId>,
     state: LoweringState,
     operations: Vec<MidOperation>,
-    score: u64,
 }
 
 #[derive(Default)]
@@ -2498,11 +2591,18 @@ fn lower_operations(
         .iter()
         .filter_map(|origin| values.get(origin).copied())
         .collect::<Vec<_>>();
+    let mut value_uses = BTreeMap::<ValueId, usize>::new();
+    for value in source
+        .iter()
+        .flat_map(|operation| operation_graph_inputs(operation, graph))
+        .chain(required_outputs.iter().copied())
+    {
+        *value_uses.entry(value).or_default() += 1;
+    }
     let mut beam = vec![BeamBranch {
         values: values.clone(),
         state: state.clone(),
         operations: Vec::new(),
-        score: 0,
     }];
     for (operation_index, operation) in source.iter().enumerate() {
         let mut expanded = Vec::new();
@@ -2512,7 +2612,6 @@ fn lower_operations(
             if let OperationKind::Repeat(repeat) = &operation.kind {
                 saw_candidate = true;
                 let mut next = branch.clone();
-                let before = next.operations.len();
                 lower_repeat(
                     operation,
                     repeat,
@@ -2523,12 +2622,6 @@ fn lower_operations(
                     &mut next.state,
                     &mut next.operations,
                 )?;
-                next.score = next.score.saturating_add(
-                    next.operations[before..]
-                        .iter()
-                        .map(|operation| operation.estimated_cycles)
-                        .sum(),
-                );
                 let peak = beam_memory_peak(
                     &next,
                     &initial,
@@ -2620,21 +2713,19 @@ fn lower_operations(
             for plan in candidate_plans {
                 saw_candidate = true;
                 let mut next = branch.clone();
-                let before = next.operations.len();
                 apply_selected_plan(
                     operation,
                     output_shape.clone(),
                     plan,
+                    &operation
+                        .inputs
+                        .iter()
+                        .map(|value| value_uses.get(value).copied().unwrap_or(0) == 1)
+                        .collect::<Vec<_>>(),
                     costs,
                     &mut next.values,
                     &mut next.state,
                     &mut next.operations,
-                );
-                next.score = next.score.saturating_add(
-                    next.operations[before..]
-                        .iter()
-                        .map(|operation| operation.estimated_cycles)
-                        .sum(),
                 );
                 let peak = beam_memory_peak(
                     &next,
@@ -2686,13 +2777,6 @@ fn lower_operations(
             }
             return Err(LoweringError::NoCandidate(operation.id));
         }
-        expanded.sort_by_cached_key(|branch| {
-            branch.score.saturating_add(format_equality_cost(
-                branch,
-                &constraints.required_equal_formats,
-                costs,
-            ))
-        });
         let future_origins = source[operation_index + 1..]
             .iter()
             .flat_map(|operation| operation_graph_inputs(operation, graph))
@@ -2704,6 +2788,11 @@ fn lower_operations(
                     .flat_map(|pair| [pair.0, pair.1]),
             )
             .collect::<BTreeSet<_>>();
+        expanded.sort_by_cached_key(|branch| {
+            deferred_aware_branch_score(branch, &future_origins).saturating_add(
+                format_equality_cost(branch, &constraints.required_equal_formats, costs),
+            )
+        });
         let mut retained_signatures = BTreeSet::new();
         expanded.retain(|branch| {
             let signature = future_origins
@@ -2724,24 +2813,75 @@ fn lower_operations(
         tracing::debug!(
             operation = operation.id.index(),
             retained = expanded.len(),
-            best_cycles = expanded[0].score,
+            best_cycles = deferred_aware_branch_score(&expanded[0], &future_origins),
             "retained planning beam"
         );
         beam = expanded;
     }
-    let best = beam
+    let mut best = beam
         .into_iter()
         .min_by_key(|branch| {
-            branch.score.saturating_add(format_equality_cost(
-                branch,
-                &constraints.required_equal_formats,
-                costs,
-            ))
+            deferred_aware_branch_score(branch, &BTreeSet::new()).saturating_add(
+                format_equality_cost(branch, &constraints.required_equal_formats, costs),
+            )
         })
         .ok_or_else(|| LoweringError::NoCandidate(source[0].id))?;
+    restore_unclaimed_deferred_costs(&mut best.operations);
     *values = best.values;
     *state = best.state;
     Ok(best.operations)
+}
+
+fn deferred_claims(operations: &[MidOperation]) -> BTreeSet<MidValueId> {
+    operations
+        .iter()
+        .filter_map(|operation| operation.operator_plan.as_ref())
+        .flat_map(|plan| plan.deferred_inputs.iter().flatten())
+        .map(|input| input.producer)
+        .collect()
+}
+
+fn deferred_aware_branch_score(
+    branch: &BeamBranch,
+    possible_future_consumers: &BTreeSet<ValueId>,
+) -> u64 {
+    let claims = deferred_claims(&branch.operations);
+    branch.operations.iter().fold(0u64, |cycles, operation| {
+        let pending = operation
+            .operator_plan
+            .as_ref()
+            .and_then(|plan| plan.deferred_output)
+            .filter(|_| {
+                operation.results.first().is_some_and(|result| {
+                    !claims.contains(result)
+                        && !possible_future_consumers.contains(&branch.state.get(*result).origin)
+                })
+            })
+            .map_or(0, |offer| offer.unfused_cycles);
+        cycles
+            .saturating_add(operation.estimated_cycles)
+            .saturating_add(pending)
+    })
+}
+
+fn restore_unclaimed_deferred_costs(operations: &mut [MidOperation]) {
+    let claims = deferred_claims(operations);
+    for operation in operations {
+        let Some(offer) = operation
+            .operator_plan
+            .as_ref()
+            .and_then(|plan| plan.deferred_output)
+        else {
+            continue;
+        };
+        if operation
+            .results
+            .first()
+            .is_some_and(|result| !claims.contains(result))
+        {
+            operation.estimated_cycles = offer.unfused_cycles;
+        }
+    }
 }
 
 fn format_equality_cost(
@@ -2789,16 +2929,19 @@ fn apply_selected_plan(
     operation: &Operation,
     output_shape: TensorShape,
     plan: Plan,
+    single_use_inputs: &[bool],
     costs: &impl CostModel,
     values: &mut BTreeMap<ValueId, MidValueId>,
     state: &mut LoweringState,
     operations: &mut Vec<MidOperation>,
 ) {
+    let plan = plan;
     let input_ids = operation
         .inputs
         .iter()
         .map(|value| values[value])
         .collect::<Vec<_>>();
+    let original_input_ids = input_ids.clone();
     let mut source_types = Vec::with_capacity(input_ids.len());
     let mut converted = Vec::with_capacity(input_ids.len());
     for (value, requirement) in input_ids.into_iter().zip(&plan.requirements.inputs) {
@@ -2840,7 +2983,7 @@ fn apply_selected_plan(
         .iter()
         .map(|value| state.get(*value).tensor_type.clone())
         .collect::<Vec<_>>();
-    let operator_cycles = costs.operator_transition_cycles(
+    let mut operator_cycles = costs.operator_transition_cycles(
         plan.operator,
         &plan.dispatch,
         &plan.requirements,
@@ -2848,6 +2991,63 @@ fn apply_selected_plan(
         &converted_types,
         &state.get(result).tensor_type,
     );
+    let mut deferred_inputs = vec![None; converted.len()];
+    for (input_index, ((&original, &converted), requirement)) in original_input_ids
+        .iter()
+        .zip(&converted)
+        .zip(&plan.requirements.inputs)
+        .enumerate()
+    {
+        let conversion_is_streamed = original == converted
+            || operations.iter().any(|candidate| {
+                candidate.inputs.as_slice() == [original]
+                    && candidate.results.as_slice() == [converted]
+                    && candidate
+                        .conversion_plan
+                        .as_ref()
+                        .is_some_and(|conversion| {
+                            conversion.output.materialization
+                                == OperandMaterialization::DispatchSlices
+                        })
+            });
+        if !conversion_is_streamed
+            || !single_use_inputs.get(input_index).copied().unwrap_or(false)
+            || requirement.materialization != OperandMaterialization::DispatchSlices
+        {
+            continue;
+        }
+        let Some(producer_index) = operations
+            .iter()
+            .position(|candidate| candidate.results.as_slice() == [original])
+        else {
+            continue;
+        };
+        let Some(offered) = operations[producer_index]
+            .operator_plan
+            .as_ref()
+            .and_then(|producer| producer.deferred_output)
+        else {
+            continue;
+        };
+        let Some(&source) = operations[producer_index].inputs.get(offered.source_input) else {
+            continue;
+        };
+        let producer_cycles = offered.unfused_cycles;
+        let fused_cycles = costs.deferred_input_cycles(
+            offered.transform,
+            &state.get(source).tensor_type,
+            &state.get(original).tensor_type,
+            &converted_types[input_index],
+            &plan.dispatch,
+            producer_cycles,
+        );
+        operator_cycles = operator_cycles.saturating_add(fused_cycles);
+        deferred_inputs[input_index] = Some(DeferredInputPlan {
+            producer: original,
+            source,
+            transform: offered.transform,
+        });
+    }
     tracing::trace!(
         source = operation.id.index(),
         cycles = operator_cycles,
@@ -2873,6 +3073,11 @@ fn apply_selected_plan(
         &state.get(result).tensor_type,
     );
     memory.exchange_row_bytes = exchange.estimated_row_bytes();
+    let mut deferred_output = plan.deferred_output;
+    if let Some(offer) = &mut deferred_output {
+        offer.unfused_cycles = operator_cycles;
+        operator_cycles = 0;
+    }
     operations.push(MidOperation {
         source: Some(operation.id),
         inputs: converted,
@@ -2883,6 +3088,8 @@ fn apply_selected_plan(
             dispatch: plan.dispatch,
             requirements: plan.requirements,
             exchange,
+            deferred_output,
+            deferred_inputs,
         }),
         conversion_plan: None,
         estimated_cycles: operator_cycles,
@@ -2933,6 +3140,7 @@ struct Plan {
     operator: MidOperator,
     dispatch: OperatorDispatch,
     requirements: OperatorRequirements,
+    deferred_output: Option<DeferredOutputPlan>,
 }
 
 fn plans(
@@ -2977,6 +3185,13 @@ fn plans(
                     output_aliasing: OutputAliasing::Fresh,
                     memory_relations: Vec::new(),
                 },
+                deferred_output: Some(DeferredOutputPlan {
+                    source_input: 0,
+                    transform: DeferredTransform::SplitLastAxisIntoLeading {
+                        parts: options.heads,
+                    },
+                    unfused_cycles: 0,
+                }),
             };
             if !plans.contains(&plan) {
                 plans.push(plan);
@@ -3057,14 +3272,18 @@ fn plans(
                 },
                 requirements: OperatorRequirements {
                     inputs: vec![
-                        OperandRequirement::new(query_format, 8),
-                        OperandRequirement::new(key_format, 8),
-                        OperandRequirement::new(value_format, 8),
+                        OperandRequirement::new(query_format, 8)
+                            .with_materialization(OperandMaterialization::DispatchSlices),
+                        OperandRequirement::new(key_format, 8)
+                            .with_materialization(OperandMaterialization::DispatchSlices),
+                        OperandRequirement::new(value_format, 8)
+                            .with_materialization(OperandMaterialization::DispatchSlices),
                     ],
                     output: OperandRequirement::new(output_format, 8),
                     output_aliasing: OutputAliasing::Fresh,
                     memory_relations: Vec::new(),
                 },
+                deferred_output: None,
             });
         }
     }
@@ -3135,6 +3354,7 @@ fn plans(
                     output_aliasing: resolved_output_aliasing(&candidate, inputs, output),
                     memory_relations: candidate.memory_relations.clone(),
                 },
+                deferred_output: None,
             };
             if !plans.contains(&plan) {
                 plans.push(plan);
@@ -4698,6 +4918,127 @@ mod tests {
             );
             assert_conversions_are_explicit(&lowered, &lowered.operations);
             assert_conversions_are_explicit(&lowered, &repeat.body.operations);
+        }
+    }
+
+    #[test]
+    fn randomized_single_use_views_are_claimed_by_slice_consumers() {
+        let mut random = fastrand::Rng::with_seed(0x6465_6665_7272_6564);
+        for case in 0..RANDOM_CASES / 32 {
+            let heads = random.u32(2..=6);
+            let head_width = random.u32(1..=4) * AMP_COLUMN_MICRO;
+            let tokens = random.u32(1..=3) * AMP_INNER_BLOCK;
+            let model_width = heads * head_width;
+            let tiles = u16::try_from(heads * tokens.div_ceil(AMP_INNER_BLOCK)).unwrap();
+            let mut graph = ComputeGraph::new();
+            let input = graph.host_input("input", [1, tokens, model_width]).unwrap();
+            let mut projected = Vec::new();
+            let mut parameters = Vec::new();
+            for index in 0..3 {
+                let weights = graph
+                    .parameter(format!("projection.{index}"), [model_width, model_width])
+                    .unwrap();
+                parameters.push(weights);
+                projected.push(graph.gemm(input, weights).unwrap());
+            }
+            let split = projected
+                .iter()
+                .map(|&value| graph.split_heads(value, heads).unwrap())
+                .collect::<Vec<_>>();
+            let output = graph.flash_attention(split[0], split[1], split[2]).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let mut config = PipelineConfig::new(tiles).with_automatic_input(input, Precision::F16);
+            for parameter in parameters {
+                config = config.with_automatic_input(parameter, Precision::F16);
+            }
+            config.conversion_streaming = ConversionStreamingPolicy::Always;
+
+            let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let producers = lowered
+                .operations
+                .iter()
+                .filter(|operation| {
+                    matches!(
+                        operation.kind,
+                        MidOperationKind::Operator(MidOperator::SplitHeads(_))
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(producers.len(), split.len(), "random case {case}");
+            assert!(
+                producers.iter().all(|operation| {
+                    operation.estimated_cycles == 0
+                        && operation
+                            .operator_plan
+                            .as_ref()
+                            .is_some_and(|plan| plan.deferred_output.is_some())
+                }),
+                "random case {case}"
+            );
+            let consumer = lowered
+                .operations
+                .iter()
+                .find(|operation| {
+                    matches!(
+                        operation.kind,
+                        MidOperationKind::Operator(MidOperator::FlashAttention { .. })
+                    )
+                })
+                .unwrap();
+            let claims = &consumer.operator_plan.as_ref().unwrap().deferred_inputs;
+            assert_eq!(claims.len(), split.len(), "random case {case}");
+            assert!(claims.iter().all(Option::is_some), "random case {case}");
+            assert_eq!(
+                lowered.estimated_cycles,
+                lowered
+                    .operations
+                    .iter()
+                    .map(|operation| operation.estimated_cycles)
+                    .sum::<u64>(),
+                "random case {case}"
+            );
+            crate::low::lower_to_tiles(&lowered, &config).unwrap();
+        }
+    }
+
+    #[test]
+    fn randomized_unclaimed_deferred_offers_restore_materialization_cost() {
+        let mut random = fastrand::Rng::with_seed(0x756e_636c_6169_6d65);
+        for case in 0..RANDOM_CASES / 8 {
+            let batch = random.u32(1..=4);
+            let heads = random.u32(1..=8);
+            let rows = random.u32(1..=4) * AMP_INNER_BLOCK;
+            let head_width = random.u32(1..=4) * AMP_COLUMN_MICRO;
+            let mut graph = ComputeGraph::new();
+            let input = graph
+                .host_input("input", [batch, rows, heads * head_width])
+                .unwrap();
+            let output = graph.split_heads(input, heads).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let tiles = u16::try_from(batch * heads).unwrap();
+            let config = PipelineConfig::new(tiles).with_automatic_input(input, Precision::F16);
+
+            let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let operation = lowered
+                .operations
+                .iter()
+                .find(|operation| {
+                    matches!(
+                        operation.kind,
+                        MidOperationKind::Operator(MidOperator::SplitHeads(_))
+                    )
+                })
+                .unwrap();
+            let offer = operation
+                .operator_plan
+                .as_ref()
+                .and_then(|plan| plan.deferred_output)
+                .unwrap();
+            assert_eq!(
+                operation.estimated_cycles, offer.unfused_cycles,
+                "random case {case}"
+            );
+            assert!(operation.estimated_cycles != 0, "random case {case}");
         }
     }
 }

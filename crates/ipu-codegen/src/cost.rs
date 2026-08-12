@@ -8,8 +8,9 @@ use crate::estimate::{
 };
 use crate::graph::TensorShape;
 use crate::mid::{
-    AmpOrder, ElementOrder, GemmDistribution, Layout, LocalOperandStaging, MemoryClass,
-    MidOperator, OperatorDispatch, OperatorRequirements, Precision, TensorAxis, TensorType,
+    AmpOrder, DeferredTransform, ElementOrder, GemmDistribution, Layout, LocalOperandStaging,
+    MemoryClass, MidOperator, OperatorDispatch, OperatorRequirements, Precision, TensorAxis,
+    TensorType,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -65,6 +66,20 @@ pub trait CostModel {
         _output: &TensorType,
     ) -> ExchangeFootprint {
         ExchangeFootprint::default()
+    }
+    /// Cost of producing dispatch-sized consumer slices through a deferred
+    /// logical transform. The default preserves the unfused producer estimate;
+    /// target models may price the actual fused staging and exchange path.
+    fn deferred_input_cycles(
+        &self,
+        _transform: DeferredTransform,
+        _source: &TensorType,
+        _logical_output: &TensorType,
+        _consumer_input: &TensorType,
+        _consumer_dispatch: &OperatorDispatch,
+        producer_cycles: u64,
+    ) -> u64 {
+        producer_cycles
     }
     fn rearrangement_cost(
         &self,
@@ -175,6 +190,25 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
     ) -> ExchangeFootprint {
         self.inner
             .operator_exchange_footprint(operator, dispatch, requirements, inputs, output)
+    }
+
+    fn deferred_input_cycles(
+        &self,
+        transform: DeferredTransform,
+        source: &TensorType,
+        logical_output: &TensorType,
+        consumer_input: &TensorType,
+        consumer_dispatch: &OperatorDispatch,
+        producer_cycles: u64,
+    ) -> u64 {
+        self.inner.deferred_input_cycles(
+            transform,
+            source,
+            logical_output,
+            consumer_input,
+            consumer_dispatch,
+            producer_cycles,
+        )
     }
 
     fn rearrangement_cost(
@@ -640,6 +674,69 @@ impl CostModel for Ipu21CostModel {
                     .saturating_add(IPU21_TARGET_COSTS.exchange_phase_cycles)
             }
         }
+    }
+
+    fn deferred_input_cycles(
+        &self,
+        transform: DeferredTransform,
+        source: &TensorType,
+        logical_output: &TensorType,
+        consumer_input: &TensorType,
+        _consumer_dispatch: &OperatorDispatch,
+        producer_cycles: u64,
+    ) -> u64 {
+        let DeferredTransform::SplitLastAxisIntoLeading { parts } = transform;
+        if parts == 0 || source.shape.0.len() != 3 || logical_output.shape.0.len() != 3 {
+            return producer_cycles;
+        }
+        let bytes = consumer_input.format.precision.bytes().max(1);
+        let source_work = maximum_shard_bytes(source).div_ceil(bytes);
+        let rank = consumer_input.shape.0.len();
+        let rows = consumer_input
+            .shape
+            .0
+            .get(rank.saturating_sub(2))
+            .copied()
+            .map_or(1, u64::from);
+        let columns = consumer_input.shape.0.last().copied().map_or(1, u64::from);
+        let panel_columns = columns.min(u64::from(crate::mid::AMP_COLUMN_MICRO));
+        let (slices, slice_rows, packing_cycles_per_element) =
+            match consumer_input.format.layout.order {
+                ElementOrder::Amp(AmpOrder::TransposedRight) => (
+                    rows.div_ceil(u64::from(crate::mid::AMP_INNER_BLOCK)),
+                    rows.min(u64::from(crate::mid::AMP_INNER_BLOCK)),
+                    3,
+                ),
+                ElementOrder::Amp(AmpOrder::RightK64) => (
+                    rows.div_ceil(u64::from(crate::mid::AMP_INNER_BLOCK)),
+                    rows.min(u64::from(crate::mid::AMP_INNER_BLOCK)),
+                    4,
+                ),
+                _ => (
+                    1,
+                    maximum_shard_bytes(consumer_input)
+                        .div_ceil(bytes)
+                        .div_ceil(columns),
+                    2,
+                ),
+            };
+        let panel_elements = slice_rows.saturating_mul(panel_columns);
+        let gather = panel_elements.div_ceil(4);
+        let pack = panel_elements.saturating_mul(packing_cycles_per_element);
+        let broadcast = panel_elements
+            .saturating_mul(bytes)
+            .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle);
+        // The producer's packed output must first become an addressable logical
+        // view. Thereafter independent panel owners overlap within each slice;
+        // only the critical panel and the two exchange epochs contribute.
+        source_work.saturating_mul(2).saturating_add(
+            slices.saturating_mul(
+                gather
+                    .saturating_add(pack)
+                    .saturating_add(broadcast)
+                    .saturating_add(IPU21_TARGET_COSTS.exchange_phase_cycles.saturating_mul(2)),
+            ),
+        )
     }
 
     fn operator_exchange_footprint(
