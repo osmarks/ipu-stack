@@ -1,5 +1,5 @@
 use ipu_package::{CycleSample, ProfileExchangeActivityKind, ProfileReport, ProfileStepKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -121,6 +121,107 @@ pub struct ExchangeActivitySummary {
     pub scheduled_event_cycles: u64,
     pub arrival_wait_cycles: u64,
     pub phase_boundary_cycles: u64,
+}
+
+/// Machine-readable local-work measurements suitable for generating a target
+/// cost table. Exchange and synchronization samples are deliberately omitted.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationDatabase {
+    pub schema_version: u32,
+    pub target: String,
+    pub build_id: String,
+    pub clock_hz: u64,
+    pub measurements: Vec<CalibrationMeasurement>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationKey {
+    pub kernel: String,
+    pub dimensions: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationMeasurement {
+    pub key: CalibrationKey,
+    pub samples: u64,
+    pub minimum_cycles: u32,
+    pub median_cycles: u32,
+    pub p95_cycles: u32,
+    pub maximum_cycles: u32,
+}
+
+/// Collates profiled kernel and local-copy calls. Consecutive calls merged by
+/// profiling are divided by their recorded invocation count before aggregation.
+pub fn calibrate_profiles(
+    reports: &[ProfileReport],
+    target: impl Into<String>,
+    build_id: impl Into<String>,
+) -> Result<CalibrationDatabase, &'static str> {
+    let Some(clock_hz) = reports.first().map(|report| report.clock_hz) else {
+        return Err("at least one profile is required");
+    };
+    if reports.iter().any(|report| report.clock_hz != clock_hz) {
+        return Err("profile clock frequencies differ");
+    }
+    let mut groups = BTreeMap::<CalibrationKey, Vec<u32>>::new();
+    for report in reports {
+        for tile in &report.tiles {
+            for sample in &tile.samples {
+                if sample.step.kind != ProfileStepKind::Compute || sample.step.kernel.is_empty() {
+                    continue;
+                }
+                let invocations = sample
+                    .step
+                    .metadata
+                    .iter()
+                    .find(|entry| entry.name == "invocations")
+                    .and_then(|entry| entry.value.parse::<u32>().ok())
+                    .unwrap_or(1)
+                    .max(1);
+                let dimensions = sample
+                    .step
+                    .metadata
+                    .iter()
+                    .filter(|entry| {
+                        !matches!(entry.name.as_str(), "reason" | "value" | "invocations")
+                    })
+                    .map(|entry| (entry.name.clone(), entry.value.clone()))
+                    .collect();
+                let cycles = duration(sample).div_ceil(invocations);
+                groups
+                    .entry(CalibrationKey {
+                        kernel: sample.step.kernel.clone(),
+                        dimensions,
+                    })
+                    .or_default()
+                    .push(cycles);
+            }
+        }
+    }
+    let measurements = groups
+        .into_iter()
+        .map(|(key, mut cycles)| {
+            cycles.sort_unstable();
+            CalibrationMeasurement {
+                key,
+                samples: cycles.len() as u64,
+                minimum_cycles: cycles[0],
+                median_cycles: percentile(&cycles, 50),
+                p95_cycles: percentile(&cycles, 95),
+                maximum_cycles: *cycles.last().unwrap(),
+            }
+        })
+        .collect();
+    Ok(CalibrationDatabase {
+        schema_version: 1,
+        target: target.into(),
+        build_id: build_id.into(),
+        clock_hz,
+        measurements,
+    })
 }
 
 /// Returns a common device-cycle origin while preserving short offsets across
@@ -688,5 +789,47 @@ mod tests {
         assert_eq!(result.groups.len(), 2);
         assert_eq!(result.groups[0].name, "1");
         assert_eq!(result.groups[1].name, "0");
+    }
+
+    #[test]
+    fn calibration_normalizes_merged_invocations_and_excludes_graph_metadata() {
+        let mut first = sample(0, ProfileStepKind::Compute, "gemm-f16", 10, 50);
+        first.step.metadata.extend([
+            ProfileMetadata {
+                name: "kernelSpec".into(),
+                value: "Gemm".into(),
+            },
+            ProfileMetadata {
+                name: "invocations".into(),
+                value: "2".into(),
+            },
+            ProfileMetadata {
+                name: "reason".into(),
+                value: "OperatorKernel".into(),
+            },
+        ]);
+        let mut second = first.clone();
+        second.start_cycle = 100;
+        second.end_cycle = 160;
+        let database = calibrate_profiles(
+            &[ProfileReport {
+                clock_hz: 1_500_000_000,
+                tiles: vec![TileProfile {
+                    physical_tile: 0,
+                    samples: vec![first, second],
+                }],
+            }],
+            "ipu21",
+            "test-build",
+        )
+        .unwrap();
+
+        assert_eq!(database.measurements.len(), 1);
+        let measurement = &database.measurements[0];
+        assert_eq!(measurement.samples, 2);
+        assert_eq!(measurement.minimum_cycles, 20);
+        assert_eq!(measurement.maximum_cycles, 30);
+        assert!(!measurement.key.dimensions.contains_key("reason"));
+        assert!(!measurement.key.dimensions.contains_key("invocations"));
     }
 }

@@ -1490,6 +1490,15 @@ fn instrument_profile(
                 step,
                 following,
             )?;
+            let invocations = schedule[index + 1..]
+                .iter()
+                .take_while(|&&next| profile_work_can_merge(work, next))
+                .count()
+                + 1;
+            description.metadata.push(ProfileMetadata {
+                name: "invocations".into(),
+                value: invocations.to_string(),
+            });
             description.local_index = u32::try_from(plans.len())?;
             plans.push(description);
         }
@@ -1642,15 +1651,35 @@ fn profile_step(
             }
         }
         (crate::TileWorkRef::Kernel(run), crate::TileStep::Compute(compute)) => {
-            profile_description(
+            let mut description = profile_description(
                 index,
                 u32::try_from(index)?,
                 &run.provenance,
                 ProfileStepKind::Compute,
                 &compute.symbol,
-            )
+            )?;
+            description.metadata.push(ProfileMetadata {
+                name: "kernelSpec".into(),
+                value: format!("{:?}", run.kernel),
+            });
+            description.metadata.push(ProfileMetadata {
+                name: "outputElements".into(),
+                value: view_logical_elements(&run.output).to_string(),
+            });
+            for (operand, input) in run.inputs.iter().enumerate() {
+                description.metadata.push(ProfileMetadata {
+                    name: format!("input{operand}Elements"),
+                    value: input
+                        .views
+                        .iter()
+                        .map(view_logical_elements)
+                        .sum::<u64>()
+                        .to_string(),
+                });
+            }
+            Ok(description)
         }
-        (crate::TileWorkRef::LocalCopy(_), crate::TileStep::Compute(compute)) => {
+        (crate::TileWorkRef::LocalCopy(copy), crate::TileStep::Compute(compute)) => {
             if let Some(provenance) = following {
                 let mut description = profile_description(
                     index,
@@ -1660,6 +1689,16 @@ fn profile_step(
                     &compute.symbol,
                 )?;
                 description.metadata[0].value = "LocalCopy".into();
+                description.metadata.extend([
+                    ProfileMetadata {
+                        name: "bytes".into(),
+                        value: copy.bytes.to_string(),
+                    },
+                    ProfileMetadata {
+                        name: "pattern".into(),
+                        value: format!("{:?}", copy.pattern),
+                    },
+                ]);
                 Ok(description)
             } else {
                 Ok(ProfileStep {
@@ -1669,10 +1708,20 @@ fn profile_step(
                     operation: String::new(),
                     kind: ProfileStepKind::Compute,
                     kernel: compute.symbol.clone(),
-                    metadata: vec![ProfileMetadata {
-                        name: "reason".into(),
-                        value: "LocalCopy".into(),
-                    }],
+                    metadata: vec![
+                        ProfileMetadata {
+                            name: "reason".into(),
+                            value: "LocalCopy".into(),
+                        },
+                        ProfileMetadata {
+                            name: "bytes".into(),
+                            value: copy.bytes.to_string(),
+                        },
+                        ProfileMetadata {
+                            name: "pattern".into(),
+                            value: format!("{:?}", copy.pattern),
+                        },
+                    ],
                     exchange_activities: Vec::new(),
                     exchange_event_cycles: 0,
                 })
@@ -1702,6 +1751,12 @@ fn profile_step(
             "tile profile work kind does not match finalized step",
         )),
     }
+}
+
+fn view_logical_elements(view: &crate::ShardView) -> u64 {
+    view.extents.iter().fold(1u64, |elements, extent| {
+        elements.saturating_mul(u64::from(extent.logical_end.saturating_sub(extent.start)))
+    })
 }
 
 fn exchange_synchronization_description(

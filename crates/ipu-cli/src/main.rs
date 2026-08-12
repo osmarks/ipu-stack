@@ -4,7 +4,8 @@ use ipu_driver::{Device, block_device_interrupt_signals};
 use ipu_elf::{LinkOptions, Toolchain, inspect_object, link};
 use ipu_package::{Application, ProfileExchangeActivityKind, ProfileReport, ProfileStepKind};
 use ipu_profile::{
-    GroupBy, Query, SortBy, StepKind, cycle_origin, exchange_activity_summary, query,
+    GroupBy, Query, SortBy, StepKind, calibrate_profiles, cycle_origin, exchange_activity_summary,
+    query,
 };
 use ipu_runtime::Runtime;
 use std::collections::{BTreeSet, HashMap};
@@ -68,6 +69,18 @@ enum Command {
         profile: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
+    },
+    /// Collate profiled local work into a machine-readable estimator database.
+    ProfileCalibrate {
+        #[arg(required = true)]
+        profiles: Vec<PathBuf>,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value = "ipu21")]
+        target: String,
+        /// Kernel/runtime build identity used to reject stale measurements.
+        #[arg(long)]
+        build_id: String,
     },
     ProfileQuery {
         profile: PathBuf,
@@ -264,6 +277,29 @@ fn main() -> Result<()> {
                 "profile={} tiles={} output={}",
                 profile.display(),
                 report.tiles.len(),
+                output.display()
+            );
+        }
+        Command::ProfileCalibrate {
+            profiles,
+            output,
+            target,
+            build_id,
+        } => {
+            let reports = profiles
+                .iter()
+                .map(|profile| {
+                    ProfileReport::read(fs::File::open(profile)?)
+                        .with_context(|| format!("reading {}", profile.display()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let database =
+                calibrate_profiles(&reports, target, build_id).map_err(anyhow::Error::msg)?;
+            fs::write(&output, serde_json::to_vec_pretty(&database)?)?;
+            println!(
+                "profiles={} measurements={} output={}",
+                profiles.len(),
+                database.measurements.len(),
                 output.display()
             );
         }
