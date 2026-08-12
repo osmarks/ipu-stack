@@ -115,6 +115,18 @@ pub enum GemmWeightLoad {
     Interleaved,
 }
 
+/// Linearization of a GEMM's logical tile grid.
+///
+/// The order is part of the operand and output layouts because it determines
+/// which tensor coordinates occupy adjacent logical (and therefore paired
+/// physical) tiles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GridOrder {
+    #[default]
+    ColumnsFast,
+    RowsFast,
+}
+
 /// Shape-independent recipe which expands into ordered device-wide exchange
 /// and tile-kernel phases after concrete shards are known.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -679,6 +691,7 @@ impl Layout {
         tile_count: u16,
         row_partitions: u16,
         column_partitions: u16,
+        grid_order: GridOrder,
     ) -> Self {
         if column_partitions == 1 && row_partitions == tile_count {
             return Self::amp_left(inner, tile_count);
@@ -689,7 +702,11 @@ impl Layout {
                 tile_count,
                 replicas: column_partitions,
                 axes: vec![
-                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
+                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject)
+                        .with_tile_stride(match grid_order {
+                            GridOrder::ColumnsFast => column_partitions,
+                            GridOrder::RowsFast => 1,
+                        }),
                     AxisTiling::new(TensorAxis::FromEnd(1), 1, u32::from(inner), Padding::Zero),
                 ],
             },
@@ -704,6 +721,7 @@ impl Layout {
         tile_count: u16,
         row_partitions: u16,
         inner_partitions: u16,
+        grid_order: GridOrder,
     ) -> Self {
         Self {
             order: ElementOrder::Amp(AmpOrder::Left),
@@ -717,8 +735,15 @@ impl Layout {
                         u32::from(inner),
                         Padding::Zero,
                     )
-                    .with_tile_stride(1),
-                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
+                    .with_tile_stride(match grid_order {
+                        GridOrder::ColumnsFast => 1,
+                        GridOrder::RowsFast => row_partitions,
+                    }),
+                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject)
+                        .with_tile_stride(match grid_order {
+                            GridOrder::ColumnsFast => inner_partitions,
+                            GridOrder::RowsFast => 1,
+                        }),
                 ],
             },
             memory_class: MemoryClass::Ipu21Standard,
@@ -733,6 +758,7 @@ impl Layout {
         tile_count: u16,
         row_partitions: u16,
         column_partitions: u16,
+        grid_order: GridOrder,
     ) -> Self {
         if output_column_block == AMP_OUTPUT_COLUMN_BLOCK
             && row_partitions == 1
@@ -753,7 +779,10 @@ impl Layout {
                         output_column_block,
                         Padding::Zero,
                     )
-                    .with_tile_stride(1),
+                    .with_tile_stride(match grid_order {
+                        GridOrder::ColumnsFast => 1,
+                        GridOrder::RowsFast => row_partitions,
+                    }),
                 ],
             },
             memory_class: MemoryClass::Ipu21Standard,
@@ -806,6 +835,7 @@ impl Layout {
         tile_count: u16,
         row_partitions: u16,
         column_partitions: u16,
+        grid_order: GridOrder,
     ) -> Self {
         if output_column_block == AMP_OUTPUT_COLUMN_BLOCK
             && column_partitions == 1
@@ -824,8 +854,16 @@ impl Layout {
                         column_partitions,
                         output_column_block,
                         Padding::Zero,
-                    ),
-                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
+                    )
+                    .with_tile_stride(match grid_order {
+                        GridOrder::ColumnsFast => 1,
+                        GridOrder::RowsFast => row_partitions,
+                    }),
+                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject)
+                        .with_tile_stride(match grid_order {
+                            GridOrder::ColumnsFast => column_partitions,
+                            GridOrder::RowsFast => 1,
+                        }),
                 ],
             },
             memory_class: MemoryClass::Ipu21Interleaved,
@@ -1574,6 +1612,7 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
                 tile_count,
                 row_partitions: rows,
                 column_partitions: columns,
+                order: GridOrder::ColumnsFast,
             };
             let mut grid = Vec::new();
             let mut placements = vec![
@@ -1793,6 +1832,7 @@ fn amp_grid_gemm_operator_candidate(
             grid.tile_count,
             grid.row_partitions,
             grid.column_partitions,
+            grid.order,
         ),
         (inner_partitions, memory_class) => Layout::amp_right_k64_storage(
             output_columns,
@@ -1818,6 +1858,7 @@ fn amp_grid_gemm_operator_candidate(
                         grid.tile_count,
                         grid.row_partitions,
                         grid.column_partitions,
+                        grid.order,
                     ),
                 },
                 32,
@@ -1840,6 +1881,7 @@ fn amp_grid_gemm_operator_candidate(
                     grid.tile_count,
                     grid.row_partitions,
                     grid.column_partitions,
+                    grid.order,
                 ),
             },
             32,
@@ -1889,6 +1931,7 @@ struct AmpGridShape {
     tile_count: u16,
     row_partitions: u16,
     column_partitions: u16,
+    order: GridOrder,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3428,14 +3471,20 @@ fn independent_parameter_storage(
             let maximum_inner_partitions = u32::from(tiles_per_copy / column_partitions)
                 .min(inner_blocks)
                 .min(u32::from(u16::MAX));
-            let inner_partitions = (1..=maximum_inner_partitions)
+            let Some(inner_partitions) = (1..=maximum_inner_partitions)
                 .rev()
-                .find(|partitions| inner_blocks.is_multiple_of(*partitions))?;
+                .find(|partitions| inner_blocks.is_multiple_of(*partitions))
+            else {
+                return None;
+            };
+            let Ok(inner_partitions) = u16::try_from(inner_partitions) else {
+                return None;
+            };
             let mut independent = candidate.clone();
             independent.inputs[input_index].format.layout = Layout::amp_right_k64_storage(
                 output_column_block,
                 column_partitions,
-                u16::try_from(inner_partitions).ok()?,
+                inner_partitions,
                 copies,
                 requirement.format.layout.memory_class,
             );
@@ -3536,6 +3585,7 @@ fn activation_stationary_reduction_candidates(
                 tile_count,
                 row_partitions,
                 inner_partitions,
+                GridOrder::ColumnsFast,
             );
             left_layout.tiling.axes.truncate(1);
             left_layout.tiling.axes.extend(row_axes.iter().copied());
@@ -3552,6 +3602,7 @@ fn activation_stationary_reduction_candidates(
                 tile_count,
                 row_partitions,
                 inner_partitions,
+                GridOrder::ColumnsFast,
             );
             output_layout.tiling.axes.truncate(1);
             output_layout.tiling.axes.extend(row_axes);
@@ -4115,6 +4166,7 @@ mod tests {
                     tile_count: tiles,
                     row_partitions,
                     column_partitions: inner_partitions,
+                    order: GridOrder::ColumnsFast,
                 },
                 AmpWeightPlacement::resident(MemoryClass::Ipu21Interleaved),
             );
@@ -4192,9 +4244,10 @@ mod tests {
             let left = TensorType::new(
                 [m, k],
                 Precision::F16,
-                Layout::amp_left_grid(64, tiles, rows, columns),
+                Layout::amp_left_grid(64, tiles, rows, columns, GridOrder::ColumnsFast),
             );
-            let mut standard_layout = Layout::amp_right_grid(64, 64, tiles, rows, columns);
+            let mut standard_layout =
+                Layout::amp_right_grid(64, 64, tiles, rows, columns, GridOrder::ColumnsFast);
             let mut direct_layout = standard_layout.clone();
             direct_layout.memory_class = MemoryClass::Ipu21Interleaved;
             standard_layout.memory_class = MemoryClass::Ipu21Standard;
@@ -4203,7 +4256,7 @@ mod tests {
             let output = TensorType::new(
                 [m, n],
                 Precision::F16,
-                Layout::amp_output_grid(64, tiles, rows, columns),
+                Layout::amp_output_grid(64, tiles, rows, columns, GridOrder::ColumnsFast),
             );
             let operator = MidOperator::Gemm {
                 options: GemmOptions::default(),
@@ -4249,6 +4302,7 @@ mod tests {
                 tile_count: tiles,
                 row_partitions,
                 column_partitions,
+                order: GridOrder::ColumnsFast,
             };
             let candidate = amp_grid_gemm_operator_candidate(
                 Precision::F16,

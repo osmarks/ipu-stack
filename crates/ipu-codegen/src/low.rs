@@ -4080,9 +4080,9 @@ mod tests {
     use super::*;
     use crate::{
         AccumulationPrecision, AxisTiling, ComputeGraph, ElementOrder, GemmDistribution,
-        GemmKernelMode, GemmWeightLoad, Ipu21CostModel, Layout, MemoryClass, MidOperator,
-        OperandRequirement, OperatorCandidate, OperatorDispatch, Padding, PipelineConfig,
-        Precision, TensorAxis, TensorFormat, TensorTiling, TileKernelSpec, lower,
+        GemmKernelMode, GemmWeightLoad, GridOrder, Ipu21CostModel, Layout, MemoryClass,
+        MidOperator, OperandRequirement, OperatorCandidate, OperatorDispatch, Padding,
+        PipelineConfig, Precision, TensorAxis, TensorFormat, TensorTiling, TileKernelSpec, lower,
     };
     use std::collections::BTreeSet;
 
@@ -4134,6 +4134,7 @@ mod tests {
                     tiles,
                     row_partitions,
                     inner_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
                 ),
             };
             let right_format = TensorFormat {
@@ -4153,6 +4154,7 @@ mod tests {
                     tiles,
                     row_partitions,
                     inner_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
                 ),
             };
             let candidate = OperatorCandidate::new(
@@ -4443,7 +4445,13 @@ mod tests {
             };
             let output_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_left_grid(64, tiles, row_partitions, column_partitions),
+                layout: Layout::amp_left_grid(
+                    64,
+                    tiles,
+                    row_partitions,
+                    column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
+                ),
             };
             let mut graph = ComputeGraph::new();
             let input = graph.host_input("input", [rows, columns]).unwrap();
@@ -4615,6 +4623,54 @@ mod tests {
                     cursor = end;
                 }
                 assert_eq!(cursor, padded.0[axis], "case {case}");
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_gemm_grid_orders_align_operands_and_pair_shared_payloads() {
+        let mut random = fastrand::Rng::with_seed(0x6772_6964_5f6f_7264);
+        for case in 0..CASES {
+            let row_partitions = 1_u16 << random.u32(1..=3);
+            let column_partitions = 1_u16 << random.u32(1..=3);
+            let tiles = row_partitions * column_partitions;
+            let rows = u32::from(row_partitions) * random.u32(1..=8);
+            let columns = u32::from(column_partitions) * 64 * random.u32(1..=3);
+            let inner = 64 * random.u32(1..=4);
+            for order in [GridOrder::ColumnsFast, GridOrder::RowsFast] {
+                let left = TensorType::new(
+                    [rows, inner],
+                    Precision::F16,
+                    Layout::amp_left_grid(64, tiles, row_partitions, column_partitions, order),
+                );
+                let right = TensorType::new(
+                    [inner, columns],
+                    Precision::F16,
+                    Layout::amp_right_grid(64, 64, tiles, row_partitions, column_partitions, order),
+                );
+                let output = TensorType::new(
+                    [rows, columns],
+                    Precision::F16,
+                    Layout::amp_output_grid(64, tiles, row_partitions, column_partitions, order),
+                );
+                let left = shard_extents(&left).unwrap();
+                let right = shard_extents(&right).unwrap();
+                let output = shard_extents(&output).unwrap();
+                for tile in 0..usize::from(tiles) {
+                    assert_eq!(left[tile][0], output[tile][0], "case {case}");
+                    assert_eq!(right[tile][1], output[tile][1], "case {case}");
+                }
+                for tile in (0..usize::from(tiles)).step_by(2) {
+                    let shared_axis = match order {
+                        GridOrder::ColumnsFast => 0,
+                        GridOrder::RowsFast => 1,
+                    };
+                    assert_eq!(
+                        output[tile][shared_axis],
+                        output[tile + 1][shared_axis],
+                        "case {case}"
+                    );
+                }
             }
         }
     }
@@ -5102,7 +5158,13 @@ mod tests {
             graph.set_outputs([output]).unwrap();
             let left_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_left_grid(64, tiles, row_partitions, column_partitions),
+                layout: Layout::amp_left_grid(
+                    64,
+                    tiles,
+                    row_partitions,
+                    column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
+                ),
             };
             let right_format = TensorFormat {
                 precision: Precision::F16,
@@ -5116,7 +5178,13 @@ mod tests {
             };
             let output_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_output_grid(64, tiles, row_partitions, column_partitions),
+                layout: Layout::amp_output_grid(
+                    64,
+                    tiles,
+                    row_partitions,
+                    column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
+                ),
             };
             let mut config = PipelineConfig::new(tiles)
                 .with_input(left, left_format.clone())

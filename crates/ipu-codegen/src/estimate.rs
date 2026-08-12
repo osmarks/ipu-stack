@@ -550,9 +550,9 @@ pub(crate) fn gemm_exchange_bytes_per_cycle(inputs: &[TensorType]) -> u64 {
         .iter()
         .find(|axis| axis.axis == TensorAxis::FromEnd(1))
         .map_or(1, |axis| axis.partitions);
-    // IPU21 pairs adjacent tiles on one shared exchange bus. With one output
-    // column partition, a streamed K panel is a full broadcast to consecutive
-    // tiles and both receivers can consume it in the same cycle.
+    // A single output-column partition produces full consecutive-tile
+    // broadcasts. Multi-column row-fast grids also pair consumers, but the
+    // resulting route pressure is not equivalent to doubling bandwidth.
     if inner_sharded && column_partitions == 1 {
         IPU21_TARGET_COSTS.exchange_bytes_per_cycle * IPU21_TARGET_COSTS.exchange_bus_sharing
     } else {
@@ -829,7 +829,13 @@ mod tests {
             let tensor = TensorType::new(
                 [rows, columns],
                 Precision::F16,
-                Layout::amp_output_grid(64, tiles, row_partitions, column_partitions),
+                Layout::amp_output_grid(
+                    64,
+                    tiles,
+                    row_partitions,
+                    column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
+                ),
             );
             let total = physical_elements(&tensor.shape, &tensor.format.layout)
                 .saturating_mul(tensor.format.precision.bytes());
@@ -925,10 +931,20 @@ mod tests {
             let rows = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4);
             let columns = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4) * 64;
             let shape = TensorShape(vec![rows, columns]);
-            let fragmented_source =
-                Layout::amp_output_grid(64, tiles, row_partitions, column_partitions);
-            let aligned_source =
-                Layout::amp_output_grid(64, tiles, column_partitions, row_partitions);
+            let fragmented_source = Layout::amp_output_grid(
+                64,
+                tiles,
+                row_partitions,
+                column_partitions,
+                crate::mid::GridOrder::ColumnsFast,
+            );
+            let aligned_source = Layout::amp_output_grid(
+                64,
+                tiles,
+                column_partitions,
+                row_partitions,
+                crate::mid::GridOrder::ColumnsFast,
+            );
             let destination =
                 Layout::amp_output_replicated_grid(tiles, column_partitions, row_partitions);
             let fragmented =

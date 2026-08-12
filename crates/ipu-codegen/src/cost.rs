@@ -983,8 +983,20 @@ mod tests {
             let rows = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4);
             let columns = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4) * 64;
             let shape = TensorShape(vec![rows, columns]);
-            let fragmented = Layout::amp_output_grid(64, tiles, row_partitions, column_partitions);
-            let aligned = Layout::amp_output_grid(64, tiles, column_partitions, row_partitions);
+            let fragmented = Layout::amp_output_grid(
+                64,
+                tiles,
+                row_partitions,
+                column_partitions,
+                crate::mid::GridOrder::ColumnsFast,
+            );
+            let aligned = Layout::amp_output_grid(
+                64,
+                tiles,
+                column_partitions,
+                row_partitions,
+                crate::mid::GridOrder::ColumnsFast,
+            );
             let destination =
                 Layout::amp_output_replicated_grid(tiles, column_partitions, row_partitions);
             let fragmented_cycles = Ipu21CostModel
