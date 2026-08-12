@@ -209,7 +209,8 @@ struct Accumulator {
     dimensions: BTreeMap<String, String>,
     durations: Vec<u32>,
     tiles: BTreeSet<u32>,
-    phases: BTreeMap<(u32, u32), Vec<(u64, u64)>>,
+    phases: BTreeSet<(u32, u32)>,
+    intervals: Vec<(u64, u64)>,
     work_cycles: u64,
     first_offset: u64,
     last_offset: u64,
@@ -261,8 +262,9 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
             accumulator.tiles.insert(tile.physical_tile);
             accumulator
                 .phases
-                .entry((sample.step.phase, sample.step.epoch))
-                .or_default()
+                .insert((sample.step.phase, sample.step.epoch));
+            accumulator
+                .intervals
                 .push((offset, offset + u64::from(sample_duration)));
             accumulator.work_cycles += u64::from(sample_duration);
             accumulator.first_offset = accumulator.first_offset.min(offset);
@@ -284,11 +286,10 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
         .into_iter()
         .map(|(name, mut accumulator)| {
             accumulator.durations.sort_unstable();
-            let phase_cycles = accumulator
-                .phases
-                .values()
-                .map(|intervals| union_length(intervals))
-                .sum::<u64>();
+            // Compute phase numbers are local schedule indices. Distinct
+            // numbers can overlap on different tiles, so union the group's
+            // complete wall-clock coverage instead of summing phase unions.
+            let phase_cycles = union_length(&accumulator.intervals);
             let mean_cycles = if accumulator.durations.is_empty() {
                 0.0
             } else {
@@ -559,7 +560,7 @@ mod tests {
                 },
                 TileProfile {
                     physical_tile: 3,
-                    samples: vec![sample(0, ProfileStepKind::Compute, "add", 100, 130)],
+                    samples: vec![sample(1, ProfileStepKind::Compute, "add", 100, 130)],
                 },
             ],
         };

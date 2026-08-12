@@ -153,6 +153,7 @@ canvas {
       <div class="section-title">Tilewise Timeline</div>
       <div class="legend">
         <label>Row height <select id="timelineRowHeight"><option value="1">compact</option><option value="2">2 px</option><option value="4">4 px</option><option value="8">8 px</option><option value="16">16 px</option></select></label>
+        <label>Tile origins <select id="tileOrigins"><option value="shared">shared clock</option><option value="aligned">align first samples</option></select></label>
         <span class="legend-item"><span class="legend-swatch" style="background:#cf3f4a"></span>compute (kernel-tinted)</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#17854c"></span>send</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#287db2"></span>receive</span>
@@ -199,12 +200,13 @@ const steps = DATA.steps.map(([phase, epoch, operation, kernel, metadata, kind, 
 for (const tile of DATA.tiles) {
   tile.samples = tile.samples.map(([step, offset, duration, activities]) => ({
     ...steps[step],
+    rawOffset: offset,
     offset,
     duration,
     exchangeActivities: activitySets[activities],
   }));
 }
-const state = { query: "", kind: "all", focus: null, time: null, viewStart: 0, viewEnd: null, timelineRowHeight: 1 };
+const state = { query: "", kind: "all", focus: null, time: null, viewStart: 0, viewEnd: null, timelineRowHeight: 1, alignTileStarts: false };
 const flame = document.getElementById("flame");
 const overview = document.getElementById("overview");
 const timeline = document.getElementById("timeline");
@@ -222,24 +224,32 @@ const colors = {
 const textColor = { exchange: "#ffffff", compute: "#ffffff", synchronization: "#ffffff", idle: "#050505" };
 const tiles = DATA.tiles.slice().sort((a, b) => a.physicalTile - b.physicalTile);
 const exchangePhaseBounds = new Map();
-for (const tile of tiles) {
-  for (const sample of tile.samples) {
-    if (sample.kind !== "exchange" || !exchangeEventCycles(sample)) continue;
-    const key = `${sample.epoch}:${sample.phase}`;
-    const phase = exchangePhaseBounds.get(key) || { starts: [], ends: [], eventCycles: 0 };
-    phase.starts.push(sample.offset);
-    phase.ends.push(sample.offset + sample.duration);
-    phase.eventCycles = Math.max(phase.eventCycles, exchangeEventCycles(sample));
-    exchangePhaseBounds.set(key, phase);
+function setTileOriginAlignment(enabled) {
+  for (const tile of tiles) {
+    const origin = enabled && tile.samples.length ? tile.samples[0].rawOffset : 0;
+    for (const sample of tile.samples) sample.offset = sample.rawOffset - origin;
+  }
+  exchangePhaseBounds.clear();
+  for (const tile of tiles) {
+    for (const sample of tile.samples) {
+      if (sample.kind !== "exchange" || !exchangeEventCycles(sample)) continue;
+      const key = `${sample.epoch}:${sample.phase}`;
+      const phase = exchangePhaseBounds.get(key) || { starts: [], ends: [], eventCycles: 0 };
+      phase.starts.push(sample.offset);
+      phase.ends.push(sample.offset + sample.duration);
+      phase.eventCycles = Math.max(phase.eventCycles, exchangeEventCycles(sample));
+      exchangePhaseBounds.set(key, phase);
+    }
+  }
+  for (const phase of exchangePhaseBounds.values()) {
+    phase.start = Math.max(...phase.starts);
+    phase.end = Math.max(...phase.ends);
+    phase.eventStart = phase.end - phase.eventCycles;
+    delete phase.starts;
+    delete phase.ends;
   }
 }
-for (const phase of exchangePhaseBounds.values()) {
-  phase.start = Math.max(...phase.starts);
-  phase.end = Math.max(...phase.ends);
-  phase.eventStart = phase.end - phase.eventCycles;
-  delete phase.starts;
-  delete phase.ends;
-}
+setTileOriginAlignment(false);
 let timelineGeom = null;
 let flameHits = [];
 let drag = null;
@@ -774,6 +784,14 @@ function render() {
   state.query = document.getElementById("search").value.trim().toLowerCase();
   state.kind = document.getElementById("kind").value;
   state.timelineRowHeight = Number(document.getElementById("timelineRowHeight").value);
+  const alignTileStarts = document.getElementById("tileOrigins").value === "aligned";
+  if (alignTileStarts !== state.alignTileStarts) {
+    state.alignTileStarts = alignTileStarts;
+    setTileOriginAlignment(alignTileStarts);
+    state.time = null;
+    state.viewStart = 0;
+    state.viewEnd = fullEnd();
+  }
   drawFlame();
   drawOverview();
   drawTimeline();
@@ -904,6 +922,7 @@ function zoomToRange(start, end) {
 document.getElementById("search").addEventListener("input", () => { state.focus = null; render(); });
 document.getElementById("kind").addEventListener("change", () => { state.focus = null; render(); });
 document.getElementById("timelineRowHeight").addEventListener("change", render);
+document.getElementById("tileOrigins").addEventListener("change", render);
 document.getElementById("zoomIn").addEventListener("click", () => zoomView(1.35));
 document.getElementById("zoomOut").addEventListener("click", () => zoomView(1 / 1.35));
 document.getElementById("reset").addEventListener("click", resetView);

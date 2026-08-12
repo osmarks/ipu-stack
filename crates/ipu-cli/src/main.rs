@@ -85,6 +85,12 @@ enum Command {
         tile: Vec<u32>,
         #[arg(long)]
         phase: Vec<u32>,
+        /// Include the longest matching individual samples.
+        #[arg(long, default_value_t = 0)]
+        samples: usize,
+        /// Restrict matches to samples active at this normalized cycle offset.
+        #[arg(long)]
+        at_offset: Option<u64>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long)]
@@ -270,6 +276,8 @@ fn main() -> Result<()> {
             operation_contains,
             tile,
             phase,
+            samples,
+            at_offset,
             limit,
             json,
         } => {
@@ -301,7 +309,9 @@ fn main() -> Result<()> {
                     operation_contains,
                     tiles: tile.into_iter().collect::<BTreeSet<_>>(),
                     phases: phase.into_iter().collect::<BTreeSet<_>>(),
+                    at_offset,
                     limit: (limit != 0).then_some(limit),
+                    sample_limit: samples,
                     ..Query::default()
                 },
             );
@@ -318,15 +328,30 @@ fn main() -> Result<()> {
                 );
                 for group in result.groups {
                     println!(
-                        "name={:?} phases={} tiles={} samples={} phaseCycles={} workCycles={} p95={} max={}",
+                        "name={:?} phases={} tiles={} samples={} timelineCycles={} workCycles={} range={}..{} p95={} max={}",
                         group.name,
                         group.phase_count,
                         group.tile_count,
                         group.sample_count,
                         group.phase_cycles,
                         group.work_cycles,
+                        group.first_offset,
+                        group.last_offset,
                         group.p95_cycles,
                         group.maximum_cycles
+                    );
+                }
+                for sample in result.samples {
+                    println!(
+                        "sample tile={} range={}..{} cycles={} phase={}/{} operation={:?} kernel={:?}",
+                        sample.physical_tile,
+                        sample.offset,
+                        sample.offset + u64::from(sample.duration),
+                        sample.duration,
+                        sample.phase,
+                        sample.epoch,
+                        sample.operation,
+                        sample.kernel,
                     );
                 }
             }
