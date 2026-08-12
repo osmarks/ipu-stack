@@ -23,6 +23,8 @@ REARRANGE_CALL_SYMBOL:
 	st32 $m4, $m11, $m15, 2
 	st32 $m5, $m11, $m15, 3
 	st32 $m6, $m11, $m15, 4
+	st32 $m7, $m11, $m15, 5
+	st32 $m8, $m11, $m15, 6
 	setzi $m0, REARRANGE_CODELET_SYMBOL
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET

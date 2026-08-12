@@ -328,7 +328,7 @@ fn right_k64_panel_spans(
     let column_start = view.extents[rank - 1].start - shard.extents[rank - 1].start;
     let inner_width = view.extents[rank - 2].physical_end - view.extents[rank - 2].start;
     let column_width = view.extents[rank - 1].physical_end - view.extents[rank - 1].start;
-    let output_column_block = shard
+    let Some(output_column_block) = shard
         .tensor_type
         .format
         .layout
@@ -338,9 +338,9 @@ fn right_k64_panel_spans(
         .find(|axis| axis.axis == crate::TensorAxis::FromEnd(1))
         .map(|axis| axis.block_size)
         .filter(|block| *block != 0 && block.is_multiple_of(AMP_COLUMN_MICRO))
-        .ok_or(StorageError::AmpBlock {
-            role: AmpOrder::RightK64,
-        })?;
+    else {
+        return Ok(None);
+    };
     if rows.is_multiple_of(AMP_INNER_BLOCK)
         && columns.is_multiple_of(output_column_block)
         && inner_width == AMP_INNER_BLOCK
@@ -749,6 +749,71 @@ mod tests {
                     * output_column_block
                     * 2
             );
+        }
+    }
+
+    #[test]
+    fn randomized_attention_micro_panels_are_directly_transferable() {
+        let mut random = fastrand::Rng::with_seed(0x6d69_6372_6f21);
+        for _ in 0..128 {
+            let panels = random.u32(1..=8);
+            let selected = random.u32(0..panels);
+            for role in [AmpOrder::TransposedRight, AmpOrder::RightK64] {
+                let layout = Layout {
+                    order: ElementOrder::Amp(role),
+                    tiling: crate::TensorTiling::replicated(1),
+                    memory_class: MemoryClass::Ipu21Standard,
+                };
+                let source = shard(layout.clone(), &[AMP_INNER_BLOCK, AMP_COLUMN_MICRO]);
+                let destination = shard(layout, &[AMP_INNER_BLOCK, panels * AMP_COLUMN_MICRO]);
+                let source_view = ShardView {
+                    shard: source.id,
+                    extents: source.extents.clone(),
+                };
+                let destination_view = ShardView {
+                    shard: destination.id,
+                    extents: vec![
+                        destination.extents[0],
+                        ShardExtent {
+                            axis: 1,
+                            start: selected * AMP_COLUMN_MICRO,
+                            logical_end: (selected + 1) * AMP_COLUMN_MICRO,
+                            physical_end: (selected + 1) * AMP_COLUMN_MICRO,
+                        },
+                    ],
+                };
+                let source_spans = view_byte_spans(&source, &source_view).unwrap();
+                let destination_spans = view_byte_spans(&destination, &destination_view).unwrap();
+                assert_eq!(
+                    source_spans.iter().map(|span| span.bytes).sum::<u32>(),
+                    destination_spans.iter().map(|span| span.bytes).sum::<u32>()
+                );
+                let source_offsets = source_spans
+                    .iter()
+                    .flat_map(|span| (span.offset..span.offset + span.bytes).step_by(2));
+                let destination_offsets = destination_spans
+                    .iter()
+                    .flat_map(|span| (span.offset..span.offset + span.bytes).step_by(2));
+                for (source_offset, destination_offset) in source_offsets.zip(destination_offsets) {
+                    let source_coordinates = physical_coordinates(
+                        &source,
+                        &[AMP_INNER_BLOCK, AMP_COLUMN_MICRO],
+                        u64::from(source_offset / 2),
+                    )
+                    .unwrap();
+                    let destination_coordinates = physical_coordinates(
+                        &destination,
+                        &[AMP_INNER_BLOCK, panels * AMP_COLUMN_MICRO],
+                        u64::from(destination_offset / 2),
+                    )
+                    .unwrap();
+                    assert_eq!(source_coordinates[0], destination_coordinates[0]);
+                    assert_eq!(
+                        source_coordinates[1] + selected * AMP_COLUMN_MICRO,
+                        destination_coordinates[1]
+                    );
+                }
+            }
         }
     }
 }

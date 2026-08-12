@@ -551,7 +551,7 @@ impl KernelBuildPlan {
             }
             (KernelSymbols::RearrangeSpecialized, TileKernelSpec::Rearrange { .. }) => self
                 .rearrange_symbols
-                .get(&(
+                .get(&rearrangement_specialization(
                     match kernel {
                         TileKernelSpec::Rearrange {
                             to:
@@ -716,7 +716,7 @@ fn collect_kernels(
                         AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightK64
                     )
                 {
-                    rearrangements.insert((
+                    rearrangements.insert(rearrangement_specialization(
                         *order,
                         matrix_extent(run, true, false)?,
                         matrix_extent(run, false, false)?,
@@ -839,6 +839,29 @@ fn matrix_extent(run: &KernelRun, logical: bool, columns: bool) -> Result<u32, K
     })
 }
 
+fn rearrangement_specialization(
+    order: AmpOrder,
+    logical_rows: u32,
+    physical_rows: u32,
+    logical_columns: u32,
+    physical_columns: u32,
+) -> (AmpOrder, u32, u32, u32, u32) {
+    if physical_rows == AMP_INNER_BLOCK
+        && logical_rows < physical_rows
+        && matches!(order, AmpOrder::TransposedRight | AmpOrder::RightK64)
+    {
+        (order, 0, physical_rows, 0, physical_columns)
+    } else {
+        (
+            order,
+            logical_rows,
+            physical_rows,
+            logical_columns,
+            physical_columns,
+        )
+    }
+}
+
 fn input_matrix_extent(
     run: &KernelRun,
     logical: bool,
@@ -888,6 +911,8 @@ fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbi
             },
             "logical_rows" => matrix_extent(run, true, false),
             "physical_rows" => matrix_extent(run, false, false),
+            "logical_columns" => matrix_extent(run, true, true),
+            "physical_columns" => matrix_extent(run, false, true),
             "target_order" => match &run.kernel {
                 TileKernel::Planned(TileKernelSpec::Rearrange {
                     to:
@@ -1055,7 +1080,16 @@ pub fn tile_kernel_abi(
                 KernelSymbols::RearrangeSpecialized,
                 KernelAvailability::Implemented,
                 1,
-                scalar_arguments(1, &["logical_rows", "physical_rows", "target_order"]),
+                scalar_arguments(
+                    1,
+                    &[
+                        "logical_rows",
+                        "physical_rows",
+                        "target_order",
+                        "logical_columns",
+                        "physical_columns",
+                    ],
+                ),
             )
         }
         TileKernelSpec::Rearrange { .. } => (

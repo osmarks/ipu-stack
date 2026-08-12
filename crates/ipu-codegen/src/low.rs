@@ -1459,8 +1459,6 @@ impl LoweringState {
             weights: LowShardId,
             key_staging: LowShardId,
             value_staging: LowShardId,
-            key_receive: Option<LowShardId>,
-            value_receive: Option<LowShardId>,
         }
         let mut tasks = Vec::with_capacity(outputs.len());
         for output in outputs {
@@ -1554,31 +1552,6 @@ impl LoweringState {
             if deferred_key != deferred_value {
                 return Err(LowLoweringError::InvalidOperatorPlan);
             }
-            let deferred_key_value = deferred_key;
-            let key_receive = deferred_key_value
-                .then(|| {
-                    self.push_attention_buffer(
-                        tile,
-                        key_block_rows,
-                        key_block_rows,
-                        query_dimension,
-                        query_dimension,
-                        ElementOrder::RowMajor,
-                    )
-                })
-                .transpose()?;
-            let value_receive = deferred_key_value
-                .then(|| {
-                    self.push_attention_buffer(
-                        tile,
-                        key_block_rows,
-                        key_block_rows,
-                        value_dimension,
-                        value_dimension,
-                        ElementOrder::RowMajor,
-                    )
-                })
-                .transpose()?;
             tasks.push(AttentionTask {
                 tile,
                 head: self.shards[output.index() as usize].extents[rank - 3].start,
@@ -1593,8 +1566,6 @@ impl LoweringState {
                 weights,
                 key_staging,
                 value_staging,
-                key_receive,
-                value_receive,
             });
         }
         let key_rows = self.shards[self.value_shards(*key)?[0].index() as usize]
@@ -1625,6 +1596,7 @@ impl LoweringState {
                     task.head,
                     task.query_row_start,
                     task.query_rows,
+                    0,
                     task.query_dimension,
                     task.query_receive
                         .ok_or(LowLoweringError::InvalidOperatorPlan)?,
@@ -1655,85 +1627,55 @@ impl LoweringState {
             let mut task_sources = Vec::with_capacity(tasks.len());
             if deferred_key_value {
                 let valid_key_rows = key_rows.saturating_sub(block_start).min(key_block_rows);
-                let owner_indices = tasks.iter().enumerate().fold(
-                    BTreeMap::<u32, usize>::new(),
-                    |mut owners, (index, task)| {
-                        owners.entry(task.head).or_insert(index);
-                        owners
+                let key_destinations = tasks.iter().fold(
+                    BTreeMap::<u32, Vec<LowShardId>>::new(),
+                    |mut destinations, task| {
+                        destinations
+                            .entry(task.head)
+                            .or_default()
+                            .push(task.key_staging);
+                        destinations
                     },
                 );
-                let mut local_copies = Vec::new();
-                for &owner_index in owner_indices.values() {
-                    let task = &tasks[owner_index];
-                    let key_receive = task
-                        .key_receive
-                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-                    let value_receive = task
-                        .value_receive
-                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-                    self.gather_deferred_split_panel(
-                        *key,
-                        task.head,
-                        block_start,
-                        valid_key_rows,
-                        task.query_dimension,
-                        key_receive,
-                        &mut transfers,
-                        &mut local_copies,
-                    )?;
-                    self.gather_deferred_split_panel(
-                        *value,
-                        task.head,
-                        block_start,
-                        valid_key_rows,
-                        task.value_dimension,
-                        value_receive,
-                        &mut transfers,
-                        &mut local_copies,
-                    )?;
-                }
-                for (tile, copy) in local_copies {
-                    self.append_local_copy(tiles, tile, copy)?;
-                }
-                self.append_phase(transfers, exchange_provenance, tiles)?;
-                for &owner_index in owner_indices.values() {
-                    let task = &tasks[owner_index];
-                    self.append_attention_rearrange(
-                        tiles,
-                        task.tile,
-                        task.key_receive
-                            .ok_or(LowLoweringError::InvalidOperatorPlan)?,
-                        task.key_staging,
-                        kernel_provenance,
-                    )?;
-                    self.append_attention_rearrange(
-                        tiles,
-                        task.tile,
-                        task.value_receive
-                            .ok_or(LowLoweringError::InvalidOperatorPlan)?,
-                        task.value_staging,
-                        kernel_provenance,
-                    )?;
-                }
-                let mut broadcasts = BTreeMap::<ShardView, Vec<ShardView>>::new();
-                for task in &tasks {
-                    let owner = &tasks[owner_indices[&task.head]];
-                    for (source, destination) in [
-                        (owner.key_staging, task.key_staging),
-                        (owner.value_staging, task.value_staging),
-                    ] {
-                        if self.shards[source.index() as usize].tile
-                            != self.shards[destination.index() as usize].tile
-                        {
-                            broadcasts
-                                .entry(self.full_view(source))
-                                .or_default()
-                                .push(self.full_view(destination));
-                        }
-                    }
-                    task_sources.push((task.key_staging, task.value_staging, valid_key_rows));
-                }
-                self.append_phase(broadcasts, exchange_provenance, tiles)?;
+                let value_destinations = tasks.iter().fold(
+                    BTreeMap::<u32, Vec<LowShardId>>::new(),
+                    |mut destinations, task| {
+                        destinations
+                            .entry(task.head)
+                            .or_default()
+                            .push(task.value_staging);
+                        destinations
+                    },
+                );
+                self.append_distributed_attention_panel(
+                    *key,
+                    &key_destinations,
+                    block_start,
+                    valid_key_rows,
+                    tasks[0].query_dimension,
+                    padded_query_dimension,
+                    AmpOrder::TransposedRight,
+                    kernel_provenance,
+                    exchange_provenance,
+                    tiles,
+                )?;
+                self.append_distributed_attention_panel(
+                    *value,
+                    &value_destinations,
+                    block_start,
+                    valid_key_rows,
+                    tasks[0].value_dimension,
+                    padded_value_dimension,
+                    AmpOrder::RightK64,
+                    kernel_provenance,
+                    exchange_provenance,
+                    tiles,
+                )?;
+                task_sources.extend(
+                    tasks
+                        .iter()
+                        .map(|task| (task.key_staging, task.value_staging, valid_key_rows)),
+                );
             } else {
                 for task in &tasks {
                     let source_matches = |candidate: &&LowShardId| {
@@ -1865,6 +1807,7 @@ impl LoweringState {
         stream: u32,
         row_start: u32,
         rows: u32,
+        column_start: u32,
         columns: u32,
         destination: LowShardId,
         transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
@@ -1876,13 +1819,14 @@ impl LoweringState {
             .ok_or(LowLoweringError::InvalidOperatorPlan)?;
         let split_type = &self.shards[self.value_shards(value)?[0].index() as usize].tensor_type;
         let head_width = split_type.shape.0[2];
-        if columns > head_width || deferred.heads == 0 {
+        if column_start + columns > head_width || deferred.heads == 0 {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
         let batch = stream / deferred.heads;
         let head = stream % deferred.heads;
         let column_base = head
             .checked_mul(head_width)
+            .and_then(|base| base.checked_add(column_start))
             .ok_or(LowLoweringError::IdOverflow)?;
         let target = vec![
             ShardExtent {
@@ -1957,6 +1901,108 @@ impl LoweringState {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_distributed_attention_panel(
+        &mut self,
+        value: MidValueId,
+        destinations: &BTreeMap<u32, Vec<LowShardId>>,
+        block_start: u32,
+        valid_rows: u32,
+        logical_columns: u32,
+        physical_columns: u32,
+        order: AmpOrder,
+        kernel_provenance: WorkProvenance,
+        exchange_provenance: WorkProvenance,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<()> {
+        let panels = physical_columns.div_ceil(AMP_COLUMN_MICRO);
+        if panels == 0 || valid_rows == 0 {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let mut gathers = BTreeMap::new();
+        let mut packed_panels = Vec::new();
+        for (&stream, stream_destinations) in destinations {
+            for panel in 0..panels {
+                let column_start = panel * AMP_COLUMN_MICRO;
+                let panel_columns = logical_columns
+                    .saturating_sub(column_start)
+                    .min(AMP_COLUMN_MICRO);
+                if panel_columns == 0 {
+                    continue;
+                }
+                let tile = stream_destinations[(panel as usize) % stream_destinations.len()];
+                let tile = self.shards[tile.index() as usize].tile;
+                let row_major = self.push_attention_buffer(
+                    tile,
+                    valid_rows,
+                    valid_rows,
+                    panel_columns,
+                    panel_columns,
+                    ElementOrder::RowMajor,
+                )?;
+                let mut local_copies = Vec::new();
+                self.gather_deferred_split_panel(
+                    value,
+                    stream,
+                    block_start,
+                    valid_rows,
+                    column_start,
+                    panel_columns,
+                    row_major,
+                    &mut gathers,
+                    &mut local_copies,
+                )?;
+                for (tile, copy) in local_copies {
+                    self.append_local_copy(tiles, tile, copy)?;
+                }
+                let packed = self.push_attention_buffer(
+                    tile,
+                    valid_rows,
+                    AMP_INNER_BLOCK,
+                    panel_columns,
+                    AMP_COLUMN_MICRO,
+                    ElementOrder::Amp(order),
+                )?;
+                packed_panels.push((panel, row_major, packed, tile, stream_destinations.clone()));
+            }
+        }
+        self.append_phase(gathers, exchange_provenance, tiles)?;
+        for &(_, row_major, packed, tile, _) in &packed_panels {
+            self.append_attention_rearrange(tiles, tile, row_major, packed, kernel_provenance)?;
+        }
+        let mut broadcasts = BTreeMap::new();
+        for (panel, _, packed, tile, stream_destinations) in packed_panels {
+            let source = self.full_view(packed);
+            let column_start = panel * AMP_COLUMN_MICRO;
+            for destination in stream_destinations {
+                let destination_tile = self.shards[destination.index() as usize].tile;
+                let destination_view = self.narrow_view(
+                    destination,
+                    &[(1, column_start, column_start + AMP_COLUMN_MICRO)],
+                )?;
+                if tile == destination_tile {
+                    let mut copies = Vec::new();
+                    append_span_copies(
+                        &self.shards,
+                        &source,
+                        &destination_view,
+                        tile,
+                        &mut copies,
+                    )?;
+                    for (tile, copy) in copies {
+                        self.append_local_copy(tiles, tile, copy)?;
+                    }
+                } else {
+                    broadcasts
+                        .entry(source.clone())
+                        .or_insert_with(Vec::new)
+                        .push(destination_view);
+                }
+            }
+        }
+        self.append_phase(broadcasts, exchange_provenance, tiles)
     }
 
     fn append_attention_rearrange(
