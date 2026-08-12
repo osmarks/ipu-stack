@@ -142,7 +142,7 @@ pub fn build_tile_program_package(
         .collect::<BTreeMap<_, _>>();
     let linked_end = linked_end(&layout)?;
     let mut memory = TileMemoryMap::new();
-    memory.reserve("linked runtime", APPLICATION_LOAD_BASE..linked_end)?;
+    reserve_linked_image(&mut memory, &layout, "linked runtime")?;
     memory.reserve(
         "host exchange aperture",
         ipu_exchange::EXCHANGE_WINDOW_BASE
@@ -377,10 +377,7 @@ fn build_package_from_objects(
     })?;
     let linked_end = linked_end(&layout)?;
     let mut memory = TileMemoryMap::new();
-    memory.reserve(
-        "linked runtime and kernels",
-        APPLICATION_LOAD_BASE..linked_end,
-    )?;
+    reserve_linked_image(&mut memory, &layout, "linked runtime and kernels")?;
     memory.reserve(
         "host exchange aperture",
         ipu_exchange::EXCHANGE_WINDOW_BASE
@@ -1021,7 +1018,13 @@ fn link_runtime(
         objects,
         &LinkOptions {
             image_base: TILE_MEMORY_BASE,
-            regions: vec![(SUPPORT_START, ipu_exchange::EXCHANGE_WINDOW_BASE)],
+            regions: vec![
+                (SUPPORT_START, ipu_exchange::EXCHANGE_WINDOW_BASE),
+                (
+                    RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES,
+                    ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                ),
+            ],
             entry_symbol: RUNTIME_ENTRY_SYMBOL.into(),
             retained_symbols,
             externals,
@@ -1548,6 +1551,21 @@ fn linked_end(linked: &LinkedImage) -> PackageBuildResult<u32> {
         .collect::<Option<Vec<_>>>()
         .and_then(|ends| ends.into_iter().max())
         .ok_or_else(|| invalid("linked runtime has no valid segments"))
+}
+
+fn reserve_linked_image(
+    memory: &mut TileMemoryMap,
+    linked: &LinkedImage,
+    name: &'static str,
+) -> PackageBuildResult<()> {
+    for segment in &linked.segments {
+        let end = segment
+            .address
+            .checked_add(u32::try_from(segment.size)?)
+            .ok_or_else(|| invalid("linked runtime segment range overflow"))?;
+        memory.reserve(name, segment.address..end)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> PackageBuildError {

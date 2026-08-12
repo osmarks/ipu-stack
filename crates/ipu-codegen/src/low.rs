@@ -8,10 +8,11 @@
 
 use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
-    AMP_INNER_BLOCK, AmpOrder, ConversionDispatch, ElementOrder, GemmDistribution, Layout,
-    LayoutError, MemoryClass, MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId,
-    OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing, PipelineConfig,
-    PointwiseInputMapping, Precision, TensorTiling, TensorType, TileKernelSpec,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, ConversionDispatch, ElementOrder,
+    GemmDistribution, Layout, LayoutError, MemoryClass, MidGraph, MidOperation, MidOperationKind,
+    MidRepeat, MidValueId, OperandRequirement, OperatorDispatch, OperatorRequirements,
+    OutputAliasing, PipelineConfig, PointwiseInputMapping, Precision, TensorTiling, TensorType,
+    TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use std::collections::{BTreeMap, BTreeSet};
@@ -410,6 +411,11 @@ pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringR
 
 type ShardIntersections = Vec<(Vec<ShardExtent>, Vec<LowShardId>)>;
 
+struct DeferredSplitHeads {
+    heads: u32,
+    shards: Vec<LowShardId>,
+}
+
 struct LoweringState {
     tile_count: u16,
     shards: Vec<LowShard>,
@@ -420,6 +426,7 @@ struct LoweringState {
     repeat_runs: Vec<RepeatRun>,
     kernel_metadata: Vec<Arc<KernelRunMetadata>>,
     deferred_conversions: BTreeMap<MidValueId, MidValueId>,
+    deferred_split_heads: BTreeMap<MidValueId, DeferredSplitHeads>,
     intersection_cache: BTreeMap<(MidValueId, Vec<ShardExtent>), ShardIntersections>,
 }
 
@@ -435,6 +442,7 @@ impl LoweringState {
             repeat_runs: Vec::new(),
             kernel_metadata: Vec::new(),
             deferred_conversions: BTreeMap::new(),
+            deferred_split_heads: BTreeMap::new(),
             intersection_cache: BTreeMap::new(),
         };
         let parameter_origins = graph
@@ -742,6 +750,15 @@ impl LoweringState {
             .collect::<Vec<_>>();
         for (index, operation) in operations.iter().enumerate() {
             let started = Instant::now();
+            if self.defer_split_heads(operation, operations, retained_values, &mut tiles)? {
+                tracing::info!(
+                    operation = index,
+                    source = ?operation.source.map(OperationId::index),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "deferred split-head materialization"
+                );
+                continue;
+            }
             if self.defer_conversion(
                 operation,
                 operations.get(index + 1),
@@ -773,6 +790,118 @@ impl LoweringState {
             );
         }
         Ok(tiles)
+    }
+
+    fn defer_split_heads(
+        &mut self,
+        operation: &MidOperation,
+        operations: &[MidOperation],
+        retained_values: &[MidValueId],
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<bool> {
+        let MidOperationKind::Operator(crate::MidOperator::SplitHeads(options)) = &operation.kind
+        else {
+            return Ok(false);
+        };
+        let ([source], [result]) = (operation.inputs.as_slice(), operation.results.as_slice())
+        else {
+            return Ok(false);
+        };
+        let uses = operations
+            .iter()
+            .flat_map(|operation| &operation.inputs)
+            .chain(retained_values)
+            .filter(|value| **value == *result)
+            .count();
+        let consumer = operations
+            .iter()
+            .find(|candidate| candidate.inputs.contains(result));
+        if uses != 1
+            || !matches!(
+                consumer.and_then(|consumer| consumer.operator_plan.as_ref()),
+                Some(plan) if matches!(plan.dispatch, OperatorDispatch::BlockedAttention { .. })
+            )
+        {
+            return Ok(false);
+        }
+        let mut staging_shards = Vec::new();
+        for source_shard in self.value_shards(*source)?.to_vec() {
+            let source_definition = self.shards[source_shard.index() as usize].clone();
+            if source_definition.extents.len() != 3
+                || source_definition.tensor_type.format.precision != Precision::F16
+                || source_definition.tensor_type.format.layout.order
+                    != ElementOrder::Amp(AmpOrder::Output)
+                || options.heads == 0
+            {
+                return Ok(false);
+            }
+            let columns = source_definition.tensor_type.shape.0[2];
+            if !columns.is_multiple_of(options.heads) {
+                return Ok(false);
+            }
+            let columns_extent = source_definition.extents[2];
+            let local_physical_columns = columns_extent.physical_end - columns_extent.start;
+            if !local_physical_columns.is_multiple_of(AMP_COLUMN_MICRO) {
+                return Ok(false);
+            }
+            let mut staging_type = source_definition.tensor_type.clone();
+            staging_type.format.layout = Layout::row_major(TensorTiling::replicated(1));
+            let staging = self.push_shard(LowShard {
+                id: LowShardId(0),
+                tile: source_definition.tile,
+                tensor_type: staging_type,
+                extents: source_definition.extents.clone(),
+                definition: ShardDefinition::Staging,
+            })?;
+            self.append_kernel(
+                tiles,
+                source_definition.tile,
+                KernelRun::new(
+                    WorkProvenance {
+                        operation: operation.source,
+                        value: Some(*result),
+                        reason: WorkReason::OperatorKernel,
+                    },
+                    TileKernel::Planned(TileKernelSpec::Rearrange {
+                        from: source_definition.tensor_type.format.layout.clone(),
+                        to: self.shards[staging.index() as usize]
+                            .tensor_type
+                            .format
+                            .layout
+                            .clone(),
+                    }),
+                    vec![KernelOperand {
+                        views: vec![self.full_view(source_shard)],
+                    }],
+                    self.full_view(staging),
+                    KernelRequirements::Conversion {
+                        input: OperandRequirement::new(
+                            source_definition.tensor_type.format.clone(),
+                            4,
+                        ),
+                        output: OperandRequirement::new(
+                            self.shards[staging.index() as usize]
+                                .tensor_type
+                                .format
+                                .clone(),
+                            4,
+                        ),
+                    },
+                ),
+            )?;
+            staging_shards.push(staging);
+        }
+        self.deferred_split_heads.insert(
+            *result,
+            DeferredSplitHeads {
+                heads: options.heads,
+                shards: staging_shards,
+            },
+        );
+        for shard in self.value_shards(*result)?.to_vec() {
+            self.shards[shard.index() as usize].definition = ShardDefinition::Unmaterialized;
+        }
+        Ok(true)
     }
 
     fn defer_conversion(
@@ -1277,14 +1406,19 @@ impl LoweringState {
         struct AttentionTask {
             tile: u16,
             head: u32,
+            query_row_start: u32,
+            query_rows: u32,
             query_dimension: u32,
             value_dimension: u32,
             query: LowShardId,
+            query_receive: Option<LowShardId>,
             output: LowShardId,
             scratch: LowShardId,
             weights: LowShardId,
             key_staging: LowShardId,
             value_staging: LowShardId,
+            key_receive: Option<LowShardId>,
+            value_receive: Option<LowShardId>,
         }
         let mut tasks = Vec::with_capacity(outputs.len());
         for output in outputs {
@@ -1304,13 +1438,38 @@ impl LoweringState {
             if rows == 0 || rows > query_block_rows {
                 return Err(LowLoweringError::InvalidOperatorPlan);
             }
-            let query = self.local_shard(*query, tile)?;
-            let query_dimension = *self.shards[query.index() as usize]
+            let canonical_query = self.local_shard(*query, tile)?;
+            let query_dimension = *self.shards[canonical_query.index() as usize]
                 .tensor_type
                 .shape
                 .0
                 .last()
                 .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            let deferred_query = self.deferred_split_heads.contains_key(query);
+            let query = if deferred_query {
+                self.push_attention_buffer(
+                    tile,
+                    rows,
+                    rows,
+                    query_dimension,
+                    padded_query_dimension,
+                    ElementOrder::Amp(AmpOrder::Left),
+                )?
+            } else {
+                canonical_query
+            };
+            let query_receive = deferred_query
+                .then(|| {
+                    self.push_attention_buffer(
+                        tile,
+                        rows,
+                        rows,
+                        query_dimension,
+                        query_dimension,
+                        ElementOrder::RowMajor,
+                    )
+                })
+                .transpose()?;
             let scratch_columns = padded_value_dimension.max(key_block_rows);
             let scratch = self.push_attention_scratch(
                 tile,
@@ -1329,45 +1488,80 @@ impl LoweringState {
                 ElementOrder::Amp(AmpOrder::Left),
                 MemoryClass::Ipu21Standard,
             )?;
-            let key_staging = self.push_attention_scratch(
+            let key_staging = self.push_attention_buffer(
                 tile,
                 key_block_rows,
+                key_block_rows,
+                query_dimension,
                 padded_query_dimension,
-                Precision::F16,
                 ElementOrder::Amp(AmpOrder::TransposedRight),
-                MemoryClass::Ipu21Standard,
             )?;
             self.shards[key_staging.index() as usize].definition = ShardDefinition::ExchangeStaging;
-            let value_staging = self.push_attention_scratch(
+            let value_staging = self.push_attention_buffer(
                 tile,
                 key_block_rows,
+                key_block_rows,
+                value_dimension,
                 padded_value_dimension,
-                Precision::F16,
                 ElementOrder::Amp(AmpOrder::RightK64),
-                MemoryClass::Ipu21Standard,
             )?;
             self.shards[value_staging.index() as usize].definition =
                 ShardDefinition::ExchangeStaging;
+            let deferred_key = self.deferred_split_heads.contains_key(key);
+            let deferred_value = self.deferred_split_heads.contains_key(value);
+            if deferred_key != deferred_value {
+                return Err(LowLoweringError::InvalidOperatorPlan);
+            }
+            let deferred_key_value = deferred_key;
+            let key_receive = deferred_key_value
+                .then(|| {
+                    self.push_attention_buffer(
+                        tile,
+                        key_block_rows,
+                        key_block_rows,
+                        query_dimension,
+                        query_dimension,
+                        ElementOrder::RowMajor,
+                    )
+                })
+                .transpose()?;
+            let value_receive = deferred_key_value
+                .then(|| {
+                    self.push_attention_buffer(
+                        tile,
+                        key_block_rows,
+                        key_block_rows,
+                        value_dimension,
+                        value_dimension,
+                        ElementOrder::RowMajor,
+                    )
+                })
+                .transpose()?;
             tasks.push(AttentionTask {
                 tile,
                 head: self.shards[output.index() as usize].extents[rank - 3].start,
+                query_row_start: self.shards[output.index() as usize].extents[rank - 2].start,
+                query_rows: rows,
                 query_dimension,
                 value_dimension,
                 query,
+                query_receive,
                 output,
                 scratch,
                 weights,
                 key_staging,
                 value_staging,
+                key_receive,
+                value_receive,
             });
         }
-        let heads = tasks
-            .iter()
-            .map(|task| task.head)
-            .max()
-            .map_or(1, |head| usize::try_from(head + 1).unwrap_or(usize::MAX));
-        let blocks = key_shards.len() / heads;
-        if blocks == 0 || blocks * heads != key_shards.len() {
+        let key_rows = self.shards[self.value_shards(*key)?[0].index() as usize]
+            .tensor_type
+            .shape
+            .0[1];
+        let blocks = usize::try_from(key_rows.div_ceil(key_block_rows))
+            .map_err(|_| LowLoweringError::IdOverflow)?;
+        if blocks == 0 {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
         let exchange_provenance = WorkProvenance {
@@ -1380,12 +1574,80 @@ impl LoweringState {
             value: Some(*result),
             reason: WorkReason::OperatorKernel,
         };
+        if self.deferred_split_heads.contains_key(query) {
+            let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+            let mut local_copies = Vec::new();
+            for task in &tasks {
+                self.gather_deferred_split_panel(
+                    *query,
+                    task.head,
+                    task.query_row_start,
+                    task.query_rows,
+                    task.query_dimension,
+                    task.query_receive
+                        .ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                    &mut transfers,
+                    &mut local_copies,
+                )?;
+            }
+            for (tile, copy) in local_copies {
+                self.append_local_copy(tiles, tile, copy)?;
+            }
+            self.append_phase(transfers, exchange_provenance, tiles)?;
+            for task in &tasks {
+                self.append_attention_rearrange(
+                    tiles,
+                    task.tile,
+                    task.query_receive
+                        .ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                    task.query,
+                    kernel_provenance,
+                )?;
+            }
+        }
         for block in 0..blocks {
             let block_start =
                 u32::try_from(block).map_err(|_| LowLoweringError::IdOverflow)? * key_block_rows;
             let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
             let mut task_sources = Vec::with_capacity(tasks.len());
             for task in &tasks {
+                if self.deferred_split_heads.contains_key(key)
+                    || self.deferred_split_heads.contains_key(value)
+                {
+                    let valid_key_rows = key_rows.saturating_sub(block_start).min(key_block_rows);
+                    let key_receive = task
+                        .key_receive
+                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                    let value_receive = task
+                        .value_receive
+                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                    let mut local_copies = Vec::new();
+                    self.gather_deferred_split_panel(
+                        *key,
+                        task.head,
+                        block_start,
+                        valid_key_rows,
+                        task.query_dimension,
+                        key_receive,
+                        &mut transfers,
+                        &mut local_copies,
+                    )?;
+                    self.gather_deferred_split_panel(
+                        *value,
+                        task.head,
+                        block_start,
+                        valid_key_rows,
+                        task.value_dimension,
+                        value_receive,
+                        &mut transfers,
+                        &mut local_copies,
+                    )?;
+                    for (tile, copy) in local_copies {
+                        self.append_local_copy(tiles, tile, copy)?;
+                    }
+                    task_sources.push((task.key_staging, task.value_staging, valid_key_rows));
+                    continue;
+                }
                 let source_matches = |candidate: &&LowShardId| {
                     let shard = &self.shards[candidate.index() as usize];
                     shard.extents[0].start == task.head && shard.extents[1].start == block_start
@@ -1419,6 +1681,28 @@ impl LoweringState {
                 task_sources.push((operands[0], operands[1], valid_key_rows));
             }
             self.append_phase(transfers, exchange_provenance, tiles)?;
+            if self.deferred_split_heads.contains_key(key)
+                || self.deferred_split_heads.contains_key(value)
+            {
+                for task in &tasks {
+                    self.append_attention_rearrange(
+                        tiles,
+                        task.tile,
+                        task.key_receive
+                            .ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                        task.key_staging,
+                        kernel_provenance,
+                    )?;
+                    self.append_attention_rearrange(
+                        tiles,
+                        task.tile,
+                        task.value_receive
+                            .ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                        task.value_staging,
+                        kernel_provenance,
+                    )?;
+                }
+            }
             for (task, (key_operand, value_operand, valid_key_rows)) in
                 tasks.iter().zip(task_sources)
             {
@@ -1507,6 +1791,144 @@ impl LoweringState {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn gather_deferred_split_panel(
+        &self,
+        value: MidValueId,
+        stream: u32,
+        row_start: u32,
+        rows: u32,
+        columns: u32,
+        destination: LowShardId,
+        transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
+        local_copies: &mut Vec<(u16, LocalCopy)>,
+    ) -> LowLoweringResult<()> {
+        let deferred = self
+            .deferred_split_heads
+            .get(&value)
+            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+        let split_type = &self.shards[self.value_shards(value)?[0].index() as usize].tensor_type;
+        let head_width = split_type.shape.0[2];
+        if columns > head_width || deferred.heads == 0 {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let batch = stream / deferred.heads;
+        let head = stream % deferred.heads;
+        let column_base = head
+            .checked_mul(head_width)
+            .ok_or(LowLoweringError::IdOverflow)?;
+        let target = vec![
+            ShardExtent {
+                axis: 0,
+                start: batch,
+                logical_end: batch + 1,
+                physical_end: batch + 1,
+            },
+            ShardExtent {
+                axis: 1,
+                start: row_start,
+                logical_end: row_start + rows,
+                physical_end: row_start + rows,
+            },
+            ShardExtent {
+                axis: 2,
+                start: column_base,
+                logical_end: column_base + columns,
+                physical_end: column_base + columns,
+            },
+        ];
+        let destination_tile = self.shards[destination.index() as usize].tile;
+        let mut covered = 0u64;
+        for &source in &deferred.shards {
+            let Some(source_extents) =
+                intersect_extents(&self.shards[source.index() as usize].extents, &target)
+            else {
+                continue;
+            };
+            let destination_extents = vec![
+                ShardExtent {
+                    axis: 0,
+                    start: source_extents[1].start - row_start,
+                    logical_end: source_extents[1].logical_end - row_start,
+                    physical_end: source_extents[1].logical_end - row_start,
+                },
+                ShardExtent {
+                    axis: 1,
+                    start: source_extents[2].start - column_base,
+                    logical_end: source_extents[2].logical_end - column_base,
+                    physical_end: source_extents[2].logical_end - column_base,
+                },
+            ];
+            covered = covered.saturating_add(
+                u64::from(source_extents[1].logical_end - source_extents[1].start)
+                    * u64::from(source_extents[2].logical_end - source_extents[2].start),
+            );
+            let source_view = ShardView {
+                shard: source,
+                extents: source_extents,
+            };
+            let destination_view = ShardView {
+                shard: destination,
+                extents: destination_extents,
+            };
+            if self.shards[source.index() as usize].tile == destination_tile {
+                append_logical_span_copies(
+                    &self.shards,
+                    &source_view,
+                    &destination_view,
+                    destination_tile,
+                    local_copies,
+                )?;
+            } else {
+                transfers
+                    .entry(source_view)
+                    .or_default()
+                    .push(destination_view);
+            }
+        }
+        if covered != u64::from(rows) * u64::from(columns) {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        Ok(())
+    }
+
+    fn append_attention_rearrange(
+        &mut self,
+        tiles: &mut [TileWorkList],
+        tile: u16,
+        source: LowShardId,
+        destination: LowShardId,
+        provenance: WorkProvenance,
+    ) -> LowLoweringResult<()> {
+        let input = self.shards[source.index() as usize]
+            .tensor_type
+            .format
+            .clone();
+        let output = self.shards[destination.index() as usize]
+            .tensor_type
+            .format
+            .clone();
+        self.append_kernel(
+            tiles,
+            tile,
+            KernelRun::new(
+                provenance,
+                TileKernel::Planned(TileKernelSpec::Rearrange {
+                    from: input.layout.clone(),
+                    to: output.layout.clone(),
+                }),
+                vec![KernelOperand {
+                    views: vec![self.full_view(source)],
+                }],
+                self.full_view(destination),
+                KernelRequirements::Conversion {
+                    input: OperandRequirement::new(input, 2),
+                    output: OperandRequirement::new(output, 2),
+                },
+            ),
+        )
+    }
+
     fn push_attention_scratch(
         &mut self,
         tile: u16,
@@ -1540,6 +1962,45 @@ impl LoweringState {
                     start: 0,
                     logical_end: columns,
                     physical_end: columns,
+                },
+            ],
+            definition: ShardDefinition::Staging,
+        })
+    }
+
+    fn push_attention_buffer(
+        &mut self,
+        tile: u16,
+        logical_rows: u32,
+        physical_rows: u32,
+        logical_columns: u32,
+        physical_columns: u32,
+        order: ElementOrder,
+    ) -> LowLoweringResult<LowShardId> {
+        self.push_shard(LowShard {
+            id: LowShardId(0),
+            tile,
+            tensor_type: TensorType::new(
+                [logical_rows, logical_columns],
+                Precision::F16,
+                Layout {
+                    order,
+                    tiling: TensorTiling::replicated(1),
+                    memory_class: MemoryClass::Ipu21Standard,
+                },
+            ),
+            extents: vec![
+                ShardExtent {
+                    axis: 0,
+                    start: 0,
+                    logical_end: logical_rows,
+                    physical_end: physical_rows,
+                },
+                ShardExtent {
+                    axis: 1,
+                    start: 0,
+                    logical_end: logical_columns,
+                    physical_end: physical_columns,
                 },
             ],
             definition: ShardDefinition::Staging,

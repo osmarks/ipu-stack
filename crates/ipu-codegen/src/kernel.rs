@@ -19,6 +19,7 @@ pub enum KernelSymbols {
     AttentionSpecialized,
     AttentionStageSpecialized,
     RearrangeSpecialized,
+    AmpOutputToRowMajorSpecialized,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +60,7 @@ pub struct KernelBuildPlan {
     attention_symbols: BTreeMap<AttentionKernelShape, String>,
     attention_stage_symbols: Vec<(TileKernelSpec, u32, String)>,
     rearrange_symbols: BTreeMap<(AmpOrder, u32, u32), String>,
+    unpack_output_symbols: BTreeMap<u32, String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -142,6 +144,7 @@ impl KernelBuildPlan {
         let mut gelu = false;
         let mut reduction_add = false;
         let mut rearrangements = BTreeSet::new();
+        let mut unpack_output_columns = BTreeSet::new();
         let mut attention = BTreeSet::new();
         let mut attention_stages = Vec::new();
         for tile in &program.tiles {
@@ -152,11 +155,38 @@ impl KernelBuildPlan {
                 &mut gelu,
                 &mut reduction_add,
                 &mut rearrangements,
+                &mut unpack_output_columns,
                 &mut attention,
                 &mut attention_stages,
             )?;
         }
         let mut plan = Self::default();
+        for columns in unpack_output_columns {
+            let suffix = format!("c{columns}");
+            let vertex = format!("RearrangeAmpOutputToRowMajorF16_{suffix}");
+            let codelet = format!("__runCodelet_{vertex}");
+            let call = format!("ipu_stack_rearrange_amp_output_to_row_major_f16_{suffix}");
+            plan.compilations.push(KernelCompilation {
+                source: "unpack_amp_output_f16.cpp",
+                name: format!("unpack_amp_output_f16_codelet_{suffix}"),
+                flags: vec![
+                    "-Oz".into(),
+                    format!("-DUNPACK_COLUMNS={columns}"),
+                    format!("-DUNPACK_VERTEX_NAME={vertex}"),
+                ],
+                retained_symbols: Vec::new(),
+            });
+            plan.compilations.push(KernelCompilation {
+                source: "unpack_amp_output_f16.S",
+                name: format!("unpack_amp_output_f16_wrapper_{suffix}"),
+                flags: vec![
+                    format!("-DUNPACK_CALL_SYMBOL={call}"),
+                    format!("-DUNPACK_CODELET_SYMBOL={codelet}"),
+                ],
+                retained_symbols: vec![call.clone()],
+            });
+            plan.unpack_output_symbols.insert(columns, call);
+        }
         for ((precision, weights, inner_block, output_columns), values) in rows {
             let values = values.into_iter().collect::<Vec<_>>();
             let (source, prefix) = match precision {
@@ -525,6 +555,12 @@ impl KernelBuildPlan {
                 ))
                 .cloned()
                 .ok_or(KernelAbiError::RequirementMismatch)?,
+            (KernelSymbols::AmpOutputToRowMajorSpecialized, TileKernelSpec::Rearrange { .. }) => {
+                self.unpack_output_symbols
+                    .get(&input_matrix_extent(run, false, true)?)
+                    .cloned()
+                    .ok_or(KernelAbiError::RequirementMismatch)?
+            }
             _ => return Err(KernelAbiError::RequirementMismatch),
         };
         Ok(PlannedKernelCall {
@@ -621,6 +657,7 @@ fn collect_kernels(
     gelu: &mut bool,
     reduction_add: &mut bool,
     rearrangements: &mut BTreeSet<(AmpOrder, u32, u32)>,
+    unpack_output_columns: &mut BTreeSet<u32>,
     attention: &mut BTreeSet<AttentionKernelShape>,
     attention_stages: &mut Vec<(TileKernelSpec, u32)>,
 ) -> Result<(), KernelAbiError> {
@@ -669,6 +706,11 @@ fn collect_kernels(
                         matrix_extent(run, true, true)?,
                         matrix_extent(run, false, true)?,
                     ));
+                } else if let TileKernelSpec::Rearrange { from, to } = kernel
+                    && from.order == ElementOrder::Amp(AmpOrder::Output)
+                    && to.order == ElementOrder::RowMajor
+                {
+                    unpack_output_columns.insert(input_matrix_extent(run, false, true)?);
                 } else if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
                     attention.insert(attention_shape(run)?);
                 } else if matches!(
@@ -688,6 +730,7 @@ fn collect_kernels(
                 gelu,
                 reduction_add,
                 rearrangements,
+                unpack_output_columns,
                 attention,
                 attention_stages,
             )?,
@@ -779,6 +822,28 @@ fn matrix_extent(run: &KernelRun, logical: bool, columns: bool) -> Result<u32, K
     })
 }
 
+fn input_matrix_extent(
+    run: &KernelRun,
+    logical: bool,
+    columns: bool,
+) -> Result<u32, KernelAbiError> {
+    let view = run
+        .inputs
+        .first()
+        .and_then(|operand| operand.views.first())
+        .ok_or(KernelAbiError::RequirementMismatch)?;
+    let rank = view.extents.len();
+    let axis = rank
+        .checked_sub(if columns { 1 } else { 2 })
+        .ok_or(KernelAbiError::RequirementMismatch)?;
+    let extent = &view.extents[axis];
+    Ok(if logical {
+        extent.logical_end - extent.start
+    } else {
+        extent.physical_end - extent.start
+    })
+}
+
 fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbiError> {
     let count = element_count(run)?;
     abi.scalar_arguments
@@ -822,6 +887,20 @@ fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbi
                 },
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
+            "flat_physical_rows" => {
+                let view = run
+                    .inputs
+                    .first()
+                    .and_then(|operand| operand.views.first())
+                    .ok_or(KernelAbiError::RequirementMismatch)?;
+                view.extents[..view.extents.len().saturating_sub(1)]
+                    .iter()
+                    .try_fold(1u32, |product, extent| {
+                        product
+                            .checked_mul(extent.physical_end - extent.start)
+                            .ok_or(KernelAbiError::ElementCountOverflow)
+                    })
+            }
             _ => Err(KernelAbiError::RequirementMismatch),
         })
         .collect()
@@ -933,6 +1012,18 @@ pub fn tile_kernel_abi(
             1,
             scalar_arguments(1, &["element_count"]),
         ),
+        TileKernelSpec::Rearrange { from, to }
+            if precision == Precision::F16
+                && from.order == ElementOrder::Amp(AmpOrder::Output)
+                && to.order == ElementOrder::RowMajor =>
+        {
+            (
+                KernelSymbols::AmpOutputToRowMajorSpecialized,
+                KernelAvailability::Implemented,
+                1,
+                scalar_arguments(1, &["flat_physical_rows"]),
+            )
+        }
         TileKernelSpec::Rearrange { from, to }
             if precision == Precision::F16
                 && from.order == ElementOrder::RowMajor
