@@ -1605,23 +1605,30 @@ impl LoweringState {
                 )?;
             }
         }
+        let deferred_key_value = self.deferred_split_heads.contains_key(key);
         for block in 0..blocks {
             let block_start =
                 u32::try_from(block).map_err(|_| LowLoweringError::IdOverflow)? * key_block_rows;
             let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
             let mut task_sources = Vec::with_capacity(tasks.len());
-            for task in &tasks {
-                if self.deferred_split_heads.contains_key(key)
-                    || self.deferred_split_heads.contains_key(value)
-                {
-                    let valid_key_rows = key_rows.saturating_sub(block_start).min(key_block_rows);
+            if deferred_key_value {
+                let valid_key_rows = key_rows.saturating_sub(block_start).min(key_block_rows);
+                let owner_indices = tasks.iter().enumerate().fold(
+                    BTreeMap::<u32, usize>::new(),
+                    |mut owners, (index, task)| {
+                        owners.entry(task.head).or_insert(index);
+                        owners
+                    },
+                );
+                let mut local_copies = Vec::new();
+                for &owner_index in owner_indices.values() {
+                    let task = &tasks[owner_index];
                     let key_receive = task
                         .key_receive
                         .ok_or(LowLoweringError::InvalidOperatorPlan)?;
                     let value_receive = task
                         .value_receive
                         .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-                    let mut local_copies = Vec::new();
                     self.gather_deferred_split_panel(
                         *key,
                         task.head,
@@ -1642,49 +1649,13 @@ impl LoweringState {
                         &mut transfers,
                         &mut local_copies,
                     )?;
-                    for (tile, copy) in local_copies {
-                        self.append_local_copy(tiles, tile, copy)?;
-                    }
-                    task_sources.push((task.key_staging, task.value_staging, valid_key_rows));
-                    continue;
                 }
-                let source_matches = |candidate: &&LowShardId| {
-                    let shard = &self.shards[candidate.index() as usize];
-                    shard.extents[0].start == task.head && shard.extents[1].start == block_start
-                };
-                let key_source = *key_shards
-                    .iter()
-                    .find(source_matches)
-                    .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-                let value_source = *value_shards
-                    .iter()
-                    .find(source_matches)
-                    .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-                let valid_key_rows = self.shards[key_source.index() as usize].extents[1]
-                    .logical_end
-                    .saturating_sub(block_start);
-                let mut operands = Vec::with_capacity(2);
-                for (source, destination) in [
-                    (key_source, task.key_staging),
-                    (value_source, task.value_staging),
-                ] {
-                    if self.shards[source.index() as usize].tile == task.tile {
-                        operands.push(source);
-                    } else {
-                        transfers
-                            .entry(self.full_view(source))
-                            .or_default()
-                            .push(self.full_view(destination));
-                        operands.push(destination);
-                    }
+                for (tile, copy) in local_copies {
+                    self.append_local_copy(tiles, tile, copy)?;
                 }
-                task_sources.push((operands[0], operands[1], valid_key_rows));
-            }
-            self.append_phase(transfers, exchange_provenance, tiles)?;
-            if self.deferred_split_heads.contains_key(key)
-                || self.deferred_split_heads.contains_key(value)
-            {
-                for task in &tasks {
+                self.append_phase(transfers, exchange_provenance, tiles)?;
+                for &owner_index in owner_indices.values() {
+                    let task = &tasks[owner_index];
                     self.append_attention_rearrange(
                         tiles,
                         task.tile,
@@ -1702,6 +1673,60 @@ impl LoweringState {
                         kernel_provenance,
                     )?;
                 }
+                let mut broadcasts = BTreeMap::<ShardView, Vec<ShardView>>::new();
+                for task in &tasks {
+                    let owner = &tasks[owner_indices[&task.head]];
+                    for (source, destination) in [
+                        (owner.key_staging, task.key_staging),
+                        (owner.value_staging, task.value_staging),
+                    ] {
+                        if self.shards[source.index() as usize].tile
+                            != self.shards[destination.index() as usize].tile
+                        {
+                            broadcasts
+                                .entry(self.full_view(source))
+                                .or_default()
+                                .push(self.full_view(destination));
+                        }
+                    }
+                    task_sources.push((task.key_staging, task.value_staging, valid_key_rows));
+                }
+                self.append_phase(broadcasts, exchange_provenance, tiles)?;
+            } else {
+                for task in &tasks {
+                    let source_matches = |candidate: &&LowShardId| {
+                        let shard = &self.shards[candidate.index() as usize];
+                        shard.extents[0].start == task.head && shard.extents[1].start == block_start
+                    };
+                    let key_source = *key_shards
+                        .iter()
+                        .find(source_matches)
+                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                    let value_source = *value_shards
+                        .iter()
+                        .find(source_matches)
+                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                    let valid_key_rows = self.shards[key_source.index() as usize].extents[1]
+                        .logical_end
+                        .saturating_sub(block_start);
+                    let mut operands = Vec::with_capacity(2);
+                    for (source, destination) in [
+                        (key_source, task.key_staging),
+                        (value_source, task.value_staging),
+                    ] {
+                        if self.shards[source.index() as usize].tile == task.tile {
+                            operands.push(source);
+                        } else {
+                            transfers
+                                .entry(self.full_view(source))
+                                .or_default()
+                                .push(self.full_view(destination));
+                            operands.push(destination);
+                        }
+                    }
+                    task_sources.push((operands[0], operands[1], valid_key_rows));
+                }
+                self.append_phase(transfers, exchange_provenance, tiles)?;
             }
             for (task, (key_operand, value_operand, valid_key_rows)) in
                 tasks.iter().zip(task_sources)
