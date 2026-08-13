@@ -24,9 +24,9 @@ REARRANGE_CALL_SYMBOL:
 	br $m10
 	.size REARRANGE_CALL_SYMBOL, .-REARRANGE_CALL_SYMBOL
 
-	// Specialized 64x16 row-major to AMP transposed-right packing. Each input
-	// row is one contiguous 32-byte AMP load channel. The channel permutation
-	// is computed once per row and the complete row moves in four 64-bit words.
+	// Specialized 64x16 row-major to transposed coefficient-panel packing. Each
+	// input row is one contiguous 32-byte load channel; ld*putcs destinations
+	// perform the final AMP coefficient permutation at consumption time.
 	.worker
 	.p2align 3
 .Lrearrange_transposed_right_f16_worker:
@@ -40,15 +40,7 @@ REARRANGE_CALL_SYMBOL:
 	shr $m5, $m4, 4
 	shl $m5, $m5, 9
 	add $m7, $m2, $m5
-	shr $m5, $m4, 1
-	and $m5, $m5, 3
-	shl $m5, $m5, 2
-	shr $m8, $m4, 3
-	and $m8, $m8, 1
-	shl $m8, $m8, 1
-	or $m5, $m5, $m8
-	and $m8, $m4, 1
-	or $m5, $m5, $m8
+	and $m5, $m4, 15
 	shl $m5, $m5, 5
 	add $m7, $m7, $m5
 	// Staging buffers guarantee eight-byte alignment; they are not required to

@@ -2,9 +2,10 @@
 
 use crate::mid::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
-    AmpOrder, ComputeStep, ElementOrder, GemmKernelMode, GemmWeightLoad, KernelRequirements,
-    KernelRun, LowProgram, LowShard, LowShardId, Precision, StepProfile, StorageError, TileAddress,
-    TileKernel, TileKernelSpec, TileWorkList, TileWorkRef, view_byte_spans,
+    AmpOrder, BlockMajorOrder, ComputeStep, ElementOrder, GemmKernelMode, GemmWeightLoad,
+    KernelRequirements, KernelRun, LowProgram, LowShard, LowShardId, Precision, StepProfile,
+    StorageError, TileAddress, TileKernel, TileKernelSpec, TileWorkList, TileWorkRef,
+    view_byte_spans,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -59,8 +60,40 @@ pub struct KernelBuildPlan {
     gemm_symbols: BTreeMap<(Precision, GemmWeightLoad, u32, u32, GemmKernelMode, u32), String>,
     attention_symbols: BTreeMap<AttentionKernelShape, String>,
     attention_stage_symbols: Vec<(TileKernelSpec, u32, String)>,
-    rearrange_symbols: BTreeMap<(AmpOrder, u32, u32, u32, u32), String>,
+    rearrange_symbols: BTreeMap<(RearrangeTarget, u32, u32, u32, u32), String>,
     unpack_output_symbols: BTreeMap<u32, String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RearrangeTarget {
+    AmpLeft,
+    AmpTransposedRight,
+    BlockMajor { row_block: u16, column_block: u16 },
+}
+
+impl RearrangeTarget {
+    fn from_order(order: ElementOrder) -> Option<Self> {
+        match order {
+            ElementOrder::Amp(AmpOrder::Left) => Some(Self::AmpLeft),
+            ElementOrder::Amp(AmpOrder::TransposedRight) => Some(Self::AmpTransposedRight),
+            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                row_block,
+                column_block,
+            }) => Some(Self::BlockMajor {
+                row_block,
+                column_block,
+            }),
+            _ => None,
+        }
+    }
+
+    const fn codelet_index(self) -> u32 {
+        match self {
+            Self::AmpLeft => 0,
+            Self::AmpTransposedRight => 1,
+            Self::BlockMajor { .. } => 2,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -284,11 +317,13 @@ impl KernelBuildPlan {
         for (order, logical_rows, physical_rows, logical_columns, physical_columns) in
             rearrangements
         {
-            let order_index = match order {
-                AmpOrder::Left => 0,
-                AmpOrder::TransposedRight => 1,
-                AmpOrder::RightBlocked(_) => 2,
-                _ => return Err(KernelAbiError::RequirementMismatch),
+            let order_index = order.codelet_index();
+            let (row_block, column_block) = match order {
+                RearrangeTarget::BlockMajor {
+                    row_block,
+                    column_block,
+                } => (row_block, column_block),
+                _ => (AMP_INNER_BLOCK as u16, AMP_COLUMN_MICRO as u16),
             };
             let suffix = format!(
                 "o{order_index}_r{logical_rows}_p{physical_rows}_c{logical_columns}_p{physical_columns}"
@@ -296,7 +331,7 @@ impl KernelBuildPlan {
             let vertex = format!("RearrangeRowMajorToAmpF16_{suffix}");
             let codelet = format!("__runCodelet_{vertex}");
             let call = format!("ipu_stack_rearrange_row_major_to_amp_f16_{suffix}");
-            if order == AmpOrder::TransposedRight
+            if order == RearrangeTarget::AmpTransposedRight
                 && logical_rows == 64
                 && physical_rows == 64
                 && logical_columns == 16
@@ -331,6 +366,8 @@ impl KernelBuildPlan {
                     format!("-DREARRANGE_LOGICAL_COLUMNS={logical_columns}"),
                     format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
                     format!("-DREARRANGE_INNER_DIMENSION={AMP_COLUMN_MICRO}"),
+                    format!("-DREARRANGE_ROW_BLOCK={row_block}"),
+                    format!("-DREARRANGE_COLUMN_BLOCK={column_block}"),
                     format!("-DREARRANGE_VERTEX_NAME={vertex}"),
                 ],
                 retained_symbols: Vec::new(),
@@ -570,13 +607,10 @@ impl KernelBuildPlan {
                 .get(&rearrangement_specialization(
                     match kernel {
                         TileKernelSpec::Rearrange {
-                            to:
-                                crate::Layout {
-                                    order: ElementOrder::Amp(order),
-                                    ..
-                                },
+                            to: crate::Layout { order, .. },
                             ..
-                        } => *order,
+                        } => RearrangeTarget::from_order(*order)
+                            .ok_or(KernelAbiError::RequirementMismatch)?,
                         _ => return Err(KernelAbiError::RequirementMismatch),
                     },
                     matrix_extent(run, true, false)?,
@@ -687,7 +721,7 @@ fn collect_kernels(
     rows: &mut BTreeMap<(Precision, GemmWeightLoad, u32, u32), BTreeSet<u32>>,
     gelu: &mut bool,
     reduction_add: &mut bool,
-    rearrangements: &mut BTreeSet<(AmpOrder, u32, u32, u32, u32)>,
+    rearrangements: &mut BTreeSet<(RearrangeTarget, u32, u32, u32, u32)>,
     unpack_output_columns: &mut BTreeSet<u32>,
     attention: &mut BTreeSet<AttentionKernelShape>,
     attention_stages: &mut Vec<(TileKernelSpec, u32)>,
@@ -721,19 +755,12 @@ fn collect_kernels(
                             order: ElementOrder::RowMajor,
                             ..
                         },
-                    to:
-                        crate::Layout {
-                            order: ElementOrder::Amp(order),
-                            ..
-                        },
+                    to: crate::Layout { order, .. },
                 } = kernel
-                    && matches!(
-                        order,
-                        AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightBlocked(_)
-                    )
+                    && let Some(target) = RearrangeTarget::from_order(*order)
                 {
                     rearrangements.insert(rearrangement_specialization(
-                        *order,
+                        target,
                         matrix_extent(run, true, false)?,
                         matrix_extent(run, false, false)?,
                         matrix_extent(run, true, true)?,
@@ -871,15 +898,18 @@ fn matrix_extent(run: &KernelRun, logical: bool, columns: bool) -> Result<u32, K
 }
 
 fn rearrangement_specialization(
-    order: AmpOrder,
+    order: RearrangeTarget,
     logical_rows: u32,
     physical_rows: u32,
     logical_columns: u32,
     physical_columns: u32,
-) -> (AmpOrder, u32, u32, u32, u32) {
+) -> (RearrangeTarget, u32, u32, u32, u32) {
     if physical_rows == AMP_INNER_BLOCK
         && logical_rows < physical_rows
-        && matches!(order, AmpOrder::TransposedRight | AmpOrder::RightBlocked(_))
+        && matches!(
+            order,
+            RearrangeTarget::AmpTransposedRight | RearrangeTarget::BlockMajor { .. }
+        )
     {
         (order, 0, physical_rows, 0, physical_columns)
     } else {
@@ -946,18 +976,11 @@ fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbi
             "physical_columns" => matrix_extent(run, false, true),
             "target_order" => match &run.kernel {
                 TileKernel::Planned(TileKernelSpec::Rearrange {
-                    to:
-                        crate::Layout {
-                            order: ElementOrder::Amp(order),
-                            ..
-                        },
+                    to: crate::Layout { order, .. },
                     ..
-                }) => match order {
-                    AmpOrder::Left => Ok(0),
-                    AmpOrder::TransposedRight => Ok(1),
-                    AmpOrder::RightBlocked(_) => Ok(2),
-                    _ => Err(KernelAbiError::RequirementMismatch),
-                },
+                }) => RearrangeTarget::from_order(*order)
+                    .map(RearrangeTarget::codelet_index)
+                    .ok_or(KernelAbiError::RequirementMismatch),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             "flat_physical_rows" => {
@@ -1108,9 +1131,8 @@ pub fn tile_kernel_abi(
                 && from.order == ElementOrder::RowMajor
                 && matches!(
                     to.order,
-                    ElementOrder::Amp(
-                        AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightBlocked(_)
-                    )
+                    ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
+                        | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
                 ) =>
         {
             (
@@ -1398,7 +1420,7 @@ mod tests {
                     right,
                     TensorFormat {
                         precision: Precision::F16,
-                        layout: Layout::amp_right(64, tiles),
+                        layout: Layout::block_major_matrix(64, tiles),
                     },
                 );
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();

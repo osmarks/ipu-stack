@@ -47,16 +47,16 @@ pub use memory::{
     IPU21_STANDARD_FIXED_BYTES,
 };
 pub use mid::{
-    AccumulationPrecision, AmpOrder, AxisTiling, ConversionDispatch, ConversionPlan,
-    ConversionStreamingPolicy, CostModel, ElementOrder, GemmDistribution, GemmKernelMode,
-    GemmOrientation, GemmWeightLoad, GridOrder, HardwareTarget, IPU21_TARGET_COSTS, Ipu21CostModel,
-    Ipu21TargetCosts, Layout, LayoutError, LocalOperandStaging, LoweringError, LoweringResult,
-    MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidGraph,
-    MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue,
-    MidValueId, OperandMaterialization, OperandRequirement, OperatorCandidate, OperatorDispatch,
-    OperatorFormatPolicy, OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing,
-    Padding, PipelineConfig, PointwiseInputMapping, Precision, ProfilingConfig, SchedulingPolicy,
-    TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
+    AccumulationPrecision, AmpOrder, AxisTiling, BlockMajorOrder, ConversionDispatch,
+    ConversionPlan, ConversionStreamingPolicy, CostModel, ElementOrder, GemmDistribution,
+    GemmKernelMode, GemmOrientation, GemmWeightLoad, GridOrder, HardwareTarget, IPU21_TARGET_COSTS,
+    Ipu21CostModel, Ipu21TargetCosts, Layout, LayoutError, LocalOperandStaging, LoweringError,
+    LoweringResult, MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation,
+    MemoryUsage, MidGraph, MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion,
+    MidRepeat, MidValue, MidValueId, OperandMaterialization, OperandRequirement, OperatorCandidate,
+    OperatorDispatch, OperatorFormatPolicy, OperatorPlan, OperatorPlanError, OperatorRequirements,
+    OutputAliasing, Padding, PipelineConfig, PointwiseInputMapping, Precision, ProfilingConfig,
+    SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{
     DiagnosticCheckpoint, DiagnosticPackage, DiagnosticShard, DiagnosticTensor, PackageBuildError,
@@ -65,8 +65,8 @@ pub use package::{
 };
 pub use place::{Placement, PlacementError, place};
 pub use storage::{
-    ByteSpan, StorageError, StorageResult, amp_matrix_coordinates, logical_view_byte_spans,
-    shard_storage_bytes, view_byte_spans,
+    ByteSpan, StorageError, StorageResult, amp_matrix_coordinates, block_major_matrix_coordinates,
+    logical_view_byte_spans, shard_storage_bytes, view_byte_spans,
 };
 pub use tile::{TileLoweringError, TileProgramLowering};
 

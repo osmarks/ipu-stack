@@ -8,9 +8,9 @@ use crate::estimate::{
 };
 use crate::graph::TensorShape;
 use crate::mid::{
-    AmpOrder, DeferredTransform, ElementOrder, GemmDistribution, Layout, LocalOperandStaging,
-    MemoryClass, MidOperator, OperatorDispatch, OperatorRequirements, Precision, TensorAxis,
-    TensorType,
+    AmpOrder, BlockMajorOrder, DeferredTransform, ElementOrder, GemmDistribution, Layout,
+    LocalOperandStaging, MemoryClass, MidOperator, OperatorDispatch, OperatorRequirements,
+    Precision, TensorAxis, TensorType,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -472,12 +472,7 @@ impl CostModel for Ipu21CostModel {
                 let streamed_blocked_standard = right.filter(|right| {
                     staged_weights
                         && right.format.layout.memory_class == MemoryClass::Ipu21Standard
-                        && matches!(
-                            right.format.layout.order,
-                            ElementOrder::Amp(
-                                AmpOrder::RightBlocked(_) | AmpOrder::TransposedRightBlocked(_),
-                            )
-                        )
+                        && matches!(right.format.layout.order, ElementOrder::BlockMajor(_))
                 });
                 let weight_feed = streamed_blocked_standard.map_or_else(
                     || {
@@ -500,7 +495,9 @@ impl CostModel for Ipu21CostModel {
                                 axis.axis
                                     == if matches!(
                                         right.format.layout.order,
-                                        ElementOrder::Amp(AmpOrder::TransposedRightBlocked(_))
+                                        ElementOrder::BlockMajor(
+                                            BlockMajorOrder::TransposedMatrix { .. }
+                                        )
                                     ) {
                                         TensorAxis::FromEnd(1)
                                     } else {
@@ -529,7 +526,9 @@ impl CostModel for Ipu21CostModel {
                             axis.axis
                                 == if matches!(
                                     right.format.layout.order,
-                                    ElementOrder::Amp(AmpOrder::TransposedRightBlocked(_))
+                                    ElementOrder::BlockMajor(
+                                        BlockMajorOrder::TransposedMatrix { .. }
+                                    )
                                 ) {
                                     TensorAxis::FromEnd(1)
                                 } else {
@@ -765,9 +764,9 @@ impl CostModel for Ipu21CostModel {
                     rows.min(u64::from(crate::mid::AMP_INNER_BLOCK)),
                     3,
                 ),
-                ElementOrder::Amp(AmpOrder::RightBlocked(inner_block)) => (
-                    rows.div_ceil(u64::from(inner_block)),
-                    rows.min(u64::from(inner_block)),
+                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block, .. }) => (
+                    rows.div_ceil(u64::from(row_block)),
+                    rows.min(u64::from(row_block)),
                     4,
                 ),
                 _ => (

@@ -24,6 +24,12 @@ using namespace poplar;
 #ifndef REARRANGE_TARGET_ORDER
 #define REARRANGE_TARGET_ORDER 0
 #endif
+#ifndef REARRANGE_ROW_BLOCK
+#define REARRANGE_ROW_BLOCK 64
+#endif
+#ifndef REARRANGE_COLUMN_BLOCK
+#define REARRANGE_COLUMN_BLOCK 16
+#endif
 
 static_assert(REARRANGE_LOGICAL_COLUMNS % 2 == 0);
 
@@ -39,8 +45,8 @@ public:
 
   bool compute(unsigned worker) {
     constexpr unsigned inner = REARRANGE_INNER_DIMENSION;
-    constexpr unsigned innerBlock = 64;
-    constexpr unsigned columnBlock = 16;
+    constexpr unsigned innerBlock = REARRANGE_ROW_BLOCK;
+    constexpr unsigned columnBlock = REARRANGE_COLUMN_BLOCK;
 #if REARRANGE_LOGICAL_ROWS == 0
     const unsigned logicalRowCount = logicalRows;
 #else
@@ -66,16 +72,13 @@ public:
 #if REARRANGE_TARGET_ORDER < 2
       for (unsigned row = worker; row < physicalRowCount; row += 6) {
 #if REARRANGE_TARGET_ORDER == 1
-        const unsigned logicalPair = row % columnBlock / 2;
-        const unsigned loadPair = logicalPair % 4 * 2 + logicalPair / 4;
-        const unsigned loadChannel = loadPair * 2 + row % 2;
         const unsigned panelRow =
             (row / columnBlock) * (physicalColumnCount / inner);
         for (unsigned column = 0; column < physicalColumnCount;
              column += inner) {
           const unsigned panel = panelRow + column / inner;
           const unsigned destinationWord =
-              (panel * inner * columnBlock + loadChannel * inner) / 2;
+              (panel * inner * columnBlock + row % columnBlock * inner) / 2;
           const unsigned sourceWord =
               (row * logicalColumnCount + column) / 2;
           for (unsigned word = 0; word < inner / 2; ++word) {
@@ -87,9 +90,6 @@ public:
           }
         }
 #else
-        const unsigned logicalPair = row % columnBlock / 2;
-        const unsigned loadPair = logicalPair % 4 * 2 + logicalPair / 4;
-        const unsigned loadChannel = loadPair * 2 + row % 2;
         for (unsigned column = 0; column < physicalColumnCount;
              column += 2) {
           unsigned low = 0;
@@ -137,17 +137,15 @@ public:
         const unsigned packedOdd =
             (sourceRow >> 16) | (sourceNextRow & 0xffff0000);
 
-        const unsigned logicalPair = column % columnBlock / 2;
-        const unsigned loadPair = logicalPair % 4 * 2 + logicalPair / 4;
         const unsigned innerGroup = row % innerBlock / inner;
         const unsigned panel =
           (row / innerBlock) * (physicalColumnCount / columnBlock) *
               (innerBlock / inner) +
           (column / columnBlock) * (innerBlock / inner) + innerGroup;
         const unsigned physicalBase = panel * inner * columnBlock + row % inner;
-        destinationWords[(physicalBase + loadPair * 2 * inner) / 2] =
+        destinationWords[(physicalBase + column % columnBlock * inner) / 2] =
             packedEven;
-        destinationWords[(physicalBase + (loadPair * 2 + 1) * inner) / 2] =
+        destinationWords[(physicalBase + (column % columnBlock + 1) * inner) / 2] =
             packedOdd;
       }
     }

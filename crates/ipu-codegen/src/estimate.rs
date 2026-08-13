@@ -3,9 +3,9 @@
 use crate::cost::IPU21_TARGET_COSTS;
 use crate::graph::TensorShape;
 use crate::mid::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, ElementOrder, GemmDistribution, Layout,
-    MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage,
-    MidOperation, MidOperationKind, MidValue, MidValueId, OperandMaterialization, OperatorDispatch,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, GemmDistribution, Layout, MemoryClass,
+    MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidOperation,
+    MidOperationKind, MidValue, MidValueId, OperandMaterialization, OperatorDispatch,
     OperatorRequirements, Precision, TensorAxis, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -636,10 +636,7 @@ pub(crate) fn gemm_requires_panel_repacking(
     output: &TensorType,
 ) -> bool {
     gemm_uses_panel_buffer(dispatch, right, output)
-        && !matches!(
-            right.format.layout.order,
-            ElementOrder::Amp(AmpOrder::RightBlocked(_) | AmpOrder::TransposedRightBlocked(_),)
-        )
+        && !matches!(right.format.layout.order, ElementOrder::BlockMajor(_))
 }
 
 pub(crate) fn gemm_exchange_bytes_per_cycle(inputs: &[TensorType]) -> u64 {

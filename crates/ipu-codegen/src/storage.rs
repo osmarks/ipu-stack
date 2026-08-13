@@ -1,7 +1,7 @@
 //! Conversion from logical shard views to physical byte ranges.
 
 use crate::low::{LowShard, ShardView};
-use crate::mid::{AMP_COLUMN_MICRO, AmpOrder, ElementOrder, Precision};
+use crate::mid::{AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, Precision};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteSpan {
@@ -16,10 +16,12 @@ pub enum StorageError {
     WrongShard,
     #[error("view extents are not a valid subset of the shard")]
     InvalidView,
-    #[error("AMP storage requires a tensor of rank at least two")]
-    AmpRank,
+    #[error("matrix storage requires a tensor of rank at least two")]
+    MatrixRank,
     #[error("AMP {role:?} storage dimensions are incompatible with its block shape")]
     AmpBlock { role: AmpOrder },
+    #[error("block-major {order:?} storage dimensions are incompatible with its block shape")]
+    BlockMajorBlock { order: BlockMajorOrder },
     #[error("tensor storage size overflowed")]
     Overflow,
 }
@@ -43,10 +45,10 @@ pub fn shard_storage_bytes(shard: &LowShard) -> StorageResult<u32> {
 
 /// Converts a rectangular semantic view into coalesced physical byte spans.
 ///
-/// AMP right operands are packed independently for each outer matrix. AMP left
-/// and output operands flatten their outer axes into the row dimension, which
-/// lets one tile-kernel invocation process activation batches with shared
-/// weights.
+/// Block-major matrices and transposed AMP operands are packed independently
+/// for each outer matrix. AMP left and output operands flatten their outer
+/// axes into the row dimension, which lets one tile-kernel invocation process
+/// activation batches with shared weights.
 pub fn view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageResult<Vec<ByteSpan>> {
     validate_view(shard, view)?;
     if shard.extents == view.extents {
@@ -55,7 +57,7 @@ pub fn view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageResult<Vec<
             bytes: shard_storage_bytes(shard)?,
         }]);
     }
-    if let Some(spans) = right_blocked_panel_spans(shard, view)? {
+    if let Some(spans) = block_major_panel_spans(shard, view)? {
         return Ok(spans);
     }
     let widths = shard
@@ -161,9 +163,32 @@ fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> Stor
     let rank = widths.len();
     match shard.tensor_type.format.layout.order {
         ElementOrder::RowMajor => encode_row_major(widths, coordinates),
+        ElementOrder::BlockMajor(order) => {
+            if rank < 2 {
+                return Err(StorageError::MatrixRank);
+            }
+            let rows = widths[rank - 2];
+            let columns = widths[rank - 1];
+            let outer = encode_row_major(&widths[..rank - 2], &coordinates[..rank - 2])?;
+            let row = coordinates[rank - 2];
+            let column = coordinates[rank - 1];
+            let matrix_elements = u64::from(rows) * u64::from(columns);
+            let within = block_major_matrix_index(
+                order,
+                shard.tensor_type.format.precision,
+                rows,
+                columns,
+                row,
+                column,
+            )?;
+            outer
+                .checked_mul(matrix_elements)
+                .and_then(|base| base.checked_add(u64::from(within)))
+                .ok_or(StorageError::Overflow)
+        }
         ElementOrder::Amp(role) => {
             if rank < 2 {
-                return Err(StorageError::AmpRank);
+                return Err(StorageError::MatrixRank);
             }
             let rows = widths[rank - 2];
             let columns = widths[rank - 1];
@@ -172,8 +197,7 @@ fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> Stor
             let column = coordinates[rank - 1];
             if role == AmpOrder::TransposedRight {
                 let matrix_elements = u64::from(rows) * u64::from(columns);
-                let within = amp_matrix_index(
-                    AmpOrder::Right,
+                let within = right_matrix_index(
                     shard.tensor_type.format.precision,
                     columns,
                     rows,
@@ -259,56 +283,10 @@ fn amp_matrix_index(
                 .and_then(|base| base.checked_add(row * inner + column % inner))
                 .ok_or(StorageError::Overflow)
         }
-        AmpOrder::Right | AmpOrder::RightBlocked(_) => {
-            let inner = amp_micro_dimension(precision);
-            if !rows.is_multiple_of(inner) || !columns.is_multiple_of(COLUMN_MICRO) {
-                return Err(StorageError::AmpBlock { role });
-            }
-            let logical_pair = column % COLUMN_MICRO / 2;
-            let load_pair = logical_pair % 4 * 2 + logical_pair / 4;
-            let load_channel = load_pair * 2 + column % 2;
-            let blocked_inner = match role {
-                AmpOrder::RightBlocked(block) => Some(u32::from(block)),
-                _ => None,
-            };
-            let inner_group = row % blocked_inner.unwrap_or(rows) / inner;
-            let panel = if let Some(inner_block) = blocked_inner {
-                if !rows.is_multiple_of(inner_block) || !inner_block.is_multiple_of(inner) {
-                    return Err(StorageError::AmpBlock { role });
-                }
-                (row / inner_block)
-                    .checked_mul(columns / COLUMN_MICRO)
-                    .and_then(|block| block.checked_mul(inner_block / inner))
-                    .and_then(|base| {
-                        base.checked_add(
-                            column / COLUMN_MICRO * (inner_block / inner) + inner_group,
-                        )
-                    })
-            } else {
-                (column / COLUMN_MICRO)
-                    .checked_mul(rows / inner)
-                    .and_then(|base| base.checked_add(row / inner))
-            }
-            .ok_or(StorageError::Overflow)?;
-            panel
-                .checked_mul(inner * COLUMN_MICRO)
-                .and_then(|base| base.checked_add(load_channel * inner + row % inner))
-                .ok_or(StorageError::Overflow)
-        }
-        AmpOrder::TransposedRight => {
-            amp_matrix_index(AmpOrder::Right, precision, columns, rows, column, row)
-        }
+        AmpOrder::TransposedRight => right_matrix_index(precision, columns, rows, column, row),
         AmpOrder::TransposedLeft => {
             amp_matrix_index(AmpOrder::Left, precision, columns, rows, column, row)
         }
-        AmpOrder::TransposedRightBlocked(block) => amp_matrix_index(
-            AmpOrder::RightBlocked(block),
-            precision,
-            columns,
-            rows,
-            column,
-            row,
-        ),
         AmpOrder::Output => {
             if !columns.is_multiple_of(COLUMN_MICRO) {
                 return Err(StorageError::AmpBlock { role });
@@ -327,7 +305,88 @@ fn amp_matrix_index(
     }
 }
 
-fn right_blocked_panel_spans(
+fn right_matrix_index(
+    precision: Precision,
+    rows: u32,
+    columns: u32,
+    row: u32,
+    column: u32,
+) -> StorageResult<u32> {
+    let inner = amp_micro_dimension(precision);
+    if row >= rows
+        || column >= columns
+        || !rows.is_multiple_of(inner)
+        || !columns.is_multiple_of(AMP_COLUMN_MICRO)
+    {
+        return Err(StorageError::InvalidView);
+    }
+    let panel = (column / AMP_COLUMN_MICRO)
+        .checked_mul(rows / inner)
+        .and_then(|base| base.checked_add(row / inner))
+        .ok_or(StorageError::Overflow)?;
+    panel
+        .checked_mul(inner * AMP_COLUMN_MICRO)
+        .and_then(|base| base.checked_add(column % AMP_COLUMN_MICRO * inner + row % inner))
+        .ok_or(StorageError::Overflow)
+}
+
+fn block_major_matrix_index(
+    order: BlockMajorOrder,
+    precision: Precision,
+    rows: u32,
+    columns: u32,
+    row: u32,
+    column: u32,
+) -> StorageResult<u32> {
+    let (row_block, column_block, transposed) = match order {
+        BlockMajorOrder::Matrix {
+            row_block,
+            column_block,
+        } => (u32::from(row_block), u32::from(column_block), false),
+        BlockMajorOrder::TransposedMatrix {
+            row_block,
+            column_block,
+        } => (u32::from(row_block), u32::from(column_block), true),
+    };
+    if transposed {
+        return block_major_matrix_index(
+            BlockMajorOrder::Matrix {
+                row_block: row_block as u16,
+                column_block: column_block as u16,
+            },
+            precision,
+            columns,
+            rows,
+            column,
+            row,
+        );
+    }
+    let row_micro = amp_micro_dimension(precision);
+    if row >= rows
+        || column >= columns
+        || row_block == 0
+        || column_block == 0
+        || !rows.is_multiple_of(row_block)
+        || !columns.is_multiple_of(column_block)
+        || !row_block.is_multiple_of(row_micro)
+    {
+        return Err(StorageError::BlockMajorBlock { order });
+    }
+    let row_groups = row_block / row_micro;
+    let panel = (row / row_block)
+        .checked_mul(columns / column_block)
+        .and_then(|block| block.checked_mul(row_groups))
+        .and_then(|base| {
+            base.checked_add(column / column_block * row_groups + row % row_block / row_micro)
+        })
+        .ok_or(StorageError::Overflow)?;
+    panel
+        .checked_mul(row_micro * column_block)
+        .and_then(|base| base.checked_add(column % column_block * row_micro + row % row_micro))
+        .ok_or(StorageError::Overflow)
+}
+
+fn block_major_panel_spans(
     shard: &LowShard,
     view: &ShardView,
 ) -> StorageResult<Option<Vec<ByteSpan>>> {
@@ -337,14 +396,14 @@ fn right_blocked_panel_spans(
     let rank = shard.extents.len();
     let (inner_block, inner_axis, column_axis, column_tensor_axis) =
         match shard.tensor_type.format.layout.order {
-            ElementOrder::Amp(AmpOrder::RightBlocked(block)) => (
-                u32::from(block),
+            ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block, .. }) => (
+                u32::from(row_block),
                 rank - 2,
                 rank - 1,
                 crate::TensorAxis::FromEnd(1),
             ),
-            ElementOrder::Amp(AmpOrder::TransposedRightBlocked(block)) => (
-                u32::from(block),
+            ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { row_block, .. }) => (
+                u32::from(row_block),
                 rank - 1,
                 rank - 2,
                 crate::TensorAxis::FromEnd(2),
@@ -465,9 +524,30 @@ fn physical_coordinates(
     let mut coordinates = vec![0; rank];
     match shard.tensor_type.format.layout.order {
         ElementOrder::RowMajor => decode_row_major(widths, physical, &mut coordinates),
+        ElementOrder::BlockMajor(order) => {
+            if rank < 2 {
+                return Err(StorageError::MatrixRank);
+            }
+            let rows = widths[rank - 2];
+            let columns = widths[rank - 1];
+            let matrix_elements = u64::from(rows) * u64::from(columns);
+            let outer = physical / matrix_elements;
+            decode_row_major(&widths[..rank - 2], outer, &mut coordinates[..rank - 2]);
+            let linear =
+                u32::try_from(physical % matrix_elements).map_err(|_| StorageError::Overflow)?;
+            let (row, column) = block_major_matrix_coordinates(
+                order,
+                shard.tensor_type.format.precision,
+                rows,
+                columns,
+                linear,
+            )?;
+            coordinates[rank - 2] = row;
+            coordinates[rank - 1] = column;
+        }
         ElementOrder::Amp(role) => {
             if rank < 2 {
-                return Err(StorageError::AmpRank);
+                return Err(StorageError::MatrixRank);
             }
             let rows = widths[rank - 2];
             let columns = widths[rank - 1];
@@ -542,67 +622,11 @@ pub fn amp_matrix_coordinates(
             let offset = linear % panel_elements;
             Ok((offset / inner, panel * inner + offset % inner))
         }
-        AmpOrder::Right => {
-            let inner = amp_micro_dimension(precision);
-            if !rows.is_multiple_of(inner) || !columns.is_multiple_of(COLUMN_MICRO) {
-                return Err(StorageError::AmpBlock { role });
-            }
-            let panel_elements = inner * COLUMN_MICRO;
-            let panel = linear / panel_elements;
-            let offset = linear % panel_elements;
-            let inner_groups = rows / inner;
-            let column_group = panel / inner_groups;
-            let inner_group = panel % inner_groups;
-            let load_channel = offset / inner;
-            let load_pair = load_channel / 2;
-            let logical_pair = (load_pair % 2) * 4 + load_pair / 2;
-            Ok((
-                inner_group * inner + offset % inner,
-                column_group * COLUMN_MICRO + logical_pair * 2 + load_channel % 2,
-            ))
-        }
-        AmpOrder::TransposedRight => {
-            amp_matrix_coordinates(AmpOrder::Right, precision, columns, rows, linear)
-                .map(|(column, row)| (row, column))
-        }
+        AmpOrder::TransposedRight => right_matrix_coordinates(precision, columns, rows, linear)
+            .map(|(column, row)| (row, column)),
         AmpOrder::TransposedLeft => {
             amp_matrix_coordinates(AmpOrder::Left, precision, columns, rows, linear)
                 .map(|(column, row)| (row, column))
-        }
-        AmpOrder::TransposedRightBlocked(block) => amp_matrix_coordinates(
-            AmpOrder::RightBlocked(block),
-            precision,
-            columns,
-            rows,
-            linear,
-        )
-        .map(|(column, row)| (row, column)),
-        AmpOrder::RightBlocked(inner_block) => {
-            let block_size = u32::from(inner_block);
-            let inner = amp_micro_dimension(precision);
-            if !rows.is_multiple_of(block_size)
-                || !columns.is_multiple_of(COLUMN_MICRO)
-                || !block_size.is_multiple_of(inner)
-            {
-                return Err(StorageError::AmpBlock { role });
-            }
-            let panel_elements = inner * COLUMN_MICRO;
-            let panel = linear / panel_elements;
-            let offset = linear % panel_elements;
-            let inner_groups_per_block = block_size / inner;
-            let column_groups = columns / COLUMN_MICRO;
-            let panels_per_inner_block = column_groups * inner_groups_per_block;
-            let block_index = panel / panels_per_inner_block;
-            let within_block = panel % panels_per_inner_block;
-            let column_group = within_block / inner_groups_per_block;
-            let inner_group = within_block % inner_groups_per_block;
-            let load_channel = offset / inner;
-            let load_pair = load_channel / 2;
-            let logical_pair = (load_pair % 2) * 4 + load_pair / 2;
-            Ok((
-                block_index * block_size + inner_group * inner + offset % inner,
-                column_group * COLUMN_MICRO + logical_pair * 2 + load_channel % 2,
-            ))
         }
         AmpOrder::Output => {
             if !columns.is_multiple_of(COLUMN_MICRO) {
@@ -626,6 +650,85 @@ pub fn amp_matrix_coordinates(
                 .map(|(column, row)| (row, column))
         }
     }
+}
+
+fn right_matrix_coordinates(
+    precision: Precision,
+    rows: u32,
+    columns: u32,
+    linear: u32,
+) -> StorageResult<(u32, u32)> {
+    let inner = amp_micro_dimension(precision);
+    if !rows.is_multiple_of(inner) || !columns.is_multiple_of(AMP_COLUMN_MICRO) {
+        return Err(StorageError::InvalidView);
+    }
+    let panel_elements = inner * AMP_COLUMN_MICRO;
+    let panel = linear / panel_elements;
+    let offset = linear % panel_elements;
+    let inner_groups = rows / inner;
+    let column_group = panel / inner_groups;
+    let inner_group = panel % inner_groups;
+    Ok((
+        inner_group * inner + offset % inner,
+        column_group * AMP_COLUMN_MICRO + offset / inner,
+    ))
+}
+
+/// Maps a physical linear element in block-major storage to its logical
+/// matrix coordinate.
+pub fn block_major_matrix_coordinates(
+    order: BlockMajorOrder,
+    precision: Precision,
+    rows: u32,
+    columns: u32,
+    linear: u32,
+) -> StorageResult<(u32, u32)> {
+    let (row_block, column_block, transposed) = match order {
+        BlockMajorOrder::Matrix {
+            row_block,
+            column_block,
+        } => (u32::from(row_block), u32::from(column_block), false),
+        BlockMajorOrder::TransposedMatrix {
+            row_block,
+            column_block,
+        } => (u32::from(row_block), u32::from(column_block), true),
+    };
+    if transposed {
+        return block_major_matrix_coordinates(
+            BlockMajorOrder::Matrix {
+                row_block: row_block as u16,
+                column_block: column_block as u16,
+            },
+            precision,
+            columns,
+            rows,
+            linear,
+        )
+        .map(|(column, row)| (row, column));
+    }
+    let row_micro = amp_micro_dimension(precision);
+    if row_block == 0
+        || column_block == 0
+        || !rows.is_multiple_of(row_block)
+        || !columns.is_multiple_of(column_block)
+        || !row_block.is_multiple_of(row_micro)
+    {
+        return Err(StorageError::BlockMajorBlock { order });
+    }
+    let panel_elements = row_micro * column_block;
+    let panel = linear / panel_elements;
+    let offset = linear % panel_elements;
+    let row_groups = row_block / row_micro;
+    let column_groups = columns / column_block;
+    let panels_per_row_block = column_groups * row_groups;
+    let row_block_index = panel / panels_per_row_block;
+    let within_block = panel % panels_per_row_block;
+    let column_group = within_block / row_groups;
+    let row_group = within_block % row_groups;
+    Ok((
+        row_block_index * row_block + row_group * row_micro + offset % row_micro,
+        column_group * column_block + offset / row_micro,
+    ))
 }
 
 fn amp_micro_dimension(precision: Precision) -> u32 {
@@ -671,9 +774,9 @@ mod tests {
             let batches = 1 + (state % 4);
             for (layout, physical_rows, columns) in [
                 (Layout::amp_left(64, 1), rows, 64),
-                (Layout::amp_right(64, 1), 32, 64),
+                (Layout::block_major_matrix(64, 1), 64, 64),
                 (
-                    Layout::amp_right_blocked_storage(
+                    Layout::block_major_matrix_storage(
                         64,
                         64,
                         1,
@@ -745,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_blocked_right_panels_are_single_contiguous_spans() {
+    fn randomized_block_major_panels_are_single_contiguous_spans() {
         let mut random = fastrand::Rng::with_seed(0x6b36_3472);
         for _ in 0..128 {
             let output_column_block = [32, 64, 128][random.usize(0..3)];
@@ -755,7 +858,7 @@ mod tests {
             let columns = column_blocks * output_column_block;
             let batches = random.u32(1..=4);
             let shard = shard(
-                Layout::amp_right_blocked_storage(
+                Layout::block_major_matrix_storage(
                     64,
                     output_column_block,
                     1,
@@ -814,9 +917,15 @@ mod tests {
         for _ in 0..128 {
             let panels = random.u32(1..=8);
             let selected = random.u32(0..panels);
-            for role in [AmpOrder::TransposedRight, AmpOrder::RightBlocked(64)] {
+            for order in [
+                ElementOrder::Amp(AmpOrder::TransposedRight),
+                ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                    row_block: 64,
+                    column_block: AMP_COLUMN_MICRO as u16,
+                }),
+            ] {
                 let layout = Layout {
-                    order: ElementOrder::Amp(role),
+                    order,
                     tiling: crate::TensorTiling::replicated(1),
                     memory_class: MemoryClass::Ipu21Standard,
                 };

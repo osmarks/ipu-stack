@@ -643,7 +643,7 @@ mod tests {
                     right,
                     TensorFormat {
                         precision: Precision::F16,
-                        layout: Layout::amp_right(64, tiles),
+                        layout: Layout::block_major_matrix(64, tiles),
                     },
                 );
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();

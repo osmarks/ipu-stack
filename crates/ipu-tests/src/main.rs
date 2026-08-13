@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use ipu_codegen::{
-    AmpOrder, ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision, TensorFormat,
-    amp_matrix_coordinates, build_diagnostic_package, build_package,
+    AmpOrder, BlockMajorOrder, ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision,
+    TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
+    build_package,
 };
 use ipu_driver::DriverError;
 use ipu_elf::Toolchain;
@@ -304,7 +305,7 @@ fn main() -> Result<()> {
                 right,
                 TensorFormat {
                     precision: Precision::F16,
-                    layout: Layout::amp_right(64, active_tiles),
+                    layout: Layout::block_major_matrix(64, active_tiles),
                 },
             );
     } else if matches!(arguments.workload, Workload::MlpSmoke) {
@@ -322,7 +323,7 @@ fn main() -> Result<()> {
         };
         let right_format = TensorFormat {
             precision: Precision::F16,
-            layout: Layout::amp_right(64, active_tiles),
+            layout: Layout::block_major_matrix(64, active_tiles),
         };
         pipeline = pipeline
             .with_input(left, left_format)
@@ -661,8 +662,16 @@ fn run_gemm(
         Ok(if selected_inner == inner { 0x3c00 } else { 0 })
     })?;
     let right_bytes = packed_binding(&right, |logical_tile, linear, elements| {
-        let (inner, column) =
-            amp_matrix_coordinates(AmpOrder::Right, Precision::F16, 64, elements / 64, linear)?;
+        let (inner, column) = block_major_matrix_coordinates(
+            BlockMajorOrder::Matrix {
+                row_block: 64,
+                column_block: 16,
+            },
+            Precision::F16,
+            64,
+            elements / 64,
+            linear,
+        )?;
         Ok(gemm_right_value(
             inner,
             u32::from(logical_tile) * 64 + column,
@@ -709,8 +718,16 @@ fn run_mlp_chain(
         ))
     })?;
     let right0_bytes = packed_binding(&right0, |logical_tile, linear, elements| {
-        let (inner, column) =
-            amp_matrix_coordinates(AmpOrder::Right, Precision::F16, 64, elements / 64, linear)?;
+        let (inner, column) = block_major_matrix_coordinates(
+            BlockMajorOrder::Matrix {
+                row_block: 64,
+                column_block: 16,
+            },
+            Precision::F16,
+            64,
+            elements / 64,
+            linear,
+        )?;
         let column = u32::from(logical_tile) * 64 + column;
         Ok(if column < 64 {
             mlp_smoke_value(
@@ -723,8 +740,16 @@ fn run_mlp_chain(
         })
     })?;
     let right1_bytes = packed_binding(&right1, |logical_tile, linear, elements| {
-        let (inner, column) =
-            amp_matrix_coordinates(AmpOrder::Right, Precision::F16, 64, elements / 64, linear)?;
+        let (inner, column) = block_major_matrix_coordinates(
+            BlockMajorOrder::Matrix {
+                row_block: 64,
+                column_block: 16,
+            },
+            Precision::F16,
+            64,
+            elements / 64,
+            linear,
+        )?;
         let column = u32::from(logical_tile) * 64 + column;
         Ok(if column < 64 {
             mlp_smoke_value(
@@ -937,8 +962,11 @@ fn run_attention_smoke(
         let tile = u32::from(logical_tile);
         let head = tile % heads;
         let partition = tile / heads;
-        let (local_row, column) = amp_matrix_coordinates(
-            AmpOrder::RightBlocked(64),
+        let (local_row, column) = block_major_matrix_coordinates(
+            BlockMajorOrder::Matrix {
+                row_block: 64,
+                column_block: 16,
+            },
             Precision::F16,
             64,
             padded_value_dimension,

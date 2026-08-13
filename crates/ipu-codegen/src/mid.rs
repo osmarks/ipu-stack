@@ -306,18 +306,25 @@ pub enum AmpOrder {
     Left,
     /// A semantic `[K, N]` matrix packed as the left operand `[N, K]`.
     TransposedLeft,
-    Right,
     /// Semantic `[key, channel]` storage packed as the right operand of
     /// `query * key.transpose()`.
     TransposedRight,
-    /// Transposed right operand with complete physical K blocks contiguous.
-    TransposedRightBlocked(u16),
-    /// Right operand ordered by the recorded K block before output-column
-    /// blocks so one blocked GEMM invocation consumes a contiguous span.
-    RightBlocked(u16),
     Output,
     /// A semantic `[M, N]` output packed as the physical output `[N, M]`.
     TransposedOutput,
+}
+
+/// Ordinary matrix elements grouped into contiguous rectangular blocks.
+///
+/// Unlike [`AmpOrder`], this is an SRAM storage layout rather than an AMP
+/// operand micro-layout. Kernels route each naturally ordered group into the
+/// required AMP register slots with `ld*putcs` destination permutations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BlockMajorOrder {
+    /// The final two semantic axes are `[rows, columns]`.
+    Matrix { row_block: u16, column_block: u16 },
+    /// The final two semantic axes are stored as `[columns, rows]`.
+    TransposedMatrix { row_block: u16, column_block: u16 },
 }
 
 pub const AMP_INNER_BLOCK: u32 = 64;
@@ -329,6 +336,7 @@ pub const AMP_COLUMN_MICRO: u32 = 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ElementOrder {
     RowMajor,
+    BlockMajor(BlockMajorOrder),
     Amp(AmpOrder),
 }
 
@@ -340,11 +348,8 @@ impl ElementOrder {
     fn requires_direct_population(&self) -> bool {
         matches!(
             self,
-            Self::Amp(
-                AmpOrder::RightBlocked(_)
-                    | AmpOrder::TransposedRight
-                    | AmpOrder::TransposedRightBlocked(_),
-            )
+            Self::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
+                | Self::Amp(AmpOrder::TransposedRight)
         )
     }
 }
@@ -633,7 +638,7 @@ impl Layout {
         }
     }
 
-    pub fn attention_key_value(order: AmpOrder, heads: u16, key_partitions: u16) -> Self {
+    pub fn attention_key(heads: u16, key_partitions: u16) -> Self {
         let axes = vec![
             AxisTiling::new(TensorAxis::FromEnd(3), heads, 1, Padding::Reject).with_tile_stride(1),
             AxisTiling::new(
@@ -646,7 +651,7 @@ impl Layout {
             AxisTiling::new(TensorAxis::FromEnd(1), 1, AMP_COLUMN_MICRO, Padding::Zero),
         ];
         Self {
-            order: ElementOrder::Amp(order),
+            order: ElementOrder::Amp(AmpOrder::TransposedRight),
             tiling: TensorTiling {
                 tile_count: heads.saturating_mul(key_partitions),
                 replicas: 1,
@@ -654,6 +659,15 @@ impl Layout {
             },
             memory_class: MemoryClass::Ipu21Standard,
         }
+    }
+
+    pub fn attention_block_major_key_value(heads: u16, key_partitions: u16) -> Self {
+        let mut layout = Self::attention_key(heads, key_partitions);
+        layout.order = ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+            row_block: AMP_INNER_BLOCK as u16,
+            column_block: AMP_COLUMN_MICRO as u16,
+        });
+        layout
     }
 
     pub fn attention_output(heads: u16, query_partitions: u16) -> Self {
@@ -682,19 +696,15 @@ impl Layout {
         }
     }
 
-    pub fn amp_right(inner: u16, tile_count: u16) -> Self {
-        Self {
-            order: ElementOrder::Amp(AmpOrder::Right),
-            tiling: TensorTiling {
-                tile_count,
-                replicas: 1,
-                axes: vec![
-                    AxisTiling::new(TensorAxis::FromEnd(2), 1, u32::from(inner), Padding::Zero),
-                    AxisTiling::new(TensorAxis::FromEnd(1), tile_count, 64, Padding::Zero),
-                ],
-            },
-            memory_class: MemoryClass::Ipu21Standard,
-        }
+    pub fn block_major_matrix(row_block: u16, tile_count: u16) -> Self {
+        Self::block_major_matrix_storage(
+            row_block,
+            AMP_OUTPUT_COLUMN_BLOCK,
+            tile_count,
+            1,
+            1,
+            MemoryClass::Ipu21Standard,
+        )
     }
 
     pub fn amp_output(tile_count: u16) -> Self {
@@ -799,9 +809,9 @@ impl Layout {
         }
     }
 
-    /// AMP right operand on a row-by-column tile grid. Each column shard is
-    /// replicated across row groups so it is local to every output shard.
-    pub fn amp_right_grid(
+    /// Block-major matrix storage on a row-by-column tile grid. Each column
+    /// shard is replicated across row groups so it is local to every consumer.
+    pub fn block_major_matrix_grid(
         inner: u16,
         output_column_block: u32,
         tile_count: u16,
@@ -809,14 +819,11 @@ impl Layout {
         column_partitions: u16,
         grid_order: GridOrder,
     ) -> Self {
-        if output_column_block == AMP_OUTPUT_COLUMN_BLOCK
-            && row_partitions == 1
-            && column_partitions == tile_count
-        {
-            return Self::amp_right(inner, tile_count);
-        }
         Self {
-            order: ElementOrder::Amp(AmpOrder::Right),
+            order: ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                row_block: inner,
+                column_block: AMP_COLUMN_MICRO as u16,
+            }),
             tiling: TensorTiling {
                 tile_count,
                 replicas: row_partitions,
@@ -838,11 +845,10 @@ impl Layout {
         }
     }
 
-    /// AMP right operand with complete inner-by-output-block kernel panels
-    /// contiguous in the selected memory class. Column and K sharding select
-    /// the owner set; `copies` controls persistent replication independently
-    /// of the eventual compute grid.
-    pub fn amp_right_blocked_storage(
+    /// Matrix storage with complete row-by-column blocks contiguous in the
+    /// selected memory class. Column and row sharding select the owner set;
+    /// `copies` controls persistent replication independently of consumers.
+    pub fn block_major_matrix_storage(
         inner_block: u16,
         output_column_block: u32,
         column_partitions: u16,
@@ -855,7 +861,10 @@ impl Layout {
             .and_then(|tiles| tiles.checked_mul(copies))
             .unwrap_or(0);
         Self {
-            order: ElementOrder::Amp(AmpOrder::RightBlocked(inner_block)),
+            order: ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                row_block: inner_block,
+                column_block: AMP_COLUMN_MICRO as u16,
+            }),
             tiling: TensorTiling {
                 tile_count,
                 replicas: copies,
@@ -879,9 +888,8 @@ impl Layout {
         }
     }
 
-    /// A semantic left-hand matrix `[M, K]` packed as the physical blocked
-    /// right operand `[K, M]`.
-    pub fn amp_transposed_right_blocked_storage(
+    /// A semantic matrix `[M, K]` stored in transposed contiguous blocks.
+    pub fn transposed_block_major_matrix_storage(
         inner_block: u16,
         output_column_block: u32,
         column_partitions: u16,
@@ -894,7 +902,10 @@ impl Layout {
             .and_then(|tiles| tiles.checked_mul(copies))
             .unwrap_or(0);
         Self {
-            order: ElementOrder::Amp(AmpOrder::TransposedRightBlocked(inner_block)),
+            order: ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix {
+                row_block: inner_block,
+                column_block: AMP_COLUMN_MICRO as u16,
+            }),
             tiling: TensorTiling {
                 tile_count,
                 replicas: copies,
@@ -1937,7 +1948,14 @@ fn amp_gemm_operator_candidate(
             OperandRequirement::new(
                 TensorFormat {
                     precision,
-                    layout: Layout::amp_right(inner, tile_count),
+                    layout: Layout::block_major_matrix_storage(
+                        inner,
+                        AMP_OUTPUT_COLUMN_BLOCK,
+                        tile_count,
+                        1,
+                        1,
+                        MemoryClass::Ipu21Standard,
+                    ),
                 },
                 32,
             ),
@@ -1966,7 +1984,7 @@ fn amp_grid_gemm_operator_candidate(
     weights: AmpWeightPlacement,
 ) -> OperatorCandidate {
     let right_layout = match (weights.inner_partitions, weights.memory_class) {
-        (1, MemoryClass::Ipu21Standard) => Layout::amp_right_grid(
+        (1, MemoryClass::Ipu21Standard) => Layout::block_major_matrix_grid(
             inner,
             output_columns,
             grid.tile_count,
@@ -1974,7 +1992,7 @@ fn amp_grid_gemm_operator_candidate(
             grid.column_partitions,
             grid.order,
         ),
-        (inner_partitions, memory_class) => Layout::amp_right_blocked_storage(
+        (inner_partitions, memory_class) => Layout::block_major_matrix_storage(
             inner,
             output_columns,
             grid.column_partitions,
@@ -2250,14 +2268,14 @@ impl OperatorPlan {
                         matches!(left.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
                             && matches!(
                                 right.format.layout.order,
-                                ElementOrder::Amp(AmpOrder::Right | AmpOrder::RightBlocked(_))
+                                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
                             )
                             && output.format.layout.order == ElementOrder::Amp(AmpOrder::Output)
                     }
                     GemmOrientation::Swapped => {
                         matches!(
                             left.format.layout.order,
-                            ElementOrder::Amp(AmpOrder::TransposedRightBlocked(_))
+                            ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
                         ) && right.format.layout.order
                             == ElementOrder::Amp(AmpOrder::TransposedLeft)
                             && output.format.layout.order
@@ -2448,7 +2466,7 @@ impl OperatorPlan {
                     )
                     || !matches!(
                         value.format.layout.order,
-                        ElementOrder::Amp(AmpOrder::RightBlocked(_))
+                        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
                     )
                     || output.format.layout.order != ElementOrder::RowMajor
                     || query.format.layout.tiling.tile_count
@@ -3761,12 +3779,9 @@ fn plans(
             .min(config.tile_count / streams);
         let layouts = [
             (query_partitions != 0).then(|| Layout::attention_query(streams, query_partitions)),
-            (key_partitions != 0).then(|| {
-                Layout::attention_key_value(AmpOrder::TransposedRight, streams, key_partitions)
-            }),
-            (key_partitions != 0).then(|| {
-                Layout::attention_key_value(AmpOrder::RightBlocked(64), streams, key_partitions)
-            }),
+            (key_partitions != 0).then(|| Layout::attention_key(streams, key_partitions)),
+            (key_partitions != 0)
+                .then(|| Layout::attention_block_major_key_value(streams, key_partitions)),
         ];
         for layout in layouts.into_iter().flatten() {
             let plan = Plan {
@@ -3828,19 +3843,11 @@ fn plans(
             };
             let key_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::attention_key_value(
-                    AmpOrder::TransposedRight,
-                    heads,
-                    key_partitions,
-                ),
+                layout: Layout::attention_key(heads, key_partitions),
             };
             let value_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::attention_key_value(
-                    AmpOrder::RightBlocked(64),
-                    heads,
-                    key_partitions,
-                ),
+                layout: Layout::attention_block_major_key_value(heads, key_partitions),
             };
             let output_format = TensorFormat {
                 precision: Precision::F32,
@@ -3978,7 +3985,10 @@ fn independent_parameter_storage(
     let Some(requirement) = candidate.inputs.get(input_index) else {
         return Vec::new();
     };
-    let ElementOrder::Amp(AmpOrder::RightBlocked(inner_block)) = requirement.format.layout.order
+    let ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+        row_block: inner_block,
+        column_block: _,
+    }) = requirement.format.layout.order
     else {
         return Vec::new();
     };
@@ -4042,7 +4052,7 @@ fn independent_parameter_storage(
         .into_iter()
         .map(|(column_partitions, inner_partitions)| {
             let mut independent = candidate.clone();
-            independent.inputs[input_index].format.layout = Layout::amp_right_blocked_storage(
+            independent.inputs[input_index].format.layout = Layout::block_major_matrix_storage(
                 inner_block,
                 output_column_block,
                 column_partitions,
@@ -4292,7 +4302,7 @@ fn parallel_reduction_candidates_for_orientation(
                         column_partitions,
                         inner_partitions,
                     );
-                    variant.inputs[1].format.layout = Layout::amp_right_blocked_storage(
+                    variant.inputs[1].format.layout = Layout::block_major_matrix_storage(
                         kernel_inner_block_u16,
                         kernel_output_columns,
                         column_partitions,
@@ -4319,7 +4329,7 @@ fn parallel_reduction_candidates_for_orientation(
                     );
                     physical_left.materialization = OperandMaterialization::DispatchSlices;
                     let mut physical_right = variant.inputs[0].clone();
-                    physical_right.format.layout = Layout::amp_transposed_right_blocked_storage(
+                    physical_right.format.layout = Layout::transposed_block_major_matrix_storage(
                         kernel_inner_block_u16,
                         kernel_output_columns,
                         column_partitions,
@@ -5058,8 +5068,14 @@ mod tests {
                 Precision::F16,
                 Layout::amp_left_grid(64, tiles, rows, columns, GridOrder::ColumnsFast),
             );
-            let mut standard_layout =
-                Layout::amp_right_grid(64, 64, tiles, rows, columns, GridOrder::ColumnsFast);
+            let mut standard_layout = Layout::block_major_matrix_grid(
+                64,
+                64,
+                tiles,
+                rows,
+                columns,
+                GridOrder::ColumnsFast,
+            );
             let mut direct_layout = standard_layout.clone();
             direct_layout.memory_class = MemoryClass::Ipu21Interleaved;
             standard_layout.memory_class = MemoryClass::Ipu21Standard;
@@ -5322,7 +5338,14 @@ mod tests {
                         scale_exponent: random.i8(-16..=16),
                     }
                 },
-                Layout::amp_right([8, 16, 32][random.usize(0..3)], tiles),
+                Layout::block_major_matrix_storage(
+                    [8, 16, 32][random.usize(0..3)],
+                    AMP_OUTPUT_COLUMN_BLOCK,
+                    tiles,
+                    1,
+                    1,
+                    MemoryClass::Ipu21Standard,
+                ),
             );
             let output_format = format(precision(&mut random), Layout::amp_output(tiles));
             let accumulate = if random.bool() {
@@ -5383,9 +5406,13 @@ mod tests {
                 &candidate.inputs[0].format,
                 "random case {case}"
             );
+            let selected_right = &value(&lowered, operator.inputs[1]).tensor_type.format;
             assert_eq!(
-                &value(&lowered, operator.inputs[1]).tensor_type.format,
-                &candidate.inputs[1].format,
+                selected_right.precision, candidate.inputs[1].format.precision,
+                "random case {case}"
+            );
+            assert_eq!(
+                selected_right.layout.order, candidate.inputs[1].format.layout.order,
                 "random case {case}"
             );
             let output = value(&lowered, lowered.outputs[0]);
@@ -5412,7 +5439,17 @@ mod tests {
             let columns = random.u32(1..=4) * 64;
             let row = format(Precision::F16, Layout::row_sharded(tiles));
             let left = format(Precision::F16, Layout::amp_left(64, tiles));
-            let right = format(Precision::F16, Layout::amp_right(64, tiles));
+            let right = format(
+                Precision::F16,
+                Layout::block_major_matrix_storage(
+                    64,
+                    AMP_OUTPUT_COLUMN_BLOCK,
+                    tiles,
+                    1,
+                    1,
+                    MemoryClass::Ipu21Standard,
+                ),
+            );
             let output = format(Precision::F16, Layout::amp_output(tiles));
 
             let mut graph = ComputeGraph::new();

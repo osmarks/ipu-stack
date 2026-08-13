@@ -8,9 +8,9 @@
 
 use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, ConversionDispatch, DeferredTransform,
-    ElementOrder, GemmDistribution, Layout, LayoutError, MemoryClass, MidGraph, MidOperation,
-    MidOperationKind, MidRepeat, MidValueId, OperandRequirement, OperatorDispatch,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ConversionDispatch,
+    DeferredTransform, ElementOrder, GemmDistribution, Layout, LayoutError, MemoryClass, MidGraph,
+    MidOperation, MidOperationKind, MidRepeat, MidValueId, OperandRequirement, OperatorDispatch,
     OperatorRequirements, OutputAliasing, PipelineConfig, PointwiseInputMapping, Precision,
     TensorTiling, TensorType, TileKernelSpec,
 };
@@ -1260,9 +1260,8 @@ impl LoweringState {
                     && source_format.layout.order == ElementOrder::RowMajor
                     && matches!(
                         destination_format.layout.order,
-                        ElementOrder::Amp(
-                            AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightBlocked(_)
-                        )
+                        ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
+                            | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
                     )
                 {
                     after_exchange_kernels.push((
@@ -1607,7 +1606,10 @@ impl LoweringState {
                 key_block_rows,
                 value_dimension,
                 padded_value_dimension,
-                ElementOrder::Amp(AmpOrder::RightBlocked(64)),
+                ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                    row_block: 64,
+                    column_block: AMP_COLUMN_MICRO as u16,
+                }),
             )?;
             self.shards[value_staging.index() as usize].definition =
                 ShardDefinition::ExchangeStaging;
@@ -1723,7 +1725,7 @@ impl LoweringState {
                     valid_key_rows,
                     tasks[0].query_dimension,
                     padded_query_dimension,
-                    AmpOrder::TransposedRight,
+                    ElementOrder::Amp(AmpOrder::TransposedRight),
                     owner_offset,
                     &mut gathers,
                     tiles,
@@ -1735,7 +1737,10 @@ impl LoweringState {
                     valid_key_rows,
                     tasks[0].value_dimension,
                     padded_value_dimension,
-                    AmpOrder::RightBlocked(64),
+                    ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                        row_block: 64,
+                        column_block: AMP_COLUMN_MICRO as u16,
+                    }),
                     owner_offset.saturating_add(key_panel_count),
                     &mut gathers,
                     tiles,
@@ -2012,7 +2017,7 @@ impl LoweringState {
         valid_rows: u32,
         logical_columns: u32,
         physical_columns: u32,
-        order: AmpOrder,
+        order: ElementOrder,
         owner_offset: u32,
         gathers: &mut BTreeMap<ShardView, Vec<ShardView>>,
         tiles: &mut [TileWorkList],
@@ -2065,7 +2070,7 @@ impl LoweringState {
                     AMP_INNER_BLOCK,
                     panel_columns,
                     AMP_COLUMN_MICRO,
-                    ElementOrder::Amp(order),
+                    order,
                 )?;
                 packed_panels.push(PreparedDistributedPanel {
                     panel,
@@ -3005,8 +3010,13 @@ impl LoweringState {
 
                     let source_panel_block = right_requirement.format.layout.order.clone();
                     let source_panel_block = match source_panel_block {
-                        ElementOrder::Amp(
-                            AmpOrder::RightBlocked(block) | AmpOrder::TransposedRightBlocked(block),
+                        ElementOrder::BlockMajor(
+                            BlockMajorOrder::Matrix {
+                                row_block: block, ..
+                            }
+                            | BlockMajorOrder::TransposedMatrix {
+                                row_block: block, ..
+                            },
                         ) => u32::from(block),
                         _ => AMP_INNER_BLOCK,
                     };
@@ -4442,7 +4452,7 @@ mod tests {
             };
             let right_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_right_blocked_storage(
+                layout: Layout::block_major_matrix_storage(
                     64,
                     output_columns,
                     column_partitions,
@@ -4562,7 +4572,7 @@ mod tests {
             };
             let right_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_right_blocked_storage(
+                layout: Layout::block_major_matrix_storage(
                     64,
                     64,
                     1,
@@ -4971,7 +4981,14 @@ mod tests {
                 let right = TensorType::new(
                     [inner, columns],
                     Precision::F16,
-                    Layout::amp_right_grid(64, 64, tiles, row_partitions, column_partitions, order),
+                    Layout::block_major_matrix_grid(
+                        64,
+                        64,
+                        tiles,
+                        row_partitions,
+                        column_partitions,
+                        order,
+                    ),
                 );
                 let output = TensorType::new(
                     [rows, columns],
@@ -5376,7 +5393,10 @@ mod tests {
                     }
                 ) && candidate.inputs.get(1).is_some_and(|requirement| {
                     requirement.format.layout.order
-                        == crate::ElementOrder::Amp(crate::AmpOrder::RightBlocked(64))
+                        == crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
+                            row_block: 64,
+                            column_block: crate::mid::AMP_COLUMN_MICRO as u16,
+                        })
                         && requirement.format.layout.tiling.tile_count == tiles
                         && requirement.format.layout.memory_class == MemoryClass::Ipu21Interleaved
                 })
@@ -5388,10 +5408,13 @@ mod tests {
                 .find(|operation| matches!(operation.kind, MidOperationKind::Operator(_)))
                 .unwrap();
             let right_type = &mid.values[operation.inputs[1].index() as usize].tensor_type;
-            assert!(matches!(
+            assert_eq!(
                 right_type.format.layout.order,
-                crate::ElementOrder::Amp(crate::AmpOrder::RightBlocked(64))
-            ));
+                crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
+                    row_block: 64,
+                    column_block: crate::mid::AMP_COLUMN_MICRO as u16,
+                })
+            );
             let low = lower_to_tiles(&mid, &config).unwrap();
             assert!(low.tiles.iter().all(|tile| low.work(tile).all(|work| {
                 !matches!(work, TileWorkRef::LocalCopy(_))
@@ -5449,7 +5472,7 @@ mod tests {
             };
             let right_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_right_blocked_storage(
+                layout: Layout::block_major_matrix_storage(
                     64,
                     64,
                     column_partitions,
