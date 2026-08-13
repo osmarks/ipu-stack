@@ -1344,13 +1344,31 @@ fn verify_constant_output(application: &Application, bytes: &[u8], expected: f32
     let mut maximum_value = f32::NEG_INFINITY;
     let mut zero_values = 0usize;
     let mut unchanged_values = 0usize;
+    let logical_values = binding
+        .shape
+        .iter()
+        .try_fold(1usize, |elements, dimension| {
+            elements.checked_mul(usize::try_from(*dimension).ok()?)
+        });
+    let logical_values = logical_values.context("MLP logical output size overflow")?;
     for raw in output.chunks_exact(2) {
         let actual = half_to_f32(u16::from_le_bytes(raw.try_into().unwrap()));
         minimum_value = minimum_value.min(actual);
         maximum_value = maximum_value.max(actual);
         zero_values += usize::from(actual == 0.0);
         unchanged_values += usize::from(actual == 1.0);
-        maximum = maximum.max((actual - expected).abs());
+        if actual != 0.0 {
+            maximum = maximum.max((actual - expected).abs());
+        }
+    }
+    let physical_values = output.len() / 2;
+    let expected_padding = physical_values
+        .checked_sub(logical_values)
+        .context("MLP binding is smaller than its logical shape")?;
+    if zero_values != expected_padding {
+        bail!(
+            "MLP output contains {zero_values} zero values, expected {expected_padding} physical padding values"
+        );
     }
     if maximum > expected.abs() * 0.02 + 0.05 {
         bail!(
