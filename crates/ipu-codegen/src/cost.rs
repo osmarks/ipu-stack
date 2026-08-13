@@ -388,6 +388,36 @@ fn reduction_tree_critical_path(partitions: u16, fan_in: u16) -> (u64, u64) {
     (rounds, additions)
 }
 
+fn partition_boundary_penalty(shape: &TensorShape, from: &Layout, to: &Layout) -> u64 {
+    let rank = shape.0.len();
+    let partitions = |layout: &Layout, resolved_axis| {
+        layout
+            .tiling
+            .axes
+            .iter()
+            .find(|tiling| tiling.axis.resolve(rank).ok() == Some(resolved_axis))
+            .map_or(1, |tiling| u64::from(tiling.partitions))
+    };
+    let gcd = |mut left: u64, mut right: u64| {
+        while right != 0 {
+            (left, right) = (right, left % right);
+        }
+        left
+    };
+    (0..rank)
+        .map(|axis| {
+            let source = partitions(from, axis);
+            let destination = partitions(to, axis);
+            let common = gcd(source, destination);
+            source
+                .saturating_div(common)
+                .saturating_mul(destination)
+                .saturating_sub(source.max(destination))
+        })
+        .sum::<u64>()
+        .saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles)
+}
+
 impl CostModel for Ipu21CostModel {
     fn operator_cycles(
         &self,
@@ -585,7 +615,8 @@ impl CostModel for Ipu21CostModel {
                                 column_partitions,
                                 inner_partitions,
                                 reduction_fan_in,
-                                result_partitions,
+                                result_row_partitions,
+                                result_column_partitions,
                                 ..
                             },
                         ..
@@ -606,11 +637,12 @@ impl CostModel for Ipu21CostModel {
                         let (rounds, reduction_additions) =
                             reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
                         let partial_bytes = maximum_shard_bytes(&compute_output);
-                        let reduction_partial_bytes = if *result_partitions > 1 {
-                            maximum_shard_bytes(output)
-                        } else {
-                            partial_bytes
-                        };
+                        let reduction_partial_bytes =
+                            if (*result_row_partitions, *result_column_partitions) != (1, 1) {
+                                maximum_shard_bytes(output)
+                            } else {
+                                partial_bytes
+                            };
                         let result_redistribution =
                             if compute_output.format.layout != output.format.layout {
                                 maximum_shard_bytes(output)
@@ -837,7 +869,8 @@ impl CostModel for Ipu21CostModel {
                     GemmDistribution::ParallelReduction {
                         inner_partitions,
                         reduction_fan_in,
-                        result_partitions,
+                        result_row_partitions,
+                        result_column_partitions,
                         ..
                     },
                 ..
@@ -847,7 +880,9 @@ impl CostModel for Ipu21CostModel {
                     reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
                 epochs
                     .saturating_mul(rounds.saturating_add(1))
-                    .saturating_add(u64::from(*result_partitions > 1))
+                    .saturating_add(u64::from(
+                        (*result_row_partitions, *result_column_partitions) != (1, 1),
+                    ))
             }
             _ => phases,
         };
@@ -918,18 +953,14 @@ impl CostModel for Ipu21CostModel {
             };
         };
         let direct_retile = from.order == to.order;
-        // Independent source/destination roles execute spatially, but adjacent
-        // IPU21 tiles share an exchange bus. Treat at most one paired role as
-        // concurrent; the per-role maxima retain skew from uneven layouts.
+        // Independent source and destination roles execute spatially, but each
+        // adjacent tile pair shares its exchange bus. Model the busiest actual
+        // bus instead of either a single tile or device-wide traffic.
         let spatial_payload = traffic
-            .source_payload_bytes
-            .div_ceil(IPU21_TARGET_COSTS.exchange_bus_sharing)
-            .max(traffic.maximum_source_payload_bytes)
+            .maximum_source_bus_payload_bytes
             .max(traffic.maximum_remote_destination_bytes);
         let spatial_fragments = traffic
-            .remote_fragments
-            .div_ceil(IPU21_TARGET_COSTS.exchange_bus_sharing)
-            .max(traffic.maximum_source_fragments)
+            .maximum_source_bus_fragments
             .max(traffic.maximum_routed_fragments);
         let occupied_exchange_cycles = spatial_payload
             .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
@@ -940,7 +971,13 @@ impl CostModel for Ipu21CostModel {
             occupied_exchange_cycles.saturating_add(if traffic.remote_fragments == 0 {
                 0
             } else {
-                IPU21_TARGET_COSTS.exchange_phase_cycles
+                IPU21_TARGET_COSTS
+                    .exchange_phase_cycles
+                    .saturating_add(if direct_retile {
+                        partition_boundary_penalty(shape, from, to)
+                    } else {
+                        0
+                    })
             });
         let (local_bytes, local_calls) = if direct_retile {
             (

@@ -16,6 +16,8 @@ pub(crate) struct ConversionTraffic {
     pub maximum_source_payload_bytes: u64,
     pub remote_fragments: u64,
     pub maximum_source_fragments: u64,
+    pub maximum_source_bus_payload_bytes: u64,
+    pub maximum_source_bus_fragments: u64,
     pub maximum_routed_fragments: u64,
     pub maximum_destination_bytes: u64,
     pub maximum_remote_destination_bytes: u64,
@@ -113,6 +115,19 @@ pub(crate) fn conversion_traffic(
     for (bytes, fragments) in source_roles.into_values() {
         traffic.maximum_source_payload_bytes = traffic.maximum_source_payload_bytes.max(bytes);
         traffic.maximum_source_fragments = traffic.maximum_source_fragments.max(fragments);
+    }
+    let mut source_buses = HashMap::<u16, (u64, u64)>::new();
+    for (source, extents) in &remote {
+        let role = source_buses.entry(*source / 2).or_default();
+        role.0 = role
+            .0
+            .saturating_add(range_elements(extents).saturating_mul(element_bytes));
+        role.1 = role.1.saturating_add(1);
+    }
+    for (bytes, fragments) in source_buses.into_values() {
+        traffic.maximum_source_bus_payload_bytes =
+            traffic.maximum_source_bus_payload_bytes.max(bytes);
+        traffic.maximum_source_bus_fragments = traffic.maximum_source_bus_fragments.max(fragments);
     }
     Some(traffic)
 }
@@ -416,7 +431,8 @@ pub(crate) fn operator_memory_estimate(
                     column_partitions,
                     inner_partitions,
                     reduction_fan_in,
-                    result_partitions,
+                    result_row_partitions,
+                    result_column_partitions,
                     ..
                 },
             output_column_block,
@@ -475,11 +491,12 @@ pub(crate) fn operator_memory_estimate(
         // one local partial plus the incoming members of one reduction group.
         // Model the larger phase instead of summing mutually exclusive scratch.
         let partial_bytes = maximum_shard_bytes(&gemm_partial_tensor(dispatch, output));
-        let reduction_partial_bytes = if *result_partitions > 1 {
-            maximum_shard_bytes(output)
-        } else {
-            partial_bytes
-        };
+        let reduction_partial_bytes =
+            if (*result_row_partitions, *result_column_partitions) != (1, 1) {
+                maximum_shard_bytes(output)
+            } else {
+                partial_bytes
+            };
         convolution.interleaved = convolution.interleaved.saturating_add(partial_bytes);
         let reduction = MemoryUsage {
             standard: 0,
@@ -1083,6 +1100,18 @@ mod tests {
         for (bytes, fragments) in source_roles.into_values() {
             traffic.maximum_source_payload_bytes = traffic.maximum_source_payload_bytes.max(bytes);
             traffic.maximum_source_fragments = traffic.maximum_source_fragments.max(fragments);
+        }
+        let mut source_buses = BTreeMap::<u16, (u64, u64)>::new();
+        for (source, extents) in &remote {
+            let role = source_buses.entry(*source / 2).or_default();
+            role.0 += range_elements(extents) * precision.bytes();
+            role.1 += 1;
+        }
+        for (bytes, fragments) in source_buses.into_values() {
+            traffic.maximum_source_bus_payload_bytes =
+                traffic.maximum_source_bus_payload_bytes.max(bytes);
+            traffic.maximum_source_bus_fragments =
+                traffic.maximum_source_bus_fragments.max(fragments);
         }
         traffic
     }

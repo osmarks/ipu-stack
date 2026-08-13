@@ -2466,7 +2466,8 @@ impl LoweringState {
             column_partitions,
             inner_partitions,
             reduction_fan_in,
-            result_partitions,
+            result_row_partitions,
+            result_column_partitions,
         } = distribution
         {
             return self.lower_parallel_reduction_gemm(
@@ -2480,7 +2481,8 @@ impl LoweringState {
                 column_partitions,
                 inner_partitions,
                 reduction_fan_in,
-                result_partitions,
+                result_row_partitions,
+                result_column_partitions,
                 requirements,
                 tiles,
             );
@@ -2775,7 +2777,8 @@ impl LoweringState {
         column_partitions: u16,
         inner_partitions: u16,
         reduction_fan_in: u16,
-        result_partitions: u16,
+        result_row_partitions: u16,
+        result_column_partitions: u16,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
@@ -2791,8 +2794,9 @@ impl LoweringState {
             || column_partitions == 0
             || inner_partitions < 2
             || reduction_fan_in < 2
-            || result_partitions == 0
-            || result_partitions > inner_partitions
+            || result_row_partitions == 0
+            || result_column_partitions == 0
+            || result_row_partitions.saturating_mul(result_column_partitions) > inner_partitions
         {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
@@ -3322,7 +3326,15 @@ impl LoweringState {
                 self.append_kernel(tiles, tile, run)?;
             }
 
-            if result_partitions > 1 {
+            tracing::debug!(
+                partial_groups = partials.len(),
+                output_shards = output_shards.len(),
+                result_row_partitions,
+                result_column_partitions,
+                "prepared parallel GEMM partials"
+            );
+
+            if (result_row_partitions, result_column_partitions) != (1, 1) {
                 let mut segmented = BTreeMap::<Vec<(u32, u32)>, Vec<(u16, ShardView)>>::new();
                 let mut seed_transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
                 let mut seed_copies = Vec::<(u16, LocalCopy)>::new();
@@ -3358,61 +3370,88 @@ impl LoweringState {
                         let Some(intersection) = intersection else {
                             continue;
                         };
-                        covered = covered.saturating_add(intersection.iter().fold(
-                            1u64,
-                            |elements, extent| {
-                                elements
-                                    .saturating_mul(u64::from(extent.physical_end - extent.start))
-                            },
-                        ));
-                        let seed = contributors
-                            .iter()
-                            .position(|(tile, _)| *tile == owner.tile)
-                            .unwrap_or(0);
-                        let source = ShardView {
-                            shard: contributors[seed].1.shard,
-                            extents: intersection.clone(),
+                        let column = intersection[output_column_axis];
+                        let column_starts = if result_row_partitions > 1 {
+                            (column.start..column.physical_end)
+                                .step_by(
+                                    usize::try_from(crate::mid::AMP_COLUMN_MICRO)
+                                        .map_err(|_| LowLoweringError::IdOverflow)?,
+                                )
+                                .collect::<Vec<_>>()
+                        } else {
+                            vec![column.start]
                         };
-                        let destination = ShardView {
-                            shard: output,
-                            extents: intersection.clone(),
-                        };
-                        if source.shard != destination.shard {
-                            if contributors[seed].0 == owner.tile {
-                                append_logical_span_copies(
-                                    &self.shards,
-                                    &source,
-                                    &destination,
-                                    owner.tile,
-                                    &mut seed_copies,
-                                )?;
-                            } else {
-                                seed_transfers
-                                    .entry(source)
-                                    .or_default()
-                                    .push(destination.clone());
+                        for column_start in column_starts {
+                            let mut segment_extents = intersection.clone();
+                            if result_row_partitions > 1 {
+                                let column_end = column_start
+                                    .saturating_add(crate::mid::AMP_COLUMN_MICRO)
+                                    .min(column.physical_end);
+                                segment_extents[output_column_axis].start = column_start;
+                                segment_extents[output_column_axis].logical_end = segment_extents
+                                    [output_column_axis]
+                                    .logical_end
+                                    .min(column_end)
+                                    .max(column_start);
+                                segment_extents[output_column_axis].physical_end = column_end;
                             }
-                        }
-                        let mut segment = Vec::with_capacity(contributors.len());
-                        segment.push((owner.tile, destination));
-                        segment.extend(contributors.iter().enumerate().filter_map(
-                            |(index, (tile, partial))| {
-                                (index != seed).then_some((
-                                    *tile,
-                                    ShardView {
-                                        shard: partial.shard,
-                                        extents: intersection.clone(),
-                                    },
-                                ))
-                            },
-                        ));
-                        segmented.insert(
-                            intersection
+                            covered = covered.saturating_add(segment_extents.iter().fold(
+                                1u64,
+                                |elements, extent| {
+                                    elements.saturating_mul(u64::from(
+                                        extent.physical_end - extent.start,
+                                    ))
+                                },
+                            ));
+                            let seed = contributors
                                 .iter()
-                                .map(|extent| (extent.start, extent.physical_end))
-                                .collect(),
-                            segment,
-                        );
+                                .position(|(tile, _)| *tile == owner.tile)
+                                .unwrap_or(0);
+                            let source = ShardView {
+                                shard: contributors[seed].1.shard,
+                                extents: segment_extents.clone(),
+                            };
+                            let destination = ShardView {
+                                shard: output,
+                                extents: segment_extents.clone(),
+                            };
+                            if source.shard != destination.shard {
+                                if contributors[seed].0 == owner.tile {
+                                    append_logical_span_copies(
+                                        &self.shards,
+                                        &source,
+                                        &destination,
+                                        owner.tile,
+                                        &mut seed_copies,
+                                    )?;
+                                } else {
+                                    seed_transfers
+                                        .entry(source)
+                                        .or_default()
+                                        .push(destination.clone());
+                                }
+                            }
+                            let mut segment = Vec::with_capacity(contributors.len());
+                            segment.push((owner.tile, destination));
+                            segment.extend(contributors.iter().enumerate().filter_map(
+                                |(index, (tile, partial))| {
+                                    (index != seed).then_some((
+                                        *tile,
+                                        ShardView {
+                                            shard: partial.shard,
+                                            extents: segment_extents.clone(),
+                                        },
+                                    ))
+                                },
+                            ));
+                            segmented.insert(
+                                segment_extents
+                                    .iter()
+                                    .map(|extent| (extent.start, extent.physical_end))
+                                    .collect(),
+                                segment,
+                            );
+                        }
                     }
                     if covered != expected {
                         return Err(LowLoweringError::InvalidOperatorPlan);
@@ -3431,6 +3470,10 @@ impl LoweringState {
                     self.append_local_copy(tiles, tile, copy)?;
                 }
                 partials = segmented;
+                tracing::debug!(
+                    reduction_segments = partials.len(),
+                    "distributed parallel GEMM reduction roots"
+                );
             }
 
             for row_partials in partials.values_mut() {
@@ -4553,7 +4596,8 @@ mod tests {
             let reduction_fan_in = random.u16(2..=inner_partitions.min(4));
             let row_partitions = random.u16(inner_partitions..=8);
             let tiles = inner_partitions * column_partitions * row_partitions;
-            let rows = u32::from(row_partitions) * random.u32(1..=4);
+            let rows_per_partition = random.u32(1..=4);
+            let rows = u32::from(row_partitions) * rows_per_partition;
             let inner = u32::from(inner_partitions)
                 * 64
                 * random.u32(1..=u32::from(row_partitions / inner_partitions));
@@ -4597,18 +4641,25 @@ mod tests {
                     MemoryClass::Ipu21Interleaved,
                 ),
             };
-            let result_partitions = if random.bool() { 1 } else { inner_partitions };
-            let storage_columns = column_partitions.saturating_mul(result_partitions);
+            let (result_row_partitions, result_column_partitions) = if random.bool() {
+                (1, 1)
+            } else if random.bool() && rows_per_partition >= u32::from(inner_partitions) {
+                (inner_partitions, 1)
+            } else {
+                (1, inner_partitions)
+            };
+            let storage_rows = row_partitions.saturating_mul(result_row_partitions);
+            let storage_columns = column_partitions.saturating_mul(result_column_partitions);
             let output_format = TensorFormat {
                 precision: Precision::F16,
                 layout: Layout::amp_left_result_grid(
-                    if result_partitions > 1 {
+                    if result_column_partitions > 1 {
                         crate::mid::AMP_COLUMN_MICRO
                     } else {
                         output_columns
                     },
-                    row_partitions * storage_columns,
-                    row_partitions,
+                    storage_rows * storage_columns,
+                    storage_rows,
                     storage_columns,
                     crate::mid::GridOrder::ColumnsFast,
                 ),
@@ -4632,7 +4683,8 @@ mod tests {
                     column_partitions,
                     inner_partitions,
                     reduction_fan_in,
-                    result_partitions,
+                    result_row_partitions,
+                    result_column_partitions,
                 },
             });
             let mut config = PipelineConfig::new(tiles)
@@ -4683,7 +4735,7 @@ mod tests {
                 })
                 .count();
             assert!(direct_parameter_runs > 0, "case {case}");
-            if result_partitions > 1 {
+            if (result_row_partitions, result_column_partitions) != (1, 1) {
                 let output_shards = low.outputs[0]
                     .shards
                     .iter()
