@@ -4392,7 +4392,22 @@ fn parallel_reduction_candidates_for_orientation(
                     reduction_fan_in,
                 };
             }
-            variants.push(variant);
+            let physical_right_index = match orientation {
+                GemmOrientation::Normal => 1,
+                GemmOrientation::Swapped => 0,
+            };
+            let local_staging_options: &[_] = match orientation {
+                GemmOrientation::Normal => &[LocalOperandStaging::Direct],
+                GemmOrientation::Swapped => &[
+                    LocalOperandStaging::Direct,
+                    LocalOperandStaging::MatchRemote,
+                ],
+            };
+            for &local_staging in local_staging_options {
+                let mut staged = variant.clone();
+                staged.inputs[physical_right_index].local_staging = local_staging;
+                variants.push(staged);
+            }
         }
     }
     variants
@@ -4928,6 +4943,24 @@ mod tests {
             // Each retained grid has standard- and interleaved-weight forms,
             // independently for the two physical matrix orientations.
             assert!(candidates.len() <= config.planning_beam_width * 4);
+            let swapped_staging = candidates
+                .iter()
+                .filter_map(|candidate| match candidate.dispatch {
+                    OperatorDispatch::BlockedGemm {
+                        orientation: GemmOrientation::Swapped,
+                        ..
+                    } => Some(candidate.inputs[0].local_staging),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                (
+                    swapped_staging.contains(&LocalOperandStaging::Direct),
+                    swapped_staging.contains(&LocalOperandStaging::MatchRemote),
+                ),
+                (true, true),
+                "shape={m}x{k}x{n} tiles={tiles}"
+            );
             for candidate in candidates {
                 assert!(
                     candidate.supports(&inputs, &TensorShape(vec![m, n])),

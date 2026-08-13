@@ -3039,9 +3039,12 @@ impl LoweringState {
                         self.shards[first_source.index() as usize].extents[right_inner_axis];
                     let source_covers_compute_inner = source_inner.start <= inner.start
                         && source_inner.physical_end >= inner.physical_end;
+                    let stage_local_sources =
+                        right_requirement.local_staging == crate::LocalOperandStaging::MatchRemote;
                     let weights = if self.shards[first_source.index() as usize].tile
                         == left_shard.tile
                         && source_covers_compute_inner
+                        && !stage_local_sources
                     {
                         None
                     } else {
@@ -3083,16 +3086,17 @@ impl LoweringState {
                                 )
                                 .next()
                                 .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-                            let source_view = self.narrow_view(
+                            let target_view = self.narrow_view(
                                 source,
                                 &[
                                     (right_inner_axis, panel_start, panel_end),
                                     (right_column_axis, column_start, column_end),
                                 ],
                             )?;
-                            let local =
+                            let source_is_local =
                                 self.shards[source.index() as usize].tile == left_shard.tile;
-                            if !local {
+                            let consume_direct = source_is_local && !stage_local_sources;
+                            if !consume_direct {
                                 let destination_view = self.narrow_view(
                                     weights.ok_or(LowLoweringError::InvalidOperatorPlan)?,
                                     &[
@@ -3100,12 +3104,22 @@ impl LoweringState {
                                         (right_column_axis, column_start, column_end),
                                     ],
                                 )?;
-                                transfers
-                                    .entry(source_view.clone())
-                                    .or_default()
-                                    .push(destination_view);
+                                if source_is_local {
+                                    append_logical_span_copies(
+                                        &self.shards,
+                                        &target_view,
+                                        &destination_view,
+                                        left_shard.tile,
+                                        &mut local_copies,
+                                    )?;
+                                } else {
+                                    transfers
+                                        .entry(target_view.clone())
+                                        .or_default()
+                                        .push(destination_view);
+                                }
                             }
-                            sources.push((source_view, local));
+                            sources.push((target_view, consume_direct));
                         }
 
                         if sources.len() > 1 && sources.iter().any(|(_, local)| *local) {
