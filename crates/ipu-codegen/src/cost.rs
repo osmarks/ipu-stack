@@ -2,9 +2,9 @@
 
 use crate::estimate::{
     average_shard_bytes, conversion_traffic, gemm_exchange_bytes_per_cycle,
-    gemm_exchange_phase_count, gemm_remote_bytes_per_tile, gemm_requires_panel_repacking,
-    gemm_uses_panel_buffer, maximum_axis_shard_extent, maximum_shard_bytes,
-    operator_memory_estimate, physical_elements,
+    gemm_exchange_phase_count, gemm_partial_tensor, gemm_remote_bytes_per_tile,
+    gemm_requires_panel_repacking, gemm_uses_panel_buffer, maximum_axis_shard_extent,
+    maximum_shard_bytes, operator_memory_estimate, physical_elements,
 };
 use crate::graph::TensorShape;
 use crate::mid::{
@@ -246,6 +246,7 @@ pub struct Ipu21TargetCosts {
     pub standard_load_bytes_per_cycle: u64,
     pub interleaved_load_bytes_per_cycle: u64,
     pub local_copy_bytes_per_cycle: u64,
+    pub reduction_output_bytes_per_cycle: u64,
     pub local_copy_call_cycles: u64,
     pub exchange_phase_cycles: u64,
     pub exchange_transfer_cycles: u64,
@@ -261,6 +262,10 @@ pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
     standard_load_bytes_per_cycle: 8,
     interleaved_load_bytes_per_cycle: 16,
     local_copy_bytes_per_cycle: 8,
+    // Reduction-add reads two partials and writes one. Current IPU21 profiles
+    // sustain roughly one output byte per cycle after all three interleaved
+    // streams and worker imbalance are included.
+    reduction_output_bytes_per_cycle: 1,
     // A finalized six-worker local-copy invocation, including supervisor and
     // worker rendezvous overhead, takes 288 tile cycles on IPU21.
     local_copy_call_cycles: 288,
@@ -396,6 +401,9 @@ impl CostModel for Ipu21CostModel {
         let spatial_occupancy_adjusted_elements = spatial_occupancy.latency_work();
         match operator {
             MidOperator::Gemm { multiply, .. } => {
+                let compute_output = gemm_partial_tensor(dispatch, output);
+                let output_elements_per_tile =
+                    SpatialOccupancy::for_output(&compute_output).latency_work();
                 let left_shape = inputs[0]
                     .format
                     .layout
@@ -417,9 +425,10 @@ impl CostModel for Ipu21CostModel {
                     Precision::F16 => 128,
                     Precision::F32 => 32,
                 };
-                let output_elements_per_tile = spatial_occupancy_adjusted_elements;
-                let output_columns_per_tile =
-                    maximum_axis_shard_extent(output, output.shape.0.len().saturating_sub(1));
+                let output_columns_per_tile = maximum_axis_shard_extent(
+                    &compute_output,
+                    output.shape.0.len().saturating_sub(1),
+                );
                 let kernel_output_elements = output_elements_per_tile;
                 let kernel_output_columns = output_columns_per_tile;
                 let arithmetic = kernel_output_elements
@@ -436,7 +445,7 @@ impl CostModel for Ipu21CostModel {
                     right.format.layout.memory_class == MemoryClass::Ipu21Interleaved
                 });
                 let staged_weights = right.is_some_and(|right| {
-                    gemm_uses_panel_buffer(dispatch, right, output)
+                    gemm_uses_panel_buffer(dispatch, right, &compute_output)
                         && right.format.precision == Precision::F16
                 });
                 let staged_local_weights = staged_weights
@@ -496,12 +505,15 @@ impl CostModel for Ipu21CostModel {
                     // The source owner changes between phases. Device latency
                     // follows that phase-local critical role rather than the
                     // accumulated work of any one physical tile.
-                    per_phase_penalty
-                        .saturating_mul(gemm_exchange_phase_count(dispatch, inputs, output))
+                    per_phase_penalty.saturating_mul(gemm_exchange_phase_count(
+                        dispatch,
+                        inputs,
+                        &compute_output,
+                    ))
                 });
                 let packing = if right.is_some_and(|right| {
                     right.format.precision == Precision::F16
-                        && gemm_requires_panel_repacking(dispatch, right, output)
+                        && gemm_requires_panel_repacking(dispatch, right, &compute_output)
                 }) {
                     right_bytes_consumed
                         .saturating_mul(2)
@@ -518,10 +530,10 @@ impl CostModel for Ipu21CostModel {
                 } else {
                     0
                 };
-                let exchange = gemm_remote_bytes_per_tile(inputs, output)
+                let exchange = gemm_remote_bytes_per_tile(inputs, &compute_output)
                     .div_ceil(gemm_exchange_bytes_per_cycle(inputs))
                     .saturating_add(
-                        gemm_exchange_phase_count(dispatch, inputs, output)
+                        gemm_exchange_phase_count(dispatch, inputs, &compute_output)
                             .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles),
                     );
                 let exchange = match dispatch {
@@ -546,7 +558,7 @@ impl CostModel for Ipu21CostModel {
                         let activation_bytes = maximum_shard_bytes(&inputs[0]);
                         let (rounds, reduction_additions) =
                             reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
-                        let partial_bytes = maximum_shard_bytes(output);
+                        let partial_bytes = maximum_shard_bytes(&compute_output);
                         weight_bytes
                             .saturating_add(activation_bytes)
                             .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
@@ -563,7 +575,9 @@ impl CostModel for Ipu21CostModel {
                             .saturating_add(
                                 reduction_additions.saturating_mul(
                                     partial_bytes
-                                        .div_ceil(12)
+                                        .div_ceil(
+                                            IPU21_TARGET_COSTS.reduction_output_bytes_per_cycle,
+                                        )
                                         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
                                 ),
                             )
@@ -600,11 +614,20 @@ impl CostModel for Ipu21CostModel {
                 } else {
                     u64::MAX / 8
                 };
+                let result_remap = (compute_output.format.layout != output.format.layout)
+                    .then(|| {
+                        maximum_shard_bytes(&compute_output)
+                            .max(maximum_shard_bytes(output))
+                            .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+                            .saturating_add(IPU21_TARGET_COSTS.exchange_phase_cycles)
+                    })
+                    .unwrap_or(0);
                 kernel
                     .saturating_add(standard_source_owner_penalty)
                     .saturating_add(packing)
                     .saturating_add(local_staging)
                     .saturating_add(exchange)
+                    .saturating_add(result_remap)
                     .saturating_add(capacity_penalty)
             }
             MidOperator::FlashAttention { .. } => {

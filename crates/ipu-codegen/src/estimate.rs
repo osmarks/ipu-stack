@@ -229,6 +229,35 @@ pub(crate) fn maximum_axis_shard_extent(tensor: &TensorType, axis: usize) -> u64
     )
 }
 
+pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorType) -> TensorType {
+    let OperatorDispatch::BlockedGemm {
+        output_column_block,
+        distribution:
+            GemmDistribution::ParallelReduction {
+                row_partitions,
+                column_partitions,
+                ..
+            },
+        ..
+    } = dispatch
+    else {
+        return output.clone();
+    };
+    TensorType {
+        shape: output.shape.clone(),
+        format: crate::mid::TensorFormat {
+            precision: output.format.precision,
+            layout: Layout::amp_output_grid(
+                *output_column_block,
+                row_partitions.saturating_mul(*column_partitions),
+                *row_partitions,
+                *column_partitions,
+                crate::mid::GridOrder::ColumnsFast,
+            ),
+        },
+    }
+}
+
 pub(crate) fn tensor_memory(tensor: &TensorType) -> MemoryUsage {
     let mut usage = MemoryUsage::default();
     usage.add_class(
@@ -402,7 +431,7 @@ pub(crate) fn operator_memory_estimate(
         // Reduction happens later, after operand staging is dead, and retains
         // one local partial plus the incoming members of one reduction group.
         // Model the larger phase instead of summing mutually exclusive scratch.
-        let partial_bytes = maximum_shard_bytes(output);
+        let partial_bytes = maximum_shard_bytes(&gemm_partial_tensor(dispatch, output));
         convolution.interleaved = convolution.interleaved.saturating_add(partial_bytes);
         let reduction = MemoryUsage {
             standard: 0,

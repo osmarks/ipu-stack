@@ -2767,28 +2767,24 @@ impl LoweringState {
         }
         let left_inner_axis = left_rank - 1;
         let output_column_axis = output_rank - 1;
-        let mut columns = output_shards
-            .iter()
-            .flat_map(|shard| {
-                let extent = self.shards[shard.index() as usize].extents[output_column_axis];
-                (extent.start..extent.physical_end)
-                    .step_by(output_column_block as usize)
-                    .map(move |start| {
-                        (
-                            start,
-                            (start + output_column_block).min(extent.physical_end),
-                        )
-                    })
-            })
+        let output_type = self.shards[output_shards[0].index() as usize]
+            .tensor_type
+            .clone();
+        let logical_columns = output_type.shape.0[output_column_axis];
+        let physical_columns = logical_columns.div_ceil(output_column_block) * output_column_block;
+        let column_blocks = physical_columns / output_column_block;
+        let columns = (0..physical_columns)
+            .step_by(output_column_block as usize)
+            .map(|start| (start, start + output_column_block))
             .collect::<Vec<_>>();
-        columns.sort_unstable();
-        columns.dedup();
-        if columns
-            .iter()
-            .any(|(start, end)| end - start != output_column_block)
-        {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
+        let mut partial_type = output_type.clone();
+        partial_type.format.layout = Layout::amp_output_grid(
+            output_column_block,
+            row_partitions.saturating_mul(column_partitions),
+            row_partitions,
+            column_partitions,
+            crate::mid::GridOrder::ColumnsFast,
+        );
 
         let mut replica_groups = BTreeMap::<Vec<(u32, u32)>, Vec<LowShardId>>::new();
         for left in left_shards.iter().copied() {
@@ -2812,16 +2808,6 @@ impl LoweringState {
                 );
             }
         }
-        let mut column_shard_starts = output_shards
-            .iter()
-            .map(|shard| self.shards[shard.index() as usize].extents[output_column_axis].start)
-            .collect::<Vec<_>>();
-        column_shard_starts.sort_unstable();
-        column_shard_starts.dedup();
-        if column_shard_starts.len() != usize::from(column_partitions) {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-
         {
             let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
             let mut local_copies = Vec::<(u16, LocalCopy)>::new();
@@ -2830,15 +2816,15 @@ impl LoweringState {
             let mut resident_lefts = BTreeMap::<LowShardId, ShardView>::new();
             let mut weight_staging = BTreeMap::<(u16, LowShardId), LowShardId>::new();
             for &(column_start, column_end) in &columns {
-                let column_outputs = output_shards
-                    .iter()
-                    .copied()
-                    .filter(|shard| {
-                        let extent =
-                            self.shards[shard.index() as usize].extents[output_column_axis];
-                        extent.start <= column_start && extent.physical_end >= column_end
-                    })
-                    .collect::<Vec<_>>();
+                let block = column_start / output_column_block;
+                let short_blocks = column_blocks / u32::from(column_partitions);
+                let long_partitions = column_blocks % u32::from(column_partitions);
+                let long_region = long_partitions.saturating_mul(short_blocks + 1);
+                let output_column = if block < long_region {
+                    block / (short_blocks + 1)
+                } else {
+                    long_partitions + (block - long_region) / short_blocks.max(1)
+                };
                 for left in left_shards.iter().copied() {
                     let left_shard = self.shards[left.index() as usize].clone();
                     let resident_left = if let Some(view) = resident_lefts.get(&left) {
@@ -2864,42 +2850,40 @@ impl LoweringState {
                     if !(inner.physical_end - inner.start).is_multiple_of(inner_block) {
                         return Err(LowLoweringError::InvalidOperatorPlan);
                     }
-                    let output = column_outputs
-                        .iter()
-                        .copied()
-                        .find(|output| {
-                            let output_extents = &self.shards[output.index() as usize].extents;
-                            left_shard.extents[..left_inner_axis]
-                                .iter()
-                                .zip(&output_extents[..output_column_axis])
-                                .all(|(left, output)| {
-                                    left.start == output.start
-                                        && left.physical_end == output.physical_end
-                                })
-                        })
-                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-                    let output_column = column_shard_starts
-                        .binary_search(
-                            &self.shards[output.index() as usize].extents[output_column_axis].start,
-                        )
-                        .map_err(|_| LowLoweringError::InvalidOperatorPlan)?;
-                    if replica_columns.get(&left).copied().map(usize::from) != Some(output_column) {
+                    if replica_columns.get(&left).copied().map(u32::from) != Some(output_column) {
                         continue;
                     }
-                    let output_tile = self.shards[output.index() as usize].tile;
-                    let output_view = self
-                        .narrow_view(output, &[(output_column_axis, column_start, column_end)])?;
-                    let partial = if left_shard.tile == output_tile {
-                        output_view
+                    let mut extents = left_shard.extents.clone();
+                    extents[output_column_axis] = ShardExtent {
+                        axis: u16::try_from(output_column_axis)
+                            .map_err(|_| LowLoweringError::IdOverflow)?,
+                        start: column_start,
+                        logical_end: column_end.min(logical_columns),
+                        physical_end: column_end,
+                    };
+                    let direct_output = output_shards.iter().copied().find(|output| {
+                        let shard = &self.shards[output.index() as usize];
+                        shard.tile == left_shard.tile
+                            && shard.tensor_type.format.layout.order
+                                == partial_type.format.layout.order
+                            && shard.tensor_type.format.layout.memory_class
+                                == partial_type.format.layout.memory_class
+                            && shard.extents.iter().zip(&extents).all(|(owner, partial)| {
+                                owner.start <= partial.start
+                                    && owner.logical_end >= partial.logical_end
+                                    && owner.physical_end >= partial.physical_end
+                            })
+                    });
+                    let partial = if let Some(output) = direct_output {
+                        ShardView {
+                            shard: output,
+                            extents: extents.clone(),
+                        }
                     } else {
-                        let mut extents = self.shards[output.index() as usize].extents.clone();
-                        extents[output_column_axis].start = column_start;
-                        extents[output_column_axis].logical_end = column_end;
-                        extents[output_column_axis].physical_end = column_end;
                         let partial = self.push_shard(LowShard {
                             id: LowShardId(0),
                             tile: left_shard.tile,
-                            tensor_type: self.shards[output.index() as usize].tensor_type.clone(),
+                            tensor_type: partial_type.clone(),
                             extents,
                             definition: ShardDefinition::Staging,
                         })?;
@@ -3239,8 +3223,9 @@ impl LoweringState {
                 }
             }
             let mut result_transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+            let mut result_copies = Vec::<(u16, LocalCopy)>::new();
             for row_partials in partials.values() {
-                let [(_, result)] = row_partials.as_slice() else {
+                let [(result_tile, result)] = row_partials.as_slice() else {
                     return Err(LowLoweringError::InvalidOperatorPlan);
                 };
                 if matches!(
@@ -3249,28 +3234,65 @@ impl LoweringState {
                 ) {
                     continue;
                 }
-                let output = output_shards
-                    .iter()
-                    .copied()
-                    .find(|output| {
-                        self.shards[output.index() as usize]
-                            .extents
-                            .iter()
-                            .zip(&result.extents)
-                            .all(|(owner, extent)| {
-                                owner.start <= extent.start
-                                    && owner.physical_end >= extent.physical_end
+                let mut covered = 0u64;
+                for output in output_shards.iter().copied() {
+                    let owner = &self.shards[output.index() as usize];
+                    let intersection = owner
+                        .extents
+                        .iter()
+                        .zip(&result.extents)
+                        .map(|(destination, source)| {
+                            let start = destination.start.max(source.start);
+                            let physical_end = destination.physical_end.min(source.physical_end);
+                            (start < physical_end).then_some(ShardExtent {
+                                axis: source.axis,
+                                start,
+                                logical_end: destination
+                                    .logical_end
+                                    .min(source.logical_end)
+                                    .max(start),
+                                physical_end,
                             })
-                    })
-                    .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-                let destination = ShardView {
-                    shard: output,
-                    extents: result.extents.clone(),
-                };
-                result_transfers
-                    .entry(result.clone())
-                    .or_default()
-                    .push(destination);
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    let Some(intersection) = intersection else {
+                        continue;
+                    };
+                    covered = covered.saturating_add(intersection.iter().fold(
+                        1u64,
+                        |elements, extent| {
+                            elements.saturating_mul(u64::from(extent.physical_end - extent.start))
+                        },
+                    ));
+                    let source = ShardView {
+                        shard: result.shard,
+                        extents: intersection.clone(),
+                    };
+                    let destination = ShardView {
+                        shard: output,
+                        extents: intersection,
+                    };
+                    if owner.tile == *result_tile {
+                        append_logical_span_copies(
+                            &self.shards,
+                            &source,
+                            &destination,
+                            *result_tile,
+                            &mut result_copies,
+                        )?;
+                    } else {
+                        result_transfers
+                            .entry(source)
+                            .or_default()
+                            .push(destination);
+                    }
+                }
+                let expected = result.extents.iter().fold(1u64, |elements, extent| {
+                    elements.saturating_mul(u64::from(extent.physical_end - extent.start))
+                });
+                if covered != expected {
+                    return Err(LowLoweringError::InvalidOperatorPlan);
+                }
             }
             self.append_phase(
                 result_transfers,
@@ -3281,6 +3303,9 @@ impl LoweringState {
                 },
                 tiles,
             )?;
+            for (tile, copy) in result_copies {
+                self.append_local_copy(tiles, tile, copy)?;
+            }
         }
         Ok(())
     }
@@ -4285,12 +4310,19 @@ mod tests {
                     MemoryClass::Ipu21Interleaved,
                 ),
             };
+            let storage_rows = if random.bool() {
+                row_partitions
+            } else {
+                u16::try_from(rows)
+                    .unwrap_or(u16::MAX)
+                    .min(row_partitions.saturating_mul(inner_partitions))
+            };
             let output_format = TensorFormat {
                 precision: Precision::F16,
                 layout: Layout::amp_output_grid(
                     output_columns,
-                    row_partitions * column_partitions,
-                    row_partitions,
+                    storage_rows * column_partitions,
+                    storage_rows,
                     column_partitions,
                     crate::mid::GridOrder::ColumnsFast,
                 ),
@@ -4339,7 +4371,7 @@ mod tests {
                 .count();
             assert!(reduction_runs > 0, "case {case}");
             assert!(
-                low.exchange_phases.len() <= usize::from(inner_partitions).saturating_add(1),
+                low.exchange_phases.len() <= usize::from(inner_partitions).saturating_add(2),
                 "case {case}"
             );
             let parameter_shards = low
