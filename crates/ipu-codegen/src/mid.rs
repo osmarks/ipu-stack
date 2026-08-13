@@ -4041,7 +4041,6 @@ fn parallel_reduction_candidates(
     }
     grids.sort_unstable();
     grids.truncate(config.planning_beam_width.max(1));
-    let storage_grids = balanced_output_grids(config.tile_count, rows, output_blocks, 1);
     let mut variants = Vec::new();
     for (_, _, _, _, row_partitions, column_partitions, inner_partitions) in grids {
         let reduction_fan_in = inner_partitions.min(4);
@@ -4099,58 +4098,10 @@ fn parallel_reduction_candidates(
                     reduction_fan_in,
                 };
             }
-            variants.push(variant.clone());
-            for &(storage_rows, storage_columns) in &storage_grids {
-                if storage_rows == row_partitions && storage_columns == column_partitions {
-                    continue;
-                }
-                let mut remapped = variant.clone();
-                remapped.output.format.layout = Layout::amp_output_grid(
-                    output_column_block,
-                    storage_rows.saturating_mul(storage_columns),
-                    storage_rows,
-                    storage_columns,
-                    GridOrder::ColumnsFast,
-                );
-                variants.push(remapped);
-            }
+            variants.push(variant);
         }
     }
     variants
-}
-
-fn balanced_output_grids(
-    capacity: u16,
-    rows: u32,
-    column_blocks: u16,
-    limit: usize,
-) -> Vec<(u16, u16)> {
-    let maximum_rows = u16::try_from(rows).unwrap_or(u16::MAX).min(capacity);
-    let mut grids = (1..=maximum_rows)
-        .flat_map(|row_partitions| {
-            let maximum_columns = column_blocks.min(capacity / row_partitions);
-            (1..=maximum_columns).map(move |column_partitions| {
-                let maximum_blocks = rows.div_ceil(u32::from(row_partitions)).saturating_mul(
-                    u32::from(column_blocks).div_ceil(u32::from(column_partitions)),
-                );
-                let used = row_partitions.saturating_mul(column_partitions);
-                (
-                    maximum_blocks,
-                    capacity.saturating_sub(used),
-                    row_partitions,
-                    column_partitions,
-                )
-            })
-        })
-        .filter(|&(_, _, rows, columns)| rows.saturating_mul(columns) >= capacity.div_ceil(2))
-        .collect::<Vec<_>>();
-    grids.sort_unstable();
-    grids.dedup_by_key(|grid| grid.0);
-    grids
-        .into_iter()
-        .take(limit)
-        .map(|(_, _, rows, columns)| (rows, columns))
-        .collect()
 }
 
 fn resolved_output_aliasing(
@@ -4681,7 +4632,7 @@ mod tests {
             let config = PipelineConfig::new(tiles).with_planning_beam_width(16);
             let candidates = parallel_reduction_candidates(&base, &inputs, &config);
             assert!(!candidates.is_empty());
-            assert!(candidates.len() <= config.planning_beam_width * 4);
+            assert!(candidates.len() <= config.planning_beam_width * 2);
             for candidate in candidates {
                 assert!(
                     candidate.supports(&inputs, &TensorShape(vec![m, n])),
