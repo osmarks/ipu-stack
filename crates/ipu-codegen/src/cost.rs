@@ -319,7 +319,7 @@ fn amp_kernel_cycles(
     if inner_block == 0
         || output_column_block == 0
         || output_columns_per_tile == 0
-        || !inner_block.is_multiple_of(64)
+        || !inner_block.is_multiple_of(u64::from(crate::mid::AMP_COLUMN_MICRO))
         || !output_column_block.is_multiple_of(IPU21_AMP_KERNEL_COSTS.column_group_width)
     {
         return None;
@@ -348,12 +348,13 @@ fn amp_kernel_cycles(
         ),
         Precision::F8F143 { .. } => return None,
     };
-    let inner_blocks_per_call = inner_block / 64;
+    let inner_micro_groups_per_call = inner_block / u64::from(crate::mid::AMP_COLUMN_MICRO);
     let call_cycles = IPU21_AMP_KERNEL_COSTS.call_cycles.saturating_add(
-        inner_blocks_per_call.saturating_mul(
+        inner_micro_groups_per_call.saturating_mul(
             output_column_block
                 .saturating_mul(row_cycles)
-                .saturating_add(column_groups.saturating_mul(group_cycles)),
+                .div_ceil(4)
+                .saturating_add(column_groups.saturating_mul(group_cycles).div_ceil(4)),
         ),
     );
     Some(
@@ -452,12 +453,15 @@ impl CostModel for Ipu21CostModel {
                     && requirements.inputs.get(1).is_some_and(|requirement| {
                         requirement.local_staging == LocalOperandStaging::MatchRemote
                     });
-                let streamed_k64_standard = right.filter(|right| {
+                let streamed_blocked_standard = right.filter(|right| {
                     staged_weights
                         && right.format.layout.memory_class == MemoryClass::Ipu21Standard
-                        && right.format.layout.order == ElementOrder::Amp(AmpOrder::RightK64)
+                        && matches!(
+                            right.format.layout.order,
+                            ElementOrder::Amp(AmpOrder::RightBlocked(_))
+                        )
                 });
-                let weight_feed = streamed_k64_standard.map_or_else(
+                let weight_feed = streamed_blocked_standard.map_or_else(
                     || {
                         right_bytes_consumed.div_ceil(
                             if resident_interleaved_weights || staged_weights {
@@ -486,7 +490,7 @@ impl CostModel for Ipu21CostModel {
                             )
                     },
                 );
-                let standard_source_owner_penalty = streamed_k64_standard.map_or(0, |right| {
+                let standard_source_owner_penalty = streamed_blocked_standard.map_or(0, |right| {
                     let owners = right
                         .format
                         .layout
@@ -718,9 +722,9 @@ impl CostModel for Ipu21CostModel {
                     rows.min(u64::from(crate::mid::AMP_INNER_BLOCK)),
                     3,
                 ),
-                ElementOrder::Amp(AmpOrder::RightK64) => (
-                    rows.div_ceil(u64::from(crate::mid::AMP_INNER_BLOCK)),
-                    rows.min(u64::from(crate::mid::AMP_INNER_BLOCK)),
+                ElementOrder::Amp(AmpOrder::RightBlocked(inner_block)) => (
+                    rows.div_ceil(u64::from(inner_block)),
+                    rows.min(u64::from(inner_block)),
                     4,
                 ),
                 _ => (

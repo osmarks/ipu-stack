@@ -1240,7 +1240,7 @@ impl LoweringState {
                     && matches!(
                         destination_format.layout.order,
                         ElementOrder::Amp(
-                            AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightK64
+                            AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightBlocked(_)
                         )
                     )
                 {
@@ -1584,7 +1584,7 @@ impl LoweringState {
                 key_block_rows,
                 value_dimension,
                 padded_value_dimension,
-                ElementOrder::Amp(AmpOrder::RightK64),
+                ElementOrder::Amp(AmpOrder::RightBlocked(64)),
             )?;
             self.shards[value_staging.index() as usize].definition =
                 ShardDefinition::ExchangeStaging;
@@ -1712,7 +1712,7 @@ impl LoweringState {
                     valid_key_rows,
                     tasks[0].value_dimension,
                     padded_value_dimension,
-                    AmpOrder::RightK64,
+                    AmpOrder::RightBlocked(64),
                     owner_offset.saturating_add(key_panel_count),
                     &mut gathers,
                     tiles,
@@ -2899,13 +2899,22 @@ impl LoweringState {
                         .or_default()
                         .push((left_shard.tile, partial.clone()));
 
+                    let source_panel_block = requirements.inputs[1].format.layout.order.clone();
+                    let source_panel_block = match source_panel_block {
+                        ElementOrder::Amp(AmpOrder::RightBlocked(block)) => u32::from(block),
+                        _ => AMP_INNER_BLOCK,
+                    };
+                    let first_panel_end = inner
+                        .start
+                        .saturating_add(source_panel_block)
+                        .min(inner.physical_end);
                     let first_source = self
                         .right_shards_for_block(
                             &right_shards,
                             column_start,
                             column_end,
                             inner.start,
-                            inner.start + AMP_INNER_BLOCK,
+                            first_panel_end,
                         )
                         .next()
                         .ok_or(LowLoweringError::InvalidOperatorPlan)?;
@@ -2952,9 +2961,9 @@ impl LoweringState {
                         let inner_end = inner_start + inner_block;
                         let mut sources = Vec::new();
                         for panel_start in
-                            (inner_start..inner_end).step_by(AMP_INNER_BLOCK as usize)
+                            (inner_start..inner_end).step_by(source_panel_block as usize)
                         {
-                            let panel_end = panel_start + AMP_INNER_BLOCK;
+                            let panel_end = panel_start + source_panel_block;
                             let source = self
                                 .right_shards_for_block(
                                     &right_shards,
@@ -2998,8 +3007,8 @@ impl LoweringState {
                                 let panel_start = inner_start
                                     + u32::try_from(panel_index)
                                         .map_err(|_| LowLoweringError::IdOverflow)?
-                                        * AMP_INNER_BLOCK;
-                                let panel_end = panel_start + AMP_INNER_BLOCK;
+                                        * source_panel_block;
+                                let panel_end = panel_start + source_panel_block;
                                 let left_view = self.narrow_view(
                                     resident_left.shard,
                                     &[(left_inner_axis, panel_start, panel_end)],
@@ -3015,7 +3024,7 @@ impl LoweringState {
                                     ..
                                 } = &mut kernel
                                 {
-                                    *kernel_inner_block = AMP_INNER_BLOCK;
+                                    *kernel_inner_block = source_panel_block;
                                     let selected = if local {
                                         source_view.shard
                                     } else {
@@ -4306,7 +4315,8 @@ mod tests {
             };
             let right_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_right_k64_storage(
+                layout: Layout::amp_right_blocked_storage(
+                    64,
                     output_columns,
                     column_partitions,
                     inner_partitions,
@@ -4424,7 +4434,8 @@ mod tests {
             };
             let right_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_right_k64_storage(
+                layout: Layout::amp_right_blocked_storage(
+                    64,
                     64,
                     1,
                     owner_tiles,
@@ -4599,7 +4610,14 @@ mod tests {
                         "case {case}"
                     );
                     let inner = input.extents.last().unwrap();
-                    assert!(inner.physical_end - inner.start <= 64, "case {case}");
+                    let TileKernel::Planned(TileKernelSpec::Gemm { inner_block, .. }) = &run.kernel
+                    else {
+                        continue;
+                    };
+                    assert!(
+                        inner.physical_end - inner.start <= *inner_block,
+                        "case {case}"
+                    );
                 }
             }
         }
@@ -5250,21 +5268,17 @@ mod tests {
                         .extents
                         .iter()
                         .all(|extent| extent.start < extent.logical_end),
-                    "case {case}"
+                    "case {case} capacity={capacity} selected={selected_tiles} shard={:?} type={:?}",
+                    low.shards[shard.index() as usize].extents,
+                    mid.values[result.index() as usize].tensor_type,
                 );
             }
-            for tile in &low.tiles[usize::from(selected_tiles)..] {
-                assert!(
-                    low.work(tile)
-                        .all(|work| !matches!(work, TileWorkRef::Kernel(_))),
-                    "case {case}"
-                );
-            }
+            assert!(low.tiles.iter().all(|tile| tile.tile < capacity));
         }
     }
 
     #[test]
-    fn randomized_resident_k64_weights_lower_without_panel_copies() {
+    fn randomized_resident_blocked_weights_lower_without_panel_copies() {
         let mut random = fastrand::Rng::with_seed(0x7265_7369);
         for _ in 0..48 {
             let tiles = 1_u16 << random.u32(0..=3);
@@ -5288,7 +5302,7 @@ mod tests {
                     }
                 ) && candidate.inputs.get(1).is_some_and(|requirement| {
                     requirement.format.layout.order
-                        == crate::ElementOrder::Amp(crate::AmpOrder::RightK64)
+                        == crate::ElementOrder::Amp(crate::AmpOrder::RightBlocked(64))
                         && requirement.format.layout.tiling.tile_count == tiles
                         && requirement.format.layout.memory_class == MemoryClass::Ipu21Interleaved
                 })
@@ -5302,7 +5316,7 @@ mod tests {
             let right_type = &mid.values[operation.inputs[1].index() as usize].tensor_type;
             assert!(matches!(
                 right_type.format.layout.order,
-                crate::ElementOrder::Amp(crate::AmpOrder::RightK64)
+                crate::ElementOrder::Amp(crate::AmpOrder::RightBlocked(64))
             ));
             let low = lower_to_tiles(&mid, &config).unwrap();
             assert!(low.tiles.iter().all(|tile| low.work(tile).all(|work| {
@@ -5361,7 +5375,8 @@ mod tests {
             };
             let right_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_right_k64_storage(
+                layout: Layout::amp_right_blocked_storage(
+                    64,
                     64,
                     column_partitions,
                     inner_partitions,

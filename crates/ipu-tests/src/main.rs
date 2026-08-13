@@ -938,7 +938,7 @@ fn run_attention_smoke(
         let head = tile % heads;
         let partition = tile / heads;
         let (local_row, column) = amp_matrix_coordinates(
-            AmpOrder::RightK64,
+            AmpOrder::RightBlocked(64),
             Precision::F16,
             64,
             padded_value_dimension,

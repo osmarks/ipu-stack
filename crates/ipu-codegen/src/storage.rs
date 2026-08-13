@@ -1,7 +1,7 @@
 //! Conversion from logical shard views to physical byte ranges.
 
 use crate::low::{LowShard, ShardView};
-use crate::mid::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, ElementOrder, Precision};
+use crate::mid::{AMP_COLUMN_MICRO, AmpOrder, ElementOrder, Precision};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteSpan {
@@ -55,7 +55,7 @@ pub fn view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageResult<Vec<
             bytes: shard_storage_bytes(shard)?,
         }]);
     }
-    if let Some(spans) = right_k64_panel_spans(shard, view)? {
+    if let Some(spans) = right_blocked_panel_spans(shard, view)? {
         return Ok(spans);
     }
     let widths = shard
@@ -259,7 +259,7 @@ fn amp_matrix_index(
                 .and_then(|base| base.checked_add(row * inner + column % inner))
                 .ok_or(StorageError::Overflow)
         }
-        AmpOrder::Right | AmpOrder::RightK64 => {
+        AmpOrder::Right | AmpOrder::RightBlocked(_) => {
             let inner = amp_micro_dimension(precision);
             if !rows.is_multiple_of(inner) || !columns.is_multiple_of(COLUMN_MICRO) {
                 return Err(StorageError::AmpBlock { role });
@@ -267,17 +267,21 @@ fn amp_matrix_index(
             let logical_pair = column % COLUMN_MICRO / 2;
             let load_pair = logical_pair % 4 * 2 + logical_pair / 4;
             let load_channel = load_pair * 2 + column % 2;
-            let inner_group = row % AMP_INNER_BLOCK / inner;
-            let panel = if role == AmpOrder::RightK64 {
-                if !rows.is_multiple_of(AMP_INNER_BLOCK) {
+            let blocked_inner = match role {
+                AmpOrder::RightBlocked(block) => Some(u32::from(block)),
+                _ => None,
+            };
+            let inner_group = row % blocked_inner.unwrap_or(rows) / inner;
+            let panel = if let Some(inner_block) = blocked_inner {
+                if !rows.is_multiple_of(inner_block) || !inner_block.is_multiple_of(inner) {
                     return Err(StorageError::AmpBlock { role });
                 }
-                (row / AMP_INNER_BLOCK)
+                (row / inner_block)
                     .checked_mul(columns / COLUMN_MICRO)
-                    .and_then(|block| block.checked_mul(AMP_INNER_BLOCK / inner))
+                    .and_then(|block| block.checked_mul(inner_block / inner))
                     .and_then(|base| {
                         base.checked_add(
-                            column / COLUMN_MICRO * (AMP_INNER_BLOCK / inner) + inner_group,
+                            column / COLUMN_MICRO * (inner_block / inner) + inner_group,
                         )
                     })
             } else {
@@ -309,15 +313,19 @@ fn amp_matrix_index(
     }
 }
 
-fn right_k64_panel_spans(
+fn right_blocked_panel_spans(
     shard: &LowShard,
     view: &ShardView,
 ) -> StorageResult<Option<Vec<ByteSpan>>> {
-    if shard.extents.len() < 2
-        || shard.tensor_type.format.layout.order != ElementOrder::Amp(AmpOrder::RightK64)
-    {
+    if shard.extents.len() < 2 {
         return Ok(None);
     }
+    let ElementOrder::Amp(AmpOrder::RightBlocked(inner_block)) =
+        shard.tensor_type.format.layout.order
+    else {
+        return Ok(None);
+    };
+    let inner_block = u32::from(inner_block);
     let rank = shard.extents.len();
     if shard.extents[..rank - 2] != view.extents[..rank - 2] {
         return Ok(None);
@@ -341,25 +349,25 @@ fn right_k64_panel_spans(
     else {
         return Ok(None);
     };
-    if rows.is_multiple_of(AMP_INNER_BLOCK)
+    if rows.is_multiple_of(inner_block)
         && columns.is_multiple_of(output_column_block)
-        && inner_width == AMP_INNER_BLOCK
+        && inner_width == inner_block
         && column_width.is_multiple_of(output_column_block)
-        && inner_start.is_multiple_of(AMP_INNER_BLOCK)
+        && inner_start.is_multiple_of(inner_block)
         && column_start.is_multiple_of(output_column_block)
     {
         let panel = inner_start
-            .checked_div(AMP_INNER_BLOCK)
+            .checked_div(inner_block)
             .and_then(|inner| inner.checked_mul(columns / output_column_block))
             .and_then(|panel| panel.checked_add(column_start / output_column_block))
             .ok_or(StorageError::Overflow)?;
-        let panel_bytes = AMP_INNER_BLOCK
+        let panel_bytes = inner_block
             .checked_mul(output_column_block)
             .and_then(|elements| {
                 elements.checked_mul(shard.tensor_type.format.precision.bytes() as u32)
             })
             .ok_or(StorageError::Overflow)?;
-        let bytes = AMP_INNER_BLOCK
+        let bytes = inner_block
             .checked_mul(column_width)
             .and_then(|elements| {
                 elements.checked_mul(shard.tensor_type.format.precision.bytes() as u32)
@@ -533,22 +541,22 @@ pub fn amp_matrix_coordinates(
             amp_matrix_coordinates(AmpOrder::Right, precision, columns, rows, linear)
                 .map(|(column, row)| (row, column))
         }
-        AmpOrder::RightK64 => {
-            const INNER_BLOCK: u32 = AMP_INNER_BLOCK;
+        AmpOrder::RightBlocked(inner_block) => {
+            let block_size = u32::from(inner_block);
             let inner = amp_micro_dimension(precision);
-            if !rows.is_multiple_of(INNER_BLOCK)
+            if !rows.is_multiple_of(block_size)
                 || !columns.is_multiple_of(COLUMN_MICRO)
-                || !INNER_BLOCK.is_multiple_of(inner)
+                || !block_size.is_multiple_of(inner)
             {
                 return Err(StorageError::AmpBlock { role });
             }
             let panel_elements = inner * COLUMN_MICRO;
             let panel = linear / panel_elements;
             let offset = linear % panel_elements;
-            let inner_groups_per_block = INNER_BLOCK / inner;
+            let inner_groups_per_block = block_size / inner;
             let column_groups = columns / COLUMN_MICRO;
             let panels_per_inner_block = column_groups * inner_groups_per_block;
-            let inner_block = panel / panels_per_inner_block;
+            let block_index = panel / panels_per_inner_block;
             let within_block = panel % panels_per_inner_block;
             let column_group = within_block / inner_groups_per_block;
             let inner_group = within_block % inner_groups_per_block;
@@ -556,7 +564,7 @@ pub fn amp_matrix_coordinates(
             let load_pair = load_channel / 2;
             let logical_pair = (load_pair % 2) * 4 + load_pair / 2;
             Ok((
-                inner_block * INNER_BLOCK + inner_group * inner + offset % inner,
+                block_index * block_size + inner_group * inner + offset % inner,
                 column_group * COLUMN_MICRO + logical_pair * 2 + load_channel % 2,
             ))
         }
@@ -592,7 +600,7 @@ fn amp_micro_dimension(precision: Precision) -> u32 {
 mod tests {
     use super::*;
     use crate::low::{LowShardId, ShardDefinition, ShardExtent};
-    use crate::mid::{Layout, MemoryClass, Precision, TensorType};
+    use crate::mid::{AMP_INNER_BLOCK, Layout, MemoryClass, Precision, TensorType};
 
     fn shard(layout: Layout, dimensions: &[u32]) -> LowShard {
         LowShard {
@@ -625,7 +633,14 @@ mod tests {
                 (Layout::amp_left(64, 1), rows, 64),
                 (Layout::amp_right(64, 1), 32, 64),
                 (
-                    Layout::amp_right_k64_storage(64, 1, 1, 1, MemoryClass::Ipu21Interleaved),
+                    Layout::amp_right_blocked_storage(
+                        64,
+                        64,
+                        1,
+                        1,
+                        1,
+                        MemoryClass::Ipu21Interleaved,
+                    ),
                     64,
                     64,
                 ),
@@ -690,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_k64_right_panels_are_single_contiguous_spans() {
+    fn randomized_blocked_right_panels_are_single_contiguous_spans() {
         let mut random = fastrand::Rng::with_seed(0x6b36_3472);
         for _ in 0..128 {
             let output_column_block = [32, 64, 128][random.usize(0..3)];
@@ -700,7 +715,8 @@ mod tests {
             let columns = column_blocks * output_column_block;
             let batches = random.u32(1..=4);
             let shard = shard(
-                Layout::amp_right_k64_storage(
+                Layout::amp_right_blocked_storage(
+                    64,
                     output_column_block,
                     1,
                     1,
@@ -758,7 +774,7 @@ mod tests {
         for _ in 0..128 {
             let panels = random.u32(1..=8);
             let selected = random.u32(0..panels);
-            for role in [AmpOrder::TransposedRight, AmpOrder::RightK64] {
+            for role in [AmpOrder::TransposedRight, AmpOrder::RightBlocked(64)] {
                 let layout = Layout {
                     order: ElementOrder::Amp(role),
                     tiling: crate::TensorTiling::replicated(1),

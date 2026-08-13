@@ -178,7 +178,7 @@ impl KernelBuildPlan {
         for ((precision, weights, inner_block, output_columns), values) in rows {
             let values = values.into_iter().collect::<Vec<_>>();
             let (source, prefix) = match precision {
-                Precision::F16 => ("gemm_f16_64_amp.S", "f16"),
+                Precision::F16 => ("gemm_f16_amp.S", "f16"),
                 Precision::F32 => ("gemm_f32_64_amp.S", "f32"),
                 Precision::F8F143 { .. } => continue,
             };
@@ -287,7 +287,7 @@ impl KernelBuildPlan {
             let order_index = match order {
                 AmpOrder::Left => 0,
                 AmpOrder::TransposedRight => 1,
-                AmpOrder::RightK64 => 2,
+                AmpOrder::RightBlocked(_) => 2,
                 _ => return Err(KernelAbiError::RequirementMismatch),
             };
             let suffix = format!(
@@ -729,7 +729,7 @@ fn collect_kernels(
                 } = kernel
                     && matches!(
                         order,
-                        AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightK64
+                        AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightBlocked(_)
                     )
                 {
                     rearrangements.insert(rearrangement_specialization(
@@ -864,7 +864,7 @@ fn rearrangement_specialization(
 ) -> (AmpOrder, u32, u32, u32, u32) {
     if physical_rows == AMP_INNER_BLOCK
         && logical_rows < physical_rows
-        && matches!(order, AmpOrder::TransposedRight | AmpOrder::RightK64)
+        && matches!(order, AmpOrder::TransposedRight | AmpOrder::RightBlocked(_))
     {
         (order, 0, physical_rows, 0, physical_columns)
     } else {
@@ -940,7 +940,7 @@ fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbi
                 }) => match order {
                     AmpOrder::Left => Ok(0),
                     AmpOrder::TransposedRight => Ok(1),
-                    AmpOrder::RightK64 => Ok(2),
+                    AmpOrder::RightBlocked(_) => Ok(2),
                     _ => Err(KernelAbiError::RequirementMismatch),
                 },
                 _ => Err(KernelAbiError::RequirementMismatch),
@@ -1094,7 +1094,7 @@ pub fn tile_kernel_abi(
                 && matches!(
                     to.order,
                     ElementOrder::Amp(
-                        AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightK64
+                        AmpOrder::Left | AmpOrder::TransposedRight | AmpOrder::RightBlocked(_)
                     )
                 ) =>
         {

@@ -598,7 +598,10 @@ pub(crate) fn gemm_requires_panel_repacking(
     output: &TensorType,
 ) -> bool {
     gemm_uses_panel_buffer(dispatch, right, output)
-        && right.format.layout.order != ElementOrder::Amp(AmpOrder::RightK64)
+        && !matches!(
+            right.format.layout.order,
+            ElementOrder::Amp(AmpOrder::RightBlocked(_))
+        )
 }
 
 pub(crate) fn gemm_exchange_bytes_per_cycle(inputs: &[TensorType]) -> u64 {
