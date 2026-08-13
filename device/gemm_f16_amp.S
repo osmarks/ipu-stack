@@ -297,15 +297,6 @@
 	add $m3, $m9, 32
 	add $m8, $m5, -1
 	bri .Lgemm_f16_load_mode_\@
-\retained_inner_name:
-	.if (\rows) < 6
-	brz $m5, .Lgemm_f16_no_rows_\@
-	.endif
-	add $m2, $m2, (\rows) * INNER_MICRO_DIMENSION * GEMM_INPUT_ELEMENT_BYTES
-	// Every inner-group invocation after the first accumulates into the
-	// retained output, irrespective of whether this call initializes the
-	// complete GEMM result. Skip the shared mode load and branch.
-	bri .Lf16_accumulate_\@
 .Lgemm_f16_load_mode_\@:
 	ld32 $m7, $mvertex_base, $m15, 5
 	brz $m7, .Lf16_accumulate_\@
@@ -371,7 +362,14 @@
 	}
 	st64pace $a6:7, $m10:11+=, $mzero, 0b00
 	exitz $mzero
-
+\retained_inner_name:
+	.if (\rows) < 6
+	brz $m5, .Lgemm_f16_no_rows_\@
+	.endif
+	// Every inner-group invocation after the first accumulates into the
+	// retained output. Place that entry immediately before the accumulate
+	// body so dispatch does not pay an additional branch for every panel.
+	add $m2, $m2, (\rows) * INNER_MICRO_DIMENSION * GEMM_INPUT_ELEMENT_BYTES
 .Lf16_accumulate_\@:
 	setzi $a6, CLEAR_AACC
 	uput $FP_CLR, $a6
@@ -416,7 +414,10 @@
 		ld2x64pace $a0:1, $a2:3, $m10:11+=, $mzero, 0b0000
 		GEMM_AMP $a4:5, $a0:1, $a2:3, GEMM_TAMP_P1
 	}
-	rpt $m8, 3
+	{
+		rpt $m8, 3
+		fnop
+	}
 	{
 		ld2xst64pace $a0:3, $a6:7, $m10:11+=, $mzero, 0b000000
 		GEMM_AMP $a6:7, $a0:1, $a2:3, GEMM_TAMP_P2
