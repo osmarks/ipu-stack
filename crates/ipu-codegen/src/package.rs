@@ -1,3 +1,4 @@
+use crate::cost::{Ipu21CostModel, KernelCalibration};
 use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
 use crate::low::{LowProgram, LowValue};
@@ -5,7 +6,7 @@ use crate::memory::{
     MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE,
     RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
 };
-use crate::mid::{Ipu21CostModel, MidGraph, MidOperationKind, PipelineConfig, Precision};
+use crate::mid::{MidGraph, MidOperationKind, PipelineConfig, Precision};
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, KernelBuildPlan, PRNG_SEED_SYMBOL,
     PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL, TileProgram,
@@ -14,7 +15,7 @@ use crate::{
     shard_storage_bytes,
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
-use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
+use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link, source_tree_digest};
 use ipu_exchange::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
 use ipu_package::{
     Application, Binding, DEBUG_ALL_TILES, DebugRegion, DebugSymbol, EntryPoint,
@@ -81,6 +82,9 @@ pub struct PackageConfig {
     pub runtime_source: PathBuf,
     pub kernel_source_directory: PathBuf,
     pub pipeline: PipelineConfig,
+    /// Hardware measurements for exact tile-local kernel specializations.
+    /// Missing entries fall back to the analytical target model.
+    pub kernel_calibration: Option<PathBuf>,
 }
 
 /// Data embedded in one logical tile image for a finalized tile-program package.
@@ -457,9 +461,44 @@ fn build_package_artifacts(
     if diagnostic_checkpoints {
         planning.profiling.enabled = false;
     }
-    let mid = build_phase("lower_mid", || {
-        Ok(lower(graph, &planning, &Ipu21CostModel)?)
-    })?;
+    let cost_model = if let Some(path) = &config.kernel_calibration {
+        let database: ipu_profile::CalibrationDatabase =
+            serde_json::from_slice(&fs::read(path).map_err(|error| {
+                invalid(format!(
+                    "read kernel calibration {}: {error}",
+                    path.display()
+                ))
+            })?)
+            .map_err(|error| {
+                invalid(format!(
+                    "parse kernel calibration {}: {error}",
+                    path.display()
+                ))
+            })?;
+        let source_id = source_tree_digest(&config.kernel_source_directory)?;
+        if database.build_id != source_id {
+            tracing::warn!(
+                path = %path.display(),
+                measured_build_id = database.build_id,
+                current_build_id = source_id,
+                "ignoring stale kernel cycle calibration"
+            );
+            Ipu21CostModel.clone()
+        } else {
+            let calibration = KernelCalibration::from_database(&database)
+                .map_err(|error| invalid(format!("invalid kernel calibration: {error}")))?;
+            tracing::info!(
+                path = %path.display(),
+                build_id = database.build_id,
+                measurements = database.measurements.len(),
+                "loaded kernel cycle calibration"
+            );
+            Ipu21CostModel::calibrated(calibration)
+        }
+    } else {
+        Ipu21CostModel.clone()
+    };
+    let mid = build_phase("lower_mid", || Ok(lower(graph, &planning, &cost_model)?))?;
     let low = build_phase("lower_tiles", || Ok(lower_to_tiles(&mid, &planning)?))?;
     tracing::info!(
         logical_shards = low.shards.len(),
@@ -1594,9 +1633,9 @@ fn profile_work_can_merge(
     ) || matches!(
         (previous, current),
         (
-            crate::TileWorkRef::LocalCopy(_),
-            crate::TileWorkRef::LocalCopy(_)
-        )
+            crate::TileWorkRef::LocalCopy(previous),
+            crate::TileWorkRef::LocalCopy(current)
+        ) if previous.bytes == current.bytes && previous.pattern == current.pattern
     )
 }
 

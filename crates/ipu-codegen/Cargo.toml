@@ -9,7 +9,9 @@ ipu-exchange = { path = "../ipu-exchange" }
 ipu-driver = { path = "../ipu-driver" }
 ipu-elf = { path = "../ipu-elf" }
 ipu-package = { path = "../ipu-package" }
+ipu-profile = { path = "../ipu-profile" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

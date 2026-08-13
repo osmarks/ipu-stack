@@ -25,6 +25,33 @@ pub const R_COLOSSUS_16_S4: u32 = 15;
 pub const R_COLOSSUS_16_S5: u32 = 16;
 pub const R_COLOSSUS_21: u32 = 17;
 
+pub fn source_tree_digest(root: impl AsRef<Path>) -> Result<String, ElfError> {
+    fn visit(root: &Path, directory: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                visit(root, &path, paths)?;
+            } else if path.is_file() {
+                paths.push(path.strip_prefix(root).unwrap_or(&path).to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    let root = root.as_ref();
+    let mut paths = Vec::new();
+    visit(root, root, &mut paths)?;
+    paths.sort();
+    let mut digest = Sha256::new();
+    for relative in paths {
+        digest.update(relative.as_os_str().as_encoded_bytes());
+        digest.update([0]);
+        digest.update(fs::read(root.join(&relative))?);
+        digest.update([0]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ElfError {
     #[error("I/O error: {0}")]
