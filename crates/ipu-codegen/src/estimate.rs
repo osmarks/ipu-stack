@@ -248,19 +248,40 @@ pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorTy
         shape: output.shape.clone(),
         format: crate::mid::TensorFormat {
             precision: output.format.precision,
-            layout: match orientation {
-                crate::GemmOrientation::Normal => Layout::amp_output_grid(
+            layout: match (orientation, output.format.layout.order) {
+                (
+                    crate::GemmOrientation::Normal,
+                    crate::ElementOrder::Amp(crate::AmpOrder::Left),
+                ) => Layout::amp_left_result_grid(
                     *output_column_block,
                     row_partitions.saturating_mul(*column_partitions),
                     *row_partitions,
                     *column_partitions,
                     crate::mid::GridOrder::ColumnsFast,
                 ),
-                crate::GemmOrientation::Swapped => Layout::amp_transposed_output_grid(
+                (
+                    crate::GemmOrientation::Swapped,
+                    crate::ElementOrder::Amp(crate::AmpOrder::TransposedLeft),
+                ) => Layout::amp_transposed_left_result_grid(
                     *output_column_block,
                     row_partitions.saturating_mul(*column_partitions),
                     *row_partitions,
                     *column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
+                ),
+                (crate::GemmOrientation::Normal, _) => Layout::amp_output_grid(
+                    *output_column_block,
+                    row_partitions.saturating_mul(*column_partitions),
+                    *row_partitions,
+                    *column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
+                ),
+                (crate::GemmOrientation::Swapped, _) => Layout::amp_transposed_output_grid(
+                    *output_column_block,
+                    row_partitions.saturating_mul(*column_partitions),
+                    *row_partitions,
+                    *column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
                 ),
             },
         },

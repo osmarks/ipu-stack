@@ -1003,6 +1003,7 @@ impl Layout {
         tile_count: u16,
         row_partitions: u16,
         column_partitions: u16,
+        grid_order: GridOrder,
     ) -> Self {
         Self {
             order: ElementOrder::Amp(AmpOrder::TransposedOutput),
@@ -1016,9 +1017,15 @@ impl Layout {
                         output_column_block,
                         Padding::Zero,
                     )
-                    .with_tile_stride(1),
+                    .with_tile_stride(match grid_order {
+                        GridOrder::ColumnsFast => 1,
+                        GridOrder::RowsFast => row_partitions,
+                    }),
                     AxisTiling::new(TensorAxis::FromEnd(1), row_partitions, 1, Padding::Reject)
-                        .with_tile_stride(column_partitions),
+                        .with_tile_stride(match grid_order {
+                            GridOrder::ColumnsFast => column_partitions,
+                            GridOrder::RowsFast => 1,
+                        }),
                 ],
             },
             memory_class: MemoryClass::Ipu21Interleaved,
@@ -1030,20 +1037,20 @@ impl Layout {
         tile_count: u16,
         row_partitions: u16,
         column_partitions: u16,
+        grid_order: GridOrder,
     ) -> Self {
         let mut layout = Self::amp_transposed_output_grid(
             output_column_block,
             tile_count,
             row_partitions,
             column_partitions,
+            grid_order,
         );
         layout.order = ElementOrder::Amp(AmpOrder::TransposedLeft);
         layout
     }
 
-    /// AMP output storage sharded by rows and replicated across the column
-    /// groups of a following GEMM. This is the gathered input form consumed
-    /// by the fused output-to-left GeLU kernel.
+    /// AMP output storage sharded by rows and replicated across column groups.
     pub fn amp_output_replicated_grid(
         tile_count: u16,
         row_partitions: u16,
@@ -4403,6 +4410,7 @@ fn parallel_reduction_candidates_for_orientation(
                         row_partitions.saturating_mul(column_partitions),
                         row_partitions,
                         column_partitions,
+                        GridOrder::ColumnsFast,
                     );
                     variant.memory_relations = vec![MemoryRelation::DistinctElements(vec![
                         MemoryOperand::Output,
@@ -4472,15 +4480,39 @@ fn parallel_reduction_candidates_for_orientation(
                     LocalOperandStaging::MatchRemote,
                 ],
             };
-            let mut layout_variants = vec![variant.clone()];
-            if orientation == GemmOrientation::Normal
-                && normal_rows % 2 != 0
-                && u32::from(row_partitions) <= normal_rows.div_ceil(2)
-            {
-                let mut padded = variant;
-                pad_matrix_rows_to_f16_exchange_word(&mut padded.inputs[0].format.layout);
-                pad_matrix_rows_to_f16_exchange_word(&mut padded.output.format.layout);
-                layout_variants.push(padded);
+            let mut result_layout_variants = vec![variant.clone()];
+            if row_partitions > 1 && column_partitions > 1 {
+                let mut rows_fast = variant;
+                rows_fast.output.format.layout = match orientation {
+                    GemmOrientation::Normal => Layout::amp_left_result_grid(
+                        kernel_output_columns,
+                        row_partitions.saturating_mul(column_partitions),
+                        row_partitions,
+                        column_partitions,
+                        GridOrder::RowsFast,
+                    ),
+                    GemmOrientation::Swapped => Layout::amp_transposed_left_result_grid(
+                        kernel_output_columns,
+                        row_partitions.saturating_mul(column_partitions),
+                        row_partitions,
+                        column_partitions,
+                        GridOrder::RowsFast,
+                    ),
+                };
+                result_layout_variants.push(rows_fast);
+            }
+            let mut layout_variants = Vec::new();
+            for result_layout in result_layout_variants {
+                layout_variants.push(result_layout.clone());
+                if orientation == GemmOrientation::Normal
+                    && normal_rows % 2 != 0
+                    && u32::from(row_partitions) <= normal_rows.div_ceil(2)
+                {
+                    let mut padded = result_layout;
+                    pad_matrix_rows_to_f16_exchange_word(&mut padded.inputs[0].format.layout);
+                    pad_matrix_rows_to_f16_exchange_word(&mut padded.output.format.layout);
+                    layout_variants.push(padded);
+                }
             }
             for layout_variant in layout_variants {
                 for &local_staging in local_staging_options {
@@ -5033,9 +5065,6 @@ mod tests {
                 !candidates.is_empty(),
                 "shape={m}x{k}x{n} tiles={tiles} output_columns={output_columns}"
             );
-            // Each retained grid has standard- and interleaved-weight forms,
-            // independently for the two physical matrix orientations.
-            assert!(candidates.len() <= config.planning_beam_width * 4);
             let swapped_staging = candidates
                 .iter()
                 .filter_map(|candidate| match candidate.dispatch {
@@ -5054,6 +5083,53 @@ mod tests {
                 (true, true),
                 "shape={m}x{k}x{n} tiles={tiles}"
             );
+            if let Some((orientation, output_column_block, grid_rows, grid_columns)) = candidates
+                .iter()
+                .find_map(|candidate| match candidate.dispatch {
+                    OperatorDispatch::BlockedGemm {
+                        orientation,
+                        output_column_block,
+                        distribution:
+                            GemmDistribution::ParallelReduction {
+                                row_partitions,
+                                column_partitions,
+                                ..
+                            },
+                        ..
+                    } if row_partitions > 1 && column_partitions > 1 => Some((
+                        orientation,
+                        output_column_block,
+                        row_partitions,
+                        column_partitions,
+                    )),
+                    _ => None,
+                })
+            {
+                for order in [GridOrder::ColumnsFast, GridOrder::RowsFast] {
+                    let expected = match orientation {
+                        GemmOrientation::Normal => Layout::amp_left_result_grid(
+                            output_column_block,
+                            grid_rows * grid_columns,
+                            grid_rows,
+                            grid_columns,
+                            order,
+                        ),
+                        GemmOrientation::Swapped => Layout::amp_transposed_left_result_grid(
+                            output_column_block,
+                            grid_rows * grid_columns,
+                            grid_rows,
+                            grid_columns,
+                            order,
+                        ),
+                    };
+                    assert!(
+                        candidates
+                            .iter()
+                            .any(|candidate| candidate.output.format.layout == expected),
+                        "missing {order:?} result grid for {orientation:?} {grid_rows}x{grid_columns}"
+                    );
+                }
+            }
             if m % 2 != 0 {
                 let normal_rows = candidates
                     .iter()

@@ -605,6 +605,14 @@ impl CostModel for Ipu21CostModel {
                         let (rounds, reduction_additions) =
                             reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
                         let partial_bytes = maximum_shard_bytes(&compute_output);
+                        let result_redistribution =
+                            if compute_output.format.layout != output.format.layout {
+                                maximum_shard_bytes(output)
+                                    .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+                                    .saturating_add(IPU21_TARGET_COSTS.exchange_phase_cycles)
+                            } else {
+                                0
+                            };
                         weight_bytes
                             .saturating_add(activation_bytes)
                             .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
@@ -627,6 +635,7 @@ impl CostModel for Ipu21CostModel {
                                         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
                                 ),
                             )
+                            .saturating_add(result_redistribution)
                     }
                     _ => exchange,
                 };

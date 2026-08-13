@@ -2871,6 +2871,7 @@ impl LoweringState {
                     partial_tiles,
                     row_partitions,
                     column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
                 )
             }
             (crate::GemmOrientation::Normal, _) => Layout::amp_output_grid(
@@ -2885,6 +2886,7 @@ impl LoweringState {
                 partial_tiles,
                 row_partitions,
                 column_partitions,
+                crate::mid::GridOrder::ColumnsFast,
             ),
         };
 
