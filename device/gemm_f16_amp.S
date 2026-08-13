@@ -217,35 +217,25 @@
 	put $CR, $m8
 	add $m4, $m4, GEMM_RIGHT_BYTE_OFFSET
 	put $CCCSLOAD, $m4
-	setzi $m8, \rows
-	mul $m4, $m8, COLUMN_MICRO_DIMENSION * 2
-	add $m5, $m2, 0
-	add $m9, $m3, 0
 	zero $m6
 	setzi $m0, \worker
 .Lcolumn_group_\@:
 	zero $m7
 .Linner_group_\@:
-	// Publish the next worker invocation only after the preceding workers have
-	// stopped reading the shared vertex. The following weight loads cover the
-	// state-write and supervisor-pipeline latency.
+	// Workers retain their activation and output state between invocations.
+	// Synchronize before replacing the shared AMP coefficients.
 	sync SYNC_COMPUTE_SET
-	st32 $m5, $m11, $m15, 0
-	st32 $m9, $m11, $m15, 1
 	LOAD_AMP16_WEIGHTS
 	runall $m0, $m11, 0
 	// Arithmetic below is independent of worker state and overlaps the worker
 	// critical path. The next loop-head sync protects the following state and
 	// weight updates.
 	setzi $m0, \retained_inner_worker
-	add $m9, $m9, $m4
 	add $m7, $m7, 1
 	setzi $m8, INNER_GROUPS
 	cmpult $m8, $m7, $m8
 	brnz $m8, .Linner_group_\@
 	setzi $m0, \retained_output_worker
-	add $m9, $m3, 0
-	add $m5, $m5, $m4
 	add $m6, $m6, 1
 	setzi $m8, OUTPUT_COLUMNS / COLUMN_MICRO_DIMENSION
 	cmpult $m8, $m6, $m8
@@ -274,7 +264,6 @@
 \name:
 	PARTITION_ROWS \rows
 	shl $m6, $m6, 5
-\retained_output_name:
 	.if (\rows) < 6
 	brz $m5, .Lgemm_f16_no_rows_\@
 	.endif
@@ -285,6 +274,14 @@
 	add $m3, $m9, 32
 	add $m8, $m5, -1
 	bri .Lgemm_f16_load_mode_\@
+\retained_output_name:
+	.if (\rows) < 6
+	brz $m5, .Lgemm_f16_no_rows_\@
+	.endif
+	add $m9, $m9, (\rows) * COLUMN_MICRO_DIMENSION * 2
+	add $m2, $m1, $m6
+	add $m3, $m9, 32
+	add $m8, $m5, -1
 .Lgemm_f16_load_mode_\@:
 	ld32 $m7, $mvertex_base, $m15, 5
 	brz $m7, .Lf16_accumulate_\@
