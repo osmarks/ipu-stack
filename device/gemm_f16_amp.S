@@ -198,7 +198,6 @@
 	st32 $m3, $m11, $m15, 1
 	setzi $m8, \initial
 	st32 $m8, $m11, $m15, 5
-	st32 $m8, $m11, $m15, 7
 	get $m8, $FP_ICTL
 	st32 $m8, $m11, $m15, 6
 #if GEMM_STOCHASTIC_ROUNDING
@@ -223,6 +222,7 @@
 	add $m5, $m2, 0
 	add $m9, $m3, 0
 	zero $m6
+	setzi $m0, \worker
 .Lcolumn_group_\@:
 	zero $m7
 .Linner_group_\@:
@@ -232,30 +232,18 @@
 	sync SYNC_COMPUTE_SET
 	st32 $m5, $m11, $m15, 0
 	st32 $m9, $m11, $m15, 1
-	zero $m0
-	ld32 $m8, $m11, $m15, 7
-	brz $m8, .Lstore_initial_\@
-	brnz $m7, .Lstore_initial_\@
-	setzi $m0, 1
-.Lstore_initial_\@:
-	st32 $m0, $m11, $m15, 5
-	setzi $m0, \worker
-	or $m8, $m6, $m7
-	brz $m8, .Lrun_workers_\@
-	setzi $m0, \retained_output_worker
-	brz $m7, .Lrun_workers_\@
-	setzi $m0, \retained_inner_worker
-.Lrun_workers_\@:
 	LOAD_AMP16_WEIGHTS
 	runall $m0, $m11, 0
 	// Arithmetic below is independent of worker state and overlaps the worker
 	// critical path. The next loop-head sync protects the following state and
 	// weight updates.
+	setzi $m0, \retained_inner_worker
 	add $m9, $m9, $m4
 	add $m7, $m7, 1
 	setzi $m8, INNER_GROUPS
 	cmpult $m8, $m7, $m8
 	brnz $m8, .Linner_group_\@
+	setzi $m0, \retained_output_worker
 	add $m9, $m3, 0
 	add $m5, $m5, $m4
 	add $m6, $m6, 1
