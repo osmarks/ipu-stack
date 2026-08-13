@@ -4403,14 +4403,38 @@ fn parallel_reduction_candidates_for_orientation(
                     LocalOperandStaging::MatchRemote,
                 ],
             };
-            for &local_staging in local_staging_options {
-                let mut staged = variant.clone();
-                staged.inputs[physical_right_index].local_staging = local_staging;
-                variants.push(staged);
+            let mut layout_variants = vec![variant.clone()];
+            if orientation == GemmOrientation::Normal
+                && normal_rows % 2 != 0
+                && u32::from(row_partitions) <= normal_rows.div_ceil(2)
+            {
+                let mut padded = variant;
+                pad_matrix_rows_to_f16_exchange_word(&mut padded.inputs[0].format.layout);
+                pad_matrix_rows_to_f16_exchange_word(&mut padded.output.format.layout);
+                layout_variants.push(padded);
+            }
+            for layout_variant in layout_variants {
+                for &local_staging in local_staging_options {
+                    let mut staged = layout_variant.clone();
+                    staged.inputs[physical_right_index].local_staging = local_staging;
+                    variants.push(staged);
+                }
             }
         }
     }
     variants
+}
+
+fn pad_matrix_rows_to_f16_exchange_word(layout: &mut Layout) {
+    if let Some(rows) = layout
+        .tiling
+        .axes
+        .iter_mut()
+        .find(|axis| axis.axis == TensorAxis::FromEnd(2))
+    {
+        rows.block_size = rows.block_size.div_ceil(2) * 2;
+        rows.padding = Padding::Zero;
+    }
 }
 
 fn resolved_output_aliasing(
@@ -4961,6 +4985,30 @@ mod tests {
                 (true, true),
                 "shape={m}x{k}x{n} tiles={tiles}"
             );
+            if m % 2 != 0 {
+                let normal_rows = candidates
+                    .iter()
+                    .filter(|candidate| {
+                        matches!(
+                            candidate.dispatch,
+                            OperatorDispatch::BlockedGemm {
+                                orientation: GemmOrientation::Normal,
+                                ..
+                            }
+                        )
+                    })
+                    .map(|candidate| {
+                        let padded = candidate.inputs[0]
+                            .format
+                            .layout
+                            .padded_shape(&inputs[0].shape)
+                            .unwrap();
+                        padded.0[padded.0.len() - 2]
+                    })
+                    .collect::<BTreeSet<_>>();
+                assert!(normal_rows.contains(&m));
+                assert!(normal_rows.contains(&(m + 1)));
+            }
             for candidate in candidates {
                 assert!(
                     candidate.supports(&inputs, &TensorShape(vec![m, n])),
