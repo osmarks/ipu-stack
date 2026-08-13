@@ -91,6 +91,17 @@ pub struct TileProgramData {
     pub data: Vec<u8>,
 }
 
+/// A loadable application together with the optimized physical storage of its
+/// graph inputs and outputs.  The storage map lets hosts populate and inspect
+/// logical tensors without assuming a particular planner-selected layout.
+#[derive(Clone, Debug)]
+pub struct CompiledPackage {
+    pub application: Application,
+    pub inputs: Vec<DiagnosticTensor>,
+    pub outputs: Vec<DiagnosticTensor>,
+    pub precisions: BTreeMap<ValueId, Precision>,
+}
+
 /// A loadable package plus the exact device storage visible at each semantic
 /// operator checkpoint.
 #[derive(Clone, Debug)]
@@ -98,6 +109,7 @@ pub struct DiagnosticPackage {
     pub application: Application,
     pub inputs: Vec<DiagnosticTensor>,
     pub checkpoints: Vec<DiagnosticCheckpoint>,
+    pub precisions: BTreeMap<ValueId, Precision>,
 }
 
 #[derive(Clone, Debug)]
@@ -371,8 +383,32 @@ fn collect_compute_symbols(symbols: &mut Vec<String>, steps: &[crate::TileStep])
 pub fn build_package(
     graph: &ComputeGraph,
     config: &PackageConfig,
-) -> PackageBuildResult<Application> {
-    Ok(build_package_artifacts(graph, config, false)?.0.application)
+) -> PackageBuildResult<CompiledPackage> {
+    let (built, mid, low) = build_package_artifacts(graph, config, false)?;
+    let topology = active_topology(low.tile_count)?;
+    let inputs = package_inputs(&mid, &low, &built.placement, &topology)?;
+    let outputs = low
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            diagnostic_tensor(
+                &mid,
+                &low,
+                &built.placement,
+                &topology,
+                output.value,
+                Some(format!("output.{index}")),
+            )
+        })
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    let precisions = package_precisions(&mid);
+    Ok(CompiledPackage {
+        application: built.application,
+        inputs,
+        outputs,
+        precisions,
+    })
 }
 
 /// Builds an ordinary optimized package with resumable PBRK0 traps after each
@@ -384,20 +420,7 @@ pub fn build_diagnostic_package(
 ) -> PackageBuildResult<DiagnosticPackage> {
     let (built, mid, low) = build_package_artifacts(graph, config, true)?;
     let topology = active_topology(low.tile_count)?;
-    let inputs = low
-        .inputs
-        .iter()
-        .map(|input| {
-            diagnostic_tensor(
-                &mid,
-                &low,
-                &built.placement,
-                &topology,
-                input.value,
-                Some(input.name.clone()),
-            )
-        })
-        .collect::<PackageBuildResult<Vec<_>>>()?;
+    let inputs = package_inputs(&mid, &low, &built.placement, &topology)?;
     let mut checkpoints = Vec::new();
     for operation in &mid.operations {
         if !matches!(
@@ -443,7 +466,36 @@ pub fn build_diagnostic_package(
         application: built.application,
         inputs,
         checkpoints,
+        precisions: package_precisions(&mid),
     })
+}
+
+fn package_precisions(mid: &MidGraph) -> BTreeMap<ValueId, Precision> {
+    mid.values
+        .iter()
+        .map(|value| (value.origin, value.tensor_type.format.precision))
+        .collect()
+}
+
+fn package_inputs(
+    mid: &MidGraph,
+    low: &LowProgram,
+    placement: &crate::Placement,
+    topology: &Topology,
+) -> PackageBuildResult<Vec<DiagnosticTensor>> {
+    low.inputs
+        .iter()
+        .map(|input| {
+            diagnostic_tensor(
+                mid,
+                low,
+                placement,
+                topology,
+                input.value,
+                Some(input.name.clone()),
+            )
+        })
+        .collect()
 }
 
 fn build_package_artifacts(

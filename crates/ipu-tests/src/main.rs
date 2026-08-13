@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use ipu_codegen::{
-    AmpOrder, BlockMajorOrder, ComputeGraph, Layout, PackageConfig, PipelineConfig, Precision,
-    TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
-    build_package,
+    AmpOrder, BlockMajorOrder, CompiledPackage, ComputeGraph, DiagnosticTensor, Layout,
+    PackageConfig, PipelineConfig, Precision, TensorFormat, amp_matrix_coordinates,
+    block_major_matrix_coordinates, build_diagnostic_package, build_package,
 };
 use ipu_driver::DriverError;
 use ipu_elf::Toolchain;
@@ -458,14 +458,16 @@ fn main() -> Result<()> {
         runtime_source,
         pipeline,
     };
+    let mut compiled_package = None;
     let diagnostic_package = if arguments.diagnostic_run {
         let package = build_diagnostic_package(&graph, &package_config)?;
         write_package(&package.application, &arguments.package)?;
         Some(package)
     } else {
         if !arguments.reuse_package {
-            let application = build_package(&graph, &package_config)?;
-            write_package(&application, &arguments.package)?;
+            let package = build_package(&graph, &package_config)?;
+            write_package(&package.application, &arguments.package)?;
+            compiled_package = Some(package);
         }
         None
     };
@@ -554,6 +556,10 @@ fn main() -> Result<()> {
                 run_siglip_mlp_benchmark(
                     &runtime,
                     &application,
+                    &graph,
+                    compiled_package.as_ref().context(
+                        "large MLP numerical validation requires rebuilding the package without --reuse-package",
+                    )?,
                     active_tiles,
                     arguments.mlp_batch,
                     arguments.mlp_tokens,
@@ -1179,6 +1185,8 @@ fn run_gemm_benchmark(
 fn run_siglip_mlp_benchmark(
     runtime: &Runtime,
     application: &Application,
+    graph: &ComputeGraph,
+    package: &CompiledPackage,
     execution_tiles: u16,
     batch: u32,
     tokens: u32,
@@ -1194,32 +1202,23 @@ fn run_siglip_mlp_benchmark(
     if clock_hz == 0 {
         bail!("benchmark clock must be nonzero");
     }
-    let left = application
-        .inputs
-        .iter()
-        .find(|binding| binding.name == "left")
-        .context("MLP benchmark package has no left binding")?;
-    let left_bytes = filled_f16_binding(left, 0x3c00)?;
-    let up_bits = f32_to_half(1.0 / dimension as f32);
-    let down_bits = f32_to_half(1.0 / hidden_dimension as f32);
-    let mut weights = Vec::new();
-    for block in 0..blocks {
-        for (projection, bits) in [(0, up_bits), (1, down_bits)] {
-            let name = mlp_weight_name(blocks, block, projection);
-            let binding = application
-                .weights
-                .iter()
-                .find(|binding| binding.name == name)
-                .with_context(|| format!("MLP benchmark package has no {name} binding"))?;
-            weights.extend_from_slice(&filled_f16_binding(binding, bits)?);
-        }
-    }
+    let (host_inputs, weights, left_bytes) =
+        diagnostic::prepare_inputs(graph, application, &package.inputs)?;
+    let references = diagnostic::evaluate(graph, host_inputs, &package.precisions)?;
 
     let output =
         run_initialized_program(runtime, application, &weights, &left_bytes, timeout_seconds)?;
 
-    let expected = (0..blocks).fold(1.0, |value, _| gelu_reference(value));
-    let maximum_absolute_error = verify_constant_output(application, &output, expected)?;
+    let output_metadata = package
+        .outputs
+        .iter()
+        .find(|tensor| tensor.name.as_deref() == Some("output.0"))
+        .context("MLP benchmark package has no logical output storage map")?;
+    let expected = references
+        .get(&output_metadata.value)
+        .context("MLP host reference has no graph output")?;
+    let maximum_absolute_error =
+        verify_logical_f16_output(application, output_metadata, &output, &expected.values)?;
     if !profiling_enabled {
         println!(
             "workload=siglip-mlp-f16-b{batch}-t{tokens}-d{dimension}-h{hidden_dimension}-n{blocks} benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} dimension={dimension} hiddenDimension={hidden_dimension} blocks={blocks} biases=false profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
@@ -1356,51 +1355,57 @@ fn verify_benchmark_output(application: &Application, bytes: &[u8], inner: u32) 
     Ok(maximum)
 }
 
-fn verify_constant_output(application: &Application, bytes: &[u8], expected: f32) -> Result<f32> {
+fn verify_logical_f16_output(
+    application: &Application,
+    tensor: &DiagnosticTensor,
+    bytes: &[u8],
+    expected: &[f32],
+) -> Result<f32> {
     let (binding, base) = output_binding(application, "output.0")?;
-    let size = binding_size(binding);
-    if size == 0 || !size.is_multiple_of(2) {
-        bail!("MLP benchmark output is not a nonempty F16 binding");
+    if tensor.precision != Precision::F16
+        || expected.len() != usize::try_from(tensor.shape.elements())?
+    {
+        bail!("MLP benchmark output metadata is inconsistent with its reference");
     }
-    let start = usize::try_from(base)?;
-    let end = usize::try_from(base.checked_add(size).context("MLP output overflow")?)?;
-    let output = bytes
-        .get(start..end)
-        .context("MLP benchmark output exceeds host output")?;
+    let mut covered = vec![false; expected.len()];
     let mut maximum = 0.0f32;
-    let mut minimum_value = f32::INFINITY;
-    let mut maximum_value = f32::NEG_INFINITY;
-    let mut zero_values = 0usize;
-    let mut unchanged_values = 0usize;
-    let logical_values = binding
-        .shape
-        .iter()
-        .try_fold(1usize, |elements, dimension| {
-            elements.checked_mul(usize::try_from(*dimension).ok()?)
-        });
-    let logical_values = logical_values.context("MLP logical output size overflow")?;
-    for raw in output.chunks_exact(2) {
-        let actual = half_to_f32(u16::from_le_bytes(raw.try_into().unwrap()));
-        minimum_value = minimum_value.min(actual);
-        maximum_value = maximum_value.max(actual);
-        zero_values += usize::from(actual == 0.0);
-        unchanged_values += usize::from(actual == 1.0);
-        if actual != 0.0 {
-            maximum = maximum.max((actual - expected).abs());
+    let mut mismatches = Vec::new();
+    let mut mismatch_count = 0usize;
+    let mut checked = 0usize;
+    for shard in &tensor.shards {
+        let slice = binding
+            .slices
+            .iter()
+            .find(|slice| {
+                slice.tile == u32::from(shard.physical_tile) && slice.tile_address == shard.address
+            })
+            .context("MLP output binding slice is missing")?;
+        for (index, offset) in diagnostic::shard_elements(tensor, shard)? {
+            let start = usize::try_from(base + slice.file_offset + u64::from(offset))?;
+            let raw = bytes
+                .get(start..start + 2)
+                .context("MLP logical output exceeds host output")?;
+            let actual = half_to_f32(u16::from_le_bytes(raw.try_into().unwrap()));
+            let reference = expected[index];
+            let error = (actual - reference).abs();
+            checked += 1;
+            maximum = maximum.max(error);
+            covered[index] = true;
+            if !actual.is_finite() || error > 0.03 + 0.05 * reference.abs() {
+                mismatch_count += 1;
+                if mismatches.len() < 16 {
+                    mismatches.push((index, reference, actual, error));
+                }
+            }
         }
     }
-    let physical_values = output.len() / 2;
-    let expected_padding = physical_values
-        .checked_sub(logical_values)
-        .context("MLP binding is smaller than its logical shape")?;
-    if zero_values != expected_padding {
-        bail!(
-            "MLP output contains {zero_values} zero values, expected {expected_padding} physical padding values"
-        );
+    if let Some(missing) = covered.iter().position(|covered| !covered) {
+        bail!("MLP output does not contain logical element {missing}");
     }
-    if maximum > expected.abs() * 0.02 + 0.05 {
+    if !mismatches.is_empty() {
         bail!(
-            "MLP benchmark numerical output differs from {expected}: maximum absolute error {maximum}, observed range {minimum_value}..={maximum_value}, zeros={zero_values}, unchanged={unchanged_values}"
+            "MLP benchmark numerical comparison failed for {mismatch_count}/{} logical shard values (maximum absolute error {maximum}): {mismatches:?}",
+            checked
         );
     }
     Ok(maximum)

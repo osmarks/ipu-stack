@@ -11,9 +11,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
-struct HostTensor {
-    shape: Vec<u32>,
-    values: Vec<f32>,
+pub(crate) struct HostTensor {
+    pub(crate) shape: Vec<u32>,
+    pub(crate) values: Vec<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -23,7 +23,7 @@ struct ComparisonOptions {
     rtol: f32,
 }
 
-type PreparedInputs = (BTreeMap<ValueId, HostTensor>, Vec<u8>, Vec<u8>);
+pub(crate) type PreparedInputs = (BTreeMap<ValueId, HostTensor>, Vec<u8>, Vec<u8>);
 
 pub fn run(
     runtime: &Runtime,
@@ -34,8 +34,8 @@ pub fn run(
     rtol: f32,
     timeout: Duration,
 ) -> Result<()> {
-    let (values, weights, inputs) = prepare_inputs(graph, package)?;
-    let references = evaluate(graph, values, package)?;
+    let (values, weights, inputs) = prepare_inputs(graph, &package.application, &package.inputs)?;
+    let references = evaluate(graph, values, &package.precisions)?;
     let mut session = runtime.host_session(&package.application)?;
     session.start()?;
     if !package.application.weights.is_empty() {
@@ -259,7 +259,7 @@ fn sample_indices(total: usize, limit: usize) -> BTreeSet<usize> {
         .collect()
 }
 
-fn shard_elements(
+pub(crate) fn shard_elements(
     tensor: &DiagnosticTensor,
     shard: &ipu_codegen::DiagnosticShard,
 ) -> Result<Vec<(usize, u32)>> {
@@ -314,11 +314,14 @@ fn decode_word(word: u32, byte: u32, precision: Precision) -> Result<f32> {
     })
 }
 
-fn prepare_inputs(graph: &ComputeGraph, package: &DiagnosticPackage) -> Result<PreparedInputs> {
+pub(crate) fn prepare_inputs(
+    graph: &ComputeGraph,
+    application: &Application,
+    metadata: &[DiagnosticTensor],
+) -> Result<PreparedInputs> {
     let mut values = BTreeMap::new();
     for input in graph.inputs() {
-        let metadata = package
-            .inputs
+        let metadata = metadata
             .iter()
             .find(|tensor| tensor.value == input.value)
             .with_context(|| format!("diagnostic metadata for {} is missing", input.name))?;
@@ -341,13 +344,13 @@ fn prepare_inputs(graph: &ComputeGraph, package: &DiagnosticPackage) -> Result<P
     let pack = |bindings: &[Binding]| -> Result<Vec<u8>> {
         let mut result = Vec::new();
         for binding in bindings {
-            let metadata = package
-                .inputs
+            let metadata = metadata
                 .iter()
                 .find(|tensor| tensor.name.as_deref() == Some(binding.name.as_str()))
                 .with_context(|| format!("diagnostic metadata for {} is missing", binding.name))?;
             let tensor = &values[&metadata.value];
             let mut bytes = vec![0; usize::try_from(super::binding_size(binding))?];
+            let mut covered = vec![false; usize::try_from(metadata.shape.elements())?];
             for shard in &metadata.shards {
                 let slice = binding
                     .slices
@@ -360,20 +363,30 @@ fn prepare_inputs(graph: &ComputeGraph, package: &DiagnosticPackage) -> Result<P
                         format!("binding slice for {} shard is missing", binding.name)
                     })?;
                 for (index, offset) in shard_elements(metadata, shard)? {
+                    if u64::from(offset) + u64::try_from(metadata.precision.bytes())? > slice.size {
+                        bail!("logical element exceeds binding {} shard", binding.name);
+                    }
                     encode_value(
                         &mut bytes,
                         usize::try_from(slice.file_offset + u64::from(offset))?,
                         tensor.values[index],
                         metadata.precision,
                     )?;
+                    covered[index] = true;
                 }
+            }
+            if let Some(missing) = covered.iter().position(|covered| !covered) {
+                bail!(
+                    "binding {} does not store logical element {missing}",
+                    binding.name
+                );
             }
             result.extend(bytes);
         }
         Ok(result)
     };
-    let weights = pack(&package.application.weights)?;
-    let inputs = pack(&package.application.inputs)?;
+    let weights = pack(&application.weights)?;
+    let inputs = pack(&application.inputs)?;
     Ok((values, weights, inputs))
 }
 
@@ -388,18 +401,12 @@ fn encode_value(bytes: &mut [u8], offset: usize, value: f32, precision: Precisio
     Ok(())
 }
 
-fn evaluate(
+pub(crate) fn evaluate(
     graph: &ComputeGraph,
     mut values: BTreeMap<ValueId, HostTensor>,
-    package: &DiagnosticPackage,
+    precisions: &BTreeMap<ValueId, Precision>,
 ) -> Result<BTreeMap<ValueId, HostTensor>> {
-    let precisions = package
-        .checkpoints
-        .iter()
-        .flat_map(|checkpoint| &checkpoint.tensors)
-        .map(|tensor| (tensor.value, tensor.precision))
-        .collect::<BTreeMap<_, _>>();
-    evaluate_operations(graph.operations(), graph, &mut values, &precisions)?;
+    evaluate_operations(graph.operations(), graph, &mut values, precisions)?;
     Ok(values)
 }
 
@@ -531,22 +538,30 @@ fn gemm(left: &HostTensor, right: &HostTensor, options: GemmOptions) -> Result<H
     )?;
     let batches = product(&batch_shape);
     let mut output = vec![0.0; batches * lm as usize * rn as usize];
+    let left_matrix_elements = product(&left.shape[left.shape.len() - 2..]);
+    let right_matrix_elements = product(&right.shape[right.shape.len() - 2..]);
+    let left_stride = *left.shape.last().context("left GEMM shape is empty")?;
+    let right_stride = *right.shape.last().context("right GEMM shape is empty")?;
     for batch in 0..batches {
         let coords = decode_index(batch, &batch_shape);
         let lb = broadcast_batch_offset(&coords, &batch_shape, &left.shape[..left.shape.len() - 2]);
         let rb =
             broadcast_batch_offset(&coords, &batch_shape, &right.shape[..right.shape.len() - 2]);
-        for row in 0..lm {
-            for column in 0..rn {
-                let mut sum = 0.0;
-                for inner in 0..lk {
-                    let li = matrix_index(&left.shape, lb, row, inner, options.transpose_left);
-                    let ri = matrix_index(&right.shape, rb, inner, column, options.transpose_right);
-                    sum += left.values[li] * right.values[ri];
-                }
-                output[(batch * lm as usize + row as usize) * rn as usize + column as usize] = sum;
-            }
-        }
+        let left = &left.values[lb * left_matrix_elements..][..left_matrix_elements];
+        let right = &right.values[rb * right_matrix_elements..][..right_matrix_elements];
+        let output = &mut output[batch * lm as usize * rn as usize..][..lm as usize * rn as usize];
+        host_sgemm(
+            left,
+            right,
+            output,
+            lm,
+            rn,
+            lk,
+            left_stride,
+            right_stride,
+            options.transpose_left,
+            options.transpose_right,
+        )?;
     }
     let mut shape = batch_shape;
     shape.extend([lm, rn]);
@@ -556,11 +571,87 @@ fn gemm(left: &HostTensor, right: &HostTensor, options: GemmOptions) -> Result<H
     })
 }
 
+#[link(name = "openblas")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        layout: i32,
+        transpose_a: i32,
+        transpose_b: i32,
+        rows: i32,
+        columns: i32,
+        inner: i32,
+        alpha: f32,
+        left: *const f32,
+        left_stride: i32,
+        right: *const f32,
+        right_stride: i32,
+        beta: f32,
+        output: *mut f32,
+        output_stride: i32,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn host_sgemm(
+    left: &[f32],
+    right: &[f32],
+    output: &mut [f32],
+    rows: u32,
+    columns: u32,
+    inner: u32,
+    left_stride: u32,
+    right_stride: u32,
+    transpose_left: bool,
+    transpose_right: bool,
+) -> Result<()> {
+    const CBLAS_ROW_MAJOR: i32 = 101;
+    const CBLAS_NO_TRANSPOSE: i32 = 111;
+    const CBLAS_TRANSPOSE: i32 = 112;
+    let rows = i32::try_from(rows)?;
+    let columns = i32::try_from(columns)?;
+    let inner = i32::try_from(inner)?;
+    let left_stride = i32::try_from(left_stride)?;
+    let right_stride = i32::try_from(right_stride)?;
+    if output.len() != usize::try_from(rows)? * usize::try_from(columns)? {
+        bail!("host GEMM output dimensions are inconsistent");
+    }
+    // SAFETY: callers provide complete row-major matrix slices, the leading
+    // dimensions come from their physical shapes, and output is exclusive.
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            if transpose_left {
+                CBLAS_TRANSPOSE
+            } else {
+                CBLAS_NO_TRANSPOSE
+            },
+            if transpose_right {
+                CBLAS_TRANSPOSE
+            } else {
+                CBLAS_NO_TRANSPOSE
+            },
+            rows,
+            columns,
+            inner,
+            1.0,
+            left.as_ptr(),
+            left_stride,
+            right.as_ptr(),
+            right_stride,
+            0.0,
+            output.as_mut_ptr(),
+            columns,
+        );
+    }
+    Ok(())
+}
+
 fn matrix_dims(shape: &[u32], transpose: bool) -> (u32, u32) {
     let pair = (shape[shape.len() - 2], shape[shape.len() - 1]);
     if transpose { (pair.1, pair.0) } else { pair }
 }
 
+#[cfg(test)]
 fn matrix_index(shape: &[u32], batch: usize, row: u32, column: u32, transpose: bool) -> usize {
     let rows = shape[shape.len() - 2] as usize;
     let columns = shape[shape.len() - 1] as usize;
@@ -752,6 +843,61 @@ fn quantize(value: f32, precision: Precision) -> f32 {
 mod tests {
     use super::*;
     use ipu_codegen::{AmpOrder, amp_matrix_coordinates};
+
+    #[test]
+    fn randomized_blas_gemm_matches_scalar_reference() -> Result<()> {
+        let mut random = fastrand::Rng::with_seed(0x424c_4153_4745_4d4d);
+        for _ in 0..256 {
+            let rows = random.u32(1..=16);
+            let inner = random.u32(1..=24);
+            let columns = random.u32(1..=16);
+            let transpose_left = random.bool();
+            let transpose_right = random.bool();
+            let left_shape = if transpose_left {
+                vec![inner, rows]
+            } else {
+                vec![rows, inner]
+            };
+            let right_shape = if transpose_right {
+                vec![columns, inner]
+            } else {
+                vec![inner, columns]
+            };
+            let left = (0..product(&left_shape))
+                .map(|_| random.f32() - 0.5)
+                .collect::<Vec<_>>();
+            let right = (0..product(&right_shape))
+                .map(|_| random.f32() - 0.5)
+                .collect::<Vec<_>>();
+            let mut accelerated = vec![0.0; rows as usize * columns as usize];
+            host_sgemm(
+                &left,
+                &right,
+                &mut accelerated,
+                rows,
+                columns,
+                inner,
+                *left_shape.last().unwrap(),
+                *right_shape.last().unwrap(),
+                transpose_left,
+                transpose_right,
+            )?;
+            for row in 0..rows {
+                for column in 0..columns {
+                    let scalar = (0..inner)
+                        .map(|inner| {
+                            left[matrix_index(&left_shape, 0, row, inner, transpose_left)]
+                                * right
+                                    [matrix_index(&right_shape, 0, inner, column, transpose_right)]
+                        })
+                        .sum::<f32>();
+                    let observed = accelerated[(row * columns + column) as usize];
+                    assert!((observed - scalar).abs() <= 2.0e-5);
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn randomized_gelu_reorder_preserves_logical_coordinates() -> Result<()> {

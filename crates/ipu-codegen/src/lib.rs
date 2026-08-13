@@ -59,9 +59,9 @@ pub use mid::{
     SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{
-    DiagnosticCheckpoint, DiagnosticPackage, DiagnosticShard, DiagnosticTensor, PackageBuildError,
-    PackageBuildResult, PackageConfig, TileProgramData, build_diagnostic_package, build_package,
-    build_tile_program_package,
+    CompiledPackage, DiagnosticCheckpoint, DiagnosticPackage, DiagnosticShard, DiagnosticTensor,
+    PackageBuildError, PackageBuildResult, PackageConfig, TileProgramData,
+    build_diagnostic_package, build_package, build_tile_program_package,
 };
 pub use place::{Placement, PlacementError, place};
 pub use storage::{
