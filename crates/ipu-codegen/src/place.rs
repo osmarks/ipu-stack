@@ -137,76 +137,129 @@ pub(crate) fn place_with_standard_ranges(
             .include(lifetime);
     }
 
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(usize::from(program.tile_count).max(1));
+    let tiles_per_worker = usize::from(program.tile_count).div_ceil(workers);
+    let mut tile_placements = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for first in (0..usize::from(program.tile_count)).step_by(tiles_per_worker) {
+            let limit = (first + tiles_per_worker).min(usize::from(program.tile_count));
+            let iterated = &iterated;
+            let members = &members;
+            let root_of_member = &root_of_member;
+            let root_requirements = &root_requirements;
+            let root_lifetimes = &root_lifetimes;
+            handles.push(scope.spawn(move || {
+                (first..limit)
+                    .map(|tile| {
+                        place_tile(
+                            program,
+                            u16::try_from(tile).map_err(|_| PlacementError::Overflow)?,
+                            standard_ranges,
+                            iterated,
+                            members,
+                            root_of_member,
+                            root_requirements,
+                            root_lifetimes,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, PlacementError>>()
+            }));
+        }
+        let mut placements = Vec::with_capacity(usize::from(program.tile_count));
+        for handle in handles {
+            placements.extend(handle.join().expect("tile placement worker panicked")?);
+        }
+        Ok::<_, PlacementError>(placements)
+    })?;
+    tile_placements.sort_by_key(|placement| placement.0);
     let mut addresses = BTreeMap::new();
     let mut tile_auxiliary_ranges = vec![Vec::new(); usize::from(program.tile_count)];
-    for tile in 0..program.tile_count {
-        let mut grouped = BTreeSet::<usize>::new();
-        for group in iterated.iter().filter(|group| group.tile == tile) {
-            let roots = group
-                .shards
-                .iter()
-                .map(|shard| sets.find(shard.index() as usize))
-                .collect::<Vec<_>>();
-            if roots.iter().any(|root| !grouped.insert(*root)) {
-                return Err(PlacementError::IteratedOverlap);
-            }
-        }
-
-        // Region 1 is shared by ordinary and interleaved loads. Place the
-        // interleaved working set first, round its boundary to a paired memory
-        // element, then return every remaining byte to standard allocations.
-        let mut interleaved = Arena::new(
-            &[(
-                IPU21_INTERLEAVED_MEMORY_BASE,
-                IPU21_INTERLEAVED_REGION_LIMIT,
-            )],
-            true,
-        );
-        allocate_tile_class(
-            program,
-            tile,
-            MemoryClass::Ipu21Interleaved,
-            &iterated,
-            &grouped,
-            &members,
-            &root_of_member,
-            &root_requirements,
-            &root_lifetimes,
-            &mut interleaved,
-            &mut addresses,
-        )?;
-        let interleaved_boundary =
-            align_up(interleaved.maximum_cursor(), IPU21_INTERLEAVED_ELEMENT_SIZE)?;
-        if interleaved_boundary > IPU21_INTERLEAVED_REGION_LIMIT {
-            return Err(PlacementError::OutOfMemory {
-                tile,
-                class: MemoryClass::Ipu21Interleaved,
-                bytes: interleaved_boundary - IPU21_INTERLEAVED_MEMORY_BASE,
-            });
-        }
-        let mut ranges = standard_ranges.to_vec();
-        ranges.push((interleaved_boundary, TILE_MEMORY_BASE + TILE_MEMORY_SIZE));
-        let mut standard = Arena::new(&ranges, false);
-        allocate_tile_class(
-            program,
-            tile,
-            MemoryClass::Ipu21Standard,
-            &iterated,
-            &grouped,
-            &members,
-            &root_of_member,
-            &root_requirements,
-            &root_lifetimes,
-            &mut standard,
-            &mut addresses,
-        )?;
-        tile_auxiliary_ranges[usize::from(tile)] = standard.unused_ranges();
+    for (tile, tile_addresses, unused) in tile_placements {
+        addresses.extend(tile_addresses);
+        tile_auxiliary_ranges[usize::from(tile)] = unused;
     }
 
     Ok(Placement {
         shard_addresses: addresses,
         tile_auxiliary_ranges,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn place_tile(
+    program: &LowProgram,
+    tile: u16,
+    standard_ranges: &[(u32, u32)],
+    iterated: &[IteratedGroup],
+    members: &BTreeMap<usize, Vec<usize>>,
+    root_of_member: &[usize],
+    root_requirements: &BTreeMap<usize, Requirement>,
+    root_lifetimes: &BTreeMap<usize, Lifetime>,
+) -> Result<(u16, BTreeMap<LowShardId, u32>, Vec<(u32, u32)>), PlacementError> {
+    let mut grouped = BTreeSet::<usize>::new();
+    for group in iterated.iter().filter(|group| group.tile == tile) {
+        let roots = group
+            .shards
+            .iter()
+            .map(|shard| root_of_member[shard.index() as usize])
+            .collect::<Vec<_>>();
+        if roots.iter().any(|root| !grouped.insert(*root)) {
+            return Err(PlacementError::IteratedOverlap);
+        }
+    }
+
+    // Region 1 is shared by ordinary and interleaved loads. Place the
+    // interleaved working set first, round its boundary to a paired memory
+    // element, then return every remaining byte to standard allocations.
+    let mut addresses = BTreeMap::new();
+    let mut interleaved = Arena::new(
+        &[(
+            IPU21_INTERLEAVED_MEMORY_BASE,
+            IPU21_INTERLEAVED_REGION_LIMIT,
+        )],
+        true,
+    );
+    allocate_tile_class(
+        program,
+        tile,
+        MemoryClass::Ipu21Interleaved,
+        iterated,
+        &grouped,
+        members,
+        root_of_member,
+        root_requirements,
+        root_lifetimes,
+        &mut interleaved,
+        &mut addresses,
+    )?;
+    let interleaved_boundary =
+        align_up(interleaved.maximum_cursor(), IPU21_INTERLEAVED_ELEMENT_SIZE)?;
+    if interleaved_boundary > IPU21_INTERLEAVED_REGION_LIMIT {
+        return Err(PlacementError::OutOfMemory {
+            tile,
+            class: MemoryClass::Ipu21Interleaved,
+            bytes: interleaved_boundary - IPU21_INTERLEAVED_MEMORY_BASE,
+        });
+    }
+    let mut ranges = standard_ranges.to_vec();
+    ranges.push((interleaved_boundary, TILE_MEMORY_BASE + TILE_MEMORY_SIZE));
+    let mut standard = Arena::new(&ranges, false);
+    allocate_tile_class(
+        program,
+        tile,
+        MemoryClass::Ipu21Standard,
+        iterated,
+        &grouped,
+        members,
+        root_of_member,
+        root_requirements,
+        root_lifetimes,
+        &mut standard,
+        &mut addresses,
+    )?;
+    Ok((tile, addresses, standard.unused_ranges()))
 }
 
 fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
