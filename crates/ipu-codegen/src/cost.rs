@@ -12,10 +12,11 @@ use crate::mid::{
     LocalOperandStaging, MemoryClass, MidOperator, OperatorDispatch, OperatorRequirements,
     Precision, TensorAxis, TensorType,
 };
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::{Arc, Mutex, OnceLock};
 
-pub trait CostModel {
+pub trait CostModel: Sync {
     fn operator_cycles(
         &self,
         operator: MidOperator,
@@ -150,7 +151,34 @@ impl ExchangeFootprint {
 pub(crate) struct MemoizedCostModel<'a, C> {
     inner: &'a C,
     spatial_capacity: u16,
-    rearrangements: RefCell<HashMap<(TensorShape, Precision, Layout, Layout), RearrangementCost>>,
+    rearrangements: Mutex<RearrangementCache>,
+}
+
+type RearrangementKey = (TensorShape, Precision, Layout, Layout);
+type RearrangementCache =
+    HashMap<RearrangementKey, Arc<OnceLock<RearrangementCost>>, BuildHasherDefault<FastHasher>>;
+
+struct FastHasher(u64);
+
+impl Default for FastHasher {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for FastHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = self.0;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = hash;
+    }
 }
 
 impl<'a, C> MemoizedCostModel<'a, C> {
@@ -158,7 +186,7 @@ impl<'a, C> MemoizedCostModel<'a, C> {
         Self {
             inner,
             spatial_capacity,
-            rearrangements: RefCell::new(HashMap::new()),
+            rearrangements: Mutex::new(HashMap::default()),
         }
     }
 }
@@ -219,20 +247,25 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         to: &Layout,
     ) -> RearrangementCost {
         let key = (shape.clone(), precision, from.clone(), to.clone());
-        if let Some(cost) = self.rearrangements.borrow().get(&key) {
-            return *cost;
-        }
-        let mut cost = self.inner.rearrangement_cost(shape, precision, from, to);
-        let active_tiles = from.tiling.tile_count.max(to.tiling.tile_count);
-        // The inner model reports occupied work. Reduced-grid conversions
-        // leave spatial issue slots idle, so convert that work into a phase
-        // horizon using the occupancy of this particular planning target.
-        cost.cycles = cost
-            .cycles
-            .saturating_mul(u64::from(self.spatial_capacity))
-            .div_ceil(u64::from(active_tiles));
-        self.rearrangements.borrow_mut().insert(key, cost);
-        cost
+        let cached = self
+            .rearrangements
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .clone();
+        *cached.get_or_init(|| {
+            let mut cost = self.inner.rearrangement_cost(shape, precision, from, to);
+            let active_tiles = from.tiling.tile_count.max(to.tiling.tile_count);
+            // The inner model reports occupied work. Reduced-grid conversions
+            // leave spatial issue slots idle, so convert that work into a phase
+            // horizon using the occupancy of this particular planning target.
+            cost.cycles = cost
+                .cycles
+                .saturating_mul(u64::from(self.spatial_capacity))
+                .div_ceil(u64::from(active_tiles));
+            cost
+        })
     }
 }
 

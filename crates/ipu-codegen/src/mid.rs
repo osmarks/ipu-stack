@@ -19,6 +19,7 @@ use crate::graph::{
     AddOptions, AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation,
     OperationId, OperationKind, Repeat, SplitHeadsOptions, TensorShape, ValueId,
 };
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// In-memory representation of one tensor element.
@@ -3234,44 +3235,55 @@ fn lower_operations(
                         })
                 })
                 .collect::<Vec<_>>();
-            let candidate_plans = candidate_plans.into_iter().flat_map(|plan| {
-                let mut complete = plan.clone();
-                for requirement in &mut complete.requirements.inputs {
-                    requirement.materialization = OperandMaterialization::Complete;
-                }
-                match config.conversion_streaming {
-                    ConversionStreamingPolicy::Never => vec![complete],
-                    ConversionStreamingPolicy::Always => vec![plan],
-                    ConversionStreamingPolicy::WhenRequired if complete == plan => vec![complete],
-                    ConversionStreamingPolicy::WhenRequired => vec![complete, plan],
-                }
-            });
-            for plan in candidate_plans {
-                saw_candidate = true;
-                let mut next = branch.clone();
-                apply_selected_plan(
-                    operation,
-                    output_shape.clone(),
-                    plan,
-                    &operation
-                        .inputs
-                        .iter()
-                        .map(|value| value_uses.get(value).copied().unwrap_or(0) == 1)
-                        .collect::<Vec<_>>(),
-                    costs,
-                    &mut next.values,
-                    &mut next.state,
-                    &mut next.operations,
-                );
-                let peak = beam_memory_peak(
-                    &next,
-                    &initial,
-                    source,
-                    operation_index,
-                    required_outputs,
-                    graph,
-                    &constraints.allocation_copies,
-                );
+            let candidate_plans = candidate_plans
+                .into_iter()
+                .flat_map(|plan| {
+                    let mut complete = plan.clone();
+                    for requirement in &mut complete.requirements.inputs {
+                        requirement.materialization = OperandMaterialization::Complete;
+                    }
+                    match config.conversion_streaming {
+                        ConversionStreamingPolicy::Never => vec![complete],
+                        ConversionStreamingPolicy::Always => vec![plan],
+                        ConversionStreamingPolicy::WhenRequired if complete == plan => {
+                            vec![complete]
+                        }
+                        ConversionStreamingPolicy::WhenRequired => vec![complete, plan],
+                    }
+                })
+                .collect::<Vec<_>>();
+            saw_candidate |= !candidate_plans.is_empty();
+            let evaluated = candidate_plans
+                .into_par_iter()
+                .map(|plan| {
+                    let mut next = branch.clone();
+                    apply_selected_plan(
+                        operation,
+                        output_shape.clone(),
+                        plan,
+                        &operation
+                            .inputs
+                            .iter()
+                            .map(|value| value_uses.get(value).copied().unwrap_or(0) == 1)
+                            .collect::<Vec<_>>(),
+                        costs,
+                        &mut next.values,
+                        &mut next.state,
+                        &mut next.operations,
+                    );
+                    let peak = beam_memory_peak(
+                        &next,
+                        &initial,
+                        source,
+                        operation_index,
+                        required_outputs,
+                        graph,
+                        &constraints.allocation_copies,
+                    );
+                    (next, peak)
+                })
+                .collect::<Vec<_>>();
+            for (mut next, peak) in evaluated {
                 if peak.fits_ipu21_with_budget(
                     config.standard_memory_reservation_bytes,
                     config.tile_memory_budget_bytes,
