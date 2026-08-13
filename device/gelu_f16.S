@@ -31,6 +31,50 @@
 	ldconst $a7, HALF_F16X2
 	.endm
 
+	.macro GELU_TWO_PAIRS
+	f16v2mul $a2, $a0, $a0
+	f16v2mul $a3, $a1, $a1
+	f16v2mul $a2, $a2, $a0
+	f16v2mul $a3, $a3, $a1
+	f16v2mul $a2, $a4, $a2
+	f16v2mul $a3, $a4, $a3
+	f16v2add $a2, $a0, $a2
+	f16v2add $a3, $a1, $a3
+	f16v2mul $a2, $a5, $a2
+	f16v2mul $a3, $a5, $a3
+	f16v2tanh $a2, $a2
+	f16v2tanh $a3, $a3
+	f16v2add $a2, $a6, $a2
+	f16v2add $a3, $a6, $a3
+	f16v2mul $a2, $a7, $a2
+	f16v2mul $a3, $a7, $a3
+	f16v2mul $a2, $a0, $a2
+	f16v2mul $a3, $a1, $a3
+	.endm
+
+	.macro GELU_EIGHT_PAIRS
+	ld32 $a0, $m3, $m15, 0
+	ld32 $a1, $m3, $m15, 1
+	GELU_TWO_PAIRS
+	st32 $a2, $m2, $m15, 0
+	st32 $a3, $m2, $m15, 1
+	ld32 $a0, $m3, $m15, 2
+	ld32 $a1, $m3, $m15, 3
+	GELU_TWO_PAIRS
+	st32 $a2, $m2, $m15, 2
+	st32 $a3, $m2, $m15, 3
+	ld32 $a0, $m3, $m15, 4
+	ld32 $a1, $m3, $m15, 5
+	GELU_TWO_PAIRS
+	st32 $a2, $m2, $m15, 4
+	st32 $a3, $m2, $m15, 5
+	ld32 $a0, $m3, $m15, 6
+	ld32 $a1, $m3, $m15, 7
+	GELU_TWO_PAIRS
+	st32 $a2, $m2, $m15, 6
+	st32 $a3, $m2, $m15, 7
+	.endm
+
 	.macro GELU_ENTRY symbol, worker
 	.section .text.\symbol,"ax",@progbits
 	.globl \symbol
@@ -61,20 +105,44 @@
 	shr $m8, $m8, 1
 	get $m4, $WSR
 	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
+	shl $m4, $m4, 3
 	cmpult $m6, $m4, $m8
 	brz $m6, .Lgelu_contiguous_done
 	LOAD_GELU_CONSTANTS
 	shl $m5, $m4, 2
 	add $m2, $m2, $m5
 	add $m3, $m3, $m5
+	setzi $m5, 8
+	add $m6, $m5, -1
+	and $m6, $m8, $m6
+	brnz $m6, .Lgelu_contiguous_loop
+.Lgelu_contiguous_aligned_loop:
+	GELU_EIGHT_PAIRS
+	add $m2, $m2, 192
+	add $m3, $m3, 192
+	add $m4, $m4, 48
+	cmpult $m6, $m4, $m8
+	brnz $m6, .Lgelu_contiguous_aligned_loop
+	bri .Lgelu_contiguous_done
 .Lgelu_contiguous_loop:
+	sub $m6, $m8, $m4
+	cmpult $m6, $m6, $m5
+	brnz $m6, .Lgelu_contiguous_tail
+	GELU_EIGHT_PAIRS
+	add $m2, $m2, 192
+	add $m3, $m3, 192
+	add $m4, $m4, 48
+	cmpult $m6, $m4, $m8
+	brnz $m6, .Lgelu_contiguous_loop
+	bri .Lgelu_contiguous_done
+.Lgelu_contiguous_tail:
 	ld32 $a0, $m3, $m15, 0
 	GELU_PAIR $a0
 	st32 $a2, $m2, $m15, 0
-	add $m2, $m2, 24
-	add $m3, $m3, 24
-	add $m4, $m4, 6
+	add $m2, $m2, 4
+	add $m3, $m3, 4
+	add $m4, $m4, 1
 	cmpult $m6, $m4, $m8
-	brnz $m6, .Lgelu_contiguous_loop
+	brnz $m6, .Lgelu_contiguous_tail
 .Lgelu_contiguous_done:
 	exitz $m15
