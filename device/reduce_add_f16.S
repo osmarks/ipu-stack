@@ -64,23 +64,17 @@
 .Lreduce_sum_loop_\@:
 	ld128 $a0:3, $m3, $m15, 0
 	ld128 $a4:7, $m4, $m15, 0
-	f16v2add $a0, $a0, $a4
-	f16v2add $a1, $a1, $a5
-	f16v2add $a2, $a2, $a6
-	f16v2add $a3, $a3, $a7
+	f16v4add $a0:1, $a0:1, $a4:5
+	f16v4add $a2:3, $a2:3, $a6:7
 	.if \inputs >= 3
 	ld128 $a4:7, $m7, $m15, 0
-	f16v2add $a0, $a0, $a4
-	f16v2add $a1, $a1, $a5
-	f16v2add $a2, $a2, $a6
-	f16v2add $a3, $a3, $a7
+	f16v4add $a0:1, $a0:1, $a4:5
+	f16v4add $a2:3, $a2:3, $a6:7
 	.endif
 	.if \inputs >= 4
 	ld128 $a4:7, $m8, $m15, 0
-	f16v2add $a0, $a0, $a4
-	f16v2add $a1, $a1, $a5
-	f16v2add $a2, $a2, $a6
-	f16v2add $a3, $a3, $a7
+	f16v4add $a0:1, $a0:1, $a4:5
+	f16v4add $a2:3, $a2:3, $a6:7
 	.endif
 	st64 $a0:1, $m2, $m15, 0
 	st64 $a2:3, $m2, $m15, 1

@@ -222,12 +222,14 @@
 	mul $m4, $m8, COLUMN_MICRO_DIMENSION * 2
 	add $m5, $m2, 0
 	add $m9, $m3, 0
-	sync SYNC_COMPUTE_SET
 	zero $m6
 .Lcolumn_group_\@:
 	zero $m7
 .Linner_group_\@:
-	LOAD_AMP16_WEIGHTS
+	// Publish the next worker invocation only after the preceding workers have
+	// stopped reading the shared vertex. The following weight loads cover the
+	// state-write and supervisor-pipeline latency.
+	sync SYNC_COMPUTE_SET
 	st32 $m5, $m11, $m15, 0
 	st32 $m9, $m11, $m15, 1
 	zero $m0
@@ -244,8 +246,11 @@
 	brz $m7, .Lrun_workers_\@
 	setzi $m0, \retained_inner_worker
 .Lrun_workers_\@:
+	LOAD_AMP16_WEIGHTS
 	runall $m0, $m11, 0
-	sync SYNC_COMPUTE_SET
+	// Arithmetic below is independent of worker state and overlaps the worker
+	// critical path. The next loop-head sync protects the following state and
+	// weight updates.
 	add $m9, $m9, $m4
 	add $m7, $m7, 1
 	setzi $m8, INNER_GROUPS
@@ -257,6 +262,7 @@
 	setzi $m8, OUTPUT_COLUMNS / COLUMN_MICRO_DIMENSION
 	cmpult $m8, $m6, $m8
 	brnz $m8, .Lcolumn_group_\@
+	sync SYNC_COMPUTE_SET
 	ld32 $m8, $m11, $m15, 6
 	put $FP_ICTL, $m8
 	add $m11, $m11, 32
