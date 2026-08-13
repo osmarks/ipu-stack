@@ -4071,9 +4071,10 @@ fn parallel_reduction_candidates(
 fn parallel_reduction_candidates_for_orientation(
     candidate: &OperatorCandidate,
     inputs: &[TensorType],
-    _config: &PipelineConfig,
+    config: &PipelineConfig,
     orientation: GemmOrientation,
 ) -> Vec<OperatorCandidate> {
+    const AMP_F16_MICROBLOCK_FIXED_CYCLES: u64 = 235;
     let OperatorDispatch::BlockedGemm {
         output_column_block,
         distribution: GemmDistribution::OutputStationary,
@@ -4169,13 +4170,17 @@ fn parallel_reduction_candidates_for_orientation(
             {
                 continue;
             }
-            // Keep invocation and arithmetic work as independent structural
-            // axes. Their relative device cost belongs to the calibrated full
-            // cost model, not this candidate-generation prefilter.
-            let invocations = u64::from(local_columns).saturating_mul(u64::from(local_inner));
-            let arithmetic = invocations
-                .saturating_mul(outer_rows)
-                .saturating_mul(u64::from(local_rows));
+            // Retain grids by the generated kernel's actual K16 x C16
+            // invocation structure, including its fixed weight-feed and
+            // worker/supervisor cost. Pure arithmetic work is almost constant
+            // across grids and incorrectly favors many tiny row runs.
+            let row_run_cycles = outer_rows
+                .saturating_mul(u64::from(local_rows))
+                .saturating_mul(4)
+                .saturating_add(AMP_F16_MICROBLOCK_FIXED_CYCLES);
+            let compute = u64::from(local_columns)
+                .saturating_mul(u64::from(local_inner))
+                .saturating_mul(row_run_cycles);
             let communication = u64::from(local_columns)
                 .saturating_mul(u64::from(local_inner))
                 .saturating_add(u64::from(local_rows).saturating_mul(u64::from(local_inner)))
@@ -4234,8 +4239,7 @@ fn parallel_reduction_candidates_for_orientation(
                 continue;
             }
             grids.push((
-                arithmetic,
-                invocations,
+                compute,
                 communication,
                 temporary_bytes,
                 u64::from(tile_count - used_tiles),
@@ -4245,22 +4249,23 @@ fn parallel_reduction_candidates_for_orientation(
             ));
         }
     }
-    let mut frontier = Vec::new();
-    for (index, grid) in grids.iter().enumerate() {
-        let dominated = grids.iter().enumerate().any(|(other_index, other)| {
-            other_index != index
-                && other.0 <= grid.0
-                && other.1 <= grid.1
-                && other.2 <= grid.2
-                && (other.0 < grid.0 || other.1 < grid.1 || other.2 < grid.2)
-        });
-        if !dominated {
-            frontier.push(*grid);
+    grids.sort_unstable();
+    // Arithmetic-favored grids and communication-favored grids are both
+    // useful inputs to the full cost model. Retain their Pareto frontier here
+    // instead of lexicographically discarding balanced plans before exchange
+    // and reduction costs are known.
+    let mut best_communication = u64::MAX;
+    grids.retain(|grid| {
+        if grid.1 >= best_communication {
+            false
+        } else {
+            best_communication = grid.1;
+            true
         }
-    }
-    frontier.sort_unstable();
+    });
+    grids.truncate(config.planning_beam_width.max(1));
     let mut variants = Vec::new();
-    for (_, _, _, _, _, row_partitions, column_partitions, inner_partitions) in frontier {
+    for (_, _, _, _, row_partitions, column_partitions, inner_partitions) in grids {
         let reduction_fan_in = inner_partitions.min(4);
         let used_tiles = row_partitions
             .saturating_mul(column_partitions)

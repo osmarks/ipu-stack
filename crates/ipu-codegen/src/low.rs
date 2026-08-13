@@ -4645,6 +4645,99 @@ mod tests {
     }
 
     #[test]
+    fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
+        let mut random = fastrand::Rng::with_seed(0x7374_7265_616d);
+        for case in 0..8 {
+            let batch = random.u32(1..=4);
+            let tokens = 16;
+            let mut graph = ComputeGraph::new();
+            let input = graph.host_input("input", [batch, tokens, 64]).unwrap();
+            let up = graph.parameter("up", [1, 64, 256]).unwrap();
+            let down = graph.parameter("down", [1, 256, 64]).unwrap();
+            let hidden = graph.gemm(input, up).unwrap();
+            let hidden = graph.gelu(hidden).unwrap();
+            let output = graph.gemm(hidden, down).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let mut config = PipelineConfig::new(16)
+                .with_active_tile_counts([16])
+                .with_automatic_input(input, Precision::F16)
+                .with_automatic_input(up, Precision::F16)
+                .with_automatic_input(down, Precision::F16);
+            config.conversion_streaming = crate::ConversionStreamingPolicy::Always;
+
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let deferred = mid
+                .operations
+                .iter()
+                .filter_map(|operation| {
+                    operation.conversion_plan.as_ref().and_then(|plan| {
+                        (plan.output.materialization
+                            == crate::OperandMaterialization::DispatchSlices)
+                            .then(|| operation.results[0])
+                    })
+                })
+                .collect::<BTreeSet<_>>();
+            assert!(!deferred.is_empty(), "case {case}");
+            let consumers = mid
+                .operations
+                .iter()
+                .filter(|operation| {
+                    operation
+                        .inputs
+                        .iter()
+                        .any(|input| deferred.contains(input))
+                })
+                .filter_map(|operation| operation.source)
+                .collect::<BTreeSet<_>>();
+
+            let low = lower_to_tiles(&mid, &config).unwrap();
+            assert!(
+                low.exchange_phases
+                    .iter()
+                    .all(|phase| phase.provenance.reason != WorkReason::LayoutRearrangement),
+                "case {case}"
+            );
+            assert!(
+                low.exchange_phases
+                    .iter()
+                    .any(|phase| phase.provenance.reason == WorkReason::OperatorInputs),
+                "case {case}"
+            );
+            assert!(
+                low.shards
+                    .iter()
+                    .filter(|shard| shard.definition == ShardDefinition::Unmaterialized)
+                    .count()
+                    >= 16 * deferred.len(),
+                "case {case}"
+            );
+            for run in &low.kernel_runs {
+                if run
+                    .provenance
+                    .operation
+                    .is_some_and(|operation| consumers.contains(&operation))
+                {
+                    let input = &run.inputs[0].views[0];
+                    assert_ne!(
+                        low.shards[input.shard.index() as usize].definition,
+                        ShardDefinition::Unmaterialized,
+                        "case {case}"
+                    );
+                    let inner = input.extents.last().unwrap();
+                    let TileKernel::Planned(TileKernelSpec::Gemm { inner_block, .. }) = &run.kernel
+                    else {
+                        continue;
+                    };
+                    assert!(
+                        inner.physical_end - inner.start <= *inner_block,
+                        "case {case}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn randomized_tile_local_gelu_reorders_without_exchange() {
         let mut random = fastrand::Rng::with_seed(0x6765_6c75);
         for case in 0..CASES {

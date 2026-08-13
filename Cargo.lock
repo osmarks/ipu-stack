@@ -272,9 +272,7 @@ dependencies = [
  "ipu-elf",
  "ipu-exchange",
  "ipu-package",
- "ipu-profile",
  "serde",
- "serde_json",
  "thiserror",
  "tracing",
 ]
@@ -295,7 +293,6 @@ dependencies = [
 name = "ipu-elf"
 version = "0.1.0"
 dependencies = [
- "hex",
  "object",
  "serde",
  "serde_json",

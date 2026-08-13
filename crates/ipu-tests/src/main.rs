@@ -46,12 +46,6 @@ struct Arguments {
     /// Write per-tile kernel and exchange cycle samples for benchmark runs.
     #[arg(long, conflicts_with = "no_profile")]
     profile_output: Option<PathBuf>,
-    /// Hardware-measured local-kernel costs used by operator planning.
-    #[arg(long, env = "IPU_STACK_KERNEL_CALIBRATION")]
-    kernel_calibration: Option<PathBuf>,
-    /// Ignore an environment-provided kernel calibration.
-    #[arg(long)]
-    no_kernel_calibration: bool,
     /// Build benchmark programs without cycle-counter or per-step profiling.
     #[arg(long)]
     no_profile: bool,
@@ -462,11 +456,6 @@ fn main() -> Result<()> {
             .to_owned(),
         runtime_source,
         pipeline,
-        kernel_calibration: if arguments.no_kernel_calibration {
-            None
-        } else {
-            arguments.kernel_calibration.clone()
-        },
     };
     let diagnostic_package = if arguments.diagnostic_run {
         let package = build_diagnostic_package(&graph, &package_config)?;
@@ -1283,11 +1272,9 @@ fn validate_benchmark_shape(rows: u32, inner: u32, columns: u32) -> Result<()> {
         || inner == 0
         || columns == 0
         || !inner.is_multiple_of(64)
-        || !columns.is_multiple_of(ipu_codegen::mid::AMP_COLUMN_MICRO)
+        || !columns.is_multiple_of(64)
     {
-        bail!(
-            "benchmark rows must be nonzero, inner must be a multiple of 64, and columns must be a multiple of 16"
-        );
+        bail!("benchmark rows must be nonzero and inner/columns must be nonzero multiples of 64");
     }
     Ok(())
 }

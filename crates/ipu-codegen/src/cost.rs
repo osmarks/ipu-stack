@@ -13,8 +13,7 @@ use crate::mid::{
     TensorType,
 };
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::HashMap;
 
 pub trait CostModel {
     fn operator_cycles(
@@ -237,163 +236,8 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct KernelCalibration {
-    measurements: BTreeMap<(String, String, u64), u64>,
-    gemm_samples: Vec<GemmCalibrationSample>,
-}
-
-#[derive(Clone, Debug)]
-struct GemmCalibrationSample {
-    family: String,
-    input0_elements: u64,
-    input1_elements: u64,
-    output_elements: u64,
-    cycles: u64,
-}
-
-impl KernelCalibration {
-    pub fn from_database(
-        database: &ipu_profile::CalibrationDatabase,
-    ) -> Result<Self, &'static str> {
-        if database.schema_version != 1 {
-            return Err("unsupported kernel calibration schema");
-        }
-        if database.target != "ipu21" {
-            return Err("kernel calibration targets another device");
-        }
-        let mut measurements = BTreeMap::new();
-        let mut gemm_samples = Vec::new();
-        for measurement in &database.measurements {
-            let (specification, elements) = if let (Some(specification), Some(elements)) = (
-                measurement.key.dimensions.get("kernelSpec"),
-                measurement
-                    .key
-                    .dimensions
-                    .get("outputElements")
-                    .and_then(|value| value.parse::<u64>().ok()),
-            ) {
-                (specification.clone(), elements)
-            } else if let (Some(pattern), Some(bytes)) = (
-                measurement.key.dimensions.get("pattern"),
-                measurement
-                    .key
-                    .dimensions
-                    .get("bytes")
-                    .and_then(|value| value.parse::<u64>().ok()),
-            ) {
-                (format!("LocalCopy:{pattern}"), bytes)
-            } else {
-                continue;
-            };
-            measurements
-                .entry((
-                    measurement.key.kernel.clone(),
-                    specification.clone(),
-                    elements,
-                ))
-                .and_modify(|cycles: &mut u64| {
-                    *cycles = (*cycles).max(u64::from(measurement.p95_cycles));
-                })
-                .or_insert(u64::from(measurement.p95_cycles));
-            if specification.starts_with("Planned(Gemm {")
-                && let (Some(input0_elements), Some(input1_elements)) = (
-                    dimension(&measurement.key.dimensions, "input0Elements"),
-                    dimension(&measurement.key.dimensions, "input1Elements"),
-                )
-            {
-                gemm_samples.push(GemmCalibrationSample {
-                    family: gemm_specification_family(&specification).to_owned(),
-                    input0_elements,
-                    input1_elements,
-                    output_elements: elements,
-                    cycles: u64::from(measurement.p95_cycles),
-                });
-            }
-        }
-        Ok(Self {
-            measurements,
-            gemm_samples,
-        })
-    }
-
-    fn cycles(&self, kernel: &str, specification: &str, output_elements: u64) -> Option<u64> {
-        self.measurements
-            .get(&(kernel.to_owned(), specification.to_owned(), output_elements))
-            .copied()
-    }
-
-    fn cycles_for_specification(&self, specification: &str, output_elements: u64) -> Option<u64> {
-        self.measurements
-            .iter()
-            .filter(|((_, candidate, elements), _)| {
-                candidate == specification && *elements == output_elements
-            })
-            .map(|(_, cycles)| *cycles)
-            .max()
-    }
-
-    fn local_copy_cycles(&self, pattern: &str, bytes: u64) -> Option<u64> {
-        self.cycles("ipu_stack_copy_u64", &format!("LocalCopy:{pattern}"), bytes)
-    }
-
-    fn gemm_cycles(
-        &self,
-        specification: &str,
-        input0_elements: u64,
-        input1_elements: u64,
-        output_elements: u64,
-    ) -> Option<u64> {
-        if let Some(exact) = self.cycles_for_specification(specification, output_elements) {
-            return Some(exact);
-        }
-        let family = gemm_specification_family(specification);
-        self.gemm_samples
-            .iter()
-            .filter(|sample| sample.family == family)
-            .map(|sample| {
-                [
-                    (input0_elements, sample.input0_elements),
-                    (input1_elements, sample.input1_elements),
-                    (output_elements, sample.output_elements),
-                ]
-                .into_iter()
-                .map(|(requested, measured)| {
-                    sample.cycles.saturating_mul(requested).div_ceil(measured)
-                })
-                .max()
-                .unwrap_or(sample.cycles)
-                .max(sample.cycles)
-            })
-            .min()
-    }
-}
-
-fn dimension(dimensions: &BTreeMap<String, String>, name: &str) -> Option<u64> {
-    dimensions.get(name)?.parse().ok()
-}
-
-fn gemm_specification_family(specification: &str) -> &str {
-    specification
-        .split_once(", inner_block:")
-        .map_or(specification, |(family, _)| family)
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Ipu21CostModel {
-    calibration: Option<Arc<KernelCalibration>>,
-}
-
-#[allow(non_upper_case_globals)]
-pub const Ipu21CostModel: Ipu21CostModel = Ipu21CostModel { calibration: None };
-
-impl Ipu21CostModel {
-    pub fn calibrated(calibration: KernelCalibration) -> Self {
-        Self {
-            calibration: Some(Arc::new(calibration)),
-        }
-    }
-}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ipu21CostModel;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ipu21TargetCosts {
@@ -402,6 +246,8 @@ pub struct Ipu21TargetCosts {
     pub standard_load_bytes_per_cycle: u64,
     pub interleaved_load_bytes_per_cycle: u64,
     pub local_copy_bytes_per_cycle: u64,
+    pub reduction_output_bytes_per_cycle: u64,
+    pub local_copy_call_cycles: u64,
     pub exchange_phase_cycles: u64,
     pub exchange_transfer_cycles: u64,
     pub kernel_launch_cycles: u64,
@@ -416,6 +262,13 @@ pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
     standard_load_bytes_per_cycle: 8,
     interleaved_load_bytes_per_cycle: 16,
     local_copy_bytes_per_cycle: 8,
+    // Reduction-add reads two partials and writes one. Current IPU21 profiles
+    // sustain roughly one output byte per cycle after all three interleaved
+    // streams and worker imbalance are included.
+    reduction_output_bytes_per_cycle: 1,
+    // A finalized six-worker local-copy invocation, including supervisor and
+    // worker rendezvous overhead, takes 288 tile cycles on IPU21.
+    local_copy_call_cycles: 288,
     // Target::getGlobalSyncCycles.
     exchange_phase_cycles: 600,
     // Each logical remote span becomes an independently routed transfer. The
@@ -426,12 +279,29 @@ pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
     kernel_launch_cycles: 11,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AmpKernelCosts {
+    call_cycles: u64,
+    column_group_width: u64,
+    interleaved_column_group_cycles: u64,
+    standard_column_group_cycles: u64,
+}
+
+// Cycle counts of the generated IPU21 AMP kernel. A column group processes
+// sixteen output columns and one 64-element K block. The row term represents
+// AMP work; the remaining group cost is dominated by feeding its weights.
+const IPU21_AMP_KERNEL_COSTS: AmpKernelCosts = AmpKernelCosts {
+    call_cycles: 294,
+    column_group_width: 16,
+    interleaved_column_group_cycles: 940,
+    standard_column_group_cycles: 1_063,
+};
+
 fn amp_kernel_cycles(
-    calibration: Option<&KernelCalibration>,
     multiply: Precision,
     dispatch: &OperatorDispatch,
-    _right: Option<&TensorType>,
-    _staged_local_weights: bool,
+    right: Option<&TensorType>,
+    staged_local_weights: bool,
     output_elements_per_tile: u64,
     output_columns_per_tile: u64,
     k: u64,
@@ -450,67 +320,57 @@ fn amp_kernel_cycles(
         || output_column_block == 0
         || output_columns_per_tile == 0
         || !inner_block.is_multiple_of(u64::from(crate::mid::AMP_COLUMN_MICRO))
-        || !output_column_block.is_multiple_of(u64::from(crate::mid::AMP_COLUMN_MICRO))
+        || !output_column_block.is_multiple_of(IPU21_AMP_KERNEL_COSTS.column_group_width)
     {
         return None;
     }
     let rows = output_elements_per_tile.div_ceil(output_columns_per_tile);
-    let inner_calls = k.div_ceil(inner_block);
-    let column_calls = output_columns_per_tile.div_ceil(output_column_block);
-    let call_output_elements = rows.saturating_mul(output_column_block);
-    let call_input0_elements = rows.saturating_mul(inner_block);
-    let call_input1_elements = inner_block.saturating_mul(output_column_block);
-    if let Some(calibration) = calibration
-        && let OperatorDispatch::BlockedGemm {
-            initialize,
-            accumulate,
-            ..
-        } = dispatch
-    {
-        let initialize = format!("Planned({initialize:?})");
-        let accumulate = format!("Planned({accumulate:?})");
-        let initialize_cycles = calibration.gemm_cycles(
-            &initialize,
-            call_input0_elements,
-            call_input1_elements,
-            call_output_elements,
-        );
-        let accumulate_cycles = if inner_calls > 1 {
-            calibration.gemm_cycles(
-                &accumulate,
-                call_input0_elements,
-                call_input1_elements,
-                call_output_elements,
-            )
-        } else {
-            Some(0)
-        };
-        if let (Some(initialize_cycles), Some(accumulate_cycles)) =
-            (initialize_cycles, accumulate_cycles)
-        {
-            return Some(
-                column_calls.saturating_mul(
-                    initialize_cycles.saturating_add(
-                        inner_calls
-                            .saturating_sub(1)
-                            .saturating_mul(accumulate_cycles),
-                    ),
-                ),
-            );
-        }
-    }
-    let _ = multiply;
-    None
+    let column_groups = output_column_block.div_ceil(IPU21_AMP_KERNEL_COSTS.column_group_width);
+    let interleaved = staged_local_weights
+        || right
+            .is_some_and(|right| right.format.layout.memory_class == MemoryClass::Ipu21Interleaved);
+    let (row_cycles, group_cycles) = match multiply {
+        Precision::F16 => (
+            rows,
+            if interleaved {
+                IPU21_AMP_KERNEL_COSTS.interleaved_column_group_cycles
+            } else {
+                IPU21_AMP_KERNEL_COSTS.standard_column_group_cycles
+            },
+        ),
+        // F32 AMP issues one quarter as many operations per cycle and feeds
+        // twice as many weight bytes as F16 for the same matrix block.
+        Precision::F32 => (
+            rows.saturating_mul(4),
+            IPU21_AMP_KERNEL_COSTS
+                .standard_column_group_cycles
+                .saturating_mul(2),
+        ),
+        Precision::F8F143 { .. } => return None,
+    };
+    let inner_micro_groups_per_call = inner_block / u64::from(crate::mid::AMP_COLUMN_MICRO);
+    let call_cycles = IPU21_AMP_KERNEL_COSTS.call_cycles.saturating_add(
+        inner_micro_groups_per_call.saturating_mul(
+            output_column_block
+                .saturating_mul(row_cycles)
+                .div_ceil(4)
+                .saturating_add(column_groups.saturating_mul(group_cycles).div_ceil(4)),
+        ),
+    );
+    Some(
+        k.div_ceil(inner_block)
+            .saturating_mul(output_columns_per_tile.div_ceil(output_column_block))
+            .saturating_mul(call_cycles),
+    )
 }
 
-fn standard_to_interleaved_copy_cycles(calibration: Option<&KernelCalibration>, bytes: u64) -> u64 {
-    calibration
-        .and_then(|calibration| calibration.local_copy_cycles("Contiguous", bytes))
-        .unwrap_or_else(|| {
-            bytes
-                .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
-                .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
-        })
+fn standard_to_interleaved_copy_cycles(bytes: u64) -> u64 {
+    // The paced parallel helper sustains about six bytes per cycle including
+    // worker scheduling (1,308 measured cycles for an 8 KiB panel). Keep this
+    // separate from the target's ideal memcpy bandwidth.
+    bytes
+        .div_ceil(6)
+        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
 }
 
 fn reduction_tree_critical_path(partitions: u16, fan_in: u16) -> (u64, u64) {
@@ -526,37 +386,6 @@ fn reduction_tree_critical_path(partitions: u16, fan_in: u16) -> (u64, u64) {
         rounds += 1;
     }
     (rounds, additions)
-}
-
-fn reduction_kernel_cycles(
-    calibration: Option<&KernelCalibration>,
-    partitions: u16,
-    fan_in: u16,
-    output_elements: u64,
-    element_bytes: u64,
-) -> u64 {
-    let mut remaining = partitions;
-    let mut cycles = 0u64;
-    while remaining > 1 {
-        let inputs = remaining.min(fan_in);
-        let specification = format!("Planned(ReductionSum {{ inputs: {inputs} }})");
-        let symbol = format!("ipu_stack_reduce_sum_{inputs}_f16");
-        cycles = cycles.saturating_add(
-            calibration
-                .and_then(|calibration| {
-                    calibration.cycles(&symbol, &specification, output_elements)
-                })
-                .unwrap_or_else(|| {
-                    output_elements
-                        .saturating_mul(element_bytes)
-                        .saturating_mul(u64::from(inputs) + 1)
-                        .div_ceil(IPU21_TARGET_COSTS.interleaved_load_bytes_per_cycle)
-                        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
-                }),
-        );
-        remaining = remaining.div_ceil(fan_in);
-    }
-    cycles
 }
 
 impl CostModel for Ipu21CostModel {
@@ -739,10 +568,7 @@ impl CostModel for Ipu21CostModel {
                     // but the critical-path tile performs one local population
                     // for every block it computes rather than one divided share
                     // of the operator's K traffic.
-                    standard_to_interleaved_copy_cycles(
-                        self.calibration.as_deref(),
-                        right_bytes_consumed,
-                    )
+                    standard_to_interleaved_copy_cycles(right_bytes_consumed)
                 } else {
                     0
                 };
@@ -780,8 +606,6 @@ impl CostModel for Ipu21CostModel {
                         let (rounds, reduction_additions) =
                             reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
                         let partial_bytes = maximum_shard_bytes(&compute_output);
-                        let partial_elements =
-                            partial_bytes.div_ceil(compute_output.format.precision.bytes());
                         weight_bytes
                             .saturating_add(activation_bytes)
                             .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
@@ -795,13 +619,15 @@ impl CostModel for Ipu21CostModel {
                                     .saturating_mul(rounds.saturating_add(1))
                                     .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles),
                             )
-                            .saturating_add(reduction_kernel_cycles(
-                                self.calibration.as_deref(),
-                                *inner_partitions,
-                                *reduction_fan_in,
-                                partial_elements,
-                                compute_output.format.precision.bytes(),
-                            ))
+                            .saturating_add(
+                                rounds.saturating_mul(
+                                    partial_bytes
+                                        .div_ceil(
+                                            IPU21_TARGET_COSTS.reduction_output_bytes_per_cycle,
+                                        )
+                                        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
+                                ),
+                            )
                     }
                     _ => exchange,
                 };
@@ -820,7 +646,6 @@ impl CostModel for Ipu21CostModel {
                     OperatorDispatch::SplitHeads => 0,
                 };
                 let kernel = amp_kernel_cycles(
-                    self.calibration.as_deref(),
                     multiply,
                     dispatch,
                     right,
@@ -892,32 +717,11 @@ impl CostModel for Ipu21CostModel {
                         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
                 }
             }
-            MidOperator::Gelu => {
-                let symbol = requirements
-                    .inputs
-                    .first()
-                    .map(|input| &input.format.layout)
-                    .filter(|input| **input != output.format.layout)
-                    .map_or(
-                        "ipu_stack_gelu_exact_f16",
-                        |_| "ipu_stack_gelu_output_to_left_f16",
-                    );
-                self.calibration
-                    .as_deref()
-                    .and_then(|calibration| {
-                        calibration.cycles(
-                            symbol,
-                            "Planned(Gelu)",
-                            spatial_occupancy_adjusted_elements,
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        spatial_occupancy_adjusted_elements
-                            .saturating_mul(output.format.precision.bytes())
-                            .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
-                            .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
-                    })
-            }
+            // The exact scalar implementation is compute-bound at roughly
+            // ten tile cycles per element across the six workers.
+            MidOperator::Gelu => spatial_occupancy_adjusted_elements
+                .saturating_mul(10)
+                .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
             MidOperator::Add(_) => spatial_occupancy_adjusted_elements
                 .div_ceil(16)
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
@@ -954,30 +758,29 @@ impl CostModel for Ipu21CostModel {
             .map_or(1, u64::from);
         let columns = consumer_input.shape.0.last().copied().map_or(1, u64::from);
         let panel_columns = columns.min(u64::from(crate::mid::AMP_COLUMN_MICRO));
-        let (slices, slice_rows) = match consumer_input.format.layout.order {
-            ElementOrder::Amp(AmpOrder::TransposedRight) => (
-                rows.div_ceil(u64::from(crate::mid::AMP_INNER_BLOCK)),
-                rows.min(u64::from(crate::mid::AMP_INNER_BLOCK)),
-            ),
-            ElementOrder::Amp(AmpOrder::RightBlocked(inner_block)) => (
-                rows.div_ceil(u64::from(inner_block)),
-                rows.min(u64::from(inner_block)),
-            ),
-            _ => (
-                1,
-                maximum_shard_bytes(consumer_input)
-                    .div_ceil(bytes)
-                    .div_ceil(columns),
-            ),
-        };
+        let (slices, slice_rows, packing_cycles_per_element) =
+            match consumer_input.format.layout.order {
+                ElementOrder::Amp(AmpOrder::TransposedRight) => (
+                    rows.div_ceil(u64::from(crate::mid::AMP_INNER_BLOCK)),
+                    rows.min(u64::from(crate::mid::AMP_INNER_BLOCK)),
+                    3,
+                ),
+                ElementOrder::Amp(AmpOrder::RightBlocked(inner_block)) => (
+                    rows.div_ceil(u64::from(inner_block)),
+                    rows.min(u64::from(inner_block)),
+                    4,
+                ),
+                _ => (
+                    1,
+                    maximum_shard_bytes(consumer_input)
+                        .div_ceil(bytes)
+                        .div_ceil(columns),
+                    2,
+                ),
+            };
         let panel_elements = slice_rows.saturating_mul(panel_columns);
-        let gather = panel_elements
-            .saturating_mul(bytes)
-            .div_ceil(IPU21_TARGET_COSTS.standard_load_bytes_per_cycle);
-        let pack = panel_elements
-            .saturating_mul(bytes)
-            .saturating_mul(2)
-            .div_ceil(IPU21_TARGET_COSTS.standard_load_bytes_per_cycle);
+        let gather = panel_elements.div_ceil(4);
+        let pack = panel_elements.saturating_mul(packing_cycles_per_element);
         let broadcast = panel_elements
             .saturating_mul(bytes)
             .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle);
@@ -1135,7 +938,7 @@ impl CostModel for Ipu21CostModel {
         };
         let local_cycles = local_bytes
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
-            .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles));
+            .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles));
         // Runtime latency benefits from spatially concurrent roles, whereas
         // every global fragment still contributes encoded row storage.
         let encoded_work = traffic
@@ -1175,57 +978,6 @@ mod tests {
     };
 
     const CASES: usize = 32;
-
-    #[test]
-    fn randomized_calibrations_preserve_exact_specialization_cycles() {
-        let mut random = fastrand::Rng::with_seed(0x6361_6c69_6272_6174);
-        for case in 0..CASES {
-            let elements = random.u64(1..=1 << 20);
-            let cycles = random.u32(1..=u32::MAX);
-            let specification = "Planned(Gemm { multiply: F16, accumulate: F16, mode: Initialize, weights: Interleaved, inner_block: 64, output_columns: 32 })".to_owned();
-            let input0_elements = elements.saturating_mul(2);
-            let input1_elements = elements.saturating_mul(3);
-            let database = ipu_profile::CalibrationDatabase {
-                schema_version: 1,
-                target: "ipu21".into(),
-                build_id: "test".into(),
-                clock_hz: 1_500_000_000,
-                measurements: vec![ipu_profile::CalibrationMeasurement {
-                    key: ipu_profile::CalibrationKey {
-                        kernel: "kernel".into(),
-                        dimensions: BTreeMap::from([
-                            ("kernelSpec".into(), specification.clone()),
-                            ("outputElements".into(), elements.to_string()),
-                            ("input0Elements".into(), input0_elements.to_string()),
-                            ("input1Elements".into(), input1_elements.to_string()),
-                        ]),
-                    },
-                    samples: 1,
-                    minimum_cycles: cycles,
-                    median_cycles: cycles,
-                    p95_cycles: cycles,
-                    maximum_cycles: cycles,
-                }],
-            };
-            let calibration = KernelCalibration::from_database(&database).unwrap();
-            assert_eq!(
-                calibration.cycles("kernel", &specification, elements),
-                Some(u64::from(cycles)),
-                "case {case}"
-            );
-            let related = "Planned(Gemm { multiply: F16, accumulate: F16, mode: Initialize, weights: Interleaved, inner_block: 128, output_columns: 64 })";
-            assert_eq!(
-                calibration.gemm_cycles(
-                    related,
-                    input0_elements * 2,
-                    input1_elements * 2,
-                    elements * 2,
-                ),
-                Some(u64::from(cycles) * 2),
-                "case {case}"
-            );
-        }
-    }
 
     fn pointwise_dispatch() -> OperatorDispatch {
         OperatorDispatch::Pointwise {
