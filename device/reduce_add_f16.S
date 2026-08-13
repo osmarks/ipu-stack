@@ -3,6 +3,7 @@
 	.text
 	.allow_optimizations
 	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
+	.set RECIPROCAL_3_SHL17, 43691
 	// Callable supervisor ABI: m2 output, m3.. inputs, then the physical
 	// half-element count and m10 return. Output may alias the first input.
 
@@ -61,6 +62,15 @@
 	.if \inputs >= 4
 	add $m8, $m8, $m10
 	.endif
+	// Divide the vector count among six workers once. A decrementing loop
+	// avoids an add and comparison for every eight output elements.
+	add $m6, $m9, 5
+	sub $m6, $m6, $m5
+	setzi $m10, RECIPROCAL_3_SHL17
+	mul $m6, $m6, $m10
+	shr $m6, $m6, 18
+	brnzdec $m6, .Lreduce_sum_loop_\@
+	bri .Lreduce_sum_done_\@
 .Lreduce_sum_loop_\@:
 	ld128step $a0:3, $mzero, $m3+=, 6
 	ld128step $a4:7, $mzero, $m4+=, 6
@@ -78,9 +88,7 @@
 	.endif
 	st64step $a0:1, $mzero, $m2+=, 1
 	st64step $a2:3, $mzero, $m2+=, 11
-	add $m5, $m5, 6
-	cmpult $m6, $m5, $m9
-	brnz $m6, .Lreduce_sum_loop_\@
+	brnzdec $m6, .Lreduce_sum_loop_\@
 .Lreduce_sum_done_\@:
 	exitz $m15
 	.endm
