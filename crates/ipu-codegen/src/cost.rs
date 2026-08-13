@@ -293,8 +293,8 @@ struct AmpKernelCosts {
 const IPU21_AMP_KERNEL_COSTS: AmpKernelCosts = AmpKernelCosts {
     call_cycles: 294,
     column_group_width: 16,
-    interleaved_column_group_cycles: 1_157,
-    standard_column_group_cycles: 1_280,
+    interleaved_column_group_cycles: 940,
+    standard_column_group_cycles: 1_063,
 };
 
 fn amp_kernel_cycles(

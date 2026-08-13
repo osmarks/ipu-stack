@@ -218,21 +218,18 @@
 	put $CR, $m8
 	add $m4, $m4, GEMM_RIGHT_BYTE_OFFSET
 	put $CCCSLOAD, $m4
+	setzi $m8, \rows
+	mul $m4, $m8, COLUMN_MICRO_DIMENSION * 2
+	add $m5, $m2, 0
+	add $m9, $m3, 0
 	sync SYNC_COMPUTE_SET
 	zero $m6
 .Lcolumn_group_\@:
 	zero $m7
 .Linner_group_\@:
 	LOAD_AMP16_WEIGHTS
-	setzi $m9, \rows
-	mul $m8, $m9, COLUMN_MICRO_DIMENSION * 2
-	mul $m8, $m8, $m6
-	add $m8, $m2, $m8
-	st32 $m8, $m11, $m15, 0
-	mul $m8, $m9, INNER_MICRO_DIMENSION * GEMM_INPUT_ELEMENT_BYTES
-	mul $m8, $m8, $m7
-	add $m8, $m3, $m8
-	st32 $m8, $m11, $m15, 1
+	st32 $m5, $m11, $m15, 0
+	st32 $m9, $m11, $m15, 1
 	zero $m0
 	ld32 $m8, $m11, $m15, 7
 	brz $m8, .Lstore_initial_\@
@@ -249,10 +246,13 @@
 .Lrun_workers_\@:
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
+	add $m9, $m9, $m4
 	add $m7, $m7, 1
 	setzi $m8, INNER_GROUPS
 	cmpult $m8, $m7, $m8
 	brnz $m8, .Linner_group_\@
+	add $m9, $m3, 0
+	add $m5, $m5, $m4
 	add $m6, $m6, 1
 	setzi $m8, OUTPUT_COLUMNS / COLUMN_MICRO_DIMENSION
 	cmpult $m8, $m6, $m8
@@ -291,7 +291,7 @@
 	bri .Lgemm_f16_load_mode_\@
 \retained_inner_name:
 	brz $m5, .Lgemm_f16_no_rows_\@
-	ld32 $m1, $mvertex_base, $m15, 1
+	add $m1, $m1, (\rows) * INNER_MICRO_DIMENSION * GEMM_INPUT_ELEMENT_BYTES
 	add $m2, $m1, $m6
 .Lgemm_f16_load_mode_\@:
 	ld32 $m7, $mvertex_base, $m15, 5

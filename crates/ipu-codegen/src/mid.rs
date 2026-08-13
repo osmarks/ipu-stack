@@ -4074,7 +4074,7 @@ fn parallel_reduction_candidates_for_orientation(
     config: &PipelineConfig,
     orientation: GemmOrientation,
 ) -> Vec<OperatorCandidate> {
-    const AMP_F16_MICROBLOCK_FIXED_CYCLES: u64 = 289;
+    const AMP_F16_MICROBLOCK_FIXED_CYCLES: u64 = 235;
     let OperatorDispatch::BlockedGemm {
         output_column_block,
         distribution: GemmDistribution::OutputStationary,
