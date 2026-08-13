@@ -17,17 +17,20 @@
 	// tanh GeLU: x/2 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3))).
 	f16v2mul $a2, \value, \value
 	f16v2mul $a2, $a2, \value
-	ldconst $a4, GELU_BETA_F16X2
 	f16v2mul $a2, $a4, $a2
 	f16v2add $a2, \value, $a2
-	ldconst $a4, GELU_ALPHA_F16X2
-	f16v2mul $a2, $a4, $a2
+	f16v2mul $a2, $a5, $a2
 	f16v2tanh $a2, $a2
-	ldconst $a4, ONE_F16X2
-	f16v2add $a2, $a4, $a2
-	ldconst $a4, HALF_F16X2
-	f16v2mul $a2, $a4, $a2
+	f16v2add $a2, $a6, $a2
+	f16v2mul $a2, $a7, $a2
 	f16v2mul $a2, \value, $a2
+	.endm
+
+	.macro LOAD_GELU_CONSTANTS
+	ldconst $a4, GELU_BETA_F16X2
+	ldconst $a5, GELU_ALPHA_F16X2
+	ldconst $a6, ONE_F16X2
+	ldconst $a7, HALF_F16X2
 	.endm
 
 	.macro GELU_ENTRY symbol, worker
@@ -63,6 +66,7 @@
 	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
 	cmpult $m6, $m4, $m8
 	brz $m6, .Lgelu_contiguous_done
+	LOAD_GELU_CONSTANTS
 	shl $m5, $m4, 2
 	add $m2, $m2, $m5
 	add $m3, $m3, $m5
@@ -78,10 +82,29 @@
 .Lgelu_contiguous_done:
 	exitz $m15
 
-	.macro GELU_REORDER_PAIR input_offset, output_offset
-	ld32 $a0, $m3, $m15, \input_offset
-	GELU_PAIR $a0
-	st32 $a2, $m2, $m15, \output_offset
+	.macro GELU_REORDER_TWO_PAIRS input0, output0, input1, output1
+	ld32 $a0, $m3, $m15, \input0
+	ld32 $a1, $m3, $m15, \input1
+	f16v2mul $a2, $a0, $a0
+	f16v2mul $a3, $a1, $a1
+	f16v2mul $a2, $a2, $a0
+	f16v2mul $a3, $a3, $a1
+	f16v2mul $a2, $a4, $a2
+	f16v2mul $a3, $a4, $a3
+	f16v2add $a2, $a0, $a2
+	f16v2add $a3, $a1, $a3
+	f16v2mul $a2, $a5, $a2
+	f16v2mul $a3, $a5, $a3
+	f16v2tanh $a2, $a2
+	f16v2tanh $a3, $a3
+	f16v2add $a2, $a6, $a2
+	f16v2add $a3, $a6, $a3
+	f16v2mul $a2, $a7, $a2
+	f16v2mul $a3, $a7, $a3
+	f16v2mul $a2, $a0, $a2
+	f16v2mul $a3, $a1, $a3
+	st32 $a2, $m2, $m15, \output0
+	st32 $a3, $m2, $m15, \output1
 	.endm
 
 	.worker
@@ -95,18 +118,15 @@
 	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
 	cmpult $m6, $m4, $m8
 	brz $m6, .Lgelu_output_to_left_done
+	LOAD_GELU_CONSTANTS
 	shl $m5, $m4, 5
 	add $m2, $m2, $m5
 	add $m3, $m3, $m5
 .Lgelu_output_to_left_loop:
-	GELU_REORDER_PAIR 0, 0
-	GELU_REORDER_PAIR 1, 4
-	GELU_REORDER_PAIR 2, 1
-	GELU_REORDER_PAIR 3, 5
-	GELU_REORDER_PAIR 4, 2
-	GELU_REORDER_PAIR 5, 6
-	GELU_REORDER_PAIR 6, 3
-	GELU_REORDER_PAIR 7, 7
+	GELU_REORDER_TWO_PAIRS 0, 0, 1, 4
+	GELU_REORDER_TWO_PAIRS 2, 1, 3, 5
+	GELU_REORDER_TWO_PAIRS 4, 2, 5, 6
+	GELU_REORDER_TWO_PAIRS 6, 3, 7, 7
 	add $m2, $m2, 192
 	add $m3, $m3, 192
 	add $m4, $m4, 6
