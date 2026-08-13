@@ -62,31 +62,22 @@
 	add $m8, $m8, $m10
 	.endif
 .Lreduce_sum_loop_\@:
-	ld128 $a0:3, $m3, $m15, 0
-	ld128 $a4:7, $m4, $m15, 0
+	ld128step $a0:3, $mzero, $m3+=, 6
+	ld128step $a4:7, $mzero, $m4+=, 6
 	f16v4add $a0:1, $a0:1, $a4:5
 	f16v4add $a2:3, $a2:3, $a6:7
 	.if \inputs >= 3
-	ld128 $a4:7, $m7, $m15, 0
+	ld128step $a4:7, $mzero, $m7+=, 6
 	f16v4add $a0:1, $a0:1, $a4:5
 	f16v4add $a2:3, $a2:3, $a6:7
 	.endif
 	.if \inputs >= 4
-	ld128 $a4:7, $m8, $m15, 0
+	ld128step $a4:7, $mzero, $m8+=, 6
 	f16v4add $a0:1, $a0:1, $a4:5
 	f16v4add $a2:3, $a2:3, $a6:7
 	.endif
-	st64 $a0:1, $m2, $m15, 0
-	st64 $a2:3, $m2, $m15, 1
-	add $m2, $m2, 96
-	add $m3, $m3, 96
-	add $m4, $m4, 96
-	.if \inputs >= 3
-	add $m7, $m7, 96
-	.endif
-	.if \inputs >= 4
-	add $m8, $m8, 96
-	.endif
+	st64step $a0:1, $mzero, $m2+=, 1
+	st64step $a2:3, $mzero, $m2+=, 11
 	add $m5, $m5, 6
 	cmpult $m6, $m5, $m9
 	brnz $m6, .Lreduce_sum_loop_\@
