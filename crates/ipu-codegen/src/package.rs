@@ -1594,9 +1594,9 @@ fn profile_work_can_merge(
     ) || matches!(
         (previous, current),
         (
-            crate::TileWorkRef::LocalCopy(_),
-            crate::TileWorkRef::LocalCopy(_)
-        )
+            crate::TileWorkRef::LocalCopy(previous),
+            crate::TileWorkRef::LocalCopy(current)
+        ) if previous.bytes == current.bytes && previous.pattern == current.pattern
     )
 }
 

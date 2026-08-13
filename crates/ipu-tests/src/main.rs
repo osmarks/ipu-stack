@@ -1272,9 +1272,11 @@ fn validate_benchmark_shape(rows: u32, inner: u32, columns: u32) -> Result<()> {
         || inner == 0
         || columns == 0
         || !inner.is_multiple_of(64)
-        || !columns.is_multiple_of(64)
+        || !columns.is_multiple_of(ipu_codegen::mid::AMP_COLUMN_MICRO)
     {
-        bail!("benchmark rows must be nonzero and inner/columns must be nonzero multiples of 64");
+        bail!(
+            "benchmark rows must be nonzero, inner must be a multiple of 64, and columns must be a multiple of 16"
+        );
     }
     Ok(())
 }

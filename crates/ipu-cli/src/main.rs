@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use ipu_driver::{Device, block_device_interrupt_signals};
-use ipu_elf::{LinkOptions, Toolchain, inspect_object, link};
+use ipu_elf::{LinkOptions, Toolchain, inspect_object, link, source_tree_digest};
 use ipu_package::{Application, ProfileExchangeActivityKind, ProfileReport, ProfileStepKind};
 use ipu_profile::{
     GroupBy, Query, SortBy, StepKind, calibrate_profiles, cycle_origin, exchange_activity_summary,
@@ -23,6 +23,10 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Hash kernel sources to identify compatible cycle measurements.
+    KernelBuildId {
+        source_directory: PathBuf,
+    },
     KernelCompile {
         source: PathBuf,
         #[arg(long)]
@@ -167,6 +171,9 @@ fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     init_tracing();
     match Arguments::parse().command {
+        Command::KernelBuildId { source_directory } => {
+            println!("{}", source_tree_digest(source_directory)?);
+        }
         Command::KernelCompile {
             source,
             name,

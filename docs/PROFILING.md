@@ -24,3 +24,16 @@ ipu-stack profile-query profile.capnp --kind exchange --group-by phase
 
 The profile schema supports operation names, phases, epochs, kernel symbols,
 and metadata for the query layer.
+
+## Kernel cycle calibration
+
+Generate a source-identified database of per-kernel hardware measurements with:
+
+```sh
+scripts/calibrate-ipu21-costs.sh c600-init.ipucfg
+```
+
+The database is written to `profiles/ipu21-kernel-costs.json` and remains
+untracked. It is intended for kernel development, regression comparisons, and
+future autotuning; the planner continues to use its established empirical cost
+model.
