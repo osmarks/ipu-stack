@@ -3169,6 +3169,9 @@ impl LoweringState {
                     let mut next = Vec::with_capacity(row_partials.len().div_ceil(fan_in));
                     for group in row_partials.chunks(fan_in) {
                         let receiver = group[0].clone();
+                        let mut inputs = vec![KernelOperand {
+                            views: vec![receiver.1.clone()],
+                        }];
                         for sender in group[1..].iter().cloned() {
                             let incoming = self.push_shard(LowShard {
                                 id: LowShardId(0),
@@ -3183,6 +3186,11 @@ impl LoweringState {
                                 .entry(sender.1.clone())
                                 .or_default()
                                 .push(self.full_view(incoming));
+                            inputs.push(KernelOperand {
+                                views: vec![self.full_view(incoming)],
+                            });
+                        }
+                        if inputs.len() > 1 {
                             reduction_runs.push((
                                 receiver.0,
                                 KernelRun::new(
@@ -3191,15 +3199,11 @@ impl LoweringState {
                                         value: Some(*output_value),
                                         reason: WorkReason::OperatorKernel,
                                     },
-                                    TileKernel::Planned(TileKernelSpec::ReductionAdd),
-                                    vec![
-                                        KernelOperand {
-                                            views: vec![receiver.1.clone()],
-                                        },
-                                        KernelOperand {
-                                            views: vec![self.full_view(incoming)],
-                                        },
-                                    ],
+                                    TileKernel::Planned(TileKernelSpec::ReductionSum {
+                                        inputs: u8::try_from(inputs.len())
+                                            .map_err(|_| LowLoweringError::IdOverflow)?,
+                                    }),
+                                    inputs,
                                     receiver.1.clone(),
                                     KernelRequirements::Operator(requirements.clone()),
                                 ),
@@ -4365,7 +4369,7 @@ mod tests {
                 .filter(|run| {
                     matches!(
                         run.kernel,
-                        TileKernel::Planned(TileKernelSpec::ReductionAdd)
+                        TileKernel::Planned(TileKernelSpec::ReductionSum { .. })
                     )
                 })
                 .count();

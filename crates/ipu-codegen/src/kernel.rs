@@ -273,7 +273,11 @@ impl KernelBuildPlan {
                 source: "reduce_add_f16.S",
                 name: "reduce_add_f16".into(),
                 flags: Vec::new(),
-                retained_symbols: vec!["ipu_stack_reduce_add_f16".into()],
+                retained_symbols: vec![
+                    "ipu_stack_reduce_sum_2_f16".into(),
+                    "ipu_stack_reduce_sum_3_f16".into(),
+                    "ipu_stack_reduce_sum_4_f16".into(),
+                ],
             });
         }
         let has_rearrange_codelets = !rearrangements.is_empty();
@@ -709,7 +713,7 @@ fn collect_kernels(
                         .insert(gemm_rows(run)?);
                 } else if matches!(kernel, TileKernelSpec::Gelu) {
                     *gelu = true;
-                } else if matches!(kernel, TileKernelSpec::ReductionAdd) {
+                } else if matches!(kernel, TileKernelSpec::ReductionSum { .. }) {
                     *reduction_add = true;
                 } else if let TileKernelSpec::Rearrange {
                     from:
@@ -1011,15 +1015,21 @@ pub fn tile_kernel_abi(
                 scalar_arguments(1, &["element_count"]),
             )
         }
-        TileKernelSpec::ReductionAdd => {
+        TileKernelSpec::ReductionSum { inputs } => {
             if precision != Precision::F16 {
                 return Err(KernelAbiError::RequirementMismatch);
             }
+            let symbol = match inputs {
+                2 => "ipu_stack_reduce_sum_2_f16",
+                3 => "ipu_stack_reduce_sum_3_f16",
+                4 => "ipu_stack_reduce_sum_4_f16",
+                _ => return Err(KernelAbiError::RequirementMismatch),
+            };
             (
-                KernelSymbols::Exact("ipu_stack_reduce_add_f16"),
+                KernelSymbols::Exact(symbol),
                 KernelAvailability::Implemented,
-                2,
-                scalar_arguments(2, &["element_count"]),
+                *inputs,
+                scalar_arguments(*inputs, &["element_count"]),
             )
         }
         TileKernelSpec::Add => (
@@ -1157,11 +1167,11 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             });
         }
     }
-    if matches!(kernel, TileKernelSpec::ReductionAdd) {
+    if matches!(kernel, TileKernelSpec::ReductionSum { .. }) {
         let count = element_count(run)?;
         if !count.is_multiple_of(8) {
             return Err(KernelAbiError::UnsupportedElementCount {
-                symbol: "ipu_stack_reduce_add_f16",
+                symbol: "ipu_stack_reduce_sum_f16",
                 count,
                 divisor: 8,
             });

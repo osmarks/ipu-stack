@@ -573,7 +573,7 @@ impl CostModel for Ipu21CostModel {
                                     .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles),
                             )
                             .saturating_add(
-                                reduction_additions.saturating_mul(
+                                rounds.saturating_mul(
                                     partial_bytes
                                         .div_ceil(
                                             IPU21_TARGET_COSTS.reduction_output_bytes_per_cycle,

@@ -76,7 +76,9 @@ pub enum TileKernelSpec {
         output_columns: u32,
     },
     Gelu,
-    ReductionAdd,
+    ReductionSum {
+        inputs: u8,
+    },
     Add,
     FlashAttention {
         options: AttentionOptions,
