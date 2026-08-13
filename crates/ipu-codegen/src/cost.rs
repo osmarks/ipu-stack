@@ -585,6 +585,7 @@ impl CostModel for Ipu21CostModel {
                                 column_partitions,
                                 inner_partitions,
                                 reduction_fan_in,
+                                result_partitions,
                                 ..
                             },
                         ..
@@ -605,6 +606,11 @@ impl CostModel for Ipu21CostModel {
                         let (rounds, reduction_additions) =
                             reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
                         let partial_bytes = maximum_shard_bytes(&compute_output);
+                        let reduction_partial_bytes = if *result_partitions > 1 {
+                            maximum_shard_bytes(output)
+                        } else {
+                            partial_bytes
+                        };
                         let result_redistribution =
                             if compute_output.format.layout != output.format.layout {
                                 maximum_shard_bytes(output)
@@ -618,7 +624,7 @@ impl CostModel for Ipu21CostModel {
                             .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
                             .saturating_add(
                                 reduction_additions
-                                    .saturating_mul(partial_bytes)
+                                    .saturating_mul(reduction_partial_bytes)
                                     .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle),
                             )
                             .saturating_add(
@@ -628,7 +634,7 @@ impl CostModel for Ipu21CostModel {
                             )
                             .saturating_add(
                                 rounds.saturating_mul(
-                                    partial_bytes
+                                    reduction_partial_bytes
                                         .div_ceil(
                                             IPU21_TARGET_COSTS.reduction_output_bytes_per_cycle,
                                         )
@@ -831,6 +837,7 @@ impl CostModel for Ipu21CostModel {
                     GemmDistribution::ParallelReduction {
                         inner_partitions,
                         reduction_fan_in,
+                        result_partitions,
                         ..
                     },
                 ..
@@ -838,7 +845,9 @@ impl CostModel for Ipu21CostModel {
                 let epochs = 1u64;
                 let (rounds, _) =
                     reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
-                epochs.saturating_mul(rounds.saturating_add(1))
+                epochs
+                    .saturating_mul(rounds.saturating_add(1))
+                    .saturating_add(u64::from(*result_partitions > 1))
             }
             _ => phases,
         };

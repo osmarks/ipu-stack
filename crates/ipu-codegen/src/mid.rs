@@ -269,6 +269,11 @@ pub enum GemmDistribution {
         column_partitions: u16,
         inner_partitions: u16,
         reduction_fan_in: u16,
+        /// Number of final physical-output-column shards produced from each
+        /// compute row/column block. A value greater than one distributes
+        /// contiguous AMP panel ranges over former K-partition tiles instead
+        /// of concentrating the result on one root per block.
+        result_partitions: u16,
     },
 }
 
@@ -2395,6 +2400,47 @@ impl OperatorPlan {
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
                 }
+                if let GemmDistribution::ParallelReduction {
+                    row_partitions,
+                    column_partitions,
+                    inner_partitions,
+                    reduction_fan_in,
+                    result_partitions,
+                } = distribution
+                {
+                    let result_columns = column_partitions.saturating_mul(*result_partitions);
+                    let expected_tiles = row_partitions.saturating_mul(result_columns);
+                    let row_axis = match orientation {
+                        GemmOrientation::Normal => TensorAxis::FromEnd(2),
+                        GemmOrientation::Swapped => TensorAxis::FromEnd(1),
+                    };
+                    let column_axis = match orientation {
+                        GemmOrientation::Normal => TensorAxis::FromEnd(1),
+                        GemmOrientation::Swapped => TensorAxis::FromEnd(2),
+                    };
+                    let axis_partitions = |axis| {
+                        output
+                            .format
+                            .layout
+                            .tiling
+                            .axes
+                            .iter()
+                            .find(|tiling| tiling.axis == axis)
+                            .map(|tiling| tiling.partitions)
+                    };
+                    if *row_partitions == 0
+                        || *column_partitions == 0
+                        || *inner_partitions < 2
+                        || *reduction_fan_in < 2
+                        || *result_partitions == 0
+                        || *result_partitions > *inner_partitions
+                        || output.format.layout.tiling.tile_count != expected_tiles
+                        || axis_partitions(row_axis) != Some(*row_partitions)
+                        || axis_partitions(column_axis) != Some(result_columns)
+                    {
+                        return Err(OperatorPlanError::InvalidBlocking);
+                    }
+                }
                 let physical_left = match orientation {
                     GemmOrientation::Normal => left,
                     GemmOrientation::Swapped => right,
@@ -2469,9 +2515,15 @@ impl OperatorPlan {
                         GemmOrientation::Normal => 1,
                         GemmOrientation::Swapped => 2,
                     };
+                let output_shard_alignment = match distribution {
+                    GemmDistribution::ParallelReduction {
+                        result_partitions, ..
+                    } if *result_partitions > 1 => AMP_COLUMN_MICRO,
+                    _ => *output_column_block,
+                };
                 if !left_padded.0[physical_left_inner_axis].is_multiple_of(*inner_block)
-                    || !output_padded.0[output_column_axis].is_multiple_of(*output_column_block)
-                    || !columns_per_output_shard.is_multiple_of(*output_column_block)
+                    || !output_padded.0[output_column_axis].is_multiple_of(output_shard_alignment)
+                    || !columns_per_output_shard.is_multiple_of(output_shard_alignment)
                     || columns_per_right_shard < *output_column_block
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
@@ -2999,6 +3051,27 @@ fn lower_operations(
         peak_memory: MemoryPeaks::default(),
     }];
     for (operation_index, operation) in source.iter().enumerate() {
+        let distributed_result_is_useful = operation.results.first().is_some_and(|result| {
+            value_uses.get(result).copied() == Some(1)
+                && source[operation_index + 1..]
+                    .iter()
+                    .find(|consumer| consumer.inputs.contains(result))
+                    .is_some_and(|consumer| {
+                        config
+                            .operator_candidates
+                            .iter()
+                            .filter(|candidate| {
+                                operator_matches(&consumer.kind, candidate.operator)
+                            })
+                            .any(|candidate| {
+                                matches!(
+                                    candidate.format_policy,
+                                    OperatorFormatPolicy::PreserveInputLayout(_)
+                                        | OperatorFormatPolicy::PreserveInputTiling(_)
+                                )
+                            })
+                    })
+        });
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
         let mut saw_candidate = false;
@@ -3116,6 +3189,7 @@ fn lower_operations(
                     &parameter_inputs,
                     &output_shape,
                     config,
+                    distributed_result_is_useful,
                 );
                 plan_cache.entry(cache_key).or_insert(generated)
             };
@@ -3831,6 +3905,7 @@ fn plans(
     parameter_inputs: &[bool],
     output: &TensorShape,
     config: &PipelineConfig,
+    distributed_result_is_useful: bool,
 ) -> Vec<Plan> {
     let mut plans = Vec::new();
     if let OperationKind::SplitHeads(options) = operation.kind
@@ -4000,7 +4075,12 @@ fn plans(
             candidate.output.format.layout.tiling = actual.format.layout.tiling.clone();
         }
         let mut variants = vec![candidate.clone()];
-        variants.extend(parallel_reduction_candidates(&candidate, inputs, config));
+        variants.extend(parallel_reduction_candidates(
+            &candidate,
+            inputs,
+            config,
+            distributed_result_is_useful,
+        ));
         for (input_index, _) in parameter_inputs
             .iter()
             .enumerate()
@@ -4135,11 +4215,18 @@ fn parallel_reduction_candidates(
     candidate: &OperatorCandidate,
     inputs: &[TensorType],
     config: &PipelineConfig,
+    distributed_result_is_useful: bool,
 ) -> Vec<OperatorCandidate> {
     [GemmOrientation::Normal, GemmOrientation::Swapped]
         .into_iter()
         .flat_map(|orientation| {
-            parallel_reduction_candidates_for_orientation(candidate, inputs, config, orientation)
+            parallel_reduction_candidates_for_orientation(
+                candidate,
+                inputs,
+                config,
+                orientation,
+                distributed_result_is_useful,
+            )
         })
         .collect()
 }
@@ -4149,6 +4236,7 @@ fn parallel_reduction_candidates_for_orientation(
     inputs: &[TensorType],
     config: &PipelineConfig,
     orientation: GemmOrientation,
+    distributed_result_is_useful: bool,
 ) -> Vec<OperatorCandidate> {
     // Residual supervisor, weight-feed, and worker setup cost after retained
     // state, measured on IPU21 independently of the four issue cycles per row.
@@ -4467,6 +4555,7 @@ fn parallel_reduction_candidates_for_orientation(
                     column_partitions,
                     inner_partitions,
                     reduction_fan_in,
+                    result_partitions: 1,
                 };
             }
             let physical_right_index = match orientation {
@@ -4480,33 +4569,78 @@ fn parallel_reduction_candidates_for_orientation(
                     LocalOperandStaging::MatchRemote,
                 ],
             };
-            let mut result_layout_variants = vec![variant.clone()];
-            if row_partitions > 1 && column_partitions > 1 {
-                let mut rows_fast = variant;
-                rows_fast.output.format.layout = match orientation {
-                    GemmOrientation::Normal => Layout::amp_left_result_grid(
-                        kernel_output_columns,
-                        row_partitions.saturating_mul(column_partitions),
-                        row_partitions,
-                        column_partitions,
-                        GridOrder::RowsFast,
-                    ),
-                    GemmOrientation::Swapped => Layout::amp_transposed_left_result_grid(
-                        kernel_output_columns,
-                        row_partitions.saturating_mul(column_partitions),
-                        row_partitions,
-                        column_partitions,
-                        GridOrder::RowsFast,
-                    ),
+            let mut result_layout_variants = Vec::new();
+            let mut result_partition_options = vec![1];
+            let maximum_result_partitions = u16::try_from(
+                columns
+                    .div_ceil(AMP_COLUMN_MICRO)
+                    .checked_div(u32::from(column_partitions))
+                    .unwrap_or(0),
+            )
+            .unwrap_or(u16::MAX)
+            .min(inner_partitions);
+            if distributed_result_is_useful && maximum_result_partitions > 1 {
+                result_partition_options.push(maximum_result_partitions);
+            }
+            for result_partitions in result_partition_options {
+                let result_columns = column_partitions.saturating_mul(result_partitions);
+                let result_column_block = if result_partitions > 1 {
+                    AMP_COLUMN_MICRO
+                } else {
+                    kernel_output_columns
                 };
-                result_layout_variants.push(rows_fast);
+                for grid_order in [GridOrder::ColumnsFast, GridOrder::RowsFast] {
+                    if grid_order == GridOrder::RowsFast
+                        && (result_partitions > 1 || row_partitions == 1 || result_columns == 1)
+                    {
+                        continue;
+                    }
+                    let mut result_variant = variant.clone();
+                    if let OperatorDispatch::BlockedGemm {
+                        distribution:
+                            GemmDistribution::ParallelReduction {
+                                result_partitions: selected,
+                                ..
+                            },
+                        ..
+                    } = &mut result_variant.dispatch
+                    {
+                        *selected = result_partitions;
+                    }
+                    result_variant.output.format.layout = match orientation {
+                        GemmOrientation::Normal => Layout::amp_left_result_grid(
+                            result_column_block,
+                            row_partitions.saturating_mul(result_columns),
+                            row_partitions,
+                            result_columns,
+                            grid_order,
+                        ),
+                        GemmOrientation::Swapped => Layout::amp_transposed_left_result_grid(
+                            result_column_block,
+                            row_partitions.saturating_mul(result_columns),
+                            row_partitions,
+                            result_columns,
+                            grid_order,
+                        ),
+                    };
+                    result_layout_variants.push(result_variant);
+                }
             }
             let mut layout_variants = Vec::new();
             for result_layout in result_layout_variants {
                 layout_variants.push(result_layout.clone());
+                let result_rows = result_layout
+                    .output
+                    .format
+                    .layout
+                    .tiling
+                    .axes
+                    .iter()
+                    .find(|axis| axis.axis == TensorAxis::FromEnd(2))
+                    .map_or(row_partitions, |axis| axis.partitions);
                 if orientation == GemmOrientation::Normal
                     && normal_rows % 2 != 0
-                    && u32::from(row_partitions) <= normal_rows.div_ceil(2)
+                    && u32::from(result_rows) <= normal_rows.div_ceil(2)
                 {
                     let mut padded = result_layout;
                     pad_matrix_rows_to_f16_exchange_word(&mut padded.inputs[0].format.layout);
@@ -5033,6 +5167,7 @@ mod tests {
     #[test]
     fn randomized_parallel_reduction_candidates_cover_uneven_three_axis_grids() {
         let mut random = fastrand::Rng::with_seed(0x7061_7274_6961_6c73);
+        let mut distributed_result_cases = 0;
         for _ in 0..RANDOM_CASES {
             let output_columns = AMP_OUTPUT_COLUMN_BLOCK;
             let inner_partitions = random.u16(2..=4);
@@ -5060,11 +5195,23 @@ mod tests {
                 TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
             ];
             let config = PipelineConfig::new(tiles).with_planning_beam_width(16);
-            let candidates = parallel_reduction_candidates(&base, &inputs, &config);
+            let candidates = parallel_reduction_candidates(&base, &inputs, &config, true);
             assert!(
                 !candidates.is_empty(),
                 "shape={m}x{k}x{n} tiles={tiles} output_columns={output_columns}"
             );
+            distributed_result_cases += usize::from(candidates.iter().any(|candidate| {
+                matches!(
+                    candidate.dispatch,
+                    OperatorDispatch::BlockedGemm {
+                        distribution: GemmDistribution::ParallelReduction {
+                            result_partitions,
+                            ..
+                        },
+                        ..
+                    } if result_partitions > 1
+                )
+            }));
             let swapped_staging = candidates
                 .iter()
                 .filter_map(|candidate| match candidate.dispatch {
@@ -5093,6 +5240,7 @@ mod tests {
                             GemmDistribution::ParallelReduction {
                                 row_partitions,
                                 column_partitions,
+                                result_partitions: 1,
                                 ..
                             },
                         ..
@@ -5186,6 +5334,7 @@ mod tests {
                 ));
             }
         }
+        assert!(distributed_result_cases > 0);
     }
 
     #[test]

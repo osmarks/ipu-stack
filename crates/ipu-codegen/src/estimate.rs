@@ -416,6 +416,7 @@ pub(crate) fn operator_memory_estimate(
                     column_partitions,
                     inner_partitions,
                     reduction_fan_in,
+                    result_partitions,
                     ..
                 },
             output_column_block,
@@ -474,10 +475,15 @@ pub(crate) fn operator_memory_estimate(
         // one local partial plus the incoming members of one reduction group.
         // Model the larger phase instead of summing mutually exclusive scratch.
         let partial_bytes = maximum_shard_bytes(&gemm_partial_tensor(dispatch, output));
+        let reduction_partial_bytes = if *result_partitions > 1 {
+            maximum_shard_bytes(output)
+        } else {
+            partial_bytes
+        };
         convolution.interleaved = convolution.interleaved.saturating_add(partial_bytes);
         let reduction = MemoryUsage {
             standard: 0,
-            interleaved: partial_bytes.saturating_mul(u64::from(*reduction_fan_in)),
+            interleaved: reduction_partial_bytes.saturating_mul(u64::from(*reduction_fan_in)),
         };
         temporary = if convolution.total() >= reduction.total() {
             convolution
