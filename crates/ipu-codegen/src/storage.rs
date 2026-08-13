@@ -60,34 +60,45 @@ pub fn view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageResult<Vec<
     if let Some(spans) = block_major_panel_spans(shard, view)? {
         return Ok(spans);
     }
-    let widths = shard
+    let shard_widths = shard
         .extents
         .iter()
         .map(|extent| extent.physical_end - extent.start)
         .collect::<Vec<_>>();
-    let elements = widths.iter().try_fold(1u64, |product, &width| {
+    let view_widths = view
+        .extents
+        .iter()
+        .map(|extent| extent.physical_end - extent.start)
+        .collect::<Vec<_>>();
+    let elements = view_widths.iter().try_fold(1u64, |product, &width| {
         product
             .checked_mul(u64::from(width))
             .ok_or(StorageError::Overflow)
     })?;
     let element_bytes = u32::try_from(shard.tensor_type.format.precision.bytes())
         .map_err(|_| StorageError::Overflow)?;
-    let mut spans = Vec::<ByteSpan>::new();
-    for physical in 0..elements {
-        let local = physical_coordinates(shard, &widths, physical)?;
-        let selected = local.iter().zip(&shard.extents).zip(&view.extents).all(
-            |((&coordinate, shard_extent), view_extent)| {
-                let global = shard_extent.start + coordinate;
-                global >= view_extent.start && global < view_extent.physical_end
-            },
-        );
-        if !selected {
-            continue;
+    let mut view_coordinates = vec![0; view_widths.len()];
+    let mut shard_coordinates = vec![0; shard_widths.len()];
+    let mut offsets = Vec::with_capacity(usize::try_from(elements).unwrap_or(0));
+    for logical in 0..elements {
+        decode_row_major(&view_widths, logical, &mut view_coordinates);
+        for ((shard_coordinate, view_coordinate), (shard_extent, view_extent)) in shard_coordinates
+            .iter_mut()
+            .zip(&view_coordinates)
+            .zip(shard.extents.iter().zip(&view.extents))
+        {
+            *shard_coordinate = view_extent.start - shard_extent.start + view_coordinate;
         }
+        let physical = physical_index(shard, &shard_widths, &shard_coordinates)?;
         let offset = u32::try_from(physical)
             .ok()
             .and_then(|index| index.checked_mul(element_bytes))
             .ok_or(StorageError::Overflow)?;
+        offsets.push(offset);
+    }
+    offsets.sort_unstable();
+    let mut spans = Vec::<ByteSpan>::new();
+    for offset in offsets {
         match spans.last_mut() {
             Some(last) if last.offset.checked_add(last.bytes) == Some(offset) => {
                 last.bytes = last
@@ -515,6 +526,7 @@ fn validate_view(shard: &LowShard, view: &ShardView) -> StorageResult<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn physical_coordinates(
     shard: &LowShard,
     widths: &[u32],
