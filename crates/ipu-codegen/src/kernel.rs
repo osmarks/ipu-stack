@@ -295,10 +295,7 @@ impl KernelBuildPlan {
                 source: "gelu_f16.S",
                 name: "gelu_f16".into(),
                 flags: Vec::new(),
-                retained_symbols: vec![
-                    "ipu_stack_gelu_exact_f16".into(),
-                    "ipu_stack_gelu_output_to_left_f16".into(),
-                ],
+                retained_symbols: vec!["ipu_stack_gelu_exact_f16".into()],
             });
         }
         if reduction_add {
@@ -1190,11 +1187,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
         let KernelSymbols::Exact(symbol) = abi.symbols else {
             return Err(KernelAbiError::RequirementMismatch);
         };
-        let divisor = if symbol == "ipu_stack_gelu_output_to_left_f16" {
-            16
-        } else {
-            2
-        };
+        let divisor = 2;
         let count = element_count(run)?;
         if !count.is_multiple_of(divisor) {
             return Err(KernelAbiError::UnsupportedElementCount {
@@ -1231,15 +1224,7 @@ fn gelu_symbol(requirements: &KernelRequirements) -> Option<&'static str> {
     }
     let input_layout = &input.format.layout;
     let output_layout = &requirements.output.format.layout;
-    if input_layout == output_layout {
-        Some("ipu_stack_gelu_exact_f16")
-    } else if matches!(input_layout.order, ElementOrder::Amp(AmpOrder::Output))
-        && matches!(output_layout.order, ElementOrder::Amp(AmpOrder::Left))
-    {
-        Some("ipu_stack_gelu_output_to_left_f16")
-    } else {
-        None
-    }
+    (input_layout == output_layout).then_some("ipu_stack_gelu_exact_f16")
 }
 
 fn gemm_symbols(
@@ -1475,17 +1460,12 @@ mod tests {
         let mut random = fastrand::Rng::with_seed(0x6765_6c75);
         for _ in 0..64 {
             let tiles = 1_u16 << random.u32(0..=5);
-            let transition = random.bool();
-            let input_layout = if transition {
-                Layout::amp_output(tiles)
+            let input_layout = if random.bool() {
+                Layout::amp_left_result(tiles)
             } else {
                 Layout::row_sharded(tiles)
             };
-            let output_layout = if transition {
-                Layout::amp_left(64, tiles)
-            } else {
-                input_layout.clone()
-            };
+            let output_layout = input_layout.clone();
             let requirement = |layout| {
                 OperandRequirement::new(
                     TensorFormat {
@@ -1507,11 +1487,7 @@ mod tests {
             assert_eq!(abi.scalar_arguments[0].register, 4);
             assert_eq!(
                 abi.symbols,
-                KernelSymbols::Exact(if transition {
-                    "ipu_stack_gelu_output_to_left_f16"
-                } else {
-                    "ipu_stack_gelu_exact_f16"
-                })
+                KernelSymbols::Exact("ipu_stack_gelu_exact_f16")
             );
         }
     }

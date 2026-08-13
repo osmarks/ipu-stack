@@ -2854,17 +2854,35 @@ impl LoweringState {
             .map(|start| (start, start + output_column_block))
             .collect::<Vec<_>>();
         let mut partial_type = output_type.clone();
-        partial_type.format.layout = match orientation {
-            crate::GemmOrientation::Normal => Layout::amp_output_grid(
+        let partial_tiles = row_partitions.saturating_mul(column_partitions);
+        partial_type.format.layout = match (orientation, output_type.format.layout.order) {
+            (crate::GemmOrientation::Normal, ElementOrder::Amp(AmpOrder::Left)) => {
+                Layout::amp_left_result_grid(
+                    output_column_block,
+                    partial_tiles,
+                    row_partitions,
+                    column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
+                )
+            }
+            (crate::GemmOrientation::Swapped, ElementOrder::Amp(AmpOrder::TransposedLeft)) => {
+                Layout::amp_transposed_left_result_grid(
+                    output_column_block,
+                    partial_tiles,
+                    row_partitions,
+                    column_partitions,
+                )
+            }
+            (crate::GemmOrientation::Normal, _) => Layout::amp_output_grid(
                 output_column_block,
-                row_partitions.saturating_mul(column_partitions),
+                partial_tiles,
                 row_partitions,
                 column_partitions,
                 crate::mid::GridOrder::ColumnsFast,
             ),
-            crate::GemmOrientation::Swapped => Layout::amp_transposed_output_grid(
+            (crate::GemmOrientation::Swapped, _) => Layout::amp_transposed_output_grid(
                 output_column_block,
-                row_partitions.saturating_mul(column_partitions),
+                partial_tiles,
                 row_partitions,
                 column_partitions,
             ),
@@ -4470,7 +4488,7 @@ mod tests {
             };
             let output_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_output_grid(
+                layout: Layout::amp_left_result_grid(
                     output_columns,
                     storage_rows * column_partitions,
                     storage_rows,
@@ -4583,7 +4601,7 @@ mod tests {
             };
             let output_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_output(compute_tiles),
+                layout: Layout::amp_left_result(compute_tiles),
             };
             let mut config = PipelineConfig::new(compute_tiles)
                 .with_input(left, left_format.clone())
@@ -5483,7 +5501,7 @@ mod tests {
             };
             let output_format = TensorFormat {
                 precision: Precision::F16,
-                layout: Layout::amp_output_grid(
+                layout: Layout::amp_left_result_grid(
                     64,
                     tiles,
                     row_partitions,

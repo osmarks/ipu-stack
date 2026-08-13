@@ -79,38 +79,38 @@
 	.endm
 
 	.macro LOAD_AMP16_WEIGHTS
-	// Source groups stay in natural block-major order. The putcs immediate is
-	// the AMP coefficient destination; changing its issue sequence performs the
-	// register permutation without pre-permuting persistent SRAM data.
+	// Source groups stay in natural output-major, inner-minor block order. Route
+	// them to the same non-monotonic CWEI destinations as Poplin's IPU21 1x1
+	// kernel so the accumulator drain is directly left-operand compatible.
 #ifdef GEMM_INTERLEAVED_WEIGHTS
 	ld128putcs 0
 	ld128putcs 2
 	ld128putcs 4
 	ld128putcs 6
-	ld128putcs 8
-	ld128putcs 10
-	ld128putcs 12
-	ld128putcs 14
-	ld128putcs 16
-	ld128putcs 18
-	ld128putcs 20
-	ld128putcs 22
-	ld128putcs 24
-	ld128putcs 26
-	ld128putcs 28
-	ld128putcs 30
 	ld128putcs 32
 	ld128putcs 34
 	ld128putcs 36
 	ld128putcs 38
+	ld128putcs 8
+	ld128putcs 10
+	ld128putcs 12
+	ld128putcs 14
 	ld128putcs 40
 	ld128putcs 42
 	ld128putcs 44
 	ld128putcs 46
+	ld128putcs 16
+	ld128putcs 18
+	ld128putcs 20
+	ld128putcs 22
 	ld128putcs 48
 	ld128putcs 50
 	ld128putcs 52
 	ld128putcs 54
+	ld128putcs 24
+	ld128putcs 26
+	ld128putcs 28
+	ld128putcs 30
 	ld128putcs 56
 	ld128putcs 58
 	ld128putcs 60
@@ -124,30 +124,6 @@
 	ld64putcs 5
 	ld64putcs 6
 	ld64putcs 7
-	ld64putcs 8
-	ld64putcs 9
-	ld64putcs 10
-	ld64putcs 11
-	ld64putcs 12
-	ld64putcs 13
-	ld64putcs 14
-	ld64putcs 15
-	ld64putcs 16
-	ld64putcs 17
-	ld64putcs 18
-	ld64putcs 19
-	ld64putcs 20
-	ld64putcs 21
-	ld64putcs 22
-	ld64putcs 23
-	ld64putcs 24
-	ld64putcs 25
-	ld64putcs 26
-	ld64putcs 27
-	ld64putcs 28
-	ld64putcs 29
-	ld64putcs 30
-	ld64putcs 31
 	ld64putcs 32
 	ld64putcs 33
 	ld64putcs 34
@@ -156,6 +132,14 @@
 	ld64putcs 37
 	ld64putcs 38
 	ld64putcs 39
+	ld64putcs 8
+	ld64putcs 9
+	ld64putcs 10
+	ld64putcs 11
+	ld64putcs 12
+	ld64putcs 13
+	ld64putcs 14
+	ld64putcs 15
 	ld64putcs 40
 	ld64putcs 41
 	ld64putcs 42
@@ -164,6 +148,14 @@
 	ld64putcs 45
 	ld64putcs 46
 	ld64putcs 47
+	ld64putcs 16
+	ld64putcs 17
+	ld64putcs 18
+	ld64putcs 19
+	ld64putcs 20
+	ld64putcs 21
+	ld64putcs 22
+	ld64putcs 23
 	ld64putcs 48
 	ld64putcs 49
 	ld64putcs 50
@@ -172,6 +164,14 @@
 	ld64putcs 53
 	ld64putcs 54
 	ld64putcs 55
+	ld64putcs 24
+	ld64putcs 25
+	ld64putcs 26
+	ld64putcs 27
+	ld64putcs 28
+	ld64putcs 29
+	ld64putcs 30
+	ld64putcs 31
 	ld64putcs 56
 	ld64putcs 57
 	ld64putcs 58

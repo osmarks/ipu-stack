@@ -722,6 +722,15 @@ impl Layout {
         }
     }
 
+    /// F16 AMP result stored in the same within-panel order as a following
+    /// left operand. The GEMM coefficient routing makes the native accumulator
+    /// drain land in this order without a post-compute permutation.
+    pub fn amp_left_result(tile_count: u16) -> Self {
+        let mut layout = Self::amp_output(tile_count);
+        layout.order = ElementOrder::Amp(AmpOrder::Left);
+        layout
+    }
+
     /// AMP left operand on a row-by-column tile grid. The row shard is
     /// replicated across column groups so it is local to every output shard.
     pub fn amp_left_grid(
@@ -970,6 +979,24 @@ impl Layout {
         }
     }
 
+    pub fn amp_left_result_grid(
+        output_column_block: u32,
+        tile_count: u16,
+        row_partitions: u16,
+        column_partitions: u16,
+        grid_order: GridOrder,
+    ) -> Self {
+        let mut layout = Self::amp_output_grid(
+            output_column_block,
+            tile_count,
+            row_partitions,
+            column_partitions,
+            grid_order,
+        );
+        layout.order = ElementOrder::Amp(AmpOrder::Left);
+        layout
+    }
+
     /// A semantic output `[M, N]` packed as the physical AMP output `[N, M]`.
     pub fn amp_transposed_output_grid(
         output_column_block: u32,
@@ -996,6 +1023,22 @@ impl Layout {
             },
             memory_class: MemoryClass::Ipu21Interleaved,
         }
+    }
+
+    pub fn amp_transposed_left_result_grid(
+        output_column_block: u32,
+        tile_count: u16,
+        row_partitions: u16,
+        column_partitions: u16,
+    ) -> Self {
+        let mut layout = Self::amp_transposed_output_grid(
+            output_column_block,
+            tile_count,
+            row_partitions,
+            column_partitions,
+        );
+        layout.order = ElementOrder::Amp(AmpOrder::TransposedLeft);
+        layout
     }
 
     /// AMP output storage sharded by rows and replicated across the column
@@ -1730,13 +1773,9 @@ fn shape_aware_active_tile_counts<'a>(
 }
 
 fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate> {
-    let amp_output_f16 = TensorFormat {
+    let amp_left_result_f16 = TensorFormat {
         precision: Precision::F16,
-        layout: Layout::amp_output(tile_count),
-    };
-    let amp_left_f16 = TensorFormat {
-        precision: Precision::F16,
-        layout: Layout::amp_left(64, tile_count),
+        layout: Layout::amp_left_result(tile_count),
     };
     let rows_f16 = TensorFormat {
         precision: Precision::F16,
@@ -1860,12 +1899,7 @@ fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate>
         }
     }
     candidates.extend([
-        OperatorCandidate::new(
-            MidOperator::Gelu,
-            [OperandRequirement::new(amp_output_f16, 8)],
-            OperandRequirement::new(amp_left_f16, 8),
-        )
-        .with_preserved_input_tiling(0),
+        format_preserving_unary_candidate(MidOperator::Gelu, amp_left_result_f16),
         format_preserving_unary_candidate(MidOperator::Gelu, rows_f16.clone()),
         format_preserving_unary_candidate(MidOperator::Gelu, rows_f32.clone()),
         pointwise_operator_candidate(
@@ -1963,7 +1997,11 @@ fn amp_gemm_operator_candidate(
         OperandRequirement::new(
             TensorFormat {
                 precision,
-                layout: Layout::amp_output(tile_count),
+                layout: if precision == Precision::F16 {
+                    Layout::amp_left_result(tile_count)
+                } else {
+                    Layout::amp_output(tile_count)
+                },
             },
             32,
         ),
@@ -2035,13 +2073,23 @@ fn amp_grid_gemm_operator_candidate(
         OperandRequirement::new(
             TensorFormat {
                 precision,
-                layout: Layout::amp_output_grid(
-                    output_columns,
-                    grid.tile_count,
-                    grid.row_partitions,
-                    grid.column_partitions,
-                    grid.order,
-                ),
+                layout: if precision == Precision::F16 {
+                    Layout::amp_left_result_grid(
+                        output_columns,
+                        grid.tile_count,
+                        grid.row_partitions,
+                        grid.column_partitions,
+                        grid.order,
+                    )
+                } else {
+                    Layout::amp_output_grid(
+                        output_columns,
+                        grid.tile_count,
+                        grid.row_partitions,
+                        grid.column_partitions,
+                        grid.order,
+                    )
+                },
             },
             32,
         ),
@@ -2244,7 +2292,9 @@ impl OperatorPlan {
         }
         match (&self.operator, &self.dispatch) {
             (
-                MidOperator::Gemm { options, .. },
+                MidOperator::Gemm {
+                    options, multiply, ..
+                },
                 OperatorDispatch::BlockedGemm {
                     initialize,
                     accumulate,
@@ -2270,7 +2320,12 @@ impl OperatorPlan {
                                 right.format.layout.order,
                                 ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
                             )
-                            && output.format.layout.order == ElementOrder::Amp(AmpOrder::Output)
+                            && output.format.layout.order
+                                == ElementOrder::Amp(if *multiply == Precision::F16 {
+                                    AmpOrder::Left
+                                } else {
+                                    AmpOrder::Output
+                                })
                     }
                     GemmOrientation::Swapped => {
                         matches!(
@@ -2279,7 +2334,11 @@ impl OperatorPlan {
                         ) && right.format.layout.order
                             == ElementOrder::Amp(AmpOrder::TransposedLeft)
                             && output.format.layout.order
-                                == ElementOrder::Amp(AmpOrder::TransposedOutput)
+                                == ElementOrder::Amp(if *multiply == Precision::F16 {
+                                    AmpOrder::TransposedLeft
+                                } else {
+                                    AmpOrder::TransposedOutput
+                                })
                     }
                 };
                 if options.transpose_left || options.transpose_right || !formats_match_orientation {
@@ -4310,7 +4369,7 @@ fn parallel_reduction_candidates_for_orientation(
                         1,
                         memory_class,
                     );
-                    variant.output.format.layout = Layout::amp_output_grid(
+                    variant.output.format.layout = Layout::amp_left_result_grid(
                         kernel_output_columns,
                         row_partitions.saturating_mul(column_partitions),
                         row_partitions,
@@ -4339,7 +4398,7 @@ fn parallel_reduction_candidates_for_orientation(
                     );
                     physical_right.materialization = OperandMaterialization::Complete;
                     variant.inputs = vec![physical_right, physical_left];
-                    variant.output.format.layout = Layout::amp_transposed_output_grid(
+                    variant.output.format.layout = Layout::amp_transposed_left_result_grid(
                         kernel_output_columns,
                         row_partitions.saturating_mul(column_partitions),
                         row_partitions,
@@ -5347,7 +5406,14 @@ mod tests {
                     MemoryClass::Ipu21Standard,
                 ),
             );
-            let output_format = format(precision(&mut random), Layout::amp_output(tiles));
+            let output_format = format(
+                precision(&mut random),
+                if multiply == Precision::F16 {
+                    Layout::amp_left_result(tiles)
+                } else {
+                    Layout::amp_output(tiles)
+                },
+            );
             let accumulate = if random.bool() {
                 AccumulationPrecision::F16
             } else {
@@ -5450,7 +5516,7 @@ mod tests {
                     MemoryClass::Ipu21Standard,
                 ),
             );
-            let output = format(Precision::F16, Layout::amp_output(tiles));
+            let output = format(Precision::F16, Layout::amp_left_result(tiles));
 
             let mut graph = ComputeGraph::new();
             let activation = graph.host_input("activation", [rows, inner]).unwrap();

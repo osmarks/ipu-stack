@@ -10,8 +10,6 @@
 	.set HALF_F16X2, 0x38003800
 	// Callable supervisor ABI: m2 output, m3 input, m4 physical element
 	// count, and m10 return. The contiguous entry accepts whole half pairs.
-	// The output-to-left entry consumes complete 16-column AMP panels and
-	// combines GeLU with the required AMP output-to-left permutation.
 
 	.macro GELU_PAIR value
 	// tanh GeLU: x/2 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3))).
@@ -53,7 +51,6 @@
 	.endm
 
 	GELU_ENTRY ipu_stack_gelu_exact_f16, .Lgelu_contiguous_worker
-	GELU_ENTRY ipu_stack_gelu_output_to_left_f16, .Lgelu_output_to_left_worker
 
 	.worker
 	.p2align 3
@@ -80,57 +77,4 @@
 	cmpult $m6, $m4, $m8
 	brnz $m6, .Lgelu_contiguous_loop
 .Lgelu_contiguous_done:
-	exitz $m15
-
-	.macro GELU_REORDER_TWO_PAIRS input0, output0, input1, output1
-	ld32 $a0, $m3, $m15, \input0
-	ld32 $a1, $m3, $m15, \input1
-	f16v2mul $a2, $a0, $a0
-	f16v2mul $a3, $a1, $a1
-	f16v2mul $a2, $a2, $a0
-	f16v2mul $a3, $a3, $a1
-	f16v2mul $a2, $a4, $a2
-	f16v2mul $a3, $a4, $a3
-	f16v2add $a2, $a0, $a2
-	f16v2add $a3, $a1, $a3
-	f16v2mul $a2, $a5, $a2
-	f16v2mul $a3, $a5, $a3
-	f16v2tanh $a2, $a2
-	f16v2tanh $a3, $a3
-	f16v2add $a2, $a6, $a2
-	f16v2add $a3, $a6, $a3
-	f16v2mul $a2, $a7, $a2
-	f16v2mul $a3, $a7, $a3
-	f16v2mul $a2, $a0, $a2
-	f16v2mul $a3, $a1, $a3
-	st32 $a2, $m2, $m15, \output0
-	st32 $a3, $m2, $m15, \output1
-	.endm
-
-	.worker
-	.p2align 3
-.Lgelu_output_to_left_worker:
-	ld32 $m2, $mvertex_base, $m15, 0
-	ld32 $m3, $mvertex_base, $m15, 1
-	ld32 $m8, $mvertex_base, $m15, 2
-	shr $m8, $m8, 4
-	get $m4, $WSR
-	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
-	cmpult $m6, $m4, $m8
-	brz $m6, .Lgelu_output_to_left_done
-	LOAD_GELU_CONSTANTS
-	shl $m5, $m4, 5
-	add $m2, $m2, $m5
-	add $m3, $m3, $m5
-.Lgelu_output_to_left_loop:
-	GELU_REORDER_TWO_PAIRS 0, 0, 1, 4
-	GELU_REORDER_TWO_PAIRS 2, 1, 3, 5
-	GELU_REORDER_TWO_PAIRS 4, 2, 5, 6
-	GELU_REORDER_TWO_PAIRS 6, 3, 7, 7
-	add $m2, $m2, 192
-	add $m3, $m3, 192
-	add $m4, $m4, 6
-	cmpult $m6, $m4, $m8
-	brnz $m6, .Lgelu_output_to_left_loop
-.Lgelu_output_to_left_done:
 	exitz $m15
