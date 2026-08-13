@@ -287,7 +287,9 @@
 	PARTITION_ROWS \rows
 	shl $m6, $m6, 5
 \retained_output_name:
+	.if (\rows) < 6
 	brz $m5, .Lgemm_f16_no_rows_\@
+	.endif
 	ld32 $m0, $mvertex_base, $m15, 0
 	ld32 $m1, $mvertex_base, $m15, 1
 	add $m9, $m0, $m6
@@ -296,9 +298,10 @@
 	add $m8, $m5, -1
 	bri .Lgemm_f16_load_mode_\@
 \retained_inner_name:
+	.if (\rows) < 6
 	brz $m5, .Lgemm_f16_no_rows_\@
-	add $m1, $m1, (\rows) * INNER_MICRO_DIMENSION * GEMM_INPUT_ELEMENT_BYTES
-	add $m2, $m1, $m6
+	.endif
+	add $m2, $m2, (\rows) * INNER_MICRO_DIMENSION * GEMM_INPUT_ELEMENT_BYTES
 	// Every inner-group invocation after the first accumulates into the
 	// retained output, irrespective of whether this call initializes the
 	// complete GEMM result. Skip the shared mode load and branch.
@@ -308,26 +311,29 @@
 	brz $m7, .Lf16_accumulate_\@
 
 	setzi $a6, CLEAR_AACC
-	uput $FP_CLR, $a6
-	ld64step $a0:1, $mzero, $m2+=, 1
 	{
-		ld64step $a0:1, $mzero, $m2+=, 1
+		add $m7, $m2, 0
+		uput $FP_CLR, $a6
+	}
+	ld64step $a0:1, $mzero, $m7+=, 1
+	{
+		ld64step $a0:1, $mzero, $m7+=, 1
 		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P0
 	}
 	{
-		ld64step $a0:1, $mzero, $m2+=, 1
+		ld64step $a0:1, $mzero, $m7+=, 1
 		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P1
 	}
 	{
-		ld64step $a0:1, $mzero, $m2+=, 1
+		ld64step $a0:1, $mzero, $m7+=, 1
 		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P2
 	}
 	{
-		ld64step $a0:1, $mzero, $m2+=, 1
+		ld64step $a0:1, $mzero, $m7+=, 1
 		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P3
 	}
 	{
-		ld64step $a0:1, $mzero, $m2+=, 1
+		ld64step $a0:1, $mzero, $m7+=, 1
 		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P0
 	}
 	tapack $m10:11, $m2, $m3, $m9
