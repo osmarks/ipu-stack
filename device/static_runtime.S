@@ -248,13 +248,20 @@ ipu_stack_copy_u64:
 	add $m3, $m3, $m8
 	add $m5, $m5, $m7
 	brz $m5, .Lcopy_u64_worker_done
-.Lcopy_u64_worker_loop:
-	ld64 $a0:1, $m3, $m15, 0
-	st64 $a0:1, $m2, $m15, 0
-	add $m3, $m3, 8
-	add $m2, $m2, 8
-	sub $m5, $m5, 1
-	brnz $m5, .Lcopy_u64_worker_loop
+	{
+		rpt $m5, (2f-1f)/8 - 1
+		fnop
+	}
+1:
+	{
+		ld64step $a0:1, $mzero, $m3+=, 1
+		fnop
+	}
+	{
+		st64step $a0:1, $mzero, $m2+=, 1
+		fnop
+	}
+2:
 .Lcopy_u64_worker_done:
 	exitz $m15
 
