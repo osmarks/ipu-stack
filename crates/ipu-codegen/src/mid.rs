@@ -400,9 +400,10 @@ impl MemoryUsage {
     }
 }
 
-/// Independent class maxima and the maximum simultaneous total. Keeping the
-/// total separately avoids adding standard and interleaved maxima which may
-/// occur in different execution phases.
+/// Independent class maxima and the maximum simultaneous total. The allocator
+/// fixes the interleaved arena boundary for the whole program, so feasibility
+/// uses the sum of the class maxima even when they occur in different phases.
+/// `total` remains useful for ranking the actual peak live working set.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryPeaks {
     pub standard: u64,
@@ -446,20 +447,27 @@ impl MemoryPeaks {
         reserved_standard_bytes: u64,
         tile_memory_budget_bytes: u64,
     ) -> bool {
+        let partitioned_bytes = self
+            .standard
+            .saturating_add(self.aligned_interleaved_bytes())
+            .saturating_add(reserved_standard_bytes);
         self.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
-            && self.total.saturating_add(reserved_standard_bytes)
+            && partitioned_bytes
                 <= tile_memory_budget_bytes.min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
             && self.standard_contiguous_overflow_with_reservation(reserved_standard_bytes) == 0
+    }
+
+    fn aligned_interleaved_bytes(self) -> u64 {
+        self.interleaved
+            .div_ceil(u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE))
+            .saturating_mul(u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE))
     }
 
     pub fn standard_contiguous_overflow_with_reservation(
         self,
         reserved_standard_bytes: u64,
     ) -> u64 {
-        let interleaved_boundary = self
-            .interleaved
-            .div_ceil(u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE))
-            * u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE);
+        let interleaved_boundary = self.aligned_interleaved_bytes();
         let upper_standard = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
             .saturating_sub(interleaved_boundary);
         let lower_standard = u64::from(crate::memory::IPU21_STANDARD_FIXED_BYTES)
@@ -5031,6 +5039,40 @@ mod tests {
     use super::*;
 
     const RANDOM_CASES: usize = 128;
+
+    #[test]
+    fn randomized_memory_peaks_reserve_disjoint_class_arenas() {
+        let mut random = fastrand::Rng::with_seed(0x636c_6173_735f_7372);
+        let capacity = u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES);
+        let interleaved_capacity = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES);
+        let element = u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE);
+        let mut rejected_noncoincident_peaks = 0;
+        for _ in 0..RANDOM_CASES * 16 {
+            let standard = random.u64(0..=capacity);
+            let interleaved = random.u64(0..=interleaved_capacity);
+            let reservation = random.u64(0..=capacity / 4);
+            let simultaneous =
+                random.u64(standard.max(interleaved)..=standard.saturating_add(interleaved));
+            let peaks = MemoryPeaks {
+                standard,
+                interleaved,
+                total: simultaneous,
+                maximum_standard_allocation: 0,
+                ..MemoryPeaks::default()
+            };
+            let aligned_interleaved = interleaved.div_ceil(element) * element;
+            let static_partition = standard
+                .saturating_add(aligned_interleaved)
+                .saturating_add(reservation);
+            let fits = peaks.fits_ipu21_with_budget(reservation, capacity);
+            assert_eq!(fits, static_partition <= capacity);
+            if simultaneous.saturating_add(reservation) <= capacity && static_partition > capacity {
+                rejected_noncoincident_peaks += 1;
+                assert!(!fits);
+            }
+        }
+        assert!(rejected_noncoincident_peaks > 0);
+    }
 
     fn dimension(random: &mut fastrand::Rng) -> u32 {
         random.u32(1..=128)
