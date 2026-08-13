@@ -299,6 +299,10 @@
 	brz $m5, .Lgemm_f16_no_rows_\@
 	add $m1, $m1, (\rows) * INNER_MICRO_DIMENSION * GEMM_INPUT_ELEMENT_BYTES
 	add $m2, $m1, $m6
+	// Every inner-group invocation after the first accumulates into the
+	// retained output, irrespective of whether this call initializes the
+	// complete GEMM result. Skip the shared mode load and branch.
+	bri .Lf16_accumulate_\@
 .Lgemm_f16_load_mode_\@:
 	ld32 $m7, $mvertex_base, $m15, 5
 	brz $m7, .Lf16_accumulate_\@
