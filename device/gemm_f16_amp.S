@@ -315,7 +315,9 @@
 		ld64step $a0:1, $mzero, $m7+=, 1
 		GEMM_AMP $a6:7, $a0:1, $azeros, GEMM_TAMP_P0
 	}
-	tapack $m10:11, $m2, $m3, $m9
+	// The six pipeline-filling loads above advance m7 by 48 bytes. Continue
+	// paced activation loads from there rather than restarting at m2.
+	tapack $m10:11, $m7, $m3, $m9
 	{
 		rpt $m8, 3
 		fnop
