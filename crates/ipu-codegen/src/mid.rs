@@ -5565,11 +5565,20 @@ mod tests {
                     requirements.output.format.layout.memory_class,
                     MemoryClass::Ipu21Interleaved
                 );
+                let orientation = match operation.operator_plan.as_ref().map(|plan| &plan.dispatch)
+                {
+                    Some(OperatorDispatch::BlockedGemm { orientation, .. }) => *orientation,
+                    _ => unreachable!(),
+                };
+                let physical_left = match orientation {
+                    GemmOrientation::Normal => 0usize,
+                    GemmOrientation::Swapped => 1usize,
+                };
                 assert_eq!(
                     requirements.memory_relations,
                     [MemoryRelation::DistinctElements(vec![
                         MemoryOperand::Output,
-                        MemoryOperand::Input(0),
+                        MemoryOperand::Input(physical_left as u16),
                     ])]
                 );
                 let expected_tail = match operation.kind {

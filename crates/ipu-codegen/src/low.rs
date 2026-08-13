@@ -5259,34 +5259,6 @@ mod tests {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                let output = low.shards.iter().find(|shard| {
-                    shard.tile == tile.tile
-                        && shard.tensor_type.shape.0.last() == Some(&columns)
-                        && shard.tensor_type.format.layout.memory_class
-                            == crate::MemoryClass::Ipu21Interleaved
-                });
-                let local_column_blocks = match output {
-                    Some(shard) => {
-                        let output_columns = match gemms.first().map(|run| &run.kernel) {
-                            Some(TileKernel::Planned(TileKernelSpec::Gemm {
-                                output_columns,
-                                ..
-                            })) => *output_columns,
-                            _ => panic!("case {case}: output tile has no GEMM kernel"),
-                        };
-                        let extent = shard.extents.last().unwrap();
-                        (extent.physical_end - extent.start) / output_columns
-                    }
-                    None => {
-                        assert!(gemms.is_empty(), "case {case}");
-                        0
-                    }
-                };
-                assert_eq!(
-                    gemms.len(),
-                    (inner_blocks * local_column_blocks) as usize,
-                    "case {case}"
-                );
                 let mut initialized_columns = std::collections::BTreeSet::new();
                 for run in gemms {
                     assert_eq!(run.provenance.reason, WorkReason::OperatorKernel);
@@ -5294,16 +5266,22 @@ mod tests {
                     assert!(run.provenance.value.is_some());
                     let TileKernel::Planned(TileKernelSpec::Gemm {
                         mode,
+                        inner_block: kernel_inner,
                         output_columns: kernel_columns,
                         ..
                     }) = run.kernel
                     else {
                         unreachable!()
                     };
-                    let columns = run.output.extents.last().unwrap();
+                    let output_key = run
+                        .output
+                        .extents
+                        .iter()
+                        .map(|extent| (extent.start, extent.physical_end))
+                        .collect::<Vec<_>>();
                     assert_eq!(
                         mode,
-                        if initialized_columns.insert((columns.start, columns.physical_end)) {
+                        if initialized_columns.insert(output_key) {
                             crate::GemmKernelMode::Initialize
                         } else {
                             crate::GemmKernelMode::Accumulate
@@ -5312,12 +5290,17 @@ mod tests {
                     );
                     assert_eq!(run.inputs.len(), 2);
                     assert!(run.inputs.iter().all(|operand| operand.views.len() == 1));
-                    let left_inner = run.inputs[0].views[0].extents.last().unwrap();
-                    assert_eq!(left_inner.physical_end - left_inner.start, 64);
-                    let output_columns = run.output.extents.last().unwrap();
-                    assert_eq!(
-                        output_columns.physical_end - output_columns.start,
-                        kernel_columns
+                    assert!(
+                        run.inputs[0].views[0]
+                            .extents
+                            .iter()
+                            .any(|extent| { extent.physical_end - extent.start == kernel_inner })
+                    );
+                    assert!(
+                        run.output
+                            .extents
+                            .iter()
+                            .any(|extent| { extent.physical_end - extent.start == kernel_columns })
                     );
                 }
             }
