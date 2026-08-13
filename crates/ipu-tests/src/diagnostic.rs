@@ -63,7 +63,14 @@ pub fn run(
             )
             .map_err(|error| DriverError::Invalid(error.to_string()))
         })
-        .inspect_err(|error| tracing::error!(%error, completed = next, "diagnostic run failed"))?;
+        .inspect_err(|error| {
+            tracing::error!(
+                %error,
+                completed = next,
+                device = %super::device_failure_diagnostics(runtime, &package.application),
+                "diagnostic run failed"
+            );
+        })?;
     if next != package.checkpoints.len() {
         bail!(
             "program completed after {next} diagnostic checkpoints; expected {}",
