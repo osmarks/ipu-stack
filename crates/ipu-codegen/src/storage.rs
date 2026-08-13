@@ -298,6 +298,17 @@ fn amp_matrix_index(
         AmpOrder::TransposedRight => {
             amp_matrix_index(AmpOrder::Right, precision, columns, rows, column, row)
         }
+        AmpOrder::TransposedLeft => {
+            amp_matrix_index(AmpOrder::Left, precision, columns, rows, column, row)
+        }
+        AmpOrder::TransposedRightBlocked(block) => amp_matrix_index(
+            AmpOrder::RightBlocked(block),
+            precision,
+            columns,
+            rows,
+            column,
+            row,
+        ),
         AmpOrder::Output => {
             if !columns.is_multiple_of(COLUMN_MICRO) {
                 return Err(StorageError::AmpBlock { role });
@@ -310,6 +321,9 @@ fn amp_matrix_index(
                 .and_then(|base| base.checked_add(row * COLUMN_MICRO + physical_column))
                 .ok_or(StorageError::Overflow)
         }
+        AmpOrder::TransposedOutput => {
+            amp_matrix_index(AmpOrder::Output, precision, columns, rows, column, row)
+        }
     }
 }
 
@@ -320,22 +334,32 @@ fn right_blocked_panel_spans(
     if shard.extents.len() < 2 {
         return Ok(None);
     }
-    let ElementOrder::Amp(AmpOrder::RightBlocked(inner_block)) =
-        shard.tensor_type.format.layout.order
-    else {
-        return Ok(None);
-    };
-    let inner_block = u32::from(inner_block);
     let rank = shard.extents.len();
+    let (inner_block, inner_axis, column_axis, column_tensor_axis) =
+        match shard.tensor_type.format.layout.order {
+            ElementOrder::Amp(AmpOrder::RightBlocked(block)) => (
+                u32::from(block),
+                rank - 2,
+                rank - 1,
+                crate::TensorAxis::FromEnd(1),
+            ),
+            ElementOrder::Amp(AmpOrder::TransposedRightBlocked(block)) => (
+                u32::from(block),
+                rank - 1,
+                rank - 2,
+                crate::TensorAxis::FromEnd(2),
+            ),
+            _ => return Ok(None),
+        };
     if shard.extents[..rank - 2] != view.extents[..rank - 2] {
         return Ok(None);
     }
-    let rows = shard.extents[rank - 2].physical_end - shard.extents[rank - 2].start;
-    let columns = shard.extents[rank - 1].physical_end - shard.extents[rank - 1].start;
-    let inner_start = view.extents[rank - 2].start - shard.extents[rank - 2].start;
-    let column_start = view.extents[rank - 1].start - shard.extents[rank - 1].start;
-    let inner_width = view.extents[rank - 2].physical_end - view.extents[rank - 2].start;
-    let column_width = view.extents[rank - 1].physical_end - view.extents[rank - 1].start;
+    let rows = shard.extents[inner_axis].physical_end - shard.extents[inner_axis].start;
+    let columns = shard.extents[column_axis].physical_end - shard.extents[column_axis].start;
+    let inner_start = view.extents[inner_axis].start - shard.extents[inner_axis].start;
+    let column_start = view.extents[column_axis].start - shard.extents[column_axis].start;
+    let inner_width = view.extents[inner_axis].physical_end - view.extents[inner_axis].start;
+    let column_width = view.extents[column_axis].physical_end - view.extents[column_axis].start;
     let Some(output_column_block) = shard
         .tensor_type
         .format
@@ -343,7 +367,7 @@ fn right_blocked_panel_spans(
         .tiling
         .axes
         .iter()
-        .find(|axis| axis.axis == crate::TensorAxis::FromEnd(1))
+        .find(|axis| axis.axis == column_tensor_axis)
         .map(|axis| axis.block_size)
         .filter(|block| *block != 0 && block.is_multiple_of(AMP_COLUMN_MICRO))
     else {
@@ -541,6 +565,18 @@ pub fn amp_matrix_coordinates(
             amp_matrix_coordinates(AmpOrder::Right, precision, columns, rows, linear)
                 .map(|(column, row)| (row, column))
         }
+        AmpOrder::TransposedLeft => {
+            amp_matrix_coordinates(AmpOrder::Left, precision, columns, rows, linear)
+                .map(|(column, row)| (row, column))
+        }
+        AmpOrder::TransposedRightBlocked(block) => amp_matrix_coordinates(
+            AmpOrder::RightBlocked(block),
+            precision,
+            columns,
+            rows,
+            linear,
+        )
+        .map(|(column, row)| (row, column)),
         AmpOrder::RightBlocked(inner_block) => {
             let block_size = u32::from(inner_block);
             let inner = amp_micro_dimension(precision);
@@ -584,6 +620,10 @@ pub fn amp_matrix_coordinates(
                 offset / COLUMN_MICRO,
                 panel * COLUMN_MICRO + logical_pair * 2 + physical_column % 2,
             ))
+        }
+        AmpOrder::TransposedOutput => {
+            amp_matrix_coordinates(AmpOrder::Output, precision, columns, rows, linear)
+                .map(|(column, row)| (row, column))
         }
     }
 }

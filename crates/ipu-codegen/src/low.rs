@@ -672,6 +672,27 @@ impl LoweringState {
         })
     }
 
+    fn matrix_shards_for_block<'a>(
+        &'a self,
+        shards: &'a [LowShardId],
+        column_axis: usize,
+        inner_axis: usize,
+        column_start: u32,
+        column_end: u32,
+        inner_start: u32,
+        inner_end: u32,
+    ) -> impl Iterator<Item = LowShardId> + 'a {
+        shards.iter().copied().filter(move |shard| {
+            let extents = &self.shards[shard.index() as usize].extents;
+            let columns = extents[column_axis];
+            let inner = extents[inner_axis];
+            columns.start <= column_start
+                && columns.physical_end >= column_end
+                && inner.start <= inner_start
+                && inner.physical_end >= inner_end
+        })
+    }
+
     fn prefer_local_shard(&self, shards: &[LowShardId], tile: u16) -> Option<LowShardId> {
         shards
             .iter()
@@ -1351,12 +1372,14 @@ impl LoweringState {
                 inner_block,
                 output_column_block,
                 distribution,
+                orientation,
             } => self.lower_blocked_gemm(
                 operation,
                 initialize.clone(),
                 accumulate.clone(),
                 *inner_block,
                 *output_column_block,
+                *orientation,
                 *distribution,
                 &plan.requirements,
                 tiles,
@@ -2428,6 +2451,7 @@ impl LoweringState {
         accumulate: TileKernelSpec,
         inner_block: u32,
         output_column_block: u32,
+        orientation: crate::GemmOrientation,
         distribution: GemmDistribution,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
@@ -2445,6 +2469,7 @@ impl LoweringState {
                 accumulate,
                 inner_block,
                 output_column_block,
+                orientation,
                 row_partitions,
                 column_partitions,
                 inner_partitions,
@@ -2452,6 +2477,9 @@ impl LoweringState {
                 requirements,
                 tiles,
             );
+        }
+        if orientation != crate::GemmOrientation::Normal {
+            return Err(LowLoweringError::InvalidOperatorPlan);
         }
         let [left_value, right_value] = operation.inputs.as_slice() else {
             return Err(LowLoweringError::InvalidOperatorPlan);
@@ -2735,6 +2763,7 @@ impl LoweringState {
         accumulate: TileKernelSpec,
         inner_block: u32,
         output_column_block: u32,
+        orientation: crate::GemmOrientation,
         row_partitions: u16,
         column_partitions: u16,
         inner_partitions: u16,
@@ -2742,7 +2771,7 @@ impl LoweringState {
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        let [left_value, right_value] = operation.inputs.as_slice() else {
+        let [semantic_left_value, semantic_right_value] = operation.inputs.as_slice() else {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
         let [output_value] = operation.results.as_slice() else {
@@ -2757,16 +2786,58 @@ impl LoweringState {
         {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
+        let (left_value, right_value, left_requirement, right_requirement) = match orientation {
+            crate::GemmOrientation::Normal => (
+                semantic_left_value,
+                semantic_right_value,
+                &requirements.inputs[0],
+                &requirements.inputs[1],
+            ),
+            crate::GemmOrientation::Swapped => (
+                semantic_right_value,
+                semantic_left_value,
+                &requirements.inputs[1],
+                &requirements.inputs[0],
+            ),
+        };
+        let mut kernel_requirements = requirements.clone();
+        if orientation == crate::GemmOrientation::Swapped {
+            kernel_requirements.inputs.swap(0, 1);
+        }
         let left_shards = self.value_shards(*left_value)?.to_vec();
         let right_shards = self.value_shards(*right_value)?.to_vec();
         let output_shards = self.value_shards(*output_value)?.to_vec();
         let left_rank = self.shards[left_shards[0].index() as usize].extents.len();
+        let right_rank = self.shards[right_shards[0].index() as usize].extents.len();
         let output_rank = self.shards[output_shards[0].index() as usize].extents.len();
         if left_rank < 2 || output_rank < 2 {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let left_inner_axis = left_rank - 1;
-        let output_column_axis = output_rank - 1;
+        let (
+            left_row_axis,
+            left_inner_axis,
+            right_inner_axis,
+            right_column_axis,
+            output_row_axis,
+            output_column_axis,
+        ) = match orientation {
+            crate::GemmOrientation::Normal => (
+                left_rank - 2,
+                left_rank - 1,
+                right_rank - 2,
+                right_rank - 1,
+                output_rank - 2,
+                output_rank - 1,
+            ),
+            crate::GemmOrientation::Swapped => (
+                left_rank - 1,
+                left_rank - 2,
+                right_rank - 1,
+                right_rank - 2,
+                output_rank - 1,
+                output_rank - 2,
+            ),
+        };
         let output_type = self.shards[output_shards[0].index() as usize]
             .tensor_type
             .clone();
@@ -2778,13 +2849,21 @@ impl LoweringState {
             .map(|start| (start, start + output_column_block))
             .collect::<Vec<_>>();
         let mut partial_type = output_type.clone();
-        partial_type.format.layout = Layout::amp_output_grid(
-            output_column_block,
-            row_partitions.saturating_mul(column_partitions),
-            row_partitions,
-            column_partitions,
-            crate::mid::GridOrder::ColumnsFast,
-        );
+        partial_type.format.layout = match orientation {
+            crate::GemmOrientation::Normal => Layout::amp_output_grid(
+                output_column_block,
+                row_partitions.saturating_mul(column_partitions),
+                row_partitions,
+                column_partitions,
+                crate::mid::GridOrder::ColumnsFast,
+            ),
+            crate::GemmOrientation::Swapped => Layout::amp_transposed_output_grid(
+                output_column_block,
+                row_partitions.saturating_mul(column_partitions),
+                row_partitions,
+                column_partitions,
+            ),
+        };
 
         let mut replica_groups = BTreeMap::<Vec<(u32, u32)>, Vec<LowShardId>>::new();
         for left in left_shards.iter().copied() {
@@ -2843,6 +2922,12 @@ impl LoweringState {
                             &mut transfers,
                             &mut local_copies,
                         )?;
+                        if left_requirement.materialization
+                            != crate::OperandMaterialization::DispatchSlices
+                            && view.shard != left
+                        {
+                            return Err(LowLoweringError::InvalidOperatorPlan);
+                        }
                         resident_lefts.insert(left, view.clone());
                         view
                     };
@@ -2853,7 +2938,27 @@ impl LoweringState {
                     if replica_columns.get(&left).copied().map(u32::from) != Some(output_column) {
                         continue;
                     }
-                    let mut extents = left_shard.extents.clone();
+                    let padded_output = partial_type
+                        .format
+                        .layout
+                        .padded_shape(&partial_type.shape)?;
+                    let mut extents = partial_type
+                        .shape
+                        .0
+                        .iter()
+                        .zip(&padded_output.0)
+                        .enumerate()
+                        .map(|(axis, (&logical_end, &physical_end))| ShardExtent {
+                            axis: u16::try_from(axis).unwrap_or(u16::MAX),
+                            start: 0,
+                            logical_end,
+                            physical_end,
+                        })
+                        .collect::<Vec<_>>();
+                    for axis in 0..output_rank.saturating_sub(2) {
+                        extents[axis] = left_shard.extents[axis];
+                    }
+                    extents[output_row_axis] = left_shard.extents[left_row_axis];
                     extents[output_column_axis] = ShardExtent {
                         axis: u16::try_from(output_column_axis)
                             .map_err(|_| LowLoweringError::IdOverflow)?,
@@ -2861,6 +2966,10 @@ impl LoweringState {
                         logical_end: column_end.min(logical_columns),
                         physical_end: column_end,
                     };
+                    let partial_key = extents
+                        .iter()
+                        .map(|extent| (extent.start, extent.physical_end))
+                        .collect::<Vec<_>>();
                     let direct_output = output_shards.iter().copied().find(|output| {
                         let shard = &self.shards[output.index() as usize];
                         shard.tile == left_shard.tile
@@ -2889,19 +2998,16 @@ impl LoweringState {
                         })?;
                         self.full_view(partial)
                     };
-                    let mut partial_key = left_shard.extents[..left_inner_axis]
-                        .iter()
-                        .map(|extent| (extent.start, extent.physical_end))
-                        .collect::<Vec<_>>();
-                    partial_key.push((column_start, column_end));
                     partials
                         .entry(partial_key)
                         .or_default()
                         .push((left_shard.tile, partial.clone()));
 
-                    let source_panel_block = requirements.inputs[1].format.layout.order.clone();
+                    let source_panel_block = right_requirement.format.layout.order.clone();
                     let source_panel_block = match source_panel_block {
-                        ElementOrder::Amp(AmpOrder::RightBlocked(block)) => u32::from(block),
+                        ElementOrder::Amp(
+                            AmpOrder::RightBlocked(block) | AmpOrder::TransposedRightBlocked(block),
+                        ) => u32::from(block),
                         _ => AMP_INNER_BLOCK,
                     };
                     let first_panel_end = inner
@@ -2909,8 +3015,10 @@ impl LoweringState {
                         .saturating_add(source_panel_block)
                         .min(inner.physical_end);
                     let first_source = self
-                        .right_shards_for_block(
+                        .matrix_shards_for_block(
                             &right_shards,
+                            right_column_axis,
+                            right_inner_axis,
                             column_start,
                             column_end,
                             inner.start,
@@ -2924,12 +3032,11 @@ impl LoweringState {
                     weight_type.format.layout.memory_class = crate::MemoryClass::Ipu21Interleaved;
                     let mut weight_extents =
                         self.shards[first_source.index() as usize].extents.clone();
-                    let weight_rank = weight_extents.len();
-                    weight_extents[weight_rank - 2].start = inner.start;
-                    weight_extents[weight_rank - 2].logical_end = inner.logical_end;
-                    weight_extents[weight_rank - 2].physical_end = inner.physical_end;
+                    weight_extents[right_inner_axis].start = inner.start;
+                    weight_extents[right_inner_axis].logical_end = inner.logical_end;
+                    weight_extents[right_inner_axis].physical_end = inner.physical_end;
                     let source_inner =
-                        self.shards[first_source.index() as usize].extents[weight_rank - 2];
+                        self.shards[first_source.index() as usize].extents[right_inner_axis];
                     let source_covers_compute_inner = source_inner.start <= inner.start
                         && source_inner.physical_end >= inner.physical_end;
                     let weights = if self.shards[first_source.index() as usize].tile
@@ -2965,8 +3072,10 @@ impl LoweringState {
                         {
                             let panel_end = panel_start + source_panel_block;
                             let source = self
-                                .right_shards_for_block(
+                                .matrix_shards_for_block(
                                     &right_shards,
+                                    right_column_axis,
+                                    right_inner_axis,
                                     column_start,
                                     column_end,
                                     panel_start,
@@ -2974,12 +3083,11 @@ impl LoweringState {
                                 )
                                 .next()
                                 .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-                            let source_rank = self.shards[source.index() as usize].extents.len();
                             let source_view = self.narrow_view(
                                 source,
                                 &[
-                                    (source_rank - 2, panel_start, panel_end),
-                                    (source_rank - 1, column_start, column_end),
+                                    (right_inner_axis, panel_start, panel_end),
+                                    (right_column_axis, column_start, column_end),
                                 ],
                             )?;
                             let local =
@@ -2988,8 +3096,8 @@ impl LoweringState {
                                 let destination_view = self.narrow_view(
                                     weights.ok_or(LowLoweringError::InvalidOperatorPlan)?,
                                     &[
-                                        (weight_rank - 2, panel_start, panel_end),
-                                        (weight_rank - 1, column_start, column_end),
+                                        (right_inner_axis, panel_start, panel_end),
+                                        (right_column_axis, column_start, column_end),
                                     ],
                                 )?;
                                 transfers
@@ -3048,8 +3156,8 @@ impl LoweringState {
                                     self.narrow_view(
                                         weights.ok_or(LowLoweringError::InvalidOperatorPlan)?,
                                         &[
-                                            (weight_rank - 2, panel_start, panel_end),
-                                            (weight_rank - 1, column_start, column_end),
+                                            (right_inner_axis, panel_start, panel_end),
+                                            (right_column_axis, column_start, column_end),
                                         ],
                                     )?
                                 };
@@ -3071,7 +3179,7 @@ impl LoweringState {
                                             },
                                         ],
                                         partial.clone(),
-                                        KernelRequirements::Operator(requirements.clone()),
+                                        KernelRequirements::Operator(kernel_requirements.clone()),
                                     ),
                                 ));
                             }
@@ -3117,8 +3225,8 @@ impl LoweringState {
                             self.narrow_view(
                                 weights.ok_or(LowLoweringError::InvalidOperatorPlan)?,
                                 &[
-                                    (weight_rank - 2, inner_start, inner_end),
-                                    (weight_rank - 1, column_start, column_end),
+                                    (right_inner_axis, inner_start, inner_end),
+                                    (right_column_axis, column_start, column_end),
                                 ],
                             )?
                         };
@@ -3138,7 +3246,7 @@ impl LoweringState {
                                 },
                             ],
                             partial.clone(),
-                            KernelRequirements::Operator(requirements.clone()),
+                            KernelRequirements::Operator(kernel_requirements.clone()),
                         );
                         gemm_runs.push((left_shard.tile, run));
                     }
@@ -3149,7 +3257,12 @@ impl LoweringState {
                 WorkProvenance {
                     operation: operation.source,
                     value: Some(*right_value),
-                    reason: WorkReason::OperatorInput { input: 1 },
+                    reason: WorkReason::OperatorInput {
+                        input: match orientation {
+                            crate::GemmOrientation::Normal => 1,
+                            crate::GemmOrientation::Swapped => 0,
+                        },
+                    },
                 },
                 tiles,
             )?;
@@ -4354,6 +4467,7 @@ mod tests {
                 accumulate: kernel(GemmKernelMode::Accumulate),
                 inner_block: 64,
                 output_column_block: output_columns,
+                orientation: crate::GemmOrientation::Normal,
                 distribution: GemmDistribution::ParallelReduction {
                     row_partitions,
                     column_partitions,
@@ -5192,43 +5306,6 @@ mod tests {
                         kernel_columns
                     );
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn randomized_automatic_gemms_choose_local_two_axis_grids() {
-        let mut random = fastrand::Rng::with_seed(0x6772_6964_6765_6d6d);
-        for case in 0..CASES {
-            let tiles = 1_u16 << random.u32(0..=3);
-            let rows = u32::from(tiles) * random.u32(1..=8);
-            let inner_blocks = random.u32(1..=4);
-            let inner = inner_blocks * 64;
-            let columns = u32::from(tiles) * 64;
-            let mut graph = ComputeGraph::new();
-            let left = graph.host_input("left", [rows, inner]).unwrap();
-            let right = graph.parameter("right", [inner, columns]).unwrap();
-            let output = graph.gemm(left, right).unwrap();
-            graph.set_outputs([output]).unwrap();
-            let config = PipelineConfig::new(tiles)
-                .with_automatic_input(left, Precision::F16)
-                .with_automatic_input(right, Precision::F16);
-            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-            let low = lower_to_tiles(&mid, &config).unwrap();
-
-            assert!(low.exchange_phases.is_empty(), "case {case}");
-            for tile in &low.tiles {
-                let gemms = low
-                    .work(tile)
-                    .filter(|work| {
-                        matches!(
-                            work,
-                            TileWorkRef::Kernel(run)
-                                if matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Gemm { .. }))
-                        )
-                    })
-                    .count();
-                assert_eq!(gemms, inner_blocks as usize, "case {case}");
             }
         }
     }

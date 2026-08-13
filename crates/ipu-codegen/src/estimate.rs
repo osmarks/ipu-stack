@@ -232,6 +232,7 @@ pub(crate) fn maximum_axis_shard_extent(tensor: &TensorType, axis: usize) -> u64
 pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorType) -> TensorType {
     let OperatorDispatch::BlockedGemm {
         output_column_block,
+        orientation,
         distribution:
             GemmDistribution::ParallelReduction {
                 row_partitions,
@@ -247,13 +248,21 @@ pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorTy
         shape: output.shape.clone(),
         format: crate::mid::TensorFormat {
             precision: output.format.precision,
-            layout: Layout::amp_output_grid(
-                *output_column_block,
-                row_partitions.saturating_mul(*column_partitions),
-                *row_partitions,
-                *column_partitions,
-                crate::mid::GridOrder::ColumnsFast,
-            ),
+            layout: match orientation {
+                crate::GemmOrientation::Normal => Layout::amp_output_grid(
+                    *output_column_block,
+                    row_partitions.saturating_mul(*column_partitions),
+                    *row_partitions,
+                    *column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
+                ),
+                crate::GemmOrientation::Swapped => Layout::amp_transposed_output_grid(
+                    *output_column_block,
+                    row_partitions.saturating_mul(*column_partitions),
+                    *row_partitions,
+                    *column_partitions,
+                ),
+            },
         },
     }
 }
@@ -380,6 +389,7 @@ pub(crate) fn operator_memory_estimate(
     let mut maximum_standard_temporary_allocation = 0u64;
     if let (
         OperatorDispatch::BlockedGemm {
+            orientation,
             distribution:
                 GemmDistribution::ParallelReduction {
                     column_partitions,
@@ -390,13 +400,21 @@ pub(crate) fn operator_memory_estimate(
             output_column_block,
             ..
         },
-        Some(left),
-        Some(right),
+        Some(first),
+        Some(second),
     ) = (dispatch, inputs.first(), inputs.get(1))
     {
+        let (left, right, left_requirement) = match orientation {
+            crate::GemmOrientation::Normal => (first, second, requirements.inputs.first()),
+            crate::GemmOrientation::Swapped => (second, first, requirements.inputs.get(1)),
+        };
         let right_rank = right.shape.0.len();
-        let inner_blocks = right.shape.0[right_rank - 2].div_ceil(AMP_INNER_BLOCK);
-        let column_blocks = right.shape.0[right_rank - 1].div_ceil(*output_column_block);
+        let (right_inner_axis, right_column_axis) = match orientation {
+            crate::GemmOrientation::Normal => (right_rank - 2, right_rank - 1),
+            crate::GemmOrientation::Swapped => (right_rank - 1, right_rank - 2),
+        };
+        let inner_blocks = right.shape.0[right_inner_axis].div_ceil(AMP_INNER_BLOCK);
+        let column_blocks = right.shape.0[right_column_axis].div_ceil(*output_column_block);
         let right_staging = u64::from(inner_blocks.div_ceil(u32::from(*inner_partitions)))
             .saturating_mul(u64::from(AMP_INNER_BLOCK))
             .saturating_mul(u64::from(
@@ -406,15 +424,18 @@ pub(crate) fn operator_memory_estimate(
             .saturating_mul(right.format.precision.bytes());
         let mut convolution = MemoryUsage::default();
         convolution.add_class(MemoryClass::Ipu21Interleaved, right_staging);
-        if requirements.inputs.first().is_some_and(|requirement| {
+        if left_requirement.is_some_and(|requirement| {
             requirement.materialization == OperandMaterialization::DispatchSlices
         }) {
-            let requirement = &requirements.inputs[0];
+            let requirement = left_requirement.expect("checked requirement");
             let mut left_staging =
                 maximum_shard_bytes(left).saturating_add(u64::from(requirement.access_tail_bytes));
             let left_must_be_distinct = requirements.memory_relations.iter().any(|relation| {
                 let MemoryRelation::DistinctElements(operands) = relation;
-                operands.contains(&MemoryOperand::Input(0))
+                operands.contains(&MemoryOperand::Input(match orientation {
+                    crate::GemmOrientation::Normal => 0,
+                    crate::GemmOrientation::Swapped => 1,
+                }))
             });
             if left_must_be_distinct {
                 left_staging = left_staging
@@ -566,7 +587,12 @@ pub(crate) fn gemm_uses_panel_buffer(
     right: &TensorType,
     output: &TensorType,
 ) -> bool {
-    let OperatorDispatch::BlockedGemm { inner_block, .. } = dispatch else {
+    let OperatorDispatch::BlockedGemm {
+        inner_block,
+        orientation,
+        ..
+    } = dispatch
+    else {
         return false;
     };
     let rank = right.shape.0.len();
@@ -574,21 +600,33 @@ pub(crate) fn gemm_uses_panel_buffer(
     if rank < 2 || output_rank < 2 {
         return true;
     }
-    let streamed = right
-        .format
-        .layout
-        .tiling
-        .axes
-        .iter()
-        .any(|axis| axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1);
+    let streamed = right.format.layout.tiling.axes.iter().any(|axis| {
+        axis.axis
+            == match orientation {
+                crate::GemmOrientation::Normal => TensorAxis::FromEnd(2),
+                crate::GemmOrientation::Swapped => TensorAxis::FromEnd(1),
+            }
+            && axis.partitions > 1
+    });
     if streamed {
         return true;
     }
     if right.format.layout.memory_class == MemoryClass::Ipu21Interleaved {
         return false;
     }
-    let k = right.shape.0[rank - 2];
-    let columns = maximum_axis_shard_extent(output, output_rank - 1);
+    let k = right.shape.0[rank
+        - match orientation {
+            crate::GemmOrientation::Normal => 2,
+            crate::GemmOrientation::Swapped => 1,
+        }];
+    let columns = maximum_axis_shard_extent(
+        output,
+        output_rank
+            - match orientation {
+                crate::GemmOrientation::Normal => 1,
+                crate::GemmOrientation::Swapped => 2,
+            },
+    );
     k > *inner_block && columns > 16
 }
 
@@ -600,7 +638,7 @@ pub(crate) fn gemm_requires_panel_repacking(
     gemm_uses_panel_buffer(dispatch, right, output)
         && !matches!(
             right.format.layout.order,
-            ElementOrder::Amp(AmpOrder::RightBlocked(_))
+            ElementOrder::Amp(AmpOrder::RightBlocked(_) | AmpOrder::TransposedRightBlocked(_),)
         )
 }
 
@@ -641,13 +679,27 @@ pub(crate) fn gemm_exchange_phase_count(
     if gemm_remote_bytes_per_tile(inputs, output) == 0 {
         return 0;
     }
-    let OperatorDispatch::BlockedGemm { inner_block, .. } = dispatch else {
+    let OperatorDispatch::BlockedGemm {
+        inner_block,
+        orientation,
+        ..
+    } = dispatch
+    else {
         return 0;
     };
-    let Some(left) = inputs.first() else {
+    let Some(left) = inputs.get(match orientation {
+        crate::GemmOrientation::Normal => 0,
+        crate::GemmOrientation::Swapped => 1,
+    }) else {
         return 0;
     };
-    let Some(&inner) = left.shape.0.last() else {
+    let Some(&inner) = left.shape.0.get(
+        left.shape.0.len()
+            - match orientation {
+                crate::GemmOrientation::Normal => 1,
+                crate::GemmOrientation::Swapped => 2,
+            },
+    ) else {
         return 0;
     };
     u64::from(inner).div_ceil(u64::from(*inner_block))

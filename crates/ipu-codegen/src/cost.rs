@@ -402,15 +402,28 @@ impl CostModel for Ipu21CostModel {
         let spatial_occupancy_adjusted_elements = spatial_occupancy.latency_work();
         match operator {
             MidOperator::Gemm { multiply, .. } => {
+                let orientation = match dispatch {
+                    OperatorDispatch::BlockedGemm { orientation, .. } => *orientation,
+                    _ => crate::GemmOrientation::Normal,
+                };
+                let (left_index, right_index, left_inner_from_end, output_column_from_end) =
+                    match orientation {
+                        crate::GemmOrientation::Normal => (0, 1, 1, 1),
+                        crate::GemmOrientation::Swapped => (1, 0, 2, 2),
+                    };
                 let compute_output = gemm_partial_tensor(dispatch, output);
                 let output_elements_per_tile =
                     SpatialOccupancy::for_output(&compute_output).latency_work();
-                let left_shape = inputs[0]
+                let left_shape = inputs[left_index]
                     .format
                     .layout
-                    .padded_shape(&inputs[0].shape)
-                    .unwrap_or_else(|_| inputs[0].shape.clone());
-                let k = left_shape.0.last().copied().unwrap_or(1) as u64;
+                    .padded_shape(&inputs[left_index].shape)
+                    .unwrap_or_else(|_| inputs[left_index].shape.clone());
+                let k = left_shape
+                    .0
+                    .get(left_shape.0.len().saturating_sub(left_inner_from_end))
+                    .copied()
+                    .unwrap_or(1) as u64;
                 let compute_k = match dispatch {
                     OperatorDispatch::BlockedGemm {
                         distribution:
@@ -428,7 +441,7 @@ impl CostModel for Ipu21CostModel {
                 };
                 let output_columns_per_tile = maximum_axis_shard_extent(
                     &compute_output,
-                    output.shape.0.len().saturating_sub(1),
+                    output.shape.0.len().saturating_sub(output_column_from_end),
                 );
                 let kernel_output_elements = output_elements_per_tile;
                 let kernel_output_columns = output_columns_per_tile;
@@ -436,7 +449,7 @@ impl CostModel for Ipu21CostModel {
                     .saturating_mul(2)
                     .saturating_mul(compute_k)
                     .div_ceil(flops_per_cycle);
-                let right = inputs.get(1);
+                let right = inputs.get(right_index);
                 let right_bytes_consumed = right.map_or(u64::MAX, |right| {
                     kernel_output_columns
                         .saturating_mul(compute_k)
@@ -450,15 +463,20 @@ impl CostModel for Ipu21CostModel {
                         && right.format.precision == Precision::F16
                 });
                 let staged_local_weights = staged_weights
-                    && requirements.inputs.get(1).is_some_and(|requirement| {
-                        requirement.local_staging == LocalOperandStaging::MatchRemote
-                    });
+                    && requirements
+                        .inputs
+                        .get(right_index)
+                        .is_some_and(|requirement| {
+                            requirement.local_staging == LocalOperandStaging::MatchRemote
+                        });
                 let streamed_blocked_standard = right.filter(|right| {
                     staged_weights
                         && right.format.layout.memory_class == MemoryClass::Ipu21Standard
                         && matches!(
                             right.format.layout.order,
-                            ElementOrder::Amp(AmpOrder::RightBlocked(_))
+                            ElementOrder::Amp(
+                                AmpOrder::RightBlocked(_) | AmpOrder::TransposedRightBlocked(_),
+                            )
                         )
                 });
                 let weight_feed = streamed_blocked_standard.map_or_else(
@@ -478,7 +496,17 @@ impl CostModel for Ipu21CostModel {
                             .tiling
                             .axes
                             .iter()
-                            .find(|axis| axis.axis == TensorAxis::FromEnd(2))
+                            .find(|axis| {
+                                axis.axis
+                                    == if matches!(
+                                        right.format.layout.order,
+                                        ElementOrder::Amp(AmpOrder::TransposedRightBlocked(_))
+                                    ) {
+                                        TensorAxis::FromEnd(1)
+                                    } else {
+                                        TensorAxis::FromEnd(2)
+                                    }
+                            })
                             .map_or(1, |axis| u64::from(axis.partitions));
                         let local = right_bytes_consumed.div_ceil(owners);
                         let remote = right_bytes_consumed.saturating_sub(local);
@@ -497,7 +525,17 @@ impl CostModel for Ipu21CostModel {
                         .tiling
                         .axes
                         .iter()
-                        .find(|axis| axis.axis == TensorAxis::FromEnd(2))
+                        .find(|axis| {
+                            axis.axis
+                                == if matches!(
+                                    right.format.layout.order,
+                                    ElementOrder::Amp(AmpOrder::TransposedRightBlocked(_))
+                                ) {
+                                    TensorAxis::FromEnd(1)
+                                } else {
+                                    TensorAxis::FromEnd(2)
+                                }
+                        })
                         .map_or(1, |axis| u64::from(axis.partitions));
                     let local_panel_bytes = right_bytes_consumed.div_ceil(owners);
                     let per_phase_penalty = local_panel_bytes
@@ -553,13 +591,18 @@ impl CostModel for Ipu21CostModel {
                         ..
                     } => {
                         let partitions = u64::from(*inner_partitions);
-                        let columns = output.shape.0.last().copied().map_or(1, u64::from);
+                        let columns = output
+                            .shape
+                            .0
+                            .get(output.shape.0.len().saturating_sub(output_column_from_end))
+                            .copied()
+                            .map_or(1, u64::from);
                         let exchange_epochs = 1u64;
                         let local_k = k.div_ceil(partitions);
                         let weight_bytes = local_k
                             .saturating_mul(columns.div_ceil(u64::from(*column_partitions)))
-                            .saturating_mul(inputs[1].format.precision.bytes());
-                        let activation_bytes = maximum_shard_bytes(&inputs[0]);
+                            .saturating_mul(inputs[right_index].format.precision.bytes());
+                        let activation_bytes = maximum_shard_bytes(&inputs[left_index]);
                         let (rounds, reduction_additions) =
                             reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
                         let partial_bytes = maximum_shard_bytes(&compute_output);

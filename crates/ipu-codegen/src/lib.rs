@@ -49,7 +49,7 @@ pub use memory::{
 pub use mid::{
     AccumulationPrecision, AmpOrder, AxisTiling, ConversionDispatch, ConversionPlan,
     ConversionStreamingPolicy, CostModel, ElementOrder, GemmDistribution, GemmKernelMode,
-    GemmWeightLoad, GridOrder, HardwareTarget, IPU21_TARGET_COSTS, Ipu21CostModel,
+    GemmOrientation, GemmWeightLoad, GridOrder, HardwareTarget, IPU21_TARGET_COSTS, Ipu21CostModel,
     Ipu21TargetCosts, Layout, LayoutError, LocalOperandStaging, LoweringError, LoweringResult,
     MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidGraph,
     MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue,

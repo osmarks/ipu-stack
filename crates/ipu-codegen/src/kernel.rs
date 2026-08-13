@@ -832,11 +832,26 @@ fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, KernelAbiErr
 
 fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
     let rank = run.output.extents.len();
-    let matrix_column_axis = rank.checked_sub(1).ok_or(KernelAbiError::MissingGemmRows)?;
-    run.output.extents[..matrix_column_axis]
+    let output_order = match &run.requirements {
+        KernelRequirements::Operator(requirements) => &requirements.output.format.layout.order,
+        KernelRequirements::Conversion { .. } => return Err(KernelAbiError::RequirementMismatch),
+    };
+    let matrix_column_axis = rank
+        .checked_sub(
+            if matches!(output_order, ElementOrder::Amp(AmpOrder::TransposedOutput)) {
+                2
+            } else {
+                1
+            },
+        )
+        .ok_or(KernelAbiError::MissingGemmRows)?;
+    run.output
+        .extents
         .iter()
+        .enumerate()
+        .filter(|(axis, _)| *axis != matrix_column_axis)
         .try_fold(1u32, |rows, extent| {
-            rows.checked_mul(extent.physical_end - extent.start)
+            rows.checked_mul(extent.1.physical_end - extent.1.start)
         })
         .filter(|&rows| rows != 0)
         .ok_or(KernelAbiError::MissingGemmRows)

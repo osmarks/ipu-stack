@@ -129,6 +129,16 @@ pub enum GridOrder {
     RowsFast,
 }
 
+/// Physical matrix orientation used by a blocked GEMM implementation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GemmOrientation {
+    #[default]
+    Normal,
+    /// Compute `(rightᵀ × leftᵀ)ᵀ`. This preserves GEMM semantics while
+    /// exchanging the physical row and output-column traversal dimensions.
+    Swapped,
+}
+
 /// Shape-independent recipe which expands into ordered device-wide exchange
 /// and tile-kernel phases after concrete shards are known.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +152,7 @@ pub enum OperatorDispatch {
         accumulate: TileKernelSpec,
         inner_block: u32,
         output_column_block: u32,
+        orientation: GemmOrientation,
         distribution: GemmDistribution,
     },
     BlockedAttention {
@@ -293,14 +304,20 @@ impl OperatorDispatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AmpOrder {
     Left,
+    /// A semantic `[K, N]` matrix packed as the left operand `[N, K]`.
+    TransposedLeft,
     Right,
     /// Semantic `[key, channel]` storage packed as the right operand of
     /// `query * key.transpose()`.
     TransposedRight,
+    /// Transposed right operand with complete physical K blocks contiguous.
+    TransposedRightBlocked(u16),
     /// Right operand ordered by the recorded K block before output-column
     /// blocks so one blocked GEMM invocation consumes a contiguous span.
     RightBlocked(u16),
     Output,
+    /// A semantic `[M, N]` output packed as the physical output `[N, M]`.
+    TransposedOutput,
 }
 
 pub const AMP_INNER_BLOCK: u32 = 64;
@@ -323,7 +340,11 @@ impl ElementOrder {
     fn requires_direct_population(&self) -> bool {
         matches!(
             self,
-            Self::Amp(AmpOrder::RightBlocked(_) | AmpOrder::TransposedRight)
+            Self::Amp(
+                AmpOrder::RightBlocked(_)
+                    | AmpOrder::TransposedRight
+                    | AmpOrder::TransposedRightBlocked(_),
+            )
         )
     }
 }
@@ -750,6 +771,34 @@ impl Layout {
         }
     }
 
+    /// A semantic right-hand matrix `[K, N]` packed as the physical left
+    /// operand `[N, K]` on a row-by-column-by-K dispatch grid.
+    pub fn amp_transposed_left_parallel_grid(
+        inner: u16,
+        tile_count: u16,
+        row_partitions: u16,
+        column_partitions: u16,
+        inner_partitions: u16,
+    ) -> Self {
+        Self {
+            order: ElementOrder::Amp(AmpOrder::TransposedLeft),
+            tiling: TensorTiling {
+                tile_count,
+                replicas: column_partitions,
+                axes: vec![
+                    AxisTiling::new(
+                        TensorAxis::FromEnd(2),
+                        inner_partitions,
+                        u32::from(inner),
+                        Padding::Zero,
+                    ),
+                    AxisTiling::new(TensorAxis::FromEnd(1), row_partitions, 1, Padding::Reject),
+                ],
+            },
+            memory_class: MemoryClass::Ipu21Standard,
+        }
+    }
+
     /// AMP right operand on a row-by-column tile grid. Each column shard is
     /// replicated across row groups so it is local to every output shard.
     pub fn amp_right_grid(
@@ -830,6 +879,45 @@ impl Layout {
         }
     }
 
+    /// A semantic left-hand matrix `[M, K]` packed as the physical blocked
+    /// right operand `[K, M]`.
+    pub fn amp_transposed_right_blocked_storage(
+        inner_block: u16,
+        output_column_block: u32,
+        column_partitions: u16,
+        inner_partitions: u16,
+        copies: u16,
+        memory_class: MemoryClass,
+    ) -> Self {
+        let tile_count = column_partitions
+            .checked_mul(inner_partitions)
+            .and_then(|tiles| tiles.checked_mul(copies))
+            .unwrap_or(0);
+        Self {
+            order: ElementOrder::Amp(AmpOrder::TransposedRightBlocked(inner_block)),
+            tiling: TensorTiling {
+                tile_count,
+                replicas: copies,
+                axes: vec![
+                    AxisTiling::new(
+                        TensorAxis::FromEnd(2),
+                        column_partitions,
+                        output_column_block,
+                        Padding::Zero,
+                    )
+                    .with_tile_stride(1),
+                    AxisTiling::new(
+                        TensorAxis::FromEnd(1),
+                        inner_partitions,
+                        u32::from(inner_block),
+                        Padding::Zero,
+                    ),
+                ],
+            },
+            memory_class,
+        }
+    }
+
     /// AMP output distributed over both matrix axes on one tile grid.
     pub fn amp_output_grid(
         output_column_block: u32,
@@ -865,6 +953,34 @@ impl Layout {
                             GridOrder::ColumnsFast => column_partitions,
                             GridOrder::RowsFast => 1,
                         }),
+                ],
+            },
+            memory_class: MemoryClass::Ipu21Interleaved,
+        }
+    }
+
+    /// A semantic output `[M, N]` packed as the physical AMP output `[N, M]`.
+    pub fn amp_transposed_output_grid(
+        output_column_block: u32,
+        tile_count: u16,
+        row_partitions: u16,
+        column_partitions: u16,
+    ) -> Self {
+        Self {
+            order: ElementOrder::Amp(AmpOrder::TransposedOutput),
+            tiling: TensorTiling {
+                tile_count,
+                replicas: 1,
+                axes: vec![
+                    AxisTiling::new(
+                        TensorAxis::FromEnd(2),
+                        column_partitions,
+                        output_column_block,
+                        Padding::Zero,
+                    )
+                    .with_tile_stride(1),
+                    AxisTiling::new(TensorAxis::FromEnd(1), row_partitions, 1, Padding::Reject)
+                        .with_tile_stride(column_partitions),
                 ],
             },
             memory_class: MemoryClass::Ipu21Interleaved,
@@ -1362,6 +1478,7 @@ fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
             },
             inner_block: AMP_INNER_BLOCK,
             output_column_block: AMP_OUTPUT_COLUMN_BLOCK,
+            orientation: GemmOrientation::Normal,
             distribution: GemmDistribution::OutputStationary,
         },
         MidOperator::Gelu => OperatorDispatch::Pointwise {
@@ -1946,6 +2063,7 @@ fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> Operator
         },
         inner_block: AMP_INNER_BLOCK,
         output_column_block: output_columns,
+        orientation: GemmOrientation::Normal,
         distribution: GemmDistribution::OutputStationary,
     }
 }
@@ -2115,6 +2233,7 @@ impl OperatorPlan {
                     inner_block,
                     output_column_block,
                     distribution,
+                    orientation,
                 },
             ) => {
                 let [left, right] = inputs else {
@@ -2126,18 +2245,26 @@ impl OperatorPlan {
                 {
                     return Err(OperatorPlanError::IncompatibleTileGroups);
                 }
-                if options.transpose_left
-                    || options.transpose_right
-                    || !matches!(left.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
-                    || !matches!(
-                        right.format.layout.order,
-                        ElementOrder::Amp(AmpOrder::Right | AmpOrder::RightBlocked(_))
-                    )
-                    || !matches!(
-                        output.format.layout.order,
-                        ElementOrder::Amp(AmpOrder::Output)
-                    )
-                {
+                let formats_match_orientation = match orientation {
+                    GemmOrientation::Normal => {
+                        matches!(left.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
+                            && matches!(
+                                right.format.layout.order,
+                                ElementOrder::Amp(AmpOrder::Right | AmpOrder::RightBlocked(_))
+                            )
+                            && output.format.layout.order == ElementOrder::Amp(AmpOrder::Output)
+                    }
+                    GemmOrientation::Swapped => {
+                        matches!(
+                            left.format.layout.order,
+                            ElementOrder::Amp(AmpOrder::TransposedRightBlocked(_))
+                        ) && right.format.layout.order
+                            == ElementOrder::Amp(AmpOrder::TransposedLeft)
+                            && output.format.layout.order
+                                == ElementOrder::Amp(AmpOrder::TransposedOutput)
+                    }
+                };
+                if options.transpose_left || options.transpose_right || !formats_match_orientation {
                     return Err(OperatorPlanError::UnsupportedGemmLayout);
                 }
                 let (
@@ -2184,17 +2311,25 @@ impl OperatorPlan {
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
                 }
-                let left_padded = left
+                let physical_left = match orientation {
+                    GemmOrientation::Normal => left,
+                    GemmOrientation::Swapped => right,
+                };
+                let left_padded = physical_left
                     .format
                     .layout
-                    .padded_shape(&left.shape)
+                    .padded_shape(&physical_left.shape)
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
                 let output_padded = output
                     .format
                     .layout
                     .padded_shape(&output.shape)
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
-                let output_column_axis = output_padded.0.len() - 1;
+                let output_column_axis = output_padded.0.len()
+                    - match orientation {
+                        GemmOrientation::Normal => 1,
+                        GemmOrientation::Swapped => 2,
+                    };
                 let columns_per_output_shard =
                     if matches!(distribution, GemmDistribution::ParallelReduction { .. }) {
                         maximum_padded_axis_shard_extent(
@@ -2205,17 +2340,29 @@ impl OperatorPlan {
                     } else {
                         padded_axis_shard_extent(output, &output_padded, output_column_axis)?
                     };
-                let right_padded = right
+                let physical_right = match orientation {
+                    GemmOrientation::Normal => right,
+                    GemmOrientation::Swapped => left,
+                };
+                let right_padded = physical_right
                     .format
                     .layout
-                    .padded_shape(&right.shape)
+                    .padded_shape(&physical_right.shape)
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
-                let right_column_axis = right_padded.0.len() - 1;
+                let right_column_axis = right_padded.0.len()
+                    - match orientation {
+                        GemmOrientation::Normal => 1,
+                        GemmOrientation::Swapped => 2,
+                    };
                 let columns_per_right_shard =
                     if matches!(distribution, GemmDistribution::ParallelReduction { .. }) {
-                        maximum_padded_axis_shard_extent(right, &right_padded, right_column_axis)?
+                        maximum_padded_axis_shard_extent(
+                            physical_right,
+                            &right_padded,
+                            right_column_axis,
+                        )?
                     } else {
-                        padded_axis_shard_extent(right, &right_padded, right_column_axis)?
+                        padded_axis_shard_extent(physical_right, &right_padded, right_column_axis)?
                     };
                 let grid_plan = left.format.layout.tiling.replicas > 1
                     || right.format.layout.tiling.replicas > 1
@@ -2233,12 +2380,13 @@ impl OperatorPlan {
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
                 }
-                if !left_padded.0.last().unwrap().is_multiple_of(*inner_block)
-                    || !output_padded
-                        .0
-                        .last()
-                        .unwrap()
-                        .is_multiple_of(*output_column_block)
+                let physical_left_inner_axis = left_padded.0.len()
+                    - match orientation {
+                        GemmOrientation::Normal => 1,
+                        GemmOrientation::Swapped => 2,
+                    };
+                if !left_padded.0[physical_left_inner_axis].is_multiple_of(*inner_block)
+                    || !output_padded.0[output_column_axis].is_multiple_of(*output_column_block)
                     || !columns_per_output_shard.is_multiple_of(*output_column_block)
                     || columns_per_right_shard < *output_column_block
                 {
@@ -3912,6 +4060,21 @@ fn parallel_reduction_candidates(
     inputs: &[TensorType],
     config: &PipelineConfig,
 ) -> Vec<OperatorCandidate> {
+    [GemmOrientation::Normal, GemmOrientation::Swapped]
+        .into_iter()
+        .flat_map(|orientation| {
+            parallel_reduction_candidates_for_orientation(candidate, inputs, config, orientation)
+        })
+        .collect()
+}
+
+fn parallel_reduction_candidates_for_orientation(
+    candidate: &OperatorCandidate,
+    inputs: &[TensorType],
+    config: &PipelineConfig,
+    orientation: GemmOrientation,
+) -> Vec<OperatorCandidate> {
+    const AMP_F16_MICROBLOCK_FIXED_CYCLES: u64 = 289;
     let OperatorDispatch::BlockedGemm {
         output_column_block,
         distribution: GemmDistribution::OutputStationary,
@@ -3940,8 +4103,13 @@ fn parallel_reduction_candidates(
     let Some(&inner) = left.shape.0.last() else {
         return Vec::new();
     };
-    let Some(&columns) = right.shape.0.last() else {
+    let Some(&normal_columns) = right.shape.0.last() else {
         return Vec::new();
+    };
+    let normal_rows = left.shape.0[left.shape.0.len() - 2];
+    let (rows, columns) = match orientation {
+        GemmOrientation::Normal => (normal_rows, normal_columns),
+        GemmOrientation::Swapped => (normal_columns, normal_rows),
     };
     // Generate the shape-specialized family once from the ordinary C64 seed.
     // Each grid chooses the exact padded local K and C extents, so one tile
@@ -3971,7 +4139,6 @@ fn parallel_reduction_candidates(
     {
         return Vec::new();
     }
-    let rows = left.shape.0[left.shape.0.len() - 2];
     let outer_rows = left.shape.0[..left.shape.0.len() - 2]
         .iter()
         .copied()
@@ -4003,9 +4170,17 @@ fn parallel_reduction_candidates(
             {
                 continue;
             }
-            let compute = u64::from(local_rows)
-                .saturating_mul(u64::from(local_columns))
-                .saturating_mul(u64::from(local_inner));
+            // Retain grids by the generated kernel's actual K16 x C16
+            // invocation structure, including its fixed weight-feed and
+            // worker/supervisor cost. Pure arithmetic work is almost constant
+            // across grids and incorrectly favors many tiny row runs.
+            let row_run_cycles = outer_rows
+                .saturating_mul(u64::from(local_rows))
+                .saturating_mul(4)
+                .saturating_add(AMP_F16_MICROBLOCK_FIXED_CYCLES);
+            let compute = u64::from(local_columns)
+                .saturating_mul(u64::from(local_inner))
+                .saturating_mul(row_run_cycles);
             let communication = u64::from(local_columns)
                 .saturating_mul(u64::from(local_inner))
                 .saturating_add(u64::from(local_rows).saturating_mul(u64::from(local_inner)))
@@ -4018,12 +4193,28 @@ fn parallel_reduction_candidates(
                 .saturating_mul(u64::from(local_rows))
                 .saturating_mul(u64::from(local_inner))
                 .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                .saturating_mul(candidate.inputs[0].format.precision.bytes());
+                .saturating_mul(
+                    candidate.inputs[match orientation {
+                        GemmOrientation::Normal => 0,
+                        GemmOrientation::Swapped => 1,
+                    }]
+                    .format
+                    .precision
+                    .bytes(),
+                );
             let right_bytes = u64::from(local_columns)
                 .saturating_mul(u64::from(AMP_COLUMN_MICRO))
                 .saturating_mul(u64::from(local_inner))
                 .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                .saturating_mul(candidate.inputs[1].format.precision.bytes());
+                .saturating_mul(
+                    candidate.inputs[match orientation {
+                        GemmOrientation::Normal => 1,
+                        GemmOrientation::Swapped => 0,
+                    }]
+                    .format
+                    .precision
+                    .bytes(),
+                );
             let partial_bytes = outer_rows
                 .saturating_mul(u64::from(local_rows))
                 .saturating_mul(u64::from(local_columns))
@@ -4059,6 +4250,19 @@ fn parallel_reduction_candidates(
         }
     }
     grids.sort_unstable();
+    // Arithmetic-favored grids and communication-favored grids are both
+    // useful inputs to the full cost model. Retain their Pareto frontier here
+    // instead of lexicographically discarding balanced plans before exchange
+    // and reduction costs are known.
+    let mut best_communication = u64::MAX;
+    grids.retain(|grid| {
+        if grid.1 >= best_communication {
+            false
+        } else {
+            best_communication = grid.1;
+            true
+        }
+    });
     grids.truncate(config.planning_beam_width.max(1));
     let mut variants = Vec::new();
     for (_, _, _, _, row_partitions, column_partitions, inner_partitions) in grids {
@@ -4077,35 +4281,71 @@ fn parallel_reduction_candidates(
         };
         for memory_class in [MemoryClass::Ipu21Standard, MemoryClass::Ipu21Interleaved] {
             let mut variant = candidate.clone();
-            variant.inputs[0].format.layout = Layout::amp_left_parallel_grid(
-                kernel_inner_block_u16,
-                used_tiles,
-                row_partitions,
-                column_partitions,
-                inner_partitions,
-            );
-            variant.inputs[1].format.layout = Layout::amp_right_blocked_storage(
-                kernel_inner_block_u16,
-                kernel_output_columns,
-                column_partitions,
-                inner_partitions,
-                1,
-                memory_class,
-            );
-            variant.output.format.layout = Layout::amp_output_grid(
-                kernel_output_columns,
-                row_partitions.saturating_mul(column_partitions),
-                row_partitions,
-                column_partitions,
-                GridOrder::ColumnsFast,
-            );
+            match orientation {
+                GemmOrientation::Normal => {
+                    variant.inputs[0].format.layout = Layout::amp_left_parallel_grid(
+                        kernel_inner_block_u16,
+                        used_tiles,
+                        row_partitions,
+                        column_partitions,
+                        inner_partitions,
+                    );
+                    variant.inputs[1].format.layout = Layout::amp_right_blocked_storage(
+                        kernel_inner_block_u16,
+                        kernel_output_columns,
+                        column_partitions,
+                        inner_partitions,
+                        1,
+                        memory_class,
+                    );
+                    variant.output.format.layout = Layout::amp_output_grid(
+                        kernel_output_columns,
+                        row_partitions.saturating_mul(column_partitions),
+                        row_partitions,
+                        column_partitions,
+                        GridOrder::ColumnsFast,
+                    );
+                }
+                GemmOrientation::Swapped => {
+                    let mut physical_left = variant.inputs[1].clone();
+                    physical_left.format.layout = Layout::amp_transposed_left_parallel_grid(
+                        kernel_inner_block_u16,
+                        used_tiles,
+                        row_partitions,
+                        column_partitions,
+                        inner_partitions,
+                    );
+                    physical_left.materialization = OperandMaterialization::DispatchSlices;
+                    let mut physical_right = variant.inputs[0].clone();
+                    physical_right.format.layout = Layout::amp_transposed_right_blocked_storage(
+                        kernel_inner_block_u16,
+                        kernel_output_columns,
+                        column_partitions,
+                        inner_partitions,
+                        row_partitions,
+                        memory_class,
+                    );
+                    physical_right.materialization = OperandMaterialization::Complete;
+                    variant.inputs = vec![physical_right, physical_left];
+                    variant.output.format.layout = Layout::amp_transposed_output_grid(
+                        kernel_output_columns,
+                        row_partitions.saturating_mul(column_partitions),
+                        row_partitions,
+                        column_partitions,
+                    );
+                    variant.memory_relations = vec![MemoryRelation::DistinctElements(vec![
+                        MemoryOperand::Output,
+                        MemoryOperand::Input(1),
+                    ])];
+                }
+            }
             if let OperatorDispatch::BlockedGemm {
                 initialize,
                 accumulate,
                 inner_block,
                 output_column_block,
+                orientation: selected_orientation,
                 distribution,
-                ..
             } = &mut variant.dispatch
             {
                 if let TileKernelSpec::Gemm { weights, .. } = initialize {
@@ -4142,6 +4382,7 @@ fn parallel_reduction_candidates(
                 }
                 *inner_block = kernel_inner_block;
                 *output_column_block = kernel_output_columns;
+                *selected_orientation = orientation;
                 *distribution = GemmDistribution::ParallelReduction {
                     row_partitions,
                     column_partitions,
@@ -4682,7 +4923,9 @@ mod tests {
                 !candidates.is_empty(),
                 "shape={m}x{k}x{n} tiles={tiles} output_columns={output_columns}"
             );
-            assert!(candidates.len() <= config.planning_beam_width * 2);
+            // Each retained grid has standard- and interleaved-weight forms,
+            // independently for the two physical matrix orientations.
+            assert!(candidates.len() <= config.planning_beam_width * 4);
             for candidate in candidates {
                 assert!(
                     candidate.supports(&inputs, &TensorShape(vec![m, n])),
@@ -4693,6 +4936,7 @@ mod tests {
                     OperatorDispatch::BlockedGemm {
                         inner_block,
                         output_column_block,
+                        orientation,
                         distribution: GemmDistribution::ParallelReduction {
                             row_partitions: actual_rows,
                             column_partitions: actual_columns,
@@ -4702,8 +4946,14 @@ mod tests {
                         ..
                     } if actual_rows * actual_columns * actual <= tiles
                         && actual_rows * actual_columns * actual >= tiles.div_ceil(2)
-                        && u32::from(actual_rows) <= m
-                        && u32::from(actual_columns) * output_column_block >= n
+                        && u32::from(actual_rows) <= match orientation {
+                            GemmOrientation::Normal => m,
+                            GemmOrientation::Swapped => n,
+                        }
+                        && u32::from(actual_columns) * output_column_block >= match orientation {
+                            GemmOrientation::Normal => n,
+                            GemmOrientation::Swapped => m,
+                        }
                         && u32::from(actual) * inner_block >= k
                 ));
             }
