@@ -3079,25 +3079,26 @@ fn lower_operations(
     }];
     for (operation_index, operation) in source.iter().enumerate() {
         let distributed_result_is_useful = operation.results.first().is_some_and(|result| {
-            value_uses.get(result).copied() == Some(1)
-                && source[operation_index + 1..]
-                    .iter()
-                    .find(|consumer| consumer.inputs.contains(result))
-                    .is_some_and(|consumer| {
-                        config
-                            .operator_candidates
-                            .iter()
-                            .filter(|candidate| {
-                                operator_matches(&consumer.kind, candidate.operator)
-                            })
-                            .any(|candidate| {
-                                matches!(
-                                    candidate.format_policy,
-                                    OperatorFormatPolicy::PreserveInputLayout(_)
-                                        | OperatorFormatPolicy::PreserveInputTiling(_)
-                                )
-                            })
-                    })
+            required_outputs.contains(result)
+                || (value_uses.get(result).copied() == Some(1)
+                    && source[operation_index + 1..]
+                        .iter()
+                        .find(|consumer| consumer.inputs.contains(result))
+                        .is_some_and(|consumer| {
+                            config
+                                .operator_candidates
+                                .iter()
+                                .filter(|candidate| {
+                                    operator_matches(&consumer.kind, candidate.operator)
+                                })
+                                .any(|candidate| {
+                                    matches!(
+                                        candidate.format_policy,
+                                        OperatorFormatPolicy::PreserveInputLayout(_)
+                                            | OperatorFormatPolicy::PreserveInputTiling(_)
+                                    )
+                                })
+                        }))
         });
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
