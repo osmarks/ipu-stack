@@ -35,12 +35,12 @@ pub use kernel::{
     materialize_kernel_run, tile_kernel_abi, validate_kernel_run,
 };
 pub use low::{
-    ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun, KernelRunId,
-    KernelRunMetadata, LocalCopy, LocalCopyId, LocalCopyPattern, LogicalExchange, LowInput,
-    LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId, LowValue, RepeatCarried,
-    RepeatInvariant, RepeatIterated, RepeatRun, RepeatRunId, ShardDefinition, ShardExtent,
-    ShardView, TileKernel, TileWork, TileWorkList, TileWorkRef, WorkProvenance, WorkReason,
-    lower_to_tiles,
+    ExchangeOrder, ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun,
+    KernelRunId, KernelRunMetadata, LocalCopy, LocalCopyId, LocalCopyPattern, LogicalExchange,
+    LowInput, LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId, LowValue,
+    RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, RepeatRunId, ShardDefinition,
+    ShardExtent, ShardView, TileKernel, TileWork, TileWorkList, TileWorkRef, WorkProvenance,
+    WorkReason, lower_to_tiles,
 };
 pub use memory::{
     IPU21_DATA_BASE, IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES,

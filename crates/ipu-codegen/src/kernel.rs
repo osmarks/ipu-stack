@@ -285,11 +285,7 @@ impl KernelBuildPlan {
                 source: "reduce_add_f16.S",
                 name: "reduce_add_f16".into(),
                 flags: Vec::new(),
-                retained_symbols: vec![
-                    "ipu_stack_reduce_sum_2_f16".into(),
-                    "ipu_stack_reduce_sum_3_f16".into(),
-                    "ipu_stack_reduce_sum_4_f16".into(),
-                ],
+                retained_symbols: vec!["ipu_stack_reduce_sum_f16".into()],
             });
         }
         let has_rearrange_codelets = !rearrangements.is_empty();
@@ -895,6 +891,12 @@ fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbi
         .iter()
         .map(|argument| match argument.name {
             "element_count" => Ok(count),
+            "num_partials" => match &run.kernel {
+                TileKernel::Planned(TileKernelSpec::ReductionSum { partials }) => {
+                    Ok(u32::from(*partials - 1))
+                }
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
             "scale_exponent" => match &run.kernel {
                 TileKernel::Planned(TileKernelSpec::Gemm {
                     multiply: Precision::F8F143 { scale_exponent },
@@ -983,21 +985,15 @@ pub fn tile_kernel_abi(
                 scalar_arguments(1, &["element_count"]),
             )
         }
-        TileKernelSpec::ReductionSum { inputs } => {
+        TileKernelSpec::ReductionSum { .. } => {
             if precision != Precision::F16 {
                 return Err(KernelAbiError::RequirementMismatch);
             }
-            let symbol = match inputs {
-                2 => "ipu_stack_reduce_sum_2_f16",
-                3 => "ipu_stack_reduce_sum_3_f16",
-                4 => "ipu_stack_reduce_sum_4_f16",
-                _ => return Err(KernelAbiError::RequirementMismatch),
-            };
             (
-                KernelSymbols::Exact(symbol),
+                KernelSymbols::Exact("ipu_stack_reduce_sum_f16"),
                 KernelAvailability::Implemented,
-                *inputs,
-                scalar_arguments(*inputs, &["element_count"]),
+                2,
+                scalar_arguments(2, &["num_partials", "element_count"]),
             )
         }
         TileKernelSpec::Add => (
@@ -1118,9 +1114,9 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             });
         }
     }
-    if matches!(kernel, TileKernelSpec::ReductionSum { .. }) {
+    if let TileKernelSpec::ReductionSum { partials } = kernel {
         let count = element_count(run)?;
-        if !count.is_multiple_of(8) {
+        if *partials < 2 || !count.is_multiple_of(8) {
             return Err(KernelAbiError::UnsupportedElementCount {
                 symbol: "ipu_stack_reduce_sum_f16",
                 count,

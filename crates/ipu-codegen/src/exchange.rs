@@ -362,14 +362,15 @@ fn prepare_transfer(
     transfer: &LogicalExchange,
 ) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
     let source = &program.shards[transfer.source.shard.index() as usize];
-    let logical_order = transfer.destinations.iter().any(|view| {
-        program.shards[view.shard.index() as usize]
-            .tensor_type
-            .format
-            .layout
-            .order
-            != source.tensor_type.format.layout.order
-    });
+    let logical_order = transfer.order == crate::low::ExchangeOrder::Semantic
+        && transfer.destinations.iter().any(|view| {
+            program.shards[view.shard.index() as usize]
+                .tensor_type
+                .format
+                .layout
+                .order
+                != source.tensor_type.format.layout.order
+        });
     let source_base = placement
         .shard_addresses
         .get(&source.id)

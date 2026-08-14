@@ -78,7 +78,7 @@ pub enum TileKernelSpec {
     },
     Gelu,
     ReductionSum {
-        inputs: u8,
+        partials: u16,
     },
     Add,
     FlashAttention {
@@ -269,7 +269,6 @@ pub enum GemmDistribution {
         row_partitions: u16,
         column_partitions: u16,
         inner_partitions: u16,
-        reduction_fan_in: u16,
         /// Additional spatial partitions of each computed output block. Their
         /// product cannot exceed the K partition count; reduction roots are
         /// spread over former K-partition tiles rather than concentrated on
@@ -2424,7 +2423,6 @@ impl OperatorPlan {
                     row_partitions,
                     column_partitions,
                     inner_partitions,
-                    reduction_fan_in,
                     result_row_partitions,
                     result_column_partitions,
                 } = distribution
@@ -2454,7 +2452,6 @@ impl OperatorPlan {
                     if *row_partitions == 0
                         || *column_partitions == 0
                         || *inner_partitions < 2
-                        || *reduction_fan_in < 2
                         || *result_row_partitions == 0
                         || *result_column_partitions == 0
                         || result_row_partitions.saturating_mul(*result_column_partitions)
@@ -4423,20 +4420,19 @@ fn parallel_reduction_candidates_for_orientation(
                 .saturating_mul(u64::from(local_columns))
                 .saturating_mul(u64::from(AMP_COLUMN_MICRO))
                 .saturating_mul(candidate.output.format.precision.bytes());
-            let reduction_fan_in = inner_partitions.min(4);
-            // Staging and the local partial coexist during convolution. The
-            // reduction reuses staging storage after convolution and needs at
-            // most `fan_in` partial buffers instead. This follows the same
-            // max-of-phases accounting used by Poplin's convolution model.
+            // Operand staging and the local partial coexist during convolution.
+            // Reduction retains that partial plus one initial, one result, and
+            // all packed remote partials in standard memory.
             let convolution_bytes = left_bytes
                 .saturating_add(right_bytes)
                 .saturating_add(partial_bytes);
-            let reduction_bytes = partial_bytes.saturating_mul(u64::from(reduction_fan_in));
+            let reduction_bytes =
+                partial_bytes.saturating_mul(u64::from(inner_partitions).saturating_add(2));
             let temporary_bytes = convolution_bytes.max(reduction_bytes);
             if temporary_bytes > u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES) {
                 continue;
             }
-            if right_bytes.saturating_add(partial_bytes.saturating_mul(u64::from(reduction_fan_in)))
+            if right_bytes.saturating_add(partial_bytes)
                 > u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
             {
                 continue;
@@ -4469,7 +4465,6 @@ fn parallel_reduction_candidates_for_orientation(
     grids.truncate(config.planning_beam_width.max(1));
     let mut variants = Vec::new();
     for (_, _, _, _, row_partitions, column_partitions, inner_partitions) in grids {
-        let reduction_fan_in = inner_partitions.min(4);
         let used_tiles = row_partitions
             .saturating_mul(column_partitions)
             .saturating_mul(inner_partitions);
@@ -4607,7 +4602,6 @@ fn parallel_reduction_candidates_for_orientation(
                     row_partitions,
                     column_partitions,
                     inner_partitions,
-                    reduction_fan_in,
                     result_row_partitions: 1,
                     result_column_partitions: 1,
                 };

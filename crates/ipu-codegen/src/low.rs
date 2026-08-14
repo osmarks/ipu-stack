@@ -130,6 +130,16 @@ pub struct LowValue {
 pub struct LogicalExchange {
     pub source: ShardView,
     pub destinations: Vec<ShardView>,
+    pub order: ExchangeOrder,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExchangeOrder {
+    /// Preserve tensor coordinates, converting between physical layouts.
+    #[default]
+    Semantic,
+    /// Preserve allocation order, treating both views as packed byte spans.
+    Physical,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2198,6 +2208,35 @@ impl LoweringState {
         })
     }
 
+    fn push_packed_buffer(
+        &mut self,
+        tile: u16,
+        elements: u32,
+        precision: Precision,
+        definition: ShardDefinition,
+    ) -> LowLoweringResult<LowShardId> {
+        self.push_shard(LowShard {
+            id: LowShardId(0),
+            tile,
+            tensor_type: TensorType::new(
+                [elements],
+                precision,
+                Layout {
+                    order: ElementOrder::RowMajor,
+                    tiling: TensorTiling::replicated(1),
+                    memory_class: MemoryClass::Ipu21Standard,
+                },
+            ),
+            extents: vec![ShardExtent {
+                axis: 0,
+                start: 0,
+                logical_end: elements,
+                physical_end: elements,
+            }],
+            definition,
+        })
+    }
+
     fn push_attention_buffer(
         &mut self,
         tile: u16,
@@ -2465,7 +2504,6 @@ impl LoweringState {
             row_partitions,
             column_partitions,
             inner_partitions,
-            reduction_fan_in,
             result_row_partitions,
             result_column_partitions,
         } = distribution
@@ -2480,7 +2518,6 @@ impl LoweringState {
                 row_partitions,
                 column_partitions,
                 inner_partitions,
-                reduction_fan_in,
                 result_row_partitions,
                 result_column_partitions,
                 requirements,
@@ -2776,7 +2813,6 @@ impl LoweringState {
         row_partitions: u16,
         column_partitions: u16,
         inner_partitions: u16,
-        reduction_fan_in: u16,
         result_row_partitions: u16,
         result_column_partitions: u16,
         requirements: &OperatorRequirements,
@@ -2793,7 +2829,6 @@ impl LoweringState {
             || row_partitions == 0
             || column_partitions == 0
             || inner_partitions < 2
-            || reduction_fan_in < 2
             || result_row_partitions == 0
             || result_column_partitions == 0
             || result_row_partitions.saturating_mul(result_column_partitions) > inner_partitions
@@ -3377,242 +3412,29 @@ impl LoweringState {
                 "prepared parallel GEMM partials"
             );
 
-            if (result_row_partitions, result_column_partitions) != (1, 1) {
-                let mut segmented = BTreeMap::<Vec<(u32, u32)>, Vec<(u16, ShardView)>>::new();
-                let mut seed_transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
-                let mut seed_copies = Vec::<(u16, LocalCopy)>::new();
-                for contributors in std::mem::take(&mut partials).into_values() {
-                    let Some((_, complete)) = contributors.first() else {
-                        return Err(LowLoweringError::InvalidOperatorPlan);
-                    };
-                    let expected = complete.extents.iter().fold(1u64, |elements, extent| {
-                        elements.saturating_mul(u64::from(extent.physical_end - extent.start))
-                    });
-                    let mut covered = 0u64;
-                    for output in output_shards.iter().copied() {
-                        let owner = &self.shards[output.index() as usize];
-                        let intersection = owner
-                            .extents
-                            .iter()
-                            .zip(&complete.extents)
-                            .map(|(destination, source)| {
-                                let start = destination.start.max(source.start);
-                                let physical_end =
-                                    destination.physical_end.min(source.physical_end);
-                                (start < physical_end).then_some(ShardExtent {
-                                    axis: source.axis,
-                                    start,
-                                    logical_end: destination
-                                        .logical_end
-                                        .min(source.logical_end)
-                                        .max(start),
-                                    physical_end,
-                                })
-                            })
-                            .collect::<Option<Vec<_>>>();
-                        let Some(intersection) = intersection else {
-                            continue;
-                        };
-                        let column = intersection[output_column_axis];
-                        let column_starts = if result_row_partitions > 1 {
-                            (column.start..column.physical_end)
-                                .step_by(
-                                    usize::try_from(crate::mid::AMP_COLUMN_MICRO)
-                                        .map_err(|_| LowLoweringError::IdOverflow)?,
-                                )
-                                .collect::<Vec<_>>()
-                        } else {
-                            vec![column.start]
-                        };
-                        for column_start in column_starts {
-                            let mut segment_extents = intersection.clone();
-                            if result_row_partitions > 1 {
-                                let column_end = column_start
-                                    .saturating_add(crate::mid::AMP_COLUMN_MICRO)
-                                    .min(column.physical_end);
-                                segment_extents[output_column_axis].start = column_start;
-                                segment_extents[output_column_axis].logical_end = segment_extents
-                                    [output_column_axis]
-                                    .logical_end
-                                    .min(column_end)
-                                    .max(column_start);
-                                segment_extents[output_column_axis].physical_end = column_end;
-                            }
-                            covered = covered.saturating_add(segment_extents.iter().fold(
-                                1u64,
-                                |elements, extent| {
-                                    elements.saturating_mul(u64::from(
-                                        extent.physical_end - extent.start,
-                                    ))
-                                },
-                            ));
-                            let seed = contributors
-                                .iter()
-                                .position(|(tile, _)| *tile == owner.tile)
-                                .unwrap_or(0);
-                            let source = ShardView {
-                                shard: contributors[seed].1.shard,
-                                extents: segment_extents.clone(),
-                            };
-                            let destination = ShardView {
-                                shard: output,
-                                extents: segment_extents.clone(),
-                            };
-                            if source.shard != destination.shard {
-                                if contributors[seed].0 == owner.tile {
-                                    append_logical_span_copies(
-                                        &self.shards,
-                                        &source,
-                                        &destination,
-                                        owner.tile,
-                                        &mut seed_copies,
-                                    )?;
-                                } else {
-                                    seed_transfers
-                                        .entry(source)
-                                        .or_default()
-                                        .push(destination.clone());
-                                }
-                            }
-                            let mut segment = Vec::with_capacity(contributors.len());
-                            segment.push((owner.tile, destination));
-                            segment.extend(contributors.iter().enumerate().filter_map(
-                                |(index, (tile, partial))| {
-                                    (index != seed).then_some((
-                                        *tile,
-                                        ShardView {
-                                            shard: partial.shard,
-                                            extents: segment_extents.clone(),
-                                        },
-                                    ))
-                                },
-                            ));
-                            segmented.insert(
-                                segment_extents
-                                    .iter()
-                                    .map(|extent| (extent.start, extent.physical_end))
-                                    .collect(),
-                                segment,
-                            );
-                        }
-                    }
-                    if covered != expected {
-                        return Err(LowLoweringError::InvalidOperatorPlan);
-                    }
-                }
-                self.append_phase(
-                    seed_transfers,
-                    WorkProvenance {
-                        operation: operation.source,
-                        value: Some(*output_value),
-                        reason: WorkReason::OperatorInputs,
-                    },
-                    tiles,
-                )?;
-                for (tile, copy) in seed_copies {
-                    self.append_local_copy(tiles, tile, copy)?;
-                }
-                partials = segmented;
-                tracing::debug!(
-                    reduction_segments = partials.len(),
-                    "distributed parallel GEMM reduction roots"
-                );
-            }
-
-            for row_partials in partials.values_mut() {
-                if let Some(root) = row_partials.iter().position(|(_, view)| {
-                    matches!(
-                        self.shards[view.shard.index() as usize].definition,
-                        ShardDefinition::Value(value) if value == *output_value
-                    )
-                }) {
-                    row_partials.swap(0, root);
-                }
-            }
-            while partials.values().any(|partials| partials.len() > 1) {
-                let mut reduction_transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
-                let mut reduction_runs = Vec::new();
-                for row_partials in partials.values_mut() {
-                    let fan_in = usize::from(reduction_fan_in);
-                    let mut next = Vec::with_capacity(row_partials.len().div_ceil(fan_in));
-                    for group in row_partials.chunks(fan_in) {
-                        let receiver = group[0].clone();
-                        let mut inputs = vec![KernelOperand {
-                            views: vec![receiver.1.clone()],
-                        }];
-                        for sender in group[1..].iter().cloned() {
-                            let incoming = self.push_shard(LowShard {
-                                id: LowShardId(0),
-                                tile: receiver.0,
-                                tensor_type: self.shards[receiver.1.shard.index() as usize]
-                                    .tensor_type
-                                    .clone(),
-                                extents: receiver.1.extents.clone(),
-                                definition: ShardDefinition::ExchangeStaging,
-                            })?;
-                            reduction_transfers
-                                .entry(sender.1.clone())
-                                .or_default()
-                                .push(self.full_view(incoming));
-                            inputs.push(KernelOperand {
-                                views: vec![self.full_view(incoming)],
-                            });
-                        }
-                        if inputs.len() > 1 {
-                            reduction_runs.push((
-                                receiver.0,
-                                KernelRun::new(
-                                    WorkProvenance {
-                                        operation: operation.source,
-                                        value: Some(*output_value),
-                                        reason: WorkReason::OperatorKernel,
-                                    },
-                                    TileKernel::Planned(TileKernelSpec::ReductionSum {
-                                        inputs: u8::try_from(inputs.len())
-                                            .map_err(|_| LowLoweringError::IdOverflow)?,
-                                    }),
-                                    inputs,
-                                    receiver.1.clone(),
-                                    KernelRequirements::Operator(requirements.clone()),
-                                ),
-                            ));
-                        }
-                        next.push(receiver);
-                    }
-                    *row_partials = next;
-                }
-                self.append_phase(
-                    reduction_transfers,
-                    WorkProvenance {
-                        operation: operation.source,
-                        value: Some(*output_value),
-                        reason: WorkReason::OperatorInputs,
-                    },
-                    tiles,
-                )?;
-                for (tile, run) in reduction_runs {
-                    self.append_kernel(tiles, tile, run)?;
-                }
-            }
-            let mut result_transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+            let mut reduction_transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+            let mut seed_copies = Vec::<(u16, LocalCopy)>::new();
+            let mut reduction_runs = Vec::<(u16, KernelRun)>::new();
             let mut result_copies = Vec::<(u16, LocalCopy)>::new();
-            for row_partials in partials.values() {
-                let [(result_tile, result)] = row_partials.as_slice() else {
+            let mut reduction_roots = 0usize;
+            for contributors in partials.into_values() {
+                let Some((_, complete)) = contributors.first() else {
                     return Err(LowLoweringError::InvalidOperatorPlan);
                 };
-                if matches!(
-                    self.shards[result.shard.index() as usize].definition,
-                    ShardDefinition::Value(value) if value == *output_value
-                ) {
-                    continue;
-                }
+                let expected = complete
+                    .extents
+                    .iter()
+                    .try_fold(1u64, |elements, extent| {
+                        elements.checked_mul(u64::from(extent.physical_end - extent.start))
+                    })
+                    .ok_or(LowLoweringError::IdOverflow)?;
                 let mut covered = 0u64;
                 for output in output_shards.iter().copied() {
-                    let owner = &self.shards[output.index() as usize];
+                    let owner = self.shards[output.index() as usize].clone();
                     let intersection = owner
                         .extents
                         .iter()
-                        .zip(&result.extents)
+                        .zip(&complete.extents)
                         .map(|(destination, source)| {
                             let start = destination.start.max(source.start);
                             let physical_end = destination.physical_end.min(source.physical_end);
@@ -3630,44 +3452,135 @@ impl LoweringState {
                     let Some(intersection) = intersection else {
                         continue;
                     };
-                    covered = covered.saturating_add(intersection.iter().fold(
-                        1u64,
-                        |elements, extent| {
-                            elements.saturating_mul(u64::from(extent.physical_end - extent.start))
-                        },
-                    ));
-                    let source = ShardView {
-                        shard: result.shard,
+                    let elements = intersection
+                        .iter()
+                        .try_fold(1u32, |elements, extent| {
+                            elements.checked_mul(extent.physical_end - extent.start)
+                        })
+                        .ok_or(LowLoweringError::IdOverflow)?;
+                    if elements == 0 || !elements.is_multiple_of(8) {
+                        return Err(LowLoweringError::InvalidOperatorPlan);
+                    }
+                    covered = covered
+                        .checked_add(u64::from(elements))
+                        .ok_or(LowLoweringError::IdOverflow)?;
+
+                    let initial = self.push_packed_buffer(
+                        owner.tile,
+                        elements,
+                        Precision::F16,
+                        ShardDefinition::Staging,
+                    )?;
+                    let remote_elements = elements
+                        .checked_mul(
+                            u32::try_from(contributors.len().saturating_sub(1))
+                                .map_err(|_| LowLoweringError::IdOverflow)?,
+                        )
+                        .ok_or(LowLoweringError::IdOverflow)?;
+                    let remote = self.push_packed_buffer(
+                        owner.tile,
+                        remote_elements,
+                        Precision::F16,
+                        ShardDefinition::ExchangeStaging,
+                    )?;
+                    let result = self.push_packed_buffer(
+                        owner.tile,
+                        elements,
+                        Precision::F16,
+                        ShardDefinition::Staging,
+                    )?;
+                    let seed = contributors
+                        .iter()
+                        .position(|(tile, _)| *tile == owner.tile)
+                        .unwrap_or(0);
+                    let source_view = |partial: &ShardView| ShardView {
+                        shard: partial.shard,
                         extents: intersection.clone(),
                     };
-                    let destination = ShardView {
-                        shard: output,
-                        extents: intersection,
-                    };
-                    if owner.tile == *result_tile {
-                        append_logical_span_copies(
+                    let seed_source = source_view(&contributors[seed].1);
+                    if contributors[seed].0 == owner.tile {
+                        append_span_copies(
                             &self.shards,
-                            &source,
-                            &destination,
-                            *result_tile,
-                            &mut result_copies,
+                            &seed_source,
+                            &self.full_view(initial),
+                            owner.tile,
+                            &mut seed_copies,
                         )?;
                     } else {
-                        result_transfers
-                            .entry(source)
+                        reduction_transfers
+                            .entry(seed_source)
                             .or_default()
-                            .push(destination);
+                            .push(self.full_view(initial));
                     }
+
+                    let mut slot = 0u32;
+                    for (index, (_, partial)) in contributors.iter().enumerate() {
+                        if index == seed {
+                            continue;
+                        }
+                        let start = slot
+                            .checked_mul(elements)
+                            .ok_or(LowLoweringError::IdOverflow)?;
+                        let end = start
+                            .checked_add(elements)
+                            .ok_or(LowLoweringError::IdOverflow)?;
+                        reduction_transfers
+                            .entry(source_view(partial))
+                            .or_default()
+                            .push(ShardView {
+                                shard: remote,
+                                extents: vec![ShardExtent {
+                                    axis: 0,
+                                    start,
+                                    logical_end: end,
+                                    physical_end: end,
+                                }],
+                            });
+                        slot += 1;
+                    }
+                    let result_view = self.full_view(result);
+                    reduction_runs.push((
+                        owner.tile,
+                        KernelRun::new(
+                            WorkProvenance {
+                                operation: operation.source,
+                                value: Some(*output_value),
+                                reason: WorkReason::OperatorKernel,
+                            },
+                            TileKernel::Planned(TileKernelSpec::ReductionSum {
+                                partials: u16::try_from(contributors.len())
+                                    .map_err(|_| LowLoweringError::IdOverflow)?,
+                            }),
+                            vec![
+                                KernelOperand {
+                                    views: vec![self.full_view(initial)],
+                                },
+                                KernelOperand {
+                                    views: vec![self.full_view(remote)],
+                                },
+                            ],
+                            result_view.clone(),
+                            KernelRequirements::Operator(requirements.clone()),
+                        ),
+                    ));
+                    append_span_copies(
+                        &self.shards,
+                        &result_view,
+                        &ShardView {
+                            shard: output,
+                            extents: intersection,
+                        },
+                        owner.tile,
+                        &mut result_copies,
+                    )?;
+                    reduction_roots += 1;
                 }
-                let expected = result.extents.iter().fold(1u64, |elements, extent| {
-                    elements.saturating_mul(u64::from(extent.physical_end - extent.start))
-                });
                 if covered != expected {
                     return Err(LowLoweringError::InvalidOperatorPlan);
                 }
             }
-            self.append_phase(
-                result_transfers,
+            self.append_physical_phase(
+                reduction_transfers,
                 WorkProvenance {
                     operation: operation.source,
                     value: Some(*output_value),
@@ -3675,9 +3588,16 @@ impl LoweringState {
                 },
                 tiles,
             )?;
+            for (tile, copy) in seed_copies {
+                self.append_local_copy(tiles, tile, copy)?;
+            }
+            for (tile, run) in reduction_runs {
+                self.append_kernel(tiles, tile, run)?;
+            }
             for (tile, copy) in result_copies {
                 self.append_local_copy(tiles, tile, copy)?;
             }
+            tracing::debug!(reduction_roots, "materialized packed parallel reduction");
         }
         Ok(())
     }
@@ -3951,6 +3871,25 @@ impl LoweringState {
         provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
+        self.append_ordered_phase(transfers, provenance, ExchangeOrder::Semantic, tiles)
+    }
+
+    fn append_physical_phase(
+        &mut self,
+        transfers: BTreeMap<ShardView, Vec<ShardView>>,
+        provenance: WorkProvenance,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<()> {
+        self.append_ordered_phase(transfers, provenance, ExchangeOrder::Physical, tiles)
+    }
+
+    fn append_ordered_phase(
+        &mut self,
+        transfers: BTreeMap<ShardView, Vec<ShardView>>,
+        provenance: WorkProvenance,
+        order: ExchangeOrder,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<()> {
         if transfers.is_empty() {
             return Ok(());
         }
@@ -3962,9 +3901,14 @@ impl LoweringState {
             provenance,
             transfers: transfers
                 .into_iter()
-                .map(|(source, destinations)| LogicalExchange {
-                    source,
-                    destinations,
+                .map(|(source, mut destinations)| {
+                    destinations.sort_unstable();
+                    destinations.dedup();
+                    LogicalExchange {
+                        source,
+                        destinations,
+                        order,
+                    }
                 })
                 .collect(),
         });
@@ -4630,13 +4574,12 @@ mod tests {
     }
 
     #[test]
-    fn randomized_parallel_reduction_gemms_lower_to_bulk_exchange_and_tree_reductions() {
+    fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         let mut random = fastrand::Rng::with_seed(0x7472_6565_5f6b_7370);
         for case in 0..CASES {
             let output_columns = [64, 128][random.usize(0..2)];
             let inner_partitions = random.u16(2..=4);
             let column_partitions = random.u16(1..=3);
-            let reduction_fan_in = random.u16(2..=inner_partitions.min(4));
             let row_partitions = random.u16(inner_partitions..=8);
             let tiles = inner_partitions * column_partitions * row_partitions;
             let rows_per_partition = random.u32(1..=4);
@@ -4725,7 +4668,6 @@ mod tests {
                     row_partitions,
                     column_partitions,
                     inner_partitions,
-                    reduction_fan_in,
                     result_row_partitions,
                     result_column_partitions,
                 },
@@ -4751,8 +4693,18 @@ mod tests {
                         TileKernel::Planned(TileKernelSpec::ReductionSum { .. })
                     )
                 })
-                .count();
-            assert!(reduction_runs > 0, "case {case}");
+                .collect::<Vec<_>>();
+            assert!(!reduction_runs.is_empty(), "case {case}");
+            assert!(
+                reduction_runs.iter().all(|run| {
+                    matches!(
+                        run.kernel,
+                        TileKernel::Planned(TileKernelSpec::ReductionSum { partials })
+                            if partials == inner_partitions
+                    ) && run.inputs.len() == 2
+                }),
+                "case {case}"
+            );
             assert!(
                 low.exchange_phases.len() <= usize::from(inner_partitions).saturating_add(2),
                 "case {case}"
@@ -4784,20 +4736,19 @@ mod tests {
                     .iter()
                     .copied()
                     .collect::<BTreeSet<_>>();
-                let reduction_destinations = low
-                    .kernel_runs
+                let packed_results = reduction_runs
                     .iter()
-                    .filter_map(|run| {
-                        matches!(
-                            run.kernel,
-                            TileKernel::Planned(TileKernelSpec::ReductionSum { .. })
-                        )
-                        .then_some(run.output.shard)
-                    })
+                    .map(|run| run.output.shard)
+                    .collect::<BTreeSet<_>>();
+                let copied_outputs = low
+                    .local_copies
+                    .iter()
+                    .filter(|copy| packed_results.contains(&copy.source))
+                    .map(|copy| copy.destination)
                     .collect::<BTreeSet<_>>();
                 assert!(
-                    output_shards.is_subset(&reduction_destinations),
-                    "case {case}: every distributed result shard must be a reduction root"
+                    output_shards.is_subset(&copied_outputs),
+                    "case {case}: every distributed result shard must receive a packed result"
                 );
             }
         }

@@ -430,7 +430,6 @@ pub(crate) fn operator_memory_estimate(
                 GemmDistribution::ParallelReduction {
                     column_partitions,
                     inner_partitions,
-                    reduction_fan_in,
                     result_row_partitions,
                     result_column_partitions,
                     ..
@@ -487,9 +486,8 @@ pub(crate) fn operator_memory_estimate(
             }
         }
         // Convolution retains one local partial alongside operand staging.
-        // Reduction happens later, after operand staging is dead, and retains
-        // one local partial plus the incoming members of one reduction group.
-        // Model the larger phase instead of summing mutually exclusive scratch.
+        // Reduction happens later and packs one initial partial, all remote
+        // partials, and one result into standard memory.
         let partial_bytes = maximum_shard_bytes(&gemm_partial_tensor(dispatch, output));
         let reduction_partial_bytes =
             if (*result_row_partitions, *result_column_partitions) != (1, 1) {
@@ -499,8 +497,9 @@ pub(crate) fn operator_memory_estimate(
             };
         convolution.interleaved = convolution.interleaved.saturating_add(partial_bytes);
         let reduction = MemoryUsage {
-            standard: 0,
-            interleaved: reduction_partial_bytes.saturating_mul(u64::from(*reduction_fan_in)),
+            standard: reduction_partial_bytes
+                .saturating_mul(u64::from(*inner_partitions).saturating_add(1)),
+            interleaved: partial_bytes,
         };
         temporary = if convolution.total() >= reduction.total() {
             convolution

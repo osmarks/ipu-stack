@@ -382,21 +382,6 @@ fn standard_to_interleaved_copy_cycles(bytes: u64) -> u64 {
         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
 }
 
-fn reduction_tree_critical_path(partitions: u16, fan_in: u16) -> (u64, u64) {
-    if partitions < 2 || fan_in < 2 {
-        return (0, 0);
-    }
-    let mut remaining = partitions;
-    let mut rounds = 0u64;
-    let mut additions = 0u64;
-    while remaining > 1 {
-        additions = additions.saturating_add(u64::from(remaining.min(fan_in) - 1));
-        remaining = remaining.div_ceil(fan_in);
-        rounds += 1;
-    }
-    (rounds, additions)
-}
-
 fn partition_boundary_penalty(shape: &TensorShape, from: &Layout, to: &Layout) -> u64 {
     let rank = shape.0.len();
     let partitions = |layout: &Layout, resolved_axis| {
@@ -623,7 +608,6 @@ impl CostModel for Ipu21CostModel {
                             GemmDistribution::ParallelReduction {
                                 column_partitions,
                                 inner_partitions,
-                                reduction_fan_in,
                                 result_row_partitions,
                                 result_column_partitions,
                                 ..
@@ -643,8 +627,6 @@ impl CostModel for Ipu21CostModel {
                             .saturating_mul(columns.div_ceil(u64::from(*column_partitions)))
                             .saturating_mul(inputs[right_index].format.precision.bytes());
                         let activation_bytes = maximum_shard_bytes(&inputs[left_index]);
-                        let (rounds, reduction_additions) =
-                            reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
                         let partial_bytes = maximum_shard_bytes(&compute_output);
                         let reduction_partial_bytes =
                             if (*result_row_partitions, *result_column_partitions) != (1, 1) {
@@ -664,23 +646,20 @@ impl CostModel for Ipu21CostModel {
                             .saturating_add(activation_bytes)
                             .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
                             .saturating_add(
-                                reduction_additions
+                                u64::from(inner_partitions.saturating_sub(1))
                                     .saturating_mul(reduction_partial_bytes)
                                     .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle),
                             )
                             .saturating_add(
                                 exchange_epochs
-                                    .saturating_mul(rounds.saturating_add(1))
+                                    .saturating_mul(2)
                                     .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles),
                             )
                             .saturating_add(
-                                rounds.saturating_mul(
-                                    reduction_partial_bytes
-                                        .div_ceil(
-                                            IPU21_TARGET_COSTS.reduction_output_bytes_per_cycle,
-                                        )
-                                        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
-                                ),
+                                u64::from(*inner_partitions)
+                                    .saturating_mul(reduction_partial_bytes)
+                                    .div_ceil(IPU21_TARGET_COSTS.reduction_output_bytes_per_cycle)
+                                    .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
                             )
                             .saturating_add(result_redistribution)
                     }
@@ -876,22 +855,12 @@ impl CostModel for Ipu21CostModel {
                 output_column_block: _,
                 distribution:
                     GemmDistribution::ParallelReduction {
-                        inner_partitions,
-                        reduction_fan_in,
-                        result_row_partitions,
-                        result_column_partitions,
-                        ..
+                        inner_partitions, ..
                     },
                 ..
             } => {
                 let epochs = 1u64;
-                let (rounds, _) =
-                    reduction_tree_critical_path(*inner_partitions, *reduction_fan_in);
-                epochs
-                    .saturating_mul(rounds.saturating_add(1))
-                    .saturating_add(u64::from(
-                        (*result_row_partitions, *result_column_partitions) != (1, 1),
-                    ))
+                epochs.saturating_mul(u64::from(*inner_partitions > 1).saturating_add(1))
             }
             _ => phases,
         };
