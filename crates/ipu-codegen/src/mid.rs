@@ -4448,20 +4448,29 @@ fn parallel_reduction_candidates_for_orientation(
             ));
         }
     }
-    grids.sort_unstable();
-    // Arithmetic-favored grids and communication-favored grids are both
-    // useful inputs to the full cost model. Retain their Pareto frontier here
-    // instead of lexicographically discarding balanced plans before exchange
-    // and reduction costs are known.
-    let mut best_communication = u64::MAX;
-    grids.retain(|grid| {
-        if grid.1 >= best_communication {
-            false
-        } else {
-            best_communication = grid.1;
-            true
+    // Do not discard a grid merely because another has lower estimated
+    // compute and communication: peak temporary storage and unused tiles are
+    // independent planning constraints. The complete cost model needs every
+    // non-dominated tradeoff in order to discover grids whose reductions or
+    // transitions are cheaper.
+    let dominates = |left: &(u64, u64, u64, u64, u16, u16, u16),
+                     right: &(u64, u64, u64, u64, u16, u16, u16)| {
+        left.0 <= right.0
+            && left.1 <= right.1
+            && left.2 <= right.2
+            && left.3 <= right.3
+            && (left.0 < right.0 || left.1 < right.1 || left.2 < right.2 || left.3 < right.3)
+    };
+    let mut frontier = Vec::new();
+    for grid in grids {
+        if frontier.iter().any(|kept| dominates(kept, &grid)) {
+            continue;
         }
-    });
+        frontier.retain(|kept| !dominates(&grid, kept));
+        frontier.push(grid);
+    }
+    frontier.sort_unstable();
+    let mut grids = frontier;
     grids.truncate(config.planning_beam_width.max(1));
     let mut variants = Vec::new();
     for (_, _, _, _, row_partitions, column_partitions, inner_partitions) in grids {
