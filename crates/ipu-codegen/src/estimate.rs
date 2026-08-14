@@ -36,18 +36,12 @@ pub(crate) fn conversion_traffic(
     let destinations = layout_extents(shape, to)?;
     let element_bytes = precision.bytes();
     let mut source_groups = HashMap::<Vec<(u32, u32)>, Vec<u16>>::new();
-    for (tile, extents) in sources.into_iter().enumerate() {
-        source_groups
-            .entry(extents)
-            .or_default()
-            .push(u16::try_from(tile).ok()?);
+    for (tile, extents) in sources {
+        source_groups.entry(extents).or_default().push(tile);
     }
     let mut destination_groups = HashMap::<Vec<(u32, u32)>, Vec<u16>>::new();
-    for (tile, extents) in destinations.into_iter().enumerate() {
-        destination_groups
-            .entry(extents)
-            .or_default()
-            .push(u16::try_from(tile).ok()?);
+    for (tile, extents) in destinations {
+        destination_groups.entry(extents).or_default().push(tile);
     }
     let mut remote = HashSet::<(u16, Vec<(u32, u32)>)>::new();
     let mut traffic = ConversionTraffic::default();
@@ -132,9 +126,52 @@ pub(crate) fn conversion_traffic(
     Some(traffic)
 }
 
-fn layout_extents(shape: &TensorShape, layout: &Layout) -> Option<Vec<Vec<(u32, u32)>>> {
+fn layout_extents(shape: &TensorShape, layout: &Layout) -> Option<Vec<(u16, Vec<(u32, u32)>)>> {
     let padded = layout.padded_shape(shape).ok()?;
     let rank = shape.0.len();
+    if let Some(grain) = layout.tiling.linear_grain() {
+        let elements = shape.elements();
+        let grains = elements / u64::from(grain);
+        let tiles = u64::from(layout.tiling.tile_count);
+        let width = u64::from(*shape.0.last()?);
+        let mut regions = Vec::new();
+        for tile in 0..layout.tiling.tile_count {
+            let start_grain =
+                u64::from(tile) * (grains / tiles) + u64::from(tile).min(grains % tiles);
+            let tile_grains = grains / tiles + u64::from(u64::from(tile) < grains % tiles);
+            let start = start_grain * u64::from(grain);
+            let end = start + tile_grains * u64::from(grain);
+            for row in start / width..end.div_ceil(width) {
+                let mut coordinates = vec![0u32; rank.saturating_sub(1)];
+                let mut remaining = row;
+                for axis in (0..rank.saturating_sub(1)).rev() {
+                    let extent = u64::from(shape.0[axis]);
+                    coordinates[axis] = u32::try_from(remaining % extent).ok()?;
+                    remaining /= extent;
+                }
+                let first = row == start / width;
+                let last = row + 1 == end.div_ceil(width);
+                let mut extents = coordinates
+                    .into_iter()
+                    .map(|coordinate| (coordinate, coordinate + 1))
+                    .collect::<Vec<_>>();
+                extents.push((
+                    if first {
+                        u32::try_from(start % width).ok()?
+                    } else {
+                        0
+                    },
+                    if last && end % width != 0 {
+                        u32::try_from(end % width).ok()?
+                    } else {
+                        u32::try_from(width).ok()?
+                    },
+                ));
+                regions.push((tile, extents));
+            }
+        }
+        return Some(regions);
+    }
     let strides = layout.tiling.axis_strides().ok()?;
     let axes = layout
         .tiling
@@ -145,7 +182,7 @@ fn layout_extents(shape: &TensorShape, layout: &Layout) -> Option<Vec<Vec<(u32, 
         .collect::<Option<Vec<_>>>()?;
     (0..layout.tiling.tile_count)
         .map(|tile| {
-            (0..rank)
+            let extents = (0..rank)
                 .map(|axis| {
                     if let Some((_, tiling, stride)) =
                         axes.iter().find(|(index, _, _)| *index == axis)
@@ -166,7 +203,8 @@ fn layout_extents(shape: &TensorShape, layout: &Layout) -> Option<Vec<Vec<(u32, 
                         (0, shape.0[axis])
                     }
                 })
-                .collect()
+                .collect();
+            (tile, extents)
         })
         .collect::<Vec<_>>()
         .into()
@@ -200,6 +238,13 @@ pub(crate) fn physical_elements(shape: &TensorShape, layout: &Layout) -> u64 {
 }
 
 pub(crate) fn maximum_shard_bytes(tensor: &TensorType) -> u64 {
+    if let Some(grain) = tensor.format.layout.tiling.linear_grain() {
+        let grains = tensor.shape.elements().div_ceil(u64::from(grain));
+        return grains
+            .div_ceil(u64::from(tensor.format.layout.tiling.tile_count))
+            .saturating_mul(u64::from(grain))
+            .saturating_mul(tensor.format.precision.bytes());
+    }
     let Ok(padded) = tensor.format.layout.padded_shape(&tensor.shape) else {
         return u64::MAX;
     };
@@ -1040,16 +1085,15 @@ mod tests {
         let destinations = layout_extents(shape, to).unwrap();
         let mut remote = BTreeSet::<(u16, Vec<(u32, u32)>)>::new();
         let mut traffic = ConversionTraffic::default();
-        for (destination_tile, destination) in destinations.iter().enumerate() {
+        for (destination_tile, destination) in &destinations {
             let mut intersections = BTreeMap::<Vec<(u32, u32)>, u16>::new();
-            for (source_tile, source) in sources.iter().enumerate() {
+            for (source_tile, source) in &sources {
                 let Some(extents) = intersect_ranges(source, destination) else {
                     continue;
                 };
-                let source_tile = source_tile as u16;
-                let selected = intersections.entry(extents).or_insert(source_tile);
-                if usize::from(source_tile) == destination_tile {
-                    *selected = source_tile;
+                let selected = intersections.entry(extents).or_insert(*source_tile);
+                if source_tile == destination_tile {
+                    *selected = *source_tile;
                 }
             }
             let mut destination_bytes = 0;
@@ -1058,7 +1102,7 @@ mod tests {
             for (extents, source_tile) in &intersections {
                 let bytes = range_elements(extents) * precision.bytes();
                 destination_bytes += bytes;
-                if usize::from(*source_tile) == destination_tile {
+                if source_tile == destination_tile {
                     local_bytes += bytes;
                     local_intersections += 1;
                 } else {

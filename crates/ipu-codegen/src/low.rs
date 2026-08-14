@@ -540,7 +540,7 @@ impl LoweringState {
             let parameter_shard_bytes = if rotate_parameter {
                 extents
                     .iter()
-                    .map(|extents| {
+                    .map(|(_, extents)| {
                         crate::shard_storage_bytes(&LowShard {
                             id: LowShardId(0),
                             tile: 0,
@@ -577,7 +577,7 @@ impl LoweringState {
                 0
             };
             let mut value_shards = Vec::with_capacity(extents.len());
-            for (logical_tile, extents) in extents.into_iter().enumerate() {
+            for (logical_shard, (owner_tile, extents)) in extents.into_iter().enumerate() {
                 let mut shard = LowShard {
                     id: LowShardId(0),
                     tile: 0,
@@ -586,15 +586,15 @@ impl LoweringState {
                     definition: ShardDefinition::Value(value.id),
                 };
                 shard.tile = if rotate_parameter {
-                    let tile =
-                        (logical_tile + usize::from(parameter_offset)) % usize::from(tile_count);
-                    let bytes = parameter_shard_bytes[logical_tile];
+                    let tile = (usize::from(owner_tile) + usize::from(parameter_offset))
+                        % usize::from(tile_count);
+                    let bytes = parameter_shard_bytes[logical_shard];
                     parameter_bytes[tile] = parameter_bytes[tile]
                         .checked_add(bytes)
                         .ok_or(LowLoweringError::IdOverflow)?;
                     u16::try_from(tile).map_err(|_| LowLoweringError::IdOverflow)?
                 } else {
-                    u16::try_from(logical_tile).map_err(|_| LowLoweringError::IdOverflow)?
+                    owner_tile
                 };
                 let id = state.push_shard(shard)?;
                 value_shards.push(id);
@@ -2310,7 +2310,17 @@ impl LoweringState {
                             .find_map(|source| self.broadcast_view(*source, output))
                             .ok_or(LowLoweringError::InvalidOperatorPlan)?,
                         PointwiseInputMapping::TileLocal => {
-                            self.full_view(self.local_shard(*input, tile)?)
+                            let output_extents = &self.shards[output.index() as usize].extents;
+                            let source = self
+                                .value_shards(*input)?
+                                .iter()
+                                .copied()
+                                .find(|source| {
+                                    let source = &self.shards[source.index() as usize];
+                                    source.tile == tile && source.extents == *output_extents
+                                })
+                                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                            self.full_view(source)
                         }
                     })
                 })
@@ -4467,10 +4477,70 @@ fn intersect_extents(left: &[ShardExtent], right: &[ShardExtent]) -> Option<Vec<
         .collect()
 }
 
-fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<Vec<ShardExtent>>> {
+fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<(u16, Vec<ShardExtent>)>> {
     let layout = &tensor_type.format.layout;
     let padded = layout.padded_shape(&tensor_type.shape)?;
     let rank = tensor_type.shape.0.len();
+    if let Some(grain) = layout.tiling.linear_grain() {
+        let elements = tensor_type.shape.elements();
+        let grains = elements / u64::from(grain);
+        let tiles = u64::from(layout.tiling.tile_count);
+        let width = u64::from(
+            *tensor_type
+                .shape
+                .0
+                .last()
+                .ok_or(LowLoweringError::InvalidOperatorPlan)?,
+        );
+        let mut all = Vec::new();
+        for tile in 0..layout.tiling.tile_count {
+            let start_grain =
+                u64::from(tile) * (grains / tiles) + u64::from(tile).min(grains % tiles);
+            let tile_grains = grains / tiles + u64::from(u64::from(tile) < grains % tiles);
+            let start = start_grain * u64::from(grain);
+            let end = start + tile_grains * u64::from(grain);
+            let first_row = start / width;
+            let last_row = end.div_ceil(width);
+            for row in first_row..last_row {
+                let column_start = if row == first_row { start % width } else { 0 };
+                let column_end = if row + 1 == last_row && end % width != 0 {
+                    end % width
+                } else {
+                    width
+                };
+                let mut coordinates = vec![0u32; rank.saturating_sub(1)];
+                let mut linear_row = row;
+                for axis in (0..rank.saturating_sub(1)).rev() {
+                    let extent = u64::from(tensor_type.shape.0[axis]);
+                    coordinates[axis] = u32::try_from(linear_row % extent)
+                        .map_err(|_| LowLoweringError::IdOverflow)?;
+                    linear_row /= extent;
+                }
+                let mut region = coordinates
+                    .into_iter()
+                    .enumerate()
+                    .map(|(axis, coordinate)| {
+                        Ok(ShardExtent {
+                            axis: u16::try_from(axis).map_err(|_| LowLoweringError::IdOverflow)?,
+                            start: coordinate,
+                            logical_end: coordinate + 1,
+                            physical_end: coordinate + 1,
+                        })
+                    })
+                    .collect::<LowLoweringResult<Vec<_>>>()?;
+                region.push(ShardExtent {
+                    axis: u16::try_from(rank - 1).map_err(|_| LowLoweringError::IdOverflow)?,
+                    start: u32::try_from(column_start).map_err(|_| LowLoweringError::IdOverflow)?,
+                    logical_end: u32::try_from(column_end)
+                        .map_err(|_| LowLoweringError::IdOverflow)?,
+                    physical_end: u32::try_from(column_end)
+                        .map_err(|_| LowLoweringError::IdOverflow)?,
+                });
+                all.push((tile, region));
+            }
+        }
+        return Ok(all);
+    }
     let strides = layout.tiling.axis_strides()?;
     let axes = layout
         .tiling
@@ -4505,7 +4575,7 @@ fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<Vec<ShardExt
                 physical_end,
             });
         }
-        all.push(extents);
+        all.push((tile, extents));
     }
     Ok(all)
 }
@@ -4570,6 +4640,60 @@ mod tests {
         TensorFormat {
             precision: Precision::F16,
             layout: Layout::row_sharded(tiles),
+        }
+    }
+
+    #[test]
+    fn randomized_linear_shards_cover_flat_storage_once_in_balanced_grains() {
+        let mut random = fastrand::Rng::with_seed(0x666c_6174_5f73_6864);
+        for case in 0..CASES {
+            let rank = random.usize(2..=4);
+            let grain = 1_u32 << random.u32(1..=5);
+            let mut shape = (0..rank - 1).map(|_| random.u32(1..=5)).collect::<Vec<_>>();
+            shape.push(grain * random.u32(1..=8));
+            let elements = shape
+                .iter()
+                .map(|&extent| u64::from(extent))
+                .product::<u64>();
+            let grains = elements / u64::from(grain);
+            let tiles = random.u16(1..=u16::try_from(grains.min(64)).unwrap());
+            let tensor =
+                TensorType::new(shape.clone(), Precision::F16, Layout::linear(tiles, grain));
+            let shards = shard_extents(&tensor).unwrap();
+            let mut coverage = vec![0_u8; usize::try_from(elements).unwrap()];
+            let mut tile_elements = vec![0_u64; usize::from(tiles)];
+            for (tile, extents) in shards {
+                assert_eq!(extents.len(), rank, "case {case}");
+                assert!(
+                    extents[..rank - 1]
+                        .iter()
+                        .all(|extent| extent.logical_end == extent.start + 1),
+                    "case {case}"
+                );
+                let mut row = 0_u64;
+                for (axis, extent) in extents[..rank - 1].iter().enumerate() {
+                    row = row * u64::from(shape[axis]) + u64::from(extent.start);
+                }
+                let columns = &extents[rank - 1];
+                let width = u64::from(shape[rank - 1]);
+                for column in columns.start..columns.logical_end {
+                    let index = usize::try_from(row * width + u64::from(column)).unwrap();
+                    coverage[index] += 1;
+                    tile_elements[usize::from(tile)] += 1;
+                }
+            }
+            assert!(coverage.into_iter().all(|count| count == 1), "case {case}");
+            assert!(
+                tile_elements
+                    .iter()
+                    .all(|count| count % u64::from(grain) == 0),
+                "case {case}"
+            );
+            assert!(
+                tile_elements.iter().max().unwrap() - tile_elements.iter().min().unwrap()
+                    <= u64::from(grain),
+                "case {case}"
+            );
         }
     }
 
@@ -5151,7 +5275,7 @@ mod tests {
             ] {
                 let ranges = shards
                     .iter()
-                    .map(|extents| (extents[axis].start, extents[axis].physical_end))
+                    .map(|(_, extents)| (extents[axis].start, extents[axis].physical_end))
                     .collect::<std::collections::BTreeSet<_>>();
                 assert_eq!(ranges.len(), usize::from(partitions), "case {case}");
                 let mut cursor = 0;
@@ -5203,8 +5327,8 @@ mod tests {
                 let right = shard_extents(&right).unwrap();
                 let output = shard_extents(&output).unwrap();
                 for tile in 0..usize::from(tiles) {
-                    assert_eq!(left[tile][0], output[tile][0], "case {case}");
-                    assert_eq!(right[tile][1], output[tile][1], "case {case}");
+                    assert_eq!(left[tile].1[0], output[tile].1[0], "case {case}");
+                    assert_eq!(right[tile].1[1], output[tile].1[1], "case {case}");
                 }
                 for tile in (0..usize::from(tiles)).step_by(2) {
                     let shared_axis = match order {
@@ -5212,8 +5336,8 @@ mod tests {
                         GridOrder::RowsFast => 1,
                     };
                     assert_eq!(
-                        output[tile][shared_axis],
-                        output[tile + 1][shared_axis],
+                        output[tile].1[shared_axis],
+                        output[tile + 1].1[shared_axis],
                         "case {case}"
                     );
                 }

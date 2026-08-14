@@ -502,6 +502,8 @@ pub struct MemoryEstimate {
 pub enum TensorAxis {
     FromStart(u16),
     FromEnd(u16),
+    /// Grain-aligned ownership intervals in canonical logical element order.
+    Linear,
 }
 
 impl TensorAxis {
@@ -574,6 +576,26 @@ pub struct TensorTiling {
 }
 
 impl TensorTiling {
+    pub fn linear(tile_count: u16, grain: u32) -> Self {
+        Self {
+            tile_count,
+            replicas: 1,
+            axes: vec![AxisTiling::new(
+                TensorAxis::Linear,
+                tile_count,
+                grain,
+                Padding::Reject,
+            )],
+        }
+    }
+
+    pub fn linear_grain(&self) -> Option<u32> {
+        match self.axes.as_slice() {
+            [axis] if axis.axis == TensorAxis::Linear => Some(axis.block_size),
+            _ => None,
+        }
+    }
+
     pub fn replicated(tile_count: u16) -> Self {
         Self {
             tile_count,
@@ -623,6 +645,18 @@ impl Layout {
             order: ElementOrder::RowMajor,
             tiling,
             memory_class: MemoryClass::Ipu21Standard,
+        }
+    }
+
+    pub fn linear(tile_count: u16, grain: u32) -> Self {
+        Self::row_major(TensorTiling::linear(tile_count, grain))
+    }
+
+    pub fn with_linear_ownership(&self, tile_count: u16, grain: u32) -> Self {
+        Self {
+            order: self.order,
+            tiling: TensorTiling::linear(tile_count, grain),
+            memory_class: self.memory_class,
         }
     }
 
@@ -1102,6 +1136,17 @@ impl Layout {
         if self.tiling.tile_count == 0 || self.tiling.replicas == 0 {
             return Err(LayoutError::EmptyTileGroup);
         }
+        if let Some(grain) = self.tiling.linear_grain() {
+            let elements = shape.elements();
+            if shape.0.is_empty()
+                || grain == 0
+                || elements / u64::from(grain) < u64::from(self.tiling.tile_count)
+                || !elements.is_multiple_of(u64::from(grain))
+            {
+                return Err(LayoutError::EmptyAxisTiling);
+            }
+            return Ok(shape.clone());
+        }
         let mut used_tiles = u32::from(self.tiling.replicas);
         let mut dimensions = shape.0.clone();
         let mut used_axes = Vec::with_capacity(self.tiling.axes.len());
@@ -1483,6 +1528,9 @@ fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> bool {
     let Ok(padded) = layout.padded_shape(shape) else {
         return true;
     };
+    if let Some(grain) = layout.tiling.linear_grain() {
+        return shape.elements() / u64::from(grain) < u64::from(layout.tiling.tile_count);
+    }
     layout.tiling.axes.iter().any(|tiling| {
         tiling.axis.resolve(padded.0.len()).map_or(true, |axis| {
             padded.0[axis] / tiling.block_size < u32::from(tiling.partitions)
@@ -2668,6 +2716,10 @@ fn layout_shards_are_nonempty(tensor: &TensorType) -> bool {
     let Ok(padded) = tensor.format.layout.padded_shape(&tensor.shape) else {
         return false;
     };
+    if let Some(grain) = tensor.format.layout.tiling.linear_grain() {
+        return tensor.shape.elements() / u64::from(grain)
+            >= u64::from(tensor.format.layout.tiling.tile_count);
+    }
     tensor.format.layout.tiling.axes.iter().all(|axis| {
         axis.axis
             .resolve(padded.0.len())
@@ -4068,6 +4120,89 @@ fn plans(
                     ],
                     output: OperandRequirement::new(output_format, 8),
                     output_aliasing: OutputAliasing::Fresh,
+                    memory_relations: Vec::new(),
+                },
+                deferred_output: None,
+            });
+        }
+    }
+    if let [input] = inputs
+        && input.shape == *output
+        && config.conversion_streaming != ConversionStreamingPolicy::Always
+    {
+        let mut flat_candidates = BTreeMap::new();
+        for candidate in config.operator_candidates.iter().filter(|candidate| {
+            operator_matches(&operation.kind, candidate.operator)
+                && candidate.inputs.len() == 1
+                && matches!(
+                    candidate.format_policy,
+                    OperatorFormatPolicy::PreserveInputLayout(0)
+                )
+                && matches!(
+                    candidate.dispatch,
+                    OperatorDispatch::Pointwise {
+                        input_mapping: PointwiseInputMapping::TileLocal,
+                        ..
+                    }
+                )
+                && candidate.inputs[0].format.precision == input.format.precision
+        }) {
+            let grain = candidate.inputs[0]
+                .alignment
+                .div_ceil(input.format.precision.bytes() as u32);
+            if grain == 0 || !output.elements().is_multiple_of(u64::from(grain)) {
+                continue;
+            }
+            let tiles = candidate.output.format.layout.tiling.tile_count;
+            let Some(&width) = output.0.last() else {
+                continue;
+            };
+            let width = u64::from(width);
+            let grains = output.elements() / u64::from(grain);
+            let splits = (1..tiles)
+                .filter(|&tile| {
+                    let tile = u64::from(tile);
+                    let offset = (tile * (grains / u64::from(tiles))
+                        + tile.min(grains % u64::from(tiles)))
+                        * u64::from(grain);
+                    !offset.is_multiple_of(width)
+                })
+                .count();
+            flat_candidates
+                .entry(tiles)
+                .or_insert((splits, grain, candidate));
+        }
+        // Retain the occupancy/fragmentation Pareto frontier. This keeps the
+        // option available without multiplying equivalent pointwise plans.
+        let flat_candidates = flat_candidates
+            .iter()
+            .filter(|(tiles, (splits, _, _))| {
+                !flat_candidates
+                    .iter()
+                    .any(|(other_tiles, (other_splits, _, _))| {
+                        other_tiles >= tiles
+                            && other_splits <= splits
+                            && (other_tiles > tiles || other_splits < splits)
+                    })
+            })
+            .map(|(_, (_, grain, candidate))| (*grain, *candidate))
+            .collect::<Vec<_>>();
+        for (grain, candidate) in flat_candidates {
+            let layout = input
+                .format
+                .layout
+                .with_linear_ownership(candidate.output.format.layout.tiling.tile_count, grain);
+            let format = TensorFormat {
+                precision: input.format.precision,
+                layout,
+            };
+            plans.push(Plan {
+                operator: candidate.operator,
+                dispatch: candidate.dispatch.clone(),
+                requirements: OperatorRequirements {
+                    inputs: vec![OperandRequirement::new(format.clone(), 8)],
+                    output: OperandRequirement::new(format, 8),
+                    output_aliasing: OutputAliasing::MayAliasInputs(vec![0]),
                     memory_relations: Vec::new(),
                 },
                 deferred_output: None,
