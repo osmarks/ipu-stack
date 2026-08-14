@@ -5,9 +5,12 @@ use crate::{
     logical_view_byte_spans, view_byte_spans,
 };
 use ipu_exchange::{
-    MAX_TRANSFER_WORDS, MulticastPlan, PlanProgramBuilder, RETURN_M10_INSTRUCTION, Topology,
+    MAX_TRANSFER_WORDS, MulticastPlan, PhaseProgramBuilder, RETURN_M10_INSTRUCTION, Topology,
     finalize_point_receiver, patch_receiver_address, patch_sender_address,
     patch_sender_instruction, sender_instruction_offsets,
+};
+use ipu_package::{
+    IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
 };
 use rayon::prelude::*;
 use std::cmp::Reverse;
@@ -43,15 +46,117 @@ pub struct ExchangeRowPatch {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExchangeActivity {
+    /// Stable index of the physical transfer within this phase.
+    pub transfer: u32,
     pub kind: ExchangeActivityKind,
     pub start_cycle: u32,
     pub end_cycle: u32,
+    /// End of the associated SRAM read or write hazard window.
+    pub memory_end_cycle: u32,
+    pub address: u32,
+    pub words: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExchangeActivityKind {
     Send,
     Receive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExchangeMemoryElement {
+    pub interleaved: bool,
+    pub index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExchangeActivityDiagnostic {
+    pub activity: ExchangeActivity,
+    pub memory_elements: Vec<ExchangeMemoryElement>,
+    pub conflicts_with_row: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExchangeTileDiagnostic {
+    pub phase: ExchangePhaseId,
+    pub tile: u16,
+    pub row_address: u32,
+    pub row_elements: Vec<ExchangeMemoryElement>,
+    pub program: ipu_exchange::diagnostic::PlanProgramDiagnostic,
+    pub activities: Vec<ExchangeActivityDiagnostic>,
+}
+
+impl ExchangeTileDiagnostic {
+    pub fn has_row_data_conflict(&self) -> bool {
+        self.activities
+            .iter()
+            .any(|activity| activity.conflicts_with_row)
+    }
+
+    pub fn render(&self) -> String {
+        let mut output = format!(
+            "phase={} tile={} row=0x{:x} rowElements={:?}\n",
+            self.phase.index(),
+            self.tile,
+            self.row_address,
+            self.row_elements
+        );
+        for activity in &self.activities {
+            output.push_str(&format!(
+                "transfer={} {:?} cycles={}..{} memoryEnd={} address=0x{:x} words={} elements={:?} rowConflict={}\n",
+                activity.activity.transfer,
+                activity.activity.kind,
+                activity.activity.start_cycle,
+                activity.activity.end_cycle,
+                activity.activity.memory_end_cycle,
+                activity.activity.address,
+                activity.activity.words,
+                activity.memory_elements,
+                activity.conflicts_with_row,
+            ));
+        }
+        output.push_str(&self.program.render());
+        output
+    }
+}
+
+pub fn diagnose_exchange_tile(
+    phase: &PhysicalExchangePhase,
+    tile: u16,
+    row_address: u32,
+) -> Result<ExchangeTileDiagnostic, ExchangeLoweringError> {
+    let program = phase
+        .programs
+        .get(usize::from(tile))
+        .ok_or(ExchangeLoweringError::DiagnosticTile(tile))?;
+    let row_words = u32::try_from(program.len()).map_err(|_| ExchangeLoweringError::Overflow)?;
+    let row_elements = effective_memory_elements(row_address, row_words);
+    let activities = phase
+        .activities
+        .get(usize::from(tile))
+        .ok_or(ExchangeLoweringError::DiagnosticTile(tile))?
+        .iter()
+        .copied()
+        .map(|activity| {
+            let memory_elements = effective_memory_elements(activity.address, activity.words);
+            let conflicts_with_row = memory_elements
+                .iter()
+                .any(|element| row_elements.contains(element));
+            ExchangeActivityDiagnostic {
+                activity,
+                memory_elements,
+                conflicts_with_row,
+            }
+        })
+        .collect();
+    Ok(ExchangeTileDiagnostic {
+        phase: phase.id,
+        tile,
+        row_address,
+        row_elements,
+        program: ipu_exchange::diagnostic::diagnose_plan_program(program, Some(row_address))?,
+        activities,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -71,7 +176,8 @@ struct TilePressure {
 #[derive(Clone, Debug)]
 struct ScheduledTransferDiagnostic {
     source: u16,
-    receiver_count: usize,
+    source_address: u32,
+    destinations: Vec<(u16, u32)>,
     words: u32,
     start: u32,
     end: u32,
@@ -107,6 +213,8 @@ pub enum ExchangeLoweringError {
     Overflow,
     #[error("structured-repeat exchange rows have incompatible shapes")]
     IncompatibleRepeatRows,
+    #[error("exchange diagnostic refers to missing tile {0}")]
+    DiagnosticTile(u16),
 }
 
 pub fn lower_exchanges(
@@ -192,38 +300,16 @@ fn lower_static_exchanges(
                     "prepared large physical exchange phase"
                 );
             }
-            let (split, atomic) = rayon::join(
-                || {
-                    materialize_greedy_schedule(
-                        topology,
-                        &pending,
-                        &incoming_bases,
-                        &receive_counts,
-                        program.tile_count,
-                        AvailabilityPolicy::SplitRoles,
-                    )
-                },
-                || {
-                    materialize_greedy_schedule(
-                        topology,
-                        &pending,
-                        &incoming_bases,
-                        &receive_counts,
-                        program.tile_count,
-                        AvailabilityPolicy::AtomicEndpoints,
-                    )
-                },
-            );
-            let split = split?;
-            let atomic = atomic?;
-            let split_horizon = schedule_score(&split);
-            let atomic_horizon = schedule_score(&atomic);
+            let mut schedule = materialize_greedy_schedule(
+                topology,
+                &pending,
+                &incoming_bases,
+                &receive_counts,
+                program.tile_count,
+            )?;
+            let initial_horizon = schedule_score(&schedule);
             let endpoint_lower_bound = endpoint_work_lower_bound(&pending, program.tile_count);
-            let (mut schedule, mut selected_kind) = if atomic_horizon < split_horizon {
-                (atomic, "atomic")
-            } else {
-                (split, "split")
-            };
+            let mut selected_kind = "endpoint-exclusive";
             let mut neighborhood_improvements = 0usize;
             loop {
                 let repaired_order =
@@ -249,8 +335,7 @@ fn lower_static_exchanges(
             if pending.len() > 1_000 {
                 tracing::info!(
                     phase = phase.id.index(),
-                    split_horizon,
-                    atomic_horizon,
+                    initial_horizon,
                     selected_horizon = schedule.horizon,
                     endpoint_lower_bound,
                     lower_bound_gap = schedule.horizon.saturating_sub(endpoint_lower_bound),
@@ -260,13 +345,14 @@ fn lower_static_exchanges(
                 );
             }
             let MaterializedSchedule {
-                mut builders,
+                builder,
                 horizon,
                 tile_availability,
                 activities,
                 scheduled_sends,
                 order,
                 timings,
+                ..
             } = schedule;
             let mut diagnostics = options
                 .diagnostics
@@ -282,7 +368,8 @@ fn lower_static_exchanges(
                     let timing = timings[index].ok_or(ExchangeLoweringError::Overflow)?;
                     diagnostics.record(
                         transfer.source,
-                        transfer.destinations.iter().map(|entry| entry.0),
+                        transfer.source_address,
+                        &transfer.destinations,
                         transfer.words,
                         timing.start,
                         timing.end,
@@ -291,34 +378,27 @@ fn lower_static_exchanges(
                 }
             }
             if let Some(diagnostics) = diagnostics {
-                let diagnostic_availability = tile_availability
-                    .iter()
-                    .map(|availability| availability.send.max(availability.receive))
-                    .collect::<Vec<_>>();
                 diagnostics.emit(
                     phase.id.index(),
                     &phase.provenance,
                     horizon,
-                    &diagnostic_availability,
-                    &builders,
+                    &tile_availability,
+                    &builder,
                 );
             }
-            let mut active = Vec::with_capacity(usize::from(program.tile_count));
-            let mut tile_event_cycles = Vec::with_capacity(usize::from(program.tile_count));
-            let programs = (0..program.tile_count)
-                .map(|tile| match builders.remove(&tile) {
-                    Some(builder) => {
-                        active.push(true);
-                        tile_event_cycles.push(builder.event_cycles());
-                        Ok(builder.finish()?)
-                    }
-                    None => {
-                        active.push(false);
-                        tile_event_cycles.push(0);
-                        Ok(inactive_exchange_program())
-                    }
-                })
-                .collect::<Result<Vec<_>, ipu_exchange::ExchangeError>>()?;
+            let phase_programs = builder.finish()?;
+            debug_assert_eq!(phase_programs.event_cycles, horizon);
+            let tile_event_cycles = phase_programs.tile_event_cycles;
+            let active = phase_programs
+                .programs
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>();
+            let programs = phase_programs
+                .programs
+                .into_iter()
+                .map(|program| program.unwrap_or_else(inactive_exchange_program))
+                .collect::<Vec<_>>();
             let repeat_patches = programs
                 .iter()
                 .enumerate()
@@ -551,7 +631,8 @@ impl PhaseDiagnostics {
     fn record(
         &mut self,
         source: u16,
-        destinations: impl Iterator<Item = u16>,
+        source_address: u32,
+        destinations: &[(u16, u32)],
         words: u32,
         start: u32,
         end: u32,
@@ -559,12 +640,11 @@ impl PhaseDiagnostics {
     ) {
         let id = self.transfers.len();
         let predecessor = self.tiles[usize::from(blocking_tile)].last_transfer;
-        let destinations = destinations.collect::<Vec<_>>();
         let source_pressure = &mut self.tiles[usize::from(source)];
         source_pressure.send_roles += 1;
         source_pressure.send_words += u64::from(words);
         source_pressure.last_transfer = Some(id);
-        for &tile in &destinations {
+        for &(tile, _) in destinations {
             let pressure = &mut self.tiles[usize::from(tile)];
             pressure.receive_roles += 1;
             pressure.receive_words += u64::from(words);
@@ -576,7 +656,8 @@ impl PhaseDiagnostics {
         self.maximum_fanout = self.maximum_fanout.max(destinations.len());
         self.transfers.push(ScheduledTransferDiagnostic {
             source,
-            receiver_count: destinations.len(),
+            source_address,
+            destinations: destinations.to_vec(),
             words,
             start,
             end,
@@ -591,7 +672,7 @@ impl PhaseDiagnostics {
         provenance: &crate::WorkProvenance,
         horizon: u32,
         tile_availability: &[u32],
-        builders: &BTreeMap<u16, PlanProgramBuilder>,
+        builder: &PhaseProgramBuilder,
     ) {
         let role_word_lower_bound = self
             .tiles
@@ -605,9 +686,7 @@ impl PhaseDiagnostics {
             .enumerate()
             .filter(|(_, tile)| tile.send_roles != 0 || tile.receive_roles != 0)
             .map(|(tile, pressure)| {
-                let encoded_end = builders
-                    .get(&(tile as u16))
-                    .map_or(0, PlanProgramBuilder::event_cycles);
+                let encoded_end = builder.tile_event_cycles(tile as u16).unwrap_or(0);
                 (
                     tile as u16,
                     pressure.send_roles,
@@ -624,14 +703,16 @@ impl PhaseDiagnostics {
             .sort_unstable_by_key(|tile| (Reverse(tile.3 + tile.4), Reverse(tile.5), tile.0));
         busiest_tiles.truncate(8);
 
-        let active_builders = builders.len() as u64;
-        let total_final_padding = builders
-            .values()
-            .map(|builder| u64::from(horizon.saturating_sub(builder.event_cycles())))
+        let active_builders = builder.active_tile_count() as u64;
+        let total_final_padding = (0..builder.tile_count())
+            .filter_map(|tile| builder.tile_event_cycles(tile).ok())
+            .filter(|cycles| *cycles != 0)
+            .map(|cycles| u64::from(horizon.saturating_sub(cycles)))
             .sum::<u64>();
-        let maximum_final_padding = builders
-            .values()
-            .map(|builder| horizon.saturating_sub(builder.event_cycles()))
+        let maximum_final_padding = (0..builder.tile_count())
+            .filter_map(|tile| builder.tile_event_cycles(tile).ok())
+            .filter(|cycles| *cycles != 0)
+            .map(|cycles| horizon.saturating_sub(cycles))
             .max()
             .unwrap_or(0);
         let maximum_scheduled_wait = self
@@ -669,7 +750,8 @@ impl PhaseDiagnostics {
                 (
                     id,
                     transfer.source,
-                    transfer.receiver_count,
+                    transfer.source_address,
+                    &transfer.destinations,
                     transfer.words,
                     transfer.start,
                     transfer.end,
@@ -782,6 +864,7 @@ struct TransferScheduler<'a> {
     word_pressure: Vec<u64>,
     dependents: Vec<Vec<usize>>,
     indegrees: Vec<usize>,
+    dependency_ready: Vec<u32>,
     ready: BinaryHeap<ReadyTransfer>,
     completed: usize,
 }
@@ -806,6 +889,7 @@ impl<'a> TransferScheduler<'a> {
             word_pressure,
             dependents,
             indegrees,
+            dependency_ready: vec![0; transfers.len()],
             ready: BinaryHeap::new(),
             completed: 0,
         };
@@ -835,35 +919,38 @@ impl<'a> TransferScheduler<'a> {
         });
     }
 
-    fn next(&mut self, tile_availability: &[TileAvailability]) -> Option<usize> {
+    fn next(&mut self, tile_availability: &[u32]) -> Option<(usize, u32)> {
         loop {
             let candidate = self.ready.pop()?;
             let index = candidate.index.0;
             let transfer = &self.transfers[index];
-            let earliest_start =
-                std::iter::once(tile_availability[usize::from(transfer.source)].send)
-                    .chain(
-                        transfer
-                            .destinations
-                            .iter()
-                            .map(|&(tile, _)| tile_availability[usize::from(tile)].receive),
-                    )
-                    .max()
-                    .unwrap_or(0);
+            let earliest_start = std::iter::once(self.dependency_ready[index])
+                .chain(std::iter::once(
+                    tile_availability[usize::from(transfer.source)],
+                ))
+                .chain(
+                    transfer
+                        .destinations
+                        .iter()
+                        .map(|&(tile, _)| tile_availability[usize::from(tile)]),
+                )
+                .max()
+                .unwrap_or(0);
             if candidate.earliest_start.0 == earliest_start {
-                return Some(index);
+                return Some((index, earliest_start));
             }
             self.push_ready(index, earliest_start);
         }
     }
 
-    fn complete(&mut self, index: usize) {
+    fn complete(&mut self, index: usize, completion: u32) {
         self.completed += 1;
         let dependents = std::mem::take(&mut self.dependents[index]);
         for dependent in dependents {
+            self.dependency_ready[dependent] = self.dependency_ready[dependent].max(completion);
             self.indegrees[dependent] -= 1;
             if self.indegrees[dependent] == 0 {
-                self.push_ready(dependent, 0);
+                self.push_ready(dependent, self.dependency_ready[dependent]);
             }
         }
     }
@@ -956,18 +1043,6 @@ struct ScheduledTransfer<'a> {
     schedule_offset: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct TileAvailability {
-    send: u32,
-    receive: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AvailabilityPolicy {
-    SplitRoles,
-    AtomicEndpoints,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct MaterializedTiming {
     start: u32,
@@ -976,10 +1051,25 @@ struct MaterializedTiming {
     predecessor: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MemoryAccess {
+    start: u32,
+    end: u32,
+    address: u32,
+    words: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TileMemorySchedule {
+    sends: Vec<MemoryAccess>,
+    receives: Vec<MemoryAccess>,
+}
+
 struct MaterializedSchedule {
-    builders: BTreeMap<u16, PlanProgramBuilder>,
+    builder: PhaseProgramBuilder,
     horizon: u32,
-    tile_availability: Vec<TileAvailability>,
+    tile_availability: Vec<u32>,
+    memory_accesses: Vec<TileMemorySchedule>,
     activities: Vec<Vec<ExchangeActivity>>,
     scheduled_sends: Vec<Vec<(LowShardId, u32)>>,
     order: Vec<usize>,
@@ -989,9 +1079,12 @@ struct MaterializedSchedule {
 impl MaterializedSchedule {
     fn new(tile_count: u16, transfer_count: usize) -> Self {
         Self {
-            builders: BTreeMap::new(),
+            builder: PhaseProgramBuilder::new(tile_count),
             horizon: 0,
-            tile_availability: vec![TileAvailability::default(); usize::from(tile_count)],
+            tile_availability: vec![0; usize::from(tile_count)],
+            memory_accesses: (0..tile_count)
+                .map(|_| TileMemorySchedule::default())
+                .collect(),
             activities: vec![Vec::new(); usize::from(tile_count)],
             scheduled_sends: vec![Vec::new(); usize::from(tile_count)],
             order: Vec::with_capacity(transfer_count),
@@ -1006,25 +1099,31 @@ impl MaterializedSchedule {
         incoming_bases: &[u32],
         receive_counts: &[usize],
         index: usize,
-        policy: AvailabilityPolicy,
+        dependency_ready: u32,
         last_transfer: &mut [Option<usize>],
-    ) -> Result<(), ExchangeLoweringError> {
+    ) -> Result<u32, ExchangeLoweringError> {
         let transfer = &pending[index];
         let (blocking_tile, latest_availability) = std::iter::once((
             transfer.source,
-            self.tile_availability[usize::from(transfer.source)].send,
+            self.tile_availability[usize::from(transfer.source)],
         ))
         .chain(
             transfer
                 .destinations
                 .iter()
-                .map(|&(tile, _)| (tile, self.tile_availability[usize::from(tile)].receive)),
+                .map(|&(tile, _)| (tile, self.tile_availability[usize::from(tile)])),
         )
         .max_by_key(|&(tile, availability)| (availability, Reverse(tile)))
         .unwrap_or((transfer.source, 0));
+        let (blocking_tile, latest_availability) = if dependency_ready > latest_availability {
+            (transfer.source, dependency_ready)
+        } else {
+            (blocking_tile, latest_availability)
+        };
         let predecessor = last_transfer[usize::from(blocking_tile)];
         let timing = append_transfer(
             topology,
+            &self.memory_accesses,
             incoming_bases,
             receive_counts,
             ScheduledTransfer {
@@ -1034,56 +1133,63 @@ impl MaterializedSchedule {
                 words: transfer.words,
                 schedule_offset: latest_availability,
             },
-            &mut self.horizon,
-            &mut self.builders,
+            &mut self.builder,
         )?;
-        let payload_end = timing
-            .start
-            .checked_add(transfer.words)
-            .ok_or(ExchangeLoweringError::Overflow)?;
+        let payload_end = timing.sender_end;
+        self.memory_accesses[usize::from(transfer.source)]
+            .sends
+            .push(MemoryAccess {
+                start: timing.start,
+                end: timing.sender_memory_end,
+                address: transfer.source_address,
+                words: transfer.words,
+            });
+        for ((&(tile, address), &start), &memory_end) in transfer
+            .destinations
+            .iter()
+            .zip(&timing.receiver_starts)
+            .zip(&timing.receiver_memory_ends)
+        {
+            self.memory_accesses[usize::from(tile)]
+                .receives
+                .push(MemoryAccess {
+                    start,
+                    end: memory_end,
+                    address,
+                    words: transfer.words,
+                });
+        }
         self.scheduled_sends[usize::from(transfer.source)]
             .push((transfer.source_shard, transfer.source_offset));
         self.activities[usize::from(transfer.source)].push(ExchangeActivity {
+            transfer: u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
             kind: ExchangeActivityKind::Send,
             start_cycle: timing.start,
             end_cycle: payload_end,
+            memory_end_cycle: timing.sender_memory_end,
+            address: transfer.source_address,
+            words: transfer.words,
         });
-        for &(tile, _) in &transfer.destinations {
+        for (((&(tile, address), &start_cycle), &end_cycle), &memory_end_cycle) in transfer
+            .destinations
+            .iter()
+            .zip(&timing.receiver_starts)
+            .zip(&timing.receiver_ends)
+            .zip(&timing.receiver_memory_ends)
+        {
             self.activities[usize::from(tile)].push(ExchangeActivity {
+                transfer: u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
                 kind: ExchangeActivityKind::Receive,
-                start_cycle: timing.start,
-                end_cycle: payload_end,
+                start_cycle,
+                end_cycle,
+                memory_end_cycle,
+                address,
+                words: transfer.words,
             });
         }
-        match policy {
-            AvailabilityPolicy::SplitRoles => {
-                self.tile_availability[usize::from(transfer.source)] = TileAvailability {
-                    // The sender remains reserved until every old receiver's
-                    // mux selection has propagated through the fabric.
-                    send: timing.end,
-                    receive: timing.sender_end,
-                };
-                for (&(tile, _), &receiver_end) in
-                    transfer.destinations.iter().zip(&timing.receiver_ends)
-                {
-                    self.tile_availability[usize::from(tile)] = TileAvailability {
-                        send: receiver_end,
-                        receive: payload_end,
-                    };
-                }
-            }
-            AvailabilityPolicy::AtomicEndpoints => {
-                let next = timing
-                    .end
-                    .checked_add(1)
-                    .ok_or(ExchangeLoweringError::Overflow)?;
-                for tile in transfer.tiles() {
-                    self.tile_availability[usize::from(tile)] = TileAvailability {
-                        send: next,
-                        receive: next,
-                    };
-                }
-            }
+        self.tile_availability[usize::from(transfer.source)] = timing.sender_end;
+        for (&(tile, _), &receiver_end) in transfer.destinations.iter().zip(&timing.receiver_ends) {
+            self.tile_availability[usize::from(tile)] = receiver_end;
         }
         for tile in transfer.tiles() {
             last_transfer[usize::from(tile)] = Some(index);
@@ -1095,16 +1201,11 @@ impl MaterializedSchedule {
             blocking_tile,
             predecessor,
         });
-        Ok(())
+        Ok(timing.end)
     }
 
     fn finish_horizon(&mut self) {
-        self.horizon = self
-            .builders
-            .values()
-            .map(PlanProgramBuilder::event_cycles)
-            .max()
-            .unwrap_or(0);
+        self.horizon = self.builder.event_cycles();
     }
 }
 
@@ -1114,22 +1215,21 @@ fn materialize_greedy_schedule(
     incoming_bases: &[u32],
     receive_counts: &[usize],
     tile_count: u16,
-    policy: AvailabilityPolicy,
 ) -> Result<MaterializedSchedule, ExchangeLoweringError> {
     let mut schedule = MaterializedSchedule::new(tile_count, pending.len());
     let mut scheduler = TransferScheduler::new(pending, tile_count);
     let mut last_transfer = vec![None; usize::from(tile_count)];
-    while let Some(index) = scheduler.next(&schedule.tile_availability) {
-        schedule.append(
+    while let Some((index, dependency_ready)) = scheduler.next(&schedule.tile_availability) {
+        let completion = schedule.append(
             topology,
             pending,
             incoming_bases,
             receive_counts,
             index,
-            policy,
+            dependency_ready,
             &mut last_transfer,
         )?;
-        scheduler.complete(index);
+        scheduler.complete(index, completion);
     }
     debug_assert!(scheduler.is_complete());
     schedule.finish_horizon();
@@ -1149,14 +1249,25 @@ fn materialize_schedule_order(
     }
     let mut schedule = MaterializedSchedule::new(tile_count, pending.len());
     let mut last_transfer = vec![None; usize::from(tile_count)];
+    let dependencies = memory_dependencies(pending, tile_count);
+    let mut predecessors = vec![Vec::new(); pending.len()];
+    for (before, after) in dependencies {
+        predecessors[after].push(before);
+    }
+    let mut completion = vec![0u32; pending.len()];
     for &index in order {
-        schedule.append(
+        let dependency_ready = predecessors[index]
+            .iter()
+            .map(|predecessor| completion[*predecessor])
+            .max()
+            .unwrap_or(0);
+        completion[index] = schedule.append(
             topology,
             pending,
             incoming_bases,
             receive_counts,
             index,
-            AvailabilityPolicy::SplitRoles,
+            dependency_ready,
             &mut last_transfer,
         )?;
     }
@@ -1377,11 +1488,11 @@ fn critical_neighborhood_order(
 
 fn append_transfer(
     topology: &Topology,
+    memory_accesses: &[TileMemorySchedule],
     incoming_bases: &[u32],
     receive_counts: &[usize],
     transfer: ScheduledTransfer<'_>,
-    horizon: &mut u32,
-    builders: &mut BTreeMap<u16, PlanProgramBuilder>,
+    builder: &mut PhaseProgramBuilder,
 ) -> Result<ScheduledTransferTiming, ExchangeLoweringError> {
     let ScheduledTransfer {
         source,
@@ -1419,64 +1530,148 @@ fn append_transfer(
     }
     let mut schedule_offset = requested_offset;
     loop {
-        let previous_offset = schedule_offset;
-        if let Some(builder) = builders.get(&source) {
-            schedule_offset =
-                builder.earliest_scheduled_row_offset(&plan.sender, schedule_offset)?;
-        }
-        for (&tile, row) in tiles.iter().zip(&plan.receivers) {
-            if let Some(builder) = builders.get(&tile) {
-                schedule_offset =
-                    builder.earliest_scheduled_receiver_offset(row, schedule_offset)?;
-            }
-        }
-        if schedule_offset == previous_offset {
+        let previous = schedule_offset;
+        schedule_offset =
+            builder.earliest_transfer_offset(source, &tiles, &plan, words, schedule_offset)?;
+        let timing = builder.transfer_timing_at(source, &tiles, &plan, schedule_offset, words)?;
+        let receiver_intervals = timing
+            .receiver_payload_starts
+            .iter()
+            .copied()
+            .zip(timing.receiver_horizons.iter().copied())
+            .collect::<Vec<_>>();
+        schedule_offset = schedule_offset.max(memory_safe_transfer_offset(
+            memory_accesses,
+            source,
+            destinations,
+            source_address,
+            words,
+            timing.payload_start,
+            timing.sender_horizon,
+            &receiver_intervals,
+            schedule_offset,
+        )?);
+        if schedule_offset == previous {
             break;
         }
     }
-    builders
-        .entry(source)
-        .or_default()
-        .append_scheduled_row_at(&plan.sender, schedule_offset)?;
-    for (&tile, row) in tiles.iter().zip(&plan.receivers) {
-        builders
-            .entry(tile)
-            .or_default()
-            .append_scheduled_receiver_row_at(row, schedule_offset, words)?;
-    }
-    let sender_end = builders
-        .get(&source)
-        .map(PlanProgramBuilder::event_cycles)
-        .ok_or(ExchangeLoweringError::Overflow)?;
-    let receiver_ends = tiles
-        .iter()
-        .map(|tile| {
-            builders
-                .get(tile)
-                .map(PlanProgramBuilder::event_cycles)
-                .ok_or(ExchangeLoweringError::Overflow)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let transfer_end = receiver_ends
-        .iter()
-        .copied()
-        .chain(std::iter::once(sender_end))
-        .max()
-        .unwrap_or(schedule_offset);
-    *horizon = (*horizon).max(transfer_end);
+    let timing = builder.append_transfer_at(source, &tiles, &plan, schedule_offset, words)?;
     Ok(ScheduledTransferTiming {
-        start: schedule_offset,
-        end: transfer_end,
-        sender_end,
-        receiver_ends,
+        start: timing.payload_start,
+        end: timing
+            .receiver_payload_ends
+            .iter()
+            .copied()
+            .chain(std::iter::once(timing.payload_end))
+            .max()
+            .unwrap_or(timing.payload_end),
+        sender_end: timing.payload_end,
+        sender_memory_end: timing.sender_horizon,
+        receiver_starts: timing.receiver_payload_starts,
+        receiver_ends: timing.receiver_payload_ends,
+        receiver_memory_ends: timing.receiver_horizons,
     })
+}
+
+fn memory_safe_transfer_offset(
+    memory_accesses: &[TileMemorySchedule],
+    source: u16,
+    destinations: &[(u16, u32)],
+    source_address: u32,
+    words: u32,
+    payload_start: u32,
+    payload_end: u32,
+    receiver_intervals: &[(u32, u32)],
+    schedule_offset: u32,
+) -> Result<u32, ExchangeLoweringError> {
+    let mut safe_offset = schedule_offset;
+    let source_clash = memory_accesses[usize::from(source)]
+        .receives
+        .iter()
+        .filter(|access| payload_start < access.end && access.start < payload_end)
+        .filter(|access| {
+            spans_share_effective_memory_element(
+                source_address,
+                words,
+                access.address,
+                access.words,
+            )
+        })
+        .map(|access| access.end)
+        .max();
+    let receiver_clash = destinations
+        .iter()
+        .zip(receiver_intervals)
+        .flat_map(|(&(tile, address), &(receive_start, receive_end))| {
+            memory_accesses[usize::from(tile)]
+                .sends
+                .iter()
+                .filter(move |access| receive_start < access.end && access.start < receive_end)
+                .filter(move |access| {
+                    spans_share_effective_memory_element(
+                        address,
+                        words,
+                        access.address,
+                        access.words,
+                    )
+                })
+                .map(move |access| access.end.saturating_sub(receive_start))
+        })
+        .max();
+    let source_delay = source_clash.map(|end| end.saturating_sub(payload_start));
+    if let Some(delay) = source_delay.into_iter().chain(receiver_clash).max() {
+        safe_offset = safe_offset
+            .checked_add(delay)
+            .ok_or(ExchangeLoweringError::Overflow)?;
+    }
+    Ok(safe_offset)
+}
+
+fn spans_share_effective_memory_element(
+    left_address: u32,
+    left_words: u32,
+    right_address: u32,
+    right_words: u32,
+) -> bool {
+    effective_memory_elements(left_address, left_words)
+        .into_iter()
+        .any(|left| {
+            effective_memory_elements(right_address, right_words)
+                .into_iter()
+                .any(|right| left == right)
+        })
+}
+
+fn effective_memory_elements(address: u32, words: u32) -> Vec<ExchangeMemoryElement> {
+    let end = address.saturating_add(words.saturating_mul(4));
+    let mut elements = Vec::new();
+    let mut cursor = address;
+    while cursor < end {
+        let interleaved = cursor >= IPU21_INTERLEAVED_MEMORY_BASE;
+        let (base, size) = if interleaved {
+            (
+                IPU21_INTERLEAVED_MEMORY_BASE,
+                IPU21_INTERLEAVED_ELEMENT_SIZE,
+            )
+        } else {
+            (0, TILE_MEMORY_ELEMENT_SIZE)
+        };
+        let index = (cursor - base) / size;
+        elements.push(ExchangeMemoryElement { interleaved, index });
+        let boundary = base.saturating_add((index + 1).saturating_mul(size));
+        cursor = boundary.min(end);
+    }
+    elements
 }
 
 struct ScheduledTransferTiming {
     start: u32,
     end: u32,
     sender_end: u32,
+    sender_memory_end: u32,
+    receiver_starts: Vec<u32>,
     receiver_ends: Vec<u32>,
+    receiver_memory_ends: Vec<u32>,
 }
 
 pub fn inactive_exchange_program() -> Vec<u32> {
@@ -1520,34 +1715,29 @@ mod tests {
                 .collect::<Vec<_>>();
             let dependencies = memory_dependencies(&transfers, tile_count);
             let mut scheduler = TransferScheduler::new(&transfers, tile_count);
-            let mut availability = vec![TileAvailability::default(); usize::from(tile_count)];
+            let mut availability = vec![0u32; usize::from(tile_count)];
             let mut occurrences = vec![0u8; transfers.len()];
             let mut intervals = vec![(0u32, 0u32); transfers.len()];
-            while let Some(index) = scheduler.next(&availability) {
+            while let Some((index, dependency_ready)) = scheduler.next(&availability) {
                 occurrences[index] += 1;
                 let transfer = &transfers[index];
-                let start = std::iter::once(availability[usize::from(transfer.source)].send)
+                let start = std::iter::once(dependency_ready)
+                    .chain(std::iter::once(availability[usize::from(transfer.source)]))
                     .chain(
                         transfer
                             .destinations
                             .iter()
-                            .map(|&(tile, _)| availability[usize::from(tile)].receive),
+                            .map(|&(tile, _)| availability[usize::from(tile)]),
                     )
                     .max()
                     .unwrap_or(0);
                 let end = start.saturating_add(transfers[index].words);
                 intervals[index] = (start, end);
-                availability[usize::from(transfer.source)] = TileAvailability {
-                    send: end,
-                    receive: end,
-                };
+                availability[usize::from(transfer.source)] = end;
                 for &(tile, _) in &transfer.destinations {
-                    availability[usize::from(tile)] = TileAvailability {
-                        send: end,
-                        receive: end,
-                    };
+                    availability[usize::from(tile)] = end;
                 }
-                scheduler.complete(index);
+                scheduler.complete(index, end);
             }
             assert!(scheduler.is_complete());
             assert!(occurrences.into_iter().all(|count| count == 1));
@@ -1649,9 +1839,6 @@ mod tests {
                     for activity in activities {
                         assert!(activity.start_cycle < activity.end_cycle);
                         assert!(activity.end_cycle <= phase.event_cycles);
-                    }
-                    for pair in activities.windows(2) {
-                        assert!(pair[0].end_cycle <= pair[1].start_cycle);
                     }
                 }
                 for ((active, program), local_cycles) in phase
