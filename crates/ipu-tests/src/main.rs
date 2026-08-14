@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
+use half::f16;
 use ipu_codegen::{
     AmpOrder, BlockMajorOrder, CompiledPackage, ComputeGraph, DiagnosticTensor, Layout,
     PackageConfig, PipelineConfig, Precision, TensorFormat, amp_matrix_coordinates,
@@ -9,6 +10,8 @@ use ipu_driver::DriverError;
 use ipu_elf::Toolchain;
 use ipu_package::{Application, Binding};
 use ipu_runtime::Runtime;
+use rand_distr::{Distribution, StandardNormal};
+use rand_xoshiro::{SplitMix64, rand_core::SeedableRng};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1589,68 +1592,16 @@ fn mlp_smoke_reference(row: u16) -> [f32; MLP_SMOKE_WIDTH as usize] {
 }
 
 fn gaussian(seed: u64, index: u64) -> f32 {
-    let first = splitmix64(seed ^ index.wrapping_mul(2));
-    let second = splitmix64(seed ^ index.wrapping_mul(2).wrapping_add(1));
-    let unit = |bits: u64| ((bits >> 40) as f32 + 0.5) / 16_777_216.0;
-    let radius = (-2.0 * unit(first).ln()).sqrt();
-    radius * (std::f32::consts::TAU * unit(second)).cos()
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
+    let mut random = SplitMix64::seed_from_u64(seed ^ index);
+    StandardNormal.sample(&mut random)
 }
 
 fn f32_to_half(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let fraction = bits & 0x7f_ffff;
-    if exponent == 0xff {
-        return sign | 0x7c00 | u16::from(fraction != 0);
-    }
-    let half_exponent = exponent - 127 + 15;
-    if half_exponent >= 31 {
-        return sign | 0x7c00;
-    }
-    if half_exponent <= 0 {
-        if half_exponent < -10 {
-            return sign;
-        }
-        let mantissa = fraction | 0x80_0000;
-        let shift = u32::try_from(14 - half_exponent).unwrap();
-        let truncated = mantissa >> shift;
-        let remainder = mantissa & ((1 << shift) - 1);
-        let halfway = 1 << (shift - 1);
-        return sign
-            | (truncated
-                + u32::from(remainder > halfway || (remainder == halfway && truncated & 1 != 0)))
-                as u16;
-    }
-    let truncated = ((half_exponent as u32) << 10) | (fraction >> 13);
-    let remainder = fraction & 0x1fff;
-    sign | (truncated
-        + u32::from(remainder > 0x1000 || (remainder == 0x1000 && truncated & 1 != 0)))
-        as u16
+    f16::from_f32(value).to_bits()
 }
 
 fn half_to_f32(bits: u16) -> f32 {
-    let sign = u32::from(bits & 0x8000) << 16;
-    let exponent = u32::from((bits >> 10) & 0x1f);
-    let fraction = u32::from(bits & 0x03ff);
-    let value = match exponent {
-        0 if fraction == 0 => sign,
-        0 => {
-            let shift = fraction.leading_zeros() - 21;
-            let normalized = fraction << shift;
-            sign | ((113 - shift) << 23) | ((normalized & 0x03ff) << 13)
-        }
-        0x1f => sign | 0x7f80_0000 | (fraction << 13),
-        _ => sign | ((exponent + 112) << 23) | (fraction << 13),
-    };
-    f32::from_bits(value)
+    f16::from_bits(bits).to_f32()
 }
 
 fn packed_binding(

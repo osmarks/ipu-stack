@@ -10,6 +10,7 @@ use ipu_package::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, IPU21_INTERLEAVED_REGION_LIMIT,
     TILE_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE, TILE_MEMORY_SIZE,
 };
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,43 +138,21 @@ pub(crate) fn place_with_standard_ranges(
             .include(lifetime);
     }
 
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(usize::from(program.tile_count).max(1));
-    let tiles_per_worker = usize::from(program.tile_count).div_ceil(workers);
-    let mut tile_placements = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
-        for first in (0..usize::from(program.tile_count)).step_by(tiles_per_worker) {
-            let limit = (first + tiles_per_worker).min(usize::from(program.tile_count));
-            let iterated = &iterated;
-            let members = &members;
-            let root_of_member = &root_of_member;
-            let root_requirements = &root_requirements;
-            let root_lifetimes = &root_lifetimes;
-            handles.push(scope.spawn(move || {
-                (first..limit)
-                    .map(|tile| {
-                        place_tile(
-                            program,
-                            u16::try_from(tile).map_err(|_| PlacementError::Overflow)?,
-                            standard_ranges,
-                            iterated,
-                            members,
-                            root_of_member,
-                            root_requirements,
-                            root_lifetimes,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, PlacementError>>()
-            }));
-        }
-        let mut placements = Vec::with_capacity(usize::from(program.tile_count));
-        for handle in handles {
-            placements.extend(handle.join().expect("tile placement worker panicked")?);
-        }
-        Ok::<_, PlacementError>(placements)
-    })?;
-    tile_placements.sort_by_key(|placement| placement.0);
+    let tile_placements = (0..usize::from(program.tile_count))
+        .into_par_iter()
+        .map(|tile| {
+            place_tile(
+                program,
+                u16::try_from(tile).map_err(|_| PlacementError::Overflow)?,
+                standard_ranges,
+                &iterated,
+                &members,
+                &root_of_member,
+                &root_requirements,
+                &root_lifetimes,
+            )
+        })
+        .collect::<Result<Vec<_>, PlacementError>>()?;
     let mut addresses = BTreeMap::new();
     let mut tile_auxiliary_ranges = vec![Vec::new(); usize::from(program.tile_count)];
     for (tile, tile_addresses, unused) in tile_placements {

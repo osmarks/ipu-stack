@@ -19,4 +19,7 @@ ipu-exchange = { path = "../ipu-exchange" }
 ipu-package = { path = "../ipu-package" }
 ipu-runtime = { path = "../ipu-runtime" }
 fastrand.workspace = true
+half.workspace = true
+rand_distr.workspace = true
+rand_xoshiro.workspace = true
 tracing.workspace = true

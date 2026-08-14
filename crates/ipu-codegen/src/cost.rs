@@ -12,8 +12,8 @@ use crate::mid::{
     LocalOperandStaging, MemoryClass, MidOperator, OperatorDispatch, OperatorRequirements,
     Precision, TensorAxis, TensorType,
 };
+use foldhash::fast::FixedState;
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub trait CostModel: Sync {
@@ -155,31 +155,7 @@ pub(crate) struct MemoizedCostModel<'a, C> {
 }
 
 type RearrangementKey = (TensorShape, Precision, Layout, Layout);
-type RearrangementCache =
-    HashMap<RearrangementKey, Arc<OnceLock<RearrangementCost>>, BuildHasherDefault<FastHasher>>;
-
-struct FastHasher(u64);
-
-impl Default for FastHasher {
-    fn default() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
-    }
-}
-
-impl Hasher for FastHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let mut hash = self.0;
-        for &byte in bytes {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        self.0 = hash;
-    }
-}
+type RearrangementCache = HashMap<RearrangementKey, Arc<OnceLock<RearrangementCost>>, FixedState>;
 
 impl<'a, C> MemoizedCostModel<'a, C> {
     pub(crate) fn new(inner: &'a C, spatial_capacity: u16) -> Self {

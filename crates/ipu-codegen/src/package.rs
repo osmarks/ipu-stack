@@ -22,6 +22,7 @@ use ipu_package::{
     ProfileMetadata, ProfileStep, ProfileStepKind, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ,
     SEGMENT_WRITE, Segment, TILE_MEMORY_BASE, TileImage, TileProfilePlan,
 };
+use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::num::TryFromIntError;
@@ -747,43 +748,47 @@ fn build_package_from_objects(
         "generated tile programs",
     )?;
     let generated_code_bytes = build_phase("size_tile_code", || {
-        parallel_try_map(&physical_to_logical, |physical, &logical| {
-            let host = &provisional_host.programs[physical];
-            let mut tile_program = provisional_finalizer.lower_tile(logical)?;
-            if let Some(storage) = &profile_storage {
-                instrument_profile(
-                    program,
-                    &provisional_exchanges,
-                    logical,
-                    u32::try_from(physical)?,
-                    &mut tile_program,
-                    storage.range.start,
+        physical_to_logical
+            .par_iter()
+            .enumerate()
+            .map(|(physical, &logical)| {
+                let host = &provisional_host.programs[physical];
+                let mut tile_program = provisional_finalizer.lower_tile(logical)?;
+                if let Some(storage) = &profile_storage {
+                    instrument_profile(
+                        program,
+                        &provisional_exchanges,
+                        logical,
+                        u32::try_from(physical)?,
+                        &mut tile_program,
+                        storage.range.start,
+                    )?;
+                }
+                let generated = emit(
+                    &tile_program,
+                    &symbols,
+                    host,
+                    &CodegenOptions {
+                        code_address: sizing_code_address,
+                        initial_profile_address: config
+                            .pipeline
+                            .profiling
+                            .enabled
+                            .then_some(PROFILE_START_CYCLE),
+                        final_profile_address: config
+                            .pipeline
+                            .profiling
+                            .enabled
+                            .then_some(PROFILE_END_CYCLE),
+                        ..CodegenOptions::default()
+                    },
                 )?;
-            }
-            let generated = emit(
-                &tile_program,
-                &symbols,
-                host,
-                &CodegenOptions {
-                    code_address: sizing_code_address,
-                    initial_profile_address: config
-                        .pipeline
-                        .profiling
-                        .enabled
-                        .then_some(PROFILE_START_CYCLE),
-                    final_profile_address: config
-                        .pipeline
-                        .profiling
-                        .enabled
-                        .then_some(PROFILE_END_CYCLE),
-                    ..CodegenOptions::default()
-                },
-            )?;
-            Ok::<_, PackageBuildError>(u32::try_from(generated.bytes.len())?)
-        })?
-        .into_iter()
-        .max()
-        .ok_or_else(|| invalid("execution topology has no tiles"))
+                Ok::<_, PackageBuildError>(u32::try_from(generated.bytes.len())?)
+            })
+            .collect::<PackageBuildResult<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .ok_or_else(|| invalid("execution topology has no tiles"))
     })?;
     let code_address = if generated_code_bytes == 0 {
         sizing_code_address
@@ -922,23 +927,27 @@ fn build_package_from_objects(
         ));
     }
     let prepared = build_phase("prepare_tile_code", || {
-        parallel_try_map(&physical_to_logical, |physical_tile, &logical| {
-            let mut tile_program = finalizer.lower_tile(logical)?;
-            let profile = profile_storage
-                .as_ref()
-                .map(|storage| {
-                    instrument_profile(
-                        program,
-                        &exchanges,
-                        logical,
-                        u32::try_from(physical_tile)?,
-                        &mut tile_program,
-                        storage.range.start,
-                    )
-                })
-                .transpose()?;
-            Ok((tile_program, profile))
-        })
+        physical_to_logical
+            .par_iter()
+            .enumerate()
+            .map(|(physical_tile, &logical)| {
+                let mut tile_program = finalizer.lower_tile(logical)?;
+                let profile = profile_storage
+                    .as_ref()
+                    .map(|storage| {
+                        instrument_profile(
+                            program,
+                            &exchanges,
+                            logical,
+                            u32::try_from(physical_tile)?,
+                            &mut tile_program,
+                            storage.range.start,
+                        )
+                    })
+                    .transpose()?;
+                Ok((tile_program, profile))
+            })
+            .collect::<PackageBuildResult<Vec<_>>>()
     })?;
     let generate = || {
         prepared
@@ -1184,44 +1193,6 @@ fn build_phase<T>(
         "package build phase finished"
     );
     result
-}
-
-fn parallel_try_map<T: Sync, R: Send, E: Send>(
-    items: &[T],
-    map: impl Fn(usize, &T) -> Result<R, E> + Sync,
-) -> Result<Vec<R>, E> {
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(32)
-        .min(items.len().max(1));
-    let chunk_size = items.len().div_ceil(workers).max(1);
-    std::thread::scope(|scope| {
-        let handles = items
-            .chunks(chunk_size)
-            .enumerate()
-            .map(|(chunk_index, chunk)| {
-                let map = &map;
-                scope.spawn(move || {
-                    let start = chunk_index * chunk_size;
-                    chunk
-                        .iter()
-                        .enumerate()
-                        .map(|(offset, item)| map(start + offset, item))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut output = Vec::with_capacity(items.len());
-        for handle in handles {
-            let chunk = handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            for item in chunk {
-                output.push(item?);
-            }
-        }
-        Ok(output)
-    })
 }
 
 fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
