@@ -277,7 +277,7 @@ impl KernelBuildPlan {
                 source: "gelu_f16.S",
                 name: "gelu_f16".into(),
                 flags: Vec::new(),
-                retained_symbols: vec!["ipu_stack_gelu_exact_f16".into()],
+                retained_symbols: vec!["ipu_stack_gelu_tanh_approx_f16".into()],
             });
         }
         if reduction_add {
@@ -1145,7 +1145,7 @@ fn gelu_symbol(requirements: &KernelRequirements) -> Option<&'static str> {
     }
     let input_layout = &input.format.layout;
     let output_layout = &requirements.output.format.layout;
-    (input_layout == output_layout).then_some("ipu_stack_gelu_exact_f16")
+    (input_layout == output_layout).then_some("ipu_stack_gelu_tanh_approx_f16")
 }
 
 fn gemm_symbols(
@@ -1408,7 +1408,7 @@ mod tests {
             assert_eq!(abi.scalar_arguments[0].register, 4);
             assert_eq!(
                 abi.symbols,
-                KernelSymbols::Exact("ipu_stack_gelu_exact_f16")
+                KernelSymbols::Exact("ipu_stack_gelu_tanh_approx_f16")
             );
         }
     }

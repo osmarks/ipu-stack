@@ -94,7 +94,7 @@
 	.size \symbol, .-\symbol
 	.endm
 
-	GELU_ENTRY ipu_stack_gelu_exact_f16, .Lgelu_contiguous_worker
+	GELU_ENTRY ipu_stack_gelu_tanh_approx_f16, .Lgelu_contiguous_worker
 
 	.worker
 	.p2align 3
