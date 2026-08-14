@@ -56,7 +56,8 @@ pub use mid::{
     MidRepeat, MidValue, MidValueId, OperandMaterialization, OperandRequirement, OperatorCandidate,
     OperatorDispatch, OperatorFormatPolicy, OperatorPlan, OperatorPlanError, OperatorRequirements,
     OutputAliasing, Padding, PipelineConfig, PointwiseInputMapping, Precision, ProfilingConfig,
-    SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
+    ReductionStaging, SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType,
+    TileKernelSpec, lower,
 };
 pub use package::{
     CompiledPackage, DiagnosticCheckpoint, DiagnosticPackage, DiagnosticShard, DiagnosticTensor,

@@ -585,11 +585,19 @@ impl CostModel for Ipu21CostModel {
                                 inner_partitions,
                                 result_row_partitions,
                                 result_column_partitions,
+                                reduction_staging,
                                 ..
                             },
                         ..
                     } => {
                         let partitions = u64::from(*inner_partitions);
+                        let remote_partials_per_stage = match reduction_staging {
+                            crate::ReductionStaging::Complete => inner_partitions.saturating_sub(1),
+                            crate::ReductionStaging::Streamed => 1,
+                        };
+                        let reduction_epochs = inner_partitions
+                            .saturating_sub(1)
+                            .div_ceil(remote_partials_per_stage.max(1));
                         let columns = output
                             .shape
                             .0
@@ -627,14 +635,21 @@ impl CostModel for Ipu21CostModel {
                             )
                             .saturating_add(
                                 exchange_epochs
-                                    .saturating_mul(2)
+                                    .saturating_add(u64::from(reduction_epochs))
                                     .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles),
                             )
                             .saturating_add(
-                                u64::from(*inner_partitions)
-                                    .saturating_mul(reduction_partial_bytes)
-                                    .div_ceil(IPU21_TARGET_COSTS.reduction_output_bytes_per_cycle)
-                                    .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
+                                u64::from(
+                                    inner_partitions
+                                        .saturating_sub(1)
+                                        .saturating_add(reduction_epochs),
+                                )
+                                .saturating_mul(reduction_partial_bytes)
+                                .div_ceil(IPU21_TARGET_COSTS.reduction_output_bytes_per_cycle)
+                                .saturating_add(
+                                    u64::from(reduction_epochs)
+                                        .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
+                                ),
                             )
                             .saturating_add(result_redistribution)
                     }
@@ -830,12 +845,21 @@ impl CostModel for Ipu21CostModel {
                 output_column_block: _,
                 distribution:
                     GemmDistribution::ParallelReduction {
-                        inner_partitions, ..
+                        inner_partitions,
+                        reduction_staging,
+                        ..
                     },
                 ..
             } => {
-                let epochs = 1u64;
-                epochs.saturating_mul(u64::from(*inner_partitions > 1).saturating_add(1))
+                let remote_partials_per_stage = match reduction_staging {
+                    crate::ReductionStaging::Complete => inner_partitions.saturating_sub(1),
+                    crate::ReductionStaging::Streamed => 1,
+                };
+                1u64.saturating_add(u64::from(
+                    inner_partitions
+                        .saturating_sub(1)
+                        .div_ceil(remote_partials_per_stage.max(1)),
+                ))
             }
             _ => phases,
         };

@@ -477,6 +477,7 @@ pub(crate) fn operator_memory_estimate(
                     inner_partitions,
                     result_row_partitions,
                     result_column_partitions,
+                    reduction_staging,
                     ..
                 },
             output_column_block,
@@ -530,9 +531,9 @@ pub(crate) fn operator_memory_estimate(
                     maximum_standard_temporary_allocation.max(left_staging);
             }
         }
-        // Convolution retains one local partial alongside operand staging.
-        // Reduction happens later and packs one initial partial, all remote
-        // partials, and one result into standard memory.
+        // Compute retains one local partial alongside operand staging. The
+        // later reduction ping-pongs an accumulator and result while its
+        // staging policy bounds the simultaneously resident remote partials.
         let partial_bytes = maximum_shard_bytes(&gemm_partial_tensor(dispatch, output));
         let reduction_partial_bytes =
             if (*result_row_partitions, *result_column_partitions) != (1, 1) {
@@ -541,15 +542,18 @@ pub(crate) fn operator_memory_estimate(
                 partial_bytes
             };
         convolution.interleaved = convolution.interleaved.saturating_add(partial_bytes);
+        let staged_remote_partials = match reduction_staging {
+            crate::ReductionStaging::Complete => inner_partitions.saturating_sub(1),
+            crate::ReductionStaging::Streamed => 1,
+        };
         let reduction = MemoryUsage {
             standard: reduction_partial_bytes
-                .saturating_mul(u64::from(*inner_partitions).saturating_add(1)),
+                .saturating_mul(u64::from(staged_remote_partials).saturating_add(2)),
             interleaved: partial_bytes,
         };
-        temporary = if convolution.total() >= reduction.total() {
-            convolution
-        } else {
-            reduction
+        temporary = MemoryUsage {
+            standard: convolution.standard.max(reduction.standard),
+            interleaved: convolution.interleaved.max(reduction.interleaved),
         };
     }
     if let (OperatorDispatch::BlockedGemm { inner_block, .. }, Some(left), Some(requirement)) =

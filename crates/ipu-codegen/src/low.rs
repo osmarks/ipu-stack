@@ -2524,6 +2524,7 @@ impl LoweringState {
             inner_partitions,
             result_row_partitions,
             result_column_partitions,
+            reduction_staging,
         } = distribution
         {
             return self.lower_parallel_reduction_gemm(
@@ -2538,6 +2539,7 @@ impl LoweringState {
                 inner_partitions,
                 result_row_partitions,
                 result_column_partitions,
+                reduction_staging,
                 requirements,
                 tiles,
             );
@@ -2833,6 +2835,7 @@ impl LoweringState {
         inner_partitions: u16,
         result_row_partitions: u16,
         result_column_partitions: u16,
+        reduction_staging: crate::ReductionStaging,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
@@ -3430,9 +3433,20 @@ impl LoweringState {
                 "prepared parallel GEMM partials"
             );
 
-            let mut reduction_transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+            let remote_partials_per_stage = match reduction_staging {
+                crate::ReductionStaging::Complete => inner_partitions.saturating_sub(1),
+                crate::ReductionStaging::Streamed => 1,
+            };
+            let reduction_stages = inner_partitions
+                .saturating_sub(1)
+                .div_ceil(remote_partials_per_stage.max(1));
+            let mut reduction_transfers = (0..reduction_stages)
+                .map(|_| BTreeMap::<ShardView, Vec<ShardView>>::new())
+                .collect::<Vec<_>>();
             let mut seed_copies = Vec::<(u16, LocalCopy)>::new();
-            let mut reduction_runs = Vec::<(u16, KernelRun)>::new();
+            let mut reduction_runs = (0..reduction_stages)
+                .map(|_| Vec::<(u16, KernelRun)>::new())
+                .collect::<Vec<_>>();
             let mut result_copies = Vec::<(u16, LocalCopy)>::new();
             let mut reduction_roots = 0usize;
             for contributors in partials.into_values() {
@@ -3490,10 +3504,7 @@ impl LoweringState {
                         ShardDefinition::Staging,
                     )?;
                     let remote_elements = elements
-                        .checked_mul(
-                            u32::try_from(contributors.len().saturating_sub(1))
-                                .map_err(|_| LowLoweringError::IdOverflow)?,
-                        )
+                        .checked_mul(u32::from(remote_partials_per_stage))
                         .ok_or(LowLoweringError::IdOverflow)?;
                     let remote = self.push_packed_buffer(
                         owner.tile,
@@ -3525,65 +3536,81 @@ impl LoweringState {
                             &mut seed_copies,
                         )?;
                     } else {
-                        reduction_transfers
+                        reduction_transfers[0]
                             .entry(seed_source)
                             .or_default()
                             .push(self.full_view(initial));
                     }
 
-                    let mut slot = 0u32;
-                    for (index, (_, partial)) in contributors.iter().enumerate() {
-                        if index == seed {
-                            continue;
+                    let remote_contributors = contributors
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| *index != seed)
+                        .map(|(_, (_, partial))| partial)
+                        .collect::<Vec<_>>();
+                    for (stage, chunk) in remote_contributors
+                        .chunks(usize::from(remote_partials_per_stage))
+                        .enumerate()
+                    {
+                        for (slot, partial) in chunk.iter().enumerate() {
+                            let start = u32::try_from(slot)
+                                .map_err(|_| LowLoweringError::IdOverflow)?
+                                .checked_mul(elements)
+                                .ok_or(LowLoweringError::IdOverflow)?;
+                            let end = start
+                                .checked_add(elements)
+                                .ok_or(LowLoweringError::IdOverflow)?;
+                            reduction_transfers[stage]
+                                .entry(source_view(partial))
+                                .or_default()
+                                .push(ShardView {
+                                    shard: remote,
+                                    extents: vec![ShardExtent {
+                                        axis: 0,
+                                        start,
+                                        logical_end: end,
+                                        physical_end: end,
+                                    }],
+                                });
                         }
-                        let start = slot
-                            .checked_mul(elements)
-                            .ok_or(LowLoweringError::IdOverflow)?;
-                        let end = start
-                            .checked_add(elements)
-                            .ok_or(LowLoweringError::IdOverflow)?;
-                        reduction_transfers
-                            .entry(source_view(partial))
-                            .or_default()
-                            .push(ShardView {
-                                shard: remote,
-                                extents: vec![ShardExtent {
-                                    axis: 0,
-                                    start,
-                                    logical_end: end,
-                                    physical_end: end,
-                                }],
-                            });
-                        slot += 1;
+                        let (accumulator, stage_result) = if stage.is_multiple_of(2) {
+                            (initial, result)
+                        } else {
+                            (result, initial)
+                        };
+                        reduction_runs[stage].push((
+                            owner.tile,
+                            KernelRun::new(
+                                WorkProvenance {
+                                    operation: operation.source,
+                                    value: Some(*output_value),
+                                    reason: WorkReason::OperatorKernel,
+                                },
+                                TileKernel::Planned(TileKernelSpec::ReductionSum {
+                                    partials: u16::try_from(chunk.len() + 1)
+                                        .map_err(|_| LowLoweringError::IdOverflow)?,
+                                }),
+                                vec![
+                                    KernelOperand {
+                                        views: vec![self.full_view(accumulator)],
+                                    },
+                                    KernelOperand {
+                                        views: vec![self.full_view(remote)],
+                                    },
+                                ],
+                                self.full_view(stage_result),
+                                KernelRequirements::Operator(requirements.clone()),
+                            ),
+                        ));
                     }
-                    let result_view = self.full_view(result);
-                    reduction_runs.push((
-                        owner.tile,
-                        KernelRun::new(
-                            WorkProvenance {
-                                operation: operation.source,
-                                value: Some(*output_value),
-                                reason: WorkReason::OperatorKernel,
-                            },
-                            TileKernel::Planned(TileKernelSpec::ReductionSum {
-                                partials: u16::try_from(contributors.len())
-                                    .map_err(|_| LowLoweringError::IdOverflow)?,
-                            }),
-                            vec![
-                                KernelOperand {
-                                    views: vec![self.full_view(initial)],
-                                },
-                                KernelOperand {
-                                    views: vec![self.full_view(remote)],
-                                },
-                            ],
-                            result_view.clone(),
-                            KernelRequirements::Operator(requirements.clone()),
-                        ),
-                    ));
+                    let final_result = if usize::from(reduction_stages).is_multiple_of(2) {
+                        initial
+                    } else {
+                        result
+                    };
                     append_span_copies(
                         &self.shards,
-                        &result_view,
+                        &self.full_view(final_result),
                         &ShardView {
                             shard: output,
                             extents: intersection,
@@ -3597,20 +3624,28 @@ impl LoweringState {
                     return Err(LowLoweringError::InvalidOperatorPlan);
                 }
             }
-            self.append_physical_phase(
-                reduction_transfers,
-                WorkProvenance {
-                    operation: operation.source,
-                    value: Some(*output_value),
-                    reason: WorkReason::OperatorInputs,
-                },
-                tiles,
-            )?;
-            for (tile, copy) in seed_copies {
-                self.append_local_copy(tiles, tile, copy)?;
-            }
-            for (tile, run) in reduction_runs {
-                self.append_kernel(tiles, tile, run)?;
+            for (stage, (transfers, runs)) in reduction_transfers
+                .into_iter()
+                .zip(reduction_runs)
+                .enumerate()
+            {
+                self.append_physical_phase(
+                    transfers,
+                    WorkProvenance {
+                        operation: operation.source,
+                        value: Some(*output_value),
+                        reason: WorkReason::OperatorInputs,
+                    },
+                    tiles,
+                )?;
+                if stage == 0 {
+                    for (tile, copy) in seed_copies.drain(..) {
+                        self.append_local_copy(tiles, tile, copy)?;
+                    }
+                }
+                for (tile, run) in runs {
+                    self.append_kernel(tiles, tile, run)?;
+                }
             }
             for (tile, copy) in result_copies {
                 self.append_local_copy(tiles, tile, copy)?;
@@ -4771,6 +4806,11 @@ mod tests {
             };
             let storage_rows = row_partitions.saturating_mul(result_row_partitions);
             let storage_columns = column_partitions.saturating_mul(result_column_partitions);
+            let reduction_staging = if random.bool() {
+                crate::ReductionStaging::Complete
+            } else {
+                crate::ReductionStaging::Streamed
+            };
             let output_format = TensorFormat {
                 precision: Precision::F16,
                 layout: Layout::amp_left_result_grid(
@@ -4805,6 +4845,7 @@ mod tests {
                     inner_partitions,
                     result_row_partitions,
                     result_column_partitions,
+                    reduction_staging,
                 },
             });
             let mut config = PipelineConfig::new(tiles)
@@ -4835,7 +4876,10 @@ mod tests {
                     matches!(
                         run.kernel,
                         TileKernel::Planned(TileKernelSpec::ReductionSum { partials })
-                            if partials == inner_partitions
+                            if partials == match reduction_staging {
+                                crate::ReductionStaging::Complete => inner_partitions,
+                                crate::ReductionStaging::Streamed => 2,
+                            }
                     ) && run.inputs.len() == 2
                 }),
                 "case {case}"

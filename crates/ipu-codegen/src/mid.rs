@@ -275,7 +275,20 @@ pub enum GemmDistribution {
         /// one root per compute row/column block.
         result_row_partitions: u16,
         result_column_partitions: u16,
+        reduction_staging: ReductionStaging,
     },
+}
+
+/// Lifetime policy for partials reduced across a GEMM's K partitions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReductionStaging {
+    /// Receive every remote partial into one packed buffer, then reduce once.
+    #[default]
+    Complete,
+    /// Receive and accumulate one remote partial at a time. This minimizes
+    /// temporary SRAM at the expense of additional exchange epochs and kernel
+    /// launches.
+    Streamed,
 }
 
 /// How a pointwise kernel's input shards are selected for each output shard.
@@ -1320,7 +1333,7 @@ pub struct OperandRequirement {
     pub materialization: OperandMaterialization,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LocalOperandStaging {
     #[default]
     Direct,
@@ -2498,6 +2511,7 @@ impl OperatorPlan {
                     inner_partitions,
                     result_row_partitions,
                     result_column_partitions,
+                    ..
                 } = distribution
                 {
                     let result_rows = row_partitions.saturating_mul(*result_row_partitions);
@@ -3088,7 +3102,69 @@ impl BeamObjective {
 struct RankedBeamBranch {
     branch: BeamBranch,
     objective: BeamObjective,
+    compatibility: FutureFormatCompatibility,
     order: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FutureFormatCompatibility(
+    Vec<(
+        ValueId,
+        Precision,
+        ElementOrderCompatibility,
+        MemoryClass,
+        Vec<TensorAxis>,
+    )>,
+);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ElementOrderCompatibility {
+    RowMajor,
+    BlockMajorMatrix,
+    BlockMajorTransposedMatrix,
+    Amp(AmpOrder),
+}
+
+fn element_order_compatibility(order: ElementOrder) -> ElementOrderCompatibility {
+    match order {
+        ElementOrder::RowMajor => ElementOrderCompatibility::RowMajor,
+        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }) => {
+            ElementOrderCompatibility::BlockMajorMatrix
+        }
+        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }) => {
+            ElementOrderCompatibility::BlockMajorTransposedMatrix
+        }
+        ElementOrder::Amp(order) => ElementOrderCompatibility::Amp(order),
+    }
+}
+
+fn future_format_compatibility(
+    branch: &BeamBranch,
+    future_origins: &BTreeSet<ValueId>,
+) -> FutureFormatCompatibility {
+    FutureFormatCompatibility(
+        future_origins
+            .iter()
+            .filter_map(|&origin| {
+                let id = branch.values.get(&origin)?;
+                let format = &branch.state.get(*id).tensor_type.format;
+                let axes = format
+                    .layout
+                    .tiling
+                    .axes
+                    .iter()
+                    .map(|axis| axis.axis)
+                    .collect();
+                Some((
+                    origin,
+                    format.precision,
+                    element_order_compatibility(format.layout.order),
+                    format.layout.memory_class,
+                    axes,
+                ))
+            })
+            .collect(),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -3291,6 +3367,7 @@ fn lower_operations(
                     &parameter_inputs,
                     &output_shape,
                     config,
+                    costs,
                     distributed_result_is_useful,
                 );
                 plan_cache.entry(cache_key).or_insert(generated)
@@ -3495,6 +3572,7 @@ fn retain_pareto_beam(
             exchange_rows: branch.peak_memory.exchange_rows,
         };
         groups.entry(signature).or_default().push(RankedBeamBranch {
+            compatibility: future_format_compatibility(&branch, future_origins),
             branch,
             objective,
             order,
@@ -3533,6 +3611,21 @@ fn retain_pareto_beam(
     let mut selected = BTreeSet::new();
     let mut diversity = 0usize;
     if frontier.len() > width {
+        // Preserve the cheapest representative of every live format family
+        // before retaining secondary memory tradeoffs. Partition counts are
+        // intentionally excluded: they are searched within a family, whereas
+        // physical order and ownership axes determine which imminent
+        // consumers can use a value without a qualitatively different
+        // conversion.
+        let mut represented = BTreeSet::new();
+        for (index, entry) in frontier.iter().enumerate() {
+            if selected.len() == width {
+                break;
+            }
+            if represented.insert(entry.compatibility.clone()) && selected.insert(index) {
+                diversity += 1;
+            }
+        }
         let objectives: [fn(&RankedBeamBranch) -> u64; 6] = [
             |entry: &RankedBeamBranch| entry.objective.standard,
             |entry: &RankedBeamBranch| entry.objective.interleaved,
@@ -4019,6 +4112,7 @@ fn plans(
     parameter_inputs: &[bool],
     output: &TensorShape,
     config: &PipelineConfig,
+    costs: &impl CostModel,
     distributed_result_is_useful: bool,
 ) -> Vec<Plan> {
     let mut plans = Vec::new();
@@ -4284,7 +4378,9 @@ fn plans(
         variants.extend(parallel_reduction_candidates(
             &candidate,
             inputs,
+            output,
             config,
+            costs,
             distributed_result_is_useful,
         ));
         for (input_index, _) in parameter_inputs
@@ -4420,7 +4516,9 @@ fn independent_parameter_storage(
 fn parallel_reduction_candidates(
     candidate: &OperatorCandidate,
     inputs: &[TensorType],
+    output: &TensorShape,
     config: &PipelineConfig,
+    costs: &impl CostModel,
     distributed_result_is_useful: bool,
 ) -> Vec<OperatorCandidate> {
     [GemmOrientation::Normal, GemmOrientation::Swapped]
@@ -4429,7 +4527,9 @@ fn parallel_reduction_candidates(
             parallel_reduction_candidates_for_orientation(
                 candidate,
                 inputs,
+                output,
                 config,
+                costs,
                 orientation,
                 distributed_result_is_useful,
             )
@@ -4440,7 +4540,9 @@ fn parallel_reduction_candidates(
 fn parallel_reduction_candidates_for_orientation(
     candidate: &OperatorCandidate,
     inputs: &[TensorType],
+    output: &TensorShape,
     config: &PipelineConfig,
+    costs: &impl CostModel,
     orientation: GemmOrientation,
     distributed_result_is_useful: bool,
 ) -> Vec<OperatorCandidate> {
@@ -4591,13 +4693,13 @@ fn parallel_reduction_candidates_for_orientation(
                 .saturating_mul(u64::from(AMP_COLUMN_MICRO))
                 .saturating_mul(candidate.output.format.precision.bytes());
             // Operand staging and the local partial coexist during convolution.
-            // Reduction retains that partial plus one initial, one result, and
-            // all packed remote partials in standard memory.
+            // A streamed reduction needs one initial, one remote partial, one
+            // result, and the local interleaved partial. Complete staging is
+            // evaluated later by the ordinary operator-memory model.
             let convolution_bytes = left_bytes
                 .saturating_add(right_bytes)
                 .saturating_add(partial_bytes);
-            let reduction_bytes =
-                partial_bytes.saturating_mul(u64::from(inner_partitions).saturating_add(2));
+            let reduction_bytes = partial_bytes.saturating_mul(4);
             let temporary_bytes = convolution_bytes.max(reduction_bytes);
             if temporary_bytes > u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES) {
                 continue;
@@ -4618,6 +4720,7 @@ fn parallel_reduction_candidates_for_orientation(
             ));
         }
     }
+    let generated_grids = grids.len();
     // Do not discard a grid merely because another has lower estimated
     // compute and communication: peak temporary storage and unused tiles are
     // independent planning constraints. The complete cost model needs every
@@ -4625,7 +4728,8 @@ fn parallel_reduction_candidates_for_orientation(
     // transitions are cheaper.
     let dominates = |left: &(u64, u64, u64, u64, u16, u16, u16),
                      right: &(u64, u64, u64, u64, u16, u16, u16)| {
-        left.0 <= right.0
+        left.6 == right.6
+            && left.0 <= right.0
             && left.1 <= right.1
             && left.2 <= right.2
             && left.3 <= right.3
@@ -4640,8 +4744,8 @@ fn parallel_reduction_candidates_for_orientation(
         frontier.push(grid);
     }
     frontier.sort_unstable();
-    let mut grids = frontier;
-    grids.truncate(config.planning_beam_width.max(1));
+    let grids = frontier;
+    let proxy_frontier_grids = grids.len();
     let mut variants = Vec::new();
     for (_, _, _, _, row_partitions, column_partitions, inner_partitions) in grids {
         let used_tiles = row_partitions
@@ -4783,6 +4887,7 @@ fn parallel_reduction_candidates_for_orientation(
                     inner_partitions,
                     result_row_partitions: 1,
                     result_column_partitions: 1,
+                    reduction_staging: ReductionStaging::Complete,
                 };
             }
             let physical_right_index = match orientation {
@@ -4897,12 +5002,219 @@ fn parallel_reduction_candidates_for_orientation(
                 for &local_staging in local_staging_options {
                     let mut staged = layout_variant.clone();
                     staged.inputs[physical_right_index].local_staging = local_staging;
+                    variants.push(staged.clone());
+                    if let OperatorDispatch::BlockedGemm {
+                        distribution:
+                            GemmDistribution::ParallelReduction {
+                                reduction_staging, ..
+                            },
+                        ..
+                    } = &mut staged.dispatch
+                    {
+                        *reduction_staging = ReductionStaging::Streamed;
+                    }
                     variants.push(staged);
                 }
             }
         }
     }
-    variants
+    let generated_variants = variants.len();
+    let retained = retain_precise_operator_candidates(
+        variants,
+        inputs,
+        output,
+        costs,
+        config.planning_beam_width.max(1),
+    );
+    tracing::debug!(
+        ?orientation,
+        generated_grids,
+        proxy_frontier_grids,
+        generated_variants,
+        retained_variants = retained.len(),
+        "retained parallel GEMM candidates"
+    );
+    retained
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OperatorCandidateObjective {
+    cycles: u64,
+    standard: u64,
+    interleaved: u64,
+    total: u64,
+    maximum_standard_allocation: u64,
+    exchange_rows: u64,
+}
+
+impl OperatorCandidateObjective {
+    fn dominates(self, other: Self) -> bool {
+        let no_worse = self.cycles <= other.cycles
+            && self.standard <= other.standard
+            && self.interleaved <= other.interleaved
+            && self.total <= other.total
+            && self.maximum_standard_allocation <= other.maximum_standard_allocation
+            && self.exchange_rows <= other.exchange_rows;
+        no_worse && self != other
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct OperatorCandidateCompatibility {
+    orientation: Option<GemmOrientation>,
+    reduction_staging: Option<ReductionStaging>,
+    inputs: Vec<(ElementOrderCompatibility, MemoryClass, LocalOperandStaging)>,
+    output: (ElementOrderCompatibility, MemoryClass, Vec<TensorAxis>),
+}
+
+fn operator_candidate_compatibility(
+    candidate: &OperatorCandidate,
+) -> OperatorCandidateCompatibility {
+    let (orientation, reduction_staging) = match candidate.dispatch {
+        OperatorDispatch::BlockedGemm {
+            orientation,
+            distribution:
+                GemmDistribution::ParallelReduction {
+                    reduction_staging, ..
+                },
+            ..
+        } => (Some(orientation), Some(reduction_staging)),
+        OperatorDispatch::BlockedGemm { orientation, .. } => (Some(orientation), None),
+        _ => (None, None),
+    };
+    OperatorCandidateCompatibility {
+        orientation,
+        reduction_staging,
+        inputs: candidate
+            .inputs
+            .iter()
+            .map(|input| {
+                (
+                    element_order_compatibility(input.format.layout.order),
+                    input.format.layout.memory_class,
+                    input.local_staging,
+                )
+            })
+            .collect(),
+        output: (
+            element_order_compatibility(candidate.output.format.layout.order),
+            candidate.output.format.layout.memory_class,
+            candidate
+                .output
+                .format
+                .layout
+                .tiling
+                .axes
+                .iter()
+                .map(|axis| axis.axis)
+                .collect(),
+        ),
+    }
+}
+
+fn retain_precise_operator_candidates(
+    candidates: Vec<OperatorCandidate>,
+    inputs: &[TensorType],
+    output: &TensorShape,
+    costs: &impl CostModel,
+    width: usize,
+) -> Vec<OperatorCandidate> {
+    let ranked = candidates
+        .into_iter()
+        .map(|candidate| {
+            let planned_inputs = inputs
+                .iter()
+                .zip(&candidate.inputs)
+                .map(|(input, requirement)| TensorType {
+                    shape: input.shape.clone(),
+                    format: requirement.format.clone(),
+                })
+                .collect::<Vec<_>>();
+            let planned_output = TensorType {
+                shape: output.clone(),
+                format: candidate.output.format.clone(),
+            };
+            let requirements = OperatorRequirements {
+                inputs: candidate.inputs.clone(),
+                output: candidate.output.clone(),
+                output_aliasing: candidate.output_aliasing.clone(),
+                memory_relations: candidate.memory_relations.clone(),
+            };
+            let memory = operator_memory_estimate(
+                &candidate.dispatch,
+                &requirements,
+                &planned_inputs,
+                &planned_output,
+            );
+            let exchange = costs.operator_exchange_footprint(
+                candidate.operator,
+                &candidate.dispatch,
+                &requirements,
+                &planned_inputs,
+                &planned_output,
+            );
+            let objective = OperatorCandidateObjective {
+                cycles: costs.operator_cycles(
+                    candidate.operator,
+                    &candidate.dispatch,
+                    &requirements,
+                    &planned_inputs,
+                    &planned_output,
+                ),
+                standard: memory.peak.standard,
+                interleaved: memory.peak.interleaved,
+                total: memory.peak.total(),
+                maximum_standard_allocation: memory.maximum_standard_temporary_allocation,
+                exchange_rows: exchange.estimated_row_bytes(),
+            };
+            let compatibility = operator_candidate_compatibility(&candidate);
+            (candidate, objective, compatibility)
+        })
+        .collect::<Vec<_>>();
+    let mut frontier = Vec::<(
+        OperatorCandidate,
+        OperatorCandidateObjective,
+        OperatorCandidateCompatibility,
+    )>::new();
+    for entry in ranked {
+        if frontier
+            .iter()
+            .any(|(_, kept, compatibility)| *compatibility == entry.2 && kept.dominates(entry.1))
+        {
+            continue;
+        }
+        frontier.retain(|(_, kept, compatibility)| {
+            *compatibility != entry.2 || !entry.1.dominates(*kept)
+        });
+        frontier.push(entry);
+    }
+    let mut ranked = frontier;
+    ranked.sort_by_key(|(_, objective, _)| {
+        (
+            objective.cycles,
+            objective.total,
+            objective.interleaved,
+            objective.exchange_rows,
+        )
+    });
+    let mut selected = BTreeSet::new();
+    let mut represented = BTreeSet::new();
+    for (index, (_, _, compatibility)) in ranked.iter().enumerate() {
+        if represented.insert(compatibility.clone()) {
+            selected.insert(index);
+        }
+    }
+    for index in 0..ranked.len() {
+        if selected.len() == width {
+            break;
+        }
+        selected.insert(index);
+    }
+    ranked
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, (candidate, _, _))| selected.contains(&index).then_some(candidate))
+        .collect()
 }
 
 fn balance_parallel_gemm_columns(layout: &mut Layout, axis: TensorAxis) {
@@ -5490,7 +5802,14 @@ mod tests {
                 TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
             ];
             let config = PipelineConfig::new(tiles).with_planning_beam_width(16);
-            let candidates = parallel_reduction_candidates(&base, &inputs, &config, true);
+            let candidates = parallel_reduction_candidates(
+                &base,
+                &inputs,
+                &TensorShape(vec![m, n]),
+                &config,
+                &Ipu21CostModel,
+                true,
+            );
             assert!(
                 !candidates.is_empty(),
                 "shape={m}x{k}x{n} tiles={tiles} output_columns={output_columns}"
@@ -5508,104 +5827,6 @@ mod tests {
                     } if (result_row_partitions, result_column_partitions) != (1, 1)
                 )
             }));
-            let swapped_staging = candidates
-                .iter()
-                .filter_map(|candidate| match candidate.dispatch {
-                    OperatorDispatch::BlockedGemm {
-                        orientation: GemmOrientation::Swapped,
-                        ..
-                    } => Some(candidate.inputs[0].local_staging),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                (
-                    swapped_staging.contains(&LocalOperandStaging::Direct),
-                    swapped_staging.contains(&LocalOperandStaging::MatchRemote),
-                ),
-                (true, true),
-                "shape={m}x{k}x{n} tiles={tiles}"
-            );
-            if let Some((orientation, output_column_block, grid_rows, grid_columns)) = candidates
-                .iter()
-                .find_map(|candidate| match candidate.dispatch {
-                    OperatorDispatch::BlockedGemm {
-                        orientation,
-                        output_column_block,
-                        distribution:
-                            GemmDistribution::ParallelReduction {
-                                row_partitions,
-                                column_partitions,
-                                result_row_partitions: 1,
-                                result_column_partitions: 1,
-                                ..
-                            },
-                        ..
-                    } if row_partitions > 1 && column_partitions > 1 => Some((
-                        orientation,
-                        output_column_block,
-                        row_partitions,
-                        column_partitions,
-                    )),
-                    _ => None,
-                })
-            {
-                for order in [GridOrder::ColumnsFast, GridOrder::RowsFast] {
-                    let mut expected = match orientation {
-                        GemmOrientation::Normal => Layout::amp_left_result_grid(
-                            output_column_block,
-                            grid_rows * grid_columns,
-                            grid_rows,
-                            grid_columns,
-                            order,
-                        ),
-                        GemmOrientation::Swapped => Layout::amp_transposed_left_result_grid(
-                            output_column_block,
-                            grid_rows * grid_columns,
-                            grid_rows,
-                            grid_columns,
-                            order,
-                        ),
-                    };
-                    balance_parallel_gemm_columns(
-                        &mut expected,
-                        match orientation {
-                            GemmOrientation::Normal => TensorAxis::FromEnd(1),
-                            GemmOrientation::Swapped => TensorAxis::FromEnd(2),
-                        },
-                    );
-                    assert!(
-                        candidates
-                            .iter()
-                            .any(|candidate| candidate.output.format.layout == expected),
-                        "missing {order:?} result grid for {orientation:?} {grid_rows}x{grid_columns}"
-                    );
-                }
-            }
-            if m % 2 != 0 {
-                let normal_rows = candidates
-                    .iter()
-                    .filter(|candidate| {
-                        matches!(
-                            candidate.dispatch,
-                            OperatorDispatch::BlockedGemm {
-                                orientation: GemmOrientation::Normal,
-                                ..
-                            }
-                        )
-                    })
-                    .map(|candidate| {
-                        let padded = candidate.inputs[0]
-                            .format
-                            .layout
-                            .padded_shape(&inputs[0].shape)
-                            .unwrap();
-                        padded.0[padded.0.len() - 2]
-                    })
-                    .collect::<BTreeSet<_>>();
-                assert!(normal_rows.contains(&m));
-                assert!(normal_rows.contains(&(m + 1)));
-            }
             for candidate in candidates {
                 assert!(
                     candidate.supports(&inputs, &TensorShape(vec![m, n])),
