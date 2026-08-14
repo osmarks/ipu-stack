@@ -5,18 +5,19 @@ use ipu_codegen::{
 };
 use ipu_elf::Toolchain;
 use ipu_exchange::{
-    MulticastPlan, PlanProgramBuilder, Topology, finalize_point_receiver, patch_receiver_address,
-    patch_sender_address, plan_event_cycles,
+    MulticastPlan, PhaseProgramBuilder, Topology, finalize_point_receiver, patch_receiver_address,
+    patch_sender_address, scheduled_receiver_timing,
 };
 use ipu_package::Application;
 use ipu_runtime::Runtime;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-const ACTIVE_TILES: u16 = 64;
 const DATA_BASE: u32 = 0x60000;
+const SOURCE_BASE: u32 = 0x65000;
+const EXPECTED_BASE: u32 = 0x6c000;
 const DATA_LIMIT: u32 = 0x73800;
-const ROW_BASE: u32 = 0x59000;
+const ROW_BASE: u32 = 0x5c000;
 
 #[derive(Clone, Debug)]
 struct Transfer {
@@ -28,20 +29,42 @@ struct Transfer {
     words: u32,
 }
 
+#[derive(Clone, Debug)]
+struct Payload {
+    case: u32,
+    source: u16,
+    destinations: Vec<u16>,
+    words: u32,
+}
+
 pub(crate) struct StressPackage {
     pub application: Application,
+    active_tiles: u16,
     transfers: Vec<Transfer>,
-    row_ranges: Vec<(u32, u32)>,
+    rows: Vec<StressRow>,
+}
+
+#[derive(Clone, Debug)]
+struct StressRow {
+    address: u32,
+    end: u32,
+    programs: BTreeMap<u16, Vec<u32>>,
 }
 
 pub(crate) fn build(
     seed: u64,
+    active_tiles: u16,
     cases: u32,
     maximum_words: u32,
+    maximum_transfers: u32,
     maximum_compute_delay: u32,
     toolchain: &Toolchain,
     runtime_source: &Path,
 ) -> Result<StressPackage> {
+    let maximum_tiles = Topology::c600().tile_count();
+    if active_tiles < 2 || usize::from(active_tiles) > maximum_tiles {
+        bail!("exchange stress requires 2..={maximum_tiles} active tiles");
+    }
     if cases == 0 {
         bail!("--exchange-cases must be nonzero");
     }
@@ -51,32 +74,60 @@ pub(crate) fn build(
             ipu_exchange::MAX_TRANSFER_WORDS
         );
     }
+    if maximum_transfers == 0 {
+        bail!("--exchange-max-transfers must be nonzero");
+    }
     if maximum_compute_delay == 0 {
         bail!("--exchange-compute-delay must be nonzero");
     }
     let topology = Topology::c600();
     let mut rng = fastrand::Rng::with_seed(seed);
-    let mut cursors = vec![DATA_BASE; usize::from(ACTIVE_TILES)];
-    let mut buffers = vec![vec![0u8; (DATA_LIMIT - DATA_BASE) as usize]; usize::from(ACTIVE_TILES)];
+    let mut destination_cursors = vec![DATA_BASE; usize::from(active_tiles)];
+    let mut source_cursors = vec![SOURCE_BASE; usize::from(active_tiles)];
+    let mut expected_cursors = vec![EXPECTED_BASE; usize::from(active_tiles)];
+    let mut buffers = BTreeMap::<u16, Vec<u8>>::new();
     let mut transfers = Vec::new();
+    let mut available_payloads = vec![Vec::<(u32, Payload)>::new(); usize::from(active_tiles)];
     let mut phase_rows = Vec::with_capacity(cases as usize);
-    let mut row_ranges = Vec::with_capacity(cases as usize);
+    let mut diagnostic_rows = Vec::with_capacity(cases as usize);
     let mut row_address = ROW_BASE;
     let mut previous_shape: Option<Vec<(u16, Vec<u16>, u32)>> = None;
 
     for case in 0..cases {
-        let mut tiles = (0..ACTIVE_TILES).collect::<Vec<_>>();
+        let mut tiles = (0..active_tiles).collect::<Vec<_>>();
         rng.shuffle(&mut tiles);
         let group_tiles = rng.usize(2..=8).min(tiles.len());
         let group = &tiles[..group_tiles];
-        let shape = if rng.bool() {
+        let contiguous_receiver = (case == 0).then_some(group[0]);
+        let shape = if let Some(receiver) = contiguous_receiver {
+            let sources = group
+                .iter()
+                .copied()
+                .filter(|tile| *tile != receiver)
+                .collect::<Vec<_>>();
+            let words = paired_control_words(&topology, sources[0], receiver, maximum_words)?
+                .unwrap_or_else(|| random_words(&mut rng, maximum_words));
+            (0..usize::try_from(maximum_transfers)?)
+                .map(|index| {
+                    if index & 1 == 0 {
+                        (sources[(index / 2) % sources.len()], vec![receiver], words)
+                    } else {
+                        (
+                            receiver,
+                            vec![sources[(index / 2 + 1) % sources.len()]],
+                            words,
+                        )
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else if rng.bool() {
             previous_shape.clone().unwrap_or_default()
         } else {
             Vec::new()
         };
         let shape = if shape.is_empty() {
             let mut shape = Vec::new();
-            for _ in 0..rng.usize(1..=4) {
+            for _ in 0..rng.usize(1..=usize::try_from(maximum_transfers)?) {
                 let source = group[rng.usize(0..group.len())];
                 let mut destinations = group
                     .iter()
@@ -92,22 +143,64 @@ pub(crate) fn build(
         } else {
             shape
         };
-        let mut builders = BTreeMap::<u16, PlanProgramBuilder>::new();
+        let mut builder = PhaseProgramBuilder::new(u16::try_from(topology.tile_count())?);
         let mut validators = BTreeMap::<u16, Vec<(u32, u32, u32)>>::new();
-        let mut horizon = 0u32;
-        for (source, destinations, words) in shape {
-            let schedule_offset = if horizon == 0 { 0 } else { horizon + 1 };
+        for (source, destinations, mut words) in shape {
+            let chained = (contiguous_receiver.is_none()
+                && !available_payloads[usize::from(source)].is_empty()
+                && rng.usize(0..4) == 0)
+                .then(|| {
+                    let candidates = &available_payloads[usize::from(source)];
+                    candidates[rng.usize(0..candidates.len())].clone()
+                });
+            let (source_address, payload) = if let Some((address, payload)) = chained {
+                words = payload.words;
+                (address, payload)
+            } else {
+                let payload = Payload {
+                    case,
+                    source,
+                    destinations: destinations.clone(),
+                    words,
+                };
+                let address = allocate(
+                    &mut source_cursors,
+                    source,
+                    words * 4,
+                    EXPECTED_BASE,
+                    &mut rng,
+                )?;
+                fill_source(
+                    buffers
+                        .entry(source)
+                        .or_insert_with(|| vec![0; (DATA_LIMIT - DATA_BASE) as usize]),
+                    address,
+                    &payload,
+                );
+                (address, payload)
+            };
             let bytes = words * 4;
-            let source_address = allocate(&mut cursors, source, bytes, &mut rng)?;
             let destination_addresses = destinations
                 .iter()
-                .map(|&tile| allocate(&mut cursors, tile, bytes, &mut rng))
+                .map(|&tile| {
+                    if contiguous_receiver == Some(tile) {
+                        allocate_with_fixed_padding(
+                            &mut destination_cursors,
+                            tile,
+                            bytes,
+                            u32::try_from(std::mem::size_of::<u32>())?,
+                            SOURCE_BASE,
+                        )
+                    } else {
+                        allocate(&mut destination_cursors, tile, bytes, SOURCE_BASE, &mut rng)
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?;
             let expected_addresses = destinations
                 .iter()
-                .map(|&tile| allocate(&mut cursors, tile, bytes, &mut rng))
+                .map(|&tile| allocate(&mut expected_cursors, tile, bytes, DATA_LIMIT, &mut rng))
                 .collect::<Result<Vec<_>>>()?;
-            let mut plan = if destinations.len() == 1 && schedule_offset == 0 {
+            let mut plan = if destinations.len() == 1 {
                 let point = topology.point_to_point(source, destinations[0], words)?;
                 MulticastPlan {
                     sender: point.sender,
@@ -123,41 +216,22 @@ pub(crate) fn build(
             for (row, &address) in plan.receivers.iter_mut().zip(&destination_addresses) {
                 patch_receiver_address(row, address)?;
             }
-            builders
-                .entry(source)
-                .or_default()
-                .append_scheduled_row_at(&plan.sender, schedule_offset)?;
-            for (&tile, row) in destinations.iter().zip(&plan.receivers) {
-                builders
-                    .entry(tile)
-                    .or_default()
-                    .append_scheduled_row_at(row, schedule_offset)?;
-            }
-            horizon = horizon.max(plan_event_cycles(&plan.sender)? + schedule_offset);
-            for row in &plan.receivers {
-                horizon = horizon.max(plan_event_cycles(row)? + schedule_offset);
-            }
-            fill_source(
-                &mut buffers[usize::from(source)],
-                source_address,
-                case,
-                source,
-                &destinations,
-                words,
-            );
+            let schedule_offset =
+                builder.earliest_transfer_offset(source, &destinations, &plan, words, 0)?;
+            builder.append_transfer_at(source, &destinations, &plan, schedule_offset, words)?;
             for ((&tile, &destination), &expected) in destinations
                 .iter()
                 .zip(&destination_addresses)
                 .zip(&expected_addresses)
             {
                 fill_source(
-                    &mut buffers[usize::from(tile)],
+                    buffers
+                        .entry(tile)
+                        .or_insert_with(|| vec![0; (DATA_LIMIT - DATA_BASE) as usize]),
                     expected,
-                    case,
-                    source,
-                    &destinations,
-                    words,
+                    &payload,
                 );
+                available_payloads[usize::from(tile)].push((destination, payload.clone()));
                 validators
                     .entry(tile)
                     .or_default()
@@ -172,14 +246,7 @@ pub(crate) fn build(
                 words,
             });
         }
-        let rows = (0..topology.tile_count() as u16)
-            .map(|tile| {
-                builders
-                    .remove(&tile)
-                    .map(|builder| builder.finish())
-                    .transpose()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let rows = builder.finish()?.programs;
         let maximum_row_words = rows
             .iter()
             .filter_map(|row| row.as_ref().map(Vec::len))
@@ -194,9 +261,20 @@ pub(crate) fn build(
         if row_end > DATA_BASE {
             bail!("{cases} stress cases exceed the exchange-row test region");
         }
-        row_ranges.push((row_address, row_end));
+        diagnostic_rows.push(StressRow {
+            address: row_address,
+            end: row_end,
+            programs: rows
+                .iter()
+                .enumerate()
+                .filter_map(|(tile, row)| {
+                    row.clone()
+                        .map(|program| (u16::try_from(tile).expect("tile count is u16"), program))
+                })
+                .collect(),
+        });
         phase_rows.push((row_address, rows, validators));
-        row_address = (row_end + 3) & !3;
+        row_address = (row_end + 7) & !7;
     }
 
     let execution_tiles = u16::try_from(topology.tile_count())?;
@@ -252,31 +330,72 @@ pub(crate) fn build(
     }
     let data = buffers
         .into_iter()
-        .enumerate()
-        .filter(|(_, bytes)| bytes.iter().any(|byte| *byte != 0))
         .map(|(tile, data)| TileProgramData {
-            tile: tile as u16,
+            tile,
             address: DATA_BASE,
             data,
         })
         .collect::<Vec<_>>();
     let application = build_tile_program_package(&programs, &data, toolchain, runtime_source)?;
     eprintln!(
-        "exchangeStress seed={seed:#x} cases={cases} transfers={} activeTiles={ACTIVE_TILES} maxWords={maximum_words} maxComputeDelay={maximum_compute_delay}",
-        transfers.len()
+        "exchangeStress seed={seed:#x} cases={cases} transfers={} activeTiles={active_tiles} maxWords={maximum_words} maxTransfers={maximum_transfers} maxComputeDelay={maximum_compute_delay}",
+        transfers.len(),
     );
     Ok(StressPackage {
         application,
+        active_tiles,
         transfers,
-        row_ranges,
+        rows: diagnostic_rows,
     })
 }
 
 impl StressPackage {
+    pub(crate) fn static_diagnostic(&self, case: u32) -> Result<String> {
+        let row = self
+            .rows
+            .get(usize::try_from(case)?)
+            .with_context(|| format!("exchange diagnostic case {case} is out of range"))?;
+        let transfers = self
+            .transfers
+            .iter()
+            .filter(|transfer| transfer.case == case)
+            .map(|transfer| {
+                format!(
+                    "source={} address=0x{:x} destinations={:?} addresses={:?} words={}",
+                    transfer.source,
+                    transfer.source_address,
+                    transfer.destinations,
+                    transfer.destination_addresses,
+                    transfer.words,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let programs = row
+            .programs
+            .iter()
+            .map(|(&tile, program)| {
+                let decoded =
+                    ipu_exchange::diagnostic::diagnose_plan_program(program, Some(row.address))?;
+                Ok(format!(
+                    "tile={tile} words={} events={}\n{}",
+                    program.len(),
+                    decoded.event_cycles,
+                    decoded.render()
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join("");
+        Ok(format!(
+            "exchangeCase={case} row=0x{:x}..0x{:x}\ntransfers:\n{transfers}\nprograms:\n{programs}",
+            row.address, row.end
+        ))
+    }
+
     pub(crate) fn failure_context(&self, runtime: &Runtime) -> String {
         let topology = Topology::c600();
         let mut stopped = Vec::new();
-        for logical in 0..ACTIVE_TILES {
+        for logical in 0..self.active_tiles {
             let Ok(physical) = topology.physical(logical) else {
                 continue;
             };
@@ -284,10 +403,10 @@ impl StressPackage {
                 continue;
             };
             if let Some((case, _)) = self
-                .row_ranges
+                .rows
                 .iter()
                 .enumerate()
-                .find(|(_, (start, end))| (*start..*end).contains(&pc))
+                .find(|(_, row)| (row.address..row.end).contains(&pc))
             {
                 stopped.push((logical, physical, case, pc));
             }
@@ -311,11 +430,54 @@ impl StressPackage {
                 )
             })
             .collect::<Vec<_>>();
-        format!("random exchange failure; stoppedRows={stopped:?}; transfers={transfers:?}")
+        let rows = stopped
+            .iter()
+            .filter_map(|&(logical, physical, case, pc)| {
+                let row = self.rows.get(case)?;
+                let expected = row.programs.get(&logical)?;
+                let actual = runtime
+                    .device()
+                    .read_tile_words_from_inactive_context(
+                        physical,
+                        1,
+                        row.address,
+                        u32::try_from(expected.len()).ok()?,
+                    )
+                    .ok()?;
+                let differences = expected
+                    .iter()
+                    .zip(&actual)
+                    .enumerate()
+                    .filter(|(_, (expected, actual))| expected != actual)
+                    .map(|(offset, (&expected, &actual))| (offset, expected, actual))
+                    .collect::<Vec<_>>();
+                let decode =
+                    ipu_exchange::diagnostic::diagnose_plan_program(expected, Some(row.address))
+                        .map(|diagnostic| diagnostic.render_around_address(pc, 16));
+                Some((
+                    logical,
+                    physical,
+                    case,
+                    pc,
+                    differences.len(),
+                    differences.into_iter().take(16).collect::<Vec<_>>(),
+                    decode,
+                ))
+            })
+            .collect::<Vec<_>>();
+        format!(
+            "random exchange failure; stoppedRows={stopped:?}; transfers={transfers:?}; rowDiagnostics={rows:?}"
+        )
     }
 }
 
-fn allocate(cursors: &mut [u32], tile: u16, bytes: u32, rng: &mut fastrand::Rng) -> Result<u32> {
+fn allocate(
+    cursors: &mut [u32],
+    tile: u16,
+    bytes: u32,
+    limit: u32,
+    rng: &mut fastrand::Rng,
+) -> Result<u32> {
     let cursor = &mut cursors[usize::from(tile)];
     *cursor = cursor
         .checked_add(rng.u32(0..=8) * 4)
@@ -324,7 +486,28 @@ fn allocate(cursors: &mut [u32], tile: u16, bytes: u32, rng: &mut fastrand::Rng)
     *cursor = cursor
         .checked_add(bytes)
         .context("test allocation overflow")?;
-    if *cursor > DATA_LIMIT {
+    if *cursor > limit {
+        bail!(
+            "random stress data exhausted tile {tile}; reduce --exchange-cases or --exchange-max-words"
+        );
+    }
+    Ok(address)
+}
+
+fn allocate_with_fixed_padding(
+    cursors: &mut [u32],
+    tile: u16,
+    bytes: u32,
+    padding: u32,
+    limit: u32,
+) -> Result<u32> {
+    let cursor = &mut cursors[usize::from(tile)];
+    let address = *cursor;
+    *cursor = cursor
+        .checked_add(bytes)
+        .and_then(|cursor| cursor.checked_add(padding))
+        .context("test allocation overflow")?;
+    if *cursor > limit {
         bail!(
             "random stress data exhausted tile {tile}; reduce --exchange-cases or --exchange-max-words"
         );
@@ -345,6 +528,21 @@ fn random_words(rng: &mut fastrand::Rng, maximum: u32) -> u32 {
     }
 }
 
+fn paired_control_words(
+    topology: &Topology,
+    source: u16,
+    receiver: u16,
+    maximum: u32,
+) -> Result<Option<u32>> {
+    let plan = topology.point_to_point(source, receiver, 1)?;
+    let receiver = finalize_point_receiver(&plan.receiver, topology.physical(source)?)?;
+    let timing = scheduled_receiver_timing(&receiver, 0)?;
+    Ok(timing
+        .pointer_event
+        .and_then(|pointer| pointer.checked_sub(timing.source_event))
+        .filter(|words| (1..=maximum).contains(words)))
+}
+
 fn word_value(case: u32, source: u16, destinations: &[u16], index: u32) -> u32 {
     let mut value =
         0x9e37_79b9u32 ^ case.wrapping_mul(0x85eb_ca6b) ^ index.wrapping_mul(0xc2b2_ae35);
@@ -355,18 +553,12 @@ fn word_value(case: u32, source: u16, destinations: &[u16], index: u32) -> u32 {
     value
 }
 
-fn fill_source(
-    buffer: &mut [u8],
-    address: u32,
-    case: u32,
-    source: u16,
-    destinations: &[u16],
-    words: u32,
-) {
+fn fill_source(buffer: &mut [u8], address: u32, payload: &Payload) {
     let offset = (address - DATA_BASE) as usize;
-    for index in 0..words {
+    for index in 0..payload.words {
         let start = offset + index as usize * 4;
-        buffer[start..start + 4]
-            .copy_from_slice(&word_value(case, source, destinations, index).to_le_bytes());
+        buffer[start..start + 4].copy_from_slice(
+            &word_value(payload.case, payload.source, &payload.destinations, index).to_le_bytes(),
+        );
     }
 }

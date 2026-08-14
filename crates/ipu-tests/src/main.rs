@@ -56,6 +56,15 @@ struct Arguments {
     /// Log exchange scheduling lower bounds and critical dependency chains.
     #[arg(long)]
     exchange_diagnostics: bool,
+    /// Decode every active supervisor row for this exchange-stress case.
+    #[arg(long, requires = "exchange_diagnostics")]
+    exchange_diagnostic_case: Option<u32>,
+    /// Summarize packaged exchange rows and exit before loading hardware.
+    #[arg(long)]
+    inspect_exchanges: bool,
+    /// Include complete decoded rows for one physical tile in the inspection.
+    #[arg(long, requires = "inspect_exchanges")]
+    inspect_exchange_tile: Option<u32>,
     /// Force eligible one-use layout conversions to stream into consumer slices.
     #[arg(long)]
     stream_conversions: bool,
@@ -107,6 +116,9 @@ struct Arguments {
     /// Maximum words in one randomized transfer.
     #[arg(long, default_value_t = 256)]
     exchange_max_words: u32,
+    /// Maximum independently scheduled transfers in one randomized epoch.
+    #[arg(long, default_value_t = 8)]
+    exchange_max_transfers: u32,
     /// Maximum worker-loop iterations between randomized exchange epochs.
     #[arg(long, default_value_t = 2048)]
     exchange_compute_delay: u32,
@@ -183,6 +195,11 @@ fn main() -> Result<()> {
     {
         bail!("--profile-output and --no-profile require a benchmark workload");
     }
+    if arguments.exchange_diagnostic_case.is_some()
+        && !matches!(arguments.workload, Workload::ExchangeStress)
+    {
+        bail!("--exchange-diagnostic-case requires --workload exchange-stress");
+    }
     if !matches!(arguments.workload, Workload::SiglipMlpBenchmark)
         && (arguments.mlp_batch != SIGLIP_MLP_BATCH
             || arguments.mlp_tokens != SIGLIP_MLP_TOKENS
@@ -239,12 +256,20 @@ fn main() -> Result<()> {
         }
         let stress = exchange_stress::build(
             arguments.exchange_seed,
+            active_tiles,
             arguments.exchange_cases,
             arguments.exchange_max_words,
+            arguments.exchange_max_transfers,
             arguments.exchange_compute_delay,
             &Toolchain::from_sdk(&arguments.sdk),
             &runtime_source,
         )?;
+        if arguments.exchange_diagnostics {
+            eprintln!(
+                "{}",
+                stress.static_diagnostic(arguments.exchange_diagnostic_case.unwrap_or(0))?
+            );
+        }
         write_package(&stress.application, &arguments.package)?;
         let configuration = fs::read(&arguments.configuration)
             .with_context(|| format!("read {}", arguments.configuration.display()))?;
@@ -478,6 +503,13 @@ fn main() -> Result<()> {
         fs::File::open(&arguments.package)
             .with_context(|| format!("open {}", arguments.package.display()))?,
     )?;
+    if arguments.inspect_exchanges {
+        println!(
+            "{}",
+            inspect_exchange_rows(&application, arguments.inspect_exchange_tile)?
+        );
+        return Ok(());
+    }
 
     let configuration = fs::read(&arguments.configuration)
         .with_context(|| format!("read {}", arguments.configuration.display()))?;
@@ -1705,6 +1737,83 @@ fn write_package(application: &Application, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn inspect_exchange_rows(application: &Application, selected_tile: Option<u32>) -> Result<String> {
+    use ipu_exchange::diagnostic::{PlanOperation, SendEncoding};
+
+    let mut summaries = Vec::new();
+    let mut selected = String::new();
+    let mut totals = [0usize; 6];
+    for region in application
+        .debug_regions
+        .iter()
+        .filter(|region| region.name == "exchange row")
+    {
+        let tile = application
+            .tiles
+            .iter()
+            .find(|tile| tile.physical_tile == region.physical_tile)
+            .context("exchange debug region refers to a missing tile")?;
+        let segment = tile
+            .segments
+            .iter()
+            .find(|segment| {
+                segment.address == region.address
+                    && segment.memory_size == region.size
+                    && segment.data.len() == region.size as usize
+            })
+            .context("exchange debug region has no exact package segment")?;
+        let words = segment
+            .data
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte exchange word")))
+            .collect::<Vec<_>>();
+        let diagnostic =
+            ipu_exchange::diagnostic::diagnose_plan_program(&words, Some(region.address))?;
+        let mut counts = [0usize; 6];
+        for instruction in &diagnostic.instructions {
+            match &instruction.operation {
+                PlanOperation::Send { encoding, .. } => {
+                    counts[match encoding {
+                        SendEncoding::Explicit => 0,
+                        SendEncoding::Offset => 1,
+                        SendEncoding::Pic => 2,
+                        SendEncoding::PicPair => 3,
+                    }] += 1;
+                }
+                PlanOperation::IncomingControl(_) => counts[4] += 1,
+                PlanOperation::Unknown(_) => counts[5] += 1,
+                _ => {}
+            }
+        }
+        for (total, count) in totals.iter_mut().zip(counts) {
+            *total += count;
+        }
+        summaries.push((
+            words.len(),
+            diagnostic.event_cycles,
+            region.physical_tile,
+            region.address,
+            counts,
+        ));
+        if selected_tile == Some(region.physical_tile) {
+            selected.push_str(&format!(
+                "tile={} row=0x{:x} words={} events={} counts={counts:?}\n{}",
+                region.physical_tile,
+                region.address,
+                words.len(),
+                diagnostic.event_cycles,
+                diagnostic.render(),
+            ));
+        }
+    }
+    summaries.sort_unstable_by_key(|summary| std::cmp::Reverse((summary.0, summary.1)));
+    let longest = summaries.iter().take(16).collect::<Vec<_>>();
+    Ok(format!(
+        "exchangeRows={} counts=[send, sendoff, sendpic, sendpicp, standaloneControl, unknown]={totals:?} longest={longest:?}\n{selected}",
+        summaries.len(),
+    ))
+}
+
 fn diagnose_completion(
     runtime: &Runtime,
     application: &Application,
@@ -1763,6 +1872,61 @@ fn summarize_states(states: &[(u16, u32)]) -> String {
     format!("counts={counts:?} firstUnexpected={unexpected:?}")
 }
 
+fn exchange_row_failure_diagnostic(
+    runtime: &Runtime,
+    application: &Application,
+    physical: u16,
+    program_counter: u32,
+) -> Option<String> {
+    let region = application.debug_regions.iter().find(|region| {
+        region.physical_tile == u32::from(physical)
+            && region.name == "exchange row"
+            && (region.address..region.address.saturating_add(region.size))
+                .contains(&program_counter)
+    })?;
+    let segment = application
+        .tiles
+        .iter()
+        .find(|tile| tile.physical_tile == u32::from(physical))?
+        .segments
+        .iter()
+        .find(|segment| {
+            segment.address == region.address
+                && segment.memory_size == region.size
+                && segment.data.len() == region.size as usize
+        })?;
+    let expected = segment
+        .data
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte exchange word")))
+        .collect::<Vec<_>>();
+    let actual = runtime
+        .device()
+        .read_tile_words_from_inactive_context(physical, 1, region.address, region.size / 4)
+        .ok()?;
+    let differences = expected
+        .iter()
+        .zip(&actual)
+        .enumerate()
+        .filter(|(_, (expected, actual))| expected != actual)
+        .map(|(offset, (&expected, &actual))| (offset, expected, actual))
+        .collect::<Vec<_>>();
+    let expected_decode =
+        ipu_exchange::diagnostic::diagnose_plan_program(&expected, Some(region.address))
+            .map(|row| row.render_around_address(program_counter, 12));
+    let actual_decode = (actual != expected).then(|| {
+        ipu_exchange::diagnostic::diagnose_plan_program(&actual, Some(region.address))
+            .map(|row| row.render_around_address(program_counter, 12))
+    });
+    Some(format!(
+        "exchangeRow=0x{:x}..0x{:x} pc=0x{program_counter:x} readbackDifferences={} firstDifferences={:?} expectedDecode={expected_decode:?} actualDecode={actual_decode:?}",
+        region.address,
+        region.address + region.size,
+        differences.len(),
+        differences.iter().take(16).collect::<Vec<_>>(),
+    ))
+}
+
 fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> String {
     let states = match supervisor_states(runtime, application) {
         Ok(states) => states,
@@ -1801,7 +1965,7 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
                     Some((segment.address, segment.memory_size, start, words))
                 })?
         });
-        let row_readback =
+        let memory_readback =
             segment
                 .as_ref()
                 .and_then(|&(address, memory_size, byte_offset, ref expected)| {
@@ -1821,8 +1985,16 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
                             (byte_offset / 4 + offset, expected, actual)
                         })
                         .collect::<Vec<_>>();
-                    Some((actual, differences))
+                    Some((
+                        actual.len(),
+                        differences.len(),
+                        differences.into_iter().take(16).collect::<Vec<_>>(),
+                    ))
                 });
+        let exchange_row = program_counter
+            .as_ref()
+            .ok()
+            .and_then(|&pc| exchange_row_failure_diagnostic(runtime, application, physical, pc));
         let supervisor_registers = (0..16)
             .map(|register| runtime.device().read_tile_m_register(physical, 0, register))
             .collect::<Result<Vec<_>, _>>();
@@ -1858,7 +2030,8 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
             program_counter,
             program_counter_symbol,
             segment,
-            row_readback,
+            memory_readback,
+            exchange_row,
             supervisor_registers,
             exchange_state,
             exchange_receive_error,
