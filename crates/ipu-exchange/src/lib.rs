@@ -232,6 +232,7 @@ struct ReceiveStream {
     horizon_cycles: u32,
     neutral_cycles: u32,
     next_address: Option<u32>,
+    source_mux: u32,
 }
 
 impl Default for PlanProgramBuilder {
@@ -267,8 +268,10 @@ impl PlanProgramBuilder {
         Ok(requested.max(self.event_cycles.saturating_sub(first_event)))
     }
 
-    /// Advances a requested transfer offset so its source-selection event can
-    /// replace or follow the preceding receive teardown on this tile.
+    /// Advances a requested transfer offset to the first compatible receive
+    /// boundary. Source-only changes and contiguous pointer carries can use
+    /// the teardown event; changing both waits for the primitive's full
+    /// receive window.
     pub fn earliest_scheduled_receiver_offset(
         &self,
         row: &PlanRow,
@@ -279,7 +282,9 @@ impl PlanProgramBuilder {
             .receive_stream
             .as_ref()
             .map_or(self.event_cycles, |stream| {
-                if base.pointer_address == stream.next_address {
+                if base.source_mux == stream.source_mux
+                    || base.pointer_address == stream.next_address
+                {
                     stream.neutral_cycles
                 } else {
                     stream.horizon_cycles
@@ -402,6 +407,7 @@ impl PlanProgramBuilder {
             horizon_cycles,
             neutral_cycles: timing.neutral_cycles,
             next_address,
+            source_mux: timing.source_mux,
         });
         debug_assert_eq!(plan_event_cycles(&self.words)?, self.event_cycles);
         Ok(())
@@ -526,6 +532,7 @@ struct ReceiveRowTiming {
     source_cycles: u32,
     horizon_cycles: u32,
     pointer_address: Option<u32>,
+    source_mux: u32,
 }
 
 fn receive_row_timing(
@@ -542,6 +549,7 @@ fn receive_row_timing(
     let mut cycles = schedule_offset;
     let mut events = Vec::new();
     let mut source_cycles = None;
+    let mut source_mux = None;
     let mut neutral_cycles = None;
     let mut pointer_address = None;
     for &instruction in &row[1..end] {
@@ -565,6 +573,7 @@ fn receive_row_timing(
                     if source_cycles.replace(cycles).is_some() {
                         return Err(ExchangeError::Schedule("multiple receive sources"));
                     }
+                    source_mux = Some(instruction & 0x1fff);
                 }
                 ReceiveEventKind::Neutral => {
                     if neutral_cycles.replace(cycles).is_some() {
@@ -593,6 +602,7 @@ fn receive_row_timing(
         source_cycles: source_cycles.ok_or(ExchangeError::Schedule("receive source timing"))?,
         horizon_cycles: cycles,
         pointer_address,
+        source_mux: source_mux.ok_or(ExchangeError::Schedule("receive source mux"))?,
     })
 }
 
@@ -1908,7 +1918,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_receiver_streams_carry_contiguous_receive_pointers() {
+    fn randomized_receiver_streams_schedule_source_and_pointer_cutovers() {
         let topology = Topology::c600();
         let mut random = fastrand::Rng::with_seed(0x6d75_785f_6375_746f);
         for _ in 0..128 {
@@ -1917,6 +1927,8 @@ mod tests {
             let words = random.u32(53..=512);
             let mut address = 0x50000 + random.u32(0..=0x2000) * 4;
             let mut pointer_writes = 1;
+            let mut mux_teardowns = 1;
+            let mut previous_source = None;
             let mut builder = PlanProgramBuilder::default();
             for index in 0..transfer_count {
                 let source = loop {
@@ -1925,9 +1937,13 @@ mod tests {
                         break candidate;
                     }
                 };
-                if index != 0 && random.bool() {
+                let has_address_gap = index != 0 && random.bool();
+                if has_address_gap {
                     address += random.u32(1..=16) * 4;
                     pointer_writes += 1;
+                }
+                if has_address_gap && previous_source.is_some_and(|previous| previous != source) {
+                    mux_teardowns += 1;
                 }
                 let mut row = topology
                     .multicast(source, &[receiver], words, 0)
@@ -1939,6 +1955,7 @@ mod tests {
                     .append_scheduled_receiver_row_at(&row, offset, words)
                     .unwrap();
                 address += words * 4;
+                previous_source = Some(source);
             }
             let expected_cycles = builder.event_cycles();
             let program = builder.finish().unwrap();
@@ -1948,14 +1965,14 @@ mod tests {
                     .iter()
                     .filter(|instruction| is_neutral_mux_teardown(**instruction))
                     .count(),
-                pointer_writes
+                mux_teardowns
             );
             assert_eq!(
                 program
                     .iter()
                     .filter(|instruction| **instruction & OPCODE_MASK == DELAY_XPIC_OPCODE)
                     .count(),
-                transfer_count + pointer_writes
+                transfer_count + mux_teardowns
             );
             assert_eq!(
                 program
