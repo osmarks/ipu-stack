@@ -731,7 +731,7 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ReadyTransfer {
     earliest_start: Reverse<u32>,
-    endpoint_pressure: usize,
+    endpoint_pressure: u64,
     fanout: usize,
     words: u32,
     source: Reverse<u16>,
@@ -744,6 +744,7 @@ struct ReadyTransfer {
 struct TransferScheduler<'a> {
     transfers: &'a [PendingTransfer],
     pressure: Vec<usize>,
+    word_pressure: Vec<u64>,
     dependents: Vec<Vec<usize>>,
     indegrees: Vec<usize>,
     ready: BinaryHeap<ReadyTransfer>,
@@ -753,9 +754,11 @@ struct TransferScheduler<'a> {
 impl<'a> TransferScheduler<'a> {
     fn new(transfers: &'a [PendingTransfer], tile_count: u16) -> Self {
         let mut pressure = vec![0usize; usize::from(tile_count)];
+        let mut word_pressure = vec![0u64; usize::from(tile_count)];
         for transfer in transfers {
             for tile in transfer.tiles() {
                 pressure[usize::from(tile)] += 1;
+                word_pressure[usize::from(tile)] += u64::from(transfer.words);
             }
         }
 
@@ -768,6 +771,7 @@ impl<'a> TransferScheduler<'a> {
         let mut scheduler = Self {
             transfers,
             pressure,
+            word_pressure,
             dependents,
             indegrees,
             ready: BinaryHeap::new(),
@@ -789,8 +793,10 @@ impl<'a> TransferScheduler<'a> {
         let transfer = &self.transfers[index];
         let endpoint_pressure = transfer
             .tiles()
-            .map(|tile| self.pressure[usize::from(tile)])
-            .sum::<usize>();
+            // Bytes, rather than role count, approximate how long selecting
+            // this hyperedge frees work on the phase's congested endpoints.
+            .map(|tile| self.word_pressure[usize::from(tile)])
+            .sum::<u64>();
         self.ready.push(ReadyTransfer {
             earliest_start: Reverse(earliest_start),
             endpoint_pressure,
