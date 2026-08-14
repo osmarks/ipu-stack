@@ -492,6 +492,18 @@ struct LoweringState {
 }
 
 impl LoweringState {
+    fn storage_root(&self, mut shard: LowShardId) -> LowShardId {
+        let mut remaining = self.shards.len().saturating_add(1);
+        while remaining != 0 {
+            remaining -= 1;
+            shard = match self.shards[shard.index() as usize].definition {
+                ShardDefinition::Alias(source) | ShardDefinition::WritableAlias(source) => source,
+                _ => return shard,
+            };
+        }
+        shard
+    }
+
     fn new(graph: &MidGraph, tile_count: u16) -> LowLoweringResult<Self> {
         let mut state = Self {
             tile_count,
@@ -3946,24 +3958,85 @@ impl LoweringState {
         if transfers.is_empty() {
             return Ok(());
         }
+        let mut transfers = transfers
+            .into_iter()
+            .map(|(source, mut destinations)| {
+                destinations.sort_unstable();
+                destinations.dedup();
+                LogicalExchange {
+                    source,
+                    destinations,
+                    order,
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Some(previous) = self.phases.last().map(|phase| phase.id)
+            && self.phases[previous.index() as usize]
+                .provenance
+                .operation
+                .is_some()
+            && self.phases[previous.index() as usize].provenance.operation == provenance.operation
+        {
+            let touched = transfers
+                .iter()
+                .flat_map(|transfer| {
+                    std::iter::once(transfer.source.shard)
+                        .chain(transfer.destinations.iter().map(|view| view.shard))
+                })
+                .map(|shard| self.storage_root(shard))
+                .collect::<BTreeSet<_>>();
+            let previous_touched = self.phases[previous.index() as usize]
+                .transfers
+                .iter()
+                .flat_map(|transfer| {
+                    std::iter::once(transfer.source.shard)
+                        .chain(transfer.destinations.iter().map(|view| view.shard))
+                })
+                .map(|shard| self.storage_root(shard))
+                .collect::<BTreeSet<_>>();
+            let disjoint_transfers = touched.is_disjoint(&previous_touched);
+            let only_independent_copies_between = tiles.iter().all(|tile| {
+                let Some(boundary) = tile
+                    .work
+                    .iter()
+                    .rposition(|work| *work == TileWork::Exchange(previous))
+                else {
+                    return false;
+                };
+                tile.work[boundary + 1..].iter().all(|work| {
+                    let TileWork::LocalCopy(copy) = *work else {
+                        return false;
+                    };
+                    let copy = &self.local_copies[copy.0 as usize];
+                    !touched.contains(&self.storage_root(copy.source))
+                        && !touched.contains(&self.storage_root(copy.destination))
+                })
+            });
+            if disjoint_transfers && only_independent_copies_between {
+                let phase = &mut self.phases[previous.index() as usize];
+                phase.transfers.append(&mut transfers);
+                if phase.provenance != provenance {
+                    phase.provenance = WorkProvenance {
+                        operation: provenance.operation,
+                        value: None,
+                        reason: WorkReason::OperatorInputs,
+                    };
+                }
+                tracing::debug!(
+                    phase = previous.index(),
+                    operation = ?provenance.operation.map(OperationId::index),
+                    "consolidated independent exchange transfers"
+                );
+                return Ok(());
+            }
+        }
         let id = ExchangePhaseId(
             u32::try_from(self.phases.len()).map_err(|_| LowLoweringError::IdOverflow)?,
         );
         self.phases.push(ExchangePhase {
             id,
             provenance,
-            transfers: transfers
-                .into_iter()
-                .map(|(source, mut destinations)| {
-                    destinations.sort_unstable();
-                    destinations.dedup();
-                    LogicalExchange {
-                        source,
-                        destinations,
-                        order,
-                    }
-                })
-                .collect(),
+            transfers,
         });
         tracing::debug!(
             phase = id.index(),
