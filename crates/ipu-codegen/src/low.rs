@@ -2856,11 +2856,39 @@ impl LoweringState {
             .tensor_type
             .clone();
         let logical_columns = output_type.shape.0[output_column_axis];
-        let physical_columns = logical_columns.div_ceil(output_column_block) * output_column_block;
-        let column_blocks = physical_columns / output_column_block;
-        let columns = (0..physical_columns)
-            .step_by(output_column_block as usize)
-            .map(|start| (start, start + output_column_block))
+        let output_padded = output_type.format.layout.padded_shape(&output_type.shape)?;
+        let physical_columns = output_padded.0[output_column_axis];
+        let column_grain = output_type
+            .format
+            .layout
+            .tiling
+            .axes
+            .iter()
+            .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))
+            .map(|axis| axis.block_size)
+            .filter(|grain| *grain != 0)
+            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+        let column_blocks = physical_columns / column_grain;
+        if !physical_columns.is_multiple_of(column_grain)
+            || column_blocks < u32::from(column_partitions)
+        {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let short_blocks = column_blocks / u32::from(column_partitions);
+        let long_partitions = column_blocks % u32::from(column_partitions);
+        let columns = (0..u32::from(column_partitions))
+            .map(|partition| {
+                let start_blocks = partition
+                    .saturating_mul(short_blocks)
+                    .saturating_add(partition.min(long_partitions));
+                let blocks = short_blocks + u32::from(partition < long_partitions);
+                (
+                    start_blocks.saturating_mul(column_grain),
+                    start_blocks
+                        .saturating_add(blocks)
+                        .saturating_mul(column_grain),
+                )
+            })
             .collect::<Vec<_>>();
         let mut partial_type = output_type.clone();
         let partial_tiles = row_partitions.saturating_mul(column_partitions);
@@ -2898,6 +2926,17 @@ impl LoweringState {
                 crate::mid::GridOrder::ColumnsFast,
             ),
         };
+        if let Some(axis) = partial_type
+            .format
+            .layout
+            .tiling
+            .axes
+            .iter_mut()
+            .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))
+        {
+            axis.block_size = column_grain;
+            axis.padding_multiple = column_grain;
+        }
 
         let mut replica_groups = BTreeMap::<Vec<(u32, u32)>, Vec<LowShardId>>::new();
         for left in left_shards.iter().copied() {
@@ -2928,16 +2967,16 @@ impl LoweringState {
             let mut partials = BTreeMap::<Vec<(u32, u32)>, Vec<(u16, ShardView)>>::new();
             let mut resident_lefts = BTreeMap::<LowShardId, ShardView>::new();
             let mut weight_staging = BTreeMap::<(u16, LowShardId), LowShardId>::new();
-            for &(column_start, column_end) in &columns {
-                let block = column_start / output_column_block;
-                let short_blocks = column_blocks / u32::from(column_partitions);
-                let long_partitions = column_blocks % u32::from(column_partitions);
-                let long_region = long_partitions.saturating_mul(short_blocks + 1);
-                let output_column = if block < long_region {
-                    block / (short_blocks + 1)
-                } else {
-                    long_partitions + (block - long_region) / short_blocks.max(1)
-                };
+            for (output_column, &(column_start, column_end)) in columns.iter().enumerate() {
+                let output_column =
+                    u32::try_from(output_column).map_err(|_| LowLoweringError::IdOverflow)?;
+                let local_output_columns = column_end - column_start;
+                if local_output_columns == 0
+                    || local_output_columns > output_column_block
+                    || !local_output_columns.is_multiple_of(crate::mid::AMP_COLUMN_MICRO)
+                {
+                    return Err(LowLoweringError::InvalidOperatorPlan);
+                }
                 for left in left_shards.iter().copied() {
                     let left_shard = self.shards[left.index() as usize].clone();
                     let resident_left = if let Some(view) = resident_lefts.get(&left) {
@@ -3182,10 +3221,12 @@ impl LoweringState {
                                 if let TileKernelSpec::Gemm {
                                     weights: load,
                                     inner_block: kernel_inner_block,
+                                    output_columns: kernel_output_columns,
                                     ..
                                 } = &mut kernel
                                 {
                                     *kernel_inner_block = source_panel_block;
+                                    *kernel_output_columns = local_output_columns;
                                     let selected = if local {
                                         source_view.shard
                                     } else {
@@ -3251,10 +3292,12 @@ impl LoweringState {
                         if let TileKernelSpec::Gemm {
                             weights: load,
                             inner_block: kernel_inner_block,
+                            output_columns: kernel_output_columns,
                             ..
                         } = &mut kernel
                         {
                             *kernel_inner_block = inner_block;
+                            *kernel_output_columns = local_output_columns;
                             let selected = if sources.len() == 1 && sources[0].1 {
                                 sources[0].0.shard
                             } else {

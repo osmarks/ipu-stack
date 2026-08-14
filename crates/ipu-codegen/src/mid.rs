@@ -2540,16 +2540,17 @@ impl OperatorPlan {
                         GemmOrientation::Normal => 1,
                         GemmOrientation::Swapped => 2,
                     };
-                let output_shard_alignment = match distribution {
-                    GemmDistribution::ParallelReduction {
-                        result_column_partitions,
-                        ..
-                    } if *result_column_partitions > 1 => AMP_COLUMN_MICRO,
-                    _ => *output_column_block,
+                let balanced_output_columns =
+                    matches!(distribution, GemmDistribution::ParallelReduction { .. });
+                let output_shard_alignment = if balanced_output_columns {
+                    AMP_COLUMN_MICRO
+                } else {
+                    *output_column_block
                 };
                 if !left_padded.0[physical_left_inner_axis].is_multiple_of(*inner_block)
                     || !output_padded.0[output_column_axis].is_multiple_of(output_shard_alignment)
                     || !columns_per_output_shard.is_multiple_of(output_shard_alignment)
+                    || (balanced_output_columns && columns_per_output_shard > *output_column_block)
                     || columns_per_right_shard < *output_column_block
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
@@ -4366,10 +4367,8 @@ fn parallel_reduction_candidates_for_orientation(
             let local_rows = rows.div_ceil(u32::from(row_partitions));
             let local_columns = u32::from(column_groups).div_ceil(u32::from(column_partitions));
             let local_inner = u32::from(inner_groups).div_ceil(u32::from(inner_partitions));
-            if u32::from(column_partitions - 1).saturating_mul(local_columns)
-                >= u32::from(column_groups)
-                || u32::from(inner_partitions - 1).saturating_mul(local_inner)
-                    >= u32::from(inner_groups)
+            if u32::from(inner_partitions - 1).saturating_mul(local_inner)
+                >= u32::from(inner_groups)
             {
                 continue;
             }
@@ -4501,12 +4500,20 @@ fn parallel_reduction_candidates_for_orientation(
                         1,
                         memory_class,
                     );
+                    balance_parallel_gemm_columns(
+                        &mut variant.inputs[1].format.layout,
+                        TensorAxis::FromEnd(1),
+                    );
                     variant.output.format.layout = Layout::amp_left_result_grid(
                         kernel_output_columns,
                         row_partitions.saturating_mul(column_partitions),
                         row_partitions,
                         column_partitions,
                         GridOrder::ColumnsFast,
+                    );
+                    balance_parallel_gemm_columns(
+                        &mut variant.output.format.layout,
+                        TensorAxis::FromEnd(1),
                     );
                 }
                 GemmOrientation::Swapped => {
@@ -4528,6 +4535,10 @@ fn parallel_reduction_candidates_for_orientation(
                         row_partitions,
                         memory_class,
                     );
+                    balance_parallel_gemm_columns(
+                        &mut physical_right.format.layout,
+                        TensorAxis::FromEnd(2),
+                    );
                     physical_right.materialization = OperandMaterialization::Complete;
                     variant.inputs = vec![physical_right, physical_left];
                     variant.output.format.layout = Layout::amp_transposed_left_result_grid(
@@ -4536,6 +4547,10 @@ fn parallel_reduction_candidates_for_orientation(
                         row_partitions,
                         column_partitions,
                         GridOrder::ColumnsFast,
+                    );
+                    balance_parallel_gemm_columns(
+                        &mut variant.output.format.layout,
+                        TensorAxis::FromEnd(2),
                     );
                     variant.memory_relations = vec![MemoryRelation::DistinctElements(vec![
                         MemoryOperand::Output,
@@ -4677,14 +4692,7 @@ fn parallel_reduction_candidates_for_orientation(
                         GemmOrientation::Normal => TensorAxis::FromEnd(1),
                         GemmOrientation::Swapped => TensorAxis::FromEnd(2),
                     };
-                    if let Some(axis) = result_layout
-                        .tiling
-                        .axes
-                        .iter_mut()
-                        .find(|axis| axis.axis == physical_column_axis)
-                    {
-                        axis.padding_multiple = kernel_output_columns;
-                    }
+                    balance_parallel_gemm_columns(&mut result_layout, physical_column_axis);
                     result_variant.output.format.layout = result_layout;
                     result_layout_variants.push(result_variant);
                 }
@@ -4721,6 +4729,19 @@ fn parallel_reduction_candidates_for_orientation(
         }
     }
     variants
+}
+
+fn balance_parallel_gemm_columns(layout: &mut Layout, axis: TensorAxis) {
+    if let Some(columns) = layout
+        .tiling
+        .axes
+        .iter_mut()
+        .find(|tiling| tiling.axis == axis)
+    {
+        columns.block_size = AMP_COLUMN_MICRO;
+        columns.padding_multiple = AMP_COLUMN_MICRO;
+        columns.padding = Padding::Zero;
+    }
 }
 
 fn pad_matrix_rows_to_f16_exchange_word(layout: &mut Layout) {
@@ -5354,7 +5375,7 @@ mod tests {
                 })
             {
                 for order in [GridOrder::ColumnsFast, GridOrder::RowsFast] {
-                    let expected = match orientation {
+                    let mut expected = match orientation {
                         GemmOrientation::Normal => Layout::amp_left_result_grid(
                             output_column_block,
                             grid_rows * grid_columns,
@@ -5370,6 +5391,13 @@ mod tests {
                             order,
                         ),
                     };
+                    balance_parallel_gemm_columns(
+                        &mut expected,
+                        match orientation {
+                            GemmOrientation::Normal => TensorAxis::FromEnd(1),
+                            GemmOrientation::Swapped => TensorAxis::FromEnd(2),
+                        },
+                    );
                     assert!(
                         candidates
                             .iter()
