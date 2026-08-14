@@ -617,7 +617,11 @@ fn build_package_from_objects(
             memory.allocate(MemoryRequest {
                 name: "exchange row tables",
                 bytes: exchange_table_bytes,
-                alignment: 4,
+                // Executed exchange rows may not share an SRAM element with
+                // any transfer source or destination. Reserve whole elements
+                // at both ends so storage placement cannot use a prefix of the
+                // row table's first element.
+                alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
                 bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
                 end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
                 guard_after: ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
@@ -740,6 +744,7 @@ fn build_package_from_objects(
         kernel_plan,
         exchange_code_base,
         execution_tile_count,
+        false,
     )?;
     let sizing_code_address = memory.next_free(
         host_code_base + host_code_bytes,
@@ -917,6 +922,7 @@ fn build_package_from_objects(
         kernel_plan,
         exchange_code_base,
         execution_tile_count,
+        true,
     )?;
     if exchange_rows
         .as_ref()

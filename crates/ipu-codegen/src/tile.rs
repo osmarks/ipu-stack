@@ -21,12 +21,15 @@ pub struct TileProgramLowering<'a> {
     exchange_code_base: u32,
     exchange_code_end: u32,
     execution_tile_count: u16,
+    validate_exchange_placement: bool,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TileLoweringError {
     #[error(transparent)]
     Kernel(#[from] crate::KernelMaterializationError),
+    #[error(transparent)]
+    ExchangeDiagnostic(#[from] crate::ExchangeLoweringError),
     #[error("tile schedule refers to an unknown exchange phase")]
     UnknownExchange,
     #[error("exchange phase has no row for tile {0}")]
@@ -43,6 +46,17 @@ pub enum TileLoweringError {
         "exchange rows occupy 0x{start:x}..0x{end:x}, beyond executable tile SRAM at 0x{limit:x}"
     )]
     ExchangeCodeMemory { start: u32, end: u32, limit: u32 },
+    #[error(
+        "tile {tile} phase {phase:?} exchange row at 0x{row_address:x} shares an SRAM element with transfer {transfer} {kind:?} data at 0x{data_address:x}"
+    )]
+    ExchangeRowDataConflict {
+        tile: u16,
+        phase: ExchangePhaseId,
+        row_address: u32,
+        transfer: u32,
+        kind: crate::ExchangeActivityKind,
+        data_address: u32,
+    },
     #[error(
         "tile {tile} local copy {source_shard:?}+{source_offset} -> {destination_shard:?}+{destination_offset} has invalid addresses or byte count {bytes}"
     )]
@@ -72,6 +86,7 @@ impl<'a> TileProgramLowering<'a> {
         kernels: &'a KernelBuildPlan,
         exchange_code_base: u32,
         execution_tile_count: u16,
+        validate_exchange_placement: bool,
     ) -> Result<Self, TileLoweringError> {
         if execution_tile_count < program.tile_count {
             return Err(TileLoweringError::MissingExecutionTiles {
@@ -107,6 +122,7 @@ impl<'a> TileProgramLowering<'a> {
             exchange_code_base,
             exchange_code_end: cursor,
             execution_tile_count,
+            validate_exchange_placement,
         })
     }
 
@@ -128,6 +144,7 @@ impl<'a> TileProgramLowering<'a> {
                 tile,
                 self.program.tile_count,
                 self.exchange_code_base,
+                self.validate_exchange_placement,
             )?;
             return Ok(TileProgram {
                 tile,
@@ -148,6 +165,7 @@ impl<'a> TileProgramLowering<'a> {
             tile,
             self.program.tile_count,
             self.exchange_code_base,
+            self.validate_exchange_placement,
         )?;
         Ok(TileProgram {
             tile,
@@ -419,7 +437,7 @@ pub fn compact_exchange_table_bytes(
 ) -> Result<u32, TileLoweringError> {
     let mut maximum = 0;
     for tile in 0..execution_tile_count {
-        let (_, end) = layout_exchange_rows(exchanges, tile, scheduled_tile_count, 0)?;
+        let (_, end) = layout_exchange_rows(exchanges, tile, scheduled_tile_count, 0, false)?;
         maximum = maximum.max(end);
     }
     Ok(maximum)
@@ -430,8 +448,12 @@ fn layout_exchange_rows(
     tile: u16,
     scheduled_tile_count: u16,
     base: u32,
+    validate_placement: bool,
 ) -> Result<(BTreeMap<ExchangePhaseId, PlacedExchange>, u32), TileLoweringError> {
-    let mut cursor = align_up(base, 4)?;
+    // SENDPICP carries its two receive-control values in the following word.
+    // Keep every exchange program naturally aligned so the phase builder can
+    // place these two-word instructions without knowing final SRAM addresses.
+    let mut cursor = align_up(base, 8)?;
     let mut result = BTreeMap::new();
     if exchanges.is_empty() {
         return Ok((result, cursor));
@@ -507,6 +529,7 @@ fn layout_exchange_rows(
         let (program, offsets) = if let Some(shared) = shared.get(&key) {
             (shared.program.clone(), shared.offsets.clone())
         } else {
+            cursor = align_up(cursor, 8)?;
             let address = cursor;
             let words = if shared_count > 1 {
                 key.0.clone()
@@ -591,6 +614,23 @@ fn layout_exchange_rows(
                 });
             }
         }
+        if active && validate_placement {
+            let diagnostic = crate::diagnose_exchange_tile(phase, tile, program.address)?;
+            if let Some(conflict) = diagnostic
+                .activities
+                .iter()
+                .find(|activity| activity.conflicts_with_row)
+            {
+                return Err(TileLoweringError::ExchangeRowDataConflict {
+                    tile,
+                    phase: phase.id,
+                    row_address: program.address,
+                    transfer: conflict.activity.transfer,
+                    kind: conflict.activity.kind,
+                    data_address: conflict.activity.address,
+                });
+            }
+        }
         result.insert(
             phase.id,
             PlacedExchange {
@@ -665,6 +705,7 @@ mod tests {
                 &kernels,
                 0x4d000,
                 tiles + filler_tiles,
+                false,
             )
             .unwrap();
             assert!(lowering.exchange_code_end() >= 0x4d000);
