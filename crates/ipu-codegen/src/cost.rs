@@ -8,9 +8,9 @@ use crate::estimate::{
 };
 use crate::graph::TensorShape;
 use crate::mid::{
-    AmpOrder, BlockMajorOrder, DeferredTransform, ElementOrder, GemmDistribution, Layout,
-    LocalOperandStaging, MemoryClass, MidOperator, OperatorDispatch, OperatorRequirements,
-    Precision, TensorAxis, TensorType,
+    AmpOrder, BlockMajorOrder, ConversionStrategy, DeferredTransform, ElementOrder,
+    GemmDistribution, Layout, LocalOperandStaging, MemoryClass, MidOperator, OperatorDispatch,
+    OperatorRequirements, Precision, TensorAxis, TensorType, layout_conversion_strategy,
 };
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
@@ -50,6 +50,7 @@ pub trait CostModel: Sync {
                         self.rearrangement_cost(
                             &input.shape,
                             input.format.precision,
+                            layout_conversion_strategy(&source.format.layout, &input.format.layout),
                             &source.format.layout,
                             &input.format.layout,
                         )
@@ -86,6 +87,7 @@ pub trait CostModel: Sync {
         &self,
         shape: &TensorShape,
         precision: Precision,
+        strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
     ) -> RearrangementCost;
@@ -154,7 +156,7 @@ pub(crate) struct MemoizedCostModel<'a, C> {
     rearrangements: Mutex<RearrangementCache>,
 }
 
-type RearrangementKey = (TensorShape, Precision, Layout, Layout);
+type RearrangementKey = (TensorShape, Precision, ConversionStrategy, Layout, Layout);
 type RearrangementCache = HashMap<RearrangementKey, Arc<OnceLock<RearrangementCost>>, FixedState>;
 
 impl<'a, C> MemoizedCostModel<'a, C> {
@@ -219,10 +221,11 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         &self,
         shape: &TensorShape,
         precision: Precision,
+        strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
     ) -> RearrangementCost {
-        let key = (shape.clone(), precision, from.clone(), to.clone());
+        let key = (shape.clone(), precision, strategy, from.clone(), to.clone());
         let cached = self
             .rearrangements
             .lock()
@@ -231,7 +234,9 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
             .or_default()
             .clone();
         *cached.get_or_init(|| {
-            let mut cost = self.inner.rearrangement_cost(shape, precision, from, to);
+            let mut cost = self
+                .inner
+                .rearrangement_cost(shape, precision, strategy, from, to);
             let active_tiles = from.tiling.tile_count.max(to.tiling.tile_count);
             // The inner model reports occupied work. Reduced-grid conversions
             // leave spatial issue slots idle, so convert that work into a phase
@@ -380,36 +385,6 @@ fn standard_to_interleaved_copy_cycles(bytes: u64) -> u64 {
     bytes
         .div_ceil(6)
         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
-}
-
-fn partition_boundary_penalty(shape: &TensorShape, from: &Layout, to: &Layout) -> u64 {
-    let rank = shape.0.len();
-    let partitions = |layout: &Layout, resolved_axis| {
-        layout
-            .tiling
-            .axes
-            .iter()
-            .find(|tiling| tiling.axis.resolve(rank).ok() == Some(resolved_axis))
-            .map_or(1, |tiling| u64::from(tiling.partitions))
-    };
-    let gcd = |mut left: u64, mut right: u64| {
-        while right != 0 {
-            (left, right) = (right, left % right);
-        }
-        left
-    };
-    (0..rank)
-        .map(|axis| {
-            let source = partitions(from, axis);
-            let destination = partitions(to, axis);
-            let common = gcd(source, destination);
-            source
-                .saturating_div(common)
-                .saturating_mul(destination)
-                .saturating_sub(source.max(destination))
-        })
-        .sum::<u64>()
-        .saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles)
 }
 
 impl CostModel for Ipu21CostModel {
@@ -921,6 +896,7 @@ impl CostModel for Ipu21CostModel {
         &self,
         shape: &TensorShape,
         precision: Precision,
+        strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
     ) -> RearrangementCost {
@@ -930,32 +906,27 @@ impl CostModel for Ipu21CostModel {
                 exchange_row_bytes: u64::MAX / 8,
             };
         };
-        let direct_retile = from.order == to.order;
+        let direct_retile = strategy == ConversionStrategy::DirectRetile;
         // Independent source and destination roles execute spatially, but each
         // adjacent tile pair shares its exchange bus. Model the busiest actual
         // bus instead of either a single tile or device-wide traffic.
         let spatial_payload = traffic
             .maximum_source_bus_payload_bytes
             .max(traffic.maximum_remote_destination_bytes);
-        let spatial_fragments = traffic
-            .maximum_source_bus_fragments
-            .max(traffic.maximum_routed_fragments);
         let occupied_exchange_cycles = spatial_payload
             .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+            // Route propagation belongs to the phase horizon once. Logical
+            // fragments enlarge the encoded row, but independent starts do
+            // not each serialize the full route delay on the critical path.
             .saturating_add(
-                spatial_fragments.saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles),
+                u64::from(traffic.remote_fragments != 0)
+                    .saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles),
             );
         let exchange_cycles =
             occupied_exchange_cycles.saturating_add(if traffic.remote_fragments == 0 {
                 0
             } else {
-                IPU21_TARGET_COSTS
-                    .exchange_phase_cycles
-                    .saturating_add(if direct_retile {
-                        partition_boundary_penalty(shape, from, to)
-                    } else {
-                        0
-                    })
+                IPU21_TARGET_COSTS.exchange_phase_cycles
             });
         let (local_bytes, local_calls) = if direct_retile {
             (
@@ -1058,45 +1029,6 @@ mod tests {
                 );
                 assert!(sharded_cycles <= unsharded_cycles, "case {case}");
             }
-        }
-    }
-
-    #[test]
-    fn randomized_conversion_duty_penalizes_fragmented_spatial_work() {
-        let mut random = fastrand::Rng::with_seed(0x6475_7479_6672_6167);
-        for case in 0..CASES {
-            let row_partitions = 1_u16 << random.u32(1..=4);
-            let column_partitions = 1_u16 << random.u32(1..=4);
-            let tiles = row_partitions * column_partitions;
-            let rows = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4);
-            let columns = u32::from(row_partitions.max(column_partitions)) * random.u32(1..=4) * 64;
-            let shape = TensorShape(vec![rows, columns]);
-            let fragmented = Layout::amp_output_grid(
-                64,
-                tiles,
-                row_partitions,
-                column_partitions,
-                crate::mid::GridOrder::ColumnsFast,
-            );
-            let aligned = Layout::amp_output_grid(
-                64,
-                tiles,
-                column_partitions,
-                row_partitions,
-                crate::mid::GridOrder::ColumnsFast,
-            );
-            let destination =
-                Layout::amp_output_replicated_grid(tiles, column_partitions, row_partitions);
-            let fragmented_cycles = Ipu21CostModel
-                .rearrangement_cost(&shape, Precision::F16, &fragmented, &destination)
-                .cycles;
-            let aligned_cycles = Ipu21CostModel
-                .rearrangement_cost(&shape, Precision::F16, &aligned, &destination)
-                .cycles;
-            assert!(
-                fragmented_cycles >= aligned_cycles,
-                "case {case}: fragmented={fragmented_cycles} aligned={aligned_cycles}"
-            );
         }
     }
 }

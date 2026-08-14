@@ -47,8 +47,8 @@ pub use memory::{
     IPU21_STANDARD_FIXED_BYTES,
 };
 pub use mid::{
-    AccumulationPrecision, AmpOrder, AxisTiling, BlockMajorOrder, ConversionDispatch,
-    ConversionPlan, ConversionStreamingPolicy, CostModel, ElementOrder, GemmDistribution,
+    AccumulationPrecision, AmpOrder, AxisTiling, BlockMajorOrder, ConversionPlan,
+    ConversionStrategy, ConversionStreamingPolicy, CostModel, ElementOrder, GemmDistribution,
     GemmKernelMode, GemmOrientation, GemmWeightLoad, GridOrder, HardwareTarget, IPU21_TARGET_COSTS,
     Ipu21CostModel, Ipu21TargetCosts, Layout, LayoutError, LocalOperandStaging, LoweringError,
     LoweringResult, MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation,

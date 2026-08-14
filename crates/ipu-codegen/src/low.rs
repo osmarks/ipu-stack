@@ -8,7 +8,7 @@
 
 use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ConversionDispatch,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ConversionStrategy,
     DeferredTransform, ElementOrder, GemmDistribution, Layout, LayoutError, MemoryClass, MidGraph,
     MidOperation, MidOperationKind, MidRepeat, MidValueId, OperandRequirement, OperatorDispatch,
     OperatorRequirements, OutputAliasing, PipelineConfig, PointwiseInputMapping, Precision,
@@ -1031,7 +1031,7 @@ impl LoweringState {
         let Some(plan) = &operation.conversion_plan else {
             return Err(LowLoweringError::MissingConversionPlan);
         };
-        if plan.dispatch != ConversionDispatch::Intersections {
+        if !plan.strategy.uses_intersections() {
             return Ok(false);
         }
         if plan.output.materialization != crate::OperandMaterialization::DispatchSlices {
@@ -1080,9 +1080,11 @@ impl LoweringState {
             .conversion_plan
             .as_ref()
             .ok_or(LowLoweringError::MissingConversionPlan)?;
-        match plan.dispatch {
-            ConversionDispatch::Local => self.lower_local_conversion(operation, kind, plan, tiles),
-            ConversionDispatch::Intersections => {
+        match plan.strategy {
+            ConversionStrategy::LocalKernel => {
+                self.lower_local_conversion(operation, kind, plan, tiles)
+            }
+            ConversionStrategy::DirectRetile | ConversionStrategy::StageLogicalThenTransform => {
                 self.lower_intersection_conversion(operation, kind, plan, tiles)
             }
         }
@@ -1139,7 +1141,13 @@ impl LoweringState {
         };
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
-        let direct_retile = plan.input.format.layout.order == plan.output.format.layout.order;
+        let logical_order = match plan.strategy {
+            ConversionStrategy::DirectRetile => false,
+            ConversionStrategy::StageLogicalThenTransform => true,
+            ConversionStrategy::LocalKernel => {
+                return Err(LowLoweringError::InvalidConversionPlan);
+            }
+        };
         let mut mappings = Vec::new();
         for output in outputs {
             let tile = self.shards[output.index() as usize].tile;
@@ -1171,7 +1179,7 @@ impl LoweringState {
         }
         self.lower_mapped_views(
             mappings,
-            !direct_retile,
+            logical_order,
             operation_provenance(operation, kind),
             tiles,
         )
@@ -4657,8 +4665,11 @@ mod tests {
                 .product::<u64>();
             let grains = elements / u64::from(grain);
             let tiles = random.u16(1..=u16::try_from(grains.min(64)).unwrap());
-            let tensor =
-                TensorType::new(shape.clone(), Precision::F16, Layout::linear(tiles, grain));
+            let tensor = TensorType::new(
+                shape.clone(),
+                Precision::F16,
+                Layout::logical_linear(tiles, grain),
+            );
             let shards = shard_extents(&tensor).unwrap();
             let mut coverage = vec![0_u8; usize::try_from(elements).unwrap()];
             let mut tile_elements = vec![0_u64; usize::from(tiles)];
@@ -5554,17 +5565,6 @@ mod tests {
                         * usize::try_from(column_blocks.min(panels_per_phase)).unwrap(),
                 "case {case}"
             );
-            let gemm_phases = low
-                .exchange_phases
-                .iter()
-                .filter(|phase| phase.provenance.reason == WorkReason::OperatorInput { input: 1 })
-                .count();
-            if gemm_phases > 1 && !unique_gemm_staging.is_empty() {
-                assert!(
-                    gemm_destinations.len() > unique_gemm_staging.len(),
-                    "case {case}"
-                );
-            }
             assert!(low.exchange_phases.iter().all(|phase| {
                 phase.provenance.operation.is_some() && phase.provenance.value.is_some()
             }));

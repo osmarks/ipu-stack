@@ -648,11 +648,11 @@ impl Layout {
         }
     }
 
-    pub fn linear(tile_count: u16, grain: u32) -> Self {
+    pub fn logical_linear(tile_count: u16, grain: u32) -> Self {
         Self::row_major(TensorTiling::linear(tile_count, grain))
     }
 
-    pub fn with_linear_ownership(&self, tile_count: u16, grain: u32) -> Self {
+    pub fn with_retained_order_linear_ownership(&self, tile_count: u16, grain: u32) -> Self {
         Self {
             order: self.order,
             tiling: TensorTiling::linear(tile_count, grain),
@@ -2325,10 +2325,35 @@ pub struct OperatorPlan {
     pub deferred_inputs: Vec<Option<DeferredInputPlan>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConversionDispatch {
-    Local,
-    Intersections,
+/// Address-independent recipe for materializing a format conversion.
+///
+/// Layouts determine the logical shard regions and relative physical spans;
+/// final tile identities and SRAM addresses remain a low-level concern.  The
+/// same recipe is consumed by the cost model and by tile-program lowering so
+/// planning cannot silently price a different conversion from the one emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConversionStrategy {
+    /// Run one tile-local kernel over corresponding resident shards.
+    LocalKernel,
+    /// Exchange logical intersections directly into the destination layout.
+    DirectRetile,
+    /// Exchange logical values into row-major staging, then transform locally
+    /// into the destination element order.
+    StageLogicalThenTransform,
+}
+
+impl ConversionStrategy {
+    pub const fn uses_intersections(self) -> bool {
+        matches!(self, Self::DirectRetile | Self::StageLogicalThenTransform)
+    }
+}
+
+pub fn layout_conversion_strategy(from: &Layout, to: &Layout) -> ConversionStrategy {
+    if from.order == to.order {
+        ConversionStrategy::DirectRetile
+    } else {
+        ConversionStrategy::StageLogicalThenTransform
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2336,7 +2361,7 @@ pub struct ConversionPlan {
     pub kernel: TileKernelSpec,
     pub input: OperandRequirement,
     pub output: OperandRequirement,
-    pub dispatch: ConversionDispatch,
+    pub strategy: ConversionStrategy,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -3715,6 +3740,7 @@ fn format_equality_cost(
                     .rearrangement_cost(
                         &source.shape,
                         target.format.precision,
+                        layout_conversion_strategy(&source.format.layout, &target.format.layout),
                         &source.format.layout,
                         &target.format.layout,
                     )
@@ -4188,25 +4214,34 @@ fn plans(
             .map(|(_, (_, grain, candidate))| (*grain, *candidate))
             .collect::<Vec<_>>();
         for (grain, candidate) in flat_candidates {
-            let layout = input
-                .format
-                .layout
-                .with_linear_ownership(candidate.output.format.layout.tiling.tile_count, grain);
-            let format = TensorFormat {
-                precision: input.format.precision,
-                layout,
-            };
-            plans.push(Plan {
-                operator: candidate.operator,
-                dispatch: candidate.dispatch.clone(),
-                requirements: OperatorRequirements {
-                    inputs: vec![OperandRequirement::new(format.clone(), 8)],
-                    output: OperandRequirement::new(format, 8),
-                    output_aliasing: OutputAliasing::MayAliasInputs(vec![0]),
-                    memory_relations: Vec::new(),
-                },
-                deferred_output: None,
-            });
+            let tiles = candidate.output.format.layout.tiling.tile_count;
+            let layouts = [
+                input
+                    .format
+                    .layout
+                    .with_retained_order_linear_ownership(tiles, grain),
+                Layout::logical_linear(tiles, grain),
+            ];
+            for layout in layouts {
+                let format = TensorFormat {
+                    precision: input.format.precision,
+                    layout,
+                };
+                let plan = Plan {
+                    operator: candidate.operator,
+                    dispatch: candidate.dispatch.clone(),
+                    requirements: OperatorRequirements {
+                        inputs: vec![OperandRequirement::new(format.clone(), 8)],
+                        output: OperandRequirement::new(format, 8),
+                        output_aliasing: OutputAliasing::MayAliasInputs(vec![0]),
+                        memory_relations: Vec::new(),
+                    },
+                    deferred_output: None,
+                };
+                if !plans.contains(&plan) {
+                    plans.push(plan);
+                }
+            }
         }
     }
     for candidate in config
@@ -5193,7 +5228,7 @@ fn ensure_format(
                 },
                 input: OperandRequirement::new(original.tensor_type.format.clone(), 8),
                 output: OperandRequirement::new(tensor_type.format.clone(), 8),
-                dispatch: ConversionDispatch::Local,
+                strategy: ConversionStrategy::LocalKernel,
             }),
             estimated_cycles: costs.cast_cycles(&original.tensor_type, target.precision),
             memory,
@@ -5206,9 +5241,11 @@ fn ensure_format(
         let from = tensor_type.format.layout.clone();
         tensor_type.format.layout = target.layout.clone();
         let result = state.derived_value(value, tensor_type.clone());
+        let strategy = layout_conversion_strategy(&from, &target.layout);
         let rearrangement = costs.rearrangement_cost(
             &tensor_type.shape,
             tensor_type.format.precision,
+            strategy,
             &from,
             &target.layout,
         );
@@ -5233,7 +5270,7 @@ fn ensure_format(
                 input: OperandRequirement::new(current.tensor_type.format.clone(), 8),
                 output: OperandRequirement::new(tensor_type.format.clone(), 8)
                     .with_materialization(materialization),
-                dispatch: ConversionDispatch::Intersections,
+                strategy,
             }),
             estimated_cycles: rearrangement.cycles,
             memory,
@@ -5807,6 +5844,7 @@ mod tests {
             &self,
             _shape: &TensorShape,
             _precision: Precision,
+            _strategy: ConversionStrategy,
             _from: &Layout,
             _to: &Layout,
         ) -> crate::cost::RearrangementCost {
