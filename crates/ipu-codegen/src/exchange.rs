@@ -720,6 +720,9 @@ impl PendingTransfer {
     }
 }
 
+/// Combines physically contiguous source and destination spans into one
+/// hardware message. Separate SEND messages require separate receive events,
+/// even when they select the same source tile.
 fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTransfer> {
     let mut merged = Vec::<PendingTransfer>::with_capacity(transfers.len());
     for transfer in transfers {

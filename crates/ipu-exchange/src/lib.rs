@@ -269,9 +269,8 @@ impl PlanProgramBuilder {
     }
 
     /// Advances a requested transfer offset to the first compatible receive
-    /// boundary. Source-only changes and contiguous pointer carries can use
-    /// the teardown event; changing both waits for the primitive's full
-    /// receive window.
+    /// boundary. An unchanged source or auto-incremented receive pointer can
+    /// start at teardown; changing both waits for the old window to close.
     pub fn earliest_scheduled_receiver_offset(
         &self,
         row: &PlanRow,
