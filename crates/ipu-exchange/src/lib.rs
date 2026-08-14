@@ -221,6 +221,17 @@ pub fn plan_event_cycles(row: &[u32]) -> Result<u32, ExchangeError> {
 pub struct PlanProgramBuilder {
     words: Vec<u32>,
     event_cycles: u32,
+    receive_stream: Option<ReceiveStream>,
+}
+
+#[derive(Clone, Debug)]
+struct ReceiveStream {
+    word_index: usize,
+    start_cycles: u32,
+    events: Vec<ReceiveEvent>,
+    horizon_cycles: u32,
+    neutral_cycles: u32,
+    next_address: Option<u32>,
 }
 
 impl Default for PlanProgramBuilder {
@@ -228,6 +239,7 @@ impl Default for PlanProgramBuilder {
         Self {
             words: Vec::new(),
             event_cycles: 0,
+            receive_stream: None,
         }
     }
 }
@@ -241,9 +253,161 @@ impl PlanProgramBuilder {
         self.append_scheduled_row_at(row, 0)
     }
 
+    /// Advances a requested transfer offset just enough that the row's first
+    /// sender event follows this tile's already encoded event stream.
+    pub fn earliest_scheduled_row_offset(
+        &self,
+        row: &PlanRow,
+        requested: u32,
+    ) -> Result<u32, ExchangeError> {
+        if self.event_cycles == 0 {
+            return Ok(requested);
+        }
+        let first_event = first_send_start_cycles(row)?;
+        Ok(requested.max(self.event_cycles.saturating_sub(first_event)))
+    }
+
+    /// Advances a requested transfer offset so its source-selection event can
+    /// replace or follow the preceding receive teardown on this tile.
+    pub fn earliest_scheduled_receiver_offset(
+        &self,
+        row: &PlanRow,
+        requested: u32,
+    ) -> Result<u32, ExchangeError> {
+        let base = receive_row_timing(row, 0)?;
+        let required_event = self
+            .receive_stream
+            .as_ref()
+            .map_or(self.event_cycles, |stream| {
+                if base.pointer_address == stream.next_address {
+                    stream.neutral_cycles
+                } else {
+                    stream.horizon_cycles
+                }
+            });
+        let mut offset = requested.max(required_event.saturating_sub(base.source_cycles));
+        let Some(stream) = &self.receive_stream else {
+            return Ok(offset);
+        };
+        loop {
+            let timing = receive_row_timing(row, offset)?;
+            let replaces_neutral = timing.source_cycles == stream.neutral_cycles;
+            let carries_pointer = timing.pointer_address == stream.next_address;
+            let collision = timing.events.iter().any(|new| {
+                if carries_pointer && new.kind == ReceiveEventKind::Pointer {
+                    return false;
+                }
+                stream.events.iter().any(|existing| {
+                    new.cycles == existing.cycles
+                        && !(replaces_neutral && existing.kind == ReceiveEventKind::Neutral)
+                })
+            });
+            if !collision {
+                return Ok(offset);
+            }
+            offset = offset
+                .checked_add(1)
+                .ok_or(ExchangeError::Schedule("receive offset overflow"))?;
+        }
+    }
+
     /// Appends a primitive row at an arbitrary absolute phase offset without
     /// requiring that offset to fit in the primitive row's spare words.
     pub fn append_scheduled_row_at(
+        &mut self,
+        row: &PlanRow,
+        schedule_offset: u32,
+    ) -> Result<(), ExchangeError> {
+        self.receive_stream = None;
+        self.append_scheduled_row_body(row, schedule_offset)?;
+        debug_assert_eq!(plan_event_cycles(&self.words)?, self.event_cycles);
+        Ok(())
+    }
+
+    /// Appends a receive row, merging its timed control writes with the
+    /// current receive stream and replacing an immediately preceding neutral
+    /// mux selection with a direct source cutover.
+    pub fn append_scheduled_receiver_row_at(
+        &mut self,
+        row: &PlanRow,
+        schedule_offset: u32,
+        received_words: u32,
+    ) -> Result<(), ExchangeError> {
+        let timing = receive_row_timing(row, schedule_offset)?;
+        let next_address = timing
+            .pointer_address
+            .map(|address| {
+                received_words
+                    .checked_mul(4)
+                    .and_then(|bytes| address.checked_add(bytes))
+                    .ok_or(ExchangeError::Schedule("receive address overflow"))
+            })
+            .transpose()?;
+        let (word_index, start_cycles, events, horizon_cycles) =
+            if let Some(stream) = self.receive_stream.take() {
+                if timing.source_cycles < stream.neutral_cycles {
+                    return Err(ExchangeError::Schedule("overlapping receive windows"));
+                }
+                let mut events = stream.events;
+                if timing.source_cycles == stream.neutral_cycles {
+                    let neutral = events
+                        .iter()
+                        .rposition(|event| {
+                            event.kind == ReceiveEventKind::Neutral
+                                && event.cycles == stream.neutral_cycles
+                        })
+                        .ok_or(ExchangeError::Schedule("receive neutral event"))?;
+                    events.remove(neutral);
+                }
+                events.extend(timing.events.iter().copied().filter(|event| {
+                    event.kind != ReceiveEventKind::Pointer
+                        || timing.pointer_address != stream.next_address
+                }));
+                events.sort_by_key(|event| event.cycles);
+                (
+                    stream.word_index,
+                    stream.start_cycles,
+                    events,
+                    stream.horizon_cycles.max(timing.horizon_cycles),
+                )
+            } else {
+                let first_cycles = timing
+                    .events
+                    .first()
+                    .ok_or(ExchangeError::Schedule("empty receive row"))?
+                    .cycles;
+                if first_cycles < self.event_cycles {
+                    return Err(ExchangeError::Schedule("unfused receive overlap"));
+                }
+                (
+                    self.words.len(),
+                    self.event_cycles,
+                    timing.events.clone(),
+                    timing.horizon_cycles,
+                )
+            };
+
+        self.words.truncate(word_index);
+        self.event_cycles = start_cycles;
+        append_receive_events(
+            &mut self.words,
+            &mut self.event_cycles,
+            &events,
+            horizon_cycles,
+        )?;
+        self.receive_stream = Some(ReceiveStream {
+            word_index,
+            start_cycles,
+            events,
+            horizon_cycles,
+            neutral_cycles: timing.neutral_cycles,
+            next_address,
+        });
+        debug_assert_eq!(plan_event_cycles(&self.words)?, self.event_cycles);
+        Ok(())
+    }
+
+    fn append_scheduled_row_body(
         &mut self,
         row: &PlanRow,
         schedule_offset: u32,
@@ -274,6 +438,9 @@ impl PlanProgramBuilder {
         let mut remaining = self.event_cycles;
         let mut consumed_delays = Vec::new();
         for (index, instruction) in body.iter_mut().enumerate() {
+            if remaining == 0 {
+                break;
+            }
             let advance = instruction_advance(*instruction);
             if advance == 0 {
                 continue;
@@ -301,8 +468,10 @@ impl PlanProgramBuilder {
     }
 
     pub fn finish(mut self) -> Result<Vec<u32>, ExchangeError> {
+        debug_assert_eq!(plan_event_cycles(&self.words)?, self.event_cycles);
         self.coalesce_one_event_mux_teardowns()?;
         self.words.push(RETURN_M10_INSTRUCTION);
+        debug_assert_eq!(plan_event_cycles(&self.words)?, self.event_cycles);
         Ok(self.words)
     }
 
@@ -334,6 +503,164 @@ impl PlanProgramBuilder {
             self.words.remove(index);
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiveEventKind {
+    Source,
+    Pointer,
+    Neutral,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReceiveEvent {
+    cycles: u32,
+    instruction: u32,
+    kind: ReceiveEventKind,
+}
+
+struct ReceiveRowTiming {
+    events: Vec<ReceiveEvent>,
+    neutral_cycles: u32,
+    source_cycles: u32,
+    horizon_cycles: u32,
+    pointer_address: Option<u32>,
+}
+
+fn receive_row_timing(
+    row: &PlanRow,
+    schedule_offset: u32,
+) -> Result<ReceiveRowTiming, ExchangeError> {
+    if row[0] != SYNC_SUPERVISOR_INSTRUCTION {
+        return Err(ExchangeError::Schedule("receive row entry"));
+    }
+    let end = row
+        .iter()
+        .position(|instruction| *instruction == RETURN_M10_INSTRUCTION)
+        .ok_or(ExchangeError::Schedule("receive row return"))?;
+    let mut cycles = schedule_offset;
+    let mut events = Vec::new();
+    let mut source_cycles = None;
+    let mut neutral_cycles = None;
+    let mut pointer_address = None;
+    for &instruction in &row[1..end] {
+        cycles = cycles
+            .checked_add(instruction_advance(instruction))
+            .ok_or(ExchangeError::Schedule("receive event horizon overflow"))?;
+        let kind = if instruction & OPCODE_MASK == DELAY_PIC_OPCODE {
+            Some(ReceiveEventKind::Pointer)
+        } else if instruction & OPCODE_MASK == DELAY_XPIC_OPCODE {
+            Some(if instruction & 0x1fff == TILE_MUX_EXCHANGE {
+                ReceiveEventKind::Neutral
+            } else {
+                ReceiveEventKind::Source
+            })
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            match kind {
+                ReceiveEventKind::Source => {
+                    if source_cycles.replace(cycles).is_some() {
+                        return Err(ExchangeError::Schedule("multiple receive sources"));
+                    }
+                }
+                ReceiveEventKind::Neutral => {
+                    if neutral_cycles.replace(cycles).is_some() {
+                        return Err(ExchangeError::Schedule("multiple receive teardowns"));
+                    }
+                }
+                ReceiveEventKind::Pointer => {
+                    if pointer_address
+                        .replace((instruction & PIC_RECEIVE_ADDRESS_MASK) << 2)
+                        .is_some()
+                    {
+                        return Err(ExchangeError::Schedule("multiple receive pointers"));
+                    }
+                }
+            }
+            events.push(ReceiveEvent {
+                cycles,
+                instruction,
+                kind,
+            });
+        }
+    }
+    Ok(ReceiveRowTiming {
+        events,
+        neutral_cycles: neutral_cycles.ok_or(ExchangeError::Schedule("receive teardown timing"))?,
+        source_cycles: source_cycles.ok_or(ExchangeError::Schedule("receive source timing"))?,
+        horizon_cycles: cycles,
+        pointer_address,
+    })
+}
+
+fn append_receive_events(
+    words: &mut Vec<u32>,
+    event_cycles: &mut u32,
+    events: &[ReceiveEvent],
+    horizon_cycles: u32,
+) -> Result<(), ExchangeError> {
+    for event in events {
+        let advance = event
+            .cycles
+            .checked_sub(*event_cycles)
+            .ok_or(ExchangeError::Schedule("receive event order"))?;
+        if advance == 0 {
+            return Err(ExchangeError::Schedule("simultaneous receive controls"));
+        }
+        let mut instruction = event.instruction;
+        let maximum_advance = maximum_timed_instruction_advance(instruction)
+            .ok_or(ExchangeError::Schedule("receive timed event"))?;
+        if advance > maximum_advance {
+            append_plain_delay(words, event_cycles, event.cycles - maximum_advance)?;
+        }
+        set_instruction_advance(&mut instruction, event.cycles - *event_cycles)?;
+        words.push(instruction);
+        *event_cycles = event.cycles;
+    }
+    append_plain_delay(words, event_cycles, horizon_cycles)
+}
+
+fn first_send_start_cycles(row: &PlanRow) -> Result<u32, ExchangeError> {
+    let mut cycles = 0u32;
+    for &instruction in row {
+        if matches!(
+            instruction & LONG_OPCODE_MASK,
+            SEND_OPCODE | SEND_OFF_OPCODE
+        ) {
+            return Ok(cycles);
+        }
+        cycles = cycles
+            .checked_add(instruction_advance(instruction))
+            .ok_or(ExchangeError::Schedule("send event horizon overflow"))?;
+    }
+    Err(ExchangeError::Schedule("send event"))
+}
+
+fn append_plain_delay(
+    words: &mut Vec<u32>,
+    event_cycles: &mut u32,
+    target_cycles: u32,
+) -> Result<(), ExchangeError> {
+    let mut remaining = target_cycles
+        .checked_sub(*event_cycles)
+        .ok_or(ExchangeError::Schedule("plan delay order"))?;
+    while remaining != 0 {
+        let chunk = remaining.min(MAX_PLAN_OFFSET_CYCLES);
+        words.push(delay(chunk - 1));
+        *event_cycles += chunk;
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
+fn maximum_timed_instruction_advance(instruction: u32) -> Option<u32> {
+    match instruction & OPCODE_MASK {
+        DELAY_PIC_OPCODE => Some(0x80),
+        DELAY_XPIC_OPCODE => Some(0x1000),
+        _ => None,
     }
 }
 
@@ -381,7 +708,10 @@ fn set_instruction_advance(instruction: &mut u32, advance: u32) -> Result<(), Ex
         *instruction = (*instruction & !0x03ff_c000) | (immediate << 14);
     } else {
         return Err(ExchangeError::Schedule(
-            "first scheduled event is not a delay",
+            match *instruction & LONG_OPCODE_MASK {
+                SEND_OPCODE | SEND_OFF_OPCODE => "scheduled offset truncates a send",
+                _ => "first scheduled event is not a delay",
+            },
         ));
     }
     Ok(())
@@ -1573,6 +1903,66 @@ mod tests {
                     .filter(|instruction| is_neutral_mux_teardown(**instruction))
                     .count(),
                 1
+            );
+        }
+    }
+
+    #[test]
+    fn randomized_receiver_streams_carry_contiguous_receive_pointers() {
+        let topology = Topology::c600();
+        let mut random = fastrand::Rng::with_seed(0x6d75_785f_6375_746f);
+        for _ in 0..128 {
+            let receiver = random.u16(0..topology.tile_count() as u16);
+            let transfer_count = random.usize(2..=12);
+            let words = random.u32(53..=512);
+            let mut address = 0x50000 + random.u32(0..=0x2000) * 4;
+            let mut pointer_writes = 1;
+            let mut builder = PlanProgramBuilder::default();
+            for index in 0..transfer_count {
+                let source = loop {
+                    let candidate = random.u16(0..topology.tile_count() as u16);
+                    if candidate != receiver {
+                        break candidate;
+                    }
+                };
+                if index != 0 && random.bool() {
+                    address += random.u32(1..=16) * 4;
+                    pointer_writes += 1;
+                }
+                let mut row = topology
+                    .multicast(source, &[receiver], words, 0)
+                    .unwrap()
+                    .receivers[0];
+                patch_receiver_address(&mut row, address).unwrap();
+                let offset = builder.earliest_scheduled_receiver_offset(&row, 0).unwrap();
+                builder
+                    .append_scheduled_receiver_row_at(&row, offset, words)
+                    .unwrap();
+                address += words * 4;
+            }
+            let expected_cycles = builder.event_cycles();
+            let program = builder.finish().unwrap();
+            assert_eq!(plan_event_cycles(&program).unwrap(), expected_cycles);
+            assert_eq!(
+                program
+                    .iter()
+                    .filter(|instruction| is_neutral_mux_teardown(**instruction))
+                    .count(),
+                pointer_writes
+            );
+            assert_eq!(
+                program
+                    .iter()
+                    .filter(|instruction| **instruction & OPCODE_MASK == DELAY_XPIC_OPCODE)
+                    .count(),
+                transfer_count + pointer_writes
+            );
+            assert_eq!(
+                program
+                    .iter()
+                    .filter(|instruction| **instruction & OPCODE_MASK == DELAY_PIC_OPCODE)
+                    .count(),
+                pointer_writes
             );
         }
     }
