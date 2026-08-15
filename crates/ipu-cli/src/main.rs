@@ -108,7 +108,7 @@ enum Command {
         /// Restrict matches to samples active at this normalized cycle offset.
         #[arg(long)]
         at_offset: Option<u64>,
-        /// Preserve device-wide sample offsets instead of aligning program entry per tile.
+        /// Preserve the leading shared-clock interval before every tile has entered profiling.
         #[arg(long)]
         shared_clock: bool,
         #[arg(long, default_value_t = 20)]

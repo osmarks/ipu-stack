@@ -153,7 +153,7 @@ canvas {
       <div class="section-title">Tilewise Timeline</div>
       <div class="legend">
         <label>Row height <select id="timelineRowHeight"><option value="1">compact</option><option value="2">2 px</option><option value="4">4 px</option><option value="8">8 px</option><option value="16">16 px</option></select></label>
-        <label>Tile origins <select id="tileOrigins"><option value="aligned">align first samples</option><option value="shared">shared clock</option></select></label>
+        <label>Timeline start <select id="timelineStart"><option value="cropped">crop initial sync entry</option><option value="shared">shared clock</option></select></label>
         <span class="legend-item"><span class="legend-swatch" style="background:#cf3f4a"></span>compute</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#17854c"></span>tx</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#287db2"></span>rx</span>
@@ -202,12 +202,13 @@ for (const tile of DATA.tiles) {
   tile.samples = tile.samples.map(([step, offset, duration, activities]) => ({
     ...steps[step],
     rawOffset: offset,
+    rawDuration: duration,
     offset,
     duration,
     exchangeActivities: activitySets[activities],
   }));
 }
-const state = { query: "", kind: "all", focus: null, time: null, viewStart: 0, viewEnd: null, timelineRowHeight: 1, alignTileStarts: true };
+const state = { query: "", kind: "all", focus: null, time: null, viewStart: 0, viewEnd: null, timelineRowHeight: 1, cropInitialEntry: true };
 const flame = document.getElementById("flame");
 const overview = document.getElementById("overview");
 const timeline = document.getElementById("timeline");
@@ -226,15 +227,21 @@ const colors = {
 const textColor = { exchange: "#ffffff", compute: "#ffffff", synchronization: "#ffffff", idle: "#050505" };
 const tiles = DATA.tiles.slice().sort((a, b) => a.physicalTile - b.physicalTile);
 const exchangePhaseBounds = new Map();
-function setTileOriginAlignment(enabled) {
+function setTimelineStart(cropInitialEntry) {
+  const origin = cropInitialEntry
+    ? tiles.reduce((latest, tile) => Math.max(latest, tile.samples[0]?.rawOffset || 0), 0)
+    : 0;
   for (const tile of tiles) {
-    const origin = enabled && tile.samples.length ? tile.samples[0].rawOffset : 0;
-    for (const sample of tile.samples) sample.offset = sample.rawOffset - origin;
+    for (const sample of tile.samples) {
+      const rawEnd = sample.rawOffset + sample.rawDuration;
+      sample.offset = Math.max(sample.rawOffset, origin) - origin;
+      sample.duration = Math.max(0, rawEnd - Math.max(sample.rawOffset, origin));
+    }
   }
   exchangePhaseBounds.clear();
   for (const tile of tiles) {
     for (const sample of tile.samples) {
-      if (sample.kind !== "exchange" || !exchangeEventCycles(sample)) continue;
+      if (sample.kind !== "exchange" || sample.duration <= 0 || !exchangeEventCycles(sample)) continue;
       const key = `${sample.epoch}:${sample.phase}`;
       const phase = exchangePhaseBounds.get(key) || { starts: [], ends: [], eventCycles: 0 };
       phase.starts.push(sample.offset);
@@ -251,7 +258,7 @@ function setTileOriginAlignment(enabled) {
     delete phase.ends;
   }
 }
-setTileOriginAlignment(true);
+setTimelineStart(true);
 let timelineGeom = null;
 let flameHits = [];
 let drag = null;
@@ -801,10 +808,10 @@ function render() {
   state.query = document.getElementById("search").value.trim().toLowerCase();
   state.kind = document.getElementById("kind").value;
   state.timelineRowHeight = Number(document.getElementById("timelineRowHeight").value);
-  const alignTileStarts = document.getElementById("tileOrigins").value === "aligned";
-  if (alignTileStarts !== state.alignTileStarts) {
-    state.alignTileStarts = alignTileStarts;
-    setTileOriginAlignment(alignTileStarts);
+  const cropInitialEntry = document.getElementById("timelineStart").value === "cropped";
+  if (cropInitialEntry !== state.cropInitialEntry) {
+    state.cropInitialEntry = cropInitialEntry;
+    setTimelineStart(cropInitialEntry);
     state.time = null;
     state.viewStart = 0;
     state.viewEnd = fullEnd();
@@ -939,7 +946,7 @@ function zoomToRange(start, end) {
 document.getElementById("search").addEventListener("input", () => { state.focus = null; render(); });
 document.getElementById("kind").addEventListener("change", () => { state.focus = null; render(); });
 document.getElementById("timelineRowHeight").addEventListener("change", render);
-document.getElementById("tileOrigins").addEventListener("change", render);
+document.getElementById("timelineStart").addEventListener("change", render);
 document.getElementById("zoomIn").addEventListener("click", () => zoomView(1.35));
 document.getElementById("zoomOut").addEventListener("click", () => zoomView(1 / 1.35));
 document.getElementById("reset").addEventListener("click", resetView);

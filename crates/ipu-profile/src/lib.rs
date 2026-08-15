@@ -52,8 +52,8 @@ pub struct Query {
     pub metadata: Vec<MetadataFilter>,
     pub metadata_key: Option<String>,
     pub at_offset: Option<u64>,
-    /// Preserve the device-wide cycle origin instead of aligning each tile's
-    /// first recorded sample to zero.
+    /// Preserve the complete device-wide timeline instead of cropping the
+    /// common leading interval before every tile has emitted its first sample.
     pub shared_clock: bool,
     pub limit: Option<usize>,
     pub sample_limit: usize,
@@ -382,22 +382,19 @@ struct Candidate<'a> {
 pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
     let sample_count = report.tiles.iter().map(|tile| tile.samples.len()).sum();
     let shared_base = cycle_origin(report);
+    let crop = if query.shared_clock {
+        0
+    } else {
+        initial_sample_entry_span(report, shared_base)
+    };
     let profile_span_cycles = report
         .tiles
         .iter()
-        .filter_map(|tile| {
-            let first = tile.samples.first()?;
-            let base = if query.shared_clock {
-                shared_base
-            } else {
-                first.start_cycle
-            };
-            tile.samples
-                .iter()
-                .map(|sample| {
-                    u64::from(sample.start_cycle.wrapping_sub(base)) + u64::from(duration(sample))
-                })
-                .max()
+        .flat_map(|tile| &tile.samples)
+        .map(|sample| {
+            u64::from(sample.start_cycle.wrapping_sub(shared_base))
+                .saturating_add(u64::from(duration(sample)))
+                .saturating_sub(crop)
         })
         .max()
         .unwrap_or(0);
@@ -406,16 +403,15 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
     let mut matched_sample_count = 0;
 
     for tile in &report.tiles {
-        let base = if query.shared_clock {
-            shared_base
-        } else {
-            tile.samples
-                .first()
-                .map_or(shared_base, |sample| sample.start_cycle)
-        };
         for sample in &tile.samples {
-            let offset = u64::from(sample.start_cycle.wrapping_sub(base));
-            let sample_duration = duration(sample);
+            let raw_offset = u64::from(sample.start_cycle.wrapping_sub(shared_base));
+            let raw_end = raw_offset.saturating_add(u64::from(duration(sample)));
+            let offset = raw_offset.saturating_sub(crop);
+            let end = raw_end.saturating_sub(crop);
+            let sample_duration = u32::try_from(end.saturating_sub(offset)).unwrap_or(u32::MAX);
+            if sample_duration == 0 {
+                continue;
+            }
             if !matches_query(query, tile.physical_tile, sample, offset, sample_duration) {
                 continue;
             }
@@ -515,6 +511,19 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
         groups: summaries,
         samples,
     }
+}
+
+/// Amount of the shared-clock timeline before the last tile emits its first
+/// sample. Cropping this common prefix preserves all cross-tile relationships
+/// after entry into the initial global boundary.
+fn initial_sample_entry_span(report: &ProfileReport, shared_base: u32) -> u64 {
+    report
+        .tiles
+        .iter()
+        .filter_map(|tile| tile.samples.first())
+        .map(|sample| u64::from(sample.start_cycle.wrapping_sub(shared_base)))
+        .max()
+        .unwrap_or(0)
 }
 
 fn matches_query(
@@ -742,33 +751,31 @@ mod tests {
     }
 
     #[test]
-    fn randomized_queries_align_only_initial_tile_offsets() {
+    fn randomized_queries_crop_one_common_initial_entry_span() {
         let mut random = fastrand::Rng::with_seed(0x7072_6f67_7261_6d);
         for case in 0..64 {
             let tile_count = random.usize(2..=32);
             let starts = (0..tile_count)
                 .map(|_| random.u32(1_000..=10_000))
                 .collect::<Vec<_>>();
-            let waits = (0..tile_count)
-                .map(|_| random.u32(1..=2_000))
-                .collect::<Vec<_>>();
+            let latest_start = *starts.iter().max().unwrap();
+            let boundary = latest_start + random.u32(1..=2_000);
             let work = random.u32(1..=2_000);
             let report = ProfileReport {
                 clock_hz: 1_000_000_000,
                 tiles: starts
                     .iter()
-                    .zip(&waits)
                     .enumerate()
-                    .map(|(tile, (&start, &wait))| TileProfile {
+                    .map(|(tile, &start)| TileProfile {
                         physical_tile: tile as u32,
                         samples: vec![
-                            sample(0, ProfileStepKind::Synchronization, "", start, start + wait),
+                            sample(0, ProfileStepKind::Synchronization, "", start, boundary),
                             sample(
                                 1,
                                 ProfileStepKind::Compute,
                                 "work",
-                                start + wait,
-                                start + wait + work,
+                                boundary,
+                                boundary + work,
                             ),
                         ],
                     })
@@ -789,10 +796,10 @@ mod tests {
                 },
             );
 
-            let longest_wait = u64::from(*waits.iter().max().unwrap());
+            let retained_wait = u64::from(boundary - latest_start);
             assert_eq!(
                 aligned.profile_span_cycles,
-                longest_wait + u64::from(work),
+                retained_wait + u64::from(work),
                 "case {case}"
             );
             assert!(
@@ -804,7 +811,14 @@ mod tests {
                 .iter()
                 .find(|group| group.name == "synchronization")
                 .unwrap();
-            assert_eq!(sync.maximum_cycles, longest_wait as u32, "case {case}");
+            assert_eq!(sync.first_offset, 0, "case {case}");
+            assert_eq!(sync.maximum_cycles, retained_wait as u32, "case {case}");
+            let compute = aligned
+                .groups
+                .iter()
+                .find(|group| group.name == "compute")
+                .unwrap();
+            assert_eq!(compute.first_offset, retained_wait, "case {case}");
         }
     }
 
