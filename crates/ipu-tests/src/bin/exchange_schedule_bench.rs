@@ -27,6 +27,11 @@ struct Arguments {
     /// Timed scheduler/codegen runs per selected phase.
     #[arg(long, default_value_t = 1)]
     iterations: usize,
+    /// Ignore sender addresses after the first Repeat iteration. This
+    /// reproduces the unsafe scheduler behavior used before Repeat-aware
+    /// memory-element hazard checking.
+    #[arg(long)]
+    first_iteration_only: bool,
 }
 
 fn main() -> Result<()> {
@@ -36,9 +41,18 @@ fn main() -> Result<()> {
     }
     let input = File::open(&arguments.snapshot)
         .with_context(|| format!("open {}", arguments.snapshot.display()))?;
-    let snapshot: ExchangeScheduleSnapshot = serde_json::from_reader(BufReader::new(input))
+    let mut snapshot: ExchangeScheduleSnapshot = serde_json::from_reader(BufReader::new(input))
         .with_context(|| format!("parse {}", arguments.snapshot.display()))?;
     snapshot.validate()?;
+    if arguments.first_iteration_only {
+        for transfer in snapshot
+            .phases
+            .iter_mut()
+            .flat_map(|phase| &mut phase.transfers)
+        {
+            transfer.source_addresses.truncate(1);
+        }
+    }
 
     let selected = arguments.phases.iter().copied().collect::<BTreeSet<_>>();
     if selected.len() != arguments.phases.len() {
@@ -56,12 +70,13 @@ fn main() -> Result<()> {
         .filter(|problem| selected.is_empty() || selected.contains(&problem.phase))
         .collect::<Vec<_>>();
     println!(
-        "snapshot={} tiles={} phases={} warmup={} iterations={}",
+        "snapshot={} tiles={} phases={} warmup={} iterations={} repeatAware={}",
         arguments.snapshot.display(),
         snapshot.tile_count,
         problems.len(),
         arguments.warmup,
-        arguments.iterations
+        arguments.iterations,
+        !arguments.first_iteration_only,
     );
 
     let total_start = Instant::now();

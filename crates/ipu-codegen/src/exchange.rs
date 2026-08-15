@@ -165,7 +165,7 @@ pub struct ExchangeLoweringOptions {
     pub diagnostics: bool,
 }
 
-pub const EXCHANGE_SCHEDULE_SNAPSHOT_VERSION: u32 = 1;
+pub const EXCHANGE_SCHEDULE_SNAPSHOT_VERSION: u32 = 2;
 
 /// Address-resolved transfers captured immediately before physical scheduling.
 /// Replaying this data exercises the production scheduler and exchange-row
@@ -186,7 +186,9 @@ pub struct ExchangeScheduleProblem {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExchangeScheduleTransfer {
     pub source: u16,
-    pub source_address: u32,
+    /// Address used by each structured-repeat iteration. Ordinary transfers
+    /// contain exactly one entry.
+    pub source_addresses: Vec<u32>,
     pub destinations: Vec<ExchangeScheduleDestination>,
     pub words: u32,
 }
@@ -311,7 +313,8 @@ fn lower_static_exchanges(
                 .into_iter()
                 .flatten()
                 .collect();
-            let pending = coalesce_pending_transfers(pending);
+            let mut pending = coalesce_pending_transfers(pending);
+            attach_repeat_source_addresses(&mut pending, &repeat_inputs, placement)?;
             let schedule_problem = schedule_problem(phase.id.index(), &pending);
             let (receive_counts, incoming_bases) =
                 receive_configuration(&pending, program.tile_count)?;
@@ -349,6 +352,37 @@ fn lower_static_exchanges(
                 &receive_counts,
                 program.tile_count,
             )?;
+            if options.diagnostics {
+                let repeat_iterations = pending
+                    .iter()
+                    .map(|transfer| transfer.source_addresses.len())
+                    .max()
+                    .unwrap_or(1);
+                if repeat_iterations > 1 {
+                    let mut unsafe_pending = pending.clone();
+                    for transfer in &mut unsafe_pending {
+                        transfer.source_addresses.truncate(1);
+                        transfer.refresh_source_elements();
+                    }
+                    let unsafe_schedule = optimize_pending_schedule(
+                        topology,
+                        &unsafe_pending,
+                        &incoming_bases,
+                        &receive_counts,
+                        program.tile_count,
+                    )?;
+                    tracing::info!(
+                        phase = phase.id.index(),
+                        repeat_iterations,
+                        unsafe_horizon = unsafe_schedule.schedule.horizon,
+                        repeat_safe_horizon = schedule.horizon,
+                        repeat_safety_cost = schedule
+                            .horizon
+                            .saturating_sub(unsafe_schedule.schedule.horizon),
+                        "compared repeat-safe exchange schedule with first-iteration-only baseline"
+                    );
+                }
+            }
             if pending.len() > 1_000 {
                 tracing::info!(
                     phase = phase.id.index(),
@@ -385,7 +419,7 @@ fn lower_static_exchanges(
                     let timing = timings[index].ok_or(ExchangeLoweringError::Overflow)?;
                     diagnostics.record(
                         transfer.source,
-                        transfer.source_address,
+                        transfer.source_address(),
                         &transfer.destinations,
                         transfer.words,
                         timing.start,
@@ -623,7 +657,8 @@ fn prepare_transfer(
                 .checked_add(source_offset)
                 .ok_or(ExchangeLoweringError::Overflow)?,
             destinations: destination_entries,
-            source_address,
+            source_addresses: vec![source_address],
+            source_elements: effective_memory_elements(source_address, chunk_bytes / 4),
             words: chunk_bytes / 4,
         });
         source_offset += chunk_bytes;
@@ -831,12 +866,14 @@ impl PhaseDiagnostics {
     }
 }
 
+#[derive(Clone)]
 struct PendingTransfer {
     source: u16,
     source_shard: LowShardId,
     source_offset: u32,
     destinations: Vec<(u16, u32)>,
-    source_address: u32,
+    source_addresses: Vec<u32>,
+    source_elements: Vec<ExchangeMemoryElement>,
     words: u32,
 }
 
@@ -844,6 +881,49 @@ impl PendingTransfer {
     fn tiles(&self) -> impl Iterator<Item = u16> + '_ {
         std::iter::once(self.source).chain(self.destinations.iter().map(|entry| entry.0))
     }
+
+    fn source_address(&self) -> u32 {
+        self.source_addresses[0]
+    }
+
+    fn refresh_source_elements(&mut self) {
+        self.source_elements = self
+            .source_addresses
+            .iter()
+            .flat_map(|&address| effective_memory_elements(address, self.words))
+            .collect();
+        self.source_elements.sort_unstable();
+        self.source_elements.dedup();
+    }
+}
+
+fn attach_repeat_source_addresses(
+    pending: &mut [PendingTransfer],
+    repeat_inputs: &BTreeMap<LowShardId, Vec<LowShardId>>,
+    placement: &Placement,
+) -> Result<(), ExchangeLoweringError> {
+    for transfer in pending {
+        if let Some(inputs) = repeat_inputs.get(&transfer.source_shard) {
+            let addresses = inputs
+                .iter()
+                .map(|input| {
+                    placement
+                        .shard_addresses
+                        .get(input)
+                        .copied()
+                        .ok_or(ExchangeLoweringError::UnplacedShard)?
+                        .checked_add(transfer.source_offset)
+                        .ok_or(ExchangeLoweringError::Overflow)
+                })
+                .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
+            if addresses.first().copied() != Some(transfer.source_address()) {
+                return Err(ExchangeLoweringError::IncompatibleRepeatRows);
+            }
+            transfer.source_addresses = addresses;
+        }
+        transfer.refresh_source_elements();
+    }
+    Ok(())
 }
 
 fn schedule_problem(phase: u32, pending: &[PendingTransfer]) -> ExchangeScheduleProblem {
@@ -853,7 +933,7 @@ fn schedule_problem(phase: u32, pending: &[PendingTransfer]) -> ExchangeSchedule
             .iter()
             .map(|transfer| ExchangeScheduleTransfer {
                 source: transfer.source,
-                source_address: transfer.source_address,
+                source_addresses: transfer.source_addresses.clone(),
                 destinations: transfer
                     .destinations
                     .iter()
@@ -886,20 +966,27 @@ fn pending_from_problem(
                     problem.phase, transfer.words
                 )));
             }
-            if transfer.source_address & 0b11 != 0 {
+            if transfer.source_addresses.is_empty() {
                 return Err(ExchangeLoweringError::InvalidSnapshot(format!(
-                    "phase {} transfer {index} has unaligned source address {:#x}",
-                    problem.phase, transfer.source_address
+                    "phase {} transfer {index} has no source addresses",
+                    problem.phase
                 )));
             }
             let bytes = transfer
                 .words
                 .checked_mul(4)
                 .ok_or(ExchangeLoweringError::Overflow)?;
-            transfer
-                .source_address
-                .checked_add(bytes)
-                .ok_or(ExchangeLoweringError::Overflow)?;
+            for &address in &transfer.source_addresses {
+                if address & 0b11 != 0 {
+                    return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+                        "phase {} transfer {index} has unaligned source address {address:#x}",
+                        problem.phase
+                    )));
+                }
+                address
+                    .checked_add(bytes)
+                    .ok_or(ExchangeLoweringError::Overflow)?;
+            }
             if transfer.destinations.is_empty() {
                 return Err(ExchangeLoweringError::InvalidSnapshot(format!(
                     "phase {} transfer {index} has no destinations",
@@ -933,16 +1020,19 @@ fn pending_from_problem(
                     Ok((destination.tile, destination.address))
                 })
                 .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-            Ok(PendingTransfer {
+            let mut pending = PendingTransfer {
                 source: transfer.source,
                 source_shard: LowShardId::from_index(
                     u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
                 ),
                 source_offset: 0,
                 destinations,
-                source_address: transfer.source_address,
+                source_addresses: transfer.source_addresses.clone(),
+                source_elements: Vec::new(),
                 words: transfer.words,
-            })
+            };
+            pending.refresh_source_elements();
+            Ok(pending)
         })
         .collect()
 }
@@ -1232,7 +1322,7 @@ pub fn validate_exchange_schedule(
             match activity.kind {
                 ExchangeActivityKind::Send => {
                     if usize::from(transfer.source) != tile
-                        || activity.address != transfer.source_address
+                        || activity.address != transfer.source_addresses[0]
                     {
                         return Err(fail(format!(
                             "phase {} transfer {transfer_index} has a mismatched send activity",
@@ -1277,6 +1367,7 @@ pub fn validate_exchange_schedule(
             .iter()
             .filter(|activity| activity.kind == ExchangeActivityKind::Send);
         for send in sends {
+            let transfer = &problem.transfers[send.transfer as usize];
             for receive in phase.activities[tile]
                 .iter()
                 .filter(|activity| activity.kind == ExchangeActivityKind::Receive)
@@ -1284,12 +1375,14 @@ pub fn validate_exchange_schedule(
                 let overlaps = send.start_cycle < receive.memory_end_cycle
                     && receive.start_cycle < send.memory_end_cycle;
                 if overlaps
-                    && spans_share_effective_memory_element(
-                        send.address,
-                        send.words,
-                        receive.address,
-                        receive.words,
-                    )
+                    && transfer.source_addresses.iter().any(|&address| {
+                        spans_share_effective_memory_element(
+                            address,
+                            send.words,
+                            receive.address,
+                            receive.words,
+                        )
+                    })
                 {
                     return Err(fail(format!(
                         "phase {} tile {tile} overlaps send/receive access to one SRAM element",
@@ -1337,10 +1430,15 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
                 .checked_add(previous_bytes)
                 .is_some_and(|end| end == transfer.source_offset)
             && previous.destinations.len() == transfer.destinations.len()
+            && previous.source_addresses.len() == transfer.source_addresses.len()
             && previous
-                .source_address
-                .checked_add(previous_bytes)
-                .is_some_and(|end| end == transfer.source_address)
+                .source_addresses
+                .iter()
+                .zip(&transfer.source_addresses)
+                .all(|(&left, &right)| {
+                    left.checked_add(previous_bytes)
+                        .is_some_and(|end| end == right)
+                })
             && previous
                 .destinations
                 .iter()
@@ -1496,12 +1594,14 @@ fn memory_dependencies(transfers: &[PendingTransfer], tile_count: u16) -> BTreeS
     let mut accesses = vec![Vec::new(); usize::from(tile_count)];
     for (index, transfer) in transfers.iter().enumerate() {
         let bytes = u64::from(transfer.words) * 4;
-        accesses[usize::from(transfer.source)].push(TransferAccess {
-            transfer: index,
-            start: u64::from(transfer.source_address),
-            end: u64::from(transfer.source_address) + bytes,
-            write: false,
-        });
+        for &address in &transfer.source_addresses {
+            accesses[usize::from(transfer.source)].push(TransferAccess {
+                transfer: index,
+                start: u64::from(address),
+                end: u64::from(address) + bytes,
+                write: false,
+            });
+        }
         for &(tile, address) in &transfer.destinations {
             accesses[usize::from(tile)].push(TransferAccess {
                 transfer: index,
@@ -1555,6 +1655,7 @@ struct ScheduledTransfer<'a> {
     source: u16,
     destinations: &'a [(u16, u32)],
     source_address: u32,
+    source_elements: &'a [ExchangeMemoryElement],
     words: u32,
     schedule_offset: u32,
 }
@@ -1579,12 +1680,11 @@ struct MaterializedTiming {
     predecessor: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct MemoryAccess {
     start: u32,
     end: u32,
-    address: u32,
-    words: u32,
+    elements: Vec<ExchangeMemoryElement>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1661,7 +1761,8 @@ impl MaterializedSchedule {
             ScheduledTransfer {
                 source: transfer.source,
                 destinations: &transfer.destinations,
-                source_address: transfer.source_address,
+                source_address: transfer.source_address(),
+                source_elements: &transfer.source_elements,
                 words: transfer.words,
                 schedule_offset: latest_availability,
             },
@@ -1673,8 +1774,7 @@ impl MaterializedSchedule {
             .push(MemoryAccess {
                 start: timing.start,
                 end: timing.sender_memory_end,
-                address: transfer.source_address,
-                words: transfer.words,
+                elements: transfer.source_elements.clone(),
             });
         for ((&(tile, address), &start), &memory_end) in transfer
             .destinations
@@ -1687,8 +1787,7 @@ impl MaterializedSchedule {
                 .push(MemoryAccess {
                     start,
                     end: memory_end,
-                    address,
-                    words: transfer.words,
+                    elements: effective_memory_elements(address, transfer.words),
                 });
         }
         self.scheduled_sends[usize::from(transfer.source)]
@@ -1699,7 +1798,7 @@ impl MaterializedSchedule {
             start_cycle: timing.start,
             end_cycle: payload_end,
             memory_end_cycle: timing.sender_memory_end,
-            address: transfer.source_address,
+            address: transfer.source_address(),
             words: transfer.words,
         });
         for (((&(tile, address), &start_cycle), &end_cycle), &memory_end_cycle) in transfer
@@ -2037,10 +2136,11 @@ fn append_transfer(
         source,
         destinations,
         source_address,
+        source_elements,
         words,
         schedule_offset: requested_offset,
     } = transfer;
-    if words == 0 {
+    if words == 0 || source_elements.is_empty() {
         return Err(ExchangeLoweringError::UnalignedPayload);
     }
     let tiles = destinations.iter().map(|entry| entry.0).collect::<Vec<_>>();
@@ -2083,7 +2183,7 @@ fn append_transfer(
             memory_accesses,
             source,
             destinations,
-            source_address,
+            source_elements,
             words,
             timing.payload_start,
             timing.sender_horizon,
@@ -2116,7 +2216,7 @@ fn memory_safe_transfer_offset(
     memory_accesses: &[TileMemorySchedule],
     source: u16,
     destinations: &[(u16, u32)],
-    source_address: u32,
+    source_elements: &[ExchangeMemoryElement],
     words: u32,
     payload_start: u32,
     payload_end: u32,
@@ -2129,12 +2229,10 @@ fn memory_safe_transfer_offset(
         .iter()
         .filter(|access| payload_start < access.end && access.start < payload_end)
         .filter(|access| {
-            spans_share_effective_memory_element(
-                source_address,
-                words,
-                access.address,
-                access.words,
-            )
+            access
+                .elements
+                .iter()
+                .any(|element| source_elements.binary_search(element).is_ok())
         })
         .map(|access| access.end)
         .max();
@@ -2147,12 +2245,9 @@ fn memory_safe_transfer_offset(
                 .iter()
                 .filter(move |access| receive_start < access.end && access.start < receive_end)
                 .filter(move |access| {
-                    spans_share_effective_memory_element(
-                        address,
-                        words,
-                        access.address,
-                        access.words,
-                    )
+                    effective_memory_elements(address, words)
+                        .iter()
+                        .any(|element| access.elements.contains(element))
                 })
                 .map(move |access| access.end.saturating_sub(receive_start))
         })
@@ -2242,14 +2337,18 @@ mod tests {
                             tiles.insert(tile);
                         }
                     }
+                    let mut source_addresses = vec![0x1_0000 + random.u32(0..32) * 0x100];
+                    if random.bool() {
+                        source_addresses.push(0x4_2000 + random.u32(0..2) * 0x4000);
+                    }
                     ExchangeScheduleTransfer {
                         source,
-                        source_address: 0x1_0000 + random.u32(0..32) * 0x100,
+                        source_addresses,
                         destinations: tiles
                             .into_iter()
                             .map(|tile| ExchangeScheduleDestination {
                                 tile,
-                                address: 0x4_0000 + random.u32(0..32) * 0x100,
+                                address: 0x4_0000 + random.u32(0..2) * 0x4000,
                             })
                             .collect(),
                         words: random.u32(1..=64),
@@ -2288,13 +2387,15 @@ mod tests {
                             receivers.push(tile);
                         }
                     }
+                    let words = random.u32(1..=MAX_TRANSFER_WORDS);
                     PendingTransfer {
                         source,
                         source_shard: LowShardId::from_index(u32::from(source)),
                         source_offset: 0,
                         destinations: receivers.into_iter().map(|tile| (tile, 0)).collect(),
-                        source_address: 0,
-                        words: random.u32(1..=MAX_TRANSFER_WORDS),
+                        source_addresses: vec![0],
+                        source_elements: effective_memory_elements(0, words),
+                        words,
                     }
                 })
                 .collect::<Vec<_>>();
