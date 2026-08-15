@@ -648,6 +648,68 @@ fn estimated_operator_exchange_cycles(
     }
 }
 
+fn deferred_split_input_cycles(
+    source: &TensorType,
+    logical_output: &TensorType,
+    consumer_input: &TensorType,
+) -> Option<(u64, u64)> {
+    if source.shape.0.len() != 3 || logical_output.shape.0.len() != 3 {
+        return None;
+    }
+    let bytes = consumer_input.format.precision.bytes().max(1);
+    let source_work = maximum_shard_bytes(source).div_ceil(bytes);
+    let rank = consumer_input.shape.0.len();
+    let rows = consumer_input
+        .shape
+        .0
+        .get(rank.saturating_sub(2))
+        .copied()
+        .map_or(1, u64::from);
+    let columns = consumer_input.shape.0.last().copied().map_or(1, u64::from);
+    let panel_columns = columns.min(u64::from(crate::mid::AMP_COLUMN_MICRO));
+    let (slices, slice_rows, packing_cycles_per_element) = match consumer_input.format.layout.order
+    {
+        ElementOrder::Amp(AmpOrder::TransposedRight) => (
+            rows.div_ceil(u64::from(crate::mid::AMP_INNER_BLOCK)),
+            rows.min(u64::from(crate::mid::AMP_INNER_BLOCK)),
+            3,
+        ),
+        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block, .. }) => (
+            rows.div_ceil(u64::from(row_block)),
+            rows.min(u64::from(row_block)),
+            4,
+        ),
+        _ => (
+            1,
+            maximum_shard_bytes(consumer_input)
+                .div_ceil(bytes)
+                .div_ceil(columns),
+            2,
+        ),
+    };
+    let panel_elements = slice_rows.saturating_mul(panel_columns);
+    let gather = panel_elements.div_ceil(4);
+    let pack = panel_elements.saturating_mul(packing_cycles_per_element);
+    let panel_bytes = panel_elements.saturating_mul(bytes);
+    let exchange_per_slice = exchange_endpoint_cycles(
+        &ExchangeEndpointTraffic::from_maxima(panel_bytes, panel_bytes, 1, 1),
+        2,
+    );
+    let exchange = slices.saturating_mul(exchange_per_slice);
+    // The packed producer first becomes an addressable logical view. Panel
+    // owners then overlap, leaving one critical gather/pack/exchange per slice.
+    Some((
+        source_work.saturating_mul(2).saturating_add(
+            slices.saturating_mul(
+                gather
+                    .saturating_add(pack)
+                    .saturating_add(exchange_per_slice),
+            ),
+        ),
+        exchange,
+    ))
+}
+
 impl CostModel for Ipu21CostModel {
     fn operator_cycles(
         &self,
@@ -994,54 +1056,11 @@ impl CostModel for Ipu21CostModel {
         producer_cycles: u64,
     ) -> u64 {
         let DeferredTransform::SplitLastAxisIntoLeading { parts } = transform;
-        if parts == 0 || source.shape.0.len() != 3 || logical_output.shape.0.len() != 3 {
+        if parts == 0 {
             return producer_cycles;
         }
-        let bytes = consumer_input.format.precision.bytes().max(1);
-        let source_work = maximum_shard_bytes(source).div_ceil(bytes);
-        let rank = consumer_input.shape.0.len();
-        let rows = consumer_input
-            .shape
-            .0
-            .get(rank.saturating_sub(2))
-            .copied()
-            .map_or(1, u64::from);
-        let columns = consumer_input.shape.0.last().copied().map_or(1, u64::from);
-        let panel_columns = columns.min(u64::from(crate::mid::AMP_COLUMN_MICRO));
-        let (slices, slice_rows, packing_cycles_per_element) =
-            match consumer_input.format.layout.order {
-                ElementOrder::Amp(AmpOrder::TransposedRight) => (
-                    rows.div_ceil(u64::from(crate::mid::AMP_INNER_BLOCK)),
-                    rows.min(u64::from(crate::mid::AMP_INNER_BLOCK)),
-                    3,
-                ),
-                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block, .. }) => (
-                    rows.div_ceil(u64::from(row_block)),
-                    rows.min(u64::from(row_block)),
-                    4,
-                ),
-                _ => (
-                    1,
-                    maximum_shard_bytes(consumer_input)
-                        .div_ceil(bytes)
-                        .div_ceil(columns),
-                    2,
-                ),
-            };
-        let panel_elements = slice_rows.saturating_mul(panel_columns);
-        let gather = panel_elements.div_ceil(4);
-        let pack = panel_elements.saturating_mul(packing_cycles_per_element);
-        let panel_bytes = panel_elements.saturating_mul(bytes);
-        let exchange = exchange_endpoint_cycles(
-            &ExchangeEndpointTraffic::from_maxima(panel_bytes, panel_bytes, 1, 1),
-            2,
-        );
-        // The producer's packed output must first become an addressable logical
-        // view. Thereafter independent panel owners overlap within each slice;
-        // only the critical panel and the two exchange epochs contribute.
-        source_work.saturating_mul(2).saturating_add(
-            slices.saturating_mul(gather.saturating_add(pack).saturating_add(exchange)),
-        )
+        deferred_split_input_cycles(source, logical_output, consumer_input)
+            .map_or(producer_cycles, |cost| cost.0)
     }
 
     fn deferred_input_exchange_cycles(
@@ -1054,35 +1073,10 @@ impl CostModel for Ipu21CostModel {
         _producer_cycles: u64,
     ) -> u64 {
         let DeferredTransform::SplitLastAxisIntoLeading { parts } = transform;
-        if parts == 0 || source.shape.0.len() != 3 || logical_output.shape.0.len() != 3 {
+        if parts == 0 {
             return 0;
         }
-        let rank = consumer_input.shape.0.len();
-        let rows = consumer_input
-            .shape
-            .0
-            .get(rank.saturating_sub(2))
-            .copied()
-            .map_or(1, u64::from);
-        let columns = consumer_input.shape.0.last().copied().map_or(1, u64::from);
-        let (slices, slice_rows) = match consumer_input.format.layout.order {
-            ElementOrder::Amp(AmpOrder::TransposedRight) => (
-                rows.div_ceil(u64::from(crate::mid::AMP_INNER_BLOCK)),
-                rows.min(u64::from(crate::mid::AMP_INNER_BLOCK)),
-            ),
-            ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block, .. }) => (
-                rows.div_ceil(u64::from(row_block)),
-                rows.min(u64::from(row_block)),
-            ),
-            _ => (1, rows),
-        };
-        let panel_bytes = slice_rows
-            .saturating_mul(columns.min(u64::from(crate::mid::AMP_COLUMN_MICRO)))
-            .saturating_mul(consumer_input.format.precision.bytes());
-        slices.saturating_mul(exchange_endpoint_cycles(
-            &ExchangeEndpointTraffic::from_maxima(panel_bytes, panel_bytes, 1, 1),
-            2,
-        ))
+        deferred_split_input_cycles(source, logical_output, consumer_input).map_or(0, |cost| cost.1)
     }
 
     fn operator_exchange_footprint(
