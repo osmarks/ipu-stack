@@ -223,6 +223,12 @@ fn lower_work(
                 TileStep::Exchange(ExchangeStep {
                     active: placed.active,
                     incoming_base: placed.incoming_base,
+                    preserve_base_registers: false,
+                    incoming_mux: None,
+                    incoming_format: 0,
+                    incoming_mux_pair: None,
+                    incoming_dcount: None,
+                    sync_in_program: false,
                     program: placed.program.clone(),
                     setup_patch: placed.setup_patch.clone(),
                     repeat_patches: inside_repeat
@@ -399,6 +405,12 @@ fn lower_inactive_work(
             TileWorkRef::Exchange(id) => steps.push(TileStep::Exchange(ExchangeStep {
                 active: exchange_rows[&id].active,
                 incoming_base: exchange_rows[&id].incoming_base,
+                preserve_base_registers: false,
+                incoming_mux: None,
+                incoming_format: 0,
+                incoming_mux_pair: None,
+                incoming_dcount: None,
+                sync_in_program: false,
                 program: exchange_rows[&id].program.clone(),
                 setup_patch: exchange_rows[&id].setup_patch.clone(),
                 repeat_patches: Vec::new(),

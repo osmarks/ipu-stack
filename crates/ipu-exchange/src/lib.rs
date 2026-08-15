@@ -2088,6 +2088,56 @@ impl Topology {
             .ok_or(ExchangeError::Tile(logical))
     }
 
+    /// Logical tile that shares this tile's double-width exchange resources.
+    pub fn paired_logical(&self, logical: u16) -> Result<u16, ExchangeError> {
+        let paired_physical = self.physical(logical)? ^ 2;
+        self.logical_to_physical
+            .iter()
+            .position(|physical| *physical == paired_physical)
+            .map(|paired| u16::try_from(paired).expect("logical tile count fits u16"))
+            .ok_or(ExchangeError::Tile(logical))
+    }
+
+    /// Physical source selected by `INCOMING_MUXPAIR` for a 64-bit send.
+    pub fn paired_source_mux(&self, sender_logical: u16) -> Result<u16, ExchangeError> {
+        Ok(self.physical(sender_logical)? ^ 2)
+    }
+
+    pub fn is_pair_primary(&self, logical: u16) -> Result<bool, ExchangeError> {
+        Ok(self.physical(logical)? & 2 == 0)
+    }
+
+    /// Direction and width control for one 64-bit route. Both borrowed lanes
+    /// follow the same fabric direction; the two members of a receiving pair
+    /// are not an ordinary two-direction multicast.
+    pub fn paired_send_control(
+        &self,
+        sender_logical: u16,
+        receiver_logical: u16,
+    ) -> Result<u8, ExchangeError> {
+        let sender = u32::from(self.physical(sender_logical)?);
+        let receiver = u32::from(self.physical(receiver_logical)?);
+        Ok(u8::try_from(direction(sender, receiver) | 4).expect("send control is three bits"))
+    }
+
+    /// IPU21 `INCOMING_FORMAT` for one member of a 64-bit receiving pair.
+    ///
+    /// The local and borrowed 32-bit routes can arrive one cycle apart. The
+    /// early member delays its local half (`64E`); the other waits for that
+    /// delayed half (`64W`). This is equivalent to the SDK architecture
+    /// helper `TPair_RxIsEarly`.
+    pub fn paired_receive_format(
+        &self,
+        receiver_logical: u16,
+        sender_logical: u16,
+    ) -> Result<u8, ExchangeError> {
+        let receiver = u32::from(self.physical(receiver_logical)?);
+        let sender = u32::from(self.physical(sender_logical)?);
+        let local = time_to_mux(sender, receiver);
+        let borrowed = time_to_mux(sender, receiver ^ 2);
+        Ok(if local < borrowed { 1 } else { 2 })
+    }
+
     pub fn point_to_point(
         &self,
         sender_logical: u16,
@@ -2262,6 +2312,90 @@ impl Topology {
     }
 }
 
+/// Selects double-width items in every outgoing instruction in a primitive
+/// sender row. Counts and absolute source operands both become 64-bit-item
+/// units; use [`patch_sender_address_64`] after selecting this control.
+pub fn set_sender_control(row: &mut PlanRow, send_control: u8) -> Result<(), ExchangeError> {
+    if !(1..=7).contains(&send_control) {
+        return Err(ExchangeError::Schedule("send control"));
+    }
+    let mut found = false;
+    for instruction in row {
+        if *instruction & LONG_OPCODE_MASK == SEND_OPCODE
+            || is_send_off(*instruction)
+            || (is_send_control_pair(*instruction) && *instruction & 3 != 0)
+        {
+            *instruction = (*instruction & !7) | u32::from(send_control);
+            found = true;
+        }
+    }
+    found
+        .then_some(())
+        .ok_or(ExchangeError::Schedule("sender payload"))
+}
+
+/// Removes standalone source-mux writes while retaining their exact event
+/// advances. The secondary member of a paired 64-bit receiver uses this when
+/// the primary member owns both `INCOMING_MUX` selections.
+pub fn replace_xpic_controls_with_delays(program: &mut [u32]) -> Result<(), ExchangeError> {
+    for instruction in program {
+        if *instruction & OPCODE_MASK == DELAY_XPIC_OPCODE {
+            *instruction = delay(instruction_advance(*instruction) - 1);
+        } else if is_send_control(*instruction) || is_send_control_pair(*instruction) {
+            return Err(ExchangeError::Schedule(
+                "paired receiver has fused XPIC control",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Selects the paired XPIC stream for every standalone receive-mux write.
+/// Double-width receivers use stream one on the primary tile; stream zero is
+/// supplied by the paired incoming-mux register.
+pub fn select_paired_xpic_stream(program: &mut [u32]) -> Result<(), ExchangeError> {
+    let mut found = false;
+    for instruction in program {
+        if *instruction & OPCODE_MASK == DELAY_XPIC_OPCODE {
+            *instruction |= 1 << 13;
+            found = true;
+        } else if is_send_control(*instruction) || is_send_control_pair(*instruction) {
+            return Err(ExchangeError::Schedule(
+                "paired receiver has fused XPIC control",
+            ));
+        }
+    }
+    found
+        .then_some(())
+        .ok_or(ExchangeError::Schedule("paired receiver XPIC control"))
+}
+
+/// Replaces the selected physical source in standalone XPIC controls.
+pub fn patch_xpic_source(program: &mut [u32], source_physical: u16) -> Result<(), ExchangeError> {
+    if u32::from(source_physical) > 0x1fff {
+        return Err(ExchangeError::Tile(source_physical));
+    }
+    let instruction = program
+        .iter_mut()
+        .find(|instruction| {
+            **instruction & OPCODE_MASK == DELAY_XPIC_OPCODE
+                && **instruction & 0x1fff != TILE_MUX_EXCHANGE
+        })
+        .ok_or(ExchangeError::Schedule("receiver source control"))?;
+    *instruction = (*instruction & !0x1fff) | u32::from(source_physical);
+    Ok(())
+}
+
+/// Executable exchange row that reserves a borrowed tile resource without
+/// sending or receiving payload data.
+pub fn timed_idle_program(cycles: u32) -> Result<Vec<u32>, ExchangeError> {
+    let mut words = Vec::new();
+    let mut event_cycles = 0;
+    append_plain_delay(&mut words, &mut event_cycles, cycles)?;
+    words.push(RETURN_M10_INSTRUCTION);
+    Ok(words)
+}
+
 pub fn c600_logical_to_physical(logical: u16) -> u16 {
     let pair = logical / 2;
     let lane = logical & 1;
@@ -2280,6 +2414,21 @@ pub fn patch_sender_address(row: &mut PlanRow, byte_address: u32) -> Result<(), 
         .find(|instruction| **instruction & LONG_OPCODE_MASK == SEND_OPCODE)
         .ok_or(ExchangeError::Address(byte_address))?;
     patch_sender_instruction(instruction, byte_address)
+}
+
+/// Replaces the absolute source of a double-width SEND. Unlike ordinary SEND,
+/// the address field is measured in 64-bit items rather than 32-bit words.
+pub fn patch_sender_address_64(row: &mut PlanRow, byte_address: u32) -> Result<(), ExchangeError> {
+    let instruction = row
+        .iter_mut()
+        .find(|instruction| **instruction & LONG_OPCODE_MASK == SEND_OPCODE)
+        .ok_or(ExchangeError::Address(byte_address))?;
+    if byte_address & 0b111 != 0 || byte_address >> 3 > 0x3_ffff {
+        return Err(ExchangeError::Address(byte_address));
+    }
+    let item_address = byte_address >> 3;
+    *instruction = (*instruction & !SEND_ADDRESS_MASK) | ((item_address << 3) & SEND_ADDRESS_MASK);
+    Ok(())
 }
 
 /// Replaces the address field of one tile-to-tile SEND instruction.
@@ -2516,16 +2665,28 @@ fn time_to_mux(source: u32, destination: u32) -> i32 {
     crossing + source_edge + turn - destination_edge + group_delta + displacement.abs() - 34
 }
 
-const fn delay(cycles: u32) -> u32 {
+pub const fn encode_exchange_delay(cycles: u32) -> u32 {
     0x40a0_0000 | (cycles & 0x7ffff)
 }
 
-fn delay_pic(a: u32, b: u32, c: u32) -> u32 {
+pub const fn encode_exchange_delay_pic(a: u32, b: u32, c: u32) -> u32 {
     0x6000_0000 | ((a << 19) & 0x03f8_0000) | ((b << 18) & 0x0004_0000) | (c & 0x3ffff)
 }
 
-fn delay_xpic(a: u32, b: u32, c: u32) -> u32 {
+pub const fn encode_exchange_delay_xpic(a: u32, b: u32, c: u32) -> u32 {
     0x6400_0000 | ((a << 14) & 0x03ff_c000) | ((b << 13) & 0x0000_2000) | (c & 0x1fff)
+}
+
+const fn delay(cycles: u32) -> u32 {
+    encode_exchange_delay(cycles)
+}
+
+const fn delay_pic(a: u32, b: u32, c: u32) -> u32 {
+    encode_exchange_delay_pic(a, b, c)
+}
+
+const fn delay_xpic(a: u32, b: u32, c: u32) -> u32 {
+    encode_exchange_delay_xpic(a, b, c)
 }
 
 pub fn encode_send(

@@ -327,6 +327,12 @@ pub struct Device {
     config: *mut u8,
 }
 
+// The kernel serializes device ioctls and the configuration BAR is accessed
+// exclusively through volatile 32-bit operations. Sharing a handle is useful
+// for a read-only watchdog while the host protocol thread is blocked. Callers
+// are still responsible for not issuing conflicting state-changing commands.
+unsafe impl Sync for Device {}
+
 impl Device {
     pub fn open(path: &str) -> Result<Self, DriverError> {
         info!(path, "opening IPU device");
@@ -774,6 +780,38 @@ impl Device {
     ) -> Result<u32, DriverError> {
         self.with_stopped_tile_context(physical_tile, context, || {
             self.read_tile_m_register_in_context(physical_tile, context, register)
+        })
+    }
+
+    /// Reads one supervisor special register through a stopped context. This
+    /// is intended for post-mortem diagnostics; stopping an executing context
+    /// changes its timing and must not be used as an in-band sampler.
+    pub fn read_tile_special_register(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        special: u8,
+    ) -> Result<u32, DriverError> {
+        self.with_tile_context(physical_tile, context, true, || {
+            let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
+            self.execute_tile_instruction(
+                physical_tile,
+                context,
+                0x4100_0000 | u32::from(special),
+            )?;
+            self.execute_tile_instruction(
+                physical_tile,
+                context,
+                tdi_instruction::PUT_DEBUG_DATA_M0,
+            )?;
+            let value = self.read_tile_debug(physical_tile, TDI_DATA);
+            self.write_tile_debug(physical_tile, TDI_DATA, original_m0)?;
+            self.execute_tile_instruction(
+                physical_tile,
+                context,
+                tdi_instruction::GET_M0_DEBUG_DATA,
+            )?;
+            value
         })
     }
 

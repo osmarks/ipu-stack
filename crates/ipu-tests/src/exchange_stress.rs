@@ -7,19 +7,26 @@ use ipu_codegen::{
 use ipu_driver::{Device, TileException};
 use ipu_elf::Toolchain;
 use ipu_exchange::{
-    MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming, Topology, finalize_point_receiver,
-    patch_receiver_address, patch_sender_address, scheduled_receiver_timing,
+    MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming, Topology, encode_exchange_delay,
+    encode_exchange_delay_pic, encode_exchange_delay_xpic, finalize_point_receiver,
+    patch_receiver_address, patch_sender_address, patch_sender_address_64,
+    scheduled_receiver_timing, set_sender_control, timed_idle_program,
 };
-use ipu_package::Application;
+use ipu_package::{Application, Binding, RegionSlice};
 use ipu_runtime::Runtime;
 use std::collections::BTreeMap;
 use std::path::Path;
 
 const DATA_BASE: u32 = 0x60000;
 const SOURCE_BASE: u32 = 0x65000;
+const WIDE_DESTINATION_BASE: u32 = DATA_BASE;
 const EXPECTED_BASE: u32 = 0x6c000;
 const DATA_LIMIT: u32 = 0x73800;
 const ROW_BASE: u32 = 0x5c000;
+const WIDE_ROW_BASE: u32 = 0x5c000;
+const WIDE_ROW_LIMIT: u32 = 0x60000;
+const INTERLEAVED_SOURCE_BASE: u32 = 0x88000;
+const INTERLEAVED_DESTINATION_BASE: u32 = 0x98000;
 
 #[derive(Clone, Debug)]
 struct Transfer {
@@ -55,6 +62,7 @@ pub(crate) struct StressPackage {
     active_tiles: u16,
     transfers: Vec<Transfer>,
     rows: Vec<StressRow>,
+    readbacks: Vec<ExpectedSpan>,
 }
 
 pub(crate) struct PhaseReplayPackage {
@@ -63,6 +71,314 @@ pub(crate) struct PhaseReplayPackage {
     expected: Vec<ExpectedSpan>,
     activities: Vec<Vec<ExchangeActivity>>,
     initial_origins: BTreeMap<u32, Vec<(u16, u32)>>,
+}
+
+pub(crate) fn build_wide(
+    active_tiles: u16,
+    cases: u32,
+    validate: bool,
+    receiver_mask: u8,
+    explicit_config: bool,
+    all_active: bool,
+    toolchain: &Toolchain,
+    runtime_source: &Path,
+) -> Result<StressPackage> {
+    if active_tiles < 4 {
+        bail!("the paired 64-bit exchange matrix requires at least four active tiles");
+    }
+    if !(1..=16).contains(&cases) {
+        bail!("the paired 64-bit exchange matrix supports 1..=16 cases");
+    }
+    if receiver_mask > 0b11 {
+        bail!("paired 64-bit receiver mask must fit in two bits");
+    }
+    let topology = Topology::c600();
+    let execution_tiles = u16::try_from(topology.tile_count())?;
+    let words = 128u32;
+    let items = words / 2;
+    let payload = (0..words)
+        .map(|word| 0x6400_0000 ^ word.wrapping_mul(0x9e37_79b9))
+        .collect::<Vec<_>>();
+    let payload_bytes = payload
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    let mut programs = (0..execution_tiles)
+        .map(|tile| TileProgram {
+            tile,
+            steps: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let mut data = Vec::new();
+    let mut transfers = Vec::new();
+    let mut diagnostic_rows = Vec::new();
+    let mut readbacks = Vec::new();
+    let mut row_address = WIDE_ROW_BASE;
+    let setup_row = vec![
+        ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION,
+        encode_exchange_delay(0),
+        ipu_exchange::RETURN_M10_INSTRUCTION,
+    ];
+    let setup_end = row_address + u32::try_from(setup_row.len())? * 4;
+    diagnostic_rows.push(StressRow {
+        case: None,
+        address: row_address,
+        end: setup_end,
+        programs: (0..execution_tiles)
+            .map(|tile| (tile, setup_row.clone()))
+            .collect(),
+    });
+    for tile in 0..execution_tiles {
+        programs[usize::from(tile)]
+            .steps
+            .push(TileStep::Exchange(ExchangeStep {
+                active: true,
+                incoming_base: 0,
+                preserve_base_registers: false,
+                incoming_mux: None,
+                incoming_format: 0,
+                incoming_mux_pair: None,
+                incoming_dcount: None,
+                sync_in_program: true,
+                program: PlacedExchangeRow {
+                    address: row_address,
+                    words: setup_row.clone(),
+                },
+                setup_patch: None,
+                repeat_patches: Vec::new(),
+                profile: StepProfile::default(),
+            }));
+    }
+    row_address = (setup_end + 7) & !7;
+    let region_bases = [
+        (SOURCE_BASE, WIDE_DESTINATION_BASE, "standard->standard"),
+        (
+            INTERLEAVED_SOURCE_BASE,
+            INTERLEAVED_DESTINATION_BASE,
+            "interleaved->interleaved",
+        ),
+        (
+            SOURCE_BASE,
+            INTERLEAVED_DESTINATION_BASE,
+            "standard->interleaved",
+        ),
+        (
+            INTERLEAVED_SOURCE_BASE,
+            WIDE_DESTINATION_BASE,
+            "interleaved->standard",
+        ),
+    ];
+
+    for (case, &(source_base, destination_base, region_name)) in region_bases
+        .iter()
+        .enumerate()
+        .flat_map(|(region, bases)| (0..4).map(move |bank_case| (region * 4 + bank_case, bases)))
+        .take(usize::try_from(cases)?)
+    {
+        let source = 0u16;
+        let destinations = [2u16, 3u16];
+        let bank_case = case & 3;
+        let source_element_size = if source_base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE {
+            ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
+        } else {
+            ipu_package::TILE_MEMORY_ELEMENT_SIZE
+        };
+        let destination_element_size =
+            if destination_base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE {
+                ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
+            } else {
+                ipu_package::TILE_MEMORY_ELEMENT_SIZE
+            };
+        let source_bank_offset = (u32::try_from(bank_case)? >> 1) * source_element_size;
+        let destination_bank_offset = (u32::try_from(bank_case)? & 1) * destination_element_size;
+        let case_offset = u32::try_from(case)? * 0x400;
+        let source_address = source_base + case_offset + source_bank_offset;
+        let destination_address = destination_base + case_offset + destination_bank_offset;
+
+        let mut plan = topology.multicast(source, &destinations, items, 0)?;
+        set_sender_control(
+            &mut plan.sender,
+            topology.paired_send_control(source, destinations[0])?,
+        )?;
+        patch_sender_address_64(&mut plan.sender, source_address)?;
+        for row in &mut plan.receivers {
+            patch_receiver_address(row, destination_address)?;
+        }
+        let mut builder = PhaseProgramBuilder::new(execution_tiles);
+        let timing = builder.append_transfer_at(source, &destinations, &plan, 0, items)?;
+        let phase = builder.finish()?;
+        let mut rows = phase.programs;
+        let paired_source = topology.paired_logical(source)?;
+        rows[usize::from(paired_source)] = Some(timed_idle_program(timing.payload_end)?);
+        let source_physical = u32::from(topology.physical(source)?);
+        let destination_word = destination_address >> 2;
+        rows[usize::from(destinations[0])] = Some(vec![
+            encode_exchange_delay_xpic(0, 1, source_physical),
+            encode_exchange_delay_pic(52, 1, 1),
+            encode_exchange_delay_pic(1, 0, destination_word),
+            encode_exchange_delay_xpic(8, 1, ipu_exchange::TILE_MUX_EXCHANGE),
+            encode_exchange_delay_pic(52, 1, 0),
+            ipu_exchange::RETURN_M10_INSTRUCTION,
+        ]);
+        rows[usize::from(destinations[1])] = Some(vec![
+            encode_exchange_delay_pic(53, 1, 1),
+            encode_exchange_delay_pic(1, 0, destination_word),
+            encode_exchange_delay_pic(61, 1, 0),
+            ipu_exchange::RETURN_M10_INSTRUCTION,
+        ]);
+        for row in rows.iter_mut().flatten() {
+            row.insert(0, ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
+        }
+        for (index, &destination) in destinations.iter().enumerate() {
+            if receiver_mask & (1 << index) == 0 {
+                rows[usize::from(destination)] = None;
+            }
+        }
+        if all_active {
+            for row in &mut rows {
+                if row.is_none() {
+                    *row = Some(vec![
+                        ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION,
+                        encode_exchange_delay(0),
+                        ipu_exchange::RETURN_M10_INSTRUCTION,
+                    ]);
+                }
+            }
+        }
+        let row_words = rows
+            .iter()
+            .filter_map(|row| row.as_ref().map(Vec::len))
+            .max()
+            .unwrap_or(1);
+        let row_end = row_address + u32::try_from(row_words)? * 4;
+        if row_end > WIDE_ROW_LIMIT {
+            bail!("paired exchange rows exceed the diagnostic row region");
+        }
+        diagnostic_rows.push(StressRow {
+            case: Some(u32::try_from(case)?),
+            address: row_address,
+            end: row_end,
+            programs: rows
+                .iter()
+                .enumerate()
+                .filter_map(|(tile, row)| {
+                    row.clone()
+                        .map(|words| (u16::try_from(tile).expect("tile index fits u16"), words))
+                })
+                .collect(),
+        });
+
+        for tile in 0..execution_tiles {
+            let row = rows[usize::from(tile)]
+                .clone()
+                .unwrap_or_else(inactive_exchange_program);
+            let active = rows[usize::from(tile)].is_some();
+            let receiving = destinations.contains(&tile) && active;
+            programs[usize::from(tile)]
+                .steps
+                .push(TileStep::Exchange(ExchangeStep {
+                    active,
+                    incoming_base: 0,
+                    preserve_base_registers: true,
+                    incoming_mux: None,
+                    incoming_format: if receiving && explicit_config {
+                        topology.paired_receive_format(tile, source)?
+                    } else {
+                        0
+                    },
+                    incoming_mux_pair: (receiving && explicit_config)
+                        .then_some(topology.paired_source_mux(source)?),
+                    incoming_dcount: None,
+                    sync_in_program: active,
+                    program: PlacedExchangeRow {
+                        address: row_address,
+                        words: row,
+                    },
+                    setup_patch: None,
+                    repeat_patches: Vec::new(),
+                    profile: StepProfile::default(),
+                }));
+        }
+        data.push(TileProgramData {
+            tile: source,
+            address: source_address,
+            data: payload_bytes.clone(),
+        });
+        if validate {
+            readbacks.push(ExpectedSpan {
+                tile: source,
+                address: source_address,
+                words: payload.clone(),
+            });
+        }
+        for &tile in &destinations {
+            data.push(TileProgramData {
+                tile,
+                address: destination_address,
+                data: vec![0; payload_bytes.len()],
+            });
+            let receiver_index = destinations
+                .iter()
+                .position(|candidate| *candidate == tile)
+                .expect("destination comes from receiver pair");
+            if validate && receiver_mask & (1 << receiver_index) != 0 {
+                readbacks.push(ExpectedSpan {
+                    tile,
+                    address: destination_address,
+                    words: payload.clone(),
+                });
+            }
+        }
+        transfers.push(Transfer {
+            case: u32::try_from(case)?,
+            source,
+            destinations: destinations.to_vec(),
+            source_address,
+            destination_addresses: vec![destination_address; destinations.len()],
+            words,
+            requested_schedule_offset: 0,
+            schedule_offset: 0,
+            timing,
+        });
+        eprintln!(
+            "exchangeWide case={case} region={region_name} sourceElement={} destinationElement={} source={source} destinations={destinations:?}",
+            source_bank_offset / source_element_size,
+            destination_bank_offset / destination_element_size,
+        );
+        row_address = (row_end + 7) & !7;
+    }
+
+    let output_bindings = readbacks
+        .iter()
+        .enumerate()
+        .map(|(index, span)| -> Result<Binding> {
+            Ok(Binding {
+                name: format!("paired-result-{index}"),
+                dtype: "u32".into(),
+                shape: vec![u32::try_from(span.words.len())?],
+                slices: vec![RegionSlice {
+                    tile: u32::from(topology.physical(span.tile)?),
+                    tile_address: span.address,
+                    file_offset: 0,
+                    size: u64::try_from(span.words.len() * 4)?,
+                }],
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let application = build_tile_program_package(
+        &programs,
+        &data,
+        &output_bindings,
+        toolchain,
+        runtime_source,
+    )?;
+    Ok(StressPackage {
+        application,
+        active_tiles,
+        transfers,
+        rows: diagnostic_rows,
+        readbacks,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +411,7 @@ enum ReplayEvent {
 
 #[derive(Clone, Debug)]
 struct StressRow {
+    case: Option<u32>,
     address: u32,
     end: u32,
     programs: BTreeMap<u16, Vec<u32>>,
@@ -353,6 +670,7 @@ pub(crate) fn build(
             bail!("{cases} stress cases exceed the exchange-row test region");
         }
         diagnostic_rows.push(StressRow {
+            case: Some(case),
             address: row_address,
             end: row_end,
             programs: rows
@@ -386,6 +704,12 @@ pub(crate) fn build(
                 .push(TileStep::Exchange(ExchangeStep {
                     active,
                     incoming_base: 0,
+                    preserve_base_registers: false,
+                    incoming_mux: None,
+                    incoming_format: 0,
+                    incoming_mux_pair: None,
+                    incoming_dcount: None,
+                    sync_in_program: false,
                     program: PlacedExchangeRow {
                         address,
                         words: row,
@@ -427,7 +751,7 @@ pub(crate) fn build(
             data,
         })
         .collect::<Vec<_>>();
-    let application = build_tile_program_package(&programs, &data, toolchain, runtime_source)?;
+    let application = build_tile_program_package(&programs, &data, &[], toolchain, runtime_source)?;
     eprintln!(
         "exchangeStress seed={seed:#x} pattern={} cases={cases} transfers={} activeTiles={active_tiles} maxWords={maximum_words} maxTransfers={maximum_transfers} maxComputeDelay={maximum_compute_delay}",
         if overlap_sweep { "overlap" } else { "random" },
@@ -438,6 +762,7 @@ pub(crate) fn build(
         active_tiles,
         transfers,
         rows: diagnostic_rows,
+        readbacks: Vec::new(),
     })
 }
 
@@ -493,6 +818,12 @@ pub(crate) fn build_phase_replay(
                         incoming_base: scheduled
                             .then(|| phase.incoming_bases[usize::from(tile)])
                             .unwrap_or(0),
+                        preserve_base_registers: false,
+                        incoming_mux: None,
+                        incoming_format: 0,
+                        incoming_mux_pair: None,
+                        incoming_dcount: None,
+                        sync_in_program: false,
                         program: PlacedExchangeRow {
                             address: row_address,
                             words,
@@ -666,7 +997,7 @@ pub(crate) fn build_phase_replay(
                 .push((u16::try_from(tile)?, address));
         }
     }
-    let application = build_tile_program_package(&programs, &data, toolchain, runtime_source)?;
+    let application = build_tile_program_package(&programs, &data, &[], toolchain, runtime_source)?;
     let overlapping_tiles = phase
         .activities
         .iter()
@@ -951,10 +1282,85 @@ fn replay_word(tile: u16, address: u32) -> u32 {
 }
 
 impl StressPackage {
+    pub(crate) fn live_exchange_state(&self, runtime: &Runtime) -> String {
+        let topology = Topology::c600();
+        let mut states = Vec::new();
+        let mut relevant = Vec::new();
+        for transfer in &self.transfers {
+            relevant.push(transfer.source);
+            relevant.extend(transfer.destinations.iter().copied());
+            if let Ok(paired) = topology.paired_logical(transfer.source) {
+                relevant.push(paired);
+            }
+        }
+        relevant.sort_unstable();
+        relevant.dedup();
+        for &logical in &relevant {
+            if logical >= self.active_tiles {
+                continue;
+            }
+            let Ok(physical) = topology.physical(logical) else {
+                continue;
+            };
+            let context = runtime.device().tile_context_state(physical, 0);
+            let error = runtime.device().tile_exchange_receive_error(physical);
+            let exchange = runtime.device().tile_exchange_state(physical);
+            let stopped = context.as_ref().is_ok_and(|state| matches!(*state, 2 | 3));
+            let status = stopped.then(|| runtime.device().read_tile_context_status(physical, 0));
+            let pc = stopped.then(|| runtime.device().read_tile_program_counter(physical, 0));
+            states.push(format!(
+                "logical={logical} physical={physical} context={context:?} ererr={error:?} exchange={exchange:?} status={status:?} pc={pc:?}"
+            ));
+        }
+        states.join("; ")
+    }
+
+    pub(crate) fn validate_readbacks(&self, output: &[u8]) -> Result<()> {
+        let mut offset = 0usize;
+        for span in &self.readbacks {
+            let bytes = span.words.len() * 4;
+            let actual = output
+                .get(offset..offset + bytes)
+                .context("paired exchange host output is truncated")?
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte word")))
+                .collect::<Vec<_>>();
+            offset += bytes;
+            let differences = span
+                .words
+                .iter()
+                .zip(&actual)
+                .enumerate()
+                .filter(|(_, (expected, actual))| expected != actual)
+                .take(16)
+                .map(|(word, (&expected, &actual))| (word, expected, actual))
+                .collect::<Vec<_>>();
+            if !differences.is_empty() {
+                bail!(
+                    "paired exchange corrupted logical tile {} at 0x{:x}: {differences:?}",
+                    span.tile,
+                    span.address,
+                );
+            }
+        }
+        if !self.readbacks.is_empty() {
+            eprintln!(
+                "exchangeWide hardwareReadback=PASS spans={} words={}",
+                self.readbacks.len(),
+                self.readbacks
+                    .iter()
+                    .map(|span| span.words.len())
+                    .sum::<usize>(),
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn static_diagnostic(&self, case: u32) -> Result<String> {
         let row = self
             .rows
-            .get(usize::try_from(case)?)
+            .iter()
+            .find(|row| row.case == Some(case))
             .with_context(|| format!("exchange diagnostic case {case} is out of range"))?;
         let transfers = self
             .transfers
@@ -1009,18 +1415,17 @@ impl StressPackage {
             let Ok(pc) = runtime.device().read_tile_program_counter(physical, 0) else {
                 continue;
             };
-            if let Some((case, _)) = self
+            if let Some(row) = self
                 .rows
                 .iter()
-                .enumerate()
-                .find(|(_, row)| (row.address..row.end).contains(&pc))
+                .find(|row| (row.address..row.end).contains(&pc))
             {
-                stopped.push((logical, physical, case, pc));
+                stopped.push((logical, physical, row.case, pc));
             }
         }
         let cases = stopped
             .iter()
-            .map(|entry| entry.2 as u32)
+            .filter_map(|entry| entry.2)
             .collect::<Vec<_>>();
         let transfers = self
             .transfers
@@ -1040,7 +1445,7 @@ impl StressPackage {
         let rows = stopped
             .iter()
             .filter_map(|&(logical, physical, case, pc)| {
-                let row = self.rows.get(case)?;
+                let row = self.rows.iter().find(|row| row.case == case)?;
                 let expected = row.programs.get(&logical)?;
                 let actual = runtime
                     .device()

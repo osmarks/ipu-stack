@@ -16,6 +16,7 @@ use rand_xoshiro::{SplitMix64, rand_core::SeedableRng};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 mod diagnostic;
@@ -147,6 +148,19 @@ struct Arguments {
     /// Maximum worker-loop iterations between randomized exchange epochs.
     #[arg(long, default_value_t = 2048)]
     exchange_compute_delay: u32,
+    /// Omit paired-width result readback while retaining the selected rows.
+    #[arg(long)]
+    exchange_skip_validation: bool,
+    /// Bit mask selecting the primary (bit 0) and secondary (bit 1) rows in
+    /// the paired-width diagnostic.
+    #[arg(long, default_value_t = 3)]
+    exchange_wide_receiver_mask: u8,
+    /// Explicitly program the otherwise self-describing paired receive CSRs.
+    #[arg(long)]
+    exchange_wide_explicit_config: bool,
+    /// Make every tile join the paired-width sync with a minimal idle row.
+    #[arg(long)]
+    exchange_wide_all_active: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -177,6 +191,8 @@ enum ExchangeStressPattern {
     Random,
     /// Controlled full-duplex cases with one tile sending and receiving.
     Overlap,
+    /// Paired 64-bit sends across the standard/interleaved SRAM bank matrix.
+    Wide,
 }
 
 impl Workload {
@@ -366,17 +382,31 @@ fn main() -> Result<()> {
                 "--reuse-package is not supported by exchange-stress because its manifest is generated with the package"
             );
         }
-        let stress = exchange_stress::build(
-            arguments.exchange_seed,
-            active_tiles,
-            arguments.exchange_cases,
-            arguments.exchange_max_words,
-            arguments.exchange_max_transfers,
-            arguments.exchange_compute_delay,
-            matches!(arguments.exchange_pattern, ExchangeStressPattern::Overlap),
-            &Toolchain::from_sdk(&arguments.sdk),
-            &runtime_source,
-        )?;
+        let toolchain = Toolchain::from_sdk(&arguments.sdk);
+        let stress = if matches!(arguments.exchange_pattern, ExchangeStressPattern::Wide) {
+            exchange_stress::build_wide(
+                active_tiles,
+                arguments.exchange_cases,
+                !arguments.exchange_skip_validation,
+                arguments.exchange_wide_receiver_mask,
+                arguments.exchange_wide_explicit_config,
+                arguments.exchange_wide_all_active,
+                &toolchain,
+                &runtime_source,
+            )?
+        } else {
+            exchange_stress::build(
+                arguments.exchange_seed,
+                active_tiles,
+                arguments.exchange_cases,
+                arguments.exchange_max_words,
+                arguments.exchange_max_transfers,
+                arguments.exchange_compute_delay,
+                matches!(arguments.exchange_pattern, ExchangeStressPattern::Overlap),
+                &toolchain,
+                &runtime_source,
+            )?
+        };
         if arguments.exchange_diagnostics {
             eprintln!(
                 "{}",
@@ -398,12 +428,35 @@ fn main() -> Result<()> {
             )?;
             let mut session = runtime.host_session(&stress.application)?;
             session.start()?;
-            let _ = session.invoke("run", &[0; 4])?;
-            diagnose_completion(
-                &runtime,
-                &stress.application,
-                Duration::from_secs(arguments.timeout_seconds),
-            )
+            std::thread::scope(|scope| {
+                let (finished_tx, finished_rx) = mpsc::channel();
+                let watchdog_timeout = Duration::from_secs(arguments.timeout_seconds);
+                let stress_ref = &stress;
+                let runtime_ref = &runtime;
+                let watchdog = scope.spawn(move || {
+                    if finished_rx.recv_timeout(watchdog_timeout).is_err() {
+                        eprintln!(
+                            "exchange watchdog: {}",
+                            stress_ref.live_exchange_state(runtime_ref)
+                        );
+                    }
+                });
+                let result = (|| {
+                    let call = session.invoke_streaming_deferred("run", &[0; 4])?;
+                    let output = session.collect(&call)?;
+                    diagnose_completion(
+                        &runtime,
+                        &stress.application,
+                        Duration::from_secs(arguments.timeout_seconds),
+                    )?;
+                    stress.validate_readbacks(&output)
+                })();
+                let _ = finished_tx.send(());
+                watchdog
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("exchange watchdog panicked"))?;
+                result
+            })
             .with_context(|| stress.failure_context(&runtime))
         })?;
         println!(

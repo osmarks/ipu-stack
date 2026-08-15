@@ -169,6 +169,7 @@ struct BuiltApplication {
 pub fn build_tile_program_package(
     programs: &[TileProgram],
     data: &[TileProgramData],
+    outputs: &[Binding],
     toolchain: &Toolchain,
     runtime_source: &std::path::Path,
 ) -> PackageBuildResult<Application> {
@@ -302,6 +303,8 @@ pub fn build_tile_program_package(
             size: 4,
         }],
     };
+    let mut run_outputs = outputs.to_vec();
+    run_outputs.push(finish);
     let host_bounds = crate::IPU21_DATA_BASE..TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
     let sizing_host_base = memory.next_free(
         linked_end,
@@ -313,7 +316,7 @@ pub fn build_tile_program_package(
     let provisional_host = host::plan(
         &[],
         std::slice::from_ref(&launch),
-        std::slice::from_ref(&finish),
+        &run_outputs,
         execution_tiles,
         sizing_host_base,
         &vec![provisional_ranges; usize::from(execution_tiles)],
@@ -334,7 +337,7 @@ pub fn build_tile_program_package(
     let host = host::plan(
         &[],
         std::slice::from_ref(&launch),
-        std::slice::from_ref(&finish),
+        &run_outputs,
         execution_tiles,
         host_code.range.start,
         &vec![host_ranges; usize::from(execution_tiles)],
@@ -466,7 +469,7 @@ pub fn build_tile_program_package(
             size: 4,
         }],
     });
-    application.outputs.push(finish);
+    application.outputs.extend(run_outputs);
     application.inputs.push(launch);
     application.entry_points.push(EntryPoint {
         name: "run".into(),

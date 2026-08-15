@@ -77,6 +77,9 @@ pub use tile::{TileLoweringError, TileProgramLowering, compact_exchange_row_addr
 
 const INCOMING_BASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;
+const INCOMING_MUX: u8 = 0xa0;
+const INCOMING_FORMAT: u8 = 0xa3;
+const INCOMING_MUXPAIR: u8 = 0xa1;
 // Recovered primitive PIC/XPIC plans arm A6 with one; their payload length is
 // encoded in the timed instructions rather than this external-stream counter.
 // Consolidated phases currently preserve that primitive-plan setting.
@@ -171,6 +174,30 @@ pub struct ExchangeStep {
     pub active: bool,
     /// Base address used by point-to-point receive rows.
     pub incoming_base: u32,
+    /// Preserve both exchange base registers on entry. Absolute-address paired
+    /// rows use the two PIC streams directly and must not reset their state.
+    #[serde(default)]
+    pub preserve_base_registers: bool,
+    /// Ordinary receive source selected outside the timed row when a paired
+    /// receive uses the neighbouring sender for its waiting half.
+    #[serde(default)]
+    pub incoming_mux: Option<u16>,
+    /// IPU21 incoming item format: 0 for 32-bit, 1 for the early half of a
+    /// paired 64-bit path, and 2 for the waiting half.
+    #[serde(default)]
+    pub incoming_format: u8,
+    /// Fixed source selection for the borrowed half of a paired 64-bit path.
+    #[serde(default)]
+    pub incoming_mux_pair: Option<u16>,
+    /// Override the ordinary internal-exchange down-count. Paired 64-bit
+    /// helper tiles execute mux timing while using zero to ignore the value.
+    #[serde(default)]
+    pub incoming_dcount: Option<u32>,
+    /// The exchange row owns its supervisor sync and does not require the
+    /// generic down-count setup. This is used by paired-width rows whose SDK
+    /// form treats the sync and the following timing program as one unit.
+    #[serde(default)]
+    pub sync_in_program: bool,
     /// Synchronization-free timed exchange program.
     pub program: PlacedExchangeRow,
     /// Address words applied before invoking a structurally shared row.
@@ -421,22 +448,45 @@ fn emit_steps(
                         symbols,
                     )?;
                 }
-                code.setzi(8, exchange.incoming_base)?;
-                code.put_special(INCOMING_BASE, 8)?;
-                code.put_special(OUTGOING_BASE, 15)?;
+                if !exchange.preserve_base_registers {
+                    code.setzi(8, exchange.incoming_base)?;
+                    code.put_special(INCOMING_BASE, 8)?;
+                }
+                if let Some(source) = exchange.incoming_mux {
+                    code.setzi(8, u32::from(source))?;
+                    code.put_special(INCOMING_MUX, 8)?;
+                }
+                if exchange.incoming_format != 0 {
+                    code.setzi(8, u32::from(exchange.incoming_format))?;
+                    code.put_special(INCOMING_FORMAT, 8)?;
+                }
+                if let Some(source) = exchange.incoming_mux_pair {
+                    code.setzi(8, u32::from(source))?;
+                    code.put_special(INCOMING_MUXPAIR, 8)?;
+                }
+                if !exchange.preserve_base_registers {
+                    code.put_special(OUTGOING_BASE, 15)?;
+                }
                 if exchange.active {
                     code.call(
                         worker_barrier.expect("active exchange phase has worker barrier"),
                         7,
                     )?;
-                    code.setzi(8, INTERNAL_EXCHANGE_DCOUNT)?;
-                    code.put_special(INCOMING_DCOUNT, 8)?;
+                    if exchange.incoming_dcount.is_some() || !exchange.sync_in_program {
+                        code.setzi(
+                            8,
+                            exchange.incoming_dcount.unwrap_or(INTERNAL_EXCHANGE_DCOUNT),
+                        )?;
+                        code.put_special(INCOMING_DCOUNT, 8)?;
+                    }
                 }
-                if exchange.active {
+                if exchange.active && !exchange.sync_in_program {
                     code.instruction(SYNC_SUPERVISOR_INSTRUCTION);
                 } else {
-                    code.instruction(SANS_INACTIVE_INSTRUCTION);
-                    code.instruction(ipu_exchange::SYNC_ANS_INSTRUCTION);
+                    if !exchange.active {
+                        code.instruction(SANS_INACTIVE_INSTRUCTION);
+                        code.instruction(ipu_exchange::SYNC_ANS_INSTRUCTION);
+                    }
                 }
                 code.call(exchange.program.address, 10)?;
                 if let Some(address) = exchange.profile.after {
@@ -575,20 +625,31 @@ fn validate_steps(
 }
 
 fn validate_exchange_program(exchange: &ExchangeStep) -> Result<()> {
+    let embedded_sync = exchange
+        .program
+        .words
+        .first()
+        .is_some_and(|word| *word == SYNC_SUPERVISOR_INSTRUCTION);
     if exchange.program.address & 0b11 != 0
         || exchange.program.words.last() != Some(&ipu_exchange::RETURN_M10_INSTRUCTION)
-        || exchange.program.words.iter().any(|word| {
-            matches!(
-                *word,
-                SANS_INACTIVE_INSTRUCTION | SYNC_SUPERVISOR_INSTRUCTION
-            )
-        })
+        || embedded_sync != exchange.sync_in_program
+        || exchange
+            .program
+            .words
+            .iter()
+            .skip(usize::from(embedded_sync))
+            .any(|word| {
+                matches!(
+                    *word,
+                    SANS_INACTIVE_INSTRUCTION | SYNC_SUPERVISOR_INSTRUCTION
+                )
+            })
     {
         return Err(invalid(
             "exchange phase has an invalid boundary or timed program",
         ));
     }
-    if exchange.active != (exchange.program.words.len() > 1) {
+    if exchange.active != (exchange.program.words.len() > 1 + usize::from(embedded_sync)) {
         return Err(invalid(
             "exchange participation does not match timed program",
         ));
@@ -967,6 +1028,12 @@ mod tests {
                 TileStep::Exchange(ExchangeStep {
                     active: false,
                     incoming_base: 0,
+                    preserve_base_registers: false,
+                    incoming_mux: None,
+                    incoming_format: 0,
+                    incoming_mux_pair: None,
+                    incoming_dcount: None,
+                    sync_in_program: false,
                     program: PlacedExchangeRow {
                         address: 0x60000,
                         words: inactive_exchange_program(),
@@ -1009,6 +1076,12 @@ mod tests {
             steps: vec![TileStep::Exchange(ExchangeStep {
                 active: false,
                 incoming_base: 0,
+                preserve_base_registers: false,
+                incoming_mux: None,
+                incoming_format: 0,
+                incoming_mux_pair: None,
+                incoming_dcount: None,
+                sync_in_program: false,
                 program: PlacedExchangeRow {
                     address: 3,
                     words: Vec::new(),
@@ -1047,6 +1120,12 @@ mod tests {
                     body: vec![TileStep::Exchange(ExchangeStep {
                         active: true,
                         incoming_base: 0x70000,
+                        preserve_base_registers: false,
+                        incoming_mux: None,
+                        incoming_format: 0,
+                        incoming_mux_pair: None,
+                        incoming_dcount: None,
+                        sync_in_program: false,
                         program: PlacedExchangeRow {
                             address: 0x60000,
                             words: vec![0, ipu_exchange::RETURN_M10_INSTRUCTION],
