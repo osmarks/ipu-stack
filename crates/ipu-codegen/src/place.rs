@@ -7,8 +7,8 @@ use crate::memory::IPU21_DATA_BASE;
 use crate::mid::{MemoryClass, MemoryOperand, MemoryRelation, OperandRequirement};
 use crate::storage::{StorageError, shard_storage_bytes};
 use ipu_package::{
-    IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, IPU21_INTERLEAVED_REGION_LIMIT,
-    TILE_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE, TILE_MEMORY_SIZE,
+    IPU21_APPLICATION_MEMORY_LIMIT, IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE,
+    TILE_MEMORY_ELEMENT_SIZE,
 };
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -196,7 +196,7 @@ fn place_tile(
     let mut interleaved = Arena::new(
         &[(
             IPU21_INTERLEAVED_MEMORY_BASE,
-            IPU21_INTERLEAVED_REGION_LIMIT,
+            IPU21_APPLICATION_MEMORY_LIMIT,
         )],
         true,
     );
@@ -215,7 +215,7 @@ fn place_tile(
     )?;
     let interleaved_boundary =
         align_up(interleaved.maximum_cursor(), IPU21_INTERLEAVED_ELEMENT_SIZE)?;
-    if interleaved_boundary > IPU21_INTERLEAVED_REGION_LIMIT {
+    if interleaved_boundary > IPU21_APPLICATION_MEMORY_LIMIT {
         return Err(PlacementError::OutOfMemory {
             tile,
             class: MemoryClass::Ipu21Interleaved,
@@ -223,7 +223,7 @@ fn place_tile(
         });
     }
     let mut ranges = standard_ranges.to_vec();
-    ranges.push((interleaved_boundary, TILE_MEMORY_BASE + TILE_MEMORY_SIZE));
+    ranges.push((interleaved_boundary, IPU21_APPLICATION_MEMORY_LIMIT));
     let mut standard = Arena::new(&ranges, false);
     allocate_tile_class(
         program,
@@ -883,7 +883,7 @@ mod tests {
                 match shard.tensor_type.format.layout.memory_class {
                     MemoryClass::Ipu21Interleaved => {
                         assert!(
-                            (IPU21_INTERLEAVED_MEMORY_BASE..IPU21_INTERLEAVED_REGION_LIMIT)
+                            (IPU21_INTERLEAVED_MEMORY_BASE..IPU21_APPLICATION_MEMORY_LIMIT)
                                 .contains(&address)
                         )
                     }

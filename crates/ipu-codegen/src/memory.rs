@@ -12,9 +12,9 @@ pub const PROFILE_END_CYCLE: u32 = RUNTIME_STATE_BASE + 8;
 
 /// First byte after the permanently reserved runtime state.
 pub const IPU21_DATA_BASE: u32 = RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES;
-/// All of architectural region 1 can back interleaved data.
+/// Loader-populatable region 1 storage available to interleaved data.
 pub const IPU21_INTERLEAVED_REGION_BYTES: u32 =
-    ipu_package::IPU21_INTERLEAVED_REGION_LIMIT - ipu_package::IPU21_INTERLEAVED_MEMORY_BASE;
+    ipu_package::IPU21_APPLICATION_MEMORY_LIMIT - ipu_package::IPU21_INTERLEAVED_MEMORY_BASE;
 /// Standard-addressable storage which is not borrowed from region 1.
 pub const IPU21_STANDARD_FIXED_BYTES: u32 =
     ipu_package::IPU21_INTERLEAVED_MEMORY_BASE - IPU21_DATA_BASE;

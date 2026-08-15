@@ -237,6 +237,12 @@ pub const IPU21_INTERLEAVED_MEMORY_BASE: u32 = TILE_MEMORY_BASE + 0x34000;
 pub const IPU21_INTERLEAVED_MEMORY_LIMIT: u32 = TILE_MEMORY_BASE + 0x3c000;
 /// End of architectural region 1, whose interleave factor is two on IPU21.
 pub const IPU21_INTERLEAVED_REGION_LIMIT: u32 = TILE_MEMORY_BASE + TILE_MEMORY_SIZE;
+/// Exclusive end of SRAM which the SDK secondary loader can populate.
+///
+/// The final 0x450 bytes are architectural tile memory, but lie beyond the
+/// loader's 643 frames of 992 payload bytes starting at `TILE_MEMORY_BASE +
+/// 0x10`. Packages intended for runtime loading must place no segment there.
+pub const IPU21_APPLICATION_MEMORY_LIMIT: u32 = 0xe7bb0;
 /// Logical bytes covered by a pair of physical elements in interleaved region 1.
 pub const IPU21_INTERLEAVED_ELEMENT_SIZE: u32 = 2 * TILE_MEMORY_ELEMENT_SIZE;
 pub const SEGMENT_READ: u32 = 1;
