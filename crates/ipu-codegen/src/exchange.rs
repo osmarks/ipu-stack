@@ -15,7 +15,7 @@ use ipu_package::{
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 #[cfg(test)]
 use ipu_exchange::plan_event_cycles;
@@ -1340,41 +1340,66 @@ fn select_transfer_widths(
         return Ok(ordinary);
     }
 
-    let all_beneficial = beneficial
-        .iter()
-        .map(|&(index, _)| index)
-        .collect::<Vec<_>>();
-    let all_selection = materialize_width_selection(
+    let mut selected = vec![beneficial[0].0];
+    let (mut pending, mut schedule) = materialize_width_selection(
         topology,
         &ordinary_pending,
         &alternatives,
-        &all_beneficial,
+        &selected,
         &ordinary.incoming_bases,
         &ordinary.receive_counts,
         tile_count,
         order,
-    );
-    let best_single = [beneficial[0].0];
-    let (selected, pending, schedule, combined_horizon) = match all_selection {
-        Ok((pending, schedule)) if schedule.horizon < beneficial[0].1 => {
-            let horizon = schedule.horizon;
-            (all_beneficial, pending, schedule, Some(horizon))
-        }
-        all_selection => {
-            let combined_horizon = all_selection.ok().map(|(_, schedule)| schedule.horizon);
-            let (pending, schedule) = materialize_width_selection(
-                topology,
-                &ordinary_pending,
-                &alternatives,
-                &best_single,
-                &ordinary.incoming_bases,
-                &ordinary.receive_counts,
-                tile_count,
-                order,
-            )?;
-            (best_single.to_vec(), pending, schedule, combined_horizon)
-        }
-    };
+    )?;
+    let mut remaining = beneficial
+        .iter()
+        .skip(1)
+        .map(|&(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut subset_trials = 0usize;
+    let mut subset_steps = 0usize;
+    while !remaining.is_empty() {
+        subset_trials += remaining.len();
+        let additions = remaining
+            .par_iter()
+            .map(|&index| {
+                let mut trial = selected.clone();
+                trial.push(index);
+                materialize_width_selection(
+                    topology,
+                    &ordinary_pending,
+                    &alternatives,
+                    &trial,
+                    &ordinary.incoming_bases,
+                    &ordinary.receive_counts,
+                    tile_count,
+                    order,
+                )
+                .map(|(_, schedule)| (index, schedule.horizon))
+            })
+            .collect::<Vec<_>>();
+        let next = additions
+            .into_iter()
+            .filter_map(Result::ok)
+            .min_by_key(|&(index, horizon)| (horizon, index));
+        let Some((index, horizon)) = next.filter(|(_, horizon)| *horizon < schedule.horizon) else {
+            break;
+        };
+        selected.push(index);
+        (pending, schedule) = materialize_width_selection(
+            topology,
+            &ordinary_pending,
+            &alternatives,
+            &selected,
+            &ordinary.incoming_bases,
+            &ordinary.receive_counts,
+            tile_count,
+            order,
+        )?;
+        debug_assert_eq!(schedule.horizon, horizon);
+        remaining.retain(|&candidate| candidate != index);
+        subset_steps += 1;
+    }
     let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
     let optimized = improve_pending_schedule(
         topology,
@@ -1392,8 +1417,9 @@ fn select_transfer_widths(
         individually_beneficial = beneficial.len(),
         rejected_candidates = rejected,
         selected_transfers = selected.len(),
+        subset_trials,
+        subset_steps,
         ordinary_horizon,
-        combined_horizon,
         selected_horizon = optimized.schedule.horizon,
         "selected exchange width per transfer"
     );
@@ -1480,6 +1506,20 @@ fn improve_pending_schedule(
     let endpoint_lower_bound = endpoint_work_lower_bound(pending, tile_count);
     let mut selected_kind = initial_kind;
     let mut neighborhood_improvements = 0usize;
+    if let Some(order) = point_to_point_matching_wave_order(pending, tile_count, &schedule.order) {
+        let matching = materialize_schedule_order(
+            topology,
+            pending,
+            incoming_bases,
+            receive_counts,
+            tile_count,
+            &order,
+        )?;
+        if schedule_score(&matching) < schedule_score(&schedule) {
+            schedule = matching;
+            selected_kind = "matching-waves";
+        }
+    }
     loop {
         let repaired_order = critical_neighborhood_order(pending, tile_count, &schedule);
         if repaired_order == schedule.order {
@@ -1911,6 +1951,7 @@ struct ReadyTransfer {
 struct TransferScheduler<'a> {
     transfers: &'a [PendingTransfer],
     word_pressure: Vec<u64>,
+    dynamic_word_pressure: bool,
     dependents: Vec<Vec<usize>>,
     indegrees: Vec<usize>,
     dependency_ready: Vec<u32>,
@@ -1937,6 +1978,12 @@ impl<'a> TransferScheduler<'a> {
         let mut scheduler = Self {
             transfers,
             word_pressure,
+            // Multicast choices release several endpoint queues at once, so
+            // their useful priority is the pressure which remains. Stable
+            // pressure is a better matching tie-break for point-to-point work.
+            dynamic_word_pressure: transfers
+                .iter()
+                .any(|transfer| transfer.destinations.len() > 1),
             dependents,
             indegrees,
             dependency_ready: vec![0; transfers.len()],
@@ -1999,6 +2046,14 @@ impl<'a> TransferScheduler<'a> {
 
     fn complete(&mut self, index: usize, completion: u32) {
         self.completed += 1;
+        let transfer = &self.transfers[index];
+        if self.dynamic_word_pressure {
+            let items = u64::from(transfer.item_count().unwrap_or(transfer.words));
+            for tile in transfer.tiles() {
+                self.word_pressure[usize::from(tile)] =
+                    self.word_pressure[usize::from(tile)].saturating_sub(items);
+            }
+        }
         let dependents = std::mem::take(&mut self.dependents[index]);
         for dependent in dependents {
             self.dependency_ready[dependent] = self.dependency_ready[dependent].max(completion);
@@ -2404,6 +2459,224 @@ fn endpoint_work_lower_bound(pending: &[PendingTransfer], tile_count: u16) -> u3
         .max()
         .unwrap_or(0)
         .min(u64::from(u32::MAX)) as u32
+}
+
+/// Orders a balanced point-to-point phase as maximum-cardinality waves over
+/// its send and receive buses. The result remains only a candidate: the exact
+/// row builder decides whether it improves the incumbent schedule.
+fn point_to_point_matching_wave_order(
+    pending: &[PendingTransfer],
+    tile_count: u16,
+    incumbent_order: &[usize],
+) -> Option<Vec<usize>> {
+    if pending.len() < 2
+        || pending
+            .iter()
+            .any(|transfer| transfer.destinations.len() != 1)
+    {
+        return None;
+    }
+
+    let tile_count = usize::from(tile_count);
+    let mut source_roles = vec![0usize; tile_count];
+    let mut destination_roles = vec![0usize; tile_count];
+    for transfer in pending {
+        source_roles[usize::from(transfer.source)] += 1;
+        destination_roles[usize::from(transfer.destinations[0].0)] += 1;
+    }
+    let active_sources = source_roles.iter().filter(|&&roles| roles != 0).count();
+    let active_destinations = destination_roles
+        .iter()
+        .filter(|&&roles| roles != 0)
+        .count();
+    let maximum_roles = source_roles
+        .iter()
+        .chain(&destination_roles)
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let mean_roles = pending
+        .len()
+        .div_ceil(active_sources.min(active_destinations).max(1));
+    // Cardinality waves are a useful approximation only while endpoint
+    // degrees are reasonably balanced. A highly skewed phase is governed by
+    // unequal release times and keeps the ordinary exact list schedule.
+    if maximum_roles > mean_roles.saturating_mul(2) {
+        return None;
+    }
+
+    let mut incumbent_rank = vec![usize::MAX; pending.len()];
+    for (rank, &index) in incumbent_order.iter().enumerate() {
+        incumbent_rank[index] = rank;
+    }
+    let mut dependents = vec![Vec::new(); pending.len()];
+    let mut indegrees = vec![0usize; pending.len()];
+    for (before, after) in memory_dependencies(pending, tile_count as u16) {
+        dependents[before].push(after);
+        indegrees[after] += 1;
+    }
+    let mut remaining_send_words = vec![0u64; tile_count];
+    let mut remaining_receive_words = vec![0u64; tile_count];
+    for transfer in pending {
+        let words = u64::from(transfer.item_count().ok()?);
+        remaining_send_words[usize::from(transfer.source)] += words;
+        remaining_receive_words[usize::from(transfer.destinations[0].0)] += words;
+    }
+
+    let mut scheduled = vec![false; pending.len()];
+    let mut order = Vec::with_capacity(pending.len());
+    while order.len() != pending.len() {
+        let mut adjacency = vec![Vec::new(); tile_count];
+        for index in 0..pending.len() {
+            if !scheduled[index] && indegrees[index] == 0 {
+                adjacency[usize::from(pending[index].source)].push(index);
+            }
+        }
+        for edges in &mut adjacency {
+            edges.sort_unstable_by_key(|&index| {
+                let transfer = &pending[index];
+                let destination = usize::from(transfer.destinations[0].0);
+                (
+                    incumbent_rank[index],
+                    Reverse(remaining_receive_words[destination]),
+                    Reverse(transfer.item_count().unwrap_or(transfer.words)),
+                    index,
+                )
+            });
+        }
+        let mut source_order = (0..tile_count)
+            .filter(|&source| !adjacency[source].is_empty())
+            .collect::<Vec<_>>();
+        source_order.sort_unstable_by_key(|&source| {
+            (
+                adjacency[source]
+                    .iter()
+                    .map(|&index| incumbent_rank[index])
+                    .min()
+                    .unwrap_or(usize::MAX),
+                Reverse(remaining_send_words[source]),
+                source,
+            )
+        });
+        let mut wave = maximum_ready_matching(pending, &adjacency, &source_order, tile_count);
+        if wave.is_empty() {
+            return None;
+        }
+        wave.sort_unstable_by_key(|&index| {
+            let transfer = &pending[index];
+            (
+                incumbent_rank[index],
+                Reverse(transfer.item_count().unwrap_or(transfer.words)),
+                transfer.source,
+                transfer.destinations[0].0,
+                index,
+            )
+        });
+        for index in wave {
+            let transfer = &pending[index];
+            let words = u64::from(transfer.item_count().ok()?);
+            scheduled[index] = true;
+            order.push(index);
+            let source = usize::from(transfer.source);
+            remaining_send_words[source] = remaining_send_words[source].saturating_sub(words);
+            let destination = usize::from(transfer.destinations[0].0);
+            remaining_receive_words[destination] =
+                remaining_receive_words[destination].saturating_sub(words);
+            for dependent in std::mem::take(&mut dependents[index]) {
+                indegrees[dependent] -= 1;
+            }
+        }
+    }
+    Some(order)
+}
+
+fn maximum_ready_matching(
+    pending: &[PendingTransfer],
+    adjacency: &[Vec<usize>],
+    source_order: &[usize],
+    tile_count: usize,
+) -> Vec<usize> {
+    let mut source_edges = vec![None; tile_count];
+    let mut destination_sources = vec![None; tile_count];
+    let mut distances = vec![usize::MAX; tile_count];
+    loop {
+        let mut queue = VecDeque::new();
+        for &source in source_order {
+            if source_edges[source].is_none() {
+                distances[source] = 0;
+                queue.push_back(source);
+            } else {
+                distances[source] = usize::MAX;
+            }
+        }
+        let mut reaches_free_destination = false;
+        while let Some(source) = queue.pop_front() {
+            for &index in &adjacency[source] {
+                let destination = usize::from(pending[index].destinations[0].0);
+                if let Some(next_source) = destination_sources[destination] {
+                    if distances[next_source] == usize::MAX {
+                        distances[next_source] = distances[source] + 1;
+                        queue.push_back(next_source);
+                    }
+                } else {
+                    reaches_free_destination = true;
+                }
+            }
+        }
+        if !reaches_free_destination {
+            break;
+        }
+        let mut augmented = false;
+        for &source in source_order {
+            if source_edges[source].is_none()
+                && augment_ready_matching(
+                    source,
+                    pending,
+                    adjacency,
+                    &mut source_edges,
+                    &mut destination_sources,
+                    &mut distances,
+                )
+            {
+                augmented = true;
+            }
+        }
+        if !augmented {
+            break;
+        }
+    }
+    source_edges.into_iter().flatten().collect()
+}
+
+fn augment_ready_matching(
+    source: usize,
+    pending: &[PendingTransfer],
+    adjacency: &[Vec<usize>],
+    source_edges: &mut [Option<usize>],
+    destination_sources: &mut [Option<usize>],
+    distances: &mut [usize],
+) -> bool {
+    for &index in &adjacency[source] {
+        let destination = usize::from(pending[index].destinations[0].0);
+        let paired_source = destination_sources[destination];
+        if paired_source.is_none_or(|paired_source| {
+            distances[paired_source] == distances[source] + 1
+                && augment_ready_matching(
+                    paired_source,
+                    pending,
+                    adjacency,
+                    source_edges,
+                    destination_sources,
+                    distances,
+                )
+        }) {
+            source_edges[source] = Some(index);
+            destination_sources[destination] = Some(source);
+            return true;
+        }
+    }
+    distances[source] = usize::MAX;
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -2831,6 +3104,116 @@ mod tests {
         ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, Precision, TensorFormat, lower,
         lower_to_tiles, place,
     };
+
+    #[test]
+    fn randomized_ready_matchings_have_maximum_cardinality() {
+        let mut random = fastrand::Rng::with_seed(0x6d61_7463_6869_6e67);
+        for _ in 0..128 {
+            let tile_count = random.usize(2..=8);
+            let mut transfers = Vec::new();
+            let mut adjacency = vec![Vec::new(); tile_count];
+            for (source, edges) in adjacency.iter_mut().enumerate() {
+                for destination in 0..tile_count {
+                    if source == destination || !random.bool() {
+                        continue;
+                    }
+                    let index = transfers.len();
+                    transfers.push(ExchangeScheduleTransfer {
+                        source: source as u16,
+                        source_addresses: vec![0x1_0000],
+                        destinations: vec![ExchangeScheduleDestination {
+                            tile: destination as u16,
+                            address: 0x4_0000,
+                        }],
+                        words: 1,
+                        width: ExchangeItemWidth::Word32,
+                    });
+                    edges.push(index);
+                }
+            }
+            let problem = ExchangeScheduleProblem {
+                phase: 0,
+                transfers,
+            };
+            let pending = pending_from_problem(tile_count as u16, &problem).unwrap();
+            let source_order = (0..tile_count).collect::<Vec<_>>();
+            let matching = maximum_ready_matching(&pending, &adjacency, &source_order, tile_count);
+            let mut matched_sources = BTreeSet::new();
+            let mut matched_destinations = BTreeSet::new();
+            for &index in &matching {
+                assert!(matched_sources.insert(pending[index].source));
+                assert!(matched_destinations.insert(pending[index].destinations[0].0));
+            }
+
+            let mut reachable = vec![false; 1usize << tile_count];
+            reachable[0] = true;
+            for edges in &adjacency {
+                let mut next = reachable.clone();
+                for (mask, &is_reachable) in reachable.iter().enumerate() {
+                    if !is_reachable {
+                        continue;
+                    }
+                    for &index in edges {
+                        let destination = usize::from(pending[index].destinations[0].0);
+                        if mask & (1 << destination) == 0 {
+                            next[mask | (1 << destination)] = true;
+                        }
+                    }
+                }
+                reachable = next;
+            }
+            let expected = reachable
+                .iter()
+                .enumerate()
+                .filter(|(_, reachable)| **reachable)
+                .map(|(mask, _)| mask.count_ones() as usize)
+                .max()
+                .unwrap_or(0);
+            assert_eq!(matching.len(), expected);
+        }
+    }
+
+    #[test]
+    fn randomized_matching_wave_orders_preserve_memory_dependencies() {
+        let mut random = fastrand::Rng::with_seed(0x7761_7665_5f64_6167);
+        for _ in 0..64 {
+            let tile_count = random.u16(8..=24);
+            let waves = random.u16(4..=8);
+            let mut transfers = Vec::new();
+            for wave in 0..waves {
+                let shift = random.u16(1..tile_count);
+                for source in 0..tile_count {
+                    transfers.push(ExchangeScheduleTransfer {
+                        source,
+                        source_addresses: vec![0x1_0000 + u32::from(random.u16(0..=wave)) * 0x100],
+                        destinations: vec![ExchangeScheduleDestination {
+                            tile: (source + shift) % tile_count,
+                            address: 0x4_0000 + u32::from(random.u16(0..=wave)) * 0x100,
+                        }],
+                        words: random.u32(1..=64),
+                        width: ExchangeItemWidth::Word32,
+                    });
+                }
+            }
+            let problem = ExchangeScheduleProblem {
+                phase: 0,
+                transfers,
+            };
+            let pending = pending_from_problem(tile_count, &problem).unwrap();
+            let incumbent = (0..pending.len()).collect::<Vec<_>>();
+            let order = point_to_point_matching_wave_order(&pending, tile_count, &incumbent)
+                .expect("balanced point-to-point phases have a matching-wave candidate");
+            let mut positions = vec![usize::MAX; pending.len()];
+            for (position, &index) in order.iter().enumerate() {
+                assert_eq!(positions[index], usize::MAX);
+                positions[index] = position;
+            }
+            assert!(positions.iter().all(|&position| position != usize::MAX));
+            for (before, after) in memory_dependencies(&pending, tile_count) {
+                assert!(positions[before] < positions[after]);
+            }
+        }
+    }
 
     #[test]
     fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
