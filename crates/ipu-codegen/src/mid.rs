@@ -371,6 +371,21 @@ impl ElementOrder {
                 | Self::Amp(AmpOrder::TransposedRight)
         )
     }
+
+    /// Smallest column span which remains a self-contained physical fragment
+    /// when canonical linear ownership divides a matrix into row segments.
+    fn retained_linear_column_grain(self, precision: Precision) -> Option<u32> {
+        match self {
+            Self::RowMajor => Some(1),
+            Self::Amp(AmpOrder::Left) => Some(match precision {
+                Precision::F8F143 { .. } => 32,
+                Precision::F16 => 16,
+                Precision::F32 => 8,
+            }),
+            Self::Amp(AmpOrder::Output) => Some(AMP_COLUMN_MICRO),
+            Self::BlockMajor(_) | Self::Amp(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -4309,13 +4324,28 @@ fn plans(
             .collect::<Vec<_>>();
         for (grain, candidate) in flat_candidates {
             let tiles = candidate.output.format.layout.tiling.tile_count;
-            let layouts = [
-                input
-                    .format
-                    .layout
-                    .with_retained_order_linear_ownership(tiles, grain),
-                Layout::logical_linear(tiles, grain),
-            ];
+            let mut layouts = vec![Layout::logical_linear(tiles, grain)];
+            if let Some(retained_grain) = input
+                .format
+                .layout
+                .order
+                .retained_linear_column_grain(input.format.precision)
+                .filter(|retained_grain| retained_grain.is_multiple_of(grain))
+                .filter(|retained_grain| {
+                    output.elements().is_multiple_of(u64::from(*retained_grain))
+                        && output
+                            .0
+                            .last()
+                            .is_some_and(|width| width.is_multiple_of(*retained_grain))
+                })
+            {
+                layouts.push(
+                    input
+                        .format
+                        .layout
+                        .with_retained_order_linear_ownership(tiles, retained_grain),
+                );
+            }
             for layout in layouts {
                 let format = TensorFormat {
                     precision: input.format.precision,

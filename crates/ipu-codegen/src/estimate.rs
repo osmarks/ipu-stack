@@ -1,6 +1,5 @@
 //! Memory, communication, and capacity estimates shared by planning policies.
 
-use crate::cost::IPU21_TARGET_COSTS;
 use crate::graph::TensorShape;
 use crate::mid::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, GemmDistribution, Layout, MemoryClass,
@@ -21,9 +20,53 @@ pub(crate) struct ConversionTraffic {
     pub maximum_routed_fragments: u64,
     pub maximum_destination_bytes: u64,
     pub maximum_remote_destination_bytes: u64,
+    pub maximum_remote_destination_fragments: u64,
     pub maximum_local_bytes: u64,
     pub maximum_intersections: u64,
     pub maximum_local_intersections: u64,
+}
+
+/// Critical endpoint work for one or more transfers which may share an
+/// exchange phase. Outgoing work is accumulated per adjacent-tile exchange
+/// bus, while incoming work is accumulated per receiving tile. A full-duplex
+/// phase is bounded by the larger direction rather than their sum.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExchangeEndpointTraffic {
+    pub maximum_outgoing_bus_bytes: u64,
+    pub maximum_incoming_bytes: u64,
+    pub maximum_outgoing_bus_fragments: u64,
+    pub maximum_incoming_fragments: u64,
+}
+
+impl ExchangeEndpointTraffic {
+    pub(crate) const fn from_conversion(traffic: ConversionTraffic) -> Self {
+        Self {
+            maximum_outgoing_bus_bytes: traffic.maximum_source_bus_payload_bytes,
+            maximum_incoming_bytes: traffic.maximum_remote_destination_bytes,
+            maximum_outgoing_bus_fragments: traffic.maximum_source_bus_fragments,
+            maximum_incoming_fragments: traffic.maximum_remote_destination_fragments,
+        }
+    }
+
+    pub(crate) const fn maximum_payload_bytes(self) -> u64 {
+        if self.maximum_outgoing_bus_bytes > self.maximum_incoming_bytes {
+            self.maximum_outgoing_bus_bytes
+        } else {
+            self.maximum_incoming_bytes
+        }
+    }
+
+    pub(crate) const fn maximum_fragments(self) -> u64 {
+        if self.maximum_outgoing_bus_fragments > self.maximum_incoming_fragments {
+            self.maximum_outgoing_bus_fragments
+        } else {
+            self.maximum_incoming_fragments
+        }
+    }
+
+    pub(crate) const fn is_empty(self) -> bool {
+        self.maximum_payload_bytes() == 0
+    }
 }
 
 pub(crate) fn conversion_traffic(
@@ -78,6 +121,9 @@ pub(crate) fn conversion_traffic(
         traffic.maximum_remote_destination_bytes = traffic
             .maximum_remote_destination_bytes
             .max(destination_bytes.saturating_sub(local_bytes));
+        traffic.maximum_remote_destination_fragments = traffic
+            .maximum_remote_destination_fragments
+            .max((intersections.len() as u64).saturating_sub(local_intersections));
         traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
         traffic.maximum_intersections = traffic
             .maximum_intersections
@@ -731,43 +777,11 @@ pub(crate) fn gemm_requires_panel_repacking(
         && !matches!(right.format.layout.order, ElementOrder::BlockMajor(_))
 }
 
-pub(crate) fn gemm_exchange_bytes_per_cycle(inputs: &[TensorType]) -> u64 {
-    let Some(right) = inputs.get(1) else {
-        return IPU21_TARGET_COSTS.exchange_bytes_per_cycle;
-    };
-    let inner_sharded = right
-        .format
-        .layout
-        .tiling
-        .axes
-        .iter()
-        .any(|axis| axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1);
-    let column_partitions = right
-        .format
-        .layout
-        .tiling
-        .axes
-        .iter()
-        .find(|axis| axis.axis == TensorAxis::FromEnd(1))
-        .map_or(1, |axis| axis.partitions);
-    // A single output-column partition produces full consecutive-tile
-    // broadcasts. Multi-column row-fast grids also pair consumers, but the
-    // resulting route pressure is not equivalent to doubling bandwidth.
-    if inner_sharded && column_partitions == 1 {
-        IPU21_TARGET_COSTS.exchange_bytes_per_cycle * IPU21_TARGET_COSTS.exchange_bus_sharing
-    } else {
-        IPU21_TARGET_COSTS.exchange_bytes_per_cycle
-    }
-}
-
 pub(crate) fn gemm_exchange_phase_count(
     dispatch: &OperatorDispatch,
     inputs: &[TensorType],
-    output: &TensorType,
+    _output: &TensorType,
 ) -> u64 {
-    if gemm_remote_bytes_per_tile(inputs, output) == 0 {
-        return 0;
-    }
     let OperatorDispatch::BlockedGemm {
         inner_block,
         orientation,
@@ -928,76 +942,176 @@ fn allocation_root(mut id: MidValueId, aliases: &BTreeMap<MidValueId, MidValueId
     id
 }
 
-pub(crate) fn gemm_remote_bytes_per_tile(inputs: &[TensorType], output: &TensorType) -> u64 {
-    let [left, right] = inputs else {
-        return u64::MAX;
+pub(crate) fn gemm_exchange_endpoint_traffic(
+    dispatch: &OperatorDispatch,
+    inputs: &[TensorType],
+    compute_output: &TensorType,
+) -> Option<ExchangeEndpointTraffic> {
+    let OperatorDispatch::BlockedGemm {
+        orientation,
+        distribution,
+        ..
+    } = dispatch
+    else {
+        return Some(ExchangeEndpointTraffic::default());
     };
-    if left.shape.0.len() < 2 || right.shape.0.len() < 2 || output.shape.0.len() < 2 {
-        return u64::MAX;
+    let [first, second] = inputs else {
+        return None;
+    };
+    let (left, right) = match orientation {
+        crate::GemmOrientation::Normal => (first, second),
+        crate::GemmOrientation::Swapped => (second, first),
+    };
+    let left_rank = left.shape.0.len();
+    let right_rank = right.shape.0.len();
+    let output_rank = compute_output.shape.0.len();
+    if left_rank < 2 || right_rank < 2 || output_rank < 2 {
+        return None;
     }
-    let tiles = output.format.layout.tiling.tile_count;
-    let output_row_axis = output.shape.0.len() - 2;
-    let output_column_axis = output.shape.0.len() - 1;
-    let left_row_axis = left.shape.0.len() - 2;
-    let right_column_axis = right.shape.0.len() - 1;
-    let right_inner_axis = right.shape.0.len() - 2;
-    let k = left.shape.0[left.shape.0.len() - 1];
-    let Some(output_rows) = tile_axis_plan(output, output_row_axis) else {
-        return u64::MAX;
+    let (left_row_axis, left_inner_axis, right_inner_axis, right_column_axis) = match orientation {
+        crate::GemmOrientation::Normal => {
+            (left_rank - 2, left_rank - 1, right_rank - 2, right_rank - 1)
+        }
+        crate::GemmOrientation::Swapped => {
+            (left_rank - 1, left_rank - 2, right_rank - 1, right_rank - 2)
+        }
     };
-    let Some(output_columns) = tile_axis_plan(output, output_column_axis) else {
-        return u64::MAX;
+    let (output_row_axis, output_column_axis) = match orientation {
+        crate::GemmOrientation::Normal => (output_rank - 2, output_rank - 1),
+        crate::GemmOrientation::Swapped => (output_rank - 1, output_rank - 2),
     };
-    let Some(left_rows) = tile_axis_plan(left, left_row_axis) else {
-        return u64::MAX;
-    };
-    let Some(right_columns) = tile_axis_plan(right, right_column_axis) else {
-        return u64::MAX;
-    };
-    let Some(right_inner) = tile_axis_plan(right, right_inner_axis) else {
-        return u64::MAX;
-    };
-    let outer_rows = output.shape.0[..output_row_axis]
-        .iter()
-        .fold(1u64, |elements, &extent| {
-            elements.saturating_mul(u64::from(extent))
-        });
-    (0..tiles).fold(0u64, |maximum, tile| {
-        let output_rows = output_rows.range(tile);
-        let output_columns = output_columns.range(tile);
-        let left_rows = left_rows.range(tile);
-        let right_columns = right_columns.range(tile);
-        let right_inner = right_inner.range(tile);
-        let required_left_elements = outer_rows
-            .saturating_mul(u64::from(output_rows.end - output_rows.start))
-            .saturating_mul(u64::from(k));
-        let local_left_rows = overlap_length(&output_rows, &left_rows);
-        let local_left_elements = outer_rows
-            .saturating_mul(u64::from(local_left_rows))
-            .saturating_mul(u64::from(k));
-        let left_remote = required_left_elements
-            .saturating_sub(local_left_elements)
-            .saturating_mul(left.format.precision.bytes());
-
-        let required_right_elements =
-            u64::from(output_columns.end - output_columns.start).saturating_mul(u64::from(k));
-        let local_right_elements = if tile < right.format.layout.tiling.tile_count {
-            u64::from(overlap_length(&output_columns, &right_columns))
-                .saturating_mul(u64::from(overlap_length(&(0..k), &right_inner)))
-        } else {
-            0
-        };
-        let right_remote = required_right_elements
-            .saturating_sub(local_right_elements)
-            .saturating_mul(right.format.precision.bytes());
-        maximum.max(left_remote.saturating_add(right_remote))
+    let parallel_inner = matches!(distribution, GemmDistribution::ParallelReduction { .. });
+    let inner_plan = parallel_inner
+        .then(|| tile_axis_plan(left, left_inner_axis))
+        .flatten();
+    if parallel_inner && inner_plan.is_none() {
+        return None;
+    }
+    let output_plans = (0..output_rank)
+        .map(|axis| tile_axis_plan(compute_output, axis))
+        .collect::<Option<Vec<_>>>()?;
+    let left_plan = GemmOperandTrafficPlan::new(
+        left,
+        compute_output,
+        left_row_axis,
+        left_inner_axis,
+        output_row_axis,
+    )?;
+    let right_plan = GemmOperandTrafficPlan::new(
+        right,
+        compute_output,
+        right_column_axis,
+        right_inner_axis,
+        output_column_axis,
+    )?;
+    let mut maximum_incoming_bytes = 0;
+    let mut left_is_remote = false;
+    let mut right_is_remote = false;
+    for tile in 0..compute_output.format.layout.tiling.tile_count {
+        let left_remote = left_plan.remote_bytes(tile, &output_plans, inner_plan)?;
+        let right_remote = right_plan.remote_bytes(tile, &output_plans, inner_plan)?;
+        left_is_remote |= left_remote != 0;
+        right_is_remote |= right_remote != 0;
+        maximum_incoming_bytes =
+            maximum_incoming_bytes.max(left_remote.saturating_add(right_remote));
+    }
+    let left_outgoing = operand_outgoing_bus_work(left, left_is_remote);
+    let right_outgoing = operand_outgoing_bus_work(right, right_is_remote);
+    Some(ExchangeEndpointTraffic {
+        maximum_outgoing_bus_bytes: left_outgoing.0.saturating_add(right_outgoing.0),
+        maximum_incoming_bytes,
+        maximum_outgoing_bus_fragments: left_outgoing.1.saturating_add(right_outgoing.1),
+        maximum_incoming_fragments: maximum_incoming_bytes
+            .div_ceil(u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4),
     })
 }
 
-fn overlap_length(left: &std::ops::Range<u32>, right: &std::ops::Range<u32>) -> u32 {
-    left.end
-        .min(right.end)
-        .saturating_sub(left.start.max(right.start))
+struct GemmOperandTrafficPlan<'a> {
+    operand: &'a TensorType,
+    operand_plans: Vec<TileAxisPlan>,
+    operand_spatial_axis: usize,
+    operand_inner_axis: usize,
+    output_spatial_axis: usize,
+    rank_offset: usize,
+}
+
+impl<'a> GemmOperandTrafficPlan<'a> {
+    fn new(
+        operand: &'a TensorType,
+        output: &TensorType,
+        operand_spatial_axis: usize,
+        operand_inner_axis: usize,
+        output_spatial_axis: usize,
+    ) -> Option<Self> {
+        let rank_offset = output.shape.0.len().checked_sub(operand.shape.0.len())?;
+        let operand_plans = (0..operand.shape.0.len())
+            .map(|axis| tile_axis_plan(operand, axis))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            operand,
+            operand_plans,
+            operand_spatial_axis,
+            operand_inner_axis,
+            output_spatial_axis,
+            rank_offset,
+        })
+    }
+
+    fn remote_bytes(
+        &self,
+        tile: u16,
+        output_plans: &[TileAxisPlan],
+        inner_plan: Option<TileAxisPlan>,
+    ) -> Option<u64> {
+        let mut required_elements = 1u64;
+        let mut local_elements = 1u64;
+        for axis in 0..self.operand.shape.0.len() {
+            let extent = self.operand.shape.0[axis];
+            let required = if axis == self.operand_spatial_axis {
+                clipped_range(output_plans[self.output_spatial_axis].range(tile), extent)
+            } else if axis == self.operand_inner_axis {
+                inner_plan.map_or(0..extent, |plan| clipped_range(plan.range(tile), extent))
+            } else if extent == 1 {
+                0..1
+            } else {
+                let output_axis = axis.checked_add(self.rank_offset)?;
+                clipped_range(output_plans[output_axis].range(tile), extent)
+            };
+            required_elements = required_elements
+                .saturating_mul(u64::from(required.end.saturating_sub(required.start)));
+            let local_length = if tile < self.operand.format.layout.tiling.tile_count {
+                let local = clipped_range(self.operand_plans[axis].range(tile), extent);
+                u64::from(
+                    required
+                        .end
+                        .min(local.end)
+                        .saturating_sub(required.start.max(local.start)),
+                )
+            } else {
+                0
+            };
+            local_elements = local_elements.saturating_mul(local_length);
+        }
+        Some(
+            required_elements
+                .saturating_sub(local_elements)
+                .saturating_mul(self.operand.format.precision.bytes()),
+        )
+    }
+}
+
+fn clipped_range(range: std::ops::Range<u32>, extent: u32) -> std::ops::Range<u32> {
+    range.start.min(extent)..range.end.min(extent)
+}
+
+fn operand_outgoing_bus_work(operand: &TensorType, remote: bool) -> (u64, u64) {
+    if !remote {
+        return (0, 0);
+    }
+    let simultaneous_sources = u64::from(operand.format.layout.tiling.tile_count.min(2));
+    let bytes = maximum_shard_bytes(operand).saturating_mul(simultaneous_sources);
+    let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
+    (bytes, bytes.div_ceil(transfer_bytes))
 }
 
 #[derive(Clone, Copy)]
@@ -1048,6 +1162,31 @@ fn tile_axis_plan(tensor: &TensorType, axis: usize) -> Option<TileAxisPlan> {
 mod tests {
     use super::*;
 
+    fn output_stationary_dispatch() -> OperatorDispatch {
+        OperatorDispatch::BlockedGemm {
+            initialize: crate::TileKernelSpec::Gemm {
+                multiply: Precision::F16,
+                accumulate: crate::AccumulationPrecision::F16,
+                mode: crate::GemmKernelMode::Initialize,
+                weights: crate::GemmWeightLoad::Standard,
+                inner_block: AMP_INNER_BLOCK,
+                output_columns: crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+            },
+            accumulate: crate::TileKernelSpec::Gemm {
+                multiply: Precision::F16,
+                accumulate: crate::AccumulationPrecision::F16,
+                mode: crate::GemmKernelMode::Accumulate,
+                weights: crate::GemmWeightLoad::Standard,
+                inner_block: AMP_INNER_BLOCK,
+                output_columns: crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+            },
+            inner_block: AMP_INNER_BLOCK,
+            output_column_block: crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+            orientation: crate::GemmOrientation::Normal,
+            distribution: GemmDistribution::OutputStationary,
+        }
+    }
+
     #[test]
     fn randomized_average_shard_storage_covers_spatial_work() {
         let mut random = fastrand::Rng::with_seed(0x7370_6174_6961_6c77);
@@ -1079,6 +1218,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn randomized_gemm_endpoint_traffic_tracks_both_exchange_directions() {
+        let mut random = fastrand::Rng::with_seed(0x6269_6469_7265_6374);
+        for case in 0..32 {
+            let row_partitions = 1_u16 << random.u32(1..=3);
+            let column_partitions = 1_u16 << random.u32(1..=3);
+            let tiles = row_partitions * column_partitions;
+            let rows = u32::from(row_partitions) * random.u32(1..=8);
+            let inner = AMP_INNER_BLOCK * random.u32(1..=4);
+            let columns = u32::from(column_partitions)
+                * crate::mid::AMP_OUTPUT_COLUMN_BLOCK
+                * random.u32(1..=3);
+            let output = TensorType::new(
+                [1, rows, columns],
+                Precision::F16,
+                Layout::amp_output_grid(
+                    crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+                    tiles,
+                    row_partitions,
+                    column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
+                ),
+            );
+            let local_left = TensorType::new(
+                [1, rows, inner],
+                Precision::F16,
+                Layout::amp_left_grid(
+                    AMP_INNER_BLOCK as u16,
+                    tiles,
+                    row_partitions,
+                    column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
+                ),
+            );
+            let local_right = TensorType::new(
+                [1, inner, columns],
+                Precision::F16,
+                Layout::block_major_matrix_grid(
+                    AMP_INNER_BLOCK as u16,
+                    crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+                    tiles,
+                    row_partitions,
+                    column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
+                ),
+            );
+            let dispatch = output_stationary_dispatch();
+            let local =
+                gemm_exchange_endpoint_traffic(&dispatch, &[local_left, local_right], &output)
+                    .unwrap();
+            assert!(local.is_empty(), "case {case}");
+
+            let sharded_left = TensorType::new(
+                [1, rows, inner],
+                Precision::F16,
+                Layout::amp_left(AMP_INNER_BLOCK as u16, row_partitions),
+            );
+            let sharded_right = TensorType::new(
+                [1, inner, columns],
+                Precision::F16,
+                Layout::block_major_matrix_storage(
+                    AMP_INNER_BLOCK as u16,
+                    crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+                    column_partitions,
+                    1,
+                    1,
+                    MemoryClass::Ipu21Standard,
+                ),
+            );
+            let remote =
+                gemm_exchange_endpoint_traffic(&dispatch, &[sharded_left, sharded_right], &output)
+                    .unwrap();
+            assert!(remote.maximum_outgoing_bus_bytes != 0, "case {case}");
+            assert!(remote.maximum_incoming_bytes != 0, "case {case}");
+            assert_eq!(
+                remote.maximum_payload_bytes(),
+                remote
+                    .maximum_outgoing_bus_bytes
+                    .max(remote.maximum_incoming_bytes),
+                "case {case}"
+            );
+        }
+    }
+
     fn conversion_traffic_reference(
         shape: &TensorShape,
         precision: Precision,
@@ -1103,6 +1326,7 @@ mod tests {
             let mut destination_bytes = 0;
             let mut local_bytes = 0;
             let mut local_intersections = 0;
+            let mut remote_intersections = 0;
             for (extents, source_tile) in &intersections {
                 let bytes = range_elements(extents) * precision.bytes();
                 destination_bytes += bytes;
@@ -1111,6 +1335,7 @@ mod tests {
                     local_intersections += 1;
                 } else {
                     remote.insert((*source_tile, extents.clone()));
+                    remote_intersections += 1;
                 }
             }
             traffic.maximum_destination_bytes =
@@ -1118,6 +1343,9 @@ mod tests {
             traffic.maximum_remote_destination_bytes = traffic
                 .maximum_remote_destination_bytes
                 .max(destination_bytes.saturating_sub(local_bytes));
+            traffic.maximum_remote_destination_fragments = traffic
+                .maximum_remote_destination_fragments
+                .max(remote_intersections);
             traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
             traffic.maximum_intersections = traffic
                 .maximum_intersections
