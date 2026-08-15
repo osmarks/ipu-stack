@@ -1202,11 +1202,12 @@ impl CostModel for Ipu21CostModel {
         let local_cycles = local_bytes
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
             .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles));
-        let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
-        let transfer_chunks = traffic
-            .source_payload_bytes
-            .div_ceil(transfer_bytes)
-            .max(traffic.remote_fragments)
+        let mut exchange_footprint = exchange_endpoint_footprint(
+            &endpoint_traffic,
+            u64::from(traffic.remote_fragments != 0),
+        );
+        exchange_footprint.maximum_transfer_chunks_per_tile = exchange_footprint
+            .maximum_transfer_chunks_per_tile
             .max(traffic.maximum_routed_fragments);
         RearrangementCost {
             cycles: exchange_cycles.saturating_add(local_cycles),
@@ -1214,11 +1215,7 @@ impl CostModel for Ipu21CostModel {
             exchange_row_bytes: if from.tiling == to.tiling {
                 0
             } else {
-                ExchangeFootprint {
-                    phases: u64::from(traffic.remote_fragments != 0),
-                    maximum_transfer_chunks_per_tile: transfer_chunks,
-                }
-                .estimated_row_bytes()
+                exchange_footprint.estimated_row_bytes()
             },
         }
     }

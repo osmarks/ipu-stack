@@ -707,6 +707,15 @@ fn select_scheduled_finalist(
             estimated_exchange_cycles = mid.estimated_exchange_cycles,
             "selected analytical operator plan"
         );
+        for operation in &mid.operations {
+            tracing::debug!(
+                source = ?operation.source,
+                kind = ?operation.kind,
+                memory = ?operation.memory,
+                plan = ?operation.operator_plan,
+                "selected mid-level operation"
+            );
+        }
         let low = lower_to_tiles(&mid, planning)?;
         return Ok((mid, low));
     }
