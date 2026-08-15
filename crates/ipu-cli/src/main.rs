@@ -245,7 +245,7 @@ fn main() -> Result<()> {
             let samples: usize = report.tiles.iter().map(|tile| tile.samples.len()).sum();
             let exchange = exchange_activity_summary(&report);
             println!(
-                "clockHz={} tiles={} samples={} exchangeSamples={} describedExchangeSamples={} sendIntervals={} receiveIntervals={} estimatedSendWorkCycles={} estimatedReceiveWorkCycles={} estimatedSimultaneousWorkCycles={} estimatedExchangeIdleWorkCycles={} measuredExchangePhaseCycles={} scheduledExchangeEventCycles={} exchangeArrivalWaitCycles={} exchangePhaseBoundaryCycles={}",
+                "clockHz={} tiles={} samples={} exchangeSamples={} describedExchangeSamples={} sendIntervals={} receiveIntervals={} partnerBusyIntervals={} estimatedSendWorkCycles={} estimatedReceiveWorkCycles={} estimatedSimultaneousWorkCycles={} estimatedPartnerBusyWorkCycles={} estimatedExchangeIdleWorkCycles={} measuredExchangePhaseCycles={} scheduledExchangeEventCycles={} exchangeArrivalWaitCycles={} exchangePhaseBoundaryCycles={}",
                 report.clock_hz,
                 report.tiles.len(),
                 samples,
@@ -253,9 +253,11 @@ fn main() -> Result<()> {
                 exchange.described_samples,
                 exchange.send_intervals,
                 exchange.receive_intervals,
+                exchange.partner_busy_intervals,
                 exchange.estimated_send_work_cycles,
                 exchange.estimated_receive_work_cycles,
                 exchange.estimated_simultaneous_work_cycles,
+                exchange.estimated_partner_busy_work_cycles,
                 exchange.estimated_idle_work_cycles,
                 exchange.measured_phase_cycles,
                 exchange.scheduled_event_cycles,
@@ -647,6 +649,7 @@ fn render_profile_html(report: &ProfileReport) -> Result<String> {
                                 match activity.kind {
                                     ProfileExchangeActivityKind::Send => 0,
                                     ProfileExchangeActivityKind::Receive => 1,
+                                    ProfileExchangeActivityKind::PartnerBusy => 2,
                                 },
                                 activity.start_cycle,
                                 activity.end_cycle,

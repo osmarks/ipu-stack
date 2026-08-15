@@ -1900,6 +1900,9 @@ fn profile_step(
                             crate::ExchangeActivityKind::Receive => {
                                 ProfileExchangeActivityKind::Receive
                             }
+                            crate::ExchangeActivityKind::PartnerBusy => {
+                                ProfileExchangeActivityKind::PartnerBusy
+                            }
                         },
                         start_cycle: activity.start_cycle,
                         end_cycle: activity.end_cycle,

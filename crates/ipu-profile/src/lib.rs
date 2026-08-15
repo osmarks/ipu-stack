@@ -120,9 +120,11 @@ pub struct ExchangeActivitySummary {
     pub described_samples: usize,
     pub send_intervals: usize,
     pub receive_intervals: usize,
+    pub partner_busy_intervals: usize,
     pub estimated_send_work_cycles: u64,
     pub estimated_receive_work_cycles: u64,
     pub estimated_simultaneous_work_cycles: u64,
+    pub estimated_partner_busy_work_cycles: u64,
     pub estimated_idle_work_cycles: u64,
     pub measured_phase_cycles: u64,
     pub scheduled_event_cycles: u64,
@@ -289,14 +291,17 @@ pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySumm
                     ProfileExchangeActivityKind::Receive => {
                         summary.receive_intervals += 1;
                     }
+                    ProfileExchangeActivityKind::PartnerBusy => {
+                        summary.partner_busy_intervals += 1;
+                    }
                 }
             }
-            let (send_events, receive_events, simultaneous_events, idle_events) =
-                exchange_role_cycles(&sample.step.exchange_activities, event_cycles);
-            summary.estimated_send_work_cycles += send_events;
-            summary.estimated_receive_work_cycles += receive_events;
-            summary.estimated_simultaneous_work_cycles += simultaneous_events;
-            summary.estimated_idle_work_cycles += idle_events;
+            let roles = exchange_role_cycles(&sample.step.exchange_activities, event_cycles);
+            summary.estimated_send_work_cycles += roles.send;
+            summary.estimated_receive_work_cycles += roles.receive;
+            summary.estimated_simultaneous_work_cycles += roles.simultaneous;
+            summary.estimated_partner_busy_work_cycles += roles.partner_busy;
+            summary.estimated_idle_work_cycles += roles.idle;
         }
     }
     for (minimum_start, maximum_start, maximum_end, scheduled) in phases.into_values() {
@@ -309,10 +314,19 @@ pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySumm
     summary
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ExchangeRoleCycles {
+    send: u64,
+    receive: u64,
+    simultaneous: u64,
+    partner_busy: u64,
+    idle: u64,
+}
+
 fn exchange_role_cycles(
     activities: &[ProfileExchangeActivity],
     event_cycles: u64,
-) -> (u64, u64, u64, u64) {
+) -> ExchangeRoleCycles {
     let mut events = Vec::with_capacity(activities.len() * 2);
     for activity in activities {
         let start = u64::from(activity.start_cycle).min(event_cycles);
@@ -320,21 +334,24 @@ fn exchange_role_cycles(
         if end <= start {
             continue;
         }
-        let (send, receive) = match activity.kind {
-            ProfileExchangeActivityKind::Send => (1i32, 0i32),
-            ProfileExchangeActivityKind::Receive => (0, 1),
+        let (send, receive, partner_busy) = match activity.kind {
+            ProfileExchangeActivityKind::Send => (1i32, 0i32, 0i32),
+            ProfileExchangeActivityKind::Receive => (0, 1, 0),
+            ProfileExchangeActivityKind::PartnerBusy => (0, 0, 1),
         };
-        events.push((start, send, receive));
-        events.push((end, -send, -receive));
+        events.push((start, send, receive, partner_busy));
+        events.push((end, -send, -receive, -partner_busy));
     }
     events.sort_unstable_by_key(|event| event.0);
 
     let mut send_depth = 0i32;
     let mut receive_depth = 0i32;
+    let mut partner_busy_depth = 0i32;
     let mut cursor = 0u64;
     let mut send_cycles = 0u64;
     let mut receive_cycles = 0u64;
     let mut simultaneous_cycles = 0u64;
+    let mut partner_busy_cycles = 0u64;
     let mut idle_cycles = 0u64;
     let mut index = 0usize;
     while index < events.len() {
@@ -343,21 +360,25 @@ fn exchange_role_cycles(
         send_cycles += cycles * u64::from(send_depth > 0);
         receive_cycles += cycles * u64::from(receive_depth > 0);
         simultaneous_cycles += cycles * u64::from(send_depth > 0 && receive_depth > 0);
-        idle_cycles += cycles * u64::from(send_depth == 0 && receive_depth == 0);
+        partner_busy_cycles += cycles * u64::from(partner_busy_depth > 0);
+        idle_cycles +=
+            cycles * u64::from(send_depth == 0 && receive_depth == 0 && partner_busy_depth == 0);
         while index < events.len() && events[index].0 == time {
             send_depth += events[index].1;
             receive_depth += events[index].2;
+            partner_busy_depth += events[index].3;
             index += 1;
         }
         cursor = time;
     }
     idle_cycles += event_cycles.saturating_sub(cursor);
-    (
-        send_cycles,
-        receive_cycles,
-        simultaneous_cycles,
-        idle_cycles,
-    )
+    ExchangeRoleCycles {
+        send: send_cycles,
+        receive: receive_cycles,
+        simultaneous: simultaneous_cycles,
+        partner_busy: partner_busy_cycles,
+        idle: idle_cycles,
+    }
 }
 
 #[derive(Default)]
@@ -895,31 +916,37 @@ mod tests {
                 .map(|_| {
                     let start_cycle = random.u32(0..event_cycles);
                     ProfileExchangeActivity {
-                        kind: if random.bool() {
-                            ProfileExchangeActivityKind::Send
-                        } else {
-                            ProfileExchangeActivityKind::Receive
+                        kind: match random.u8(0..3) {
+                            0 => ProfileExchangeActivityKind::Send,
+                            1 => ProfileExchangeActivityKind::Receive,
+                            _ => ProfileExchangeActivityKind::PartnerBusy,
                         },
                         start_cycle,
                         end_cycle: random.u32(start_cycle + 1..=event_cycles),
                     }
                 })
                 .collect::<Vec<_>>();
-            let expected = (0..event_cycles).fold((0, 0, 0, 0), |mut totals, cycle| {
-                let send = activities.iter().any(|activity| {
-                    activity.kind == ProfileExchangeActivityKind::Send
-                        && (activity.start_cycle..activity.end_cycle).contains(&cycle)
+            let expected =
+                (0..event_cycles).fold(ExchangeRoleCycles::default(), |mut totals, cycle| {
+                    let send = activities.iter().any(|activity| {
+                        activity.kind == ProfileExchangeActivityKind::Send
+                            && (activity.start_cycle..activity.end_cycle).contains(&cycle)
+                    });
+                    let receive = activities.iter().any(|activity| {
+                        activity.kind == ProfileExchangeActivityKind::Receive
+                            && (activity.start_cycle..activity.end_cycle).contains(&cycle)
+                    });
+                    let partner_busy = activities.iter().any(|activity| {
+                        activity.kind == ProfileExchangeActivityKind::PartnerBusy
+                            && (activity.start_cycle..activity.end_cycle).contains(&cycle)
+                    });
+                    totals.send += u64::from(send);
+                    totals.receive += u64::from(receive);
+                    totals.simultaneous += u64::from(send && receive);
+                    totals.partner_busy += u64::from(partner_busy);
+                    totals.idle += u64::from(!send && !receive && !partner_busy);
+                    totals
                 });
-                let receive = activities.iter().any(|activity| {
-                    activity.kind == ProfileExchangeActivityKind::Receive
-                        && (activity.start_cycle..activity.end_cycle).contains(&cycle)
-                });
-                totals.0 += u64::from(send);
-                totals.1 += u64::from(receive);
-                totals.2 += u64::from(send && receive);
-                totals.3 += u64::from(!send && !receive);
-                totals
-            });
             assert_eq!(
                 exchange_role_cycles(&activities, u64::from(event_cycles)),
                 expected

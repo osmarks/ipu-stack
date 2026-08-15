@@ -29,6 +29,7 @@ pub enum ProfileStepKind {
 pub enum ProfileExchangeActivityKind {
     Send,
     Receive,
+    PartnerBusy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,7 +83,7 @@ impl ProfileReport {
     pub fn write(&self, mut output: impl Write) -> Result<(), PackageError> {
         let mut message = message::Builder::new_default();
         let mut root = message.init_root::<profile_capnp::profile::Builder>();
-        root.set_schema_version(4);
+        root.set_schema_version(5);
         root.set_clock_hz(self.clock_hz);
         let mut tiles = root.reborrow().init_tiles(self.tiles.len() as u32);
         for (tile_index, tile) in self.tiles.iter().enumerate() {
@@ -128,6 +129,9 @@ impl ProfileReport {
                         ProfileExchangeActivityKind::Receive => {
                             profile_capnp::ExchangeActivityKind::Receive
                         }
+                        ProfileExchangeActivityKind::PartnerBusy => {
+                            profile_capnp::ExchangeActivityKind::PartnerBusy
+                        }
                     });
                     output_activity.set_start_cycle(activity.start_cycle);
                     output_activity.set_end_cycle(activity.end_cycle);
@@ -141,7 +145,7 @@ impl ProfileReport {
     pub fn read(mut input: impl Read) -> Result<Self, PackageError> {
         let message = serialize::read_message(&mut input, capnp_reader_options())?;
         let root = message.get_root::<profile_capnp::profile::Reader>()?;
-        if !matches!(root.get_schema_version(), 1..=4) {
+        if !matches!(root.get_schema_version(), 1..=5) {
             return Err(PackageError::Invalid(format!(
                 "unsupported profile schema version {}",
                 root.get_schema_version()
@@ -193,6 +197,9 @@ impl ProfileReport {
                                                 profile_capnp::ExchangeActivityKind::Receive => {
                                                     ProfileExchangeActivityKind::Receive
                                                 }
+                                                profile_capnp::ExchangeActivityKind::PartnerBusy => {
+                                                    ProfileExchangeActivityKind::PartnerBusy
+                                                }
                                             },
                                             start_cycle: activity.get_start_cycle(),
                                             end_cycle: activity.get_end_cycle(),
@@ -219,7 +226,7 @@ impl ProfileReport {
     }
 }
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 pub const TARGET_IPU21: &str = "ipu21";
 pub const TILE_MEMORY_BASE: u32 = 0x4c000;
 pub const TILE_MEMORY_SIZE: u32 = 624 * 1024;
@@ -1014,6 +1021,9 @@ fn write_profile_tiles(
                     ProfileExchangeActivityKind::Receive => {
                         application_capnp::ProfileExchangeActivityKind::Receive
                     }
+                    ProfileExchangeActivityKind::PartnerBusy => {
+                        application_capnp::ProfileExchangeActivityKind::PartnerBusy
+                    }
                 });
                 output_activity.set_start_cycle(activity.start_cycle);
                 output_activity.set_end_cycle(activity.end_cycle);
@@ -1073,6 +1083,9 @@ fn read_profile_tiles(
                                             }
                                             application_capnp::ProfileExchangeActivityKind::Receive => {
                                                 ProfileExchangeActivityKind::Receive
+                                            }
+                                            application_capnp::ProfileExchangeActivityKind::PartnerBusy => {
+                                                ProfileExchangeActivityKind::PartnerBusy
                                             }
                                         },
                                         start_cycle: activity.get_start_cycle(),
@@ -1237,11 +1250,18 @@ mod tests {
                     name: "reason".into(),
                     value: "OperatorKernel".into(),
                 }],
-                exchange_activities: vec![ProfileExchangeActivity {
-                    kind: ProfileExchangeActivityKind::Receive,
-                    start_cycle: 3,
-                    end_cycle: 11,
-                }],
+                exchange_activities: vec![
+                    ProfileExchangeActivity {
+                        kind: ProfileExchangeActivityKind::Receive,
+                        start_cycle: 3,
+                        end_cycle: 11,
+                    },
+                    ProfileExchangeActivity {
+                        kind: ProfileExchangeActivityKind::PartnerBusy,
+                        start_cycle: 1,
+                        end_cycle: 3,
+                    },
+                ],
                 exchange_event_cycles: 13,
             }],
         });
@@ -1467,14 +1487,22 @@ mod tests {
                             name: "innerBlock".into(),
                             value: "8".into(),
                         }],
-                        exchange_activities: (kind == ProfileStepKind::Exchange)
-                            .then_some(ProfileExchangeActivity {
-                                kind: ProfileExchangeActivityKind::Send,
-                                start_cycle: 2,
-                                end_cycle: 6,
-                            })
-                            .into_iter()
-                            .collect(),
+                        exchange_activities: if kind == ProfileStepKind::Exchange {
+                            vec![
+                                ProfileExchangeActivity {
+                                    kind: ProfileExchangeActivityKind::Send,
+                                    start_cycle: 2,
+                                    end_cycle: 6,
+                                },
+                                ProfileExchangeActivity {
+                                    kind: ProfileExchangeActivityKind::PartnerBusy,
+                                    start_cycle: 6,
+                                    end_cycle: 8,
+                                },
+                            ]
+                        } else {
+                            Vec::new()
+                        },
                         exchange_event_cycles: 9,
                     },
                     start_cycle: (u32::MAX - 10).wrapping_add(index as u32),

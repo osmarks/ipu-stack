@@ -10,6 +10,7 @@ enum StepKind {
 enum ExchangeActivityKind {
   send @0;
   receive @1;
+  partnerBusy @2;
 }
 
 struct ExchangeActivity {

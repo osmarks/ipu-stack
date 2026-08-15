@@ -87,6 +87,7 @@ enum ProfileStepKind {
 enum ProfileExchangeActivityKind {
   send @0;
   receive @1;
+  partnerBusy @2;
 }
 
 struct ProfileExchangeActivity {

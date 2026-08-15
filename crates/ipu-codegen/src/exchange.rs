@@ -62,6 +62,8 @@ pub struct ExchangeActivity {
 pub enum ExchangeActivityKind {
     Send,
     Receive,
+    /// This tile's paired-width exchange resources are borrowed by its partner.
+    PartnerBusy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1450,6 +1452,7 @@ pub fn validate_exchange_schedule(
     }
 
     let mut send_counts = vec![0usize; problem.transfers.len()];
+    let mut partner_busy_counts = vec![0usize; problem.transfers.len()];
     let mut receive_counts = problem
         .transfers
         .iter()
@@ -1532,6 +1535,20 @@ pub fn validate_exchange_schedule(
                         })?;
                     receive_counts[transfer_index][destination] += 1;
                 }
+                ExchangeActivityKind::PartnerBusy => {
+                    let expected = (transfer.width == ExchangeItemWidth::Paired64)
+                        .then(|| Topology::c600().paired_logical(transfer.source))
+                        .transpose()?;
+                    if expected != Some(tile_u16)
+                        || activity.address != transfer.source_addresses[0]
+                    {
+                        return Err(fail(format!(
+                            "phase {} transfer {transfer_index} has a mismatched partner-busy activity",
+                            problem.phase
+                        )));
+                    }
+                    partner_busy_counts[transfer_index] += 1;
+                }
             }
         }
         for kind in [ExchangeActivityKind::Send, ExchangeActivityKind::Receive] {
@@ -1576,11 +1593,35 @@ pub fn validate_exchange_schedule(
                 }
             }
         }
+        for partner_busy in phase.activities[tile]
+            .iter()
+            .filter(|activity| activity.kind == ExchangeActivityKind::PartnerBusy)
+        {
+            if phase.activities[tile].iter().any(|activity| {
+                activity.transfer != partner_busy.transfer
+                    && activity.start_cycle < partner_busy.end_cycle
+                    && partner_busy.start_cycle < activity.end_cycle
+            }) {
+                return Err(fail(format!(
+                    "phase {} tile {tile} overlaps partner-busy and local bus intervals",
+                    problem.phase
+                )));
+            }
+        }
     }
     for (index, count) in send_counts.into_iter().enumerate() {
         if count != 1 {
             return Err(fail(format!(
                 "phase {} transfer {index} has {count} send activities",
+                problem.phase
+            )));
+        }
+    }
+    for (index, count) in partner_busy_counts.into_iter().enumerate() {
+        let expected = usize::from(problem.transfers[index].width == ExchangeItemWidth::Paired64);
+        if count != expected {
+            return Err(fail(format!(
+                "phase {} transfer {index} has {count} partner-busy activities, expected {expected}",
                 problem.phase
             )));
         }
@@ -2007,6 +2048,17 @@ impl MaterializedSchedule {
             address: transfer.source_address(),
             words: transfer.words,
         });
+        if let Some(tile) = transfer.reserved_source {
+            self.activities[usize::from(tile)].push(ExchangeActivity {
+                transfer: u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
+                kind: ExchangeActivityKind::PartnerBusy,
+                start_cycle: timing.start,
+                end_cycle: timing.sender_memory_end,
+                memory_end_cycle: timing.sender_memory_end,
+                address: transfer.source_address(),
+                words: transfer.words,
+            });
+        }
         for (((&(tile, address), &start_cycle), &end_cycle), &memory_end_cycle) in transfer
             .destinations
             .iter()

@@ -158,6 +158,7 @@ canvas {
         <span class="legend-item"><span class="legend-swatch" style="background:#17854c"></span>tx</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#287db2"></span>rx</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#6b5596"></span>tx/rx</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#9a547f"></span>partner bus</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#8ebeb4"></span>exchange idle</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#c58b24"></span>sync</span>
       </div>
@@ -177,8 +178,9 @@ const metadataSets = DATA.metadataSets.map(([start, count]) => {
   }
   return entries;
 });
+const exchangeActivityKinds = ["send", "receive", "partnerBusy"];
 const activitySets = DATA.activitySets.map(activities => activities.map(([kind, start, end]) => ({
-  kind: kind === 0 ? "send" : "receive",
+  kind: exchangeActivityKinds[kind] || "exchangeIdle",
   start,
   end,
 })));
@@ -219,6 +221,7 @@ const colors = {
   send: "#17854c",
   receive: "#287db2",
   sendReceive: "#6b5596",
+  partnerBusy: "#9a547f",
   exchangeIdle: "#8ebeb4",
   compute: "#cf3f4a",
   synchronization: "#c58b24",
@@ -376,28 +379,31 @@ function displaySegments(sample) {
     if (end <= start) continue;
     const send = activity.kind === "send" ? 1 : 0;
     const receive = activity.kind === "receive" ? 1 : 0;
-    events.push({ time: start, send, receive });
-    events.push({ time: end, send: -send, receive: -receive });
+    const partnerBusy = activity.kind === "partnerBusy" ? 1 : 0;
+    events.push({ time: start, send, receive, partnerBusy });
+    events.push({ time: end, send: -send, receive: -receive, partnerBusy: -partnerBusy });
   }
   events.sort((a, b) => a.time - b.time);
-  const activityKind = (send, receive) => {
+  const activityKind = (send, receive, partnerBusy) => {
     if (send && receive) return "sendReceive";
     if (send) return "send";
     if (receive) return "receive";
+    if (partnerBusy) return "partnerBusy";
     return "exchangeIdle";
   };
-  let cursor = exchangeStart, send = 0, receive = 0, event = 0;
+  let cursor = exchangeStart, send = 0, receive = 0, partnerBusy = 0, event = 0;
   while (event < events.length) {
     const time = events[event].time;
-    if (time > cursor) segments.push({ kind: activityKind(send, receive), start: cursor, end: time });
+    if (time > cursor) segments.push({ kind: activityKind(send, receive, partnerBusy), start: cursor, end: time });
     while (event < events.length && events[event].time === time) {
       send += events[event].send;
       receive += events[event].receive;
+      partnerBusy += events[event].partnerBusy;
       event++;
     }
     cursor = time;
   }
-  if (cursor < exchangeEnd) segments.push({ kind: activityKind(send, receive), start: cursor, end: exchangeEnd });
+  if (cursor < exchangeEnd) segments.push({ kind: activityKind(send, receive, partnerBusy), start: cursor, end: exchangeEnd });
   if (exchangeEnd < sampleEnd) {
     segments.push({ kind: "synchronization", start: exchangeEnd, end: sampleEnd });
   }
@@ -611,7 +617,7 @@ function drawOverview() {
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, width, height);
-  const kinds = ["compute", "send", "receive", "sendReceive", "exchangeIdle", "exchange", "synchronization", "idle"];
+  const kinds = ["compute", "send", "receive", "sendReceive", "partnerBusy", "exchangeIdle", "exchange", "synchronization", "idle"];
   const deltas = Object.fromEntries(kinds.map(kind => [kind, new Float64Array(width + 1)]));
   const edges = Object.fromEntries(kinds.map(kind => [kind, new Float64Array(width)]));
   const scale = width / maxEnd;
@@ -755,6 +761,7 @@ function drawDetails() {
       send: 0,
       receive: 0,
       sendReceive: 0,
+      partnerBusy: 0,
       exchangeIdle: 0,
       exchange: 0,
       synchronization: 0,

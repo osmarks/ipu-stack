@@ -944,6 +944,7 @@ fn build_physical_phase_replay(
                     }
                 }
                 ExchangeActivityKind::Receive => transfer.1.push((tile, activity)),
+                ExchangeActivityKind::PartnerBusy => {}
             }
             for word in 0..activity.words {
                 let address = activity
