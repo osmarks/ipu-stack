@@ -248,6 +248,8 @@ pub struct DeferredOutputPlan {
     pub transform: DeferredTransform,
     /// Cost restored if no later consumer claims this offer.
     pub unfused_cycles: u64,
+    /// Exchange portion of `unfused_cycles`, restored with the offer.
+    pub unfused_exchange_cycles: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1707,6 +1709,9 @@ pub struct PipelineConfig {
     /// Maximum number of partial format assignments retained after each
     /// operation in a straight-line region.
     pub planning_beam_width: usize,
+    /// Number of complete beam finalists to materialize and rank with the
+    /// physical exchange scheduler. One retains analytical-only selection.
+    pub exchange_schedule_finalists: usize,
     /// Standard-addressed SRAM retained for exchange tables, profiling data,
     /// host commands, and generated tile programs built after planning.
     pub standard_memory_reservation_bytes: u64,
@@ -1764,6 +1769,7 @@ impl PipelineConfig {
             operator_candidates: default_operator_candidates(tile_count),
             shape_aware_active_tile_counts: true,
             planning_beam_width: 64,
+            exchange_schedule_finalists: 1,
             standard_memory_reservation_bytes: u64::from(
                 crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
             ),
@@ -1790,6 +1796,11 @@ impl PipelineConfig {
 
     pub fn with_planning_beam_width(mut self, width: usize) -> Self {
         self.planning_beam_width = width.max(1);
+        self
+    }
+
+    pub fn with_exchange_schedule_finalists(mut self, finalists: usize) -> Self {
+        self.exchange_schedule_finalists = finalists.max(1);
         self
     }
 
@@ -2329,6 +2340,7 @@ pub struct MidOperation {
     pub operator_plan: Option<OperatorPlan>,
     pub conversion_plan: Option<ConversionPlan>,
     pub estimated_cycles: u64,
+    pub estimated_exchange_cycles: u64,
     pub memory: MemoryEstimate,
 }
 
@@ -2815,6 +2827,7 @@ pub struct MidGraph {
     pub operations: Vec<MidOperation>,
     pub outputs: Vec<MidValueId>,
     pub estimated_cycles: u64,
+    pub estimated_exchange_cycles: u64,
     pub peak_memory: MemoryPeaks,
 }
 
@@ -2861,6 +2874,15 @@ pub fn lower(
     config: &PipelineConfig,
     costs: &impl CostModel,
 ) -> LoweringResult<MidGraph> {
+    Ok(lower_finalists(graph, config, costs, 1)?.remove(0))
+}
+
+pub(crate) fn lower_finalists(
+    graph: &ComputeGraph,
+    config: &PipelineConfig,
+    costs: &impl CostModel,
+    finalist_count: usize,
+) -> LoweringResult<Vec<MidGraph>> {
     if config.tile_count == 0 {
         return Err(LoweringError::EmptyTileGroup);
     }
@@ -2921,7 +2943,7 @@ pub fn lower(
             value,
         });
     }
-    let operations = lower_operations(
+    let branches = lower_operation_candidates(
         graph.operations(),
         graph.outputs(),
         &mut values,
@@ -2932,65 +2954,63 @@ pub fn lower(
         &mut state,
         &RegionPlanningConstraints::default(),
     )?;
-    let outputs = graph
-        .outputs()
-        .iter()
-        .map(|value| lookup(&values, *value))
-        .collect::<LoweringResult<Vec<_>>>()?;
-    let estimated_cycles = operations
-        .iter()
-        .map(|operation| operation.estimated_cycles)
-        .sum();
     let initial = inputs.iter().map(|input| input.value).collect::<Vec<_>>();
-    let peak_memory = region_peak_memory(&initial, &operations, &outputs, &state.values);
-    tracing::info!(
-        values = state.values.len(),
-        operations = operations.len(),
-        estimated_cycles,
-        exchange_row_bytes = peak_memory.exchange_rows,
-        peak_standard_bytes = peak_memory.standard,
-        peak_interleaved_bytes = peak_memory.interleaved,
-        peak_total_bytes = peak_memory.total,
-        maximum_standard_allocation_bytes = peak_memory.maximum_standard_allocation,
-        active_tile_counts = ?operations
-            .iter()
-            .filter_map(|operation| operation.results.first())
-            .map(|result| state.values[result.index() as usize]
-                .tensor_type
-                .format
-                .layout
-                .tiling
-                .tile_count)
-            .collect::<BTreeSet<_>>(),
-        "selected operator plans"
-    );
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        for (index, operation) in operations.iter().enumerate() {
-            tracing::debug!(
-                index,
-                source = operation.source.map(OperationId::index),
-                kind = ?operation.kind,
-                input_formats = ?operation.inputs.iter().map(|value| {
-                    &state.values[value.index() as usize].tensor_type.format
-                }).collect::<Vec<_>>(),
-                output_formats = ?operation.results.iter().map(|value| {
-                    &state.values[value.index() as usize].tensor_type.format
-                }).collect::<Vec<_>>(),
-                dispatch = ?operation.operator_plan.as_ref().map(|plan| &plan.dispatch),
-                estimated_cycles = operation.estimated_cycles,
-                memory = ?operation.memory,
-                "selected mid operation"
+    branches
+        .into_iter()
+        .take(finalist_count.max(1))
+        .enumerate()
+        .map(|(finalist, branch)| {
+            let outputs = graph
+                .outputs()
+                .iter()
+                .map(|value| lookup(&branch.values, *value))
+                .collect::<LoweringResult<Vec<_>>>()?;
+            let estimated_cycles = branch
+                .operations
+                .iter()
+                .map(|operation| operation.estimated_cycles)
+                .sum();
+            let estimated_exchange_cycles = branch
+                .operations
+                .iter()
+                .map(|operation| operation.estimated_exchange_cycles)
+                .sum();
+            let peak_memory =
+                region_peak_memory(&initial, &branch.operations, &outputs, &branch.state.values);
+            tracing::info!(
+                finalist,
+                values = branch.state.values.len(),
+                operations = branch.operations.len(),
+                estimated_cycles,
+                estimated_exchange_cycles,
+                exchange_row_bytes = peak_memory.exchange_rows,
+                peak_standard_bytes = peak_memory.standard,
+                peak_interleaved_bytes = peak_memory.interleaved,
+                peak_total_bytes = peak_memory.total,
+                maximum_standard_allocation_bytes = peak_memory.maximum_standard_allocation,
+                active_tile_counts = ?branch.operations
+                    .iter()
+                    .filter_map(|operation| operation.results.first())
+                    .map(|result| branch.state.values[result.index() as usize]
+                        .tensor_type
+                        .format
+                        .layout
+                        .tiling
+                        .tile_count)
+                    .collect::<BTreeSet<_>>(),
+                "retained operator-plan finalist"
             );
-        }
-    }
-    Ok(MidGraph {
-        inputs,
-        values: state.values,
-        operations,
-        outputs,
-        estimated_cycles,
-        peak_memory,
-    })
+            Ok(MidGraph {
+                inputs: inputs.clone(),
+                values: branch.state.values,
+                operations: branch.operations,
+                outputs,
+                estimated_cycles,
+                estimated_exchange_cycles,
+                peak_memory,
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Default)]
@@ -3198,7 +3218,7 @@ struct RegionPlanningConstraints {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_operations(
+fn lower_operation_candidates(
     source: &[Operation],
     required_outputs: &[ValueId],
     values: &mut BTreeMap<ValueId, MidValueId>,
@@ -3208,9 +3228,14 @@ fn lower_operations(
     costs: &impl CostModel,
     state: &mut LoweringState,
     constraints: &RegionPlanningConstraints,
-) -> LoweringResult<Vec<MidOperation>> {
+) -> LoweringResult<Vec<BeamBranch>> {
     if source.is_empty() {
-        return Ok(Vec::new());
+        return Ok(vec![BeamBranch {
+            values: values.clone(),
+            state: state.clone(),
+            operations: Vec::new(),
+            peak_memory: MemoryPeaks::default(),
+        }]);
     }
     let relevant_origins = source
         .iter()
@@ -3551,15 +3576,47 @@ fn lower_operations(
             })
         })
         .collect::<Vec<_>>();
-    let mut best = beam
-        .into_iter()
-        .min_by_key(|branch| {
-            deferred_aware_branch_score(branch, &BTreeSet::new()).saturating_add(
-                format_equality_cost(branch, &constraints.required_equal_formats, costs),
-            )
-        })
-        .ok_or_else(|| LoweringError::NoCandidate(source[0].id))?;
-    restore_unclaimed_deferred_costs(&mut best.operations);
+    let mut beam = beam;
+    beam.sort_by_key(|branch| {
+        deferred_aware_branch_score(branch, &BTreeSet::new()).saturating_add(format_equality_cost(
+            branch,
+            &constraints.required_equal_formats,
+            costs,
+        ))
+    });
+    if beam.is_empty() {
+        return Err(LoweringError::NoCandidate(source[0].id));
+    }
+    for branch in &mut beam {
+        restore_unclaimed_deferred_costs(&mut branch.operations);
+    }
+    Ok(beam)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_operations(
+    source: &[Operation],
+    required_outputs: &[ValueId],
+    values: &mut BTreeMap<ValueId, MidValueId>,
+    shapes: &BTreeMap<ValueId, TensorShape>,
+    graph: &ComputeGraph,
+    config: &PipelineConfig,
+    costs: &impl CostModel,
+    state: &mut LoweringState,
+    constraints: &RegionPlanningConstraints,
+) -> LoweringResult<Vec<MidOperation>> {
+    let mut candidates = lower_operation_candidates(
+        source,
+        required_outputs,
+        values,
+        shapes,
+        graph,
+        config,
+        costs,
+        state,
+        constraints,
+    )?;
+    let best = candidates.remove(0);
     *values = best.values;
     *state = best.state;
     Ok(best.operations)
@@ -3823,6 +3880,7 @@ fn restore_unclaimed_deferred_costs(operations: &mut [MidOperation]) {
             .is_some_and(|result| !claims.contains(result))
         {
             operation.estimated_cycles = offer.unfused_cycles;
+            operation.estimated_exchange_cycles = offer.unfused_exchange_cycles;
         }
     }
 }
@@ -3907,6 +3965,7 @@ fn apply_selected_plan(
                 });
                 if streamed {
                     conversion.estimated_cycles = 0;
+                    conversion.estimated_exchange_cycles = 0;
                     conversion.inputs.first().copied()
                 } else {
                     None
@@ -3928,6 +3987,14 @@ fn apply_selected_plan(
         .map(|value| state.get(*value).tensor_type.clone())
         .collect::<Vec<_>>();
     let mut operator_cycles = costs.operator_transition_cycles(
+        plan.operator,
+        &plan.dispatch,
+        &plan.requirements,
+        &source_types,
+        &converted_types,
+        &state.get(result).tensor_type,
+    );
+    let mut operator_exchange_cycles = costs.operator_transition_exchange_cycles(
         plan.operator,
         &plan.dispatch,
         &plan.requirements,
@@ -3986,6 +4053,15 @@ fn apply_selected_plan(
             producer_cycles,
         );
         operator_cycles = operator_cycles.saturating_add(fused_cycles);
+        operator_exchange_cycles =
+            operator_exchange_cycles.saturating_add(costs.deferred_input_exchange_cycles(
+                offered.transform,
+                &state.get(source).tensor_type,
+                &state.get(original).tensor_type,
+                &converted_types[input_index],
+                &plan.dispatch,
+                producer_cycles,
+            ));
         deferred_inputs[input_index] = Some(DeferredInputPlan {
             producer: original,
             source,
@@ -4020,7 +4096,9 @@ fn apply_selected_plan(
     let mut deferred_output = plan.deferred_output;
     if let Some(offer) = &mut deferred_output {
         offer.unfused_cycles = operator_cycles;
+        offer.unfused_exchange_cycles = operator_exchange_cycles;
         operator_cycles = 0;
+        operator_exchange_cycles = 0;
     }
     operations.push(MidOperation {
         source: Some(operation.id),
@@ -4037,6 +4115,7 @@ fn apply_selected_plan(
         }),
         conversion_plan: None,
         estimated_cycles: operator_cycles,
+        estimated_exchange_cycles: operator_exchange_cycles,
         memory,
     });
     values.insert(operation.results[0], result);
@@ -4169,6 +4248,7 @@ fn plans(
                         parts: options.heads,
                     },
                     unfused_cycles: 0,
+                    unfused_exchange_cycles: 0,
                 }),
             };
             if !plans.contains(&plan) {
@@ -5486,6 +5566,10 @@ fn lower_repeat(
         .iter()
         .map(|operation| operation.estimated_cycles)
         .sum();
+    let body_exchange_cost = body_operations
+        .iter()
+        .map(|operation| operation.estimated_exchange_cycles)
+        .sum::<u64>();
     let body_allocation_multiplicity = arguments
         .iter()
         .skip(inputs.len())
@@ -5531,6 +5615,7 @@ fn lower_repeat(
         operator_plan: None,
         conversion_plan: None,
         estimated_cycles: body_cost.saturating_mul(u64::from(repeat.count)),
+        estimated_exchange_cycles: body_exchange_cost.saturating_mul(u64::from(repeat.count)),
         memory: MemoryEstimate {
             live: body_peak.conservative_tensor_usage(),
             temporary: MemoryUsage::default(),
@@ -5582,6 +5667,7 @@ fn ensure_format(
                 strategy: ConversionStrategy::LocalKernel,
             }),
             estimated_cycles: costs.cast_cycles(&original.tensor_type, target.precision),
+            estimated_exchange_cycles: 0,
             memory,
         });
         value = result;
@@ -5624,6 +5710,7 @@ fn ensure_format(
                 strategy,
             }),
             estimated_cycles: rearrangement.cycles,
+            estimated_exchange_cycles: rearrangement.exchange_cycles,
             memory,
         });
         value = result;
@@ -6349,7 +6436,36 @@ mod tests {
             };
             let greedy = lower(&graph, &make_config(1), &Ipu21CostModel).unwrap();
             let searched_config = make_config(2);
-            let searched = lower(&graph, &searched_config, &Ipu21CostModel).unwrap();
+            let finalists = lower_finalists(&graph, &searched_config, &Ipu21CostModel, 2).unwrap();
+            assert!(
+                !finalists.is_empty() && finalists.len() <= 2,
+                "random case {case}"
+            );
+            for finalist in &finalists {
+                assert_eq!(
+                    finalist.estimated_cycles,
+                    finalist
+                        .operations
+                        .iter()
+                        .map(|operation| operation.estimated_cycles)
+                        .sum::<u64>(),
+                    "random case {case}"
+                );
+                assert_eq!(
+                    finalist.estimated_exchange_cycles,
+                    finalist
+                        .operations
+                        .iter()
+                        .map(|operation| operation.estimated_exchange_cycles)
+                        .sum::<u64>(),
+                    "random case {case}"
+                );
+                assert!(
+                    finalist.estimated_exchange_cycles <= finalist.estimated_cycles,
+                    "random case {case}"
+                );
+            }
+            let searched = &finalists[0];
 
             assert!(
                 searched.estimated_cycles < greedy.estimated_cycles,
@@ -6366,7 +6482,7 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(
-                value(&searched, gelu.results[0]).tensor_type.format,
+                value(searched, gelu.results[0]).tensor_type.format,
                 left,
                 "random case {case}"
             );

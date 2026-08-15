@@ -82,6 +82,9 @@ struct Arguments {
     /// Constrain planning as though only this much SRAM per tile were free.
     #[arg(long, conflicts_with = "reuse_package")]
     tile_memory_budget_kib: Option<u64>,
+    /// Rank this many complete planner finalists with physical exchange scheduling.
+    #[arg(long, default_value_t = 1, conflicts_with = "reuse_package")]
+    exchange_schedule_finalists: usize,
     #[arg(long, default_value_t = c600_tile_count())]
     tiles: u32,
     #[arg(long)]
@@ -329,6 +332,7 @@ fn main() -> Result<()> {
     }
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
+    pipeline = pipeline.with_exchange_schedule_finalists(arguments.exchange_schedule_finalists);
     if let Some(kib) = arguments.tile_memory_budget_kib {
         let bytes = kib.checked_mul(1024).context("tile SRAM budget overflow")?;
         pipeline = pipeline.with_tile_memory_budget(bytes);

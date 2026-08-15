@@ -5,13 +5,15 @@ use crate::memory::{
     MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE,
     RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
 };
-use crate::mid::{Ipu21CostModel, MidGraph, MidOperationKind, PipelineConfig, Precision};
+use crate::mid::{
+    Ipu21CostModel, MidGraph, MidOperationKind, PipelineConfig, Precision, lower_finalists,
+};
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HOST_RUN_SYMBOL, KernelBuildPlan,
     PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL,
     SAMPLE_CYCLE_SYMBOL, TileProgram, TileProgramLowering, WORKER_BARRIER_SYMBOL,
-    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower, lower_exchanges,
-    lower_to_tiles, place, shard_storage_bytes,
+    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower_exchanges, lower_to_tiles,
+    place, shard_storage_bytes,
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
@@ -654,10 +656,17 @@ fn build_package_artifacts(
     if diagnostic_checkpoints {
         planning.profiling.enabled = false;
     }
-    let mid = build_phase("lower_mid", || {
-        Ok(lower(graph, &planning, &Ipu21CostModel)?)
+    let finalists = build_phase("lower_mid", || {
+        Ok(lower_finalists(
+            graph,
+            &planning,
+            &Ipu21CostModel,
+            planning.exchange_schedule_finalists,
+        )?)
     })?;
-    let low = build_phase("lower_tiles", || Ok(lower_to_tiles(&mid, &planning)?))?;
+    let (mid, low) = build_phase("select_finalist", || {
+        select_scheduled_finalist(finalists, &planning)
+    })?;
     tracing::info!(
         logical_shards = low.shards.len(),
         exchange_phases = low.exchange_phases.len(),
@@ -685,6 +694,60 @@ fn build_package_artifacts(
     package_config.pipeline = planning;
     let built = build_package_from_objects(&low, &package_config, &objects, &kernel_plan)?;
     Ok((built, mid, low))
+}
+
+fn select_scheduled_finalist(
+    finalists: Vec<MidGraph>,
+    planning: &PipelineConfig,
+) -> PackageBuildResult<(MidGraph, LowProgram)> {
+    if finalists.len() == 1 {
+        let mid = finalists.into_iter().next().unwrap();
+        let low = lower_to_tiles(&mid, planning)?;
+        return Ok((mid, low));
+    }
+
+    let topology = active_topology(planning.tile_count)?;
+    let mut ranked = Vec::with_capacity(finalists.len());
+    for (index, mid) in finalists.into_iter().enumerate() {
+        let low = lower_to_tiles(&mid, planning)?;
+        let placement = place(&low)?;
+        let exchanges = lower_exchanges(
+            &low,
+            &placement,
+            &topology,
+            crate::ExchangeLoweringOptions::default(),
+        )?;
+        let scheduled_exchange_cycles = exchanges
+            .phases
+            .iter()
+            .map(|phase| u64::from(phase.event_cycles))
+            .sum::<u64>()
+            .saturating_add(
+                (exchanges.phases.len() as u64)
+                    .saturating_mul(crate::IPU21_TARGET_COSTS.exchange_phase_cycles),
+            );
+        let estimated_non_exchange_cycles = mid
+            .estimated_cycles
+            .saturating_sub(mid.estimated_exchange_cycles);
+        let refined_cycles =
+            estimated_non_exchange_cycles.saturating_add(scheduled_exchange_cycles);
+        tracing::info!(
+            finalist = index,
+            analytical_cycles = mid.estimated_cycles,
+            analytical_exchange_cycles = mid.estimated_exchange_cycles,
+            scheduled_exchange_cycles,
+            refined_cycles,
+            "scheduled operator-plan finalist"
+        );
+        ranked.push((refined_cycles, index, mid, low));
+    }
+    ranked.sort_by_key(|(cycles, index, _, _)| (*cycles, *index));
+    let (_, selected, mid, low) = ranked.remove(0);
+    tracing::info!(
+        selected,
+        "selected physically scheduled operator-plan finalist"
+    );
+    Ok((mid, low))
 }
 
 fn build_package_from_objects(

@@ -26,6 +26,16 @@ pub trait CostModel: Sync {
         output: &TensorType,
     ) -> u64;
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
+    fn operator_exchange_cycles(
+        &self,
+        _operator: MidOperator,
+        _dispatch: &OperatorDispatch,
+        _requirements: &OperatorRequirements,
+        _inputs: &[TensorType],
+        _output: &TensorType,
+    ) -> u64 {
+        0
+    }
     fn operator_transition_cycles(
         &self,
         operator: MidOperator,
@@ -59,6 +69,39 @@ pub trait CostModel: Sync {
                 },
             )
     }
+    fn operator_transition_exchange_cycles(
+        &self,
+        operator: MidOperator,
+        dispatch: &OperatorDispatch,
+        requirements: &OperatorRequirements,
+        source_inputs: &[TensorType],
+        inputs: &[TensorType],
+        output: &TensorType,
+    ) -> u64 {
+        source_inputs
+            .iter()
+            .zip(inputs)
+            .zip(&requirements.inputs)
+            .filter(|((source, input), requirement)| {
+                requirement.materialization == crate::OperandMaterialization::DispatchSlices
+                    && source.format.layout != input.format.layout
+            })
+            .fold(
+                self.operator_exchange_cycles(operator, dispatch, requirements, inputs, output),
+                |cycles, ((source, input), _)| {
+                    cycles.saturating_add(
+                        self.rearrangement_cost(
+                            &input.shape,
+                            input.format.precision,
+                            layout_conversion_strategy(&source.format.layout, &input.format.layout),
+                            &source.format.layout,
+                            &input.format.layout,
+                        )
+                        .exchange_cycles,
+                    )
+                },
+            )
+    }
     fn operator_exchange_footprint(
         &self,
         _operator: MidOperator,
@@ -83,6 +126,17 @@ pub trait CostModel: Sync {
     ) -> u64 {
         producer_cycles
     }
+    fn deferred_input_exchange_cycles(
+        &self,
+        _transform: DeferredTransform,
+        _source: &TensorType,
+        _logical_output: &TensorType,
+        _consumer_input: &TensorType,
+        _consumer_dispatch: &OperatorDispatch,
+        _producer_cycles: u64,
+    ) -> u64 {
+        0
+    }
     fn rearrangement_cost(
         &self,
         shape: &TensorShape,
@@ -96,6 +150,7 @@ pub trait CostModel: Sync {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RearrangementCost {
     pub cycles: u64,
+    pub exchange_cycles: u64,
     pub exchange_row_bytes: u64,
 }
 
@@ -186,6 +241,18 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         self.inner.cast_cycles(input, to)
     }
 
+    fn operator_exchange_cycles(
+        &self,
+        operator: MidOperator,
+        dispatch: &OperatorDispatch,
+        requirements: &OperatorRequirements,
+        inputs: &[TensorType],
+        output: &TensorType,
+    ) -> u64 {
+        self.inner
+            .operator_exchange_cycles(operator, dispatch, requirements, inputs, output)
+    }
+
     fn operator_exchange_footprint(
         &self,
         operator: MidOperator,
@@ -208,6 +275,25 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         producer_cycles: u64,
     ) -> u64 {
         self.inner.deferred_input_cycles(
+            transform,
+            source,
+            logical_output,
+            consumer_input,
+            consumer_dispatch,
+            producer_cycles,
+        )
+    }
+
+    fn deferred_input_exchange_cycles(
+        &self,
+        transform: DeferredTransform,
+        source: &TensorType,
+        logical_output: &TensorType,
+        consumer_input: &TensorType,
+        consumer_dispatch: &OperatorDispatch,
+        producer_cycles: u64,
+    ) -> u64 {
+        self.inner.deferred_input_exchange_cycles(
             transform,
             source,
             logical_output,
@@ -482,6 +568,86 @@ fn standard_to_interleaved_copy_cycles(bytes: u64) -> u64 {
         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
 }
 
+fn estimated_operator_exchange_cycles(
+    dispatch: &OperatorDispatch,
+    inputs: &[TensorType],
+    output: &TensorType,
+) -> u64 {
+    match dispatch {
+        OperatorDispatch::BlockedGemm {
+            distribution:
+                GemmDistribution::ParallelReduction {
+                    inner_partitions,
+                    result_row_partitions,
+                    result_column_partitions,
+                    reduction_staging,
+                    ..
+                },
+            ..
+        } => {
+            let compute_output = gemm_partial_tensor(dispatch, output);
+            let endpoint = gemm_exchange_endpoint_traffic(dispatch, inputs, &compute_output)
+                .unwrap_or_else(|| {
+                    ExchangeEndpointTraffic::from_maxima(
+                        u64::MAX / 16,
+                        u64::MAX / 16,
+                        u64::MAX / 16,
+                        u64::MAX / 16,
+                    )
+                });
+            let remote_partials_per_stage = match reduction_staging {
+                crate::ReductionStaging::Complete => inner_partitions.saturating_sub(1),
+                crate::ReductionStaging::Streamed => 1,
+            };
+            let reduction_epochs = inner_partitions
+                .saturating_sub(1)
+                .div_ceil(remote_partials_per_stage.max(1));
+            let reduction_partial_bytes =
+                if (*result_row_partitions, *result_column_partitions) != (1, 1) {
+                    maximum_shard_bytes(output)
+                } else {
+                    maximum_shard_bytes(&compute_output)
+                };
+            let reduction = ExchangeEndpointTraffic::from_maxima(
+                reduction_partial_bytes.saturating_mul(2),
+                u64::from(inner_partitions.saturating_sub(1))
+                    .saturating_mul(reduction_partial_bytes),
+                2,
+                u64::from(inner_partitions.saturating_sub(1)),
+            );
+            exchange_endpoint_cycles(&endpoint, 1).saturating_add(exchange_endpoint_cycles(
+                &reduction,
+                u64::from(reduction_epochs),
+            ))
+        }
+        OperatorDispatch::BlockedGemm { .. } => {
+            let compute_output = gemm_partial_tensor(dispatch, output);
+            let traffic = gemm_exchange_endpoint_traffic(dispatch, inputs, &compute_output)
+                .unwrap_or_else(|| {
+                    ExchangeEndpointTraffic::from_maxima(
+                        u64::MAX / 16,
+                        u64::MAX / 16,
+                        u64::MAX / 16,
+                        u64::MAX / 16,
+                    )
+                });
+            exchange_endpoint_cycles(
+                &traffic,
+                gemm_exchange_phase_count(dispatch, inputs, &compute_output),
+            )
+        }
+        OperatorDispatch::BlockedAttention { .. } => {
+            attention_endpoint_traffic(inputs, output, dispatch)
+                .map(|(traffic, phases)| exchange_endpoint_cycles(&traffic, phases))
+                .unwrap_or(u64::MAX / 8)
+        }
+        OperatorDispatch::SplitHeads => inputs.first().map_or(0, |input| {
+            exchange_endpoint_cycles(&tensor_transition_endpoint_traffic(input, output), 1)
+        }),
+        OperatorDispatch::Pointwise { .. } => 0,
+    }
+}
+
 impl CostModel for Ipu21CostModel {
     fn operator_cycles(
         &self,
@@ -665,20 +831,8 @@ impl CostModel for Ipu21CostModel {
                 } else {
                     0
                 };
-                let endpoint_traffic =
-                    gemm_exchange_endpoint_traffic(dispatch, inputs, &compute_output).unwrap_or(
-                        ExchangeEndpointTraffic::from_maxima(
-                            u64::MAX / 16,
-                            u64::MAX / 16,
-                            u64::MAX / 16,
-                            u64::MAX / 16,
-                        ),
-                    );
-                let exchange = exchange_endpoint_cycles(
-                    &endpoint_traffic,
-                    gemm_exchange_phase_count(dispatch, inputs, &compute_output),
-                );
-                let exchange = match dispatch {
+                let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
+                let reduction_work = match dispatch {
                     OperatorDispatch::BlockedGemm {
                         output_column_block: _,
                         distribution:
@@ -706,36 +860,19 @@ impl CostModel for Ipu21CostModel {
                             } else {
                                 partial_bytes
                             };
-                        // At most two adjacent source tiles contribute one
-                        // partial each; the reduction root receives every
-                        // nonlocal partial over the complete reduction.
-                        let reduction_traffic = ExchangeEndpointTraffic::from_maxima(
-                            reduction_partial_bytes.saturating_mul(2),
-                            u64::from(inner_partitions.saturating_sub(1))
-                                .saturating_mul(reduction_partial_bytes),
-                            2,
-                            u64::from(inner_partitions.saturating_sub(1)),
-                        );
-                        exchange_endpoint_cycles(&endpoint_traffic, 1)
-                            .saturating_add(exchange_endpoint_cycles(
-                                &reduction_traffic,
-                                u64::from(reduction_epochs),
-                            ))
-                            .saturating_add(
-                                u64::from(
-                                    inner_partitions
-                                        .saturating_sub(1)
-                                        .saturating_add(reduction_epochs),
-                                )
-                                .saturating_mul(reduction_partial_bytes)
-                                .div_ceil(IPU21_TARGET_COSTS.reduction_output_bytes_per_cycle)
-                                .saturating_add(
-                                    u64::from(reduction_epochs)
-                                        .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
-                                ),
-                            )
+                        u64::from(
+                            inner_partitions
+                                .saturating_sub(1)
+                                .saturating_add(reduction_epochs),
+                        )
+                        .saturating_mul(reduction_partial_bytes)
+                        .div_ceil(IPU21_TARGET_COSTS.reduction_output_bytes_per_cycle)
+                        .saturating_add(
+                            u64::from(reduction_epochs)
+                                .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
+                        )
                     }
-                    _ => exchange,
+                    _ => 0,
                 };
                 let calls = match dispatch {
                     OperatorDispatch::BlockedGemm {
@@ -775,6 +912,7 @@ impl CostModel for Ipu21CostModel {
                     .saturating_add(packing)
                     .saturating_add(local_staging)
                     .saturating_add(exchange)
+                    .saturating_add(reduction_work)
                     .saturating_add(result_copy)
                     .saturating_add(capacity_penalty)
             }
@@ -804,9 +942,7 @@ impl CostModel for Ipu21CostModel {
                             .saturating_mul(2)
                             .div_ceil(128);
                         let blocks = key_rows.div_ceil(u64::from(*key_block_rows));
-                        let exchange = attention_endpoint_traffic(inputs, output, dispatch)
-                            .map(|(traffic, phases)| exchange_endpoint_cycles(&traffic, phases))
-                            .unwrap_or(u64::MAX / 8);
+                        let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
                         arithmetic
                             .saturating_add(
                                 blocks
@@ -832,12 +968,20 @@ impl CostModel for Ipu21CostModel {
                 .div_ceil(16)
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
             MidOperator::SplitHeads(_) => {
-                let Some(input) = inputs.first() else {
-                    return u64::MAX / 8;
-                };
-                exchange_endpoint_cycles(&tensor_transition_endpoint_traffic(input, output), 1)
+                estimated_operator_exchange_cycles(dispatch, inputs, output)
             }
         }
+    }
+
+    fn operator_exchange_cycles(
+        &self,
+        _operator: MidOperator,
+        dispatch: &OperatorDispatch,
+        _requirements: &OperatorRequirements,
+        inputs: &[TensorType],
+        output: &TensorType,
+    ) -> u64 {
+        estimated_operator_exchange_cycles(dispatch, inputs, output)
     }
 
     fn deferred_input_cycles(
@@ -898,6 +1042,47 @@ impl CostModel for Ipu21CostModel {
         source_work.saturating_mul(2).saturating_add(
             slices.saturating_mul(gather.saturating_add(pack).saturating_add(exchange)),
         )
+    }
+
+    fn deferred_input_exchange_cycles(
+        &self,
+        transform: DeferredTransform,
+        source: &TensorType,
+        logical_output: &TensorType,
+        consumer_input: &TensorType,
+        _consumer_dispatch: &OperatorDispatch,
+        _producer_cycles: u64,
+    ) -> u64 {
+        let DeferredTransform::SplitLastAxisIntoLeading { parts } = transform;
+        if parts == 0 || source.shape.0.len() != 3 || logical_output.shape.0.len() != 3 {
+            return 0;
+        }
+        let rank = consumer_input.shape.0.len();
+        let rows = consumer_input
+            .shape
+            .0
+            .get(rank.saturating_sub(2))
+            .copied()
+            .map_or(1, u64::from);
+        let columns = consumer_input.shape.0.last().copied().map_or(1, u64::from);
+        let (slices, slice_rows) = match consumer_input.format.layout.order {
+            ElementOrder::Amp(AmpOrder::TransposedRight) => (
+                rows.div_ceil(u64::from(crate::mid::AMP_INNER_BLOCK)),
+                rows.min(u64::from(crate::mid::AMP_INNER_BLOCK)),
+            ),
+            ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block, .. }) => (
+                rows.div_ceil(u64::from(row_block)),
+                rows.min(u64::from(row_block)),
+            ),
+            _ => (1, rows),
+        };
+        let panel_bytes = slice_rows
+            .saturating_mul(columns.min(u64::from(crate::mid::AMP_COLUMN_MICRO)))
+            .saturating_mul(consumer_input.format.precision.bytes());
+        slices.saturating_mul(exchange_endpoint_cycles(
+            &ExchangeEndpointTraffic::from_maxima(panel_bytes, panel_bytes, 1, 1),
+            2,
+        ))
     }
 
     fn operator_exchange_footprint(
@@ -995,12 +1180,14 @@ impl CostModel for Ipu21CostModel {
             // hardware cannot send. Do not price an unmaterializable plan.
             return RearrangementCost {
                 cycles: u64::MAX / 8,
+                exchange_cycles: u64::MAX / 8,
                 exchange_row_bytes: u64::MAX / 8,
             };
         }
         let Some(traffic) = conversion_traffic(shape, precision, from, to) else {
             return RearrangementCost {
                 cycles: u64::MAX / 8,
+                exchange_cycles: u64::MAX / 8,
                 exchange_row_bytes: u64::MAX / 8,
             };
         };
@@ -1029,6 +1216,7 @@ impl CostModel for Ipu21CostModel {
             .max(traffic.maximum_routed_fragments);
         RearrangementCost {
             cycles: exchange_cycles.saturating_add(local_cycles),
+            exchange_cycles,
             exchange_row_bytes: if from.tiling == to.tiling {
                 0
             } else {
