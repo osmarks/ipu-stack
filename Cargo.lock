@@ -432,6 +432,7 @@ dependencies = [
  "ipu-runtime",
  "rand_distr",
  "rand_xoshiro",
+ "serde_json",
  "tracing",
 ]
 

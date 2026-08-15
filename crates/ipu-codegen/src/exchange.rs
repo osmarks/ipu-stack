@@ -13,6 +13,7 @@ use ipu_package::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
 };
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
@@ -164,6 +165,52 @@ pub struct ExchangeLoweringOptions {
     pub diagnostics: bool,
 }
 
+pub const EXCHANGE_SCHEDULE_SNAPSHOT_VERSION: u32 = 1;
+
+/// Address-resolved transfers captured immediately before physical scheduling.
+/// Replaying this data exercises the production scheduler and exchange-row
+/// encoder without compiling kernels or loading a device.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeScheduleSnapshot {
+    pub schema_version: u32,
+    pub tile_count: u16,
+    pub phases: Vec<ExchangeScheduleProblem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeScheduleProblem {
+    pub phase: u32,
+    pub transfers: Vec<ExchangeScheduleTransfer>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeScheduleTransfer {
+    pub source: u16,
+    pub source_address: u32,
+    pub destinations: Vec<ExchangeScheduleDestination>,
+    pub words: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeScheduleDestination {
+    pub tile: u16,
+    pub address: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct LoweredExchanges {
+    pub phases: Vec<PhysicalExchangePhase>,
+    pub schedule_snapshot: ExchangeScheduleSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExchangeScheduleRun {
+    pub phase: PhysicalExchangePhase,
+    pub initial_horizon: u32,
+    pub endpoint_lower_bound: u32,
+    pub neighborhood_improvements: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 struct TilePressure {
     send_roles: u32,
@@ -215,6 +262,10 @@ pub enum ExchangeLoweringError {
     IncompatibleRepeatRows,
     #[error("exchange diagnostic refers to missing tile {0}")]
     DiagnosticTile(u16),
+    #[error("invalid exchange-schedule snapshot: {0}")]
+    InvalidSnapshot(String),
+    #[error("exchange-schedule invariant failed: {0}")]
+    Invariant(String),
 }
 
 pub fn lower_exchanges(
@@ -222,7 +273,7 @@ pub fn lower_exchanges(
     placement: &Placement,
     topology: &Topology,
     options: ExchangeLoweringOptions,
-) -> Result<Vec<PhysicalExchangePhase>, ExchangeLoweringError> {
+) -> Result<LoweredExchanges, ExchangeLoweringError> {
     lower_static_exchanges(program, placement, topology, options)
 }
 
@@ -231,7 +282,7 @@ fn lower_static_exchanges(
     placement: &Placement,
     topology: &Topology,
     options: ExchangeLoweringOptions,
-) -> Result<Vec<PhysicalExchangePhase>, ExchangeLoweringError> {
+) -> Result<LoweredExchanges, ExchangeLoweringError> {
     let mut repeat_inputs = BTreeMap::<LowShardId, Vec<LowShardId>>::new();
     for repeat in &program.repeat_runs {
         for iterated in &repeat.iterated {
@@ -261,24 +312,9 @@ fn lower_static_exchanges(
                 .flatten()
                 .collect();
             let pending = coalesce_pending_transfers(pending);
-            let mut receive_counts = vec![0usize; usize::from(program.tile_count)];
-            for transfer in &pending {
-                for &(tile, _) in &transfer.destinations {
-                    receive_counts[usize::from(tile)] += 1;
-                }
-            }
-            let mut incoming_bases = vec![None::<u32>; usize::from(program.tile_count)];
-            for transfer in &pending {
-                if let [(tile, address)] = transfer.destinations.as_slice() {
-                    if receive_counts[usize::from(*tile)] == 1 {
-                        incoming_bases[usize::from(*tile)] = Some(*address);
-                    }
-                }
-            }
-            let incoming_bases = incoming_bases
-                .into_iter()
-                .map(|base| base.unwrap_or(0))
-                .collect::<Vec<_>>();
+            let schedule_problem = schedule_problem(phase.id.index(), &pending);
+            let (receive_counts, incoming_bases) =
+                receive_configuration(&pending, program.tile_count)?;
             let mut destination_multiplicity = BTreeMap::new();
             for transfer in &pending {
                 for &(tile, address) in &transfer.destinations {
@@ -300,38 +336,19 @@ fn lower_static_exchanges(
                     "prepared large physical exchange phase"
                 );
             }
-            let mut schedule = materialize_greedy_schedule(
+            let OptimizedSchedule {
+                schedule,
+                initial_horizon,
+                endpoint_lower_bound,
+                selected_kind,
+                neighborhood_improvements,
+            } = optimize_pending_schedule(
                 topology,
                 &pending,
                 &incoming_bases,
                 &receive_counts,
                 program.tile_count,
             )?;
-            let initial_horizon = schedule_score(&schedule);
-            let endpoint_lower_bound = endpoint_work_lower_bound(&pending, program.tile_count);
-            let mut selected_kind = "full-duplex";
-            let mut neighborhood_improvements = 0usize;
-            loop {
-                let repaired_order =
-                    critical_neighborhood_order(&pending, program.tile_count, &schedule);
-                if repaired_order == schedule.order {
-                    break;
-                }
-                let repaired = materialize_schedule_order(
-                    topology,
-                    &pending,
-                    &incoming_bases,
-                    &receive_counts,
-                    program.tile_count,
-                    &repaired_order,
-                )?;
-                if schedule_score(&repaired) >= schedule_score(&schedule) {
-                    break;
-                }
-                schedule = repaired;
-                selected_kind = "critical-neighborhood";
-                neighborhood_improvements += 1;
-            }
             if pending.len() > 1_000 {
                 tracing::info!(
                     phase = phase.id.index(),
@@ -459,18 +476,32 @@ fn lower_static_exchanges(
                     "finished large physical exchange phase"
                 );
             }
-            Ok(PhysicalExchangePhase {
-                id: phase.id,
-                active,
-                programs,
-                incoming_bases,
-                tile_event_cycles,
-                event_cycles: horizon,
-                activities,
-                repeat_patches,
-            })
+            Ok((
+                PhysicalExchangePhase {
+                    id: phase.id,
+                    active,
+                    programs,
+                    incoming_bases,
+                    tile_event_cycles,
+                    event_cycles: horizon,
+                    activities,
+                    repeat_patches,
+                },
+                schedule_problem,
+            ))
         })
-        .collect()
+        .collect::<Result<Vec<_>, ExchangeLoweringError>>()
+        .map(|lowered| {
+            let (phases, schedule_phases) = lowered.into_iter().unzip();
+            LoweredExchanges {
+                phases,
+                schedule_snapshot: ExchangeScheduleSnapshot {
+                    schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
+                    tile_count: program.tile_count,
+                    phases: schedule_phases,
+                },
+            }
+        })
 }
 
 fn prepare_transfer(
@@ -813,6 +844,478 @@ impl PendingTransfer {
     fn tiles(&self) -> impl Iterator<Item = u16> + '_ {
         std::iter::once(self.source).chain(self.destinations.iter().map(|entry| entry.0))
     }
+}
+
+fn schedule_problem(phase: u32, pending: &[PendingTransfer]) -> ExchangeScheduleProblem {
+    ExchangeScheduleProblem {
+        phase,
+        transfers: pending
+            .iter()
+            .map(|transfer| ExchangeScheduleTransfer {
+                source: transfer.source,
+                source_address: transfer.source_address,
+                destinations: transfer
+                    .destinations
+                    .iter()
+                    .map(|&(tile, address)| ExchangeScheduleDestination { tile, address })
+                    .collect(),
+                words: transfer.words,
+            })
+            .collect(),
+    }
+}
+
+fn pending_from_problem(
+    tile_count: u16,
+    problem: &ExchangeScheduleProblem,
+) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
+    problem
+        .transfers
+        .iter()
+        .enumerate()
+        .map(|(index, transfer)| {
+            if transfer.source >= tile_count {
+                return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+                    "phase {} transfer {index} has source tile {} outside 0..{tile_count}",
+                    problem.phase, transfer.source
+                )));
+            }
+            if transfer.words == 0 || transfer.words > MAX_TRANSFER_WORDS {
+                return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+                    "phase {} transfer {index} has invalid word count {}",
+                    problem.phase, transfer.words
+                )));
+            }
+            if transfer.source_address & 0b11 != 0 {
+                return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+                    "phase {} transfer {index} has unaligned source address {:#x}",
+                    problem.phase, transfer.source_address
+                )));
+            }
+            let bytes = transfer
+                .words
+                .checked_mul(4)
+                .ok_or(ExchangeLoweringError::Overflow)?;
+            transfer
+                .source_address
+                .checked_add(bytes)
+                .ok_or(ExchangeLoweringError::Overflow)?;
+            if transfer.destinations.is_empty() {
+                return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+                    "phase {} transfer {index} has no destinations",
+                    problem.phase
+                )));
+            }
+            let mut destination_tiles = BTreeSet::new();
+            let destinations = transfer
+                .destinations
+                .iter()
+                .map(|destination| {
+                    if destination.tile >= tile_count
+                        || destination.tile == transfer.source
+                        || !destination_tiles.insert(destination.tile)
+                    {
+                        return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+                            "phase {} transfer {index} has invalid destination tile {}",
+                            problem.phase, destination.tile
+                        )));
+                    }
+                    if destination.address & 0b11 != 0 {
+                        return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+                            "phase {} transfer {index} has unaligned destination address {:#x}",
+                            problem.phase, destination.address
+                        )));
+                    }
+                    destination
+                        .address
+                        .checked_add(bytes)
+                        .ok_or(ExchangeLoweringError::Overflow)?;
+                    Ok((destination.tile, destination.address))
+                })
+                .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
+            Ok(PendingTransfer {
+                source: transfer.source,
+                source_shard: LowShardId::from_index(
+                    u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
+                ),
+                source_offset: 0,
+                destinations,
+                source_address: transfer.source_address,
+                words: transfer.words,
+            })
+        })
+        .collect()
+}
+
+fn receive_configuration(
+    pending: &[PendingTransfer],
+    tile_count: u16,
+) -> Result<(Vec<usize>, Vec<u32>), ExchangeLoweringError> {
+    let mut receive_counts = vec![0usize; usize::from(tile_count)];
+    for transfer in pending {
+        for &(tile, _) in &transfer.destinations {
+            let count = receive_counts
+                .get_mut(usize::from(tile))
+                .ok_or(ExchangeLoweringError::InvalidDestination)?;
+            *count += 1;
+        }
+    }
+    let mut incoming_bases = vec![None::<u32>; usize::from(tile_count)];
+    for transfer in pending {
+        if let [(tile, address)] = transfer.destinations.as_slice() {
+            if receive_counts[usize::from(*tile)] == 1 {
+                incoming_bases[usize::from(*tile)] = Some(*address);
+            }
+        }
+    }
+    Ok((
+        receive_counts,
+        incoming_bases
+            .into_iter()
+            .map(|base| base.unwrap_or(0))
+            .collect(),
+    ))
+}
+
+struct OptimizedSchedule {
+    schedule: MaterializedSchedule,
+    initial_horizon: u32,
+    endpoint_lower_bound: u32,
+    selected_kind: &'static str,
+    neighborhood_improvements: usize,
+}
+
+fn optimize_pending_schedule(
+    topology: &Topology,
+    pending: &[PendingTransfer],
+    incoming_bases: &[u32],
+    receive_counts: &[usize],
+    tile_count: u16,
+) -> Result<OptimizedSchedule, ExchangeLoweringError> {
+    let mut schedule = materialize_greedy_schedule(
+        topology,
+        pending,
+        incoming_bases,
+        receive_counts,
+        tile_count,
+    )?;
+    let initial_horizon = schedule_score(&schedule);
+    let endpoint_lower_bound = endpoint_work_lower_bound(pending, tile_count);
+    let mut selected_kind = "full-duplex";
+    let mut neighborhood_improvements = 0usize;
+    loop {
+        let repaired_order = critical_neighborhood_order(pending, tile_count, &schedule);
+        if repaired_order == schedule.order {
+            break;
+        }
+        let repaired = materialize_schedule_order(
+            topology,
+            pending,
+            incoming_bases,
+            receive_counts,
+            tile_count,
+            &repaired_order,
+        )?;
+        if schedule_score(&repaired) >= schedule_score(&schedule) {
+            break;
+        }
+        schedule = repaired;
+        selected_kind = "critical-neighborhood";
+        neighborhood_improvements += 1;
+    }
+    Ok(OptimizedSchedule {
+        schedule,
+        initial_horizon,
+        endpoint_lower_bound,
+        selected_kind,
+        neighborhood_improvements,
+    })
+}
+
+impl ExchangeScheduleSnapshot {
+    pub fn validate(&self) -> Result<(), ExchangeLoweringError> {
+        if self.schema_version != EXCHANGE_SCHEDULE_SNAPSHOT_VERSION {
+            return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+                "unsupported schema version {} (expected {})",
+                self.schema_version, EXCHANGE_SCHEDULE_SNAPSHOT_VERSION
+            )));
+        }
+        if self.tile_count == 0 || usize::from(self.tile_count) > Topology::c600().tile_count() {
+            return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+                "tile count {} is outside the C600 topology",
+                self.tile_count
+            )));
+        }
+        let mut phases = BTreeSet::new();
+        for problem in &self.phases {
+            if !phases.insert(problem.phase) {
+                return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+                    "duplicate phase {}",
+                    problem.phase
+                )));
+            }
+            pending_from_problem(self.tile_count, problem)?;
+        }
+        Ok(())
+    }
+}
+
+/// Runs the same ordering, timing, full-duplex code generation, and row
+/// validation used by package lowering on one captured phase.
+pub fn schedule_exchange_problem(
+    tile_count: u16,
+    problem: &ExchangeScheduleProblem,
+) -> Result<ExchangeScheduleRun, ExchangeLoweringError> {
+    if tile_count == 0 || usize::from(tile_count) > Topology::c600().tile_count() {
+        return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+            "tile count {tile_count} is outside the C600 topology"
+        )));
+    }
+    let topology = Topology::new(
+        (0..tile_count)
+            .map(ipu_exchange::c600_logical_to_physical)
+            .collect(),
+    )?;
+    let pending = pending_from_problem(tile_count, problem)?;
+    let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
+    let OptimizedSchedule {
+        schedule,
+        initial_horizon,
+        endpoint_lower_bound,
+        neighborhood_improvements,
+        ..
+    } = optimize_pending_schedule(
+        &topology,
+        &pending,
+        &incoming_bases,
+        &receive_counts,
+        tile_count,
+    )?;
+    let MaterializedSchedule {
+        builder,
+        horizon,
+        activities,
+        ..
+    } = schedule;
+    let phase_programs = builder.finish()?;
+    if phase_programs.event_cycles != horizon {
+        return Err(ExchangeLoweringError::Invariant(format!(
+            "phase {} row horizon {} differs from scheduled horizon {horizon}",
+            problem.phase, phase_programs.event_cycles
+        )));
+    }
+    let tile_event_cycles = phase_programs.tile_event_cycles;
+    let active = phase_programs
+        .programs
+        .iter()
+        .map(Option::is_some)
+        .collect::<Vec<_>>();
+    let programs = phase_programs
+        .programs
+        .into_iter()
+        .map(|program| program.unwrap_or_else(inactive_exchange_program))
+        .collect::<Vec<_>>();
+    let phase = PhysicalExchangePhase {
+        id: ExchangePhaseId::from_index(problem.phase),
+        active,
+        programs,
+        incoming_bases,
+        tile_event_cycles,
+        event_cycles: horizon,
+        activities,
+        repeat_patches: vec![Vec::new(); usize::from(tile_count)],
+    };
+    Ok(ExchangeScheduleRun {
+        phase,
+        initial_horizon,
+        endpoint_lower_bound,
+        neighborhood_improvements,
+    })
+}
+
+/// Checks that scheduled activities and encoded rows preserve the captured
+/// transfer set and obey per-tile bus and SRAM-element hazards.
+pub fn validate_exchange_schedule(
+    tile_count: u16,
+    problem: &ExchangeScheduleProblem,
+    phase: &PhysicalExchangePhase,
+) -> Result<(), ExchangeLoweringError> {
+    let fail = |message| ExchangeLoweringError::Invariant(message);
+    let size = usize::from(tile_count);
+    if phase.id.index() != problem.phase {
+        return Err(fail(format!(
+            "phase id {} differs from snapshot phase {}",
+            phase.id.index(),
+            problem.phase
+        )));
+    }
+    for (name, length) in [
+        ("active", phase.active.len()),
+        ("programs", phase.programs.len()),
+        ("incoming bases", phase.incoming_bases.len()),
+        ("tile horizons", phase.tile_event_cycles.len()),
+        ("activities", phase.activities.len()),
+        ("repeat patches", phase.repeat_patches.len()),
+    ] {
+        if length != size {
+            return Err(fail(format!(
+                "phase {} has {length} {name} entries for {tile_count} tiles",
+                problem.phase
+            )));
+        }
+    }
+    if phase
+        .repeat_patches
+        .iter()
+        .any(|patches| !patches.is_empty())
+    {
+        return Err(fail(format!(
+            "standalone phase {} unexpectedly contains repeat patches",
+            problem.phase
+        )));
+    }
+    let maximum_horizon = phase.tile_event_cycles.iter().copied().max().unwrap_or(0);
+    if phase.event_cycles != maximum_horizon {
+        return Err(fail(format!(
+            "phase {} horizon {} differs from maximum tile horizon {maximum_horizon}",
+            problem.phase, phase.event_cycles
+        )));
+    }
+
+    let mut send_counts = vec![0usize; problem.transfers.len()];
+    let mut receive_counts = problem
+        .transfers
+        .iter()
+        .map(|transfer| vec![0usize; transfer.destinations.len()])
+        .collect::<Vec<_>>();
+    for tile in 0..size {
+        let decoded = ipu_exchange::diagnostic::diagnose_plan_program(&phase.programs[tile], None)?;
+        if decoded.event_cycles != phase.tile_event_cycles[tile] {
+            return Err(fail(format!(
+                "phase {} tile {tile} decoded horizon {} differs from {}",
+                problem.phase, decoded.event_cycles, phase.tile_event_cycles[tile]
+            )));
+        }
+        let expected_active = !phase.activities[tile].is_empty();
+        if phase.active[tile] != expected_active
+            || phase.active[tile] != (phase.tile_event_cycles[tile] != 0)
+        {
+            return Err(fail(format!(
+                "phase {} tile {tile} has inconsistent active state",
+                problem.phase
+            )));
+        }
+        for activity in &phase.activities[tile] {
+            if activity.start_cycle > activity.end_cycle
+                || activity.end_cycle > activity.memory_end_cycle
+                || activity.memory_end_cycle > phase.tile_event_cycles[tile]
+            {
+                return Err(fail(format!(
+                    "phase {} tile {tile} transfer {} has invalid cycle interval",
+                    problem.phase, activity.transfer
+                )));
+            }
+            let transfer_index =
+                usize::try_from(activity.transfer).map_err(|_| ExchangeLoweringError::Overflow)?;
+            let transfer = problem.transfers.get(transfer_index).ok_or_else(|| {
+                fail(format!(
+                    "phase {} tile {tile} references missing transfer {}",
+                    problem.phase, activity.transfer
+                ))
+            })?;
+            if activity.words != transfer.words {
+                return Err(fail(format!(
+                    "phase {} tile {tile} transfer {transfer_index} has wrong word count",
+                    problem.phase
+                )));
+            }
+            match activity.kind {
+                ExchangeActivityKind::Send => {
+                    if usize::from(transfer.source) != tile
+                        || activity.address != transfer.source_address
+                    {
+                        return Err(fail(format!(
+                            "phase {} transfer {transfer_index} has a mismatched send activity",
+                            problem.phase
+                        )));
+                    }
+                    send_counts[transfer_index] += 1;
+                }
+                ExchangeActivityKind::Receive => {
+                    let destination = transfer
+                        .destinations
+                        .iter()
+                        .position(|destination| {
+                            usize::from(destination.tile) == tile
+                                && destination.address == activity.address
+                        })
+                        .ok_or_else(|| {
+                            fail(format!(
+                                "phase {} transfer {transfer_index} has an unexpected receive activity on tile {tile}",
+                                problem.phase
+                            ))
+                        })?;
+                    receive_counts[transfer_index][destination] += 1;
+                }
+            }
+        }
+        for kind in [ExchangeActivityKind::Send, ExchangeActivityKind::Receive] {
+            let mut intervals = phase.activities[tile]
+                .iter()
+                .filter(|activity| activity.kind == kind)
+                .map(|activity| (activity.start_cycle, activity.end_cycle))
+                .collect::<Vec<_>>();
+            intervals.sort_unstable();
+            if intervals.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+                return Err(fail(format!(
+                    "phase {} tile {tile} has overlapping {kind:?} bus intervals",
+                    problem.phase
+                )));
+            }
+        }
+        let sends = phase.activities[tile]
+            .iter()
+            .filter(|activity| activity.kind == ExchangeActivityKind::Send);
+        for send in sends {
+            for receive in phase.activities[tile]
+                .iter()
+                .filter(|activity| activity.kind == ExchangeActivityKind::Receive)
+            {
+                let overlaps = send.start_cycle < receive.memory_end_cycle
+                    && receive.start_cycle < send.memory_end_cycle;
+                if overlaps
+                    && spans_share_effective_memory_element(
+                        send.address,
+                        send.words,
+                        receive.address,
+                        receive.words,
+                    )
+                {
+                    return Err(fail(format!(
+                        "phase {} tile {tile} overlaps send/receive access to one SRAM element",
+                        problem.phase
+                    )));
+                }
+            }
+        }
+    }
+    for (index, count) in send_counts.into_iter().enumerate() {
+        if count != 1 {
+            return Err(fail(format!(
+                "phase {} transfer {index} has {count} send activities",
+                problem.phase
+            )));
+        }
+    }
+    for (transfer, counts) in receive_counts.into_iter().enumerate() {
+        if counts.into_iter().any(|count| count != 1) {
+            return Err(fail(format!(
+                "phase {} transfer {transfer} does not have exactly one activity per destination",
+                problem.phase
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Combines physically contiguous source and destination spans into one
@@ -1723,6 +2226,52 @@ mod tests {
     };
 
     #[test]
+    fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
+        let mut random = fastrand::Rng::with_seed(0x736e_6170_7368_6f74);
+        for phase in 0..32 {
+            let tile_count = random.u16(2..=16);
+            let transfer_count = random.usize(1..=64);
+            let transfers = (0..transfer_count)
+                .map(|_| {
+                    let source = random.u16(0..tile_count);
+                    let destination_count = random.usize(1..=usize::from(tile_count.min(4) - 1));
+                    let mut tiles = BTreeSet::new();
+                    while tiles.len() != destination_count {
+                        let tile = random.u16(0..tile_count);
+                        if tile != source {
+                            tiles.insert(tile);
+                        }
+                    }
+                    ExchangeScheduleTransfer {
+                        source,
+                        source_address: 0x1_0000 + random.u32(0..32) * 0x100,
+                        destinations: tiles
+                            .into_iter()
+                            .map(|tile| ExchangeScheduleDestination {
+                                tile,
+                                address: 0x4_0000 + random.u32(0..32) * 0x100,
+                            })
+                            .collect(),
+                        words: random.u32(1..=64),
+                    }
+                })
+                .collect();
+            let problem = ExchangeScheduleProblem { phase, transfers };
+            let first = schedule_exchange_problem(tile_count, &problem).unwrap();
+            validate_exchange_schedule(tile_count, &problem, &first.phase).unwrap();
+            let second = schedule_exchange_problem(tile_count, &problem).unwrap();
+            validate_exchange_schedule(tile_count, &problem, &second.phase).unwrap();
+            assert_eq!(first.phase, second.phase);
+            assert_eq!(first.initial_horizon, second.initial_horizon);
+            assert_eq!(first.endpoint_lower_bound, second.endpoint_lower_bound);
+            assert_eq!(
+                first.neighborhood_improvements,
+                second.neighborhood_improvements
+            );
+        }
+    }
+
+    #[test]
     fn randomized_transfer_schedules_preserve_hazards_without_same_role_overlap() {
         let mut random = fastrand::Rng::with_seed(0x736c_6f74);
         for _ in 0..64 {
@@ -1881,7 +2430,8 @@ mod tests {
                 &Topology::c600(),
                 ExchangeLoweringOptions::default(),
             )
-            .unwrap();
+            .unwrap()
+            .phases;
             assert_eq!(phases.len(), low.exchange_phases.len());
             for phase in phases {
                 assert_eq!(phase.programs.len(), usize::from(tiles));

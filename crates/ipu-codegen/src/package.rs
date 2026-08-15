@@ -104,6 +104,8 @@ pub struct CompiledPackage {
     /// Exact physical exchange schedules retained for low-level diagnostics.
     /// This is build metadata and is not serialized into the application.
     pub exchange_phases: Vec<crate::PhysicalExchangePhase>,
+    /// Address-resolved inputs to physical exchange scheduling and row codegen.
+    pub exchange_schedule: crate::ExchangeScheduleSnapshot,
     /// Base address used when laying out the compact per-tile exchange table.
     pub exchange_code_base: u32,
 }
@@ -119,6 +121,8 @@ pub struct DiagnosticPackage {
     /// Exact physical exchange schedules retained for low-level diagnostics.
     /// This is build metadata and is not serialized into the application.
     pub exchange_phases: Vec<crate::PhysicalExchangePhase>,
+    /// Address-resolved inputs to physical exchange scheduling and row codegen.
+    pub exchange_schedule: crate::ExchangeScheduleSnapshot,
     /// Base address used when laying out the compact per-tile exchange table.
     pub exchange_code_base: u32,
 }
@@ -150,6 +154,7 @@ struct BuiltApplication {
     application: Application,
     placement: crate::Placement,
     exchange_phases: Vec<crate::PhysicalExchangePhase>,
+    exchange_schedule: crate::ExchangeScheduleSnapshot,
     exchange_code_base: u32,
 }
 
@@ -543,6 +548,7 @@ pub fn build_package(
         outputs,
         precisions,
         exchange_phases: built.exchange_phases,
+        exchange_schedule: built.exchange_schedule,
         exchange_code_base: built.exchange_code_base,
     })
 }
@@ -604,6 +610,7 @@ pub fn build_diagnostic_package(
         checkpoints,
         precisions: package_precisions(&mid),
         exchange_phases: built.exchange_phases,
+        exchange_schedule: built.exchange_schedule,
         exchange_code_base: built.exchange_code_base,
     })
 }
@@ -717,7 +724,8 @@ fn build_package_from_objects(
             &topology,
             crate::ExchangeLoweringOptions::default(),
         )?)
-    })?;
+    })?
+    .phases;
     let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
     let exchange_table_bytes = crate::tile::compact_exchange_table_bytes(
         &provisional_exchanges,
@@ -971,7 +979,7 @@ fn build_package_from_objects(
             &standard_ranges,
         )?)
     })?;
-    let exchanges = build_phase("lower_exchanges", || {
+    let lowered_exchanges = build_phase("lower_exchanges", || {
         Ok(lower_exchanges(
             program,
             &placement,
@@ -981,6 +989,8 @@ fn build_package_from_objects(
             },
         )?)
     })?;
+    let exchange_schedule = lowered_exchanges.schedule_snapshot;
+    let exchanges = lowered_exchanges.phases;
     let inputs = program
         .inputs
         .iter()
@@ -1206,6 +1216,7 @@ fn build_package_from_objects(
         application,
         placement,
         exchange_phases: exchanges,
+        exchange_schedule,
         exchange_code_base,
     })
 }

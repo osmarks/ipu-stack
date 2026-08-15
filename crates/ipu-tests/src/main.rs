@@ -70,6 +70,9 @@ struct Arguments {
     /// Summarize packaged exchange rows and exit before loading hardware.
     #[arg(long)]
     inspect_exchanges: bool,
+    /// Write the address-resolved pre-scheduling exchange input and exit.
+    #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "exchange_replay_phase"])]
+    export_exchange_schedule: Option<PathBuf>,
     /// Include complete decoded rows for one physical tile in the inspection.
     #[arg(long, requires = "inspect_exchanges")]
     inspect_exchange_tile: Option<u32>,
@@ -525,6 +528,29 @@ fn main() -> Result<()> {
         }
         None
     };
+    if let Some(path) = &arguments.export_exchange_schedule {
+        let compiled = compiled_package
+            .as_ref()
+            .context("--export-exchange-schedule requires a newly compiled package")?;
+        let output =
+            fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+        serde_json::to_writer(std::io::BufWriter::new(output), &compiled.exchange_schedule)
+            .with_context(|| format!("write {}", path.display()))?;
+        let transfers = compiled
+            .exchange_schedule
+            .phases
+            .iter()
+            .map(|phase| phase.transfers.len())
+            .sum::<usize>();
+        println!(
+            "exchangeSchedule={} tiles={} phases={} transfers={}",
+            path.display(),
+            compiled.exchange_schedule.tile_count,
+            compiled.exchange_schedule.phases.len(),
+            transfers
+        );
+        return Ok(());
+    }
     if let Some(phase) = arguments.exchange_replay_phase {
         let compiled = compiled_package
             .as_ref()

@@ -8,6 +8,10 @@ license.workspace = true
 name = "ipu-trivial-test"
 path = "src/main.rs"
 
+[[bin]]
+name = "ipu-exchange-schedule-bench"
+path = "src/bin/exchange_schedule_bench.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -22,4 +26,5 @@ fastrand.workspace = true
 half.workspace = true
 rand_distr.workspace = true
 rand_xoshiro.workspace = true
+serde_json.workspace = true
 tracing.workspace = true

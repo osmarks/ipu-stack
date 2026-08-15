@@ -711,7 +711,8 @@ mod tests {
                 &Topology::c600(),
                 crate::ExchangeLoweringOptions::default(),
             )
-            .unwrap();
+            .unwrap()
+            .phases;
             let filler_tiles = random.u16(1..=4);
             let lowering = TileProgramLowering::new(
                 &low,

@@ -37,6 +37,10 @@ impl LowShardId {
 pub struct ExchangePhaseId(u32);
 
 impl ExchangePhaseId {
+    pub const fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+
     pub const fn index(self) -> u32 {
         self.0
     }
