@@ -262,7 +262,6 @@ pub struct Ipu21TargetCosts {
     pub reduction_output_bytes_per_cycle: u64,
     pub local_copy_call_cycles: u64,
     pub exchange_phase_cycles: u64,
-    pub exchange_transfer_cycles: u64,
     pub kernel_launch_cycles: u64,
 }
 
@@ -283,15 +282,11 @@ pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
     local_copy_call_cycles: 288,
     // Target::getGlobalSyncCycles.
     exchange_phase_cycles: 600,
-    // Each logical remote span becomes an independently routed transfer. The
-    // target's getMaxIPUSyncDelay is a conservative bound for its route/start
-    // latency until topology-aware scheduling moves into the search cost.
-    exchange_transfer_cycles: 126,
     // popops::internal::basicOpSupervisorOverhead(false).
     kernel_launch_cycles: 11,
 };
 
-fn exchange_endpoint_cycles(traffic: ExchangeEndpointTraffic, phases: u64) -> u64 {
+fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases: u64) -> u64 {
     if traffic.is_empty() || phases == 0 {
         return 0;
     }
@@ -299,12 +294,6 @@ fn exchange_endpoint_cycles(traffic: ExchangeEndpointTraffic, phases: u64) -> u6
         .maximum_payload_bytes()
         .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
         .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles))
-        .saturating_add(
-            traffic
-                .maximum_fragments()
-                .max(phases)
-                .saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles),
-        )
 }
 
 /// Conservative endpoint proxy for an operator-internal redistribution which
@@ -317,15 +306,18 @@ fn tensor_transition_endpoint_traffic(
     let outgoing = maximum_shard_bytes(source)
         .saturating_mul(u64::from(source.format.layout.tiling.tile_count.min(2)));
     let incoming = maximum_shard_bytes(destination);
-    ExchangeEndpointTraffic {
-        maximum_outgoing_bus_bytes: outgoing,
-        maximum_incoming_bytes: incoming,
-        maximum_outgoing_bus_fragments: outgoing.div_ceil(transfer_bytes),
-        maximum_incoming_fragments: incoming.div_ceil(transfer_bytes),
-    }
+    ExchangeEndpointTraffic::from_maxima(
+        outgoing,
+        incoming,
+        outgoing.div_ceil(transfer_bytes),
+        incoming.div_ceil(transfer_bytes),
+    )
 }
 
-fn exchange_endpoint_footprint(traffic: ExchangeEndpointTraffic, phases: u64) -> ExchangeFootprint {
+fn exchange_endpoint_footprint(
+    traffic: &ExchangeEndpointTraffic,
+    phases: u64,
+) -> ExchangeFootprint {
     if traffic.is_empty() || phases == 0 {
         return ExchangeFootprint::default();
     }
@@ -386,12 +378,12 @@ fn attention_endpoint_traffic(
     let owner_panels = blocks.saturating_mul(panels_per_block).div_ceil(owners);
     let outgoing_bus = owner_panels.saturating_mul(panel_bytes).saturating_mul(2);
     Some((
-        ExchangeEndpointTraffic {
-            maximum_outgoing_bus_bytes: outgoing_bus,
-            maximum_incoming_bytes: incoming,
-            maximum_outgoing_bus_fragments: owner_panels.saturating_mul(2),
-            maximum_incoming_fragments: blocks.saturating_mul(panels_per_block),
-        },
+        ExchangeEndpointTraffic::from_maxima(
+            outgoing_bus,
+            incoming,
+            owner_panels.saturating_mul(2),
+            blocks.saturating_mul(panels_per_block),
+        ),
         blocks.saturating_add(2),
     ))
 }
@@ -675,15 +667,15 @@ impl CostModel for Ipu21CostModel {
                 };
                 let endpoint_traffic =
                     gemm_exchange_endpoint_traffic(dispatch, inputs, &compute_output).unwrap_or(
-                        ExchangeEndpointTraffic {
-                            maximum_outgoing_bus_bytes: u64::MAX / 16,
-                            maximum_incoming_bytes: u64::MAX / 16,
-                            maximum_outgoing_bus_fragments: u64::MAX / 16,
-                            maximum_incoming_fragments: u64::MAX / 16,
-                        },
+                        ExchangeEndpointTraffic::from_maxima(
+                            u64::MAX / 16,
+                            u64::MAX / 16,
+                            u64::MAX / 16,
+                            u64::MAX / 16,
+                        ),
                     );
                 let exchange = exchange_endpoint_cycles(
-                    endpoint_traffic,
+                    &endpoint_traffic,
                     gemm_exchange_phase_count(dispatch, inputs, &compute_output),
                 );
                 let exchange = match dispatch {
@@ -714,21 +706,19 @@ impl CostModel for Ipu21CostModel {
                             } else {
                                 partial_bytes
                             };
-                        let reduction_traffic = ExchangeEndpointTraffic {
-                            // At most two adjacent source tiles contribute one
-                            // partial each; the reduction root receives every
-                            // nonlocal partial over the complete reduction.
-                            maximum_outgoing_bus_bytes: reduction_partial_bytes.saturating_mul(2),
-                            maximum_incoming_bytes: u64::from(inner_partitions.saturating_sub(1))
+                        // At most two adjacent source tiles contribute one
+                        // partial each; the reduction root receives every
+                        // nonlocal partial over the complete reduction.
+                        let reduction_traffic = ExchangeEndpointTraffic::from_maxima(
+                            reduction_partial_bytes.saturating_mul(2),
+                            u64::from(inner_partitions.saturating_sub(1))
                                 .saturating_mul(reduction_partial_bytes),
-                            maximum_outgoing_bus_fragments: 2,
-                            maximum_incoming_fragments: u64::from(
-                                inner_partitions.saturating_sub(1),
-                            ),
-                        };
-                        exchange_endpoint_cycles(endpoint_traffic, 1)
+                            2,
+                            u64::from(inner_partitions.saturating_sub(1)),
+                        );
+                        exchange_endpoint_cycles(&endpoint_traffic, 1)
                             .saturating_add(exchange_endpoint_cycles(
-                                reduction_traffic,
+                                &reduction_traffic,
                                 u64::from(reduction_epochs),
                             ))
                             .saturating_add(
@@ -815,7 +805,7 @@ impl CostModel for Ipu21CostModel {
                             .div_ceil(128);
                         let blocks = key_rows.div_ceil(u64::from(*key_block_rows));
                         let exchange = attention_endpoint_traffic(inputs, output, dispatch)
-                            .map(|(traffic, phases)| exchange_endpoint_cycles(traffic, phases))
+                            .map(|(traffic, phases)| exchange_endpoint_cycles(&traffic, phases))
                             .unwrap_or(u64::MAX / 8);
                         arithmetic
                             .saturating_add(
@@ -845,7 +835,7 @@ impl CostModel for Ipu21CostModel {
                 let Some(input) = inputs.first() else {
                     return u64::MAX / 8;
                 };
-                exchange_endpoint_cycles(tensor_transition_endpoint_traffic(input, output), 1)
+                exchange_endpoint_cycles(&tensor_transition_endpoint_traffic(input, output), 1)
             }
         }
     }
@@ -899,12 +889,7 @@ impl CostModel for Ipu21CostModel {
         let pack = panel_elements.saturating_mul(packing_cycles_per_element);
         let panel_bytes = panel_elements.saturating_mul(bytes);
         let exchange = exchange_endpoint_cycles(
-            ExchangeEndpointTraffic {
-                maximum_outgoing_bus_bytes: panel_bytes,
-                maximum_incoming_bytes: panel_bytes,
-                maximum_outgoing_bus_fragments: 1,
-                maximum_incoming_fragments: 1,
-            },
+            &ExchangeEndpointTraffic::from_maxima(panel_bytes, panel_bytes, 1, 1),
             2,
         );
         // The producer's packed output must first become an addressable logical
@@ -965,7 +950,7 @@ impl CostModel for Ipu21CostModel {
                 return ExchangeFootprint::default();
             };
             return exchange_endpoint_footprint(
-                tensor_transition_endpoint_traffic(input, output),
+                &tensor_transition_endpoint_traffic(input, output),
                 phases,
             );
         }
@@ -973,12 +958,12 @@ impl CostModel for Ipu21CostModel {
             let Some((traffic, _)) = attention_endpoint_traffic(inputs, output, dispatch) else {
                 return ExchangeFootprint::default();
             };
-            return exchange_endpoint_footprint(traffic, phases);
+            return exchange_endpoint_footprint(&traffic, phases);
         }
         let Some(traffic) = gemm_exchange_endpoint_traffic(dispatch, inputs, output) else {
             return ExchangeFootprint::default();
         };
-        exchange_endpoint_footprint(traffic, phases)
+        exchange_endpoint_footprint(&traffic, phases)
     }
 
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
@@ -1020,8 +1005,8 @@ impl CostModel for Ipu21CostModel {
             };
         };
         let direct_retile = strategy == ConversionStrategy::DirectRetile;
-        let endpoint_traffic = ExchangeEndpointTraffic::from_conversion(traffic);
-        let exchange_cycles = exchange_endpoint_cycles(endpoint_traffic, 1);
+        let endpoint_traffic = ExchangeEndpointTraffic::from_conversion(&traffic);
+        let exchange_cycles = exchange_endpoint_cycles(&endpoint_traffic, 1);
         let (local_bytes, local_calls) = if direct_retile {
             (
                 traffic.maximum_local_bytes,
@@ -1036,31 +1021,22 @@ impl CostModel for Ipu21CostModel {
         let local_cycles = local_bytes
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
             .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles));
-        // Runtime latency benefits from spatially concurrent roles, whereas
-        // every global fragment still contributes encoded row storage.
-        let encoded_work = traffic
+        let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
+        let transfer_chunks = traffic
             .source_payload_bytes
-            .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
-            .saturating_add(
-                traffic
-                    .remote_fragments
-                    .max(traffic.maximum_routed_fragments)
-                    .saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles),
-            )
-            .saturating_add(if traffic.remote_fragments == 0 {
-                0
-            } else {
-                IPU21_TARGET_COSTS.exchange_phase_cycles
-            });
-        let cycles_per_word = IPU21_TARGET_COSTS
-            .exchange_transfer_cycles
-            .saturating_mul(16);
+            .div_ceil(transfer_bytes)
+            .max(traffic.remote_fragments)
+            .max(traffic.maximum_routed_fragments);
         RearrangementCost {
             cycles: exchange_cycles.saturating_add(local_cycles),
             exchange_row_bytes: if from.tiling == to.tiling {
                 0
             } else {
-                encoded_work.div_ceil(cycles_per_word).saturating_mul(4)
+                ExchangeFootprint {
+                    phases: u64::from(traffic.remote_fragments != 0),
+                    maximum_transfer_chunks_per_tile: transfer_chunks,
+                }
+                .estimated_row_bytes()
             },
         }
     }
@@ -1096,24 +1072,18 @@ mod tests {
     fn randomized_exchange_endpoint_costs_overlap_opposite_directions() {
         let mut random = fastrand::Rng::with_seed(0x6675_6c6c_6475_706c);
         for case in 0..CASES {
-            let outgoing = random.u64(1..=1 << 20);
-            let incoming = random.u64(1..=1 << 20);
+            let mut traffic = ExchangeEndpointTraffic::default();
+            for bus in 0..random.u16(1..=32) {
+                traffic.add_outgoing(bus, random.u64(1..=1 << 20), random.u64(1..=256));
+            }
+            for tile in 0..random.u16(1..=64) {
+                traffic.add_incoming(tile, random.u64(1..=1 << 20), random.u64(1..=256));
+            }
+            let outgoing = traffic.maximum_outgoing_bytes();
+            let incoming = traffic.maximum_incoming_bytes();
             let phases = random.u64(1..=32);
-            let traffic = ExchangeEndpointTraffic {
-                maximum_outgoing_bus_bytes: outgoing,
-                maximum_incoming_bytes: incoming,
-                maximum_outgoing_bus_fragments: random.u64(1..=256),
-                maximum_incoming_fragments: random.u64(1..=256),
-            };
-            let fixed = phases
-                .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles)
-                .saturating_add(
-                    traffic
-                        .maximum_fragments()
-                        .max(phases)
-                        .saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles),
-                );
-            let cycles = exchange_endpoint_cycles(traffic, phases);
+            let fixed = phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles);
+            let cycles = exchange_endpoint_cycles(&traffic, phases);
             assert_eq!(
                 cycles.saturating_sub(fixed),
                 outgoing
@@ -1121,17 +1091,15 @@ mod tests {
                     .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle),
                 "case {case}"
             );
-            let reversed = exchange_endpoint_cycles(
-                ExchangeEndpointTraffic {
-                    maximum_outgoing_bus_bytes: incoming,
-                    maximum_incoming_bytes: outgoing,
-                    maximum_outgoing_bus_fragments: traffic.maximum_incoming_fragments,
-                    maximum_incoming_fragments: traffic.maximum_outgoing_bus_fragments,
-                },
-                phases,
+            let reversed_traffic = ExchangeEndpointTraffic::from_maxima(
+                incoming,
+                outgoing,
+                traffic.maximum_incoming_fragments(),
+                traffic.maximum_outgoing_fragments(),
             );
+            let reversed = exchange_endpoint_cycles(&reversed_traffic, phases);
             assert_eq!(cycles, reversed, "case {case}");
-            let footprint = exchange_endpoint_footprint(traffic, phases);
+            let footprint = exchange_endpoint_footprint(&traffic, phases);
             let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
             assert_eq!(footprint.phases, phases, "case {case}");
             assert!(
@@ -1140,10 +1108,7 @@ mod tests {
                 "case {case}"
             );
             assert!(
-                footprint.maximum_transfer_chunks_per_tile
-                    >= traffic
-                        .maximum_outgoing_bus_fragments
-                        .max(traffic.maximum_incoming_fragments),
+                footprint.maximum_transfer_chunks_per_tile >= traffic.maximum_fragments(),
                 "case {case}"
             );
         }

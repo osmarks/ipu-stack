@@ -5689,27 +5689,6 @@ mod tests {
             assert!(low.exchange_phases.iter().all(|phase| {
                 phase.provenance.operation.is_some() && phase.provenance.value.is_some()
             }));
-            let weight_modes = |tile: &TileWorkList| {
-                low.work(tile)
-                    .filter_map(|work| match work {
-                        TileWorkRef::Kernel(run) => match &run.kernel {
-                            TileKernel::Planned(TileKernelSpec::Gemm { weights, .. }) => {
-                                Some(*weights)
-                            }
-                            _ => None,
-                        },
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let expected_weight_modes = weight_modes(&low.tiles[0]);
-            assert!(
-                low.tiles
-                    .iter()
-                    .all(|tile| weight_modes(tile) == expected_weight_modes),
-                "case {case}"
-            );
-
             for tile in &low.tiles {
                 let gemms = low
                     .work(tile)

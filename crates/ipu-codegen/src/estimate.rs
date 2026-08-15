@@ -9,7 +9,7 @@ use crate::mid::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConversionTraffic {
     pub source_payload_bytes: u64,
     pub maximum_source_payload_bytes: u64,
@@ -24,49 +24,131 @@ pub(crate) struct ConversionTraffic {
     pub maximum_local_bytes: u64,
     pub maximum_intersections: u64,
     pub maximum_local_intersections: u64,
+    pub source_bus_loads: Vec<ExchangeEndpointLoad>,
+    pub remote_destination_loads: Vec<ExchangeEndpointLoad>,
 }
 
-/// Critical endpoint work for one or more transfers which may share an
-/// exchange phase. Outgoing work is accumulated per adjacent-tile exchange
-/// bus, while incoming work is accumulated per receiving tile. A full-duplex
-/// phase is bounded by the larger direction rather than their sum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExchangeEndpointLoad {
+    pub bytes: u64,
+    pub fragments: u64,
+}
+
+impl ExchangeEndpointLoad {
+    fn add(&mut self, bytes: u64, fragments: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.fragments = self.fragments.saturating_add(fragments);
+    }
+}
+
+/// Resource-indexed work for one or more transfers which share an exchange
+/// phase. Sends from an adjacent tile pair occupy one shared bus; receives are
+/// independent per tile. Keeping those roles separate allows independently
+/// produced traffic estimates to be combined before finding the bottleneck.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExchangeEndpointTraffic {
-    pub maximum_outgoing_bus_bytes: u64,
-    pub maximum_incoming_bytes: u64,
-    pub maximum_outgoing_bus_fragments: u64,
-    pub maximum_incoming_fragments: u64,
+    pub outgoing_buses: Vec<ExchangeEndpointLoad>,
+    pub incoming_tiles: Vec<ExchangeEndpointLoad>,
 }
 
 impl ExchangeEndpointTraffic {
-    pub(crate) const fn from_conversion(traffic: ConversionTraffic) -> Self {
+    pub(crate) fn from_conversion(traffic: &ConversionTraffic) -> Self {
         Self {
-            maximum_outgoing_bus_bytes: traffic.maximum_source_bus_payload_bytes,
-            maximum_incoming_bytes: traffic.maximum_remote_destination_bytes,
-            maximum_outgoing_bus_fragments: traffic.maximum_source_bus_fragments,
-            maximum_incoming_fragments: traffic.maximum_remote_destination_fragments,
+            outgoing_buses: traffic.source_bus_loads.clone(),
+            incoming_tiles: traffic.remote_destination_loads.clone(),
         }
     }
 
-    pub(crate) const fn maximum_payload_bytes(self) -> u64 {
-        if self.maximum_outgoing_bus_bytes > self.maximum_incoming_bytes {
-            self.maximum_outgoing_bus_bytes
-        } else {
-            self.maximum_incoming_bytes
+    pub(crate) fn from_maxima(
+        outgoing_bytes: u64,
+        incoming_bytes: u64,
+        outgoing_fragments: u64,
+        incoming_fragments: u64,
+    ) -> Self {
+        let mut traffic = Self::default();
+        traffic.add_outgoing(0, outgoing_bytes, outgoing_fragments);
+        traffic.add_incoming(0, incoming_bytes, incoming_fragments);
+        traffic
+    }
+
+    pub(crate) fn add_outgoing(&mut self, bus: u16, bytes: u64, fragments: u64) {
+        add_endpoint_load(&mut self.outgoing_buses, bus, bytes, fragments);
+    }
+
+    pub(crate) fn add_incoming(&mut self, tile: u16, bytes: u64, fragments: u64) {
+        add_endpoint_load(&mut self.incoming_tiles, tile, bytes, fragments);
+    }
+
+    pub(crate) fn merge(&mut self, other: &Self) {
+        for (bus, load) in other.outgoing_buses.iter().copied().enumerate() {
+            self.add_outgoing(bus as u16, load.bytes, load.fragments);
+        }
+        for (tile, load) in other.incoming_tiles.iter().copied().enumerate() {
+            self.add_incoming(tile as u16, load.bytes, load.fragments);
         }
     }
 
-    pub(crate) const fn maximum_fragments(self) -> u64 {
-        if self.maximum_outgoing_bus_fragments > self.maximum_incoming_fragments {
-            self.maximum_outgoing_bus_fragments
-        } else {
-            self.maximum_incoming_fragments
-        }
+    pub(crate) fn maximum_outgoing_bytes(&self) -> u64 {
+        self.outgoing_buses
+            .iter()
+            .map(|load| load.bytes)
+            .max()
+            .unwrap_or(0)
     }
 
-    pub(crate) const fn is_empty(self) -> bool {
+    pub(crate) fn maximum_incoming_bytes(&self) -> u64 {
+        self.incoming_tiles
+            .iter()
+            .map(|load| load.bytes)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn maximum_payload_bytes(&self) -> u64 {
+        self.maximum_outgoing_bytes()
+            .max(self.maximum_incoming_bytes())
+    }
+
+    pub(crate) fn maximum_outgoing_fragments(&self) -> u64 {
+        self.outgoing_buses
+            .iter()
+            .map(|load| load.fragments)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn maximum_incoming_fragments(&self) -> u64 {
+        self.incoming_tiles
+            .iter()
+            .map(|load| load.fragments)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn maximum_fragments(&self) -> u64 {
+        self.maximum_outgoing_fragments()
+            .max(self.maximum_incoming_fragments())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
         self.maximum_payload_bytes() == 0
     }
+}
+
+fn add_endpoint_load(
+    loads: &mut Vec<ExchangeEndpointLoad>,
+    endpoint: u16,
+    bytes: u64,
+    fragments: u64,
+) {
+    if bytes == 0 && fragments == 0 {
+        return;
+    }
+    loads.resize(
+        loads.len().max(usize::from(endpoint).saturating_add(1)),
+        ExchangeEndpointLoad::default(),
+    );
+    loads[usize::from(endpoint)].add(bytes, fragments);
 }
 
 pub(crate) fn conversion_traffic(
@@ -97,39 +179,46 @@ pub(crate) fn conversion_traffic(
             intersections.push((extents, source_tiles));
         }
         let mut destination_bytes = 0u64;
-        let mut local_bytes = 0u64;
-        let mut local_intersections = 0u64;
-        for (extents, source_tiles) in &intersections {
+        for (extents, _) in &intersections {
             let bytes = range_elements(extents).saturating_mul(element_bytes);
             destination_bytes = destination_bytes.saturating_add(bytes);
-            if destination_tiles
-                .iter()
-                .any(|tile| source_tiles.binary_search(tile).is_ok())
-            {
-                local_bytes = local_bytes.max(bytes);
-                local_intersections = 1;
-            }
-            if destination_tiles
-                .iter()
-                .any(|tile| source_tiles.binary_search(tile).is_err())
-            {
-                remote.insert((source_tiles[0], extents.clone()));
-            }
         }
         traffic.maximum_destination_bytes =
             traffic.maximum_destination_bytes.max(destination_bytes);
-        traffic.maximum_remote_destination_bytes = traffic
-            .maximum_remote_destination_bytes
-            .max(destination_bytes.saturating_sub(local_bytes));
-        traffic.maximum_remote_destination_fragments = traffic
-            .maximum_remote_destination_fragments
-            .max((intersections.len() as u64).saturating_sub(local_intersections));
-        traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
         traffic.maximum_intersections = traffic
             .maximum_intersections
             .max(intersections.len() as u64);
-        traffic.maximum_local_intersections =
-            traffic.maximum_local_intersections.max(local_intersections);
+        for &destination_tile in destination_tiles {
+            let mut remote_bytes = 0u64;
+            let mut remote_fragments = 0u64;
+            let mut local_bytes = 0u64;
+            let mut local_intersections = 0u64;
+            for (extents, source_tiles) in &intersections {
+                let bytes = range_elements(extents).saturating_mul(element_bytes);
+                if source_tiles.binary_search(&destination_tile).is_ok() {
+                    local_bytes = local_bytes.saturating_add(bytes);
+                    local_intersections = local_intersections.saturating_add(1);
+                } else {
+                    remote_bytes = remote_bytes.saturating_add(bytes);
+                    remote_fragments = remote_fragments.saturating_add(1);
+                    remote.insert((source_tiles[0], extents.clone()));
+                }
+            }
+            add_endpoint_load(
+                &mut traffic.remote_destination_loads,
+                destination_tile,
+                remote_bytes,
+                remote_fragments,
+            );
+            traffic.maximum_remote_destination_bytes =
+                traffic.maximum_remote_destination_bytes.max(remote_bytes);
+            traffic.maximum_remote_destination_fragments = traffic
+                .maximum_remote_destination_fragments
+                .max(remote_fragments);
+            traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
+            traffic.maximum_local_intersections =
+                traffic.maximum_local_intersections.max(local_intersections);
+        }
     }
     traffic.remote_fragments = remote.len() as u64;
     traffic.maximum_routed_fragments = if from.order == to.order {
@@ -164,10 +253,11 @@ pub(crate) fn conversion_traffic(
             .saturating_add(range_elements(extents).saturating_mul(element_bytes));
         role.1 = role.1.saturating_add(1);
     }
-    for (bytes, fragments) in source_buses.into_values() {
+    for (bus, (bytes, fragments)) in source_buses {
         traffic.maximum_source_bus_payload_bytes =
             traffic.maximum_source_bus_payload_bytes.max(bytes);
         traffic.maximum_source_bus_fragments = traffic.maximum_source_bus_fragments.max(fragments);
+        add_endpoint_load(&mut traffic.source_bus_loads, bus, bytes, fragments);
     }
     Some(traffic)
 }
@@ -1017,7 +1107,8 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
         right_inner_axis,
         output_column_axis,
     )?;
-    let mut maximum_incoming_bytes = 0;
+    let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
+    let mut traffic = ExchangeEndpointTraffic::default();
     let mut left_is_remote = false;
     let mut right_is_remote = false;
     for tile in 0..compute_output.format.layout.tiling.tile_count {
@@ -1025,18 +1116,12 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
         let right_remote = right_plan.remote_bytes(tile, &output_plans, None)?;
         left_is_remote |= left_remote != 0;
         right_is_remote |= right_remote != 0;
-        maximum_incoming_bytes =
-            maximum_incoming_bytes.max(left_remote.saturating_add(right_remote));
+        let incoming = left_remote.saturating_add(right_remote);
+        traffic.add_incoming(tile, incoming, incoming.div_ceil(transfer_bytes));
     }
-    let left_outgoing = operand_outgoing_bus_work(left, left_is_remote);
-    let right_outgoing = operand_outgoing_bus_work(right, right_is_remote);
-    Some(ExchangeEndpointTraffic {
-        maximum_outgoing_bus_bytes: left_outgoing.0.saturating_add(right_outgoing.0),
-        maximum_incoming_bytes,
-        maximum_outgoing_bus_fragments: left_outgoing.1.saturating_add(right_outgoing.1),
-        maximum_incoming_fragments: maximum_incoming_bytes
-            .div_ceil(u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4),
-    })
+    add_operand_outgoing_bus_work(&mut traffic, left, left_is_remote);
+    add_operand_outgoing_bus_work(&mut traffic, right, right_is_remote);
+    Some(traffic)
 }
 
 fn parallel_gemm_operand_traffic(
@@ -1045,7 +1130,6 @@ fn parallel_gemm_operand_traffic(
     right: &TensorType,
     right_required_replicas: u16,
 ) -> ExchangeEndpointTraffic {
-    let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
     let mut traffic = ExchangeEndpointTraffic::default();
     for (operand, required_replicas) in [
         (left, left_required_replicas),
@@ -1054,20 +1138,73 @@ fn parallel_gemm_operand_traffic(
         if operand.format.layout.tiling.replicas >= required_replicas {
             continue;
         }
-        let incoming = maximum_shard_bytes(operand);
-        let outgoing =
-            incoming.saturating_mul(u64::from(operand.format.layout.tiling.tile_count.min(2)));
-        traffic.maximum_incoming_bytes = traffic.maximum_incoming_bytes.saturating_add(incoming);
-        traffic.maximum_outgoing_bus_bytes =
-            traffic.maximum_outgoing_bus_bytes.saturating_add(outgoing);
-        traffic.maximum_incoming_fragments = traffic
-            .maximum_incoming_fragments
-            .saturating_add(incoming.div_ceil(transfer_bytes));
-        traffic.maximum_outgoing_bus_fragments = traffic
-            .maximum_outgoing_bus_fragments
-            .saturating_add(outgoing.div_ceil(transfer_bytes));
+        let stored_replicas = operand.format.layout.tiling.replicas.max(1);
+        let base_tiles = operand
+            .format
+            .layout
+            .tiling
+            .tile_count
+            .checked_div(stored_replicas)
+            .unwrap_or(0);
+        let Some(tile_count) = base_tiles.checked_mul(required_replicas) else {
+            return ExchangeEndpointTraffic::from_maxima(
+                u64::MAX / 16,
+                u64::MAX / 16,
+                u64::MAX / 16,
+                u64::MAX / 16,
+            );
+        };
+        let mut consumer_layout = operand.format.layout.clone();
+        consumer_layout.tiling.tile_count = tile_count;
+        consumer_layout.tiling.replicas = required_replicas;
+        let Some(replication) = replica_shortfall_traffic(operand, &consumer_layout) else {
+            return ExchangeEndpointTraffic::from_maxima(
+                u64::MAX / 16,
+                u64::MAX / 16,
+                u64::MAX / 16,
+                u64::MAX / 16,
+            );
+        };
+        traffic.merge(&replication);
     }
     traffic
+}
+
+/// Replicating an otherwise unchanged layout only matches identical shard
+/// extents. Account for those roles directly instead of running the general
+/// all-pairs layout-intersection algorithm for every GEMM candidate.
+fn replica_shortfall_traffic(
+    operand: &TensorType,
+    consumer_layout: &Layout,
+) -> Option<ExchangeEndpointTraffic> {
+    let sources = layout_extents(&operand.shape, &operand.format.layout)?;
+    let destinations = layout_extents(&operand.shape, consumer_layout)?;
+    let mut source_groups = HashMap::<Vec<(u32, u32)>, Vec<u16>>::new();
+    for (tile, extents) in sources {
+        source_groups.entry(extents).or_default().push(tile);
+    }
+    let mut destination_groups = HashMap::<Vec<(u32, u32)>, Vec<u16>>::new();
+    for (tile, extents) in destinations {
+        destination_groups.entry(extents).or_default().push(tile);
+    }
+
+    let mut traffic = ExchangeEndpointTraffic::default();
+    for (extents, destination_tiles) in destination_groups {
+        let source_tiles = source_groups.get(&extents)?;
+        let remote_destinations = destination_tiles
+            .into_iter()
+            .filter(|tile| source_tiles.binary_search(tile).is_err())
+            .collect::<Vec<_>>();
+        if remote_destinations.is_empty() {
+            continue;
+        }
+        let bytes = range_elements(&extents).saturating_mul(operand.format.precision.bytes());
+        traffic.add_outgoing(source_tiles[0] / 2, bytes, 1);
+        for tile in remote_destinations {
+            traffic.add_incoming(tile, bytes, 1);
+        }
+    }
+    Some(traffic)
 }
 
 struct GemmOperandTrafficPlan<'a> {
@@ -1148,14 +1285,19 @@ fn clipped_range(range: std::ops::Range<u32>, extent: u32) -> std::ops::Range<u3
     range.start.min(extent)..range.end.min(extent)
 }
 
-fn operand_outgoing_bus_work(operand: &TensorType, remote: bool) -> (u64, u64) {
+fn add_operand_outgoing_bus_work(
+    traffic: &mut ExchangeEndpointTraffic,
+    operand: &TensorType,
+    remote: bool,
+) {
     if !remote {
-        return (0, 0);
+        return;
     }
-    let simultaneous_sources = u64::from(operand.format.layout.tiling.tile_count.min(2));
-    let bytes = maximum_shard_bytes(operand).saturating_mul(simultaneous_sources);
     let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
-    (bytes, bytes.div_ceil(transfer_bytes))
+    for tile in 0..operand.format.layout.tiling.tile_count {
+        let bytes = maximum_shard_bytes(operand);
+        traffic.add_outgoing(tile / 2, bytes, bytes.div_ceil(transfer_bytes));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1354,13 +1496,13 @@ mod tests {
             let remote =
                 gemm_exchange_endpoint_traffic(&dispatch, &[sharded_left, sharded_right], &output)
                     .unwrap();
-            assert!(remote.maximum_outgoing_bus_bytes != 0, "case {case}");
-            assert!(remote.maximum_incoming_bytes != 0, "case {case}");
+            assert!(remote.maximum_outgoing_bytes() != 0, "case {case}");
+            assert!(remote.maximum_incoming_bytes() != 0, "case {case}");
             assert_eq!(
                 remote.maximum_payload_bytes(),
                 remote
-                    .maximum_outgoing_bus_bytes
-                    .max(remote.maximum_incoming_bytes),
+                    .maximum_outgoing_bytes()
+                    .max(remote.maximum_incoming_bytes()),
                 "case {case}"
             );
         }
@@ -1443,11 +1585,13 @@ mod tests {
                 gemm_exchange_endpoint_traffic(&dispatch, &[left, sharded_right], &compute_output)
                     .unwrap();
             assert_eq!(
-                streamed.maximum_incoming_bytes, expected_incoming,
+                streamed.maximum_incoming_bytes(),
+                expected_incoming,
                 "case {case}"
             );
             assert_eq!(
-                streamed.maximum_outgoing_bus_bytes, expected_outgoing,
+                streamed.maximum_outgoing_bytes(),
+                expected_outgoing,
                 "case {case}"
             );
         }
@@ -1497,6 +1641,12 @@ mod tests {
             traffic.maximum_remote_destination_fragments = traffic
                 .maximum_remote_destination_fragments
                 .max(remote_intersections);
+            add_endpoint_load(
+                &mut traffic.remote_destination_loads,
+                *destination_tile,
+                destination_bytes.saturating_sub(local_bytes),
+                remote_intersections,
+            );
             traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
             traffic.maximum_intersections = traffic
                 .maximum_intersections
@@ -1533,11 +1683,12 @@ mod tests {
             role.0 += range_elements(extents) * precision.bytes();
             role.1 += 1;
         }
-        for (bytes, fragments) in source_buses.into_values() {
+        for (bus, (bytes, fragments)) in source_buses {
             traffic.maximum_source_bus_payload_bytes =
                 traffic.maximum_source_bus_payload_bytes.max(bytes);
             traffic.maximum_source_bus_fragments =
                 traffic.maximum_source_bus_fragments.max(fragments);
+            add_endpoint_load(&mut traffic.source_bus_loads, bus, bytes, fragments);
         }
         traffic
     }
