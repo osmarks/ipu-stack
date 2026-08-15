@@ -2,8 +2,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
-    AmpOrder, BlockMajorOrder, CompiledPackage, ComputeGraph, DiagnosticTensor, Layout,
-    PackageConfig, PipelineConfig, Precision, TensorFormat, amp_matrix_coordinates,
+    AmpOrder, BlockMajorOrder, CompiledPackage, ComputeGraph, DiagnosticTensor, GemmOrientation,
+    GemmPlanConstraint, Layout, LocalOperandStaging, MemoryClass, PackageConfig, PipelineConfig,
+    Precision, ReductionStaging, TensorFormat, amp_matrix_coordinates,
     block_major_matrix_coordinates, build_diagnostic_package, build_package,
 };
 use ipu_driver::DriverError;
@@ -85,6 +86,13 @@ struct Arguments {
     /// Rank this many complete planner finalists with physical exchange scheduling.
     #[arg(long, default_value_t = 1, conflicts_with = "reuse_package")]
     exchange_schedule_finalists: usize,
+    /// Retain an exact GEMM family: OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION:LOCAL.
+    #[arg(
+        long,
+        value_parser = parse_gemm_plan_constraint,
+        conflicts_with = "reuse_package"
+    )]
+    gemm_plan_constraint: Vec<GemmPlanConstraint>,
     #[arg(long, default_value_t = c600_tile_count())]
     tiles: u32,
     #[arg(long)]
@@ -200,6 +208,82 @@ fn mlp_weight_name(blocks: u32, block: u32, projection: u32) -> String {
     } else {
         format!("right.{block}.{projection}")
     }
+}
+
+fn parse_gemm_plan_constraint(value: &str) -> Result<GemmPlanConstraint, String> {
+    let fields = value.split(':').collect::<Vec<_>>();
+    let [
+        operation,
+        grid,
+        result_grid,
+        columns,
+        memory,
+        orientation,
+        reduction,
+        local,
+    ] = fields.as_slice()
+    else {
+        return Err("expected OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION:LOCAL".into());
+    };
+    let grid = grid
+        .split('x')
+        .map(|field| field.parse::<u16>().map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let [row_partitions, column_partitions, inner_partitions] = grid.as_slice() else {
+        return Err("GEMM grid must be ROWSxCOLUMNSxINNER".into());
+    };
+    let result_grid = result_grid
+        .split('x')
+        .map(|field| field.parse::<u16>().map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let [result_row_partitions, result_column_partitions] = result_grid.as_slice() else {
+        return Err("result grid must be ROWSxCOLUMNS".into());
+    };
+    let nonzero = [
+        *row_partitions,
+        *column_partitions,
+        *inner_partitions,
+        *result_row_partitions,
+        *result_column_partitions,
+    ];
+    if nonzero.contains(&0) {
+        return Err("GEMM and result grid partitions must be nonzero".into());
+    }
+    let output_column_block = columns.parse::<u32>().map_err(|error| error.to_string())?;
+    if output_column_block == 0 {
+        return Err("GEMM output column block must be nonzero".into());
+    }
+    Ok(GemmPlanConstraint {
+        source_operation: operation
+            .parse::<u32>()
+            .map_err(|error| error.to_string())?,
+        orientation: match *orientation {
+            "normal" => GemmOrientation::Normal,
+            "swapped" => GemmOrientation::Swapped,
+            _ => return Err("orientation must be normal or swapped".into()),
+        },
+        row_partitions: *row_partitions,
+        column_partitions: *column_partitions,
+        inner_partitions: *inner_partitions,
+        result_row_partitions: *result_row_partitions,
+        result_column_partitions: *result_column_partitions,
+        output_column_block,
+        weight_memory_class: match *memory {
+            "standard" => MemoryClass::Ipu21Standard,
+            "interleaved" => MemoryClass::Ipu21Interleaved,
+            _ => return Err("memory must be standard or interleaved".into()),
+        },
+        reduction_staging: match *reduction {
+            "complete" => ReductionStaging::Complete,
+            "streamed" => ReductionStaging::Streamed,
+            _ => return Err("reduction must be complete or streamed".into()),
+        },
+        local_weight_staging: match *local {
+            "direct" => LocalOperandStaging::Direct,
+            "match-remote" => LocalOperandStaging::MatchRemote,
+            _ => return Err("local staging must be direct or match-remote".into()),
+        },
+    })
 }
 
 fn main() -> Result<()> {
@@ -333,6 +417,9 @@ fn main() -> Result<()> {
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
     pipeline = pipeline.with_exchange_schedule_finalists(arguments.exchange_schedule_finalists);
+    for constraint in &arguments.gemm_plan_constraint {
+        pipeline = pipeline.with_gemm_plan_constraint(*constraint);
+    }
     if let Some(kib) = arguments.tile_memory_budget_kib {
         let bytes = kib.checked_mul(1024).context("tile SRAM budget overflow")?;
         pipeline = pipeline.with_tile_memory_budget(bytes);

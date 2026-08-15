@@ -702,6 +702,11 @@ fn select_scheduled_finalist(
 ) -> PackageBuildResult<(MidGraph, LowProgram)> {
     if finalists.len() == 1 {
         let mid = finalists.into_iter().next().unwrap();
+        tracing::info!(
+            estimated_cycles = mid.estimated_cycles,
+            estimated_exchange_cycles = mid.estimated_exchange_cycles,
+            "selected analytical operator plan"
+        );
         let low = lower_to_tiles(&mid, planning)?;
         return Ok((mid, low));
     }

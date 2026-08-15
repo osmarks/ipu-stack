@@ -281,6 +281,25 @@ pub enum GemmDistribution {
     },
 }
 
+/// Exact blocked-GEMM geometry retained for planner diagnosis. Constraints
+/// are keyed by the source graph operation and bypass candidate pruning and
+/// conservative whole-graph memory rejection. Concrete placement remains the
+/// final authority on whether the resulting package fits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemmPlanConstraint {
+    pub source_operation: u32,
+    pub orientation: GemmOrientation,
+    pub row_partitions: u16,
+    pub column_partitions: u16,
+    pub inner_partitions: u16,
+    pub result_row_partitions: u16,
+    pub result_column_partitions: u16,
+    pub output_column_block: u32,
+    pub weight_memory_class: MemoryClass,
+    pub reduction_staging: ReductionStaging,
+    pub local_weight_staging: LocalOperandStaging,
+}
+
 /// Lifetime policy for partials reduced across a GEMM's K partitions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReductionStaging {
@@ -1712,6 +1731,9 @@ pub struct PipelineConfig {
     /// Number of complete beam finalists to materialize and rank with the
     /// physical exchange scheduler. One retains analytical-only selection.
     pub exchange_schedule_finalists: usize,
+    /// Diagnostic constraints which retain only one GEMM plan family for the
+    /// named source operations.
+    pub gemm_plan_constraints: Vec<GemmPlanConstraint>,
     /// Standard-addressed SRAM retained for exchange tables, profiling data,
     /// host commands, and generated tile programs built after planning.
     pub standard_memory_reservation_bytes: u64,
@@ -1770,6 +1792,7 @@ impl PipelineConfig {
             shape_aware_active_tile_counts: true,
             planning_beam_width: 64,
             exchange_schedule_finalists: 1,
+            gemm_plan_constraints: Vec::new(),
             standard_memory_reservation_bytes: u64::from(
                 crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
             ),
@@ -1801,6 +1824,13 @@ impl PipelineConfig {
 
     pub fn with_exchange_schedule_finalists(mut self, finalists: usize) -> Self {
         self.exchange_schedule_finalists = finalists.max(1);
+        self
+    }
+
+    pub fn with_gemm_plan_constraint(mut self, constraint: GemmPlanConstraint) -> Self {
+        self.gemm_plan_constraints
+            .retain(|existing| existing.source_operation != constraint.source_operation);
+        self.gemm_plan_constraints.push(constraint);
         self
     }
 
@@ -3477,10 +3507,20 @@ fn lower_operation_candidates(
                 })
                 .collect::<Vec<_>>();
             for (mut next, peak) in evaluated {
-                if peak.fits_ipu21_with_budget(
+                let fits = peak.fits_ipu21_with_budget(
                     config.standard_memory_reservation_bytes,
                     config.tile_memory_budget_bytes,
-                ) {
+                );
+                if fits || branch_contains_gemm_constraint(&next, config) {
+                    if !fits {
+                        tracing::debug!(
+                            operation = operation.id.index(),
+                            standard = peak.standard,
+                            interleaved = peak.interleaved,
+                            total = peak.total,
+                            "retained constrained GEMM past conservative memory estimate"
+                        );
+                    }
                     next.peak_memory = peak;
                     expanded.push(next);
                 } else {
@@ -3566,10 +3606,10 @@ fn lower_operation_candidates(
                 graph,
                 &constraints.allocation_copies,
             );
-            peak.fits_ipu21_with_budget(
+            (peak.fits_ipu21_with_budget(
                 config.standard_memory_reservation_bytes,
                 config.tile_memory_budget_bytes,
-            )
+            ) || branch_contains_gemm_constraint(&branch, config))
             .then(|| {
                 branch.peak_memory = peak;
                 branch
@@ -3591,6 +3631,17 @@ fn lower_operation_candidates(
         restore_unclaimed_deferred_costs(&mut branch.operations);
     }
     Ok(beam)
+}
+
+fn branch_contains_gemm_constraint(branch: &BeamBranch, config: &PipelineConfig) -> bool {
+    branch.operations.iter().any(|operation| {
+        operation.source.is_some_and(|source| {
+            config
+                .gemm_plan_constraints
+                .iter()
+                .any(|constraint| constraint.source_operation == source.index())
+        })
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4210,6 +4261,10 @@ fn plans(
     distributed_result_is_useful: bool,
 ) -> Vec<Plan> {
     let mut plans = Vec::new();
+    let gemm_constraint = config
+        .gemm_plan_constraints
+        .iter()
+        .find(|constraint| constraint.source_operation == operation.id.index());
     if let OperationKind::SplitHeads(options) = operation.kind
         && let [input] = inputs
         && output.0.len() == 3
@@ -4492,6 +4547,7 @@ fn plans(
             config,
             costs,
             distributed_result_is_useful,
+            gemm_constraint,
         ));
         for (input_index, _) in parameter_inputs
             .iter()
@@ -4528,7 +4584,59 @@ fn plans(
         }
     }
     plans.retain(|plan| plan_fits_operator_memory(plan, inputs, output, config));
+    if let Some(constraint) = gemm_constraint {
+        plans.retain(|plan| {
+            gemm_plan_matches(constraint, &plan.dispatch, &plan.requirements.inputs)
+        });
+        tracing::info!(
+            source_operation = constraint.source_operation,
+            matching_plans = plans.len(),
+            ?constraint,
+            "applied GEMM plan constraint"
+        );
+    }
     plans
+}
+
+fn gemm_plan_matches(
+    constraint: &GemmPlanConstraint,
+    dispatch: &OperatorDispatch,
+    inputs: &[OperandRequirement],
+) -> bool {
+    let OperatorDispatch::BlockedGemm {
+        output_column_block,
+        orientation,
+        distribution:
+            GemmDistribution::ParallelReduction {
+                row_partitions,
+                column_partitions,
+                inner_partitions,
+                result_row_partitions,
+                result_column_partitions,
+                reduction_staging,
+            },
+        ..
+    } = dispatch
+    else {
+        return false;
+    };
+    let weight_index = match orientation {
+        GemmOrientation::Normal => 1,
+        GemmOrientation::Swapped => 0,
+    };
+    let Some(weight) = inputs.get(weight_index) else {
+        return false;
+    };
+    *orientation == constraint.orientation
+        && *row_partitions == constraint.row_partitions
+        && *column_partitions == constraint.column_partitions
+        && *inner_partitions == constraint.inner_partitions
+        && *result_row_partitions == constraint.result_row_partitions
+        && *result_column_partitions == constraint.result_column_partitions
+        && *output_column_block == constraint.output_column_block
+        && weight.format.layout.memory_class == constraint.weight_memory_class
+        && *reduction_staging == constraint.reduction_staging
+        && weight.local_staging == constraint.local_weight_staging
 }
 
 fn independent_parameter_storage(
@@ -4630,6 +4738,7 @@ fn parallel_reduction_candidates(
     config: &PipelineConfig,
     costs: &impl CostModel,
     distributed_result_is_useful: bool,
+    constraint: Option<&GemmPlanConstraint>,
 ) -> Vec<OperatorCandidate> {
     [GemmOrientation::Normal, GemmOrientation::Swapped]
         .into_iter()
@@ -4642,6 +4751,7 @@ fn parallel_reduction_candidates(
                 costs,
                 orientation,
                 distributed_result_is_useful,
+                constraint,
             )
         })
         .collect()
@@ -4655,6 +4765,7 @@ fn parallel_reduction_candidates_for_orientation(
     costs: &impl CostModel,
     orientation: GemmOrientation,
     distributed_result_is_useful: bool,
+    constraint: Option<&GemmPlanConstraint>,
 ) -> Vec<OperatorCandidate> {
     // Residual supervisor, weight-feed, and worker setup cost after retained
     // state, measured on IPU21 independently of the four issue cycles per row.
@@ -4831,30 +4942,40 @@ fn parallel_reduction_candidates_for_orientation(
         }
     }
     let generated_grids = grids.len();
-    // Do not discard a grid merely because another has lower estimated
-    // compute and communication: peak temporary storage and unused tiles are
-    // independent planning constraints. The complete cost model needs every
-    // non-dominated tradeoff in order to discover grids whose reductions or
-    // transitions are cheaper.
-    let dominates = |left: &(u64, u64, u64, u64, u16, u16, u16),
-                     right: &(u64, u64, u64, u64, u16, u16, u16)| {
-        left.6 == right.6
-            && left.0 <= right.0
-            && left.1 <= right.1
-            && left.2 <= right.2
-            && left.3 <= right.3
-            && (left.0 < right.0 || left.1 < right.1 || left.2 < right.2 || left.3 < right.3)
-    };
-    let mut frontier = Vec::new();
-    for grid in grids {
-        if frontier.iter().any(|kept| dominates(kept, &grid)) {
-            continue;
+    let grids = if let Some(constraint) = constraint {
+        grids
+            .into_iter()
+            .filter(|grid| {
+                orientation == constraint.orientation
+                    && grid.4 == constraint.row_partitions
+                    && grid.5 == constraint.column_partitions
+                    && grid.6 == constraint.inner_partitions
+            })
+            .collect::<Vec<_>>()
+    } else {
+        // Peak temporary storage and unused tiles are independent planning
+        // constraints, so retain every non-dominated proxy tradeoff until the
+        // precise operator estimator can rank it.
+        let dominates = |left: &(u64, u64, u64, u64, u16, u16, u16),
+                         right: &(u64, u64, u64, u64, u16, u16, u16)| {
+            left.6 == right.6
+                && left.0 <= right.0
+                && left.1 <= right.1
+                && left.2 <= right.2
+                && left.3 <= right.3
+                && (left.0 < right.0 || left.1 < right.1 || left.2 < right.2 || left.3 < right.3)
+        };
+        let mut frontier = Vec::new();
+        for grid in grids {
+            if frontier.iter().any(|kept| dominates(kept, &grid)) {
+                continue;
+            }
+            frontier.retain(|kept| !dominates(&grid, kept));
+            frontier.push(grid);
         }
-        frontier.retain(|kept| !dominates(&grid, kept));
-        frontier.push(grid);
-    }
-    frontier.sort_unstable();
-    let grids = frontier;
+        frontier.sort_unstable();
+        frontier
+    };
     let proxy_frontier_grids = grids.len();
     let mut variants = Vec::new();
     for (_, _, _, _, row_partitions, column_partitions, inner_partitions) in grids {
@@ -5138,13 +5259,22 @@ fn parallel_reduction_candidates_for_orientation(
         }
     }
     let generated_variants = variants.len();
-    let retained = retain_precise_operator_candidates(
-        variants,
-        inputs,
-        output,
-        costs,
-        config.planning_beam_width.max(1),
-    );
+    let retained = if let Some(constraint) = constraint {
+        variants
+            .into_iter()
+            .filter(|candidate| {
+                gemm_plan_matches(constraint, &candidate.dispatch, &candidate.inputs)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        retain_precise_operator_candidates(
+            variants,
+            inputs,
+            output,
+            costs,
+            config.planning_beam_width.max(1),
+        )
+    };
     tracing::debug!(
         ?orientation,
         generated_grids,
@@ -5935,6 +6065,7 @@ mod tests {
                 &config,
                 &Ipu21CostModel,
                 true,
+                None,
             );
             assert!(
                 !candidates.is_empty(),
