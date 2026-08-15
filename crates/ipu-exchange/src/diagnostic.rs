@@ -216,7 +216,7 @@ fn decode_operation(
                     },
                     IncomingControl {
                         stream: IncomingControlStream::Pic,
-                        value: payload & PIC_RECEIVE_ADDRESS_MASK,
+                        value: (((word >> 27) & 1) << 18) | (payload & PIC_RECEIVE_ADDRESS_MASK),
                     },
                 ],
             },
@@ -285,6 +285,7 @@ fn decode_operation(
 }
 
 pub(super) fn validate_tile_program(
+    tile: usize,
     schedule: &TileProgramSchedule,
     words: &[u32],
 ) -> Result<PlanProgramDiagnostic, ExchangeError> {
@@ -335,12 +336,15 @@ pub(super) fn validate_tile_program(
         .iter()
         .map(|event| {
             let control = match event.kind {
-                ReceiveEventKind::Pointer => IncomingControl {
+                ReceiveEventKind::Pointer | ReceiveEventKind::Format => IncomingControl {
                     stream: IncomingControlStream::Pic,
                     value: (((event.instruction >> 18) & 1) << 18)
                         | (event.instruction & PIC_RECEIVE_ADDRESS_MASK),
                 },
-                ReceiveEventKind::Source | ReceiveEventKind::Neutral => IncomingControl {
+                ReceiveEventKind::OrdinarySource
+                | ReceiveEventKind::OrdinaryNeutral
+                | ReceiveEventKind::PairedSource
+                | ReceiveEventKind::PairedNeutral => IncomingControl {
                     stream: IncomingControlStream::Xpic,
                     value: (((event.instruction >> 13) & 1) << 13) | (event.instruction & 0x1fff),
                 },
@@ -350,6 +354,25 @@ pub(super) fn validate_tile_program(
         .collect::<Vec<_>>();
     expected_controls.sort_unstable_by_key(|entry| (entry.0, control_key(entry.1)));
     if actual_controls != expected_controls {
+        let first_mismatch = actual_controls
+            .iter()
+            .zip(&expected_controls)
+            .position(|(actual, expected)| actual != expected)
+            .unwrap_or_else(|| actual_controls.len().min(expected_controls.len()));
+        let window_start = first_mismatch.saturating_sub(3);
+        let window_end =
+            (first_mismatch + 4).min(actual_controls.len().max(expected_controls.len()));
+        tracing::debug!(
+            tile,
+            first_mismatch,
+            actual_len = actual_controls.len(),
+            expected_len = expected_controls.len(),
+            actual = ?actual_controls.get(first_mismatch),
+            expected = ?expected_controls.get(first_mismatch),
+            actual_window = ?actual_controls.get(window_start..window_end.min(actual_controls.len())),
+            expected_window = ?expected_controls.get(window_start..window_end.min(expected_controls.len())),
+            "encoded incoming controls differ from the phase schedule"
+        );
         return Err(ExchangeError::Schedule("encoded incoming-control mismatch"));
     }
 
@@ -464,5 +487,30 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn paired_control_decoder_preserves_the_pic_selector() {
+        let events = [
+            ReceiveEvent {
+                cycles: 1,
+                instruction: delay_xpic(0, 0, 0),
+                kind: ReceiveEventKind::OrdinarySource,
+            },
+            ReceiveEvent {
+                cycles: 1,
+                instruction: delay_pic(0, 1, 1),
+                kind: ReceiveEventKind::Format,
+            },
+        ];
+        let (instruction, payload) = encode_send_control_pair(0, 0, 0, &events).unwrap();
+        let decoded = diagnose_plan_program(&[instruction, payload], None).unwrap();
+        let PlanOperation::Send { controls, .. } = &decoded.instructions[0].operation else {
+            panic!("expected a paired control instruction");
+        };
+        assert!(controls.contains(&IncomingControl {
+            stream: IncomingControlStream::Pic,
+            value: 0x40001,
+        }));
     }
 }

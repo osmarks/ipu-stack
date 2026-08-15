@@ -20,11 +20,12 @@ pub mod place;
 pub mod storage;
 pub mod tile;
 pub use exchange::{
-    ExchangeActivity, ExchangeActivityDiagnostic, ExchangeActivityKind, ExchangeLoweringError,
-    ExchangeLoweringOptions, ExchangeMemoryElement, ExchangeScheduleDestination,
-    ExchangeScheduleProblem, ExchangeScheduleRun, ExchangeScheduleSnapshot,
-    ExchangeScheduleTransfer, ExchangeTileDiagnostic, LoweredExchanges, PhysicalExchangePhase,
-    diagnose_exchange_tile, inactive_exchange_program, lower_exchanges, schedule_exchange_problem,
+    EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityDiagnostic,
+    ExchangeActivityKind, ExchangeItemWidth, ExchangeLoweringError, ExchangeLoweringOptions,
+    ExchangeMemoryElement, ExchangeScheduleDestination, ExchangeScheduleProblem,
+    ExchangeScheduleRun, ExchangeScheduleSnapshot, ExchangeScheduleTransfer,
+    ExchangeTileDiagnostic, LoweredExchanges, PhysicalExchangePhase, diagnose_exchange_tile,
+    inactive_exchange_program, lower_exchanges, schedule_exchange_problem,
     validate_exchange_schedule,
 };
 pub use graph::{

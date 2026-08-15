@@ -65,10 +65,24 @@ struct Arguments {
     /// physical exchange phase and verify every touched word after execution.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
     exchange_replay_phase: Option<usize>,
+    /// Replay a phase from an exported address-resolved schedule without
+    /// recompiling the model.
+    #[arg(
+        long,
+        requires = "exchange_replay_phase",
+        conflicts_with = "export_exchange_schedule"
+    )]
+    replay_exchange_schedule: Option<PathBuf>,
     /// Maximum number of systematically distributed words read back by an
     /// exact exchange-phase replay.
     #[arg(long, default_value_t = 8192)]
     exchange_replay_samples: usize,
+    /// Replay only this prefix of the selected phase's transfer list.
+    #[arg(long, requires = "exchange_replay_phase")]
+    exchange_replay_transfer_limit: Option<usize>,
+    /// Skip this many transfers before applying the replay transfer limit.
+    #[arg(long, default_value_t = 0, requires = "exchange_replay_phase")]
+    exchange_replay_first_transfer: usize,
     /// Summarize packaged exchange rows and exit before loading hardware.
     #[arg(long)]
     inspect_exchanges: bool,
@@ -139,6 +153,9 @@ struct Arguments {
     /// Number of randomized exchange epochs in one stress package.
     #[arg(long, default_value_t = 128)]
     exchange_cases: u32,
+    /// First bank/class combination selected by the paired-width diagnostic.
+    #[arg(long, default_value_t = 0)]
+    exchange_wide_first_case: u32,
     /// Maximum words in one randomized transfer.
     #[arg(long, default_value_t = 256)]
     exchange_max_words: u32,
@@ -161,6 +178,15 @@ struct Arguments {
     /// Make every tile join the paired-width sync with a minimal idle row.
     #[arg(long)]
     exchange_wide_all_active: bool,
+    /// Number of complete physical receiver pairs in the paired-width diagnostic.
+    #[arg(long, default_value_t = 1)]
+    exchange_wide_pairs: u16,
+    /// Logical source tile used by the paired-width diagnostic.
+    #[arg(long, default_value_t = 0)]
+    exchange_wide_source: u16,
+    /// First logical receiver tile; it must begin a complete physical pair.
+    #[arg(long, default_value_t = 2)]
+    exchange_wide_first_destination: u16,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -370,11 +396,12 @@ fn main() -> Result<()> {
         },
         Ok,
     )?;
-    let runtime_source = arguments.runtime_source.unwrap_or_else(|| {
+    let runtime_source = arguments.runtime_source.clone().unwrap_or_else(|| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../device/static_runtime.S")
     });
     let bootloader = arguments
         .bootloader
+        .clone()
         .unwrap_or_else(|| arguments.sdk.join("bin/ipu/tile_bootloader_cc_ipu21.elf"));
     if matches!(arguments.workload, Workload::ExchangeStress) {
         if arguments.reuse_package {
@@ -386,11 +413,16 @@ fn main() -> Result<()> {
         let stress = if matches!(arguments.exchange_pattern, ExchangeStressPattern::Wide) {
             exchange_stress::build_wide(
                 active_tiles,
+                arguments.exchange_wide_first_case,
                 arguments.exchange_cases,
+                arguments.exchange_max_words,
                 !arguments.exchange_skip_validation,
                 arguments.exchange_wide_receiver_mask,
                 arguments.exchange_wide_explicit_config,
                 arguments.exchange_wide_all_active,
+                arguments.exchange_wide_pairs,
+                arguments.exchange_wide_source,
+                arguments.exchange_wide_first_destination,
                 &toolchain,
                 &runtime_source,
             )?
@@ -465,6 +497,32 @@ fn main() -> Result<()> {
             arguments.exchange_seed,
             arguments.exchange_cases
         );
+        return Ok(());
+    }
+    if let Some(path) = &arguments.replay_exchange_schedule {
+        let phase = arguments
+            .exchange_replay_phase
+            .expect("clap requires a replay phase");
+        let input = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+        let snapshot: ipu_codegen::ExchangeScheduleSnapshot =
+            serde_json::from_reader(std::io::BufReader::new(input))
+                .with_context(|| format!("read {}", path.display()))?;
+        if snapshot.schema_version != ipu_codegen::EXCHANGE_SCHEDULE_SNAPSHOT_VERSION {
+            bail!(
+                "exchange schedule schema {} does not match supported schema {}",
+                snapshot.schema_version,
+                ipu_codegen::EXCHANGE_SCHEDULE_SNAPSHOT_VERSION
+            );
+        }
+        let replay = exchange_stress::build_schedule_phase_replay(
+            &snapshot,
+            phase,
+            arguments.exchange_replay_first_transfer,
+            arguments.exchange_replay_transfer_limit,
+            &Toolchain::from_sdk(&arguments.sdk),
+            &runtime_source,
+        )?;
+        execute_exchange_replay(&arguments, &replay, &bootloader)?;
         return Ok(());
     }
     let mut graph = ComputeGraph::default();
@@ -705,49 +763,7 @@ fn main() -> Result<()> {
             &package_config.toolchain,
             &package_config.runtime_source,
         )?;
-        write_package(&replay.application, &arguments.package)?;
-        let configuration = fs::read(&arguments.configuration)
-            .with_context(|| format!("read {}", arguments.configuration.display()))?;
-        let bootloader_bytes =
-            fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
-        retry_after_reset(&arguments.sdk, || {
-            let runtime = open_and_load_once(
-                &arguments.device,
-                &configuration,
-                &replay.application,
-                &bootloader_bytes,
-                replay.application.host_exchange.startup_mark,
-            )?;
-            let mut session = runtime.host_session(&replay.application)?;
-            session.start()?;
-            let mut serviced = false;
-            let executed = session
-                .invoke_streaming_deferred_with_poll("run", &[0; 4], |device| {
-                    replay
-                        .service_readback(device, arguments.exchange_replay_samples, &mut serviced)
-                        .map_err(|error| DriverError::Invalid(error.to_string()))
-                })
-                .inspect_err(|error| {
-                    tracing::error!(
-                        %error,
-                        device = %device_failure_diagnostics(&runtime, &replay.application),
-                        "exchange replay failed"
-                    );
-                })?;
-            if !serviced {
-                bail!("exchange replay completed without reaching its readback trap");
-            }
-            let _ = session.collect(&executed)?;
-            diagnose_completion(
-                &runtime,
-                &replay.application,
-                Duration::from_secs(arguments.timeout_seconds),
-            )
-        })?;
-        println!(
-            "package={} exchangeReplayPhase={phase} hardwareTest=PASS",
-            arguments.package.display()
-        );
+        execute_exchange_replay(&arguments, &replay, &bootloader)?;
         return Ok(());
     }
     let application = Application::read(
@@ -921,6 +937,58 @@ fn retry_after_reset<T>(sdk: &Path, mut attempt: impl FnMut() -> Result<T>) -> R
         }
         Err(error) => Err(error),
     }
+}
+
+fn execute_exchange_replay(
+    arguments: &Arguments,
+    replay: &exchange_stress::PhaseReplayPackage,
+    bootloader: &Path,
+) -> Result<()> {
+    write_package(&replay.application, &arguments.package)?;
+    let configuration = fs::read(&arguments.configuration)
+        .with_context(|| format!("read {}", arguments.configuration.display()))?;
+    let bootloader_bytes =
+        fs::read(bootloader).with_context(|| format!("read {}", bootloader.display()))?;
+    retry_after_reset(&arguments.sdk, || {
+        let runtime = open_and_load_once(
+            &arguments.device,
+            &configuration,
+            &replay.application,
+            &bootloader_bytes,
+            replay.application.host_exchange.startup_mark,
+        )?;
+        let mut session = runtime.host_session(&replay.application)?;
+        session.start()?;
+        let mut serviced = false;
+        let executed = session
+            .invoke_streaming_deferred_with_poll("run", &[0; 4], |device| {
+                replay
+                    .service_readback(device, arguments.exchange_replay_samples, &mut serviced)
+                    .map_err(|error| DriverError::Invalid(error.to_string()))
+            })
+            .inspect_err(|error| {
+                tracing::error!(
+                    %error,
+                    device = %device_failure_diagnostics(&runtime, &replay.application),
+                    "exchange replay failed"
+                );
+            })?;
+        if !serviced {
+            bail!("exchange replay completed without reaching its readback trap");
+        }
+        let _ = session.collect(&executed)?;
+        diagnose_completion(
+            &runtime,
+            &replay.application,
+            Duration::from_secs(arguments.timeout_seconds),
+        )
+    })?;
+    println!(
+        "package={} exchangeReplayPhase={} hardwareTest=PASS",
+        arguments.package.display(),
+        replay.phase
+    );
+    Ok(())
 }
 
 fn run_gemm(

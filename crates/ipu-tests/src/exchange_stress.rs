@@ -2,19 +2,18 @@ use anyhow::{Context, Result, bail};
 use ipu_codegen::{
     CheckpointStep, CompiledPackage, ComputeStep, ExchangeActivity, ExchangeActivityKind,
     ExchangeStep, PlacedExchangeRow, StepProfile, TileAddress, TileProgram, TileProgramData,
-    TileStep, build_tile_program_package, compact_exchange_row_address, inactive_exchange_program,
+    TileStep, build_tile_program_package, inactive_exchange_program,
 };
 use ipu_driver::{Device, TileException};
 use ipu_elf::Toolchain;
 use ipu_exchange::{
     MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming, Topology, encode_exchange_delay,
-    encode_exchange_delay_pic, encode_exchange_delay_xpic, finalize_point_receiver,
-    patch_receiver_address, patch_sender_address, patch_sender_address_64,
-    scheduled_receiver_timing, set_sender_control, timed_idle_program,
+    finalize_point_receiver, patch_receiver_address, patch_sender_address,
+    scheduled_receiver_timing,
 };
 use ipu_package::{Application, Binding, RegionSlice};
 use ipu_runtime::Runtime;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const DATA_BASE: u32 = 0x60000;
@@ -67,7 +66,7 @@ pub(crate) struct StressPackage {
 
 pub(crate) struct PhaseReplayPackage {
     pub application: Application,
-    phase: usize,
+    pub phase: usize,
     expected: Vec<ExpectedSpan>,
     activities: Vec<Vec<ExchangeActivity>>,
     initial_origins: BTreeMap<u32, Vec<(u16, u32)>>,
@@ -75,26 +74,44 @@ pub(crate) struct PhaseReplayPackage {
 
 pub(crate) fn build_wide(
     active_tiles: u16,
+    first_case: u32,
     cases: u32,
+    words: u32,
     validate: bool,
     receiver_mask: u8,
     explicit_config: bool,
     all_active: bool,
+    receiver_pairs: u16,
+    source: u16,
+    first_destination: u16,
     toolchain: &Toolchain,
     runtime_source: &Path,
 ) -> Result<StressPackage> {
     if active_tiles < 4 {
         bail!("the paired 64-bit exchange matrix requires at least four active tiles");
     }
-    if !(1..=16).contains(&cases) {
-        bail!("the paired 64-bit exchange matrix supports 1..=16 cases");
+    if cases == 0 || first_case >= 16 || first_case + cases > 16 {
+        bail!("the paired 64-bit exchange matrix selects cases from 0..16");
     }
     if receiver_mask > 0b11 {
         bail!("paired 64-bit receiver mask must fit in two bits");
     }
+    let destination_end = first_destination.saturating_add(receiver_pairs.saturating_mul(2));
+    if receiver_pairs == 0
+        || source >= active_tiles
+        || (source ^ 1) >= active_tiles
+        || first_destination & 1 != 0
+        || destination_end > active_tiles
+        || (first_destination..destination_end).contains(&source)
+        || (first_destination..destination_end).contains(&(source ^ 1))
+    {
+        bail!("paired 64-bit diagnostic has invalid source or receiver-pair tiles");
+    }
     let topology = Topology::c600();
     let execution_tiles = u16::try_from(topology.tile_count())?;
-    let words = 128u32;
+    if words < 128 || words & 1 != 0 || words / 2 > ipu_exchange::MAX_TRANSFER_WORDS {
+        bail!("paired 64-bit exchange payload must contain 128..=8296 even u32 words");
+    }
     let items = words / 2;
     let payload = (0..words)
         .map(|word| 0x6400_0000 ^ word.wrapping_mul(0x9e37_79b9))
@@ -113,6 +130,8 @@ pub(crate) fn build_wide(
     let mut transfers = Vec::new();
     let mut diagnostic_rows = Vec::new();
     let mut readbacks = Vec::new();
+    let mut initialized = BTreeSet::new();
+    let mut validated = BTreeSet::new();
     let mut row_address = WIDE_ROW_BASE;
     let setup_row = vec![
         ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION,
@@ -173,10 +192,10 @@ pub(crate) fn build_wide(
         .iter()
         .enumerate()
         .flat_map(|(region, bases)| (0..4).map(move |bank_case| (region * 4 + bank_case, bases)))
+        .skip(usize::try_from(first_case)?)
         .take(usize::try_from(cases)?)
     {
-        let source = 0u16;
-        let destinations = [2u16, 3u16];
+        let destinations = (first_destination..destination_end).collect::<Vec<_>>();
         let bank_case = case & 3;
         let source_element_size = if source_base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE {
             ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
@@ -191,46 +210,47 @@ pub(crate) fn build_wide(
             };
         let source_bank_offset = (u32::try_from(bank_case)? >> 1) * source_element_size;
         let destination_bank_offset = (u32::try_from(bank_case)? & 1) * destination_element_size;
-        let case_offset = u32::try_from(case)? * 0x400;
-        let source_address = source_base + case_offset + source_bank_offset;
-        let destination_address = destination_base + case_offset + destination_bank_offset;
+        let payload_stride = (words * 4 + 7) & !7;
+        let region_slot = u32::try_from(case / 8)?;
+        if (region_slot + 1) * payload_stride > source_element_size.min(destination_element_size) {
+            bail!(
+                "paired exchange bank matrix payloads do not fit within their selected memory elements"
+            );
+        }
+        let region_offset = region_slot * payload_stride;
+        let source_address = source_base + region_offset + source_bank_offset;
+        let destination_address = destination_base + region_offset + destination_bank_offset;
 
-        let mut plan = topology.multicast(source, &destinations, items, 0)?;
-        set_sender_control(
-            &mut plan.sender,
-            topology.paired_send_control(source, destinations[0])?,
-        )?;
-        patch_sender_address_64(&mut plan.sender, source_address)?;
+        let mut plan = topology.paired_multicast(source, &destinations, items)?;
+        patch_sender_address(&mut plan.sender, source_address)?;
         for row in &mut plan.receivers {
             patch_receiver_address(row, destination_address)?;
         }
         let mut builder = PhaseProgramBuilder::new(execution_tiles);
-        let timing = builder.append_transfer_at(source, &destinations, &plan, 0, items)?;
+        let paired_source = topology.paired_logical(source)?;
+        let schedule_offset = builder.earliest_transfer_offset(
+            source,
+            &[paired_source],
+            &destinations,
+            &plan,
+            items,
+            0,
+        )?;
+        let timing = builder.append_transfer_at(
+            source,
+            &[paired_source],
+            &destinations,
+            &plan,
+            schedule_offset,
+            items,
+        )?;
         let phase = builder.finish()?;
         let mut rows = phase.programs;
-        let paired_source = topology.paired_logical(source)?;
-        rows[usize::from(paired_source)] = Some(timed_idle_program(timing.payload_end)?);
-        let source_physical = u32::from(topology.physical(source)?);
-        let destination_word = destination_address >> 2;
-        rows[usize::from(destinations[0])] = Some(vec![
-            encode_exchange_delay_xpic(0, 1, source_physical),
-            encode_exchange_delay_pic(52, 1, 1),
-            encode_exchange_delay_pic(1, 0, destination_word),
-            encode_exchange_delay_xpic(8, 1, ipu_exchange::TILE_MUX_EXCHANGE),
-            encode_exchange_delay_pic(52, 1, 0),
-            ipu_exchange::RETURN_M10_INSTRUCTION,
-        ]);
-        rows[usize::from(destinations[1])] = Some(vec![
-            encode_exchange_delay_pic(53, 1, 1),
-            encode_exchange_delay_pic(1, 0, destination_word),
-            encode_exchange_delay_pic(61, 1, 0),
-            ipu_exchange::RETURN_M10_INSTRUCTION,
-        ]);
         for row in rows.iter_mut().flatten() {
             row.insert(0, ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
         }
         for (index, &destination) in destinations.iter().enumerate() {
-            if receiver_mask & (1 << index) == 0 {
+            if receiver_mask & (1 << (index & 1)) == 0 {
                 rows[usize::from(destination)] = None;
             }
         }
@@ -282,7 +302,11 @@ pub(crate) fn build_wide(
                     preserve_base_registers: true,
                     incoming_mux: None,
                     incoming_format: if receiving && explicit_config {
-                        topology.paired_receive_format(tile, source)?
+                        if topology.paired_receiver_is_early(tile, source)? {
+                            1
+                        } else {
+                            2
+                        }
                     } else {
                         0
                     },
@@ -299,12 +323,14 @@ pub(crate) fn build_wide(
                     profile: StepProfile::default(),
                 }));
         }
-        data.push(TileProgramData {
-            tile: source,
-            address: source_address,
-            data: payload_bytes.clone(),
-        });
-        if validate {
+        if initialized.insert((source, source_address)) {
+            data.push(TileProgramData {
+                tile: source,
+                address: source_address,
+                data: payload_bytes.clone(),
+            });
+        }
+        if validate && validated.insert((source, source_address)) {
             readbacks.push(ExpectedSpan {
                 tile: source,
                 address: source_address,
@@ -312,16 +338,21 @@ pub(crate) fn build_wide(
             });
         }
         for &tile in &destinations {
-            data.push(TileProgramData {
-                tile,
-                address: destination_address,
-                data: vec![0; payload_bytes.len()],
-            });
+            if initialized.insert((tile, destination_address)) {
+                data.push(TileProgramData {
+                    tile,
+                    address: destination_address,
+                    data: vec![0; payload_bytes.len()],
+                });
+            }
             let receiver_index = destinations
                 .iter()
                 .position(|candidate| *candidate == tile)
                 .expect("destination comes from receiver pair");
-            if validate && receiver_mask & (1 << receiver_index) != 0 {
+            if validate
+                && receiver_mask & (1 << (receiver_index & 1)) != 0
+                && validated.insert((tile, destination_address))
+            {
                 readbacks.push(ExpectedSpan {
                     tile,
                     address: destination_address,
@@ -612,13 +643,14 @@ pub(crate) fn build(
             let requested_schedule_offset = schedule_offset.unwrap_or(0);
             let schedule_offset = builder.earliest_transfer_offset(
                 source,
+                &[],
                 &destinations,
                 &plan,
                 words,
                 requested_schedule_offset,
             )?;
             let timing = builder
-                .append_transfer_at(source, &destinations, &plan, schedule_offset, words)
+                .append_transfer_at(source, &[], &destinations, &plan, schedule_offset, words)
                 .with_context(|| {
                     format!(
                         "case {case} cannot encode transfer {source} -> {destinations:?} at schedule offset {schedule_offset}"
@@ -776,6 +808,42 @@ pub(crate) fn build_phase_replay(
         .exchange_phases
         .get(phase_index)
         .with_context(|| format!("exchange phase {phase_index} is out of range"))?;
+    build_physical_phase_replay(phase, phase_index, toolchain, runtime_source)
+}
+
+pub(crate) fn build_schedule_phase_replay(
+    snapshot: &ipu_codegen::ExchangeScheduleSnapshot,
+    phase_index: usize,
+    first_transfer: usize,
+    transfer_limit: Option<usize>,
+    toolchain: &Toolchain,
+    runtime_source: &Path,
+) -> Result<PhaseReplayPackage> {
+    let mut problem = snapshot
+        .phases
+        .get(phase_index)
+        .with_context(|| format!("exchange phase {phase_index} is out of range"))?
+        .clone();
+    if first_transfer > problem.transfers.len() {
+        bail!("--exchange-replay-first-transfer is beyond the selected phase");
+    }
+    problem.transfers.drain(..first_transfer);
+    if let Some(limit) = transfer_limit {
+        if limit == 0 {
+            bail!("--exchange-replay-transfer-limit must be nonzero");
+        }
+        problem.transfers.truncate(limit);
+    }
+    let scheduled = ipu_codegen::schedule_exchange_problem(snapshot.tile_count, &problem)?;
+    build_physical_phase_replay(&scheduled.phase, phase_index, toolchain, runtime_source)
+}
+
+fn build_physical_phase_replay(
+    phase: &ipu_codegen::PhysicalExchangePhase,
+    phase_index: usize,
+    toolchain: &Toolchain,
+    runtime_source: &Path,
+) -> Result<PhaseReplayPackage> {
     let topology = Topology::c600();
     let execution_tiles = u16::try_from(topology.tile_count())?;
     let scheduled_tiles = u16::try_from(phase.programs.len())?;
@@ -803,13 +871,7 @@ pub(crate) fn build_phase_replay(
             } else {
                 inactive_exchange_program()
             };
-            let row_address = compact_exchange_row_address(
-                &compiled.exchange_phases,
-                tile,
-                scheduled_tiles,
-                compiled.exchange_code_base,
-                phase.id,
-            )?;
+            let row_address = ROW_BASE;
             Ok(TileProgram {
                 tile,
                 steps: vec![

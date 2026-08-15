@@ -165,7 +165,7 @@ pub struct ExchangeLoweringOptions {
     pub diagnostics: bool,
 }
 
-pub const EXCHANGE_SCHEDULE_SNAPSHOT_VERSION: u32 = 2;
+pub const EXCHANGE_SCHEDULE_SNAPSHOT_VERSION: u32 = 3;
 
 /// Address-resolved transfers captured immediately before physical scheduling.
 /// Replaying this data exercises the production scheduler and exchange-row
@@ -191,6 +191,31 @@ pub struct ExchangeScheduleTransfer {
     pub source_addresses: Vec<u32>,
     pub destinations: Vec<ExchangeScheduleDestination>,
     pub words: u32,
+    pub width: ExchangeItemWidth,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExchangeItemWidth {
+    #[default]
+    Word32,
+    Paired64,
+}
+
+impl ExchangeItemWidth {
+    fn item_words(self) -> u32 {
+        match self {
+            Self::Word32 => 1,
+            Self::Paired64 => 2,
+        }
+    }
+
+    fn item_count(self, words: u32) -> Result<u32, ExchangeLoweringError> {
+        let item_words = self.item_words();
+        if words == 0 || words % item_words != 0 {
+            return Err(ExchangeLoweringError::UnalignedPayload);
+        }
+        Ok(words / item_words)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +340,7 @@ fn lower_static_exchanges(
                 .collect();
             let mut pending = coalesce_pending_transfers(pending);
             attach_repeat_source_addresses(&mut pending, &repeat_inputs, placement)?;
+            let pending = split_paired_transfers(pending, topology, program.tile_count)?;
             let schedule_problem = schedule_problem(phase.id.index(), &pending);
             let (receive_counts, incoming_bases) =
                 receive_configuration(&pending, program.tile_count)?;
@@ -660,6 +686,8 @@ fn prepare_transfer(
             source_addresses: vec![source_address],
             source_elements: effective_memory_elements(source_address, chunk_bytes / 4),
             words: chunk_bytes / 4,
+            width: ExchangeItemWidth::Word32,
+            reserved_source: None,
         });
         source_offset += chunk_bytes;
         if source_offset == source_span.bytes {
@@ -875,15 +903,23 @@ struct PendingTransfer {
     source_addresses: Vec<u32>,
     source_elements: Vec<ExchangeMemoryElement>,
     words: u32,
+    width: ExchangeItemWidth,
+    reserved_source: Option<u16>,
 }
 
 impl PendingTransfer {
     fn tiles(&self) -> impl Iterator<Item = u16> + '_ {
-        std::iter::once(self.source).chain(self.destinations.iter().map(|entry| entry.0))
+        std::iter::once(self.source)
+            .chain(self.reserved_source)
+            .chain(self.destinations.iter().map(|entry| entry.0))
     }
 
     fn source_address(&self) -> u32 {
         self.source_addresses[0]
+    }
+
+    fn item_count(&self) -> Result<u32, ExchangeLoweringError> {
+        self.width.item_count(self.words)
     }
 
     fn refresh_source_elements(&mut self) {
@@ -926,6 +962,123 @@ fn attach_repeat_source_addresses(
     Ok(())
 }
 
+fn split_paired_transfers(
+    pending: Vec<PendingTransfer>,
+    topology: &Topology,
+    tile_count: u16,
+) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
+    let mut split = Vec::with_capacity(pending.len());
+    for transfer in pending {
+        if transfer.width != ExchangeItemWidth::Word32
+            || transfer.words < 128
+            || transfer
+                .source_addresses
+                .iter()
+                .any(|address| address & 0b111 != 0)
+        {
+            split.push(transfer);
+            continue;
+        }
+        let source_pair = topology.paired_logical(transfer.source)?;
+        if source_pair >= tile_count {
+            split.push(transfer);
+            continue;
+        }
+
+        let mut by_pair = BTreeMap::<u16, Vec<(u16, u32)>>::new();
+        for &(tile, address) in &transfer.destinations {
+            by_pair
+                .entry(topology.physical(tile)? & !2)
+                .or_default()
+                .push((tile, address));
+        }
+        let mut paired_destinations = Vec::new();
+        let mut ordinary_destinations = Vec::new();
+        for destinations in by_pair.into_values() {
+            let complete_pair = destinations.len() == 2
+                && topology.paired_logical(destinations[0].0)? == destinations[1].0;
+            let eligible = complete_pair
+                && destinations
+                    .iter()
+                    .all(|(tile, address)| *tile != source_pair && address & 0b111 == 0)
+                && destinations[0].1 == destinations[1].1;
+            if eligible {
+                paired_destinations.extend(destinations);
+            } else {
+                ordinary_destinations.extend(destinations);
+            }
+        }
+        if paired_destinations.is_empty() {
+            split.push(transfer);
+            continue;
+        }
+
+        let paired_words = transfer.words & !1;
+        let paired_tiles = paired_destinations
+            .iter()
+            .map(|&(tile, _)| tile)
+            .collect::<Vec<_>>();
+        if topology
+            .paired_multicast(transfer.source, &paired_tiles, paired_words / 2)
+            .is_err()
+        {
+            split.push(transfer);
+            continue;
+        }
+        if !ordinary_destinations.is_empty() {
+            let mut ordinary = transfer.clone();
+            ordinary.destinations = ordinary_destinations;
+            ordinary.width = ExchangeItemWidth::Word32;
+            ordinary.reserved_source = None;
+            ordinary.refresh_source_elements();
+            split.push(ordinary);
+        }
+        let mut paired = transfer.clone();
+        paired.destinations = paired_destinations.clone();
+        paired.words = paired_words;
+        paired.width = ExchangeItemWidth::Paired64;
+        paired.reserved_source = Some(source_pair);
+        paired.refresh_source_elements();
+        split.push(paired);
+        if paired_words != transfer.words {
+            let byte_offset = paired_words
+                .checked_mul(4)
+                .ok_or(ExchangeLoweringError::Overflow)?;
+            let mut remainder = transfer;
+            remainder.source_offset = remainder
+                .source_offset
+                .checked_add(byte_offset)
+                .ok_or(ExchangeLoweringError::Overflow)?;
+            remainder.source_addresses = remainder
+                .source_addresses
+                .iter()
+                .map(|address| {
+                    address
+                        .checked_add(byte_offset)
+                        .ok_or(ExchangeLoweringError::Overflow)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            remainder.destinations = paired_destinations
+                .into_iter()
+                .map(|(tile, address)| {
+                    Ok((
+                        tile,
+                        address
+                            .checked_add(byte_offset)
+                            .ok_or(ExchangeLoweringError::Overflow)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
+            remainder.words -= paired_words;
+            remainder.width = ExchangeItemWidth::Word32;
+            remainder.reserved_source = None;
+            remainder.refresh_source_elements();
+            split.push(remainder);
+        }
+    }
+    Ok(split)
+}
+
 fn schedule_problem(phase: u32, pending: &[PendingTransfer]) -> ExchangeScheduleProblem {
     ExchangeScheduleProblem {
         phase,
@@ -940,6 +1093,7 @@ fn schedule_problem(phase: u32, pending: &[PendingTransfer]) -> ExchangeSchedule
                     .map(|&(tile, address)| ExchangeScheduleDestination { tile, address })
                     .collect(),
                 words: transfer.words,
+                width: transfer.width,
             })
             .collect(),
     }
@@ -966,6 +1120,14 @@ fn pending_from_problem(
                     problem.phase, transfer.words
                 )));
             }
+            if transfer.width == ExchangeItemWidth::Paired64
+                && (transfer.words < 128 || transfer.words & 1 != 0)
+            {
+                return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+                    "phase {} transfer {index} has invalid {}-word paired payload",
+                    problem.phase, transfer.words
+                )));
+            }
             if transfer.source_addresses.is_empty() {
                 return Err(ExchangeLoweringError::InvalidSnapshot(format!(
                     "phase {} transfer {index} has no source addresses",
@@ -977,7 +1139,11 @@ fn pending_from_problem(
                 .checked_mul(4)
                 .ok_or(ExchangeLoweringError::Overflow)?;
             for &address in &transfer.source_addresses {
-                if address & 0b11 != 0 {
+                let alignment_mask = match transfer.width {
+                    ExchangeItemWidth::Word32 => 0b11,
+                    ExchangeItemWidth::Paired64 => 0b111,
+                };
+                if address & alignment_mask != 0 {
                     return Err(ExchangeLoweringError::InvalidSnapshot(format!(
                         "phase {} transfer {index} has unaligned source address {address:#x}",
                         problem.phase
@@ -1007,7 +1173,11 @@ fn pending_from_problem(
                             problem.phase, destination.tile
                         )));
                     }
-                    if destination.address & 0b11 != 0 {
+                    let alignment_mask = match transfer.width {
+                        ExchangeItemWidth::Word32 => 0b11,
+                        ExchangeItemWidth::Paired64 => 0b111,
+                    };
+                    if destination.address & alignment_mask != 0 {
                         return Err(ExchangeLoweringError::InvalidSnapshot(format!(
                             "phase {} transfer {index} has unaligned destination address {:#x}",
                             problem.phase, destination.address
@@ -1030,6 +1200,13 @@ fn pending_from_problem(
                 source_addresses: transfer.source_addresses.clone(),
                 source_elements: Vec::new(),
                 words: transfer.words,
+                width: transfer.width,
+                reserved_source: match transfer.width {
+                    ExchangeItemWidth::Word32 => None,
+                    ExchangeItemWidth::Paired64 => {
+                        Some(Topology::c600().paired_logical(transfer.source)?)
+                    }
+                },
             };
             pending.refresh_source_elements();
             Ok(pending)
@@ -1278,6 +1455,12 @@ pub fn validate_exchange_schedule(
         .iter()
         .map(|transfer| vec![0usize; transfer.destinations.len()])
         .collect::<Vec<_>>();
+    let reserved_paired_sources = problem
+        .transfers
+        .iter()
+        .filter(|transfer| transfer.width == ExchangeItemWidth::Paired64)
+        .map(|transfer| Topology::c600().paired_logical(transfer.source))
+        .collect::<Result<BTreeSet<_>, _>>()?;
     for tile in 0..size {
         let decoded = ipu_exchange::diagnostic::diagnose_plan_program(&phase.programs[tile], None)?;
         if decoded.event_cycles != phase.tile_event_cycles[tile] {
@@ -1286,7 +1469,9 @@ pub fn validate_exchange_schedule(
                 problem.phase, decoded.event_cycles, phase.tile_event_cycles[tile]
             )));
         }
-        let expected_active = !phase.activities[tile].is_empty();
+        let tile_u16 = u16::try_from(tile).map_err(|_| ExchangeLoweringError::Overflow)?;
+        let expected_active =
+            !phase.activities[tile].is_empty() || reserved_paired_sources.contains(&tile_u16);
         if phase.active[tile] != expected_active
             || phase.active[tile] != (phase.tile_event_cycles[tile] != 0)
         {
@@ -1424,6 +1609,7 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
         let previous_bytes = previous.words * 4;
         let combined_words = previous.words.checked_add(transfer.words);
         let contiguous = previous.source == transfer.source
+            && previous.width == transfer.width
             && previous.source_shard == transfer.source_shard
             && previous
                 .source_offset
@@ -1487,8 +1673,9 @@ impl<'a> TransferScheduler<'a> {
     fn new(transfers: &'a [PendingTransfer], tile_count: u16) -> Self {
         let mut word_pressure = vec![0u64; usize::from(tile_count)];
         for transfer in transfers {
+            let items = u64::from(transfer.item_count().unwrap_or(transfer.words));
             for tile in transfer.tiles() {
-                word_pressure[usize::from(tile)] += u64::from(transfer.words);
+                word_pressure[usize::from(tile)] += items;
             }
         }
 
@@ -1527,7 +1714,7 @@ impl<'a> TransferScheduler<'a> {
             earliest_start: Reverse(earliest_start),
             endpoint_pressure,
             fanout: transfer.destinations.len(),
-            words: transfer.words,
+            words: transfer.item_count().unwrap_or(transfer.words),
             source: Reverse(transfer.source),
             index: Reverse(index),
         });
@@ -1542,6 +1729,10 @@ impl<'a> TransferScheduler<'a> {
                 .chain(std::iter::once(
                     tile_availability[usize::from(transfer.source)].send,
                 ))
+                .chain(transfer.reserved_source.into_iter().map(|tile| {
+                    let availability = tile_availability[usize::from(tile)];
+                    availability.send.max(availability.receive)
+                }))
                 .chain(
                     transfer
                         .destinations
@@ -1657,6 +1848,7 @@ struct ScheduledTransfer<'a> {
     source_address: u32,
     source_elements: &'a [ExchangeMemoryElement],
     words: u32,
+    width: ExchangeItemWidth,
     schedule_offset: u32,
 }
 
@@ -1735,6 +1927,10 @@ impl MaterializedSchedule {
             transfer.source,
             self.tile_availability[usize::from(transfer.source)].send,
         ))
+        .chain(transfer.reserved_source.into_iter().map(|tile| {
+            let availability = self.tile_availability[usize::from(tile)];
+            (tile, availability.send.max(availability.receive))
+        }))
         .chain(
             transfer
                 .destinations
@@ -1750,6 +1946,15 @@ impl MaterializedSchedule {
         };
         let predecessor = if blocking_tile == transfer.source {
             last_transfer[usize::from(blocking_tile)].send
+        } else if transfer.reserved_source == Some(blocking_tile) {
+            let predecessor = last_transfer[usize::from(blocking_tile)];
+            if self.tile_availability[usize::from(blocking_tile)].send
+                >= self.tile_availability[usize::from(blocking_tile)].receive
+            {
+                predecessor.send
+            } else {
+                predecessor.receive
+            }
         } else {
             last_transfer[usize::from(blocking_tile)].receive
         };
@@ -1764,6 +1969,7 @@ impl MaterializedSchedule {
                 source_address: transfer.source_address(),
                 source_elements: &transfer.source_elements,
                 words: transfer.words,
+                width: transfer.width,
                 schedule_offset: latest_availability,
             },
             &mut self.builder,
@@ -1819,6 +2025,12 @@ impl MaterializedSchedule {
             });
         }
         self.tile_availability[usize::from(transfer.source)].send = timing.sender_end;
+        if let Some(tile) = transfer.reserved_source {
+            self.tile_availability[usize::from(tile)].send = timing.sender_memory_end;
+            self.tile_availability[usize::from(tile)].receive = timing.sender_memory_end;
+            last_transfer[usize::from(tile)].send = Some(index);
+            last_transfer[usize::from(tile)].receive = Some(index);
+        }
         for (&(tile, _), &receiver_end) in transfer.destinations.iter().zip(&timing.receiver_ends) {
             self.tile_availability[usize::from(tile)].receive = receiver_end;
         }
@@ -1915,9 +2127,14 @@ fn endpoint_work_lower_bound(pending: &[PendingTransfer], tile_count: u16) -> u3
     let mut send_words = vec![0u64; usize::from(tile_count)];
     let mut receive_words = vec![0u64; usize::from(tile_count)];
     for transfer in pending {
-        send_words[usize::from(transfer.source)] += u64::from(transfer.words);
+        let items = u64::from(transfer.item_count().unwrap_or(transfer.words));
+        send_words[usize::from(transfer.source)] += items;
+        if let Some(tile) = transfer.reserved_source {
+            send_words[usize::from(tile)] += items;
+            receive_words[usize::from(tile)] += items;
+        }
         for &(tile, _) in &transfer.destinations {
-            receive_words[usize::from(tile)] += u64::from(transfer.words);
+            receive_words[usize::from(tile)] += items;
         }
     }
     send_words
@@ -1952,6 +2169,11 @@ fn repair_ready(
 ) -> RepairReady {
     let transfer = &pending[index];
     let earliest_start = std::iter::once(availability[usize::from(transfer.source)].send)
+        .chain(transfer.reserved_source.into_iter().map(|tile| {
+            availability[usize::from(tile)]
+                .send
+                .max(availability[usize::from(tile)].receive)
+        }))
         .chain(
             transfer
                 .destinations
@@ -2043,8 +2265,9 @@ fn critical_neighborhood_order(
     let epoch_width = pending.len().isqrt().max(1);
     let mut word_pressure = vec![0u64; usize::from(tile_count)];
     for transfer in pending {
+        let items = u64::from(transfer.item_count().unwrap_or(transfer.words));
         for tile in transfer.tiles() {
-            word_pressure[usize::from(tile)] += u64::from(transfer.words);
+            word_pressure[usize::from(tile)] += items;
         }
     }
     let mut availability = vec![TileAvailability::default(); usize::from(tile_count)];
@@ -2083,11 +2306,16 @@ fn critical_neighborhood_order(
         }
         let transfer = &pending[index];
         let start = candidate.earliest_start.0;
-        let end = match start.checked_add(transfer.words) {
+        let items = transfer.item_count().unwrap_or(transfer.words);
+        let end = match start.checked_add(items) {
             Some(end) => end,
             None => return incumbent.order.clone(),
         };
         availability[usize::from(transfer.source)].send = end;
+        if let Some(tile) = transfer.reserved_source {
+            availability[usize::from(tile)].send = end;
+            availability[usize::from(tile)].receive = end;
+        }
         let bytes = match transfer.words.checked_mul(4) {
             Some(bytes) => bytes,
             None => return incumbent.order.clone(),
@@ -2098,7 +2326,7 @@ fn critical_neighborhood_order(
         }
         for tile in transfer.tiles() {
             word_pressure[usize::from(tile)] =
-                word_pressure[usize::from(tile)].saturating_sub(u64::from(transfer.words));
+                word_pressure[usize::from(tile)].saturating_sub(u64::from(items));
         }
         order.push(index);
         for dependent in std::mem::take(&mut dependents[index]) {
@@ -2138,18 +2366,28 @@ fn append_transfer(
         source_address,
         source_elements,
         words,
+        width,
         schedule_offset: requested_offset,
     } = transfer;
     if words == 0 || source_elements.is_empty() {
         return Err(ExchangeLoweringError::UnalignedPayload);
     }
     let tiles = destinations.iter().map(|entry| entry.0).collect::<Vec<_>>();
-    let point_receiver = destinations.first().is_some_and(|&(tile, address)| {
-        destinations.len() == 1
-            && receive_counts[usize::from(tile)] == 1
-            && incoming_bases[usize::from(tile)] == address
-    });
-    let mut plan = if point_receiver {
+    let item_count = width.item_count(words)?;
+    let reserved_tile = match width {
+        ExchangeItemWidth::Word32 => None,
+        ExchangeItemWidth::Paired64 => Some(topology.paired_logical(source)?),
+    };
+    let reserved_tiles = reserved_tile.as_slice();
+    let point_receiver = width == ExchangeItemWidth::Word32
+        && destinations.first().is_some_and(|&(tile, address)| {
+            destinations.len() == 1
+                && receive_counts[usize::from(tile)] == 1
+                && incoming_bases[usize::from(tile)] == address
+        });
+    let mut plan = if width == ExchangeItemWidth::Paired64 {
+        topology.paired_multicast(source, &tiles, item_count)?
+    } else if point_receiver {
         let point = topology.point_to_point(source, tiles[0], words)?;
         MulticastPlan {
             sender: point.sender,
@@ -2159,7 +2397,7 @@ fn append_transfer(
             )?],
         }
     } else {
-        topology.multicast(source, &tiles, words, 0)?
+        topology.multicast(source, &tiles, item_count, 0)?
     };
     patch_sender_address(&mut plan.sender, source_address)?;
     if !point_receiver {
@@ -2170,9 +2408,16 @@ fn append_transfer(
     let mut schedule_offset = requested_offset;
     loop {
         let previous = schedule_offset;
-        schedule_offset =
-            builder.earliest_transfer_offset(source, &tiles, &plan, words, schedule_offset)?;
-        let timing = builder.transfer_timing_at(source, &tiles, &plan, schedule_offset, words)?;
+        schedule_offset = builder.earliest_transfer_offset(
+            source,
+            reserved_tiles,
+            &tiles,
+            &plan,
+            item_count,
+            schedule_offset,
+        )?;
+        let timing =
+            builder.transfer_timing_at(source, &tiles, &plan, schedule_offset, item_count)?;
         let receiver_intervals = timing
             .receiver_payload_starts
             .iter()
@@ -2194,7 +2439,14 @@ fn append_transfer(
             break;
         }
     }
-    let timing = builder.append_transfer_at(source, &tiles, &plan, schedule_offset, words)?;
+    let timing = builder.append_transfer_at(
+        source,
+        reserved_tiles,
+        &tiles,
+        &plan,
+        schedule_offset,
+        item_count,
+    )?;
     Ok(ScheduledTransferTiming {
         start: timing.payload_start,
         end: timing
@@ -2352,6 +2604,7 @@ mod tests {
                             })
                             .collect(),
                         words: random.u32(1..=64),
+                        width: ExchangeItemWidth::Word32,
                     }
                 })
                 .collect();
@@ -2367,6 +2620,110 @@ mod tests {
                 first.neighborhood_improvements,
                 second.neighborhood_improvements
             );
+        }
+    }
+
+    #[test]
+    fn randomized_eligible_physical_pairs_use_double_width_transfers() {
+        let topology = Topology::c600();
+        let tile_count = topology.tile_count() as u16;
+        let all_pairs = (0..tile_count)
+            .filter_map(|tile| {
+                let paired = topology.paired_logical(tile).ok()?;
+                (tile < paired).then_some([tile, paired])
+            })
+            .collect::<Vec<_>>();
+        let mut random = fastrand::Rng::with_seed(0x7769_6465_7061_6972);
+
+        for case in 0..128 {
+            let source = random.u16(0..tile_count);
+            let source_pair = topology.paired_logical(source).unwrap();
+            let mut candidates = all_pairs
+                .iter()
+                .copied()
+                .filter(|pair| !pair.contains(&source) && !pair.contains(&source_pair))
+                .collect::<Vec<_>>();
+            random.shuffle(&mut candidates);
+            let pair_count = random.usize(1..=candidates.len().min(16));
+            let destination_base = if case & 1 == 0 { 0x1_8000 } else { 0x4_4000 };
+            let destinations = candidates[..pair_count]
+                .iter()
+                .enumerate()
+                .flat_map(|(index, pair)| {
+                    let address = destination_base + (index as u32) * 0x200;
+                    pair.map(|tile| (tile, address))
+                })
+                .collect::<Vec<_>>();
+            let words = random.u32(128..=1024);
+            let source_address = if random.bool() { 0x1_0000 } else { 0x4_2000 };
+            let original = PendingTransfer {
+                source,
+                source_shard: LowShardId::from_index(u32::from(source)),
+                source_offset: random.u32(0..16) * 8,
+                destinations: destinations.clone(),
+                source_addresses: vec![source_address],
+                source_elements: effective_memory_elements(source_address, words),
+                words,
+                width: ExchangeItemWidth::Word32,
+                reserved_source: None,
+            };
+            let paired_tiles = destinations
+                .iter()
+                .map(|&(tile, _)| tile)
+                .collect::<Vec<_>>();
+            let paired_is_encodable = topology
+                .paired_multicast(source, &paired_tiles, (words & !1) / 2)
+                .is_ok();
+            let split =
+                split_paired_transfers(vec![original.clone()], &topology, tile_count).unwrap();
+            if !paired_is_encodable {
+                assert_eq!(split.len(), 1);
+                assert_eq!(split[0].width, ExchangeItemWidth::Word32);
+                assert_eq!(split[0].words, words);
+                continue;
+            }
+            let paired = split
+                .iter()
+                .find(|transfer| transfer.width == ExchangeItemWidth::Paired64)
+                .expect("eligible transfer must have a double-width part");
+            assert_eq!(paired.source, source);
+            assert_eq!(paired.reserved_source, Some(source_pair));
+            assert_eq!(paired.words, words & !1);
+            let mut paired_destinations = paired.destinations.clone();
+            paired_destinations.sort_unstable();
+            let mut expected_destinations = destinations.clone();
+            expected_destinations.sort_unstable();
+            assert_eq!(paired_destinations, expected_destinations);
+            assert_eq!(paired.source_addresses, original.source_addresses);
+
+            let remainder_words = split
+                .iter()
+                .filter(|transfer| transfer.width == ExchangeItemWidth::Word32)
+                .map(|transfer| transfer.words)
+                .sum::<u32>();
+            assert_eq!(paired.words + remainder_words, words);
+            assert_eq!(split.len(), if words & 1 == 0 { 1 } else { 2 });
+            if let Some(remainder) = split
+                .iter()
+                .find(|transfer| transfer.width == ExchangeItemWidth::Word32)
+            {
+                assert_eq!(remainder.words, 1);
+                let mut remainder_destinations = remainder.destinations.clone();
+                remainder_destinations.sort_unstable();
+                let expected_remainder_destinations = expected_destinations
+                    .iter()
+                    .map(|&(tile, address)| (tile, address + paired.words * 4))
+                    .collect::<Vec<_>>();
+                assert_eq!(remainder_destinations, expected_remainder_destinations);
+                assert_eq!(
+                    remainder.source_addresses[0],
+                    source_address + paired.words * 4
+                );
+                assert_eq!(
+                    remainder.source_offset,
+                    original.source_offset + paired.words * 4
+                );
+            }
         }
     }
 
@@ -2396,6 +2753,8 @@ mod tests {
                         source_addresses: vec![0],
                         source_elements: effective_memory_elements(0, words),
                         words,
+                        width: ExchangeItemWidth::Word32,
+                        reserved_source: None,
                     }
                 })
                 .collect::<Vec<_>>();
