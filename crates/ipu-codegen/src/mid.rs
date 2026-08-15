@@ -5007,8 +5007,11 @@ fn parallel_reduction_candidates_for_orientation(
                 }
             }
             let mut layout_variants = Vec::new();
-            for result_layout in result_layout_variants {
-                layout_variants.push(result_layout.clone());
+            for mut result_layout in result_layout_variants {
+                let (physical_row_axis, physical_rows, physical_left_index) = match orientation {
+                    GemmOrientation::Normal => (TensorAxis::FromEnd(2), normal_rows, 0),
+                    GemmOrientation::Swapped => (TensorAxis::FromEnd(1), normal_columns, 1),
+                };
                 let result_rows = result_layout
                     .output
                     .format
@@ -5016,17 +5019,23 @@ fn parallel_reduction_candidates_for_orientation(
                     .tiling
                     .axes
                     .iter()
-                    .find(|axis| axis.axis == TensorAxis::FromEnd(2))
+                    .find(|axis| axis.axis == physical_row_axis)
                     .map_or(row_partitions, |axis| axis.partitions);
-                if orientation == GemmOrientation::Normal
-                    && normal_rows % 2 != 0
-                    && u32::from(result_rows) <= normal_rows.div_ceil(2)
-                {
-                    let mut padded = result_layout;
-                    pad_matrix_rows_to_f16_exchange_word(&mut padded.inputs[0].format.layout);
-                    pad_matrix_rows_to_f16_exchange_word(&mut padded.output.format.layout);
-                    layout_variants.push(padded);
+                // Exchange moves whole 32-bit words. Give every F16 shard an
+                // even physical-row grain rather than allowing a later layout
+                // conversion to discover an unsendable two-byte tail.
+                if u32::from(result_rows) > physical_rows.div_ceil(2) {
+                    continue;
                 }
+                pad_axis_to_f16_exchange_word(
+                    &mut result_layout.inputs[physical_left_index].format.layout,
+                    physical_row_axis,
+                );
+                pad_axis_to_f16_exchange_word(
+                    &mut result_layout.output.format.layout,
+                    physical_row_axis,
+                );
+                layout_variants.push(result_layout);
             }
             for layout_variant in layout_variants {
                 for &local_staging in local_staging_options {
@@ -5260,16 +5269,16 @@ fn balance_parallel_gemm_columns(layout: &mut Layout, axis: TensorAxis) {
     }
 }
 
-fn pad_matrix_rows_to_f16_exchange_word(layout: &mut Layout) {
-    if let Some(rows) = layout
+fn pad_axis_to_f16_exchange_word(layout: &mut Layout, axis: TensorAxis) {
+    if let Some(tiling) = layout
         .tiling
         .axes
         .iter_mut()
-        .find(|axis| axis.axis == TensorAxis::FromEnd(2))
+        .find(|tiling| tiling.axis == axis)
     {
-        rows.block_size = rows.block_size.div_ceil(2) * 2;
-        rows.padding_multiple = rows.padding_multiple.div_ceil(2) * 2;
-        rows.padding = Padding::Zero;
+        tiling.block_size = tiling.block_size.div_ceil(2) * 2;
+        tiling.padding_multiple = tiling.padding_multiple.div_ceil(2) * 2;
+        tiling.padding = Padding::Zero;
     }
 }
 

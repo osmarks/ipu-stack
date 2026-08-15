@@ -962,6 +962,26 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
         crate::GemmOrientation::Normal => (first, second),
         crate::GemmOrientation::Swapped => (second, first),
     };
+    if let GemmDistribution::ParallelReduction {
+        row_partitions,
+        column_partitions,
+        ..
+    } = distribution
+    {
+        // The parallel dispatch grid contains a K axis which is deliberately
+        // absent from `compute_output`: every K group produces a partial with
+        // the same logical output extent. Consequently, matching operand and
+        // partial-output tile numbers cannot determine locality. The physical
+        // left operand is replicated across output-column groups and the
+        // physical right operand across output-row groups; only a shortfall in
+        // those explicit replica counts creates operator-internal traffic.
+        return Some(parallel_gemm_operand_traffic(
+            left,
+            *column_partitions,
+            right,
+            *row_partitions,
+        ));
+    }
     let left_rank = left.shape.0.len();
     let right_rank = right.shape.0.len();
     let output_rank = compute_output.shape.0.len();
@@ -980,13 +1000,6 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
         crate::GemmOrientation::Normal => (output_rank - 2, output_rank - 1),
         crate::GemmOrientation::Swapped => (output_rank - 1, output_rank - 2),
     };
-    let parallel_inner = matches!(distribution, GemmDistribution::ParallelReduction { .. });
-    let inner_plan = parallel_inner
-        .then(|| tile_axis_plan(left, left_inner_axis))
-        .flatten();
-    if parallel_inner && inner_plan.is_none() {
-        return None;
-    }
     let output_plans = (0..output_rank)
         .map(|axis| tile_axis_plan(compute_output, axis))
         .collect::<Option<Vec<_>>>()?;
@@ -1008,8 +1021,8 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
     let mut left_is_remote = false;
     let mut right_is_remote = false;
     for tile in 0..compute_output.format.layout.tiling.tile_count {
-        let left_remote = left_plan.remote_bytes(tile, &output_plans, inner_plan)?;
-        let right_remote = right_plan.remote_bytes(tile, &output_plans, inner_plan)?;
+        let left_remote = left_plan.remote_bytes(tile, &output_plans, None)?;
+        let right_remote = right_plan.remote_bytes(tile, &output_plans, None)?;
         left_is_remote |= left_remote != 0;
         right_is_remote |= right_remote != 0;
         maximum_incoming_bytes =
@@ -1024,6 +1037,37 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
         maximum_incoming_fragments: maximum_incoming_bytes
             .div_ceil(u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4),
     })
+}
+
+fn parallel_gemm_operand_traffic(
+    left: &TensorType,
+    left_required_replicas: u16,
+    right: &TensorType,
+    right_required_replicas: u16,
+) -> ExchangeEndpointTraffic {
+    let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
+    let mut traffic = ExchangeEndpointTraffic::default();
+    for (operand, required_replicas) in [
+        (left, left_required_replicas),
+        (right, right_required_replicas),
+    ] {
+        if operand.format.layout.tiling.replicas >= required_replicas {
+            continue;
+        }
+        let incoming = maximum_shard_bytes(operand);
+        let outgoing =
+            incoming.saturating_mul(u64::from(operand.format.layout.tiling.tile_count.min(2)));
+        traffic.maximum_incoming_bytes = traffic.maximum_incoming_bytes.saturating_add(incoming);
+        traffic.maximum_outgoing_bus_bytes =
+            traffic.maximum_outgoing_bus_bytes.saturating_add(outgoing);
+        traffic.maximum_incoming_fragments = traffic
+            .maximum_incoming_fragments
+            .saturating_add(incoming.div_ceil(transfer_bytes));
+        traffic.maximum_outgoing_bus_fragments = traffic
+            .maximum_outgoing_bus_fragments
+            .saturating_add(outgoing.div_ceil(transfer_bytes));
+    }
+    traffic
 }
 
 struct GemmOperandTrafficPlan<'a> {
@@ -1187,6 +1231,26 @@ mod tests {
         }
     }
 
+    fn parallel_reduction_dispatch(
+        row_partitions: u16,
+        column_partitions: u16,
+        inner_partitions: u16,
+    ) -> OperatorDispatch {
+        let mut dispatch = output_stationary_dispatch();
+        let OperatorDispatch::BlockedGemm { distribution, .. } = &mut dispatch else {
+            unreachable!();
+        };
+        *distribution = GemmDistribution::ParallelReduction {
+            row_partitions,
+            column_partitions,
+            inner_partitions,
+            result_row_partitions: 1,
+            result_column_partitions: 1,
+            reduction_staging: crate::ReductionStaging::Streamed,
+        };
+        dispatch
+    }
+
     #[test]
     fn randomized_average_shard_storage_covers_spatial_work() {
         let mut random = fastrand::Rng::with_seed(0x7370_6174_6961_6c77);
@@ -1297,6 +1361,93 @@ mod tests {
                 remote
                     .maximum_outgoing_bus_bytes
                     .max(remote.maximum_incoming_bytes),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn randomized_parallel_gemm_traffic_tracks_replica_shortfalls() {
+        let mut random = fastrand::Rng::with_seed(0x7265_706c_6963_6173);
+        for case in 0..32 {
+            let row_partitions = random.u16(2..=5);
+            let column_partitions = random.u16(2..=5);
+            let inner_partitions = random.u16(2..=5);
+            let tiles = row_partitions * column_partitions * inner_partitions;
+            let inner_block = 16 * random.u16(1..=4);
+            let column_block = 16 * random.u32(1..=4);
+            let rows = u32::from(row_partitions) * random.u32(1..=8);
+            let inner = u32::from(inner_partitions) * u32::from(inner_block);
+            let columns = u32::from(column_partitions) * column_block;
+            let left = TensorType::new(
+                [1, rows, inner],
+                Precision::F16,
+                Layout::amp_left_parallel_grid(
+                    inner_block,
+                    tiles,
+                    row_partitions,
+                    column_partitions,
+                    inner_partitions,
+                ),
+            );
+            let resident_right = TensorType::new(
+                [1, inner, columns],
+                Precision::F16,
+                Layout::block_major_matrix_storage(
+                    inner_block,
+                    column_block,
+                    column_partitions,
+                    inner_partitions,
+                    row_partitions,
+                    MemoryClass::Ipu21Standard,
+                ),
+            );
+            let compute_output = TensorType::new(
+                [1, rows, columns],
+                Precision::F16,
+                Layout::amp_left_result_grid(
+                    column_block,
+                    row_partitions * column_partitions,
+                    row_partitions,
+                    column_partitions,
+                    crate::mid::GridOrder::ColumnsFast,
+                ),
+            );
+            let dispatch =
+                parallel_reduction_dispatch(row_partitions, column_partitions, inner_partitions);
+            let resident = gemm_exchange_endpoint_traffic(
+                &dispatch,
+                &[left.clone(), resident_right],
+                &compute_output,
+            )
+            .unwrap();
+            assert!(resident.is_empty(), "case {case}");
+
+            let sharded_right = TensorType::new(
+                [1, inner, columns],
+                Precision::F16,
+                Layout::block_major_matrix_storage(
+                    inner_block,
+                    column_block,
+                    column_partitions,
+                    inner_partitions,
+                    1,
+                    MemoryClass::Ipu21Standard,
+                ),
+            );
+            let expected_incoming = maximum_shard_bytes(&sharded_right);
+            let expected_outgoing = expected_incoming.saturating_mul(u64::from(
+                sharded_right.format.layout.tiling.tile_count.min(2),
+            ));
+            let streamed =
+                gemm_exchange_endpoint_traffic(&dispatch, &[left, sharded_right], &compute_output)
+                    .unwrap();
+            assert_eq!(
+                streamed.maximum_incoming_bytes, expected_incoming,
+                "case {case}"
+            );
+            assert_eq!(
+                streamed.maximum_outgoing_bus_bytes, expected_outgoing,
                 "case {case}"
             );
         }

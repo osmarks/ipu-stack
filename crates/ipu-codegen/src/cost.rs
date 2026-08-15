@@ -298,12 +298,12 @@ fn exchange_endpoint_cycles(traffic: ExchangeEndpointTraffic, phases: u64) -> u6
     traffic
         .maximum_payload_bytes()
         .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+        .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles))
         .saturating_add(
-            phases.saturating_mul(
-                IPU21_TARGET_COSTS
-                    .exchange_phase_cycles
-                    .saturating_add(IPU21_TARGET_COSTS.exchange_transfer_cycles),
-            ),
+            traffic
+                .maximum_fragments()
+                .max(phases)
+                .saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles),
         )
 }
 
@@ -777,20 +777,15 @@ impl CostModel for Ipu21CostModel {
                 } else {
                     u64::MAX / 8
                 };
-                let result_remap = (compute_output.format.layout != output.format.layout)
-                    .then(|| {
-                        exchange_endpoint_cycles(
-                            tensor_transition_endpoint_traffic(&compute_output, output),
-                            1,
-                        )
-                    })
+                let result_copy = (compute_output.format.layout != output.format.layout)
+                    .then(|| standard_to_interleaved_copy_cycles(maximum_shard_bytes(output)))
                     .unwrap_or(0);
                 kernel
                     .saturating_add(standard_source_owner_penalty)
                     .saturating_add(packing)
                     .saturating_add(local_staging)
                     .saturating_add(exchange)
-                    .saturating_add(result_remap)
+                    .saturating_add(result_copy)
                     .saturating_add(capacity_penalty)
             }
             MidOperator::FlashAttention { .. } => {
@@ -1005,6 +1000,19 @@ impl CostModel for Ipu21CostModel {
         from: &Layout,
         to: &Layout,
     ) -> RearrangementCost {
+        if strategy == ConversionStrategy::StageLogicalThenTransform
+            && from.order != ElementOrder::RowMajor
+            && to.order != ElementOrder::RowMajor
+        {
+            // This strategy receives into row-major destination staging. It
+            // does not yet pack a permuted source locally, so a non-row-major
+            // source can expose sub-word logical spans which the exchange
+            // hardware cannot send. Do not price an unmaterializable plan.
+            return RearrangementCost {
+                cycles: u64::MAX / 8,
+                exchange_row_bytes: u64::MAX / 8,
+            };
+        }
         let Some(traffic) = conversion_traffic(shape, precision, from, to) else {
             return RearrangementCost {
                 cycles: u64::MAX / 8,
@@ -1097,11 +1105,14 @@ mod tests {
                 maximum_outgoing_bus_fragments: random.u64(1..=256),
                 maximum_incoming_fragments: random.u64(1..=256),
             };
-            let fixed = phases.saturating_mul(
-                IPU21_TARGET_COSTS
-                    .exchange_phase_cycles
-                    .saturating_add(IPU21_TARGET_COSTS.exchange_transfer_cycles),
-            );
+            let fixed = phases
+                .saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles)
+                .saturating_add(
+                    traffic
+                        .maximum_fragments()
+                        .max(phases)
+                        .saturating_mul(IPU21_TARGET_COSTS.exchange_transfer_cycles),
+                );
             let cycles = exchange_endpoint_cycles(traffic, phases);
             assert_eq!(
                 cycles.saturating_sub(fixed),
