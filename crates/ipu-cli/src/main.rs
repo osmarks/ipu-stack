@@ -108,6 +108,9 @@ enum Command {
         /// Restrict matches to samples active at this normalized cycle offset.
         #[arg(long)]
         at_offset: Option<u64>,
+        /// Preserve device-wide sample offsets instead of aligning program entry per tile.
+        #[arg(long)]
+        shared_clock: bool,
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long)]
@@ -322,6 +325,7 @@ fn main() -> Result<()> {
             phase,
             samples,
             at_offset,
+            shared_clock,
             limit,
             json,
         } => {
@@ -354,6 +358,7 @@ fn main() -> Result<()> {
                     tiles: tile.into_iter().collect::<BTreeSet<_>>(),
                     phases: phase.into_iter().collect::<BTreeSet<_>>(),
                     at_offset,
+                    shared_clock,
                     limit: (limit != 0).then_some(limit),
                     sample_limit: samples,
                     ..Query::default()

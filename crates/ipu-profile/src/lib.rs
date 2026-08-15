@@ -52,6 +52,9 @@ pub struct Query {
     pub metadata: Vec<MetadataFilter>,
     pub metadata_key: Option<String>,
     pub at_offset: Option<u64>,
+    /// Preserve the device-wide cycle origin instead of aligning each tile's
+    /// first recorded sample to zero.
+    pub shared_clock: bool,
     pub limit: Option<usize>,
     pub sample_limit: usize,
 }
@@ -378,12 +381,17 @@ struct Candidate<'a> {
 
 pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
     let sample_count = report.tiles.iter().map(|tile| tile.samples.len()).sum();
-    let base = cycle_origin(report);
+    let shared_base = cycle_origin(report);
     let profile_span_cycles = report
         .tiles
         .iter()
         .filter_map(|tile| {
-            tile.samples.first()?;
+            let first = tile.samples.first()?;
+            let base = if query.shared_clock {
+                shared_base
+            } else {
+                first.start_cycle
+            };
             tile.samples
                 .iter()
                 .map(|sample| {
@@ -398,6 +406,13 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
     let mut matched_sample_count = 0;
 
     for tile in &report.tiles {
+        let base = if query.shared_clock {
+            shared_base
+        } else {
+            tile.samples
+                .first()
+                .map_or(shared_base, |sample| sample.start_cycle)
+        };
         for sample in &tile.samples {
             let offset = u64::from(sample.start_cycle.wrapping_sub(base));
             let sample_duration = duration(sample);
@@ -727,6 +742,73 @@ mod tests {
     }
 
     #[test]
+    fn randomized_queries_align_only_initial_tile_offsets() {
+        let mut random = fastrand::Rng::with_seed(0x7072_6f67_7261_6d);
+        for case in 0..64 {
+            let tile_count = random.usize(2..=32);
+            let starts = (0..tile_count)
+                .map(|_| random.u32(1_000..=10_000))
+                .collect::<Vec<_>>();
+            let waits = (0..tile_count)
+                .map(|_| random.u32(1..=2_000))
+                .collect::<Vec<_>>();
+            let work = random.u32(1..=2_000);
+            let report = ProfileReport {
+                clock_hz: 1_000_000_000,
+                tiles: starts
+                    .iter()
+                    .zip(&waits)
+                    .enumerate()
+                    .map(|(tile, (&start, &wait))| TileProfile {
+                        physical_tile: tile as u32,
+                        samples: vec![
+                            sample(0, ProfileStepKind::Synchronization, "", start, start + wait),
+                            sample(
+                                1,
+                                ProfileStepKind::Compute,
+                                "work",
+                                start + wait,
+                                start + wait + work,
+                            ),
+                        ],
+                    })
+                    .collect(),
+            };
+            let aligned = query(
+                &report,
+                &Query {
+                    group_by: GroupBy::Kind,
+                    ..Query::default()
+                },
+            );
+            let shared = query(
+                &report,
+                &Query {
+                    shared_clock: true,
+                    ..Query::default()
+                },
+            );
+
+            let longest_wait = u64::from(*waits.iter().max().unwrap());
+            assert_eq!(
+                aligned.profile_span_cycles,
+                longest_wait + u64::from(work),
+                "case {case}"
+            );
+            assert!(
+                shared.profile_span_cycles >= aligned.profile_span_cycles,
+                "case {case}"
+            );
+            let sync = aligned
+                .groups
+                .iter()
+                .find(|group| group.name == "synchronization")
+                .unwrap();
+            assert_eq!(sync.maximum_cycles, longest_wait as u32, "case {case}");
+        }
+    }
+
+    #[test]
     fn phase_cycles_include_sequential_repeated_operations() {
         let report = ProfileReport {
             clock_hz: 1_000_000_000,
@@ -780,6 +862,7 @@ mod tests {
             &Query {
                 kind: Some(StepKind::Compute),
                 sample_limit: 2,
+                shared_clock: true,
                 ..Query::default()
             },
         );
