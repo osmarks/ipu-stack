@@ -208,7 +208,7 @@ for (const tile of DATA.tiles) {
     exchangeActivities: activitySets[activities],
   }));
 }
-const state = { query: "", kind: "all", focus: null, time: null, viewStart: 0, viewEnd: null, timelineRowHeight: 1, cropInitialEntry: true };
+const state = { query: "", kind: "all", focus: null, time: null, viewStart: 0, viewEnd: null, timelineRowHeight: 1, cropInitialEntry: true, timelineOrigin: 0 };
 const flame = document.getElementById("flame");
 const overview = document.getElementById("overview");
 const timeline = document.getElementById("timeline");
@@ -231,6 +231,7 @@ function setTimelineStart(cropInitialEntry) {
   const origin = cropInitialEntry
     ? tiles.reduce((latest, tile) => Math.max(latest, tile.samples[0]?.rawOffset || 0), 0)
     : 0;
+  state.timelineOrigin = origin;
   for (const tile of tiles) {
     for (const sample of tile.samples) {
       const rawEnd = sample.rawOffset + sample.rawDuration;
@@ -264,8 +265,6 @@ let flameHits = [];
 let drag = null;
 const zoomHistory = [];
 let flameTotal = 0;
-document.getElementById("stats").textContent =
-  `${DATA.tileCount} tiles, ${DATA.sampleCount} samples, ${formatRangeValue(0, fullEnd())} range, ${formatHz(DATA.clockHz)}`;
 
 function formatHz(hz) {
   if (!hz) return "clock unknown";
@@ -284,6 +283,13 @@ function formatRange(sample) {
 }
 function formatRangeValue(start, end) {
   return `${formatOffset(start)} / ${formatOffset(end)}`;
+}
+function updateStats() {
+  const view = currentView();
+  const start = state.timelineOrigin + view.start;
+  const end = state.timelineOrigin + view.end;
+  document.getElementById("stats").textContent =
+    `${DATA.tileCount} tiles, ${DATA.sampleCount} samples, ${formatRangeValue(start, end)} selected range, ${formatCount(end - start)} cycles, ${formatHz(DATA.clockHz)}`;
 }
 function metadataEntries(sample) {
   return Array.isArray(sample.metadata) ? sample.metadata.filter(entry => entry.name || entry.value) : [];
@@ -820,6 +826,7 @@ function render() {
   drawOverview();
   drawTimeline();
   drawDetails();
+  updateStats();
 }
 function timelineHit(event) {
   const rect = timeline.getBoundingClientRect();
