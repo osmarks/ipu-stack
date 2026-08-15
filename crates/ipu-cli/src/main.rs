@@ -242,7 +242,7 @@ fn main() -> Result<()> {
             let samples: usize = report.tiles.iter().map(|tile| tile.samples.len()).sum();
             let exchange = exchange_activity_summary(&report);
             println!(
-                "clockHz={} tiles={} samples={} exchangeSamples={} describedExchangeSamples={} sendIntervals={} receiveIntervals={} estimatedSendWorkCycles={} estimatedReceiveWorkCycles={} estimatedExchangeIdleWorkCycles={} measuredExchangePhaseCycles={} scheduledExchangeEventCycles={} exchangeArrivalWaitCycles={} exchangePhaseBoundaryCycles={}",
+                "clockHz={} tiles={} samples={} exchangeSamples={} describedExchangeSamples={} sendIntervals={} receiveIntervals={} estimatedSendWorkCycles={} estimatedReceiveWorkCycles={} estimatedSimultaneousWorkCycles={} estimatedExchangeIdleWorkCycles={} measuredExchangePhaseCycles={} scheduledExchangeEventCycles={} exchangeArrivalWaitCycles={} exchangePhaseBoundaryCycles={}",
                 report.clock_hz,
                 report.tiles.len(),
                 samples,
@@ -252,6 +252,7 @@ fn main() -> Result<()> {
                 exchange.receive_intervals,
                 exchange.estimated_send_work_cycles,
                 exchange.estimated_receive_work_cycles,
+                exchange.estimated_simultaneous_work_cycles,
                 exchange.estimated_idle_work_cycles,
                 exchange.measured_phase_cycles,
                 exchange.scheduled_event_cycles,

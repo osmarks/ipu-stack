@@ -157,6 +157,7 @@ canvas {
         <span class="legend-item"><span class="legend-swatch" style="background:#cf3f4a"></span>compute (kernel-tinted)</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#17854c"></span>send</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#287db2"></span>receive</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:#6b5596"></span>simultaneous send/receive</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#8ebeb4"></span>exchange idle (estimated)</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#c58b24"></span>sync</span>
       </div>
@@ -216,6 +217,7 @@ const colors = {
   exchange: "#17854c",
   send: "#17854c",
   receive: "#287db2",
+  sendReceive: "#6b5596",
   exchangeIdle: "#8ebeb4",
   compute: "#cf3f4a",
   synchronization: "#c58b24",
@@ -354,21 +356,35 @@ function displaySegments(sample) {
   if (sample.offset < exchangeStart) {
     segments.push({ kind: "synchronization", start: sample.offset, end: exchangeStart });
   }
-  const activities = sample.exchangeActivities
-    .map(activity => ({
-      kind: activity.kind,
-      start: Math.max(exchangeStart, Math.min(exchangeEnd, (bounds?.eventStart ?? sample.offset) + activity.start)),
-      end: Math.max(exchangeStart, Math.min(exchangeEnd, (bounds?.eventStart ?? sample.offset) + activity.end)),
-    }))
-    .filter(activity => activity.end > activity.start)
-    .sort((a, b) => a.start - b.start || a.end - b.end);
-  let cursor = exchangeStart;
-  for (const activity of activities) {
-    if (activity.start > cursor) segments.push({ kind: "exchangeIdle", start: cursor, end: activity.start });
-    segments.push(activity);
-    cursor = Math.max(cursor, activity.end);
+  const events = [];
+  for (const activity of sample.exchangeActivities) {
+    const start = Math.max(exchangeStart, Math.min(exchangeEnd, (bounds?.eventStart ?? sample.offset) + activity.start));
+    const end = Math.max(exchangeStart, Math.min(exchangeEnd, (bounds?.eventStart ?? sample.offset) + activity.end));
+    if (end <= start) continue;
+    const send = activity.kind === "send" ? 1 : 0;
+    const receive = activity.kind === "receive" ? 1 : 0;
+    events.push({ time: start, send, receive });
+    events.push({ time: end, send: -send, receive: -receive });
   }
-  if (cursor < exchangeEnd) segments.push({ kind: "exchangeIdle", start: cursor, end: exchangeEnd });
+  events.sort((a, b) => a.time - b.time);
+  const activityKind = (send, receive) => {
+    if (send && receive) return "sendReceive";
+    if (send) return "send";
+    if (receive) return "receive";
+    return "exchangeIdle";
+  };
+  let cursor = exchangeStart, send = 0, receive = 0, event = 0;
+  while (event < events.length) {
+    const time = events[event].time;
+    if (time > cursor) segments.push({ kind: activityKind(send, receive), start: cursor, end: time });
+    while (event < events.length && events[event].time === time) {
+      send += events[event].send;
+      receive += events[event].receive;
+      event++;
+    }
+    cursor = time;
+  }
+  if (cursor < exchangeEnd) segments.push({ kind: activityKind(send, receive), start: cursor, end: exchangeEnd });
   if (exchangeEnd < sampleEnd) {
     segments.push({ kind: "synchronization", start: exchangeEnd, end: sampleEnd });
   }
@@ -582,7 +598,7 @@ function drawOverview() {
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, width, height);
-  const kinds = ["compute", "send", "receive", "exchangeIdle", "exchange", "synchronization", "idle"];
+  const kinds = ["compute", "send", "receive", "sendReceive", "exchangeIdle", "exchange", "synchronization", "idle"];
   const deltas = Object.fromEntries(kinds.map(kind => [kind, new Float64Array(width + 1)]));
   const edges = Object.fromEntries(kinds.map(kind => [kind, new Float64Array(width)]));
   const scale = width / maxEnd;
@@ -725,6 +741,7 @@ function drawDetails() {
       compute: 0,
       send: 0,
       receive: 0,
+      sendReceive: 0,
       exchangeIdle: 0,
       exchange: 0,
       synchronization: 0,
