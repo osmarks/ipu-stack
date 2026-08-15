@@ -586,6 +586,12 @@ impl LoweringState {
                             (loads.into_iter().max().unwrap_or(u64::MAX), offset)
                         })
                         .ok_or(LowLoweringError::EmptyTileGroup)?;
+                    tracing::debug!(
+                        ?placement_group,
+                        offset,
+                        shards = parameter_shard_bytes.len(),
+                        "assigned parameter storage group to tiles"
+                    );
                     parameter_offsets.insert(placement_group, offset);
                     offset
                 }
