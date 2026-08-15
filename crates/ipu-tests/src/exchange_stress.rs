@@ -1,12 +1,14 @@
 use anyhow::{Context, Result, bail};
 use ipu_codegen::{
-    ComputeStep, ExchangeStep, PlacedExchangeRow, StepProfile, TileAddress, TileProgram,
-    TileProgramData, TileStep, build_tile_program_package, inactive_exchange_program,
+    CheckpointStep, CompiledPackage, ComputeStep, ExchangeActivity, ExchangeActivityKind,
+    ExchangeStep, PlacedExchangeRow, StepProfile, TileAddress, TileProgram, TileProgramData,
+    TileStep, build_tile_program_package, compact_exchange_row_address, inactive_exchange_program,
 };
+use ipu_driver::{Device, TileException};
 use ipu_elf::Toolchain;
 use ipu_exchange::{
-    MulticastPlan, PhaseProgramBuilder, Topology, finalize_point_receiver, patch_receiver_address,
-    patch_sender_address, scheduled_receiver_timing,
+    MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming, Topology, finalize_point_receiver,
+    patch_receiver_address, patch_sender_address, scheduled_receiver_timing,
 };
 use ipu_package::Application;
 use ipu_runtime::Runtime;
@@ -27,6 +29,17 @@ struct Transfer {
     source_address: u32,
     destination_addresses: Vec<u32>,
     words: u32,
+    requested_schedule_offset: u32,
+    schedule_offset: u32,
+    timing: PhaseTransferTiming,
+}
+
+#[derive(Clone, Debug)]
+struct TransferSpec {
+    source: u16,
+    destinations: Vec<u16>,
+    words: u32,
+    schedule_offset: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +57,42 @@ pub(crate) struct StressPackage {
     rows: Vec<StressRow>,
 }
 
+pub(crate) struct PhaseReplayPackage {
+    pub application: Application,
+    phase: usize,
+    expected: Vec<ExpectedSpan>,
+    activities: Vec<Vec<ExchangeActivity>>,
+    initial_origins: BTreeMap<u32, Vec<(u16, u32)>>,
+}
+
+#[derive(Clone, Debug)]
+struct ExpectedSpan {
+    tile: u16,
+    address: u32,
+    words: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct ReplayTransfer {
+    send: ExchangeActivity,
+    receives: Vec<(u16, ExchangeActivity)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReplayEvent {
+    Receive {
+        transfer: u32,
+        tile: u16,
+        address: u32,
+    },
+    Send {
+        transfer: u32,
+        tile: u16,
+        address: u32,
+        words: u32,
+    },
+}
+
 #[derive(Clone, Debug)]
 struct StressRow {
     address: u32,
@@ -58,12 +107,16 @@ pub(crate) fn build(
     maximum_words: u32,
     maximum_transfers: u32,
     maximum_compute_delay: u32,
+    overlap_sweep: bool,
     toolchain: &Toolchain,
     runtime_source: &Path,
 ) -> Result<StressPackage> {
     let maximum_tiles = Topology::c600().tile_count();
     if active_tiles < 2 || usize::from(active_tiles) > maximum_tiles {
         bail!("exchange stress requires 2..={maximum_tiles} active tiles");
+    }
+    if overlap_sweep && active_tiles < 3 {
+        bail!("the exchange overlap sweep requires at least three active tiles");
     }
     if cases == 0 {
         bail!("--exchange-cases must be nonzero");
@@ -91,15 +144,21 @@ pub(crate) fn build(
     let mut phase_rows = Vec::with_capacity(cases as usize);
     let mut diagnostic_rows = Vec::with_capacity(cases as usize);
     let mut row_address = ROW_BASE;
-    let mut previous_shape: Option<Vec<(u16, Vec<u16>, u32)>> = None;
+    let mut previous_shape: Option<Vec<TransferSpec>> = None;
 
     for case in 0..cases {
         let mut tiles = (0..active_tiles).collect::<Vec<_>>();
         rng.shuffle(&mut tiles);
-        let group_tiles = rng.usize(2..=8).min(tiles.len());
+        let group_tiles = if overlap_sweep {
+            3
+        } else {
+            rng.usize(2..=8).min(tiles.len())
+        };
         let group = &tiles[..group_tiles];
-        let contiguous_receiver = (case == 0).then_some(group[0]);
-        let shape = if let Some(receiver) = contiguous_receiver {
+        let contiguous_receiver = (!overlap_sweep && case == 0).then_some(group[0]);
+        let shape = if overlap_sweep {
+            overlap_specs(&topology, case, &group[..3], maximum_words, &mut rng)?
+        } else if let Some(receiver) = contiguous_receiver {
             let sources = group
                 .iter()
                 .copied()
@@ -110,13 +169,19 @@ pub(crate) fn build(
             (0..usize::try_from(maximum_transfers)?)
                 .map(|index| {
                     if index & 1 == 0 {
-                        (sources[(index / 2) % sources.len()], vec![receiver], words)
-                    } else {
-                        (
-                            receiver,
-                            vec![sources[(index / 2 + 1) % sources.len()]],
+                        TransferSpec {
+                            source: sources[(index / 2) % sources.len()],
+                            destinations: vec![receiver],
                             words,
-                        )
+                            schedule_offset: None,
+                        }
+                    } else {
+                        TransferSpec {
+                            source: receiver,
+                            destinations: vec![sources[(index / 2 + 1) % sources.len()]],
+                            words,
+                            schedule_offset: None,
+                        }
                     }
                 })
                 .collect::<Vec<_>>()
@@ -136,7 +201,12 @@ pub(crate) fn build(
                     .collect::<Vec<_>>();
                 rng.shuffle(&mut destinations);
                 destinations.truncate(rng.usize(1..=3).min(destinations.len()));
-                shape.push((source, destinations, random_words(&mut rng, maximum_words)));
+                shape.push(TransferSpec {
+                    source,
+                    destinations,
+                    words: random_words(&mut rng, maximum_words),
+                    schedule_offset: None,
+                });
             }
             previous_shape = Some(shape.clone());
             shape
@@ -145,7 +215,13 @@ pub(crate) fn build(
         };
         let mut builder = PhaseProgramBuilder::new(u16::try_from(topology.tile_count())?);
         let mut validators = BTreeMap::<u16, Vec<(u32, u32, u32)>>::new();
-        for (source, destinations, mut words) in shape {
+        for TransferSpec {
+            source,
+            destinations,
+            mut words,
+            schedule_offset,
+        } in shape
+        {
             let chained = (contiguous_receiver.is_none()
                 && !available_payloads[usize::from(source)].is_empty()
                 && rng.usize(0..4) == 0)
@@ -216,9 +292,21 @@ pub(crate) fn build(
             for (row, &address) in plan.receivers.iter_mut().zip(&destination_addresses) {
                 patch_receiver_address(row, address)?;
             }
-            let schedule_offset =
-                builder.earliest_transfer_offset(source, &destinations, &plan, words, 0)?;
-            builder.append_transfer_at(source, &destinations, &plan, schedule_offset, words)?;
+            let requested_schedule_offset = schedule_offset.unwrap_or(0);
+            let schedule_offset = builder.earliest_transfer_offset(
+                source,
+                &destinations,
+                &plan,
+                words,
+                requested_schedule_offset,
+            )?;
+            let timing = builder
+                .append_transfer_at(source, &destinations, &plan, schedule_offset, words)
+                .with_context(|| {
+                    format!(
+                        "case {case} cannot encode transfer {source} -> {destinations:?} at schedule offset {schedule_offset}"
+                    )
+                })?;
             for ((&tile, &destination), &expected) in destinations
                 .iter()
                 .zip(&destination_addresses)
@@ -244,6 +332,9 @@ pub(crate) fn build(
                 source_address,
                 destination_addresses,
                 words,
+                requested_schedule_offset,
+                schedule_offset,
+                timing,
             });
         }
         let rows = builder.finish()?.programs;
@@ -338,7 +429,8 @@ pub(crate) fn build(
         .collect::<Vec<_>>();
     let application = build_tile_program_package(&programs, &data, toolchain, runtime_source)?;
     eprintln!(
-        "exchangeStress seed={seed:#x} cases={cases} transfers={} activeTiles={active_tiles} maxWords={maximum_words} maxTransfers={maximum_transfers} maxComputeDelay={maximum_compute_delay}",
+        "exchangeStress seed={seed:#x} pattern={} cases={cases} transfers={} activeTiles={active_tiles} maxWords={maximum_words} maxTransfers={maximum_transfers} maxComputeDelay={maximum_compute_delay}",
+        if overlap_sweep { "overlap" } else { "random" },
         transfers.len(),
     );
     Ok(StressPackage {
@@ -347,6 +439,515 @@ pub(crate) fn build(
         transfers,
         rows: diagnostic_rows,
     })
+}
+
+pub(crate) fn build_phase_replay(
+    compiled: &CompiledPackage,
+    phase_index: usize,
+    toolchain: &Toolchain,
+    runtime_source: &Path,
+) -> Result<PhaseReplayPackage> {
+    let phase = compiled
+        .exchange_phases
+        .get(phase_index)
+        .with_context(|| format!("exchange phase {phase_index} is out of range"))?;
+    let topology = Topology::c600();
+    let execution_tiles = u16::try_from(topology.tile_count())?;
+    let scheduled_tiles = u16::try_from(phase.programs.len())?;
+    if phase.active.len() != usize::from(scheduled_tiles)
+        || phase.incoming_bases.len() != usize::from(scheduled_tiles)
+        || phase.activities.len() != usize::from(scheduled_tiles)
+    {
+        bail!("exchange phase {phase_index} has inconsistent per-tile metadata");
+    }
+    if phase
+        .repeat_patches
+        .iter()
+        .any(|patches| !patches.is_empty())
+    {
+        bail!(
+            "exchange phase {phase_index} uses repeat patches; replay a concrete iteration instead"
+        );
+    }
+
+    let programs = (0..execution_tiles)
+        .map(|tile| {
+            let scheduled = tile < scheduled_tiles;
+            let words = if scheduled {
+                phase.programs[usize::from(tile)].clone()
+            } else {
+                inactive_exchange_program()
+            };
+            let row_address = compact_exchange_row_address(
+                &compiled.exchange_phases,
+                tile,
+                scheduled_tiles,
+                compiled.exchange_code_base,
+                phase.id,
+            )?;
+            Ok(TileProgram {
+                tile,
+                steps: vec![
+                    TileStep::Exchange(ExchangeStep {
+                        active: scheduled && phase.active[usize::from(tile)],
+                        incoming_base: scheduled
+                            .then(|| phase.incoming_bases[usize::from(tile)])
+                            .unwrap_or(0),
+                        program: PlacedExchangeRow {
+                            address: row_address,
+                            words,
+                        },
+                        setup_patch: None,
+                        repeat_patches: Vec::new(),
+                        profile: StepProfile::default(),
+                    }),
+                    // A patched breakpoint immediately following the final
+                    // internal-exchange dispatch is not durable on IPU21.
+                    // Cross one ordinary worker-call boundary before trapping;
+                    // this occurs after the exchange epoch under test.
+                    TileStep::Compute(ComputeStep {
+                        symbol: "ipu_stack_static_worker_delay".into(),
+                        output_address: TileAddress::Absolute(DATA_BASE),
+                        input_addresses: vec![TileAddress::Absolute(DATA_BASE)],
+                        arguments: vec![1],
+                        profile: StepProfile::default(),
+                    }),
+                    TileStep::Checkpoint(CheckpointStep {
+                        operation: u32::try_from(phase_index)?,
+                        breakpoint: 0,
+                        profile: StepProfile::default(),
+                    }),
+                ],
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut transfers = BTreeMap::<
+        u32,
+        (
+            Option<(u16, ExchangeActivity)>,
+            Vec<(u16, ExchangeActivity)>,
+        ),
+    >::new();
+    let mut initial = vec![BTreeMap::<u32, u32>::new(); usize::from(scheduled_tiles)];
+    for (tile, activities) in phase.activities.iter().enumerate() {
+        let tile = u16::try_from(tile)?;
+        for &activity in activities {
+            if activity.address & 0b11 != 0 {
+                bail!(
+                    "phase {phase_index} transfer {} has unaligned address 0x{:x}",
+                    activity.transfer,
+                    activity.address
+                );
+            }
+            let transfer = transfers.entry(activity.transfer).or_default();
+            match activity.kind {
+                ExchangeActivityKind::Send => {
+                    if transfer.0.replace((tile, activity)).is_some() {
+                        bail!(
+                            "phase {phase_index} transfer {} has multiple senders",
+                            activity.transfer
+                        );
+                    }
+                }
+                ExchangeActivityKind::Receive => transfer.1.push((tile, activity)),
+            }
+            for word in 0..activity.words {
+                let address = activity
+                    .address
+                    .checked_add(word.checked_mul(4).context("activity offset overflow")?)
+                    .context("activity address overflow")?;
+                initial[usize::from(tile)]
+                    .entry(address)
+                    .or_insert_with(|| replay_word(tile, address));
+            }
+        }
+    }
+
+    let transfers = transfers
+        .into_iter()
+        .map(|(id, (send, receives))| {
+            let (source, send) =
+                send.with_context(|| format!("phase {phase_index} transfer {id} has no sender"))?;
+            if receives.is_empty() {
+                bail!("phase {phase_index} transfer {id} has no receivers");
+            }
+            if receives
+                .iter()
+                .any(|(_, receive)| receive.words != send.words)
+            {
+                bail!("phase {phase_index} transfer {id} has inconsistent word counts");
+            }
+            Ok((id, source, ReplayTransfer { send, receives }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut events = Vec::new();
+    for &(transfer, source, ref replay) in &transfers {
+        events.push((
+            replay.send.start_cycle,
+            1u8,
+            ReplayEvent::Send {
+                transfer,
+                tile: source,
+                address: replay.send.address,
+                words: replay.send.words,
+            },
+        ));
+        for &(tile, receive) in &replay.receives {
+            events.push((
+                receive.memory_end_cycle,
+                0u8,
+                ReplayEvent::Receive {
+                    transfer,
+                    tile,
+                    address: receive.address,
+                },
+            ));
+        }
+    }
+    events.sort_unstable_by_key(|&(cycle, order, _)| (cycle, order));
+
+    let mut expected_memory = initial.clone();
+    let mut payloads = BTreeMap::<u32, Vec<u32>>::new();
+    for (_, _, event) in events {
+        match event {
+            ReplayEvent::Send {
+                transfer,
+                tile,
+                address,
+                words,
+            } => {
+                let memory = &expected_memory[usize::from(tile)];
+                let payload = (0..words)
+                    .map(|word| {
+                        let address = address + word * 4;
+                        memory.get(&address).copied().with_context(|| {
+                            format!(
+                                "phase {phase_index} transfer {transfer} reads untracked tile {tile} address 0x{address:x}"
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                payloads.insert(transfer, payload);
+            }
+            ReplayEvent::Receive {
+                transfer,
+                tile,
+                address,
+            } => {
+                let payload = payloads.get(&transfer).with_context(|| {
+                    format!(
+                        "phase {phase_index} transfer {transfer} completes a receive before its send snapshot"
+                    )
+                })?;
+                let memory = &mut expected_memory[usize::from(tile)];
+                for (word, &value) in payload.iter().enumerate() {
+                    memory.insert(address + u32::try_from(word)? * 4, value);
+                }
+            }
+        }
+    }
+
+    let data = memory_spans(&initial)
+        .into_iter()
+        .map(|span| TileProgramData {
+            tile: span.tile,
+            address: span.address,
+            data: span.words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        })
+        .collect::<Vec<_>>();
+    let expected = memory_spans(&expected_memory);
+    let mut initial_origins = BTreeMap::<u32, Vec<(u16, u32)>>::new();
+    for (tile, memory) in initial.iter().enumerate() {
+        for (&address, &word) in memory {
+            initial_origins
+                .entry(word)
+                .or_default()
+                .push((u16::try_from(tile)?, address));
+        }
+    }
+    let application = build_tile_program_package(&programs, &data, toolchain, runtime_source)?;
+    let overlapping_tiles = phase
+        .activities
+        .iter()
+        .filter(|activities| {
+            activities.iter().any(|send| {
+                send.kind == ExchangeActivityKind::Send
+                    && activities.iter().any(|receive| {
+                        receive.kind == ExchangeActivityKind::Receive
+                            && send.start_cycle < receive.end_cycle
+                            && receive.start_cycle < send.end_cycle
+                    })
+            })
+        })
+        .count();
+    eprintln!(
+        "exchangeReplay phase={phase_index} transfers={} activeTiles={} overlappingTiles={} eventCycles={} touchedSpans={}",
+        transfers.len(),
+        phase.active.iter().filter(|&&active| active).count(),
+        overlapping_tiles,
+        phase.event_cycles,
+        expected.len(),
+    );
+    Ok(PhaseReplayPackage {
+        application,
+        phase: phase_index,
+        expected,
+        activities: phase.activities.clone(),
+        initial_origins,
+    })
+}
+
+impl PhaseReplayPackage {
+    pub(crate) fn service_readback(
+        &self,
+        device: &Device,
+        sample_limit: usize,
+        serviced: &mut bool,
+    ) -> Result<()> {
+        if *serviced {
+            return Ok(());
+        }
+        let topology = Topology::c600();
+        for tile in &self.application.tiles {
+            if device.tile_context_state(u16::try_from(tile.physical_tile)?, 0)? != 2 {
+                return Ok(());
+            }
+        }
+        for tile in &self.application.tiles {
+            let physical = u16::try_from(tile.physical_tile)?;
+            let status = device.read_tile_context_status(physical, 0)?;
+            let exception = TileException::from_status(status);
+            if exception != TileException::PatchedBreak0 {
+                bail!(
+                    "exchange replay phase {} tile {physical} stopped with {exception} (status {status:#x})",
+                    self.phase,
+                );
+            }
+        }
+        let samples = replay_samples(&self.expected, sample_limit);
+        let mut checked = 0usize;
+        for (tile, samples) in samples {
+            let physical = topology.physical(tile)?;
+            let addresses = samples
+                .iter()
+                .map(|&(address, _)| address)
+                .collect::<Vec<_>>();
+            let actual = device
+                .read_tile_words_at_addresses_from_inactive_context(physical, 1, &addresses)
+                .with_context(|| {
+                    format!(
+                        "read replay phase {} logical tile {} physical tile {} at {} sampled addresses",
+                        self.phase, tile, physical, addresses.len(),
+                    )
+                })?;
+            let differences = actual
+                .iter()
+                .zip(&samples)
+                .filter(|(actual, (_, expected))| **actual != *expected)
+                .take(16)
+                .map(|(&actual, &(address, expected))| {
+                    let roles = self.activities[usize::from(tile)]
+                        .iter()
+                        .filter(|activity| {
+                            let end = activity.address.saturating_add(activity.words * 4);
+                            (activity.address..end).contains(&address)
+                        })
+                        .map(|activity| {
+                            (
+                                activity.transfer,
+                                activity.kind,
+                                activity.start_cycle,
+                                activity.end_cycle,
+                                activity.memory_end_cycle,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let window = roles.iter().fold(None, |window, &(_, _, start, end, _)| {
+                        Some(window.map_or((start, end), |(first, last): (u32, u32)| {
+                            (first.min(start), last.max(end))
+                        }))
+                    });
+                    let concurrent = window.map_or_else(Vec::new, |(start, end)| {
+                        self.activities[usize::from(tile)]
+                            .iter()
+                            .filter(|activity| {
+                                activity.start_cycle < end && start < activity.end_cycle
+                            })
+                            .map(|activity| {
+                                (
+                                    activity.transfer,
+                                    activity.kind,
+                                    activity.start_cycle,
+                                    activity.end_cycle,
+                                    activity.address,
+                                    activity.words,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    let transfer_ids = roles
+                        .iter()
+                        .map(|&(transfer, ..)| transfer)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let transfer_ids_ref = &transfer_ids;
+                    let endpoints = self
+                        .activities
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(endpoint_tile, activities)| {
+                            activities.iter().filter_map(move |activity| {
+                                transfer_ids_ref.contains(&activity.transfer).then_some((
+                                    u16::try_from(endpoint_tile).unwrap(),
+                                    activity.transfer,
+                                    activity.kind,
+                                    activity.start_cycle,
+                                    activity.end_cycle,
+                                    activity.address,
+                                    activity.words,
+                                ))
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let endpoint_concurrent = endpoints
+                        .iter()
+                        .flat_map(|&(endpoint_tile, transfer, kind, start, end, _, _)| {
+                            self.activities[usize::from(endpoint_tile)]
+                                .iter()
+                                .filter(move |activity| {
+                                    activity.transfer != transfer
+                                        && activity.start_cycle < end
+                                        && start < activity.end_cycle
+                                })
+                                .map(move |activity| {
+                                    (
+                                        endpoint_tile,
+                                        kind,
+                                        transfer,
+                                        activity.transfer,
+                                        activity.kind,
+                                        activity.start_cycle,
+                                        activity.end_cycle,
+                                        activity.address,
+                                        activity.words,
+                                    )
+                                })
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        address,
+                        expected,
+                        actual,
+                        self.initial_origins.get(&expected),
+                        self.initial_origins.get(&actual),
+                        roles,
+                        concurrent,
+                        endpoints,
+                        endpoint_concurrent,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !differences.is_empty() {
+                bail!(
+                    "exchange replay phase {} corrupted logical tile {tile}: {differences:?}",
+                    self.phase,
+                );
+            }
+            checked += samples.len();
+        }
+        eprintln!("exchangeReplay phase={} sampledWords={checked}", self.phase);
+        const IPU21_NOP_INSTRUCTION: u32 = 0x19e0_0000;
+        for tile in &self.application.tiles {
+            let physical = u16::try_from(tile.physical_tile)?;
+            let pc = device.read_tile_program_counter(physical, 0)?;
+            device.write_tile_word_from_stopped_context(physical, 0, pc, IPU21_NOP_INSTRUCTION)?;
+            device.clear_tile_exception(physical, 0)?;
+        }
+        *serviced = true;
+        Ok(())
+    }
+}
+
+fn replay_samples(expected: &[ExpectedSpan], limit: usize) -> BTreeMap<u16, Vec<(u32, u32)>> {
+    let total_words = expected.iter().map(|span| span.words.len()).sum::<usize>();
+    let wanted = limit.min(total_words);
+    let mut selected = std::collections::BTreeSet::<(usize, usize)>::new();
+    if wanted == 0 || expected.is_empty() {
+        return BTreeMap::new();
+    }
+    let first_span_samples = wanted.min(expected.len());
+    for sample in 0..first_span_samples {
+        let span = sample * expected.len() / first_span_samples;
+        selected.insert((span, 0));
+    }
+    if selected.len() < wanted && first_span_samples == expected.len() {
+        for (span, values) in expected.iter().enumerate() {
+            if selected.len() == wanted {
+                break;
+            }
+            selected.insert((span, values.words.len() - 1));
+        }
+    }
+    let mut ends = Vec::with_capacity(expected.len());
+    let mut end = 0usize;
+    for span in expected {
+        end += span.words.len();
+        ends.push(end);
+    }
+    let attempts = wanted.saturating_mul(4).max(wanted);
+    for sample in 0..attempts {
+        if selected.len() == wanted {
+            break;
+        }
+        let linear = sample * total_words / attempts;
+        let span = ends.partition_point(|&end| end <= linear);
+        let start = span.checked_sub(1).map_or(0, |previous| ends[previous]);
+        selected.insert((span, linear - start));
+    }
+    let mut result = BTreeMap::<u16, Vec<(u32, u32)>>::new();
+    for (span, word) in selected {
+        let span = &expected[span];
+        result.entry(span.tile).or_default().push((
+            span.address + u32::try_from(word).expect("tile word index fits u32") * 4,
+            span.words[word],
+        ));
+    }
+    for samples in result.values_mut() {
+        samples.sort_unstable_by_key(|&(address, _)| address);
+    }
+    result
+}
+
+fn memory_spans(memory: &[BTreeMap<u32, u32>]) -> Vec<ExpectedSpan> {
+    let mut spans = Vec::new();
+    for (tile, words) in memory.iter().enumerate() {
+        let mut current: Option<ExpectedSpan> = None;
+        for (&address, &word) in words {
+            let contiguous = current.as_ref().is_some_and(|span| {
+                span.address + u32::try_from(span.words.len()).unwrap() * 4 == address
+            });
+            if contiguous {
+                current.as_mut().unwrap().words.push(word);
+            } else {
+                if let Some(span) = current.take() {
+                    spans.push(span);
+                }
+                current = Some(ExpectedSpan {
+                    tile: u16::try_from(tile).expect("tile count was supplied as u16"),
+                    address,
+                    words: vec![word],
+                });
+            }
+        }
+        if let Some(span) = current {
+            spans.push(span);
+        }
+    }
+    spans
+}
+
+fn replay_word(tile: u16, address: u32) -> u32 {
+    0xa5a5_5a5a ^ u32::from(tile).wrapping_mul(0x9e37_79b9) ^ (address >> 2).rotate_left(13)
 }
 
 impl StressPackage {
@@ -361,12 +962,18 @@ impl StressPackage {
             .filter(|transfer| transfer.case == case)
             .map(|transfer| {
                 format!(
-                    "source={} address=0x{:x} destinations={:?} addresses={:?} words={}",
+                    "source={} address=0x{:x} destinations={:?} addresses={:?} words={} requestedOffset={} encodedOffset={} sender={}..{} receivers={:?}..{:?}",
                     transfer.source,
                     transfer.source_address,
                     transfer.destinations,
                     transfer.destination_addresses,
                     transfer.words,
+                    transfer.requested_schedule_offset,
+                    transfer.schedule_offset,
+                    transfer.timing.payload_start,
+                    transfer.timing.payload_end,
+                    transfer.timing.receiver_payload_starts,
+                    transfer.timing.receiver_payload_ends,
                 )
             })
             .collect::<Vec<_>>()
@@ -526,6 +1133,74 @@ fn random_words(rng: &mut fastrand::Rng, maximum: u32) -> u32 {
     } else {
         rng.u32(1..=maximum)
     }
+}
+
+fn overlap_specs(
+    topology: &Topology,
+    case: u32,
+    tiles: &[u16],
+    maximum_words: u32,
+    rng: &mut fastrand::Rng,
+) -> Result<Vec<TransferSpec>> {
+    let [incoming_source, pivot, outgoing_destination] = *tiles else {
+        bail!("overlap case requires exactly three tiles");
+    };
+    let words = random_words(rng, maximum_words);
+    let incoming = point_plan(topology, incoming_source, pivot, words)?;
+    let outgoing = point_plan(topology, pivot, outgoing_destination, words)?;
+    let empty = PhaseProgramBuilder::new(u16::try_from(topology.tile_count())?);
+    let incoming_base = empty.transfer_timing_at(incoming_source, &[pivot], &incoming, 0, words)?;
+    let outgoing_base =
+        empty.transfer_timing_at(pivot, &[outgoing_destination], &outgoing, 0, words)?;
+    let incoming_start = incoming_base.receiver_payload_starts[0];
+    let outgoing_start = outgoing_base.payload_start;
+    let anchor = incoming_start.max(outgoing_start);
+    let maximum_delta = words.saturating_sub(1);
+    let deltas = [
+        0,
+        1.min(maximum_delta),
+        maximum_delta / 4,
+        maximum_delta / 2,
+        maximum_delta.saturating_sub(1),
+        maximum_delta,
+    ];
+    let delta = deltas[usize::try_from(case)? % deltas.len()];
+    let incoming_first = case & 1 == 0;
+    let incoming_target = anchor + if incoming_first { 0 } else { delta };
+    let outgoing_target = anchor + if incoming_first { delta } else { 0 };
+    let incoming = TransferSpec {
+        source: incoming_source,
+        destinations: vec![pivot],
+        words,
+        schedule_offset: Some(incoming_target - incoming_start),
+    };
+    let outgoing = TransferSpec {
+        source: pivot,
+        destinations: vec![outgoing_destination],
+        words,
+        schedule_offset: Some(outgoing_target - outgoing_start),
+    };
+    Ok(if incoming_first {
+        vec![incoming, outgoing]
+    } else {
+        vec![outgoing, incoming]
+    })
+}
+
+fn point_plan(
+    topology: &Topology,
+    source: u16,
+    destination: u16,
+    words: u32,
+) -> Result<MulticastPlan> {
+    let point = topology.point_to_point(source, destination, words)?;
+    Ok(MulticastPlan {
+        sender: point.sender,
+        receivers: vec![finalize_point_receiver(
+            &point.receiver,
+            topology.physical(source)?,
+        )?],
+    })
 }
 
 fn paired_control_words(

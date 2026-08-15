@@ -38,6 +38,9 @@ pub enum PlanOperation {
         /// Encoding-specific raw operand: an initial source word address, a
         /// continuation delta, or compact direction/control bits.
         raw_operand: u32,
+        /// Explicit three-bit SCTL field. `None` denotes SENDPIC, which
+        /// continues the currently active outgoing stream implicitly.
+        send_control: Option<u8>,
         controls: Vec<IncomingControl>,
     },
     Sync(u8),
@@ -205,6 +208,7 @@ fn decode_operation(
                 encoding: SendEncoding::PicPair,
                 words,
                 raw_operand: (word & SEND_ADDRESS_MASK) >> 3,
+                send_control: Some((word & 7) as u8),
                 controls: vec![
                     IncomingControl {
                         stream: IncomingControlStream::Xpic,
@@ -239,6 +243,7 @@ fn decode_operation(
                 encoding: SendEncoding::Pic,
                 words,
                 raw_operand: word & PIC_RECEIVE_ADDRESS_MASK,
+                send_control: None,
                 controls: vec![control],
             },
             words,
@@ -252,6 +257,7 @@ fn decode_operation(
                 encoding: SendEncoding::Explicit,
                 words,
                 raw_operand: (word & SEND_ADDRESS_MASK) >> 3,
+                send_control: Some((word & 7) as u8),
                 controls: Vec::new(),
             },
             words,
@@ -265,13 +271,14 @@ fn decode_operation(
                 encoding: SendEncoding::Offset,
                 words,
                 raw_operand: (word & 0x3ff8) >> 3,
+                send_control: Some((word & 7) as u8),
                 controls: Vec::new(),
             },
             words,
             1,
         ));
     }
-    if word & OPCODE_MASK == SYNC_OPCODE {
+    if word & !0xff == SYNC_OPCODE {
         return Ok((PlanOperation::Sync((word & 0xff) as u8), 0, 1));
     }
     Ok((PlanOperation::Unknown(word), 0, 1))
@@ -303,7 +310,10 @@ pub(super) fn validate_tile_program(
                 actual_controls.push((instruction.end_cycle, *control));
             }
             PlanOperation::Send {
-                encoding, controls, ..
+                encoding,
+                send_control,
+                controls,
+                ..
             } => {
                 // Merged incoming writes happen when the send is issued, not
                 // after all of its serial payload words have left the tile.
@@ -312,7 +322,9 @@ pub(super) fn validate_tile_program(
                         .iter()
                         .map(|control| (instruction.start_cycle + 1, *control)),
                 );
-                actual_sends.push((instruction.start_cycle, instruction.end_cycle, *encoding));
+                if *send_control != Some(0) {
+                    actual_sends.push((instruction.start_cycle, instruction.end_cycle, *encoding));
+                }
             }
             _ => {}
         }
@@ -358,12 +370,12 @@ pub(super) fn validate_tile_program(
             return Err(ExchangeError::Schedule("encoded sender interval mismatch"));
         }
     }
-    for (start, end, encoding) in actual_sends {
+    for (start, end, _) in actual_sends {
         let belongs_to_sender = schedule
             .senders
             .iter()
             .any(|sender| sender.start_cycles <= start && end <= sender.end_cycles);
-        if !belongs_to_sender && encoding != SendEncoding::PicPair {
+        if !belongs_to_sender {
             return Err(ExchangeError::Schedule(
                 "unexpected encoded outgoing interval",
             ));
@@ -426,6 +438,31 @@ mod tests {
                 .instructions
                 .iter()
                 .all(|instruction| !matches!(instruction.operation, PlanOperation::Unknown(_)))
+        );
+    }
+
+    #[test]
+    fn sdk_full_duplex_pair_decodes_absolute_send_restart() {
+        let decoded = diagnose_plan_program(&[0xf54a_0109, 0x1901_5000], None).unwrap();
+        assert_eq!(decoded.event_cycles, 43);
+        assert_eq!(
+            decoded.instructions[0].operation,
+            PlanOperation::Send {
+                encoding: SendEncoding::PicPair,
+                words: 43,
+                raw_operand: 0x14021,
+                send_control: Some(1),
+                controls: vec![
+                    IncomingControl {
+                        stream: IncomingControlStream::Xpic,
+                        value: 0x640,
+                    },
+                    IncomingControl {
+                        stream: IncomingControlStream::Pic,
+                        value: 0x15000,
+                    },
+                ],
+            }
         );
     }
 }

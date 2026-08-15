@@ -7,11 +7,11 @@ use crate::memory::{
 };
 use crate::mid::{Ipu21CostModel, MidGraph, MidOperationKind, PipelineConfig, Precision};
 use crate::{
-    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, KernelBuildPlan, PRNG_SEED_SYMBOL,
-    PROGRAM_ADDRESS_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL, TileProgram,
-    TileProgramLowering, WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL,
-    WORKER_SYNC_CONTEXT_SYMBOL, emit, lower, lower_exchanges, lower_to_tiles, place,
-    shard_storage_bytes,
+    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HOST_RUN_SYMBOL, KernelBuildPlan,
+    PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL,
+    SAMPLE_CYCLE_SYMBOL, TileProgram, TileProgramLowering, WORKER_BARRIER_SYMBOL,
+    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower, lower_exchanges,
+    lower_to_tiles, place, shard_storage_bytes,
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
@@ -101,6 +101,11 @@ pub struct CompiledPackage {
     pub inputs: Vec<DiagnosticTensor>,
     pub outputs: Vec<DiagnosticTensor>,
     pub precisions: BTreeMap<ValueId, Precision>,
+    /// Exact physical exchange schedules retained for low-level diagnostics.
+    /// This is build metadata and is not serialized into the application.
+    pub exchange_phases: Vec<crate::PhysicalExchangePhase>,
+    /// Base address used when laying out the compact per-tile exchange table.
+    pub exchange_code_base: u32,
 }
 
 /// A loadable package plus the exact device storage visible at each semantic
@@ -111,6 +116,11 @@ pub struct DiagnosticPackage {
     pub inputs: Vec<DiagnosticTensor>,
     pub checkpoints: Vec<DiagnosticCheckpoint>,
     pub precisions: BTreeMap<ValueId, Precision>,
+    /// Exact physical exchange schedules retained for low-level diagnostics.
+    /// This is build metadata and is not serialized into the application.
+    pub exchange_phases: Vec<crate::PhysicalExchangePhase>,
+    /// Base address used when laying out the compact per-tile exchange table.
+    pub exchange_code_base: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -139,13 +149,16 @@ pub struct DiagnosticShard {
 struct BuiltApplication {
     application: Application,
     placement: crate::Placement,
+    exchange_phases: Vec<crate::PhysicalExchangePhase>,
+    exchange_code_base: u32,
 }
 
 /// Builds an application from address-resolved tile programs.
 ///
 /// This is the low-level counterpart to [`build_package`]. It deliberately has
-/// no tensor bindings or host program: callers supply initialized tile data and
-/// inspect it through driver diagnostics after completion.
+/// no tensor bindings: callers supply initialized tile data and inspect it
+/// through driver diagnostics. A zero-payload `run` rendezvous starts execution
+/// after loading, so breakpoints in the program cannot race the loader.
 pub fn build_tile_program_package(
     programs: &[TileProgram],
     data: &[TileProgramData],
@@ -176,7 +189,12 @@ pub fn build_tile_program_package(
     let runtime_artifact = toolchain.compile(runtime_source, "static_runtime", &[])?;
     let objects = vec![fs::read(runtime_artifact.object)?];
     let kernels = KernelBuildPlan::default();
-    let mut retained_runtime = vec![COMPLETE_SYMBOL.into(), WORKER_BARRIER_SYMBOL.into()];
+    let mut retained_runtime = vec![
+        COMPLETE_SYMBOL.into(),
+        HOST_RUN_SYMBOL.into(),
+        REPEAT_CALL_SYMBOL.into(),
+        WORKER_BARRIER_SYMBOL.into(),
+    ];
     for program in programs {
         collect_compute_symbols(&mut retained_runtime, &program.steps);
     }
@@ -205,49 +223,152 @@ pub fn build_tile_program_package(
         "runtime state",
         RUNTIME_STATE_BASE..RUNTIME_EXECUTABLE_START,
     )?;
-    let mut reserved_data = Vec::new();
+    let mut tile_data = vec![Vec::<(u32, u32)>::new(); usize::from(execution_tiles)];
     for segment in data {
         let bytes = u32::try_from(segment.data.len())?;
         let end = segment
             .address
             .checked_add(bytes)
             .ok_or_else(|| invalid("tile data range overflow"))?;
-        reserved_data.push((segment.address, end));
+        tile_data[usize::from(segment.tile)].push((segment.address, end));
     }
-    reserved_data.sort_unstable();
-    let mut merged_data = Vec::<(u32, u32)>::new();
-    for (start, end) in reserved_data {
-        if let Some((_, previous_end)) = merged_data.last_mut()
+    let mut tile_rows = vec![Vec::<(u32, u32)>::new(); usize::from(execution_tiles)];
+    for program in programs {
+        let mut rows = BTreeMap::new();
+        collect_exchange_rows(&mut rows, &program.steps)?;
+        tile_rows[usize::from(program.tile)].extend(rows);
+    }
+    for tile in 0..execution_tiles {
+        for &(data_start, data_end) in &tile_data[usize::from(tile)] {
+            if let Some(&(row_start, row_end)) = tile_rows[usize::from(tile)]
+                .iter()
+                .find(|&&(row_start, row_end)| data_start < row_end && row_start < data_end)
+            {
+                return Err(invalid(format!(
+                    "tile {tile} data at 0x{data_start:x}..0x{data_end:x} overlaps exchange row 0x{row_start:x}..0x{row_end:x}"
+                )));
+            }
+        }
+    }
+    // Generated and linked code use common addresses on every tile, so choose
+    // them against the union of tile-local data and row ranges. Data on one
+    // tile may otherwise legally share an address with a row on another tile.
+    let mut tile_local_ranges = tile_data
+        .into_iter()
+        .chain(tile_rows)
+        .flatten()
+        .collect::<Vec<_>>();
+    tile_local_ranges.sort_unstable();
+    let mut merged_tile_local = Vec::<(u32, u32)>::new();
+    for (start, end) in tile_local_ranges {
+        if let Some((_, previous_end)) = merged_tile_local.last_mut()
             && start <= *previous_end
         {
             *previous_end = (*previous_end).max(end);
         } else {
-            merged_data.push((start, end));
+            merged_tile_local.push((start, end));
         }
     }
-    for (start, end) in merged_data {
-        memory.reserve("tile-program data", start..end)?;
+    for (start, end) in merged_tile_local {
+        memory.reserve("tile-local data or exchange rows", start..end)?;
     }
-    let mut reserved_rows = BTreeMap::new();
-    for program in programs {
-        collect_exchange_rows(&mut reserved_rows, &program.steps)?;
+
+    let launch = Binding {
+        name: "run-gate".into(),
+        dtype: "u32".into(),
+        shape: vec![1],
+        slices: vec![RegionSlice {
+            tile: u32::from(topology.physical(0)?),
+            tile_address: COMPLETION_ADDRESS + 4,
+            file_offset: 0,
+            size: 4,
+        }],
+    };
+    let finish = Binding {
+        name: "run-finish".into(),
+        dtype: "u32".into(),
+        shape: vec![1],
+        slices: vec![RegionSlice {
+            tile: u32::from(topology.physical(0)?),
+            tile_address: COMPLETION_ADDRESS + 8,
+            file_offset: 0,
+            size: 4,
+        }],
+    };
+    let host_bounds = crate::IPU21_DATA_BASE..TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
+    let sizing_host_base = memory.next_free(
+        linked_end,
+        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        8,
+        "host programs",
+    )?;
+    let provisional_ranges = memory.free_ranges(host_bounds.clone());
+    let provisional_host = host::plan(
+        &[],
+        std::slice::from_ref(&launch),
+        std::slice::from_ref(&finish),
+        execution_tiles,
+        sizing_host_base,
+        &vec![provisional_ranges; usize::from(execution_tiles)],
+    )?;
+    let host_code_bytes = provisional_host
+        .end
+        .checked_sub(sizing_host_base)
+        .ok_or_else(|| invalid("host program size underflow"))?;
+    let host_code = memory.allocate(MemoryRequest {
+        name: "host programs",
+        bytes: host_code_bytes,
+        alignment: 8,
+        bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        end_alignment: 8,
+        guard_after: 0,
+    })?;
+    let host_ranges = memory.free_ranges(host_bounds.clone());
+    let host = host::plan(
+        &[],
+        std::slice::from_ref(&launch),
+        std::slice::from_ref(&finish),
+        execution_tiles,
+        host_code.range.start,
+        &vec![host_ranges; usize::from(execution_tiles)],
+    )?;
+    if host.end - host_code.range.start > host_code_bytes {
+        return Err(invalid("host program grew after placement"));
     }
-    for (start, end) in reserved_rows {
-        memory.reserve("exchange rows", start..end)?;
+    let mut host_data_ranges = host
+        .segments
+        .iter()
+        .flatten()
+        .filter(|segment| segment.flags & SEGMENT_EXECUTE == 0)
+        .map(|segment| (segment.address, segment.address + segment.memory_size))
+        .collect::<Vec<_>>();
+    host_data_ranges.sort_unstable();
+    let mut merged_host_data = Vec::<(u32, u32)>::new();
+    for (start, end) in host_data_ranges {
+        if let Some((_, previous_end)) = merged_host_data.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged_host_data.push((start, end));
+        }
+    }
+    for (start, end) in merged_host_data {
+        memory.reserve("host program data", start..end)?;
     }
 
     let sizing_address = memory.next_free(
-        linked_end,
+        host_code.range.end,
         TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
         8,
         "generated tile programs",
     )?;
-    let host = crate::HostProgram::default();
     let maximum_bytes = programs.iter().try_fold(0u32, |maximum, program| {
+        let physical = topology.physical(program.tile)?;
         let generated = emit(
             program,
             &symbols,
-            &host,
+            &host.programs[usize::from(physical)],
             &CodegenOptions {
                 code_address: sizing_address,
                 ..CodegenOptions::default()
@@ -273,10 +394,11 @@ pub fn build_tile_program_package(
     let generated = programs
         .iter()
         .map(|program| {
+            let physical = topology.physical(program.tile)?;
             Ok(emit(
                 program,
                 &symbols,
-                &host,
+                &host.programs[usize::from(physical)],
                 &CodegenOptions {
                     code_address,
                     ..CodegenOptions::default()
@@ -295,12 +417,15 @@ pub fn build_tile_program_package(
             flags: SEGMENT_READ | SEGMENT_WRITE,
         });
     }
+    for (physical, host_segments) in host.segments.iter().enumerate() {
+        segments[physical].extend(host_segments.iter().cloned());
+    }
     let context = TileBuildContext {
         objects: &objects,
         kernel_plan: &kernels,
         retained_runtime: &retained_runtime,
         code_address,
-        host_staging_address: 0,
+        host_staging_address: host.staging_address,
     };
     let mut tiles = Vec::with_capacity(usize::from(execution_tiles));
     for logical in 0..execution_tiles {
@@ -334,6 +459,14 @@ pub fn build_tile_program_package(
             size: 4,
         }],
     });
+    application.outputs.push(finish);
+    application.inputs.push(launch);
+    application.entry_points.push(EntryPoint {
+        name: "run".into(),
+        command: 0,
+        external_syncs: 0,
+    });
+    application.host_exchange = host.protocol;
     application.validate()?;
     Ok(application)
 }
@@ -409,6 +542,8 @@ pub fn build_package(
         inputs,
         outputs,
         precisions,
+        exchange_phases: built.exchange_phases,
+        exchange_code_base: built.exchange_code_base,
     })
 }
 
@@ -468,6 +603,8 @@ pub fn build_diagnostic_package(
         inputs,
         checkpoints,
         precisions: package_precisions(&mid),
+        exchange_phases: built.exchange_phases,
+        exchange_code_base: built.exchange_code_base,
     })
 }
 
@@ -1068,6 +1205,8 @@ fn build_package_from_objects(
     Ok(BuiltApplication {
         application,
         placement,
+        exchange_phases: exchanges,
+        exchange_code_base,
     })
 }
 

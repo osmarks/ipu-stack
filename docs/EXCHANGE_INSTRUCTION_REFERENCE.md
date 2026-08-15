@@ -52,8 +52,9 @@ instruction count. One instruction can represent many serial send events.
 
 ## Recovered encodings
 
-The formulas use assembler operand order. `packed_source` contains a word
-address or delta together with the low route bits used by the hardware.
+The formulas use assembler operand order. An initial `send` carries an
+absolute tile-memory word address. `sendoff` continues the current outgoing
+stream and uses its smaller address field as a source delta.
 
 ```text
 delay(events - 1)
@@ -71,18 +72,18 @@ delayxpic(events - 1, selector, value)
   | ((selector << 13) & 0x00002000)
   | (value & 0x1fff)
 
-send(words - 1, packed_source, format)
+send(words - 1, source_word_address, sctl)
   0x78000000
   | (((words - 1) << 21) & 0x07e00000)
-  | ((packed_source << 3) & 0x001ffff8)
-  | format
+  | ((source_word_address << 3) & 0x001ffff8)
+  | sctl
 
-sendoff(words - 1, packed_source, format)
+sendoff(words - 1, source_delta, sctl)
   0x70000000
   | (((words - 1) << 21) & 0x07e00000)
   | ((((words - 1) >> 6) << 14) & 0x000fc000)
-  | ((packed_source << 3) & 0x00003ff8)
-  | format
+  | ((source_delta << 3) & 0x00003ff8)
+  | sctl
 
 sendpic(words - 1, control_selector, control_value)
   0x70100000
@@ -90,6 +91,19 @@ sendpic(words - 1, control_selector, control_value)
   | ((control_selector << 18) & 0x000c0000)
   | (control_value & 0x3ffff)
 ```
+
+`sctl` is the three-bit send-control field, not an opaque format number. Two
+bits enable the two exchange-fabric directions independently; values 1 and 2
+select one direction and 3 broadcasts in both. The remaining bit selects
+64-bit rather than 32-bit items. ipu-stack's internal tensor exchanges are
+currently 32-bit-word streams, so they use only values 1, 2, or 3. A zero
+direction field advances the outgoing event stream without putting a packet
+on either route.
+
+There is no separately encoded `delaypicp` mnemonic in the IPU21 encoder or
+assembler tables. A directionless `sendpicp` performs the useful equivalent:
+it advances an event interval and applies both controls without transmitting a
+packet. SDK-generated receiver-only rows use this form.
 
 `sendpic` continues the implicit outgoing stream while applying one incoming
 control. Selectors 0 and 1 carry the two XPIC forms; selectors 2 and 3 carry the
@@ -106,9 +120,10 @@ The prefix is:
 
 ```text
 0xf0000000
+| ((pic_selector << 27) & 0x08000000)
 | (((words - 1) << 21) & 0x07e00000)
-| (packed_source << 3)
-| format/control bits
+| ((source_word_address << 3) & 0x001ffff8)
+| sctl
 ```
 
 The following inline word is not decoded or executed independently:
@@ -117,10 +132,26 @@ The following inline word is not decoded or executed independently:
 (xpic_configuration_14_bits << 18) | pic_configuration_18_bits
 ```
 
-The instruction must start at an eight-byte boundary. ipu-stack currently
-uses the verified zero form of the extra prefix control/format fields and
-32-bit words. Those fields remain named as raw fields in diagnostics until a
-program differential establishes their individual semantics.
+`pic_selector` is the high selector bit for the PIC value in the inline word.
+The XPIC value uses all fourteen high bits of that word. The instruction must
+start at an eight-byte boundary.
+
+Unlike `sendpic`, a transmitting `sendpicp` restarts the outgoing stream from
+the absolute `source_word_address` in its prefix. The address must therefore
+name the first word sent by this instruction, not the beginning of the larger
+message. A directionless receiver-only form uses `sctl = 0`; its source address
+is immaterial and ipu-stack encodes zero.
+
+For example, this SDK-generated full-duplex instruction sends 43 words from
+word address `0x14021` in direction 1 while changing both incoming controls:
+
+```text
+f54a0109 19015000        sendpicp 42, 0x14021, 1, 0
+```
+
+It follows an initial send from `0x14000` which has already transmitted 33
+words. Encoding only the direction at bit 3 instead would select address 1 and
+leave `sctl` zero, silently disabling this portion of the outgoing message.
 
 An SDK receiver row for four consecutive 52-word messages demonstrates the
 form directly:

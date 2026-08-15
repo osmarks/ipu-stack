@@ -59,6 +59,14 @@ struct Arguments {
     /// Decode every active supervisor row for this exchange-stress case.
     #[arg(long, requires = "exchange_diagnostics")]
     exchange_diagnostic_case: Option<u32>,
+    /// Replace the compiled workload with a tokenized replay of one exact
+    /// physical exchange phase and verify every touched word after execution.
+    #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
+    exchange_replay_phase: Option<usize>,
+    /// Maximum number of systematically distributed words read back by an
+    /// exact exchange-phase replay.
+    #[arg(long, default_value_t = 8192)]
+    exchange_replay_samples: usize,
     /// Summarize packaged exchange rows and exit before loading hardware.
     #[arg(long)]
     inspect_exchanges: bool,
@@ -110,6 +118,9 @@ struct Arguments {
     /// Reproducible random seed for --workload exchange-stress.
     #[arg(long, default_value_t = 0x4950_5532_3100_0001)]
     exchange_seed: u64,
+    /// Schedule family exercised by --workload exchange-stress.
+    #[arg(long, value_enum, default_value_t = ExchangeStressPattern::Random)]
+    exchange_pattern: ExchangeStressPattern,
     /// Number of randomized exchange epochs in one stress package.
     #[arg(long, default_value_t = 128)]
     exchange_cases: u32,
@@ -144,6 +155,14 @@ enum Workload {
     SiglipAttentionBenchmark,
     /// Run reproducible randomized small-group tile exchanges.
     ExchangeStress,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ExchangeStressPattern {
+    /// Random small-group transfers, including repeated and chained payloads.
+    Random,
+    /// Controlled full-duplex cases with one tile sending and receiving.
+    Overlap,
 }
 
 impl Workload {
@@ -186,6 +205,9 @@ fn main() -> Result<()> {
     }
     if arguments.diagnostic_run && arguments.diagnostic_samples == 0 {
         bail!("--diagnostic-samples must be nonzero");
+    }
+    if arguments.exchange_replay_phase.is_some() && arguments.exchange_replay_samples == 0 {
+        bail!("--exchange-replay-samples must be nonzero");
     }
     if arguments.diagnostic_run && arguments.profile_output.is_some() {
         bail!("--diagnostic-run cannot be combined with --profile-output");
@@ -261,6 +283,7 @@ fn main() -> Result<()> {
             arguments.exchange_max_words,
             arguments.exchange_max_transfers,
             arguments.exchange_compute_delay,
+            matches!(arguments.exchange_pattern, ExchangeStressPattern::Overlap),
             &Toolchain::from_sdk(&arguments.sdk),
             &runtime_source,
         )?;
@@ -281,8 +304,11 @@ fn main() -> Result<()> {
                 &configuration,
                 &stress.application,
                 &bootloader_bytes,
-                0,
+                stress.application.host_exchange.startup_mark,
             )?;
+            let mut session = runtime.host_session(&stress.application)?;
+            session.start()?;
+            let _ = session.invoke("run", &[0; 4])?;
             diagnose_completion(
                 &runtime,
                 &stress.application,
@@ -499,6 +525,61 @@ fn main() -> Result<()> {
         }
         None
     };
+    if let Some(phase) = arguments.exchange_replay_phase {
+        let compiled = compiled_package
+            .as_ref()
+            .context("--exchange-replay-phase requires a newly compiled package")?;
+        let replay = exchange_stress::build_phase_replay(
+            compiled,
+            phase,
+            &package_config.toolchain,
+            &package_config.runtime_source,
+        )?;
+        write_package(&replay.application, &arguments.package)?;
+        let configuration = fs::read(&arguments.configuration)
+            .with_context(|| format!("read {}", arguments.configuration.display()))?;
+        let bootloader_bytes =
+            fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
+        retry_after_reset(&arguments.sdk, || {
+            let runtime = open_and_load_once(
+                &arguments.device,
+                &configuration,
+                &replay.application,
+                &bootloader_bytes,
+                replay.application.host_exchange.startup_mark,
+            )?;
+            let mut session = runtime.host_session(&replay.application)?;
+            session.start()?;
+            let mut serviced = false;
+            let executed = session
+                .invoke_streaming_deferred_with_poll("run", &[0; 4], |device| {
+                    replay
+                        .service_readback(device, arguments.exchange_replay_samples, &mut serviced)
+                        .map_err(|error| DriverError::Invalid(error.to_string()))
+                })
+                .inspect_err(|error| {
+                    tracing::error!(
+                        %error,
+                        device = %device_failure_diagnostics(&runtime, &replay.application),
+                        "exchange replay failed"
+                    );
+                })?;
+            if !serviced {
+                bail!("exchange replay completed without reaching its readback trap");
+            }
+            let _ = session.collect(&executed)?;
+            diagnose_completion(
+                &runtime,
+                &replay.application,
+                Duration::from_secs(arguments.timeout_seconds),
+            )
+        })?;
+        println!(
+            "package={} exchangeReplayPhase={phase} hardwareTest=PASS",
+            arguments.package.display()
+        );
+        return Ok(());
+    }
     let application = Application::read(
         fs::File::open(&arguments.package)
             .with_context(|| format!("open {}", arguments.package.display()))?,

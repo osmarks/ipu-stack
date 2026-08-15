@@ -14,3 +14,11 @@ public:
   poplar::InOut<poplar::Vector<unsigned>> d3;
   bool compute() { return true; }
 };
+
+class [[poplar::constraint("elem(*incoming) != elem(*outgoing)")]]
+KeepPairSeparated : public poplar::Vertex {
+public:
+  poplar::InOut<poplar::Vector<unsigned>> incoming;
+  poplar::InOut<poplar::Vector<unsigned>> outgoing;
+  bool compute() { return true; }
+};

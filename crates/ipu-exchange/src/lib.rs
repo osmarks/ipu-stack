@@ -34,6 +34,7 @@ const SEND_OFF_OPCODE: u32 = 0x7000_0000;
 const SEND_PIC_OPCODE: u32 = 0x7010_0000;
 const SEND_PICP_OPCODE: u32 = 0xf000_0000;
 const SEND_CONTROL_OPCODE_MASK: u32 = 0xf810_0000;
+const SEND_PICP_OPCODE_MASK: u32 = 0xf000_0000;
 const SEND_COUNT_MASK: u32 = 0x07e0_0000;
 const SYNC_OPCODE: u32 = 0x4180_0000;
 const SANS_OPCODE: u32 = 0x40c0_0000;
@@ -819,6 +820,10 @@ fn scheduled_receive_window(
     previous: Option<&ReceiveStream>,
 ) -> Result<ScheduledReceiverWindow, ExchangeError> {
     let timing = receive_row_timing_from_base(base, schedule_offset)?;
+    // The incoming source is occupied for exactly one event per word. The
+    // pointer stream has a physical-row phase of its own and must not extend
+    // source ownership: SDK full-duplex rows switch XPIC at this boundary
+    // while their PIC update and outgoing SEND stream continue independently.
     let source_end = timing
         .source_cycles
         .checked_add(received_words)
@@ -1125,7 +1130,9 @@ fn append_sender_message(
     append_plain_delay(words, event_cycles, sender.start_cycles)?;
     let (initial_instruction, payload_words) = sender_payload(&sender.row)?;
     let direction = initial_instruction & 7;
+    let initial_source = (initial_instruction & SEND_ADDRESS_MASK) >> 3;
     let mut remaining = payload_words;
+    let mut sent = 0u32;
     let mut started = false;
 
     let mut cursor = 0;
@@ -1149,6 +1156,7 @@ fn append_sender_message(
             initial_instruction,
             direction,
             &mut remaining,
+            &mut sent,
             &mut started,
             distance,
             (group.len() == 2).then_some(0),
@@ -1178,13 +1186,18 @@ fn append_sender_message(
             ));
         }
         if group.len() == 2 {
-            let (instruction, payload) = encode_send_control_pair(chunk - 1, direction, group)?;
+            let source = initial_source
+                .checked_add(sent)
+                .ok_or(ExchangeError::Schedule("SENDPICP source overflow"))?;
+            let (instruction, payload) =
+                encode_send_control_pair(chunk - 1, source, direction, group)?;
             words.extend([instruction, payload]);
         } else {
             words.push(encode_send_control(chunk - 1, group[0])?);
         }
         *event_cycles += chunk;
         remaining -= chunk;
+        sent += chunk;
         cursor = end;
     }
 
@@ -1213,6 +1226,7 @@ fn emit_sender_words(
     initial_instruction: u32,
     direction: u32,
     remaining: &mut u32,
+    sent: &mut u32,
     started: &mut bool,
     count: u32,
     final_word_parity: Option<usize>,
@@ -1257,6 +1271,7 @@ fn emit_sender_words(
         }
         *event_cycles += chunk;
         *remaining -= chunk;
+        *sent += chunk;
     }
     if final_word_parity.is_some_and(|parity| words.len() & 1 != parity) {
         return Err(ExchangeError::Schedule("SENDPICP instruction alignment"));
@@ -1337,7 +1352,7 @@ fn append_receive_events(
             if advance == 0 {
                 return Err(ExchangeError::Schedule("empty SENDPICP interval"));
             }
-            let (instruction, payload) = encode_send_control_pair(advance - 1, 0, group)?;
+            let (instruction, payload) = encode_send_control_pair(advance - 1, 0, 0, group)?;
             words.extend([instruction, payload]);
             *event_cycles += advance;
         } else {
@@ -1366,10 +1381,15 @@ fn append_receive_events(
 
 fn encode_send_control_pair(
     count_minus_one: u32,
-    direction: u32,
+    source_word_address: u32,
+    send_control: u32,
     events: &[ReceiveEvent],
 ) -> Result<(u32, u32), ExchangeError> {
-    if count_minus_one > 63 || direction > 7 || events.len() != 2 {
+    if count_minus_one > 63
+        || source_word_address > SEND_ADDRESS_MASK >> 3
+        || send_control > 7
+        || events.len() != 2
+    {
         return Err(ExchangeError::Schedule("SENDPICP operand"));
     }
     let pointer = events
@@ -1383,7 +1403,16 @@ fn encode_send_control_pair(
     if pointer.cycles != source.cycles {
         return Err(ExchangeError::Schedule("SENDPICP event time"));
     }
-    let instruction = SEND_PICP_OPCODE | (count_minus_one << 21) | (direction << 3);
+    // SENDPICP uses the same outgoing fields as SEND: an absolute source word
+    // address followed by the three-bit SCTL field. Its fourth operand carries
+    // the high PIC selector bit; the inline word holds all fourteen XPIC bits
+    // and the remaining eighteen PIC bits.
+    let pointer_selector = (pointer.instruction >> 18) & 1;
+    let instruction = SEND_PICP_OPCODE
+        | (pointer_selector << 27)
+        | (count_minus_one << 21)
+        | ((source_word_address << 3) & SEND_ADDRESS_MASK)
+        | send_control;
     let payload =
         ((source.instruction & 0x3fff) << 18) | (pointer.instruction & PIC_RECEIVE_ADDRESS_MASK);
     Ok((instruction, payload))
@@ -1482,7 +1511,7 @@ fn is_send_control(instruction: u32) -> bool {
 }
 
 fn is_send_control_pair(instruction: u32) -> bool {
-    instruction & SEND_CONTROL_OPCODE_MASK == SEND_PICP_OPCODE
+    instruction & SEND_PICP_OPCODE_MASK == SEND_PICP_OPCODE
 }
 
 fn is_send_off(instruction: u32) -> bool {
@@ -2261,7 +2290,9 @@ pub fn patch_sender_instruction(
     if byte_address & 3 != 0 || byte_address >> 2 > 0x1f_ffff {
         return Err(ExchangeError::Address(byte_address));
     }
-    if *instruction & LONG_OPCODE_MASK != SEND_OPCODE {
+    if *instruction & LONG_OPCODE_MASK != SEND_OPCODE
+        && !(is_send_control_pair(*instruction) && *instruction & 7 != 0)
+    {
         return Err(ExchangeError::Address(byte_address));
     }
     let word_address = byte_address >> 2;
@@ -2269,24 +2300,53 @@ pub fn patch_sender_instruction(
     Ok(())
 }
 
-/// Clears the address field of a tile-to-tile SEND for structural plan deduplication.
-/// Returns the word offset and original instruction needed to restore this instance.
-pub fn normalize_sender_instruction(row: &mut [u32]) -> Option<(usize, u32)> {
-    let (index, instruction) = row
-        .iter_mut()
-        .enumerate()
-        .find(|(_, instruction)| **instruction & LONG_OPCODE_MASK == SEND_OPCODE)?;
-    let original = *instruction;
-    *instruction &= !SEND_ADDRESS_MASK;
-    Some((index, original))
-}
-
-/// Returns every tile-to-tile SEND instruction offset in execution order.
-pub fn sender_instruction_offsets(row: &[u32]) -> impl Iterator<Item = usize> + '_ {
-    row.iter()
-        .enumerate()
-        .filter(|(_, instruction)| **instruction & LONG_OPCODE_MASK == SEND_OPCODE)
-        .map(|(index, _)| index)
+/// Address-bearing instructions for each outgoing message, in execution
+/// order. Each entry is `(word offset, byte offset from the message source)`.
+/// SENDPICP restarts the outgoing source stream explicitly after its inline
+/// control word, so repeat relocation must patch it as well as the first SEND.
+pub fn sender_address_instruction_groups(
+    row: &[u32],
+) -> Result<Vec<Vec<(usize, u32)>>, ExchangeError> {
+    let mut groups = Vec::<Vec<(usize, u32)>>::new();
+    let mut sent_words = None;
+    let mut cursor = 0;
+    while cursor < row.len() {
+        let instruction = row[cursor];
+        if instruction & LONG_OPCODE_MASK == SEND_OPCODE {
+            groups.push(vec![(cursor, 0)]);
+            sent_words = Some(instruction_advance(instruction));
+        } else if is_send_control_pair(instruction) && instruction & 7 != 0 {
+            let sent = sent_words.ok_or(ExchangeError::Schedule(
+                "SENDPICP precedes initial outgoing SEND",
+            ))?;
+            groups
+                .last_mut()
+                .ok_or(ExchangeError::Schedule("SENDPICP outgoing group"))?
+                .push((
+                    cursor,
+                    sent.checked_mul(4)
+                        .ok_or(ExchangeError::Schedule("sender byte offset overflow"))?,
+                ));
+            sent_words = Some(
+                sent.checked_add(instruction_advance(instruction))
+                    .ok_or(ExchangeError::Schedule("sender word offset overflow"))?,
+            );
+        } else if (is_send_off(instruction) || is_send_control(instruction)) && sent_words.is_some()
+        {
+            sent_words = Some(
+                sent_words
+                    .unwrap()
+                    .checked_add(instruction_advance(instruction))
+                    .ok_or(ExchangeError::Schedule("sender word offset overflow"))?,
+            );
+        }
+        cursor += if is_send_control_pair(instruction) {
+            2
+        } else {
+            1
+        };
+    }
+    Ok(groups)
 }
 
 /// Removes tile-memory address fields while retaining exchange roles, routes,
@@ -2298,6 +2358,9 @@ pub fn normalized_exchange_address_words(row: &[u32]) -> Vec<u32> {
     while cursor < normalized.len() {
         let instruction = normalized[cursor];
         if is_send_control_pair(instruction) {
+            if instruction & 7 != 0 {
+                normalized[cursor] &= !SEND_ADDRESS_MASK;
+            }
             if let Some(payload) = normalized.get_mut(cursor + 1) {
                 *payload &= !PIC_RECEIVE_ADDRESS_MASK;
             }
@@ -2306,9 +2369,9 @@ pub fn normalized_exchange_address_words(row: &[u32]) -> Vec<u32> {
         }
         normalized[cursor] = if instruction & LONG_OPCODE_MASK == SEND_OPCODE {
             instruction & !SEND_ADDRESS_MASK
-        } else if is_send_control(instruction) && (instruction >> 18) & 3 >= 2 {
-            instruction & !PIC_RECEIVE_ADDRESS_MASK
-        } else if instruction & OPCODE_MASK == DELAY_PIC_OPCODE {
+        } else if (is_send_control(instruction) && (instruction >> 18) & 3 >= 2)
+            || instruction & OPCODE_MASK == DELAY_PIC_OPCODE
+        {
             instruction & !PIC_RECEIVE_ADDRESS_MASK
         } else {
             instruction
@@ -2524,21 +2587,39 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_only_the_sender_address_field() {
-        let mut row = [
+    fn normalizes_all_sender_address_fields() {
+        let row = [
             SYNC_SUPERVISOR_INSTRUCTION,
             encode_send(1, 3, 0x1a048).unwrap(),
+            SEND_PICP_OPCODE | (7 << 21) | (0x1a04a << 3) | 3,
+            0x1901_5000,
             RETURN_M10_INSTRUCTION,
         ];
-        let original = row;
+        let normalized = normalized_exchange_address_words(&row);
+        assert_eq!(normalized[1] ^ row[1], row[1] & SEND_ADDRESS_MASK);
+        assert_eq!(normalized[2] ^ row[2], row[2] & SEND_ADDRESS_MASK);
+        assert_eq!(normalized[0], row[0]);
+        assert_eq!(normalized[4], row[4]);
+    }
 
-        let (index, instruction) = normalize_sender_instruction(&mut row).unwrap();
-
-        assert_eq!(index, 1);
-        assert_eq!(instruction, original[1]);
-        assert_eq!(row[1] ^ original[1], original[1] & SEND_ADDRESS_MASK);
-        assert_eq!(row[0], original[0]);
-        assert_eq!(row[2], original[2]);
+    #[test]
+    fn paired_send_matches_sdk_full_duplex_oracle() {
+        let events = [
+            ReceiveEvent {
+                cycles: 189,
+                instruction: delay_xpic(0, 0, TILE_MUX_EXCHANGE),
+                kind: ReceiveEventKind::Neutral,
+            },
+            ReceiveEvent {
+                cycles: 189,
+                instruction: delay_pic(0, 0, 0x15000),
+                kind: ReceiveEventKind::Pointer,
+            },
+        ];
+        assert_eq!(
+            encode_send_control_pair(42, 0x14021, 1, &events).unwrap(),
+            (0xf54a_0109, 0x1901_5000)
+        );
     }
 
     #[test]
@@ -2640,7 +2721,7 @@ mod tests {
     #[test]
     fn single_receiver_uses_the_directional_route_for_every_payload_instruction() {
         let topology = Topology::c600();
-        let mut random = fastrand::Rng::with_seed(0x726f_7574_696e_67);
+        let mut random = fastrand::Rng::with_seed(0x0072_6f75_7469_6e67);
         for _ in 0..128 {
             let source = random.u16(0..topology.tile_count() as u16);
             let mut destination = random.u16(0..topology.tile_count() as u16);
@@ -2673,7 +2754,7 @@ mod tests {
     #[test]
     fn randomized_internal_receives_leave_the_neutral_mux_selected() {
         let topology = Topology::c600();
-        let mut random = fastrand::Rng::with_seed(0x6e65_7574_7261_6c);
+        let mut random = fastrand::Rng::with_seed(0x006e_6575_7472_616c);
         for _ in 0..128 {
             let source = random.u16(0..topology.tile_count() as u16);
             let receiver_count = random.usize(1..=4);
@@ -2758,7 +2839,7 @@ mod tests {
     #[test]
     fn randomized_mixed_role_programs_fuse_receive_controls_into_sends() {
         let topology = Topology::c600();
-        let mut random = fastrand::Rng::with_seed(0x7365_6e64_7069_63);
+        let mut random = fastrand::Rng::with_seed(0x0073_656e_6470_6963);
         let mut fused_programs = 0;
         for _ in 0..256 {
             let tile = random.u16(0..topology.tile_count() as u16);

@@ -25,3 +25,37 @@ words. Run it with the Python interpreter from the enabled SDK environment.
 
 The recovered instruction semantics and the corresponding ipu-stack decoder
 are documented in `docs/EXCHANGE_INSTRUCTION_REFERENCE.md`.
+
+`overlap.cpp` is the corresponding full-duplex oracle. It gives one tile an
+independent incoming and outgoing copy in the same program region and forces
+their buffers into different SRAM elements. The final argument reverses the
+source-level order of the two copies, allowing the extracted phase rows to be
+compared without assuming that order is semantically significant:
+
+```sh
+g++ -std=c++17 -O2 overlap.cpp -o /tmp/sdk-exchange-overlap \
+  -I"$POPLAR_SDK_ENABLED/include" -L"$POPLAR_SDK_ENABLED/lib" -lpoplar
+/tmp/sdk-exchange-overlap /tmp/sdk-exchange-overlap.poplar_exec \
+  52 5 100 900 0
+../../../ipu-exchange-re/tools/extract_gc_exe.sh \
+  /tmp/sdk-exchange-overlap.poplar_exec /tmp/sdk-exchange-overlap
+```
+
+`instructions.cpp` uses `libipu_arch_info` directly to expose individual
+`send`/`sendpicp` fields and disassemble the complete words recovered from the
+full-duplex oracle:
+
+```sh
+g++ -std=c++17 -O2 instructions.cpp -o /tmp/sdk-exchange-instructions \
+  -I"$POPLAR_SDK_ENABLED/include" -L"$POPLAR_SDK_ENABLED/lib" \
+  -Wl,-rpath,"$POPLAR_SDK_ENABLED/lib" -lipu_arch_info
+/tmp/sdk-exchange-instructions
+```
+
+For the focused paired-send row used by the ipu-stack hardware diagnostic,
+generate the oracle with:
+
+```sh
+/tmp/sdk-exchange-overlap /tmp/sdk-exchange-pair.poplar_exec \
+  76 54 24 38 0
+```

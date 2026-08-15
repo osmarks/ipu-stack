@@ -443,6 +443,21 @@ pub fn compact_exchange_table_bytes(
     Ok(maximum)
 }
 
+/// Returns the final row address for one tile and physical exchange phase in
+/// the same compact table layout used by package generation.
+pub fn compact_exchange_row_address(
+    exchanges: &[PhysicalExchangePhase],
+    tile: u16,
+    scheduled_tile_count: u16,
+    base: u32,
+    phase: ExchangePhaseId,
+) -> Result<u32, TileLoweringError> {
+    let (rows, _) = layout_exchange_rows(exchanges, tile, scheduled_tile_count, base, false)?;
+    rows.get(&phase)
+        .map(|row| row.program.address)
+        .ok_or(TileLoweringError::UnknownExchange)
+}
+
 fn layout_exchange_rows(
     exchanges: &[PhysicalExchangePhase],
     tile: u16,
