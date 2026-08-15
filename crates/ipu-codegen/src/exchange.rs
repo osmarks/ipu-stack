@@ -342,10 +342,13 @@ fn lower_static_exchanges(
                 .collect();
             let mut pending = coalesce_pending_transfers(pending);
             attach_repeat_source_addresses(&mut pending, &repeat_inputs, placement)?;
-            let pending = split_paired_transfers(pending, topology, program.tile_count)?;
+            let ScheduledPending {
+                pending,
+                receive_counts,
+                incoming_bases,
+                optimized,
+            } = select_transfer_widths(phase.id.index(), topology, pending, program.tile_count)?;
             let schedule_problem = schedule_problem(phase.id.index(), &pending);
-            let (receive_counts, incoming_bases) =
-                receive_configuration(&pending, program.tile_count)?;
             let mut destination_multiplicity = BTreeMap::new();
             for transfer in &pending {
                 for &(tile, address) in &transfer.destinations {
@@ -373,13 +376,7 @@ fn lower_static_exchanges(
                 endpoint_lower_bound,
                 selected_kind,
                 neighborhood_improvements,
-            } = optimize_pending_schedule(
-                topology,
-                &pending,
-                &incoming_bases,
-                &receive_counts,
-                program.tile_count,
-            )?;
+            } = optimized;
             if options.diagnostics {
                 let repeat_iterations = pending
                     .iter()
@@ -964,26 +961,27 @@ fn attach_repeat_source_addresses(
     Ok(())
 }
 
-fn split_paired_transfers(
-    pending: Vec<PendingTransfer>,
+fn paired_transfer_alternatives(
+    pending: &[PendingTransfer],
     topology: &Topology,
     tile_count: u16,
-) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
-    let mut split = Vec::with_capacity(pending.len());
+) -> Result<Vec<Option<PendingTransfer>>, ExchangeLoweringError> {
+    let mut alternatives = Vec::with_capacity(pending.len());
     for transfer in pending {
         if transfer.width != ExchangeItemWidth::Word32
             || transfer.words < 128
+            || transfer.words & 1 != 0
             || transfer
                 .source_addresses
                 .iter()
                 .any(|address| address & 0b111 != 0)
         {
-            split.push(transfer);
+            alternatives.push(None);
             continue;
         }
         let source_pair = topology.paired_logical(transfer.source)?;
         if source_pair >= tile_count {
-            split.push(transfer);
+            alternatives.push(None);
             continue;
         }
 
@@ -994,91 +992,45 @@ fn split_paired_transfers(
                 .or_default()
                 .push((tile, address));
         }
-        let mut paired_destinations = Vec::new();
-        let mut ordinary_destinations = Vec::new();
-        for destinations in by_pair.into_values() {
+        let mut paired_destinations = Vec::with_capacity(transfer.destinations.len());
+        let all_destinations_pairable = by_pair.into_values().all(|destinations| {
             let complete_pair = destinations.len() == 2
-                && topology.paired_logical(destinations[0].0)? == destinations[1].0;
-            let eligible = complete_pair
+                && topology
+                    .paired_logical(destinations[0].0)
+                    .is_ok_and(|paired| paired == destinations[1].0);
+            let pairable = complete_pair
                 && destinations
                     .iter()
                     .all(|(tile, address)| *tile != source_pair && address & 0b111 == 0)
                 && destinations[0].1 == destinations[1].1;
-            if eligible {
+            if pairable {
                 paired_destinations.extend(destinations);
-            } else {
-                ordinary_destinations.extend(destinations);
             }
-        }
-        if paired_destinations.is_empty() {
-            split.push(transfer);
+            pairable
+        });
+        if !all_destinations_pairable || paired_destinations.is_empty() {
+            alternatives.push(None);
             continue;
         }
 
-        let paired_words = transfer.words & !1;
         let paired_tiles = paired_destinations
             .iter()
             .map(|&(tile, _)| tile)
             .collect::<Vec<_>>();
         if topology
-            .paired_multicast(transfer.source, &paired_tiles, paired_words / 2)
+            .paired_multicast(transfer.source, &paired_tiles, transfer.words / 2)
             .is_err()
         {
-            split.push(transfer);
+            alternatives.push(None);
             continue;
         }
-        if !ordinary_destinations.is_empty() {
-            let mut ordinary = transfer.clone();
-            ordinary.destinations = ordinary_destinations;
-            ordinary.width = ExchangeItemWidth::Word32;
-            ordinary.reserved_source = None;
-            ordinary.refresh_source_elements();
-            split.push(ordinary);
-        }
         let mut paired = transfer.clone();
-        paired.destinations = paired_destinations.clone();
-        paired.words = paired_words;
+        paired.destinations = paired_destinations;
         paired.width = ExchangeItemWidth::Paired64;
         paired.reserved_source = Some(source_pair);
-        paired.refresh_source_elements();
-        split.push(paired);
-        if paired_words != transfer.words {
-            let byte_offset = paired_words
-                .checked_mul(4)
-                .ok_or(ExchangeLoweringError::Overflow)?;
-            let mut remainder = transfer;
-            remainder.source_offset = remainder
-                .source_offset
-                .checked_add(byte_offset)
-                .ok_or(ExchangeLoweringError::Overflow)?;
-            remainder.source_addresses = remainder
-                .source_addresses
-                .iter()
-                .map(|address| {
-                    address
-                        .checked_add(byte_offset)
-                        .ok_or(ExchangeLoweringError::Overflow)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            remainder.destinations = paired_destinations
-                .into_iter()
-                .map(|(tile, address)| {
-                    Ok((
-                        tile,
-                        address
-                            .checked_add(byte_offset)
-                            .ok_or(ExchangeLoweringError::Overflow)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-            remainder.words -= paired_words;
-            remainder.width = ExchangeItemWidth::Word32;
-            remainder.reserved_source = None;
-            remainder.refresh_source_elements();
-            split.push(remainder);
-        }
+        alternatives.push(Some(paired));
     }
-    Ok(split)
+    Ok(alternatives)
 }
 
 fn schedule_problem(phase: u32, pending: &[PendingTransfer]) -> ExchangeScheduleProblem {
@@ -1254,6 +1206,241 @@ struct OptimizedSchedule {
     neighborhood_improvements: usize,
 }
 
+struct ScheduledPending {
+    pending: Vec<PendingTransfer>,
+    receive_counts: Vec<usize>,
+    incoming_bases: Vec<u32>,
+    optimized: OptimizedSchedule,
+}
+
+fn optimize_owned_pending(
+    topology: &Topology,
+    pending: Vec<PendingTransfer>,
+    tile_count: u16,
+) -> Result<ScheduledPending, ExchangeLoweringError> {
+    let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
+    let optimized = optimize_pending_schedule(
+        topology,
+        &pending,
+        &incoming_bases,
+        &receive_counts,
+        tile_count,
+    )?;
+    Ok(ScheduledPending {
+        pending,
+        receive_counts,
+        incoming_bases,
+        optimized,
+    })
+}
+
+fn critical_transfer_indices(schedule: &MaterializedSchedule) -> BTreeSet<usize> {
+    let maximum_end = schedule
+        .timings
+        .iter()
+        .flatten()
+        .map(|timing| timing.end)
+        .max()
+        .unwrap_or(0);
+    let mut pending = schedule
+        .timings
+        .iter()
+        .enumerate()
+        .filter_map(|(index, timing)| {
+            timing
+                .as_ref()
+                .is_some_and(|timing| timing.end == maximum_end)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let mut critical = BTreeSet::new();
+    while let Some(index) = pending.pop() {
+        if critical.insert(index)
+            && let Some(predecessor) = schedule.timings[index].and_then(|timing| timing.predecessor)
+        {
+            pending.push(predecessor);
+        }
+    }
+    critical
+}
+
+fn select_transfer_widths(
+    phase: u32,
+    topology: &Topology,
+    ordinary_pending: Vec<PendingTransfer>,
+    tile_count: u16,
+) -> Result<ScheduledPending, ExchangeLoweringError> {
+    let alternatives = paired_transfer_alternatives(&ordinary_pending, topology, tile_count)?;
+    let candidate_count = alternatives.iter().flatten().count();
+    let ordinary = optimize_owned_pending(topology, ordinary_pending.clone(), tile_count)?;
+    if candidate_count == 0 {
+        return Ok(ordinary);
+    }
+
+    let ordinary_horizon = ordinary.optimized.schedule.horizon;
+    let critical = critical_transfer_indices(&ordinary.optimized.schedule);
+    let critical_candidates = alternatives
+        .iter()
+        .enumerate()
+        .filter_map(|(index, alternative)| {
+            (alternative.is_some() && critical.contains(&index)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if critical_candidates.is_empty() {
+        tracing::info!(
+            phase,
+            candidate_count,
+            ordinary_horizon,
+            "no paired transfer contributes to the ordinary schedule's critical path"
+        );
+        return Ok(ordinary);
+    }
+
+    let order = &ordinary.optimized.schedule.order;
+    let individual_trials = critical_candidates
+        .par_iter()
+        .map(|&index| {
+            let mut trial = ordinary_pending.clone();
+            trial[index] = alternatives[index]
+                .clone()
+                .expect("critical candidate has a paired alternative");
+            materialize_schedule_order(
+                topology,
+                &trial,
+                &ordinary.incoming_bases,
+                &ordinary.receive_counts,
+                tile_count,
+                order,
+            )
+            .map(|schedule| (index, schedule.horizon))
+        })
+        .collect::<Vec<_>>();
+    let mut rejected = 0usize;
+    let mut beneficial = individual_trials
+        .into_iter()
+        .filter_map(|trial| match trial {
+            Ok((index, horizon)) if horizon < ordinary_horizon => Some((index, horizon)),
+            Ok(_) => None,
+            Err(_) => {
+                rejected += 1;
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    beneficial.sort_unstable_by_key(|&(index, horizon)| (horizon, index));
+    if beneficial.is_empty() {
+        tracing::info!(
+            phase,
+            candidate_count,
+            critical_candidates = critical_candidates.len(),
+            rejected_candidates = rejected,
+            ordinary_horizon,
+            "no individual paired transfer shortens the exchange critical path"
+        );
+        return Ok(ordinary);
+    }
+
+    let all_beneficial = beneficial
+        .iter()
+        .map(|&(index, _)| index)
+        .collect::<Vec<_>>();
+    let all_selection = materialize_width_selection(
+        topology,
+        &ordinary_pending,
+        &alternatives,
+        &all_beneficial,
+        &ordinary.incoming_bases,
+        &ordinary.receive_counts,
+        tile_count,
+        order,
+    );
+    let best_single = [beneficial[0].0];
+    let (selected, pending, schedule, combined_horizon) = match all_selection {
+        Ok((pending, schedule)) if schedule.horizon < beneficial[0].1 => {
+            let horizon = schedule.horizon;
+            (all_beneficial, pending, schedule, Some(horizon))
+        }
+        all_selection => {
+            let combined_horizon = all_selection.ok().map(|(_, schedule)| schedule.horizon);
+            let (pending, schedule) = materialize_width_selection(
+                topology,
+                &ordinary_pending,
+                &alternatives,
+                &best_single,
+                &ordinary.incoming_bases,
+                &ordinary.receive_counts,
+                tile_count,
+                order,
+            )?;
+            (best_single.to_vec(), pending, schedule, combined_horizon)
+        }
+    };
+    let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
+    let optimized = improve_pending_schedule(
+        topology,
+        &pending,
+        &incoming_bases,
+        &receive_counts,
+        tile_count,
+        schedule,
+        "transfer-width",
+    )?;
+    tracing::info!(
+        phase,
+        candidate_count,
+        critical_candidates = critical_candidates.len(),
+        individually_beneficial = beneficial.len(),
+        rejected_candidates = rejected,
+        selected_transfers = selected.len(),
+        ordinary_horizon,
+        combined_horizon,
+        selected_horizon = optimized.schedule.horizon,
+        "selected exchange width per transfer"
+    );
+    Ok(ScheduledPending {
+        pending,
+        receive_counts,
+        incoming_bases,
+        optimized,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_width_selection(
+    topology: &Topology,
+    ordinary: &[PendingTransfer],
+    alternatives: &[Option<PendingTransfer>],
+    selected: &[usize],
+    incoming_bases: &[u32],
+    receive_counts: &[usize],
+    tile_count: u16,
+    order: &[usize],
+) -> Result<(Vec<PendingTransfer>, MaterializedSchedule), ExchangeLoweringError> {
+    let selected = selected.iter().copied().collect::<BTreeSet<_>>();
+    let pending = ordinary
+        .iter()
+        .enumerate()
+        .map(|(index, transfer)| {
+            if selected.contains(&index) {
+                alternatives[index]
+                    .clone()
+                    .unwrap_or_else(|| transfer.clone())
+            } else {
+                transfer.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let schedule = materialize_schedule_order(
+        topology,
+        &pending,
+        incoming_bases,
+        receive_counts,
+        tile_count,
+        order,
+    )?;
+    Ok((pending, schedule))
+}
+
 fn optimize_pending_schedule(
     topology: &Topology,
     pending: &[PendingTransfer],
@@ -1261,16 +1448,37 @@ fn optimize_pending_schedule(
     receive_counts: &[usize],
     tile_count: u16,
 ) -> Result<OptimizedSchedule, ExchangeLoweringError> {
-    let mut schedule = materialize_greedy_schedule(
+    let schedule = materialize_greedy_schedule(
         topology,
         pending,
         incoming_bases,
         receive_counts,
         tile_count,
     )?;
+    improve_pending_schedule(
+        topology,
+        pending,
+        incoming_bases,
+        receive_counts,
+        tile_count,
+        schedule,
+        "full-duplex",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn improve_pending_schedule(
+    topology: &Topology,
+    pending: &[PendingTransfer],
+    incoming_bases: &[u32],
+    receive_counts: &[usize],
+    tile_count: u16,
+    mut schedule: MaterializedSchedule,
+    initial_kind: &'static str,
+) -> Result<OptimizedSchedule, ExchangeLoweringError> {
     let initial_horizon = schedule_score(&schedule);
     let endpoint_lower_bound = endpoint_work_lower_bound(pending, tile_count);
-    let mut selected_kind = "full-duplex";
+    let mut selected_kind = initial_kind;
     let mut neighborhood_improvements = 0usize;
     loop {
         let repaired_order = critical_neighborhood_order(pending, tile_count, &schedule);
@@ -2706,7 +2914,7 @@ mod tests {
                     pair.map(|tile| (tile, address))
                 })
                 .collect::<Vec<_>>();
-            let words = random.u32(128..=1024);
+            let words = random.u32(64..=512) * 2;
             let source_address = if random.bool() { 0x1_0000 } else { 0x4_2000 };
             let original = PendingTransfer {
                 source,
@@ -2726,17 +2934,18 @@ mod tests {
             let paired_is_encodable = topology
                 .paired_multicast(source, &paired_tiles, (words & !1) / 2)
                 .is_ok();
-            let split =
-                split_paired_transfers(vec![original.clone()], &topology, tile_count).unwrap();
+            let alternatives = paired_transfer_alternatives(
+                std::slice::from_ref(&original),
+                &topology,
+                tile_count,
+            )
+            .unwrap();
             if !paired_is_encodable {
-                assert_eq!(split.len(), 1);
-                assert_eq!(split[0].width, ExchangeItemWidth::Word32);
-                assert_eq!(split[0].words, words);
+                assert!(alternatives[0].is_none());
                 continue;
             }
-            let paired = split
-                .iter()
-                .find(|transfer| transfer.width == ExchangeItemWidth::Paired64)
+            let paired = alternatives[0]
+                .as_ref()
                 .expect("eligible transfer must have a double-width part");
             assert_eq!(paired.source, source);
             assert_eq!(paired.reserved_source, Some(source_pair));
@@ -2748,34 +2957,17 @@ mod tests {
             assert_eq!(paired_destinations, expected_destinations);
             assert_eq!(paired.source_addresses, original.source_addresses);
 
-            let remainder_words = split
-                .iter()
-                .filter(|transfer| transfer.width == ExchangeItemWidth::Word32)
-                .map(|transfer| transfer.words)
-                .sum::<u32>();
-            assert_eq!(paired.words + remainder_words, words);
-            assert_eq!(split.len(), if words & 1 == 0 { 1 } else { 2 });
-            if let Some(remainder) = split
-                .iter()
-                .find(|transfer| transfer.width == ExchangeItemWidth::Word32)
-            {
-                assert_eq!(remainder.words, 1);
-                let mut remainder_destinations = remainder.destinations.clone();
-                remainder_destinations.sort_unstable();
-                let expected_remainder_destinations = expected_destinations
-                    .iter()
-                    .map(|&(tile, address)| (tile, address + paired.words * 4))
-                    .collect::<Vec<_>>();
-                assert_eq!(remainder_destinations, expected_remainder_destinations);
-                assert_eq!(
-                    remainder.source_addresses[0],
-                    source_address + paired.words * 4
-                );
-                assert_eq!(
-                    remainder.source_offset,
-                    original.source_offset + paired.words * 4
-                );
+            let mut inexact = original.clone();
+            if random.bool() {
+                inexact.words -= 1;
+            } else {
+                inexact.destinations.pop();
             }
+            assert!(
+                paired_transfer_alternatives(std::slice::from_ref(&inexact), &topology, tile_count)
+                    .unwrap()[0]
+                    .is_none()
+            );
         }
     }
 
