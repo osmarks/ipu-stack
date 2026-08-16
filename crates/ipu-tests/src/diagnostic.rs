@@ -281,7 +281,7 @@ pub(crate) fn shard_elements(
         .collect::<Vec<_>>();
     let view = ShardView {
         shard: shard.storage.id,
-        extents: logical_extents.clone(),
+        extents: logical_extents.clone().into(),
     };
     let element_bytes = u32::try_from(tensor.precision.bytes())?;
     let offsets = logical_view_byte_spans(&shard.storage, &view)?

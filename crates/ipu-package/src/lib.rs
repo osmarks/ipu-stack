@@ -279,6 +279,51 @@ pub struct Segment {
     pub flags: u32,
 }
 
+/// Half-open tile-memory address interval.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AddressRegion {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl AddressRegion {
+    pub const fn new(start: u32, end: u32) -> Self {
+        Self { start, end }
+    }
+
+    pub fn from_start_size(start: u32, size: u32) -> Option<Self> {
+        Some(Self::new(start, start.checked_add(size)?))
+    }
+
+    pub const fn size(self) -> u32 {
+        self.end.saturating_sub(self.start)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.start <= other.start && other.end <= self.end
+    }
+
+    pub const fn intersects(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+impl From<std::ops::Range<u32>> for AddressRegion {
+    fn from(range: std::ops::Range<u32>) -> Self {
+        Self::new(range.start, range.end)
+    }
+}
+
+impl From<AddressRegion> for std::ops::Range<u32> {
+    fn from(region: AddressRegion) -> Self {
+        region.start..region.end
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileImage {
     pub physical_tile: u32,

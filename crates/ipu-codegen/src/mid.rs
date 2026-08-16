@@ -1384,15 +1384,42 @@ impl TensorType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OperandRequirement {
     pub format: TensorFormat,
-    pub alignment: u32,
-    /// Bytes the kernel may access beyond the logical tensor payload.
-    pub access_tail_bytes: u32,
+    pub allocation: AllocationRequirements,
     /// How a locally resident operand should be consumed when other tiles use
     /// an operator-local staging buffer for the same operand.
     pub local_staging: LocalOperandStaging,
     /// Whether a dispatch may populate and consume bounded operand slices
     /// instead of materializing the complete required format first.
     pub materialization: OperandMaterialization,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MemoryElementRequirement {
+    #[default]
+    Any,
+    Distinct,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocationRequirements {
+    pub alignment: u32,
+    /// Bytes the kernel may access beyond the logical tensor payload.
+    pub access_tail_bytes: u32,
+    pub memory_element: MemoryElementRequirement,
+}
+
+impl AllocationRequirements {
+    pub fn merge(&mut self, other: Self) {
+        self.alignment = self.alignment.max(other.alignment);
+        self.access_tail_bytes = self.access_tail_bytes.max(other.access_tail_bytes);
+        if other.memory_element == MemoryElementRequirement::Distinct {
+            self.memory_element = MemoryElementRequirement::Distinct;
+        }
+    }
+
+    pub fn require_distinct_element(&mut self) {
+        self.memory_element = MemoryElementRequirement::Distinct;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -1413,15 +1440,17 @@ impl OperandRequirement {
     pub fn new(format: TensorFormat, alignment: u32) -> Self {
         Self {
             format,
-            alignment,
-            access_tail_bytes: 0,
+            allocation: AllocationRequirements {
+                alignment,
+                ..AllocationRequirements::default()
+            },
             local_staging: LocalOperandStaging::Direct,
             materialization: OperandMaterialization::Complete,
         }
     }
 
     pub fn with_access_tail(mut self, bytes: u32) -> Self {
-        self.access_tail_bytes = bytes;
+        self.allocation.access_tail_bytes = bytes;
         self
     }
 
@@ -1449,10 +1478,22 @@ pub enum MemoryOperand {
     Input(u16),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MemoryRelation {
-    /// Operand ranges must not occupy the same effective tile-memory element.
-    DistinctElements(Vec<MemoryOperand>),
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemorySpaceRequirements {
+    /// Each group names operand ranges which must occupy distinct effective
+    /// tile-memory elements.
+    pub distinct_element_groups: Vec<Vec<MemoryOperand>>,
+}
+
+impl MemorySpaceRequirements {
+    pub fn with_distinct_elements(
+        mut self,
+        operands: impl IntoIterator<Item = MemoryOperand>,
+    ) -> Self {
+        self.distinct_element_groups
+            .push(operands.into_iter().collect());
+        self
+    }
 }
 
 /// A GEMM plan after its blocking, layouts, and dispatch have been
@@ -1462,7 +1503,7 @@ struct GemmPlan {
     dispatch: OperatorDispatch,
     inputs: Vec<OperandRequirement>,
     output: OperandRequirement,
-    memory_relations: Vec<MemoryRelation>,
+    memory_space: MemorySpaceRequirements,
 }
 
 fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> bool {
@@ -1487,7 +1528,8 @@ fn alias_compatible(
 }
 
 fn valid_requirement(requirement: &OperandRequirement, shape: &TensorShape) -> bool {
-    requirement.alignment.is_power_of_two() && requirement.format.layout.resolve(shape).is_ok()
+    requirement.allocation.alignment.is_power_of_two()
+        && requirement.format.layout.resolve(shape).is_ok()
 }
 
 fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -> bool {
@@ -2054,10 +2096,8 @@ fn amp_gemm_plan(
             },
             32,
         ),
-        memory_relations: vec![MemoryRelation::DistinctElements(vec![
-            MemoryOperand::Output,
-            MemoryOperand::Input(0),
-        ])],
+        memory_space: MemorySpaceRequirements::default()
+            .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(0)]),
         dispatch: blocked_gemm_dispatch(operator, output_columns),
     }
 }
@@ -2142,10 +2182,8 @@ fn amp_grid_gemm_plan(
             },
             32,
         ),
-        memory_relations: vec![MemoryRelation::DistinctElements(vec![
-            MemoryOperand::Output,
-            MemoryOperand::Input(0),
-        ])],
+        memory_space: MemorySpaceRequirements::default()
+            .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(0)]),
         dispatch: blocked_gemm_dispatch(operator, output_columns),
     }
 }
@@ -2294,7 +2332,7 @@ pub struct OperatorRequirements {
     pub inputs: Vec<OperandRequirement>,
     pub output: OperandRequirement,
     pub output_aliasing: OutputAliasing,
-    pub memory_relations: Vec<MemoryRelation>,
+    pub memory_space: MemorySpaceRequirements,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4225,18 +4263,17 @@ impl OperatorPlan {
         if !alias_valid
             || !self
                 .requirements
-                .memory_relations
+                .memory_space
+                .distinct_element_groups
                 .iter()
-                .all(|relation| match relation {
-                    MemoryRelation::DistinctElements(operands) => {
-                        operands.len() >= 2
-                            && operands
-                                .iter()
-                                .all(|operand| valid_memory_operand(*operand, inputs.len()))
-                            && operands.iter().enumerate().all(|(index, operand)| {
-                                !operands[..index].iter().any(|previous| previous == operand)
-                            })
-                    }
+                .all(|operands| {
+                    operands.len() >= 2
+                        && operands
+                            .iter()
+                            .all(|operand| valid_memory_operand(*operand, inputs.len()))
+                        && operands.iter().enumerate().all(|(index, operand)| {
+                            !operands[..index].iter().any(|previous| previous == operand)
+                        })
                 })
         {
             return false;
@@ -4472,7 +4509,7 @@ fn plans_for_operation(
                         8,
                     ),
                     output_aliasing: OutputAliasing::Fresh,
-                    memory_relations: Vec::new(),
+                    memory_space: MemorySpaceRequirements::default(),
                 },
                 deferred_output: Some(DeferredOutputPlan {
                     source_input: 0,
@@ -4580,7 +4617,7 @@ fn plans_for_operation(
                         ],
                         output: OperandRequirement::new(output_format.clone(), 8),
                         output_aliasing: OutputAliasing::Fresh,
-                        memory_relations: Vec::new(),
+                        memory_space: MemorySpaceRequirements::default(),
                     },
                     deferred_output: None,
                     exchange: ExchangeFootprint::default(),
@@ -4632,7 +4669,7 @@ fn plans_for_operation(
                         ],
                         output: OperandRequirement::new(output_format, 8),
                         output_aliasing: OutputAliasing::Fresh,
-                        memory_relations: Vec::new(),
+                        memory_space: MemorySpaceRequirements::default(),
                     },
                     deferred_output: None,
                     exchange: ExchangeFootprint::default(),
@@ -4740,7 +4777,7 @@ fn pointwise_plans(
                         .collect(),
                     output: OperandRequirement::new(format, 8),
                     output_aliasing: aliasing,
-                    memory_relations: Vec::new(),
+                    memory_space: MemorySpaceRequirements::default(),
                 },
                 deferred_output: None,
                 exchange: ExchangeFootprint::default(),
@@ -4888,7 +4925,7 @@ fn finish_gemm_plan(options: GemmOptions, plan: GemmPlan) -> OperatorPlan {
             inputs: plan.inputs,
             output: plan.output,
             output_aliasing: OutputAliasing::Fresh,
-            memory_relations: plan.memory_relations,
+            memory_space: plan.memory_space,
         },
         None,
     )
@@ -5406,10 +5443,8 @@ fn parallel_reduction_plans_for_orientation(
                         &mut variant.output.format.layout,
                         TensorAxis::FromEnd(2),
                     );
-                    variant.memory_relations = vec![MemoryRelation::DistinctElements(vec![
-                        MemoryOperand::Output,
-                        MemoryOperand::Input(1),
-                    ])];
+                    variant.memory_space = MemorySpaceRequirements::default()
+                        .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(1)]);
                 }
             }
             if let OperatorDispatch::BlockedGemm(plan) = &mut variant.dispatch {
@@ -5728,7 +5763,7 @@ fn retain_precise_gemm_plans(
                 inputs: candidate.inputs.clone(),
                 output: candidate.output.clone(),
                 output_aliasing: OutputAliasing::Fresh,
-                memory_relations: candidate.memory_relations.clone(),
+                memory_space: candidate.memory_space.clone(),
             };
             let memory = operator_memory_estimate(
                 &candidate.dispatch,
@@ -6564,7 +6599,7 @@ mod tests {
                 inputs: Vec::new(),
                 output: OperandRequirement::new(output.format.clone(), 8),
                 output_aliasing: OutputAliasing::Fresh,
-                memory_relations: Vec::new(),
+                memory_space: MemorySpaceRequirements::default(),
             };
             let standard_cost = Ipu21CostModel.operator_cycles(
                 operator,
@@ -6982,7 +7017,7 @@ mod tests {
                         .inputs
                         .iter()
                         .chain([&requirements.output])
-                        .all(|requirement| requirement.alignment == 32)
+                        .all(|requirement| requirement.allocation.alignment == 32)
                 );
                 assert_eq!(
                     requirements.output.format.layout.memory_class,
@@ -6997,11 +7032,11 @@ mod tests {
                     GemmOrientation::Swapped => 1usize,
                 };
                 assert_eq!(
-                    requirements.memory_relations,
-                    [MemoryRelation::DistinctElements(vec![
+                    requirements.memory_space.distinct_element_groups,
+                    [vec![
                         MemoryOperand::Output,
                         MemoryOperand::Input(physical_left as u16),
-                    ])]
+                    ]]
                 );
                 let expected_tail = match operation.operator() {
                     Some(MidOperator::Gemm {
@@ -7014,7 +7049,10 @@ mod tests {
                     }) => 32,
                     _ => unreachable!(),
                 };
-                assert_eq!(requirements.inputs[0].access_tail_bytes, expected_tail);
+                assert_eq!(
+                    requirements.inputs[0].allocation.access_tail_bytes,
+                    expected_tail
+                );
             }
         }
     }

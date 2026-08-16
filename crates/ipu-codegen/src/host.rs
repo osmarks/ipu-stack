@@ -1,7 +1,7 @@
 use crate::{HostPhase, HostProgram};
 use ipu_package::{
-    Binding, HostCall, HostExchange, HostPage, HostSlice, RegionSlice, SEGMENT_EXECUTE,
-    SEGMENT_READ, Segment,
+    AddressRegion, Binding, HostCall, HostExchange, HostPage, HostSlice, RegionSlice,
+    SEGMENT_EXECUTE, SEGMENT_READ, Segment,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -59,7 +59,7 @@ pub(crate) fn plan(
     outputs: &[Binding],
     execution_tiles: u16,
     base: u32,
-    data_ranges: &[Vec<(u32, u32)>],
+    data_ranges: &[Vec<AddressRegion>],
 ) -> PackageBuildResult<HostPackagePlan> {
     if data_ranges.len() != usize::from(execution_tiles) {
         return Err(invalid("host plan has no data ranges for every tile"));
@@ -313,7 +313,7 @@ fn plan_tile(
     physical_tile: u16,
     phases: &[Phase],
     base: u32,
-    data_ranges: &[(u32, u32)],
+    data_ranges: &[AddressRegion],
 ) -> PackageBuildResult<PlannedTile> {
     let follower = align_up(base, 8)?;
     let mut cursor = follower + 12;
@@ -376,11 +376,11 @@ fn plan_tile(
 }
 
 struct DataArena {
-    ranges: Vec<(u32, u32)>,
+    ranges: Vec<AddressRegion>,
 }
 
 impl DataArena {
-    fn new(ranges: &[(u32, u32)]) -> Self {
+    fn new(ranges: &[AddressRegion]) -> Self {
         Self {
             ranges: ranges.to_vec(),
         }
@@ -391,10 +391,10 @@ impl DataArena {
             .ranges
             .iter()
             .enumerate()
-            .filter_map(|(index, &(base, limit))| {
-                let start = align_up(base, alignment).ok()?;
+            .filter_map(|(index, range)| {
+                let start = align_up(range.start, alignment).ok()?;
                 let end = start.checked_add(bytes)?;
-                (end <= limit).then_some((limit - end, index, start, end))
+                (end <= range.end).then_some((range.end - end, index, start, end))
             })
             .min_by_key(|candidate| (candidate.0, candidate.2))
             .ok_or_else(|| {
@@ -403,14 +403,14 @@ impl DataArena {
                 ))
             })?;
         let (_, index, start, end) = candidate;
-        let (base, limit) = self.ranges.remove(index);
-        if base < start {
-            self.ranges.push((base, start));
+        let range = self.ranges.remove(index);
+        if range.start < start {
+            self.ranges.push(AddressRegion::new(range.start, start));
         }
-        if end < limit {
-            self.ranges.push((end, limit));
+        if end < range.end {
+            self.ranges.push(AddressRegion::new(end, range.end));
         }
-        self.ranges.sort_unstable();
+        self.ranges.sort_unstable_by_key(|range| range.start);
         Ok(start)
     }
 }

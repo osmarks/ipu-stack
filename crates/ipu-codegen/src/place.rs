@@ -4,11 +4,14 @@ use crate::low::{
     KernelRequirements, LowProgram, LowShardId, ShardDefinition, TileWorkList, TileWorkRef,
 };
 use crate::memory::IPU21_DATA_BASE;
-use crate::mid::{MemoryClass, MemoryOperand, MemoryRelation, OperandRequirement};
+use crate::mid::{
+    AllocationRequirements, MemoryClass, MemoryElementRequirement, MemoryOperand,
+    OperandRequirement,
+};
 use crate::storage::{StorageError, shard_storage_bytes};
 use ipu_package::{
-    IPU21_APPLICATION_MEMORY_LIMIT, IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE,
-    TILE_MEMORY_ELEMENT_SIZE,
+    AddressRegion, IPU21_APPLICATION_MEMORY_LIMIT, IPU21_INTERLEAVED_ELEMENT_SIZE,
+    IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
 };
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placement {
     pub shard_addresses: BTreeMap<LowShardId, u32>,
-    pub tile_auxiliary_ranges: Vec<Vec<(u32, u32)>>,
+    pub tile_auxiliary_ranges: Vec<Vec<AddressRegion>>,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -39,13 +42,6 @@ pub enum PlacementError {
     },
     #[error("placement arithmetic overflowed")]
     Overflow,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct Requirement {
-    alignment: u32,
-    access_tail: u32,
-    distinct_element: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -76,18 +72,28 @@ impl Lifetime {
 }
 
 pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
-    place_with_standard_ranges(program, &[(IPU21_DATA_BASE, IPU21_INTERLEAVED_MEMORY_BASE)])
+    place_with_standard_ranges(
+        program,
+        &[AddressRegion::new(
+            IPU21_DATA_BASE,
+            IPU21_INTERLEAVED_MEMORY_BASE,
+        )],
+    )
 }
 
 pub(crate) fn place_with_standard_ranges(
     program: &LowProgram,
-    standard_ranges: &[(u32, u32)],
+    standard_ranges: &[AddressRegion],
 ) -> Result<Placement, PlacementError> {
     if standard_ranges.is_empty()
-        || standard_ranges.iter().any(|&(start, end)| {
-            start < IPU21_DATA_BASE || end > IPU21_INTERLEAVED_MEMORY_BASE || start >= end
+        || standard_ranges.iter().any(|range| {
+            range.start < IPU21_DATA_BASE
+                || range.end > IPU21_INTERLEAVED_MEMORY_BASE
+                || range.is_empty()
         })
-        || standard_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0)
+        || standard_ranges
+            .windows(2)
+            .any(|pair| pair[0].end > pair[1].start)
     {
         return Err(PlacementError::OutOfMemory {
             tile: 0,
@@ -108,17 +114,15 @@ pub(crate) fn place_with_standard_ranges(
         collect_repeat_constraints(program, tile, &mut sets, &mut iterated)?;
     }
 
-    let mut requirements = vec![Requirement::default(); program.shards.len()];
+    let mut requirements = vec![AllocationRequirements::default(); program.shards.len()];
     for tile in &program.tiles {
         collect_requirements(program, tile, &mut requirements);
     }
-    let mut root_requirements = BTreeMap::<usize, Requirement>::new();
+    let mut root_requirements = BTreeMap::<usize, AllocationRequirements>::new();
     for (index, requirement) in requirements.into_iter().enumerate() {
         let root = sets.find(index);
         let combined = root_requirements.entry(root).or_default();
-        combined.alignment = combined.alignment.max(requirement.alignment);
-        combined.access_tail = combined.access_tail.max(requirement.access_tail);
-        combined.distinct_element |= requirement.distinct_element;
+        combined.merge(requirement);
     }
 
     let mut members = BTreeMap::<usize, Vec<usize>>::new();
@@ -170,13 +174,13 @@ pub(crate) fn place_with_standard_ranges(
 fn place_tile(
     program: &LowProgram,
     tile: u16,
-    standard_ranges: &[(u32, u32)],
+    standard_ranges: &[AddressRegion],
     iterated: &[IteratedGroup],
     members: &BTreeMap<usize, Vec<usize>>,
     root_of_member: &[usize],
-    root_requirements: &BTreeMap<usize, Requirement>,
+    root_requirements: &BTreeMap<usize, AllocationRequirements>,
     root_lifetimes: &BTreeMap<usize, Lifetime>,
-) -> Result<(u16, BTreeMap<LowShardId, u32>, Vec<(u32, u32)>), PlacementError> {
+) -> Result<(u16, BTreeMap<LowShardId, u32>, Vec<AddressRegion>), PlacementError> {
     let mut grouped = BTreeSet::<usize>::new();
     for group in iterated.iter().filter(|group| group.tile == tile) {
         let roots = group
@@ -222,7 +226,10 @@ fn place_tile(
             bytes: interleaved_boundary - IPU21_INTERLEAVED_MEMORY_BASE,
         });
     }
-    let mut ranges = standard_ranges.to_vec();
+    let mut ranges = standard_ranges
+        .iter()
+        .map(|range| (range.start, range.end))
+        .collect::<Vec<_>>();
     ranges.push((interleaved_boundary, IPU21_APPLICATION_MEMORY_LIMIT));
     let mut standard = Arena::new(&ranges, false);
     allocate_tile_class(
@@ -238,7 +245,15 @@ fn place_tile(
         &mut standard,
         &mut addresses,
     )?;
-    Ok((tile, addresses, standard.unused_ranges()))
+    Ok((
+        tile,
+        addresses,
+        standard
+            .unused_ranges()
+            .into_iter()
+            .map(|(start, end)| AddressRegion::new(start, end))
+            .collect(),
+    ))
 }
 
 fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
@@ -386,36 +401,35 @@ fn collect_repeat_constraints(
 fn collect_requirements(
     program: &LowProgram,
     tile: &TileWorkList,
-    requirements: &mut [Requirement],
+    requirements: &mut [AllocationRequirements],
 ) {
     for work in program.work(tile) {
         match work {
             TileWorkRef::Kernel(run) => {
-                let (inputs, output, memory_relations) = match &run.requirements {
+                let (inputs, output, memory_space) = match &run.requirements {
                     KernelRequirements::Operator(operator_requirements) => (
                         &operator_requirements.inputs[..],
                         &operator_requirements.output,
-                        &operator_requirements.memory_relations,
+                        &operator_requirements.memory_space,
                     ),
                     KernelRequirements::Conversion {
                         input,
                         output,
-                        memory_relations,
-                    } => (std::slice::from_ref(input), output, memory_relations),
+                        memory_space,
+                    } => (std::slice::from_ref(input), output, memory_space),
                 };
-                for relation in memory_relations {
-                    let MemoryRelation::DistinctElements(operands) = relation;
+                for operands in &memory_space.distinct_element_groups {
                     for operand in operands {
                         match operand {
                             MemoryOperand::Output => {
-                                requirements[run.output.shard.index() as usize].distinct_element =
-                                    true;
+                                requirements[run.output.shard.index() as usize]
+                                    .require_distinct_element();
                             }
                             MemoryOperand::Input(index) => {
                                 if let Some(input) = run.inputs.get(usize::from(*index)) {
                                     for view in &input.views {
                                         requirements[view.shard.index() as usize]
-                                            .distinct_element = true;
+                                            .require_distinct_element();
                                     }
                                 }
                             }
@@ -448,9 +462,8 @@ fn collect_requirements(
     }
 }
 
-fn apply_requirement(target: &mut Requirement, requirement: &OperandRequirement) {
-    target.alignment = target.alignment.max(requirement.alignment);
-    target.access_tail = target.access_tail.max(requirement.access_tail_bytes);
+fn apply_requirement(target: &mut AllocationRequirements, requirement: &OperandRequirement) {
+    target.merge(requirement.allocation);
 }
 
 fn checked_union(
@@ -493,20 +506,20 @@ fn validate_alias_groups(
 fn allocation_bytes(
     program: &LowProgram,
     members: &[usize],
-    requirement: Requirement,
+    requirement: AllocationRequirements,
 ) -> Result<u32, PlacementError> {
     let bytes = members
         .iter()
         .map(|&index| {
             shard_storage_bytes(&program.shards[index])?
-                .checked_add(requirement.access_tail)
+                .checked_add(requirement.access_tail_bytes)
                 .ok_or(PlacementError::Overflow)
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .max()
         .ok_or(PlacementError::Overflow)?;
-    if requirement.distinct_element {
+    if requirement.memory_element == MemoryElementRequirement::Distinct {
         align_up(bytes, memory_element_size(program, members))
     } else {
         Ok(bytes)
@@ -525,8 +538,12 @@ fn memory_element_size(program: &LowProgram, members: &[usize]) -> u32 {
     }
 }
 
-fn allocation_alignment(program: &LowProgram, members: &[usize], requirement: Requirement) -> u32 {
-    if requirement.distinct_element {
+fn allocation_alignment(
+    program: &LowProgram,
+    members: &[usize],
+    requirement: AllocationRequirements,
+) -> u32 {
+    if requirement.memory_element == MemoryElementRequirement::Distinct {
         requirement
             .alignment
             .max(memory_element_size(program, members))
@@ -558,7 +575,7 @@ fn allocate_tile_class(
     grouped: &BTreeSet<usize>,
     members: &BTreeMap<usize, Vec<usize>>,
     root_of_member: &[usize],
-    root_requirements: &BTreeMap<usize, Requirement>,
+    root_requirements: &BTreeMap<usize, AllocationRequirements>,
     root_lifetimes: &BTreeMap<usize, Lifetime>,
     arena: &mut Arena,
     addresses: &mut BTreeMap<LowShardId, u32>,
@@ -903,8 +920,7 @@ mod tests {
                         )
                         .unwrap();
                         if let KernelRequirements::Operator(requirements) = &run.requirements {
-                            for relation in &requirements.memory_relations {
-                                let MemoryRelation::DistinctElements(operands) = relation;
+                            for operands in &requirements.memory_space.distinct_element_groups {
                                 let mut ranges = Vec::new();
                                 for operand in operands {
                                     let shards = match operand {

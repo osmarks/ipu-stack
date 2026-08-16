@@ -1,5 +1,7 @@
 //! Machine-readable ABI contracts for tile-local kernel calls.
 
+#[cfg(test)]
+use crate::MemorySpaceRequirements;
 use crate::mid::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
     AmpOrder, BlockMajorOrder, ComputeStep, ElementOrder, GemmKernelMode, GemmWeightLoad,
@@ -1601,7 +1603,7 @@ mod tests {
                     inputs: Vec::new(),
                     output: OperandRequirement::new(format, 8),
                     output_aliasing: OutputAliasing::Fresh,
-                    memory_relations: Vec::new(),
+                    memory_space: MemorySpaceRequirements::default(),
                 }),
             );
             let expected = outer
@@ -1646,7 +1648,7 @@ mod tests {
                 inputs: vec![operand.clone(), operand.clone()],
                 output: operand,
                 output_aliasing: OutputAliasing::Fresh,
-                memory_relations: Vec::new(),
+                memory_space: MemorySpaceRequirements::default(),
             });
             let abi = tile_kernel_abi(
                 &TileKernelSpec::Gemm {
@@ -1770,7 +1772,7 @@ mod tests {
                 inputs: vec![requirement(input_layout)],
                 output: requirement(output_layout),
                 output_aliasing: OutputAliasing::Fresh,
-                memory_relations: Vec::new(),
+                memory_space: MemorySpaceRequirements::default(),
             });
             let abi = tile_kernel_abi(&TileKernelSpec::Gelu, &requirements).unwrap();
             assert_eq!(abi.availability, KernelAvailability::Implemented);

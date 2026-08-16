@@ -17,7 +17,7 @@ use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
 use ipu_exchange::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
 use ipu_package::{
-    Application, Binding, DEBUG_ALL_TILES, DebugRegion, DebugSymbol, EntryPoint,
+    AddressRegion, Application, Binding, DEBUG_ALL_TILES, DebugRegion, DebugSymbol, EntryPoint,
     PROFILE_CYCLES_BINDING, PackageError, ProfileExchangeActivity, ProfileExchangeActivityKind,
     ProfileMetadata, ProfileStep, ProfileStepKind, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ,
     SEGMENT_WRITE, Segment, TILE_MEMORY_BASE, TileImage, TileProfilePlan,
@@ -222,12 +222,14 @@ pub fn build_tile_program_package(
     reserve_linked_image(&mut memory, &layout, "linked runtime")?;
     memory.reserve(
         "host exchange aperture",
-        ipu_exchange::EXCHANGE_WINDOW_BASE
-            ..ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+        AddressRegion::new(
+            ipu_exchange::EXCHANGE_WINDOW_BASE,
+            ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+        ),
     )?;
     memory.reserve(
         "runtime state",
-        RUNTIME_STATE_BASE..RUNTIME_EXECUTABLE_START,
+        AddressRegion::new(RUNTIME_STATE_BASE, RUNTIME_EXECUTABLE_START),
     )?;
     let mut tile_data = vec![Vec::<(u32, u32)>::new(); usize::from(execution_tiles)];
     for segment in data {
@@ -276,7 +278,10 @@ pub fn build_tile_program_package(
         }
     }
     for (start, end) in merged_tile_local {
-        memory.reserve("tile-local data or exchange rows", start..end)?;
+        memory.reserve(
+            "tile-local data or exchange rows",
+            AddressRegion::new(start, end),
+        )?;
     }
 
     let launch = Binding {
@@ -303,10 +308,13 @@ pub fn build_tile_program_package(
     };
     let mut run_outputs = outputs.to_vec();
     run_outputs.push(finish);
-    let host_bounds = crate::IPU21_DATA_BASE..TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
+    let host_bounds = AddressRegion::new(
+        crate::IPU21_DATA_BASE,
+        TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+    );
     let sizing_host_base = memory.next_free(
         linked_end,
-        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        AddressRegion::new(TILE_MEMORY_BASE, ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT),
         8,
         "host programs",
     )?;
@@ -327,7 +335,7 @@ pub fn build_tile_program_package(
         name: "host programs",
         bytes: host_code_bytes,
         alignment: 8,
-        bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        bounds: AddressRegion::new(linked_end, ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT),
         end_alignment: 8,
         guard_after: 0,
     })?;
@@ -362,12 +370,12 @@ pub fn build_tile_program_package(
         }
     }
     for (start, end) in merged_host_data {
-        memory.reserve("host program data", start..end)?;
+        memory.reserve("host program data", AddressRegion::new(start, end))?;
     }
 
     let sizing_address = memory.next_free(
         host_code.range.end,
-        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        AddressRegion::new(TILE_MEMORY_BASE, ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT),
         8,
         "generated tile programs",
     )?;
@@ -389,7 +397,7 @@ pub fn build_tile_program_package(
             name: "generated tile programs",
             bytes: maximum_bytes,
             alignment: 4,
-            bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+            bounds: AddressRegion::new(linked_end, ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT),
             // Supervisor instruction fetch and exchange/paired memory access
             // cannot safely use the same standard-memory element. Reserve the
             // rest of the element so subsequently placed tensor data cannot
@@ -787,12 +795,14 @@ fn build_package_from_objects(
     reserve_linked_image(&mut memory, &layout, "linked runtime and kernels")?;
     memory.reserve(
         "host exchange aperture",
-        ipu_exchange::EXCHANGE_WINDOW_BASE
-            ..ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+        AddressRegion::new(
+            ipu_exchange::EXCHANGE_WINDOW_BASE,
+            ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+        ),
     )?;
     memory.reserve(
         "runtime state",
-        RUNTIME_STATE_BASE..RUNTIME_EXECUTABLE_START,
+        AddressRegion::new(RUNTIME_STATE_BASE, RUNTIME_EXECUTABLE_START),
     )?;
 
     let provisional_placement = build_phase("plan_exchange_storage", || Ok(place(program)?))?;
@@ -833,7 +843,10 @@ fn build_package_from_objects(
                 // executes its host-readback program. Those accesses must not
                 // share a standard-memory element with instruction fetch.
                 alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+                bounds: AddressRegion::new(
+                    crate::IPU21_DATA_BASE,
+                    ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+                ),
                 end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
                 guard_after: 0,
             })?)
@@ -849,7 +862,10 @@ fn build_package_from_objects(
                 // at both ends so storage placement cannot use a prefix of the
                 // row table's first element.
                 alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                bounds: AddressRegion::new(
+                    crate::IPU21_DATA_BASE,
+                    ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                ),
                 end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
                 guard_after: ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
             })
@@ -909,12 +925,12 @@ fn build_package_from_objects(
     }
     let sizing_host_base = memory.next_free(
         linked_end,
-        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        AddressRegion::new(TILE_MEMORY_BASE, ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT),
         4,
         "host programs",
     )?;
     let mut provisional_auxiliary_ranges = vec![
-        vec![(
+        vec![AddressRegion::new(
             crate::IPU21_DATA_BASE,
             TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
         )];
@@ -942,7 +958,7 @@ fn build_package_from_objects(
                 name: "host programs",
                 bytes: host_code_bytes,
                 alignment: 8,
-                bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                bounds: AddressRegion::new(linked_end, ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT),
                 end_alignment: 8,
                 guard_after: 0,
             })
@@ -975,7 +991,7 @@ fn build_package_from_objects(
     )?;
     let sizing_code_address = memory.next_free(
         host_code_base + host_code_bytes,
-        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        AddressRegion::new(TILE_MEMORY_BASE, ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT),
         4,
         "generated tile programs",
     )?;
@@ -1030,8 +1046,10 @@ fn build_package_from_objects(
                 name: "generated tile programs",
                 bytes: generated_code_bytes,
                 alignment: 4,
-                bounds: (host_code_base + host_code_bytes)
-                    ..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                bounds: AddressRegion::new(
+                    host_code_base + host_code_bytes,
+                    ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                ),
                 // Host programs and generated tile code form one contiguous
                 // executable region. Keep planned standard-memory values out
                 // of its final memory element.
@@ -1041,13 +1059,15 @@ fn build_package_from_objects(
             .range
             .start
     };
-    let standard_ranges =
-        memory.free_ranges(crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE);
+    let standard_ranges = memory.free_ranges(AddressRegion::new(
+        crate::IPU21_DATA_BASE,
+        ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+    ));
     tracing::info!(
         linked_end,
         profile_bytes = profile_storage
             .as_ref()
-            .map_or(0, |allocation| allocation.range.len()),
+            .map_or(0, |allocation| allocation.range.size()),
         exchange_table_bytes,
         host_code_bytes,
         generated_code_bytes,
@@ -1117,7 +1137,7 @@ fn build_package_from_objects(
         ));
     }
     let mut inactive_auxiliary_ranges = standard_ranges.clone();
-    inactive_auxiliary_ranges.push((
+    inactive_auxiliary_ranges.push(AddressRegion::new(
         ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
         TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
     ));
@@ -2212,7 +2232,7 @@ fn reserve_linked_image(
             .address
             .checked_add(u32::try_from(segment.size)?)
             .ok_or_else(|| invalid("linked runtime segment range overflow"))?;
-        memory.reserve(name, segment.address..end)?;
+        memory.reserve(name, AddressRegion::new(segment.address, end))?;
     }
     Ok(())
 }

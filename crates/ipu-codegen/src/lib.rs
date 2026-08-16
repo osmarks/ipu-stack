@@ -40,7 +40,7 @@ pub use kernel::{
     KernelMaterializationError, KernelSymbols, PlannedKernelCall, ScalarArgument,
     materialize_kernel_run, tile_kernel_abi, validate_kernel_run,
 };
-pub use layout::ShardExtent;
+pub use layout::{ShardExtent, TensorRegion};
 pub use low::{
     ExchangeOrder, ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun,
     KernelRunId, KernelRunMetadata, LocalCopy, LocalCopyId, LocalCopyPattern, LogicalExchange,
@@ -53,19 +53,20 @@ pub use memory::{
     IPU21_STANDARD_FIXED_BYTES,
 };
 pub use mid::{
-    AccumulationPrecision, AmpOrder, AttentionBlocking, AttentionKernelFamily, AttentionPadding,
-    AttentionPlan, AttentionStrategy, AxisTiling, BlockMajorOrder, BlockedGemmPlan, ConversionPlan,
-    ConversionStrategy, ConversionStreamingPolicy, CostModel, ElementOrder, GemmBlockShape,
-    GemmDistribution, GemmGeometry, GemmGrid, GemmKernelFamily, GemmKernelMode, GemmOrientation,
-    GemmPlanConstraint, GemmResultGrid, GemmWeightLoad, GridOrder, HardwareMemoryConstraints,
-    HardwareTarget, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, Layout, LayoutError,
-    LocalOperandStaging, LoweringError, LoweringResult, MemoryClass, MemoryEstimate, MemoryOperand,
-    MemoryPeaks, MemoryRelation, MemoryUsage, MidGraph, MidInput, MidOperation, MidOperationKind,
-    MidOperator, MidRegion, MidRepeat, MidValue, MidValueId, OperandMaterialization,
-    OperandRequirement, OperatorClass, OperatorDispatch, OperatorPlan, OperatorPlanError,
-    OperatorRequirements, OutputAliasing, Padding, ParallelReductionPlan, PipelineConfig,
-    PlannerSearchDomain, PointwiseInputMapping, Precision, ProfilingMode, ReductionStaging,
-    TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
+    AccumulationPrecision, AllocationRequirements, AmpOrder, AttentionBlocking,
+    AttentionKernelFamily, AttentionPadding, AttentionPlan, AttentionStrategy, AxisTiling,
+    BlockMajorOrder, BlockedGemmPlan, ConversionPlan, ConversionStrategy,
+    ConversionStreamingPolicy, CostModel, ElementOrder, GemmBlockShape, GemmDistribution,
+    GemmGeometry, GemmGrid, GemmKernelFamily, GemmKernelMode, GemmOrientation, GemmPlanConstraint,
+    GemmResultGrid, GemmWeightLoad, GridOrder, HardwareMemoryConstraints, HardwareTarget,
+    IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, Layout, LayoutError, LocalOperandStaging,
+    LoweringError, LoweringResult, MemoryClass, MemoryElementRequirement, MemoryEstimate,
+    MemoryOperand, MemoryPeaks, MemorySpaceRequirements, MemoryUsage, MidGraph, MidInput,
+    MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId,
+    OperandMaterialization, OperandRequirement, OperatorClass, OperatorDispatch, OperatorPlan,
+    OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, ParallelReductionPlan,
+    PipelineConfig, PlannerSearchDomain, PointwiseInputMapping, Precision, ProfilingMode,
+    ReductionStaging, TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{
     CompiledPackage, DiagnosticCheckpoint, DiagnosticPackage, DiagnosticShard, DiagnosticTensor,

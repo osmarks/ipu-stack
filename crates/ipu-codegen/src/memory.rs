@@ -1,4 +1,4 @@
-use std::ops::Range;
+use ipu_package::AddressRegion;
 
 /// Runtime completion word followed by the supervisor and worker stack state.
 pub const RUNTIME_STATE_BASE: u32 =
@@ -31,13 +31,13 @@ pub const IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES: u32 = 3 * ipu_package::TILE_M
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemoryAllocation {
     pub name: &'static str,
-    pub range: Range<u32>,
-    reserved: Range<u32>,
+    pub range: AddressRegion,
+    reserved: AddressRegion,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct TileMemoryMap {
-    free: Vec<Range<u32>>,
+    free: Vec<AddressRegion>,
     allocations: Vec<MemoryAllocation>,
 }
 
@@ -46,7 +46,7 @@ pub(crate) struct MemoryRequest {
     pub name: &'static str,
     pub bytes: u32,
     pub alignment: u32,
-    pub bounds: Range<u32>,
+    pub bounds: AddressRegion,
     /// Aligns the first following allocation and reserves any resulting gap.
     pub end_alignment: u32,
     /// Additional inaccessible bytes after the payload, before end alignment.
@@ -69,10 +69,10 @@ pub(crate) enum MemoryLayoutError {
 
 impl TileMemoryMap {
     pub(crate) fn new() -> Self {
-        let free = std::iter::once(
-            ipu_package::TILE_MEMORY_BASE
-                ..ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-        )
+        let free = std::iter::once(AddressRegion::new(
+            ipu_package::TILE_MEMORY_BASE,
+            ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+        ))
         .collect();
         Self {
             free,
@@ -83,7 +83,7 @@ impl TileMemoryMap {
     pub(crate) fn reserve(
         &mut self,
         name: &'static str,
-        range: Range<u32>,
+        range: AddressRegion,
     ) -> Result<MemoryAllocation, MemoryLayoutError> {
         if range.start >= range.end {
             return Err(MemoryLayoutError::Invalid(name));
@@ -101,15 +101,15 @@ impl TileMemoryMap {
         };
         let free = self.free.remove(index);
         if free.start < range.start {
-            self.free.push(free.start..range.start);
+            self.free.push(AddressRegion::new(free.start, range.start));
         }
         if range.end < free.end {
-            self.free.push(range.end..free.end);
+            self.free.push(AddressRegion::new(range.end, free.end));
         }
         self.free.sort_by_key(|range| range.start);
         let allocation = MemoryAllocation {
             name,
-            range: range.clone(),
+            range,
             reserved: range,
         };
         self.allocations.push(allocation.clone());
@@ -141,8 +141,9 @@ impl TileMemoryMap {
             };
             let reserved_end = align_up(guarded_end, request.end_alignment, request.name)?;
             if reserved_end <= free.end.min(request.bounds.end) {
-                let payload = start..payload_end;
-                let reserved = self.reserve(request.name, start..reserved_end)?;
+                let payload = AddressRegion::new(start, payload_end);
+                let reserved =
+                    self.reserve(request.name, AddressRegion::new(start, reserved_end))?;
                 let allocation = MemoryAllocation {
                     name: request.name,
                     range: payload,
@@ -161,13 +162,13 @@ impl TileMemoryMap {
         })
     }
 
-    pub(crate) fn free_ranges(&self, bounds: Range<u32>) -> Vec<(u32, u32)> {
+    pub(crate) fn free_ranges(&self, bounds: AddressRegion) -> Vec<AddressRegion> {
         self.free
             .iter()
             .filter_map(|free| {
                 let start = free.start.max(bounds.start);
                 let end = free.end.min(bounds.end);
-                (start < end).then_some((start, end))
+                (start < end).then_some(AddressRegion::new(start, end))
             })
             .collect()
     }
@@ -175,7 +176,7 @@ impl TileMemoryMap {
     pub(crate) fn next_free(
         &self,
         start: u32,
-        bounds: Range<u32>,
+        bounds: AddressRegion,
         alignment: u32,
         name: &'static str,
     ) -> Result<u32, MemoryLayoutError> {
@@ -184,9 +185,9 @@ impl TileMemoryMap {
         }
         self.free_ranges(bounds)
             .into_iter()
-            .find_map(|(free_start, free_end)| {
-                let address = align_up(free_start.max(start), alignment, name).ok()?;
-                (address < free_end).then_some(address)
+            .find_map(|free| {
+                let address = align_up(free.start.max(start), alignment, name).ok()?;
+                (address < free.end).then_some(address)
             })
             .ok_or(MemoryLayoutError::OutOfMemory { name, bytes: 1 })
     }
@@ -208,7 +209,8 @@ mod tests {
         let mut random = fastrand::Rng::with_seed(0x6d65_6d6f_7279);
         for _ in 0..128 {
             let mut map = TileMemoryMap::new();
-            map.reserve("fixed", 0x50000..0x58000).unwrap();
+            map.reserve("fixed", AddressRegion::new(0x50000, 0x58000))
+                .unwrap();
             for _ in 0..random.usize(1..=24) {
                 let alignment = 1 << random.u32(2..=14);
                 let bytes = 4 * random.u32(1..=1024);
@@ -216,14 +218,16 @@ mod tests {
                     name: "random",
                     bytes,
                     alignment,
-                    bounds: ipu_package::TILE_MEMORY_BASE
-                        ..ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                    bounds: AddressRegion::new(
+                        ipu_package::TILE_MEMORY_BASE,
+                        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                    ),
                     end_alignment: 1 << random.u32(0..=14),
                     guard_after: random.u32(0..=64),
                 });
                 if let Ok(allocation) = result {
                     assert!(allocation.range.start.is_multiple_of(alignment));
-                    assert_eq!(allocation.range.len(), bytes as usize);
+                    assert_eq!(allocation.range.size(), bytes);
                 }
             }
             let mut ranges = map

@@ -1,5 +1,7 @@
 //! Analytical IPU21 cycle estimation used during operator planning.
 
+#[cfg(test)]
+use crate::MemorySpaceRequirements;
 use crate::estimate::{
     ExchangeEndpointTraffic, average_shard_bytes, conversion_traffic,
     gemm_exchange_endpoint_traffic, gemm_exchange_phase_count, gemm_partial_tensor,
@@ -1525,7 +1527,7 @@ mod tests {
             inputs: vec![OperandRequirement::new(format.clone(), 8)],
             output: OperandRequirement::new(format, 8),
             output_aliasing: OutputAliasing::Fresh,
-            memory_relations: Vec::new(),
+            memory_space: MemorySpaceRequirements::default(),
         }
     }
 

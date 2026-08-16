@@ -2,10 +2,10 @@
 
 use crate::graph::TensorShape;
 use crate::mid::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, GemmDistribution, Layout, MemoryClass,
-    MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidOperation,
-    MidOperationKind, MidValue, MidValueId, OperandMaterialization, OperatorDispatch,
-    OperatorRequirements, Precision, TensorAxis, TensorType,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AllocationRequirements, ElementOrder, GemmDistribution,
+    Layout, MemoryClass, MemoryElementRequirement, MemoryEstimate, MemoryOperand, MemoryPeaks,
+    MemoryUsage, MidOperation, MidOperationKind, MidValue, MidValueId, OperandMaterialization,
+    OperatorDispatch, OperatorRequirements, Precision, TensorAxis, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -413,15 +413,10 @@ pub(crate) fn tensor_memory(tensor: &TensorType) -> MemoryUsage {
     usage
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct AllocationRequirement {
-    access_tail: u64,
-    distinct_element: bool,
-}
-
-fn allocation_memory(tensor: &TensorType, requirement: AllocationRequirement) -> MemoryUsage {
-    let mut bytes = maximum_shard_bytes(tensor).saturating_add(requirement.access_tail);
-    if requirement.distinct_element {
+fn allocation_memory(tensor: &TensorType, requirement: AllocationRequirements) -> MemoryUsage {
+    let mut bytes =
+        maximum_shard_bytes(tensor).saturating_add(u64::from(requirement.access_tail_bytes));
+    if requirement.memory_element == MemoryElementRequirement::Distinct {
         let element = match tensor.format.layout.memory_class {
             MemoryClass::Standard => ipu_package::TILE_MEMORY_ELEMENT_SIZE,
             MemoryClass::Interleaved => ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE,
@@ -435,24 +430,19 @@ fn allocation_memory(tensor: &TensorType, requirement: AllocationRequirement) ->
 
 fn allocation_requirements(
     operations: &[MidOperation],
-) -> BTreeMap<MidValueId, AllocationRequirement> {
-    let mut requirements = BTreeMap::<MidValueId, AllocationRequirement>::new();
+) -> BTreeMap<MidValueId, AllocationRequirements> {
+    let mut requirements = BTreeMap::<MidValueId, AllocationRequirements>::new();
     for operation in operations {
         if let Some(plan) = operation.operator_plan() {
             for (&id, operand) in operation.inputs.iter().zip(&plan.requirements.inputs) {
                 let requirement = requirements.entry(id).or_default();
-                requirement.access_tail = requirement
-                    .access_tail
-                    .max(u64::from(operand.access_tail_bytes));
+                requirement.merge(operand.allocation);
             }
             if let Some(&id) = operation.results.first() {
                 let requirement = requirements.entry(id).or_default();
-                requirement.access_tail = requirement
-                    .access_tail
-                    .max(u64::from(plan.requirements.output.access_tail_bytes));
+                requirement.merge(plan.requirements.output.allocation);
             }
-            for relation in &plan.requirements.memory_relations {
-                let MemoryRelation::DistinctElements(operands) = relation;
+            for operands in &plan.requirements.memory_space.distinct_element_groups {
                 for operand in operands {
                     let id = match operand {
                         MemoryOperand::Output => operation.results.first().copied(),
@@ -461,7 +451,10 @@ fn allocation_requirements(
                         }
                     };
                     if let Some(id) = id {
-                        requirements.entry(id).or_default().distinct_element = true;
+                        requirements
+                            .entry(id)
+                            .or_default()
+                            .require_distinct_element();
                     }
                 }
             }
@@ -469,15 +462,11 @@ fn allocation_requirements(
         if let Some(plan) = &operation.conversion_plan {
             if let Some(&id) = operation.inputs.first() {
                 let requirement = requirements.entry(id).or_default();
-                requirement.access_tail = requirement
-                    .access_tail
-                    .max(u64::from(plan.input.access_tail_bytes));
+                requirement.merge(plan.input.allocation);
             }
             if let Some(&id) = operation.results.first() {
                 let requirement = requirements.entry(id).or_default();
-                requirement.access_tail = requirement
-                    .access_tail
-                    .max(u64::from(plan.output.access_tail_bytes));
+                requirement.merge(plan.output.allocation);
             }
         }
     }
@@ -487,7 +476,7 @@ fn allocation_requirements(
 fn value_allocation(
     id: MidValueId,
     values: &[MidValue],
-    requirements: &BTreeMap<MidValueId, AllocationRequirement>,
+    requirements: &BTreeMap<MidValueId, AllocationRequirements>,
 ) -> MemoryUsage {
     allocation_memory(
         &values[id.index() as usize].tensor_type,
@@ -498,7 +487,7 @@ fn value_allocation(
 fn maximum_standard_allocation(
     ids: &BTreeSet<MidValueId>,
     values: &[MidValue],
-    requirements: &BTreeMap<MidValueId, AllocationRequirement>,
+    requirements: &BTreeMap<MidValueId, AllocationRequirements>,
 ) -> u64 {
     ids.iter()
         .map(|&id| value_allocation(id, values, requirements).standard)
@@ -554,15 +543,18 @@ pub(crate) fn operator_memory_estimate(
             requirement.materialization == OperandMaterialization::DispatchSlices
         }) {
             let requirement = left_requirement.expect("checked requirement");
-            let mut left_staging =
-                maximum_shard_bytes(left).saturating_add(u64::from(requirement.access_tail_bytes));
-            let left_must_be_distinct = requirements.memory_relations.iter().any(|relation| {
-                let MemoryRelation::DistinctElements(operands) = relation;
-                operands.contains(&MemoryOperand::Input(match orientation {
-                    crate::GemmOrientation::Normal => 0,
-                    crate::GemmOrientation::Swapped => 1,
-                }))
-            });
+            let mut left_staging = maximum_shard_bytes(left)
+                .saturating_add(u64::from(requirement.allocation.access_tail_bytes));
+            let left_must_be_distinct = requirements
+                .memory_space
+                .distinct_element_groups
+                .iter()
+                .any(|operands| {
+                    operands.contains(&MemoryOperand::Input(match orientation {
+                        crate::GemmOrientation::Normal => 0,
+                        crate::GemmOrientation::Swapped => 1,
+                    }))
+                });
             if left_must_be_distinct {
                 left_staging = left_staging
                     .div_ceil(u64::from(ipu_package::TILE_MEMORY_ELEMENT_SIZE))
@@ -611,7 +603,7 @@ pub(crate) fn operator_memory_estimate(
         let bytes = maximum_shard_bytes(left)
             .div_ceil(inner)
             .saturating_mul(u64::from(plan.geometry.block.inner))
-            .saturating_add(u64::from(requirement.access_tail_bytes));
+            .saturating_add(u64::from(requirement.allocation.access_tail_bytes));
         temporary.add_class(left.format.layout.memory_class, bytes);
     }
     if let (OperatorDispatch::BlockedGemm(plan), Some(right)) = (dispatch, inputs.get(1))

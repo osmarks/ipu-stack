@@ -12,12 +12,69 @@ pub struct ShardExtent {
     pub physical_end: u32,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TensorRegion {
+    pub extents: Vec<ShardExtent>,
+}
+
+impl TensorRegion {
+    pub fn new(extents: impl IntoIterator<Item = ShardExtent>) -> Self {
+        Self {
+            extents: extents.into_iter().collect(),
+        }
+    }
+}
+
+impl std::ops::Deref for TensorRegion {
+    type Target = [ShardExtent];
+
+    fn deref(&self) -> &Self::Target {
+        &self.extents
+    }
+}
+
+impl std::ops::DerefMut for TensorRegion {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.extents
+    }
+}
+
+impl<'a> IntoIterator for &'a TensorRegion {
+    type Item = &'a ShardExtent;
+    type IntoIter = std::slice::Iter<'a, ShardExtent>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.extents.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut TensorRegion {
+    type Item = &'a mut ShardExtent;
+    type IntoIter = std::slice::IterMut<'a, ShardExtent>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.extents.iter_mut()
+    }
+}
+
+impl From<Vec<ShardExtent>> for TensorRegion {
+    fn from(extents: Vec<ShardExtent>) -> Self {
+        Self { extents }
+    }
+}
+
+impl FromIterator<ShardExtent> for TensorRegion {
+    fn from_iter<T: IntoIterator<Item = ShardExtent>>(iter: T) -> Self {
+        Self::new(iter)
+    }
+}
+
 /// One rectangular region owned by a tile. Linear ownership can give a tile
 /// several regions when its interval crosses row boundaries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedShard {
     pub tile: u16,
-    pub extents: Vec<ShardExtent>,
+    pub extents: TensorRegion,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,7 +469,10 @@ impl ResolvedLayout {
                     logical_end: column_end as u32,
                     physical_end: column_end as u32,
                 });
-                shards.push(ResolvedShard { tile, extents });
+                shards.push(ResolvedShard {
+                    tile,
+                    extents: extents.into(),
+                });
             }
         }
         shards

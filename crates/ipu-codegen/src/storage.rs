@@ -999,7 +999,8 @@ mod tests {
                         logical_end: column + view_columns,
                         physical_end: column + view_columns,
                     },
-                ],
+                ]
+                .into(),
             };
             let spans = view_byte_spans(&shard, &view).unwrap();
             assert_eq!(
@@ -1050,7 +1051,8 @@ mod tests {
                             logical_end: (selected + 1) * AMP_COLUMN_MICRO,
                             physical_end: (selected + 1) * AMP_COLUMN_MICRO,
                         },
-                    ],
+                    ]
+                    .into(),
                 };
                 let source_spans = view_byte_spans(&source, &source_view).unwrap();
                 let destination_spans = view_byte_spans(&destination, &destination_view).unwrap();
@@ -1129,7 +1131,8 @@ mod tests {
                             logical_end: (selected + 1) * AMP_COLUMN_MICRO,
                             physical_end: (selected + 1) * AMP_COLUMN_MICRO,
                         },
-                    ],
+                    ]
+                    .into(),
                 };
                 let destination_view = ShardView {
                     shard: destination.id,

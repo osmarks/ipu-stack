@@ -7,13 +7,13 @@
 //! remaining choices.
 
 use crate::graph::{GraphInputKind, OperationId};
-use crate::layout::ShardExtent;
+use crate::layout::{ShardExtent, TensorRegion};
 use crate::mid::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ConversionStrategy,
     DeferredTransform, ElementOrder, GemmDistribution, Layout, LayoutError, MemoryClass,
-    MemoryOperand, MemoryRelation, MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId,
-    OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing, PipelineConfig,
-    PointwiseInputMapping, Precision, TensorTiling, TensorType, TileKernelSpec,
+    MemoryOperand, MemorySpaceRequirements, MidGraph, MidOperation, MidOperationKind, MidRepeat,
+    MidValueId, OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing,
+    PipelineConfig, PointwiseInputMapping, Precision, TensorTiling, TensorType, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,7 +77,7 @@ impl RepeatRunId {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShardView {
     pub shard: LowShardId,
-    pub extents: Vec<ShardExtent>,
+    pub extents: TensorRegion,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +100,7 @@ pub struct LowShard {
     pub id: LowShardId,
     pub tile: u16,
     pub tensor_type: TensorType,
-    pub extents: Vec<ShardExtent>,
+    pub extents: TensorRegion,
     pub definition: ShardDefinition,
 }
 
@@ -167,7 +167,7 @@ pub enum KernelRequirements {
     Conversion {
         input: OperandRequirement,
         output: OperandRequirement,
-        memory_relations: Vec<MemoryRelation>,
+        memory_space: crate::MemorySpaceRequirements,
     },
 }
 
@@ -646,7 +646,7 @@ impl LoweringState {
                             id: LowShardId(0),
                             tile: 0,
                             tensor_type: value.tensor_type.clone(),
-                            extents: extents.clone(),
+                            extents: extents.clone().into(),
                             definition: ShardDefinition::Value(value.id),
                         })
                         .map(u64::from)
@@ -689,7 +689,7 @@ impl LoweringState {
                     id: LowShardId(0),
                     tile: 0,
                     tensor_type: value.tensor_type.clone(),
-                    extents,
+                    extents: extents.into(),
                     definition: ShardDefinition::Value(value.id),
                 };
                 shard.tile = if rotate_parameter {
@@ -1152,7 +1152,7 @@ impl LoweringState {
                                 .clone(),
                             4,
                         ),
-                        memory_relations: Vec::new(),
+                        memory_space: MemorySpaceRequirements::default(),
                     },
                 ),
             )?;
@@ -1362,7 +1362,7 @@ impl LoweringState {
                     KernelRequirements::Conversion {
                         input: plan.input.clone(),
                         output: plan.output.clone(),
-                        memory_relations: Vec::new(),
+                        memory_space: MemorySpaceRequirements::default(),
                     },
                 ),
             )?;
@@ -1412,11 +1412,11 @@ impl LoweringState {
                 mappings.push((
                     ShardView {
                         shard: source,
-                        extents: extents.clone(),
+                        extents: extents.clone().into(),
                     },
                     ShardView {
                         shard: output,
-                        extents,
+                        extents: extents.into(),
                     },
                 ));
             }
@@ -1557,10 +1557,11 @@ impl LoweringState {
                             KernelRequirements::Conversion {
                                 input: OperandRequirement::new(source_format, 2),
                                 output: OperandRequirement::new(destination_format, 2),
-                                memory_relations: vec![MemoryRelation::DistinctElements(vec![
-                                    MemoryOperand::Input(0),
-                                    MemoryOperand::Output,
-                                ])],
+                                memory_space: MemorySpaceRequirements::default()
+                                    .with_distinct_elements([
+                                        MemoryOperand::Input(0),
+                                        MemoryOperand::Output,
+                                    ]),
                             },
                         ),
                     ));
@@ -1825,11 +1826,11 @@ impl LoweringState {
                     }
                     let source_view = ShardView {
                         shard: source,
-                        extents: source_extents,
+                        extents: source_extents.into(),
                     };
                     let destination_view = ShardView {
                         shard: output,
-                        extents: destination_extents,
+                        extents: destination_extents.into(),
                     };
                     mappings.push((source_view, destination_view));
                 }
@@ -2763,11 +2764,11 @@ impl LoweringState {
             );
             let source_view = ShardView {
                 shard: source,
-                extents: source_extents,
+                extents: source_extents.into(),
             };
             let destination_view = ShardView {
                 shard: destination,
-                extents: destination_extents,
+                extents: destination_extents.into(),
             };
             mappings.push((source_view, destination_view));
         }
@@ -3155,7 +3156,7 @@ impl LoweringState {
                 KernelRequirements::Conversion {
                     input: OperandRequirement::new(input, 2),
                     output: OperandRequirement::new(output, 2),
-                    memory_relations: Vec::new(),
+                    memory_space: MemorySpaceRequirements::default(),
                 },
             ),
         )
@@ -3189,7 +3190,7 @@ impl LoweringState {
                     inputs: Vec::new(),
                     output,
                     output_aliasing: crate::OutputAliasing::Fresh,
-                    memory_relations: Vec::new(),
+                    memory_space: MemorySpaceRequirements::default(),
                 }),
             ),
         )
@@ -3229,7 +3230,8 @@ impl LoweringState {
                     logical_end: columns,
                     physical_end: columns,
                 },
-            ],
+            ]
+            .into(),
             definition: ShardDefinition::Staging,
         })
     }
@@ -3258,7 +3260,8 @@ impl LoweringState {
                 start: 0,
                 logical_end: elements,
                 physical_end: elements,
-            }],
+            }]
+            .into(),
             definition,
         })
     }
@@ -3297,7 +3300,8 @@ impl LoweringState {
                     logical_end: logical_columns,
                     physical_end: physical_columns,
                 },
-            ],
+            ]
+            .into(),
             definition: ShardDefinition::Staging,
         })
     }
@@ -3499,11 +3503,11 @@ impl LoweringState {
         for (extents, source) in intersections {
             let source_view = ShardView {
                 shard: source,
-                extents: extents.clone(),
+                extents: extents.clone().into(),
             };
             let destination_view = ShardView {
                 shard: staging,
-                extents,
+                extents: extents.into(),
             };
             if self.shards[source.index() as usize].tile == tile {
                 append_logical_span_copies(
@@ -3654,7 +3658,7 @@ impl LoweringState {
                         &right_shards,
                         column_start..column_end,
                         0..inner_block,
-                        requirements.inputs[1].access_tail_bytes,
+                        requirements.inputs[1].allocation.access_tail_bytes,
                     )?;
                     let staging_slot =
                         usize::try_from((column_start - phase_column_start) / output_column_block)
@@ -4149,14 +4153,14 @@ impl LoweringState {
                     let partial = if let Some(output) = direct_output {
                         ShardView {
                             shard: output,
-                            extents: extents.clone(),
+                            extents: extents.clone().into(),
                         }
                     } else {
                         let partial = self.push_shard(LowShard {
                             id: LowShardId(0),
                             tile: left_shard.tile,
                             tensor_type: partial_type.clone(),
-                            extents,
+                            extents: extents.into(),
                             definition: ShardDefinition::Staging,
                         })?;
                         self.full_view(partial)
@@ -4542,7 +4546,7 @@ impl LoweringState {
                         .unwrap_or(0);
                     let source_view = |partial: &ShardView| ShardView {
                         shard: partial.shard,
-                        extents: intersection.clone(),
+                        extents: intersection.clone().into(),
                     };
                     let seed_source = source_view(&contributors[seed].1);
                     if contributors[seed].0 == owner.tile {
@@ -4588,7 +4592,8 @@ impl LoweringState {
                                         start,
                                         logical_end: end,
                                         physical_end: end,
-                                    }],
+                                    }]
+                                    .into(),
                                 });
                         }
                         let (accumulator, stage_result) = if stage.is_multiple_of(2) {
@@ -4631,7 +4636,7 @@ impl LoweringState {
                         &self.full_view(final_result),
                         &ShardView {
                             shard: output,
-                            extents: intersection,
+                            extents: intersection.into(),
                         },
                         owner.tile,
                         &mut result_copies,
@@ -4727,7 +4732,7 @@ impl LoweringState {
                         && self.interleaved_capacity_available(
                             tile,
                             staging_bytes,
-                            requirements.inputs[1].access_tail_bytes,
+                            requirements.inputs[1].allocation.access_tail_bytes,
                         )?,
                 )
             })?;
@@ -5623,8 +5628,8 @@ fn body_storage_requirement(value: MidValueId, operations: &[MidOperation]) -> (
                 .and_then(|plan| plan.requirements.inputs.get(index))
                 .or_else(|| operation.conversion_plan.as_ref().map(|plan| &plan.input));
             if let Some(requirement) = requirement {
-                alignment = alignment.max(requirement.alignment);
-                access_tail = access_tail.max(requirement.access_tail_bytes);
+                alignment = alignment.max(requirement.allocation.alignment);
+                access_tail = access_tail.max(requirement.allocation.access_tail_bytes);
             }
         }
     }
@@ -5695,7 +5700,7 @@ fn intersect_extents_with_shared_padding(
         .collect()
 }
 
-fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<(u16, Vec<ShardExtent>)>> {
+fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<(u16, TensorRegion)>> {
     Ok(tensor_type
         .format
         .layout
@@ -6789,7 +6794,8 @@ mod tests {
                         logical_end: AMP_COLUMN_MICRO,
                         physical_end: AMP_COLUMN_MICRO,
                     },
-                ],
+                ]
+                .into(),
                 definition: ShardDefinition::ExchangeStaging,
             };
             let destination = LowShard {
@@ -6820,7 +6826,8 @@ mod tests {
                         logical_end: AMP_COLUMN_MICRO,
                         physical_end: AMP_COLUMN_MICRO,
                     },
-                ],
+                ]
+                .into(),
                 definition: ShardDefinition::ExchangeStaging,
             };
             let logical_view = |shard: &LowShard| ShardView {
