@@ -367,9 +367,31 @@ fn range_elements(extents: &[(u32, u32)]) -> u64 {
 }
 
 pub(crate) fn physical_elements(shape: &TensorShape, layout: &Layout) -> u64 {
-    layout
-        .padded_shape(shape)
-        .map_or_else(|_| shape.elements(), |shape| shape.elements())
+    let Ok(padded) = layout.padded_shape(shape) else {
+        return shape
+            .elements()
+            .saturating_mul(u64::from(layout.tiling.replicas));
+    };
+    padded
+        .0
+        .iter()
+        .enumerate()
+        .map(|(index, &extent)| {
+            layout
+                .tiling
+                .axes
+                .iter()
+                .find(|axis| axis.axis.resolve(padded.0.len()) == Ok(index))
+                .map_or(u64::from(extent), |axis| {
+                    (0..u32::from(axis.partitions))
+                        .map(|coordinate| {
+                            axis.shard_bounds(extent, shape.0[index], coordinate)
+                                .map_or(u64::MAX, |(start, _, end)| u64::from(end - start))
+                        })
+                        .fold(0_u64, u64::saturating_add)
+                })
+        })
+        .fold(1_u64, u64::saturating_mul)
         .saturating_mul(u64::from(layout.tiling.replicas))
 }
 
@@ -397,8 +419,14 @@ pub(crate) fn maximum_shard_bytes(tensor: &TensorType) -> u64 {
                 .iter()
                 .find(|axis| axis.axis.resolve(padded.0.len()) == Ok(index))
                 .map_or(u64::from(extent), |axis| {
-                    let blocks = extent / axis.block_size;
-                    u64::from(blocks.div_ceil(u32::from(axis.partitions)) * axis.block_size)
+                    (0..u32::from(axis.partitions))
+                        .filter_map(|coordinate| {
+                            axis.shard_bounds(extent, tensor.shape.0[index], coordinate)
+                                .ok()
+                                .map(|(start, _, end)| u64::from(end - start))
+                        })
+                        .max()
+                        .unwrap_or(u64::MAX)
                 })
         })
         .product::<u64>()

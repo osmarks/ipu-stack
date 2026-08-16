@@ -9,10 +9,10 @@
 use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ConversionStrategy,
-    DeferredTransform, ElementOrder, GemmDistribution, Layout, LayoutError, MemoryClass, MidGraph,
-    MidOperation, MidOperationKind, MidRepeat, MidValueId, OperandRequirement, OperatorDispatch,
-    OperatorRequirements, OutputAliasing, PipelineConfig, PointwiseInputMapping, Precision,
-    TensorTiling, TensorType, TileKernelSpec,
+    DeferredTransform, ElementOrder, GemmDistribution, Layout, LayoutError, MemoryClass,
+    MemoryOperand, MemoryRelation, MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId,
+    OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing, PipelineConfig,
+    PointwiseInputMapping, Precision, TensorTiling, TensorType, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use std::collections::{BTreeMap, BTreeSet};
@@ -181,6 +181,7 @@ pub enum KernelRequirements {
     Conversion {
         input: OperandRequirement,
         output: OperandRequirement,
+        memory_relations: Vec<MemoryRelation>,
     },
 }
 
@@ -1165,6 +1166,7 @@ impl LoweringState {
                                 .clone(),
                             4,
                         ),
+                        memory_relations: Vec::new(),
                     },
                 ),
             )?;
@@ -1376,6 +1378,7 @@ impl LoweringState {
                     KernelRequirements::Conversion {
                         input: plan.input.clone(),
                         output: plan.output.clone(),
+                        memory_relations: Vec::new(),
                     },
                 ),
             )?;
@@ -1564,6 +1567,10 @@ impl LoweringState {
                             KernelRequirements::Conversion {
                                 input: OperandRequirement::new(source_format, 2),
                                 output: OperandRequirement::new(destination_format, 2),
+                                memory_relations: vec![MemoryRelation::DistinctElements(vec![
+                                    MemoryOperand::Input(0),
+                                    MemoryOperand::Output,
+                                ])],
                             },
                         ),
                     ));
@@ -1838,10 +1845,10 @@ impl LoweringState {
                 stream_extents[0].physical_end = stream + 1;
                 let (target, column_base) =
                     split_head_source_extents(&stream_extents, heads, head_width)?;
-                for (source_extents, source) in
+                for (mut source_extents, source) in
                     self.intersecting_shard_set(&source_shards, &target, tile)
                 {
-                    let destination_extents = vec![
+                    let mut destination_extents = vec![
                         stream_extents[0],
                         source_extents[1],
                         ShardExtent {
@@ -1851,6 +1858,22 @@ impl LoweringState {
                             physical_end: source_extents[2].logical_end - column_base,
                         },
                     ];
+                    let source_shard = &self.shards[source.index() as usize];
+                    let complete_head = source_extents[2].start == column_base
+                        && source_extents[2].logical_end == column_base + head_width
+                        && source_shard.extents[2].start == column_base
+                        && source_shard.extents[2].logical_end == column_base + head_width;
+                    if complete_head {
+                        let source_padding = source_shard.extents[2]
+                            .physical_end
+                            .saturating_sub(source_extents[2].logical_end);
+                        let destination_padding = output_extents[2]
+                            .physical_end
+                            .saturating_sub(output_extents[2].logical_end);
+                        let padding = source_padding.min(destination_padding);
+                        source_extents[2].physical_end += padding;
+                        destination_extents[2].physical_end += padding;
+                    }
                     let source_view = ShardView {
                         shard: source,
                         extents: source_extents,
@@ -3173,6 +3196,7 @@ impl LoweringState {
                 KernelRequirements::Conversion {
                     input: OperandRequirement::new(input, 2),
                     output: OperandRequirement::new(output, 2),
+                    memory_relations: Vec::new(),
                 },
             ),
         )
@@ -3959,6 +3983,14 @@ impl LoweringState {
             .map(|axis| axis.block_size)
             .filter(|grain| *grain != 0)
             .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+        let column_tiling = output_type
+            .format
+            .layout
+            .tiling
+            .axes
+            .iter()
+            .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))
+            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
         let column_blocks = physical_columns / column_grain;
         if !physical_columns.is_multiple_of(column_grain)
             || column_blocks < u32::from(column_partitions)
@@ -3969,18 +4001,26 @@ impl LoweringState {
         let long_partitions = column_blocks % u32::from(column_partitions);
         let columns = (0..u32::from(column_partitions))
             .map(|partition| {
+                if column_tiling.partitions == column_partitions {
+                    return column_tiling
+                        .shard_bounds(physical_columns, logical_columns, partition)
+                        .map_err(LowLoweringError::from);
+                }
                 let start_blocks = partition
                     .saturating_mul(short_blocks)
                     .saturating_add(partition.min(long_partitions));
                 let blocks = short_blocks + u32::from(partition < long_partitions);
-                (
-                    start_blocks.saturating_mul(column_grain),
-                    start_blocks
-                        .saturating_add(blocks)
-                        .saturating_mul(column_grain),
-                )
+                let start = start_blocks.saturating_mul(column_grain);
+                let physical_end = start_blocks
+                    .saturating_add(blocks)
+                    .saturating_mul(column_grain);
+                Ok((
+                    start,
+                    physical_end.min(logical_columns).max(start),
+                    physical_end,
+                ))
             })
-            .collect::<Vec<_>>();
+            .collect::<LowLoweringResult<Vec<_>>>()?;
         let mut partial_type = output_type.clone();
         let partial_tiles = row_partitions.saturating_mul(column_partitions);
         partial_type.format.layout = match (orientation, output_type.format.layout.order) {
@@ -4027,6 +4067,11 @@ impl LoweringState {
         {
             axis.block_size = column_grain;
             axis.padding_multiple = column_grain;
+            if column_tiling.partitions == column_partitions {
+                axis.block_size = column_tiling.block_size;
+                axis.padding_multiple = column_tiling.padding_multiple;
+                axis.shard_padding_multiple = column_tiling.shard_padding_multiple;
+            }
         }
 
         let mut replica_groups = BTreeMap::<Vec<(u32, u32)>, Vec<LowShardId>>::new();
@@ -4058,7 +4103,9 @@ impl LoweringState {
             let mut partials = BTreeMap::<Vec<(u32, u32)>, Vec<(u16, ShardView)>>::new();
             let mut resident_lefts = BTreeMap::<LowShardId, ShardView>::new();
             let mut weight_staging = BTreeMap::<(u16, LowShardId), LowShardId>::new();
-            for (output_column, &(column_start, column_end)) in columns.iter().enumerate() {
+            for (output_column, &(column_start, logical_column_end, column_end)) in
+                columns.iter().enumerate()
+            {
                 let output_column =
                     u32::try_from(output_column).map_err(|_| LowLoweringError::IdOverflow)?;
                 let local_output_columns = column_end - column_start;
@@ -4133,7 +4180,7 @@ impl LoweringState {
                         axis: u16::try_from(output_column_axis)
                             .map_err(|_| LowLoweringError::IdOverflow)?,
                         start: column_start,
-                        logical_end: column_end.min(logical_columns),
+                        logical_end: logical_column_end,
                         physical_end: column_end,
                     };
                     let partial_key = extents
@@ -5765,25 +5812,22 @@ fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<(u16, Vec<Sh
     for tile in 0..layout.tiling.tile_count {
         let mut extents = Vec::with_capacity(rank);
         for axis in 0..rank {
-            let (start, physical_end) = if let Some((_, tiling, stride)) =
+            let (start, logical_end, physical_end) = if let Some((_, tiling, stride)) =
                 axes.iter().find(|(index, _, _)| *index == axis)
             {
                 let coordinate = (u32::from(tile) / *stride) % u32::from(tiling.partitions);
-                let blocks = padded.0[axis] / tiling.block_size;
-                let partitions = u32::from(tiling.partitions);
-                let short_size = blocks / partitions;
-                let long_shards = blocks % partitions;
-                let start_blocks = coordinate * short_size + coordinate.min(long_shards);
-                let shard_blocks = short_size + u32::from(coordinate < long_shards);
-                let start = start_blocks * tiling.block_size;
-                (start, start + shard_blocks * tiling.block_size)
+                tiling.shard_bounds(padded.0[axis], tensor_type.shape.0[axis], coordinate)?
             } else {
-                (0, padded.0[axis])
+                (
+                    0,
+                    padded.0[axis].min(tensor_type.shape.0[axis]),
+                    padded.0[axis],
+                )
             };
             extents.push(ShardExtent {
                 axis: u16::try_from(axis).map_err(|_| LowLoweringError::IdOverflow)?,
                 start,
-                logical_end: physical_end.min(tensor_type.shape.0[axis]).max(start),
+                logical_end,
                 physical_end,
             });
         }
@@ -6696,6 +6740,69 @@ mod tests {
                 }
                 assert_eq!(cursor, padded.0[axis], "case {case}");
             }
+        }
+    }
+
+    #[test]
+    fn randomized_partition_padding_preserves_logical_groups() {
+        let mut random = fastrand::Rng::with_seed(0x6772_6f75_705f_7064);
+        for case in 0..CASES * 8 {
+            let groups = random.u16(1..=32);
+            let group_width = random.u32(1..=127);
+            let rows = random.u32(1..=16);
+            let physical_multiple = 1_u32 << random.u32(1..=4);
+            let layout = Layout {
+                order: ElementOrder::RowMajor,
+                tiling: TensorTiling {
+                    tile_count: groups,
+                    replicas: 1,
+                    axes: vec![
+                        AxisTiling::new(TensorAxis::FromEnd(1), groups, 1, Padding::Zero)
+                            .with_shard_padding_multiple(physical_multiple),
+                    ],
+                },
+                memory_class: MemoryClass::Ipu21Standard,
+            };
+            let tensor = TensorType::new(
+                [rows, u32::from(groups) * group_width],
+                Precision::F16,
+                layout,
+            );
+            let physical_width = group_width.div_ceil(physical_multiple) * physical_multiple;
+            let shards = shard_extents(&tensor).unwrap();
+            assert_eq!(shards.len(), usize::from(groups), "case {case}");
+            for (coordinate, (_, extents)) in shards.iter().enumerate() {
+                let start = u32::try_from(coordinate).unwrap() * group_width;
+                assert_eq!(extents[1].start, start, "case {case}");
+                assert_eq!(extents[1].logical_end, start + group_width, "case {case}");
+                assert_eq!(
+                    extents[1].physical_end,
+                    start + physical_width,
+                    "case {case}"
+                );
+                assert_eq!(
+                    crate::shard_storage_bytes(&LowShard {
+                        id: LowShardId(0),
+                        tile: 0,
+                        tensor_type: tensor.clone(),
+                        extents: extents.clone(),
+                        definition: ShardDefinition::Staging,
+                    })
+                    .unwrap(),
+                    rows * physical_width * 2,
+                    "case {case}"
+                );
+            }
+            assert_eq!(
+                crate::estimate::physical_elements(&tensor.shape, &tensor.format.layout),
+                u64::from(rows) * u64::from(groups) * u64::from(physical_width),
+                "case {case}"
+            );
+            assert_eq!(
+                crate::estimate::maximum_shard_bytes(&tensor),
+                u64::from(rows) * u64::from(physical_width) * 2,
+                "case {case}"
+            );
         }
     }
 

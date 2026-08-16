@@ -523,7 +523,9 @@ const IPU21_AMP_KERNEL_COSTS: AmpKernelCosts = AmpKernelCosts {
 // its final coefficient permutation is performed by the GEMM's ld*putcs
 // sequence. Keep these costs separate from ideal memcpy bandwidth.
 const IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT: u64 = 10;
-const IPU21_AMP_LEFT_PACK_CYCLES_PER_ELEMENT: u64 = 12;
+// The unrolled six-worker panel pack measures about 2,364 cycles for the
+// 640-element attention shards, including launch and tail initialization.
+const IPU21_AMP_LEFT_PACK_CYCLES_PER_ELEMENT: u64 = 4;
 const IPU21_CONTIGUOUS_PANEL_PACK_CYCLES_PER_ELEMENT: u64 = 3;
 // The paired-row assembly pack has a roughly four-thousand-cycle fixed worker
 // cost, then sustains about four cycles per F16 element for both 64x16 and

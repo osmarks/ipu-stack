@@ -391,36 +391,37 @@ fn collect_requirements(
     for work in program.work(tile) {
         match work {
             TileWorkRef::Kernel(run) => {
-                let (inputs, output) = match &run.requirements {
-                    KernelRequirements::Operator(operator_requirements) => {
-                        for relation in &operator_requirements.memory_relations {
-                            let MemoryRelation::DistinctElements(operands) = relation;
-                            for operand in operands {
-                                match operand {
-                                    MemoryOperand::Output => {
-                                        requirements[run.output.shard.index() as usize]
+                let (inputs, output, memory_relations) = match &run.requirements {
+                    KernelRequirements::Operator(operator_requirements) => (
+                        &operator_requirements.inputs[..],
+                        &operator_requirements.output,
+                        &operator_requirements.memory_relations,
+                    ),
+                    KernelRequirements::Conversion {
+                        input,
+                        output,
+                        memory_relations,
+                    } => (std::slice::from_ref(input), output, memory_relations),
+                };
+                for relation in memory_relations {
+                    let MemoryRelation::DistinctElements(operands) = relation;
+                    for operand in operands {
+                        match operand {
+                            MemoryOperand::Output => {
+                                requirements[run.output.shard.index() as usize].distinct_element =
+                                    true;
+                            }
+                            MemoryOperand::Input(index) => {
+                                if let Some(input) = run.inputs.get(usize::from(*index)) {
+                                    for view in &input.views {
+                                        requirements[view.shard.index() as usize]
                                             .distinct_element = true;
-                                    }
-                                    MemoryOperand::Input(index) => {
-                                        if let Some(input) = run.inputs.get(usize::from(*index)) {
-                                            for view in &input.views {
-                                                requirements[view.shard.index() as usize]
-                                                    .distinct_element = true;
-                                            }
-                                        }
                                     }
                                 }
                             }
                         }
-                        (
-                            &operator_requirements.inputs[..],
-                            &operator_requirements.output,
-                        )
                     }
-                    KernelRequirements::Conversion { input, output } => {
-                        (std::slice::from_ref(input), output)
-                    }
-                };
+                }
                 for (operand, requirement) in run.inputs.iter().zip(inputs) {
                     for view in &operand.views {
                         apply_requirement(

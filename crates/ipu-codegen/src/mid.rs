@@ -629,6 +629,10 @@ pub struct AxisTiling {
     /// between partitions. This permits fine-grained ownership of an axis
     /// whose producer operates on wider padded blocks.
     pub padding_multiple: u32,
+    /// Physical extent multiple applied independently to every partition.
+    /// Unlike `padding_multiple`, this does not change semantic partition
+    /// boundaries: padding belongs to the allocation owned by that partition.
+    pub shard_padding_multiple: u32,
     pub padding: Padding,
     /// Optional physical-tile stride for this partition coordinate. When
     /// absent, axes are packed after the replica coordinate and preceding
@@ -644,6 +648,7 @@ impl AxisTiling {
             partitions,
             block_size,
             padding_multiple: block_size,
+            shard_padding_multiple: 1,
             padding,
             tile_stride: None,
         }
@@ -657,6 +662,54 @@ impl AxisTiling {
     pub const fn with_padding_multiple(mut self, padding_multiple: u32) -> Self {
         self.padding_multiple = padding_multiple;
         self
+    }
+
+    pub const fn with_shard_padding_multiple(mut self, shard_padding_multiple: u32) -> Self {
+        self.shard_padding_multiple = shard_padding_multiple;
+        self
+    }
+
+    pub(crate) fn shard_bounds(
+        self,
+        padded_extent: u32,
+        logical_extent: u32,
+        coordinate: u32,
+    ) -> Result<(u32, u32, u32), LayoutError> {
+        let blocks = padded_extent / self.block_size;
+        let partitions = u32::from(self.partitions);
+        let short_size = blocks / partitions;
+        let long_shards = blocks % partitions;
+        let start_blocks = coordinate * short_size + coordinate.min(long_shards);
+        let shard_blocks = short_size + u32::from(coordinate < long_shards);
+        let start = start_blocks
+            .checked_mul(self.block_size)
+            .ok_or(LayoutError::ExtentOverflow(0))?;
+        let allocated = shard_blocks
+            .checked_mul(self.block_size)
+            .ok_or(LayoutError::ExtentOverflow(0))?;
+        let remainder = allocated % self.shard_padding_multiple;
+        if remainder != 0 && self.padding == Padding::Reject {
+            return Err(LayoutError::IndivisibleShard {
+                extent: allocated,
+                block_size: self.shard_padding_multiple,
+            });
+        }
+        let physical_width = if remainder == 0 {
+            allocated
+        } else {
+            allocated
+                .checked_add(self.shard_padding_multiple - remainder)
+                .ok_or(LayoutError::ExtentOverflow(0))?
+        };
+        let logical_end = start
+            .checked_add(allocated)
+            .ok_or(LayoutError::ExtentOverflow(0))?
+            .min(logical_extent)
+            .max(start);
+        let physical_end = start
+            .checked_add(physical_width)
+            .ok_or(LayoutError::ExtentOverflow(0))?;
+        Ok((start, logical_end, physical_end))
     }
 }
 
@@ -1244,7 +1297,11 @@ impl Layout {
         let mut dimensions = shape.0.clone();
         let mut used_axes = Vec::with_capacity(self.tiling.axes.len());
         for tiling in &self.tiling.axes {
-            if tiling.partitions == 0 || tiling.block_size == 0 || tiling.padding_multiple == 0 {
+            if tiling.partitions == 0
+                || tiling.block_size == 0
+                || tiling.padding_multiple == 0
+                || tiling.shard_padding_multiple == 0
+            {
                 return Err(LayoutError::EmptyAxisTiling);
             }
             used_tiles = used_tiles
@@ -1370,6 +1427,8 @@ pub enum LayoutError {
         extent: u32,
         block_size: u32,
     },
+    #[error("shard extent {extent} is not divisible by block size {block_size}")]
+    IndivisibleShard { extent: u32, block_size: u32 },
     #[error("padded extent for axis {0} overflowed")]
     ExtentOverflow(usize),
     #[error("layout declares {declared} tiles but its tiling implies {implied}")]
@@ -1663,9 +1722,12 @@ fn padded_axis_shard_extent(
     let divided = padded.0[axis]
         .checked_div(partitions)
         .ok_or(OperatorPlanError::InvalidBlocking)?;
-    Ok(axis_tilings
-        .iter()
-        .fold(divided, |extent, tiling| extent.max(tiling.block_size)))
+    Ok(axis_tilings.iter().fold(divided, |extent, tiling| {
+        let extent = extent.max(tiling.block_size);
+        extent
+            .div_ceil(tiling.shard_padding_multiple)
+            .saturating_mul(tiling.shard_padding_multiple)
+    }))
 }
 
 fn maximum_padded_axis_shard_extent(
@@ -1683,10 +1745,16 @@ fn maximum_padded_axis_shard_extent(
     else {
         return Ok(padded.0[axis]);
     };
-    let blocks = padded.0[axis] / tiling.block_size;
-    Ok(blocks
-        .div_ceil(u32::from(tiling.partitions))
-        .saturating_mul(tiling.block_size))
+    let maximum = (0..u32::from(tiling.partitions))
+        .filter_map(|coordinate| {
+            tiling
+                .shard_bounds(padded.0[axis], tensor.shape.0[axis], coordinate)
+                .ok()
+                .map(|(start, _, end)| end - start)
+        })
+        .max()
+        .ok_or(OperatorPlanError::InvalidBlocking)?;
+    Ok(maximum)
 }
 
 fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
@@ -3309,7 +3377,7 @@ struct FutureFormatCompatibility(
         Precision,
         ElementOrderCompatibility,
         MemoryClass,
-        Vec<TensorAxis>,
+        Vec<(TensorAxis, u32)>,
     )>,
 );
 
@@ -3349,7 +3417,7 @@ fn future_format_compatibility(
                     .tiling
                     .axes
                     .iter()
-                    .map(|axis| axis.axis)
+                    .map(|axis| (axis.axis, axis.shard_padding_multiple))
                     .collect();
                 Some((
                     origin,
@@ -3538,6 +3606,13 @@ fn lower_operation_candidates(
                 .get(&operation.results[0])
                 .cloned()
                 .ok_or(LoweringError::MissingShape(operation.results[0]))?;
+            let grouped_output = grouped_output_layout(
+                source,
+                operation_index,
+                operation,
+                &output_shape,
+                &value_uses,
+            );
             let parameter_inputs = input_ids
                 .iter()
                 .map(|id| branch.state.parameter_values.contains(id))
@@ -3570,6 +3645,7 @@ fn lower_operation_candidates(
                     config,
                     costs,
                     distributed_result_is_useful,
+                    grouped_output,
                 );
                 plan_cache.entry(cache_key).or_insert(generated)
             };
@@ -4388,6 +4464,37 @@ fn plan_fits_operator_memory(
                 .min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GroupedOutputLayout {
+    groups: u16,
+    physical_lane_multiple: u32,
+}
+
+fn grouped_output_layout(
+    source: &[Operation],
+    operation_index: usize,
+    operation: &Operation,
+    output: &TensorShape,
+    value_uses: &BTreeMap<ValueId, usize>,
+) -> Option<GroupedOutputLayout> {
+    let result = *operation.results.first()?;
+    if value_uses.get(&result).copied() != Some(1) {
+        return None;
+    }
+    let consumer = source[operation_index + 1..]
+        .iter()
+        .find(|candidate| candidate.inputs.contains(&result))?;
+    let OperationKind::SplitHeads(options) = consumer.kind else {
+        return None;
+    };
+    let groups = u16::try_from(options.heads).ok()?;
+    let width = *output.0.last()?;
+    (groups != 0 && width.is_multiple_of(u32::from(groups))).then_some(GroupedOutputLayout {
+        groups,
+        physical_lane_multiple: AMP_COLUMN_MICRO,
+    })
+}
+
 fn plans(
     operation: &Operation,
     inputs: &[TensorType],
@@ -4396,6 +4503,7 @@ fn plans(
     config: &PipelineConfig,
     costs: &impl CostModel,
     distributed_result_is_useful: bool,
+    grouped_output: Option<GroupedOutputLayout>,
 ) -> Vec<Plan> {
     let mut plans = Vec::new();
     let gemm_constraint = config
@@ -4739,6 +4847,7 @@ fn plans(
             costs,
             distributed_result_is_useful,
             gemm_constraint,
+            grouped_output,
         ));
         for (input_index, _) in parameter_inputs
             .iter()
@@ -4931,6 +5040,7 @@ fn parallel_reduction_candidates(
     costs: &impl CostModel,
     distributed_result_is_useful: bool,
     constraint: Option<&GemmPlanConstraint>,
+    grouped_output: Option<GroupedOutputLayout>,
 ) -> Vec<OperatorCandidate> {
     [GemmOrientation::Normal, GemmOrientation::Swapped]
         .into_iter()
@@ -4944,6 +5054,7 @@ fn parallel_reduction_candidates(
                 orientation,
                 distributed_result_is_useful,
                 constraint,
+                grouped_output,
             )
         })
         .collect()
@@ -4958,6 +5069,7 @@ fn parallel_reduction_candidates_for_orientation(
     orientation: GemmOrientation,
     distributed_result_is_useful: bool,
     constraint: Option<&GemmPlanConstraint>,
+    grouped_output: Option<GroupedOutputLayout>,
 ) -> Vec<OperatorCandidate> {
     // Residual supervisor, weight-feed, and worker setup cost after retained
     // state, measured on IPU21 independently of the four issue cycles per row.
@@ -5431,6 +5543,10 @@ fn parallel_reduction_candidates_for_orientation(
                 layout_variants.push(result_layout);
             }
             for layout_variant in layout_variants {
+                let grouped_variant = grouped_output.and_then(|grouping| {
+                    let mut grouped = layout_variant.clone();
+                    apply_grouped_output_layout(&mut grouped, grouping).then_some(grouped)
+                });
                 for &local_staging in local_staging_options {
                     let mut staged = layout_variant.clone();
                     staged.inputs[physical_right_index].local_staging = local_staging;
@@ -5446,11 +5562,39 @@ fn parallel_reduction_candidates_for_orientation(
                         *reduction_staging = ReductionStaging::Streamed;
                     }
                     variants.push(staged);
+                    if let Some(mut grouped) = grouped_variant.clone() {
+                        grouped.inputs[physical_right_index].local_staging = local_staging;
+                        variants.push(grouped.clone());
+                        if let OperatorDispatch::BlockedGemm {
+                            distribution:
+                                GemmDistribution::ParallelReduction {
+                                    reduction_staging, ..
+                                },
+                            ..
+                        } = &mut grouped.dispatch
+                        {
+                            *reduction_staging = ReductionStaging::Streamed;
+                        }
+                        variants.push(grouped);
+                    }
                 }
             }
         }
     }
     let generated_variants = variants.len();
+    let generated_grouped_variants = variants
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .output
+                .format
+                .layout
+                .tiling
+                .axes
+                .iter()
+                .any(|axis| axis.shard_padding_multiple > 1)
+        })
+        .count();
     let retained = if let Some(constraint) = constraint {
         variants
             .into_iter()
@@ -5472,6 +5616,18 @@ fn parallel_reduction_candidates_for_orientation(
         generated_grids,
         proxy_frontier_grids,
         generated_variants,
+        generated_grouped_variants,
+        retained_grouped_variants = retained
+            .iter()
+            .filter(|candidate| candidate
+                .output
+                .format
+                .layout
+                .tiling
+                .axes
+                .iter()
+                .any(|axis| axis.shard_padding_multiple > 1))
+            .count(),
         retained_variants = retained.len(),
         "retained parallel GEMM candidates"
     );
@@ -5505,7 +5661,11 @@ struct OperatorCandidateCompatibility {
     orientation: Option<GemmOrientation>,
     reduction_staging: Option<ReductionStaging>,
     inputs: Vec<(ElementOrderCompatibility, MemoryClass, LocalOperandStaging)>,
-    output: (ElementOrderCompatibility, MemoryClass, Vec<TensorAxis>),
+    output: (
+        ElementOrderCompatibility,
+        MemoryClass,
+        Vec<(TensorAxis, u32)>,
+    ),
 }
 
 fn operator_candidate_compatibility(
@@ -5547,7 +5707,7 @@ fn operator_candidate_compatibility(
                 .tiling
                 .axes
                 .iter()
-                .map(|axis| axis.axis)
+                .map(|axis| (axis.axis, axis.shard_padding_multiple))
                 .collect(),
         ),
     }
@@ -5669,6 +5829,41 @@ fn balance_parallel_gemm_columns(layout: &mut Layout, axis: TensorAxis) {
         columns.padding_multiple = AMP_COLUMN_MICRO;
         columns.padding = Padding::Zero;
     }
+}
+
+fn apply_grouped_output_layout(
+    candidate: &mut OperatorCandidate,
+    grouping: GroupedOutputLayout,
+) -> bool {
+    if candidate.output.format.precision != Precision::F16
+        || grouping.groups == 0
+        || grouping.physical_lane_multiple == 0
+    {
+        return false;
+    }
+    let configure = |layout: &mut Layout| {
+        let Some(axis) = layout
+            .tiling
+            .axes
+            .iter_mut()
+            .find(|axis| axis.axis == TensorAxis::FromEnd(1))
+        else {
+            return false;
+        };
+        if axis.partitions != grouping.groups {
+            return false;
+        }
+        // Partition in logical elements so each group retains its semantic
+        // boundary, then round only that partition's allocation for the
+        // physical consumer panel.
+        axis.block_size = 1;
+        axis.padding_multiple = 1;
+        axis.shard_padding_multiple = grouping.physical_lane_multiple;
+        axis.padding = Padding::Zero;
+        true
+    };
+    configure(&mut candidate.inputs[1].format.layout)
+        && configure(&mut candidate.output.format.layout)
 }
 
 fn pad_axis_to_f16_exchange_word(layout: &mut Layout, axis: TensorAxis) {
@@ -6257,6 +6452,7 @@ mod tests {
                 &config,
                 &Ipu21CostModel,
                 true,
+                None,
                 None,
             );
             assert!(
