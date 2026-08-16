@@ -492,6 +492,64 @@ const IPU21_AMP_KERNEL_COSTS: AmpKernelCosts = AmpKernelCosts {
     standard_column_group_cycles: 1_063,
 };
 
+// Indexed F16 layout transforms execute scalar address arithmetic as well as
+// their loads and stores. The transposed-right panel is a contiguous copy:
+// its final coefficient permutation is performed by the GEMM's ld*putcs
+// sequence. Keep these costs separate from ideal memcpy bandwidth.
+const IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT: u64 = 10;
+const IPU21_AMP_LEFT_PACK_CYCLES_PER_ELEMENT: u64 = 12;
+const IPU21_CONTIGUOUS_PANEL_PACK_CYCLES_PER_ELEMENT: u64 = 3;
+// The paired-row assembly pack has a roughly four-thousand-cycle fixed worker
+// cost, then sustains about four cycles per F16 element for both 64x16 and
+// 64x80 destinations.
+const IPU21_BLOCK_MAJOR_PACK_STARTUP_CYCLES: u64 = 4_096;
+const IPU21_BLOCK_MAJOR_PACK_CYCLES_PER_ELEMENT: u64 = 4;
+
+fn maximum_shard_elements(tensor: &TensorType) -> u64 {
+    maximum_shard_bytes(tensor).div_ceil(tensor.format.precision.bytes().max(1))
+}
+
+fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
+    let cycles_per_element = match tensor.format.layout.order {
+        ElementOrder::RowMajor => return 0,
+        ElementOrder::Amp(AmpOrder::TransposedRight) => {
+            IPU21_CONTIGUOUS_PANEL_PACK_CYCLES_PER_ELEMENT
+        }
+        ElementOrder::Amp(AmpOrder::Left) => IPU21_AMP_LEFT_PACK_CYCLES_PER_ELEMENT,
+        ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+            row_block,
+            column_block,
+        }) if u32::from(row_block) == crate::mid::AMP_INNER_BLOCK
+            && u32::from(column_block) == crate::mid::AMP_COLUMN_MICRO =>
+        {
+            return elements
+                .saturating_mul(IPU21_BLOCK_MAJOR_PACK_CYCLES_PER_ELEMENT)
+                .saturating_add(IPU21_BLOCK_MAJOR_PACK_STARTUP_CYCLES);
+        }
+        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }) | ElementOrder::Amp(_) => {
+            IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT
+        }
+        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }) => {
+            IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT
+        }
+    };
+    elements
+        .saturating_mul(cycles_per_element)
+        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
+}
+
+fn amp_unpack_cycles(tensor: &TensorType) -> u64 {
+    if !matches!(
+        tensor.format.layout.order,
+        ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedLeft)
+    ) {
+        return 0;
+    }
+    maximum_shard_elements(tensor)
+        .saturating_mul(IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT)
+        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
+}
+
 fn amp_kernel_cycles(
     multiply: Precision,
     dispatch: &OperatorDispatch,
@@ -652,12 +710,13 @@ fn deferred_split_input_cycles(
     source: &TensorType,
     logical_output: &TensorType,
     consumer_input: &TensorType,
+    consumer_dispatch: &OperatorDispatch,
 ) -> Option<(u64, u64)> {
     if source.shape.0.len() != 3 || logical_output.shape.0.len() != 3 {
         return None;
     }
     let bytes = consumer_input.format.precision.bytes().max(1);
-    let source_work = maximum_shard_bytes(source).div_ceil(bytes);
+    let source_unpack = amp_unpack_cycles(source);
     let rank = consumer_input.shape.0.len();
     let rows = consumer_input
         .shape
@@ -665,48 +724,65 @@ fn deferred_split_input_cycles(
         .get(rank.saturating_sub(2))
         .copied()
         .map_or(1, u64::from);
-    let columns = consumer_input.shape.0.last().copied().map_or(1, u64::from);
-    let panel_columns = columns.min(u64::from(crate::mid::AMP_COLUMN_MICRO));
-    let (slices, slice_rows, packing_cycles_per_element) = match consumer_input.format.layout.order
-    {
-        ElementOrder::Amp(AmpOrder::TransposedRight) => (
-            rows.div_ceil(u64::from(crate::mid::AMP_INNER_BLOCK)),
-            rows.min(u64::from(crate::mid::AMP_INNER_BLOCK)),
-            3,
-        ),
-        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block, .. }) => (
-            rows.div_ceil(u64::from(row_block)),
-            rows.min(u64::from(row_block)),
-            4,
-        ),
-        _ => (
-            1,
-            maximum_shard_bytes(consumer_input)
-                .div_ceil(bytes)
-                .div_ceil(columns),
-            2,
-        ),
+    if matches!(
+        consumer_input.format.layout.order,
+        ElementOrder::Amp(AmpOrder::Left)
+    ) {
+        let local_elements = maximum_shard_elements(consumer_input);
+        let gather = local_elements
+            .saturating_mul(bytes)
+            .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle);
+        return Some((
+            source_unpack
+                .saturating_add(gather)
+                .saturating_add(row_major_pack_cycles(consumer_input, local_elements)),
+            0,
+        ));
+    }
+
+    let (query_block_rows, key_block_rows) = match consumer_dispatch {
+        OperatorDispatch::BlockedAttention {
+            query_block_rows,
+            key_block_rows,
+            ..
+        } => (u64::from(*query_block_rows), u64::from(*key_block_rows)),
+        _ => (rows, u64::from(crate::mid::AMP_INNER_BLOCK)),
     };
-    let panel_elements = slice_rows.saturating_mul(panel_columns);
-    let gather = panel_elements.div_ceil(4);
-    let pack = panel_elements.saturating_mul(packing_cycles_per_element);
-    let panel_bytes = panel_elements.saturating_mul(bytes);
-    let exchange_per_slice = exchange_endpoint_cycles(
-        &ExchangeEndpointTraffic::from_maxima(panel_bytes, panel_bytes, 1, 1),
-        2,
-    );
-    let exchange = slices.saturating_mul(exchange_per_slice);
-    // The packed producer first becomes an addressable logical view. Panel
-    // owners then overlap, leaving one critical gather/pack/exchange per slice.
+    let block_rows = key_block_rows.max(1);
+    let blocks = rows.div_ceil(block_rows);
+    let physical_columns = consumer_input
+        .format
+        .layout
+        .padded_shape(&consumer_input.shape)
+        .ok()?
+        .0
+        .last()
+        .copied()
+        .map(u64::from)?;
+    let panel_columns = u64::from(crate::mid::AMP_COLUMN_MICRO);
+    let panels_per_block = physical_columns.div_ceil(panel_columns);
+    let owners = rows.div_ceil(query_block_rows.max(1)).max(1);
+    let panels_per_owner = blocks.saturating_mul(panels_per_block).div_ceil(owners);
+    let panel_elements = block_rows.saturating_mul(panel_columns);
+    let gather = panel_elements
+        .saturating_mul(bytes)
+        .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle);
+    let pack = row_major_pack_cycles(consumer_input, panel_elements);
+    // A materialized block is one contiguous source span. Deferral assigns its
+    // micro-panels to independent owners, so every source change after the
+    // first adds another panel-serialization horizon on the shared exchange
+    // paths even though the destination byte volume is unchanged.
+    let fragmented_exchange = blocks
+        .saturating_mul(panels_per_block.saturating_sub(1))
+        .saturating_mul(panel_elements)
+        .saturating_mul(bytes)
+        .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle);
+
     Some((
-        source_work.saturating_mul(2).saturating_add(
-            slices.saturating_mul(
-                gather
-                    .saturating_add(pack)
-                    .saturating_add(exchange_per_slice),
-            ),
-        ),
-        exchange,
+        source_unpack
+            .saturating_add(panels_per_owner.saturating_mul(gather.saturating_add(pack)))
+            .saturating_add(fragmented_exchange),
+        fragmented_exchange,
     ))
 }
 
@@ -1030,7 +1106,13 @@ impl CostModel for Ipu21CostModel {
                 .div_ceil(16)
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
             MidOperator::SplitHeads(_) => {
-                estimated_operator_exchange_cycles(dispatch, inputs, output)
+                let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
+                let source_unpack = inputs.first().map_or(0, amp_unpack_cycles);
+                let destination_pack =
+                    row_major_pack_cycles(output, maximum_shard_elements(output));
+                source_unpack
+                    .saturating_add(destination_pack)
+                    .saturating_add(exchange)
             }
         }
     }
@@ -1052,14 +1134,14 @@ impl CostModel for Ipu21CostModel {
         source: &TensorType,
         logical_output: &TensorType,
         consumer_input: &TensorType,
-        _consumer_dispatch: &OperatorDispatch,
+        consumer_dispatch: &OperatorDispatch,
         producer_cycles: u64,
     ) -> u64 {
         let DeferredTransform::SplitLastAxisIntoLeading { parts } = transform;
         if parts == 0 {
             return producer_cycles;
         }
-        deferred_split_input_cycles(source, logical_output, consumer_input)
+        deferred_split_input_cycles(source, logical_output, consumer_input, consumer_dispatch)
             .map_or(producer_cycles, |cost| cost.0)
     }
 
@@ -1069,14 +1151,15 @@ impl CostModel for Ipu21CostModel {
         source: &TensorType,
         logical_output: &TensorType,
         consumer_input: &TensorType,
-        _consumer_dispatch: &OperatorDispatch,
+        consumer_dispatch: &OperatorDispatch,
         _producer_cycles: u64,
     ) -> u64 {
         let DeferredTransform::SplitLastAxisIntoLeading { parts } = transform;
         if parts == 0 {
             return 0;
         }
-        deferred_split_input_cycles(source, logical_output, consumer_input).map_or(0, |cost| cost.1)
+        deferred_split_input_cycles(source, logical_output, consumer_input, consumer_dispatch)
+            .map_or(0, |cost| cost.1)
     }
 
     fn operator_exchange_footprint(

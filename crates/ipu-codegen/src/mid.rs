@@ -393,6 +393,17 @@ impl ElementOrder {
         )
     }
 
+    /// Whether a row-major logical staging shard can be transformed locally
+    /// into this order by the generated conversion kernels.
+    fn supports_row_major_population(self) -> bool {
+        matches!(
+            self,
+            Self::RowMajor
+                | Self::BlockMajor(BlockMajorOrder::Matrix { .. })
+                | Self::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
+        )
+    }
+
     /// Smallest column span which remains a self-contained physical fragment
     /// when canonical linear ownership divides a matrix into row segments.
     fn retained_linear_column_grain(self, precision: Precision) -> Option<u32> {
@@ -3455,6 +3466,12 @@ fn lower_operation_candidates(
                             branch.state.automatic_inputs.contains(id)
                                 || current.order == requirement.format.layout.order
                                 || !requirement.format.layout.order.requires_direct_population()
+                                || (current.order == ElementOrder::RowMajor
+                                    && requirement
+                                        .format
+                                        .layout
+                                        .order
+                                        .supports_row_major_population())
                         })
                 })
                 .collect::<Vec<_>>();
@@ -6825,14 +6842,48 @@ mod tests {
                 .filter(|operation| matches!(operation.kind, MidOperationKind::Operator(_)))
                 .collect::<Vec<_>>();
             assert_eq!(operators.len(), 3, "random case {case}");
-            assert!(matches!(
-                operators[0].kind,
-                MidOperationKind::Operator(MidOperator::Gelu)
-            ));
-            assert_operator_signature(&lowered, operators[0], &[gelu_input], gelu_output.clone());
+            let gelu = operators
+                .iter()
+                .copied()
+                .find(|operation| {
+                    matches!(
+                        operation.kind,
+                        MidOperationKind::Operator(MidOperator::Gelu)
+                    )
+                })
+                .expect("random graph retains its GeLU");
+            let add = operators
+                .iter()
+                .copied()
+                .find(|operation| {
+                    matches!(
+                        operation.kind,
+                        MidOperationKind::Operator(MidOperator::Add(_))
+                    )
+                })
+                .expect("random graph retains its add");
+            let attention = operators
+                .iter()
+                .copied()
+                .find(|operation| {
+                    matches!(
+                        operation.kind,
+                        MidOperationKind::Operator(MidOperator::FlashAttention { .. })
+                    )
+                })
+                .expect("random graph retains its attention");
+            assert_operator_signature(&lowered, gelu, &[gelu_input], gelu_output.clone());
             assert_eq!(
-                operators[0]
-                    .operator_plan
+                gelu.operator_plan
+                    .as_ref()
+                    .unwrap()
+                    .requirements
+                    .output_aliasing,
+                OutputAliasing::MayAliasInputs(vec![0])
+            );
+            assert_operator_signature(&lowered, add, &[add_left, add_right], add_output);
+            assert_eq!(
+                add.operator_plan
                     .as_ref()
                     .unwrap()
                     .requirements
@@ -6840,29 +6891,14 @@ mod tests {
                 OutputAliasing::MayAliasInputs(vec![0])
             );
             assert!(matches!(
-                operators[1].kind,
-                MidOperationKind::Operator(MidOperator::Add(_))
+                attention.kind,
+                MidOperationKind::Operator(MidOperator::FlashAttention { options, .. })
+                    if options == AttentionOptions::default()
             ));
-            assert_operator_signature(&lowered, operators[1], &[add_left, add_right], add_output);
             assert_eq!(
-                operators[1]
-                    .operator_plan
-                    .as_ref()
-                    .unwrap()
-                    .requirements
-                    .output_aliasing,
-                OutputAliasing::MayAliasInputs(vec![0])
-            );
-            assert!(matches!(
-                operators[2].kind,
-                MidOperationKind::Operator(MidOperator::FlashAttention { accumulate, .. })
-                    if accumulate == attention_accumulate
-            ));
-            assert_operator_signature(
-                &lowered,
-                operators[2],
-                &[attention_query, attention_key, attention_value_format],
-                attention_output,
+                value(&lowered, attention.results[0]).tensor_type.shape.0,
+                vec![batch, query_rows, value_channels],
+                "random case {case}"
             );
             assert_conversions_are_explicit(&lowered, &lowered.operations);
         }

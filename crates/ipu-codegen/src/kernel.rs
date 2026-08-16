@@ -375,6 +375,36 @@ impl KernelBuildPlan {
             let vertex = format!("RearrangeRowMajorToAmpF16_{suffix}");
             let codelet = format!("__runCodelet_{vertex}");
             let call = format!("ipu_stack_rearrange_row_major_to_amp_f16_{suffix}");
+            if order
+                == (RearrangeTarget::BlockMajor {
+                    row_block: AMP_INNER_BLOCK as u16,
+                    column_block: AMP_COLUMN_MICRO as u16,
+                })
+                && physical_rows == AMP_INNER_BLOCK
+                && logical_columns.is_multiple_of(4)
+                && physical_columns.is_multiple_of(AMP_COLUMN_MICRO)
+            {
+                plan.compilations.push(KernelCompilation {
+                    source: "rearrange_block_major_f16.S",
+                    name: format!("rearrange_block_major_f16_{suffix}"),
+                    flags: vec![
+                        format!("-DREARRANGE_CALL_SYMBOL={call}"),
+                        format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
+                    ],
+                    retained_symbols: vec![call.clone()],
+                });
+                plan.rearrange_symbols.insert(
+                    (
+                        order,
+                        logical_rows,
+                        physical_rows,
+                        logical_columns,
+                        physical_columns,
+                    ),
+                    call,
+                );
+                continue;
+            }
             if order == RearrangeTarget::AmpTransposedRight
                 && logical_rows == 64
                 && physical_rows == 64

@@ -93,8 +93,11 @@ struct Arguments {
     #[arg(long, requires = "inspect_exchanges")]
     inspect_exchange_tile: Option<u32>,
     /// Force eligible one-use layout conversions to stream into consumer slices.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "materialize_conversions")]
     stream_conversions: bool,
+    /// Materialize eligible layout conversions before their consumers.
+    #[arg(long, conflicts_with = "stream_conversions")]
+    materialize_conversions: bool,
     /// Constrain planning as though only this much SRAM per tile were free.
     #[arg(long, conflicts_with = "reuse_package")]
     tile_memory_budget_kib: Option<u64>,
@@ -538,6 +541,8 @@ fn main() -> Result<()> {
     pipeline.exchange_diagnostics = arguments.exchange_diagnostics;
     if arguments.stream_conversions {
         pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Always;
+    } else if arguments.materialize_conversions {
+        pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Never;
     }
     if matches!(
         arguments.workload,
@@ -623,8 +628,9 @@ fn main() -> Result<()> {
                 .with_automatic_input(value_weights, Precision::F16);
             pipeline.profiling.enabled = !arguments.no_profile;
         } else {
-            let (heads, query_rows, key_rows, query_dimension, value_dimension) =
-                (4, 17, 19, 16, 12);
+            let (heads, query_rows, key_rows) = (4, 17, 19);
+            let query_dimension = SIGLIP_ATTENTION_HEAD_DIMENSION;
+            let value_dimension = SIGLIP_ATTENTION_HEAD_DIMENSION;
             if active_tiles < heads as u16 {
                 bail!("attention workload requires at least {heads} tiles");
             }
@@ -633,10 +639,35 @@ fn main() -> Result<()> {
             let value = graph.host_input("value", [heads, key_rows, value_dimension])?;
             let output = graph.flash_attention(query, key, value)?;
             graph.set_outputs([output])?;
+            let heads = u16::try_from(heads)?;
+            let query_partitions = u16::try_from(query_rows)?.min(active_tiles / heads).max(1);
+            let key_partitions = u16::try_from(key_rows.div_ceil(64))?;
             pipeline = pipeline
-                .with_automatic_input(query, Precision::F16)
-                .with_automatic_input(key, Precision::F16)
-                .with_automatic_input(value, Precision::F16);
+                .with_input(
+                    query,
+                    TensorFormat {
+                        precision: Precision::F16,
+                        layout: Layout::attention_output(heads, query_partitions),
+                    },
+                )
+                .with_input(
+                    key,
+                    TensorFormat {
+                        precision: Precision::F16,
+                        layout: Layout::attention_output(heads, key_partitions),
+                    },
+                )
+                .with_input(
+                    value,
+                    TensorFormat {
+                        precision: Precision::F16,
+                        layout: Layout::attention_output(heads, key_partitions),
+                    },
+                );
+            // Exercise the tiled attention lowering and its explicit input
+            // conversions rather than the independent whole-head codelet.
+            pipeline.operator_candidates.clear();
+            pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Never;
             pipeline.profiling.enabled = !arguments.no_profile;
         }
     } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
@@ -839,8 +870,9 @@ fn main() -> Result<()> {
                     arguments.profile_output.as_deref(),
                 )?;
             } else if matches!(arguments.workload, Workload::AttentionSmoke) {
-                let (heads, query_rows, key_rows, query_dimension, value_dimension, checked_rows) =
-                    (4, 17, 19, 16, 12, 17);
+                let (heads, query_rows, key_rows) = (4, 17, 19);
+                let query_dimension = SIGLIP_ATTENTION_HEAD_DIMENSION;
+                let value_dimension = SIGLIP_ATTENTION_HEAD_DIMENSION;
                 run_attention_smoke(
                     &runtime,
                     &application,
@@ -849,7 +881,7 @@ fn main() -> Result<()> {
                     key_rows,
                     query_dimension,
                     value_dimension,
-                    checked_rows,
+                    query_rows,
                     arguments.clock_hz,
                     arguments.timeout_seconds,
                     arguments.profile_output.as_deref(),
@@ -1276,14 +1308,8 @@ fn run_attention_smoke(
         let tile = u32::from(logical_tile);
         let head = tile % heads;
         let partition = tile / heads;
-        let (_, local_rows) = balanced_range(query_rows, query_partitions, partition);
-        let (local_row, column) = amp_matrix_coordinates(
-            AmpOrder::Left,
-            Precision::F16,
-            local_rows,
-            padded_query_dimension,
-            linear,
-        )?;
+        let local_row = linear / padded_query_dimension;
+        let column = linear % padded_query_dimension;
         let (row_start, _) = balanced_range(query_rows, query_partitions, partition);
         Ok(if column < query_dimension {
             mlp_smoke_value(
@@ -1296,18 +1322,26 @@ fn run_attention_smoke(
             0
         })
     })?;
-    let key_bytes = packed_binding(&key_binding, |logical_tile, linear, _| {
+    let key_bytes = packed_binding(&key_binding, |logical_tile, linear, elements| {
         let tile = u32::from(logical_tile);
         let head = tile % heads;
         let partition = tile / heads;
-        let (local_row, column) = amp_matrix_coordinates(
-            AmpOrder::TransposedRight,
-            Precision::F16,
-            64,
-            padded_query_dimension,
-            linear,
-        )?;
-        let row = partition * 64 + local_row;
+        let (local_row, column) = if elements == 64 * padded_query_dimension {
+            amp_matrix_coordinates(
+                AmpOrder::TransposedRight,
+                Precision::F16,
+                64,
+                padded_query_dimension,
+                linear,
+            )?
+        } else {
+            (
+                linear / padded_query_dimension,
+                linear % padded_query_dimension,
+            )
+        };
+        let (row_start, _) = balanced_range(key_rows, key_rows.div_ceil(64), partition);
+        let row = row_start + local_row;
         Ok(if row < key_rows && column < query_dimension {
             mlp_smoke_value(
                 KEY_SEED,
@@ -1318,21 +1352,29 @@ fn run_attention_smoke(
             0
         })
     })?;
-    let value_bytes = packed_binding(&value_binding, |logical_tile, linear, _| {
+    let value_bytes = packed_binding(&value_binding, |logical_tile, linear, elements| {
         let tile = u32::from(logical_tile);
         let head = tile % heads;
         let partition = tile / heads;
-        let (local_row, column) = block_major_matrix_coordinates(
-            BlockMajorOrder::Matrix {
-                row_block: 64,
-                column_block: 16,
-            },
-            Precision::F16,
-            64,
-            padded_value_dimension,
-            linear,
-        )?;
-        let row = partition * 64 + local_row;
+        let (local_row, column) = if elements == 64 * padded_value_dimension {
+            block_major_matrix_coordinates(
+                BlockMajorOrder::Matrix {
+                    row_block: 64,
+                    column_block: 16,
+                },
+                Precision::F16,
+                64,
+                padded_value_dimension,
+                linear,
+            )?
+        } else {
+            (
+                linear / padded_value_dimension,
+                linear % padded_value_dimension,
+            )
+        };
+        let (row_start, _) = balanced_range(key_rows, key_rows.div_ceil(64), partition);
+        let row = row_start + local_row;
         Ok(if row < key_rows && column < value_dimension {
             mlp_smoke_value(
                 VALUE_SEED,
@@ -1359,6 +1401,7 @@ fn run_attention_smoke(
     let mut maximum_error = 0.0f32;
     let mut squared_error = 0.0f64;
     let mut checks = 0usize;
+    let mut first_mismatch = None;
     for head in 0..heads {
         for query_row in 0..checked_query_rows.min(query_rows) {
             let mut scores = vec![0.0f32; key_rows as usize];
@@ -1402,6 +1445,9 @@ fn run_attention_smoke(
                 let error = (observed - expected).abs();
                 maximum_error = maximum_error.max(error);
                 squared_error += f64::from(error) * f64::from(error);
+                if error > 0.012 {
+                    first_mismatch.get_or_insert((head, query_row, column, expected, observed));
+                }
                 checks += 1;
             }
         }
@@ -1409,7 +1455,7 @@ fn run_attention_smoke(
     let rms_error = (squared_error / checks as f64).sqrt();
     if maximum_error > 0.012 || rms_error > 0.003 {
         bail!(
-            "FlashAttention numerical verification failed: checks={checks} maxError={maximum_error:.6} rmsError={rms_error:.6}"
+            "FlashAttention numerical verification failed: checks={checks} maxError={maximum_error:.6} rmsError={rms_error:.6} firstMismatch={first_mismatch:?}"
         );
     }
     println!(

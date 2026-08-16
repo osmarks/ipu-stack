@@ -306,8 +306,16 @@ ipu_stack_copy_strided_u64:
 	mul $m9, $m4, $m8
 	add $m2, $m2, $m9
 	shl $m1, $m5, 3
-	sub $m0, $m7, $m1
-	sub $m1, $m8, $m1
+	// Each worker owns rows context, context + 6, ... . Account for the full
+	// six-row step after the inner loop has already advanced by one row width.
+	shl $m0, $m7, 1
+	add $m0, $m0, $m7
+	shl $m0, $m0, 1
+	sub $m0, $m0, $m1
+	shl $m9, $m8, 1
+	add $m9, $m9, $m8
+	shl $m9, $m9, 1
+	sub $m1, $m9, $m1
 .Lcopy_strided_u64_row:
 	add $m9, $m5, 0
 .Lcopy_strided_u64_word:
