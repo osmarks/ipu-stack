@@ -87,6 +87,37 @@
 	add $m3, $m3, 4
 	.endm
 
+	.macro ATTENTION_SOFTMAX_MAX_THREE_PAIRS
+	ld32 $a0, $m3, $m15, 0
+	ld32 $a2, $m3, $m15, 1
+	ld32 $a4, $m3, $m15, 2
+	f16v2tof32 $a0:1, $a0
+	f16v2tof32 $a2:3, $a2
+	f16v2tof32 $a4:5, $a4
+	f32v2max $a0:1, $a0:1, $a2:3
+	f32v2max $a0:1, $a0:1, $a4:5
+	f32max $a0, $a0, $a1
+	f32max $a7, $a7, $a0
+	add $m3, $m3, 12
+	.endm
+
+	.macro ATTENTION_SOFTMAX_MAX_TWO_PAIRS
+	ld32 $a0, $m3, $m15, 0
+	ld32 $a2, $m3, $m15, 1
+	f16v2tof32 $a0:1, $a0
+	f16v2tof32 $a2:3, $a2
+	f32v2max $a0:1, $a0:1, $a2:3
+	f32max $a0, $a0, $a1
+	f32max $a7, $a7, $a0
+	add $m3, $m3, 8
+	.endm
+
+	.macro ATTENTION_SOFTMAX_MAX_PANEL
+	ATTENTION_SOFTMAX_MAX_THREE_PAIRS
+	ATTENTION_SOFTMAX_MAX_THREE_PAIRS
+	ATTENTION_SOFTMAX_MAX_TWO_PAIRS
+	.endm
+
 	.macro ATTENTION_SOFTMAX_NORMALIZE_PAIR
 	ld32 $a0, $m3, $m15, 0
 	f16v2tof32 $a0:1, $a0
@@ -98,12 +129,60 @@
 	add $m3, $m3, 4
 	.endm
 
+	.macro ATTENTION_SOFTMAX_NORMALIZE_TWO_PAIRS
+	ld32 $a0, $m3, $m15, 0
+	ld32 $a2, $m3, $m15, 1
+	f16v2tof32 $a0:1, $a0
+	f16v2tof32 $a2:3, $a2
+	f32v2mul $a0:1, $a4:B, $a0:1
+	f32v2mul $a2:3, $a4:B, $a2:3
+	f32v2add $a0:1, $a5:B, $a0:1
+	f32v2add $a2:3, $a5:B, $a2:3
+	f32v2tof16 $a0, $a0:1
+	f32v2tof16 $a2, $a2:3
+	st32 $a0, $m2, $m15, 0
+	st32 $a2, $m2, $m15, 1
+	add $m2, $m2, 8
+	add $m3, $m3, 8
+	.endm
+
 	.macro ATTENTION_SOFTMAX_SUM_PAIR
 	ld32 $a0, $m2, $m15, 0
 	f16v2tof32 $a0:1, $a0
-	f32add $a6, $a6, $a0
-	f32add $a6, $a6, $a1
+	f32add $a7, $a7, $a0
+	f32add $a7, $a7, $a1
 	add $m2, $m2, 4
+	.endm
+
+	.macro ATTENTION_SOFTMAX_SUM_THREE_PAIRS
+	ld32 $a0, $m2, $m15, 0
+	ld32 $a2, $m2, $m15, 1
+	ld32 $a4, $m2, $m15, 2
+	f16v2tof32 $a0:1, $a0
+	f16v2tof32 $a2:3, $a2
+	f16v2tof32 $a4:5, $a4
+	f32v2add $a0:1, $a0:1, $a2:3
+	f32v2add $a0:1, $a0:1, $a4:5
+	f32add $a0, $a0, $a1
+	f32add $a7, $a7, $a0
+	add $m2, $m2, 12
+	.endm
+
+	.macro ATTENTION_SOFTMAX_SUM_TWO_PAIRS
+	ld32 $a0, $m2, $m15, 0
+	ld32 $a2, $m2, $m15, 1
+	f16v2tof32 $a0:1, $a0
+	f16v2tof32 $a2:3, $a2
+	f32v2add $a0:1, $a0:1, $a2:3
+	f32add $a0, $a0, $a1
+	f32add $a7, $a7, $a0
+	add $m2, $m2, 8
+	.endm
+
+	.macro ATTENTION_SOFTMAX_SUM_PANEL
+	ATTENTION_SOFTMAX_SUM_THREE_PAIRS
+	ATTENTION_SOFTMAX_SUM_THREE_PAIRS
+	ATTENTION_SOFTMAX_SUM_TWO_PAIRS
 	.endm
 
 	.worker
@@ -131,9 +210,7 @@
 	shr $m7, $m6, 4
 	brz $m7, .Lattention_softmax_max_tail_setup
 .Lattention_softmax_max_panels:
-	.rept 8
-	ATTENTION_SOFTMAX_MAX_PAIR
-	.endr
+	ATTENTION_SOFTMAX_MAX_PANEL
 	add $m3, $m3, $m8
 	sub $m7, $m7, 1
 	brnz $m7, .Lattention_softmax_max_panels
@@ -167,8 +244,8 @@
 	shr $m7, $m6, 4
 	brz $m7, .Lattention_softmax_norm_tail_setup
 .Lattention_softmax_norm_panels:
-	.rept 8
-	ATTENTION_SOFTMAX_NORMALIZE_PAIR
+	.rept 4
+	ATTENTION_SOFTMAX_NORMALIZE_TWO_PAIRS
 	.endr
 	add $m2, $m2, $m8
 	add $m3, $m3, $m8
@@ -215,6 +292,15 @@
 	brnz $m7, .Lattention_softmax_zero_pairs
 
 .Lattention_softmax_exp_setup:
+	// The maximum is complete before the exp/sum passes, so commit it now and
+	// reuse its ARF register for a tree-accumulated denominator.
+	ld32 $m2, $mvertex_base, $m15, 0
+	setzi $m10, ATTENTION_KEY_BLOCK_COLUMNS * 2
+	mul $m10, $m5, $m10
+	add $m2, $m2, $m10
+	shl $m10, $m4, 2
+	add $m2, $m2, $m10
+	st32 $a7, $m2, $m15, 0
 	ld32 $m1, $mvertex_base, $m15, 0
 	shl $m10, $m4, 5
 	add $m1, $m1, $m10
@@ -253,12 +339,10 @@
 	shl $m10, $m4, 5
 	add $m2, $m2, $m10
 	shr $m7, $m6, 4
-	ldconst $a6, 0
+	ldconst $a7, 0
 	brz $m7, .Lattention_softmax_sum_tail_setup
 .Lattention_softmax_sum_panels:
-	.rept 8
-	ATTENTION_SOFTMAX_SUM_PAIR
-	.endr
+	ATTENTION_SOFTMAX_SUM_PANEL
 	add $m2, $m2, $m8
 	sub $m7, $m7, 1
 	brnz $m7, .Lattention_softmax_sum_panels
@@ -275,18 +359,17 @@
 	brz $m10, .Lattention_softmax_store_state
 	ld32 $a0, $m2, $m15, 0
 	f16v2tof32 $a0:1, $a0
-	f32add $a6, $a6, $a0
+	f32add $a7, $a7, $a0
 .Lattention_softmax_store_state:
 	ld32 $m2, $mvertex_base, $m15, 0
 	setzi $m10, ATTENTION_KEY_BLOCK_COLUMNS * 2
 	mul $m10, $m5, $m10
 	add $m2, $m2, $m10
+	shl $m10, $m5, 2
+	add $m2, $m2, $m10
 	shl $m10, $m4, 2
 	add $m2, $m2, $m10
 	st32 $a7, $m2, $m15, 0
-	shl $m10, $m5, 2
-	add $m2, $m2, $m10
-	st32 $a6, $m2, $m15, 0
 	add $m4, $m4, 6
 	cmpult $m7, $m4, $m5
 	brnz $m7, .Lattention_softmax_row
