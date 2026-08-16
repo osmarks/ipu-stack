@@ -1,11 +1,10 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use ipu_driver::{Device, block_device_interrupt_signals};
 use ipu_elf::{LinkOptions, Toolchain, inspect_object, link, source_tree_digest};
 use ipu_package::{Application, ProfileExchangeActivityKind, ProfileReport, ProfileStepKind};
 use ipu_profile::{
-    GroupBy, Query, SortBy, StepKind, calibrate_profiles, cycle_origin, exchange_activity_summary,
-    query,
+    GroupBy, Query, SortBy, calibrate_profiles, cycle_origin, exchange_activity_summary, query,
 };
 use ipu_runtime::Runtime;
 use std::collections::{BTreeSet, HashMap};
@@ -88,12 +87,12 @@ enum Command {
     },
     ProfileQuery {
         profile: PathBuf,
-        #[arg(long, value_enum, default_value = "kernel")]
-        group_by: ProfileGroup,
-        #[arg(long, value_enum, default_value = "phase-cycles")]
-        sort_by: ProfileSort,
-        #[arg(long, value_enum)]
-        kind: Option<ProfileKind>,
+        #[arg(long, default_value_t = GroupBy::Kernel)]
+        group_by: GroupBy,
+        #[arg(long, default_value_t = SortBy::PhaseCycles)]
+        sort_by: SortBy,
+        #[arg(long)]
+        kind: Option<ProfileStepKind>,
         #[arg(long)]
         kernel: Option<String>,
         #[arg(long)]
@@ -142,32 +141,6 @@ enum Command {
         #[arg(required = true)]
         calls: Vec<String>,
     },
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ProfileGroup {
-    Kind,
-    Kernel,
-    Operation,
-    Phase,
-    Tile,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ProfileSort {
-    PhaseCycles,
-    WorkCycles,
-    MaximumCycles,
-    Samples,
-    Name,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ProfileKind {
-    Compute,
-    Exchange,
-    Synchronization,
-    Idle,
 }
 
 fn main() -> Result<()> {
@@ -335,26 +308,9 @@ fn main() -> Result<()> {
             let result = query(
                 &report,
                 &Query {
-                    group_by: match group_by {
-                        ProfileGroup::Kind => GroupBy::Kind,
-                        ProfileGroup::Kernel => GroupBy::Kernel,
-                        ProfileGroup::Operation => GroupBy::Operation,
-                        ProfileGroup::Phase => GroupBy::Phase,
-                        ProfileGroup::Tile => GroupBy::Tile,
-                    },
-                    sort_by: match sort_by {
-                        ProfileSort::PhaseCycles => SortBy::PhaseCycles,
-                        ProfileSort::WorkCycles => SortBy::WorkCycles,
-                        ProfileSort::MaximumCycles => SortBy::MaximumCycles,
-                        ProfileSort::Samples => SortBy::Samples,
-                        ProfileSort::Name => SortBy::Name,
-                    },
-                    kind: kind.map(|kind| match kind {
-                        ProfileKind::Compute => StepKind::Compute,
-                        ProfileKind::Exchange => StepKind::Exchange,
-                        ProfileKind::Synchronization => StepKind::Synchronization,
-                        ProfileKind::Idle => StepKind::Idle,
-                    }),
+                    group_by,
+                    sort_by,
+                    kind,
                     kernel,
                     operation_contains,
                     tiles: tile.into_iter().collect::<BTreeSet<_>>(),

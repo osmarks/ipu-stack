@@ -555,9 +555,8 @@ impl MemoryUsage {
         }
     }
 
-    pub fn fits_ipu21(self) -> bool {
-        self.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
-            && self.total() <= u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+    pub fn fits(self, constraints: HardwareMemoryConstraints) -> bool {
+        self.interleaved <= constraints.interleaved_bytes && self.total() <= constraints.total_bytes
     }
 }
 
@@ -579,7 +578,12 @@ pub struct MemoryPeaks {
 }
 
 impl MemoryPeaks {
-    pub(crate) fn observe(&mut self, usage: MemoryUsage, maximum_standard_allocation: u64) {
+    pub(crate) fn observe(
+        &mut self,
+        usage: MemoryUsage,
+        maximum_standard_allocation: u64,
+        constraints: HardwareMemoryConstraints,
+    ) {
         self.standard = self.standard.max(usage.standard);
         self.interleaved = self.interleaved.max(usage.interleaved);
         self.total = self.total.max(usage.total());
@@ -588,50 +592,58 @@ impl MemoryPeaks {
             .max(maximum_standard_allocation);
         let interleaved_boundary = self
             .interleaved
-            .div_ceil(u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE))
-            * u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE);
-        let upper_standard = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+            .div_ceil(constraints.interleaved_element_bytes)
+            * constraints.interleaved_element_bytes;
+        let upper_standard = constraints
+            .interleaved_bytes
             .saturating_sub(interleaved_boundary);
-        let contiguous_capacity =
-            u64::from(crate::memory::IPU21_STANDARD_FIXED_BYTES).max(upper_standard);
+        let contiguous_capacity = constraints.standard_fixed_bytes.max(upper_standard);
         self.standard_contiguous_overflow = self
             .maximum_standard_allocation
             .saturating_sub(contiguous_capacity);
     }
 
-    pub fn fits_ipu21(self) -> bool {
-        self.fits_ipu21_with_budget(0, u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
+    pub fn fits(self, constraints: HardwareMemoryConstraints) -> bool {
+        self.fits_with_budget(constraints, 0, constraints.total_bytes)
     }
 
-    pub fn fits_ipu21_with_budget(
+    pub fn fits_with_budget(
         self,
+        constraints: HardwareMemoryConstraints,
         reserved_standard_bytes: u64,
         tile_memory_budget_bytes: u64,
     ) -> bool {
         let partitioned_bytes = self
             .standard
-            .saturating_add(self.aligned_interleaved_bytes())
+            .saturating_add(self.aligned_interleaved_bytes(constraints))
             .saturating_add(reserved_standard_bytes);
-        self.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
-            && partitioned_bytes
-                <= tile_memory_budget_bytes.min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
-            && self.standard_contiguous_overflow_with_reservation(reserved_standard_bytes) == 0
+        self.interleaved <= constraints.interleaved_bytes
+            && partitioned_bytes <= tile_memory_budget_bytes.min(constraints.total_bytes)
+            && self
+                .standard_contiguous_overflow_with_reservation(constraints, reserved_standard_bytes)
+                == 0
     }
 
-    fn aligned_interleaved_bytes(self) -> u64 {
+    fn aligned_interleaved_bytes(self, constraints: HardwareMemoryConstraints) -> u64 {
         self.interleaved
-            .div_ceil(u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE))
-            .saturating_mul(u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE))
+            .div_ceil(constraints.interleaved_element_bytes)
+            .saturating_mul(constraints.interleaved_element_bytes)
     }
 
     pub fn standard_contiguous_overflow_with_reservation(
         self,
+        constraints: HardwareMemoryConstraints,
         reserved_standard_bytes: u64,
     ) -> u64 {
-        let interleaved_boundary = self.aligned_interleaved_bytes();
-        let upper_standard = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+        let interleaved_boundary = self
+            .interleaved
+            .div_ceil(constraints.interleaved_element_bytes)
+            .saturating_mul(constraints.interleaved_element_bytes);
+        let upper_standard = constraints
+            .interleaved_bytes
             .saturating_sub(interleaved_boundary);
-        let lower_standard = u64::from(crate::memory::IPU21_STANDARD_FIXED_BYTES)
+        let lower_standard = constraints
+            .standard_fixed_bytes
             .saturating_sub(reserved_standard_bytes.saturating_add(self.exchange_rows));
         self.maximum_standard_allocation
             .saturating_sub(lower_standard.max(upper_standard))
@@ -1606,6 +1618,29 @@ pub enum AttentionStrategy {
     Materialized,
 }
 
+impl std::fmt::Display for AttentionStrategy {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str(match self {
+            Self::Automatic => "auto",
+            Self::Flash => "flash",
+            Self::Materialized => "materialized",
+        })
+    }
+}
+
+impl std::str::FromStr for AttentionStrategy {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" | "automatic" => Ok(Self::Automatic),
+            "flash" => Ok(Self::Flash),
+            "materialized" => Ok(Self::Materialized),
+            _ => Err("expected auto, flash, or materialized"),
+        }
+    }
+}
+
 /// Semantic operator family used to scope otherwise global search choices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OperatorClass {
@@ -1749,6 +1784,7 @@ pub enum HardwareTarget {
 pub struct HardwareMemoryConstraints {
     pub standard_fixed_bytes: u64,
     pub interleaved_bytes: u64,
+    pub interleaved_element_bytes: u64,
     pub total_bytes: u64,
     pub default_standard_reservation_bytes: u64,
 }
@@ -1765,6 +1801,7 @@ impl HardwareTarget {
             Self::Ipu21 => HardwareMemoryConstraints {
                 standard_fixed_bytes: crate::memory::IPU21_STANDARD_FIXED_BYTES as u64,
                 interleaved_bytes: crate::memory::IPU21_INTERLEAVED_REGION_BYTES as u64,
+                interleaved_element_bytes: ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE as u64,
                 total_bytes: crate::memory::IPU21_PLANNED_DATA_BYTES as u64,
                 default_standard_reservation_bytes:
                     crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES as u64,
@@ -2945,8 +2982,13 @@ pub(crate) fn lower_finalists(
                 .fold(CostEstimate::default(), |cost, operation| {
                     cost.sequence(operation.metrics.cost)
                 });
-            let peak_memory =
-                region_peak_memory(&initial, &branch.operations, &outputs, &branch.state.values);
+            let peak_memory = region_peak_memory(
+                &initial,
+                &branch.operations,
+                &outputs,
+                &branch.state.values,
+                config.target.memory_constraints(),
+            );
             tracing::info!(
                 finalist,
                 values = branch.state.values.len(),
@@ -3364,8 +3406,10 @@ fn plan_region_frontier(
                     required_outputs,
                     graph,
                     &constraints.allocation_copies,
+                    config.target.memory_constraints(),
                 );
-                if peak.fits_ipu21_with_budget(
+                if peak.fits_with_budget(
+                    config.target.memory_constraints(),
                     config.standard_memory_reservation_bytes,
                     config.tile_memory_budget_bytes,
                 ) {
@@ -3378,6 +3422,7 @@ fn plan_region_frontier(
                         interleaved = peak.interleaved,
                         total = peak.total,
                         contiguous_overflow = peak.standard_contiguous_overflow_with_reservation(
+                            config.target.memory_constraints(),
                             config.standard_memory_reservation_bytes,
                         ),
                         plan = ?next.operations.last().and_then(|operation| operation.operator_plan()),
@@ -3526,12 +3571,14 @@ fn plan_region_frontier(
                         required_outputs,
                         graph,
                         &constraints.allocation_copies,
+                        config.target.memory_constraints(),
                     );
                     (next, peak)
                 })
                 .collect::<Vec<_>>();
             for (mut next, peak) in evaluated {
-                let fits = peak.fits_ipu21_with_budget(
+                let fits = peak.fits_with_budget(
+                    config.target.memory_constraints(),
                     config.standard_memory_reservation_bytes,
                     config.tile_memory_budget_bytes,
                 );
@@ -3554,6 +3601,7 @@ fn plan_region_frontier(
                         interleaved = peak.interleaved,
                         total = peak.total,
                         contiguous_overflow = peak.standard_contiguous_overflow_with_reservation(
+                            config.target.memory_constraints(),
                             config.standard_memory_reservation_bytes,
                         ),
                         plan = ?next.operations.last().and_then(|operation| operation.operator_plan()),
@@ -3577,6 +3625,7 @@ fn plan_region_frontier(
                     total: peak.total,
                     standard_contiguous_overflow: peak
                         .standard_contiguous_overflow_with_reservation(
+                            config.target.memory_constraints(),
                             config.standard_memory_reservation_bytes,
                         ),
                 });
@@ -3629,8 +3678,10 @@ fn plan_region_frontier(
                 required_outputs,
                 graph,
                 &constraints.allocation_copies,
+                config.target.memory_constraints(),
             );
-            (peak.fits_ipu21_with_budget(
+            (peak.fits_with_budget(
+                config.target.memory_constraints(),
                 config.standard_memory_reservation_bytes,
                 config.tile_memory_budget_bytes,
             ) || branch_contains_gemm_constraint(&branch, config))
@@ -4200,6 +4251,7 @@ fn beam_memory_peak(
     required_outputs: &[ValueId],
     graph: &ComputeGraph,
     allocation_multiplicity: &BTreeMap<ValueId, u32>,
+    memory_constraints: HardwareMemoryConstraints,
 ) -> MemoryPeaks {
     let live_origins = source[operation_index + 1..]
         .iter()
@@ -4226,6 +4278,7 @@ fn beam_memory_peak(
         &live,
         &branch.state.values,
         &multiplicity,
+        memory_constraints,
     )
 }
 
@@ -4339,13 +4392,12 @@ fn plan_fits_operator_memory(
         &planned_output,
     )
     .peak;
-    peak.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+    let constraints = config.target.memory_constraints();
+    peak.interleaved <= constraints.interleaved_bytes
         && peak
             .total()
             .saturating_add(config.standard_memory_reservation_bytes)
-            <= config
-                .tile_memory_budget_bytes
-                .min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
+            <= config.tile_memory_budget_bytes.min(constraints.total_bytes)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5291,9 +5343,9 @@ fn parallel_reduction_plans_for_orientation(
                     .saturating_add(partial_bytes);
                 let reduction_bytes = partial_bytes.saturating_mul(4);
                 let temporary_bytes = convolution_bytes.max(reduction_bytes);
-                if temporary_bytes > u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
-                    || right_bytes.saturating_add(partial_bytes)
-                        > u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+                let constraints = config.target.memory_constraints();
+                if temporary_bytes > constraints.total_bytes
+                    || right_bytes.saturating_add(partial_bytes) > constraints.interleaved_bytes
                 {
                     continue;
                 }
@@ -6071,6 +6123,7 @@ fn lower_repeat(
         &yields,
         &state.values,
         &body_allocation_multiplicity,
+        config.target.memory_constraints(),
     );
     let mut results = Vec::new();
     for (origin, input) in operation.results.iter().zip(&inputs) {
@@ -6220,8 +6273,9 @@ mod tests {
     #[test]
     fn randomized_memory_peaks_reserve_disjoint_class_arenas() {
         let mut random = fastrand::Rng::with_seed(0x636c_6173_735f_7372);
-        let capacity = u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES);
-        let interleaved_capacity = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES);
+        let constraints = HardwareTarget::Ipu21.memory_constraints();
+        let capacity = constraints.total_bytes;
+        let interleaved_capacity = constraints.interleaved_bytes;
         let element = u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE);
         let mut rejected_noncoincident_peaks = 0;
         for _ in 0..RANDOM_CASES * 16 {
@@ -6241,7 +6295,11 @@ mod tests {
             let static_partition = standard
                 .saturating_add(aligned_interleaved)
                 .saturating_add(reservation);
-            let fits = peaks.fits_ipu21_with_budget(reservation, capacity);
+            let fits = peaks.fits_with_budget(
+                HardwareTarget::Ipu21.memory_constraints(),
+                reservation,
+                capacity,
+            );
             assert_eq!(fits, static_partition <= capacity);
             if simultaneous.saturating_add(reservation) <= capacity && static_partition > capacity {
                 rejected_noncoincident_peaks += 1;
@@ -6933,7 +6991,8 @@ mod tests {
             }
             let searched = &finalists[0];
             assert!(
-                searched.metrics.memory.fits_ipu21_with_budget(
+                searched.metrics.memory.fits_with_budget(
+                    searched_config.target.memory_constraints(),
                     searched_config.standard_memory_reservation_bytes,
                     searched_config.tile_memory_budget_bytes,
                 ),

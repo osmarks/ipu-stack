@@ -1233,7 +1233,10 @@ impl CostModel for Ipu21CostModel {
                 .map(|cycles| cycles.saturating_mul(matrices_per_tile))
                 .unwrap_or_else(|| arithmetic.max(weight_feed).saturating_add(calls));
                 let memory = operator_memory_estimate(dispatch, requirements, inputs, output);
-                let capacity_penalty = if memory.peak.fits_ipu21() {
+                let capacity_penalty = if memory
+                    .peak
+                    .fits(crate::HardwareTarget::Ipu21.memory_constraints())
+                {
                     0
                 } else {
                     u64::MAX / 8

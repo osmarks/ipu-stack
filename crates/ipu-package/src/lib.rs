@@ -11,6 +11,10 @@ pub mod profile_capnp {
     include!(concat!(env!("OUT_DIR"), "/profile_capnp.rs"));
 }
 
+pub mod profile_common_capnp {
+    include!(concat!(env!("OUT_DIR"), "/profile_common_capnp.rs"));
+}
+
 fn capnp_reader_options() -> message::ReaderOptions {
     let mut options = message::ReaderOptions::new();
     options.traversal_limit_in_words(None);
@@ -23,6 +27,31 @@ pub enum ProfileStepKind {
     Compute,
     Synchronization,
     Idle,
+}
+
+impl std::fmt::Display for ProfileStepKind {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str(match self {
+            Self::Exchange => "exchange",
+            Self::Compute => "compute",
+            Self::Synchronization => "synchronization",
+            Self::Idle => "idle",
+        })
+    }
+}
+
+impl std::str::FromStr for ProfileStepKind {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "exchange" => Ok(Self::Exchange),
+            "compute" => Ok(Self::Compute),
+            "synchronization" | "sync" => Ok(Self::Synchronization),
+            "idle" => Ok(Self::Idle),
+            _ => Err("expected exchange, compute, synchronization, or idle"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,10 +131,12 @@ impl ProfileReport {
                 step.set_epoch(sample.step.epoch);
                 step.set_operation(&sample.step.operation);
                 step.set_kind(match sample.step.kind {
-                    ProfileStepKind::Exchange => profile_capnp::StepKind::Exchange,
-                    ProfileStepKind::Compute => profile_capnp::StepKind::Compute,
-                    ProfileStepKind::Synchronization => profile_capnp::StepKind::Synchronization,
-                    ProfileStepKind::Idle => profile_capnp::StepKind::Idle,
+                    ProfileStepKind::Exchange => profile_common_capnp::StepKind::Exchange,
+                    ProfileStepKind::Compute => profile_common_capnp::StepKind::Compute,
+                    ProfileStepKind::Synchronization => {
+                        profile_common_capnp::StepKind::Synchronization
+                    }
+                    ProfileStepKind::Idle => profile_common_capnp::StepKind::Idle,
                 });
                 step.set_kernel(&sample.step.kernel);
                 step.set_exchange_event_cycles(sample.step.exchange_event_cycles);
@@ -124,13 +155,13 @@ impl ProfileReport {
                     let mut output_activity = activities.reborrow().get(index as u32);
                     output_activity.set_kind(match activity.kind {
                         ProfileExchangeActivityKind::Send => {
-                            profile_capnp::ExchangeActivityKind::Send
+                            profile_common_capnp::ExchangeActivityKind::Send
                         }
                         ProfileExchangeActivityKind::Receive => {
-                            profile_capnp::ExchangeActivityKind::Receive
+                            profile_common_capnp::ExchangeActivityKind::Receive
                         }
                         ProfileExchangeActivityKind::PartnerBusy => {
-                            profile_capnp::ExchangeActivityKind::PartnerBusy
+                            profile_common_capnp::ExchangeActivityKind::PartnerBusy
                         }
                     });
                     output_activity.set_start_cycle(activity.start_cycle);
@@ -167,12 +198,12 @@ impl ProfileReport {
                                 epoch: step.get_epoch(),
                                 operation: step.get_operation()?.to_str()?.into(),
                                 kind: match step.get_kind()? {
-                                    profile_capnp::StepKind::Exchange => ProfileStepKind::Exchange,
-                                    profile_capnp::StepKind::Compute => ProfileStepKind::Compute,
-                                    profile_capnp::StepKind::Synchronization => {
+                                    profile_common_capnp::StepKind::Exchange => ProfileStepKind::Exchange,
+                                    profile_common_capnp::StepKind::Compute => ProfileStepKind::Compute,
+                                    profile_common_capnp::StepKind::Synchronization => {
                                         ProfileStepKind::Synchronization
                                     }
-                                    profile_capnp::StepKind::Idle => ProfileStepKind::Idle,
+                                    profile_common_capnp::StepKind::Idle => ProfileStepKind::Idle,
                                 },
                                 kernel: step.get_kernel()?.to_str()?.into(),
                                 metadata: step
@@ -191,13 +222,13 @@ impl ProfileReport {
                                     .map(|activity| {
                                         Ok(ProfileExchangeActivity {
                                             kind: match activity.get_kind()? {
-                                                profile_capnp::ExchangeActivityKind::Send => {
+                                                profile_common_capnp::ExchangeActivityKind::Send => {
                                                     ProfileExchangeActivityKind::Send
                                                 }
-                                                profile_capnp::ExchangeActivityKind::Receive => {
+                                                profile_common_capnp::ExchangeActivityKind::Receive => {
                                                     ProfileExchangeActivityKind::Receive
                                                 }
-                                                profile_capnp::ExchangeActivityKind::PartnerBusy => {
+                                                profile_common_capnp::ExchangeActivityKind::PartnerBusy => {
                                                     ProfileExchangeActivityKind::PartnerBusy
                                                 }
                                             },
@@ -1037,12 +1068,10 @@ fn write_profile_tiles(
             output_step.set_epoch(step.epoch);
             output_step.set_operation(&step.operation);
             output_step.set_kind(match step.kind {
-                ProfileStepKind::Exchange => application_capnp::ProfileStepKind::Exchange,
-                ProfileStepKind::Compute => application_capnp::ProfileStepKind::Compute,
-                ProfileStepKind::Synchronization => {
-                    application_capnp::ProfileStepKind::Synchronization
-                }
-                ProfileStepKind::Idle => application_capnp::ProfileStepKind::Idle,
+                ProfileStepKind::Exchange => profile_common_capnp::StepKind::Exchange,
+                ProfileStepKind::Compute => profile_common_capnp::StepKind::Compute,
+                ProfileStepKind::Synchronization => profile_common_capnp::StepKind::Synchronization,
+                ProfileStepKind::Idle => profile_common_capnp::StepKind::Idle,
             });
             output_step.set_kernel(&step.kernel);
             output_step.set_exchange_event_cycles(step.exchange_event_cycles);
@@ -1061,13 +1090,13 @@ fn write_profile_tiles(
                 let mut output_activity = activities.reborrow().get(activity_index as u32);
                 output_activity.set_kind(match activity.kind {
                     ProfileExchangeActivityKind::Send => {
-                        application_capnp::ProfileExchangeActivityKind::Send
+                        profile_common_capnp::ExchangeActivityKind::Send
                     }
                     ProfileExchangeActivityKind::Receive => {
-                        application_capnp::ProfileExchangeActivityKind::Receive
+                        profile_common_capnp::ExchangeActivityKind::Receive
                     }
                     ProfileExchangeActivityKind::PartnerBusy => {
-                        application_capnp::ProfileExchangeActivityKind::PartnerBusy
+                        profile_common_capnp::ExchangeActivityKind::PartnerBusy
                     }
                 });
                 output_activity.set_start_cycle(activity.start_cycle);
@@ -1095,16 +1124,16 @@ fn read_profile_tiles(
                             epoch: step.get_epoch(),
                             operation: step.get_operation()?.to_str()?.into(),
                             kind: match step.get_kind()? {
-                                application_capnp::ProfileStepKind::Exchange => {
+                                profile_common_capnp::StepKind::Exchange => {
                                     ProfileStepKind::Exchange
                                 }
-                                application_capnp::ProfileStepKind::Compute => {
+                                profile_common_capnp::StepKind::Compute => {
                                     ProfileStepKind::Compute
                                 }
-                                application_capnp::ProfileStepKind::Synchronization => {
+                                profile_common_capnp::StepKind::Synchronization => {
                                     ProfileStepKind::Synchronization
                                 }
-                                application_capnp::ProfileStepKind::Idle => ProfileStepKind::Idle,
+                                profile_common_capnp::StepKind::Idle => ProfileStepKind::Idle,
                             },
                             kernel: step.get_kernel()?.to_str()?.into(),
                             metadata: step
@@ -1123,13 +1152,13 @@ fn read_profile_tiles(
                                 .map(|activity| {
                                     Ok(ProfileExchangeActivity {
                                         kind: match activity.get_kind()? {
-                                            application_capnp::ProfileExchangeActivityKind::Send => {
+                                            profile_common_capnp::ExchangeActivityKind::Send => {
                                                 ProfileExchangeActivityKind::Send
                                             }
-                                            application_capnp::ProfileExchangeActivityKind::Receive => {
+                                            profile_common_capnp::ExchangeActivityKind::Receive => {
                                                 ProfileExchangeActivityKind::Receive
                                             }
-                                            application_capnp::ProfileExchangeActivityKind::PartnerBusy => {
+                                            profile_common_capnp::ExchangeActivityKind::PartnerBusy => {
                                                 ProfileExchangeActivityKind::PartnerBusy
                                             }
                                         },

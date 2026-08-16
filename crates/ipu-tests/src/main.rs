@@ -132,8 +132,8 @@ struct Arguments {
     #[arg(long, default_value_t = 1)]
     attention_batch: u32,
     /// Restrict attention planning for controlled strategy comparisons.
-    #[arg(long, value_enum, default_value_t = AttentionMode::Auto)]
-    attention_strategy: AttentionMode,
+    #[arg(long, default_value_t = AttentionStrategy::Automatic)]
+    attention_strategy: AttentionStrategy,
     #[arg(long, default_value_t = SIGLIP_ATTENTION_HEADS)]
     attention_heads: u32,
     /// Defaults to SigLIP's 4304-wide intermediate for the canonical 1152D
@@ -227,23 +227,6 @@ enum ExchangeStressPattern {
     Overlap,
     /// Paired 64-bit sends across the standard/interleaved SRAM bank matrix.
     Wide,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum AttentionMode {
-    Auto,
-    Flash,
-    Materialized,
-}
-
-impl From<AttentionMode> for AttentionStrategy {
-    fn from(value: AttentionMode) -> Self {
-        match value {
-            AttentionMode::Auto => Self::Automatic,
-            AttentionMode::Flash => Self::Flash,
-            AttentionMode::Materialized => Self::Materialized,
-        }
-    }
 }
 
 impl Workload {
@@ -572,7 +555,7 @@ fn main() -> Result<()> {
     }
     let mut graph = ComputeGraph::default();
     let mut search_domain =
-        PlannerSearchDomain::default().with_attention_strategy(arguments.attention_strategy.into());
+        PlannerSearchDomain::default().with_attention_strategy(arguments.attention_strategy);
     for constraint in &arguments.gemm_plan_constraint {
         search_domain = search_domain.with_gemm_plan_constraint(*constraint);
     }

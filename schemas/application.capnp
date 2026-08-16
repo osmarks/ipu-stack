@@ -1,5 +1,7 @@
 @0xd3bce605d3d25b4f;
 
+using Profile = import "profile_common.capnp";
+
 struct Segment {
   address @0 :UInt32;
   memorySize @1 :UInt32;
@@ -72,45 +74,9 @@ struct DeviceConfigWrite {
   value @1 :UInt32;
 }
 
-struct ProfileMetadata {
-  name @0 :Text;
-  value @1 :Text;
-}
-
-enum ProfileStepKind {
-  exchange @0;
-  compute @1;
-  synchronization @2;
-  idle @3;
-}
-
-enum ProfileExchangeActivityKind {
-  send @0;
-  receive @1;
-  partnerBusy @2;
-}
-
-struct ProfileExchangeActivity {
-  kind @0 :ProfileExchangeActivityKind;
-  startCycle @1 :UInt32;
-  endCycle @2 :UInt32;
-}
-
-struct ProfileStepPlan {
-  localIndex @0 :UInt32;
-  phase @1 :UInt32;
-  epoch @2 :UInt32;
-  operation @3 :Text;
-  kind @4 :ProfileStepKind;
-  kernel @5 :Text;
-  metadata @6 :List(ProfileMetadata);
-  exchangeActivities @7 :List(ProfileExchangeActivity);
-  exchangeEventCycles @8 :UInt32;
-}
-
 struct TileProfilePlan {
   physicalTile @0 :UInt32;
-  steps @1 :List(ProfileStepPlan);
+  steps @1 :List(Profile.Step);
 }
 
 struct DebugSymbol {

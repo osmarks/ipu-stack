@@ -16,6 +16,35 @@ pub enum GroupBy {
     Metadata,
 }
 
+impl std::fmt::Display for GroupBy {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str(match self {
+            Self::Kind => "kind",
+            Self::Kernel => "kernel",
+            Self::Operation => "operation",
+            Self::Phase => "phase",
+            Self::Tile => "tile",
+            Self::Metadata => "metadata",
+        })
+    }
+}
+
+impl std::str::FromStr for GroupBy {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "kind" => Ok(Self::Kind),
+            "kernel" => Ok(Self::Kernel),
+            "operation" => Ok(Self::Operation),
+            "phase" => Ok(Self::Phase),
+            "tile" => Ok(Self::Tile),
+            "metadata" => Ok(Self::Metadata),
+            _ => Err("expected kind, kernel, operation, phase, tile, or metadata"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SortBy {
     #[default]
@@ -26,12 +55,31 @@ pub enum SortBy {
     Name,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StepKind {
-    Exchange,
-    Compute,
-    Synchronization,
-    Idle,
+impl std::fmt::Display for SortBy {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str(match self {
+            Self::PhaseCycles => "phase-cycles",
+            Self::WorkCycles => "work-cycles",
+            Self::MaximumCycles => "maximum-cycles",
+            Self::Samples => "samples",
+            Self::Name => "name",
+        })
+    }
+}
+
+impl std::str::FromStr for SortBy {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "phase-cycles" => Ok(Self::PhaseCycles),
+            "work-cycles" => Ok(Self::WorkCycles),
+            "maximum-cycles" => Ok(Self::MaximumCycles),
+            "samples" => Ok(Self::Samples),
+            "name" => Ok(Self::Name),
+            _ => Err("expected phase-cycles, work-cycles, maximum-cycles, samples, or name"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,7 +92,7 @@ pub struct MetadataFilter {
 pub struct Query {
     pub group_by: GroupBy,
     pub sort_by: SortBy,
-    pub kind: Option<StepKind>,
+    pub kind: Option<ProfileStepKind>,
     pub kernel: Option<String>,
     pub operation_contains: Option<String>,
     pub tiles: BTreeSet<u32>,
@@ -619,21 +667,16 @@ fn group_key(query: &Query, tile: u32, sample: &CycleSample) -> (String, BTreeMa
     (name, dimensions)
 }
 
-fn kind_of(sample: &CycleSample) -> StepKind {
-    match sample.step.kind {
-        ProfileStepKind::Exchange => StepKind::Exchange,
-        ProfileStepKind::Compute => StepKind::Compute,
-        ProfileStepKind::Synchronization => StepKind::Synchronization,
-        ProfileStepKind::Idle => StepKind::Idle,
-    }
+fn kind_of(sample: &CycleSample) -> ProfileStepKind {
+    sample.step.kind
 }
 
 fn kind_name(sample: &CycleSample) -> &'static str {
     match kind_of(sample) {
-        StepKind::Exchange => "exchange",
-        StepKind::Compute => "compute",
-        StepKind::Synchronization => "synchronization",
-        StepKind::Idle => "idle",
+        ProfileStepKind::Exchange => "exchange",
+        ProfileStepKind::Compute => "compute",
+        ProfileStepKind::Synchronization => "synchronization",
+        ProfileStepKind::Idle => "idle",
     }
 }
 
@@ -895,7 +938,7 @@ mod tests {
         let result = query(
             &report,
             &Query {
-                kind: Some(StepKind::Compute),
+                kind: Some(ProfileStepKind::Compute),
                 sample_limit: 2,
                 shared_clock: true,
                 ..Query::default()

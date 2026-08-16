@@ -869,8 +869,16 @@ pub(crate) fn region_peak_memory(
     operations: &[MidOperation],
     outputs: &[MidValueId],
     values: &[MidValue],
+    constraints: crate::HardwareMemoryConstraints,
 ) -> MemoryPeaks {
-    region_peak_memory_with_multiplicity(initial, operations, outputs, values, &BTreeMap::new())
+    region_peak_memory_with_multiplicity(
+        initial,
+        operations,
+        outputs,
+        values,
+        &BTreeMap::new(),
+        constraints,
+    )
 }
 
 pub(crate) fn region_peak_memory_with_multiplicity(
@@ -879,6 +887,7 @@ pub(crate) fn region_peak_memory_with_multiplicity(
     outputs: &[MidValueId],
     values: &[MidValue],
     allocation_multiplicity: &BTreeMap<MidValueId, u32>,
+    constraints: crate::HardwareMemoryConstraints,
 ) -> MemoryPeaks {
     let requirements = allocation_requirements(operations);
     let streamed_aliases = operations
@@ -919,6 +928,7 @@ pub(crate) fn region_peak_memory_with_multiplicity(
         peaks.observe(
             live.saturating_add(temporary),
             maximum_standard_allocation(&roots, values, &requirements),
+            constraints,
         );
     };
     observe(&mut peaks, &live_values, MemoryUsage::default());
@@ -947,6 +957,7 @@ pub(crate) fn region_peak_memory_with_multiplicity(
                     .memory
                     .maximum_standard_temporary_allocation,
             ),
+            constraints,
         );
         for input in operation_value_inputs(operation) {
             if let Some(remaining) = uses.get_mut(input) {
