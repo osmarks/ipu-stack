@@ -257,20 +257,8 @@ struct ScheduledSenderRow {
 }
 
 #[derive(Clone, Debug)]
-struct ScheduledPhaseTransfer {
-    source: u16,
-    reserved_tiles: Vec<u16>,
-    receivers: Vec<u16>,
-    sender: PlanRow,
-    receiver_rows: Vec<PlanRow>,
-    schedule_offset: u32,
-    words: u32,
-}
-
-#[derive(Clone, Debug)]
 pub struct PhaseProgramBuilder {
     tile_states: Vec<TileProgramSchedule>,
-    transfers: Vec<ScheduledPhaseTransfer>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,7 +283,6 @@ impl PhaseProgramBuilder {
     pub fn new(tile_count: u16) -> Self {
         Self {
             tile_states: vec![TileProgramSchedule::default(); usize::from(tile_count)],
-            transfers: Vec::new(),
         }
     }
 
@@ -363,44 +350,9 @@ impl PhaseProgramBuilder {
                 offset = schedule.earliest_receiver_offset(row, words, offset)?;
             }
             if offset == previous {
-                match self.transfer_is_encodable_at(source, receivers, plan, offset, words) {
-                    Ok(()) => return Ok(offset),
-                    Err(ExchangeError::Schedule("SENDPICP instruction alignment")) => {
-                        offset = offset
-                            .checked_add(1)
-                            .ok_or(ExchangeError::Schedule("receive offset overflow"))?;
-                    }
-                    Err(error) => return Err(error),
-                }
+                return Ok(offset);
             }
         }
-    }
-
-    fn transfer_is_encodable_at(
-        &self,
-        source: u16,
-        receivers: &[u16],
-        plan: &MulticastPlan,
-        schedule_offset: u32,
-        words: u32,
-    ) -> Result<(), ExchangeError> {
-        let mut source_schedule = self
-            .tile_states
-            .get(usize::from(source))
-            .ok_or(ExchangeError::Tile(source))?
-            .clone();
-        source_schedule.append_sender_at(&plan.sender, schedule_offset)?;
-        source_schedule.finish()?;
-        for (&receiver, row) in receivers.iter().zip(&plan.receivers) {
-            let mut receiver_schedule = self
-                .tile_states
-                .get(usize::from(receiver))
-                .ok_or(ExchangeError::Tile(receiver))?
-                .clone();
-            receiver_schedule.append_receiver_at(row, schedule_offset, words)?;
-            receiver_schedule.finish()?;
-        }
-        Ok(())
     }
 
     /// Adds one transfer to the phase schedule. The transfer's sender and all
@@ -460,16 +412,6 @@ impl PhaseProgramBuilder {
         for (tile, schedule) in updates {
             self.tile_states[usize::from(tile)] = schedule;
         }
-        self.transfers.push(ScheduledPhaseTransfer {
-            source,
-            reserved_tiles: reserved_tiles.to_vec(),
-            receivers: receivers.to_vec(),
-            sender: plan.sender,
-            receiver_rows: plan.receivers.clone(),
-            schedule_offset,
-            words,
-        });
-
         Ok(transfer_timing)
     }
 
@@ -535,35 +477,11 @@ impl PhaseProgramBuilder {
     }
 
     pub fn finish(self) -> Result<PhasePrograms, ExchangeError> {
-        // Per-tile state is an index used to search the phase schedule. Build
-        // executable rows afresh from the authoritative, phase-wide transfer
-        // list so controls and sends can be encoded as one global timeline.
-        let expected_states = self.tile_states;
-        let mut tile_states = vec![TileProgramSchedule::default(); expected_states.len()];
-        for transfer in self.transfers {
-            tile_states[usize::from(transfer.source)]
-                .append_sender_at(&transfer.sender, transfer.schedule_offset)?;
-            let sender_horizon =
-                sender_row_timing(&transfer.sender, transfer.schedule_offset)?.horizon_cycles;
-            for &tile in &transfer.reserved_tiles {
-                tile_states[usize::from(tile)].event_cycles = tile_states[usize::from(tile)]
-                    .event_cycles
-                    .max(sender_horizon);
-            }
-            for (&receiver, row) in transfer.receivers.iter().zip(&transfer.receiver_rows) {
-                tile_states[usize::from(receiver)].append_receiver_at(
-                    row,
-                    transfer.schedule_offset,
-                    transfer.words,
-                )?;
-            }
-        }
-        debug_assert!(
-            tile_states
-                .iter()
-                .zip(&expected_states)
-                .all(|(actual, expected)| actual.event_cycles == expected.event_cycles)
-        );
+        // `append_transfer_at` has already merged the authoritative
+        // phase-wide schedule into these per-tile sender and receive-event
+        // timelines. Encoding them directly avoids replaying every transfer
+        // and performing the same conflict checks a second time.
+        let tile_states = self.tile_states;
         let event_cycles = tile_states
             .iter()
             .map(|schedule| schedule.event_cycles)
@@ -780,9 +698,12 @@ impl TileProgramSchedule {
                 }
             }
         }
+        // `earliest_receiver_offset` checked the new events against the full
+        // existing stream, while `scheduled_receive_window` validated the new
+        // group internally. Source and pointer controls are independent and
+        // may be inserted on opposite sides of an older teardown event, so
+        // keep insertion order here and sort once when encoding the row.
         self.receive_events.extend(timing.events.iter().copied());
-        self.receive_events.sort_by_key(|event| event.cycles);
-        validate_receive_events(&self.receive_events)?;
         self.event_cycles = self.event_cycles.max(timing.horizon);
         self.receive_stream = Some(ReceiveStream {
             mode: base.mode,
