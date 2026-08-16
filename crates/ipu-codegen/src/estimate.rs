@@ -765,7 +765,6 @@ pub(crate) fn operator_memory_estimate(
         live,
         temporary,
         peak: live.saturating_add(temporary),
-        exchange_row_bytes: 0,
         maximum_standard_temporary_allocation,
     }
 }
@@ -861,7 +860,6 @@ pub(crate) fn conversion_memory_estimate(
         live,
         temporary: MemoryUsage::default(),
         peak: live,
-        exchange_row_bytes: 0,
         maximum_standard_temporary_allocation: 0,
     }
 }
@@ -942,9 +940,13 @@ pub(crate) fn region_peak_memory_with_multiplicity(
             })
         });
         peaks.observe(
-            live.saturating_add(operation.memory.temporary),
-            maximum_standard_allocation(&roots, values, &requirements)
-                .max(operation.memory.maximum_standard_temporary_allocation),
+            live.saturating_add(operation.metrics.memory.temporary),
+            maximum_standard_allocation(&roots, values, &requirements).max(
+                operation
+                    .metrics
+                    .memory
+                    .maximum_standard_temporary_allocation,
+            ),
         );
         for input in operation_value_inputs(operation) {
             if let Some(remaining) = uses.get_mut(input) {
@@ -963,7 +965,7 @@ pub(crate) fn region_peak_memory_with_multiplicity(
     observe(&mut peaks, &live_values, MemoryUsage::default());
     let exchange_rows = operations
         .iter()
-        .map(|operation| operation.memory.exchange_row_bytes)
+        .map(|operation| operation.metrics.cost.exchange_row_bytes())
         .fold(0u64, u64::saturating_add);
     peaks.exchange_rows = exchange_rows;
     peaks.standard = peaks.standard.saturating_add(exchange_rows);

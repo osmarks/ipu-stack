@@ -146,20 +146,61 @@ pub trait CostModel: Sync {
         strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
-    ) -> RearrangementCost;
+    ) -> CostEstimate;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RearrangementCost {
+pub struct CostEstimate {
     pub cycles: u64,
     pub exchange_cycles: u64,
-    pub exchange_row_bytes: u64,
+    pub exchange_footprint: ExchangeFootprint,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExchangeFootprint {
     pub phases: u64,
     pub maximum_transfer_chunks_per_tile: u64,
+}
+
+impl CostEstimate {
+    pub const fn exchange_row_bytes(self) -> u64 {
+        self.exchange_footprint.estimated_row_bytes()
+    }
+
+    pub const fn sequence(self, next: Self) -> Self {
+        Self {
+            cycles: self.cycles.saturating_add(next.cycles),
+            exchange_cycles: self.exchange_cycles.saturating_add(next.exchange_cycles),
+            exchange_footprint: ExchangeFootprint {
+                phases: self
+                    .exchange_footprint
+                    .phases
+                    .saturating_add(next.exchange_footprint.phases),
+                maximum_transfer_chunks_per_tile: if self
+                    .exchange_footprint
+                    .maximum_transfer_chunks_per_tile
+                    > next.exchange_footprint.maximum_transfer_chunks_per_tile
+                {
+                    self.exchange_footprint.maximum_transfer_chunks_per_tile
+                } else {
+                    next.exchange_footprint.maximum_transfer_chunks_per_tile
+                },
+            },
+        }
+    }
+
+    pub const fn repeated(self, count: u32) -> Self {
+        Self {
+            cycles: self.cycles.saturating_mul(count as u64),
+            exchange_cycles: self.exchange_cycles.saturating_mul(count as u64),
+            exchange_footprint: ExchangeFootprint {
+                phases: self.exchange_footprint.phases.saturating_mul(count as u64),
+                maximum_transfer_chunks_per_tile: self
+                    .exchange_footprint
+                    .maximum_transfer_chunks_per_tile,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,7 +255,7 @@ pub(crate) struct MemoizedCostModel<'a, C> {
 }
 
 type RearrangementKey = (TensorShape, Precision, ConversionStrategy, Layout, Layout);
-type RearrangementCache = HashMap<RearrangementKey, Arc<OnceLock<RearrangementCost>>, FixedState>;
+type RearrangementCache = HashMap<RearrangementKey, Arc<OnceLock<CostEstimate>>, FixedState>;
 
 impl<'a, C> MemoizedCostModel<'a, C> {
     pub(crate) fn new(inner: &'a C, spatial_capacity: u16) -> Self {
@@ -312,7 +353,7 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
-    ) -> RearrangementCost {
+    ) -> CostEstimate {
         let key = (shape.clone(), precision, strategy, from.clone(), to.clone());
         let cached = self
             .rearrangements
@@ -1447,7 +1488,7 @@ impl CostModel for Ipu21CostModel {
         strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
-    ) -> RearrangementCost {
+    ) -> CostEstimate {
         if strategy == ConversionStrategy::StageLogicalThenTransform
             && from.order != ElementOrder::RowMajor
             && to.order != ElementOrder::RowMajor
@@ -1456,17 +1497,23 @@ impl CostModel for Ipu21CostModel {
             // does not yet pack a permuted source locally, so a non-row-major
             // source can expose sub-word logical spans which the exchange
             // hardware cannot send. Do not price an unmaterializable plan.
-            return RearrangementCost {
+            return CostEstimate {
                 cycles: u64::MAX / 8,
                 exchange_cycles: u64::MAX / 8,
-                exchange_row_bytes: u64::MAX / 8,
+                exchange_footprint: ExchangeFootprint {
+                    phases: u64::MAX / 8,
+                    maximum_transfer_chunks_per_tile: u64::MAX / 8,
+                },
             };
         }
         let Some(traffic) = conversion_traffic(shape, precision, from, to) else {
-            return RearrangementCost {
+            return CostEstimate {
                 cycles: u64::MAX / 8,
                 exchange_cycles: u64::MAX / 8,
-                exchange_row_bytes: u64::MAX / 8,
+                exchange_footprint: ExchangeFootprint {
+                    phases: u64::MAX / 8,
+                    maximum_transfer_chunks_per_tile: u64::MAX / 8,
+                },
             };
         };
         let direct_retile = strategy == ConversionStrategy::DirectRetile;
@@ -1493,13 +1540,13 @@ impl CostModel for Ipu21CostModel {
         exchange_footprint.maximum_transfer_chunks_per_tile = exchange_footprint
             .maximum_transfer_chunks_per_tile
             .max(traffic.maximum_routed_fragments);
-        RearrangementCost {
+        CostEstimate {
             cycles: exchange_cycles.saturating_add(local_cycles),
             exchange_cycles,
-            exchange_row_bytes: if from.tiling == to.tiling {
-                0
+            exchange_footprint: if from.tiling == to.tiling {
+                ExchangeFootprint::default()
             } else {
-                exchange_footprint.estimated_row_bytes()
+                exchange_footprint
             },
         }
     }

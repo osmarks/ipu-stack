@@ -713,15 +713,15 @@ fn select_scheduled_finalist(
     if finalists.len() == 1 {
         let mid = finalists.into_iter().next().unwrap();
         tracing::info!(
-            estimated_cycles = mid.estimated_cycles,
-            estimated_exchange_cycles = mid.estimated_exchange_cycles,
+            estimated_cycles = mid.metrics.cost.cycles,
+            estimated_exchange_cycles = mid.metrics.cost.exchange_cycles,
             "selected analytical operator plan"
         );
         for operation in &mid.operations {
             tracing::debug!(
                 source = ?operation.source,
                 kind = ?operation.kind,
-                memory = ?operation.memory,
+                memory = ?operation.metrics.memory,
                 plan = ?operation.operator_plan(),
                 "selected mid-level operation"
             );
@@ -751,14 +751,16 @@ fn select_scheduled_finalist(
                     .saturating_mul(crate::IPU21_TARGET_COSTS.exchange_phase_cycles),
             );
         let estimated_non_exchange_cycles = mid
-            .estimated_cycles
-            .saturating_sub(mid.estimated_exchange_cycles);
+            .metrics
+            .cost
+            .cycles
+            .saturating_sub(mid.metrics.cost.exchange_cycles);
         let refined_cycles =
             estimated_non_exchange_cycles.saturating_add(scheduled_exchange_cycles);
         tracing::info!(
             finalist = index,
-            analytical_cycles = mid.estimated_cycles,
-            analytical_exchange_cycles = mid.estimated_exchange_cycles,
+            analytical_cycles = mid.metrics.cost.cycles,
+            analytical_exchange_cycles = mid.metrics.cost.exchange_cycles,
             scheduled_exchange_cycles,
             refined_cycles,
             "scheduled operator-plan finalist"

@@ -9,7 +9,8 @@
 
 use crate::cost::MemoizedCostModel;
 pub use crate::cost::{
-    CostModel, ExchangeFootprint, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts,
+    CostEstimate, CostModel, ExchangeFootprint, IPU21_TARGET_COSTS, Ipu21CostModel,
+    Ipu21TargetCosts,
 };
 use crate::estimate::{
     conversion_memory_estimate, operator_memory_estimate, region_peak_memory,
@@ -651,11 +652,19 @@ pub struct MemoryEstimate {
     pub live: MemoryUsage,
     pub temporary: MemoryUsage,
     pub peak: MemoryUsage,
-    pub exchange_row_bytes: u64,
     /// Largest phase-local standard-addressed buffer which must fit in one
     /// contiguous standard-memory range.
     pub maximum_standard_temporary_allocation: u64,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlanMetrics<M = MemoryEstimate> {
+    pub cost: CostEstimate,
+    pub memory: M,
+}
+
+pub type OperationMetrics = PlanMetrics<MemoryEstimate>;
+pub type RegionMetrics = PlanMetrics<MemoryPeaks>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TensorAxis {
@@ -2298,9 +2307,7 @@ pub struct MidOperation {
     pub results: Vec<MidValueId>,
     pub kind: MidOperationKind,
     pub conversion_plan: Option<ConversionPlan>,
-    pub estimated_cycles: u64,
-    pub estimated_exchange_cycles: u64,
-    pub memory: MemoryEstimate,
+    pub metrics: OperationMetrics,
 }
 
 impl MidOperation {
@@ -2340,7 +2347,6 @@ pub struct OperatorPlan {
     pub operator: MidOperator,
     pub dispatch: OperatorDispatch,
     pub requirements: OperatorRequirements,
-    pub exchange: ExchangeFootprint,
     /// A view transformation offered by this plan. It is materialized normally
     /// unless a later plan records a matching entry in `deferred_inputs`.
     pub deferred_output: Option<DeferredOutputPlan>,
@@ -2774,8 +2780,7 @@ pub struct MidRegion {
     pub arguments: Vec<MidValueId>,
     pub operations: Vec<MidOperation>,
     pub yields: Vec<MidValueId>,
-    pub estimated_cycles: u64,
-    pub peak_memory: MemoryPeaks,
+    pub metrics: RegionMetrics,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2802,9 +2807,7 @@ pub struct MidGraph {
     pub values: Vec<MidValue>,
     pub operations: Vec<MidOperation>,
     pub outputs: Vec<MidValueId>,
-    pub estimated_cycles: u64,
-    pub estimated_exchange_cycles: u64,
-    pub peak_memory: MemoryPeaks,
+    pub metrics: RegionMetrics,
 }
 
 // Estimation policy is kept in `estimate` so this module remains focused on IR and lowering.
@@ -2929,13 +2932,19 @@ pub(crate) fn lower_finalists(
             let estimated_cycles = branch
                 .operations
                 .iter()
-                .map(|operation| operation.estimated_cycles)
-                .sum();
+                .map(|operation| operation.metrics.cost.cycles)
+                .sum::<u64>();
             let estimated_exchange_cycles = branch
                 .operations
                 .iter()
-                .map(|operation| operation.estimated_exchange_cycles)
-                .sum();
+                .map(|operation| operation.metrics.cost.exchange_cycles)
+                .sum::<u64>();
+            let cost = branch
+                .operations
+                .iter()
+                .fold(CostEstimate::default(), |cost, operation| {
+                    cost.sequence(operation.metrics.cost)
+                });
             let peak_memory =
                 region_peak_memory(&initial, &branch.operations, &outputs, &branch.state.values);
             tracing::info!(
@@ -2988,8 +2997,8 @@ pub(crate) fn lower_finalists(
                         &plan.dispatch,
                         plan.requirements.inputs.iter().map(|input| &input.format.layout).collect::<Vec<_>>(),
                         &plan.requirements.output.format.layout,
-                        operation.estimated_cycles,
-                        operation.estimated_exchange_cycles,
+                        operation.metrics.cost.cycles,
+                        operation.metrics.cost.exchange_cycles,
                     )))
                     .collect::<Vec<_>>(),
                 conversions = ?branch.operations
@@ -2998,8 +3007,8 @@ pub(crate) fn lower_finalists(
                         operation.source,
                         &plan.input.format.layout,
                         &plan.output.format.layout,
-                        operation.estimated_cycles,
-                        operation.estimated_exchange_cycles,
+                        operation.metrics.cost.cycles,
+                        operation.metrics.cost.exchange_cycles,
                     )))
                     .collect::<Vec<_>>(),
                 "retained operator-plan details"
@@ -3009,9 +3018,10 @@ pub(crate) fn lower_finalists(
                 values: branch.state.values,
                 operations: branch.operations,
                 outputs,
-                estimated_cycles,
-                estimated_exchange_cycles,
-                peak_memory,
+                metrics: RegionMetrics {
+                    cost,
+                    memory: peak_memory,
+                },
             })
         })
         .collect()
@@ -3108,8 +3118,7 @@ struct FutureBeamState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BeamObjective {
-    cycles: u64,
+struct ParetoMemoryKey {
     standard: u64,
     interleaved: u64,
     total: u64,
@@ -3118,29 +3127,36 @@ struct BeamObjective {
     exchange_rows: u64,
 }
 
-impl BeamObjective {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParetoKey {
+    cycles: u64,
+    memory: ParetoMemoryKey,
+}
+
+impl ParetoKey {
     fn dominates(self, other: Self) -> bool {
         let no_worse = self.cycles <= other.cycles
-            && self.standard <= other.standard
-            && self.interleaved <= other.interleaved
-            && self.total <= other.total
-            && self.maximum_standard_allocation <= other.maximum_standard_allocation
-            && self.standard_contiguous_overflow <= other.standard_contiguous_overflow
-            && self.exchange_rows <= other.exchange_rows;
+            && self.memory.standard <= other.memory.standard
+            && self.memory.interleaved <= other.memory.interleaved
+            && self.memory.total <= other.memory.total
+            && self.memory.maximum_standard_allocation <= other.memory.maximum_standard_allocation
+            && self.memory.standard_contiguous_overflow
+                <= other.memory.standard_contiguous_overflow
+            && self.memory.exchange_rows <= other.memory.exchange_rows;
         let strictly_better = self.cycles < other.cycles
-            || self.standard < other.standard
-            || self.interleaved < other.interleaved
-            || self.total < other.total
-            || self.maximum_standard_allocation < other.maximum_standard_allocation
-            || self.standard_contiguous_overflow < other.standard_contiguous_overflow
-            || self.exchange_rows < other.exchange_rows;
+            || self.memory.standard < other.memory.standard
+            || self.memory.interleaved < other.memory.interleaved
+            || self.memory.total < other.memory.total
+            || self.memory.maximum_standard_allocation < other.memory.maximum_standard_allocation
+            || self.memory.standard_contiguous_overflow < other.memory.standard_contiguous_overflow
+            || self.memory.exchange_rows < other.memory.exchange_rows;
         no_worse && strictly_better
     }
 }
 
 struct RankedBeamBranch {
     branch: BeamBranch,
-    objective: BeamObjective,
+    objective: ParetoKey,
     compatibility: FutureFormatCompatibility,
     order: usize,
 }
@@ -3692,16 +3708,18 @@ fn retain_pareto_beam(
     let mut groups = BTreeMap::<FutureBeamState, Vec<RankedBeamBranch>>::new();
     for (order, branch) in branches.into_iter().enumerate() {
         let signature = future_beam_state(&branch, future_origins, constraints);
-        let objective = BeamObjective {
+        let objective = ParetoKey {
             cycles: deferred_aware_branch_score(&branch, future_origins).saturating_add(
                 format_equality_cost(&branch, &constraints.required_equal_formats, costs),
             ),
-            standard: branch.peak_memory.standard,
-            interleaved: branch.peak_memory.interleaved,
-            total: branch.peak_memory.total,
-            maximum_standard_allocation: branch.peak_memory.maximum_standard_allocation,
-            standard_contiguous_overflow: branch.peak_memory.standard_contiguous_overflow,
-            exchange_rows: branch.peak_memory.exchange_rows,
+            memory: ParetoMemoryKey {
+                standard: branch.peak_memory.standard,
+                interleaved: branch.peak_memory.interleaved,
+                total: branch.peak_memory.total,
+                maximum_standard_allocation: branch.peak_memory.maximum_standard_allocation,
+                standard_contiguous_overflow: branch.peak_memory.standard_contiguous_overflow,
+                exchange_rows: branch.peak_memory.exchange_rows,
+            },
         };
         groups.entry(signature).or_default().push(RankedBeamBranch {
             compatibility: future_format_compatibility(&branch, future_origins),
@@ -3759,12 +3777,12 @@ fn retain_pareto_beam(
             }
         }
         let objectives: [fn(&RankedBeamBranch) -> u64; 6] = [
-            |entry: &RankedBeamBranch| entry.objective.standard,
-            |entry: &RankedBeamBranch| entry.objective.interleaved,
-            |entry: &RankedBeamBranch| entry.objective.total,
-            |entry: &RankedBeamBranch| entry.objective.maximum_standard_allocation,
-            |entry: &RankedBeamBranch| entry.objective.standard_contiguous_overflow,
-            |entry: &RankedBeamBranch| entry.objective.exchange_rows,
+            |entry: &RankedBeamBranch| entry.objective.memory.standard,
+            |entry: &RankedBeamBranch| entry.objective.memory.interleaved,
+            |entry: &RankedBeamBranch| entry.objective.memory.total,
+            |entry: &RankedBeamBranch| entry.objective.memory.maximum_standard_allocation,
+            |entry: &RankedBeamBranch| entry.objective.memory.standard_contiguous_overflow,
+            |entry: &RankedBeamBranch| entry.objective.memory.exchange_rows,
         ];
         selected.insert(0);
         for objective in objectives {
@@ -3917,7 +3935,7 @@ fn deferred_aware_branch_score(
             })
             .map_or(0, |offer| offer.unfused_cycles);
         cycles
-            .saturating_add(operation.estimated_cycles)
+            .saturating_add(operation.metrics.cost.cycles)
             .saturating_add(pending)
     })
 }
@@ -3936,8 +3954,8 @@ fn restore_unclaimed_deferred_costs(operations: &mut [MidOperation]) {
             .first()
             .is_some_and(|result| !claims.contains(result))
         {
-            operation.estimated_cycles = offer.unfused_cycles;
-            operation.estimated_exchange_cycles = offer.unfused_exchange_cycles;
+            operation.metrics.cost.cycles = offer.unfused_cycles;
+            operation.metrics.cost.exchange_cycles = offer.unfused_exchange_cycles;
         }
     }
 }
@@ -4020,8 +4038,8 @@ fn apply_selected_plan(
                     plan.output.materialization == OperandMaterialization::DispatchSlices
                 });
                 if streamed {
-                    conversion.estimated_cycles = 0;
-                    conversion.estimated_exchange_cycles = 0;
+                    conversion.metrics.cost.cycles = 0;
+                    conversion.metrics.cost.exchange_cycles = 0;
                     conversion.inputs.first().copied()
                 } else {
                     None
@@ -4141,13 +4159,12 @@ fn apply_selected_plan(
         &converted_types,
         &state.get(result).tensor_type,
     );
-    let mut memory = operator_memory_estimate(
+    let memory = operator_memory_estimate(
         &plan.dispatch,
         &plan.requirements,
         &converted_types,
         &state.get(result).tensor_type,
     );
-    memory.exchange_row_bytes = exchange.estimated_row_bytes();
     let mut deferred_output = plan.deferred_output;
     if let Some(offer) = &mut deferred_output {
         offer.unfused_cycles = operator_cycles;
@@ -4155,7 +4172,6 @@ fn apply_selected_plan(
         operator_cycles = 0;
         operator_exchange_cycles = 0;
     }
-    plan.exchange = exchange;
     plan.deferred_output = deferred_output;
     plan.deferred_inputs = deferred_inputs;
     operations.push(MidOperation {
@@ -4164,9 +4180,14 @@ fn apply_selected_plan(
         results: vec![result],
         kind: MidOperationKind::Operator(plan),
         conversion_plan: None,
-        estimated_cycles: operator_cycles,
-        estimated_exchange_cycles: operator_exchange_cycles,
-        memory,
+        metrics: OperationMetrics {
+            cost: CostEstimate {
+                cycles: operator_cycles,
+                exchange_cycles: operator_exchange_cycles,
+                exchange_footprint: exchange,
+            },
+            memory,
+        },
     });
     values.insert(operation.results[0], result);
 }
@@ -4220,7 +4241,6 @@ impl OperatorPlan {
             operator,
             dispatch,
             requirements,
-            exchange: ExchangeFootprint::default(),
             deferred_output,
             deferred_inputs: vec![None; input_count],
         }
@@ -4519,7 +4539,6 @@ fn plans_for_operation(
                     unfused_cycles: 0,
                     unfused_exchange_cycles: 0,
                 }),
-                exchange: ExchangeFootprint::default(),
                 deferred_inputs: vec![None],
             };
             if !plans.contains(&plan) {
@@ -4620,7 +4639,6 @@ fn plans_for_operation(
                         memory_space: MemorySpaceRequirements::default(),
                     },
                     deferred_output: None,
-                    exchange: ExchangeFootprint::default(),
                     deferred_inputs: vec![None; 3],
                 });
             }
@@ -4672,7 +4690,6 @@ fn plans_for_operation(
                         memory_space: MemorySpaceRequirements::default(),
                     },
                     deferred_output: None,
-                    exchange: ExchangeFootprint::default(),
                     deferred_inputs: vec![None; 3],
                 });
             }
@@ -4780,7 +4797,6 @@ fn pointwise_plans(
                     memory_space: MemorySpaceRequirements::default(),
                 },
                 deferred_output: None,
-                exchange: ExchangeFootprint::default(),
                 deferred_inputs: vec![None; inputs.len()],
             };
             if !plans.contains(&plan) {
@@ -5661,28 +5677,6 @@ fn parallel_reduction_plans_for_orientation(
     retained
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GemmPlanObjective {
-    cycles: u64,
-    standard: u64,
-    interleaved: u64,
-    total: u64,
-    maximum_standard_allocation: u64,
-    exchange_rows: u64,
-}
-
-impl GemmPlanObjective {
-    fn dominates(self, other: Self) -> bool {
-        let no_worse = self.cycles <= other.cycles
-            && self.standard <= other.standard
-            && self.interleaved <= other.interleaved
-            && self.total <= other.total
-            && self.maximum_standard_allocation <= other.maximum_standard_allocation
-            && self.exchange_rows <= other.exchange_rows;
-        no_worse && self != other
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct GemmPlanCompatibility {
     orientation: Option<GemmOrientation>,
@@ -5778,7 +5772,7 @@ fn retain_precise_gemm_plans(
                 &planned_inputs,
                 &planned_output,
             );
-            let objective = GemmPlanObjective {
+            let objective = ParetoKey {
                 cycles: costs.operator_cycles(
                     operator,
                     &candidate.dispatch,
@@ -5786,17 +5780,20 @@ fn retain_precise_gemm_plans(
                     &planned_inputs,
                     &planned_output,
                 ),
-                standard: memory.peak.standard,
-                interleaved: memory.peak.interleaved,
-                total: memory.peak.total(),
-                maximum_standard_allocation: memory.maximum_standard_temporary_allocation,
-                exchange_rows: exchange.estimated_row_bytes(),
+                memory: ParetoMemoryKey {
+                    standard: memory.peak.standard,
+                    interleaved: memory.peak.interleaved,
+                    total: memory.peak.total(),
+                    maximum_standard_allocation: memory.maximum_standard_temporary_allocation,
+                    standard_contiguous_overflow: 0,
+                    exchange_rows: exchange.estimated_row_bytes(),
+                },
             };
             let compatibility = gemm_plan_compatibility(&candidate);
             (candidate, objective, compatibility)
         })
         .collect::<Vec<_>>();
-    let mut frontier = Vec::<(GemmPlan, GemmPlanObjective, GemmPlanCompatibility)>::new();
+    let mut frontier = Vec::<(GemmPlan, ParetoKey, GemmPlanCompatibility)>::new();
     for entry in ranked {
         if frontier
             .iter()
@@ -5813,9 +5810,9 @@ fn retain_precise_gemm_plans(
     ranked.sort_by_key(|(_, objective, _)| {
         (
             objective.cycles,
-            objective.total,
-            objective.interleaved,
-            objective.exchange_rows,
+            objective.memory.total,
+            objective.memory.interleaved,
+            objective.memory.exchange_rows,
         )
     });
     let mut selected = BTreeSet::new();
@@ -6057,14 +6054,11 @@ fn lower_repeat(
             &mut body_operations,
         ));
     }
-    let body_cost = body_operations
+    let body_metrics = body_operations
         .iter()
-        .map(|operation| operation.estimated_cycles)
-        .sum();
-    let body_exchange_cost = body_operations
-        .iter()
-        .map(|operation| operation.estimated_exchange_cycles)
-        .sum::<u64>();
+        .fold(CostEstimate::default(), |cost, operation| {
+            cost.sequence(operation.metrics.cost)
+        });
     let body_allocation_multiplicity = arguments
         .iter()
         .skip(inputs.len())
@@ -6078,10 +6072,6 @@ fn lower_repeat(
         &state.values,
         &body_allocation_multiplicity,
     );
-    let body_exchange_row_bytes = body_operations
-        .iter()
-        .map(|operation| operation.memory.exchange_row_bytes)
-        .fold(0u64, u64::saturating_add);
     let mut results = Vec::new();
     for (origin, input) in operation.results.iter().zip(&inputs) {
         let tensor_type = state.get(*input).tensor_type.clone();
@@ -6103,19 +6093,21 @@ fn lower_repeat(
                 arguments,
                 operations: body_operations,
                 yields,
-                estimated_cycles: body_cost,
-                peak_memory: body_peak,
+                metrics: RegionMetrics {
+                    cost: body_metrics,
+                    memory: body_peak,
+                },
             },
         }),
         conversion_plan: None,
-        estimated_cycles: body_cost.saturating_mul(u64::from(repeat.count)),
-        estimated_exchange_cycles: body_exchange_cost.saturating_mul(u64::from(repeat.count)),
-        memory: MemoryEstimate {
-            live: body_peak.conservative_tensor_usage(),
-            temporary: MemoryUsage::default(),
-            peak: body_peak.conservative_tensor_usage(),
-            exchange_row_bytes: body_exchange_row_bytes,
-            maximum_standard_temporary_allocation: 0,
+        metrics: OperationMetrics {
+            cost: body_metrics.repeated(repeat.count),
+            memory: MemoryEstimate {
+                live: body_peak.conservative_tensor_usage(),
+                temporary: MemoryUsage::default(),
+                peak: body_peak.conservative_tensor_usage(),
+                maximum_standard_temporary_allocation: 0,
+            },
         },
     });
     Ok(())
@@ -6159,9 +6151,13 @@ fn ensure_format(
                 output: OperandRequirement::new(tensor_type.format.clone(), 8),
                 strategy: ConversionStrategy::LocalKernel,
             }),
-            estimated_cycles: costs.cast_cycles(&original.tensor_type, target.precision),
-            estimated_exchange_cycles: 0,
-            memory,
+            metrics: OperationMetrics {
+                cost: CostEstimate {
+                    cycles: costs.cast_cycles(&original.tensor_type, target.precision),
+                    ..CostEstimate::default()
+                },
+                memory,
+            },
         });
         value = result;
     }
@@ -6179,10 +6175,7 @@ fn ensure_format(
             &from,
             &target.layout,
         );
-        let mut memory = conversion_memory_estimate(&current.tensor_type, &tensor_type);
-        if from.tiling != target.layout.tiling {
-            memory.exchange_row_bytes = rearrangement.exchange_row_bytes;
-        }
+        let memory = conversion_memory_estimate(&current.tensor_type, &tensor_type);
         operations.push(MidOperation {
             source: Some(source),
             inputs: vec![value],
@@ -6201,9 +6194,10 @@ fn ensure_format(
                     .with_materialization(materialization),
                 strategy,
             }),
-            estimated_cycles: rearrangement.cycles,
-            estimated_exchange_cycles: rearrangement.exchange_cycles,
-            memory,
+            metrics: OperationMetrics {
+                cost: rearrangement,
+                memory,
+            },
         });
         value = result;
     }
@@ -6748,8 +6742,8 @@ mod tests {
             _strategy: ConversionStrategy,
             _from: &Layout,
             _to: &Layout,
-        ) -> crate::cost::RearrangementCost {
-            crate::cost::RearrangementCost::default()
+        ) -> crate::cost::CostEstimate {
+            crate::cost::CostEstimate::default()
         }
     }
 
@@ -6915,31 +6909,31 @@ mod tests {
             );
             for finalist in &finalists {
                 assert_eq!(
-                    finalist.estimated_cycles,
+                    finalist.metrics.cost.cycles,
                     finalist
                         .operations
                         .iter()
-                        .map(|operation| operation.estimated_cycles)
+                        .map(|operation| operation.metrics.cost.cycles)
                         .sum::<u64>(),
                     "random case {case}"
                 );
                 assert_eq!(
-                    finalist.estimated_exchange_cycles,
+                    finalist.metrics.cost.exchange_cycles,
                     finalist
                         .operations
                         .iter()
-                        .map(|operation| operation.estimated_exchange_cycles)
+                        .map(|operation| operation.metrics.cost.exchange_cycles)
                         .sum::<u64>(),
                     "random case {case}"
                 );
                 assert!(
-                    finalist.estimated_exchange_cycles <= finalist.estimated_cycles,
+                    finalist.metrics.cost.exchange_cycles <= finalist.metrics.cost.cycles,
                     "random case {case}"
                 );
             }
             let searched = &finalists[0];
             assert!(
-                searched.peak_memory.fits_ipu21_with_budget(
+                searched.metrics.memory.fits_ipu21_with_budget(
                     searched_config.standard_memory_reservation_bytes,
                     searched_config.tile_memory_budget_bytes,
                 ),
@@ -7266,7 +7260,7 @@ mod tests {
             assert_eq!(producers.len(), split.len(), "random case {case}");
             assert!(
                 producers.iter().all(|operation| {
-                    operation.estimated_cycles == 0
+                    operation.metrics.cost.cycles == 0
                         && operation
                             .operator_plan()
                             .is_some_and(|plan| plan.deferred_output.is_some())
@@ -7287,19 +7281,19 @@ mod tests {
             assert_eq!(claims.len(), split.len(), "random case {case}");
             assert!(claims.iter().all(Option::is_some), "random case {case}");
             assert!(
-                consumer.operator_plan().unwrap().exchange.phases >= 2,
+                consumer.metrics.cost.exchange_footprint.phases >= 2,
                 "random case {case}"
             );
             assert!(
-                consumer.memory.exchange_row_bytes != 0,
+                consumer.metrics.cost.exchange_row_bytes() != 0,
                 "random case {case}"
             );
             assert_eq!(
-                lowered.estimated_cycles,
+                lowered.metrics.cost.cycles,
                 lowered
                     .operations
                     .iter()
-                    .map(|operation| operation.estimated_cycles)
+                    .map(|operation| operation.metrics.cost.cycles)
                     .sum::<u64>(),
                 "random case {case}"
             );
@@ -7351,10 +7345,10 @@ mod tests {
                 .and_then(|plan| plan.deferred_output)
                 .unwrap();
             assert_eq!(
-                operation.estimated_cycles, offer.unfused_cycles,
+                operation.metrics.cost.cycles, offer.unfused_cycles,
                 "random case {case}"
             );
-            assert!(operation.estimated_cycles != 0, "random case {case}");
+            assert!(operation.metrics.cost.cycles != 0, "random case {case}");
         }
     }
 }
