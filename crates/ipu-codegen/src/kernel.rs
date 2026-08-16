@@ -564,7 +564,9 @@ impl KernelBuildPlan {
                     });
             let (head_dimension, value_dimension, padded_value_dimension, key_block_columns) =
                 configuration.ok_or(KernelAbiError::RequirementMismatch)?;
-            let mut softmax_symbols = Vec::new();
+            let assembly_tail_softmax = small_key != large_key;
+            let mut softmax_cpp_symbols = Vec::new();
+            let mut softmax_assembly_symbols = Vec::new();
             let mut merge_symbols = Vec::new();
             for (kernel, rows) in attention_stages {
                 let size = if rows == small_query {
@@ -589,7 +591,12 @@ impl KernelBuildPlan {
                     _ => return Err(KernelAbiError::RequirementMismatch),
                 };
                 let retained_symbols = match &kernel {
-                    TileKernelSpec::AttentionSoftmax { .. } => &mut softmax_symbols,
+                    TileKernelSpec::AttentionSoftmax {
+                        key_block_columns, ..
+                    } if assembly_tail_softmax && *key_block_columns == small_key => {
+                        &mut softmax_assembly_symbols
+                    }
+                    TileKernelSpec::AttentionSoftmax { .. } => &mut softmax_cpp_symbols,
                     TileKernelSpec::AttentionMerge { .. } => &mut merge_symbols,
                     _ => return Err(KernelAbiError::RequirementMismatch),
                 };
@@ -617,26 +624,34 @@ impl KernelBuildPlan {
             plan.compilations.push(KernelCompilation {
                 source: "attention_softmax_f16_wrapper.S",
                 name: "attention_softmax_wrapper".into(),
-                flags: Vec::new(),
-                retained_symbols: softmax_symbols,
+                flags: assembly_tail_softmax
+                    .then(|| "-DATTENTION_USE_ASSEMBLY_SMALL_KEY".into())
+                    .into_iter()
+                    .collect(),
+                retained_symbols: softmax_cpp_symbols,
             });
+            let mut attention_stage_flags = vec![
+                "-O2".into(),
+                format!("-DATTENTION_HEAD_DIMENSION={head_dimension}"),
+                format!("-DATTENTION_VALUE_DIMENSION={value_dimension}"),
+                format!("-DATTENTION_PADDED_VALUE_DIMENSION={padded_value_dimension}"),
+                format!("-DATTENTION_KEY_BLOCK_COLUMNS={key_block_columns}"),
+                format!("-DATTENTION_SMALL_QUERY_ROWS={small_query}"),
+                format!("-DATTENTION_LARGE_QUERY_ROWS={large_query}"),
+                format!("-DATTENTION_SMALL_KEY_ROWS={small_key}"),
+                format!("-DATTENTION_LARGE_KEY_ROWS={large_key}"),
+                format!("-DATTENTION_SCALE_BITS=0x{scale_bits:08x}"),
+            ];
+            if assembly_tail_softmax {
+                attention_stage_flags.push("-DATTENTION_BUILD_ASSEMBLY_SOFTMAX_SMALL_KEY".into());
+                merge_symbols.extend(softmax_assembly_symbols);
+            }
             plan.compilations.push(KernelCompilation {
                 source: "attention_stages_f16.S",
                 name: format!(
                     "attention_stages_q{small_query}_q{large_query}_d{head_dimension}_v{value_dimension}"
                 ),
-                flags: vec![
-                    "-O2".into(),
-                    format!("-DATTENTION_HEAD_DIMENSION={head_dimension}"),
-                    format!("-DATTENTION_VALUE_DIMENSION={value_dimension}"),
-                    format!("-DATTENTION_PADDED_VALUE_DIMENSION={padded_value_dimension}"),
-                    format!("-DATTENTION_KEY_BLOCK_COLUMNS={key_block_columns}"),
-                    format!("-DATTENTION_SMALL_QUERY_ROWS={small_query}"),
-                    format!("-DATTENTION_LARGE_QUERY_ROWS={large_query}"),
-                    format!("-DATTENTION_SMALL_KEY_ROWS={small_key}"),
-                    format!("-DATTENTION_LARGE_KEY_ROWS={large_key}"),
-                    format!("-DATTENTION_SCALE_BITS=0x{scale_bits:08x}"),
-                ],
+                flags: attention_stage_flags,
                 retained_symbols: merge_symbols,
             });
         }
