@@ -616,44 +616,35 @@
 	bri .Lattention_softmax_panel_normalize_panel
 
 .Lattention_softmax_panel_sum_setup:
-	// m6 was used as a tail-loop temporary; restore the logical key count.
-	ld32 $m6, $mvertex_base, $m15, 3
 	setzi $m0, 0
 .Lattention_softmax_panel_sum_row:
 	ldconst $a7, 0
 	mov $m4, $m1
 .Lattention_softmax_panel_sum_panel:
-	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS / 16
+	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS / ATTENTION_PANEL_COLUMNS
 	cmpult $m7, $m4, $m7
 	brz $m7, .Lattention_softmax_panel_sum_store
-	shl $m10, $m4, 4
-	cmpult $m7, $m10, $m6
-	brz $m7, .Lattention_softmax_panel_sum_next
 	mul $m7, $m4, $m8
 	ld32 $m2, $mvertex_base, $m15, 0
 	add $m2, $m2, $m7
 	shl $m7, $m0, 5
 	add $m2, $m2, $m7
-	sub $m7, $m6, $m10
-	setzi $m3, 16
-	cmpult $m3, $m7, $m3
-	brnz $m3, .Lattention_softmax_panel_sum_partial
-	ATTENTION_SOFTMAX_SUM_PANEL
-	bri .Lattention_softmax_panel_sum_next
-.Lattention_softmax_panel_sum_partial:
-	shr $m3, $m7, 1
-	brz $m3, .Lattention_softmax_panel_sum_partial_odd
-.Lattention_softmax_panel_sum_partial_pairs:
-	ATTENTION_SOFTMAX_SUM_PAIR
-	sub $m3, $m3, 1
-	brnz $m3, .Lattention_softmax_panel_sum_partial_pairs
-.Lattention_softmax_panel_sum_partial_odd:
-	and $m10, $m7, 1
-	brz $m10, .Lattention_softmax_panel_sum_next
-	ld32 $a0, $m2, $m15, 0
+	ld64step $a0:1, $mzero, $m2+=, 1
+	ld64step $a2:3, $mzero, $m2+=, 1
+	f16v2add $a0, $a0, $a1
+	f16v2add $a2, $a2, $a3
+	f16v2add $a0, $a0, $a2
 	f16v2tof32 $a0:1, $a0
+	f32add $a0, $a0, $a1
 	f32add $a7, $a7, $a0
-.Lattention_softmax_panel_sum_next:
+	ld64step $a0:1, $mzero, $m2+=, 1
+	ld64step $a2:3, $mzero, $m2+=, 1
+	f16v2add $a0, $a0, $a1
+	f16v2add $a2, $a2, $a3
+	f16v2add $a0, $a0, $a2
+	f16v2tof32 $a0:1, $a0
+	f32add $a0, $a0, $a1
+	f32add $a7, $a7, $a0
 	add $m4, $m4, ATTENTION_WORKER_CONTEXTS
 	bri .Lattention_softmax_panel_sum_panel
 .Lattention_softmax_panel_sum_store:
