@@ -372,6 +372,13 @@ pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
     kernel_launch_cycles: 11,
 };
 
+// Fragmented logical conversions spend most of their critical path changing
+// endpoints and receive pointers rather than moving payload. Current IPU21
+// schedules sustain about 160 event cycles per independent fragment once
+// routing and pointer cutovers are included. This is used to choose between a
+// direct word-fragment exchange and one local packed staging pass.
+pub(crate) const IPU21_LOGICAL_FRAGMENT_CYCLES: u64 = 160;
+
 fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases: u64) -> u64 {
     if traffic.is_empty() || phases == 0 {
         return 0;
@@ -528,7 +535,7 @@ fn maximum_shard_elements(tensor: &TensorType) -> u64 {
     maximum_shard_bytes(tensor).div_ceil(tensor.format.precision.bytes().max(1))
 }
 
-fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
+pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
     let cycles_per_element = match tensor.format.layout.order {
         ElementOrder::RowMajor => return 0,
         ElementOrder::Amp(AmpOrder::TransposedRight) => {
@@ -578,6 +585,41 @@ fn split_heads_uses_micro_panel_exchange(source: &TensorType, output: &TensorTyp
             .0
             .last()
             .is_some_and(|width| width.is_multiple_of(2))
+}
+
+fn split_heads_word_fragment_cycles(output: &TensorType) -> Option<u64> {
+    if output.format.precision != Precision::F16
+        || !output
+            .shape
+            .0
+            .last()
+            .is_some_and(|width| width.is_multiple_of(2))
+        || !matches!(
+            output.format.layout.order,
+            ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
+        )
+    {
+        return None;
+    }
+    let physical_elements = maximum_shard_elements(output);
+    let fragments = physical_elements.div_ceil(u64::from(crate::mid::AMP_COLUMN_MICRO));
+    let clear_cycles = (output
+        .format
+        .layout
+        .padded_shape(&output.shape)
+        .ok()
+        .is_some_and(|padded| padded != output.shape))
+    .then(|| {
+        maximum_shard_bytes(output)
+            .div_ceil(8 * 6)
+            .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
+    })
+    .unwrap_or(0);
+    Some(
+        fragments
+            .saturating_mul(IPU21_LOGICAL_FRAGMENT_CYCLES)
+            .saturating_add(clear_cycles),
+    )
 }
 
 fn amp_kernel_cycles(
@@ -1191,8 +1233,10 @@ impl CostModel for Ipu21CostModel {
                 let source_unpack = inputs.first().map_or(0, amp_unpack_cycles);
                 let destination_pack =
                     row_major_pack_cycles(output, maximum_shard_elements(output));
+                let materialization = split_heads_word_fragment_cycles(output)
+                    .map_or(destination_pack, |direct| direct.min(destination_pack));
                 source_unpack
-                    .saturating_add(destination_pack)
+                    .saturating_add(materialization)
                     .saturating_add(exchange)
             }
         }

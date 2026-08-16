@@ -68,6 +68,7 @@ pub enum MidOperator {
 /// A tile-local callable selected by a whole-device operator plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileKernelSpec {
+    FillZero,
     Gemm {
         multiply: Precision,
         accumulate: AccumulationPrecision,
@@ -7108,7 +7109,7 @@ mod tests {
         let mut random = fastrand::Rng::with_seed(0x6465_6665_7272_6564);
         for case in 0..RANDOM_CASES / 32 {
             let heads = random.u32(2..=6);
-            let head_width = random.u32(1..=4) * AMP_COLUMN_MICRO;
+            let head_width = random.u32(4..=40) * 2;
             let tokens = random.u32(1..=3) * AMP_INNER_BLOCK;
             let model_width = heads * head_width;
             let tiles = u16::try_from(heads * tokens.div_ceil(AMP_INNER_BLOCK)).unwrap();

@@ -1405,25 +1405,33 @@ impl LoweringState {
             let destination_format = &self.shards[destination_shard.index() as usize]
                 .tensor_type
                 .format;
-            let mut stage_destination = logical_order
-                && mappings.iter().any(|(source, _)| {
+            let destination_unaligned = mappings.iter().try_fold(
+                false,
+                |unaligned, (_, destination)| -> LowLoweringResult<bool> {
+                    let spans = logical_view_byte_spans(
+                        &self.shards[destination.shard.index() as usize],
+                        destination,
+                    )?;
+                    Ok(unaligned
+                        || spans
+                            .iter()
+                            .any(|span| span.offset & 0b11 != 0 || span.bytes & 0b11 != 0))
+                },
+            )?;
+            let requires_materialization = logical_order
+                && (mappings.iter().any(|(source, _)| {
                     self.shards[source.shard.index() as usize]
                         .tensor_type
                         .format
                         .layout
                         .order
                         != destination_format.layout.order
-                });
-            if logical_order {
-                for (_, destination) in &mappings {
-                    let spans = logical_view_byte_spans(
-                        &self.shards[destination.shard.index() as usize],
-                        destination,
-                    )?;
-                    stage_destination |= spans
-                        .iter()
-                        .any(|span| span.offset & 0b11 != 0 || span.bytes & 0b11 != 0);
-                }
+                }) || destination_unaligned);
+            let direct_logical = requires_materialization
+                && self.mappings_benefit_from_word_exchange(&mappings, destination_shard)?;
+            let stage_destination = requires_materialization && !direct_logical;
+            if direct_logical && self.shard_has_padding(destination_shard) {
+                self.append_fill_zero(tiles, destination_shard, provenance.clone())?;
             }
             let staging = if stage_destination {
                 Some(self.push_conversion_staging(destination_shard)?)
@@ -1876,8 +1884,17 @@ impl LoweringState {
             } else {
                 canonical_query
             };
-            let direct_query =
-                deferred_query && self.deferred_supports_physical_exchange(query, query_shard);
+            let direct_query = deferred_query
+                && (self.deferred_supports_physical_exchange(query, query_shard)
+                    || self.deferred_panel_benefits_from_word_exchange(
+                        query,
+                        self.shards[output.index() as usize].extents[rank - 3].start,
+                        self.shards[output.index() as usize].extents[rank - 2].start,
+                        rows,
+                        0,
+                        query_dimension,
+                        query_shard,
+                    )?);
             let query_receive = (deferred_query && !direct_query)
                 .then(|| {
                     self.push_attention_buffer(
@@ -1960,6 +1977,18 @@ impl LoweringState {
         let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
         let mut local_copies = Vec::new();
         let physical = tasks.iter().all(|task| task.query_receive.is_none());
+        let physical = physical
+            && tasks
+                .iter()
+                .all(|task| self.deferred_supports_physical_exchange(query, task.query));
+        let direct = tasks.iter().all(|task| task.query_receive.is_none());
+        if direct && !physical {
+            for task in tasks {
+                if self.shard_has_padding(task.query) {
+                    self.append_fill_zero(tiles, task.query, provenance.clone())?;
+                }
+            }
+        }
         for task in tasks {
             self.gather_deferred_panel(
                 query,
@@ -2064,6 +2093,7 @@ impl LoweringState {
                 owner_offset,
                 &mut semantic_gathers,
                 &mut physical_gathers,
+                provenance.clone(),
                 tiles,
             )?;
             let row_block =
@@ -2082,6 +2112,7 @@ impl LoweringState {
                 owner_offset + key_panel_count,
                 &mut semantic_gathers,
                 &mut physical_gathers,
+                provenance.clone(),
                 tiles,
             )?;
             prepared.push(PreparedAttentionBlock {
@@ -2595,7 +2626,7 @@ impl LoweringState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn gather_deferred_panel(
+    fn deferred_panel_mappings(
         &self,
         value: MidValueId,
         stream: u32,
@@ -2604,10 +2635,7 @@ impl LoweringState {
         column_start: u32,
         columns: u32,
         destination: LowShardId,
-        order: ExchangeOrder,
-        transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
-        local_copies: &mut Vec<(u16, LocalCopy)>,
-    ) -> LowLoweringResult<()> {
+    ) -> LowLoweringResult<Vec<(ShardView, ShardView)>> {
         let deferred_root = self
             .deferred_root(value)
             .ok_or(LowLoweringError::InvalidOperatorPlan)?;
@@ -2643,6 +2671,7 @@ impl LoweringState {
             .collect::<LowLoweringResult<Vec<_>>>()?;
         let destination_tile = self.shards[destination.index() as usize].tile;
         let mut covered = 0u64;
+        let mut mappings = Vec::new();
         for (source_extents, source) in
             self.intersecting_shard_set(&deferred_shards, &target, destination_tile)
         {
@@ -2679,6 +2708,171 @@ impl LoweringState {
                 shard: destination,
                 extents: destination_extents,
             };
+            mappings.push((source_view, destination_view));
+        }
+        if covered != u64::from(rows) * u64::from(columns) {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        Ok(mappings)
+    }
+
+    fn mapping_word_exchange_fragments(
+        &self,
+        mappings: &[(ShardView, ShardView)],
+    ) -> LowLoweringResult<Option<u64>> {
+        let maximum_bytes = ipu_exchange::MAX_TRANSFER_WORDS
+            .checked_mul(4)
+            .ok_or(LowLoweringError::IdOverflow)?;
+        let mut fragments = 0u64;
+        for (source, destination) in mappings {
+            let source_spans =
+                logical_view_byte_spans(&self.shards[source.shard.index() as usize], source)?;
+            let destination_spans = logical_view_byte_spans(
+                &self.shards[destination.shard.index() as usize],
+                destination,
+            )?;
+            let aligned = source_spans
+                .iter()
+                .chain(&destination_spans)
+                .all(|span| span.offset & 0b11 == 0 && span.bytes & 0b11 == 0);
+            let source_bytes = source_spans.iter().map(|span| span.bytes).sum::<u32>();
+            let destination_bytes = destination_spans.iter().map(|span| span.bytes).sum::<u32>();
+            if !aligned || source_bytes != destination_bytes {
+                tracing::trace!(
+                    source = ?source,
+                    destination = ?destination,
+                    source_order = ?self.shards[source.shard.index() as usize]
+                        .tensor_type.format.layout.order,
+                    destination_order = ?self.shards[destination.shard.index() as usize]
+                        .tensor_type.format.layout.order,
+                    source_spans = ?source_spans,
+                    destination_spans = ?destination_spans,
+                    aligned,
+                    source_bytes,
+                    destination_bytes,
+                    "deferred logical fragment cannot be exchanged directly"
+                );
+                return Ok(None);
+            }
+            let mut source_index = 0usize;
+            let mut destination_index = 0usize;
+            let mut source_offset = 0u32;
+            let mut destination_offset = 0u32;
+            while source_index < source_spans.len() && destination_index < destination_spans.len() {
+                let source_remaining = source_spans[source_index].bytes - source_offset;
+                let destination_remaining =
+                    destination_spans[destination_index].bytes - destination_offset;
+                let bytes = source_remaining
+                    .min(destination_remaining)
+                    .min(maximum_bytes);
+                if bytes == 0 || bytes & 0b11 != 0 {
+                    return Ok(None);
+                }
+                fragments = fragments.saturating_add(1);
+                source_offset += bytes;
+                destination_offset += bytes;
+                if source_offset == source_spans[source_index].bytes {
+                    source_index += 1;
+                    source_offset = 0;
+                }
+                if destination_offset == destination_spans[destination_index].bytes {
+                    destination_index += 1;
+                    destination_offset = 0;
+                }
+            }
+            if source_index != source_spans.len()
+                || destination_index != destination_spans.len()
+                || source_offset != 0
+                || destination_offset != 0
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(fragments))
+    }
+
+    fn mappings_benefit_from_word_exchange(
+        &self,
+        mappings: &[(ShardView, ShardView)],
+        destination: LowShardId,
+    ) -> LowLoweringResult<bool> {
+        let Some(fragments) = self.mapping_word_exchange_fragments(mappings)? else {
+            return Ok(false);
+        };
+        let shard = &self.shards[destination.index() as usize];
+        let bytes = u64::from(crate::shard_storage_bytes(shard)?);
+        let elements = bytes.div_ceil(shard.tensor_type.format.precision.bytes().max(1));
+        let packed_cycles = crate::cost::row_major_pack_cycles(&shard.tensor_type, elements);
+        let clear_cycles = if self.shard_has_padding(destination) {
+            crate::cost::IPU21_TARGET_COSTS
+                .kernel_launch_cycles
+                .saturating_add(bytes.div_ceil(8 * 6))
+        } else {
+            0
+        };
+        let fragment_cycles = fragments
+            .saturating_mul(crate::cost::IPU21_LOGICAL_FRAGMENT_CYCLES)
+            .saturating_add(clear_cycles);
+        let direct = fragment_cycles < packed_cycles;
+        tracing::trace!(
+            destination = destination.index(),
+            fragments,
+            fragment_cycles,
+            packed_cycles,
+            direct,
+            "selected logical conversion materialization"
+        );
+        Ok(direct)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deferred_panel_benefits_from_word_exchange(
+        &self,
+        value: MidValueId,
+        stream: u32,
+        row_start: u32,
+        rows: u32,
+        column_start: u32,
+        columns: u32,
+        destination: LowShardId,
+    ) -> LowLoweringResult<bool> {
+        let mappings = self.deferred_panel_mappings(
+            value,
+            stream,
+            row_start,
+            rows,
+            column_start,
+            columns,
+            destination,
+        )?;
+        self.mappings_benefit_from_word_exchange(&mappings, destination)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gather_deferred_panel(
+        &self,
+        value: MidValueId,
+        stream: u32,
+        row_start: u32,
+        rows: u32,
+        column_start: u32,
+        columns: u32,
+        destination: LowShardId,
+        order: ExchangeOrder,
+        transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
+        local_copies: &mut Vec<(u16, LocalCopy)>,
+    ) -> LowLoweringResult<()> {
+        let destination_tile = self.shards[destination.index() as usize].tile;
+        let mappings = self.deferred_panel_mappings(
+            value,
+            stream,
+            row_start,
+            rows,
+            column_start,
+            columns,
+            destination,
+        )?;
+        for (source_view, destination_view) in mappings {
             let mappings = if order == ExchangeOrder::Physical {
                 self.f16_micro_panel_mappings(vec![(source_view, destination_view)])?
                     .ok_or(LowLoweringError::InvalidOperatorPlan)?
@@ -2686,7 +2880,7 @@ impl LoweringState {
                 vec![(source_view, destination_view)]
             };
             for (source_view, destination_view) in mappings {
-                if self.shards[source.index() as usize].tile == destination_tile {
+                if self.shards[source_view.shard.index() as usize].tile == destination_tile {
                     if order == ExchangeOrder::Physical {
                         append_span_copies(
                             &self.shards,
@@ -2712,9 +2906,6 @@ impl LoweringState {
                 }
             }
         }
-        if covered != u64::from(rows) * u64::from(columns) {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
         Ok(())
     }
 
@@ -2731,6 +2922,7 @@ impl LoweringState {
         owner_offset: u32,
         semantic_gathers: &mut BTreeMap<ShardView, Vec<ShardView>>,
         physical_gathers: &mut BTreeMap<ShardView, Vec<ShardView>>,
+        provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<Vec<PreparedDistributedPanel>> {
         let panels = physical_columns.div_ceil(AMP_COLUMN_MICRO);
@@ -2761,7 +2953,20 @@ impl LoweringState {
                     order,
                 )?;
                 let physical = self.deferred_supports_physical_exchange(value, packed);
-                let row_major = if physical {
+                let word_exchange = !physical
+                    && self.deferred_panel_benefits_from_word_exchange(
+                        value,
+                        stream,
+                        block_start,
+                        valid_rows,
+                        column_start,
+                        panel_columns,
+                        packed,
+                    )?;
+                if word_exchange && self.shard_has_padding(packed) {
+                    self.append_fill_zero(tiles, packed, provenance.clone())?;
+                }
+                let row_major = if physical || word_exchange {
                     None
                 } else {
                     Some(self.push_attention_buffer(
@@ -2890,6 +3095,40 @@ impl LoweringState {
                     input: OperandRequirement::new(input, 2),
                     output: OperandRequirement::new(output, 2),
                 },
+            ),
+        )
+    }
+
+    fn shard_has_padding(&self, shard: LowShardId) -> bool {
+        self.shards[shard.index() as usize]
+            .extents
+            .iter()
+            .any(|extent| extent.logical_end < extent.physical_end)
+    }
+
+    fn append_fill_zero(
+        &mut self,
+        tiles: &mut [TileWorkList],
+        shard: LowShardId,
+        provenance: WorkProvenance,
+    ) -> LowLoweringResult<()> {
+        let shard_data = &self.shards[shard.index() as usize];
+        let tile = shard_data.tile;
+        let output = OperandRequirement::new(shard_data.tensor_type.format.clone(), 8);
+        self.append_kernel(
+            tiles,
+            tile,
+            KernelRun::new(
+                provenance,
+                TileKernel::Planned(TileKernelSpec::FillZero),
+                Vec::new(),
+                self.full_view(shard),
+                KernelRequirements::Operator(OperatorRequirements {
+                    inputs: Vec::new(),
+                    output,
+                    output_aliasing: crate::OutputAliasing::Fresh,
+                    memory_relations: Vec::new(),
+                }),
             ),
         )
     }

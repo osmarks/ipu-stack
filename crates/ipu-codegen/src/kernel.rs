@@ -1147,6 +1147,8 @@ fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbi
                 }
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
+            "words_per_worker" => output_byte_count(run).map(|bytes| bytes / 8 / 6),
+            "remainder_workers" => output_byte_count(run).map(|bytes| bytes / 8 % 6),
             "logical_rows" => matrix_extent(run, true, false),
             "physical_rows" => matrix_extent(run, false, false),
             "matrices" => matrix_count(run),
@@ -1174,6 +1176,18 @@ fn element_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
     })
 }
 
+fn output_byte_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
+    let precision = match &run.requirements {
+        KernelRequirements::Operator(requirements) => requirements.output.format.precision,
+        KernelRequirements::Conversion { output, .. } => output.format.precision,
+    };
+    element_count(run)?
+        .checked_mul(
+            u32::try_from(precision.bytes()).map_err(|_| KernelAbiError::ElementCountOverflow)?,
+        )
+        .ok_or(KernelAbiError::ElementCountOverflow)
+}
+
 pub fn tile_kernel_abi(
     kernel: &TileKernelSpec,
     requirements: &KernelRequirements,
@@ -1183,6 +1197,12 @@ pub fn tile_kernel_abi(
         KernelRequirements::Conversion { output, .. } => output.format.precision,
     };
     let (symbols, availability, inputs, scalars) = match kernel {
+        TileKernelSpec::FillZero => (
+            KernelSymbols::Exact(crate::FILL_ZERO_U64_SYMBOL),
+            KernelAvailability::Implemented,
+            0,
+            scalar_arguments(0, &["words_per_worker", "remainder_workers"]),
+        ),
         TileKernelSpec::Gemm {
             multiply,
             mode,
@@ -1373,6 +1393,16 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             return Err(KernelAbiError::UnsupportedElementCount {
                 symbol: "ipu_stack_reduce_sum_f16",
                 count,
+                divisor: 8,
+            });
+        }
+    }
+    if matches!(kernel, TileKernelSpec::FillZero) {
+        let bytes = output_byte_count(run)?;
+        if !bytes.is_multiple_of(8) {
+            return Err(KernelAbiError::UnsupportedElementCount {
+                symbol: crate::FILL_ZERO_U64_SYMBOL,
+                count: bytes,
                 divisor: 8,
             });
         }

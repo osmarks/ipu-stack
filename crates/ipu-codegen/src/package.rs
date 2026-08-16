@@ -1592,7 +1592,29 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
         symbols.push(crate::COPY_U64_SYMBOL.into());
         symbols.push(crate::COPY_STRIDED_U64_SYMBOL.into());
     }
+    if program
+        .tiles
+        .iter()
+        .any(|tile| tile_has_fill_zero(program, tile))
+    {
+        symbols.push(crate::FILL_ZERO_U64_SYMBOL.into());
+    }
     symbols
+}
+
+fn tile_has_fill_zero(program: &LowProgram, tile: &crate::TileWorkList) -> bool {
+    program.work(tile).any(|work| match work {
+        crate::TileWorkRef::Kernel(run) => {
+            matches!(
+                run.kernel,
+                crate::TileKernel::Planned(crate::TileKernelSpec::FillZero)
+            )
+        }
+        crate::TileWorkRef::Repeat(repeat) => tile_has_fill_zero(program, &repeat.body),
+        crate::TileWorkRef::Exchange(_)
+        | crate::TileWorkRef::LocalCopy(_)
+        | crate::TileWorkRef::Checkpoint(..) => false,
+    })
 }
 
 fn tile_has_halfword_copy(program: &LowProgram, tile: &crate::TileWorkList) -> bool {

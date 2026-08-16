@@ -764,7 +764,10 @@ fn amp_micro_dimension(precision: Precision) -> u32 {
 mod tests {
     use super::*;
     use crate::low::{LowShardId, ShardDefinition, ShardExtent};
-    use crate::mid::{AMP_INNER_BLOCK, Layout, MemoryClass, Precision, TensorType};
+    use crate::mid::{
+        AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
+        MemoryClass, Precision, TensorTiling, TensorType,
+    };
 
     fn shard(layout: Layout, dimensions: &[u32]) -> LowShard {
         LowShard {
@@ -864,6 +867,93 @@ mod tests {
                         .sum::<u64>(),
                     selected
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_word_aligned_logical_transfers_populate_packed_storage() {
+        let mut random = fastrand::Rng::with_seed(0x776f_7264_5f70_6163);
+        for case in 0..128 {
+            let batches = random.u32(1..=3);
+            let rows = AMP_INNER_BLOCK;
+            let columns = random.u32(2..=48) * 2;
+            let physical_columns = columns.div_ceil(AMP_COLUMN_MICRO) * AMP_COLUMN_MICRO;
+            let source = shard(
+                Layout::row_major(TensorTiling::replicated(1)),
+                &[batches, rows, columns],
+            );
+            let source_view = ShardView {
+                shard: source.id,
+                extents: source.extents.clone(),
+            };
+            for order in [
+                ElementOrder::Amp(AmpOrder::Left),
+                ElementOrder::Amp(AmpOrder::TransposedRight),
+            ] {
+                let mut destination = shard(
+                    Layout {
+                        order,
+                        tiling: TensorTiling::replicated(1),
+                        memory_class: MemoryClass::Ipu21Standard,
+                    },
+                    &[batches, rows, columns],
+                );
+                destination.extents[2].physical_end = physical_columns;
+                let mut destination_view = ShardView {
+                    shard: destination.id,
+                    extents: destination.extents.clone(),
+                };
+                destination_view.extents[2].physical_end = columns;
+                let source_spans = logical_view_byte_spans(&source, &source_view).unwrap();
+                let destination_spans =
+                    logical_view_byte_spans(&destination, &destination_view).unwrap();
+                assert!(
+                    source_spans
+                        .iter()
+                        .chain(&destination_spans)
+                        .all(|span| span.offset & 0b11 == 0 && span.bytes & 0b11 == 0),
+                    "case {case}, order {order:?}"
+                );
+
+                let logical_elements = usize::try_from(batches * rows * columns).unwrap();
+                let source_data = (0..logical_elements)
+                    .map(|index| u16::try_from(index).unwrap())
+                    .collect::<Vec<_>>();
+                let mut destination_data =
+                    vec![0u16; usize::try_from(batches * rows * physical_columns).unwrap()];
+                let mut source_position = (0usize, 0u32);
+                let mut destination_position = (0usize, 0u32);
+                while source_position.0 < source_spans.len() {
+                    let source_span = source_spans[source_position.0];
+                    let destination_span = destination_spans[destination_position.0];
+                    let bytes = (source_span.bytes - source_position.1)
+                        .min(destination_span.bytes - destination_position.1);
+                    let source_start =
+                        usize::try_from((source_span.offset + source_position.1) / 2).unwrap();
+                    let destination_start =
+                        usize::try_from((destination_span.offset + destination_position.1) / 2)
+                            .unwrap();
+                    let elements = usize::try_from(bytes / 2).unwrap();
+                    destination_data[destination_start..destination_start + elements]
+                        .copy_from_slice(&source_data[source_start..source_start + elements]);
+                    source_position.1 += bytes;
+                    destination_position.1 += bytes;
+                    if source_position.1 == source_span.bytes {
+                        source_position = (source_position.0 + 1, 0);
+                    }
+                    if destination_position.1 == destination_span.bytes {
+                        destination_position = (destination_position.0 + 1, 0);
+                    }
+                }
+                let unpacked = destination_spans
+                    .iter()
+                    .flat_map(|span| {
+                        (span.offset / 2..(span.offset + span.bytes) / 2)
+                            .map(|index| destination_data[index as usize])
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(unpacked, source_data, "case {case}, order {order:?}");
             }
         }
     }

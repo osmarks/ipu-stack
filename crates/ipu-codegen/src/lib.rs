@@ -98,6 +98,7 @@ pub const COPY_U16_SYMBOL: &str = "ipu_stack_static_copy_u16";
 pub const COPY_U32_SYMBOL: &str = "ipu_stack_static_copy_u32";
 pub const COPY_U64_SYMBOL: &str = "ipu_stack_copy_u64";
 pub const COPY_STRIDED_U64_SYMBOL: &str = "ipu_stack_copy_strided_u64";
+pub const FILL_ZERO_U64_SYMBOL: &str = "ipu_stack_fill_zero_u64";
 pub const PATCH_WORD_SYMBOL: &str = "ipu_stack_static_patch_word";
 pub const PATCH_ROW_SYMBOL: &str = "ipu_stack_static_patch_row";
 pub const RUNTIME_ENTRY_SYMBOL: &str = "ipu_stack_static_start";
@@ -591,7 +592,7 @@ fn validate_steps(
                 }
                 let values = compute.input_addresses.len() + compute.arguments.len();
                 let available = usize::from(LAST_VALUE_REGISTER - FIRST_INPUT_REGISTER + 1);
-                if compute.input_addresses.is_empty() || values > available {
+                if values == 0 || values > available {
                     return Err(invalid(format!(
                         "kernel {} needs {values} input/argument registers; 1..={available} are supported",
                         compute.symbol

@@ -265,6 +265,54 @@ ipu_stack_copy_u64:
 .Lcopy_u64_worker_done:
 	exitz $m15
 
+	.section .text.ipu_stack_fill_zero_u64,"ax",@progbits
+	// Tile-kernel ABI: m2 destination, m3 words/worker, m4 remainder workers,
+	// m10 return. The allocation must contain a whole number of 64-bit words.
+	.globl ipu_stack_fill_zero_u64
+	.p2align 2
+	.type ipu_stack_fill_zero_u64,@function
+ipu_stack_fill_zero_u64:
+	.supervisor
+	add $m11, $m11, -12
+	st32 $m2, $m11, $m15, 0
+	st32 $m3, $m11, $m15, 1
+	st32 $m4, $m11, $m15, 2
+	setzi $m0, .Lfill_zero_u64_worker
+	runall $m0, $m11, 0
+	sync SYNC_COMPUTE_SET
+	add $m11, $m11, 12
+	br $m10
+	.size ipu_stack_fill_zero_u64, .-ipu_stack_fill_zero_u64
+
+	.worker
+	.p2align 2
+.Lfill_zero_u64_worker:
+	ld32 $m2, $mvertex_base, $m15, 0
+	ld32 $m5, $mvertex_base, $m15, 1
+	ld32 $m6, $mvertex_base, $m15, 2
+	get $m4, $WSR
+	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
+	cmpult $m7, $m4, $m6
+	mul $m8, $m4, $m5
+	min $m9, $m4, $m6
+	add $m8, $m8, $m9
+	shl $m8, $m8, 3
+	add $m2, $m2, $m8
+	add $m5, $m5, $m7
+	brz $m5, .Lfill_zero_u64_worker_done
+	{
+		rpt $m5, (2f-1f)/8 - 1
+		fnop
+	}
+1:
+	{
+		st64step $azeros, $mzero, $m2+=, 1
+		fnop
+	}
+2:
+.Lfill_zero_u64_worker_done:
+	exitz $m15
+
 	.section .text.ipu_stack_copy_strided_u64,"ax",@progbits
 	// Runtime helper ABI: m2 destination, m3 source, m4 words/row, m5 rows,
 	// m6 source stride, m7 destination stride, m10 return. One call replaces
