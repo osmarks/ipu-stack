@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use ipu_codegen::{
     CheckpointStep, CompiledPackage, ComputeStep, ExchangeActivity, ExchangeActivityKind,
-    ExchangeStep, PlacedExchangeRow, StepProfile, TileAddress, TileProgram, TileProgramData,
-    TileStep, build_tile_program_package, inactive_exchange_program,
+    ExchangeStep, PhysicalTransfer, PlacedExchangeRow, StepProfile, TileAddress, TileProgram,
+    TileProgramData, TileStep, TransferEndpoint, TransferWidth, build_tile_program_package,
+    inactive_exchange_program,
 };
 use ipu_driver::{Device, TileException};
 use ipu_elf::Toolchain;
@@ -30,14 +31,25 @@ const INTERLEAVED_DESTINATION_BASE: u32 = 0x98000;
 #[derive(Clone, Debug)]
 struct Transfer {
     case: u32,
-    source: u16,
-    destinations: Vec<u16>,
-    source_address: u32,
-    destination_addresses: Vec<u32>,
-    words: u32,
+    physical: PhysicalTransfer,
+    expected_words: Vec<u32>,
     requested_schedule_offset: u32,
     schedule_offset: u32,
     timing: PhaseTransferTiming,
+}
+
+impl Transfer {
+    fn source_address(&self) -> u32 {
+        self.physical.source_addresses[0]
+    }
+
+    fn destination_tiles(&self) -> impl Iterator<Item = u16> + '_ {
+        self.physical.destinations.iter().map(|endpoint| endpoint.0)
+    }
+
+    fn destination_addresses(&self) -> impl Iterator<Item = u32> + '_ {
+        self.physical.destinations.iter().map(|endpoint| endpoint.1)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -46,14 +58,6 @@ struct TransferSpec {
     destinations: Vec<u16>,
     words: u32,
     schedule_offset: Option<u32>,
-}
-
-#[derive(Clone, Debug)]
-struct Payload {
-    case: u32,
-    source: u16,
-    destinations: Vec<u16>,
-    words: u32,
 }
 
 pub(crate) struct StressPackage {
@@ -362,11 +366,17 @@ pub(crate) fn build_wide(
         }
         transfers.push(Transfer {
             case: u32::try_from(case)?,
-            source,
-            destinations: destinations.to_vec(),
-            source_address,
-            destination_addresses: vec![destination_address; destinations.len()],
-            words,
+            physical: PhysicalTransfer {
+                source,
+                source_addresses: vec![source_address],
+                destinations: destinations
+                    .iter()
+                    .map(|&tile| TransferEndpoint(tile, destination_address))
+                    .collect(),
+                words,
+                width: TransferWidth::Paired64,
+            },
+            expected_words: payload.clone(),
             requested_schedule_offset: 0,
             schedule_offset: 0,
             timing,
@@ -421,23 +431,15 @@ struct ExpectedSpan {
 
 #[derive(Clone, Debug)]
 struct ReplayTransfer {
+    physical: PhysicalTransfer,
     send: ExchangeActivity,
     receives: Vec<(u16, ExchangeActivity)>,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum ReplayEvent {
-    Receive {
-        transfer: u32,
-        tile: u16,
-        address: u32,
-    },
-    Send {
-        transfer: u32,
-        tile: u16,
-        address: u32,
-        words: u32,
-    },
+    Receive { transfer: usize, destination: usize },
+    Send { transfer: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -488,7 +490,7 @@ pub(crate) fn build(
     let mut expected_cursors = vec![EXPECTED_BASE; usize::from(active_tiles)];
     let mut buffers = BTreeMap::<u16, Vec<u8>>::new();
     let mut transfers = Vec::new();
-    let mut available_payloads = vec![Vec::<(u32, Payload)>::new(); usize::from(active_tiles)];
+    let mut available_payloads = vec![Vec::<(u32, Vec<u32>)>::new(); usize::from(active_tiles)];
     let mut phase_rows = Vec::with_capacity(cases as usize);
     let mut diagnostic_rows = Vec::with_capacity(cases as usize);
     let mut row_address = ROW_BASE;
@@ -578,15 +580,12 @@ pub(crate) fn build(
                     candidates[rng.usize(0..candidates.len())].clone()
                 });
             let (source_address, payload) = if let Some((address, payload)) = chained {
-                words = payload.words;
+                words = u32::try_from(payload.len())?;
                 (address, payload)
             } else {
-                let payload = Payload {
-                    case,
-                    source,
-                    destinations: destinations.clone(),
-                    words,
-                };
+                let payload = (0..words)
+                    .map(|index| word_value(case, source, &destinations, index))
+                    .collect::<Vec<_>>();
                 let address = allocate(
                     &mut source_cursors,
                     source,
@@ -676,11 +675,18 @@ pub(crate) fn build(
             }
             transfers.push(Transfer {
                 case,
-                source,
-                destinations,
-                source_address,
-                destination_addresses,
-                words,
+                physical: PhysicalTransfer {
+                    source,
+                    source_addresses: vec![source_address],
+                    destinations: destinations
+                        .into_iter()
+                        .zip(destination_addresses)
+                        .map(TransferEndpoint::from)
+                        .collect(),
+                    words,
+                    width: TransferWidth::Word32,
+                },
+                expected_words: payload,
                 requested_schedule_offset,
                 schedule_offset,
                 timing,
@@ -973,29 +979,45 @@ fn build_physical_phase_replay(
             {
                 bail!("phase {phase_index} transfer {id} has inconsistent word counts");
             }
-            Ok((id, source, ReplayTransfer { send, receives }))
+            let width = phase
+                .activities
+                .iter()
+                .flatten()
+                .any(|activity| {
+                    activity.transfer == id && activity.kind == ExchangeActivityKind::PartnerBusy
+                })
+                .then_some(TransferWidth::Paired64)
+                .unwrap_or(TransferWidth::Word32);
+            let physical = PhysicalTransfer {
+                source,
+                source_addresses: vec![send.address],
+                destinations: receives
+                    .iter()
+                    .map(|&(tile, receive)| TransferEndpoint(tile, receive.address))
+                    .collect(),
+                words: send.words,
+                width,
+            };
+            Ok((
+                id,
+                ReplayTransfer {
+                    physical,
+                    send,
+                    receives,
+                },
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut events = Vec::new();
-    for &(transfer, source, ref replay) in &transfers {
-        events.push((
-            replay.send.start_cycle,
-            1u8,
-            ReplayEvent::Send {
-                transfer,
-                tile: source,
-                address: replay.send.address,
-                words: replay.send.words,
-            },
-        ));
-        for &(tile, receive) in &replay.receives {
+    for (transfer, (_, replay)) in transfers.iter().enumerate() {
+        events.push((replay.send.start_cycle, 1u8, ReplayEvent::Send { transfer }));
+        for (destination, &(_, receive)) in replay.receives.iter().enumerate() {
             events.push((
                 receive.memory_end_cycle,
                 0u8,
                 ReplayEvent::Receive {
                     transfer,
-                    tile,
-                    address: receive.address,
+                    destination,
                 },
             ));
         }
@@ -1003,36 +1025,35 @@ fn build_physical_phase_replay(
     events.sort_unstable_by_key(|&(cycle, order, _)| (cycle, order));
 
     let mut expected_memory = initial.clone();
-    let mut payloads = BTreeMap::<u32, Vec<u32>>::new();
+    let mut payloads = vec![None; transfers.len()];
     for (_, _, event) in events {
         match event {
-            ReplayEvent::Send {
-                transfer,
-                tile,
-                address,
-                words,
-            } => {
+            ReplayEvent::Send { transfer } => {
+                let (id, replay) = &transfers[transfer];
+                let tile = replay.physical.source;
+                let address = replay.physical.source_addresses[0];
                 let memory = &expected_memory[usize::from(tile)];
-                let payload = (0..words)
+                let payload = (0..replay.physical.words)
                     .map(|word| {
                         let address = address + word * 4;
                         memory.get(&address).copied().with_context(|| {
                             format!(
-                                "phase {phase_index} transfer {transfer} reads untracked tile {tile} address 0x{address:x}"
+                                "phase {phase_index} transfer {id} reads untracked tile {tile} address 0x{address:x}"
                             )
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                payloads.insert(transfer, payload);
+                payloads[transfer] = Some(payload);
             }
             ReplayEvent::Receive {
                 transfer,
-                tile,
-                address,
+                destination,
             } => {
-                let payload = payloads.get(&transfer).with_context(|| {
+                let (id, replay) = &transfers[transfer];
+                let TransferEndpoint(tile, address) = replay.physical.destinations[destination];
+                let payload = payloads[transfer].as_ref().with_context(|| {
                     format!(
-                        "phase {phase_index} transfer {transfer} completes a receive before its send snapshot"
+                        "phase {phase_index} transfer {id} completes a receive before its send snapshot"
                     )
                 })?;
                 let memory = &mut expected_memory[usize::from(tile)];
@@ -1351,9 +1372,9 @@ impl StressPackage {
         let mut states = Vec::new();
         let mut relevant = Vec::new();
         for transfer in &self.transfers {
-            relevant.push(transfer.source);
-            relevant.extend(transfer.destinations.iter().copied());
-            if let Ok(paired) = topology.paired_logical(transfer.source) {
+            relevant.push(transfer.physical.source);
+            relevant.extend(transfer.destination_tiles());
+            if let Ok(paired) = topology.paired_logical(transfer.physical.source) {
                 relevant.push(paired);
             }
         }
@@ -1432,12 +1453,13 @@ impl StressPackage {
             .filter(|transfer| transfer.case == case)
             .map(|transfer| {
                 format!(
-                    "source={} address=0x{:x} destinations={:?} addresses={:?} words={} requestedOffset={} encodedOffset={} sender={}..{} receivers={:?}..{:?}",
-                    transfer.source,
-                    transfer.source_address,
-                    transfer.destinations,
-                    transfer.destination_addresses,
-                    transfer.words,
+                    "source={} address=0x{:x} destinations={:?} addresses={:?} words={} expectedWords={} requestedOffset={} encodedOffset={} sender={}..{} receivers={:?}..{:?}",
+                    transfer.physical.source,
+                    transfer.source_address(),
+                    transfer.destination_tiles().collect::<Vec<_>>(),
+                    transfer.destination_addresses().collect::<Vec<_>>(),
+                    transfer.physical.words,
+                    transfer.expected_words.len(),
                     transfer.requested_schedule_offset,
                     transfer.schedule_offset,
                     transfer.timing.payload_start,
@@ -1498,11 +1520,11 @@ impl StressPackage {
             .map(|transfer| {
                 (
                     transfer.case,
-                    transfer.source,
-                    &transfer.destinations,
-                    transfer.words,
-                    transfer.source_address,
-                    &transfer.destination_addresses,
+                    transfer.physical.source,
+                    transfer.destination_tiles().collect::<Vec<_>>(),
+                    transfer.physical.words,
+                    transfer.source_address(),
+                    transfer.destination_addresses().collect::<Vec<_>>(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1697,12 +1719,10 @@ fn word_value(case: u32, source: u16, destinations: &[u16], index: u32) -> u32 {
     value
 }
 
-fn fill_source(buffer: &mut [u8], address: u32, payload: &Payload) {
+fn fill_source(buffer: &mut [u8], address: u32, payload: &[u32]) {
     let offset = (address - DATA_BASE) as usize;
-    for index in 0..payload.words {
-        let start = offset + index as usize * 4;
-        buffer[start..start + 4].copy_from_slice(
-            &word_value(payload.case, payload.source, &payload.destinations, index).to_le_bytes(),
-        );
+    for (index, &word) in payload.iter().enumerate() {
+        let start = offset + index * 4;
+        buffer[start..start + 4].copy_from_slice(&word.to_le_bytes());
     }
 }
