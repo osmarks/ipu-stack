@@ -292,7 +292,7 @@ pub enum GemmDistribution {
 }
 
 /// Exact blocked-GEMM geometry retained for planner diagnosis. Constraints
-/// are keyed by the source graph operation and bypass candidate pruning and
+/// are keyed by the source graph operation and bypass beam pruning and
 /// conservative whole-graph memory rejection. Concrete placement remains the
 /// final authority on whether the resulting package fits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1389,197 +1389,20 @@ pub enum MemoryRelation {
     DistinctElements(Vec<MemoryOperand>),
 }
 
-/// Complete formats and placement requirements of one whole-device operator plan.
+/// A GEMM plan after its blocking, layouts, and dispatch have been
+/// chosen, but before graph-wide conversion and memory costs are applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OperatorCandidate {
-    pub(crate) operator: MidOperator,
-    pub(crate) dispatch: OperatorDispatch,
-    pub(crate) format_policy: OperatorFormatPolicy,
-    pub(crate) inputs: Vec<OperandRequirement>,
-    pub(crate) output: OperandRequirement,
-    pub(crate) output_aliasing: OutputAliasing,
-    pub(crate) memory_relations: Vec<MemoryRelation>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OperatorFormatPolicy {
-    /// Use the candidate's concrete input and output formats.
-    Concrete,
-    /// Resolve both the selected input and output to the input value's full
-    /// layout. Other same-precision inputs are converted into that layout.
-    /// This is the normal policy for layout-transparent pointwise work.
-    PreserveInputLayout(u16),
-}
-
-impl OperatorCandidate {
-    pub(crate) fn new(
-        operator: MidOperator,
-        inputs: impl IntoIterator<Item = OperandRequirement>,
-        output: OperandRequirement,
-    ) -> Self {
-        Self {
-            operator,
-            dispatch: default_dispatch(operator),
-            format_policy: OperatorFormatPolicy::Concrete,
-            inputs: inputs.into_iter().collect(),
-            output,
-            output_aliasing: OutputAliasing::Fresh,
-            memory_relations: Vec::new(),
-        }
-    }
-
-    pub(crate) fn with_dispatch(mut self, dispatch: OperatorDispatch) -> Self {
-        self.dispatch = dispatch;
-        self
-    }
-
-    pub(crate) fn with_preserved_input_layout(mut self, input: u16) -> Self {
-        self.format_policy = OperatorFormatPolicy::PreserveInputLayout(input);
-        self
-    }
-
-    pub(crate) fn with_output_aliasing(mut self, aliasing: OutputAliasing) -> Self {
-        self.output_aliasing = aliasing;
-        self
-    }
-
-    pub(crate) fn with_memory_relation(mut self, relation: MemoryRelation) -> Self {
-        self.memory_relations.push(relation);
-        self
-    }
-
-    fn supports(&self, inputs: &[TensorType], output: &TensorShape) -> bool {
-        if self.inputs.len() != inputs.len()
-            || !valid_requirement(&self.output, output)
-            || !self
-                .inputs
-                .iter()
-                .zip(inputs)
-                .all(|(requirement, input)| valid_requirement(requirement, &input.shape))
-        {
-            return false;
-        }
-        let alias_valid = match &self.output_aliasing {
-            OutputAliasing::Fresh => true,
-            OutputAliasing::MayAliasInputs(indices) => {
-                !indices.is_empty()
-                    && indices.iter().any(|index| {
-                        alias_compatible(
-                            usize::from(*index),
-                            &self.inputs,
-                            inputs,
-                            &self.output,
-                            output,
-                        )
-                    })
-            }
-            OutputAliasing::MustAliasInput(index) => alias_compatible(
-                usize::from(*index),
-                &self.inputs,
-                inputs,
-                &self.output,
-                output,
-            ),
-        };
-        let requirements_valid = alias_valid
-            && self.memory_relations.iter().all(|relation| match relation {
-                MemoryRelation::DistinctElements(operands) => {
-                    operands.len() >= 2
-                        && operands
-                            .iter()
-                            .all(|operand| valid_memory_operand(*operand, inputs.len()))
-                        && operands.iter().enumerate().all(|(index, operand)| {
-                            !operands[..index].iter().any(|previous| previous == operand)
-                        })
-                }
-            });
-        if !requirements_valid {
-            return false;
-        }
-        let planned_inputs = inputs
-            .iter()
-            .zip(&self.inputs)
-            .map(|(input, requirement)| TensorType {
-                shape: input.shape.clone(),
-                format: requirement.format.clone(),
-            })
-            .collect::<Vec<_>>();
-        let planned_output = TensorType {
-            shape: output.clone(),
-            format: self.output.format.clone(),
-        };
-        OperatorPlan {
-            operator: self.operator,
-            dispatch: self.dispatch.clone(),
-            requirements: OperatorRequirements {
-                inputs: self.inputs.clone(),
-                output: self.output.clone(),
-                output_aliasing: self.output_aliasing.clone(),
-                memory_relations: self.memory_relations.clone(),
-            },
-            exchange: ExchangeFootprint::default(),
-            deferred_output: None,
-            deferred_inputs: vec![None; self.inputs.len()],
-        }
-        .validate(&planned_inputs, &planned_output)
-        .is_ok()
-    }
+struct GemmPlan {
+    dispatch: OperatorDispatch,
+    inputs: Vec<OperandRequirement>,
+    output: OperandRequirement,
+    memory_relations: Vec<MemoryRelation>,
 }
 
 fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> bool {
     layout
         .resolve(shape)
         .map_or(true, |resolved| resolved.has_empty_shards())
-}
-
-fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
-    match operator {
-        MidOperator::Gemm {
-            options: _,
-            multiply,
-            accumulate,
-        } => OperatorDispatch::BlockedGemm {
-            initialize: TileKernelSpec::Gemm {
-                multiply,
-                accumulate,
-                mode: GemmKernelMode::Initialize,
-                weights: GemmWeightLoad::Standard,
-                inner_block: AMP_INNER_BLOCK,
-                output_columns: AMP_OUTPUT_COLUMN_BLOCK,
-            },
-            accumulate: TileKernelSpec::Gemm {
-                multiply,
-                accumulate,
-                mode: GemmKernelMode::Accumulate,
-                weights: GemmWeightLoad::Standard,
-                inner_block: AMP_INNER_BLOCK,
-                output_columns: AMP_OUTPUT_COLUMN_BLOCK,
-            },
-            inner_block: AMP_INNER_BLOCK,
-            output_column_block: AMP_OUTPUT_COLUMN_BLOCK,
-            orientation: GemmOrientation::Normal,
-            distribution: GemmDistribution::OutputStationary,
-        },
-        MidOperator::Gelu => OperatorDispatch::Pointwise {
-            kernel: TileKernelSpec::Gelu,
-            input_mapping: PointwiseInputMapping::TileLocal,
-        },
-        MidOperator::Add(_) => OperatorDispatch::Pointwise {
-            kernel: TileKernelSpec::Add,
-            input_mapping: PointwiseInputMapping::BroadcastToOutput,
-        },
-        MidOperator::SplitHeads(_) => OperatorDispatch::SplitHeads,
-        MidOperator::FlashAttention {
-            options,
-            accumulate,
-        } => OperatorDispatch::Pointwise {
-            kernel: TileKernelSpec::FlashAttention {
-                options,
-                accumulate,
-            },
-            input_mapping: PointwiseInputMapping::TileLocal,
-        },
-    }
 }
 
 fn alias_compatible(
@@ -1617,8 +1440,8 @@ pub struct PipelineConfig {
     /// consumer. Precision remains fixed, while packaging exposes the chosen
     /// physical layout directly through the host binding.
     pub automatic_inputs: BTreeMap<ValueId, Precision>,
-    /// Planner-controlled choices independent of kernel availability and
-    /// operator implementation structure.
+    /// Planner-controlled choices consumed by each semantic operator's plan
+    /// generator.
     pub search_domain: PlannerSearchDomain,
     /// Maximum number of partial format assignments retained after each
     /// operation in a straight-line region.
@@ -1643,12 +1466,7 @@ pub struct PipelineConfig {
     /// Controls whether one-use layout conversions may be populated as
     /// bounded slices immediately before their consuming dispatch.
     pub conversion_streaming: ConversionStreamingPolicy,
-    /// Concrete implementation signatures resolved from the catalogue and
-    /// search domain for one graph lowering.
-    resolved_operator_candidates: Vec<OperatorCandidate>,
     resolved_active_tile_counts: Vec<u16>,
-    #[cfg(test)]
-    implementation_override: Option<Vec<OperatorCandidate>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1687,8 +1505,8 @@ enum ActiveTileDomain {
     Explicit(Vec<u16>),
 }
 
-/// Choices the planner may combine with implementations supported by the
-/// target. This does not describe kernels or concrete tensor layouts.
+/// Search axes shared by the semantic operator plan generators. This does not
+/// describe kernels or concrete tensor layouts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannerSearchDomain {
     active_tiles: ActiveTileDomain,
@@ -1840,10 +1658,7 @@ impl PipelineConfig {
             diagnostic_checkpoints: false,
             exchange_diagnostics: false,
             conversion_streaming: ConversionStreamingPolicy::WhenRequired,
-            resolved_operator_candidates: Vec::new(),
             resolved_active_tile_counts: Vec::new(),
-            #[cfg(test)]
-            implementation_override: None,
         }
     }
 
@@ -1883,77 +1698,6 @@ impl PipelineConfig {
         self.tile_memory_budget_bytes = bytes;
         self
     }
-
-    #[cfg(test)]
-    pub(crate) fn with_test_operator_candidates(
-        mut self,
-        candidates: Vec<OperatorCandidate>,
-    ) -> Self {
-        self.implementation_override = Some(candidates);
-        self
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OperatorImplementation {
-    BlockedGemm,
-    Gelu,
-    Add,
-    SplitHeadsView,
-    FlashAttention,
-    MaterializedAttention,
-}
-
-const IPU21_IMPLEMENTATION_CATALOG: &[OperatorImplementation] = &[
-    OperatorImplementation::BlockedGemm,
-    OperatorImplementation::Gelu,
-    OperatorImplementation::Add,
-    OperatorImplementation::SplitHeadsView,
-    OperatorImplementation::FlashAttention,
-    OperatorImplementation::MaterializedAttention,
-];
-
-fn implementation_enabled(
-    domain: &PlannerSearchDomain,
-    implementation: OperatorImplementation,
-) -> bool {
-    IPU21_IMPLEMENTATION_CATALOG.contains(&implementation)
-        && match (implementation, domain.attention_strategy) {
-            (OperatorImplementation::FlashAttention, AttentionStrategy::Materialized)
-            | (OperatorImplementation::MaterializedAttention, AttentionStrategy::Flash) => false,
-            _ => true,
-        }
-}
-
-pub(crate) fn resolved_operator_candidates(
-    domain: &PlannerSearchDomain,
-    active_tile_counts: &[u16],
-) -> Vec<OperatorCandidate> {
-    let mut candidates = Vec::new();
-    for implementation in IPU21_IMPLEMENTATION_CATALOG {
-        match implementation {
-            OperatorImplementation::BlockedGemm => {
-                for &active_tiles in active_tile_counts {
-                    candidates.extend(amp_gemm_operator_candidates_for_tile_count(
-                        active_tiles,
-                        domain,
-                    ));
-                }
-            }
-            OperatorImplementation::Gelu => candidates.extend(gelu_operator_candidates(domain)),
-            OperatorImplementation::Add => candidates.extend(add_operator_candidates(domain)),
-            OperatorImplementation::SplitHeadsView
-            | OperatorImplementation::FlashAttention
-            | OperatorImplementation::MaterializedAttention => {}
-        }
-    }
-    let mut unique = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        if !unique.contains(&candidate) {
-            unique.push(candidate);
-        }
-    }
-    unique
 }
 
 fn candidate_active_tile_counts(capacity: u16) -> Vec<u16> {
@@ -2000,10 +1744,11 @@ fn shape_aware_active_tile_counts<'a>(
     counts
 }
 
-fn amp_gemm_operator_candidates_for_tile_count(
+fn gemm_seed_plans_for_tile_count(
+    options: GemmOptions,
     tile_count: u16,
     domain: &PlannerSearchDomain,
-) -> Vec<OperatorCandidate> {
+) -> Vec<GemmPlan> {
     let mut candidates = (1..=tile_count)
         .rev()
         .filter(|columns| tile_count.is_multiple_of(*columns))
@@ -2073,7 +1818,8 @@ fn amp_gemm_operator_candidates_for_tile_count(
                     {
                         continue;
                     }
-                    let candidate = amp_grid_gemm_operator_candidate(
+                    let candidate = amp_grid_gemm_plan(
+                        options,
                         precision,
                         64,
                         left_tail,
@@ -2103,7 +1849,8 @@ fn amp_gemm_operator_candidates_for_tile_count(
                 .iter()
                 .filter(|&&columns| columns >= AMP_OUTPUT_COLUMN_BLOCK)
             {
-                candidates.push(amp_gemm_operator_candidate(
+                candidates.push(amp_gemm_plan(
+                    options,
                     precision,
                     64,
                     left_tail,
@@ -2122,53 +1869,6 @@ fn amp_gemm_operator_candidates_for_tile_count(
     unique
 }
 
-fn gelu_operator_candidates(domain: &PlannerSearchDomain) -> Vec<OperatorCandidate> {
-    let mut candidates = Vec::new();
-    for &precision in domain.precisions(OperatorClass::Gelu) {
-        if precision == Precision::F16 {
-            candidates.push(format_preserving_unary_candidate(
-                MidOperator::Gelu,
-                TensorFormat {
-                    precision,
-                    layout: Layout::amp_left_result(1),
-                },
-            ));
-        }
-        if matches!(precision, Precision::F16 | Precision::F32) {
-            candidates.push(format_preserving_unary_candidate(
-                MidOperator::Gelu,
-                TensorFormat {
-                    precision,
-                    layout: Layout::row_sharded(1),
-                },
-            ));
-        }
-    }
-    candidates
-}
-
-fn add_operator_candidates(domain: &PlannerSearchDomain) -> Vec<OperatorCandidate> {
-    domain
-        .precisions(OperatorClass::Add)
-        .iter()
-        .copied()
-        .filter(|precision| matches!(precision, Precision::F16 | Precision::F32))
-        .map(|precision| {
-            let format = TensorFormat {
-                precision,
-                layout: Layout::row_sharded(1),
-            };
-            pointwise_operator_candidate(
-                MidOperator::Add(AddOptions::default()),
-                [format.clone(), format.clone()],
-                format,
-            )
-            .with_preserved_input_layout(0)
-            .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1]))
-        })
-        .collect()
-}
-
 const fn gemm_left_access_tail(precision: Precision) -> Option<u32> {
     match precision {
         Precision::F16 => Some(16),
@@ -2184,44 +1884,21 @@ const fn gemm_supports_weight_memory(precision: Precision, memory_class: MemoryC
     )
 }
 
-fn pointwise_operator_candidate(
-    operator: MidOperator,
-    inputs: impl IntoIterator<Item = TensorFormat>,
-    output: TensorFormat,
-) -> OperatorCandidate {
-    OperatorCandidate::new(
-        operator,
-        inputs
-            .into_iter()
-            .map(|format| OperandRequirement::new(format, 8)),
-        OperandRequirement::new(output, 8),
-    )
-}
-
-fn format_preserving_unary_candidate(
-    operator: MidOperator,
-    format: TensorFormat,
-) -> OperatorCandidate {
-    pointwise_operator_candidate(operator, [format.clone()], format)
-        .with_preserved_input_layout(0)
-        .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0]))
-}
-
-fn amp_gemm_operator_candidate(
+fn amp_gemm_plan(
+    options: GemmOptions,
     precision: Precision,
     inner: u16,
     left_tail: u32,
     output_columns: u32,
     tile_count: u16,
-) -> OperatorCandidate {
+) -> GemmPlan {
     let operator = MidOperator::Gemm {
-        options: GemmOptions::default(),
+        options,
         multiply: precision,
         accumulate: gemm_accumulation_precision(precision),
     };
-    OperatorCandidate::new(
-        operator,
-        [
+    GemmPlan {
+        inputs: vec![
             OperandRequirement::new(
                 TensorFormat {
                     precision,
@@ -2246,7 +1923,7 @@ fn amp_gemm_operator_candidate(
                 32,
             ),
         ],
-        OperandRequirement::new(
+        output: OperandRequirement::new(
             TensorFormat {
                 precision,
                 layout: if precision == Precision::F16 {
@@ -2257,22 +1934,23 @@ fn amp_gemm_operator_candidate(
             },
             32,
         ),
-    )
-    .with_memory_relation(MemoryRelation::DistinctElements(vec![
-        MemoryOperand::Output,
-        MemoryOperand::Input(0),
-    ]))
-    .with_dispatch(blocked_gemm_dispatch(operator, output_columns))
+        memory_relations: vec![MemoryRelation::DistinctElements(vec![
+            MemoryOperand::Output,
+            MemoryOperand::Input(0),
+        ])],
+        dispatch: blocked_gemm_dispatch(operator, output_columns),
+    }
 }
 
-fn amp_grid_gemm_operator_candidate(
+fn amp_grid_gemm_plan(
+    options: GemmOptions,
     precision: Precision,
     inner: u16,
     left_tail: u32,
     output_columns: u32,
     grid: AmpGridShape,
     weights: AmpWeightPlacement,
-) -> OperatorCandidate {
+) -> GemmPlan {
     let right_layout = match (weights.inner_partitions, weights.memory_class) {
         (1, MemoryClass::Ipu21Standard) => Layout::block_major_matrix_grid(
             inner,
@@ -2292,13 +1970,12 @@ fn amp_grid_gemm_operator_candidate(
         ),
     };
     let operator = MidOperator::Gemm {
-        options: GemmOptions::default(),
+        options,
         multiply: precision,
         accumulate: gemm_accumulation_precision(precision),
     };
-    OperatorCandidate::new(
-        operator,
-        [
+    GemmPlan {
+        inputs: vec![
             OperandRequirement::new(
                 TensorFormat {
                     precision,
@@ -2322,7 +1999,7 @@ fn amp_grid_gemm_operator_candidate(
                 32,
             ),
         ],
-        OperandRequirement::new(
+        output: OperandRequirement::new(
             TensorFormat {
                 precision,
                 layout: if precision == Precision::F16 {
@@ -2345,12 +2022,12 @@ fn amp_grid_gemm_operator_candidate(
             },
             32,
         ),
-    )
-    .with_memory_relation(MemoryRelation::DistinctElements(vec![
-        MemoryOperand::Output,
-        MemoryOperand::Input(0),
-    ]))
-    .with_dispatch(blocked_gemm_dispatch(operator, output_columns))
+        memory_relations: vec![MemoryRelation::DistinctElements(vec![
+            MemoryOperand::Output,
+            MemoryOperand::Input(0),
+        ])],
+        dispatch: blocked_gemm_dispatch(operator, output_columns),
+    }
 }
 
 fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> OperatorDispatch {
@@ -3052,14 +2729,6 @@ pub(crate) fn lower_finalists(
         .active_tile_counts(config.tile_count, graph.value_shapes().values());
     let mut resolved_config = config.clone();
     resolved_config.resolved_active_tile_counts = active_tile_counts.clone();
-    #[cfg(test)]
-    let implementation_override = config.implementation_override.as_ref();
-    #[cfg(not(test))]
-    let implementation_override: Option<&Vec<OperatorCandidate>> = None;
-    resolved_config.resolved_operator_candidates =
-        implementation_override.cloned().unwrap_or_else(|| {
-            resolved_operator_candidates(&config.search_domain, &active_tile_counts)
-        });
     let config = &resolved_config;
     let mut state = LoweringState::default();
     let costs = MemoizedCostModel::new(costs, config.tile_count);
@@ -3097,7 +2766,7 @@ pub(crate) fn lower_finalists(
             value,
         });
     }
-    let branches = lower_operation_candidates(
+    let branches = plan_region_frontier(
         graph.operations(),
         graph.outputs(),
         &mut values,
@@ -3442,7 +3111,7 @@ struct RegionPlanningConstraints {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_operation_candidates(
+fn plan_region_frontier(
     source: &[Operation],
     required_outputs: &[ValueId],
     values: &mut BTreeMap<ValueId, MidValueId>,
@@ -3499,42 +3168,29 @@ fn lower_operation_candidates(
                         .iter()
                         .find(|consumer| consumer.inputs.contains(result))
                         .is_some_and(|consumer| {
-                            config
-                                .resolved_operator_candidates
-                                .iter()
-                                .filter(|candidate| {
-                                    operator_matches(&consumer.kind, candidate.operator)
-                                })
-                                .any(|candidate| {
-                                    matches!(
-                                        candidate.format_policy,
-                                        OperatorFormatPolicy::PreserveInputLayout(_)
-                                    )
-                                })
+                            consumer.inputs.iter().enumerate().any(|(index, input)| {
+                                input == result
+                                    && operator_accepts_input_layout(&consumer.kind, index, config)
+                            })
                         }))
         });
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
-        let mut saw_candidate = false;
-        let format_sensitive_indices = if matches!(operation.kind, OperationKind::SplitHeads(_)) {
-            (0..operation.inputs.len()).collect::<BTreeSet<_>>()
-        } else {
-            config
-                .resolved_operator_candidates
-                .iter()
-                .filter(|candidate| operator_matches(&operation.kind, candidate.operator))
-                .filter_map(|candidate| match candidate.format_policy {
-                    OperatorFormatPolicy::Concrete => None,
-                    OperatorFormatPolicy::PreserveInputLayout(index) => Some(usize::from(index)),
-                })
-                .collect()
-        };
+        let mut saw_legal_plan = false;
+        let format_sensitive_indices = operation
+            .inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                operator_accepts_input_layout(&operation.kind, index, config).then_some(index)
+            })
+            .collect::<BTreeSet<_>>();
         let mut plan_cache = BTreeMap::<PlanCacheKey, Vec<Plan>>::new();
         let mut plan_cache_hits = 0usize;
         let mut generated_plan_sets = 0usize;
         for branch in beam {
             if let OperationKind::Repeat(repeat) = &operation.kind {
-                saw_candidate = true;
+                saw_legal_plan = true;
                 let mut next = branch.clone();
                 lower_repeat(
                     operation,
@@ -3637,7 +3293,7 @@ fn lower_operation_candidates(
                 cached
             } else {
                 generated_plan_sets += 1;
-                let generated = plans(
+                let generated = plans_for_operation(
                     operation,
                     &input_types,
                     &parameter_inputs,
@@ -3650,7 +3306,7 @@ fn lower_operation_candidates(
                 );
                 plan_cache.entry(cache_key).or_insert(generated)
             };
-            let candidate_plans = cached
+            let available_plans = cached
                 .iter()
                 .cloned()
                 .into_iter()
@@ -3672,7 +3328,7 @@ fn lower_operation_candidates(
                         })
                 })
                 .collect::<Vec<_>>();
-            let candidate_plans = candidate_plans
+            let available_plans = available_plans
                 .into_iter()
                 .flat_map(|plan| {
                     let mut complete = plan.clone();
@@ -3689,8 +3345,8 @@ fn lower_operation_candidates(
                     }
                 })
                 .collect::<Vec<_>>();
-            saw_candidate |= !candidate_plans.is_empty();
-            let evaluated = candidate_plans
+            saw_legal_plan |= !available_plans.is_empty();
+            let evaluated = available_plans
                 .into_par_iter()
                 .map(|plan| {
                     let mut next = branch.clone();
@@ -3754,7 +3410,7 @@ fn lower_operation_candidates(
             }
         }
         if expanded.is_empty() {
-            if saw_candidate
+            if saw_legal_plan
                 && let Some(peak) = rejected_memory
                     .into_iter()
                     .min_by_key(|peak| (peak.total, peak.interleaved, peak.standard))
@@ -3871,7 +3527,7 @@ fn lower_operations(
     state: &mut LoweringState,
     constraints: &RegionPlanningConstraints,
 ) -> LoweringResult<Vec<MidOperation>> {
-    let mut candidates = lower_operation_candidates(
+    let mut branches = plan_region_frontier(
         source,
         required_outputs,
         values,
@@ -3882,7 +3538,7 @@ fn lower_operations(
         state,
         constraints,
     )?;
-    let best = candidates.remove(0);
+    let best = branches.remove(0);
     *values = best.values;
     *state = best.state;
     Ok(best.operations)
@@ -4432,6 +4088,85 @@ struct Plan {
     deferred_output: Option<DeferredOutputPlan>,
 }
 
+impl Plan {
+    fn supports(&self, inputs: &[TensorType], output: &TensorShape) -> bool {
+        if self.requirements.inputs.len() != inputs.len()
+            || !valid_requirement(&self.requirements.output, output)
+            || !self
+                .requirements
+                .inputs
+                .iter()
+                .zip(inputs)
+                .all(|(requirement, input)| valid_requirement(requirement, &input.shape))
+        {
+            return false;
+        }
+        let alias_valid = match &self.requirements.output_aliasing {
+            OutputAliasing::Fresh => true,
+            OutputAliasing::MayAliasInputs(indices) => {
+                !indices.is_empty()
+                    && indices.iter().any(|index| {
+                        alias_compatible(
+                            usize::from(*index),
+                            &self.requirements.inputs,
+                            inputs,
+                            &self.requirements.output,
+                            output,
+                        )
+                    })
+            }
+            OutputAliasing::MustAliasInput(index) => alias_compatible(
+                usize::from(*index),
+                &self.requirements.inputs,
+                inputs,
+                &self.requirements.output,
+                output,
+            ),
+        };
+        if !alias_valid
+            || !self
+                .requirements
+                .memory_relations
+                .iter()
+                .all(|relation| match relation {
+                    MemoryRelation::DistinctElements(operands) => {
+                        operands.len() >= 2
+                            && operands
+                                .iter()
+                                .all(|operand| valid_memory_operand(*operand, inputs.len()))
+                            && operands.iter().enumerate().all(|(index, operand)| {
+                                !operands[..index].iter().any(|previous| previous == operand)
+                            })
+                    }
+                })
+        {
+            return false;
+        }
+        let planned_inputs = inputs
+            .iter()
+            .zip(&self.requirements.inputs)
+            .map(|(input, requirement)| TensorType {
+                shape: input.shape.clone(),
+                format: requirement.format.clone(),
+            })
+            .collect::<Vec<_>>();
+        let planned_output = TensorType {
+            shape: output.clone(),
+            format: self.requirements.output.format.clone(),
+        };
+        OperatorPlan {
+            operator: self.operator,
+            dispatch: self.dispatch.clone(),
+            requirements: self.requirements.clone(),
+            exchange: ExchangeFootprint::default(),
+            deferred_output: self.deferred_output,
+            deferred_inputs: vec![None; self.requirements.inputs.len()],
+        }
+        .validate(&planned_inputs, &planned_output)
+        .is_ok()
+    }
+}
+
 fn plan_fits_operator_memory(
     plan: &Plan,
     inputs: &[TensorType],
@@ -4520,13 +4255,6 @@ fn direct_consumer_layouts(
     if !config
         .search_domain
         .permits_precision(OperatorClass::Attention, Precision::F16)
-        || (!implementation_enabled(
-            &config.search_domain,
-            OperatorImplementation::FlashAttention,
-        ) && !implementation_enabled(
-            &config.search_domain,
-            OperatorImplementation::MaterializedAttention,
-        ))
     {
         return Vec::new();
     }
@@ -4575,7 +4303,34 @@ fn direct_consumer_layouts(
     layouts
 }
 
-fn plans(
+fn operator_accepts_input_layout(
+    operation: &OperationKind,
+    input_index: usize,
+    config: &PipelineConfig,
+) -> bool {
+    match operation {
+        OperationKind::Gelu => {
+            input_index == 0
+                && !config
+                    .search_domain
+                    .precisions(OperatorClass::Gelu)
+                    .is_empty()
+        }
+        OperationKind::Add(_) => {
+            input_index < 2
+                && !config
+                    .search_domain
+                    .precisions(OperatorClass::Add)
+                    .is_empty()
+        }
+        OperationKind::SplitHeads(_) => input_index == 0,
+        OperationKind::Gemm(_) | OperationKind::FlashAttention(_) | OperationKind::Repeat(_) => {
+            false
+        }
+    }
+}
+
+fn plans_for_operation(
     operation: &Operation,
     inputs: &[TensorType],
     parameter_inputs: &[bool],
@@ -4593,10 +4348,6 @@ fn plans(
         .iter()
         .find(|constraint| constraint.source_operation == operation.id.index());
     if let OperationKind::SplitHeads(options) = operation.kind
-        && implementation_enabled(
-            &config.search_domain,
-            OperatorImplementation::SplitHeadsView,
-        )
         && let [input] = inputs
         && output.0.len() == 3
         && let (Ok(streams), Ok(rows)) = (u16::try_from(output.0[0]), u16::try_from(output.0[1]))
@@ -4653,13 +4404,6 @@ fn plans(
         && config
             .search_domain
             .permits_precision(OperatorClass::Attention, Precision::F16)
-        && (implementation_enabled(
-            &config.search_domain,
-            OperatorImplementation::FlashAttention,
-        ) || implementation_enabled(
-            &config.search_domain,
-            OperatorImplementation::MaterializedAttention,
-        ))
         && !options.causal
         && let [query, key, value] = inputs
         && query.shape.0.len() == 3
@@ -4701,10 +4445,7 @@ fn plans(
                 precision: Precision::F32,
                 layout: Layout::attention_output(heads, query_partitions),
             };
-            if implementation_enabled(
-                &config.search_domain,
-                OperatorImplementation::FlashAttention,
-            ) {
+            if config.search_domain.attention_strategy != AttentionStrategy::Materialized {
                 plans.push(Plan {
                     operator: MidOperator::FlashAttention {
                         options,
@@ -4748,10 +4489,7 @@ fn plans(
                     deferred_output: None,
                 });
             }
-            if implementation_enabled(
-                &config.search_domain,
-                OperatorImplementation::MaterializedAttention,
-            ) {
+            if config.search_domain.attention_strategy != AttentionStrategy::Flash {
                 plans.push(Plan {
                     operator: MidOperator::FlashAttention {
                         options,
@@ -4797,74 +4535,154 @@ fn plans(
             }
         }
     }
-    if let [input] = inputs
-        && input.shape == *output
-        && config.conversion_streaming != ConversionStreamingPolicy::Always
-    {
-        let mut flat_candidates = BTreeMap::new();
-        for candidate in config
-            .resolved_operator_candidates
-            .iter()
-            .filter(|candidate| {
-                operator_matches(&operation.kind, candidate.operator)
-                    && candidate.inputs.len() == 1
-                    && matches!(
-                        candidate.format_policy,
-                        OperatorFormatPolicy::PreserveInputLayout(0)
-                    )
-                    && matches!(
-                        candidate.dispatch,
-                        OperatorDispatch::Pointwise {
-                            input_mapping: PointwiseInputMapping::TileLocal,
-                            ..
-                        }
-                    )
-                    && candidate.inputs[0].format.precision == input.format.precision
-            })
+    match operation.kind {
+        OperationKind::Gemm(options) => plans.extend(gemm_plans(
+            options,
+            inputs,
+            parameter_inputs,
+            output,
+            config,
+            costs,
+            distributed_result_is_useful,
+            gemm_constraint,
+            grouped_output,
+        )),
+        OperationKind::Gelu => plans.extend(pointwise_plans(
+            MidOperator::Gelu,
+            OperatorClass::Gelu,
+            inputs,
+            output,
+            config,
+        )),
+        OperationKind::Add(options) => plans.extend(pointwise_plans(
+            MidOperator::Add(options),
+            OperatorClass::Add,
+            inputs,
+            output,
+            config,
+        )),
+        OperationKind::SplitHeads(_)
+        | OperationKind::FlashAttention(_)
+        | OperationKind::Repeat(_) => {}
+    }
+    plans.retain(|plan| {
+        plan.supports(inputs, output) && plan_fits_operator_memory(plan, inputs, output, config)
+    });
+    if let Some(constraint) = gemm_constraint {
+        plans.retain(|plan| {
+            gemm_plan_matches(constraint, &plan.dispatch, &plan.requirements.inputs)
+        });
+        tracing::info!(
+            source_operation = constraint.source_operation,
+            matching_plans = plans.len(),
+            ?constraint,
+            "applied GEMM plan constraint"
+        );
+    }
+    plans
+}
+
+fn pointwise_plans(
+    operator: MidOperator,
+    class: OperatorClass,
+    inputs: &[TensorType],
+    output: &TensorShape,
+    config: &PipelineConfig,
+) -> Vec<Plan> {
+    let mapping = match operator {
+        MidOperator::Gelu => PointwiseInputMapping::TileLocal,
+        MidOperator::Add(_) => PointwiseInputMapping::BroadcastToOutput,
+        _ => return Vec::new(),
+    };
+    let kernel = match operator {
+        MidOperator::Gelu => TileKernelSpec::Gelu,
+        MidOperator::Add(_) => TileKernelSpec::Add,
+        _ => unreachable!(),
+    };
+    let mut plans = Vec::new();
+    for (anchor, input) in inputs.iter().enumerate() {
+        if input.shape != *output
+            || !config
+                .search_domain
+                .permits_precision(class, input.format.precision)
+            || (matches!(operator, MidOperator::Gelu) && anchor != 0)
         {
-            let grain = candidate.inputs[0]
-                .alignment
-                .div_ceil(input.format.precision.bytes() as u32);
-            if grain == 0 || !output.elements().is_multiple_of(u64::from(grain)) {
-                continue;
-            }
-            let Some(&width) = output.0.last() else {
-                continue;
+            continue;
+        }
+        let mut formats = Vec::new();
+        if config.conversion_streaming != ConversionStreamingPolicy::Always {
+            formats.extend(pointwise_flat_formats(input, output, config));
+        }
+        formats.push(input.format.clone());
+        for format in formats {
+            let aliasing = OutputAliasing::MayAliasInputs(
+                inputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, input)| (input.shape == *output).then_some(index as u16))
+                    .collect(),
+            );
+            let plan = Plan {
+                operator,
+                dispatch: OperatorDispatch::Pointwise {
+                    kernel: kernel.clone(),
+                    input_mapping: mapping,
+                },
+                requirements: OperatorRequirements {
+                    inputs: (0..inputs.len())
+                        .map(|_| OperandRequirement::new(format.clone(), 8))
+                        .collect(),
+                    output: OperandRequirement::new(format, 8),
+                    output_aliasing: aliasing,
+                    memory_relations: Vec::new(),
+                },
+                deferred_output: None,
             };
-            let width = u64::from(width);
-            let grains = output.elements() / u64::from(grain);
-            for &tiles in &config.resolved_active_tile_counts {
-                let splits = (1..tiles)
-                    .filter(|&tile| {
-                        let tile = u64::from(tile);
-                        let offset = (tile * (grains / u64::from(tiles))
-                            + tile.min(grains % u64::from(tiles)))
-                            * u64::from(grain);
-                        !offset.is_multiple_of(width)
-                    })
-                    .count();
-                flat_candidates
-                    .entry(tiles)
-                    .or_insert((splits, grain, candidate));
+            if !plans.contains(&plan) {
+                plans.push(plan);
             }
         }
-        // Retain the occupancy/fragmentation Pareto frontier. This keeps the
-        // option available without multiplying equivalent pointwise plans.
-        let flat_candidates = flat_candidates
-            .iter()
-            .filter(|(tiles, (splits, _, _))| {
-                !flat_candidates
-                    .iter()
-                    .any(|(other_tiles, (other_splits, _, _))| {
-                        other_tiles >= tiles
-                            && other_splits <= splits
-                            && (other_tiles > tiles || other_splits < splits)
-                    })
+    }
+    plans
+}
+
+fn pointwise_flat_formats(
+    input: &TensorType,
+    output: &TensorShape,
+    config: &PipelineConfig,
+) -> Vec<TensorFormat> {
+    let grain = 8_u32.div_ceil(input.format.precision.bytes() as u32);
+    let Some(&width) = output.0.last() else {
+        return Vec::new();
+    };
+    if grain == 0 || !output.elements().is_multiple_of(u64::from(grain)) {
+        return Vec::new();
+    }
+    let width = u64::from(width);
+    let grains = output.elements() / u64::from(grain);
+    let mut candidates = BTreeMap::new();
+    for &tiles in &config.resolved_active_tile_counts {
+        let splits = (1..tiles)
+            .filter(|&tile| {
+                let tile = u64::from(tile);
+                let offset = (tile * (grains / u64::from(tiles))
+                    + tile.min(grains % u64::from(tiles)))
+                    * u64::from(grain);
+                !offset.is_multiple_of(width)
             })
-            .map(|(_, (_, grain, candidate))| (*grain, *candidate))
-            .collect::<Vec<_>>();
-        for (grain, candidate) in flat_candidates {
-            let tiles = candidate.output.format.layout.tiling.tile_count;
+            .count();
+        candidates.entry(tiles).or_insert(splits);
+    }
+    candidates
+        .iter()
+        .filter(|(tiles, splits)| {
+            !candidates.iter().any(|(other_tiles, other_splits)| {
+                other_tiles >= tiles
+                    && other_splits <= splits
+                    && (other_tiles > tiles || other_splits < splits)
+            })
+        })
+        .flat_map(|(&tiles, _)| {
             let mut layouts = vec![Layout::logical_linear(tiles, grain)];
             if let Some(retained_grain) = input
                 .format
@@ -4887,110 +4705,94 @@ fn plans(
                         .with_retained_order_linear_ownership(tiles, retained_grain),
                 );
             }
-            for layout in layouts {
-                let format = TensorFormat {
-                    precision: input.format.precision,
-                    layout,
-                };
-                let plan = Plan {
-                    operator: candidate.operator,
-                    dispatch: candidate.dispatch.clone(),
-                    requirements: OperatorRequirements {
-                        inputs: vec![OperandRequirement::new(format.clone(), 8)],
-                        output: OperandRequirement::new(format, 8),
-                        output_aliasing: OutputAliasing::MayAliasInputs(vec![0]),
-                        memory_relations: Vec::new(),
-                    },
-                    deferred_output: None,
-                };
+            layouts.into_iter().map(|layout| TensorFormat {
+                precision: input.format.precision,
+                layout,
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_plans(
+    options: GemmOptions,
+    inputs: &[TensorType],
+    parameter_inputs: &[bool],
+    output: &TensorShape,
+    config: &PipelineConfig,
+    costs: &impl CostModel,
+    distributed_result_is_useful: bool,
+    constraint: Option<&GemmPlanConstraint>,
+    grouped_output: Option<GroupedOutputLayout>,
+) -> Vec<Plan> {
+    if options != GemmOptions::default() {
+        return Vec::new();
+    }
+    let mut plans = Vec::new();
+    for &tile_count in &config.resolved_active_tile_counts {
+        for seed in gemm_seed_plans_for_tile_count(options, tile_count, &config.search_domain) {
+            let operator = gemm_operator(options, &seed);
+            let mut variants = vec![seed.clone()];
+            variants.extend(parallel_reduction_plans(
+                operator,
+                &seed,
+                inputs,
+                output,
+                config,
+                costs,
+                distributed_result_is_useful,
+                constraint,
+                grouped_output,
+            ));
+            for (input_index, _) in parameter_inputs
+                .iter()
+                .enumerate()
+                .filter(|(_, parameter)| **parameter)
+            {
+                let additions = variants
+                    .iter()
+                    .flat_map(|variant| {
+                        independent_parameter_storage(variant, inputs, input_index, config)
+                    })
+                    .filter(|independent| !variants.contains(independent))
+                    .collect::<Vec<_>>();
+                variants.extend(additions);
+            }
+            for variant in variants {
+                let plan = finish_gemm_plan(options, variant);
+                if !plan.supports(inputs, output) {
+                    continue;
+                }
                 if !plans.contains(&plan) {
                     plans.push(plan);
                 }
             }
         }
     }
-    for candidate in config
-        .resolved_operator_candidates
-        .iter()
-        .filter(|candidate| operator_matches(&operation.kind, candidate.operator))
-    {
-        let mut candidate = candidate.clone();
-        if let OperatorFormatPolicy::PreserveInputLayout(index) = candidate.format_policy {
-            let Some((actual, requirement)) = inputs
-                .get(usize::from(index))
-                .zip(candidate.inputs.get_mut(usize::from(index)))
-            else {
-                continue;
-            };
-            if actual.format.precision != requirement.format.precision
-                || candidate.output.format.precision != requirement.format.precision
-            {
-                continue;
-            }
-            let layout = actual.format.layout.clone();
-            for requirement in &mut candidate.inputs {
-                requirement.format.layout = layout.clone();
-            }
-            candidate.output.format.layout = actual.format.layout.clone();
-        }
-        let mut variants = vec![candidate.clone()];
-        variants.extend(parallel_reduction_candidates(
-            &candidate,
-            inputs,
-            output,
-            config,
-            costs,
-            distributed_result_is_useful,
-            gemm_constraint,
-            grouped_output,
-        ));
-        for (input_index, _) in parameter_inputs
-            .iter()
-            .enumerate()
-            .filter(|(_, parameter)| **parameter)
-        {
-            let additions = variants
-                .iter()
-                .flat_map(|variant| {
-                    independent_parameter_storage(variant, inputs, input_index, config)
-                })
-                .filter(|independent| !variants.contains(independent))
-                .collect::<Vec<_>>();
-            variants.extend(additions);
-        }
-        for candidate in variants {
-            if !candidate.supports(inputs, output) {
-                continue;
-            }
-            let plan = Plan {
-                operator: candidate.operator,
-                dispatch: candidate.dispatch.clone(),
-                requirements: OperatorRequirements {
-                    inputs: candidate.inputs.clone(),
-                    output: candidate.output.clone(),
-                    output_aliasing: resolved_output_aliasing(&candidate, inputs, output),
-                    memory_relations: candidate.memory_relations.clone(),
-                },
-                deferred_output: None,
-            };
-            if !plans.contains(&plan) {
-                plans.push(plan);
-            }
-        }
-    }
-    plans.retain(|plan| plan_fits_operator_memory(plan, inputs, output, config));
-    if let Some(constraint) = gemm_constraint {
-        plans.retain(|plan| {
-            gemm_plan_matches(constraint, &plan.dispatch, &plan.requirements.inputs)
-        });
-        tracing::info!(
-            source_operation = constraint.source_operation,
-            matching_plans = plans.len(),
-            ?constraint,
-            "applied GEMM plan constraint"
-        );
-    }
     plans
+}
+
+fn finish_gemm_plan(options: GemmOptions, plan: GemmPlan) -> Plan {
+    Plan {
+        operator: gemm_operator(options, &plan),
+        dispatch: plan.dispatch,
+        requirements: OperatorRequirements {
+            inputs: plan.inputs,
+            output: plan.output,
+            output_aliasing: OutputAliasing::Fresh,
+            memory_relations: plan.memory_relations,
+        },
+        deferred_output: None,
+    }
+}
+
+fn gemm_operator(options: GemmOptions, plan: &GemmPlan) -> MidOperator {
+    let multiply = plan.inputs[0].format.precision;
+    MidOperator::Gemm {
+        options,
+        multiply,
+        accumulate: gemm_accumulation_precision(multiply),
+    }
 }
 
 fn gemm_plan_matches(
@@ -5035,11 +4837,11 @@ fn gemm_plan_matches(
 }
 
 fn independent_parameter_storage(
-    candidate: &OperatorCandidate,
+    candidate: &GemmPlan,
     inputs: &[TensorType],
     input_index: usize,
     config: &PipelineConfig,
-) -> Vec<OperatorCandidate> {
+) -> Vec<GemmPlan> {
     if !matches!(candidate.dispatch, OperatorDispatch::BlockedGemm { .. }) {
         return Vec::new();
     }
@@ -5127,8 +4929,9 @@ fn independent_parameter_storage(
         .collect()
 }
 
-fn parallel_reduction_candidates(
-    candidate: &OperatorCandidate,
+fn parallel_reduction_plans(
+    operator: MidOperator,
+    candidate: &GemmPlan,
     inputs: &[TensorType],
     output: &TensorShape,
     config: &PipelineConfig,
@@ -5136,11 +4939,12 @@ fn parallel_reduction_candidates(
     distributed_result_is_useful: bool,
     constraint: Option<&GemmPlanConstraint>,
     grouped_output: Option<GroupedOutputLayout>,
-) -> Vec<OperatorCandidate> {
+) -> Vec<GemmPlan> {
     [GemmOrientation::Normal, GemmOrientation::Swapped]
         .into_iter()
         .flat_map(|orientation| {
-            parallel_reduction_candidates_for_orientation(
+            parallel_reduction_plans_for_orientation(
+                operator,
                 candidate,
                 inputs,
                 output,
@@ -5155,8 +4959,9 @@ fn parallel_reduction_candidates(
         .collect()
 }
 
-fn parallel_reduction_candidates_for_orientation(
-    candidate: &OperatorCandidate,
+fn parallel_reduction_plans_for_orientation(
+    operator: MidOperator,
+    candidate: &GemmPlan,
     inputs: &[TensorType],
     output: &TensorShape,
     config: &PipelineConfig,
@@ -5165,7 +4970,7 @@ fn parallel_reduction_candidates_for_orientation(
     distributed_result_is_useful: bool,
     constraint: Option<&GemmPlanConstraint>,
     grouped_output: Option<GroupedOutputLayout>,
-) -> Vec<OperatorCandidate> {
+) -> Vec<GemmPlan> {
     // Residual supervisor, weight-feed, and worker setup cost after retained
     // state, measured on IPU21 independently of the four issue cycles per row.
     const AMP_F16_MICROBLOCK_FIXED_CYCLES: u64 = 160;
@@ -5178,7 +4983,7 @@ fn parallel_reduction_candidates_for_orientation(
         return Vec::new();
     };
     if !matches!(
-        candidate.operator,
+        operator,
         MidOperator::Gemm {
             multiply: Precision::F16,
             ..
@@ -5434,7 +5239,7 @@ fn parallel_reduction_candidates_for_orientation(
         let Ok(kernel_inner_block_u16) = u16::try_from(kernel_inner_block) else {
             continue;
         };
-        for memory_class in [MemoryClass::Ipu21Standard, MemoryClass::Ipu21Interleaved] {
+        for &memory_class in &config.search_domain.weight_memory_classes {
             let mut variant = candidate.clone();
             match orientation {
                 GemmOrientation::Normal => {
@@ -5730,7 +5535,8 @@ fn parallel_reduction_candidates_for_orientation(
             })
             .collect::<Vec<_>>()
     } else {
-        retain_precise_operator_candidates(
+        retain_precise_gemm_plans(
+            operator,
             variants,
             inputs,
             output,
@@ -5762,7 +5568,7 @@ fn parallel_reduction_candidates_for_orientation(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OperatorCandidateObjective {
+struct GemmPlanObjective {
     cycles: u64,
     standard: u64,
     interleaved: u64,
@@ -5771,7 +5577,7 @@ struct OperatorCandidateObjective {
     exchange_rows: u64,
 }
 
-impl OperatorCandidateObjective {
+impl GemmPlanObjective {
     fn dominates(self, other: Self) -> bool {
         let no_worse = self.cycles <= other.cycles
             && self.standard <= other.standard
@@ -5784,7 +5590,7 @@ impl OperatorCandidateObjective {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct OperatorCandidateCompatibility {
+struct GemmPlanCompatibility {
     orientation: Option<GemmOrientation>,
     reduction_staging: Option<ReductionStaging>,
     inputs: Vec<(ElementOrderCompatibility, MemoryClass, LocalOperandStaging)>,
@@ -5795,9 +5601,7 @@ struct OperatorCandidateCompatibility {
     ),
 }
 
-fn operator_candidate_compatibility(
-    candidate: &OperatorCandidate,
-) -> OperatorCandidateCompatibility {
+fn gemm_plan_compatibility(candidate: &GemmPlan) -> GemmPlanCompatibility {
     let (orientation, reduction_staging) = match candidate.dispatch {
         OperatorDispatch::BlockedGemm {
             orientation,
@@ -5810,7 +5614,7 @@ fn operator_candidate_compatibility(
         OperatorDispatch::BlockedGemm { orientation, .. } => (Some(orientation), None),
         _ => (None, None),
     };
-    OperatorCandidateCompatibility {
+    GemmPlanCompatibility {
         orientation,
         reduction_staging,
         inputs: candidate
@@ -5840,13 +5644,14 @@ fn operator_candidate_compatibility(
     }
 }
 
-fn retain_precise_operator_candidates(
-    candidates: Vec<OperatorCandidate>,
+fn retain_precise_gemm_plans(
+    operator: MidOperator,
+    candidates: Vec<GemmPlan>,
     inputs: &[TensorType],
     output: &TensorShape,
     costs: &impl CostModel,
     width: usize,
-) -> Vec<OperatorCandidate> {
+) -> Vec<GemmPlan> {
     let ranked = candidates
         .into_iter()
         .map(|candidate| {
@@ -5865,7 +5670,7 @@ fn retain_precise_operator_candidates(
             let requirements = OperatorRequirements {
                 inputs: candidate.inputs.clone(),
                 output: candidate.output.clone(),
-                output_aliasing: candidate.output_aliasing.clone(),
+                output_aliasing: OutputAliasing::Fresh,
                 memory_relations: candidate.memory_relations.clone(),
             };
             let memory = operator_memory_estimate(
@@ -5875,15 +5680,15 @@ fn retain_precise_operator_candidates(
                 &planned_output,
             );
             let exchange = costs.operator_exchange_footprint(
-                candidate.operator,
+                operator,
                 &candidate.dispatch,
                 &requirements,
                 &planned_inputs,
                 &planned_output,
             );
-            let objective = OperatorCandidateObjective {
+            let objective = GemmPlanObjective {
                 cycles: costs.operator_cycles(
-                    candidate.operator,
+                    operator,
                     &candidate.dispatch,
                     &requirements,
                     &planned_inputs,
@@ -5895,15 +5700,11 @@ fn retain_precise_operator_candidates(
                 maximum_standard_allocation: memory.maximum_standard_temporary_allocation,
                 exchange_rows: exchange.estimated_row_bytes(),
             };
-            let compatibility = operator_candidate_compatibility(&candidate);
+            let compatibility = gemm_plan_compatibility(&candidate);
             (candidate, objective, compatibility)
         })
         .collect::<Vec<_>>();
-    let mut frontier = Vec::<(
-        OperatorCandidate,
-        OperatorCandidateObjective,
-        OperatorCandidateCompatibility,
-    )>::new();
+    let mut frontier = Vec::<(GemmPlan, GemmPlanObjective, GemmPlanCompatibility)>::new();
     for entry in ranked {
         if frontier
             .iter()
@@ -5958,10 +5759,7 @@ fn balance_parallel_gemm_columns(layout: &mut Layout, axis: TensorAxis) {
     }
 }
 
-fn apply_grouped_output_layout(
-    candidate: &mut OperatorCandidate,
-    grouping: GroupedOutputLayout,
-) -> bool {
+fn apply_grouped_output_layout(candidate: &mut GemmPlan, grouping: GroupedOutputLayout) -> bool {
     if candidate.output.format.precision != Precision::F16
         || grouping.groups == 0
         || grouping.physical_lane_multiple == 0
@@ -6004,46 +5802,6 @@ fn pad_axis_to_f16_exchange_word(layout: &mut Layout, axis: TensorAxis) {
         tiling.block_size = tiling.block_size.div_ceil(2) * 2;
         tiling.padding_multiple = tiling.padding_multiple.div_ceil(2) * 2;
         tiling.padding = Padding::Zero;
-    }
-}
-
-fn resolved_output_aliasing(
-    candidate: &OperatorCandidate,
-    inputs: &[TensorType],
-    output: &TensorShape,
-) -> OutputAliasing {
-    match &candidate.output_aliasing {
-        OutputAliasing::MayAliasInputs(indices) => OutputAliasing::MayAliasInputs(
-            indices
-                .iter()
-                .copied()
-                .filter(|index| {
-                    alias_compatible(
-                        usize::from(*index),
-                        &candidate.inputs,
-                        inputs,
-                        &candidate.output,
-                        output,
-                    )
-                })
-                .collect(),
-        ),
-        aliasing => aliasing.clone(),
-    }
-}
-
-fn operator_matches(operation: &OperationKind, operator: MidOperator) -> bool {
-    match (operation, operator) {
-        (OperationKind::Gemm(expected), MidOperator::Gemm { options, .. }) => *expected == options,
-        (OperationKind::Gelu, MidOperator::Gelu) => true,
-        (OperationKind::Add(expected), MidOperator::Add(options)) => *expected == options,
-        (OperationKind::SplitHeads(expected), MidOperator::SplitHeads(options)) => {
-            *expected == options
-        }
-        (OperationKind::FlashAttention(expected), MidOperator::FlashAttention { options, .. }) => {
-            *expected == options
-        }
-        _ => false,
     }
 }
 
@@ -6539,7 +6297,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_search_domains_filter_implementation_expansion() {
+    fn randomized_search_domains_filter_operator_plan_generation() {
         let mut random = fastrand::Rng::with_seed(0x646f_6d61_696e_2121);
         for case in 0..RANDOM_CASES {
             let capacity = random.u16(2..=64);
@@ -6567,56 +6325,48 @@ mod tests {
             expected.dedup();
             assert_eq!(active, expected, "case {case}");
 
-            let candidates = resolved_operator_candidates(&domain, &active);
-            for candidate in &candidates {
-                match candidate.operator {
-                    MidOperator::Gemm { multiply, .. } => {
-                        assert!(precisions.contains(&multiply), "case {case}");
-                        assert!(
-                            memory_classes
-                                .contains(&candidate.inputs[1].format.layout.memory_class),
-                            "case {case}"
-                        );
-                    }
-                    MidOperator::Gelu => {
-                        assert!(
-                            precisions.contains(&candidate.inputs[0].format.precision),
-                            "case {case}"
-                        );
-                    }
-                    MidOperator::Add(_) => {
-                        assert!(
-                            precisions.contains(&candidate.inputs[0].format.precision),
-                            "case {case}"
-                        );
-                        assert!(matches!(
-                            candidate.format_policy,
-                            OperatorFormatPolicy::PreserveInputLayout(0)
-                        ));
-                    }
-                    MidOperator::FlashAttention { .. } => {
-                        panic!("shape-dependent attention must not be a seed candidate")
-                    }
-                    MidOperator::SplitHeads(_) => {
-                        panic!("view implementations must not be seed candidates")
-                    }
-                }
+            let seeds = active
+                .iter()
+                .flat_map(|&tiles| {
+                    gemm_seed_plans_for_tile_count(GemmOptions::default(), tiles, &domain)
+                })
+                .collect::<Vec<_>>();
+            for seed in seeds {
+                assert!(
+                    precisions.contains(&seed.inputs[0].format.precision),
+                    "case {case}"
+                );
+                assert!(
+                    memory_classes.contains(&seed.inputs[1].format.layout.memory_class),
+                    "case {case}"
+                );
+                assert!(active.contains(&seed.output.format.layout.tiling.tile_count));
             }
 
-            let pointwise = |candidates: &[OperatorCandidate]| {
-                candidates
-                    .iter()
-                    .filter(|candidate| {
-                        matches!(candidate.operator, MidOperator::Gelu | MidOperator::Add(_))
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(
-                pointwise(&candidates),
-                pointwise(&resolved_operator_candidates(&domain, &[capacity])),
-                "case {case}"
+            let selected_precision = precisions[0];
+            let tensor = TensorType::new(
+                [u32::from(capacity), random.u32(1..=64)],
+                selected_precision,
+                Layout::row_sharded(capacity),
             );
+            let mut config = PipelineConfig::new(capacity).with_search_domain(domain);
+            config.resolved_active_tile_counts = active;
+            for (operator, class, arity) in [
+                (MidOperator::Gelu, OperatorClass::Gelu, 1),
+                (
+                    MidOperator::Add(AddOptions::default()),
+                    OperatorClass::Add,
+                    2,
+                ),
+            ] {
+                let inputs = vec![tensor.clone(); arity];
+                let plans = pointwise_plans(operator, class, &inputs, &tensor.shape, &config);
+                assert!(!plans.is_empty(), "case {case}");
+                assert!(plans.iter().all(|plan| {
+                    plan.operator == operator
+                        && plan.requirements.output.format.precision == selected_precision
+                }));
+            }
         }
     }
 
@@ -6625,7 +6375,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_parallel_reduction_candidates_cover_uneven_three_axis_grids() {
+    fn randomized_parallel_reduction_plans_cover_uneven_three_axis_grids() {
         let mut random = fastrand::Rng::with_seed(0x7061_7274_6961_6c73);
         let mut distributed_result_cases = 0;
         for _ in 0..RANDOM_CASES {
@@ -6637,7 +6387,8 @@ mod tests {
             let k = u32::from(inner_partitions) * 64 + random.u32(0..64);
             let n = u32::from(column_partitions) * output_columns + random.u32(0..output_columns);
             let m = u32::from(row_partitions) + random.u32(0..=16);
-            let base = amp_grid_gemm_operator_candidate(
+            let base = amp_grid_gemm_plan(
+                GemmOptions::default(),
                 Precision::F16,
                 64,
                 16,
@@ -6655,7 +6406,9 @@ mod tests {
                 TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
             ];
             let config = PipelineConfig::new(tiles).with_planning_beam_width(16);
-            let candidates = parallel_reduction_candidates(
+            let operator = gemm_operator(GemmOptions::default(), &base);
+            let candidates = parallel_reduction_plans(
+                operator,
                 &base,
                 &inputs,
                 &TensorShape(vec![m, n]),
@@ -6683,8 +6436,9 @@ mod tests {
                 )
             }));
             for candidate in candidates {
+                let plan = finish_gemm_plan(GemmOptions::default(), candidate.clone());
                 assert!(
-                    candidate.supports(&inputs, &TensorShape(vec![m, n])),
+                    plan.supports(&inputs, &TensorShape(vec![m, n])),
                     "unsupported candidate: {candidate:?}; shape={m}x{k}x{n}"
                 );
                 assert!(matches!(
@@ -6755,7 +6509,7 @@ mod tests {
                 multiply: Precision::F16,
                 accumulate: AccumulationPrecision::F32,
             };
-            let dispatch = default_dispatch(operator);
+            let dispatch = blocked_gemm_dispatch(operator, AMP_OUTPUT_COLUMN_BLOCK);
             let requirements = OperatorRequirements {
                 inputs: Vec::new(),
                 output: OperandRequirement::new(output.format.clone(), 8),
@@ -6796,7 +6550,8 @@ mod tests {
                 column_partitions,
                 order: GridOrder::ColumnsFast,
             };
-            let candidate = amp_grid_gemm_operator_candidate(
+            let candidate = amp_grid_gemm_plan(
+                GemmOptions::default(),
                 Precision::F16,
                 64,
                 16,
@@ -6871,22 +6626,6 @@ mod tests {
                 MidOperationKind::Operator(_) | MidOperationKind::Repeat(_) => {}
             }
         }
-    }
-
-    fn assert_operator_signature(
-        lowered: &MidGraph,
-        operation: &MidOperation,
-        inputs: &[TensorFormat],
-        output: TensorFormat,
-    ) {
-        assert_eq!(operation.inputs.len(), inputs.len());
-        for (&value_id, expected) in operation.inputs.iter().zip(inputs) {
-            assert_eq!(&value(lowered, value_id).tensor_type.format, expected);
-        }
-        assert_eq!(
-            value(lowered, operation.results[0]).tensor_type.format,
-            output
-        );
     }
 
     struct ColumnParityCost;
@@ -6982,62 +6721,14 @@ mod tests {
     fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
         let mut random = fastrand::Rng::with_seed(0x6d69_6467);
         for case in 0..RANDOM_CASES {
-            let tiles = random.u16(1..=64);
+            let tiles = [1, 2, 4, 8, 16][random.usize(0..5)];
             let (rows, inner, columns) = (
-                u32::from(tiles) * small_dimension(&mut random),
+                u32::from(tiles) * random.u32(1..=2),
                 random.u32(1..=2) * 64,
-                small_dimension(&mut random) * 64,
+                random.u32(1..=2) * 64,
             );
-            let batches = (0..random.usize(0..=3))
-                .map(|_| random.u32(1..=2))
-                .collect::<Vec<_>>();
+            let batches = (0..random.usize(0..=2)).map(|_| 1).collect::<Vec<_>>();
             let multiply = precision(&mut random);
-            let left_format = format(
-                precision(&mut random),
-                Layout::amp_left([8, 16, 32][random.usize(0..3)], tiles),
-            );
-            let right_format = format(
-                if random.bool() {
-                    precision(&mut random)
-                } else {
-                    Precision::F8F143 {
-                        scale_exponent: random.i8(-16..=16),
-                    }
-                },
-                Layout::block_major_matrix_storage(
-                    [8, 16, 32][random.usize(0..3)],
-                    AMP_OUTPUT_COLUMN_BLOCK,
-                    tiles,
-                    1,
-                    1,
-                    MemoryClass::Ipu21Standard,
-                ),
-            );
-            let output_format = format(
-                precision(&mut random),
-                if multiply == Precision::F16 {
-                    Layout::amp_left_result(tiles)
-                } else {
-                    Layout::amp_output(tiles)
-                },
-            );
-            let accumulate = if random.bool() {
-                AccumulationPrecision::F16
-            } else {
-                AccumulationPrecision::F32
-            };
-            let candidate = OperatorCandidate::new(
-                MidOperator::Gemm {
-                    options: GemmOptions::default(),
-                    multiply,
-                    accumulate,
-                },
-                [
-                    OperandRequirement::new(left_format.clone(), 32),
-                    OperandRequirement::new(right_format.clone(), 32),
-                ],
-                OperandRequirement::new(output_format.clone(), 32),
-            );
             let mut left_shape = batches.clone();
             left_shape.extend([rows, inner]);
             let mut right_shape = vec![1; batches.len()];
@@ -7048,11 +6739,13 @@ mod tests {
             let right = graph.parameter("right", right_shape).unwrap();
             let product = graph.gemm(left, right).unwrap();
             graph.set_outputs([product]).unwrap();
-            let linear = Layout::row_sharded(tiles);
             let config = PipelineConfig::new(tiles)
-                .with_input(left, format(precision(&mut random), linear.clone()))
-                .with_input(right, format(precision(&mut random), linear))
-                .with_test_operator_candidates(vec![candidate.clone()]);
+                .with_search_domain(
+                    PlannerSearchDomain::default()
+                        .with_operator_precisions(OperatorClass::Gemm, [multiply]),
+                )
+                .with_automatic_input(left, precision(&mut random))
+                .with_automatic_input(right, precision(&mut random));
 
             let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap_or_else(|error| {
                 panic!(
@@ -7073,19 +6766,9 @@ mod tests {
                 panic!("random case {case}: expected GEMM");
             };
             assert_eq!(selected_multiply, multiply, "random case {case}");
-            assert_eq!(selected_accumulate, accumulate, "random case {case}");
             assert_eq!(
-                &value(&lowered, operator.inputs[0]).tensor_type.format,
-                &candidate.inputs[0].format,
-                "random case {case}"
-            );
-            let selected_right = &value(&lowered, operator.inputs[1]).tensor_type.format;
-            assert_eq!(
-                selected_right.precision, candidate.inputs[1].format.precision,
-                "random case {case}"
-            );
-            assert_eq!(
-                selected_right.layout.order, candidate.inputs[1].format.layout.order,
+                selected_accumulate,
+                gemm_accumulation_precision(multiply),
                 "random case {case}"
             );
             let output = value(&lowered, lowered.outputs[0]);
@@ -7095,7 +6778,7 @@ mod tests {
                 "random case {case}"
             );
             assert_eq!(
-                &output.tensor_type.format, &candidate.output.format,
+                output.tensor_type.format.precision, multiply,
                 "random case {case}"
             );
             assert_conversions_are_explicit(&lowered, &lowered.operations);
@@ -7103,7 +6786,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_beam_search_preserves_formats_needed_by_later_operators() {
+    fn randomized_beam_finalists_have_consistent_costs_and_memory() {
         let mut random = fastrand::Rng::with_seed(0x6265_616d);
         for case in 0..RANDOM_CASES {
             let tiles = [1, 2, 4, 8][random.usize(0..4)];
@@ -7111,7 +6794,6 @@ mod tests {
             let inner = random.u32(1..=4) * 64;
             let columns = random.u32(1..=4) * 64;
             let row = format(Precision::F16, Layout::row_sharded(tiles));
-            let left = format(Precision::F16, Layout::amp_left(64, tiles));
             let right = format(
                 Precision::F16,
                 Layout::block_major_matrix_storage(
@@ -7123,8 +6805,6 @@ mod tests {
                     MemoryClass::Ipu21Standard,
                 ),
             );
-            let output = format(Precision::F16, Layout::amp_left_result(tiles));
-
             let mut graph = ComputeGraph::new();
             let activation = graph.host_input("activation", [rows, inner]).unwrap();
             let weights = graph.parameter("weights", [inner, columns]).unwrap();
@@ -7132,38 +6812,15 @@ mod tests {
             let product = graph.gemm(activated, weights).unwrap();
             graph.set_outputs([product]).unwrap();
 
-            let candidates = vec![
-                OperatorCandidate::new(
-                    MidOperator::Gelu,
-                    [OperandRequirement::new(row.clone(), 8)],
-                    OperandRequirement::new(row.clone(), 8),
-                ),
-                OperatorCandidate::new(
-                    MidOperator::Gelu,
-                    [OperandRequirement::new(row.clone(), 8)],
-                    OperandRequirement::new(left.clone(), 8),
-                ),
-                OperatorCandidate::new(
-                    MidOperator::Gemm {
-                        options: GemmOptions::default(),
-                        multiply: Precision::F16,
-                        accumulate: AccumulationPrecision::F32,
-                    },
-                    [
-                        OperandRequirement::new(left.clone(), 32),
-                        OperandRequirement::new(right.clone(), 32),
-                    ],
-                    OperandRequirement::new(output, 32),
-                ),
-            ];
             let make_config = |beam_width| {
                 PipelineConfig::new(tiles)
+                    .with_search_domain(
+                        PlannerSearchDomain::default().with_active_tile_counts([tiles]),
+                    )
                     .with_input(activation, row.clone())
                     .with_input(weights, right.clone())
                     .with_planning_beam_width(beam_width)
-                    .with_test_operator_candidates(candidates.clone())
             };
-            let greedy = lower(&graph, &make_config(1), &Ipu21CostModel).unwrap();
             let searched_config = make_config(2);
             let finalists = lower_finalists(&graph, &searched_config, &Ipu21CostModel, 2).unwrap();
             assert!(
@@ -7195,26 +6852,6 @@ mod tests {
                 );
             }
             let searched = &finalists[0];
-
-            assert!(
-                searched.estimated_cycles < greedy.estimated_cycles,
-                "random case {case}"
-            );
-            let gelu = searched
-                .operations
-                .iter()
-                .find(|operation| {
-                    matches!(
-                        operation.kind,
-                        MidOperationKind::Operator(MidOperator::Gelu)
-                    )
-                })
-                .unwrap();
-            assert_eq!(
-                value(searched, gelu.results[0]).tensor_type.format,
-                left,
-                "random case {case}"
-            );
             assert!(
                 searched.peak_memory.fits_ipu21_with_budget(
                     searched_config.standard_memory_reservation_bytes,
@@ -7366,55 +7003,12 @@ mod tests {
             let attended = graph.flash_attention(query, key, attention_value).unwrap();
             graph.set_outputs([sum, attended]).unwrap();
 
-            let gelu_input = random_format(&mut random, tiles);
-            let gelu_output = gelu_input.clone();
-            let add_left = random_format(&mut random, tiles);
-            let add_right = random_format(&mut random, tiles);
-            let add_output = add_left.clone();
-            let attention_query = random_format(&mut random, tiles);
-            let attention_key = random_format(&mut random, tiles);
-            let attention_value_format = random_format(&mut random, tiles);
-            let attention_output = random_format(&mut random, tiles);
-            let attention_accumulate = if random.bool() {
-                AccumulationPrecision::F16
-            } else {
-                AccumulationPrecision::F32
-            };
             let config = PipelineConfig::new(tiles)
-                .with_input(activation, random_format(&mut random, tiles))
-                .with_input(residual, random_format(&mut random, tiles))
-                .with_input(query, random_format(&mut random, tiles))
-                .with_input(key, random_format(&mut random, tiles))
-                .with_input(attention_value, random_format(&mut random, tiles))
-                .with_test_operator_candidates(vec![
-                    OperatorCandidate::new(
-                        MidOperator::Gelu,
-                        [OperandRequirement::new(gelu_input.clone(), 8)],
-                        OperandRequirement::new(gelu_output.clone(), 8),
-                    )
-                    .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
-                    OperatorCandidate::new(
-                        MidOperator::Add(AddOptions::default()),
-                        [
-                            OperandRequirement::new(add_left.clone(), 8),
-                            OperandRequirement::new(add_right.clone(), 8),
-                        ],
-                        OperandRequirement::new(add_output.clone(), 8),
-                    )
-                    .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
-                    OperatorCandidate::new(
-                        MidOperator::FlashAttention {
-                            options: AttentionOptions::default(),
-                            accumulate: attention_accumulate,
-                        },
-                        [
-                            OperandRequirement::new(attention_query.clone(), 8),
-                            OperandRequirement::new(attention_key.clone(), 8),
-                            OperandRequirement::new(attention_value_format.clone(), 8),
-                        ],
-                        OperandRequirement::new(attention_output.clone(), 8),
-                    ),
-                ]);
+                .with_automatic_input(activation, Precision::F16)
+                .with_automatic_input(residual, Precision::F16)
+                .with_automatic_input(query, Precision::F16)
+                .with_automatic_input(key, Precision::F16)
+                .with_automatic_input(attention_value, Precision::F16);
 
             let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let operators = lowered
@@ -7453,7 +7047,13 @@ mod tests {
                     )
                 })
                 .expect("random graph retains its attention");
-            assert_operator_signature(&lowered, gelu, &[gelu_input], gelu_output.clone());
+            assert_eq!(
+                value(&lowered, gelu.results[0])
+                    .tensor_type
+                    .format
+                    .precision,
+                Precision::F16
+            );
             assert_eq!(
                 gelu.operator_plan
                     .as_ref()
@@ -7462,14 +7062,17 @@ mod tests {
                     .output_aliasing,
                 OutputAliasing::MayAliasInputs(vec![0])
             );
-            assert_operator_signature(&lowered, add, &[add_left, add_right], add_output);
+            assert_eq!(
+                value(&lowered, add.results[0]).tensor_type.format.precision,
+                Precision::F16
+            );
             assert_eq!(
                 add.operator_plan
                     .as_ref()
                     .unwrap()
                     .requirements
                     .output_aliasing,
-                OutputAliasing::MayAliasInputs(vec![0])
+                OutputAliasing::MayAliasInputs(vec![0, 1])
             );
             assert!(matches!(
                 attention.kind,

@@ -58,18 +58,20 @@ Physical element order remains a separate concern: `ResolvedLayout` describes
 which physical tensor elements each tile owns, while `storage` maps a resolved
 view to byte spans for row-major, block-major, and AMP encodings.
 
-### Separate implementation families from the search domain
+### Make plan generation operator-directed
 
-The operator-candidate list currently combines kernel availability, precision,
-active tile counts, layouts, GEMM grids, memory classes, and staging policy.
-`plans()` then adds separate shape-dependent SplitHeads, attention, pointwise,
-GEMM, and parameter-storage variants.
+Each semantic `OperationKind` should invoke its own typed plan generator. GEMM
+generation owns GEMM grids, blocking, parameter placement, and reduction
+staging; pointwise generation propagates compatible input layouts and offers
+useful ownership transitions; attention generation owns its materialized and
+blocked algorithms. A flat cross-operator implementation catalogue obscures
+these dependencies and still requires a second dispatch layer.
 
-Replace this with a small internal implementation catalogue and an explicit
-search domain. Active tile counts, allowed precisions, memory classes, and
-diagnostic restrictions should be planner inputs, not duplicated seed
-candidates. Layout-transparent pointwise implementations should be described
-once rather than once per tile count.
+The generators share an explicit search domain for genuinely global choices:
+active tile counts, permitted precisions, weight memory classes, attention
+strategy, and diagnostic restrictions. These values are planner inputs rather
+than placeholder plans. Shape-dependent layouts and dispatches are emitted
+only by the generator for the corresponding high-level operator.
 
 ### Normalize plan representations
 
@@ -172,7 +174,8 @@ tradeoffs and should be unified rather than removed:
 ## Suggested order
 
 1. Add canonical layout resolution and migrate every layout consumer.
-2. Remove dead configuration and narrow the public planner API.
+2. Factor out the shared search domain and make plan generation
+   operator-directed.
 3. Consolidate candidate and selected-plan representations.
 4. Replace deferred SplitHeads machinery with generic views.
 5. Normalize GEMM plans and their lowering.

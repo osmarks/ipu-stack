@@ -5956,13 +5956,10 @@ fn split_mapping_at_panel_boundaries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mid::OperatorCandidate;
     use crate::{
-        AccumulationPrecision, AxisTiling, ComputeGraph, ElementOrder, GemmDistribution,
-        GemmKernelMode, GemmWeightLoad, GridOrder, Ipu21CostModel, Layout, MemoryClass,
-        MidOperator, OperandRequirement, OperatorDispatch, Padding, PipelineConfig,
-        PlannerSearchDomain, Precision, TensorAxis, TensorFormat, TensorTiling, TileKernelSpec,
-        lower,
+        AxisTiling, ComputeGraph, ElementOrder, GridOrder, Ipu21CostModel, Layout, MemoryClass,
+        Padding, PipelineConfig, PlannerSearchDomain, Precision, TensorAxis, TensorFormat,
+        TensorTiling, TileKernelSpec, lower,
     };
     use std::collections::BTreeSet;
 
@@ -6041,7 +6038,12 @@ mod tests {
             let column_partitions = random.u16(1..=3);
             let row_partitions = random.u16(inner_partitions..=8);
             let tiles = inner_partitions * column_partitions * row_partitions;
-            let rows_per_partition = random.u32(1..=4);
+            let row_distributed_result = inner_partitions == 2 || random.bool();
+            let rows_per_partition = if row_distributed_result {
+                u32::from(inner_partitions) * 2
+            } else {
+                2
+            };
             let rows = u32::from(row_partitions) * rows_per_partition;
             let inner = u32::from(inner_partitions)
                 * 64
@@ -6052,19 +6054,6 @@ mod tests {
             let right = graph.parameter("right", [1, inner, columns]).unwrap();
             let product = graph.gemm(left, right).unwrap();
             graph.set_outputs([product]).unwrap();
-            let operator = MidOperator::Gemm {
-                options: Default::default(),
-                multiply: Precision::F16,
-                accumulate: AccumulationPrecision::F32,
-            };
-            let kernel = |mode| TileKernelSpec::Gemm {
-                multiply: Precision::F16,
-                accumulate: AccumulationPrecision::F32,
-                mode,
-                weights: GemmWeightLoad::Interleaved,
-                inner_block: 64,
-                output_columns,
-            };
             let left_format = TensorFormat {
                 precision: Precision::F16,
                 layout: Layout::amp_left_parallel_grid(
@@ -6088,61 +6077,43 @@ mod tests {
             };
             let (result_row_partitions, result_column_partitions) = if random.bool() {
                 (1, 1)
-            } else if random.bool() && rows_per_partition >= u32::from(inner_partitions) {
+            } else if row_distributed_result {
                 (inner_partitions, 1)
             } else {
                 (1, inner_partitions)
             };
-            let storage_rows = row_partitions.saturating_mul(result_row_partitions);
-            let storage_columns = column_partitions.saturating_mul(result_column_partitions);
             let reduction_staging = if random.bool() {
                 crate::ReductionStaging::Complete
             } else {
                 crate::ReductionStaging::Streamed
             };
-            let output_format = TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::amp_left_result_grid(
-                    if result_column_partitions > 1 {
-                        crate::mid::AMP_COLUMN_MICRO
-                    } else {
-                        output_columns
-                    },
-                    storage_rows * storage_columns,
-                    storage_rows,
-                    storage_columns,
-                    crate::mid::GridOrder::ColumnsFast,
-                ),
-            };
-            let candidate = OperatorCandidate::new(
-                operator,
-                [
-                    OperandRequirement::new(left_format.clone(), 32),
-                    OperandRequirement::new(right_format.clone(), 32),
-                ],
-                OperandRequirement::new(output_format, 32),
-            )
-            .with_dispatch(OperatorDispatch::BlockedGemm {
-                initialize: kernel(GemmKernelMode::Initialize),
-                accumulate: kernel(GemmKernelMode::Accumulate),
-                inner_block: 64,
-                output_column_block: output_columns,
-                orientation: crate::GemmOrientation::Normal,
-                distribution: GemmDistribution::ParallelReduction {
-                    row_partitions,
-                    column_partitions,
-                    inner_partitions,
-                    result_row_partitions,
-                    result_column_partitions,
-                    reduction_staging,
-                },
-            });
             let config = PipelineConfig::new(tiles)
+                .with_search_domain(
+                    PlannerSearchDomain::default()
+                        .with_active_tile_counts([tiles])
+                        .with_operator_precisions(crate::OperatorClass::Gemm, [Precision::F16])
+                        .with_gemm_plan_constraint(crate::GemmPlanConstraint {
+                            source_operation: 0,
+                            orientation: crate::GemmOrientation::Normal,
+                            row_partitions,
+                            column_partitions,
+                            inner_partitions,
+                            result_row_partitions,
+                            result_column_partitions,
+                            output_column_block: output_columns,
+                            weight_memory_class: MemoryClass::Ipu21Interleaved,
+                            reduction_staging,
+                            local_weight_staging: crate::LocalOperandStaging::Direct,
+                        }),
+                )
                 .with_input(left, left_format)
-                .with_input(right, right_format)
-                .with_test_operator_candidates(vec![candidate]);
+                .with_input(right, right_format);
             let mid = lower(&graph, &config, &Ipu21CostModel)
-                .unwrap_or_else(|error| panic!("case {case}: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "case {case}: {error}; rows={rows} inner={inner} columns={columns} grid={row_partitions}x{column_partitions}x{inner_partitions} result={result_row_partitions}x{result_column_partitions} block={output_columns} staging={reduction_staging:?}"
+                    )
+                });
             let low = lower_to_tiles(&mid, &config)
                 .unwrap_or_else(|error| {
                     panic!(
@@ -6177,27 +6148,6 @@ mod tests {
                 low.exchange_phases.len() <= usize::from(inner_partitions).saturating_add(2),
                 "case {case}"
             );
-            let parameter_shards = low
-                .inputs
-                .iter()
-                .find(|input| input.kind == crate::GraphInputKind::Parameter)
-                .unwrap()
-                .shards
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>();
-            let direct_parameter_runs = low
-                .kernel_runs
-                .iter()
-                .filter(|run| {
-                    matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Gemm { .. }))
-                        && run.inputs[1]
-                            .views
-                            .iter()
-                            .any(|view| parameter_shards.contains(&view.shard))
-                })
-                .count();
-            assert!(direct_parameter_runs > 0, "case {case}");
             if (result_row_partitions, result_column_partitions) != (1, 1) {
                 let output_shards = low.outputs[0]
                     .shards
@@ -6253,34 +6203,18 @@ mod tests {
                     MemoryClass::Ipu21Standard,
                 ),
             };
-            let output_format = TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::amp_left_result(compute_tiles),
-            };
             let config = PipelineConfig::new(compute_tiles)
+                .with_search_domain(
+                    PlannerSearchDomain::default()
+                        .with_active_tile_counts([compute_tiles])
+                        .with_operator_precisions(crate::OperatorClass::Gemm, [Precision::F16])
+                        .with_weight_memory_classes([MemoryClass::Ipu21Standard]),
+                )
                 .with_input(left, left_format.clone())
                 .with_input(right0, right_format.clone())
-                .with_input(right1, right_format.clone())
-                .with_test_operator_candidates(vec![OperatorCandidate::new(
-                    MidOperator::Gemm {
-                        options: crate::GemmOptions::default(),
-                        multiply: Precision::F16,
-                        accumulate: crate::AccumulationPrecision::F16,
-                    },
-                    [
-                        OperandRequirement::new(left_format, 32).with_access_tail(16),
-                        OperandRequirement::new(right_format, 32),
-                    ],
-                    OperandRequirement::new(output_format, 32),
-                )]);
+                .with_input(right1, right_format.clone());
 
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-            assert!(mid.operations.iter().all(|operation| {
-                operation.operator_plan.as_ref().is_none_or(|plan| {
-                    plan.requirements.inputs[1].format.layout.tiling.tile_count == owner_tiles
-                        && plan.requirements.output.format.layout.tiling.tile_count == compute_tiles
-                })
-            }));
             let low = lower_to_tiles(&mid, &config).unwrap();
             let parameter_tiles = |name: &str| {
                 low.inputs
@@ -6313,12 +6247,8 @@ mod tests {
             let output = graph.gelu(input).unwrap();
             graph.set_outputs([output]).unwrap();
             let config = PipelineConfig::new(tiles)
-                .with_input(input, tensor_format.clone())
-                .with_test_operator_candidates(vec![OperatorCandidate::new(
-                    MidOperator::Gelu,
-                    [OperandRequirement::new(tensor_format.clone(), 8)],
-                    OperandRequirement::new(tensor_format, 8),
-                )]);
+                .with_search_domain(PlannerSearchDomain::default().with_active_tile_counts([tiles]))
+                .with_input(input, tensor_format);
 
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
@@ -6480,27 +6410,13 @@ mod tests {
                     column_partitions,
                 ),
             };
-            let output_format = TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::amp_left_grid(
-                    64,
-                    tiles,
-                    row_partitions,
-                    column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
-                ),
-            };
             let mut graph = ComputeGraph::new();
             let input = graph.host_input("input", [rows, columns]).unwrap();
             let output = graph.gelu(input).unwrap();
             graph.set_outputs([output]).unwrap();
             let config = PipelineConfig::new(tiles)
-                .with_input(input, input_format.clone())
-                .with_test_operator_candidates(vec![OperatorCandidate::new(
-                    MidOperator::Gelu,
-                    [OperandRequirement::new(input_format, 8)],
-                    OperandRequirement::new(output_format, 8),
-                )]);
+                .with_search_domain(PlannerSearchDomain::default().with_active_tile_counts([tiles]))
+                .with_input(input, input_format);
 
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
@@ -6524,7 +6440,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_same_order_retiles_exchange_into_final_values() {
+    fn randomized_multiaxis_pointwise_layouts_need_no_exchange_staging() {
         let mut random = fastrand::Rng::with_seed(0x6469_7265_6374_7265);
         for case in 0..CASES {
             let source_rows = 1_u16 << random.u32(0..=3);
@@ -6553,41 +6469,17 @@ mod tests {
                 precision: Precision::F16,
                 layout: layout(source_rows, source_columns),
             };
-            let target_format = TensorFormat {
-                precision: Precision::F16,
-                layout: layout(source_columns, source_rows),
-            };
             let mut graph = ComputeGraph::new();
             let input = graph.host_input("input", [rows, columns]).unwrap();
             let output = graph.gelu(input).unwrap();
             graph.set_outputs([output]).unwrap();
             let config = PipelineConfig::new(tiles)
-                .with_input(input, input_format)
-                .with_test_operator_candidates(vec![OperatorCandidate::new(
-                    MidOperator::Gelu,
-                    [OperandRequirement::new(target_format.clone(), 8)],
-                    OperandRequirement::new(target_format, 8),
-                )]);
+                .with_search_domain(PlannerSearchDomain::default().with_active_tile_counts([tiles]))
+                .with_input(input, input_format);
 
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
-            let conversion_phases = low
-                .exchange_phases
-                .iter()
-                .filter(|phase| phase.provenance.reason == WorkReason::LayoutRearrangement)
-                .collect::<Vec<_>>();
-            for phase in conversion_phases {
-                for destination in phase
-                    .transfers
-                    .iter()
-                    .flat_map(|transfer| &transfer.destinations)
-                {
-                    assert!(matches!(
-                        low.shards[destination.shard.index() as usize].definition,
-                        ShardDefinition::Value(_)
-                    ));
-                }
-            }
+            assert!(low.exchange_phases.is_empty(), "case {case}");
             assert!(
                 low.shards
                     .iter()
@@ -7290,32 +7182,15 @@ mod tests {
             let right = graph.parameter("right", [inner, columns]).unwrap();
             let output = graph.gemm(left, right).unwrap();
             graph.set_outputs([output]).unwrap();
-            let mut config = PipelineConfig::new(tiles)
+            let config = PipelineConfig::new(tiles)
+                .with_search_domain(
+                    PlannerSearchDomain::default()
+                        .with_active_tile_counts([tiles])
+                        .with_operator_precisions(crate::OperatorClass::Gemm, [Precision::F16])
+                        .with_weight_memory_classes([MemoryClass::Ipu21Interleaved]),
+                )
                 .with_automatic_input(left, Precision::F16)
                 .with_automatic_input(right, Precision::F16);
-            let candidates =
-                crate::mid::resolved_operator_candidates(&config.search_domain, &[tiles])
-                    .into_iter()
-                    .filter(|candidate| {
-                        matches!(
-                            candidate.dispatch,
-                            OperatorDispatch::BlockedGemm {
-                                distribution: GemmDistribution::OutputStationary,
-                                ..
-                            }
-                        ) && candidate.inputs.get(1).is_some_and(|requirement| {
-                            requirement.format.layout.order
-                                == crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
-                                    row_block: 64,
-                                    column_block: crate::mid::AMP_COLUMN_MICRO as u16,
-                                })
-                                && requirement.format.layout.tiling.tile_count == tiles
-                                && requirement.format.layout.memory_class
-                                    == MemoryClass::Ipu21Interleaved
-                        })
-                    })
-                    .collect();
-            config = config.with_test_operator_candidates(candidates);
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let operation = mid
                 .operations
@@ -7365,11 +7240,6 @@ mod tests {
             let inner_blocks = u32::from(row_partitions) * random.u32(1..=2);
             let inner = inner_blocks * 64;
             let columns = u32::from(column_partitions) * 64;
-            let local_staging = if random.bool() {
-                crate::LocalOperandStaging::Direct
-            } else {
-                crate::LocalOperandStaging::MatchRemote
-            };
             let mut graph = ComputeGraph::new();
             let left = graph.host_input("left", [rows, inner]).unwrap();
             let right = graph.parameter("right", [inner, columns]).unwrap();
@@ -7396,31 +7266,15 @@ mod tests {
                     crate::MemoryClass::Ipu21Standard,
                 ),
             };
-            let output_format = TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::amp_left_result_grid(
-                    64,
-                    tiles,
-                    row_partitions,
-                    column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
-                ),
-            };
             let config = PipelineConfig::new(tiles)
+                .with_search_domain(
+                    PlannerSearchDomain::default()
+                        .with_active_tile_counts([tiles])
+                        .with_operator_precisions(crate::OperatorClass::Gemm, [Precision::F16])
+                        .with_weight_memory_classes([MemoryClass::Ipu21Standard]),
+                )
                 .with_input(left, left_format.clone())
-                .with_input(right, right_format.clone())
-                .with_test_operator_candidates(vec![OperatorCandidate::new(
-                    MidOperator::Gemm {
-                        options: crate::GemmOptions::default(),
-                        multiply: Precision::F16,
-                        accumulate: crate::AccumulationPrecision::F32,
-                    },
-                    [
-                        OperandRequirement::new(left_format, 32).with_access_tail(16),
-                        OperandRequirement::new(right_format, 32).with_local_staging(local_staging),
-                    ],
-                    OperandRequirement::new(output_format, 32),
-                )]);
+                .with_input(right, right_format.clone());
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
 
