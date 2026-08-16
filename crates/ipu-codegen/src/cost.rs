@@ -943,7 +943,17 @@ impl CostModel for Ipu21CostModel {
                     &compute_output,
                     output.shape.0.len().saturating_sub(output_column_from_end),
                 );
-                let kernel_output_elements = output_elements_per_tile;
+                // Batched GEMMs are dispatched as one AMP invocation sequence
+                // per physical matrix: matrix-major storage does not make the
+                // rows of adjacent matrices one contiguous matrix. Preserve
+                // that call structure in the estimate instead of treating the
+                // leading axes as extra rows in one artificially cheap call.
+                let matrices_per_tile = (0..compute_output.shape.0.len().saturating_sub(2))
+                    .map(|axis| maximum_axis_shard_extent(&compute_output, axis))
+                    .fold(1u64, u64::saturating_mul)
+                    .max(1);
+                let kernel_output_elements =
+                    output_elements_per_tile.div_ceil(matrices_per_tile);
                 let kernel_output_columns = output_columns_per_tile;
                 let arithmetic = kernel_output_elements
                     .saturating_mul(2)
@@ -1123,6 +1133,7 @@ impl CostModel for Ipu21CostModel {
                         .div_ceil(u64::from(*inner_block))
                         .saturating_mul(kernel_output_columns)
                         .div_ceil(u64::from(*output_column_block))
+                        .saturating_mul(matrices_per_tile)
                         .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
                     OperatorDispatch::Pointwise { .. } => 0,
                     OperatorDispatch::BlockedAttention { .. } => 0,
@@ -1138,6 +1149,7 @@ impl CostModel for Ipu21CostModel {
                     kernel_output_columns,
                     compute_k,
                 )
+                .map(|cycles| cycles.saturating_mul(matrices_per_tile))
                 .unwrap_or_else(|| arithmetic.max(weight_feed).saturating_add(calls));
                 let memory = operator_memory_estimate(dispatch, requirements, inputs, output);
                 let capacity_penalty = if memory.peak.fits_ipu21() {
