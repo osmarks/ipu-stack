@@ -48,6 +48,7 @@
 	.set ATTENTION_VALUE_FULL_PANELS, ATTENTION_VALUE_DIMENSION / 16
 	.set ATTENTION_VALUE_TAIL_PAIRS, (ATTENTION_VALUE_DIMENSION % 16 + 1) / 2
 
+#ifdef ATTENTION_BUILD_ASSEMBLY_SOFTMAX
 	// Callable supervisor ABI for softmax: m2 weights, m3 scores, m10 return.
 	// Query/key row counts are specialization constants placed in the shared
 	// worker argument block. The four public entries therefore share one worker
@@ -375,6 +376,7 @@
 	brnz $m7, .Lattention_softmax_row
 .Lattention_softmax_done:
 	exitz $m15
+#endif
 
 	// Callable supervisor ABI for merge: m2 accumulator, m3 block values,
 	// m4 softmax state, m5 initial-block flag, m6 final-block flag, m10 return.

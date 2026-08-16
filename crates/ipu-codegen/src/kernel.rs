@@ -564,7 +564,8 @@ impl KernelBuildPlan {
                     });
             let (head_dimension, value_dimension, padded_value_dimension, key_block_columns) =
                 configuration.ok_or(KernelAbiError::RequirementMismatch)?;
-            let mut retained_symbols = Vec::new();
+            let mut softmax_symbols = Vec::new();
+            let mut merge_symbols = Vec::new();
             for (kernel, rows) in attention_stages {
                 let size = if rows == small_query {
                     "small"
@@ -587,12 +588,38 @@ impl KernelBuildPlan {
                     }
                     _ => return Err(KernelAbiError::RequirementMismatch),
                 };
+                let retained_symbols = match &kernel {
+                    TileKernelSpec::AttentionSoftmax { .. } => &mut softmax_symbols,
+                    TileKernelSpec::AttentionMerge { .. } => &mut merge_symbols,
+                    _ => return Err(KernelAbiError::RequirementMismatch),
+                };
                 if !retained_symbols.contains(&symbol) {
                     retained_symbols.push(symbol.clone());
                 }
                 plan.attention_stage_symbols.push((kernel, rows, symbol));
             }
             let scale_bits = (1.0_f32 / (head_dimension as f32).sqrt()).to_bits();
+            let softmax_flags = vec![
+                "-Os".into(),
+                format!("-DATTENTION_HEAD_DIMENSION={head_dimension}"),
+                format!("-DATTENTION_KEY_BLOCK_COLUMNS={key_block_columns}"),
+                format!("-DATTENTION_SMALL_QUERY_ROWS={small_query}"),
+                format!("-DATTENTION_LARGE_QUERY_ROWS={large_query}"),
+                format!("-DATTENTION_SMALL_KEY_ROWS={small_key}"),
+                format!("-DATTENTION_LARGE_KEY_ROWS={large_key}"),
+            ];
+            plan.compilations.push(KernelCompilation {
+                source: "attention_softmax_f16.cpp",
+                name: format!("attention_softmax_q{small_query}_q{large_query}_d{head_dimension}"),
+                flags: softmax_flags,
+                retained_symbols: Vec::new(),
+            });
+            plan.compilations.push(KernelCompilation {
+                source: "attention_softmax_f16_wrapper.S",
+                name: "attention_softmax_wrapper".into(),
+                flags: Vec::new(),
+                retained_symbols: softmax_symbols,
+            });
             plan.compilations.push(KernelCompilation {
                 source: "attention_stages_f16.S",
                 name: format!(
@@ -610,7 +637,7 @@ impl KernelBuildPlan {
                     format!("-DATTENTION_LARGE_KEY_ROWS={large_key}"),
                     format!("-DATTENTION_SCALE_BITS=0x{scale_bits:08x}"),
                 ],
-                retained_symbols,
+                retained_symbols: merge_symbols,
             });
         }
         Ok(plan)
