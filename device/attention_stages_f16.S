@@ -383,7 +383,7 @@
 	brz $m6, .Lattention_merge_update_state
 	st32 $a0, $m8, $m15, 0
 	st32 $a1, $m8, $m15, 1
-#if ATTENTION_VALUE_FULL_PANELS > 0
+	.if ATTENTION_VALUE_FULL_PANELS
 	setzi $m2, ATTENTION_VALUE_FULL_PANELS
 .Lattention_merge_initial_panels:
 	.rept 8
@@ -392,7 +392,7 @@
 	add $m1, $m1, $m10
 	sub $m2, $m2, 1
 	brnz $m2, .Lattention_merge_initial_panels
-#endif
+	.endif
 	.rept ATTENTION_VALUE_TAIL_PAIRS
 	ATTENTION_MERGE_INITIAL_PAIR
 	.endr
@@ -411,7 +411,7 @@
 	f32add $a3, $a3, $a1
 	st32 $a4, $m8, $m15, 0
 	st32 $a3, $m8, $m15, 1
-#if ATTENTION_VALUE_FULL_PANELS > 0
+	.if ATTENTION_VALUE_FULL_PANELS
 	setzi $m2, ATTENTION_VALUE_FULL_PANELS
 .Lattention_merge_update_panels:
 	.rept 8
@@ -420,7 +420,7 @@
 	add $m1, $m1, $m10
 	sub $m2, $m2, 1
 	brnz $m2, .Lattention_merge_update_panels
-#endif
+	.endif
 	.rept ATTENTION_VALUE_TAIL_PAIRS
 	ATTENTION_MERGE_UPDATE_PAIR
 	.endr
@@ -434,14 +434,14 @@
 	mul $m2, $m9, $m2
 	add $m0, $m0, $m2
 	setzi $m2, ATTENTION_VALUE_FULL_PANELS
-#if ATTENTION_VALUE_FULL_PANELS > 0
+	.if ATTENTION_VALUE_FULL_PANELS
 .Lattention_merge_normalize_panels:
 	.rept 8
 	ATTENTION_MERGE_NORMALIZE_PAIR
 	.endr
 	sub $m2, $m2, 1
 	brnz $m2, .Lattention_merge_normalize_panels
-#endif
+	.endif
 	.rept ATTENTION_VALUE_TAIL_PAIRS
 	ATTENTION_MERGE_NORMALIZE_PAIR
 	.endr
