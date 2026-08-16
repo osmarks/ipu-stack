@@ -430,35 +430,20 @@ fn attention_endpoint_traffic(
     output: &TensorType,
     dispatch: &OperatorDispatch,
 ) -> Option<(ExchangeEndpointTraffic, u64)> {
-    let (query_block_rows, key_block_rows, padded_query_dimension, padded_value_dimension, phases) =
-        match dispatch {
-            OperatorDispatch::BlockedAttention {
-                query_block_rows,
-                key_block_rows,
-                padded_query_dimension,
-                padded_value_dimension,
-                ..
-            } => (
-                *query_block_rows,
-                *key_block_rows,
-                *padded_query_dimension,
-                *padded_value_dimension,
-                None,
-            ),
-            OperatorDispatch::MaterializedAttention {
-                query_block_rows,
-                padded_query_dimension,
-                padded_value_dimension,
-                ..
-            } => (
-                *query_block_rows,
-                crate::mid::AMP_INNER_BLOCK,
-                *padded_query_dimension,
-                *padded_value_dimension,
-                Some(3),
-            ),
-            _ => return Some((ExchangeEndpointTraffic::default(), 0)),
-        };
+    let OperatorDispatch::Attention(plan) = dispatch else {
+        return Some((ExchangeEndpointTraffic::default(), 0));
+    };
+    let (query_block_rows, key_block_rows, phases) = match plan.blocking {
+        crate::AttentionBlocking::Flash {
+            query_rows,
+            key_rows,
+        } => (query_rows, key_rows, None),
+        crate::AttentionBlocking::Materialized { query_rows, .. } => {
+            (query_rows, crate::mid::AMP_INNER_BLOCK, Some(3))
+        }
+    };
+    let padded_query_dimension = plan.padding.query_dimension;
+    let padded_value_dimension = plan.padding.value_dimension;
     let key = inputs.get(1)?;
     let key_rows = key
         .shape
@@ -686,16 +671,11 @@ fn amp_kernel_cycles(
     output_columns_per_tile: u64,
     k: u64,
 ) -> Option<u64> {
-    let OperatorDispatch::BlockedGemm {
-        inner_block,
-        output_column_block,
-        ..
-    } = dispatch
-    else {
+    let OperatorDispatch::BlockedGemm(plan) = dispatch else {
         return None;
     };
-    let inner_block = u64::from(*inner_block);
-    let output_column_block = u64::from(*output_column_block);
+    let inner_block = u64::from(plan.geometry.block.inner);
+    let output_column_block = u64::from(plan.geometry.block.output_columns);
     if inner_block == 0
         || output_column_block == 0
         || output_columns_per_tile == 0
@@ -758,17 +738,14 @@ fn estimated_operator_exchange_cycles(
     output: &TensorType,
 ) -> u64 {
     match dispatch {
-        OperatorDispatch::BlockedGemm {
-            distribution:
-                GemmDistribution::ParallelReduction {
-                    inner_partitions,
-                    result_row_partitions,
-                    result_column_partitions,
-                    reduction_staging,
+        OperatorDispatch::BlockedGemm(crate::BlockedGemmPlan {
+            geometry:
+                crate::GemmGeometry {
+                    distribution: GemmDistribution::ParallelReduction(reduction),
                     ..
                 },
             ..
-        } => {
+        }) => {
             let compute_output = gemm_partial_tensor(dispatch, output);
             let endpoint = gemm_exchange_endpoint_traffic(dispatch, inputs, &compute_output)
                 .unwrap_or_else(|| {
@@ -779,32 +756,34 @@ fn estimated_operator_exchange_cycles(
                         u64::MAX / 16,
                     )
                 });
-            let remote_partials_per_stage = match reduction_staging {
-                crate::ReductionStaging::Complete => inner_partitions.saturating_sub(1),
+            let remote_partials_per_stage = match reduction.staging {
+                crate::ReductionStaging::Complete => reduction.compute.inner.saturating_sub(1),
                 crate::ReductionStaging::Streamed => 1,
             };
-            let reduction_epochs = inner_partitions
+            let reduction_epochs = reduction
+                .compute
+                .inner
                 .saturating_sub(1)
                 .div_ceil(remote_partials_per_stage.max(1));
             let reduction_partial_bytes =
-                if (*result_row_partitions, *result_column_partitions) != (1, 1) {
+                if (reduction.result.rows, reduction.result.columns) != (1, 1) {
                     maximum_shard_bytes(output)
                 } else {
                     maximum_shard_bytes(&compute_output)
                 };
             let reduction = ExchangeEndpointTraffic::from_maxima(
                 reduction_partial_bytes.saturating_mul(2),
-                u64::from(inner_partitions.saturating_sub(1))
+                u64::from(reduction.compute.inner.saturating_sub(1))
                     .saturating_mul(reduction_partial_bytes),
                 2,
-                u64::from(inner_partitions.saturating_sub(1)),
+                u64::from(reduction.compute.inner.saturating_sub(1)),
             );
             exchange_endpoint_cycles(&endpoint, 1).saturating_add(exchange_endpoint_cycles(
                 &reduction,
                 u64::from(reduction_epochs),
             ))
         }
-        OperatorDispatch::BlockedGemm { .. } => {
+        OperatorDispatch::BlockedGemm(_) => {
             let compute_output = gemm_partial_tensor(dispatch, output);
             let traffic = gemm_exchange_endpoint_traffic(dispatch, inputs, &compute_output)
                 .unwrap_or_else(|| {
@@ -820,12 +799,9 @@ fn estimated_operator_exchange_cycles(
                 gemm_exchange_phase_count(dispatch, inputs, &compute_output),
             )
         }
-        OperatorDispatch::BlockedAttention { .. }
-        | OperatorDispatch::MaterializedAttention { .. } => {
-            attention_endpoint_traffic(inputs, output, dispatch)
-                .map(|(traffic, phases)| exchange_endpoint_cycles(&traffic, phases))
-                .unwrap_or(u64::MAX / 8)
-        }
+        OperatorDispatch::Attention(_) => attention_endpoint_traffic(inputs, output, dispatch)
+            .map(|(traffic, phases)| exchange_endpoint_cycles(&traffic, phases))
+            .unwrap_or(u64::MAX / 8),
         OperatorDispatch::SplitHeads => inputs.first().map_or(0, |input| {
             exchange_endpoint_cycles(&tensor_transition_endpoint_traffic(input, output), 1)
         }),
@@ -885,17 +861,16 @@ fn deferred_split_input_cycles(
     }
 
     let (query_block_rows, key_block_rows) = match consumer_dispatch {
-        OperatorDispatch::BlockedAttention {
-            query_block_rows,
-            key_block_rows,
-            ..
-        } => (u64::from(*query_block_rows), u64::from(*key_block_rows)),
-        OperatorDispatch::MaterializedAttention {
-            query_block_rows, ..
-        } => (
-            u64::from(*query_block_rows),
-            u64::from(crate::mid::AMP_INNER_BLOCK),
-        ),
+        OperatorDispatch::Attention(plan) => match plan.blocking {
+            crate::AttentionBlocking::Flash {
+                query_rows,
+                key_rows,
+            } => (u64::from(query_rows), u64::from(key_rows)),
+            crate::AttentionBlocking::Materialized { query_rows, .. } => (
+                u64::from(query_rows),
+                u64::from(crate::mid::AMP_INNER_BLOCK),
+            ),
+        },
         _ => (rows, u64::from(crate::mid::AMP_INNER_BLOCK)),
     };
     let block_rows = key_block_rows.max(1);
@@ -965,7 +940,7 @@ impl CostModel for Ipu21CostModel {
         match operator {
             MidOperator::Gemm { multiply, .. } => {
                 let orientation = match dispatch {
-                    OperatorDispatch::BlockedGemm { orientation, .. } => *orientation,
+                    OperatorDispatch::BlockedGemm(plan) => plan.geometry.orientation,
                     _ => crate::GemmOrientation::Normal,
                 };
                 let (left_index, right_index, left_inner_from_end, output_column_from_end) =
@@ -988,13 +963,12 @@ impl CostModel for Ipu21CostModel {
                     .copied()
                     .unwrap_or(1) as u64;
                 let compute_k = match dispatch {
-                    OperatorDispatch::BlockedGemm {
-                        distribution:
-                            GemmDistribution::ParallelReduction {
-                                inner_partitions, ..
-                            },
-                        ..
-                    } => k.div_ceil(u64::from(*inner_partitions)),
+                    OperatorDispatch::BlockedGemm(plan) => match plan.geometry.distribution {
+                        GemmDistribution::ParallelReduction(reduction) => {
+                            k.div_ceil(u64::from(reduction.compute.inner))
+                        }
+                        GemmDistribution::OutputStationary => k,
+                    },
                     _ => k,
                 };
                 let flops_per_cycle: u64 = match multiply {
@@ -1151,35 +1125,36 @@ impl CostModel for Ipu21CostModel {
                 };
                 let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
                 let reduction_work = match dispatch {
-                    OperatorDispatch::BlockedGemm {
-                        output_column_block: _,
-                        distribution:
-                            GemmDistribution::ParallelReduction {
-                                column_partitions: _,
-                                inner_partitions,
-                                result_row_partitions,
-                                result_column_partitions,
-                                reduction_staging,
+                    OperatorDispatch::BlockedGemm(crate::BlockedGemmPlan {
+                        geometry:
+                            crate::GemmGeometry {
+                                distribution: GemmDistribution::ParallelReduction(reduction),
                                 ..
                             },
                         ..
-                    } => {
-                        let remote_partials_per_stage = match reduction_staging {
-                            crate::ReductionStaging::Complete => inner_partitions.saturating_sub(1),
+                    }) => {
+                        let remote_partials_per_stage = match reduction.staging {
+                            crate::ReductionStaging::Complete => {
+                                reduction.compute.inner.saturating_sub(1)
+                            }
                             crate::ReductionStaging::Streamed => 1,
                         };
-                        let reduction_epochs = inner_partitions
+                        let reduction_epochs = reduction
+                            .compute
+                            .inner
                             .saturating_sub(1)
                             .div_ceil(remote_partials_per_stage.max(1));
                         let partial_bytes = maximum_shard_bytes(&compute_output);
                         let reduction_partial_bytes =
-                            if (*result_row_partitions, *result_column_partitions) != (1, 1) {
+                            if (reduction.result.rows, reduction.result.columns) != (1, 1) {
                                 maximum_shard_bytes(output)
                             } else {
                                 partial_bytes
                             };
                         u64::from(
-                            inner_partitions
+                            reduction
+                                .compute
+                                .inner
                                 .saturating_sub(1)
                                 .saturating_add(reduction_epochs),
                         )
@@ -1193,19 +1168,14 @@ impl CostModel for Ipu21CostModel {
                     _ => 0,
                 };
                 let calls = match dispatch {
-                    OperatorDispatch::BlockedGemm {
-                        inner_block,
-                        output_column_block,
-                        ..
-                    } => compute_k
-                        .div_ceil(u64::from(*inner_block))
+                    OperatorDispatch::BlockedGemm(plan) => compute_k
+                        .div_ceil(u64::from(plan.geometry.block.inner))
                         .saturating_mul(kernel_output_columns)
-                        .div_ceil(u64::from(*output_column_block))
+                        .div_ceil(u64::from(plan.geometry.block.output_columns))
                         .saturating_mul(matrices_per_tile)
                         .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
                     OperatorDispatch::Pointwise { .. } => 0,
-                    OperatorDispatch::BlockedAttention { .. } => 0,
-                    OperatorDispatch::MaterializedAttention { .. } => 0,
+                    OperatorDispatch::Attention(_) => 0,
                     OperatorDispatch::SplitHeads => 0,
                 };
                 let kernel = amp_kernel_cycles(
@@ -1256,7 +1226,14 @@ impl CostModel for Ipu21CostModel {
                 let output_values_per_query = value_dimension.max(1);
                 let query_rows = elements.div_ceil(output_values_per_query);
                 match dispatch {
-                    OperatorDispatch::BlockedAttention { key_block_rows, .. } => {
+                    OperatorDispatch::Attention(crate::AttentionPlan {
+                        blocking:
+                            crate::AttentionBlocking::Flash {
+                                key_rows: key_block_rows,
+                                ..
+                            },
+                        ..
+                    }) => {
                         let arithmetic = query_rows
                             .saturating_mul(key_rows)
                             .saturating_mul(query_dimension.saturating_add(value_dimension))
@@ -1272,7 +1249,10 @@ impl CostModel for Ipu21CostModel {
                             )
                             .saturating_add(exchange)
                     }
-                    OperatorDispatch::MaterializedAttention { .. } => {
+                    OperatorDispatch::Attention(crate::AttentionPlan {
+                        blocking: crate::AttentionBlocking::Materialized { .. },
+                        ..
+                    }) => {
                         let arithmetic = query_rows
                             .saturating_mul(key_rows)
                             .saturating_mul(query_dimension.saturating_add(value_dimension))
@@ -1388,33 +1368,35 @@ impl CostModel for Ipu21CostModel {
     ) -> ExchangeFootprint {
         let phases = match dispatch {
             OperatorDispatch::SplitHeads => 1,
-            OperatorDispatch::BlockedAttention { key_block_rows, .. } => inputs
-                .get(1)
-                .and_then(|key| key.shape.0.get(key.shape.0.len().saturating_sub(2)))
-                .copied()
-                .map_or(0, u64::from)
-                .div_ceil(u64::from(*key_block_rows).max(1))
-                .saturating_add(2),
-            OperatorDispatch::MaterializedAttention { .. } => 3,
+            OperatorDispatch::Attention(plan) => match plan.blocking {
+                crate::AttentionBlocking::Flash { key_rows, .. } => inputs
+                    .get(1)
+                    .and_then(|key| key.shape.0.get(key.shape.0.len().saturating_sub(2)))
+                    .copied()
+                    .map_or(0, u64::from)
+                    .div_ceil(u64::from(key_rows).max(1))
+                    .saturating_add(2),
+                crate::AttentionBlocking::Materialized { .. } => 3,
+            },
             _ => gemm_exchange_phase_count(dispatch, inputs, output),
         };
         let phases = match dispatch {
-            OperatorDispatch::BlockedGemm {
-                output_column_block: _,
-                distribution:
-                    GemmDistribution::ParallelReduction {
-                        inner_partitions,
-                        reduction_staging,
+            OperatorDispatch::BlockedGemm(crate::BlockedGemmPlan {
+                geometry:
+                    crate::GemmGeometry {
+                        distribution: GemmDistribution::ParallelReduction(reduction),
                         ..
                     },
                 ..
-            } => {
-                let remote_partials_per_stage = match reduction_staging {
-                    crate::ReductionStaging::Complete => inner_partitions.saturating_sub(1),
+            }) => {
+                let remote_partials_per_stage = match reduction.staging {
+                    crate::ReductionStaging::Complete => reduction.compute.inner.saturating_sub(1),
                     crate::ReductionStaging::Streamed => 1,
                 };
                 1u64.saturating_add(u64::from(
-                    inner_partitions
+                    reduction
+                        .compute
+                        .inner
                         .saturating_sub(1)
                         .div_ceil(remote_partials_per_stage.max(1)),
                 ))
@@ -1433,11 +1415,7 @@ impl CostModel for Ipu21CostModel {
                 phases,
             );
         }
-        if matches!(
-            dispatch,
-            OperatorDispatch::BlockedAttention { .. }
-                | OperatorDispatch::MaterializedAttention { .. }
-        ) {
+        if matches!(dispatch, OperatorDispatch::Attention(_)) {
             let Some((traffic, _)) = attention_endpoint_traffic(inputs, output, dispatch) else {
                 return ExchangeFootprint::default();
             };

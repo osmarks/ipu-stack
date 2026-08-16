@@ -714,7 +714,7 @@ fn select_scheduled_finalist(
                 source = ?operation.source,
                 kind = ?operation.kind,
                 memory = ?operation.memory,
-                plan = ?operation.operator_plan,
+                plan = ?operation.operator_plan(),
                 "selected mid-level operation"
             );
         }

@@ -1169,8 +1169,7 @@ impl LoweringState {
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<bool> {
         let Some(offered) = operation
-            .operator_plan
-            .as_ref()
+            .operator_plan()
             .and_then(|plan| plan.deferred_output)
         else {
             return Ok(false);
@@ -1188,7 +1187,7 @@ impl LoweringState {
             .filter(|value| **value == *result)
             .count();
         let claimed = operations.iter().any(|candidate| {
-            candidate.operator_plan.as_ref().is_some_and(|plan| {
+            candidate.operator_plan().is_some_and(|plan| {
                 plan.deferred_inputs.iter().flatten().any(|input| {
                     input.producer == *result
                         && input.source == *source
@@ -1299,8 +1298,7 @@ impl LoweringState {
             return Ok(false);
         };
         let streamable = next
-            .operator_plan
-            .as_ref()
+            .operator_plan()
             .and_then(|plan| plan.requirements.inputs.get(input_index))
             .is_some_and(|requirement| {
                 requirement.materialization == crate::OperandMaterialization::DispatchSlices
@@ -1635,8 +1633,7 @@ impl LoweringState {
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         let plan = operation
-            .operator_plan
-            .as_ref()
+            .operator_plan()
             .ok_or(LowLoweringError::MissingOperatorPlan)?;
         match &plan.dispatch {
             OperatorDispatch::Pointwise {
@@ -1649,60 +1646,20 @@ impl LoweringState {
                 &plan.requirements,
                 tiles,
             ),
-            OperatorDispatch::BlockedGemm {
-                initialize,
-                accumulate,
-                inner_block,
-                output_column_block,
-                distribution,
-                orientation,
-            } => self.lower_blocked_gemm(
-                operation,
-                initialize.clone(),
-                accumulate.clone(),
-                *inner_block,
-                *output_column_block,
-                *orientation,
-                *distribution,
-                &plan.requirements,
-                tiles,
-            ),
-            OperatorDispatch::BlockedAttention {
-                query_key,
-                probability_value,
-                query_block_rows,
-                key_block_rows,
-                padded_query_dimension,
-                padded_value_dimension,
-            } => self.lower_blocked_attention(
-                operation,
-                query_key.clone(),
-                probability_value.clone(),
-                *query_block_rows,
-                *key_block_rows,
-                *padded_query_dimension,
-                *padded_value_dimension,
-                &plan.requirements,
-                tiles,
-            ),
-            OperatorDispatch::MaterializedAttention {
-                query_key,
-                probability_value,
-                query_block_rows,
-                padded_key_rows,
-                padded_query_dimension,
-                padded_value_dimension,
-            } => self.lower_materialized_attention(
-                operation,
-                query_key.clone(),
-                probability_value.clone(),
-                *query_block_rows,
-                *padded_key_rows,
-                *padded_query_dimension,
-                *padded_value_dimension,
-                &plan.requirements,
-                tiles,
-            ),
+            OperatorDispatch::BlockedGemm(dispatch) => {
+                self.lower_blocked_gemm(operation, dispatch, &plan.requirements, tiles)
+            }
+            OperatorDispatch::Attention(attention) => match attention.blocking {
+                crate::AttentionBlocking::Flash { .. } => {
+                    self.lower_blocked_attention(operation, attention, &plan.requirements, tiles)
+                }
+                crate::AttentionBlocking::Materialized { .. } => self.lower_materialized_attention(
+                    operation,
+                    attention,
+                    &plan.requirements,
+                    tiles,
+                ),
+            },
             OperatorDispatch::SplitHeads => {
                 self.lower_split_heads(operation, &plan.operator, tiles)
             }
@@ -2235,19 +2192,24 @@ impl LoweringState {
         Ok(prepared)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn lower_blocked_attention(
         &mut self,
         operation: &MidOperation,
-        query_key: TileKernelSpec,
-        probability_value: TileKernelSpec,
-        query_block_rows: u32,
-        key_block_rows: u32,
-        padded_query_dimension: u32,
-        padded_value_dimension: u32,
+        plan: &crate::AttentionPlan,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
+        let crate::AttentionBlocking::Flash {
+            query_rows: query_block_rows,
+            key_rows: key_block_rows,
+        } = plan.blocking
+        else {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        };
+        let query_key = plan.kernels.query_key.clone();
+        let probability_value = plan.kernels.probability_value.clone();
+        let padded_query_dimension = plan.padding.query_dimension;
+        let padded_value_dimension = plan.padding.value_dimension;
         let [query, key, value] = operation.inputs.as_slice() else {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
@@ -2535,19 +2497,24 @@ impl LoweringState {
         self.append_physical_phase(transfers, provenance, tiles)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn lower_materialized_attention(
         &mut self,
         operation: &MidOperation,
-        query_key: TileKernelSpec,
-        probability_value: TileKernelSpec,
-        query_block_rows: u32,
-        padded_key_rows: u32,
-        padded_query_dimension: u32,
-        padded_value_dimension: u32,
+        plan: &crate::AttentionPlan,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
+        let crate::AttentionBlocking::Materialized {
+            query_rows: query_block_rows,
+            padded_key_rows,
+        } = plan.blocking
+        else {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        };
+        let query_key = plan.kernels.query_key.clone();
+        let probability_value = plan.kernels.probability_value.clone();
+        let padded_query_dimension = plan.padding.query_dimension;
+        let padded_value_dimension = plan.padding.value_dimension;
         let [query, key, value] = operation.inputs.as_slice() else {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
@@ -3556,45 +3523,31 @@ impl LoweringState {
         Ok(self.full_view(staging))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn lower_blocked_gemm(
         &mut self,
         operation: &MidOperation,
-        initialize: TileKernelSpec,
-        accumulate: TileKernelSpec,
-        inner_block: u32,
-        output_column_block: u32,
-        orientation: crate::GemmOrientation,
-        distribution: GemmDistribution,
+        plan: &crate::BlockedGemmPlan,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        if let GemmDistribution::ParallelReduction {
-            row_partitions,
-            column_partitions,
-            inner_partitions,
-            result_row_partitions,
-            result_column_partitions,
-            reduction_staging,
-        } = distribution
-        {
+        if let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution {
             return self.lower_parallel_reduction_gemm(
                 operation,
-                initialize,
-                accumulate,
-                inner_block,
-                output_column_block,
-                orientation,
-                row_partitions,
-                column_partitions,
-                inner_partitions,
-                result_row_partitions,
-                result_column_partitions,
-                reduction_staging,
+                plan,
+                reduction,
                 requirements,
                 tiles,
             );
         }
+        let inner_block = plan.geometry.block.inner;
+        let output_column_block = plan.geometry.block.output_columns;
+        let orientation = plan.geometry.orientation;
+        let initialize = plan
+            .kernel
+            .kernel(crate::GemmKernelMode::Initialize, plan.geometry.block);
+        let accumulate = plan
+            .kernel
+            .kernel(crate::GemmKernelMode::Accumulate, plan.geometry.block);
         if orientation != crate::GemmOrientation::Normal {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
@@ -3870,24 +3823,29 @@ impl LoweringState {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn lower_parallel_reduction_gemm(
         &mut self,
         operation: &MidOperation,
-        initialize: TileKernelSpec,
-        accumulate: TileKernelSpec,
-        inner_block: u32,
-        output_column_block: u32,
-        orientation: crate::GemmOrientation,
-        row_partitions: u16,
-        column_partitions: u16,
-        inner_partitions: u16,
-        result_row_partitions: u16,
-        result_column_partitions: u16,
-        reduction_staging: crate::ReductionStaging,
+        plan: &crate::BlockedGemmPlan,
+        reduction: crate::ParallelReductionPlan,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
+        let inner_block = plan.geometry.block.inner;
+        let output_column_block = plan.geometry.block.output_columns;
+        let orientation = plan.geometry.orientation;
+        let initialize = plan
+            .kernel
+            .kernel(crate::GemmKernelMode::Initialize, plan.geometry.block);
+        let accumulate = plan
+            .kernel
+            .kernel(crate::GemmKernelMode::Accumulate, plan.geometry.block);
+        let row_partitions = reduction.compute.rows;
+        let column_partitions = reduction.compute.columns;
+        let inner_partitions = reduction.compute.inner;
+        let result_row_partitions = reduction.result.rows;
+        let result_column_partitions = reduction.result.columns;
+        let reduction_staging = reduction.staging;
         let [semantic_left_value, semantic_right_value] = operation.inputs.as_slice() else {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
@@ -5614,7 +5572,7 @@ fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOpera
     else {
         return false;
     };
-    let Some(plan) = &operation.operator_plan else {
+    let Some(plan) = operation.operator_plan() else {
         return false;
     };
     let indices = match &plan.requirements.output_aliasing {
@@ -5661,8 +5619,7 @@ fn body_storage_requirement(value: MidValueId, operations: &[MidOperation]) -> (
                 continue;
             }
             let requirement = operation
-                .operator_plan
-                .as_ref()
+                .operator_plan()
                 .and_then(|plan| plan.requirements.inputs.get(index))
                 .or_else(|| operation.conversion_plan.as_ref().map(|plan| &plan.input));
             if let Some(requirement) = requirement {
@@ -6089,15 +6046,31 @@ mod tests {
                         .with_operator_precisions(crate::OperatorClass::Gemm, [Precision::F16])
                         .with_gemm_plan_constraint(crate::GemmPlanConstraint {
                             source_operation: 0,
-                            orientation: crate::GemmOrientation::Normal,
-                            row_partitions,
-                            column_partitions,
-                            inner_partitions,
-                            result_row_partitions,
-                            result_column_partitions,
-                            output_column_block: output_columns,
+                            geometry: crate::GemmGeometry {
+                                block: crate::GemmBlockShape {
+                                    inner: inner
+                                        .div_ceil(u32::from(inner_partitions))
+                                        .div_ceil(crate::mid::AMP_COLUMN_MICRO)
+                                        * crate::mid::AMP_COLUMN_MICRO,
+                                    output_columns,
+                                },
+                                orientation: crate::GemmOrientation::Normal,
+                                distribution: GemmDistribution::ParallelReduction(
+                                    crate::ParallelReductionPlan {
+                                        compute: crate::GemmGrid {
+                                            rows: row_partitions,
+                                            columns: column_partitions,
+                                            inner: inner_partitions,
+                                        },
+                                        result: crate::GemmResultGrid {
+                                            rows: result_row_partitions,
+                                            columns: result_column_partitions,
+                                        },
+                                        staging: reduction_staging,
+                                    },
+                                ),
+                            },
                             weight_memory_class: MemoryClass::Interleaved,
-                            reduction_staging,
                             local_weight_staging: crate::LocalOperandStaging::Direct,
                         }),
                 )

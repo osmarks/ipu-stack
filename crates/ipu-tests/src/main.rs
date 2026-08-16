@@ -3,10 +3,11 @@ use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
     AmpOrder, AttentionStrategy, BlockMajorOrder, CompiledPackage, ComputeGraph, DiagnosticTensor,
-    GemmOrientation, GemmPlanConstraint, Layout, LocalOperandStaging, MemoryClass, OperatorClass,
-    PackageConfig, PipelineConfig, PlannerSearchDomain, Precision, ProfilingMode, ReductionStaging,
-    TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
-    build_package,
+    GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid, GemmOrientation, GemmPlanConstraint,
+    GemmResultGrid, Layout, LocalOperandStaging, MemoryClass, OperatorClass, PackageConfig,
+    ParallelReductionPlan, PipelineConfig, PlannerSearchDomain, Precision, ProfilingMode,
+    ReductionStaging, TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates,
+    build_diagnostic_package, build_package,
 };
 use ipu_driver::DriverError;
 use ipu_elf::Toolchain;
@@ -105,7 +106,7 @@ struct Arguments {
     /// Rank this many complete planner finalists with physical exchange scheduling.
     #[arg(long, default_value_t = 1, conflicts_with = "reuse_package")]
     exchange_schedule_finalists: usize,
-    /// Retain an exact GEMM family: OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION:LOCAL.
+    /// Retain an exact GEMM family: OP:RxCxK:RRxRC:KxC:MEMORY:ORIENTATION:REDUCTION:LOCAL.
     #[arg(
         long,
         value_parser = parse_gemm_plan_constraint,
@@ -282,14 +283,14 @@ fn parse_gemm_plan_constraint(value: &str) -> Result<GemmPlanConstraint, String>
         operation,
         grid,
         result_grid,
-        columns,
+        block,
         memory,
         orientation,
         reduction,
         local,
     ] = fields.as_slice()
     else {
-        return Err("expected OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION:LOCAL".into());
+        return Err("expected OP:RxCxK:RRxRC:KxC:MEMORY:ORIENTATION:REDUCTION:LOCAL".into());
     };
     let grid = grid
         .split('x')
@@ -315,34 +316,53 @@ fn parse_gemm_plan_constraint(value: &str) -> Result<GemmPlanConstraint, String>
     if nonzero.contains(&0) {
         return Err("GEMM and result grid partitions must be nonzero".into());
     }
-    let output_column_block = columns.parse::<u32>().map_err(|error| error.to_string())?;
-    if output_column_block == 0 {
-        return Err("GEMM output column block must be nonzero".into());
+    let block = block
+        .split('x')
+        .map(|field| field.parse::<u32>().map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let [inner_block, output_column_block] = block.as_slice() else {
+        return Err("GEMM block must be INNERxCOLUMNS".into());
+    };
+    if *inner_block == 0 || *output_column_block == 0 {
+        return Err("GEMM block dimensions must be nonzero".into());
     }
+    let orientation = match *orientation {
+        "normal" => GemmOrientation::Normal,
+        "swapped" => GemmOrientation::Swapped,
+        _ => return Err("orientation must be normal or swapped".into()),
+    };
+    let staging = match *reduction {
+        "complete" => ReductionStaging::Complete,
+        "streamed" => ReductionStaging::Streamed,
+        _ => return Err("reduction must be complete or streamed".into()),
+    };
     Ok(GemmPlanConstraint {
         source_operation: operation
             .parse::<u32>()
             .map_err(|error| error.to_string())?,
-        orientation: match *orientation {
-            "normal" => GemmOrientation::Normal,
-            "swapped" => GemmOrientation::Swapped,
-            _ => return Err("orientation must be normal or swapped".into()),
+        geometry: GemmGeometry {
+            block: GemmBlockShape {
+                inner: *inner_block,
+                output_columns: *output_column_block,
+            },
+            orientation,
+            distribution: GemmDistribution::ParallelReduction(ParallelReductionPlan {
+                compute: GemmGrid {
+                    rows: *row_partitions,
+                    columns: *column_partitions,
+                    inner: *inner_partitions,
+                },
+                result: GemmResultGrid {
+                    rows: *result_row_partitions,
+                    columns: *result_column_partitions,
+                },
+                staging,
+            }),
         },
-        row_partitions: *row_partitions,
-        column_partitions: *column_partitions,
-        inner_partitions: *inner_partitions,
-        result_row_partitions: *result_row_partitions,
-        result_column_partitions: *result_column_partitions,
-        output_column_block,
         weight_memory_class: match *memory {
             "standard" => MemoryClass::Standard,
             "interleaved" => MemoryClass::Interleaved,
             _ => return Err("memory must be standard or interleaved".into()),
-        },
-        reduction_staging: match *reduction {
-            "complete" => ReductionStaging::Complete,
-            "streamed" => ReductionStaging::Streamed,
-            _ => return Err("reduction must be complete or streamed".into()),
         },
         local_weight_staging: match *local {
             "direct" => LocalOperandStaging::Direct,

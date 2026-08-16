@@ -350,57 +350,53 @@ pub(crate) fn maximum_axis_shard_extent(tensor: &TensorType, axis: usize) -> u64
 }
 
 pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorType) -> TensorType {
-    let OperatorDispatch::BlockedGemm {
-        output_column_block,
-        orientation,
-        distribution:
-            GemmDistribution::ParallelReduction {
-                row_partitions,
-                column_partitions,
-                ..
-            },
-        ..
-    } = dispatch
-    else {
+    let OperatorDispatch::BlockedGemm(plan) = dispatch else {
         return output.clone();
     };
+    let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution else {
+        return output.clone();
+    };
+    let output_column_block = plan.geometry.block.output_columns;
+    let orientation = plan.geometry.orientation;
+    let row_partitions = reduction.compute.rows;
+    let column_partitions = reduction.compute.columns;
     TensorType {
         shape: output.shape.clone(),
         format: crate::mid::TensorFormat {
             precision: output.format.precision,
-            layout: match (orientation, output.format.layout.order) {
+            layout: match (&orientation, output.format.layout.order) {
                 (
                     crate::GemmOrientation::Normal,
                     crate::ElementOrder::Amp(crate::AmpOrder::Left),
                 ) => Layout::amp_left_result_grid(
-                    *output_column_block,
-                    row_partitions.saturating_mul(*column_partitions),
-                    *row_partitions,
-                    *column_partitions,
+                    output_column_block,
+                    row_partitions.saturating_mul(column_partitions),
+                    row_partitions,
+                    column_partitions,
                     crate::mid::GridOrder::ColumnsFast,
                 ),
                 (
                     crate::GemmOrientation::Swapped,
                     crate::ElementOrder::Amp(crate::AmpOrder::TransposedLeft),
                 ) => Layout::amp_transposed_left_result_grid(
-                    *output_column_block,
-                    row_partitions.saturating_mul(*column_partitions),
-                    *row_partitions,
-                    *column_partitions,
+                    output_column_block,
+                    row_partitions.saturating_mul(column_partitions),
+                    row_partitions,
+                    column_partitions,
                     crate::mid::GridOrder::ColumnsFast,
                 ),
                 (crate::GemmOrientation::Normal, _) => Layout::amp_output_grid(
-                    *output_column_block,
-                    row_partitions.saturating_mul(*column_partitions),
-                    *row_partitions,
-                    *column_partitions,
+                    output_column_block,
+                    row_partitions.saturating_mul(column_partitions),
+                    row_partitions,
+                    column_partitions,
                     crate::mid::GridOrder::ColumnsFast,
                 ),
                 (crate::GemmOrientation::Swapped, _) => Layout::amp_transposed_output_grid(
-                    *output_column_block,
-                    row_partitions.saturating_mul(*column_partitions),
-                    *row_partitions,
-                    *column_partitions,
+                    output_column_block,
+                    row_partitions.saturating_mul(column_partitions),
+                    row_partitions,
+                    column_partitions,
                     crate::mid::GridOrder::ColumnsFast,
                 ),
             },
@@ -442,7 +438,7 @@ fn allocation_requirements(
 ) -> BTreeMap<MidValueId, AllocationRequirement> {
     let mut requirements = BTreeMap::<MidValueId, AllocationRequirement>::new();
     for operation in operations {
-        if let Some(plan) = &operation.operator_plan {
+        if let Some(plan) = operation.operator_plan() {
             for (&id, operand) in operation.inputs.iter().zip(&plan.requirements.inputs) {
                 let requirement = requirements.entry(id).or_default();
                 requirement.access_tail = requirement
@@ -528,25 +524,12 @@ pub(crate) fn operator_memory_estimate(
     );
     let mut temporary = MemoryUsage::default();
     let mut maximum_standard_temporary_allocation = 0u64;
-    if let (
-        OperatorDispatch::BlockedGemm {
-            orientation,
-            distribution:
-                GemmDistribution::ParallelReduction {
-                    column_partitions,
-                    inner_partitions,
-                    result_row_partitions,
-                    result_column_partitions,
-                    reduction_staging,
-                    ..
-                },
-            output_column_block,
-            ..
-        },
-        Some(first),
-        Some(second),
-    ) = (dispatch, inputs.first(), inputs.get(1))
+    if let (OperatorDispatch::BlockedGemm(plan), Some(first), Some(second)) =
+        (dispatch, inputs.first(), inputs.get(1))
+        && let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution
     {
+        let orientation = plan.geometry.orientation;
+        let output_column_block = plan.geometry.block.output_columns;
         let (left, right, left_requirement) = match orientation {
             crate::GemmOrientation::Normal => (first, second, requirements.inputs.first()),
             crate::GemmOrientation::Swapped => (second, first, requirements.inputs.get(1)),
@@ -557,13 +540,13 @@ pub(crate) fn operator_memory_estimate(
             crate::GemmOrientation::Swapped => (right_rank - 1, right_rank - 2),
         };
         let inner_blocks = right.shape.0[right_inner_axis].div_ceil(AMP_INNER_BLOCK);
-        let column_blocks = right.shape.0[right_column_axis].div_ceil(*output_column_block);
-        let right_staging = u64::from(inner_blocks.div_ceil(u32::from(*inner_partitions)))
+        let column_blocks = right.shape.0[right_column_axis].div_ceil(output_column_block);
+        let right_staging = u64::from(inner_blocks.div_ceil(u32::from(reduction.compute.inner)))
             .saturating_mul(u64::from(AMP_INNER_BLOCK))
             .saturating_mul(u64::from(
-                column_blocks.div_ceil(u32::from(*column_partitions)),
+                column_blocks.div_ceil(u32::from(reduction.compute.columns)),
             ))
-            .saturating_mul(u64::from(*output_column_block))
+            .saturating_mul(u64::from(output_column_block))
             .saturating_mul(right.format.precision.bytes());
         let mut convolution = MemoryUsage::default();
         convolution.add_class(MemoryClass::Interleaved, right_staging);
@@ -595,15 +578,15 @@ pub(crate) fn operator_memory_estimate(
         // later reduction ping-pongs an accumulator and result while its
         // staging policy bounds the simultaneously resident remote partials.
         let partial_bytes = maximum_shard_bytes(&gemm_partial_tensor(dispatch, output));
-        let reduction_partial_bytes =
-            if (*result_row_partitions, *result_column_partitions) != (1, 1) {
-                maximum_shard_bytes(output)
-            } else {
-                partial_bytes
-            };
+        let reduction_partial_bytes = if (reduction.result.rows, reduction.result.columns) != (1, 1)
+        {
+            maximum_shard_bytes(output)
+        } else {
+            partial_bytes
+        };
         convolution.interleaved = convolution.interleaved.saturating_add(partial_bytes);
-        let staged_remote_partials = match reduction_staging {
-            crate::ReductionStaging::Complete => inner_partitions.saturating_sub(1),
+        let staged_remote_partials = match reduction.staging {
+            crate::ReductionStaging::Complete => reduction.compute.inner.saturating_sub(1),
             crate::ReductionStaging::Streamed => 1,
         };
         let reduction = MemoryUsage {
@@ -616,39 +599,26 @@ pub(crate) fn operator_memory_estimate(
             interleaved: convolution.interleaved.max(reduction.interleaved),
         };
     }
-    if let (OperatorDispatch::BlockedGemm { inner_block, .. }, Some(left), Some(requirement)) =
+    if let (OperatorDispatch::BlockedGemm(plan), Some(left), Some(requirement)) =
         (dispatch, inputs.first(), requirements.inputs.first())
         && requirement.materialization == OperandMaterialization::DispatchSlices
         && !matches!(
-            dispatch,
-            OperatorDispatch::BlockedGemm {
-                distribution: GemmDistribution::ParallelReduction { .. },
-                ..
-            }
+            plan.geometry.distribution,
+            GemmDistribution::ParallelReduction(_)
         )
     {
         let inner = left.shape.0.last().copied().map_or(1, u64::from).max(1);
         let bytes = maximum_shard_bytes(left)
             .div_ceil(inner)
-            .saturating_mul(u64::from(*inner_block))
+            .saturating_mul(u64::from(plan.geometry.block.inner))
             .saturating_add(u64::from(requirement.access_tail_bytes));
         temporary.add_class(left.format.layout.memory_class, bytes);
     }
-    if let (
-        OperatorDispatch::BlockedGemm {
-            inner_block,
-            output_column_block,
-            ..
-        },
-        Some(right),
-    ) = (dispatch, inputs.get(1))
+    if let (OperatorDispatch::BlockedGemm(plan), Some(right)) = (dispatch, inputs.get(1))
         && right.format.precision == Precision::F16
         && !matches!(
-            dispatch,
-            OperatorDispatch::BlockedGemm {
-                distribution: GemmDistribution::ParallelReduction { .. },
-                ..
-            }
+            plan.geometry.distribution,
+            GemmDistribution::ParallelReduction(_)
         )
         && gemm_uses_panel_buffer(dispatch, right, output)
     {
@@ -656,20 +626,24 @@ pub(crate) fn operator_memory_estimate(
         // across K phases. Remote bytes can be exchanged directly into it.
         let output_columns =
             maximum_axis_shard_extent(output, output.shape.0.len().saturating_sub(1));
-        let panels = output_columns.div_ceil(u64::from(*output_column_block));
+        let panels = output_columns.div_ceil(u64::from(plan.geometry.block.output_columns));
         temporary.interleaved = panels
-            .saturating_mul(u64::from(*inner_block))
-            .saturating_mul(u64::from(*output_column_block))
+            .saturating_mul(u64::from(plan.geometry.block.inner))
+            .saturating_mul(u64::from(plan.geometry.block.output_columns))
             .saturating_mul(right.format.precision.bytes());
     }
-    if let OperatorDispatch::BlockedAttention {
-        query_block_rows,
-        key_block_rows,
-        padded_query_dimension,
-        padded_value_dimension,
+    if let OperatorDispatch::Attention(crate::AttentionPlan {
+        blocking:
+            crate::AttentionBlocking::Flash {
+                query_rows: query_block_rows,
+                key_rows: key_block_rows,
+            },
+        padding,
         ..
-    } = dispatch
+    }) = dispatch
     {
+        let padded_query_dimension = &padding.query_dimension;
+        let padded_value_dimension = &padding.value_dimension;
         let element_bytes = inputs.first().map_or(Precision::F16.bytes(), |input| {
             input.format.precision.bytes()
         });
@@ -725,14 +699,18 @@ pub(crate) fn operator_memory_estimate(
                 .saturating_mul(Precision::F32.bytes()),
         );
     }
-    if let OperatorDispatch::MaterializedAttention {
-        query_block_rows,
-        padded_key_rows,
-        padded_query_dimension,
-        padded_value_dimension,
+    if let OperatorDispatch::Attention(crate::AttentionPlan {
+        blocking:
+            crate::AttentionBlocking::Materialized {
+                query_rows: query_block_rows,
+                padded_key_rows,
+            },
+        padding,
         ..
-    } = dispatch
+    }) = dispatch
     {
+        let padded_query_dimension = &padding.query_dimension;
+        let padded_value_dimension = &padding.value_dimension;
         let element_bytes = inputs.first().map_or(Precision::F16.bytes(), |input| {
             input.format.precision.bytes()
         });
@@ -805,14 +783,11 @@ pub(crate) fn gemm_uses_panel_buffer(
     right: &TensorType,
     output: &TensorType,
 ) -> bool {
-    let OperatorDispatch::BlockedGemm {
-        inner_block,
-        orientation,
-        ..
-    } = dispatch
-    else {
+    let OperatorDispatch::BlockedGemm(plan) = dispatch else {
         return false;
     };
+    let inner_block = plan.geometry.block.inner;
+    let orientation = plan.geometry.orientation;
     let rank = right.shape.0.len();
     let output_rank = output.shape.0.len();
     if rank < 2 || output_rank < 2 {
@@ -845,7 +820,7 @@ pub(crate) fn gemm_uses_panel_buffer(
                 crate::GemmOrientation::Swapped => 2,
             },
     );
-    k > *inner_block && columns > 16
+    k > inner_block && columns > 16
 }
 
 pub(crate) fn gemm_requires_panel_repacking(
@@ -862,14 +837,11 @@ pub(crate) fn gemm_exchange_phase_count(
     inputs: &[TensorType],
     _output: &TensorType,
 ) -> u64 {
-    let OperatorDispatch::BlockedGemm {
-        inner_block,
-        orientation,
-        ..
-    } = dispatch
-    else {
+    let OperatorDispatch::BlockedGemm(plan) = dispatch else {
         return 0;
     };
+    let inner_block = plan.geometry.block.inner;
+    let orientation = plan.geometry.orientation;
     let Some(left) = inputs.get(match orientation {
         crate::GemmOrientation::Normal => 0,
         crate::GemmOrientation::Swapped => 1,
@@ -885,7 +857,7 @@ pub(crate) fn gemm_exchange_phase_count(
     ) else {
         return 0;
     };
-    u64::from(inner).div_ceil(u64::from(*inner_block))
+    u64::from(inner).div_ceil(u64::from(inner_block))
 }
 
 pub(crate) fn conversion_memory_estimate(
@@ -1027,27 +999,17 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
     inputs: &[TensorType],
     compute_output: &TensorType,
 ) -> Option<ExchangeEndpointTraffic> {
-    let OperatorDispatch::BlockedGemm {
-        orientation,
-        distribution,
-        ..
-    } = dispatch
-    else {
+    let OperatorDispatch::BlockedGemm(plan) = dispatch else {
         return Some(ExchangeEndpointTraffic::default());
     };
     let [first, second] = inputs else {
         return None;
     };
-    let (left, right) = match orientation {
+    let (left, right) = match plan.geometry.orientation {
         crate::GemmOrientation::Normal => (first, second),
         crate::GemmOrientation::Swapped => (second, first),
     };
-    if let GemmDistribution::ParallelReduction {
-        row_partitions,
-        column_partitions,
-        ..
-    } = distribution
-    {
+    if let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution {
         // The parallel dispatch grid contains a K axis which is deliberately
         // absent from `compute_output`: every K group produces a partial with
         // the same logical output extent. Consequently, matching operand and
@@ -1057,11 +1019,12 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
         // those explicit replica counts creates operator-internal traffic.
         return Some(parallel_gemm_operand_traffic(
             left,
-            *column_partitions,
+            reduction.compute.columns,
             right,
-            *row_partitions,
+            reduction.compute.rows,
         ));
     }
+    let orientation = plan.geometry.orientation;
     let left_rank = left.shape.0.len();
     let right_rank = right.shape.0.len();
     let output_rank = compute_output.shape.0.len();
@@ -1318,28 +1281,21 @@ mod tests {
     use super::*;
 
     fn output_stationary_dispatch() -> OperatorDispatch {
-        OperatorDispatch::BlockedGemm {
-            initialize: crate::TileKernelSpec::Gemm {
+        OperatorDispatch::BlockedGemm(crate::BlockedGemmPlan {
+            kernel: crate::GemmKernelFamily {
                 multiply: Precision::F16,
                 accumulate: crate::AccumulationPrecision::F16,
-                mode: crate::GemmKernelMode::Initialize,
                 weights: crate::GemmWeightLoad::Standard,
-                inner_block: AMP_INNER_BLOCK,
-                output_columns: crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
             },
-            accumulate: crate::TileKernelSpec::Gemm {
-                multiply: Precision::F16,
-                accumulate: crate::AccumulationPrecision::F16,
-                mode: crate::GemmKernelMode::Accumulate,
-                weights: crate::GemmWeightLoad::Standard,
-                inner_block: AMP_INNER_BLOCK,
-                output_columns: crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+            geometry: crate::GemmGeometry {
+                block: crate::GemmBlockShape {
+                    inner: AMP_INNER_BLOCK,
+                    output_columns: crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+                },
+                orientation: crate::GemmOrientation::Normal,
+                distribution: GemmDistribution::OutputStationary,
             },
-            inner_block: AMP_INNER_BLOCK,
-            output_column_block: crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
-            orientation: crate::GemmOrientation::Normal,
-            distribution: GemmDistribution::OutputStationary,
-        }
+        })
     }
 
     fn parallel_reduction_dispatch(
@@ -1348,17 +1304,22 @@ mod tests {
         inner_partitions: u16,
     ) -> OperatorDispatch {
         let mut dispatch = output_stationary_dispatch();
-        let OperatorDispatch::BlockedGemm { distribution, .. } = &mut dispatch else {
+        let OperatorDispatch::BlockedGemm(plan) = &mut dispatch else {
             unreachable!();
         };
-        *distribution = GemmDistribution::ParallelReduction {
-            row_partitions,
-            column_partitions,
-            inner_partitions,
-            result_row_partitions: 1,
-            result_column_partitions: 1,
-            reduction_staging: crate::ReductionStaging::Streamed,
-        };
+        plan.geometry.distribution =
+            GemmDistribution::ParallelReduction(crate::ParallelReductionPlan {
+                compute: crate::GemmGrid {
+                    rows: row_partitions,
+                    columns: column_partitions,
+                    inner: inner_partitions,
+                },
+                result: crate::GemmResultGrid {
+                    rows: 1,
+                    columns: 1,
+                },
+                staging: crate::ReductionStaging::Streamed,
+            });
         dispatch
     }
 

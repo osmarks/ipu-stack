@@ -150,34 +150,43 @@ pub enum OperatorDispatch {
         kernel: TileKernelSpec,
         input_mapping: PointwiseInputMapping,
     },
-    BlockedGemm {
-        initialize: TileKernelSpec,
-        accumulate: TileKernelSpec,
-        inner_block: u32,
-        output_column_block: u32,
-        orientation: GemmOrientation,
-        distribution: GemmDistribution,
-    },
-    BlockedAttention {
-        query_key: TileKernelSpec,
-        probability_value: TileKernelSpec,
-        query_block_rows: u32,
-        key_block_rows: u32,
-        padded_query_dimension: u32,
-        padded_value_dimension: u32,
-    },
-    MaterializedAttention {
-        query_key: TileKernelSpec,
-        probability_value: TileKernelSpec,
-        query_block_rows: u32,
-        padded_key_rows: u32,
-        padded_query_dimension: u32,
-        padded_value_dimension: u32,
-    },
+    BlockedGemm(BlockedGemmPlan),
+    Attention(AttentionPlan),
     /// Redistribute packed projection columns into independent attention
     /// streams. The byte mapping is performed directly by local copies and
     /// exchanges, without a tile kernel.
     SplitHeads,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttentionKernelFamily {
+    pub query_key: TileKernelSpec,
+    pub probability_value: TileKernelSpec,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AttentionPadding {
+    pub query_dimension: u32,
+    pub value_dimension: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AttentionBlocking {
+    Flash {
+        query_rows: u32,
+        key_rows: u32,
+    },
+    Materialized {
+        query_rows: u32,
+        padded_key_rows: u32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttentionPlan {
+    pub kernels: AttentionKernelFamily,
+    pub blocking: AttentionBlocking,
+    pub padding: AttentionPadding,
 }
 
 /// A logical value transformation whose physical materialization may be
@@ -277,18 +286,84 @@ pub enum GemmDistribution {
     /// Distribute independent row, output-column, and K block ranges. Each
     /// row/K activation shard is replicated over the column groups, computes
     /// one local partial, and is reduced over K onto the output owner.
-    ParallelReduction {
-        row_partitions: u16,
-        column_partitions: u16,
-        inner_partitions: u16,
-        /// Additional spatial partitions of each computed output block. Their
-        /// product cannot exceed the K partition count; reduction roots are
-        /// spread over former K-partition tiles rather than concentrated on
-        /// one root per compute row/column block.
-        result_row_partitions: u16,
-        result_column_partitions: u16,
-        reduction_staging: ReductionStaging,
-    },
+    ParallelReduction(ParallelReductionPlan),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GemmGrid {
+    pub rows: u16,
+    pub columns: u16,
+    pub inner: u16,
+}
+
+impl GemmGrid {
+    pub const fn tile_count(self) -> u16 {
+        self.rows
+            .saturating_mul(self.columns)
+            .saturating_mul(self.inner)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GemmResultGrid {
+    pub rows: u16,
+    pub columns: u16,
+}
+
+impl GemmResultGrid {
+    pub const fn tile_count(self) -> u16 {
+        self.rows.saturating_mul(self.columns)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParallelReductionPlan {
+    pub compute: GemmGrid,
+    /// Additional spatial partitions of each computed output block. Their
+    /// product cannot exceed the K partition count; reduction roots are
+    /// spread over former K-partition tiles rather than concentrated on one
+    /// root per compute row/column block.
+    pub result: GemmResultGrid,
+    pub staging: ReductionStaging,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GemmBlockShape {
+    pub inner: u32,
+    pub output_columns: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemmKernelFamily {
+    pub multiply: Precision,
+    pub accumulate: AccumulationPrecision,
+    pub weights: GemmWeightLoad,
+}
+
+impl GemmKernelFamily {
+    pub fn kernel(self, mode: GemmKernelMode, block: GemmBlockShape) -> TileKernelSpec {
+        TileKernelSpec::Gemm {
+            multiply: self.multiply,
+            accumulate: self.accumulate,
+            mode,
+            weights: self.weights,
+            inner_block: block.inner,
+            output_columns: block.output_columns,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemmGeometry {
+    pub block: GemmBlockShape,
+    pub orientation: GemmOrientation,
+    pub distribution: GemmDistribution,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockedGemmPlan {
+    pub kernel: GemmKernelFamily,
+    pub geometry: GemmGeometry,
 }
 
 /// Exact blocked-GEMM geometry retained for planner diagnosis. Constraints
@@ -298,15 +373,8 @@ pub enum GemmDistribution {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GemmPlanConstraint {
     pub source_operation: u32,
-    pub orientation: GemmOrientation,
-    pub row_partitions: u16,
-    pub column_partitions: u16,
-    pub inner_partitions: u16,
-    pub result_row_partitions: u16,
-    pub result_column_partitions: u16,
-    pub output_column_block: u32,
+    pub geometry: GemmGeometry,
     pub weight_memory_class: MemoryClass,
-    pub reduction_staging: ReductionStaging,
     pub local_weight_staging: LocalOperandStaging,
 }
 
@@ -343,9 +411,7 @@ impl OperatorDispatch {
         match self {
             Self::Pointwise { .. } => EmptyOutputShardPolicy::Skip,
             Self::SplitHeads => EmptyOutputShardPolicy::Reject,
-            Self::BlockedGemm { .. }
-            | Self::BlockedAttention { .. }
-            | Self::MaterializedAttention { .. } => EmptyOutputShardPolicy::Reject,
+            Self::BlockedGemm(_) | Self::Attention(_) => EmptyOutputShardPolicy::Reject,
         }
     }
 }
@@ -1812,9 +1878,7 @@ fn gemm_seed_plans_for_tile_count(
         .flat_map(|columns| {
             let rows = tile_count / columns;
             let grid_shape = AmpGridShape {
-                tile_count,
-                row_partitions: rows,
-                column_partitions: columns,
+                result: GemmResultGrid { rows, columns },
                 order: GridOrder::ColumnsFast,
             };
             let mut grid = Vec::new();
@@ -2011,17 +2075,17 @@ fn amp_grid_gemm_plan(
         (1, MemoryClass::Standard) => Layout::block_major_matrix_grid(
             inner,
             output_columns,
-            grid.tile_count,
-            grid.row_partitions,
-            grid.column_partitions,
+            grid.result.tile_count(),
+            grid.result.rows,
+            grid.result.columns,
             grid.order,
         ),
         (inner_partitions, memory_class) => Layout::block_major_matrix_storage(
             inner,
             output_columns,
-            grid.column_partitions,
+            grid.result.columns,
             inner_partitions,
-            grid.row_partitions / inner_partitions,
+            grid.result.rows / inner_partitions,
             memory_class,
         ),
     };
@@ -2037,9 +2101,9 @@ fn amp_grid_gemm_plan(
                     precision,
                     layout: Layout::amp_left_grid(
                         inner,
-                        grid.tile_count,
-                        grid.row_partitions,
-                        grid.column_partitions,
+                        grid.result.tile_count(),
+                        grid.result.rows,
+                        grid.result.columns,
                         grid.order,
                     ),
                 },
@@ -2061,17 +2125,17 @@ fn amp_grid_gemm_plan(
                 layout: if precision == Precision::F16 {
                     Layout::amp_left_result_grid(
                         output_columns,
-                        grid.tile_count,
-                        grid.row_partitions,
-                        grid.column_partitions,
+                        grid.result.tile_count(),
+                        grid.result.rows,
+                        grid.result.columns,
                         grid.order,
                     )
                 } else {
                     Layout::amp_output_grid(
                         output_columns,
-                        grid.tile_count,
-                        grid.row_partitions,
-                        grid.column_partitions,
+                        grid.result.tile_count(),
+                        grid.result.rows,
+                        grid.result.columns,
                         grid.order,
                     )
                 },
@@ -2095,35 +2159,26 @@ fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> Operator
     else {
         unreachable!("blocked GEMM dispatch requires a GEMM operator")
     };
-    OperatorDispatch::BlockedGemm {
-        initialize: TileKernelSpec::Gemm {
+    OperatorDispatch::BlockedGemm(BlockedGemmPlan {
+        kernel: GemmKernelFamily {
             multiply,
             accumulate,
-            mode: GemmKernelMode::Initialize,
             weights: GemmWeightLoad::Standard,
-            inner_block: AMP_INNER_BLOCK,
-            output_columns,
         },
-        accumulate: TileKernelSpec::Gemm {
-            multiply,
-            accumulate,
-            mode: GemmKernelMode::Accumulate,
-            weights: GemmWeightLoad::Standard,
-            inner_block: AMP_INNER_BLOCK,
-            output_columns,
+        geometry: GemmGeometry {
+            block: GemmBlockShape {
+                inner: AMP_INNER_BLOCK,
+                output_columns,
+            },
+            orientation: GemmOrientation::Normal,
+            distribution: GemmDistribution::OutputStationary,
         },
-        inner_block: AMP_INNER_BLOCK,
-        output_column_block: output_columns,
-        orientation: GemmOrientation::Normal,
-        distribution: GemmDistribution::OutputStationary,
-    }
+    })
 }
 
 #[derive(Clone, Copy)]
 struct AmpGridShape {
-    tile_count: u16,
-    row_partitions: u16,
-    column_partitions: u16,
+    result: GemmResultGrid,
     order: GridOrder,
 }
 
@@ -2192,7 +2247,7 @@ pub struct MidValue {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidOperationKind {
-    Operator(MidOperator),
+    Operator(OperatorPlan),
     CastPrecision { from: Precision, to: Precision },
     Rearrange { from: Layout, to: Layout },
     Repeat(MidRepeat),
@@ -2204,11 +2259,34 @@ pub struct MidOperation {
     pub inputs: Vec<MidValueId>,
     pub results: Vec<MidValueId>,
     pub kind: MidOperationKind,
-    pub operator_plan: Option<OperatorPlan>,
     pub conversion_plan: Option<ConversionPlan>,
     pub estimated_cycles: u64,
     pub estimated_exchange_cycles: u64,
     pub memory: MemoryEstimate,
+}
+
+impl MidOperation {
+    pub fn operator_plan(&self) -> Option<&OperatorPlan> {
+        match &self.kind {
+            MidOperationKind::Operator(plan) => Some(plan),
+            MidOperationKind::CastPrecision { .. }
+            | MidOperationKind::Rearrange { .. }
+            | MidOperationKind::Repeat(_) => None,
+        }
+    }
+
+    pub fn operator_plan_mut(&mut self) -> Option<&mut OperatorPlan> {
+        match &mut self.kind {
+            MidOperationKind::Operator(plan) => Some(plan),
+            MidOperationKind::CastPrecision { .. }
+            | MidOperationKind::Rearrange { .. }
+            | MidOperationKind::Repeat(_) => None,
+        }
+    }
+
+    pub fn operator(&self) -> Option<MidOperator> {
+        self.operator_plan().map(|plan| plan.operator)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2306,15 +2384,12 @@ impl OperatorPlan {
                 MidOperator::Gemm {
                     options, multiply, ..
                 },
-                OperatorDispatch::BlockedGemm {
-                    initialize,
-                    accumulate,
-                    inner_block,
-                    output_column_block,
-                    distribution,
-                    orientation,
-                },
+                OperatorDispatch::BlockedGemm(plan),
             ) => {
+                let inner_block = &plan.geometry.block.inner;
+                let output_column_block = &plan.geometry.block.output_columns;
+                let distribution = &plan.geometry.distribution;
+                let orientation = &plan.geometry.orientation;
                 let [left, right] = inputs else {
                     return Err(OperatorPlanError::OperandArity);
                 };
@@ -2355,41 +2430,15 @@ impl OperatorPlan {
                 if options.transpose_left || options.transpose_right || !formats_match_orientation {
                     return Err(OperatorPlanError::UnsupportedGemmLayout);
                 }
-                let (
-                    TileKernelSpec::Gemm {
-                        multiply: init_multiply,
-                        accumulate: init_accumulate,
-                        mode: GemmKernelMode::Initialize,
-                        inner_block: init_inner_block,
-                        output_columns: init_output_columns,
-                        ..
-                    },
-                    TileKernelSpec::Gemm {
-                        multiply: next_multiply,
-                        accumulate: next_accumulate,
-                        mode: GemmKernelMode::Accumulate,
-                        inner_block: next_inner_block,
-                        output_columns: next_output_columns,
-                        ..
-                    },
-                    MidOperator::Gemm {
-                        multiply,
-                        accumulate,
-                        ..
-                    },
-                ) = (initialize, accumulate, &self.operator)
+                let MidOperator::Gemm {
+                    multiply,
+                    accumulate,
+                    ..
+                } = &self.operator
                 else {
                     return Err(OperatorPlanError::DispatchMismatch);
                 };
-                if init_multiply != multiply
-                    || next_multiply != multiply
-                    || init_accumulate != accumulate
-                    || next_accumulate != accumulate
-                    || init_inner_block != inner_block
-                    || next_inner_block != inner_block
-                    || init_output_columns != output_column_block
-                    || next_output_columns != output_column_block
-                {
+                if plan.kernel.multiply != *multiply || plan.kernel.accumulate != *accumulate {
                     return Err(OperatorPlanError::DispatchMismatch);
                 }
                 if *inner_block == 0
@@ -2399,18 +2448,12 @@ impl OperatorPlan {
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
                 }
-                if let GemmDistribution::ParallelReduction {
-                    row_partitions,
-                    column_partitions,
-                    inner_partitions,
-                    result_row_partitions,
-                    result_column_partitions,
-                    ..
-                } = distribution
-                {
-                    let result_rows = row_partitions.saturating_mul(*result_row_partitions);
-                    let result_columns =
-                        column_partitions.saturating_mul(*result_column_partitions);
+                if let GemmDistribution::ParallelReduction(reduction) = distribution {
+                    let result_rows = reduction.compute.rows.saturating_mul(reduction.result.rows);
+                    let result_columns = reduction
+                        .compute
+                        .columns
+                        .saturating_mul(reduction.result.columns);
                     let expected_tiles = result_rows.saturating_mul(result_columns);
                     let row_axis = match orientation {
                         GemmOrientation::Normal => TensorAxis::FromEnd(2),
@@ -2430,13 +2473,12 @@ impl OperatorPlan {
                             .find(|tiling| tiling.axis == axis)
                             .map(|tiling| tiling.partitions)
                     };
-                    if *row_partitions == 0
-                        || *column_partitions == 0
-                        || *inner_partitions < 2
-                        || *result_row_partitions == 0
-                        || *result_column_partitions == 0
-                        || result_row_partitions.saturating_mul(*result_column_partitions)
-                            > *inner_partitions
+                    if reduction.compute.rows == 0
+                        || reduction.compute.columns == 0
+                        || reduction.compute.inner < 2
+                        || reduction.result.rows == 0
+                        || reduction.result.columns == 0
+                        || reduction.result.tile_count() > reduction.compute.inner
                         || output.format.layout.tiling.tile_count != expected_tiles
                         || axis_partitions(row_axis) != Some(result_rows)
                         || axis_partitions(column_axis) != Some(result_columns)
@@ -2508,7 +2550,7 @@ impl OperatorPlan {
                         GemmOrientation::Swapped => 2,
                     };
                 let balanced_output_columns =
-                    matches!(distribution, GemmDistribution::ParallelReduction { .. });
+                    matches!(distribution, GemmDistribution::ParallelReduction(_));
                 let output_shard_alignment = if balanced_output_columns {
                     AMP_COLUMN_MICRO
                 } else {
@@ -2553,24 +2595,25 @@ impl OperatorPlan {
                     options,
                     accumulate,
                 },
-                OperatorDispatch::BlockedAttention {
-                    query_key,
-                    probability_value,
-                    query_block_rows,
-                    key_block_rows,
-                    padded_query_dimension,
-                    padded_value_dimension,
-                },
+                OperatorDispatch::Attention(AttentionPlan {
+                    kernels,
+                    blocking:
+                        AttentionBlocking::Flash {
+                            query_rows,
+                            key_rows,
+                        },
+                    padding,
+                }),
             ) => {
                 let [query, key, value] = inputs else {
                     return Err(OperatorPlanError::OperandArity);
                 };
                 if options.causal
                     || *accumulate != AccumulationPrecision::F32
-                    || *query_block_rows == 0
-                    || *key_block_rows != AMP_INNER_BLOCK
-                    || *padded_query_dimension == 0
-                    || *padded_value_dimension == 0
+                    || *query_rows == 0
+                    || *key_rows != AMP_INNER_BLOCK
+                    || padding.query_dimension == 0
+                    || padding.value_dimension == 0
                     || !matches!(query.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
                     || !matches!(
                         key.format.layout.order,
@@ -2584,8 +2627,8 @@ impl OperatorPlan {
                     || query.format.layout.tiling.tile_count
                         != output.format.layout.tiling.tile_count
                     || key.format.layout.tiling.tile_count != value.format.layout.tiling.tile_count
-                    || !matches!(query_key, TileKernelSpec::Gemm { .. })
-                    || !matches!(probability_value, TileKernelSpec::Gemm { .. })
+                    || !matches!(kernels.query_key, TileKernelSpec::Gemm { .. })
+                    || !matches!(kernels.probability_value, TileKernelSpec::Gemm { .. })
                 {
                     Err(OperatorPlanError::InvalidBlocking)
                 } else {
@@ -2597,25 +2640,26 @@ impl OperatorPlan {
                     options,
                     accumulate,
                 },
-                OperatorDispatch::MaterializedAttention {
-                    query_key,
-                    probability_value,
-                    query_block_rows,
-                    padded_key_rows,
-                    padded_query_dimension,
-                    padded_value_dimension,
-                },
+                OperatorDispatch::Attention(AttentionPlan {
+                    kernels,
+                    blocking:
+                        AttentionBlocking::Materialized {
+                            query_rows,
+                            padded_key_rows,
+                        },
+                    padding,
+                }),
             ) => {
                 let [query, key, value] = inputs else {
                     return Err(OperatorPlanError::OperandArity);
                 };
                 if options.causal
                     || *accumulate != AccumulationPrecision::F32
-                    || *query_block_rows == 0
+                    || *query_rows == 0
                     || *padded_key_rows == 0
                     || !padded_key_rows.is_multiple_of(AMP_INNER_BLOCK)
-                    || *padded_query_dimension == 0
-                    || *padded_value_dimension == 0
+                    || padding.query_dimension == 0
+                    || padding.value_dimension == 0
                     || !matches!(query.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
                     || !matches!(
                         key.format.layout.order,
@@ -2629,8 +2673,8 @@ impl OperatorPlan {
                     || query.format.layout.tiling.tile_count
                         != output.format.layout.tiling.tile_count
                     || key.format.layout.tiling.tile_count != value.format.layout.tiling.tile_count
-                    || !matches!(query_key, TileKernelSpec::Gemm { .. })
-                    || !matches!(probability_value, TileKernelSpec::Gemm { .. })
+                    || !matches!(kernels.query_key, TileKernelSpec::Gemm { .. })
+                    || !matches!(kernels.probability_value, TileKernelSpec::Gemm { .. })
                 {
                     Err(OperatorPlanError::InvalidBlocking)
                 } else {
@@ -2901,7 +2945,7 @@ pub(crate) fn lower_finalists(
                 finalist,
                 plans = ?branch.operations
                     .iter()
-                    .filter_map(|operation| operation.operator_plan.as_ref().map(|plan| (
+                    .filter_map(|operation| operation.operator_plan().map(|plan| (
                         operation.source,
                         &plan.dispatch,
                         plan.requirements.inputs.iter().map(|input| &input.format.layout).collect::<Vec<_>>(),
@@ -3138,7 +3182,7 @@ fn future_format_compatibility(
             .rev()
             .find(|operation| operation.results.first() == Some(&id))
             .and_then(|operation| {
-                let offer = operation.operator_plan.as_ref()?.deferred_output?;
+                let offer = operation.operator_plan()?.deferred_output?;
                 operation.inputs.get(offer.source_input).copied()
             });
         if let Some(source) = deferred_source {
@@ -3241,7 +3285,7 @@ fn plan_region_frontier(
                 operator_accepts_input_layout(&operation.kind, index, config).then_some(index)
             })
             .collect::<BTreeSet<_>>();
-        let mut plan_cache = BTreeMap::<PlanCacheKey, Vec<Plan>>::new();
+        let mut plan_cache = BTreeMap::<PlanCacheKey, Vec<OperatorPlan>>::new();
         let mut plan_cache_hits = 0usize;
         let mut generated_plan_sets = 0usize;
         for branch in beam {
@@ -3282,7 +3326,7 @@ fn plan_region_frontier(
                         contiguous_overflow = peak.standard_contiguous_overflow_with_reservation(
                             config.standard_memory_reservation_bytes,
                         ),
-                        plan = ?next.operations.last().and_then(|operation| operation.operator_plan.as_ref()),
+                        plan = ?next.operations.last().and_then(|operation| operation.operator_plan()),
                         "rejected planning branch for memory"
                     );
                     rejected_memory.push(peak);
@@ -3458,7 +3502,7 @@ fn plan_region_frontier(
                         contiguous_overflow = peak.standard_contiguous_overflow_with_reservation(
                             config.standard_memory_reservation_bytes,
                         ),
-                        plan = ?next.operations.last().and_then(|operation| operation.operator_plan.as_ref()),
+                        plan = ?next.operations.last().and_then(|operation| operation.operator_plan()),
                         "rejected planning branch for memory"
                     );
                     rejected_memory.push(peak);
@@ -3763,8 +3807,7 @@ fn future_beam_state(
             });
         let Some((operation, offer)) = offer.and_then(|operation| {
             operation
-                .operator_plan
-                .as_ref()
+                .operator_plan()
                 .and_then(|plan| plan.deferred_output)
                 .map(|offer| (operation, offer))
         }) else {
@@ -3813,7 +3856,7 @@ fn future_beam_state(
 fn deferred_claims(operations: &[MidOperation]) -> BTreeSet<MidValueId> {
     operations
         .iter()
-        .filter_map(|operation| operation.operator_plan.as_ref())
+        .filter_map(|operation| operation.operator_plan())
         .flat_map(|plan| plan.deferred_inputs.iter().flatten())
         .map(|input| input.producer)
         .collect()
@@ -3826,8 +3869,7 @@ fn deferred_aware_branch_score(
     let claims = deferred_claims(&branch.operations);
     branch.operations.iter().fold(0u64, |cycles, operation| {
         let pending = operation
-            .operator_plan
-            .as_ref()
+            .operator_plan()
             .and_then(|plan| plan.deferred_output)
             .filter(|_| {
                 operation.results.first().is_some_and(|result| {
@@ -3846,8 +3888,7 @@ fn restore_unclaimed_deferred_costs(operations: &mut [MidOperation]) {
     let claims = deferred_claims(operations);
     for operation in operations {
         let Some(offer) = operation
-            .operator_plan
-            .as_ref()
+            .operator_plan()
             .and_then(|plan| plan.deferred_output)
         else {
             continue;
@@ -3908,14 +3949,13 @@ fn operation_graph_inputs(operation: &Operation, graph: &ComputeGraph) -> Vec<Va
 fn apply_selected_plan(
     operation: &Operation,
     output_shape: TensorShape,
-    plan: Plan,
+    mut plan: OperatorPlan,
     single_use_inputs: &[bool],
     costs: &impl CostModel,
     values: &mut BTreeMap<ValueId, MidValueId>,
     state: &mut LoweringState,
     operations: &mut Vec<MidOperation>,
 ) {
-    let plan = plan;
     let input_ids = operation
         .inputs
         .iter()
@@ -4012,8 +4052,7 @@ fn apply_selected_plan(
             continue;
         };
         let Some(offered) = operations[producer_index]
-            .operator_plan
-            .as_ref()
+            .operator_plan()
             .and_then(|producer| producer.deferred_output)
         else {
             continue;
@@ -4078,19 +4117,14 @@ fn apply_selected_plan(
         operator_cycles = 0;
         operator_exchange_cycles = 0;
     }
+    plan.exchange = exchange;
+    plan.deferred_output = deferred_output;
+    plan.deferred_inputs = deferred_inputs;
     operations.push(MidOperation {
         source: Some(operation.id),
         inputs: converted,
         results: vec![result],
-        kind: MidOperationKind::Operator(plan.operator),
-        operator_plan: Some(OperatorPlan {
-            operator: plan.operator,
-            dispatch: plan.dispatch,
-            requirements: plan.requirements,
-            exchange,
-            deferred_output,
-            deferred_inputs,
-        }),
+        kind: MidOperationKind::Operator(plan),
         conversion_plan: None,
         estimated_cycles: operator_cycles,
         estimated_exchange_cycles: operator_exchange_cycles,
@@ -4136,15 +4170,24 @@ fn beam_memory_peak(
     )
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct Plan {
-    operator: MidOperator,
-    dispatch: OperatorDispatch,
-    requirements: OperatorRequirements,
-    deferred_output: Option<DeferredOutputPlan>,
-}
+impl OperatorPlan {
+    fn candidate(
+        operator: MidOperator,
+        dispatch: OperatorDispatch,
+        requirements: OperatorRequirements,
+        deferred_output: Option<DeferredOutputPlan>,
+    ) -> Self {
+        let input_count = requirements.inputs.len();
+        Self {
+            operator,
+            dispatch,
+            requirements,
+            exchange: ExchangeFootprint::default(),
+            deferred_output,
+            deferred_inputs: vec![None; input_count],
+        }
+    }
 
-impl Plan {
     fn supports(&self, inputs: &[TensorType], output: &TensorShape) -> bool {
         if self.requirements.inputs.len() != inputs.len()
             || !valid_requirement(&self.requirements.output, output)
@@ -4210,21 +4253,12 @@ impl Plan {
             shape: output.clone(),
             format: self.requirements.output.format.clone(),
         };
-        OperatorPlan {
-            operator: self.operator,
-            dispatch: self.dispatch.clone(),
-            requirements: self.requirements.clone(),
-            exchange: ExchangeFootprint::default(),
-            deferred_output: self.deferred_output,
-            deferred_inputs: vec![None; self.requirements.inputs.len()],
-        }
-        .validate(&planned_inputs, &planned_output)
-        .is_ok()
+        self.validate(&planned_inputs, &planned_output).is_ok()
     }
 }
 
 fn plan_fits_operator_memory(
-    plan: &Plan,
+    plan: &OperatorPlan,
     inputs: &[TensorType],
     output: &TensorShape,
     config: &PipelineConfig,
@@ -4269,9 +4303,7 @@ struct ParallelGridProxy {
     communication: u64,
     temporary_bytes: u64,
     unused_tiles: u64,
-    row_partitions: u16,
-    column_partitions: u16,
-    inner_partitions: u16,
+    grid: GemmGrid,
     physical_column_groups: u16,
     grouped: bool,
 }
@@ -4396,7 +4428,7 @@ fn plans_for_operation(
     distributed_result_is_useful: bool,
     grouped_output: Option<GroupedOutputLayout>,
     direct_consumer_layouts: &[Layout],
-) -> Vec<Plan> {
+) -> Vec<OperatorPlan> {
     let mut plans = Vec::new();
     let gemm_constraint = config
         .search_domain
@@ -4427,7 +4459,7 @@ fn plans_for_operation(
             direct_consumer_layouts.to_vec()
         };
         for layout in layouts {
-            let plan = Plan {
+            let plan = OperatorPlan {
                 operator: MidOperator::SplitHeads(options),
                 dispatch: OperatorDispatch::SplitHeads,
                 requirements: OperatorRequirements {
@@ -4450,6 +4482,8 @@ fn plans_for_operation(
                     unfused_cycles: 0,
                     unfused_exchange_cycles: 0,
                 }),
+                exchange: ExchangeFootprint::default(),
+                deferred_inputs: vec![None],
             };
             if !plans.contains(&plan) {
                 plans.push(plan);
@@ -4502,33 +4536,39 @@ fn plans_for_operation(
                 layout: Layout::attention_output(heads, query_partitions),
             };
             if config.search_domain.attention_strategy != AttentionStrategy::Materialized {
-                plans.push(Plan {
+                plans.push(OperatorPlan {
                     operator: MidOperator::FlashAttention {
                         options,
                         accumulate: AccumulationPrecision::F32,
                     },
-                    dispatch: OperatorDispatch::BlockedAttention {
-                        query_key: TileKernelSpec::Gemm {
-                            multiply: Precision::F16,
-                            accumulate: AccumulationPrecision::F32,
-                            mode: GemmKernelMode::Initialize,
-                            weights: GemmWeightLoad::Standard,
-                            inner_block: padded_query_dimension,
-                            output_columns: AMP_INNER_BLOCK,
+                    dispatch: OperatorDispatch::Attention(AttentionPlan {
+                        kernels: AttentionKernelFamily {
+                            query_key: TileKernelSpec::Gemm {
+                                multiply: Precision::F16,
+                                accumulate: AccumulationPrecision::F32,
+                                mode: GemmKernelMode::Initialize,
+                                weights: GemmWeightLoad::Standard,
+                                inner_block: padded_query_dimension,
+                                output_columns: AMP_INNER_BLOCK,
+                            },
+                            probability_value: TileKernelSpec::Gemm {
+                                multiply: Precision::F16,
+                                accumulate: AccumulationPrecision::F32,
+                                mode: GemmKernelMode::Initialize,
+                                weights: GemmWeightLoad::Standard,
+                                inner_block: AMP_INNER_BLOCK,
+                                output_columns: padded_value_dimension,
+                            },
                         },
-                        probability_value: TileKernelSpec::Gemm {
-                            multiply: Precision::F16,
-                            accumulate: AccumulationPrecision::F32,
-                            mode: GemmKernelMode::Initialize,
-                            weights: GemmWeightLoad::Standard,
-                            inner_block: AMP_INNER_BLOCK,
-                            output_columns: padded_value_dimension,
+                        blocking: AttentionBlocking::Flash {
+                            query_rows: query_rows.div_ceil(u32::from(query_partitions)),
+                            key_rows: AMP_INNER_BLOCK,
                         },
-                        query_block_rows: query_rows.div_ceil(u32::from(query_partitions)),
-                        key_block_rows: AMP_INNER_BLOCK,
-                        padded_query_dimension,
-                        padded_value_dimension,
-                    },
+                        padding: AttentionPadding {
+                            query_dimension: padded_query_dimension,
+                            value_dimension: padded_value_dimension,
+                        },
+                    }),
                     requirements: OperatorRequirements {
                         inputs: vec![
                             OperandRequirement::new(query_format.clone(), 8)
@@ -4543,36 +4583,44 @@ fn plans_for_operation(
                         memory_relations: Vec::new(),
                     },
                     deferred_output: None,
+                    exchange: ExchangeFootprint::default(),
+                    deferred_inputs: vec![None; 3],
                 });
             }
             if config.search_domain.attention_strategy != AttentionStrategy::Flash {
-                plans.push(Plan {
+                plans.push(OperatorPlan {
                     operator: MidOperator::FlashAttention {
                         options,
                         accumulate: AccumulationPrecision::F32,
                     },
-                    dispatch: OperatorDispatch::MaterializedAttention {
-                        query_key: TileKernelSpec::Gemm {
-                            multiply: Precision::F16,
-                            accumulate: AccumulationPrecision::F32,
-                            mode: GemmKernelMode::Initialize,
-                            weights: GemmWeightLoad::Standard,
-                            inner_block: padded_query_dimension,
-                            output_columns: padded_key_rows,
+                    dispatch: OperatorDispatch::Attention(AttentionPlan {
+                        kernels: AttentionKernelFamily {
+                            query_key: TileKernelSpec::Gemm {
+                                multiply: Precision::F16,
+                                accumulate: AccumulationPrecision::F32,
+                                mode: GemmKernelMode::Initialize,
+                                weights: GemmWeightLoad::Standard,
+                                inner_block: padded_query_dimension,
+                                output_columns: padded_key_rows,
+                            },
+                            probability_value: TileKernelSpec::Gemm {
+                                multiply: Precision::F16,
+                                accumulate: AccumulationPrecision::F32,
+                                mode: GemmKernelMode::Initialize,
+                                weights: GemmWeightLoad::Standard,
+                                inner_block: padded_key_rows,
+                                output_columns: padded_value_dimension,
+                            },
                         },
-                        probability_value: TileKernelSpec::Gemm {
-                            multiply: Precision::F16,
-                            accumulate: AccumulationPrecision::F32,
-                            mode: GemmKernelMode::Initialize,
-                            weights: GemmWeightLoad::Standard,
-                            inner_block: padded_key_rows,
-                            output_columns: padded_value_dimension,
+                        blocking: AttentionBlocking::Materialized {
+                            query_rows: query_rows.div_ceil(u32::from(query_partitions)),
+                            padded_key_rows,
                         },
-                        query_block_rows: query_rows.div_ceil(u32::from(query_partitions)),
-                        padded_key_rows,
-                        padded_query_dimension,
-                        padded_value_dimension,
-                    },
+                        padding: AttentionPadding {
+                            query_dimension: padded_query_dimension,
+                            value_dimension: padded_value_dimension,
+                        },
+                    }),
                     requirements: OperatorRequirements {
                         inputs: vec![
                             OperandRequirement::new(query_format, 8)
@@ -4587,6 +4635,8 @@ fn plans_for_operation(
                         memory_relations: Vec::new(),
                     },
                     deferred_output: None,
+                    exchange: ExchangeFootprint::default(),
+                    deferred_inputs: vec![None; 3],
                 });
             }
         }
@@ -4644,7 +4694,7 @@ fn pointwise_plans(
     inputs: &[TensorType],
     output: &TensorShape,
     config: &PipelineConfig,
-) -> Vec<Plan> {
+) -> Vec<OperatorPlan> {
     let mapping = match operator {
         MidOperator::Gelu => PointwiseInputMapping::TileLocal,
         MidOperator::Add(_) => PointwiseInputMapping::BroadcastToOutput,
@@ -4678,7 +4728,7 @@ fn pointwise_plans(
                     .filter_map(|(index, input)| (input.shape == *output).then_some(index as u16))
                     .collect(),
             );
-            let plan = Plan {
+            let plan = OperatorPlan {
                 operator,
                 dispatch: OperatorDispatch::Pointwise {
                     kernel: kernel.clone(),
@@ -4693,6 +4743,8 @@ fn pointwise_plans(
                     memory_relations: Vec::new(),
                 },
                 deferred_output: None,
+                exchange: ExchangeFootprint::default(),
+                deferred_inputs: vec![None; inputs.len()],
             };
             if !plans.contains(&plan) {
                 plans.push(plan);
@@ -4780,7 +4832,7 @@ fn gemm_plans(
     distributed_result_is_useful: bool,
     constraint: Option<&GemmPlanConstraint>,
     grouped_output: Option<GroupedOutputLayout>,
-) -> Vec<Plan> {
+) -> Vec<OperatorPlan> {
     if options != GemmOptions::default() {
         return Vec::new();
     }
@@ -4828,18 +4880,18 @@ fn gemm_plans(
     plans
 }
 
-fn finish_gemm_plan(options: GemmOptions, plan: GemmPlan) -> Plan {
-    Plan {
-        operator: gemm_operator(options, &plan),
-        dispatch: plan.dispatch,
-        requirements: OperatorRequirements {
+fn finish_gemm_plan(options: GemmOptions, plan: GemmPlan) -> OperatorPlan {
+    OperatorPlan::candidate(
+        gemm_operator(options, &plan),
+        plan.dispatch,
+        OperatorRequirements {
             inputs: plan.inputs,
             output: plan.output,
             output_aliasing: OutputAliasing::Fresh,
             memory_relations: plan.memory_relations,
         },
-        deferred_output: None,
-    }
+        None,
+    )
 }
 
 fn gemm_operator(options: GemmOptions, plan: &GemmPlan) -> MidOperator {
@@ -4856,39 +4908,24 @@ fn gemm_plan_matches(
     dispatch: &OperatorDispatch,
     inputs: &[OperandRequirement],
 ) -> bool {
-    let OperatorDispatch::BlockedGemm {
-        output_column_block,
-        orientation,
-        distribution:
-            GemmDistribution::ParallelReduction {
-                row_partitions,
-                column_partitions,
-                inner_partitions,
-                result_row_partitions,
-                result_column_partitions,
-                reduction_staging,
-            },
-        ..
-    } = dispatch
-    else {
+    let OperatorDispatch::BlockedGemm(plan) = dispatch else {
         return false;
     };
-    let weight_index = match orientation {
+    if !matches!(
+        plan.geometry.distribution,
+        GemmDistribution::ParallelReduction(_)
+    ) {
+        return false;
+    }
+    let weight_index = match plan.geometry.orientation {
         GemmOrientation::Normal => 1,
         GemmOrientation::Swapped => 0,
     };
     let Some(weight) = inputs.get(weight_index) else {
         return false;
     };
-    *orientation == constraint.orientation
-        && *row_partitions == constraint.row_partitions
-        && *column_partitions == constraint.column_partitions
-        && *inner_partitions == constraint.inner_partitions
-        && *result_row_partitions == constraint.result_row_partitions
-        && *result_column_partitions == constraint.result_column_partitions
-        && *output_column_block == constraint.output_column_block
+    plan.geometry == constraint.geometry
         && weight.format.layout.memory_class == constraint.weight_memory_class
-        && *reduction_staging == constraint.reduction_staging
         && weight.local_staging == constraint.local_weight_staging
 }
 
@@ -4898,7 +4935,7 @@ fn independent_parameter_storage(
     input_index: usize,
     config: &PipelineConfig,
 ) -> Vec<GemmPlan> {
-    if !matches!(candidate.dispatch, OperatorDispatch::BlockedGemm { .. }) {
+    if !matches!(candidate.dispatch, OperatorDispatch::BlockedGemm(_)) {
         return Vec::new();
     }
     let Some(requirement) = candidate.inputs.get(input_index) else {
@@ -4926,13 +4963,9 @@ fn independent_parameter_storage(
     };
     let inner_blocks = inner.div_ceil(u32::from(inner_block));
     let output_column_block = match candidate.dispatch {
-        OperatorDispatch::BlockedGemm {
-            output_column_block,
-            ..
-        } => output_column_block,
+        OperatorDispatch::BlockedGemm(plan) => plan.geometry.block.output_columns,
         OperatorDispatch::Pointwise { .. }
-        | OperatorDispatch::BlockedAttention { .. }
-        | OperatorDispatch::MaterializedAttention { .. }
+        | OperatorDispatch::Attention(_)
         | OperatorDispatch::SplitHeads => {
             return Vec::new();
         }
@@ -5030,14 +5063,16 @@ fn parallel_reduction_plans_for_orientation(
     // Residual supervisor, weight-feed, and worker setup cost after retained
     // state, measured on IPU21 independently of the four issue cycles per row.
     const AMP_F16_MICROBLOCK_FIXED_CYCLES: u64 = 160;
-    let OperatorDispatch::BlockedGemm {
-        output_column_block,
-        distribution: GemmDistribution::OutputStationary,
-        ..
-    } = candidate.dispatch
-    else {
+    let OperatorDispatch::BlockedGemm(plan) = candidate.dispatch else {
         return Vec::new();
     };
+    if !matches!(
+        plan.geometry.distribution,
+        GemmDistribution::OutputStationary
+    ) {
+        return Vec::new();
+    }
+    let output_column_block = plan.geometry.block.output_columns;
     if !matches!(
         operator,
         MidOperator::Gemm {
@@ -5214,9 +5249,11 @@ fn parallel_reduction_plans_for_orientation(
                     communication,
                     temporary_bytes,
                     unused_tiles: u64::from(tile_count - used_tiles),
-                    row_partitions,
-                    column_partitions,
-                    inner_partitions,
+                    grid: GemmGrid {
+                        rows: row_partitions,
+                        columns: column_partitions,
+                        inner: inner_partitions,
+                    },
                     physical_column_groups,
                     grouped,
                 });
@@ -5228,10 +5265,12 @@ fn parallel_reduction_plans_for_orientation(
         grids
             .into_iter()
             .filter(|grid| {
-                orientation == constraint.orientation
-                    && grid.row_partitions == constraint.row_partitions
-                    && grid.column_partitions == constraint.column_partitions
-                    && grid.inner_partitions == constraint.inner_partitions
+                let GemmDistribution::ParallelReduction(reduction) =
+                    constraint.geometry.distribution
+                else {
+                    return false;
+                };
+                orientation == constraint.geometry.orientation && grid.grid == reduction.compute
             })
             .collect::<Vec<_>>()
     } else {
@@ -5239,7 +5278,7 @@ fn parallel_reduction_plans_for_orientation(
         // constraints, so retain every non-dominated proxy tradeoff until the
         // precise operator estimator can rank it.
         let dominates = |left: &ParallelGridProxy, right: &ParallelGridProxy| {
-            left.inner_partitions == right.inner_partitions
+            left.grid.inner == right.grid.inner
                 && left.grouped == right.grouped
                 && left.compute <= right.compute
                 && left.communication <= right.communication
@@ -5264,9 +5303,7 @@ fn parallel_reduction_plans_for_orientation(
                 grid.communication,
                 grid.temporary_bytes,
                 grid.unused_tiles,
-                grid.row_partitions,
-                grid.column_partitions,
-                grid.inner_partitions,
+                grid.grid,
                 grid.grouped,
             )
         });
@@ -5276,9 +5313,12 @@ fn parallel_reduction_plans_for_orientation(
     let mut variants = Vec::new();
     for grid in grids {
         let ParallelGridProxy {
-            row_partitions,
-            column_partitions,
-            inner_partitions,
+            grid:
+                GemmGrid {
+                    rows: row_partitions,
+                    columns: column_partitions,
+                    inner: inner_partitions,
+                },
             physical_column_groups,
             grouped,
             ..
@@ -5372,57 +5412,30 @@ fn parallel_reduction_plans_for_orientation(
                     ])];
                 }
             }
-            if let OperatorDispatch::BlockedGemm {
-                initialize,
-                accumulate,
-                inner_block,
-                output_column_block,
-                orientation: selected_orientation,
-                distribution,
-            } = &mut variant.dispatch
-            {
-                if let TileKernelSpec::Gemm { weights, .. } = initialize {
-                    *weights = if memory_class == MemoryClass::Interleaved {
-                        GemmWeightLoad::Interleaved
-                    } else {
-                        GemmWeightLoad::Standard
-                    };
-                }
-                if let TileKernelSpec::Gemm {
-                    inner_block,
-                    output_columns,
-                    ..
-                } = initialize
-                {
-                    *inner_block = kernel_inner_block;
-                    *output_columns = kernel_output_columns;
-                }
-                if let TileKernelSpec::Gemm { weights, .. } = accumulate {
-                    *weights = if memory_class == MemoryClass::Interleaved {
-                        GemmWeightLoad::Interleaved
-                    } else {
-                        GemmWeightLoad::Standard
-                    };
-                }
-                if let TileKernelSpec::Gemm {
-                    inner_block,
-                    output_columns,
-                    ..
-                } = accumulate
-                {
-                    *inner_block = kernel_inner_block;
-                    *output_columns = kernel_output_columns;
-                }
-                *inner_block = kernel_inner_block;
-                *output_column_block = kernel_output_columns;
-                *selected_orientation = orientation;
-                *distribution = GemmDistribution::ParallelReduction {
-                    row_partitions,
-                    column_partitions,
-                    inner_partitions,
-                    result_row_partitions: 1,
-                    result_column_partitions: 1,
-                    reduction_staging: ReductionStaging::Complete,
+            if let OperatorDispatch::BlockedGemm(plan) = &mut variant.dispatch {
+                plan.kernel.weights = if memory_class == MemoryClass::Interleaved {
+                    GemmWeightLoad::Interleaved
+                } else {
+                    GemmWeightLoad::Standard
+                };
+                plan.geometry = GemmGeometry {
+                    block: GemmBlockShape {
+                        inner: kernel_inner_block,
+                        output_columns: kernel_output_columns,
+                    },
+                    orientation,
+                    distribution: GemmDistribution::ParallelReduction(ParallelReductionPlan {
+                        compute: GemmGrid {
+                            rows: row_partitions,
+                            columns: column_partitions,
+                            inner: inner_partitions,
+                        },
+                        result: GemmResultGrid {
+                            rows: 1,
+                            columns: 1,
+                        },
+                        staging: ReductionStaging::Complete,
+                    }),
                 };
             }
             let physical_right_index = match orientation {
@@ -5473,18 +5486,12 @@ fn parallel_reduction_plans_for_orientation(
                         continue;
                     }
                     let mut result_variant = variant.clone();
-                    if let OperatorDispatch::BlockedGemm {
-                        distribution:
-                            GemmDistribution::ParallelReduction {
-                                result_row_partitions: selected_rows,
-                                result_column_partitions: selected_columns,
-                                ..
-                            },
-                        ..
-                    } = &mut result_variant.dispatch
+                    if let OperatorDispatch::BlockedGemm(plan) = &mut result_variant.dispatch
+                        && let GemmDistribution::ParallelReduction(reduction) =
+                            &mut plan.geometry.distribution
                     {
-                        *selected_rows = result_row_partitions;
-                        *selected_columns = result_column_partitions;
+                        reduction.result.rows = result_row_partitions;
+                        reduction.result.columns = result_column_partitions;
                     }
                     let mut result_layout = match orientation {
                         GemmOrientation::Normal => Layout::amp_left_result_grid(
@@ -5554,15 +5561,11 @@ fn parallel_reduction_plans_for_orientation(
                     let mut staged = layout_variant.clone();
                     staged.inputs[physical_right_index].local_staging = local_staging;
                     variants.push(staged.clone());
-                    if let OperatorDispatch::BlockedGemm {
-                        distribution:
-                            GemmDistribution::ParallelReduction {
-                                reduction_staging, ..
-                            },
-                        ..
-                    } = &mut staged.dispatch
+                    if let OperatorDispatch::BlockedGemm(plan) = &mut staged.dispatch
+                        && let GemmDistribution::ParallelReduction(reduction) =
+                            &mut plan.geometry.distribution
                     {
-                        *reduction_staging = ReductionStaging::Streamed;
+                        reduction.staging = ReductionStaging::Streamed;
                     }
                     variants.push(staged);
                 }
@@ -5659,15 +5662,13 @@ struct GemmPlanCompatibility {
 
 fn gemm_plan_compatibility(candidate: &GemmPlan) -> GemmPlanCompatibility {
     let (orientation, reduction_staging) = match candidate.dispatch {
-        OperatorDispatch::BlockedGemm {
-            orientation,
-            distribution:
-                GemmDistribution::ParallelReduction {
-                    reduction_staging, ..
-                },
-            ..
-        } => (Some(orientation), Some(reduction_staging)),
-        OperatorDispatch::BlockedGemm { orientation, .. } => (Some(orientation), None),
+        OperatorDispatch::BlockedGemm(plan) => (
+            Some(plan.geometry.orientation),
+            match plan.geometry.distribution {
+                GemmDistribution::ParallelReduction(reduction) => Some(reduction.staging),
+                GemmDistribution::OutputStationary => None,
+            },
+        ),
         _ => (None, None),
     };
     GemmPlanCompatibility {
@@ -6071,7 +6072,6 @@ fn lower_repeat(
                 peak_memory: body_peak,
             },
         }),
-        operator_plan: None,
         conversion_plan: None,
         estimated_cycles: body_cost.saturating_mul(u64::from(repeat.count)),
         estimated_exchange_cycles: body_exchange_cost.saturating_mul(u64::from(repeat.count)),
@@ -6115,7 +6115,6 @@ fn ensure_format(
                 from,
                 to: target.precision,
             },
-            operator_plan: None,
             conversion_plan: Some(ConversionPlan {
                 kernel: TileKernelSpec::Cast {
                     from,
@@ -6157,7 +6156,6 @@ fn ensure_format(
                 from: from.clone(),
                 to: target.layout.clone(),
             },
-            operator_plan: None,
             conversion_plan: Some(ConversionPlan {
                 kernel: TileKernelSpec::Rearrange {
                     from: from.clone(),
@@ -6450,9 +6448,10 @@ mod tests {
                 16,
                 output_columns,
                 AmpGridShape {
-                    tile_count: tiles,
-                    row_partitions: 1,
-                    column_partitions: tiles,
+                    result: GemmResultGrid {
+                        rows: 1,
+                        columns: tiles,
+                    },
                     order: GridOrder::ColumnsFast,
                 },
                 AmpWeightPlacement::resident(MemoryClass::Standard),
@@ -6479,17 +6478,14 @@ mod tests {
                 "shape={m}x{k}x{n} tiles={tiles} output_columns={output_columns}"
             );
             distributed_result_cases += usize::from(candidates.iter().any(|candidate| {
-                matches!(
-                    candidate.dispatch,
-                    OperatorDispatch::BlockedGemm {
-                        distribution: GemmDistribution::ParallelReduction {
-                            result_row_partitions,
-                            result_column_partitions,
-                            ..
-                        },
-                        ..
-                    } if (result_row_partitions, result_column_partitions) != (1, 1)
-                )
+                let OperatorDispatch::BlockedGemm(plan) = candidate.dispatch else {
+                    return false;
+                };
+                let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution
+                else {
+                    return false;
+                };
+                (reduction.result.rows, reduction.result.columns) != (1, 1)
             }));
             for candidate in candidates {
                 let plan = finish_gemm_plan(GemmOptions::default(), candidate.clone());
@@ -6497,20 +6493,18 @@ mod tests {
                     plan.supports(&inputs, &TensorShape(vec![m, n])),
                     "unsupported candidate: {candidate:?}; shape={m}x{k}x{n}"
                 );
-                assert!(matches!(
-                    candidate.dispatch,
-                    OperatorDispatch::BlockedGemm {
-                        inner_block,
-                        output_column_block,
-                        orientation,
-                        distribution: GemmDistribution::ParallelReduction {
-                            row_partitions: actual_rows,
-                            column_partitions: actual_columns,
-                            inner_partitions: actual,
-                            ..
+                assert!(matches!(candidate.dispatch,
+                    OperatorDispatch::BlockedGemm(BlockedGemmPlan {
+                        geometry: GemmGeometry {
+                            block: GemmBlockShape { inner: inner_block, output_columns: output_column_block },
+                            orientation,
+                            distribution: GemmDistribution::ParallelReduction(ParallelReductionPlan {
+                                compute: GemmGrid { rows: actual_rows, columns: actual_columns, inner: actual },
+                                ..
+                            }),
                         },
                         ..
-                    } if actual_rows * actual_columns * actual <= tiles
+                    }) if actual_rows * actual_columns * actual <= tiles
                         && actual_rows * actual_columns * actual >= tiles.div_ceil(2)
                         && u32::from(actual_rows) <= match orientation {
                             GemmOrientation::Normal => m,
@@ -6601,9 +6595,10 @@ mod tests {
             let inner = inner_blocks * AMP_INNER_BLOCK;
             let columns = u32::from(column_partitions) * AMP_OUTPUT_COLUMN_BLOCK;
             let grid = AmpGridShape {
-                tile_count: tiles,
-                row_partitions,
-                column_partitions,
+                result: GemmResultGrid {
+                    rows: row_partitions,
+                    columns: column_partitions,
+                },
                 order: GridOrder::ColumnsFast,
             };
             let candidate = amp_grid_gemm_plan(
@@ -6813,11 +6808,11 @@ mod tests {
                 .iter()
                 .find(|operation| matches!(operation.kind, MidOperationKind::Operator(_)))
                 .unwrap();
-            let MidOperationKind::Operator(MidOperator::Gemm {
+            let Some(MidOperator::Gemm {
                 multiply: selected_multiply,
                 accumulate: selected_accumulate,
                 ..
-            }) = operator.kind
+            }) = operator.operator()
             else {
                 panic!("random case {case}: expected GEMM");
             };
@@ -6966,10 +6961,8 @@ mod tests {
             let chosen = lowered
                 .operations
                 .iter()
-                .filter_map(|operation| match operation.kind {
-                    MidOperationKind::Operator(MidOperator::Gemm { multiply, .. }) => {
-                        Some(multiply)
-                    }
+                .filter_map(|operation| match operation.operator() {
+                    Some(MidOperator::Gemm { multiply, .. }) => Some(multiply),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -6978,13 +6971,12 @@ mod tests {
                 vec![Precision::F16, Precision::F32],
                 "random case {case}"
             );
-            for operation in lowered.operations.iter().filter(|operation| {
-                matches!(
-                    operation.kind,
-                    MidOperationKind::Operator(MidOperator::Gemm { .. })
-                )
-            }) {
-                let requirements = &operation.operator_plan.as_ref().unwrap().requirements;
+            for operation in lowered
+                .operations
+                .iter()
+                .filter(|operation| matches!(operation.operator(), Some(MidOperator::Gemm { .. })))
+            {
+                let requirements = &operation.operator_plan().unwrap().requirements;
                 assert!(
                     requirements
                         .inputs
@@ -6996,9 +6988,8 @@ mod tests {
                     requirements.output.format.layout.memory_class,
                     MemoryClass::Interleaved
                 );
-                let orientation = match operation.operator_plan.as_ref().map(|plan| &plan.dispatch)
-                {
-                    Some(OperatorDispatch::BlockedGemm { orientation, .. }) => *orientation,
+                let orientation = match operation.operator_plan().map(|plan| &plan.dispatch) {
+                    Some(OperatorDispatch::BlockedGemm(plan)) => plan.geometry.orientation,
                     _ => unreachable!(),
                 };
                 let physical_left = match orientation {
@@ -7012,12 +7003,12 @@ mod tests {
                         MemoryOperand::Input(physical_left as u16),
                     ])]
                 );
-                let expected_tail = match operation.kind {
-                    MidOperationKind::Operator(MidOperator::Gemm {
+                let expected_tail = match operation.operator() {
+                    Some(MidOperator::Gemm {
                         multiply: Precision::F16,
                         ..
                     }) => 16,
-                    MidOperationKind::Operator(MidOperator::Gemm {
+                    Some(MidOperator::Gemm {
                         multiply: Precision::F32,
                         ..
                     }) => 32,
@@ -7076,30 +7067,20 @@ mod tests {
             let gelu = operators
                 .iter()
                 .copied()
-                .find(|operation| {
-                    matches!(
-                        operation.kind,
-                        MidOperationKind::Operator(MidOperator::Gelu)
-                    )
-                })
+                .find(|operation| matches!(operation.operator(), Some(MidOperator::Gelu)))
                 .expect("random graph retains its GeLU");
             let add = operators
                 .iter()
                 .copied()
-                .find(|operation| {
-                    matches!(
-                        operation.kind,
-                        MidOperationKind::Operator(MidOperator::Add(_))
-                    )
-                })
+                .find(|operation| matches!(operation.operator(), Some(MidOperator::Add(_))))
                 .expect("random graph retains its add");
             let attention = operators
                 .iter()
                 .copied()
                 .find(|operation| {
                     matches!(
-                        operation.kind,
-                        MidOperationKind::Operator(MidOperator::FlashAttention { .. })
+                        operation.operator(),
+                        Some(MidOperator::FlashAttention { .. })
                     )
                 })
                 .expect("random graph retains its attention");
@@ -7111,11 +7092,7 @@ mod tests {
                 Precision::F16
             );
             assert_eq!(
-                gelu.operator_plan
-                    .as_ref()
-                    .unwrap()
-                    .requirements
-                    .output_aliasing,
+                gelu.operator_plan().unwrap().requirements.output_aliasing,
                 OutputAliasing::MayAliasInputs(vec![0])
             );
             assert_eq!(
@@ -7123,16 +7100,12 @@ mod tests {
                 Precision::F16
             );
             assert_eq!(
-                add.operator_plan
-                    .as_ref()
-                    .unwrap()
-                    .requirements
-                    .output_aliasing,
+                add.operator_plan().unwrap().requirements.output_aliasing,
                 OutputAliasing::MayAliasInputs(vec![0, 1])
             );
             assert!(matches!(
-                attention.kind,
-                MidOperationKind::Operator(MidOperator::FlashAttention { options, .. })
+                attention.operator(),
+                Some(MidOperator::FlashAttention { options, .. })
                     if options == AttentionOptions::default()
             ));
             assert_eq!(
@@ -7249,10 +7222,7 @@ mod tests {
                 .operations
                 .iter()
                 .filter(|operation| {
-                    matches!(
-                        operation.kind,
-                        MidOperationKind::Operator(MidOperator::SplitHeads(_))
-                    )
+                    matches!(operation.operator(), Some(MidOperator::SplitHeads(_)))
                 })
                 .collect::<Vec<_>>();
             assert_eq!(producers.len(), split.len(), "random case {case}");
@@ -7260,8 +7230,7 @@ mod tests {
                 producers.iter().all(|operation| {
                     operation.estimated_cycles == 0
                         && operation
-                            .operator_plan
-                            .as_ref()
+                            .operator_plan()
                             .is_some_and(|plan| plan.deferred_output.is_some())
                 }),
                 "random case {case}"
@@ -7271,16 +7240,16 @@ mod tests {
                 .iter()
                 .find(|operation| {
                     matches!(
-                        operation.kind,
-                        MidOperationKind::Operator(MidOperator::FlashAttention { .. })
+                        operation.operator(),
+                        Some(MidOperator::FlashAttention { .. })
                     )
                 })
                 .unwrap();
-            let claims = &consumer.operator_plan.as_ref().unwrap().deferred_inputs;
+            let claims = &consumer.operator_plan().unwrap().deferred_inputs;
             assert_eq!(claims.len(), split.len(), "random case {case}");
             assert!(claims.iter().all(Option::is_some), "random case {case}");
             assert!(
-                consumer.operator_plan.as_ref().unwrap().exchange.phases >= 2,
+                consumer.operator_plan().unwrap().exchange.phases >= 2,
                 "random case {case}"
             );
             assert!(
@@ -7337,16 +7306,10 @@ mod tests {
             let operation = lowered
                 .operations
                 .iter()
-                .find(|operation| {
-                    matches!(
-                        operation.kind,
-                        MidOperationKind::Operator(MidOperator::SplitHeads(_))
-                    )
-                })
+                .find(|operation| matches!(operation.operator(), Some(MidOperator::SplitHeads(_))))
                 .unwrap();
             let offer = operation
-                .operator_plan
-                .as_ref()
+                .operator_plan()
                 .and_then(|plan| plan.deferred_output)
                 .unwrap();
             assert_eq!(
