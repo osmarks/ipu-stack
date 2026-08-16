@@ -1499,9 +1499,15 @@ impl LoweringState {
             } else {
                 None
             };
-            for (source, mut destination) in mappings.drain(..) {
+            for (mut source, mut destination) in mappings.drain(..) {
                 if let Some(staging) = staging {
                     destination.shard = staging;
+                    for extent in &mut source.extents {
+                        extent.physical_end = extent.logical_end;
+                    }
+                    for extent in &mut destination.extents {
+                        extent.physical_end = extent.logical_end;
+                    }
                 }
                 let source_tile = self.shards[source.shard.index() as usize].tile;
                 let destination_tile = self.shards[destination.shard.index() as usize].tile;
@@ -4551,24 +4557,8 @@ impl LoweringState {
                 let mut covered = 0u64;
                 for output in output_shards.iter().copied() {
                     let owner = self.shards[output.index() as usize].clone();
-                    let intersection = owner
-                        .extents
-                        .iter()
-                        .zip(&complete.extents)
-                        .map(|(destination, source)| {
-                            let start = destination.start.max(source.start);
-                            let physical_end = destination.physical_end.min(source.physical_end);
-                            (start < physical_end).then_some(ShardExtent {
-                                axis: source.axis,
-                                start,
-                                logical_end: destination
-                                    .logical_end
-                                    .min(source.logical_end)
-                                    .max(start),
-                                physical_end,
-                            })
-                        })
-                        .collect::<Option<Vec<_>>>();
+                    let intersection =
+                        intersect_extents_with_shared_padding(&owner.extents, &complete.extents);
                     let Some(intersection) = intersection else {
                         continue;
                     };
@@ -5736,6 +5726,38 @@ fn intersect_extents(left: &[ShardExtent], right: &[ShardExtent]) -> Option<Vec<
         .collect()
 }
 
+fn intersect_extents_with_shared_padding(
+    left: &[ShardExtent],
+    right: &[ShardExtent],
+) -> Option<Vec<ShardExtent>> {
+    if left.len() != right.len() {
+        return None;
+    }
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| {
+            let start = left.start.max(right.start);
+            let logical_end = left.logical_end.min(right.logical_end);
+            (start < logical_end).then(|| {
+                let shared_tail =
+                    if logical_end == left.logical_end && logical_end == right.logical_end {
+                        left.physical_end
+                            .saturating_sub(left.logical_end)
+                            .min(right.physical_end.saturating_sub(right.logical_end))
+                    } else {
+                        0
+                    };
+                ShardExtent {
+                    axis: left.axis,
+                    start,
+                    logical_end,
+                    physical_end: logical_end + shared_tail,
+                }
+            })
+        })
+        .collect()
+}
+
 fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<(u16, Vec<ShardExtent>)>> {
     let layout = &tensor_type.format.layout;
     let padded = layout.padded_shape(&tensor_type.shape)?;
@@ -6801,6 +6823,49 @@ mod tests {
             assert_eq!(
                 crate::estimate::maximum_shard_bytes(&tensor),
                 u64::from(rows) * u64::from(physical_width) * 2,
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn randomized_padded_intersections_do_not_claim_adjacent_groups() {
+        let mut random = fastrand::Rng::with_seed(0x7064_5f69_6e74_6572);
+        for case in 0..CASES * 8 {
+            let width = random.u32(1..=127);
+            let padding = random.u32(1..=31);
+            let group = random.u32(0..=30);
+            let start = group * width;
+            let owned = ShardExtent {
+                axis: 0,
+                start,
+                logical_end: start + width,
+                physical_end: start + width + padding,
+            };
+            let matching = intersect_extents_with_shared_padding(&[owned], &[owned]).unwrap();
+            assert_eq!(matching, vec![owned], "case {case}");
+
+            let adjacent = ShardExtent {
+                axis: 0,
+                start: start + width,
+                logical_end: start + width * 2,
+                physical_end: start + width * 2 + padding,
+            };
+            assert!(
+                intersect_extents_with_shared_padding(&[owned], &[adjacent]).is_none(),
+                "case {case}"
+            );
+
+            let narrower_padding = random.u32(0..=padding);
+            let narrower = ShardExtent {
+                physical_end: owned.logical_end + narrower_padding,
+                ..owned
+            };
+            let intersection =
+                intersect_extents_with_shared_padding(&[owned], &[narrower]).unwrap();
+            assert_eq!(
+                intersection[0].physical_end,
+                owned.logical_end + narrower_padding,
                 "case {case}"
             );
         }
