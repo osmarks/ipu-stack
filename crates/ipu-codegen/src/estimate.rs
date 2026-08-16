@@ -8,6 +8,7 @@ use crate::mid::{
     OperatorRequirements, Precision, TensorAxis, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConversionTraffic {
@@ -263,79 +264,24 @@ pub(crate) fn conversion_traffic(
 }
 
 fn layout_extents(shape: &TensorShape, layout: &Layout) -> Option<Vec<(u16, Vec<(u32, u32)>)>> {
-    let padded = layout.padded_shape(shape).ok()?;
-    let rank = shape.0.len();
-    if let Some(grain) = layout.tiling.linear_grain() {
-        let elements = shape.elements();
-        let grains = elements / u64::from(grain);
-        let tiles = u64::from(layout.tiling.tile_count);
-        let width = u64::from(*shape.0.last()?);
-        let mut regions = Vec::new();
-        for tile in 0..layout.tiling.tile_count {
-            let start_grain =
-                u64::from(tile) * (grains / tiles) + u64::from(tile).min(grains % tiles);
-            let tile_grains = grains / tiles + u64::from(u64::from(tile) < grains % tiles);
-            let start = start_grain * u64::from(grain);
-            let end = start + tile_grains * u64::from(grain);
-            for row in start / width..end.div_ceil(width) {
-                let mut coordinates = vec![0u32; rank.saturating_sub(1)];
-                let mut remaining = row;
-                for axis in (0..rank.saturating_sub(1)).rev() {
-                    let extent = u64::from(shape.0[axis]);
-                    coordinates[axis] = u32::try_from(remaining % extent).ok()?;
-                    remaining /= extent;
-                }
-                let first = row == start / width;
-                let last = row + 1 == end.div_ceil(width);
-                let mut extents = coordinates
-                    .into_iter()
-                    .map(|coordinate| (coordinate, coordinate + 1))
-                    .collect::<Vec<_>>();
-                extents.push((
-                    if first {
-                        u32::try_from(start % width).ok()?
-                    } else {
-                        0
-                    },
-                    if last && end % width != 0 {
-                        u32::try_from(end % width).ok()?
-                    } else {
-                        u32::try_from(width).ok()?
-                    },
-                ));
-                regions.push((tile, extents));
-            }
-        }
-        return Some(regions);
-    }
-    let strides = layout.tiling.axis_strides().ok()?;
-    let axes = layout
-        .tiling
-        .axes
-        .iter()
-        .zip(strides)
-        .map(|(axis, stride)| Some((axis.axis.resolve(rank).ok()?, axis, stride)))
-        .collect::<Option<Vec<_>>>()?;
-    (0..layout.tiling.tile_count)
-        .map(|tile| {
-            let extents = (0..rank)
-                .map(|axis| {
-                    if let Some((_, tiling, stride)) =
-                        axes.iter().find(|(index, _, _)| *index == axis)
-                    {
-                        let coordinate = (u32::from(tile) / *stride) % u32::from(tiling.partitions);
-                        let (start, end, _) = tiling
-                            .shard_bounds(padded.0[axis], shape.0[axis], coordinate)
-                            .ok()?;
-                        Some((start, end))
-                    } else {
-                        Some((0, shape.0[axis]))
-                    }
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some((tile, extents))
-        })
-        .collect()
+    Some(
+        layout
+            .resolve(shape)
+            .ok()?
+            .shard_extents()
+            .into_iter()
+            .map(|shard| {
+                (
+                    shard.tile,
+                    shard
+                        .extents
+                        .into_iter()
+                        .map(|extent| (extent.start, extent.logical_end))
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
 }
 
 fn intersect_ranges(left: &[(u32, u32)], right: &[(u32, u32)]) -> Option<Vec<(u32, u32)>> {
@@ -359,90 +305,48 @@ fn range_elements(extents: &[(u32, u32)]) -> u64 {
 }
 
 pub(crate) fn physical_elements(shape: &TensorShape, layout: &Layout) -> u64 {
-    let Ok(padded) = layout.padded_shape(shape) else {
-        return shape
-            .elements()
-            .saturating_mul(u64::from(layout.tiling.replicas));
-    };
-    padded
-        .0
-        .iter()
-        .enumerate()
-        .map(|(index, &extent)| {
-            layout
-                .tiling
-                .axes
-                .iter()
-                .find(|axis| axis.axis.resolve(padded.0.len()) == Ok(index))
-                .map_or(u64::from(extent), |axis| {
-                    (0..u32::from(axis.partitions))
-                        .map(|coordinate| {
-                            axis.shard_bounds(extent, shape.0[index], coordinate)
-                                .map_or(u64::MAX, |(start, _, end)| u64::from(end - start))
-                        })
-                        .fold(0_u64, u64::saturating_add)
-                })
-        })
-        .fold(1_u64, u64::saturating_mul)
-        .saturating_mul(u64::from(layout.tiling.replicas))
+    layout.resolve(shape).map_or_else(
+        |_| {
+            shape
+                .elements()
+                .saturating_mul(u64::from(layout.tiling.replicas))
+        },
+        |resolved| resolved.total_elements(),
+    )
 }
 
 pub(crate) fn maximum_shard_bytes(tensor: &TensorType) -> u64 {
-    if let Some(grain) = tensor.format.layout.tiling.linear_grain() {
-        let grains = tensor.shape.elements().div_ceil(u64::from(grain));
-        return grains
-            .div_ceil(u64::from(tensor.format.layout.tiling.tile_count))
-            .saturating_mul(u64::from(grain))
-            .saturating_mul(tensor.format.precision.bytes());
-    }
-    let Ok(padded) = tensor.format.layout.padded_shape(&tensor.shape) else {
+    let Ok(resolved) = tensor.format.layout.resolve(&tensor.shape) else {
         return u64::MAX;
     };
-    padded
-        .0
-        .iter()
-        .enumerate()
-        .map(|(index, &extent)| {
-            tensor
-                .format
-                .layout
-                .tiling
-                .axes
-                .iter()
-                .find(|axis| axis.axis.resolve(padded.0.len()) == Ok(index))
-                .map_or(u64::from(extent), |axis| {
-                    (0..u32::from(axis.partitions))
-                        .filter_map(|coordinate| {
-                            axis.shard_bounds(extent, tensor.shape.0[index], coordinate)
-                                .ok()
-                                .map(|(start, _, end)| u64::from(end - start))
-                        })
-                        .max()
-                        .unwrap_or(u64::MAX)
-                })
-        })
-        .product::<u64>()
+    resolved
+        .maximum_tile_elements()
         .saturating_mul(tensor.format.precision.bytes())
 }
 
 /// Mean physical storage assigned to one active spatial tile. Replicated
 /// layouts include each replica in both the total storage and tile count.
 pub(crate) fn average_shard_bytes(tensor: &TensorType) -> u64 {
-    let tiles = u64::from(tensor.format.layout.tiling.tile_count).max(1);
-    physical_elements(&tensor.shape, &tensor.format.layout)
-        .saturating_mul(tensor.format.precision.bytes())
-        .div_ceil(tiles)
+    tensor
+        .format
+        .layout
+        .resolve(&tensor.shape)
+        .map_or(u64::MAX, |resolved| {
+            resolved
+                .total_elements()
+                .saturating_mul(tensor.format.precision.bytes())
+                .div_ceil(u64::from(resolved.tile_count()).max(1))
+        })
 }
 
 pub(crate) fn maximum_axis_shard_extent(tensor: &TensorType, axis: usize) -> u64 {
-    let Some(plan) = tile_axis_plan(tensor, axis) else {
-        return u64::MAX;
-    };
-    u64::from(
-        plan.blocks
-            .div_ceil(plan.partitions)
-            .saturating_mul(plan.block_size),
-    )
+    tensor
+        .format
+        .layout
+        .resolve(&tensor.shape)
+        .ok()
+        .and_then(|resolved| resolved.maximum_axis_extent(axis))
+        .map_or(u64::MAX, u64::from)
 }
 
 pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorType) -> TensorType {
@@ -1176,9 +1080,7 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
         crate::GemmOrientation::Normal => (output_rank - 2, output_rank - 1),
         crate::GemmOrientation::Swapped => (output_rank - 1, output_rank - 2),
     };
-    let output_plans = (0..output_rank)
-        .map(|axis| tile_axis_plan(compute_output, axis))
-        .collect::<Option<Vec<_>>>()?;
+    let output_plans = tile_axis_plans(compute_output)?;
     let left_plan = GemmOperandTrafficPlan::new(
         left,
         compute_output,
@@ -1311,9 +1213,7 @@ impl<'a> GemmOperandTrafficPlan<'a> {
         output_spatial_axis: usize,
     ) -> Option<Self> {
         let rank_offset = output.shape.0.len().checked_sub(operand.shape.0.len())?;
-        let operand_plans = (0..operand.shape.0.len())
-            .map(|axis| tile_axis_plan(operand, axis))
-            .collect::<Option<Vec<_>>>()?;
+        let operand_plans = tile_axis_plans(operand)?;
         Some(Self {
             operand,
             operand_plans,
@@ -1328,7 +1228,7 @@ impl<'a> GemmOperandTrafficPlan<'a> {
         &self,
         tile: u16,
         output_plans: &[TileAxisPlan],
-        inner_plan: Option<TileAxisPlan>,
+        inner_plan: Option<&TileAxisPlan>,
     ) -> Option<u64> {
         let mut required_elements = 1u64;
         let mut local_elements = 1u64;
@@ -1386,48 +1286,31 @@ fn add_operand_outgoing_bus_work(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TileAxisPlan {
-    blocks: u32,
-    block_size: u32,
-    partitions: u32,
-    stride: u32,
+    layout: Arc<crate::layout::ResolvedLayout>,
+    axis: usize,
 }
 
 impl TileAxisPlan {
-    fn range(self, tile: u16) -> std::ops::Range<u32> {
-        let coordinate = (u32::from(tile) / self.stride) % self.partitions;
-        let short = self.blocks / self.partitions;
-        let long = self.blocks % self.partitions;
-        let start_blocks = coordinate * short + coordinate.min(long);
-        let shard_blocks = short + u32::from(coordinate < long);
-        start_blocks * self.block_size..(start_blocks + shard_blocks) * self.block_size
+    fn range(&self, tile: u16) -> std::ops::Range<u32> {
+        self.layout
+            .tile_axis_range(tile, self.axis)
+            .expect("axis plan was resolved for this tile")
     }
 }
 
-fn tile_axis_plan(tensor: &TensorType, axis: usize) -> Option<TileAxisPlan> {
-    let layout = &tensor.format.layout;
-    let padded = layout.padded_shape(&tensor.shape).ok()?;
-    let Some((tiling, stride)) = layout
-        .tiling
-        .axes
-        .iter()
-        .zip(layout.tiling.axis_strides().ok()?)
-        .find(|(tiling, _)| tiling.axis.resolve(padded.0.len()) == Ok(axis))
-    else {
-        return Some(TileAxisPlan {
-            blocks: 1,
-            block_size: padded.0[axis],
-            partitions: 1,
-            stride: 1,
-        });
-    };
-    Some(TileAxisPlan {
-        blocks: padded.0[axis] / tiling.block_size,
-        block_size: tiling.block_size,
-        partitions: u32::from(tiling.partitions),
-        stride,
-    })
+fn tile_axis_plans(tensor: &TensorType) -> Option<Vec<TileAxisPlan>> {
+    let layout = Arc::new(tensor.format.layout.resolve(&tensor.shape).ok()?);
+    (0..tensor.shape.0.len())
+        .map(|axis| {
+            layout.maximum_axis_extent(axis)?;
+            Some(TileAxisPlan {
+                layout: Arc::clone(&layout),
+                axis,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

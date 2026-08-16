@@ -608,9 +608,9 @@ fn split_heads_word_fragment_cycles(output: &TensorType) -> Option<u64> {
     let clear_cycles = (output
         .format
         .layout
-        .padded_shape(&output.shape)
+        .resolve(&output.shape)
         .ok()
-        .is_some_and(|padded| padded != output.shape))
+        .is_some_and(|resolved| resolved.padded_shape() != &output.shape))
     .then(|| {
         maximum_shard_bytes(output)
             .div_ceil(8 * 6)
@@ -904,8 +904,9 @@ fn deferred_split_input_cycles(
     let physical_columns = consumer_input
         .format
         .layout
-        .padded_shape(&consumer_input.shape)
+        .resolve(&consumer_input.shape)
         .ok()?
+        .padded_shape()
         .0
         .last()
         .copied()
@@ -979,7 +980,8 @@ impl CostModel for Ipu21CostModel {
                 let left_shape = inputs[left_index]
                     .format
                     .layout
-                    .padded_shape(&inputs[left_index].shape)
+                    .resolve(&inputs[left_index].shape)
+                    .map(|resolved| resolved.padded_shape().clone())
                     .unwrap_or_else(|_| inputs[left_index].shape.clone());
                 let k = left_shape
                     .0

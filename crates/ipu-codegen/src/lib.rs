@@ -12,6 +12,7 @@ pub mod exchange;
 pub mod graph;
 mod host;
 pub mod kernel;
+mod layout;
 pub mod low;
 pub mod memory;
 pub mod mid;
@@ -39,13 +40,14 @@ pub use kernel::{
     KernelMaterializationError, KernelSymbols, PlannedKernelCall, ScalarArgument,
     materialize_kernel_run, tile_kernel_abi, validate_kernel_run,
 };
+pub use layout::ShardExtent;
 pub use low::{
     ExchangeOrder, ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun,
     KernelRunId, KernelRunMetadata, LocalCopy, LocalCopyId, LocalCopyPattern, LogicalExchange,
     LowInput, LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId, LowValue,
     RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, RepeatRunId, ShardDefinition,
-    ShardExtent, ShardView, TileKernel, TileWork, TileWorkList, TileWorkRef, WorkProvenance,
-    WorkReason, lower_to_tiles,
+    ShardView, TileKernel, TileWork, TileWorkList, TileWorkRef, WorkProvenance, WorkReason,
+    lower_to_tiles,
 };
 pub use memory::{
     IPU21_DATA_BASE, IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES,

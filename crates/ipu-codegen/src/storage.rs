@@ -763,7 +763,8 @@ fn amp_micro_dimension(precision: Precision) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::low::{LowShardId, ShardDefinition, ShardExtent};
+    use crate::ShardExtent;
+    use crate::low::{LowShardId, ShardDefinition};
     use crate::mid::{
         AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
         MemoryClass, Precision, TensorTiling, TensorType,

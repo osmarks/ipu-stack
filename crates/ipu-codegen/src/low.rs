@@ -7,6 +7,7 @@
 //! remaining choices.
 
 use crate::graph::{GraphInputKind, OperationId};
+use crate::layout::ShardExtent;
 use crate::mid::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ConversionStrategy,
     DeferredTransform, ElementOrder, GemmDistribution, Layout, LayoutError, MemoryClass,
@@ -71,16 +72,6 @@ impl RepeatRunId {
     pub const fn index(self) -> u32 {
         self.0
     }
-}
-
-/// Half-open bounds along one tensor axis. `physical_end` includes any zero
-/// padding while `logical_end` never exceeds the semantic tensor shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ShardExtent {
-    pub axis: u16,
-    pub start: u32,
-    pub logical_end: u32,
-    pub physical_end: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -3649,12 +3640,10 @@ impl LoweringState {
         if left_rank < 2 || output_rank < 2 {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let inner_extent = left_type.format.layout.padded_shape(&left_type.shape)?.0[left_rank - 1];
-        let column_extent = output_type
-            .format
-            .layout
-            .padded_shape(&output_type.shape)?
-            .0[output_rank - 1];
+        let left_layout = left_type.format.layout.resolve(&left_type.shape)?;
+        let output_layout = output_type.format.layout.resolve(&output_type.shape)?;
+        let inner_extent = left_layout.padded_shape().0[left_rank - 1];
+        let column_extent = output_layout.padded_shape().0[output_rank - 1];
         if !inner_extent.is_multiple_of(inner_block)
             || !column_extent.is_multiple_of(output_column_block)
         {
@@ -3977,8 +3966,8 @@ impl LoweringState {
             .tensor_type
             .clone();
         let logical_columns = output_type.shape.0[output_column_axis];
-        let output_padded = output_type.format.layout.padded_shape(&output_type.shape)?;
-        let physical_columns = output_padded.0[output_column_axis];
+        let output_layout = output_type.format.layout.resolve(&output_type.shape)?;
+        let physical_columns = output_layout.padded_shape().0[output_column_axis];
         let column_grain = output_type
             .format
             .layout
@@ -4008,9 +3997,9 @@ impl LoweringState {
         let columns = (0..u32::from(column_partitions))
             .map(|partition| {
                 if column_tiling.partitions == column_partitions {
-                    return column_tiling
-                        .shard_bounds(physical_columns, logical_columns, partition)
-                        .map_err(LowLoweringError::from);
+                    return output_layout
+                        .axis_bounds(output_column_axis, partition)
+                        .ok_or(LowLoweringError::InvalidOperatorPlan);
                 }
                 let start_blocks = partition
                     .saturating_mul(short_blocks)
@@ -4155,10 +4144,8 @@ impl LoweringState {
                     if replica_columns.get(&left).copied().map(u32::from) != Some(output_column) {
                         continue;
                     }
-                    let padded_output = partial_type
-                        .format
-                        .layout
-                        .padded_shape(&partial_type.shape)?;
+                    let partial_layout = partial_type.format.layout.resolve(&partial_type.shape)?;
+                    let padded_output = partial_layout.padded_shape();
                     let mut extents = partial_type
                         .shape
                         .0
@@ -4763,12 +4750,10 @@ impl LoweringState {
         if left_rank < 2 || output_rank < 2 {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let inner_extent = left_type.format.layout.padded_shape(&left_type.shape)?.0[left_rank - 1];
-        let column_extent = output_type
-            .format
-            .layout
-            .padded_shape(&output_type.shape)?
-            .0[output_rank - 1];
+        let left_layout = left_type.format.layout.resolve(&left_type.shape)?;
+        let output_layout = output_type.format.layout.resolve(&output_type.shape)?;
+        let inner_extent = left_layout.padded_shape().0[left_rank - 1];
+        let column_extent = output_layout.padded_shape().0[output_rank - 1];
         if !inner_extent.is_multiple_of(inner_block)
             || !column_extent.is_multiple_of(output_column_block)
         {
@@ -5759,103 +5744,14 @@ fn intersect_extents_with_shared_padding(
 }
 
 fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<(u16, Vec<ShardExtent>)>> {
-    let layout = &tensor_type.format.layout;
-    let padded = layout.padded_shape(&tensor_type.shape)?;
-    let rank = tensor_type.shape.0.len();
-    if let Some(grain) = layout.tiling.linear_grain() {
-        let elements = tensor_type.shape.elements();
-        let grains = elements / u64::from(grain);
-        let tiles = u64::from(layout.tiling.tile_count);
-        let width = u64::from(
-            *tensor_type
-                .shape
-                .0
-                .last()
-                .ok_or(LowLoweringError::InvalidOperatorPlan)?,
-        );
-        let mut all = Vec::new();
-        for tile in 0..layout.tiling.tile_count {
-            let start_grain =
-                u64::from(tile) * (grains / tiles) + u64::from(tile).min(grains % tiles);
-            let tile_grains = grains / tiles + u64::from(u64::from(tile) < grains % tiles);
-            let start = start_grain * u64::from(grain);
-            let end = start + tile_grains * u64::from(grain);
-            let first_row = start / width;
-            let last_row = end.div_ceil(width);
-            for row in first_row..last_row {
-                let column_start = if row == first_row { start % width } else { 0 };
-                let column_end = if row + 1 == last_row && end % width != 0 {
-                    end % width
-                } else {
-                    width
-                };
-                let mut coordinates = vec![0u32; rank.saturating_sub(1)];
-                let mut linear_row = row;
-                for axis in (0..rank.saturating_sub(1)).rev() {
-                    let extent = u64::from(tensor_type.shape.0[axis]);
-                    coordinates[axis] = u32::try_from(linear_row % extent)
-                        .map_err(|_| LowLoweringError::IdOverflow)?;
-                    linear_row /= extent;
-                }
-                let mut region = coordinates
-                    .into_iter()
-                    .enumerate()
-                    .map(|(axis, coordinate)| {
-                        Ok(ShardExtent {
-                            axis: u16::try_from(axis).map_err(|_| LowLoweringError::IdOverflow)?,
-                            start: coordinate,
-                            logical_end: coordinate + 1,
-                            physical_end: coordinate + 1,
-                        })
-                    })
-                    .collect::<LowLoweringResult<Vec<_>>>()?;
-                region.push(ShardExtent {
-                    axis: u16::try_from(rank - 1).map_err(|_| LowLoweringError::IdOverflow)?,
-                    start: u32::try_from(column_start).map_err(|_| LowLoweringError::IdOverflow)?,
-                    logical_end: u32::try_from(column_end)
-                        .map_err(|_| LowLoweringError::IdOverflow)?,
-                    physical_end: u32::try_from(column_end)
-                        .map_err(|_| LowLoweringError::IdOverflow)?,
-                });
-                all.push((tile, region));
-            }
-        }
-        return Ok(all);
-    }
-    let strides = layout.tiling.axis_strides()?;
-    let axes = layout
-        .tiling
-        .axes
-        .iter()
-        .zip(strides)
-        .map(|(tiling, stride)| Ok((tiling.axis.resolve(rank)?, tiling, stride)))
-        .collect::<LowLoweringResult<Vec<_>>>()?;
-    let mut all = Vec::with_capacity(usize::from(layout.tiling.tile_count));
-    for tile in 0..layout.tiling.tile_count {
-        let mut extents = Vec::with_capacity(rank);
-        for axis in 0..rank {
-            let (start, logical_end, physical_end) = if let Some((_, tiling, stride)) =
-                axes.iter().find(|(index, _, _)| *index == axis)
-            {
-                let coordinate = (u32::from(tile) / *stride) % u32::from(tiling.partitions);
-                tiling.shard_bounds(padded.0[axis], tensor_type.shape.0[axis], coordinate)?
-            } else {
-                (
-                    0,
-                    padded.0[axis].min(tensor_type.shape.0[axis]),
-                    padded.0[axis],
-                )
-            };
-            extents.push(ShardExtent {
-                axis: u16::try_from(axis).map_err(|_| LowLoweringError::IdOverflow)?,
-                start,
-                logical_end,
-                physical_end,
-            });
-        }
-        all.push((tile, extents));
-    }
-    Ok(all)
+    Ok(tensor_type
+        .format
+        .layout
+        .resolve(&tensor_type.shape)?
+        .shard_extents()
+        .into_iter()
+        .map(|shard| (shard.tile, shard.extents))
+        .collect())
 }
 
 fn split_head_source_extents(
@@ -6740,7 +6636,8 @@ mod tests {
                 Precision::F16,
                 layout.clone(),
             );
-            let padded = layout.padded_shape(&tensor_type.shape).unwrap();
+            let resolved = layout.resolve(&tensor_type.shape).unwrap();
+            let padded = resolved.padded_shape();
             let shards = shard_extents(&tensor_type).unwrap();
             assert_eq!(shards.len(), usize::from(tile_count), "case {case}");
 

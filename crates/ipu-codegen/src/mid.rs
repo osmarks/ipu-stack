@@ -679,84 +679,6 @@ impl AxisTiling {
         self.padding_groups = padding_groups;
         self
     }
-
-    pub(crate) fn shard_bounds(
-        self,
-        padded_extent: u32,
-        logical_extent: u32,
-        coordinate: u32,
-    ) -> Result<(u32, u32, u32), LayoutError> {
-        let partitions = u32::from(self.partitions);
-        let groups = u32::from(self.padding_groups);
-        if groups == 0
-            || coordinate >= partitions
-            || !partitions.is_multiple_of(groups)
-            || !padded_extent.is_multiple_of(groups)
-            || !logical_extent.is_multiple_of(groups)
-        {
-            return Err(LayoutError::InvalidPaddingGroups {
-                groups: self.padding_groups,
-                partitions: self.partitions,
-                extent: logical_extent,
-            });
-        }
-        let partitions_per_group = partitions / groups;
-        let group = coordinate / partitions_per_group;
-        let coordinate_in_group = coordinate % partitions_per_group;
-        let padded_group_extent = padded_extent / groups;
-        let logical_group_extent = logical_extent / groups;
-        if !padded_group_extent.is_multiple_of(self.block_size) {
-            return Err(LayoutError::IndivisibleAxis {
-                axis: 0,
-                extent: padded_group_extent,
-                block_size: self.block_size,
-            });
-        }
-        let blocks = padded_group_extent / self.block_size;
-        let short_size = blocks / partitions_per_group;
-        let long_shards = blocks % partitions_per_group;
-        let start_blocks = coordinate_in_group * short_size + coordinate_in_group.min(long_shards);
-        let shard_blocks = short_size + u32::from(coordinate_in_group < long_shards);
-        let start_in_group = start_blocks
-            .checked_mul(self.block_size)
-            .ok_or(LayoutError::ExtentOverflow(0))?;
-        let allocated = shard_blocks
-            .checked_mul(self.block_size)
-            .ok_or(LayoutError::ExtentOverflow(0))?;
-        let remainder = allocated % self.shard_padding_multiple;
-        if remainder != 0 && self.padding == Padding::Reject {
-            return Err(LayoutError::IndivisibleShard {
-                extent: allocated,
-                block_size: self.shard_padding_multiple,
-            });
-        }
-        let physical_width = if remainder == 0 {
-            allocated
-        } else {
-            allocated
-                .checked_add(self.shard_padding_multiple - remainder)
-                .ok_or(LayoutError::ExtentOverflow(0))?
-        };
-        let group_logical_base = group
-            .checked_mul(logical_group_extent)
-            .ok_or(LayoutError::ExtentOverflow(0))?;
-        let start = group_logical_base
-            .checked_add(start_in_group)
-            .ok_or(LayoutError::ExtentOverflow(0))?;
-        let logical_end = group_logical_base
-            .checked_add(
-                start_in_group
-                    .checked_add(allocated)
-                    .ok_or(LayoutError::ExtentOverflow(0))?
-                    .min(logical_group_extent)
-                    .max(start_in_group),
-            )
-            .ok_or(LayoutError::ExtentOverflow(0))?;
-        let physical_end = start
-            .checked_add(physical_width)
-            .ok_or(LayoutError::ExtentOverflow(0))?;
-        Ok((start, logical_end, physical_end))
-    }
 }
 
 /// Logical tile group and the tensor axes distributed or blocked within it.
@@ -1322,159 +1244,6 @@ impl Layout {
             memory_class: MemoryClass::Ipu21Interleaved,
         }
     }
-
-    /// Returns the physical extents after applying declared zero padding.
-    pub fn padded_shape(&self, shape: &TensorShape) -> Result<TensorShape, LayoutError> {
-        if self.tiling.tile_count == 0 || self.tiling.replicas == 0 {
-            return Err(LayoutError::EmptyTileGroup);
-        }
-        if let Some(grain) = self.tiling.linear_grain() {
-            let elements = shape.elements();
-            if shape.0.is_empty()
-                || grain == 0
-                || elements / u64::from(grain) < u64::from(self.tiling.tile_count)
-                || !elements.is_multiple_of(u64::from(grain))
-            {
-                return Err(LayoutError::EmptyAxisTiling);
-            }
-            return Ok(shape.clone());
-        }
-        let mut used_tiles = u32::from(self.tiling.replicas);
-        let mut dimensions = shape.0.clone();
-        let mut used_axes = Vec::with_capacity(self.tiling.axes.len());
-        for tiling in &self.tiling.axes {
-            if tiling.partitions == 0
-                || tiling.padding_groups == 0
-                || tiling.block_size == 0
-                || tiling.padding_multiple == 0
-                || tiling.shard_padding_multiple == 0
-            {
-                return Err(LayoutError::EmptyAxisTiling);
-            }
-            used_tiles = used_tiles
-                .checked_mul(u32::from(tiling.partitions))
-                .ok_or(LayoutError::TileCountOverflow)?;
-            let axis = tiling.axis.resolve(dimensions.len())?;
-            if used_axes.contains(&axis) {
-                return Err(LayoutError::DuplicateAxis(axis));
-            }
-            used_axes.push(axis);
-            let extent = dimensions[axis];
-            if !u32::from(tiling.partitions).is_multiple_of(u32::from(tiling.padding_groups))
-                || !extent.is_multiple_of(u32::from(tiling.padding_groups))
-            {
-                return Err(LayoutError::InvalidPaddingGroups {
-                    groups: tiling.padding_groups,
-                    partitions: tiling.partitions,
-                    extent,
-                });
-            }
-            let group_extent = extent / u32::from(tiling.padding_groups);
-            let remainder = group_extent % tiling.padding_multiple;
-            if remainder != 0 {
-                match tiling.padding {
-                    Padding::Reject => {
-                        return Err(LayoutError::IndivisibleAxis {
-                            axis,
-                            extent: group_extent,
-                            block_size: tiling.padding_multiple,
-                        });
-                    }
-                    Padding::Zero => {}
-                }
-            }
-            if remainder != 0 && tiling.padding == Padding::Zero {
-                let padded_group_extent = group_extent
-                    .checked_add(tiling.padding_multiple - remainder)
-                    .ok_or(LayoutError::ExtentOverflow(axis))?;
-                dimensions[axis] = padded_group_extent
-                    .checked_mul(u32::from(tiling.padding_groups))
-                    .ok_or(LayoutError::ExtentOverflow(axis))?;
-            }
-            let padded_group_extent = dimensions[axis] / u32::from(tiling.padding_groups);
-            if !padded_group_extent.is_multiple_of(tiling.block_size) {
-                return Err(LayoutError::IndivisibleAxis {
-                    axis,
-                    extent: padded_group_extent,
-                    block_size: tiling.block_size,
-                });
-            }
-        }
-        if used_tiles != u32::from(self.tiling.tile_count) {
-            return Err(LayoutError::TileCountMismatch {
-                declared: self.tiling.tile_count,
-                implied: used_tiles,
-            });
-        }
-        let strides = self.tiling.axis_strides()?;
-        if has_regular_tile_mapping(&self.tiling, &strides) {
-            return Ok(TensorShape(dimensions));
-        }
-        let coordinate_count = self
-            .tiling
-            .axes
-            .iter()
-            .try_fold(1usize, |count, axis| {
-                count.checked_mul(usize::from(axis.partitions))
-            })
-            .ok_or(LayoutError::TileCountOverflow)?;
-        let mut coordinate_copies = vec![0u16; coordinate_count];
-        for tile in 0..self.tiling.tile_count {
-            let coordinate = self
-                .tiling
-                .axes
-                .iter()
-                .zip(&strides)
-                .try_fold(0usize, |coordinate, (axis, stride)| {
-                    coordinate
-                        .checked_mul(usize::from(axis.partitions))
-                        .and_then(|coordinate| {
-                            coordinate.checked_add(
-                                ((u32::from(tile) / stride) % u32::from(axis.partitions)) as usize,
-                            )
-                        })
-                })
-                .ok_or(LayoutError::TileCountOverflow)?;
-            coordinate_copies[coordinate] = coordinate_copies[coordinate]
-                .checked_add(1)
-                .ok_or(LayoutError::TileCountOverflow)?;
-        }
-        if coordinate_copies
-            .iter()
-            .any(|copies| *copies != self.tiling.replicas)
-        {
-            return Err(LayoutError::InvalidTileMapping);
-        }
-        Ok(TensorShape(dimensions))
-    }
-}
-
-fn has_regular_tile_mapping(tiling: &TensorTiling, strides: &[u32]) -> bool {
-    let mut digits = tiling
-        .axes
-        .iter()
-        .zip(strides)
-        .filter(|(axis, _)| axis.partitions > 1)
-        .map(|(axis, &stride)| (stride, u32::from(axis.partitions)))
-        .collect::<Vec<_>>();
-    digits.sort_unstable();
-    let Some(&(base, _)) = digits.first() else {
-        return true;
-    };
-    if base == 0 || !u32::from(tiling.replicas).is_multiple_of(base) {
-        return false;
-    }
-    let mut expected_stride = base;
-    for (stride, partitions) in digits {
-        if stride != expected_stride {
-            return false;
-        }
-        let Some(next) = expected_stride.checked_mul(partitions) else {
-            return false;
-        };
-        expected_stride = next;
-    }
-    true
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -1487,6 +1256,8 @@ pub enum LayoutError {
     TileCountOverflow,
     #[error("axis {axis:?} is outside rank {rank}")]
     AxisOutOfRange { axis: TensorAxis, rank: usize },
+    #[error("tensor rank {0} cannot be represented by shard axis identifiers")]
+    RankTooLarge(usize),
     #[error("axis {0} is tiled more than once")]
     DuplicateAxis(usize),
     #[error("axis {axis} extent {extent} is not divisible by block size {block_size}")]
@@ -1763,81 +1534,9 @@ impl OperatorCandidate {
 }
 
 fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> bool {
-    let Ok(padded) = layout.padded_shape(shape) else {
-        return true;
-    };
-    if let Some(grain) = layout.tiling.linear_grain() {
-        return shape.elements() / u64::from(grain) < u64::from(layout.tiling.tile_count);
-    }
-    layout.tiling.axes.iter().any(|tiling| {
-        tiling.axis.resolve(padded.0.len()).map_or(true, |axis| {
-            let partitions_per_group = tiling.partitions / tiling.padding_groups;
-            tiling
-                .shard_bounds(
-                    padded.0[axis],
-                    shape.0[axis],
-                    u32::from(partitions_per_group.saturating_sub(1)),
-                )
-                .map_or(true, |(start, logical_end, _)| start == logical_end)
-        })
-    })
-}
-
-fn padded_axis_shard_extent(
-    tensor: &TensorType,
-    padded: &TensorShape,
-    axis: usize,
-) -> Result<u32, OperatorPlanError> {
-    let axis_tilings = tensor
-        .format
-        .layout
-        .tiling
-        .axes
-        .iter()
-        .filter(|tiling| tiling.axis.resolve(padded.0.len()).ok() == Some(axis))
-        .collect::<Vec<_>>();
-    let partitions = axis_tilings
-        .iter()
-        .try_fold(1_u32, |partitions, tiling| {
-            partitions.checked_mul(u32::from(tiling.partitions))
-        })
-        .ok_or(OperatorPlanError::InvalidBlocking)?;
-    let divided = padded.0[axis]
-        .checked_div(partitions)
-        .ok_or(OperatorPlanError::InvalidBlocking)?;
-    Ok(axis_tilings.iter().fold(divided, |extent, tiling| {
-        let extent = extent.max(tiling.block_size);
-        extent
-            .div_ceil(tiling.shard_padding_multiple)
-            .saturating_mul(tiling.shard_padding_multiple)
-    }))
-}
-
-fn maximum_padded_axis_shard_extent(
-    tensor: &TensorType,
-    padded: &TensorShape,
-    axis: usize,
-) -> Result<u32, OperatorPlanError> {
-    let Some(tiling) = tensor
-        .format
-        .layout
-        .tiling
-        .axes
-        .iter()
-        .find(|tiling| tiling.axis.resolve(padded.0.len()).ok() == Some(axis))
-    else {
-        return Ok(padded.0[axis]);
-    };
-    let maximum = (0..u32::from(tiling.partitions))
-        .filter_map(|coordinate| {
-            tiling
-                .shard_bounds(padded.0[axis], tensor.shape.0[axis], coordinate)
-                .ok()
-                .map(|(start, _, end)| end - start)
-        })
-        .max()
-        .ok_or(OperatorPlanError::InvalidBlocking)?;
-    Ok(maximum)
+    layout
+        .resolve(shape)
+        .map_or(true, |resolved| resolved.has_empty_shards())
 }
 
 fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
@@ -1906,7 +1605,7 @@ fn alias_compatible(
 }
 
 fn valid_requirement(requirement: &OperandRequirement, shape: &TensorShape) -> bool {
-    requirement.alignment.is_power_of_two() && requirement.format.layout.padded_shape(shape).is_ok()
+    requirement.alignment.is_power_of_two() && requirement.format.layout.resolve(shape).is_ok()
 }
 
 fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -> bool {
@@ -2833,55 +2532,44 @@ impl OperatorPlan {
                     GemmOrientation::Normal => left,
                     GemmOrientation::Swapped => right,
                 };
-                let left_padded = physical_left
+                let left_layout = physical_left
                     .format
                     .layout
-                    .padded_shape(&physical_left.shape)
+                    .resolve(&physical_left.shape)
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
-                let output_padded = output
+                let output_layout = output
                     .format
                     .layout
-                    .padded_shape(&output.shape)
+                    .resolve(&output.shape)
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
+                let left_padded = left_layout.padded_shape();
+                let output_padded = output_layout.padded_shape();
                 let output_column_axis = output_padded.0.len()
                     - match orientation {
                         GemmOrientation::Normal => 1,
                         GemmOrientation::Swapped => 2,
                     };
-                let columns_per_output_shard =
-                    if matches!(distribution, GemmDistribution::ParallelReduction { .. }) {
-                        maximum_padded_axis_shard_extent(
-                            output,
-                            &output_padded,
-                            output_column_axis,
-                        )?
-                    } else {
-                        padded_axis_shard_extent(output, &output_padded, output_column_axis)?
-                    };
+                let columns_per_output_shard = output_layout
+                    .maximum_axis_extent(output_column_axis)
+                    .ok_or(OperatorPlanError::InvalidBlocking)?;
                 let physical_right = match orientation {
                     GemmOrientation::Normal => right,
                     GemmOrientation::Swapped => left,
                 };
-                let right_padded = physical_right
+                let right_layout = physical_right
                     .format
                     .layout
-                    .padded_shape(&physical_right.shape)
+                    .resolve(&physical_right.shape)
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
+                let right_padded = right_layout.padded_shape();
                 let right_column_axis = right_padded.0.len()
                     - match orientation {
                         GemmOrientation::Normal => 1,
                         GemmOrientation::Swapped => 2,
                     };
-                let columns_per_right_shard =
-                    if matches!(distribution, GemmDistribution::ParallelReduction { .. }) {
-                        maximum_padded_axis_shard_extent(
-                            physical_right,
-                            &right_padded,
-                            right_column_axis,
-                        )?
-                    } else {
-                        padded_axis_shard_extent(physical_right, &right_padded, right_column_axis)?
-                    };
+                let columns_per_right_shard = right_layout
+                    .maximum_axis_extent(right_column_axis)
+                    .ok_or(OperatorPlanError::InvalidBlocking)?;
                 let grid_plan = left.format.layout.tiling.replicas > 1
                     || right.format.layout.tiling.replicas > 1
                     || right
@@ -3076,24 +2764,11 @@ impl OperatorPlan {
 }
 
 fn layout_shards_are_nonempty(tensor: &TensorType) -> bool {
-    let Ok(padded) = tensor.format.layout.padded_shape(&tensor.shape) else {
-        return false;
-    };
-    if let Some(grain) = tensor.format.layout.tiling.linear_grain() {
-        return tensor.shape.elements() / u64::from(grain)
-            >= u64::from(tensor.format.layout.tiling.tile_count);
-    }
-    tensor.format.layout.tiling.axes.iter().all(|axis| {
-        axis.axis.resolve(padded.0.len()).is_ok_and(|index| {
-            let partitions_per_group = axis.partitions / axis.padding_groups;
-            axis.shard_bounds(
-                padded.0[index],
-                tensor.shape.0[index],
-                u32::from(partitions_per_group.saturating_sub(1)),
-            )
-            .is_ok_and(|(start, logical_end, _)| start < logical_end)
-        })
-    })
+    tensor
+        .format
+        .layout
+        .resolve(&tensor.shape)
+        .is_ok_and(|resolved| !resolved.has_empty_shards())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6885,7 +6560,7 @@ mod tests {
                     variant.inputs[1]
                         .format
                         .layout
-                        .padded_shape(&inputs[1].shape)
+                        .resolve(&inputs[1].shape)
                         .is_ok(),
                     "case {case}"
                 );
@@ -7006,14 +6681,15 @@ mod tests {
                 )],
             });
 
-            let result = layout.padded_shape(&TensorShape(shape.clone()));
+            let result = layout.resolve(&TensorShape(shape.clone()));
             if padding == Padding::Reject && !extent.is_multiple_of(block_size) {
                 assert!(
                     matches!(result, Err(LayoutError::IndivisibleAxis { .. })),
                     "random case {case}"
                 );
             } else {
-                let padded = result.unwrap();
+                let resolved = result.unwrap();
+                let padded = resolved.padded_shape();
                 let expected = extent.div_ceil(block_size) * block_size;
                 assert_eq!(padded.0[axis], expected, "random case {case}");
                 for (other, original) in shape.iter().enumerate() {
