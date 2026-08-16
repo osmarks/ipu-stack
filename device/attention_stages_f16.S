@@ -48,7 +48,7 @@
 	.set ATTENTION_VALUE_FULL_PANELS, ATTENTION_VALUE_DIMENSION / 16
 	.set ATTENTION_VALUE_TAIL_PAIRS, (ATTENTION_VALUE_DIMENSION % 16 + 1) / 2
 
-#if defined(ATTENTION_BUILD_ASSEMBLY_SOFTMAX) || defined(ATTENTION_BUILD_ASSEMBLY_SOFTMAX_SMALL_KEY)
+#if defined(ATTENTION_BUILD_ASSEMBLY_SOFTMAX_SMALL_KEY) || defined(ATTENTION_BUILD_ASSEMBLY_SOFTMAX_LARGE_KEY)
 	// Callable supervisor ABI for softmax: m2 weights, m3 scores, m10 return.
 	// Query/key row counts are specialization constants placed in the shared
 	// worker argument block. The four public entries therefore share one worker
@@ -75,9 +75,11 @@
 	.size \name, .-\name
 	.endm
 
+#ifdef ATTENTION_BUILD_ASSEMBLY_SOFTMAX_SMALL_KEY
 	ATTENTION_SOFTMAX_ENTRY ipu_stack_attention_softmax_small_query_small_key_f16, ATTENTION_SMALL_QUERY_ROWS, ATTENTION_SMALL_KEY_ROWS
 	ATTENTION_SOFTMAX_ENTRY ipu_stack_attention_softmax_large_query_small_key_f16, ATTENTION_LARGE_QUERY_ROWS, ATTENTION_SMALL_KEY_ROWS
-#ifdef ATTENTION_BUILD_ASSEMBLY_SOFTMAX
+#endif
+#ifdef ATTENTION_BUILD_ASSEMBLY_SOFTMAX_LARGE_KEY
 	ATTENTION_SOFTMAX_ENTRY ipu_stack_attention_softmax_small_query_large_key_f16, ATTENTION_SMALL_QUERY_ROWS, ATTENTION_LARGE_KEY_ROWS
 	ATTENTION_SOFTMAX_ENTRY ipu_stack_attention_softmax_large_query_large_key_f16, ATTENTION_LARGE_QUERY_ROWS, ATTENTION_LARGE_KEY_ROWS
 #endif

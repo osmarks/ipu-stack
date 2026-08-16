@@ -481,6 +481,46 @@ struct PreparedDistributedPanel {
     destinations: Vec<LowShardId>,
 }
 
+struct PreparedAttentionBlock {
+    row_start: u32,
+    valid_rows: u32,
+    key_panels: Vec<PreparedDistributedPanel>,
+    value_panels: Vec<PreparedDistributedPanel>,
+}
+
+struct AttentionTask {
+    tile: u16,
+    head: u32,
+    query_row_start: u32,
+    query_rows: u32,
+    query_dimension: u32,
+    value_dimension: u32,
+    query: LowShardId,
+    query_receive: Option<LowShardId>,
+    output: LowShardId,
+    scratch: LowShardId,
+    weights: LowShardId,
+    key_staging: LowShardId,
+    value_staging: LowShardId,
+}
+
+#[derive(Clone, Copy)]
+struct AttentionBufferShape {
+    query_block_rows: u32,
+    logical_staging_rows: u32,
+    physical_staging_rows: u32,
+    scratch_columns: u32,
+    state_columns: u32,
+    padded_query_dimension: u32,
+    padded_value_dimension: u32,
+}
+
+#[derive(Clone, Copy)]
+enum AttentionOperand {
+    Key,
+    Value,
+}
+
 struct LoweringState {
     tile_count: u16,
     shards: Vec<LowShard>,
@@ -1580,6 +1620,24 @@ impl LoweringState {
                 &plan.requirements,
                 tiles,
             ),
+            OperatorDispatch::MaterializedAttention {
+                query_key,
+                probability_value,
+                query_block_rows,
+                padded_key_rows,
+                padded_query_dimension,
+                padded_value_dimension,
+            } => self.lower_materialized_attention(
+                operation,
+                query_key.clone(),
+                probability_value.clone(),
+                *query_block_rows,
+                *padded_key_rows,
+                *padded_query_dimension,
+                *padded_value_dimension,
+                &plan.requirements,
+                tiles,
+            ),
             OperatorDispatch::SplitHeads => {
                 self.lower_split_heads(operation, &plan.operator, tiles)
             }
@@ -1771,6 +1829,289 @@ impl LoweringState {
         Ok(Some(split))
     }
 
+    fn build_attention_tasks(
+        &mut self,
+        query: MidValueId,
+        result: MidValueId,
+        shape: AttentionBufferShape,
+    ) -> LowLoweringResult<Vec<AttentionTask>> {
+        let value_row_block = u16::try_from(shape.physical_staging_rows)
+            .map_err(|_| LowLoweringError::InvalidOperatorPlan)?;
+        let outputs = self.value_shards(result)?.to_vec();
+        let mut tasks = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            let tile = self.shards[output.index() as usize].tile;
+            let rank = self.shards[output.index() as usize].extents.len();
+            if rank != 3 {
+                return Err(LowLoweringError::InvalidOperatorPlan);
+            }
+            let rows = self.shards[output.index() as usize].extents[rank - 2].physical_end
+                - self.shards[output.index() as usize].extents[rank - 2].start;
+            let value_dimension = *self.shards[output.index() as usize]
+                .tensor_type
+                .shape
+                .0
+                .last()
+                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            if rows == 0 || rows > shape.query_block_rows {
+                return Err(LowLoweringError::InvalidOperatorPlan);
+            }
+            let canonical_query = self.local_shard(query, tile)?;
+            let query_dimension = *self.shards[canonical_query.index() as usize]
+                .tensor_type
+                .shape
+                .0
+                .last()
+                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            let deferred_query = self.has_deferred_value(query);
+            let query_shard = if deferred_query {
+                self.push_attention_buffer(
+                    tile,
+                    rows,
+                    rows,
+                    query_dimension,
+                    shape.padded_query_dimension,
+                    ElementOrder::Amp(AmpOrder::Left),
+                )?
+            } else {
+                canonical_query
+            };
+            let direct_query =
+                deferred_query && self.deferred_supports_physical_exchange(query, query_shard);
+            let query_receive = (deferred_query && !direct_query)
+                .then(|| {
+                    self.push_attention_buffer(
+                        tile,
+                        rows,
+                        rows,
+                        query_dimension,
+                        query_dimension,
+                        ElementOrder::RowMajor,
+                    )
+                })
+                .transpose()?;
+            let scratch = self.push_attention_scratch(
+                tile,
+                rows,
+                shape.scratch_columns,
+                Precision::F16,
+                ElementOrder::Amp(AmpOrder::Left),
+                MemoryClass::Ipu21Interleaved,
+            )?;
+            let weights = self.push_attention_scratch(
+                tile,
+                rows,
+                shape.state_columns,
+                Precision::F16,
+                ElementOrder::Amp(AmpOrder::Left),
+                MemoryClass::Ipu21Standard,
+            )?;
+            let key_staging = self.push_attention_buffer(
+                tile,
+                shape.logical_staging_rows,
+                shape.physical_staging_rows,
+                query_dimension,
+                shape.padded_query_dimension,
+                ElementOrder::Amp(AmpOrder::TransposedRight),
+            )?;
+            self.shards[key_staging.index() as usize].definition = ShardDefinition::ExchangeStaging;
+            let value_staging = self.push_attention_buffer(
+                tile,
+                shape.logical_staging_rows,
+                shape.physical_staging_rows,
+                value_dimension,
+                shape.padded_value_dimension,
+                ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                    row_block: value_row_block,
+                    column_block: AMP_COLUMN_MICRO as u16,
+                }),
+            )?;
+            self.shards[value_staging.index() as usize].definition =
+                ShardDefinition::ExchangeStaging;
+            tasks.push(AttentionTask {
+                tile,
+                head: self.shards[output.index() as usize].extents[rank - 3].start,
+                query_row_start: self.shards[output.index() as usize].extents[rank - 2].start,
+                query_rows: rows,
+                query_dimension,
+                value_dimension,
+                query: query_shard,
+                query_receive,
+                output,
+                scratch,
+                weights,
+                key_staging,
+                value_staging,
+            });
+        }
+        Ok(tasks)
+    }
+
+    fn materialize_attention_queries(
+        &mut self,
+        query: MidValueId,
+        tasks: &[AttentionTask],
+        provenance: WorkProvenance,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<()> {
+        if !self.has_deferred_value(query) {
+            return Ok(());
+        }
+        let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+        let mut local_copies = Vec::new();
+        let physical = tasks.iter().all(|task| task.query_receive.is_none());
+        for task in tasks {
+            self.gather_deferred_panel(
+                query,
+                task.head,
+                task.query_row_start,
+                task.query_rows,
+                0,
+                task.query_dimension,
+                task.query_receive.unwrap_or(task.query),
+                if physical {
+                    ExchangeOrder::Physical
+                } else {
+                    ExchangeOrder::Semantic
+                },
+                &mut transfers,
+                &mut local_copies,
+            )?;
+        }
+        for (tile, copy) in local_copies {
+            self.append_local_copy(tiles, tile, copy)?;
+        }
+        self.append_ordered_phase(
+            transfers,
+            provenance,
+            if physical {
+                ExchangeOrder::Physical
+            } else {
+                ExchangeOrder::Semantic
+            },
+            tiles,
+        )?;
+        if !physical {
+            for task in tasks {
+                self.append_attention_rearrange(
+                    tiles,
+                    task.tile,
+                    task.query_receive
+                        .ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                    task.query,
+                    WorkProvenance {
+                        operation: provenance.operation,
+                        value: provenance.value,
+                        reason: WorkReason::OperatorKernel,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_attention_blocks(
+        &mut self,
+        key: MidValueId,
+        value: MidValueId,
+        tasks: &[AttentionTask],
+        key_rows: u32,
+        block_rows: u32,
+        padded_query_dimension: u32,
+        padded_value_dimension: u32,
+        provenance: WorkProvenance,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<Vec<PreparedAttentionBlock>> {
+        let blocks = key_rows.div_ceil(block_rows);
+        let key_destinations = tasks.iter().fold(
+            BTreeMap::<u32, Vec<LowShardId>>::new(),
+            |mut destinations, task| {
+                destinations
+                    .entry(task.head)
+                    .or_default()
+                    .push(task.key_staging);
+                destinations
+            },
+        );
+        let value_destinations = tasks.iter().fold(
+            BTreeMap::<u32, Vec<LowShardId>>::new(),
+            |mut destinations, task| {
+                destinations
+                    .entry(task.head)
+                    .or_default()
+                    .push(task.value_staging);
+                destinations
+            },
+        );
+        let key_panel_count = padded_query_dimension.div_ceil(AMP_COLUMN_MICRO);
+        let value_panel_count = padded_value_dimension.div_ceil(AMP_COLUMN_MICRO);
+        let mut semantic_gathers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+        let mut physical_gathers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+        let mut prepared = Vec::new();
+        for block in 0..blocks {
+            let row_start = block * block_rows;
+            let valid_rows = key_rows.saturating_sub(row_start).min(block_rows);
+            let owner_offset = block.saturating_mul(key_panel_count + value_panel_count);
+            let key_panels = self.prepare_distributed_attention_panels(
+                key,
+                &key_destinations,
+                row_start,
+                valid_rows,
+                tasks[0].query_dimension,
+                padded_query_dimension,
+                ElementOrder::Amp(AmpOrder::TransposedRight),
+                owner_offset,
+                &mut semantic_gathers,
+                &mut physical_gathers,
+                tiles,
+            )?;
+            let row_block =
+                u16::try_from(block_rows).map_err(|_| LowLoweringError::InvalidOperatorPlan)?;
+            let value_panels = self.prepare_distributed_attention_panels(
+                value,
+                &value_destinations,
+                row_start,
+                valid_rows,
+                tasks[0].value_dimension,
+                padded_value_dimension,
+                ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                    row_block,
+                    column_block: AMP_COLUMN_MICRO as u16,
+                }),
+                owner_offset + key_panel_count,
+                &mut semantic_gathers,
+                &mut physical_gathers,
+                tiles,
+            )?;
+            prepared.push(PreparedAttentionBlock {
+                row_start,
+                valid_rows,
+                key_panels,
+                value_panels,
+            });
+        }
+        self.append_mixed_phase(semantic_gathers, physical_gathers, provenance, tiles)?;
+        for block in &prepared {
+            for panel in block.key_panels.iter().chain(&block.value_panels) {
+                if let Some(row_major) = panel.row_major {
+                    self.append_attention_rearrange(
+                        tiles,
+                        panel.tile,
+                        row_major,
+                        panel.packed,
+                        WorkProvenance {
+                            operation: provenance.operation,
+                            value: provenance.value,
+                            reason: WorkReason::OperatorKernel,
+                        },
+                    )?;
+                }
+            }
+        }
+        Ok(prepared)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn lower_blocked_attention(
         &mut self,
@@ -1793,140 +2134,27 @@ impl LoweringState {
         if key_block_rows != AMP_INNER_BLOCK || query_block_rows == 0 {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let outputs = self.value_shards(*result)?.to_vec();
         let key_shards = self.value_shards(*key)?.to_vec();
         let value_shards = self.value_shards(*value)?.to_vec();
         if key_shards.len() != value_shards.len() {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        struct AttentionTask {
-            tile: u16,
-            head: u32,
-            query_row_start: u32,
-            query_rows: u32,
-            query_dimension: u32,
-            value_dimension: u32,
-            query: LowShardId,
-            query_receive: Option<LowShardId>,
-            output: LowShardId,
-            scratch: LowShardId,
-            weights: LowShardId,
-            key_staging: LowShardId,
-            value_staging: LowShardId,
+        if self.has_deferred_value(*key) != self.has_deferred_value(*value) {
+            return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let mut tasks = Vec::with_capacity(outputs.len());
-        for output in outputs {
-            let tile = self.shards[output.index() as usize].tile;
-            let rank = self.shards[output.index() as usize].extents.len();
-            if rank != 3 {
-                return Err(LowLoweringError::InvalidOperatorPlan);
-            }
-            let rows = self.shards[output.index() as usize].extents[rank - 2].physical_end
-                - self.shards[output.index() as usize].extents[rank - 2].start;
-            let value_dimension = *self.shards[output.index() as usize]
-                .tensor_type
-                .shape
-                .0
-                .last()
-                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-            if rows == 0 || rows > query_block_rows {
-                return Err(LowLoweringError::InvalidOperatorPlan);
-            }
-            let canonical_query = self.local_shard(*query, tile)?;
-            let query_dimension = *self.shards[canonical_query.index() as usize]
-                .tensor_type
-                .shape
-                .0
-                .last()
-                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-            let deferred_query = self.has_deferred_value(*query);
-            let query_shard = if deferred_query {
-                self.push_attention_buffer(
-                    tile,
-                    rows,
-                    rows,
-                    query_dimension,
-                    padded_query_dimension,
-                    ElementOrder::Amp(AmpOrder::Left),
-                )?
-            } else {
-                canonical_query
-            };
-            let direct_query =
-                deferred_query && self.deferred_supports_physical_exchange(*query, query_shard);
-            let query_receive = (deferred_query && !direct_query)
-                .then(|| {
-                    self.push_attention_buffer(
-                        tile,
-                        rows,
-                        rows,
-                        query_dimension,
-                        query_dimension,
-                        ElementOrder::RowMajor,
-                    )
-                })
-                .transpose()?;
-            let scratch_columns = padded_value_dimension.max(key_block_rows);
-            let scratch = self.push_attention_scratch(
-                tile,
-                rows,
-                scratch_columns,
-                Precision::F16,
-                ElementOrder::Amp(AmpOrder::Left),
-                MemoryClass::Ipu21Interleaved,
-            )?;
-            let state_columns = key_block_rows + 16;
-            let weights = self.push_attention_scratch(
-                tile,
-                rows,
-                state_columns,
-                Precision::F16,
-                ElementOrder::Amp(AmpOrder::Left),
-                MemoryClass::Ipu21Standard,
-            )?;
-            let key_staging = self.push_attention_buffer(
-                tile,
-                key_block_rows,
-                key_block_rows,
-                query_dimension,
+        let tasks = self.build_attention_tasks(
+            *query,
+            *result,
+            AttentionBufferShape {
+                query_block_rows,
+                logical_staging_rows: key_block_rows,
+                physical_staging_rows: key_block_rows,
+                scratch_columns: padded_value_dimension.max(key_block_rows),
+                state_columns: key_block_rows + 16,
                 padded_query_dimension,
-                ElementOrder::Amp(AmpOrder::TransposedRight),
-            )?;
-            self.shards[key_staging.index() as usize].definition = ShardDefinition::ExchangeStaging;
-            let value_staging = self.push_attention_buffer(
-                tile,
-                key_block_rows,
-                key_block_rows,
-                value_dimension,
                 padded_value_dimension,
-                ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                    row_block: 64,
-                    column_block: AMP_COLUMN_MICRO as u16,
-                }),
-            )?;
-            self.shards[value_staging.index() as usize].definition =
-                ShardDefinition::ExchangeStaging;
-            let deferred_key = self.has_deferred_value(*key);
-            let deferred_value = self.has_deferred_value(*value);
-            if deferred_key != deferred_value {
-                return Err(LowLoweringError::InvalidOperatorPlan);
-            }
-            tasks.push(AttentionTask {
-                tile,
-                head: self.shards[output.index() as usize].extents[rank - 3].start,
-                query_row_start: self.shards[output.index() as usize].extents[rank - 2].start,
-                query_rows: rows,
-                query_dimension,
-                value_dimension,
-                query: query_shard,
-                query_receive,
-                output,
-                scratch,
-                weights,
-                key_staging,
-                value_staging,
-            });
-        }
+            },
+        )?;
         let key_rows = self.shards[self.value_shards(*key)?[0].index() as usize]
             .tensor_type
             .shape
@@ -1946,155 +2174,49 @@ impl LoweringState {
             value: Some(*result),
             reason: WorkReason::OperatorKernel,
         };
-        if self.has_deferred_value(*query) {
-            let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
-            let mut local_copies = Vec::new();
-            let physical = tasks.iter().all(|task| task.query_receive.is_none());
-            for task in &tasks {
-                self.gather_deferred_panel(
-                    *query,
-                    task.head,
-                    task.query_row_start,
-                    task.query_rows,
-                    0,
-                    task.query_dimension,
-                    task.query_receive.unwrap_or(task.query),
-                    if physical {
-                        ExchangeOrder::Physical
-                    } else {
-                        ExchangeOrder::Semantic
-                    },
-                    &mut transfers,
-                    &mut local_copies,
-                )?;
-            }
-            for (tile, copy) in local_copies {
-                self.append_local_copy(tiles, tile, copy)?;
-            }
-            self.append_ordered_phase(
-                transfers,
-                exchange_provenance,
-                if physical {
-                    ExchangeOrder::Physical
-                } else {
-                    ExchangeOrder::Semantic
-                },
-                tiles,
-            )?;
-            if !physical {
-                for task in &tasks {
-                    self.append_attention_rearrange(
-                        tiles,
-                        task.tile,
-                        task.query_receive
-                            .ok_or(LowLoweringError::InvalidOperatorPlan)?,
-                        task.query,
-                        kernel_provenance,
-                    )?;
-                }
-            }
-        }
+        self.materialize_attention_queries(*query, &tasks, exchange_provenance, tiles)?;
         let deferred_key_value = self.has_deferred_value(*key);
-        let mut prepared_blocks = Vec::new();
-        if deferred_key_value {
-            let mut semantic_gathers = BTreeMap::<ShardView, Vec<ShardView>>::new();
-            let mut physical_gathers = BTreeMap::<ShardView, Vec<ShardView>>::new();
-            for block in 0..blocks {
-                let block_start = u32::try_from(block).map_err(|_| LowLoweringError::IdOverflow)?
-                    * key_block_rows;
-                let valid_key_rows = key_rows.saturating_sub(block_start).min(key_block_rows);
-                let key_destinations = tasks.iter().fold(
-                    BTreeMap::<u32, Vec<LowShardId>>::new(),
-                    |mut destinations, task| {
-                        destinations
-                            .entry(task.head)
-                            .or_default()
-                            .push(task.key_staging);
-                        destinations
-                    },
-                );
-                let value_destinations = tasks.iter().fold(
-                    BTreeMap::<u32, Vec<LowShardId>>::new(),
-                    |mut destinations, task| {
-                        destinations
-                            .entry(task.head)
-                            .or_default()
-                            .push(task.value_staging);
-                        destinations
-                    },
-                );
-                let key_panel_count = padded_query_dimension.div_ceil(AMP_COLUMN_MICRO);
-                let value_panel_count = padded_value_dimension.div_ceil(AMP_COLUMN_MICRO);
-                let owner_offset = u32::try_from(block)
-                    .map_err(|_| LowLoweringError::IdOverflow)?
-                    .saturating_mul(key_panel_count.saturating_add(value_panel_count));
-                let key_panels = self.prepare_distributed_attention_panels(
-                    *key,
-                    &key_destinations,
-                    block_start,
-                    valid_key_rows,
-                    tasks[0].query_dimension,
-                    padded_query_dimension,
-                    ElementOrder::Amp(AmpOrder::TransposedRight),
-                    owner_offset,
-                    &mut semantic_gathers,
-                    &mut physical_gathers,
-                    tiles,
-                )?;
-                let value_panels = self.prepare_distributed_attention_panels(
-                    *value,
-                    &value_destinations,
-                    block_start,
-                    valid_key_rows,
-                    tasks[0].value_dimension,
-                    padded_value_dimension,
-                    ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                        row_block: 64,
-                        column_block: AMP_COLUMN_MICRO as u16,
-                    }),
-                    owner_offset.saturating_add(key_panel_count),
-                    &mut semantic_gathers,
-                    &mut physical_gathers,
-                    tiles,
-                )?;
-                prepared_blocks.push((key_panels, value_panels, valid_key_rows));
-            }
-            self.append_mixed_phase(
-                semantic_gathers,
-                physical_gathers,
+        let prepared_blocks = if deferred_key_value {
+            self.prepare_attention_blocks(
+                *key,
+                *value,
+                &tasks,
+                key_rows,
+                key_block_rows,
+                padded_query_dimension,
+                padded_value_dimension,
                 exchange_provenance,
                 tiles,
-            )?;
-            for (key_panels, value_panels, _) in &prepared_blocks {
-                for panel in key_panels.iter().chain(value_panels) {
-                    if let Some(row_major) = panel.row_major {
-                        self.append_attention_rearrange(
-                            tiles,
-                            panel.tile,
-                            row_major,
-                            panel.packed,
-                            kernel_provenance,
-                        )?;
-                    }
-                }
-            }
-        }
+            )?
+        } else {
+            Vec::new()
+        };
         for block in 0..blocks {
             let block_start =
                 u32::try_from(block).map_err(|_| LowLoweringError::IdOverflow)? * key_block_rows;
             let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
             let mut task_sources = Vec::with_capacity(tasks.len());
             if deferred_key_value {
-                let (key_panels, value_panels, valid_key_rows) = prepared_blocks
+                let prepared = prepared_blocks
                     .get(block)
                     .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-                self.append_prepared_panel_broadcasts(key_panels, &mut transfers, tiles)?;
-                self.append_prepared_panel_broadcasts(value_panels, &mut transfers, tiles)?;
+                self.append_prepared_panel_broadcasts(
+                    &prepared.key_panels,
+                    0,
+                    &mut transfers,
+                    tiles,
+                )?;
+                self.append_prepared_panel_broadcasts(
+                    &prepared.value_panels,
+                    0,
+                    &mut transfers,
+                    tiles,
+                )?;
                 self.append_phase(transfers, exchange_provenance, tiles)?;
                 task_sources.extend(
                     tasks
                         .iter()
-                        .map(|task| (task.key_staging, task.value_staging, *valid_key_rows)),
+                        .map(|task| (task.key_staging, task.value_staging, prepared.valid_rows)),
                 );
             } else {
                 for task in &tasks {
@@ -2161,7 +2283,8 @@ impl LoweringState {
                         kernel_provenance,
                         TileKernel::Planned(TileKernelSpec::AttentionSoftmax {
                             head_dimension: task.query_dimension,
-                            key_block_columns: valid_key_rows,
+                            key_columns: valid_key_rows,
+                            padded_key_columns: key_block_rows,
                         }),
                         vec![KernelOperand {
                             views: vec![score_view],
@@ -2216,6 +2339,257 @@ impl LoweringState {
                     ),
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    fn append_materialized_attention_input(
+        &mut self,
+        operand: AttentionOperand,
+        sources: &[LowShardId],
+        prepared: &[PreparedAttentionBlock],
+        tasks: &[AttentionTask],
+        provenance: WorkProvenance,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<()> {
+        let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+        if prepared.is_empty() {
+            for task in tasks {
+                let destination = match operand {
+                    AttentionOperand::Key => task.key_staging,
+                    AttentionOperand::Value => task.value_staging,
+                };
+                let matching_sources = sources
+                    .iter()
+                    .copied()
+                    .filter(|source| {
+                        self.shards[source.index() as usize].extents[0].start == task.head
+                    })
+                    .collect::<Vec<_>>();
+                for source in matching_sources {
+                    let source_view = self.full_view(source);
+                    let row_extent = self.shards[source.index() as usize].extents[1];
+                    let destination_view = self.narrow_view(
+                        destination,
+                        &[(0, row_extent.start, row_extent.physical_end)],
+                    )?;
+                    let source_tile = self.shards[source.index() as usize].tile;
+                    if source_tile == task.tile {
+                        let mut copies = Vec::new();
+                        append_span_copies(
+                            &self.shards,
+                            &source_view,
+                            &destination_view,
+                            task.tile,
+                            &mut copies,
+                        )?;
+                        for (tile, copy) in copies {
+                            self.append_local_copy(tiles, tile, copy)?;
+                        }
+                    } else {
+                        transfers
+                            .entry(source_view)
+                            .or_default()
+                            .push(destination_view);
+                    }
+                }
+            }
+        } else {
+            for block in prepared {
+                let panels = match operand {
+                    AttentionOperand::Key => &block.key_panels,
+                    AttentionOperand::Value => &block.value_panels,
+                };
+                self.append_prepared_panel_broadcasts(
+                    panels,
+                    block.row_start,
+                    &mut transfers,
+                    tiles,
+                )?;
+            }
+        }
+        self.append_physical_phase(transfers, provenance, tiles)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_materialized_attention(
+        &mut self,
+        operation: &MidOperation,
+        query_key: TileKernelSpec,
+        probability_value: TileKernelSpec,
+        query_block_rows: u32,
+        padded_key_rows: u32,
+        padded_query_dimension: u32,
+        padded_value_dimension: u32,
+        requirements: &OperatorRequirements,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<()> {
+        let [query, key, value] = operation.inputs.as_slice() else {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        };
+        let [result] = operation.results.as_slice() else {
+            return Err(LowLoweringError::ResultArity);
+        };
+        if query_block_rows == 0
+            || padded_key_rows == 0
+            || !padded_key_rows.is_multiple_of(AMP_INNER_BLOCK)
+            || self.has_deferred_value(*key) != self.has_deferred_value(*value)
+        {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let key_shards = self.value_shards(*key)?.to_vec();
+        let value_shards = self.value_shards(*value)?.to_vec();
+        if key_shards.len() != value_shards.len() {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let key_rows = self.shards[key_shards[0].index() as usize]
+            .tensor_type
+            .shape
+            .0[1];
+        if key_rows == 0 || key_rows > padded_key_rows {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let tasks = self.build_attention_tasks(
+            *query,
+            *result,
+            AttentionBufferShape {
+                query_block_rows,
+                logical_staging_rows: key_rows,
+                physical_staging_rows: padded_key_rows,
+                scratch_columns: padded_key_rows.max(padded_value_dimension),
+                state_columns: padded_key_rows + AMP_COLUMN_MICRO,
+                padded_query_dimension,
+                padded_value_dimension,
+            },
+        )?;
+        if tasks.is_empty() {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let exchange_provenance = WorkProvenance {
+            operation: operation.source,
+            value: Some(*key),
+            reason: WorkReason::OperatorInputs,
+        };
+        let kernel_provenance = WorkProvenance {
+            operation: operation.source,
+            value: Some(*result),
+            reason: WorkReason::OperatorKernel,
+        };
+        self.materialize_attention_queries(*query, &tasks, exchange_provenance, tiles)?;
+        let prepared = if self.has_deferred_value(*key) {
+            self.prepare_attention_blocks(
+                *key,
+                *value,
+                &tasks,
+                key_rows,
+                AMP_INNER_BLOCK,
+                padded_query_dimension,
+                padded_value_dimension,
+                exchange_provenance,
+                tiles,
+            )?
+        } else {
+            Vec::new()
+        };
+        self.append_materialized_attention_input(
+            AttentionOperand::Key,
+            &key_shards,
+            &prepared,
+            &tasks,
+            exchange_provenance,
+            tiles,
+        )?;
+        for task in &tasks {
+            let scores = self.narrow_view(task.scratch, &[(1, 0, padded_key_rows)])?;
+            self.append_kernel(
+                tiles,
+                task.tile,
+                KernelRun::new(
+                    kernel_provenance,
+                    TileKernel::Planned(query_key.clone()),
+                    vec![
+                        KernelOperand {
+                            views: vec![self.full_view(task.query)],
+                        },
+                        KernelOperand {
+                            views: vec![self.full_view(task.key_staging)],
+                        },
+                    ],
+                    scores.clone(),
+                    KernelRequirements::Operator(requirements.clone()),
+                ),
+            )?;
+            self.append_kernel(
+                tiles,
+                task.tile,
+                KernelRun::new(
+                    kernel_provenance,
+                    TileKernel::Planned(TileKernelSpec::AttentionSoftmax {
+                        head_dimension: task.query_dimension,
+                        key_columns: key_rows,
+                        padded_key_columns: padded_key_rows,
+                    }),
+                    vec![KernelOperand {
+                        views: vec![scores],
+                    }],
+                    self.full_view(task.weights),
+                    KernelRequirements::Operator(requirements.clone()),
+                ),
+            )?;
+        }
+        self.append_materialized_attention_input(
+            AttentionOperand::Value,
+            &value_shards,
+            &prepared,
+            &tasks,
+            exchange_provenance,
+            tiles,
+        )?;
+        for task in &tasks {
+            let probabilities = self.narrow_view(task.weights, &[(1, 0, padded_key_rows)])?;
+            let block_value = self.narrow_view(task.scratch, &[(1, 0, padded_value_dimension)])?;
+            self.append_kernel(
+                tiles,
+                task.tile,
+                KernelRun::new(
+                    kernel_provenance,
+                    TileKernel::Planned(probability_value.clone()),
+                    vec![
+                        KernelOperand {
+                            views: vec![probabilities],
+                        },
+                        KernelOperand {
+                            views: vec![self.full_view(task.value_staging)],
+                        },
+                    ],
+                    block_value.clone(),
+                    KernelRequirements::Operator(requirements.clone()),
+                ),
+            )?;
+            self.append_kernel(
+                tiles,
+                task.tile,
+                KernelRun::new(
+                    kernel_provenance,
+                    TileKernel::Planned(TileKernelSpec::AttentionMerge {
+                        value_dimension: task.value_dimension,
+                        padded_value_dimension,
+                        key_block_columns: padded_key_rows,
+                        initial: true,
+                        final_block: true,
+                    }),
+                    vec![
+                        KernelOperand {
+                            views: vec![block_value],
+                        },
+                        KernelOperand {
+                            views: vec![self.full_view(task.weights)],
+                        },
+                    ],
+                    self.full_view(task.output),
+                    KernelRequirements::Operator(requirements.clone()),
+                ),
+            )?;
         }
         Ok(())
     }
@@ -2439,17 +2813,26 @@ impl LoweringState {
     fn append_prepared_panel_broadcasts(
         &mut self,
         panels: &[PreparedDistributedPanel],
+        destination_row_start: u32,
         broadcasts: &mut BTreeMap<ShardView, Vec<ShardView>>,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         for panel in panels {
             let source = self.full_view(panel.packed);
+            let source_rows = source.extents[0].physical_end - source.extents[0].start;
             let column_start = panel.panel * AMP_COLUMN_MICRO;
             for &destination in &panel.destinations {
                 let destination_tile = self.shards[destination.index() as usize].tile;
                 let destination_view = self.narrow_view(
                     destination,
-                    &[(1, column_start, column_start + AMP_COLUMN_MICRO)],
+                    &[
+                        (
+                            0,
+                            destination_row_start,
+                            destination_row_start + source_rows,
+                        ),
+                        (1, column_start, column_start + AMP_COLUMN_MICRO),
+                    ],
                 )?;
                 if panel.tile == destination_tile {
                     let mut copies = Vec::new();

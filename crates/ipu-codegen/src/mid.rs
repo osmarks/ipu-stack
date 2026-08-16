@@ -87,7 +87,8 @@ pub enum TileKernelSpec {
     },
     AttentionSoftmax {
         head_dimension: u32,
-        key_block_columns: u32,
+        key_columns: u32,
+        padded_key_columns: u32,
     },
     AttentionMerge {
         value_dimension: u32,
@@ -161,6 +162,14 @@ pub enum OperatorDispatch {
         probability_value: TileKernelSpec,
         query_block_rows: u32,
         key_block_rows: u32,
+        padded_query_dimension: u32,
+        padded_value_dimension: u32,
+    },
+    MaterializedAttention {
+        query_key: TileKernelSpec,
+        probability_value: TileKernelSpec,
+        query_block_rows: u32,
+        padded_key_rows: u32,
         padded_query_dimension: u32,
         padded_value_dimension: u32,
     },
@@ -333,9 +342,9 @@ impl OperatorDispatch {
         match self {
             Self::Pointwise { .. } => EmptyOutputShardPolicy::Skip,
             Self::SplitHeads => EmptyOutputShardPolicy::Reject,
-            Self::BlockedGemm { .. } | Self::BlockedAttention { .. } => {
-                EmptyOutputShardPolicy::Reject
-            }
+            Self::BlockedGemm { .. }
+            | Self::BlockedAttention { .. }
+            | Self::MaterializedAttention { .. } => EmptyOutputShardPolicy::Reject,
         }
     }
 }
@@ -2815,6 +2824,51 @@ impl OperatorPlan {
                     options,
                     accumulate,
                 },
+                OperatorDispatch::MaterializedAttention {
+                    query_key,
+                    probability_value,
+                    query_block_rows,
+                    padded_key_rows,
+                    padded_query_dimension,
+                    padded_value_dimension,
+                },
+            ) => {
+                let [query, key, value] = inputs else {
+                    return Err(OperatorPlanError::OperandArity);
+                };
+                if options.causal
+                    || *accumulate != AccumulationPrecision::F32
+                    || *query_block_rows == 0
+                    || *padded_key_rows == 0
+                    || !padded_key_rows.is_multiple_of(AMP_INNER_BLOCK)
+                    || *padded_query_dimension == 0
+                    || *padded_value_dimension == 0
+                    || !matches!(query.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
+                    || !matches!(
+                        key.format.layout.order,
+                        ElementOrder::Amp(AmpOrder::TransposedRight)
+                    )
+                    || !matches!(
+                        value.format.layout.order,
+                        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
+                    )
+                    || output.format.layout.order != ElementOrder::RowMajor
+                    || query.format.layout.tiling.tile_count
+                        != output.format.layout.tiling.tile_count
+                    || key.format.layout.tiling.tile_count != value.format.layout.tiling.tile_count
+                    || !matches!(query_key, TileKernelSpec::Gemm { .. })
+                    || !matches!(probability_value, TileKernelSpec::Gemm { .. })
+                {
+                    Err(OperatorPlanError::InvalidBlocking)
+                } else {
+                    Ok(())
+                }
+            }
+            (
+                MidOperator::FlashAttention {
+                    options,
+                    accumulate,
+                },
                 OperatorDispatch::Pointwise {
                     kernel:
                         TileKernelSpec::FlashAttention {
@@ -4386,6 +4440,7 @@ fn plans(
                 query.shape.0[2].div_ceil(AMP_COLUMN_MICRO) * AMP_COLUMN_MICRO;
             let padded_value_dimension =
                 value.shape.0[2].div_ceil(AMP_COLUMN_MICRO) * AMP_COLUMN_MICRO;
+            let padded_key_rows = key.shape.0[1].div_ceil(AMP_INNER_BLOCK) * AMP_INNER_BLOCK;
             let query_format = TensorFormat {
                 precision: Precision::F16,
                 layout: Layout::attention_query(heads, query_partitions),
@@ -4426,6 +4481,48 @@ fn plans(
                     },
                     query_block_rows: query_rows.div_ceil(u32::from(query_partitions)),
                     key_block_rows: AMP_INNER_BLOCK,
+                    padded_query_dimension,
+                    padded_value_dimension,
+                },
+                requirements: OperatorRequirements {
+                    inputs: vec![
+                        OperandRequirement::new(query_format.clone(), 8)
+                            .with_materialization(OperandMaterialization::DispatchSlices),
+                        OperandRequirement::new(key_format.clone(), 8)
+                            .with_materialization(OperandMaterialization::DispatchSlices),
+                        OperandRequirement::new(value_format.clone(), 8)
+                            .with_materialization(OperandMaterialization::DispatchSlices),
+                    ],
+                    output: OperandRequirement::new(output_format.clone(), 8),
+                    output_aliasing: OutputAliasing::Fresh,
+                    memory_relations: Vec::new(),
+                },
+                deferred_output: None,
+            });
+            plans.push(Plan {
+                operator: MidOperator::FlashAttention {
+                    options,
+                    accumulate: AccumulationPrecision::F32,
+                },
+                dispatch: OperatorDispatch::MaterializedAttention {
+                    query_key: TileKernelSpec::Gemm {
+                        multiply: Precision::F16,
+                        accumulate: AccumulationPrecision::F32,
+                        mode: GemmKernelMode::Initialize,
+                        weights: GemmWeightLoad::Standard,
+                        inner_block: padded_query_dimension,
+                        output_columns: padded_key_rows,
+                    },
+                    probability_value: TileKernelSpec::Gemm {
+                        multiply: Precision::F16,
+                        accumulate: AccumulationPrecision::F32,
+                        mode: GemmKernelMode::Initialize,
+                        weights: GemmWeightLoad::Standard,
+                        inner_block: padded_key_rows,
+                        output_columns: padded_value_dimension,
+                    },
+                    query_block_rows: query_rows.div_ceil(u32::from(query_partitions)),
+                    padded_key_rows,
                     padded_query_dimension,
                     padded_value_dimension,
                 },
@@ -4729,6 +4826,7 @@ fn independent_parameter_storage(
         } => output_column_block,
         OperatorDispatch::Pointwise { .. }
         | OperatorDispatch::BlockedAttention { .. }
+        | OperatorDispatch::MaterializedAttention { .. }
         | OperatorDispatch::SplitHeads => {
             return Vec::new();
         }

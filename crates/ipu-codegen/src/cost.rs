@@ -423,16 +423,35 @@ fn attention_endpoint_traffic(
     output: &TensorType,
     dispatch: &OperatorDispatch,
 ) -> Option<(ExchangeEndpointTraffic, u64)> {
-    let OperatorDispatch::BlockedAttention {
-        query_block_rows,
-        key_block_rows,
-        padded_query_dimension,
-        padded_value_dimension,
-        ..
-    } = dispatch
-    else {
-        return Some((ExchangeEndpointTraffic::default(), 0));
-    };
+    let (query_block_rows, key_block_rows, padded_query_dimension, padded_value_dimension, phases) =
+        match dispatch {
+            OperatorDispatch::BlockedAttention {
+                query_block_rows,
+                key_block_rows,
+                padded_query_dimension,
+                padded_value_dimension,
+                ..
+            } => (
+                *query_block_rows,
+                *key_block_rows,
+                *padded_query_dimension,
+                *padded_value_dimension,
+                None,
+            ),
+            OperatorDispatch::MaterializedAttention {
+                query_block_rows,
+                padded_query_dimension,
+                padded_value_dimension,
+                ..
+            } => (
+                *query_block_rows,
+                crate::mid::AMP_INNER_BLOCK,
+                *padded_query_dimension,
+                *padded_value_dimension,
+                Some(3),
+            ),
+            _ => return Some((ExchangeEndpointTraffic::default(), 0)),
+        };
     let key = inputs.get(1)?;
     let key_rows = key
         .shape
@@ -440,12 +459,12 @@ fn attention_endpoint_traffic(
         .get(key.shape.0.len().checked_sub(2)?)
         .copied()
         .map(u64::from)?;
-    let block_rows = u64::from(*key_block_rows).max(1);
+    let block_rows = u64::from(key_block_rows).max(1);
     let blocks = key_rows.div_ceil(block_rows);
     let panel_columns = u64::from(crate::mid::AMP_COLUMN_MICRO);
-    let panels_per_block = u64::from(*padded_query_dimension)
+    let panels_per_block = u64::from(padded_query_dimension)
         .div_ceil(panel_columns)
-        .saturating_add(u64::from(*padded_value_dimension).div_ceil(panel_columns));
+        .saturating_add(u64::from(padded_value_dimension).div_ceil(panel_columns));
     let element_bytes = key.format.precision.bytes();
     let panel_bytes = block_rows
         .saturating_mul(panel_columns)
@@ -459,7 +478,7 @@ fn attention_endpoint_traffic(
         .get(output.shape.0.len().checked_sub(2)?)
         .copied()
         .map(u64::from)?;
-    let query_block_rows = u64::from(*query_block_rows).max(1);
+    let query_block_rows = u64::from(query_block_rows).max(1);
     let owners = query_rows.div_ceil(query_block_rows).max(1);
     let owner_panels = blocks.saturating_mul(panels_per_block).div_ceil(owners);
     let outgoing_bus = owner_panels.saturating_mul(panel_bytes).saturating_mul(2);
@@ -470,7 +489,7 @@ fn attention_endpoint_traffic(
             owner_panels.saturating_mul(2),
             blocks.saturating_mul(panels_per_block),
         ),
-        blocks.saturating_add(2),
+        phases.unwrap_or_else(|| blocks.saturating_add(2)),
     ))
 }
 
@@ -705,7 +724,8 @@ fn estimated_operator_exchange_cycles(
                 gemm_exchange_phase_count(dispatch, inputs, &compute_output),
             )
         }
-        OperatorDispatch::BlockedAttention { .. } => {
+        OperatorDispatch::BlockedAttention { .. }
+        | OperatorDispatch::MaterializedAttention { .. } => {
             attention_endpoint_traffic(inputs, output, dispatch)
                 .map(|(traffic, phases)| exchange_endpoint_cycles(&traffic, phases))
                 .unwrap_or(u64::MAX / 8)
@@ -772,6 +792,12 @@ fn deferred_split_input_cycles(
             key_block_rows,
             ..
         } => (u64::from(*query_block_rows), u64::from(*key_block_rows)),
+        OperatorDispatch::MaterializedAttention {
+            query_block_rows, ..
+        } => (
+            u64::from(*query_block_rows),
+            u64::from(crate::mid::AMP_INNER_BLOCK),
+        ),
         _ => (rows, u64::from(crate::mid::AMP_INNER_BLOCK)),
     };
     let block_rows = key_block_rows.max(1);
@@ -1058,6 +1084,7 @@ impl CostModel for Ipu21CostModel {
                         .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
                     OperatorDispatch::Pointwise { .. } => 0,
                     OperatorDispatch::BlockedAttention { .. } => 0,
+                    OperatorDispatch::MaterializedAttention { .. } => 0,
                     OperatorDispatch::SplitHeads => 0,
                 };
                 let kernel = amp_kernel_cycles(
@@ -1122,6 +1149,20 @@ impl CostModel for Ipu21CostModel {
                                     .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
                             )
                             .saturating_add(exchange)
+                    }
+                    OperatorDispatch::MaterializedAttention { .. } => {
+                        let arithmetic = query_rows
+                            .saturating_mul(key_rows)
+                            .saturating_mul(query_dimension.saturating_add(value_dimension))
+                            .saturating_mul(2)
+                            .div_ceil(128);
+                        arithmetic
+                            .saturating_add(
+                                4u64.saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
+                            )
+                            .saturating_add(estimated_operator_exchange_cycles(
+                                dispatch, inputs, output,
+                            ))
                     }
                     _ => query_rows
                         .saturating_mul(key_rows)
@@ -1219,6 +1260,7 @@ impl CostModel for Ipu21CostModel {
                 .map_or(0, u64::from)
                 .div_ceil(u64::from(*key_block_rows).max(1))
                 .saturating_add(2),
+            OperatorDispatch::MaterializedAttention { .. } => 3,
             _ => gemm_exchange_phase_count(dispatch, inputs, output),
         };
         let phases = match dispatch {
@@ -1256,7 +1298,11 @@ impl CostModel for Ipu21CostModel {
                 phases,
             );
         }
-        if let OperatorDispatch::BlockedAttention { .. } = dispatch {
+        if matches!(
+            dispatch,
+            OperatorDispatch::BlockedAttention { .. }
+                | OperatorDispatch::MaterializedAttention { .. }
+        ) {
             let Some((traffic, _)) = attention_endpoint_traffic(inputs, output, dispatch) else {
                 return ExchangeFootprint::default();
             };

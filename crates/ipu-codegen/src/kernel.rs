@@ -526,9 +526,7 @@ impl KernelBuildPlan {
             let mut key_rows = attention_stages
                 .iter()
                 .filter_map(|(kernel, _)| match kernel {
-                    TileKernelSpec::AttentionSoftmax {
-                        key_block_columns, ..
-                    } => Some(*key_block_columns),
+                    TileKernelSpec::AttentionSoftmax { key_columns, .. } => Some(*key_columns),
                     _ => None,
                 })
                 .collect::<BTreeSet<_>>();
@@ -540,9 +538,16 @@ impl KernelBuildPlan {
                 attention_stages
                     .iter()
                     .fold(None, |configuration, (kernel, _)| match kernel {
-                        TileKernelSpec::AttentionSoftmax { head_dimension, .. } => {
-                            Some(configuration.unwrap_or((*head_dimension, 0, 0, AMP_INNER_BLOCK)))
-                        }
+                        TileKernelSpec::AttentionSoftmax {
+                            head_dimension,
+                            padded_key_columns,
+                            ..
+                        } => Some(configuration.unwrap_or((
+                            *head_dimension,
+                            0,
+                            0,
+                            *padded_key_columns,
+                        ))),
                         TileKernelSpec::AttentionMerge {
                             value_dimension,
                             padded_value_dimension,
@@ -564,7 +569,17 @@ impl KernelBuildPlan {
                     });
             let (head_dimension, value_dimension, padded_value_dimension, key_block_columns) =
                 configuration.ok_or(KernelAbiError::RequirementMismatch)?;
-            let assembly_tail_softmax = small_key != large_key;
+            let assembly_softmax_keys = attention_stages
+                .iter()
+                .filter_map(|(kernel, _)| match kernel {
+                    TileKernelSpec::AttentionSoftmax {
+                        key_columns,
+                        padded_key_columns,
+                        ..
+                    } if key_columns != padded_key_columns => Some(*key_columns),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
             let mut softmax_cpp_symbols = Vec::new();
             let mut softmax_assembly_symbols = Vec::new();
             let mut merge_symbols = Vec::new();
@@ -575,10 +590,8 @@ impl KernelBuildPlan {
                     "large"
                 };
                 let symbol = match &kernel {
-                    TileKernelSpec::AttentionSoftmax {
-                        key_block_columns, ..
-                    } => {
-                        let key_size = if *key_block_columns == small_key {
+                    TileKernelSpec::AttentionSoftmax { key_columns, .. } => {
+                        let key_size = if *key_columns == small_key {
                             "small"
                         } else {
                             "large"
@@ -591,9 +604,9 @@ impl KernelBuildPlan {
                     _ => return Err(KernelAbiError::RequirementMismatch),
                 };
                 let retained_symbols = match &kernel {
-                    TileKernelSpec::AttentionSoftmax {
-                        key_block_columns, ..
-                    } if assembly_tail_softmax && *key_block_columns == small_key => {
+                    TileKernelSpec::AttentionSoftmax { key_columns, .. }
+                        if assembly_softmax_keys.contains(key_columns) =>
+                    {
                         &mut softmax_assembly_symbols
                     }
                     TileKernelSpec::AttentionSoftmax { .. } => &mut softmax_cpp_symbols,
@@ -624,10 +637,16 @@ impl KernelBuildPlan {
             plan.compilations.push(KernelCompilation {
                 source: "attention_softmax_f16_wrapper.S",
                 name: "attention_softmax_wrapper".into(),
-                flags: assembly_tail_softmax
-                    .then(|| "-DATTENTION_USE_ASSEMBLY_SMALL_KEY".into())
-                    .into_iter()
-                    .collect(),
+                flags: [
+                    assembly_softmax_keys
+                        .contains(&small_key)
+                        .then(|| "-DATTENTION_USE_ASSEMBLY_SMALL_KEY".into()),
+                    (large_key != small_key && assembly_softmax_keys.contains(&large_key))
+                        .then(|| "-DATTENTION_USE_ASSEMBLY_LARGE_KEY".into()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
                 retained_symbols: softmax_cpp_symbols,
             });
             let mut attention_stage_flags = vec![
@@ -642,10 +661,13 @@ impl KernelBuildPlan {
                 format!("-DATTENTION_LARGE_KEY_ROWS={large_key}"),
                 format!("-DATTENTION_SCALE_BITS=0x{scale_bits:08x}"),
             ];
-            if assembly_tail_softmax {
+            if assembly_softmax_keys.contains(&small_key) {
                 attention_stage_flags.push("-DATTENTION_BUILD_ASSEMBLY_SOFTMAX_SMALL_KEY".into());
-                merge_symbols.extend(softmax_assembly_symbols);
             }
+            if large_key != small_key && assembly_softmax_keys.contains(&large_key) {
+                attention_stage_flags.push("-DATTENTION_BUILD_ASSEMBLY_SOFTMAX_LARGE_KEY".into());
+            }
+            merge_symbols.extend(softmax_assembly_symbols);
             plan.compilations.push(KernelCompilation {
                 source: "attention_stages_f16.S",
                 name: format!(
