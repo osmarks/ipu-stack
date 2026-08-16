@@ -43,8 +43,10 @@
 
 	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
 	.set ATTENTION_MINIMUM_F32, 0xc77fe000
+	.set ATTENTION_MINIMUM_F16X2, 0xfbfffbff
 	.set ATTENTION_PHYSICAL_KEY_PAIRS, ATTENTION_KEY_BLOCK_COLUMNS / 2
-	.set ATTENTION_VALUE_PAIRS, (ATTENTION_VALUE_DIMENSION + 1) / 2
+	.set ATTENTION_VALUE_FULL_PANELS, ATTENTION_VALUE_DIMENSION / 16
+	.set ATTENTION_VALUE_TAIL_PAIRS, (ATTENTION_VALUE_DIMENSION % 16 + 1) / 2
 
 	// Callable supervisor ABI for softmax: m2 weights, m3 scores, m10 return.
 	// Query/key row counts are specialization constants placed in the shared
@@ -77,6 +79,33 @@
 	ATTENTION_SOFTMAX_ENTRY ipu_stack_attention_softmax_large_query_small_key_f16, ATTENTION_LARGE_QUERY_ROWS, ATTENTION_SMALL_KEY_ROWS
 	ATTENTION_SOFTMAX_ENTRY ipu_stack_attention_softmax_large_query_large_key_f16, ATTENTION_LARGE_QUERY_ROWS, ATTENTION_LARGE_KEY_ROWS
 
+	.macro ATTENTION_SOFTMAX_MAX_PAIR
+	ld32 $a0, $m3, $m15, 0
+	f16v2tof32 $a0:1, $a0
+	f32max $a7, $a7, $a0
+	f32max $a7, $a7, $a1
+	add $m3, $m3, 4
+	.endm
+
+	.macro ATTENTION_SOFTMAX_NORMALIZE_PAIR
+	ld32 $a0, $m3, $m15, 0
+	f16v2tof32 $a0:1, $a0
+	f32v2mul $a2:3, $a4:B, $a0:1
+	f32v2add $a2:3, $a5:B, $a2:3
+	f32v2tof16 $a2, $a2:3
+	st32 $a2, $m2, $m15, 0
+	add $m2, $m2, 4
+	add $m3, $m3, 4
+	.endm
+
+	.macro ATTENTION_SOFTMAX_SUM_PAIR
+	ld32 $a0, $m2, $m15, 0
+	f16v2tof32 $a0:1, $a0
+	f32add $a6, $a6, $a0
+	f32add $a6, $a6, $a1
+	add $m2, $m2, 4
+	.endm
+
 	.worker
 	.p2align 3
 .Lattention_softmax_worker:
@@ -99,22 +128,23 @@
 	// Scores originate in F16, so reducing their maximum in F32 is exact while
 	// avoiding scalar address reconstruction.
 	ldconst $a7, ATTENTION_MINIMUM_F32
-	shr $m7, $m6, 1
-	setzi $m9, 0
-	brz $m7, .Lattention_softmax_max_odd
-.Lattention_softmax_max_pairs:
-	ld32 $a0, $m3, $m15, 0
-	f16v2tof32 $a0:1, $a0
-	f32max $a7, $a7, $a0
-	f32max $a7, $a7, $a1
-	add $m3, $m3, 4
-	add $m9, $m9, 1
-	and $m10, $m9, 7
-	brnz $m10, .Lattention_softmax_max_no_panel_step
+	shr $m7, $m6, 4
+	brz $m7, .Lattention_softmax_max_tail_setup
+.Lattention_softmax_max_panels:
+	.rept 8
+	ATTENTION_SOFTMAX_MAX_PAIR
+	.endr
 	add $m3, $m3, $m8
-.Lattention_softmax_max_no_panel_step:
 	sub $m7, $m7, 1
-	brnz $m7, .Lattention_softmax_max_pairs
+	brnz $m7, .Lattention_softmax_max_panels
+.Lattention_softmax_max_tail_setup:
+	and $m7, $m6, 15
+	shr $m7, $m7, 1
+	brz $m7, .Lattention_softmax_max_odd
+.Lattention_softmax_max_tail:
+	ATTENTION_SOFTMAX_MAX_PAIR
+	sub $m7, $m7, 1
+	brnz $m7, .Lattention_softmax_max_tail
 .Lattention_softmax_max_odd:
 	and $m10, $m6, 1
 	brz $m10, .Lattention_softmax_max_ready
@@ -125,67 +155,56 @@
 	ldconst $a4, ATTENTION_SCALE_BITS
 	f32mul $a7, $a7, $a4
 	f32sub $a5, $azero, $a7
-	ldconst $a6, 0
 
-	// Rewind the two panel streams. Normalization, F16 rounding, exponentiation,
-	// denominator accumulation, and the output store are fused in one pass.
+	// First round normalized scores to F16. Exponentiation is kept in a separate
+	// software pipeline below: f16v2exp has enough latency that consuming every
+	// result immediately would serialize the entire row.
 	ld32 $m2, $mvertex_base, $m15, 0
 	ld32 $m3, $mvertex_base, $m15, 1
 	shl $m10, $m4, 5
 	add $m2, $m2, $m10
 	add $m3, $m3, $m10
-	shr $m7, $m6, 1
-	setzi $m9, 0
-	brz $m7, .Lattention_softmax_norm_odd
-.Lattention_softmax_norm_pairs:
-	ld32 $a0, $m3, $m15, 0
-	f16v2tof32 $a0:1, $a0
-	f32v2mul $a2:3, $a4:B, $a0:1
-	f32v2add $a2:3, $a5:B, $a2:3
-	f32v2tof16 $a2, $a2:3
-	f16v2exp $a2, $a2
-	st32 $a2, $m2, $m15, 0
-	f16v2tof32 $a2:3, $a2
-	f32add $a6, $a6, $a2
-	f32add $a6, $a6, $a3
-	add $m2, $m2, 4
-	add $m3, $m3, 4
-	add $m9, $m9, 1
-	and $m10, $m9, 7
-	brnz $m10, .Lattention_softmax_norm_no_panel_step
+	shr $m7, $m6, 4
+	brz $m7, .Lattention_softmax_norm_tail_setup
+.Lattention_softmax_norm_panels:
+	.rept 8
+	ATTENTION_SOFTMAX_NORMALIZE_PAIR
+	.endr
 	add $m2, $m2, $m8
 	add $m3, $m3, $m8
-.Lattention_softmax_norm_no_panel_step:
 	sub $m7, $m7, 1
-	brnz $m7, .Lattention_softmax_norm_pairs
+	brnz $m7, .Lattention_softmax_norm_panels
+.Lattention_softmax_norm_tail_setup:
+	and $m7, $m6, 15
+	shr $m7, $m7, 1
+	brz $m7, .Lattention_softmax_norm_odd
+.Lattention_softmax_norm_tail:
+	ATTENTION_SOFTMAX_NORMALIZE_PAIR
+	sub $m7, $m7, 1
+	brnz $m7, .Lattention_softmax_norm_tail
 .Lattention_softmax_norm_odd:
 	and $m10, $m6, 1
-	brz $m10, .Lattention_softmax_zero_padding
+	brz $m10, .Lattention_softmax_padding_setup
 	ld32 $a0, $m3, $m15, 0
 	f16v2tof32 $a0:1, $a0
 	f32v2mul $a2:3, $a4:B, $a0:1
 	f32v2add $a2:3, $a5:B, $a2:3
-	// The high lane is outside the logical key block. Converting -65504 before
-	// applying exp guarantees that the stored padding lane is zero.
+	// The high lane is outside the logical key block. Rounding -65504 before the
+	// exponentiation pass guarantees that the stored padding lane becomes zero.
 	ldconst $a3, ATTENTION_MINIMUM_F32
 	f32v2tof16 $a2, $a2:3
-	f16v2exp $a2, $a2
 	st32 $a2, $m2, $m15, 0
-	f16v2tof32 $a2:3, $a2
-	f32add $a6, $a6, $a2
 	add $m2, $m2, 4
-	add $m9, $m9, 1
-	and $m10, $m9, 7
-	brnz $m10, .Lattention_softmax_zero_padding
-	add $m2, $m2, $m8
-.Lattention_softmax_zero_padding:
+.Lattention_softmax_padding_setup:
 	add $m7, $m6, 1
 	shr $m7, $m7, 1
+	mov $m9, $m7
 	setzi $m10, ATTENTION_PHYSICAL_KEY_PAIRS
 	sub $m7, $m10, $m7
-	brz $m7, .Lattention_softmax_store_state
+	brz $m7, .Lattention_softmax_exp_setup
+	ldconst $a0, ATTENTION_MINIMUM_F16X2
 .Lattention_softmax_zero_pairs:
-	st32 $azero, $m2, $m15, 0
+	st32 $a0, $m2, $m15, 0
 	add $m2, $m2, 4
 	add $m9, $m9, 1
 	and $m10, $m9, 7
@@ -194,6 +213,69 @@
 .Lattention_softmax_zero_no_panel_step:
 	sub $m7, $m7, 1
 	brnz $m7, .Lattention_softmax_zero_pairs
+
+.Lattention_softmax_exp_setup:
+	ld32 $m1, $mvertex_base, $m15, 0
+	shl $m10, $m4, 5
+	add $m1, $m1, $m10
+	add $m10, $m8, 32
+	setzi $m0, ATTENTION_KEY_BLOCK_COLUMNS / 16
+.Lattention_softmax_exp_panel:
+	mov $m2, $m1
+	mov $m3, $m1
+	setzi $m7, 4
+	// Four independent half4 groups keep the nonlinear pipeline occupied. This
+	// is the same schedule used by the standalone vector exp implementation.
+	brnzdec $m7, 3f
+	bri 4f
+	.p2align 3
+	nop
+3:
+	ld64step $a0:1, $mzero, $m2+=, 1
+	{ rpt $m7, (2f-1f)/8 - 1
+	  f16v2exp $a2, $a0 }
+1:
+	{ ld64step $a0:1, $mzero, $m2+=, 1
+	  f16v2exp $a3, $a1 }
+	{ st64step $a2:3, $mzero, $m3+=, 1
+	  f16v2exp $a2, $a0 }
+2:
+	f16v2exp $a3, $a1
+	st64step $a2:3, $mzero, $m3+=, 1
+4:
+	add $m1, $m1, $m10
+	sub $m0, $m0, 1
+	brnz $m0, .Lattention_softmax_exp_panel
+
+	// Accumulate after the nonlinear pipeline so no exp result feeds directly
+	// into the loop-carried denominator dependency.
+	ld32 $m2, $mvertex_base, $m15, 0
+	shl $m10, $m4, 5
+	add $m2, $m2, $m10
+	shr $m7, $m6, 4
+	ldconst $a6, 0
+	brz $m7, .Lattention_softmax_sum_tail_setup
+.Lattention_softmax_sum_panels:
+	.rept 8
+	ATTENTION_SOFTMAX_SUM_PAIR
+	.endr
+	add $m2, $m2, $m8
+	sub $m7, $m7, 1
+	brnz $m7, .Lattention_softmax_sum_panels
+.Lattention_softmax_sum_tail_setup:
+	and $m7, $m6, 15
+	shr $m7, $m7, 1
+	brz $m7, .Lattention_softmax_sum_odd
+.Lattention_softmax_sum_tail:
+	ATTENTION_SOFTMAX_SUM_PAIR
+	sub $m7, $m7, 1
+	brnz $m7, .Lattention_softmax_sum_tail
+.Lattention_softmax_sum_odd:
+	and $m10, $m6, 1
+	brz $m10, .Lattention_softmax_store_state
+	ld32 $a0, $m2, $m15, 0
+	f16v2tof32 $a0:1, $a0
+	f32add $a6, $a6, $a0
 .Lattention_softmax_store_state:
 	ld32 $m2, $mvertex_base, $m15, 0
 	setzi $m10, ATTENTION_KEY_BLOCK_COLUMNS * 2
@@ -239,6 +321,33 @@
 	ATTENTION_MERGE_ENTRY ipu_stack_attention_merge_small_query_f16, ATTENTION_SMALL_QUERY_ROWS
 	ATTENTION_MERGE_ENTRY ipu_stack_attention_merge_large_query_f16, ATTENTION_LARGE_QUERY_ROWS
 
+	.macro ATTENTION_MERGE_INITIAL_PAIR
+	ld32 $a0, $m1, $m15, 0
+	f16v2tof32 $a0:1, $a0
+	st64 $a0:1, $m0, $m15, 0
+	add $m1, $m1, 4
+	add $m0, $m0, 8
+	.endm
+
+	.macro ATTENTION_MERGE_UPDATE_PAIR
+	ld32 $a0, $m1, $m15, 0
+	f16v2tof32 $a0:1, $a0
+	ld64 $a2:3, $m0, $m15, 0
+	f32v2mul $a2:3, $a5:B, $a2:3
+	f32v2mul $a0:1, $a6:B, $a0:1
+	f32v2add $a2:3, $a2:3, $a0:1
+	st64 $a2:3, $m0, $m15, 0
+	add $m1, $m1, 4
+	add $m0, $m0, 8
+	.endm
+
+	.macro ATTENTION_MERGE_NORMALIZE_PAIR
+	ld64 $a0:1, $m0, $m15, 0
+	f32v2mul $a0:1, $a7:B, $a0:1
+	st64 $a0:1, $m0, $m15, 0
+	add $m0, $m0, 8
+	.endm
+
 	.worker
 	.p2align 3
 .Lattention_merge_worker:
@@ -274,21 +383,19 @@
 	brz $m6, .Lattention_merge_update_state
 	st32 $a0, $m8, $m15, 0
 	st32 $a1, $m8, $m15, 1
-	setzi $m2, ATTENTION_VALUE_PAIRS
-	setzi $m3, 0
-.Lattention_merge_initial_values:
-	ld32 $a0, $m1, $m15, 0
-	f16v2tof32 $a0:1, $a0
-	st64 $a0:1, $m0, $m15, 0
-	add $m0, $m0, 8
-	add $m1, $m1, 4
-	add $m3, $m3, 1
-	and $m4, $m3, 7
-	brnz $m4, .Lattention_merge_initial_no_panel_step
+#if ATTENTION_VALUE_FULL_PANELS > 0
+	setzi $m2, ATTENTION_VALUE_FULL_PANELS
+.Lattention_merge_initial_panels:
+	.rept 8
+	ATTENTION_MERGE_INITIAL_PAIR
+	.endr
 	add $m1, $m1, $m10
-.Lattention_merge_initial_no_panel_step:
 	sub $m2, $m2, 1
-	brnz $m2, .Lattention_merge_initial_values
+	brnz $m2, .Lattention_merge_initial_panels
+#endif
+	.rept ATTENTION_VALUE_TAIL_PAIRS
+	ATTENTION_MERGE_INITIAL_PAIR
+	.endr
 	bri .Lattention_merge_maybe_normalize
 
 .Lattention_merge_update_state:
@@ -304,43 +411,40 @@
 	f32add $a3, $a3, $a1
 	st32 $a4, $m8, $m15, 0
 	st32 $a3, $m8, $m15, 1
-	setzi $m2, ATTENTION_VALUE_PAIRS
-	setzi $m3, 0
-.Lattention_merge_update_values:
-	ld32 $a0, $m1, $m15, 0
-	f16v2tof32 $a0:1, $a0
-	ld64 $a2:3, $m0, $m15, 0
-	f32v2mul $a2:3, $a5:B, $a2:3
-	f32v2mul $a0:1, $a6:B, $a0:1
-	f32v2add $a2:3, $a2:3, $a0:1
-	st64 $a2:3, $m0, $m15, 0
-	add $m0, $m0, 8
-	add $m1, $m1, 4
-	add $m3, $m3, 1
-	and $m4, $m3, 7
-	brnz $m4, .Lattention_merge_update_no_panel_step
+#if ATTENTION_VALUE_FULL_PANELS > 0
+	setzi $m2, ATTENTION_VALUE_FULL_PANELS
+.Lattention_merge_update_panels:
+	.rept 8
+	ATTENTION_MERGE_UPDATE_PAIR
+	.endr
 	add $m1, $m1, $m10
-.Lattention_merge_update_no_panel_step:
 	sub $m2, $m2, 1
-	brnz $m2, .Lattention_merge_update_values
+	brnz $m2, .Lattention_merge_update_panels
+#endif
+	.rept ATTENTION_VALUE_TAIL_PAIRS
+	ATTENTION_MERGE_UPDATE_PAIR
+	.endr
 
 .Lattention_merge_maybe_normalize:
 	brz $m7, .Lattention_merge_next_row
 	ld32 $a7, $m8, $m15, 1
-	f32exp $a6, $azero
-	f32div $a7, $a6, $a7
+	f32oox $a7, $a7
 	ld32 $m0, $mvertex_base, $m15, 0
 	setzi $m2, ATTENTION_PADDED_VALUE_DIMENSION * 4
 	mul $m2, $m9, $m2
 	add $m0, $m0, $m2
-	setzi $m2, ATTENTION_VALUE_PAIRS
-.Lattention_merge_normalize:
-	ld64 $a0:1, $m0, $m15, 0
-	f32v2mul $a0:1, $a7:B, $a0:1
-	st64 $a0:1, $m0, $m15, 0
-	add $m0, $m0, 8
+	setzi $m2, ATTENTION_VALUE_FULL_PANELS
+#if ATTENTION_VALUE_FULL_PANELS > 0
+.Lattention_merge_normalize_panels:
+	.rept 8
+	ATTENTION_MERGE_NORMALIZE_PAIR
+	.endr
 	sub $m2, $m2, 1
-	brnz $m2, .Lattention_merge_normalize
+	brnz $m2, .Lattention_merge_normalize_panels
+#endif
+	.rept ATTENTION_VALUE_TAIL_PAIRS
+	ATTENTION_MERGE_NORMALIZE_PAIR
+	.endr
 .Lattention_merge_next_row:
 	add $m9, $m9, 6
 	cmpult $m0, $m9, $m5
