@@ -5,9 +5,7 @@ use crate::memory::{
     MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE,
     RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
 };
-use crate::mid::{
-    Ipu21CostModel, MidGraph, MidOperationKind, PipelineConfig, Precision, lower_finalists,
-};
+use crate::mid::{MidGraph, MidOperationKind, PipelineConfig, Precision, lower_finalists};
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HOST_RUN_SYMBOL, KernelBuildPlan,
     PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL,
@@ -657,13 +655,14 @@ fn build_package_artifacts(
     let mut planning = config.pipeline.clone();
     planning.diagnostic_checkpoints = diagnostic_checkpoints;
     if diagnostic_checkpoints {
-        planning.profiling.enabled = false;
+        planning.profiling = crate::ProfilingMode::Disabled;
     }
+    let cost_model = planning.target.cost_model();
     let finalists = build_phase("lower_mid", || {
         Ok(lower_finalists(
             graph,
             &planning,
-            &Ipu21CostModel,
+            &cost_model,
             planning.exchange_schedule_finalists,
         )?)
     })?;
@@ -812,7 +811,7 @@ fn build_package_from_objects(
         execution_tile_count,
         program.tile_count,
     )?;
-    let profile_samples = config.pipeline.profiling.enabled.then(|| {
+    let profile_samples = config.pipeline.profiling.records_steps().then(|| {
         program
             .tiles
             .iter()
@@ -1006,12 +1005,12 @@ fn build_package_from_objects(
                         initial_profile_address: config
                             .pipeline
                             .profiling
-                            .enabled
+                            .records_overall_time()
                             .then_some(PROFILE_START_CYCLE),
                         final_profile_address: config
                             .pipeline
                             .profiling
-                            .enabled
+                            .records_overall_time()
                             .then_some(PROFILE_END_CYCLE),
                         ..CodegenOptions::default()
                     },
@@ -1092,22 +1091,24 @@ fn build_package_from_objects(
         .enumerate()
         .map(|(index, output)| output_binding(program, &placement, &topology, output, index))
         .collect::<PackageBuildResult<Vec<_>>>()?;
-    if config.pipeline.profiling.enabled {
+    if config.pipeline.profiling.records_overall_time() {
         outputs.push(cycle_binding(
             "profile.start-cycle",
             PROFILE_START_CYCLE,
             program.tile_count,
             &topology,
         ));
-        outputs.push(profile_binding(
-            program,
-            &physical_to_logical,
-            profile_storage
-                .as_ref()
-                .expect("profiling storage is allocated when profiling is enabled")
-                .range
-                .start,
-        )?);
+        if config.pipeline.profiling.records_steps() {
+            outputs.push(profile_binding(
+                program,
+                &physical_to_logical,
+                profile_storage
+                    .as_ref()
+                    .expect("full profiling allocates per-step storage")
+                    .range
+                    .start,
+            )?);
+        }
         outputs.push(cycle_binding(
             "profile.end-cycle",
             PROFILE_END_CYCLE,
@@ -1199,12 +1200,12 @@ fn build_package_from_objects(
                         initial_profile_address: config
                             .pipeline
                             .profiling
-                            .enabled
+                            .records_overall_time()
                             .then_some(PROFILE_START_CYCLE),
                         final_profile_address: config
                             .pipeline
                             .profiling
-                            .enabled
+                            .records_overall_time()
                             .then_some(PROFILE_END_CYCLE),
                         ..CodegenOptions::default()
                     },
@@ -1569,7 +1570,7 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
             symbols.push(crate::PATCH_WORD_SYMBOL.into());
         }
     }
-    if config.pipeline.profiling.enabled {
+    if config.pipeline.profiling.records_overall_time() {
         symbols.push(SAMPLE_CYCLE_SYMBOL.into());
     }
     if !program.inputs.is_empty() || !program.outputs.is_empty() {
@@ -1605,10 +1606,7 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
 fn tile_has_fill_zero(program: &LowProgram, tile: &crate::TileWorkList) -> bool {
     program.work(tile).any(|work| match work {
         crate::TileWorkRef::Kernel(run) => {
-            matches!(
-                run.kernel,
-                crate::TileKernel::Planned(crate::TileKernelSpec::FillZero)
-            )
+            matches!(run.kernel, crate::TileKernelSpec::FillZero)
         }
         crate::TileWorkRef::Repeat(repeat) => tile_has_fill_zero(program, &repeat.body),
         crate::TileWorkRef::Exchange(_)

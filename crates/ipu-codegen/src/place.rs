@@ -91,7 +91,7 @@ pub(crate) fn place_with_standard_ranges(
     {
         return Err(PlacementError::OutOfMemory {
             tile: 0,
-            class: MemoryClass::Ipu21Standard,
+            class: MemoryClass::Standard,
             bytes: 0,
         });
     }
@@ -203,7 +203,7 @@ fn place_tile(
     allocate_tile_class(
         program,
         tile,
-        MemoryClass::Ipu21Interleaved,
+        MemoryClass::Interleaved,
         iterated,
         &grouped,
         members,
@@ -218,7 +218,7 @@ fn place_tile(
     if interleaved_boundary > IPU21_APPLICATION_MEMORY_LIMIT {
         return Err(PlacementError::OutOfMemory {
             tile,
-            class: MemoryClass::Ipu21Interleaved,
+            class: MemoryClass::Interleaved,
             bytes: interleaved_boundary - IPU21_INTERLEAVED_MEMORY_BASE,
         });
     }
@@ -228,7 +228,7 @@ fn place_tile(
     allocate_tile_class(
         program,
         tile,
-        MemoryClass::Ipu21Standard,
+        MemoryClass::Standard,
         iterated,
         &grouped,
         members,
@@ -520,8 +520,8 @@ fn memory_element_size(program: &LowProgram, members: &[usize]) -> u32 {
         .layout
         .memory_class
     {
-        MemoryClass::Ipu21Standard => TILE_MEMORY_ELEMENT_SIZE,
-        MemoryClass::Ipu21Interleaved => IPU21_INTERLEAVED_ELEMENT_SIZE,
+        MemoryClass::Standard => TILE_MEMORY_ELEMENT_SIZE,
+        MemoryClass::Interleaved => IPU21_INTERLEAVED_ELEMENT_SIZE,
     }
 }
 
@@ -882,13 +882,13 @@ mod tests {
             for shard in &low.shards {
                 let address = placement.shard_addresses[&shard.id];
                 match shard.tensor_type.format.layout.memory_class {
-                    MemoryClass::Ipu21Interleaved => {
+                    MemoryClass::Interleaved => {
                         assert!(
                             (IPU21_INTERLEAVED_MEMORY_BASE..IPU21_APPLICATION_MEMORY_LIMIT)
                                 .contains(&address)
                         )
                     }
-                    MemoryClass::Ipu21Standard => assert!(address >= IPU21_DATA_BASE),
+                    MemoryClass::Standard => assert!(address >= IPU21_DATA_BASE),
                 }
             }
             for tile in &low.tiles {

@@ -427,8 +427,8 @@ fn allocation_memory(tensor: &TensorType, requirement: AllocationRequirement) ->
     let mut bytes = maximum_shard_bytes(tensor).saturating_add(requirement.access_tail);
     if requirement.distinct_element {
         let element = match tensor.format.layout.memory_class {
-            MemoryClass::Ipu21Standard => ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-            MemoryClass::Ipu21Interleaved => ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE,
+            MemoryClass::Standard => ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+            MemoryClass::Interleaved => ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE,
         };
         bytes = bytes.div_ceil(u64::from(element)) * u64::from(element);
     }
@@ -566,7 +566,7 @@ pub(crate) fn operator_memory_estimate(
             .saturating_mul(u64::from(*output_column_block))
             .saturating_mul(right.format.precision.bytes());
         let mut convolution = MemoryUsage::default();
-        convolution.add_class(MemoryClass::Ipu21Interleaved, right_staging);
+        convolution.add_class(MemoryClass::Interleaved, right_staging);
         if left_requirement.is_some_and(|requirement| {
             requirement.materialization == OperandMaterialization::DispatchSlices
         }) {
@@ -586,7 +586,7 @@ pub(crate) fn operator_memory_estimate(
                     .saturating_mul(u64::from(ipu_package::TILE_MEMORY_ELEMENT_SIZE));
             }
             convolution.add_class(left.format.layout.memory_class, left_staging);
-            if left.format.layout.memory_class == MemoryClass::Ipu21Standard {
+            if left.format.layout.memory_class == MemoryClass::Standard {
                 maximum_standard_temporary_allocation =
                     maximum_standard_temporary_allocation.max(left_staging);
             }
@@ -829,7 +829,7 @@ pub(crate) fn gemm_uses_panel_buffer(
     if streamed {
         return true;
     }
-    if right.format.layout.memory_class == MemoryClass::Ipu21Interleaved {
+    if right.format.layout.memory_class == MemoryClass::Interleaved {
         return false;
     }
     let k = right.shape.0[rank
@@ -1459,7 +1459,7 @@ mod tests {
                     column_partitions,
                     1,
                     1,
-                    MemoryClass::Ipu21Standard,
+                    MemoryClass::Standard,
                 ),
             );
             let remote =
@@ -1510,7 +1510,7 @@ mod tests {
                     column_partitions,
                     inner_partitions,
                     row_partitions,
-                    MemoryClass::Ipu21Standard,
+                    MemoryClass::Standard,
                 ),
             );
             let compute_output = TensorType::new(
@@ -1543,7 +1543,7 @@ mod tests {
                     column_partitions,
                     inner_partitions,
                     1,
-                    MemoryClass::Ipu21Standard,
+                    MemoryClass::Standard,
                 ),
             );
             let expected_incoming = maximum_shard_bytes(&sharded_right);

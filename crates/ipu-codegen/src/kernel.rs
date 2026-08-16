@@ -4,8 +4,7 @@ use crate::mid::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
     AmpOrder, BlockMajorOrder, ComputeStep, ElementOrder, GemmKernelMode, GemmWeightLoad,
     KernelRequirements, KernelRun, LowProgram, LowShard, LowShardId, Precision, StepProfile,
-    StorageError, TileAddress, TileKernel, TileKernelSpec, TileWorkList, TileWorkRef,
-    view_byte_spans,
+    StorageError, TileAddress, TileKernelSpec, TileWorkList, TileWorkRef, view_byte_spans,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -710,7 +709,7 @@ impl KernelBuildPlan {
 
     pub fn call(&self, run: &KernelRun) -> Result<PlannedKernelCall, KernelAbiError> {
         let abi = validate_kernel_run(run)?;
-        let TileKernel::Planned(kernel) = &run.kernel;
+        let kernel = &run.kernel;
         if abi.availability != KernelAvailability::Implemented {
             return Err(KernelAbiError::Unavailable(kernel.clone()));
         }
@@ -899,7 +898,7 @@ fn collect_kernels(
         match work {
             TileWorkRef::Kernel(run) => {
                 let abi = validate_kernel_run(run)?;
-                let TileKernel::Planned(kernel) = &run.kernel;
+                let kernel = &run.kernel;
                 if abi.availability != KernelAvailability::Implemented {
                     return Err(KernelAbiError::Unavailable(kernel.clone()));
                 }
@@ -982,10 +981,10 @@ fn collect_kernels(
 }
 
 fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, KernelAbiError> {
-    let TileKernel::Planned(TileKernelSpec::FlashAttention {
+    let TileKernelSpec::FlashAttention {
         options,
         accumulate,
-    }) = &run.kernel
+    } = &run.kernel
     else {
         return Err(KernelAbiError::RequirementMismatch);
     };
@@ -1151,28 +1150,22 @@ fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbi
         .map(|argument| match argument.name {
             "element_count" => Ok(count),
             "num_partials" => match &run.kernel {
-                TileKernel::Planned(TileKernelSpec::ReductionSum { partials }) => {
-                    Ok(u32::from(*partials - 1))
-                }
+                TileKernelSpec::ReductionSum { partials } => Ok(u32::from(*partials - 1)),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             "scale_exponent" => match &run.kernel {
-                TileKernel::Planned(TileKernelSpec::Gemm {
+                TileKernelSpec::Gemm {
                     multiply: Precision::F8F143 { scale_exponent },
                     ..
-                }) => Ok(u32::from_ne_bytes(i32::from(*scale_exponent).to_ne_bytes())),
+                } => Ok(u32::from_ne_bytes(i32::from(*scale_exponent).to_ne_bytes())),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             "initial_block" => match &run.kernel {
-                TileKernel::Planned(TileKernelSpec::AttentionMerge { initial, .. }) => {
-                    Ok(u32::from(*initial))
-                }
+                TileKernelSpec::AttentionMerge { initial, .. } => Ok(u32::from(*initial)),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             "final_block" => match &run.kernel {
-                TileKernel::Planned(TileKernelSpec::AttentionMerge { final_block, .. }) => {
-                    Ok(u32::from(*final_block))
-                }
+                TileKernelSpec::AttentionMerge { final_block, .. } => Ok(u32::from(*final_block)),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             "words_per_worker" => output_byte_count(run).map(|bytes| bytes / 8 / 6),
@@ -1183,10 +1176,10 @@ fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbi
             "logical_columns" => matrix_extent(run, true, true),
             "physical_columns" => matrix_extent(run, false, true),
             "target_order" => match &run.kernel {
-                TileKernel::Planned(TileKernelSpec::Rearrange {
+                TileKernelSpec::Rearrange {
                     to: crate::Layout { order, .. },
                     ..
-                }) => RearrangeTarget::from_order(*order)
+                } => RearrangeTarget::from_order(*order)
                     .map(RearrangeTarget::codelet_index)
                     .ok_or(KernelAbiError::RequirementMismatch),
                 _ => Err(KernelAbiError::RequirementMismatch),
@@ -1386,7 +1379,7 @@ pub fn tile_kernel_abi(
 }
 
 pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError> {
-    let TileKernel::Planned(kernel) = &run.kernel;
+    let kernel = &run.kernel;
     let abi = tile_kernel_abi(kernel, &run.requirements)?;
     if run.inputs.len() != abi.input_registers.len() {
         return Err(KernelAbiError::PointerArity {
@@ -1573,7 +1566,7 @@ mod tests {
                 layout: Layout {
                     order: ElementOrder::Amp(order),
                     tiling: TensorTiling::replicated(1),
-                    memory_class: MemoryClass::Ipu21Standard,
+                    memory_class: MemoryClass::Standard,
                 },
             };
             let run = KernelRun::new(
@@ -1582,14 +1575,14 @@ mod tests {
                     value: None,
                     reason: WorkReason::OperatorKernel,
                 },
-                TileKernel::Planned(TileKernelSpec::Gemm {
+                TileKernelSpec::Gemm {
                     multiply: Precision::F16,
                     accumulate: AccumulationPrecision::F32,
                     mode: GemmKernelMode::Initialize,
                     weights: GemmWeightLoad::Standard,
                     inner_block: 64,
                     output_columns: 16,
-                }),
+                },
                 Vec::new(),
                 ShardView {
                     shard: LowShardId::from_index(0),
@@ -1645,7 +1638,7 @@ mod tests {
                 layout: Layout {
                     order: crate::ElementOrder::RowMajor,
                     tiling: TensorTiling::replicated(1),
-                    memory_class: MemoryClass::Ipu21Standard,
+                    memory_class: MemoryClass::Standard,
                 },
             };
             let operand = OperandRequirement::new(format, 8);

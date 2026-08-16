@@ -162,11 +162,6 @@ pub struct WorkProvenance {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TileKernel {
-    Planned(TileKernelSpec),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KernelRequirements {
     Operator(OperatorRequirements),
     Conversion {
@@ -185,7 +180,7 @@ pub struct KernelOperand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelRunMetadata {
     pub provenance: WorkProvenance,
-    pub kernel: TileKernel,
+    pub kernel: TileKernelSpec,
     pub requirements: KernelRequirements,
 }
 
@@ -199,7 +194,7 @@ pub struct KernelRun {
 impl KernelRun {
     pub fn new(
         provenance: WorkProvenance,
-        kernel: TileKernel,
+        kernel: TileKernelSpec,
         inputs: Vec<KernelOperand>,
         output: ShardView,
         requirements: KernelRequirements,
@@ -450,7 +445,7 @@ fn append_checkpoint(tiles: &mut [TileWorkList], operation: OperationId, breakpo
     fields(
         tile_count = config.tile_count,
         operations = graph.operations.len(),
-        profiling = config.profiling.enabled
+        profiling = ?config.profiling
     )
 )]
 pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringResult<LowProgram> {
@@ -736,7 +731,7 @@ impl LoweringState {
             .filter(|shard| {
                 shard.tile == tile
                     && shard.tensor_type.format.layout.memory_class
-                        == crate::MemoryClass::Ipu21Interleaved
+                        == crate::MemoryClass::Interleaved
                     && !matches!(
                         shard.definition,
                         ShardDefinition::Alias(_)
@@ -1136,14 +1131,14 @@ impl LoweringState {
                 source.tile,
                 KernelRun::new(
                     provenance,
-                    TileKernel::Planned(TileKernelSpec::Rearrange {
+                    TileKernelSpec::Rearrange {
                         from: source.tensor_type.format.layout.clone(),
                         to: self.shards[staging.index() as usize]
                             .tensor_type
                             .format
                             .layout
                             .clone(),
-                    }),
+                    },
                     vec![KernelOperand {
                         views: vec![self.full_view(source_shard)],
                     }],
@@ -1361,7 +1356,7 @@ impl LoweringState {
                 tile,
                 KernelRun::new(
                     operation_provenance(operation, kind),
-                    TileKernel::Planned(plan.kernel.clone()),
+                    plan.kernel.clone(),
                     vec![KernelOperand {
                         views: vec![self.full_view(input)],
                     }],
@@ -1553,10 +1548,10 @@ impl LoweringState {
                         tile,
                         KernelRun::new(
                             provenance.clone(),
-                            TileKernel::Planned(TileKernelSpec::Rearrange {
+                            TileKernelSpec::Rearrange {
                                 from: source_format.layout.clone(),
                                 to: destination_format.layout.clone(),
-                            }),
+                            },
                             vec![KernelOperand {
                                 views: vec![staging],
                             }],
@@ -1617,7 +1612,7 @@ impl LoweringState {
                     layout: Layout {
                         order: ElementOrder::RowMajor,
                         tiling: TensorTiling::replicated(1),
-                        memory_class: MemoryClass::Ipu21Standard,
+                        memory_class: MemoryClass::Standard,
                     },
                 },
             },
@@ -1999,7 +1994,7 @@ impl LoweringState {
                 shape.scratch_columns,
                 Precision::F16,
                 ElementOrder::Amp(AmpOrder::Left),
-                MemoryClass::Ipu21Interleaved,
+                MemoryClass::Interleaved,
             )?;
             let key_staging = self.push_attention_buffer(
                 tile,
@@ -2016,7 +2011,7 @@ impl LoweringState {
                 shape.state_columns,
                 Precision::F16,
                 ElementOrder::Amp(AmpOrder::Left),
-                MemoryClass::Ipu21Standard,
+                MemoryClass::Standard,
             )?;
             if shape.reuse_key_staging_for_state
                 && crate::shard_storage_bytes(&self.shards[weights.index() as usize])?
@@ -2392,7 +2387,7 @@ impl LoweringState {
                     task.tile,
                     KernelRun::new(
                         kernel_provenance,
-                        TileKernel::Planned(query_key.clone()),
+                        query_key.clone(),
                         vec![
                             KernelOperand {
                                 views: vec![self.full_view(task.query)],
@@ -2410,11 +2405,11 @@ impl LoweringState {
                     task.tile,
                     KernelRun::new(
                         kernel_provenance,
-                        TileKernel::Planned(TileKernelSpec::AttentionSoftmax {
+                        TileKernelSpec::AttentionSoftmax {
                             head_dimension: task.query_dimension,
                             key_columns: valid_key_rows,
                             padded_key_columns: key_block_rows,
-                        }),
+                        },
                         vec![KernelOperand {
                             views: vec![score_view],
                         }],
@@ -2430,7 +2425,7 @@ impl LoweringState {
                     task.tile,
                     KernelRun::new(
                         kernel_provenance,
-                        TileKernel::Planned(probability_value.clone()),
+                        probability_value.clone(),
                         vec![
                             KernelOperand {
                                 views: vec![probability_view],
@@ -2448,13 +2443,13 @@ impl LoweringState {
                     task.tile,
                     KernelRun::new(
                         kernel_provenance,
-                        TileKernel::Planned(TileKernelSpec::AttentionMerge {
+                        TileKernelSpec::AttentionMerge {
                             value_dimension: task.value_dimension,
                             padded_value_dimension,
                             key_block_columns: key_block_rows,
                             initial: block == 0,
                             final_block: block + 1 == blocks,
-                        }),
+                        },
                         vec![
                             KernelOperand {
                                 views: vec![block_value_view],
@@ -2636,7 +2631,7 @@ impl LoweringState {
                 task.tile,
                 KernelRun::new(
                     kernel_provenance,
-                    TileKernel::Planned(query_key.clone()),
+                    query_key.clone(),
                     vec![
                         KernelOperand {
                             views: vec![self.full_view(task.query)],
@@ -2654,11 +2649,11 @@ impl LoweringState {
                 task.tile,
                 KernelRun::new(
                     kernel_provenance,
-                    TileKernel::Planned(TileKernelSpec::AttentionSoftmax {
+                    TileKernelSpec::AttentionSoftmax {
                         head_dimension: task.query_dimension,
                         key_columns: key_rows,
                         padded_key_columns: padded_key_rows,
-                    }),
+                    },
                     vec![KernelOperand {
                         views: vec![scores],
                     }],
@@ -2683,7 +2678,7 @@ impl LoweringState {
                 task.tile,
                 KernelRun::new(
                     kernel_provenance,
-                    TileKernel::Planned(probability_value.clone()),
+                    probability_value.clone(),
                     vec![
                         KernelOperand {
                             views: vec![probabilities],
@@ -2701,13 +2696,13 @@ impl LoweringState {
                 task.tile,
                 KernelRun::new(
                     kernel_provenance,
-                    TileKernel::Planned(TileKernelSpec::AttentionMerge {
+                    TileKernelSpec::AttentionMerge {
                         value_dimension: task.value_dimension,
                         padded_value_dimension,
                         key_block_columns: padded_key_rows,
                         initial: true,
                         final_block: true,
-                    }),
+                    },
                     vec![
                         KernelOperand {
                             views: vec![block_value],
@@ -3182,10 +3177,10 @@ impl LoweringState {
             tile,
             KernelRun::new(
                 provenance,
-                TileKernel::Planned(TileKernelSpec::Rearrange {
+                TileKernelSpec::Rearrange {
                     from: input.layout.clone(),
                     to: output.layout.clone(),
-                }),
+                },
                 vec![KernelOperand {
                     views: vec![self.full_view(source)],
                 }],
@@ -3220,7 +3215,7 @@ impl LoweringState {
             tile,
             KernelRun::new(
                 provenance,
-                TileKernel::Planned(TileKernelSpec::FillZero),
+                TileKernelSpec::FillZero,
                 Vec::new(),
                 self.full_view(shard),
                 KernelRequirements::Operator(OperatorRequirements {
@@ -3288,7 +3283,7 @@ impl LoweringState {
                 Layout {
                     order: ElementOrder::RowMajor,
                     tiling: TensorTiling::replicated(1),
-                    memory_class: MemoryClass::Ipu21Standard,
+                    memory_class: MemoryClass::Standard,
                 },
             ),
             extents: vec![ShardExtent {
@@ -3319,7 +3314,7 @@ impl LoweringState {
                 Layout {
                     order,
                     tiling: TensorTiling::replicated(1),
-                    memory_class: MemoryClass::Ipu21Standard,
+                    memory_class: MemoryClass::Standard,
                 },
             ),
             extents: vec![
@@ -3433,7 +3428,7 @@ impl LoweringState {
                             value: operation.results.first().copied(),
                             reason: WorkReason::OperatorKernel,
                         },
-                        TileKernel::Planned(kernel.clone()),
+                        kernel.clone(),
                         inputs,
                         ShardView {
                             shard: output,
@@ -3756,7 +3751,7 @@ impl LoweringState {
                                     self.shards[right.index() as usize].tensor_type.clone();
                                 if use_interleaved_staging {
                                     tensor_type.format.layout.memory_class =
-                                        crate::MemoryClass::Ipu21Interleaved;
+                                        crate::MemoryClass::Interleaved;
                                 }
                                 let copy = self.push_shard(LowShard {
                                     id: LowShardId(0),
@@ -3822,7 +3817,7 @@ impl LoweringState {
                             .format
                             .layout
                             .memory_class
-                            == crate::MemoryClass::Ipu21Interleaved
+                            == crate::MemoryClass::Interleaved
                             && let TileKernelSpec::Gemm { weights, .. } = &mut selected_kernel
                         {
                             *weights = crate::GemmWeightLoad::Interleaved;
@@ -3835,7 +3830,7 @@ impl LoweringState {
                                     value: Some(*output_value),
                                     reason: WorkReason::OperatorKernel,
                                 },
-                                TileKernel::Planned(selected_kernel),
+                                selected_kernel,
                                 vec![
                                     KernelOperand {
                                         views: vec![left_view],
@@ -4244,7 +4239,7 @@ impl LoweringState {
                     let mut weight_type = self.shards[first_source.index() as usize]
                         .tensor_type
                         .clone();
-                    weight_type.format.layout.memory_class = crate::MemoryClass::Ipu21Interleaved;
+                    weight_type.format.layout.memory_class = crate::MemoryClass::Interleaved;
                     let mut weight_extents =
                         self.shards[first_source.index() as usize].extents.clone();
                     weight_extents[right_inner_axis].start = inner.start;
@@ -4374,7 +4369,7 @@ impl LoweringState {
                                         .format
                                         .layout
                                         .memory_class
-                                        == crate::MemoryClass::Ipu21Standard
+                                        == crate::MemoryClass::Standard
                                     {
                                         crate::GemmWeightLoad::Standard
                                     } else {
@@ -4400,7 +4395,7 @@ impl LoweringState {
                                             value: Some(*output_value),
                                             reason: WorkReason::OperatorKernel,
                                         },
-                                        TileKernel::Planned(kernel),
+                                        kernel,
                                         vec![
                                             KernelOperand {
                                                 views: vec![left_view],
@@ -4445,7 +4440,7 @@ impl LoweringState {
                                 .format
                                 .layout
                                 .memory_class
-                                == crate::MemoryClass::Ipu21Standard
+                                == crate::MemoryClass::Standard
                             {
                                 crate::GemmWeightLoad::Standard
                             } else {
@@ -4469,7 +4464,7 @@ impl LoweringState {
                                 value: Some(*output_value),
                                 reason: WorkReason::OperatorKernel,
                             },
-                            TileKernel::Planned(kernel),
+                            kernel,
                             vec![
                                 KernelOperand {
                                     views: vec![left_view],
@@ -4651,10 +4646,10 @@ impl LoweringState {
                                     value: Some(*output_value),
                                     reason: WorkReason::OperatorKernel,
                                 },
-                                TileKernel::Planned(TileKernelSpec::ReductionSum {
+                                TileKernelSpec::ReductionSum {
                                     partials: u16::try_from(chunk.len() + 1)
                                         .map_err(|_| LowLoweringError::IdOverflow)?,
-                                }),
+                                },
                                 vec![
                                     KernelOperand {
                                         views: vec![self.full_view(accumulator)],
@@ -4874,7 +4869,7 @@ impl LoweringState {
                                         self.shards[right.index() as usize].tensor_type.clone();
                                     if use_interleaved_staging {
                                         tensor_type.format.layout.memory_class =
-                                            crate::MemoryClass::Ipu21Interleaved;
+                                            crate::MemoryClass::Interleaved;
                                     }
                                     let resident = self.push_shard(LowShard {
                                         id: LowShardId(0),
@@ -4928,7 +4923,7 @@ impl LoweringState {
                             .format
                             .layout
                             .memory_class
-                            == crate::MemoryClass::Ipu21Interleaved
+                            == crate::MemoryClass::Interleaved
                             && let TileKernelSpec::Gemm { weights, .. } = &mut kernel
                         {
                             *weights = crate::GemmWeightLoad::Interleaved;
@@ -4941,7 +4936,7 @@ impl LoweringState {
                                     value: Some(*output_value),
                                     reason: WorkReason::OperatorKernel,
                                 },
-                                TileKernel::Planned(kernel),
+                                kernel,
                                 vec![
                                     KernelOperand {
                                         views: vec![left_view],
@@ -5151,7 +5146,7 @@ impl LoweringState {
                     ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
                 )
             });
-        if matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Gemm { .. }))
+        if matches!(run.kernel, TileKernelSpec::Gemm { .. })
             && run.output.extents.len() > 2
             && !output_flattens_outer_rows
         {
@@ -6072,7 +6067,7 @@ mod tests {
                     column_partitions,
                     inner_partitions,
                     1,
-                    MemoryClass::Ipu21Interleaved,
+                    MemoryClass::Interleaved,
                 ),
             };
             let (result_row_partitions, result_column_partitions) = if random.bool() {
@@ -6101,7 +6096,7 @@ mod tests {
                             result_row_partitions,
                             result_column_partitions,
                             output_column_block: output_columns,
-                            weight_memory_class: MemoryClass::Ipu21Interleaved,
+                            weight_memory_class: MemoryClass::Interleaved,
                             reduction_staging,
                             local_weight_staging: crate::LocalOperandStaging::Direct,
                         }),
@@ -6123,19 +6118,14 @@ mod tests {
             let reduction_runs = low
                 .kernel_runs
                 .iter()
-                .filter(|run| {
-                    matches!(
-                        run.kernel,
-                        TileKernel::Planned(TileKernelSpec::ReductionSum { .. })
-                    )
-                })
+                .filter(|run| matches!(run.kernel, TileKernelSpec::ReductionSum { .. }))
                 .collect::<Vec<_>>();
             assert!(!reduction_runs.is_empty(), "case {case}");
             assert!(
                 reduction_runs.iter().all(|run| {
                     matches!(
                         run.kernel,
-                        TileKernel::Planned(TileKernelSpec::ReductionSum { partials })
+                        TileKernelSpec::ReductionSum { partials }
                             if partials == match reduction_staging {
                                 crate::ReductionStaging::Complete => inner_partitions,
                                 crate::ReductionStaging::Streamed => 2,
@@ -6200,7 +6190,7 @@ mod tests {
                     1,
                     owner_tiles,
                     1,
-                    MemoryClass::Ipu21Standard,
+                    MemoryClass::Standard,
                 ),
             };
             let config = PipelineConfig::new(compute_tiles)
@@ -6208,7 +6198,7 @@ mod tests {
                     PlannerSearchDomain::default()
                         .with_active_tile_counts([compute_tiles])
                         .with_operator_precisions(crate::OperatorClass::Gemm, [Precision::F16])
-                        .with_weight_memory_classes([MemoryClass::Ipu21Standard]),
+                        .with_weight_memory_classes([MemoryClass::Standard]),
                 )
                 .with_input(left, left_format.clone())
                 .with_input(right0, right_format.clone())
@@ -6324,10 +6314,7 @@ mod tests {
                     .flat_map(|tile| low.work(tile))
                     .filter_map(|work| match work {
                         TileWorkRef::Kernel(run)
-                            if matches!(
-                                run.kernel,
-                                TileKernel::Planned(TileKernelSpec::Gemm { .. })
-                            ) =>
+                            if matches!(run.kernel, TileKernelSpec::Gemm { .. }) =>
                         {
                             Some(run)
                         }
@@ -6380,8 +6367,7 @@ mod tests {
                         "case {case}"
                     );
                     let inner = input.extents.last().unwrap();
-                    let TileKernel::Planned(TileKernelSpec::Gemm { inner_block, .. }) = &run.kernel
-                    else {
+                    let TileKernelSpec::Gemm { inner_block, .. } = &run.kernel else {
                         continue;
                     };
                     assert!(
@@ -6463,7 +6449,7 @@ mod tests {
                         ),
                     ],
                 },
-                memory_class: MemoryClass::Ipu21Standard,
+                memory_class: MemoryClass::Standard,
             };
             let input_format = TensorFormat {
                 precision: Precision::F16,
@@ -6523,7 +6509,7 @@ mod tests {
                         ),
                     ],
                 },
-                memory_class: MemoryClass::Ipu21Standard,
+                memory_class: MemoryClass::Standard,
             };
             let tensor_type = TensorType::new(
                 [
@@ -6587,7 +6573,7 @@ mod tests {
                         .with_padding_groups(groups),
                     ],
                 },
-                memory_class: MemoryClass::Ipu21Standard,
+                memory_class: MemoryClass::Standard,
             };
             let tensor = TensorType::new(
                 [rows, u32::from(groups) * group_width],
@@ -6814,7 +6800,7 @@ mod tests {
                     Layout {
                         order: ElementOrder::Amp(AmpOrder::TransposedLeft),
                         tiling: TensorTiling::replicated(1),
-                        memory_class: MemoryClass::Ipu21Standard,
+                        memory_class: MemoryClass::Standard,
                     },
                 ),
                 extents: vec![
@@ -6845,7 +6831,7 @@ mod tests {
                             column_block: AMP_COLUMN_MICRO as u16,
                         }),
                         tiling: TensorTiling::replicated(1),
-                        memory_class: MemoryClass::Ipu21Standard,
+                        memory_class: MemoryClass::Standard,
                     },
                 ),
                 extents: vec![
@@ -6988,9 +6974,7 @@ mod tests {
                 let add = low
                     .work(tile)
                     .find_map(|work| match work {
-                        TileWorkRef::Kernel(run)
-                            if matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Add)) =>
-                        {
+                        TileWorkRef::Kernel(run) if matches!(run.kernel, TileKernelSpec::Add) => {
                             Some(run)
                         }
                         _ => None,
@@ -7067,10 +7051,7 @@ mod tests {
                     .work(tile)
                     .filter_map(|work| match work {
                         TileWorkRef::Kernel(run)
-                            if matches!(
-                                run.kernel,
-                                TileKernel::Planned(TileKernelSpec::Gemm { .. })
-                            ) =>
+                            if matches!(run.kernel, TileKernelSpec::Gemm { .. }) =>
                         {
                             Some(run)
                         }
@@ -7082,12 +7063,12 @@ mod tests {
                     assert_eq!(run.provenance.reason, WorkReason::OperatorKernel);
                     assert!(run.provenance.operation.is_some());
                     assert!(run.provenance.value.is_some());
-                    let TileKernel::Planned(TileKernelSpec::Gemm {
+                    let TileKernelSpec::Gemm {
                         mode,
                         inner_block: kernel_inner,
                         output_columns: kernel_columns,
                         ..
-                    }) = run.kernel
+                    } = run.kernel
                     else {
                         unreachable!()
                     };
@@ -7187,7 +7168,7 @@ mod tests {
                     PlannerSearchDomain::default()
                         .with_active_tile_counts([tiles])
                         .with_operator_precisions(crate::OperatorClass::Gemm, [Precision::F16])
-                        .with_weight_memory_classes([MemoryClass::Ipu21Interleaved]),
+                        .with_weight_memory_classes([MemoryClass::Interleaved]),
                 )
                 .with_automatic_input(left, Precision::F16)
                 .with_automatic_input(right, Precision::F16);
@@ -7218,10 +7199,10 @@ mod tests {
                         matches!(
                             work,
                             TileWorkRef::Kernel(run)
-                                if matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Gemm {
+                                if matches!(run.kernel, TileKernelSpec::Gemm {
                                     weights: crate::GemmWeightLoad::Interleaved,
                                     ..
-                                }))
+                                })
                         )
                     })
             );
@@ -7263,7 +7244,7 @@ mod tests {
                     column_partitions,
                     inner_partitions,
                     row_partitions / inner_partitions,
-                    crate::MemoryClass::Ipu21Standard,
+                    crate::MemoryClass::Standard,
                 ),
             };
             let config = PipelineConfig::new(tiles)
@@ -7271,7 +7252,7 @@ mod tests {
                     PlannerSearchDomain::default()
                         .with_active_tile_counts([tiles])
                         .with_operator_precisions(crate::OperatorClass::Gemm, [Precision::F16])
-                        .with_weight_memory_classes([MemoryClass::Ipu21Standard]),
+                        .with_weight_memory_classes([MemoryClass::Standard]),
                 )
                 .with_input(left, left_format.clone())
                 .with_input(right, right_format.clone());

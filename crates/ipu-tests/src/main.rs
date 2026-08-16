@@ -4,8 +4,8 @@ use half::f16;
 use ipu_codegen::{
     AmpOrder, AttentionStrategy, BlockMajorOrder, CompiledPackage, ComputeGraph, DiagnosticTensor,
     GemmOrientation, GemmPlanConstraint, Layout, LocalOperandStaging, MemoryClass, OperatorClass,
-    PackageConfig, PipelineConfig, PlannerSearchDomain, Precision, ReductionStaging, TensorFormat,
-    amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
+    PackageConfig, PipelineConfig, PlannerSearchDomain, Precision, ProfilingMode, ReductionStaging,
+    TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
     build_package,
 };
 use ipu_driver::DriverError;
@@ -51,11 +51,11 @@ struct Arguments {
     #[arg(long, default_value_t = 0.03)]
     diagnostic_rtol: f32,
     /// Write per-tile kernel and exchange cycle samples for benchmark runs.
-    #[arg(long, conflicts_with = "no_profile")]
-    profile_output: Option<PathBuf>,
-    /// Build benchmark programs without cycle-counter or per-step profiling.
     #[arg(long)]
-    no_profile: bool,
+    profile_output: Option<PathBuf>,
+    /// Profiling instrumentation: none, overall start/end timing, or full step traces.
+    #[arg(long, default_value = "full")]
+    profiling: ProfilingMode,
     /// Log exchange scheduling lower bounds and critical dependency chains.
     #[arg(long)]
     exchange_diagnostics: bool,
@@ -335,8 +335,8 @@ fn parse_gemm_plan_constraint(value: &str) -> Result<GemmPlanConstraint, String>
         result_column_partitions: *result_column_partitions,
         output_column_block,
         weight_memory_class: match *memory {
-            "standard" => MemoryClass::Ipu21Standard,
-            "interleaved" => MemoryClass::Ipu21Interleaved,
+            "standard" => MemoryClass::Standard,
+            "interleaved" => MemoryClass::Interleaved,
             _ => return Err("memory must be standard or interleaved".into()),
         },
         reduction_staging: match *reduction {
@@ -368,10 +368,11 @@ fn main() -> Result<()> {
     if arguments.diagnostic_run && arguments.profile_output.is_some() {
         bail!("--diagnostic-run cannot be combined with --profile-output");
     }
-    if !arguments.workload.is_benchmark()
-        && (arguments.profile_output.is_some() || arguments.no_profile)
-    {
-        bail!("--profile-output and --no-profile require a benchmark workload");
+    if !arguments.workload.is_benchmark() && arguments.profile_output.is_some() {
+        bail!("--profile-output requires a benchmark workload");
+    }
+    if arguments.profile_output.is_some() && !arguments.profiling.records_steps() {
+        bail!("--profile-output requires --profiling full");
     }
     if arguments.exchange_diagnostic_case.is_some()
         && !matches!(arguments.workload, Workload::ExchangeStress)
@@ -560,6 +561,7 @@ fn main() -> Result<()> {
             search_domain.with_operator_precisions(OperatorClass::Gemm, [Precision::F16]);
     }
     let mut pipeline = PipelineConfig::new(active_tiles).with_search_domain(search_domain);
+    pipeline.profiling = arguments.profiling;
     pipeline = pipeline.with_exchange_schedule_finalists(arguments.exchange_schedule_finalists);
     if let Some(kib) = arguments.tile_memory_budget_kib {
         let bytes = kib.checked_mul(1024).context("tile SRAM budget overflow")?;
@@ -653,7 +655,6 @@ fn main() -> Result<()> {
                 .with_automatic_input(query_weights, Precision::F16)
                 .with_automatic_input(key_weights, Precision::F16)
                 .with_automatic_input(value_weights, Precision::F16);
-            pipeline.profiling.enabled = !arguments.no_profile;
         } else {
             let (heads, query_rows, key_rows) = (4, 17, 19);
             let query_dimension = SIGLIP_ATTENTION_HEAD_DIMENSION;
@@ -692,7 +693,6 @@ fn main() -> Result<()> {
                     },
                 );
             pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Never;
-            pipeline.profiling.enabled = !arguments.no_profile;
         }
     } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
         validate_mlp_benchmark_shape(
@@ -740,7 +740,6 @@ fn main() -> Result<()> {
             )?[0]
         };
         graph.set_outputs([output])?;
-        pipeline.profiling.enabled = !arguments.no_profile;
         pipeline = pipeline.with_automatic_input(left, Precision::F16);
         for weight in right0.into_iter().chain(right1) {
             pipeline = pipeline.with_automatic_input(weight, Precision::F16);
@@ -758,7 +757,6 @@ fn main() -> Result<()> {
         )?;
         let output = graph.gemm(left, right)?;
         graph.set_outputs([output])?;
-        pipeline.profiling.enabled = !arguments.no_profile;
         pipeline = pipeline
             .with_automatic_input(left, Precision::F16)
             .with_automatic_input(right, Precision::F16);
@@ -892,6 +890,7 @@ fn main() -> Result<()> {
                     arguments.clock_hz,
                     arguments.timeout_seconds,
                     arguments.profile_output.as_deref(),
+                    arguments.profiling,
                 )?;
             } else if matches!(arguments.workload, Workload::AttentionSmoke) {
                 let (heads, query_rows, key_rows) = (4, 17, 19);
@@ -909,6 +908,7 @@ fn main() -> Result<()> {
                     arguments.clock_hz,
                     arguments.timeout_seconds,
                     arguments.profile_output.as_deref(),
+                    arguments.profiling,
                 )?;
             } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
                 run_siglip_mlp_benchmark(
@@ -927,7 +927,7 @@ fn main() -> Result<()> {
                     arguments.clock_hz,
                     arguments.timeout_seconds,
                     arguments.profile_output.as_deref(),
-                    !arguments.no_profile,
+                    arguments.profiling,
                 )?;
             } else {
                 run_gemm_benchmark(
@@ -940,7 +940,7 @@ fn main() -> Result<()> {
                     arguments.clock_hz,
                     arguments.timeout_seconds,
                     arguments.profile_output.as_deref(),
-                    !arguments.no_profile,
+                    arguments.profiling,
                 )?;
             }
         } else {
@@ -1194,6 +1194,7 @@ fn run_projected_attention_benchmark(
     clock_hz: u64,
     timeout_seconds: u64,
     profile_output: Option<&Path>,
+    profiling: ProfilingMode,
 ) -> Result<()> {
     let streams = batch
         .checked_mul(heads)
@@ -1224,7 +1225,9 @@ fn run_projected_attention_benchmark(
         &input_bytes,
         timeout_seconds,
     )?;
-    write_profile(application, &actual, clock_hz, profile_output)?;
+    if profiling.records_steps() {
+        write_profile(application, &actual, clock_hz, profile_output)?;
+    }
 
     let output = application
         .outputs
@@ -1301,6 +1304,7 @@ fn run_attention_smoke(
     clock_hz: u64,
     timeout_seconds: u64,
     profile_output: Option<&Path>,
+    profiling: ProfilingMode,
 ) -> Result<()> {
     const QUERY_SEED: u64 = 0x6174_746e_5f71;
     const KEY_SEED: u64 = 0x6174_746e_5f6b;
@@ -1414,7 +1418,9 @@ fn run_attention_smoke(
     inputs.extend_from_slice(&key_bytes);
     inputs.extend_from_slice(&value_bytes);
     let actual = run_initialized_program(runtime, application, &[], &inputs, timeout_seconds)?;
-    write_profile(application, &actual, clock_hz, profile_output)?;
+    if profiling.records_steps() {
+        write_profile(application, &actual, clock_hz, profile_output)?;
+    }
     let output = binding("output.0", &application.outputs)?;
     if output.slices.len() < usize::try_from(heads * query_partitions)? {
         bail!("attention output has fewer shards than its query tiling");
@@ -1555,7 +1561,7 @@ fn run_gemm_benchmark(
     clock_hz: u64,
     timeout_seconds: u64,
     profile_output: Option<&Path>,
-    profiling_enabled: bool,
+    profiling: ProfilingMode,
 ) -> Result<()> {
     validate_benchmark_shape(rows, inner, columns)?;
     if clock_hz == 0 {
@@ -1581,14 +1587,16 @@ fn run_gemm_benchmark(
         timeout_seconds,
     )?;
     let maximum_absolute_error = verify_benchmark_output(application, &output, inner)?;
-    if !profiling_enabled {
+    if !profiling.records_overall_time() {
         println!(
             "workload=gemm-f16-r{rows}-k{inner}-c{columns} benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
         );
         return Ok(());
     }
     let (cycles, minimum_cycles) = benchmark_cycles(application, &output, execution_tiles)?;
-    write_profile(application, &output, clock_hz, profile_output)?;
+    if profiling.records_steps() {
+        write_profile(application, &output, clock_hz, profile_output)?;
+    }
     let active_tiles = binding_tile_count(application, "output.0")?;
     let rows = u64::from(rows);
     let flops = 2.0 * rows as f64 * f64::from(inner) * f64::from(columns);
@@ -1620,7 +1628,7 @@ fn run_siglip_mlp_benchmark(
     clock_hz: u64,
     timeout_seconds: u64,
     profile_output: Option<&Path>,
-    profiling_enabled: bool,
+    profiling: ProfilingMode,
 ) -> Result<()> {
     validate_mlp_benchmark_shape(batch, tokens, dimension, hidden_dimension)?;
     if clock_hz == 0 {
@@ -1643,14 +1651,16 @@ fn run_siglip_mlp_benchmark(
         .context("MLP host reference has no graph output")?;
     let maximum_absolute_error =
         verify_logical_f16_output(application, output_metadata, &output, &expected.values)?;
-    if !profiling_enabled {
+    if !profiling.records_overall_time() {
         println!(
             "workload=siglip-mlp-f16-b{batch}-t{tokens}-d{dimension}-h{hidden_dimension}-n{blocks} benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} dimension={dimension} hiddenDimension={hidden_dimension} blocks={blocks} biases=false profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
         );
         return Ok(());
     }
     let (cycles, minimum_cycles) = benchmark_cycles(application, &output, execution_tiles)?;
-    write_profile(application, &output, clock_hz, profile_output)?;
+    if profiling.records_steps() {
+        write_profile(application, &output, clock_hz, profile_output)?;
+    }
     let active_tiles = binding_tile_count(application, "output.0")?;
     let rows = u64::from(batch) * u64::from(tokens);
     let flops =

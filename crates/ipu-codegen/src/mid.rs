@@ -455,8 +455,8 @@ impl ElementOrder {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MemoryClass {
-    Ipu21Standard,
-    Ipu21Interleaved,
+    Standard,
+    Interleaved,
 }
 
 /// Maximum per-tile bytes attributed to each address/load class. The classes
@@ -475,8 +475,8 @@ impl MemoryUsage {
 
     pub(crate) fn add_class(&mut self, class: MemoryClass, bytes: u64) {
         let target = match class {
-            MemoryClass::Ipu21Standard => &mut self.standard,
-            MemoryClass::Ipu21Interleaved => &mut self.interleaved,
+            MemoryClass::Standard => &mut self.standard,
+            MemoryClass::Interleaved => &mut self.interleaved,
         };
         *target = target.saturating_add(bytes);
     }
@@ -758,7 +758,7 @@ impl Layout {
         Self {
             order: ElementOrder::RowMajor,
             tiling,
-            memory_class: MemoryClass::Ipu21Standard,
+            memory_class: MemoryClass::Standard,
         }
     }
 
@@ -806,7 +806,7 @@ impl Layout {
         Self {
             order: ElementOrder::Amp(AmpOrder::Left),
             tiling,
-            memory_class: MemoryClass::Ipu21Standard,
+            memory_class: MemoryClass::Standard,
         }
     }
 
@@ -829,7 +829,7 @@ impl Layout {
                 replicas: 1,
                 axes,
             },
-            memory_class: MemoryClass::Ipu21Standard,
+            memory_class: MemoryClass::Standard,
         }
     }
 
@@ -864,7 +864,7 @@ impl Layout {
                     AxisTiling::new(TensorAxis::FromEnd(1), 1, u32::from(inner), Padding::Zero),
                 ],
             },
-            memory_class: MemoryClass::Ipu21Standard,
+            memory_class: MemoryClass::Standard,
         }
     }
 
@@ -875,7 +875,7 @@ impl Layout {
             tile_count,
             1,
             1,
-            MemoryClass::Ipu21Standard,
+            MemoryClass::Standard,
         )
     }
 
@@ -890,7 +890,7 @@ impl Layout {
                     AxisTiling::new(TensorAxis::FromEnd(1), 1, 64, Padding::Zero),
                 ],
             },
-            memory_class: MemoryClass::Ipu21Interleaved,
+            memory_class: MemoryClass::Interleaved,
         }
     }
 
@@ -929,7 +929,7 @@ impl Layout {
                     AxisTiling::new(TensorAxis::FromEnd(1), 1, u32::from(inner), Padding::Zero),
                 ],
             },
-            memory_class: MemoryClass::Ipu21Standard,
+            memory_class: MemoryClass::Standard,
         }
     }
 
@@ -958,7 +958,7 @@ impl Layout {
                     AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
                 ],
             },
-            memory_class: MemoryClass::Ipu21Standard,
+            memory_class: MemoryClass::Standard,
         }
     }
 
@@ -986,7 +986,7 @@ impl Layout {
                     AxisTiling::new(TensorAxis::FromEnd(1), row_partitions, 1, Padding::Reject),
                 ],
             },
-            memory_class: MemoryClass::Ipu21Standard,
+            memory_class: MemoryClass::Standard,
         }
     }
 
@@ -1022,7 +1022,7 @@ impl Layout {
                     }),
                 ],
             },
-            memory_class: MemoryClass::Ipu21Standard,
+            memory_class: MemoryClass::Standard,
         }
     }
 
@@ -1147,7 +1147,7 @@ impl Layout {
                         }),
                 ],
             },
-            memory_class: MemoryClass::Ipu21Interleaved,
+            memory_class: MemoryClass::Interleaved,
         }
     }
 
@@ -1200,7 +1200,7 @@ impl Layout {
                         }),
                 ],
             },
-            memory_class: MemoryClass::Ipu21Interleaved,
+            memory_class: MemoryClass::Interleaved,
         }
     }
 
@@ -1241,7 +1241,7 @@ impl Layout {
                     AxisTiling::new(TensorAxis::FromEnd(1), 1, 64, Padding::Zero),
                 ],
             },
-            memory_class: MemoryClass::Ipu21Interleaved,
+            memory_class: MemoryClass::Interleaved,
         }
     }
 }
@@ -1456,8 +1456,7 @@ pub struct PipelineConfig {
     /// reservation. Lower values emulate a model whose other persistent state
     /// occupies the remainder of SRAM.
     pub tile_memory_budget_bytes: u64,
-    pub scheduling: SchedulingPolicy,
-    pub profiling: ProfilingConfig,
+    pub profiling: ProfilingMode,
     /// Insert all-tile patched-breakpoint stops after semantic operators.
     pub diagnostic_checkpoints: bool,
     /// Emit exchange-scheduler lower bounds, per-tile role pressure, and
@@ -1526,7 +1525,7 @@ impl Default for PlannerSearchDomain {
                 (OperatorClass::Add, vec![Precision::F16, Precision::F32]),
                 (OperatorClass::Attention, vec![Precision::F16]),
             ]),
-            weight_memory_classes: vec![MemoryClass::Ipu21Standard, MemoryClass::Ipu21Interleaved],
+            weight_memory_classes: vec![MemoryClass::Standard, MemoryClass::Interleaved],
             attention_strategy: AttentionStrategy::Automatic,
             gemm_plan_constraints: Vec::new(),
         }
@@ -1630,31 +1629,89 @@ pub enum HardwareTarget {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SchedulingPolicy {
-    OperatorPlans,
+pub struct HardwareMemoryConstraints {
+    pub standard_fixed_bytes: u64,
+    pub interleaved_bytes: u64,
+    pub total_bytes: u64,
+    pub default_standard_reservation_bytes: u64,
+}
+
+impl HardwareTarget {
+    pub const fn cost_model(self) -> Ipu21CostModel {
+        match self {
+            Self::Ipu21 => Ipu21CostModel,
+        }
+    }
+
+    pub const fn memory_constraints(self) -> HardwareMemoryConstraints {
+        match self {
+            Self::Ipu21 => HardwareMemoryConstraints {
+                standard_fixed_bytes: crate::memory::IPU21_STANDARD_FIXED_BYTES as u64,
+                interleaved_bytes: crate::memory::IPU21_INTERLEAVED_REGION_BYTES as u64,
+                total_bytes: crate::memory::IPU21_PLANNED_DATA_BYTES as u64,
+                default_standard_reservation_bytes:
+                    crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES as u64,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ProfilingConfig {
-    pub enabled: bool,
+pub enum ProfilingMode {
+    #[default]
+    Disabled,
+    Overall,
+    Full,
+}
+
+impl ProfilingMode {
+    pub const fn records_overall_time(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    pub const fn records_steps(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
+impl std::fmt::Display for ProfilingMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Disabled => "none",
+            Self::Overall => "overall",
+            Self::Full => "full",
+        })
+    }
+}
+
+impl std::str::FromStr for ProfilingMode {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "none" | "disabled" => Ok(Self::Disabled),
+            "overall" => Ok(Self::Overall),
+            "full" => Ok(Self::Full),
+            _ => Err("profiling mode must be one of: none, overall, full"),
+        }
+    }
 }
 
 impl PipelineConfig {
     pub fn new(tile_count: u16) -> Self {
+        let target = HardwareTarget::Ipu21;
+        let memory = target.memory_constraints();
         Self {
-            target: HardwareTarget::Ipu21,
+            target,
             tile_count,
             inputs: BTreeMap::new(),
             automatic_inputs: BTreeMap::new(),
             search_domain: PlannerSearchDomain::default(),
             planning_beam_width: 64,
             exchange_schedule_finalists: 1,
-            standard_memory_reservation_bytes: u64::from(
-                crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
-            ),
-            tile_memory_budget_bytes: u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
-            scheduling: SchedulingPolicy::OperatorPlans,
-            profiling: ProfilingConfig::default(),
+            standard_memory_reservation_bytes: memory.default_standard_reservation_bytes,
+            tile_memory_budget_bytes: memory.total_bytes,
+            profiling: ProfilingMode::default(),
             diagnostic_checkpoints: false,
             exchange_diagnostics: false,
             conversion_streaming: ConversionStreamingPolicy::WhenRequired,
@@ -1798,12 +1855,12 @@ fn gemm_seed_plans_for_tile_count(
             if rows > 2
                 && rows.is_multiple_of(2)
                 && domain.permits_precision(OperatorClass::Gemm, Precision::F16)
-                && domain.permits_weight_memory(MemoryClass::Ipu21Interleaved)
+                && domain.permits_weight_memory(MemoryClass::Interleaved)
             {
                 placements.push((
                     Precision::F16,
                     16,
-                    AmpWeightPlacement::sharded(2, MemoryClass::Ipu21Interleaved),
+                    AmpWeightPlacement::sharded(2, MemoryClass::Interleaved),
                 ));
             }
             for (precision, left_tail, weights) in placements {
@@ -1814,7 +1871,7 @@ fn gemm_seed_plans_for_tile_count(
                     // and are not offered until ownership is part of the cost.
                     if output_columns < AMP_OUTPUT_COLUMN_BLOCK
                         && !(weights.inner_partitions == 1
-                            && weights.memory_class == MemoryClass::Ipu21Interleaved)
+                            && weights.memory_class == MemoryClass::Interleaved)
                     {
                         continue;
                     }
@@ -1828,8 +1885,7 @@ fn gemm_seed_plans_for_tile_count(
                         weights,
                     );
                     grid.push(candidate.clone());
-                    if precision == Precision::F16
-                        && weights.memory_class == MemoryClass::Ipu21Standard
+                    if precision == Precision::F16 && weights.memory_class == MemoryClass::Standard
                     {
                         let mut staged = candidate;
                         staged.inputs[1].local_staging = LocalOperandStaging::MatchRemote;
@@ -1840,7 +1896,7 @@ fn gemm_seed_plans_for_tile_count(
             grid
         })
         .collect::<Vec<_>>();
-    if domain.permits_weight_memory(MemoryClass::Ipu21Standard) {
+    if domain.permits_weight_memory(MemoryClass::Standard) {
         for &precision in domain.precisions(OperatorClass::Gemm) {
             let Some(left_tail) = gemm_left_access_tail(precision) else {
                 continue;
@@ -1880,7 +1936,7 @@ const fn gemm_left_access_tail(precision: Precision) -> Option<u32> {
 const fn gemm_supports_weight_memory(precision: Precision, memory_class: MemoryClass) -> bool {
     matches!(
         (precision, memory_class),
-        (Precision::F16, _) | (Precision::F32, MemoryClass::Ipu21Standard)
+        (Precision::F16, _) | (Precision::F32, MemoryClass::Standard)
     )
 }
 
@@ -1917,7 +1973,7 @@ fn amp_gemm_plan(
                         tile_count,
                         1,
                         1,
-                        MemoryClass::Ipu21Standard,
+                        MemoryClass::Standard,
                     ),
                 },
                 32,
@@ -1952,7 +2008,7 @@ fn amp_grid_gemm_plan(
     weights: AmpWeightPlacement,
 ) -> GemmPlan {
     let right_layout = match (weights.inner_partitions, weights.memory_class) {
-        (1, MemoryClass::Ipu21Standard) => Layout::block_major_matrix_grid(
+        (1, MemoryClass::Standard) => Layout::block_major_matrix_grid(
             inner,
             output_columns,
             grid.tile_count,
@@ -5045,7 +5101,7 @@ fn parallel_reduction_plans_for_orientation(
         .find(|axis| axis.axis == TensorAxis::FromEnd(1))
         .map(|axis| axis.partitions);
     if output_seed_partitions != Some(tile_count)
-        || candidate.inputs[1].format.layout.memory_class != MemoryClass::Ipu21Standard
+        || candidate.inputs[1].format.layout.memory_class != MemoryClass::Standard
         || candidate.inputs[1].local_staging != LocalOperandStaging::Direct
     {
         return Vec::new();
@@ -5326,7 +5382,7 @@ fn parallel_reduction_plans_for_orientation(
             } = &mut variant.dispatch
             {
                 if let TileKernelSpec::Gemm { weights, .. } = initialize {
-                    *weights = if memory_class == MemoryClass::Ipu21Interleaved {
+                    *weights = if memory_class == MemoryClass::Interleaved {
                         GemmWeightLoad::Interleaved
                     } else {
                         GemmWeightLoad::Standard
@@ -5342,7 +5398,7 @@ fn parallel_reduction_plans_for_orientation(
                     *output_columns = kernel_output_columns;
                 }
                 if let TileKernelSpec::Gemm { weights, .. } = accumulate {
-                    *weights = if memory_class == MemoryClass::Ipu21Interleaved {
+                    *weights = if memory_class == MemoryClass::Interleaved {
                         GemmWeightLoad::Interleaved
                     } else {
                         GemmWeightLoad::Standard
@@ -6196,7 +6252,7 @@ mod tests {
         };
         let mut layout = Layout::row_major(tiling);
         if random.bool() {
-            layout.memory_class = MemoryClass::Ipu21Interleaved;
+            layout.memory_class = MemoryClass::Interleaved;
         }
         format(precision(random), layout)
     }
@@ -6309,9 +6365,9 @@ mod tests {
                 _ => vec![Precision::F16, Precision::F32],
             };
             let memory_classes = if random.bool() {
-                vec![MemoryClass::Ipu21Standard]
+                vec![MemoryClass::Standard]
             } else {
-                vec![MemoryClass::Ipu21Interleaved]
+                vec![MemoryClass::Interleaved]
             };
             let domain = PlannerSearchDomain::default()
                 .with_active_tile_counts([first, second, first, 0, capacity.saturating_add(1)])
@@ -6399,7 +6455,7 @@ mod tests {
                     column_partitions: tiles,
                     order: GridOrder::ColumnsFast,
                 },
-                AmpWeightPlacement::resident(MemoryClass::Ipu21Standard),
+                AmpWeightPlacement::resident(MemoryClass::Standard),
             );
             let inputs = [
                 TensorType::new([m, k], Precision::F16, Layout::row_sharded(tiles)),
@@ -6495,8 +6551,8 @@ mod tests {
                 GridOrder::ColumnsFast,
             );
             let mut direct_layout = standard_layout.clone();
-            direct_layout.memory_class = MemoryClass::Ipu21Interleaved;
-            standard_layout.memory_class = MemoryClass::Ipu21Standard;
+            direct_layout.memory_class = MemoryClass::Interleaved;
+            standard_layout.memory_class = MemoryClass::Standard;
             let standard = TensorType::new([k, n], Precision::F16, standard_layout);
             let direct = TensorType::new([k, n], Precision::F16, direct_layout);
             let output = TensorType::new(
@@ -6557,7 +6613,7 @@ mod tests {
                 16,
                 AMP_OUTPUT_COLUMN_BLOCK,
                 grid,
-                AmpWeightPlacement::resident(MemoryClass::Ipu21Interleaved),
+                AmpWeightPlacement::resident(MemoryClass::Interleaved),
             );
             let inputs = [
                 TensorType::new(
@@ -6802,7 +6858,7 @@ mod tests {
                     tiles,
                     1,
                     1,
-                    MemoryClass::Ipu21Standard,
+                    MemoryClass::Standard,
                 ),
             );
             let mut graph = ComputeGraph::new();
@@ -6938,7 +6994,7 @@ mod tests {
                 );
                 assert_eq!(
                     requirements.output.format.layout.memory_class,
-                    MemoryClass::Ipu21Interleaved
+                    MemoryClass::Interleaved
                 );
                 let orientation = match operation.operator_plan.as_ref().map(|plan| &plan.dispatch)
                 {

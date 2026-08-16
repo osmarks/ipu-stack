@@ -46,8 +46,7 @@ pub use low::{
     KernelRunId, KernelRunMetadata, LocalCopy, LocalCopyId, LocalCopyPattern, LogicalExchange,
     LowInput, LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId, LowValue,
     RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, RepeatRunId, ShardDefinition,
-    ShardView, TileKernel, TileWork, TileWorkList, TileWorkRef, WorkProvenance, WorkReason,
-    lower_to_tiles,
+    ShardView, TileWork, TileWorkList, TileWorkRef, WorkProvenance, WorkReason, lower_to_tiles,
 };
 pub use memory::{
     IPU21_DATA_BASE, IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES,
@@ -57,14 +56,14 @@ pub use mid::{
     AccumulationPrecision, AmpOrder, AttentionStrategy, AxisTiling, BlockMajorOrder,
     ConversionPlan, ConversionStrategy, ConversionStreamingPolicy, CostModel, ElementOrder,
     GemmDistribution, GemmKernelMode, GemmOrientation, GemmPlanConstraint, GemmWeightLoad,
-    GridOrder, HardwareTarget, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, Layout,
-    LayoutError, LocalOperandStaging, LoweringError, LoweringResult, MemoryClass, MemoryEstimate,
-    MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidGraph, MidInput, MidOperation,
-    MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId,
-    OperandMaterialization, OperandRequirement, OperatorClass, OperatorDispatch, OperatorPlan,
-    OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, PipelineConfig,
-    PlannerSearchDomain, PointwiseInputMapping, Precision, ProfilingConfig, ReductionStaging,
-    SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
+    GridOrder, HardwareMemoryConstraints, HardwareTarget, IPU21_TARGET_COSTS, Ipu21CostModel,
+    Ipu21TargetCosts, Layout, LayoutError, LocalOperandStaging, LoweringError, LoweringResult,
+    MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidGraph,
+    MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue,
+    MidValueId, OperandMaterialization, OperandRequirement, OperatorClass, OperatorDispatch,
+    OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, PipelineConfig,
+    PlannerSearchDomain, PointwiseInputMapping, Precision, ProfilingMode, ReductionStaging,
+    TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{
     CompiledPackage, DiagnosticCheckpoint, DiagnosticPackage, DiagnosticShard, DiagnosticTensor,

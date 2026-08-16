@@ -707,8 +707,7 @@ fn amp_kernel_cycles(
     let rows = output_elements_per_tile.div_ceil(output_columns_per_tile);
     let column_groups = output_column_block.div_ceil(IPU21_AMP_KERNEL_COSTS.column_group_width);
     let interleaved = staged_local_weights
-        || right
-            .is_some_and(|right| right.format.layout.memory_class == MemoryClass::Ipu21Interleaved);
+        || right.is_some_and(|right| right.format.layout.memory_class == MemoryClass::Interleaved);
     let (row_cycles, group_cycles) = match multiply {
         Precision::F16 => (
             rows,
@@ -1035,7 +1034,7 @@ impl CostModel for Ipu21CostModel {
                         .saturating_mul(right.format.precision.bytes())
                 });
                 let resident_interleaved_weights = right.is_some_and(|right| {
-                    right.format.layout.memory_class == MemoryClass::Ipu21Interleaved
+                    right.format.layout.memory_class == MemoryClass::Interleaved
                 });
                 let staged_weights = right.is_some_and(|right| {
                     gemm_uses_panel_buffer(dispatch, right, &compute_output)
@@ -1050,7 +1049,7 @@ impl CostModel for Ipu21CostModel {
                         });
                 let streamed_blocked_standard = right.filter(|right| {
                     staged_weights
-                        && right.format.layout.memory_class == MemoryClass::Ipu21Standard
+                        && right.format.layout.memory_class == MemoryClass::Standard
                         && matches!(right.format.layout.order, ElementOrder::BlockMajor(_))
                 });
                 let weight_feed = streamed_blocked_standard.map_or_else(

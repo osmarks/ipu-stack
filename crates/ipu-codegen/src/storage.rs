@@ -801,14 +801,7 @@ mod tests {
                 (Layout::amp_left(64, 1), rows, 64),
                 (Layout::block_major_matrix(64, 1), 64, 64),
                 (
-                    Layout::block_major_matrix_storage(
-                        64,
-                        64,
-                        1,
-                        1,
-                        1,
-                        MemoryClass::Ipu21Interleaved,
-                    ),
+                    Layout::block_major_matrix_storage(64, 64, 1, 1, 1, MemoryClass::Interleaved),
                     64,
                     64,
                 ),
@@ -896,7 +889,7 @@ mod tests {
                     Layout {
                         order,
                         tiling: TensorTiling::replicated(1),
-                        memory_class: MemoryClass::Ipu21Standard,
+                        memory_class: MemoryClass::Standard,
                     },
                     &[batches, rows, columns],
                 );
@@ -976,7 +969,7 @@ mod tests {
                     1,
                     1,
                     1,
-                    MemoryClass::Ipu21Interleaved,
+                    MemoryClass::Interleaved,
                 ),
                 &[batches, rows, columns],
             );
@@ -1039,7 +1032,7 @@ mod tests {
                 let layout = Layout {
                     order,
                     tiling: crate::TensorTiling::replicated(1),
-                    memory_class: MemoryClass::Ipu21Standard,
+                    memory_class: MemoryClass::Standard,
                 };
                 let source = shard(layout.clone(), &[AMP_INNER_BLOCK, AMP_COLUMN_MICRO]);
                 let destination = shard(layout, &[AMP_INNER_BLOCK, panels * AMP_COLUMN_MICRO]);
@@ -1116,7 +1109,7 @@ mod tests {
                 let layout = |order| Layout {
                     order,
                     tiling: crate::TensorTiling::replicated(1),
-                    memory_class: MemoryClass::Ipu21Standard,
+                    memory_class: MemoryClass::Standard,
                 };
                 let source = shard(
                     layout(source_order),

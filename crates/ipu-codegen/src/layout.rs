@@ -662,7 +662,7 @@ mod tests {
                         .with_shard_padding_multiple(random.u32(1..=16)),
                     ],
                 },
-                memory_class: MemoryClass::Ipu21Standard,
+                memory_class: MemoryClass::Standard,
             };
             let resolved = layout.resolve(&TensorShape(shape.clone())).unwrap();
             let shards = resolved.shard_extents();
