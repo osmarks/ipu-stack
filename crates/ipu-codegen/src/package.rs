@@ -830,9 +830,12 @@ fn build_package_from_objects(
             Ok(memory.allocate(MemoryRequest {
                 name: "cycle profile samples",
                 bytes,
-                alignment: 4,
+                // Profile samples are transferred to the host while the tile
+                // executes its host-readback program. Those accesses must not
+                // share a standard-memory element with instruction fetch.
+                alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
                 bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
-                end_alignment: 4,
+                end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
                 guard_after: 0,
             })?)
         })
