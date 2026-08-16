@@ -28,6 +28,9 @@
 #define ATTENTION_SCALE_BITS 0x3e000000
 #endif
 
+#define ATTENTION_WORKER_CONTEXTS 6
+#define ATTENTION_PANEL_COLUMNS 16
+
 #if ATTENTION_HEAD_DIMENSION <= 0
 #error "attention head dimension must be positive"
 #endif
@@ -67,8 +70,22 @@
 	st32 $m0, $m11, $m15, 2
 	setzi $m0, \key_rows
 	st32 $m0, $m11, $m15, 3
+#if ATTENTION_KEY_BLOCK_COLUMNS >= ATTENTION_WORKER_CONTEXTS * ATTENTION_PANEL_COLUMNS
+	setzi $m0, .Lattention_softmax_panel_max_worker
+	runall $m0, $m11, 0
+	sync SYNC_COMPUTE_SET
+	setzi $m0, .Lattention_softmax_reduce_max_worker
+	runall $m0, $m11, 0
+	sync SYNC_COMPUTE_SET
+	setzi $m0, .Lattention_softmax_panel_exp_worker
+	runall $m0, $m11, 0
+	sync SYNC_COMPUTE_SET
+	setzi $m0, .Lattention_softmax_reduce_sum_worker
+	runall $m0, $m11, 0
+#else
 	setzi $m0, .Lattention_softmax_worker
 	runall $m0, $m11, 0
+#endif
 	sync SYNC_COMPUTE_SET
 	add $m11, $m11, 16
 	br $m10
@@ -192,6 +209,7 @@
 
 	.worker
 	.p2align 3
+#if ATTENTION_KEY_BLOCK_COLUMNS < ATTENTION_WORKER_CONTEXTS * ATTENTION_PANEL_COLUMNS
 .Lattention_softmax_worker:
 	ld32 $m5, $mvertex_base, $m15, 2
 	ld32 $m6, $mvertex_base, $m15, 3
@@ -375,11 +393,315 @@
 	shl $m10, $m4, 2
 	add $m2, $m2, $m10
 	st32 $a7, $m2, $m15, 0
-	add $m4, $m4, 6
+	add $m4, $m4, ATTENTION_WORKER_CONTEXTS
 	cmpult $m7, $m4, $m5
 	brnz $m7, .Lattention_softmax_row
 .Lattention_softmax_done:
 	exitz $m15
+#else
+	// For wide rows, assign 16-column panels rather than complete rows to
+	// workers. Six partial maxima and sums are reduced by short worker waves;
+	// the extra state panel already reserved after the probability matrix holds
+	// both sets of partials without increasing the allocation.
+.Lattention_softmax_panel_max_worker:
+	ld32 $m5, $mvertex_base, $m15, 2
+	ld32 $m6, $mvertex_base, $m15, 3
+	get $m1, $WSR
+	and $m1, $m1, CSR_W_WSR__CTXTID_M1__MASK
+	shl $m8, $m5, 5
+	setzi $m0, 0
+.Lattention_softmax_panel_max_row:
+	ldconst $a7, ATTENTION_MINIMUM_F32
+	mov $m4, $m1
+.Lattention_softmax_panel_max_panel:
+	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS / 16
+	cmpult $m7, $m4, $m7
+	brz $m7, .Lattention_softmax_panel_max_store
+	shl $m10, $m4, 4
+	cmpult $m7, $m10, $m6
+	brz $m7, .Lattention_softmax_panel_max_next
+	mul $m7, $m4, $m8
+	ld32 $m3, $mvertex_base, $m15, 1
+	add $m3, $m3, $m7
+	shl $m7, $m0, 5
+	add $m3, $m3, $m7
+	sub $m7, $m6, $m10
+	setzi $m9, 16
+	cmpult $m9, $m7, $m9
+	brnz $m9, .Lattention_softmax_panel_max_partial
+	ATTENTION_SOFTMAX_MAX_PANEL
+	bri .Lattention_softmax_panel_max_next
+.Lattention_softmax_panel_max_partial:
+	shr $m9, $m7, 1
+	brz $m9, .Lattention_softmax_panel_max_partial_odd
+.Lattention_softmax_panel_max_partial_pairs:
+	ATTENTION_SOFTMAX_MAX_PAIR
+	sub $m9, $m9, 1
+	brnz $m9, .Lattention_softmax_panel_max_partial_pairs
+.Lattention_softmax_panel_max_partial_odd:
+	and $m10, $m7, 1
+	brz $m10, .Lattention_softmax_panel_max_next
+	ld32 $a0, $m3, $m15, 0
+	f16v2tof32 $a0:1, $a0
+	f32max $a7, $a7, $a0
+.Lattention_softmax_panel_max_next:
+	add $m4, $m4, 6
+	bri .Lattention_softmax_panel_max_panel
+.Lattention_softmax_panel_max_store:
+	ld32 $m2, $mvertex_base, $m15, 0
+	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS * 2
+	mul $m7, $m5, $m7
+	add $m2, $m2, $m7
+	mul $m7, $m1, $m5
+	add $m7, $m7, $m0
+	shl $m7, $m7, 2
+	add $m2, $m2, $m7
+	st32 $a7, $m2, $m15, 0
+	add $m0, $m0, 1
+	cmpult $m7, $m0, $m5
+	brnz $m7, .Lattention_softmax_panel_max_row
+	exitz $m15
+
+.Lattention_softmax_reduce_max_worker:
+	ld32 $m5, $mvertex_base, $m15, 2
+	get $m0, $WSR
+	and $m0, $m0, CSR_W_WSR__CTXTID_M1__MASK
+	cmpult $m7, $m0, $m5
+	brz $m7, .Lattention_softmax_reduce_max_done
+	ld32 $m2, $mvertex_base, $m15, 0
+	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS * 2
+	mul $m7, $m5, $m7
+	add $m2, $m2, $m7
+	shl $m8, $m5, 2
+.Lattention_softmax_reduce_max_row:
+	shl $m7, $m0, 2
+	add $m9, $m2, $m7
+	mov $m3, $m9
+	ld32 $a7, $m3, $m15, 0
+	.rept ATTENTION_WORKER_CONTEXTS - 1
+	add $m3, $m3, $m8
+	ld32 $a0, $m3, $m15, 0
+	f32max $a7, $a7, $a0
+	.endr
+	ldconst $a4, ATTENTION_SCALE_BITS
+	f32mul $a7, $a7, $a4
+	st32 $a7, $m9, $m15, 0
+	add $m0, $m0, ATTENTION_WORKER_CONTEXTS
+	cmpult $m7, $m0, $m5
+	brnz $m7, .Lattention_softmax_reduce_max_row
+.Lattention_softmax_reduce_max_done:
+	exitz $m15
+
+.Lattention_softmax_panel_exp_worker:
+	ld32 $m5, $mvertex_base, $m15, 2
+	ld32 $m6, $mvertex_base, $m15, 3
+	get $m1, $WSR
+	and $m1, $m1, CSR_W_WSR__CTXTID_M1__MASK
+	shl $m8, $m5, 5
+	ld32 $m9, $mvertex_base, $m15, 0
+	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS * 2
+	mul $m7, $m5, $m7
+	add $m9, $m9, $m7
+	ldconst $a4, ATTENTION_SCALE_BITS
+	mov $m4, $m1
+.Lattention_softmax_panel_normalize_panel:
+	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS / 16
+	cmpult $m7, $m4, $m7
+	brz $m7, .Lattention_softmax_panel_sum_setup
+	mul $m7, $m4, $m8
+	ld32 $m2, $mvertex_base, $m15, 0
+	ld32 $m3, $mvertex_base, $m15, 1
+	add $m2, $m2, $m7
+	add $m3, $m3, $m7
+	shl $m10, $m4, 4
+	cmpult $m7, $m10, $m6
+	brz $m7, .Lattention_softmax_panel_zero
+	sub $m10, $m6, $m10
+	setzi $m7, 16
+	cmpult $m7, $m10, $m7
+	brnz $m7, .Lattention_softmax_panel_normalize_partial
+	mov $m0, $m5
+	mov $m7, $m9
+.Lattention_softmax_panel_normalize_full_row:
+	ld32 $a7, $m7, $m15, 0
+	add $m7, $m7, 4
+	f32sub $a5, $azero, $a7
+	.rept 4
+	ATTENTION_SOFTMAX_NORMALIZE_TWO_PAIRS
+	.endr
+	sub $m0, $m0, 1
+	brnz $m0, .Lattention_softmax_panel_normalize_full_row
+	bri .Lattention_softmax_panel_exp
+.Lattention_softmax_panel_normalize_partial:
+	mov $m0, $m5
+	mov $m7, $m9
+.Lattention_softmax_panel_normalize_partial_row:
+	ld32 $a7, $m7, $m15, 0
+	add $m7, $m7, 4
+	f32sub $a5, $azero, $a7
+	shr $m6, $m10, 1
+	brz $m6, .Lattention_softmax_panel_normalize_partial_odd
+.Lattention_softmax_panel_normalize_partial_pairs:
+	ATTENTION_SOFTMAX_NORMALIZE_PAIR
+	sub $m6, $m6, 1
+	brnz $m6, .Lattention_softmax_panel_normalize_partial_pairs
+.Lattention_softmax_panel_normalize_partial_odd:
+	and $m6, $m10, 1
+	brz $m6, .Lattention_softmax_panel_normalize_partial_fill
+	ld32 $a0, $m3, $m15, 0
+	f16v2tof32 $a0:1, $a0
+	f32v2mul $a2:3, $a4:B, $a0:1
+	f32v2add $a2:3, $a5:B, $a2:3
+	ldconst $a3, ATTENTION_MINIMUM_F32
+	f32v2tof16 $a2, $a2:3
+	st32 $a2, $m2, $m15, 0
+	add $m2, $m2, 4
+	add $m3, $m3, 4
+.Lattention_softmax_panel_normalize_partial_fill:
+	ldconst $a0, ATTENTION_MINIMUM_F16X2
+	add $m6, $m10, 1
+	shr $m6, $m6, 1
+	setzi $m3, 8
+	sub $m6, $m3, $m6
+	brz $m6, .Lattention_softmax_panel_normalize_partial_next
+.Lattention_softmax_panel_normalize_partial_fill_pairs:
+	st32 $a0, $m2, $m15, 0
+	add $m2, $m2, 4
+	sub $m6, $m6, 1
+	brnz $m6, .Lattention_softmax_panel_normalize_partial_fill_pairs
+.Lattention_softmax_panel_normalize_partial_next:
+	sub $m0, $m0, 1
+	brz $m0, .Lattention_softmax_panel_exp
+	// Reload the next source row because m3 was used as a fill-loop temporary.
+	ld32 $m3, $mvertex_base, $m15, 1
+	mul $m6, $m4, $m8
+	add $m3, $m3, $m6
+	sub $m6, $m5, $m0
+	shl $m6, $m6, 5
+	add $m3, $m3, $m6
+	bri .Lattention_softmax_panel_normalize_partial_row
+.Lattention_softmax_panel_zero:
+	shl $m7, $m5, 2
+.Lattention_softmax_panel_zero_loop:
+	st64step $azeros, $mzero, $m2+=, 1
+	sub $m7, $m7, 1
+	brnz $m7, .Lattention_softmax_panel_zero_loop
+	bri .Lattention_softmax_panel_normalize_next
+.Lattention_softmax_panel_exp:
+	ld32 $m2, $mvertex_base, $m15, 0
+	mul $m7, $m4, $m8
+	add $m2, $m2, $m7
+	mov $m3, $m2
+	shl $m7, $m5, 2
+	brnzdec $m7, 3f
+	bri 4f
+	.p2align 3
+	nop
+3:
+	ld64step $a0:1, $mzero, $m2+=, 1
+	{ rpt $m7, (2f-1f)/8 - 1
+	  f16v2exp $a2, $a0 }
+1:
+	{ ld64step $a0:1, $mzero, $m2+=, 1
+	  f16v2exp $a3, $a1 }
+	{ st64step $a2:3, $mzero, $m3+=, 1
+	  f16v2exp $a2, $a0 }
+2:
+	f16v2exp $a3, $a1
+	st64step $a2:3, $mzero, $m3+=, 1
+4:
+.Lattention_softmax_panel_normalize_next:
+	ld32 $m6, $mvertex_base, $m15, 3
+	add $m4, $m4, ATTENTION_WORKER_CONTEXTS
+	bri .Lattention_softmax_panel_normalize_panel
+
+.Lattention_softmax_panel_sum_setup:
+	// m6 was used as a tail-loop temporary; restore the logical key count.
+	ld32 $m6, $mvertex_base, $m15, 3
+	setzi $m0, 0
+.Lattention_softmax_panel_sum_row:
+	ldconst $a7, 0
+	mov $m4, $m1
+.Lattention_softmax_panel_sum_panel:
+	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS / 16
+	cmpult $m7, $m4, $m7
+	brz $m7, .Lattention_softmax_panel_sum_store
+	shl $m10, $m4, 4
+	cmpult $m7, $m10, $m6
+	brz $m7, .Lattention_softmax_panel_sum_next
+	mul $m7, $m4, $m8
+	ld32 $m2, $mvertex_base, $m15, 0
+	add $m2, $m2, $m7
+	shl $m7, $m0, 5
+	add $m2, $m2, $m7
+	sub $m7, $m6, $m10
+	setzi $m3, 16
+	cmpult $m3, $m7, $m3
+	brnz $m3, .Lattention_softmax_panel_sum_partial
+	ATTENTION_SOFTMAX_SUM_PANEL
+	bri .Lattention_softmax_panel_sum_next
+.Lattention_softmax_panel_sum_partial:
+	shr $m3, $m7, 1
+	brz $m3, .Lattention_softmax_panel_sum_partial_odd
+.Lattention_softmax_panel_sum_partial_pairs:
+	ATTENTION_SOFTMAX_SUM_PAIR
+	sub $m3, $m3, 1
+	brnz $m3, .Lattention_softmax_panel_sum_partial_pairs
+.Lattention_softmax_panel_sum_partial_odd:
+	and $m10, $m7, 1
+	brz $m10, .Lattention_softmax_panel_sum_next
+	ld32 $a0, $m2, $m15, 0
+	f16v2tof32 $a0:1, $a0
+	f32add $a7, $a7, $a0
+.Lattention_softmax_panel_sum_next:
+	add $m4, $m4, ATTENTION_WORKER_CONTEXTS
+	bri .Lattention_softmax_panel_sum_panel
+.Lattention_softmax_panel_sum_store:
+	ld32 $m2, $mvertex_base, $m15, 0
+	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS * 2
+	mul $m7, $m5, $m7
+	add $m2, $m2, $m7
+	shl $m7, $m5, 2
+	add $m2, $m2, $m7
+	mul $m7, $m1, $m5
+	add $m7, $m7, $m0
+	shl $m7, $m7, 2
+	add $m2, $m2, $m7
+	st32 $a7, $m2, $m15, 0
+	add $m0, $m0, 1
+	cmpult $m7, $m0, $m5
+	brnz $m7, .Lattention_softmax_panel_sum_row
+	exitz $m15
+
+.Lattention_softmax_reduce_sum_worker:
+	ld32 $m5, $mvertex_base, $m15, 2
+	get $m0, $WSR
+	and $m0, $m0, CSR_W_WSR__CTXTID_M1__MASK
+	cmpult $m7, $m0, $m5
+	brz $m7, .Lattention_softmax_reduce_sum_done
+	ld32 $m2, $mvertex_base, $m15, 0
+	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS * 2
+	mul $m7, $m5, $m7
+	add $m2, $m2, $m7
+	shl $m8, $m5, 2
+	add $m2, $m2, $m8
+.Lattention_softmax_reduce_sum_row:
+	shl $m7, $m0, 2
+	add $m9, $m2, $m7
+	mov $m3, $m9
+	ld32 $a7, $m3, $m15, 0
+	.rept ATTENTION_WORKER_CONTEXTS - 1
+	add $m3, $m3, $m8
+	ld32 $a0, $m3, $m15, 0
+	f32add $a7, $a7, $a0
+	.endr
+	st32 $a7, $m9, $m15, 0
+	add $m0, $m0, ATTENTION_WORKER_CONTEXTS
+	cmpult $m7, $m0, $m5
+	brnz $m7, .Lattention_softmax_reduce_sum_row
+.Lattention_softmax_reduce_sum_done:
+	exitz $m15
+#endif
 #endif
 
 	// Callable supervisor ABI for merge: m2 accumulator, m3 block values,
