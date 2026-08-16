@@ -564,28 +564,6 @@ impl KernelBuildPlan {
                     });
             let (head_dimension, value_dimension, padded_value_dimension, key_block_columns) =
                 configuration.ok_or(KernelAbiError::RequirementMismatch)?;
-            plan.compilations.push(KernelCompilation {
-                source: "flash_attention_f16.cpp",
-                name: format!(
-                    "flash_attention_blocks_q{small_query}_q{large_query}_d{head_dimension}_v{value_dimension}"
-                ),
-                flags: vec![
-                    "-Os".into(),
-                    format!("-DATTENTION_HEAD_DIMENSION={head_dimension}"),
-                    format!(
-                        "-DATTENTION_PADDED_HEAD_DIMENSION={}",
-                        head_dimension.div_ceil(16) * 16
-                    ),
-                    format!("-DATTENTION_VALUE_DIMENSION={value_dimension}"),
-                    format!("-DATTENTION_PADDED_VALUE_DIMENSION={padded_value_dimension}"),
-                    format!("-DATTENTION_KEY_BLOCK_COLUMNS={key_block_columns}"),
-                    format!("-DATTENTION_SMALL_QUERY_ROWS={small_query}"),
-                    format!("-DATTENTION_LARGE_QUERY_ROWS={large_query}"),
-                    format!("-DATTENTION_SMALL_KEY_ROWS={small_key}"),
-                    format!("-DATTENTION_LARGE_KEY_ROWS={large_key}"),
-                ],
-                retained_symbols: Vec::new(),
-            });
             let mut retained_symbols = Vec::new();
             for (kernel, rows) in attention_stages {
                 let size = if rows == small_query {
@@ -614,10 +592,24 @@ impl KernelBuildPlan {
                 }
                 plan.attention_stage_symbols.push((kernel, rows, symbol));
             }
+            let scale_bits = (1.0_f32 / (head_dimension as f32).sqrt()).to_bits();
             plan.compilations.push(KernelCompilation {
-                source: "flash_attention_f16.S",
-                name: "flash_attention_blocks_wrapper".into(),
-                flags: Vec::new(),
+                source: "attention_stages_f16.S",
+                name: format!(
+                    "attention_stages_q{small_query}_q{large_query}_d{head_dimension}_v{value_dimension}"
+                ),
+                flags: vec![
+                    "-O2".into(),
+                    format!("-DATTENTION_HEAD_DIMENSION={head_dimension}"),
+                    format!("-DATTENTION_VALUE_DIMENSION={value_dimension}"),
+                    format!("-DATTENTION_PADDED_VALUE_DIMENSION={padded_value_dimension}"),
+                    format!("-DATTENTION_KEY_BLOCK_COLUMNS={key_block_columns}"),
+                    format!("-DATTENTION_SMALL_QUERY_ROWS={small_query}"),
+                    format!("-DATTENTION_LARGE_QUERY_ROWS={large_query}"),
+                    format!("-DATTENTION_SMALL_KEY_ROWS={small_key}"),
+                    format!("-DATTENTION_LARGE_KEY_ROWS={large_key}"),
+                    format!("-DATTENTION_SCALE_BITS=0x{scale_bits:08x}"),
+                ],
                 retained_symbols,
             });
         }
