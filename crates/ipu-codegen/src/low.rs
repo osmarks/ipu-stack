@@ -570,6 +570,7 @@ struct AttentionBufferShape {
     state_columns: u32,
     padded_query_dimension: u32,
     padded_value_dimension: u32,
+    reuse_key_staging_for_state: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1823,35 +1824,43 @@ impl LoweringState {
         for &output in output_shards {
             let output_extents = self.shards[output.index() as usize].extents.clone();
             let tile = self.shards[output.index() as usize].tile;
-            if output_extents.len() != 3
-                || output_extents[0].logical_end - output_extents[0].start != 1
-            {
+            if output_extents.len() != 3 {
                 return Err(LowLoweringError::InvalidOperatorPlan);
             }
-            let (target, column_base) =
-                split_head_source_extents(&output_extents, heads, head_width)?;
-            for (source_extents, source) in
-                self.intersecting_shard_set(&source_shards, &target, tile)
-            {
-                let destination_extents = vec![
-                    output_extents[0],
-                    source_extents[1],
-                    ShardExtent {
-                        axis: 2,
-                        start: source_extents[2].start - column_base,
-                        logical_end: source_extents[2].logical_end - column_base,
-                        physical_end: source_extents[2].logical_end - column_base,
-                    },
-                ];
-                let source_view = ShardView {
-                    shard: source,
-                    extents: source_extents,
-                };
-                let destination_view = ShardView {
-                    shard: output,
-                    extents: destination_extents,
-                };
-                mappings.push((source_view, destination_view));
+            // A legal layout may assign several complete attention streams to
+            // one tile. Split that allocation into per-stream views here: the
+            // batch/head reshape is semantic, but it does not require the
+            // ownership layout itself to shard the stream axis one-by-one.
+            for stream in output_extents[0].start..output_extents[0].logical_end {
+                let mut stream_extents = output_extents.clone();
+                stream_extents[0].start = stream;
+                stream_extents[0].logical_end = stream + 1;
+                stream_extents[0].physical_end = stream + 1;
+                let (target, column_base) =
+                    split_head_source_extents(&stream_extents, heads, head_width)?;
+                for (source_extents, source) in
+                    self.intersecting_shard_set(&source_shards, &target, tile)
+                {
+                    let destination_extents = vec![
+                        stream_extents[0],
+                        source_extents[1],
+                        ShardExtent {
+                            axis: 2,
+                            start: source_extents[2].start - column_base,
+                            logical_end: source_extents[2].logical_end - column_base,
+                            physical_end: source_extents[2].logical_end - column_base,
+                        },
+                    ];
+                    let source_view = ShardView {
+                        shard: source,
+                        extents: source_extents,
+                    };
+                    let destination_view = ShardView {
+                        shard: output,
+                        extents: destination_extents,
+                    };
+                    mappings.push((source_view, destination_view));
+                }
             }
         }
         Ok(mappings)
@@ -1972,14 +1981,6 @@ impl LoweringState {
                 ElementOrder::Amp(AmpOrder::Left),
                 MemoryClass::Ipu21Interleaved,
             )?;
-            let weights = self.push_attention_scratch(
-                tile,
-                rows,
-                shape.state_columns,
-                Precision::F16,
-                ElementOrder::Amp(AmpOrder::Left),
-                MemoryClass::Ipu21Standard,
-            )?;
             let key_staging = self.push_attention_buffer(
                 tile,
                 shape.logical_staging_rows,
@@ -1989,6 +1990,25 @@ impl LoweringState {
                 ElementOrder::Amp(AmpOrder::TransposedRight),
             )?;
             self.shards[key_staging.index() as usize].definition = ShardDefinition::ExchangeStaging;
+            let weights = self.push_attention_scratch(
+                tile,
+                rows,
+                shape.state_columns,
+                Precision::F16,
+                ElementOrder::Amp(AmpOrder::Left),
+                MemoryClass::Ipu21Standard,
+            )?;
+            if shape.reuse_key_staging_for_state
+                && crate::shard_storage_bytes(&self.shards[weights.index() as usize])?
+                    <= crate::shard_storage_bytes(&self.shards[key_staging.index() as usize])?
+            {
+                // Materialized QK consumes the packed K matrix before softmax
+                // starts. Reinterpret that now-dead standard-memory allocation
+                // as probabilities plus row state so the PV kernel retains its
+                // proven standard-load path without a second large buffer.
+                self.shards[weights.index() as usize].definition =
+                    ShardDefinition::Alias(key_staging);
+            }
             let value_staging = self.push_attention_buffer(
                 tile,
                 shape.logical_staging_rows,
@@ -2241,6 +2261,7 @@ impl LoweringState {
                 state_columns: key_block_rows + 16,
                 padded_query_dimension,
                 padded_value_dimension,
+                reuse_key_staging_for_state: false,
             },
         )?;
         let key_rows = self.shards[self.value_shards(*key)?[0].index() as usize]
@@ -2548,6 +2569,7 @@ impl LoweringState {
                 state_columns: padded_key_rows + AMP_COLUMN_MICRO,
                 padded_query_dimension,
                 padded_value_dimension,
+                reuse_key_staging_for_state: true,
             },
         )?;
         if tasks.is_empty() {
@@ -5098,8 +5120,18 @@ impl LoweringState {
         tile: u16,
         run: KernelRun,
     ) -> LowLoweringResult<()> {
+        let output_flattens_outer_rows = self
+            .shards
+            .get(run.output.shard.index() as usize)
+            .is_some_and(|shard| {
+                matches!(
+                    shard.tensor_type.format.layout.order,
+                    ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+                )
+            });
         if matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Gemm { .. }))
             && run.output.extents.len() > 2
+            && !output_flattens_outer_rows
         {
             let matrix_axes = run.output.extents.len() - 2;
             let mut coordinates = vec![0; matrix_axes];
@@ -6407,10 +6439,16 @@ mod tests {
                         _ => None,
                     })
             {
+                let output = &low.shards[run.output.shard.index() as usize];
+                let flattens_outer_rows = matches!(
+                    output.tensor_type.format.layout.order,
+                    ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+                );
                 assert!(
-                    run.output.extents[..run.output.extents.len() - 2]
-                        .iter()
-                        .all(|extent| extent.physical_end - extent.start == 1),
+                    flattens_outer_rows
+                        || run.output.extents[..run.output.extents.len() - 2]
+                            .iter()
+                            .all(|extent| extent.physical_end - extent.start == 1),
                     "case {case}"
                 );
             }

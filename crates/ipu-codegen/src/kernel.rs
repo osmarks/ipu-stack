@@ -1715,7 +1715,9 @@ mod tests {
                 assert!(call.arguments.is_empty());
                 let compute =
                     materialize_kernel_run(run, &low.shards, &addresses, &plan, &BTreeMap::new())
-                        .unwrap();
+                        .unwrap_or_else(|error| {
+                            panic!("batch={batch} tiles={tiles} run={run:?}: {error}")
+                        });
                 assert_eq!(compute.symbol, call.symbol);
                 assert_eq!(compute.input_addresses.len(), 2);
             }

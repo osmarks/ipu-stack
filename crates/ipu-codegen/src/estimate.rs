@@ -845,6 +845,9 @@ pub(crate) fn operator_memory_estimate(
             .saturating_mul(element_bytes);
         maximum_standard_temporary_allocation =
             maximum_standard_temporary_allocation.max(operand_staging);
+        let probability_state = u64::from(*query_block_rows)
+            .saturating_mul(u64::from(padded_key_rows + AMP_COLUMN_MICRO))
+            .saturating_mul(element_bytes);
         temporary.standard = temporary.standard.saturating_add(
             operand_staging
                 .saturating_add(
@@ -853,9 +856,9 @@ pub(crate) fn operator_memory_estimate(
                         .saturating_mul(2),
                 )
                 .saturating_add(
-                    u64::from(*query_block_rows)
-                        .saturating_mul(u64::from(padded_key_rows + AMP_COLUMN_MICRO))
-                        .saturating_mul(element_bytes),
+                    (probability_state > operand_staging)
+                        .then_some(probability_state)
+                        .unwrap_or(0),
                 ),
         );
         temporary.interleaved = temporary.interleaved.saturating_add(

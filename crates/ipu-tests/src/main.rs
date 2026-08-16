@@ -3,9 +3,10 @@ use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
     AmpOrder, AttentionStrategy, BlockMajorOrder, CompiledPackage, ComputeGraph, DiagnosticTensor,
-    GemmOrientation, GemmPlanConstraint, Layout, LocalOperandStaging, MemoryClass, PackageConfig,
-    PipelineConfig, Precision, ReductionStaging, TensorFormat, amp_matrix_coordinates,
-    block_major_matrix_coordinates, build_diagnostic_package, build_package,
+    GemmOrientation, GemmPlanConstraint, Layout, LocalOperandStaging, MemoryClass, MidOperator,
+    PackageConfig, PipelineConfig, Precision, ReductionStaging, TensorFormat,
+    amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
+    build_package,
 };
 use ipu_driver::DriverError;
 use ipu_elf::Toolchain;
@@ -647,6 +648,15 @@ fn main() -> Result<()> {
                 .with_automatic_input(query_weights, Precision::F16)
                 .with_automatic_input(key_weights, Precision::F16)
                 .with_automatic_input(value_weights, Precision::F16);
+            // This benchmark compares the two F16 attention strategies. Keep
+            // projection precision controlled as batch size changes instead
+            // of allowing a different GEMM precision to confound the sweep.
+            pipeline.operator_candidates.retain(|candidate| {
+                !matches!(
+                    candidate.operator,
+                    MidOperator::Gemm { multiply, .. } if multiply != Precision::F16
+                )
+            });
             pipeline.profiling.enabled = !arguments.no_profile;
         } else {
             let (heads, query_rows, key_rows) = (4, 17, 19);
