@@ -1805,6 +1805,9 @@ pub struct PipelineConfig {
     /// Controls whether one-use layout conversions may be populated as
     /// bounded slices immediately before their consuming dispatch.
     pub conversion_streaming: ConversionStreamingPolicy,
+    /// Restricts attention planning to one execution strategy for controlled
+    /// benchmarking; automatic planning retains both alternatives.
+    pub attention_strategy: AttentionStrategy,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1818,6 +1821,14 @@ pub enum ConversionStreamingPolicy {
     /// Stream every eligible conversion, primarily for diagnostics and
     /// memory-constrained deployment experiments.
     Always,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttentionStrategy {
+    #[default]
+    Automatic,
+    Flash,
+    Materialized,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1856,6 +1867,7 @@ impl PipelineConfig {
             diagnostic_checkpoints: false,
             exchange_diagnostics: false,
             conversion_streaming: ConversionStreamingPolicy::WhenRequired,
+            attention_strategy: AttentionStrategy::Automatic,
         }
     }
 
@@ -1878,6 +1890,11 @@ impl PipelineConfig {
 
     pub fn with_exchange_schedule_finalists(mut self, finalists: usize) -> Self {
         self.exchange_schedule_finalists = finalists.max(1);
+        self
+    }
+
+    pub fn with_attention_strategy(mut self, strategy: AttentionStrategy) -> Self {
+        self.attention_strategy = strategy;
         self
     }
 
@@ -4542,6 +4559,17 @@ fn plans(
                 },
                 deferred_output: None,
             });
+        }
+        match config.attention_strategy {
+            AttentionStrategy::Automatic => {}
+            AttentionStrategy::Flash => plans.retain(|plan| {
+                !matches!(
+                    plan.dispatch,
+                    OperatorDispatch::MaterializedAttention { .. }
+                )
+            }),
+            AttentionStrategy::Materialized => plans
+                .retain(|plan| !matches!(plan.dispatch, OperatorDispatch::BlockedAttention { .. })),
         }
     }
     if let [input] = inputs

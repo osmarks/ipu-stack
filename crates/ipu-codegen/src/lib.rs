@@ -52,17 +52,17 @@ pub use memory::{
     IPU21_STANDARD_FIXED_BYTES,
 };
 pub use mid::{
-    AccumulationPrecision, AmpOrder, AxisTiling, BlockMajorOrder, ConversionPlan,
-    ConversionStrategy, ConversionStreamingPolicy, CostModel, ElementOrder, GemmDistribution,
-    GemmKernelMode, GemmOrientation, GemmPlanConstraint, GemmWeightLoad, GridOrder, HardwareTarget,
-    IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, Layout, LayoutError, LocalOperandStaging,
-    LoweringError, LoweringResult, MemoryClass, MemoryEstimate, MemoryOperand, MemoryPeaks,
-    MemoryRelation, MemoryUsage, MidGraph, MidInput, MidOperation, MidOperationKind, MidOperator,
-    MidRegion, MidRepeat, MidValue, MidValueId, OperandMaterialization, OperandRequirement,
-    OperatorCandidate, OperatorDispatch, OperatorFormatPolicy, OperatorPlan, OperatorPlanError,
-    OperatorRequirements, OutputAliasing, Padding, PipelineConfig, PointwiseInputMapping,
-    Precision, ProfilingConfig, ReductionStaging, SchedulingPolicy, TensorAxis, TensorFormat,
-    TensorTiling, TensorType, TileKernelSpec, lower,
+    AccumulationPrecision, AmpOrder, AttentionStrategy, AxisTiling, BlockMajorOrder,
+    ConversionPlan, ConversionStrategy, ConversionStreamingPolicy, CostModel, ElementOrder,
+    GemmDistribution, GemmKernelMode, GemmOrientation, GemmPlanConstraint, GemmWeightLoad,
+    GridOrder, HardwareTarget, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, Layout,
+    LayoutError, LocalOperandStaging, LoweringError, LoweringResult, MemoryClass, MemoryEstimate,
+    MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidGraph, MidInput, MidOperation,
+    MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId,
+    OperandMaterialization, OperandRequirement, OperatorCandidate, OperatorDispatch,
+    OperatorFormatPolicy, OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing,
+    Padding, PipelineConfig, PointwiseInputMapping, Precision, ProfilingConfig, ReductionStaging,
+    SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{
     CompiledPackage, DiagnosticCheckpoint, DiagnosticPackage, DiagnosticShard, DiagnosticTensor,

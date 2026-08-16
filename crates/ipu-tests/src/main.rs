@@ -2,9 +2,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
-    AmpOrder, BlockMajorOrder, CompiledPackage, ComputeGraph, DiagnosticTensor, GemmOrientation,
-    GemmPlanConstraint, Layout, LocalOperandStaging, MemoryClass, PackageConfig, PipelineConfig,
-    Precision, ReductionStaging, TensorFormat, amp_matrix_coordinates,
+    AmpOrder, AttentionStrategy, BlockMajorOrder, CompiledPackage, ComputeGraph, DiagnosticTensor,
+    GemmOrientation, GemmPlanConstraint, Layout, LocalOperandStaging, MemoryClass, PackageConfig,
+    PipelineConfig, Precision, ReductionStaging, TensorFormat, amp_matrix_coordinates,
     block_major_matrix_coordinates, build_diagnostic_package, build_package,
 };
 use ipu_driver::DriverError;
@@ -129,6 +129,9 @@ struct Arguments {
     /// Independent attention batches, flattened into the head axis.
     #[arg(long, default_value_t = 1)]
     attention_batch: u32,
+    /// Restrict attention planning for controlled strategy comparisons.
+    #[arg(long, value_enum, default_value_t = AttentionMode::Auto)]
+    attention_strategy: AttentionMode,
     #[arg(long, default_value_t = SIGLIP_ATTENTION_HEADS)]
     attention_heads: u32,
     /// Defaults to SigLIP's 4304-wide intermediate for the canonical 1152D
@@ -222,6 +225,23 @@ enum ExchangeStressPattern {
     Overlap,
     /// Paired 64-bit sends across the standard/interleaved SRAM bank matrix.
     Wide,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AttentionMode {
+    Auto,
+    Flash,
+    Materialized,
+}
+
+impl From<AttentionMode> for AttentionStrategy {
+    fn from(value: AttentionMode) -> Self {
+        match value {
+            AttentionMode::Auto => Self::Automatic,
+            AttentionMode::Flash => Self::Flash,
+            AttentionMode::Materialized => Self::Materialized,
+        }
+    }
 }
 
 impl Workload {
@@ -531,6 +551,7 @@ fn main() -> Result<()> {
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
     pipeline = pipeline.with_exchange_schedule_finalists(arguments.exchange_schedule_finalists);
+    pipeline = pipeline.with_attention_strategy(arguments.attention_strategy.into());
     for constraint in &arguments.gemm_plan_constraint {
         pipeline = pipeline.with_gemm_plan_constraint(*constraint);
     }
