@@ -1527,8 +1527,10 @@ fn improve_pending_schedule(
             receive_counts,
             tile_count,
             &order,
-        )?;
-        if schedule_score(&matching) < schedule_score(&schedule) {
+        );
+        if let Ok(matching) = matching
+            && schedule_score(&matching) < schedule_score(&schedule)
+        {
             schedule = matching;
             selected_kind = "matching-waves";
         }
@@ -1545,7 +1547,10 @@ fn improve_pending_schedule(
             receive_counts,
             tile_count,
             &repaired_order,
-        )?;
+        );
+        let Ok(repaired) = repaired else {
+            break;
+        };
         if schedule_score(&repaired) >= schedule_score(&schedule) {
             break;
         }
@@ -2237,6 +2242,7 @@ impl MaterializedSchedule {
         receive_counts: &[usize],
         index: usize,
         dependency_ready: u32,
+        validate_encoding: bool,
         last_transfer: &mut [TilePredecessor],
     ) -> Result<u32, ExchangeLoweringError> {
         let transfer = &pending[index];
@@ -2290,6 +2296,7 @@ impl MaterializedSchedule {
                 schedule_offset: latest_availability,
             },
             &mut self.builder,
+            validate_encoding,
         )?;
         let payload_end = timing.sender_end;
         self.memory_accesses[usize::from(transfer.source)]
@@ -2388,6 +2395,39 @@ fn materialize_greedy_schedule(
     receive_counts: &[usize],
     tile_count: u16,
 ) -> Result<MaterializedSchedule, ExchangeLoweringError> {
+    let schedule = materialize_greedy_schedule_impl(
+        topology,
+        pending,
+        incoming_bases,
+        receive_counts,
+        tile_count,
+        false,
+    )?;
+    if schedule_encoding_is_valid(&schedule)? {
+        return Ok(schedule);
+    }
+    tracing::debug!(
+        transfers = pending.len(),
+        "retrying exchange schedule with incremental instruction-alignment validation"
+    );
+    materialize_greedy_schedule_impl(
+        topology,
+        pending,
+        incoming_bases,
+        receive_counts,
+        tile_count,
+        true,
+    )
+}
+
+fn materialize_greedy_schedule_impl(
+    topology: &Topology,
+    pending: &[PendingTransfer],
+    incoming_bases: &[u32],
+    receive_counts: &[usize],
+    tile_count: u16,
+    validate_encoding: bool,
+) -> Result<MaterializedSchedule, ExchangeLoweringError> {
     let mut schedule = MaterializedSchedule::new(tile_count, pending.len());
     let mut scheduler = TransferScheduler::new(pending, tile_count);
     let mut last_transfer = vec![TilePredecessor::default(); usize::from(tile_count)];
@@ -2399,6 +2439,7 @@ fn materialize_greedy_schedule(
             receive_counts,
             index,
             dependency_ready,
+            validate_encoding,
             &mut last_transfer,
         )?;
         scheduler.complete(index, completion);
@@ -2440,11 +2481,26 @@ fn materialize_schedule_order(
             receive_counts,
             index,
             dependency_ready,
+            false,
             &mut last_transfer,
         )?;
     }
     schedule.finish_horizon();
-    Ok(schedule)
+    if schedule_encoding_is_valid(&schedule)? {
+        Ok(schedule)
+    } else {
+        Err(ipu_exchange::ExchangeError::Schedule("SENDPICP instruction alignment").into())
+    }
+}
+
+fn schedule_encoding_is_valid(
+    schedule: &MaterializedSchedule,
+) -> Result<bool, ExchangeLoweringError> {
+    match schedule.builder.clone().finish() {
+        Ok(_) => Ok(true),
+        Err(ipu_exchange::ExchangeError::Schedule("SENDPICP instruction alignment")) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn schedule_score(schedule: &MaterializedSchedule) -> u32 {
@@ -2905,6 +2961,7 @@ fn append_transfer(
     receive_counts: &[usize],
     transfer: ScheduledTransfer<'_>,
     builder: &mut PhaseProgramBuilder,
+    validate_encoding: bool,
 ) -> Result<ScheduledTransferTiming, ExchangeLoweringError> {
     let ScheduledTransfer {
         source,
@@ -2954,14 +3011,25 @@ fn append_transfer(
     let mut schedule_offset = requested_offset;
     loop {
         let previous = schedule_offset;
-        schedule_offset = builder.earliest_transfer_offset(
-            source,
-            reserved_tiles,
-            &tiles,
-            &plan,
-            item_count,
-            schedule_offset,
-        )?;
+        schedule_offset = if validate_encoding {
+            builder.earliest_transfer_offset(
+                source,
+                reserved_tiles,
+                &tiles,
+                &plan,
+                item_count,
+                schedule_offset,
+            )?
+        } else {
+            builder.earliest_transfer_offset_deferred(
+                source,
+                reserved_tiles,
+                &tiles,
+                &plan,
+                item_count,
+                schedule_offset,
+            )?
+        };
         let timing =
             builder.transfer_timing_at(source, &tiles, &plan, schedule_offset, item_count)?;
         let receiver_intervals = timing

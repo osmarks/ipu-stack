@@ -324,6 +324,52 @@ impl PhaseProgramBuilder {
         words: u32,
         requested: u32,
     ) -> Result<u32, ExchangeError> {
+        self.earliest_transfer_offset_impl(
+            source,
+            reserved_tiles,
+            receivers,
+            plan,
+            words,
+            requested,
+            true,
+        )
+    }
+
+    /// Finds an endpoint-compatible offset while deferring whole-row encoding
+    /// validation until the complete phase is available. Callers must encode
+    /// the completed phase and retry with [`Self::earliest_transfer_offset`]
+    /// if instruction alignment is not representable.
+    pub fn earliest_transfer_offset_deferred(
+        &self,
+        source: u16,
+        reserved_tiles: &[u16],
+        receivers: &[u16],
+        plan: &MulticastPlan,
+        words: u32,
+        requested: u32,
+    ) -> Result<u32, ExchangeError> {
+        self.earliest_transfer_offset_impl(
+            source,
+            reserved_tiles,
+            receivers,
+            plan,
+            words,
+            requested,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn earliest_transfer_offset_impl(
+        &self,
+        source: u16,
+        reserved_tiles: &[u16],
+        receivers: &[u16],
+        plan: &MulticastPlan,
+        words: u32,
+        requested: u32,
+        validate_encoding: bool,
+    ) -> Result<u32, ExchangeError> {
         if receivers.len() != plan.receivers.len() {
             return Err(ExchangeError::Schedule("receiver row count"));
         }
@@ -350,9 +396,47 @@ impl PhaseProgramBuilder {
                 offset = schedule.earliest_receiver_offset(row, words, offset)?;
             }
             if offset == previous {
-                return Ok(offset);
+                if !validate_encoding {
+                    return Ok(offset);
+                }
+                match self.transfer_is_encodable_at(source, receivers, plan, offset, words) {
+                    Ok(()) => return Ok(offset),
+                    Err(ExchangeError::Schedule("SENDPICP instruction alignment")) => {
+                        offset = offset
+                            .checked_add(1)
+                            .ok_or(ExchangeError::Schedule("receive offset overflow"))?;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
+    }
+
+    fn transfer_is_encodable_at(
+        &self,
+        source: u16,
+        receivers: &[u16],
+        plan: &MulticastPlan,
+        schedule_offset: u32,
+        words: u32,
+    ) -> Result<(), ExchangeError> {
+        let mut source_schedule = self
+            .tile_states
+            .get(usize::from(source))
+            .ok_or(ExchangeError::Tile(source))?
+            .clone();
+        source_schedule.append_sender_at(&plan.sender, schedule_offset)?;
+        source_schedule.finish()?;
+        for (&receiver, row) in receivers.iter().zip(&plan.receivers) {
+            let mut receiver_schedule = self
+                .tile_states
+                .get(usize::from(receiver))
+                .ok_or(ExchangeError::Tile(receiver))?
+                .clone();
+            receiver_schedule.append_receiver_at(row, schedule_offset, words)?;
+            receiver_schedule.finish()?;
+        }
+        Ok(())
     }
 
     /// Adds one transfer to the phase schedule. The transfer's sender and all
