@@ -3146,6 +3146,21 @@ pub(crate) fn lower_finalists(
                     .collect::<BTreeSet<_>>(),
                 "retained operator-plan finalist"
             );
+            tracing::debug!(
+                finalist,
+                plans = ?branch.operations
+                    .iter()
+                    .filter_map(|operation| operation.operator_plan.as_ref().map(|plan| (
+                        operation.source,
+                        &plan.dispatch,
+                        plan.requirements.inputs.iter().map(|input| &input.format.layout).collect::<Vec<_>>(),
+                        &plan.requirements.output.format.layout,
+                        operation.estimated_cycles,
+                        operation.estimated_exchange_cycles,
+                    )))
+                    .collect::<Vec<_>>(),
+                "retained operator-plan details"
+            );
             Ok(MidGraph {
                 inputs: inputs.clone(),
                 values: branch.state.values,
