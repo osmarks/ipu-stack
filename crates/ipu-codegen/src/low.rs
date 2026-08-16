@@ -6769,18 +6769,28 @@ mod tests {
     fn randomized_partition_padding_preserves_logical_groups() {
         let mut random = fastrand::Rng::with_seed(0x6772_6f75_705f_7064);
         for case in 0..CASES * 8 {
-            let groups = random.u16(1..=32);
+            let groups = random.u16(1..=16);
             let group_width = random.u32(1..=127);
             let rows = random.u32(1..=16);
             let physical_multiple = 1_u32 << random.u32(1..=4);
+            let physical_width = group_width.div_ceil(physical_multiple) * physical_multiple;
+            let physical_blocks = physical_width / physical_multiple;
+            let partitions_per_group =
+                random.u16(1..=u16::try_from(physical_blocks.min(8)).unwrap());
+            let partitions = groups * partitions_per_group;
             let layout = Layout {
                 order: ElementOrder::RowMajor,
                 tiling: TensorTiling {
-                    tile_count: groups,
+                    tile_count: partitions,
                     replicas: 1,
                     axes: vec![
-                        AxisTiling::new(TensorAxis::FromEnd(1), groups, 1, Padding::Zero)
-                            .with_shard_padding_multiple(physical_multiple),
+                        AxisTiling::new(
+                            TensorAxis::FromEnd(1),
+                            partitions,
+                            physical_multiple,
+                            Padding::Zero,
+                        )
+                        .with_padding_groups(groups),
                     ],
                 },
                 memory_class: MemoryClass::Ipu21Standard,
@@ -6790,30 +6800,37 @@ mod tests {
                 Precision::F16,
                 layout,
             );
-            let physical_width = group_width.div_ceil(physical_multiple) * physical_multiple;
             let shards = shard_extents(&tensor).unwrap();
-            assert_eq!(shards.len(), usize::from(groups), "case {case}");
-            for (coordinate, (_, extents)) in shards.iter().enumerate() {
-                let start = u32::try_from(coordinate).unwrap() * group_width;
-                assert_eq!(extents[1].start, start, "case {case}");
-                assert_eq!(extents[1].logical_end, start + group_width, "case {case}");
-                assert_eq!(
-                    extents[1].physical_end,
-                    start + physical_width,
-                    "case {case}"
-                );
-                assert_eq!(
-                    crate::shard_storage_bytes(&LowShard {
-                        id: LowShardId(0),
-                        tile: 0,
-                        tensor_type: tensor.clone(),
-                        extents: extents.clone(),
-                        definition: ShardDefinition::Staging,
-                    })
-                    .unwrap(),
-                    rows * physical_width * 2,
-                    "case {case}"
-                );
+            assert_eq!(shards.len(), usize::from(partitions), "case {case}");
+            for group in 0..groups {
+                let group_base = u32::from(group) * group_width;
+                let group_shards = &shards[usize::from(group * partitions_per_group)
+                    ..usize::from((group + 1) * partitions_per_group)];
+                let mut cursor = group_base;
+                let mut allocated = 0;
+                for (_, extents) in group_shards {
+                    assert_eq!(extents[1].start, cursor, "case {case}");
+                    assert!(
+                        extents[1].logical_end <= group_base + group_width,
+                        "case {case}"
+                    );
+                    cursor = extents[1].logical_end;
+                    allocated += extents[1].physical_end - extents[1].start;
+                    assert_eq!(
+                        crate::shard_storage_bytes(&LowShard {
+                            id: LowShardId(0),
+                            tile: 0,
+                            tensor_type: tensor.clone(),
+                            extents: extents.clone(),
+                            definition: ShardDefinition::Staging,
+                        })
+                        .unwrap(),
+                        rows * (extents[1].physical_end - extents[1].start) * 2,
+                        "case {case}"
+                    );
+                }
+                assert_eq!(cursor, group_base + group_width, "case {case}");
+                assert_eq!(allocated, physical_width, "case {case}");
             }
             assert_eq!(
                 crate::estimate::physical_elements(&tensor.shape, &tensor.format.layout),
@@ -6822,7 +6839,12 @@ mod tests {
             );
             assert_eq!(
                 crate::estimate::maximum_shard_bytes(&tensor),
-                u64::from(rows) * u64::from(physical_width) * 2,
+                u64::from(rows)
+                    * u64::from(
+                        physical_blocks.div_ceil(u32::from(partitions_per_group))
+                            * physical_multiple,
+                    )
+                    * 2,
                 "case {case}"
             );
         }

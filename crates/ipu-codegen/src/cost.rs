@@ -624,6 +624,59 @@ fn split_heads_word_fragment_cycles(output: &TensorType) -> Option<u64> {
     )
 }
 
+fn split_head_panel_exchange_cycles(
+    source: &TensorType,
+    logical_output: &TensorType,
+    destination: &TensorType,
+) -> Option<u64> {
+    let (&source_columns, &head_columns) = (source.shape.0.last()?, logical_output.shape.0.last()?);
+    if head_columns == 0 || !source_columns.is_multiple_of(head_columns) {
+        return None;
+    }
+    let groups = source_columns / head_columns;
+    let source_grouped = source
+        .format
+        .layout
+        .tiling
+        .axes
+        .iter()
+        .find(|axis| axis.axis.resolve(source.shape.0.len()).ok() == Some(source.shape.0.len() - 1))
+        .is_some_and(|axis| u32::from(axis.padding_groups) == groups);
+    let panel = crate::mid::AMP_COLUMN_MICRO;
+    let panels_per_group = head_columns.div_ceil(panel);
+    let segments = if source_grouped {
+        u64::from(groups).saturating_mul(u64::from(panels_per_group))
+    } else {
+        (0..groups).fold(0_u64, |total, group| {
+            let base = group.saturating_mul(head_columns);
+            let destination_boundaries = head_columns.saturating_sub(1) / panel;
+            let first_source_boundary = (panel - base % panel) % panel;
+            let source_boundaries = if first_source_boundary == 0 {
+                destination_boundaries
+            } else if first_source_boundary >= head_columns {
+                0
+            } else {
+                1 + (head_columns - 1 - first_source_boundary) / panel
+            };
+            let shared_boundaries = if base.is_multiple_of(panel) {
+                destination_boundaries
+            } else {
+                0
+            };
+            total.saturating_add(u64::from(
+                1 + destination_boundaries + source_boundaries - shared_boundaries,
+            ))
+        })
+    };
+    let baseline_segments = u64::from(groups).saturating_mul(u64::from(panels_per_group));
+    let baseline_cycles = split_heads_word_fragment_cycles(destination)?;
+    Some(
+        baseline_cycles
+            .saturating_mul(segments)
+            .div_ceil(baseline_segments.max(1)),
+    )
+}
+
 fn amp_kernel_cycles(
     multiply: Precision,
     dispatch: &OperatorDispatch,
@@ -816,7 +869,9 @@ fn deferred_split_input_cycles(
         ElementOrder::Amp(AmpOrder::Left)
     ) {
         if direct_panel_exchange {
-            return Some((0, 0));
+            let exchange =
+                split_head_panel_exchange_cycles(source, logical_output, consumer_input)?;
+            return Some((exchange, exchange));
         }
         let local_elements = maximum_shard_elements(consumer_input);
         let gather = local_elements
@@ -881,6 +936,11 @@ fn deferred_split_input_cycles(
         .saturating_mul(panel_elements)
         .saturating_mul(bytes)
         .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle);
+    let panel_exchange = direct_panel_exchange
+        .then(|| split_head_panel_exchange_cycles(source, logical_output, consumer_input))
+        .flatten()
+        .unwrap_or(0);
+    let fragmented_exchange = fragmented_exchange.saturating_add(panel_exchange);
 
     Some((
         source_unpack
@@ -1243,11 +1303,12 @@ impl CostModel for Ipu21CostModel {
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
             MidOperator::SplitHeads(_) => {
                 let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
-                if inputs
-                    .first()
-                    .is_some_and(|input| split_heads_uses_micro_panel_exchange(input, output))
+                if let Some(input) = inputs.first()
+                    && split_heads_uses_micro_panel_exchange(input, output)
                 {
-                    return exchange;
+                    return exchange.saturating_add(
+                        split_head_panel_exchange_cycles(input, output, output).unwrap_or(0),
+                    );
                 }
                 let source_unpack = inputs.first().map_or(0, amp_unpack_cycles);
                 let destination_pack =
@@ -1263,13 +1324,23 @@ impl CostModel for Ipu21CostModel {
 
     fn operator_exchange_cycles(
         &self,
-        _operator: MidOperator,
+        operator: MidOperator,
         dispatch: &OperatorDispatch,
         _requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
-        estimated_operator_exchange_cycles(dispatch, inputs, output)
+        let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
+        if matches!(operator, MidOperator::SplitHeads(_))
+            && let Some(input) = inputs.first()
+            && split_heads_uses_micro_panel_exchange(input, output)
+        {
+            exchange.saturating_add(
+                split_head_panel_exchange_cycles(input, output, output).unwrap_or(0),
+            )
+        } else {
+            exchange
+        }
     }
 
     fn deferred_input_cycles(
@@ -1557,5 +1628,57 @@ mod tests {
                 assert!(sharded_cycles <= unsharded_cycles, "case {case}");
             }
         }
+    }
+
+    #[test]
+    fn randomized_group_padding_never_adds_split_panel_boundaries() {
+        let mut random = fastrand::Rng::with_seed(0x6865_6164_5f67_7264);
+        let mut improvements = 0;
+        for case in 0..CASES * 8 {
+            let groups = random.u16(2..=16);
+            let head_columns = loop {
+                let columns = random.u32(1..=64) * 2;
+                if !columns.is_multiple_of(crate::mid::AMP_COLUMN_MICRO) {
+                    break columns;
+                }
+            };
+            let panels = head_columns.div_ceil(crate::mid::AMP_COLUMN_MICRO);
+            let partitions_per_group = random.u16(1..=u16::try_from(panels).unwrap());
+            let column_partitions = groups * partitions_per_group;
+            let rows = random.u32(1..=128);
+            let batch = random.u32(1..=4);
+            let source_shape =
+                TensorShape::new([batch, rows, u32::from(groups).saturating_mul(head_columns)]);
+            let logical_output_shape =
+                TensorShape::new([batch * u32::from(groups), rows, head_columns]);
+            let ordinary_layout = Layout::amp_left_result_grid(
+                crate::mid::AMP_COLUMN_MICRO,
+                column_partitions,
+                1,
+                column_partitions,
+                crate::GridOrder::ColumnsFast,
+            );
+            let mut grouped_layout = ordinary_layout.clone();
+            grouped_layout.tiling.axes[0].padding_groups = groups;
+            let ordinary = TensorType::new(source_shape.0.clone(), Precision::F16, ordinary_layout);
+            let grouped = TensorType::new(source_shape.0.clone(), Precision::F16, grouped_layout);
+            let logical_output = TensorType::new(
+                logical_output_shape.0.clone(),
+                Precision::F16,
+                Layout::attention_query(u16::try_from(logical_output_shape.0[0]).unwrap(), 1),
+            );
+            let ordinary_cycles =
+                split_head_panel_exchange_cycles(&ordinary, &logical_output, &logical_output)
+                    .unwrap();
+            let grouped_cycles =
+                split_head_panel_exchange_cycles(&grouped, &logical_output, &logical_output)
+                    .unwrap();
+            improvements += usize::from(grouped_cycles < ordinary_cycles);
+            assert!(
+                grouped_cycles <= ordinary_cycles,
+                "random case {case}: groups={groups} columns={head_columns} ordinary={ordinary_cycles} grouped={grouped_cycles}"
+            );
+        }
+        assert!(improvements > 0);
     }
 }

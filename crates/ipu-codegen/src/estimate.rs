@@ -324,26 +324,18 @@ fn layout_extents(shape: &TensorShape, layout: &Layout) -> Option<Vec<(u16, Vec<
                         axes.iter().find(|(index, _, _)| *index == axis)
                     {
                         let coordinate = (u32::from(tile) / *stride) % u32::from(tiling.partitions);
-                        let blocks = padded.0[axis] / tiling.block_size;
-                        let partitions = u32::from(tiling.partitions);
-                        let short_size = blocks / partitions;
-                        let long_shards = blocks % partitions;
-                        let start_blocks = coordinate * short_size + coordinate.min(long_shards);
-                        let shard_blocks = short_size + u32::from(coordinate < long_shards);
-                        let start = start_blocks * tiling.block_size;
-                        let end = (start + shard_blocks * tiling.block_size)
-                            .min(shape.0[axis])
-                            .max(start);
-                        (start, end)
+                        let (start, end, _) = tiling
+                            .shard_bounds(padded.0[axis], shape.0[axis], coordinate)
+                            .ok()?;
+                        Some((start, end))
                     } else {
-                        (0, shape.0[axis])
+                        Some((0, shape.0[axis]))
                     }
                 })
-                .collect();
-            (tile, extents)
+                .collect::<Option<Vec<_>>>()?;
+            Some((tile, extents))
         })
-        .collect::<Vec<_>>()
-        .into()
+        .collect()
 }
 
 fn intersect_ranges(left: &[(u32, u32)], right: &[(u32, u32)]) -> Option<Vec<(u32, u32)>> {

@@ -623,6 +623,11 @@ pub struct AxisTiling {
     pub axis: TensorAxis,
     /// Number of contiguous partitions distributed across the tile group.
     pub partitions: u16,
+    /// Number of equal semantic groups which are padded independently before
+    /// partitioning. Partitions must subdivide groups evenly. This keeps, for
+    /// example, attention-head boundaries intact without coupling the number
+    /// of column shards to the number of heads.
+    pub padding_groups: u16,
     /// Required physical block multiple. One imposes no blocking constraint.
     pub block_size: u32,
     /// Physical extent multiple, independently of the grain distributed
@@ -646,6 +651,7 @@ impl AxisTiling {
         Self {
             axis,
             partitions,
+            padding_groups: 1,
             block_size,
             padding_multiple: block_size,
             shard_padding_multiple: 1,
@@ -669,19 +675,49 @@ impl AxisTiling {
         self
     }
 
+    pub const fn with_padding_groups(mut self, padding_groups: u16) -> Self {
+        self.padding_groups = padding_groups;
+        self
+    }
+
     pub(crate) fn shard_bounds(
         self,
         padded_extent: u32,
         logical_extent: u32,
         coordinate: u32,
     ) -> Result<(u32, u32, u32), LayoutError> {
-        let blocks = padded_extent / self.block_size;
         let partitions = u32::from(self.partitions);
-        let short_size = blocks / partitions;
-        let long_shards = blocks % partitions;
-        let start_blocks = coordinate * short_size + coordinate.min(long_shards);
-        let shard_blocks = short_size + u32::from(coordinate < long_shards);
-        let start = start_blocks
+        let groups = u32::from(self.padding_groups);
+        if groups == 0
+            || coordinate >= partitions
+            || !partitions.is_multiple_of(groups)
+            || !padded_extent.is_multiple_of(groups)
+            || !logical_extent.is_multiple_of(groups)
+        {
+            return Err(LayoutError::InvalidPaddingGroups {
+                groups: self.padding_groups,
+                partitions: self.partitions,
+                extent: logical_extent,
+            });
+        }
+        let partitions_per_group = partitions / groups;
+        let group = coordinate / partitions_per_group;
+        let coordinate_in_group = coordinate % partitions_per_group;
+        let padded_group_extent = padded_extent / groups;
+        let logical_group_extent = logical_extent / groups;
+        if !padded_group_extent.is_multiple_of(self.block_size) {
+            return Err(LayoutError::IndivisibleAxis {
+                axis: 0,
+                extent: padded_group_extent,
+                block_size: self.block_size,
+            });
+        }
+        let blocks = padded_group_extent / self.block_size;
+        let short_size = blocks / partitions_per_group;
+        let long_shards = blocks % partitions_per_group;
+        let start_blocks = coordinate_in_group * short_size + coordinate_in_group.min(long_shards);
+        let shard_blocks = short_size + u32::from(coordinate_in_group < long_shards);
+        let start_in_group = start_blocks
             .checked_mul(self.block_size)
             .ok_or(LayoutError::ExtentOverflow(0))?;
         let allocated = shard_blocks
@@ -701,11 +737,21 @@ impl AxisTiling {
                 .checked_add(self.shard_padding_multiple - remainder)
                 .ok_or(LayoutError::ExtentOverflow(0))?
         };
-        let logical_end = start
-            .checked_add(allocated)
-            .ok_or(LayoutError::ExtentOverflow(0))?
-            .min(logical_extent)
-            .max(start);
+        let group_logical_base = group
+            .checked_mul(logical_group_extent)
+            .ok_or(LayoutError::ExtentOverflow(0))?;
+        let start = group_logical_base
+            .checked_add(start_in_group)
+            .ok_or(LayoutError::ExtentOverflow(0))?;
+        let logical_end = group_logical_base
+            .checked_add(
+                start_in_group
+                    .checked_add(allocated)
+                    .ok_or(LayoutError::ExtentOverflow(0))?
+                    .min(logical_group_extent)
+                    .max(start_in_group),
+            )
+            .ok_or(LayoutError::ExtentOverflow(0))?;
         let physical_end = start
             .checked_add(physical_width)
             .ok_or(LayoutError::ExtentOverflow(0))?;
@@ -1298,6 +1344,7 @@ impl Layout {
         let mut used_axes = Vec::with_capacity(self.tiling.axes.len());
         for tiling in &self.tiling.axes {
             if tiling.partitions == 0
+                || tiling.padding_groups == 0
                 || tiling.block_size == 0
                 || tiling.padding_multiple == 0
                 || tiling.shard_padding_multiple == 0
@@ -1313,13 +1360,23 @@ impl Layout {
             }
             used_axes.push(axis);
             let extent = dimensions[axis];
-            let remainder = extent % tiling.padding_multiple;
+            if !u32::from(tiling.partitions).is_multiple_of(u32::from(tiling.padding_groups))
+                || !extent.is_multiple_of(u32::from(tiling.padding_groups))
+            {
+                return Err(LayoutError::InvalidPaddingGroups {
+                    groups: tiling.padding_groups,
+                    partitions: tiling.partitions,
+                    extent,
+                });
+            }
+            let group_extent = extent / u32::from(tiling.padding_groups);
+            let remainder = group_extent % tiling.padding_multiple;
             if remainder != 0 {
                 match tiling.padding {
                     Padding::Reject => {
                         return Err(LayoutError::IndivisibleAxis {
                             axis,
-                            extent,
+                            extent: group_extent,
                             block_size: tiling.padding_multiple,
                         });
                     }
@@ -1327,9 +1384,20 @@ impl Layout {
                 }
             }
             if remainder != 0 && tiling.padding == Padding::Zero {
-                dimensions[axis] = extent
+                let padded_group_extent = group_extent
                     .checked_add(tiling.padding_multiple - remainder)
                     .ok_or(LayoutError::ExtentOverflow(axis))?;
+                dimensions[axis] = padded_group_extent
+                    .checked_mul(u32::from(tiling.padding_groups))
+                    .ok_or(LayoutError::ExtentOverflow(axis))?;
+            }
+            let padded_group_extent = dimensions[axis] / u32::from(tiling.padding_groups);
+            if !padded_group_extent.is_multiple_of(tiling.block_size) {
+                return Err(LayoutError::IndivisibleAxis {
+                    axis,
+                    extent: padded_group_extent,
+                    block_size: tiling.block_size,
+                });
             }
         }
         if used_tiles != u32::from(self.tiling.tile_count) {
@@ -1429,6 +1497,14 @@ pub enum LayoutError {
     },
     #[error("shard extent {extent} is not divisible by block size {block_size}")]
     IndivisibleShard { extent: u32, block_size: u32 },
+    #[error(
+        "axis extent {extent} cannot be divided into {groups} padding groups and {partitions} partitions"
+    )]
+    InvalidPaddingGroups {
+        groups: u16,
+        partitions: u16,
+        extent: u32,
+    },
     #[error("padded extent for axis {0} overflowed")]
     ExtentOverflow(usize),
     #[error("layout declares {declared} tiles but its tiling implies {implied}")]
@@ -1695,7 +1771,14 @@ fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> bool {
     }
     layout.tiling.axes.iter().any(|tiling| {
         tiling.axis.resolve(padded.0.len()).map_or(true, |axis| {
-            padded.0[axis] / tiling.block_size < u32::from(tiling.partitions)
+            let partitions_per_group = tiling.partitions / tiling.padding_groups;
+            tiling
+                .shard_bounds(
+                    padded.0[axis],
+                    shape.0[axis],
+                    u32::from(partitions_per_group.saturating_sub(1)),
+                )
+                .map_or(true, |(start, logical_end, _)| start == logical_end)
         })
     })
 }
@@ -3001,9 +3084,15 @@ fn layout_shards_are_nonempty(tensor: &TensorType) -> bool {
             >= u64::from(tensor.format.layout.tiling.tile_count);
     }
     tensor.format.layout.tiling.axes.iter().all(|axis| {
-        axis.axis
-            .resolve(padded.0.len())
-            .is_ok_and(|index| padded.0[index] / axis.block_size >= u32::from(axis.partitions))
+        axis.axis.resolve(padded.0.len()).is_ok_and(|index| {
+            let partitions_per_group = axis.partitions / axis.padding_groups;
+            axis.shard_bounds(
+                padded.0[index],
+                tensor.shape.0[index],
+                u32::from(partitions_per_group.saturating_sub(1)),
+            )
+            .is_ok_and(|(start, logical_end, _)| start < logical_end)
+        })
     })
 }
 
@@ -3212,6 +3301,24 @@ pub(crate) fn lower_finalists(
                         .tiling
                         .tile_count)
                     .collect::<BTreeSet<_>>(),
+                padding_group_counts = ?branch.operations
+                    .iter()
+                    .flat_map(|operation| operation.results.iter())
+                    .flat_map(|result| branch.state.values[result.index() as usize]
+                        .tensor_type
+                        .format
+                        .layout
+                        .tiling
+                        .axes
+                        .iter()
+                        .map(|axis| axis.padding_groups))
+                    .filter(|groups| *groups > 1)
+                    .collect::<BTreeSet<_>>(),
+                conversion_sources = ?branch.operations
+                    .iter()
+                    .filter(|operation| operation.conversion_plan.is_some())
+                    .map(|operation| operation.source)
+                    .collect::<Vec<_>>(),
                 "retained operator-plan finalist"
             );
             tracing::debug!(
@@ -3223,6 +3330,16 @@ pub(crate) fn lower_finalists(
                         &plan.dispatch,
                         plan.requirements.inputs.iter().map(|input| &input.format.layout).collect::<Vec<_>>(),
                         &plan.requirements.output.format.layout,
+                        operation.estimated_cycles,
+                        operation.estimated_exchange_cycles,
+                    )))
+                    .collect::<Vec<_>>(),
+                conversions = ?branch.operations
+                    .iter()
+                    .filter_map(|operation| operation.conversion_plan.as_ref().map(|plan| (
+                        operation.source,
+                        &plan.input.format.layout,
+                        &plan.output.format.layout,
                         operation.estimated_cycles,
                         operation.estimated_exchange_cycles,
                     )))
@@ -3374,12 +3491,19 @@ struct RankedBeamBranch {
 struct FutureFormatCompatibility(
     Vec<(
         ValueId,
+        FutureFormatRole,
         Precision,
         ElementOrderCompatibility,
         MemoryClass,
-        Vec<(TensorAxis, u32)>,
+        Vec<(TensorAxis, u16, u32)>,
     )>,
 );
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FutureFormatRole {
+    Value,
+    DeferredSource,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ElementOrderCompatibility {
@@ -3406,29 +3530,49 @@ fn future_format_compatibility(
     branch: &BeamBranch,
     future_origins: &BTreeSet<ValueId>,
 ) -> FutureFormatCompatibility {
-    FutureFormatCompatibility(
-        future_origins
+    let mut formats = Vec::new();
+    for &origin in future_origins {
+        let Some(&id) = branch.values.get(&origin) else {
+            continue;
+        };
+        let mut add = |role, format: &TensorFormat| {
+            let axes = format
+                .layout
+                .tiling
+                .axes
+                .iter()
+                .map(|axis| (axis.axis, axis.padding_groups, axis.shard_padding_multiple))
+                .collect();
+            formats.push((
+                origin,
+                role,
+                format.precision,
+                element_order_compatibility(format.layout.order),
+                format.layout.memory_class,
+                axes,
+            ));
+        };
+        add(
+            FutureFormatRole::Value,
+            &branch.state.get(id).tensor_type.format,
+        );
+        let deferred_source = branch
+            .operations
             .iter()
-            .filter_map(|&origin| {
-                let id = branch.values.get(&origin)?;
-                let format = &branch.state.get(*id).tensor_type.format;
-                let axes = format
-                    .layout
-                    .tiling
-                    .axes
-                    .iter()
-                    .map(|axis| (axis.axis, axis.shard_padding_multiple))
-                    .collect();
-                Some((
-                    origin,
-                    format.precision,
-                    element_order_compatibility(format.layout.order),
-                    format.layout.memory_class,
-                    axes,
-                ))
-            })
-            .collect(),
-    )
+            .rev()
+            .find(|operation| operation.results.first() == Some(&id))
+            .and_then(|operation| {
+                let offer = operation.operator_plan.as_ref()?.deferred_output?;
+                operation.inputs.get(offer.source_input).copied()
+            });
+        if let Some(source) = deferred_source {
+            add(
+                FutureFormatRole::DeferredSource,
+                &branch.state.get(source).tensor_type.format,
+            );
+        }
+    }
+    FutureFormatCompatibility(formats)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -3613,6 +3757,13 @@ fn lower_operation_candidates(
                 &output_shape,
                 &value_uses,
             );
+            let direct_consumer_layouts = direct_consumer_layouts(
+                source,
+                operation_index,
+                operation.results[0],
+                &output_shape,
+                config,
+            );
             let parameter_inputs = input_ids
                 .iter()
                 .map(|id| branch.state.parameter_values.contains(id))
@@ -3646,6 +3797,7 @@ fn lower_operation_candidates(
                     costs,
                     distributed_result_is_useful,
                     grouped_output,
+                    &direct_consumer_layouts,
                 );
                 plan_cache.entry(cache_key).or_insert(generated)
             };
@@ -4470,6 +4622,19 @@ struct GroupedOutputLayout {
     physical_lane_multiple: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParallelGridProxy {
+    compute: u64,
+    communication: u64,
+    temporary_bytes: u64,
+    unused_tiles: u64,
+    row_partitions: u16,
+    column_partitions: u16,
+    inner_partitions: u16,
+    physical_column_groups: u16,
+    grouped: bool,
+}
+
 fn grouped_output_layout(
     source: &[Operation],
     operation_index: usize,
@@ -4495,6 +4660,58 @@ fn grouped_output_layout(
     })
 }
 
+fn direct_consumer_layouts(
+    source: &[Operation],
+    operation_index: usize,
+    result: ValueId,
+    output: &TensorShape,
+    config: &PipelineConfig,
+) -> Vec<Layout> {
+    let Ok(streams) = u16::try_from(output.0.first().copied().unwrap_or(0)) else {
+        return Vec::new();
+    };
+    if streams == 0 {
+        return Vec::new();
+    }
+    let Some(&rows) = output.0.get(1) else {
+        return Vec::new();
+    };
+    let query_partitions = u16::try_from(rows)
+        .unwrap_or(u16::MAX)
+        .min(config.tile_count / streams);
+    let key_partitions = u16::try_from(rows.div_ceil(AMP_INNER_BLOCK))
+        .unwrap_or(u16::MAX)
+        .min(config.tile_count / streams);
+    let mut layouts = Vec::new();
+    for consumer in &source[operation_index + 1..] {
+        for input_index in consumer
+            .inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &input)| (input == result).then_some(index))
+        {
+            let layout = match (&consumer.kind, input_index) {
+                (OperationKind::FlashAttention(_), 0) if query_partitions != 0 => {
+                    Some(Layout::attention_query(streams, query_partitions))
+                }
+                (OperationKind::FlashAttention(_), 1) if key_partitions != 0 => {
+                    Some(Layout::attention_key(streams, key_partitions))
+                }
+                (OperationKind::FlashAttention(_), 2) if key_partitions != 0 => Some(
+                    Layout::attention_block_major_key_value(streams, key_partitions),
+                ),
+                _ => None,
+            };
+            if let Some(layout) = layout
+                && !layouts.contains(&layout)
+            {
+                layouts.push(layout);
+            }
+        }
+    }
+    layouts
+}
+
 fn plans(
     operation: &Operation,
     inputs: &[TensorType],
@@ -4504,6 +4721,7 @@ fn plans(
     costs: &impl CostModel,
     distributed_result_is_useful: bool,
     grouped_output: Option<GroupedOutputLayout>,
+    direct_consumer_layouts: &[Layout],
 ) -> Vec<Plan> {
     let mut plans = Vec::new();
     let gemm_constraint = config
@@ -4520,13 +4738,20 @@ fn plans(
         let key_partitions = u16::try_from(output.0[1].div_ceil(AMP_INNER_BLOCK))
             .unwrap_or(u16::MAX)
             .min(config.tile_count / streams);
-        let layouts = [
-            (query_partitions != 0).then(|| Layout::attention_query(streams, query_partitions)),
-            (key_partitions != 0).then(|| Layout::attention_key(streams, key_partitions)),
-            (key_partitions != 0)
-                .then(|| Layout::attention_block_major_key_value(streams, key_partitions)),
-        ];
-        for layout in layouts.into_iter().flatten() {
+        let layouts = if direct_consumer_layouts.is_empty() {
+            [
+                (query_partitions != 0).then(|| Layout::attention_query(streams, query_partitions)),
+                (key_partitions != 0).then(|| Layout::attention_key(streams, key_partitions)),
+                (key_partitions != 0)
+                    .then(|| Layout::attention_block_major_key_value(streams, key_partitions)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+        } else {
+            direct_consumer_layouts.to_vec()
+        };
+        for layout in layouts {
             let plan = Plan {
                 operator: MidOperator::SplitHeads(options),
                 dispatch: OperatorDispatch::SplitHeads,
@@ -5123,6 +5348,18 @@ fn parallel_reduction_candidates_for_orientation(
     let Ok(column_groups) = u16::try_from(column_groups) else {
         return Vec::new();
     };
+    let grouped_column_groups = grouped_output.and_then(|grouping| {
+        let groups = u32::from(grouping.groups);
+        (groups != 0 && columns.is_multiple_of(groups)).then(|| {
+            let columns_per_group = columns / groups;
+            columns_per_group
+                .div_ceil(grouping.physical_lane_multiple)
+                .saturating_mul(groups)
+        })
+    });
+    let grouped_column_groups = grouped_column_groups
+        .and_then(|groups| u16::try_from(groups).ok())
+        .filter(|groups| *groups >= column_groups);
     let output_seed_partitions = candidate
         .output
         .format
@@ -5146,103 +5383,113 @@ fn parallel_reduction_candidates_for_orientation(
         });
     let mut grids = Vec::new();
     for inner_partitions in 2..=inner_groups.min(tile_count) {
-        let maximum_columns = column_groups.min(tile_count / inner_partitions);
+        let maximum_columns = grouped_column_groups
+            .unwrap_or(column_groups)
+            .min(tile_count / inner_partitions);
         for column_partitions in 1..=maximum_columns {
-            let row_partitions = (tile_count / inner_partitions / column_partitions)
-                .min(u16::try_from(rows).unwrap_or(u16::MAX));
-            let used_tiles = row_partitions
-                .saturating_mul(column_partitions)
-                .saturating_mul(inner_partitions);
-            if used_tiles < tile_count.div_ceil(2) {
-                continue;
+            let grouped_options = [
+                (column_partitions <= column_groups).then_some((false, column_groups)),
+                grouped_output.and_then(|grouping| {
+                    let physical = grouped_column_groups?;
+                    column_partitions
+                        .is_multiple_of(grouping.groups)
+                        .then_some((true, physical))
+                }),
+            ];
+            for (grouped, physical_column_groups) in grouped_options.into_iter().flatten() {
+                let row_partitions = (tile_count / inner_partitions / column_partitions)
+                    .min(u16::try_from(rows).unwrap_or(u16::MAX));
+                let used_tiles = row_partitions
+                    .saturating_mul(column_partitions)
+                    .saturating_mul(inner_partitions);
+                if used_tiles < tile_count.div_ceil(2) || u32::from(row_partitions) > rows {
+                    continue;
+                }
+                let local_rows = rows.div_ceil(u32::from(row_partitions));
+                let local_columns =
+                    u32::from(physical_column_groups).div_ceil(u32::from(column_partitions));
+                let local_inner = u32::from(inner_groups).div_ceil(u32::from(inner_partitions));
+                if u32::from(inner_partitions - 1).saturating_mul(local_inner)
+                    >= u32::from(inner_groups)
+                {
+                    continue;
+                }
+                // Retain grids by the generated kernel's actual K16 x C16
+                // invocation structure, including its fixed weight-feed and
+                // worker/supervisor cost. Pure arithmetic work is almost
+                // constant across grids and incorrectly favors tiny row runs.
+                let row_run_cycles = outer_rows
+                    .saturating_mul(u64::from(local_rows))
+                    .saturating_mul(4)
+                    .saturating_add(AMP_F16_MICROBLOCK_FIXED_CYCLES);
+                let compute = u64::from(local_columns)
+                    .saturating_mul(u64::from(local_inner))
+                    .saturating_mul(row_run_cycles);
+                let communication = u64::from(local_columns)
+                    .saturating_mul(u64::from(local_inner))
+                    .saturating_add(u64::from(local_rows).saturating_mul(u64::from(local_inner)))
+                    .saturating_add(
+                        u64::from(local_rows)
+                            .saturating_mul(u64::from(local_columns))
+                            .saturating_mul(u64::from(inner_partitions - 1)),
+                    );
+                let left_bytes = outer_rows
+                    .saturating_mul(u64::from(local_rows))
+                    .saturating_mul(u64::from(local_inner))
+                    .saturating_mul(u64::from(AMP_COLUMN_MICRO))
+                    .saturating_mul(
+                        candidate.inputs[match orientation {
+                            GemmOrientation::Normal => 0,
+                            GemmOrientation::Swapped => 1,
+                        }]
+                        .format
+                        .precision
+                        .bytes(),
+                    );
+                let right_bytes = u64::from(local_columns)
+                    .saturating_mul(u64::from(AMP_COLUMN_MICRO))
+                    .saturating_mul(u64::from(local_inner))
+                    .saturating_mul(u64::from(AMP_COLUMN_MICRO))
+                    .saturating_mul(
+                        candidate.inputs[match orientation {
+                            GemmOrientation::Normal => 1,
+                            GemmOrientation::Swapped => 0,
+                        }]
+                        .format
+                        .precision
+                        .bytes(),
+                    );
+                let partial_bytes = outer_rows
+                    .saturating_mul(u64::from(local_rows))
+                    .saturating_mul(u64::from(local_columns))
+                    .saturating_mul(u64::from(AMP_COLUMN_MICRO))
+                    .saturating_mul(candidate.output.format.precision.bytes());
+                // Operand staging and the local partial coexist during
+                // convolution. Complete staging is evaluated later by the
+                // ordinary operator-memory model.
+                let convolution_bytes = left_bytes
+                    .saturating_add(right_bytes)
+                    .saturating_add(partial_bytes);
+                let reduction_bytes = partial_bytes.saturating_mul(4);
+                let temporary_bytes = convolution_bytes.max(reduction_bytes);
+                if temporary_bytes > u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+                    || right_bytes.saturating_add(partial_bytes)
+                        > u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+                {
+                    continue;
+                }
+                grids.push(ParallelGridProxy {
+                    compute,
+                    communication,
+                    temporary_bytes,
+                    unused_tiles: u64::from(tile_count - used_tiles),
+                    row_partitions,
+                    column_partitions,
+                    inner_partitions,
+                    physical_column_groups,
+                    grouped,
+                });
             }
-            if u32::from(row_partitions) > rows {
-                continue;
-            }
-            let local_rows = rows.div_ceil(u32::from(row_partitions));
-            let local_columns = u32::from(column_groups).div_ceil(u32::from(column_partitions));
-            let local_inner = u32::from(inner_groups).div_ceil(u32::from(inner_partitions));
-            if u32::from(inner_partitions - 1).saturating_mul(local_inner)
-                >= u32::from(inner_groups)
-            {
-                continue;
-            }
-            // Retain grids by the generated kernel's actual K16 x C16
-            // invocation structure, including its fixed weight-feed and
-            // worker/supervisor cost. Pure arithmetic work is almost constant
-            // across grids and incorrectly favors many tiny row runs.
-            let row_run_cycles = outer_rows
-                .saturating_mul(u64::from(local_rows))
-                .saturating_mul(4)
-                .saturating_add(AMP_F16_MICROBLOCK_FIXED_CYCLES);
-            let compute = u64::from(local_columns)
-                .saturating_mul(u64::from(local_inner))
-                .saturating_mul(row_run_cycles);
-            let communication = u64::from(local_columns)
-                .saturating_mul(u64::from(local_inner))
-                .saturating_add(u64::from(local_rows).saturating_mul(u64::from(local_inner)))
-                .saturating_add(
-                    u64::from(local_rows)
-                        .saturating_mul(u64::from(local_columns))
-                        .saturating_mul(u64::from(inner_partitions - 1)),
-                );
-            let left_bytes = outer_rows
-                .saturating_mul(u64::from(local_rows))
-                .saturating_mul(u64::from(local_inner))
-                .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                .saturating_mul(
-                    candidate.inputs[match orientation {
-                        GemmOrientation::Normal => 0,
-                        GemmOrientation::Swapped => 1,
-                    }]
-                    .format
-                    .precision
-                    .bytes(),
-                );
-            let right_bytes = u64::from(local_columns)
-                .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                .saturating_mul(u64::from(local_inner))
-                .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                .saturating_mul(
-                    candidate.inputs[match orientation {
-                        GemmOrientation::Normal => 1,
-                        GemmOrientation::Swapped => 0,
-                    }]
-                    .format
-                    .precision
-                    .bytes(),
-                );
-            let partial_bytes = outer_rows
-                .saturating_mul(u64::from(local_rows))
-                .saturating_mul(u64::from(local_columns))
-                .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                .saturating_mul(candidate.output.format.precision.bytes());
-            // Operand staging and the local partial coexist during convolution.
-            // A streamed reduction needs one initial, one remote partial, one
-            // result, and the local interleaved partial. Complete staging is
-            // evaluated later by the ordinary operator-memory model.
-            let convolution_bytes = left_bytes
-                .saturating_add(right_bytes)
-                .saturating_add(partial_bytes);
-            let reduction_bytes = partial_bytes.saturating_mul(4);
-            let temporary_bytes = convolution_bytes.max(reduction_bytes);
-            if temporary_bytes > u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES) {
-                continue;
-            }
-            if right_bytes.saturating_add(partial_bytes)
-                > u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
-            {
-                continue;
-            }
-            grids.push((
-                compute,
-                communication,
-                temporary_bytes,
-                u64::from(tile_count - used_tiles),
-                row_partitions,
-                column_partitions,
-                inner_partitions,
-            ));
         }
     }
     let generated_grids = grids.len();
@@ -5251,23 +5498,26 @@ fn parallel_reduction_candidates_for_orientation(
             .into_iter()
             .filter(|grid| {
                 orientation == constraint.orientation
-                    && grid.4 == constraint.row_partitions
-                    && grid.5 == constraint.column_partitions
-                    && grid.6 == constraint.inner_partitions
+                    && grid.row_partitions == constraint.row_partitions
+                    && grid.column_partitions == constraint.column_partitions
+                    && grid.inner_partitions == constraint.inner_partitions
             })
             .collect::<Vec<_>>()
     } else {
         // Peak temporary storage and unused tiles are independent planning
         // constraints, so retain every non-dominated proxy tradeoff until the
         // precise operator estimator can rank it.
-        let dominates = |left: &(u64, u64, u64, u64, u16, u16, u16),
-                         right: &(u64, u64, u64, u64, u16, u16, u16)| {
-            left.6 == right.6
-                && left.0 <= right.0
-                && left.1 <= right.1
-                && left.2 <= right.2
-                && left.3 <= right.3
-                && (left.0 < right.0 || left.1 < right.1 || left.2 < right.2 || left.3 < right.3)
+        let dominates = |left: &ParallelGridProxy, right: &ParallelGridProxy| {
+            left.inner_partitions == right.inner_partitions
+                && left.grouped == right.grouped
+                && left.compute <= right.compute
+                && left.communication <= right.communication
+                && left.temporary_bytes <= right.temporary_bytes
+                && left.unused_tiles <= right.unused_tiles
+                && (left.compute < right.compute
+                    || left.communication < right.communication
+                    || left.temporary_bytes < right.temporary_bytes
+                    || left.unused_tiles < right.unused_tiles)
         };
         let mut frontier = Vec::new();
         for grid in grids {
@@ -5277,19 +5527,38 @@ fn parallel_reduction_candidates_for_orientation(
             frontier.retain(|kept| !dominates(&grid, kept));
             frontier.push(grid);
         }
-        frontier.sort_unstable();
+        frontier.sort_by_key(|grid| {
+            (
+                grid.compute,
+                grid.communication,
+                grid.temporary_bytes,
+                grid.unused_tiles,
+                grid.row_partitions,
+                grid.column_partitions,
+                grid.inner_partitions,
+                grid.grouped,
+            )
+        });
         frontier
     };
     let proxy_frontier_grids = grids.len();
     let mut variants = Vec::new();
-    for (_, _, _, _, row_partitions, column_partitions, inner_partitions) in grids {
+    for grid in grids {
+        let ParallelGridProxy {
+            row_partitions,
+            column_partitions,
+            inner_partitions,
+            physical_column_groups,
+            grouped,
+            ..
+        } = grid;
         let used_tiles = row_partitions
             .saturating_mul(column_partitions)
             .saturating_mul(inner_partitions);
         let kernel_inner_block = u32::from(inner_groups)
             .div_ceil(u32::from(inner_partitions))
             .saturating_mul(AMP_COLUMN_MICRO);
-        let kernel_output_columns = u32::from(column_groups)
+        let kernel_output_columns = u32::from(physical_column_groups)
             .div_ceil(u32::from(column_partitions))
             .saturating_mul(AMP_COLUMN_MICRO);
         let Ok(kernel_inner_block_u16) = u16::try_from(kernel_inner_block) else {
@@ -5542,11 +5811,14 @@ fn parallel_reduction_candidates_for_orientation(
                 );
                 layout_variants.push(result_layout);
             }
-            for layout_variant in layout_variants {
-                let grouped_variant = grouped_output.and_then(|grouping| {
-                    let mut grouped = layout_variant.clone();
-                    apply_grouped_output_layout(&mut grouped, grouping).then_some(grouped)
-                });
+            for mut layout_variant in layout_variants {
+                if grouped
+                    && !grouped_output.is_some_and(|grouping| {
+                        apply_grouped_output_layout(&mut layout_variant, grouping)
+                    })
+                {
+                    continue;
+                }
                 for &local_staging in local_staging_options {
                     let mut staged = layout_variant.clone();
                     staged.inputs[physical_right_index].local_staging = local_staging;
@@ -5562,21 +5834,6 @@ fn parallel_reduction_candidates_for_orientation(
                         *reduction_staging = ReductionStaging::Streamed;
                     }
                     variants.push(staged);
-                    if let Some(mut grouped) = grouped_variant.clone() {
-                        grouped.inputs[physical_right_index].local_staging = local_staging;
-                        variants.push(grouped.clone());
-                        if let OperatorDispatch::BlockedGemm {
-                            distribution:
-                                GemmDistribution::ParallelReduction {
-                                    reduction_staging, ..
-                                },
-                            ..
-                        } = &mut grouped.dispatch
-                        {
-                            *reduction_staging = ReductionStaging::Streamed;
-                        }
-                        variants.push(grouped);
-                    }
                 }
             }
         }
@@ -5592,7 +5849,7 @@ fn parallel_reduction_candidates_for_orientation(
                 .tiling
                 .axes
                 .iter()
-                .any(|axis| axis.shard_padding_multiple > 1)
+                .any(|axis| axis.padding_groups > 1)
         })
         .count();
     let retained = if let Some(constraint) = constraint {
@@ -5626,7 +5883,7 @@ fn parallel_reduction_candidates_for_orientation(
                 .tiling
                 .axes
                 .iter()
-                .any(|axis| axis.shard_padding_multiple > 1))
+                .any(|axis| axis.padding_groups > 1))
             .count(),
         retained_variants = retained.len(),
         "retained parallel GEMM candidates"
@@ -5664,7 +5921,7 @@ struct OperatorCandidateCompatibility {
     output: (
         ElementOrderCompatibility,
         MemoryClass,
-        Vec<(TensorAxis, u32)>,
+        Vec<(TensorAxis, u16, u32)>,
     ),
 }
 
@@ -5707,7 +5964,7 @@ fn operator_candidate_compatibility(
                 .tiling
                 .axes
                 .iter()
-                .map(|axis| (axis.axis, axis.shard_padding_multiple))
+                .map(|axis| (axis.axis, axis.padding_groups, axis.shard_padding_multiple))
                 .collect(),
         ),
     }
@@ -5850,15 +6107,16 @@ fn apply_grouped_output_layout(
         else {
             return false;
         };
-        if axis.partitions != grouping.groups {
+        if !axis.partitions.is_multiple_of(grouping.groups) {
             return false;
         }
-        // Partition in logical elements so each group retains its semantic
-        // boundary, then round only that partition's allocation for the
-        // physical consumer panel.
-        axis.block_size = 1;
-        axis.padding_multiple = 1;
-        axis.shard_padding_multiple = grouping.physical_lane_multiple;
+        // Subdivide every semantic group independently. This permits several
+        // shards per group while keeping padding at the group boundary rather
+        // than inserting it at unrelated grid boundaries.
+        axis.block_size = grouping.physical_lane_multiple;
+        axis.padding_multiple = grouping.physical_lane_multiple;
+        axis.padding_groups = grouping.groups;
+        axis.shard_padding_multiple = 1;
         axis.padding = Padding::Zero;
         true
     };
