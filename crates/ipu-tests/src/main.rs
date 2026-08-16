@@ -809,9 +809,13 @@ fn main() -> Result<()> {
             .context("--export-exchange-schedule requires a newly compiled package")?;
         let output =
             fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-        serde_json::to_writer(std::io::BufWriter::new(output), &compiled.exchange_schedule)
-            .with_context(|| format!("write {}", path.display()))?;
+        serde_json::to_writer(
+            std::io::BufWriter::new(output),
+            &compiled.exchanges.exchange_schedule,
+        )
+        .with_context(|| format!("write {}", path.display()))?;
         let transfers = compiled
+            .exchanges
             .exchange_schedule
             .phases
             .iter()
@@ -820,8 +824,8 @@ fn main() -> Result<()> {
         println!(
             "exchangeSchedule={} tiles={} phases={} transfers={}",
             path.display(),
-            compiled.exchange_schedule.tile_count,
-            compiled.exchange_schedule.phases.len(),
+            compiled.exchanges.exchange_schedule.tile_count,
+            compiled.exchanges.exchange_schedule.phases.len(),
             transfers
         );
         return Ok(());
@@ -1655,13 +1659,14 @@ fn run_siglip_mlp_benchmark(
         bail!("benchmark clock must be nonzero");
     }
     let (host_inputs, weights, left_bytes) =
-        diagnostic::prepare_inputs(graph, application, &package.inputs)?;
-    let references = diagnostic::evaluate(graph, host_inputs, &package.precisions)?;
+        diagnostic::prepare_inputs(graph, application, &package.tensors.inputs)?;
+    let references = diagnostic::evaluate(graph, host_inputs, &package.tensors.precisions)?;
 
     let output =
         run_initialized_program(runtime, application, &weights, &left_bytes, timeout_seconds)?;
 
     let output_metadata = package
+        .tensors
         .outputs
         .iter()
         .find(|tensor| tensor.name.as_deref() == Some("output.0"))

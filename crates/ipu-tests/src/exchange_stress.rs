@@ -805,6 +805,7 @@ pub(crate) fn build_phase_replay(
     runtime_source: &Path,
 ) -> Result<PhaseReplayPackage> {
     let phase = compiled
+        .exchanges
         .exchange_phases
         .get(phase_index)
         .with_context(|| format!("exchange phase {phase_index} is out of range"))?;

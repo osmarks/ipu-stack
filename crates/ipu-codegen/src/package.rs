@@ -98,26 +98,21 @@ pub struct TileProgramData {
 #[derive(Clone, Debug)]
 pub struct CompiledPackage {
     pub application: Application,
+    pub tensors: PackageTensorMetadata,
+    pub exchanges: PackageExchangeArtifacts,
+    pub checkpoints: Vec<DiagnosticCheckpoint>,
+    placement: crate::Placement,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PackageTensorMetadata {
     pub inputs: Vec<DiagnosticTensor>,
     pub outputs: Vec<DiagnosticTensor>,
     pub precisions: BTreeMap<ValueId, Precision>,
-    /// Exact physical exchange schedules retained for low-level diagnostics.
-    /// This is build metadata and is not serialized into the application.
-    pub exchange_phases: Vec<crate::PhysicalExchangePhase>,
-    /// Address-resolved inputs to physical exchange scheduling and row codegen.
-    pub exchange_schedule: crate::ExchangeScheduleSnapshot,
-    /// Base address used when laying out the compact per-tile exchange table.
-    pub exchange_code_base: u32,
 }
 
-/// A loadable package plus the exact device storage visible at each semantic
-/// operator checkpoint.
 #[derive(Clone, Debug)]
-pub struct DiagnosticPackage {
-    pub application: Application,
-    pub inputs: Vec<DiagnosticTensor>,
-    pub checkpoints: Vec<DiagnosticCheckpoint>,
-    pub precisions: BTreeMap<ValueId, Precision>,
+pub struct PackageExchangeArtifacts {
     /// Exact physical exchange schedules retained for low-level diagnostics.
     /// This is build metadata and is not serialized into the application.
     pub exchange_phases: Vec<crate::PhysicalExchangePhase>,
@@ -148,14 +143,6 @@ pub struct DiagnosticShard {
     pub physical_tile: u16,
     pub address: u32,
     pub storage: crate::LowShard,
-}
-
-struct BuiltApplication {
-    application: Application,
-    placement: crate::Placement,
-    exchange_phases: Vec<crate::PhysicalExchangePhase>,
-    exchange_schedule: crate::ExchangeScheduleSnapshot,
-    exchange_code_base: u32,
 }
 
 /// Builds an application from address-resolved tile programs.
@@ -534,34 +521,10 @@ pub fn build_package(
     graph: &ComputeGraph,
     config: &PackageConfig,
 ) -> PackageBuildResult<CompiledPackage> {
-    let (built, mid, low) = build_package_artifacts(graph, config, false)?;
+    let (mut built, mid, low) = build_package_artifacts(graph, config, false)?;
     let topology = active_topology(low.tile_count)?;
-    let inputs = package_inputs(&mid, &low, &built.placement, &topology)?;
-    let outputs = low
-        .outputs
-        .iter()
-        .enumerate()
-        .map(|(index, output)| {
-            diagnostic_tensor(
-                &mid,
-                &low,
-                &built.placement,
-                &topology,
-                output.value,
-                Some(format!("output.{index}")),
-            )
-        })
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-    let precisions = package_precisions(&mid);
-    Ok(CompiledPackage {
-        application: built.application,
-        inputs,
-        outputs,
-        precisions,
-        exchange_phases: built.exchange_phases,
-        exchange_schedule: built.exchange_schedule,
-        exchange_code_base: built.exchange_code_base,
-    })
+    built.tensors = package_tensors(&mid, &low, &built.placement, &topology)?;
+    Ok(built)
 }
 
 /// Builds an ordinary optimized package with resumable PBRK0 traps after each
@@ -570,10 +533,9 @@ pub fn build_package(
 pub fn build_diagnostic_package(
     graph: &ComputeGraph,
     config: &PackageConfig,
-) -> PackageBuildResult<DiagnosticPackage> {
-    let (built, mid, low) = build_package_artifacts(graph, config, true)?;
+) -> PackageBuildResult<CompiledPackage> {
+    let (mut built, mid, low) = build_package_artifacts(graph, config, true)?;
     let topology = active_topology(low.tile_count)?;
-    let inputs = package_inputs(&mid, &low, &built.placement, &topology)?;
     let mut checkpoints = Vec::new();
     for operation in &mid.operations {
         if !matches!(
@@ -615,15 +577,9 @@ pub fn build_diagnostic_package(
             tensors,
         });
     }
-    Ok(DiagnosticPackage {
-        application: built.application,
-        inputs,
-        checkpoints,
-        precisions: package_precisions(&mid),
-        exchange_phases: built.exchange_phases,
-        exchange_schedule: built.exchange_schedule,
-        exchange_code_base: built.exchange_code_base,
-    })
+    built.tensors = package_tensors(&mid, &low, &built.placement, &topology)?;
+    built.checkpoints = checkpoints;
+    Ok(built)
 }
 
 fn package_precisions(mid: &MidGraph) -> BTreeMap<ValueId, Precision> {
@@ -633,13 +589,14 @@ fn package_precisions(mid: &MidGraph) -> BTreeMap<ValueId, Precision> {
         .collect()
 }
 
-fn package_inputs(
+fn package_tensors(
     mid: &MidGraph,
     low: &LowProgram,
     placement: &crate::Placement,
     topology: &Topology,
-) -> PackageBuildResult<Vec<DiagnosticTensor>> {
-    low.inputs
+) -> PackageBuildResult<PackageTensorMetadata> {
+    let inputs = low
+        .inputs
         .iter()
         .map(|input| {
             diagnostic_tensor(
@@ -651,14 +608,34 @@ fn package_inputs(
                 Some(input.name.clone()),
             )
         })
-        .collect()
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    let outputs = low
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            diagnostic_tensor(
+                mid,
+                low,
+                placement,
+                topology,
+                output.value,
+                Some(format!("output.{index}")),
+            )
+        })
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    Ok(PackageTensorMetadata {
+        inputs,
+        outputs,
+        precisions: package_precisions(mid),
+    })
 }
 
 fn build_package_artifacts(
     graph: &ComputeGraph,
     config: &PackageConfig,
     diagnostic_checkpoints: bool,
-) -> PackageBuildResult<(BuiltApplication, MidGraph, LowProgram)> {
+) -> PackageBuildResult<(CompiledPackage, MidGraph, LowProgram)> {
     validate_tile_count(u32::from(config.pipeline.tile_count))?;
     let mut planning = config.pipeline.clone();
     planning.diagnostic_checkpoints = diagnostic_checkpoints;
@@ -781,7 +758,7 @@ fn build_package_from_objects(
     config: &PackageConfig,
     objects: &[Vec<u8>],
     kernel_plan: &KernelBuildPlan,
-) -> PackageBuildResult<BuiltApplication> {
+) -> PackageBuildResult<CompiledPackage> {
     let topology = active_topology(program.tile_count)?;
     let retained_runtime = runtime_retained_symbols(program, config);
     let layout = build_phase("link_runtime", || {
@@ -1318,12 +1295,16 @@ fn build_package_from_objects(
     });
     application.host_exchange = host.protocol;
     application.validate()?;
-    Ok(BuiltApplication {
+    Ok(CompiledPackage {
         application,
+        tensors: PackageTensorMetadata::default(),
+        exchanges: PackageExchangeArtifacts {
+            exchange_phases: exchanges,
+            exchange_schedule,
+            exchange_code_base,
+        },
+        checkpoints: Vec::new(),
         placement,
-        exchange_phases: exchanges,
-        exchange_schedule,
-        exchange_code_base,
     })
 }
 

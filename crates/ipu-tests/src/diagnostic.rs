@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use ipu_codegen::{
-    AttentionScale, ComputeGraph, DiagnosticPackage, DiagnosticTensor, GemmOptions, Operation,
+    AttentionScale, CompiledPackage, ComputeGraph, DiagnosticTensor, GemmOptions, Operation,
     OperationKind, Precision, Region, Repeat, ShardExtent, ShardView, ValueId,
     logical_view_byte_spans,
 };
@@ -28,14 +28,15 @@ pub(crate) type PreparedInputs = (BTreeMap<ValueId, HostTensor>, Vec<u8>, Vec<u8
 pub fn run(
     runtime: &Runtime,
     graph: &ComputeGraph,
-    package: &DiagnosticPackage,
+    package: &CompiledPackage,
     samples: usize,
     atol: f32,
     rtol: f32,
     timeout: Duration,
 ) -> Result<()> {
-    let (values, weights, inputs) = prepare_inputs(graph, &package.application, &package.inputs)?;
-    let references = evaluate(graph, values, &package.precisions)?;
+    let (values, weights, inputs) =
+        prepare_inputs(graph, &package.application, &package.tensors.inputs)?;
+    let references = evaluate(graph, values, &package.tensors.precisions)?;
     let mut session = runtime.host_session(&package.application)?;
     session.start()?;
     if !package.application.weights.is_empty() {
@@ -92,7 +93,7 @@ pub fn run(
 fn service_checkpoint(
     device: &Device,
     application: &Application,
-    package: &DiagnosticPackage,
+    package: &CompiledPackage,
     references: &BTreeMap<ValueId, HostTensor>,
     next: &mut usize,
     waiting_for_resume: &mut bool,
