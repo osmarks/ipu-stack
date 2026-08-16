@@ -3,8 +3,8 @@ use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
     AmpOrder, AttentionStrategy, BlockMajorOrder, CompiledPackage, ComputeGraph, DiagnosticTensor,
-    GemmOrientation, GemmPlanConstraint, Layout, LocalOperandStaging, MemoryClass, MidOperator,
-    PackageConfig, PipelineConfig, Precision, ReductionStaging, TensorFormat,
+    GemmOrientation, GemmPlanConstraint, Layout, LocalOperandStaging, MemoryClass, OperatorClass,
+    PackageConfig, PipelineConfig, PlannerSearchDomain, Precision, ReductionStaging, TensorFormat,
     amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
     build_package,
 };
@@ -550,12 +550,17 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let mut graph = ComputeGraph::default();
-    let mut pipeline = PipelineConfig::new(active_tiles);
-    pipeline = pipeline.with_exchange_schedule_finalists(arguments.exchange_schedule_finalists);
-    pipeline = pipeline.with_attention_strategy(arguments.attention_strategy.into());
+    let mut search_domain =
+        PlannerSearchDomain::default().with_attention_strategy(arguments.attention_strategy.into());
     for constraint in &arguments.gemm_plan_constraint {
-        pipeline = pipeline.with_gemm_plan_constraint(*constraint);
+        search_domain = search_domain.with_gemm_plan_constraint(*constraint);
     }
+    if matches!(arguments.workload, Workload::SiglipAttentionBenchmark) {
+        search_domain =
+            search_domain.with_operator_precisions(OperatorClass::Gemm, [Precision::F16]);
+    }
+    let mut pipeline = PipelineConfig::new(active_tiles).with_search_domain(search_domain);
+    pipeline = pipeline.with_exchange_schedule_finalists(arguments.exchange_schedule_finalists);
     if let Some(kib) = arguments.tile_memory_budget_kib {
         let bytes = kib.checked_mul(1024).context("tile SRAM budget overflow")?;
         pipeline = pipeline.with_tile_memory_budget(bytes);
@@ -648,15 +653,6 @@ fn main() -> Result<()> {
                 .with_automatic_input(query_weights, Precision::F16)
                 .with_automatic_input(key_weights, Precision::F16)
                 .with_automatic_input(value_weights, Precision::F16);
-            // This benchmark compares the two F16 attention strategies. Keep
-            // projection precision controlled as batch size changes instead
-            // of allowing a different GEMM precision to confound the sweep.
-            pipeline.operator_candidates.retain(|candidate| {
-                !matches!(
-                    candidate.operator,
-                    MidOperator::Gemm { multiply, .. } if multiply != Precision::F16
-                )
-            });
             pipeline.profiling.enabled = !arguments.no_profile;
         } else {
             let (heads, query_rows, key_rows) = (4, 17, 19);
@@ -695,9 +691,6 @@ fn main() -> Result<()> {
                         layout: Layout::attention_output(heads, key_partitions),
                     },
                 );
-            // Exercise the tiled attention lowering and its explicit input
-            // conversions rather than the independent whole-head codelet.
-            pipeline.operator_candidates.clear();
             pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Never;
             pipeline.profiling.enabled = !arguments.no_profile;
         }

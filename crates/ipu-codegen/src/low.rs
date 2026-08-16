@@ -5956,11 +5956,13 @@ fn split_mapping_at_panel_boundaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mid::OperatorCandidate;
     use crate::{
         AccumulationPrecision, AxisTiling, ComputeGraph, ElementOrder, GemmDistribution,
         GemmKernelMode, GemmWeightLoad, GridOrder, Ipu21CostModel, Layout, MemoryClass,
-        MidOperator, OperandRequirement, OperatorCandidate, OperatorDispatch, Padding,
-        PipelineConfig, Precision, TensorAxis, TensorFormat, TensorTiling, TileKernelSpec, lower,
+        MidOperator, OperandRequirement, OperatorDispatch, Padding, PipelineConfig,
+        PlannerSearchDomain, Precision, TensorAxis, TensorFormat, TensorTiling, TileKernelSpec,
+        lower,
     };
     use std::collections::BTreeSet;
 
@@ -6135,10 +6137,10 @@ mod tests {
                     reduction_staging,
                 },
             });
-            let mut config = PipelineConfig::new(tiles)
+            let config = PipelineConfig::new(tiles)
                 .with_input(left, left_format)
-                .with_input(right, right_format);
-            config.operator_candidates = vec![candidate];
+                .with_input(right, right_format)
+                .with_test_operator_candidates(vec![candidate]);
             let mid = lower(&graph, &config, &Ipu21CostModel)
                 .unwrap_or_else(|error| panic!("case {case}: {error}"));
             let low = lower_to_tiles(&mid, &config)
@@ -6255,22 +6257,22 @@ mod tests {
                 precision: Precision::F16,
                 layout: Layout::amp_left_result(compute_tiles),
             };
-            let mut config = PipelineConfig::new(compute_tiles)
+            let config = PipelineConfig::new(compute_tiles)
                 .with_input(left, left_format.clone())
                 .with_input(right0, right_format.clone())
-                .with_input(right1, right_format.clone());
-            config.operator_candidates = vec![OperatorCandidate::new(
-                MidOperator::Gemm {
-                    options: crate::GemmOptions::default(),
-                    multiply: Precision::F16,
-                    accumulate: crate::AccumulationPrecision::F16,
-                },
-                [
-                    OperandRequirement::new(left_format, 32).with_access_tail(16),
-                    OperandRequirement::new(right_format, 32),
-                ],
-                OperandRequirement::new(output_format, 32),
-            )];
+                .with_input(right1, right_format.clone())
+                .with_test_operator_candidates(vec![OperatorCandidate::new(
+                    MidOperator::Gemm {
+                        options: crate::GemmOptions::default(),
+                        multiply: Precision::F16,
+                        accumulate: crate::AccumulationPrecision::F16,
+                    },
+                    [
+                        OperandRequirement::new(left_format, 32).with_access_tail(16),
+                        OperandRequirement::new(right_format, 32),
+                    ],
+                    OperandRequirement::new(output_format, 32),
+                )]);
 
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             assert!(mid.operations.iter().all(|operation| {
@@ -6310,12 +6312,13 @@ mod tests {
             let input = graph.host_input("input", [rows, columns]).unwrap();
             let output = graph.gelu(input).unwrap();
             graph.set_outputs([output]).unwrap();
-            let mut config = PipelineConfig::new(tiles).with_input(input, tensor_format.clone());
-            config.operator_candidates = vec![OperatorCandidate::new(
-                MidOperator::Gelu,
-                [OperandRequirement::new(tensor_format.clone(), 8)],
-                OperandRequirement::new(tensor_format, 8),
-            )];
+            let config = PipelineConfig::new(tiles)
+                .with_input(input, tensor_format.clone())
+                .with_test_operator_candidates(vec![OperatorCandidate::new(
+                    MidOperator::Gelu,
+                    [OperandRequirement::new(tensor_format.clone(), 8)],
+                    OperandRequirement::new(tensor_format, 8),
+                )]);
 
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
@@ -6353,7 +6356,7 @@ mod tests {
             let output = graph.gemm(hidden, down).unwrap();
             graph.set_outputs([output]).unwrap();
             let mut config = PipelineConfig::new(16)
-                .with_active_tile_counts([16])
+                .with_search_domain(PlannerSearchDomain::default().with_active_tile_counts([16]))
                 .with_automatic_input(input, Precision::F16)
                 .with_automatic_input(up, Precision::F16)
                 .with_automatic_input(down, Precision::F16);
@@ -6491,12 +6494,13 @@ mod tests {
             let input = graph.host_input("input", [rows, columns]).unwrap();
             let output = graph.gelu(input).unwrap();
             graph.set_outputs([output]).unwrap();
-            let mut config = PipelineConfig::new(tiles).with_input(input, input_format.clone());
-            config.operator_candidates = vec![OperatorCandidate::new(
-                MidOperator::Gelu,
-                [OperandRequirement::new(input_format, 8)],
-                OperandRequirement::new(output_format, 8),
-            )];
+            let config = PipelineConfig::new(tiles)
+                .with_input(input, input_format.clone())
+                .with_test_operator_candidates(vec![OperatorCandidate::new(
+                    MidOperator::Gelu,
+                    [OperandRequirement::new(input_format, 8)],
+                    OperandRequirement::new(output_format, 8),
+                )]);
 
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
@@ -6557,12 +6561,13 @@ mod tests {
             let input = graph.host_input("input", [rows, columns]).unwrap();
             let output = graph.gelu(input).unwrap();
             graph.set_outputs([output]).unwrap();
-            let mut config = PipelineConfig::new(tiles).with_input(input, input_format);
-            config.operator_candidates = vec![OperatorCandidate::new(
-                MidOperator::Gelu,
-                [OperandRequirement::new(target_format.clone(), 8)],
-                OperandRequirement::new(target_format, 8),
-            )];
+            let config = PipelineConfig::new(tiles)
+                .with_input(input, input_format)
+                .with_test_operator_candidates(vec![OperatorCandidate::new(
+                    MidOperator::Gelu,
+                    [OperandRequirement::new(target_format.clone(), 8)],
+                    OperandRequirement::new(target_format, 8),
+                )]);
 
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
@@ -7018,7 +7023,7 @@ mod tests {
             let output = graph.add(left, right).unwrap();
             graph.set_outputs([output]).unwrap();
             let config = PipelineConfig::new(tiles)
-                .with_active_tile_counts([tiles])
+                .with_search_domain(PlannerSearchDomain::default().with_active_tile_counts([tiles]))
                 .with_input(left, format(tiles))
                 .with_input(right, format(tiles));
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
@@ -7124,7 +7129,7 @@ mod tests {
             let output = graph.gemm(left, right).unwrap();
             graph.set_outputs([output]).unwrap();
             let config = PipelineConfig::new(tiles)
-                .with_active_tile_counts([tiles])
+                .with_search_domain(PlannerSearchDomain::default().with_active_tile_counts([tiles]))
                 .with_input(left, format(tiles))
                 .with_input(right, format(tiles));
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
@@ -7288,23 +7293,29 @@ mod tests {
             let mut config = PipelineConfig::new(tiles)
                 .with_automatic_input(left, Precision::F16)
                 .with_automatic_input(right, Precision::F16);
-            config.operator_candidates.retain(|candidate| {
-                matches!(
-                    candidate.dispatch,
-                    OperatorDispatch::BlockedGemm {
-                        distribution: GemmDistribution::OutputStationary,
-                        ..
-                    }
-                ) && candidate.inputs.get(1).is_some_and(|requirement| {
-                    requirement.format.layout.order
-                        == crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
-                            row_block: 64,
-                            column_block: crate::mid::AMP_COLUMN_MICRO as u16,
+            let candidates =
+                crate::mid::resolved_operator_candidates(&config.search_domain, &[tiles])
+                    .into_iter()
+                    .filter(|candidate| {
+                        matches!(
+                            candidate.dispatch,
+                            OperatorDispatch::BlockedGemm {
+                                distribution: GemmDistribution::OutputStationary,
+                                ..
+                            }
+                        ) && candidate.inputs.get(1).is_some_and(|requirement| {
+                            requirement.format.layout.order
+                                == crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
+                                    row_block: 64,
+                                    column_block: crate::mid::AMP_COLUMN_MICRO as u16,
+                                })
+                                && requirement.format.layout.tiling.tile_count == tiles
+                                && requirement.format.layout.memory_class
+                                    == MemoryClass::Ipu21Interleaved
                         })
-                        && requirement.format.layout.tiling.tile_count == tiles
-                        && requirement.format.layout.memory_class == MemoryClass::Ipu21Interleaved
-                })
-            });
+                    })
+                    .collect();
+            config = config.with_test_operator_candidates(candidates);
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let operation = mid
                 .operations
@@ -7395,22 +7406,21 @@ mod tests {
                     crate::mid::GridOrder::ColumnsFast,
                 ),
             };
-            let mut config = PipelineConfig::new(tiles)
+            let config = PipelineConfig::new(tiles)
                 .with_input(left, left_format.clone())
-                .with_input(right, right_format.clone());
-            config.operator_candidates = vec![crate::OperatorCandidate::new(
-                crate::MidOperator::Gemm {
-                    options: crate::GemmOptions::default(),
-                    multiply: Precision::F16,
-                    accumulate: crate::AccumulationPrecision::F32,
-                },
-                [
-                    crate::OperandRequirement::new(left_format, 32).with_access_tail(16),
-                    crate::OperandRequirement::new(right_format, 32)
-                        .with_local_staging(local_staging),
-                ],
-                crate::OperandRequirement::new(output_format, 32),
-            )];
+                .with_input(right, right_format.clone())
+                .with_test_operator_candidates(vec![OperatorCandidate::new(
+                    MidOperator::Gemm {
+                        options: crate::GemmOptions::default(),
+                        multiply: Precision::F16,
+                        accumulate: crate::AccumulationPrecision::F32,
+                    },
+                    [
+                        OperandRequirement::new(left_format, 32).with_access_tail(16),
+                        OperandRequirement::new(right_format, 32).with_local_staging(local_staging),
+                    ],
+                    OperandRequirement::new(output_format, 32),
+                )]);
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
 

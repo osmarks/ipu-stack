@@ -680,8 +680,8 @@ fn layout_exchange_rows(
 mod tests {
     use super::*;
     use crate::{
-        ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, Precision, TensorFormat, lower,
-        lower_exchanges, lower_to_tiles, place,
+        ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, PlannerSearchDomain, Precision,
+        TensorFormat, lower, lower_exchanges, lower_to_tiles, place,
     };
     use ipu_exchange::{RETURN_M10_INSTRUCTION, Topology};
 
@@ -698,7 +698,7 @@ mod tests {
             let output = graph.gemm(left, right).unwrap();
             graph.set_outputs([output]).unwrap();
             let config = PipelineConfig::new(tiles)
-                .with_active_tile_counts([tiles])
+                .with_search_domain(PlannerSearchDomain::default().with_active_tile_counts([tiles]))
                 .with_input(
                     left,
                     TensorFormat {

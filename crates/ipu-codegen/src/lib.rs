@@ -61,9 +61,9 @@ pub use mid::{
     LayoutError, LocalOperandStaging, LoweringError, LoweringResult, MemoryClass, MemoryEstimate,
     MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidGraph, MidInput, MidOperation,
     MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId,
-    OperandMaterialization, OperandRequirement, OperatorCandidate, OperatorDispatch,
-    OperatorFormatPolicy, OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing,
-    Padding, PipelineConfig, PointwiseInputMapping, Precision, ProfilingConfig, ReductionStaging,
+    OperandMaterialization, OperandRequirement, OperatorClass, OperatorDispatch, OperatorPlan,
+    OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, PipelineConfig,
+    PlannerSearchDomain, PointwiseInputMapping, Precision, ProfilingConfig, ReductionStaging,
     SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{

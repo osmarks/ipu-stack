@@ -1549,8 +1549,9 @@ mod tests {
     use super::*;
     use crate::{
         AccumulationPrecision, ComputeGraph, Ipu21CostModel, Layout, MemoryClass,
-        OperandRequirement, OperatorRequirements, OutputAliasing, PipelineConfig, ShardExtent,
-        ShardView, TensorFormat, TensorTiling, WorkProvenance, WorkReason, lower, lower_to_tiles,
+        OperandRequirement, OperatorRequirements, OutputAliasing, PipelineConfig,
+        PlannerSearchDomain, ShardExtent, ShardView, TensorFormat, TensorTiling, WorkProvenance,
+        WorkReason, lower, lower_to_tiles,
     };
 
     #[test]
@@ -1688,7 +1689,7 @@ mod tests {
             let result = graph.gemm(left, right).unwrap();
             graph.set_outputs([result]).unwrap();
             let config = PipelineConfig::new(tiles)
-                .with_active_tile_counts([tiles])
+                .with_search_domain(PlannerSearchDomain::default().with_active_tile_counts([tiles]))
                 .with_input(
                     left,
                     TensorFormat {
