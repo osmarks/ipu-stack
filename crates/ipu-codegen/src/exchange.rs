@@ -335,7 +335,20 @@ fn lower_static_exchanges(
             let pending = phase
                 .transfers
                 .par_iter()
-                .map(|transfer| prepare_transfer(program, placement, transfer))
+                .enumerate()
+                .map(|(index, transfer)| {
+                    prepare_transfer(program, placement, transfer).inspect_err(|error| {
+                        tracing::error!(
+                            phase = phase.id.index(),
+                            transfer = index,
+                            provenance = ?phase.provenance,
+                            source = ?transfer.source,
+                            destinations = ?transfer.destinations,
+                            ?error,
+                            "failed to prepare logical exchange transfer"
+                        );
+                    })
+                })
                 .collect::<Result<Vec<_>, ExchangeLoweringError>>()?
                 .into_iter()
                 .flatten()

@@ -521,6 +521,15 @@ fn validate_view(shard: &LowShard, view: &ShardView) -> StorageResult<()> {
                     || view.physical_end > shard.physical_end
             })
     {
+        tracing::error!(
+            shard = ?shard.id,
+            tile = shard.tile,
+            shape = ?shard.tensor_type.shape,
+            layout = ?shard.tensor_type.format.layout,
+            shard_extents = ?shard.extents,
+            view_extents = ?view.extents,
+            "tensor view falls outside its storage shard"
+        );
         return Err(StorageError::InvalidView);
     }
     Ok(())

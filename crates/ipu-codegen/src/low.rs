@@ -854,6 +854,33 @@ impl LoweringState {
             .collect())
     }
 
+    fn intersecting_shard_set(
+        &self,
+        sources: &[LowShardId],
+        target: &[ShardExtent],
+        local_tile: u16,
+    ) -> Vec<(Vec<ShardExtent>, LowShardId)> {
+        let mut groups = BTreeMap::<Vec<ShardExtent>, Vec<LowShardId>>::new();
+        for &source in sources {
+            if let Some(extents) =
+                intersect_extents(&self.shards[source.index() as usize].extents, target)
+            {
+                groups.entry(extents).or_default().push(source);
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(extents, candidates)| {
+                let selected = candidates
+                    .iter()
+                    .copied()
+                    .find(|source| self.shards[source.index() as usize].tile == local_tile)
+                    .unwrap_or(candidates[0]);
+                (extents, selected)
+            })
+            .collect()
+    }
+
     fn lower_region(
         &mut self,
         operations: &[MidOperation],
@@ -892,12 +919,24 @@ impl LoweringState {
                 );
                 continue;
             }
-            match &operation.kind {
+            let lowered = match &operation.kind {
                 MidOperationKind::Repeat(repeat) => {
-                    self.lower_repeat(operation, repeat, &mut tiles)?;
+                    self.lower_repeat(operation, repeat, &mut tiles)
                 }
-                MidOperationKind::Operator(_) => self.lower_operator(operation, &mut tiles)?,
-                kind => self.lower_conversion(operation, kind, &mut tiles)?,
+                MidOperationKind::Operator(_) => self.lower_operator(operation, &mut tiles),
+                kind => self.lower_conversion(operation, kind, &mut tiles),
+            };
+            if let Err(error) = lowered {
+                tracing::error!(
+                    operation = index,
+                    source = ?operation.source.map(OperationId::index),
+                    kind = ?operation.kind,
+                    inputs = ?operation.inputs,
+                    results = ?operation.results,
+                    ?error,
+                    "failed to lower mid operation to tile work"
+                );
+                return Err(error);
             }
             if checkpoints
                 && matches!(
@@ -919,6 +958,87 @@ impl LoweringState {
             );
         }
         Ok(tiles)
+    }
+
+    fn unpack_amp_to_row_major(
+        &mut self,
+        source: MidValueId,
+        provenance: WorkProvenance,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<Option<Vec<LowShardId>>> {
+        let sources = self.value_shards(source)?.to_vec();
+        for &source_shard in &sources {
+            let source = &self.shards[source_shard.index() as usize];
+            let compatible = source.extents.len() == 3
+                && source.tensor_type.format.precision == Precision::F16
+                && match source.tensor_type.format.layout.order {
+                    ElementOrder::Amp(AmpOrder::Output) => {
+                        let columns = source.extents[2];
+                        (columns.physical_end - columns.start).is_multiple_of(AMP_COLUMN_MICRO)
+                    }
+                    ElementOrder::Amp(AmpOrder::TransposedLeft) => {
+                        let rows = source.extents[1];
+                        (rows.physical_end - rows.start).is_multiple_of(AMP_COLUMN_MICRO)
+                    }
+                    _ => false,
+                };
+            if !compatible {
+                tracing::debug!(
+                    shard = source_shard.index(),
+                    rank = source.extents.len(),
+                    precision = ?source.tensor_type.format.precision,
+                    order = ?source.tensor_type.format.layout.order,
+                    extents = ?source.extents,
+                    "cannot unpack source storage into row-major order"
+                );
+                return Ok(None);
+            }
+        }
+
+        let mut staging_shards = Vec::with_capacity(sources.len());
+        for source_shard in sources {
+            let source = self.shards[source_shard.index() as usize].clone();
+            let mut staging_type = source.tensor_type.clone();
+            staging_type.format.layout = Layout::row_major(TensorTiling::replicated(1));
+            let staging = self.push_shard(LowShard {
+                id: LowShardId(0),
+                tile: source.tile,
+                tensor_type: staging_type,
+                extents: source.extents.clone(),
+                definition: ShardDefinition::Staging,
+            })?;
+            self.append_kernel(
+                tiles,
+                source.tile,
+                KernelRun::new(
+                    provenance,
+                    TileKernel::Planned(TileKernelSpec::Rearrange {
+                        from: source.tensor_type.format.layout.clone(),
+                        to: self.shards[staging.index() as usize]
+                            .tensor_type
+                            .format
+                            .layout
+                            .clone(),
+                    }),
+                    vec![KernelOperand {
+                        views: vec![self.full_view(source_shard)],
+                    }],
+                    self.full_view(staging),
+                    KernelRequirements::Conversion {
+                        input: OperandRequirement::new(source.tensor_type.format, 4),
+                        output: OperandRequirement::new(
+                            self.shards[staging.index() as usize]
+                                .tensor_type
+                                .format
+                                .clone(),
+                            4,
+                        ),
+                    },
+                ),
+            )?;
+            staging_shards.push(staging);
+        }
+        Ok(Some(staging_shards))
     }
 
     fn defer_fused_output(
@@ -957,76 +1077,35 @@ impl LoweringState {
             })
         });
         if uses != 1 || !claimed {
+            tracing::debug!(
+                source = ?operation.source.map(OperationId::index),
+                ?result,
+                uses,
+                claimed,
+                "cannot defer fused output because its consumer contract is not exclusive"
+            );
             return Ok(false);
         }
         let DeferredTransform::SplitLastAxisIntoLeading { parts } = offered.transform;
-        let mut staging_shards = Vec::new();
-        for source_shard in self.value_shards(*source)?.to_vec() {
-            let source_definition = self.shards[source_shard.index() as usize].clone();
-            if source_definition.extents.len() != 3
-                || source_definition.tensor_type.format.precision != Precision::F16
-                || source_definition.tensor_type.format.layout.order
-                    != ElementOrder::Amp(AmpOrder::Output)
-                || parts == 0
-            {
-                return Ok(false);
-            }
-            let columns = source_definition.tensor_type.shape.0[2];
-            if !columns.is_multiple_of(parts) {
-                return Ok(false);
-            }
-            let columns_extent = source_definition.extents[2];
-            let local_physical_columns = columns_extent.physical_end - columns_extent.start;
-            if !local_physical_columns.is_multiple_of(AMP_COLUMN_MICRO) {
-                return Ok(false);
-            }
-            let mut staging_type = source_definition.tensor_type.clone();
-            staging_type.format.layout = Layout::row_major(TensorTiling::replicated(1));
-            let staging = self.push_shard(LowShard {
-                id: LowShardId(0),
-                tile: source_definition.tile,
-                tensor_type: staging_type,
-                extents: source_definition.extents.clone(),
-                definition: ShardDefinition::Staging,
-            })?;
-            self.append_kernel(
-                tiles,
-                source_definition.tile,
-                KernelRun::new(
-                    WorkProvenance {
-                        operation: operation.source,
-                        value: Some(*result),
-                        reason: WorkReason::OperatorKernel,
-                    },
-                    TileKernel::Planned(TileKernelSpec::Rearrange {
-                        from: source_definition.tensor_type.format.layout.clone(),
-                        to: self.shards[staging.index() as usize]
-                            .tensor_type
-                            .format
-                            .layout
-                            .clone(),
-                    }),
-                    vec![KernelOperand {
-                        views: vec![self.full_view(source_shard)],
-                    }],
-                    self.full_view(staging),
-                    KernelRequirements::Conversion {
-                        input: OperandRequirement::new(
-                            source_definition.tensor_type.format.clone(),
-                            4,
-                        ),
-                        output: OperandRequirement::new(
-                            self.shards[staging.index() as usize]
-                                .tensor_type
-                                .format
-                                .clone(),
-                            4,
-                        ),
-                    },
-                ),
-            )?;
-            staging_shards.push(staging);
+        let columns = self.shards[self.value_shards(*source)?[0].index() as usize]
+            .tensor_type
+            .shape
+            .0[2];
+        if parts == 0 || !columns.is_multiple_of(parts) {
+            return Ok(false);
         }
+        let Some(staging_shards) = self.unpack_amp_to_row_major(
+            *source,
+            WorkProvenance {
+                operation: operation.source,
+                value: Some(*result),
+                reason: WorkReason::OperatorKernel,
+            },
+            tiles,
+        )?
+        else {
+            return Ok(false);
+        };
         self.deferred_values.insert(
             *result,
             DeferredValue {
@@ -1474,6 +1553,23 @@ impl LoweringState {
         if head_width == 0 || head_width * options.heads != input_type.shape.0[2] {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
+        let source_shards = if matches!(
+            input_type.format.layout.order,
+            ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedLeft)
+        ) {
+            self.unpack_amp_to_row_major(
+                *input,
+                WorkProvenance {
+                    operation: operation.source,
+                    value: Some(*result),
+                    reason: WorkReason::OperatorKernel,
+                },
+                tiles,
+            )?
+            .ok_or(LowLoweringError::InvalidOperatorPlan)?
+        } else {
+            self.value_shards(*input)?.to_vec()
+        };
 
         let mut mappings = Vec::new();
         for output in self.value_shards(*result)?.to_vec() {
@@ -1486,7 +1582,9 @@ impl LoweringState {
             }
             let (target, column_base) =
                 split_head_source_extents(&output_extents, options.heads, head_width)?;
-            for (source_extents, source) in self.intersecting_shards(*input, &target, tile)? {
+            for (source_extents, source) in
+                self.intersecting_shard_set(&source_shards, &target, tile)
+            {
                 let destination_extents = vec![
                     output_extents[0],
                     source_extents[1],
@@ -1619,7 +1717,7 @@ impl LoweringState {
                 rows,
                 scratch_columns,
                 Precision::F16,
-                ElementOrder::Amp(AmpOrder::Output),
+                ElementOrder::Amp(AmpOrder::Left),
                 MemoryClass::Ipu21Interleaved,
             )?;
             let state_columns = key_block_rows + 16;
@@ -3106,10 +3204,16 @@ impl LoweringState {
                             physical_end,
                         })
                         .collect::<Vec<_>>();
-                    for axis in 0..output_rank.saturating_sub(2) {
-                        extents[axis] = left_shard.extents[axis];
+                    if orientation == crate::GemmOrientation::Normal {
+                        for axis in 0..output_rank.saturating_sub(2) {
+                            extents[axis] = left_shard.extents[axis];
+                            extents[axis].axis =
+                                u16::try_from(axis).map_err(|_| LowLoweringError::IdOverflow)?;
+                        }
                     }
                     extents[output_row_axis] = left_shard.extents[left_row_axis];
+                    extents[output_row_axis].axis =
+                        u16::try_from(output_row_axis).map_err(|_| LowLoweringError::IdOverflow)?;
                     extents[output_column_axis] = ShardExtent {
                         axis: u16::try_from(output_column_axis)
                             .map_err(|_| LowLoweringError::IdOverflow)?,

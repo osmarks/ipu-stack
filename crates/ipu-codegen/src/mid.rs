@@ -7021,6 +7021,8 @@ mod tests {
                 "random case {case}"
             );
             let tiled = crate::low::lower_to_tiles(&lowered, &config).unwrap();
+            crate::KernelBuildPlan::from_program(&tiled)
+                .unwrap_or_else(|error| panic!("random case {case}: {error}"));
             let attention_phases = tiled
                 .exchange_phases
                 .iter()

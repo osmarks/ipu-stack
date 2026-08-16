@@ -69,11 +69,6 @@ static __attribute__((always_inline)) void expHalf16(half *values) {
                : "$a0:1", "$a2:3", "memory");
 }
 
-constexpr unsigned logicalPairForPhysical(unsigned physicalPair) {
-  return physicalPair % 2 == 0 ? physicalPair / 2
-                               : 4 + physicalPair / 2;
-}
-
 template <unsigned QueryRows, unsigned KeyRows, typename Scores,
           typename Weights>
 __attribute__((always_inline)) bool softmaxBlock(const Scores &scores,
@@ -91,8 +86,7 @@ __attribute__((always_inline)) bool softmaxBlock(const Scores &scores,
          ++panel) {
 #pragma unroll
       for (unsigned physicalPair = 0; physicalPair < 8; ++physicalPair) {
-        const unsigned logicalPair = logicalPairForPhysical(physicalPair);
-        const unsigned column = panel * 16 + logicalPair * 2;
+        const unsigned column = panel * 16 + physicalPair * 2;
         if (column < KeyRows) {
           const unsigned source = panel * QueryRows * 16 + row * 16 +
                                   physicalPair * 2;
@@ -111,8 +105,7 @@ __attribute__((always_inline)) bool softmaxBlock(const Scores &scores,
          ++panel) {
 #pragma unroll
       for (unsigned physicalPair = 0; physicalPair < 8; ++physicalPair) {
-        const unsigned logicalPair = logicalPairForPhysical(physicalPair);
-        const unsigned column = panel * 16 + logicalPair * 2;
+        const unsigned column = panel * 16 + physicalPair * 2;
         float2 normalized = {-65504.0f, -65504.0f};
         if (column < KeyRows) {
           const unsigned source = panel * QueryRows * 16 + row * 16 +
@@ -125,7 +118,7 @@ __attribute__((always_inline)) bool softmaxBlock(const Scores &scores,
             normalized[1] = unpacked[1] * scale - scaledMaximum;
         }
         const unsigned destination =
-            panel * QueryRows * 16 + row * 16 + logicalPair * 2;
+            panel * QueryRows * 16 + row * 16 + physicalPair * 2;
         *reinterpret_cast<half2 *>(&weights[destination]) =
             __builtin_convertvector(normalized, half2);
       }
@@ -213,8 +206,7 @@ __attribute__((always_inline)) bool mergeBlock(const BlockValues &blockValues,
          ++panel) {
 #pragma unroll
       for (unsigned physicalPair = 0; physicalPair < 8; ++physicalPair) {
-        const unsigned logicalPair = logicalPairForPhysical(physicalPair);
-        const unsigned column = panel * 16 + logicalPair * 2;
+        const unsigned column = panel * 16 + physicalPair * 2;
         if (column < dimension) {
           const unsigned source = panel * QueryRows * 16 + row * 16 +
                                   physicalPair * 2;

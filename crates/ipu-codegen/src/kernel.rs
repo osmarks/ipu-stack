@@ -20,6 +20,7 @@ pub enum KernelSymbols {
     AttentionSpecialized,
     AttentionStageSpecialized,
     RearrangeSpecialized,
+    UnpackSpecialized,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +61,7 @@ pub struct KernelBuildPlan {
     attention_symbols: BTreeMap<AttentionKernelShape, String>,
     attention_stage_symbols: Vec<(TileKernelSpec, u32, String)>,
     rearrange_symbols: BTreeMap<(RearrangeTarget, u32, u32, u32, u32), String>,
+    unpack_symbols: BTreeMap<(UnpackSource, u32, u32, u32, u32), String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -67,6 +69,29 @@ enum RearrangeTarget {
     AmpLeft,
     AmpTransposedRight,
     BlockMajor { row_block: u16, column_block: u16 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum UnpackSource {
+    AmpOutput,
+    AmpTransposedLeft,
+}
+
+impl UnpackSource {
+    fn from_order(order: ElementOrder) -> Option<Self> {
+        match order {
+            ElementOrder::Amp(AmpOrder::Output) => Some(Self::AmpOutput),
+            ElementOrder::Amp(AmpOrder::TransposedLeft) => Some(Self::AmpTransposedLeft),
+            _ => None,
+        }
+    }
+
+    const fn codelet_index(self) -> u32 {
+        match self {
+            Self::AmpOutput => 0,
+            Self::AmpTransposedLeft => 1,
+        }
+    }
 }
 
 impl RearrangeTarget {
@@ -175,6 +200,7 @@ impl KernelBuildPlan {
         let mut gelu = false;
         let mut reduction_add = false;
         let mut rearrangements = BTreeSet::new();
+        let mut unpacks = BTreeSet::new();
         let mut attention = BTreeSet::new();
         let mut attention_stages = Vec::new();
         for tile in &program.tiles {
@@ -185,6 +211,7 @@ impl KernelBuildPlan {
                 &mut gelu,
                 &mut reduction_add,
                 &mut rearrangements,
+                &mut unpacks,
                 &mut attention,
                 &mut attention_stages,
             )?;
@@ -288,7 +315,49 @@ impl KernelBuildPlan {
                 retained_symbols: vec!["ipu_stack_reduce_sum_f16".into()],
             });
         }
-        let has_rearrange_codelets = !rearrangements.is_empty();
+        let has_worker_codelets = !rearrangements.is_empty() || !unpacks.is_empty();
+        for (order, logical_rows, physical_rows, logical_columns, physical_columns) in unpacks {
+            let order_index = order.codelet_index();
+            let suffix = format!(
+                "o{order_index}_r{logical_rows}_p{physical_rows}_c{logical_columns}_p{physical_columns}"
+            );
+            let vertex = format!("UnpackAmpToRowMajorF16_{suffix}");
+            let codelet = format!("__runCodelet_{vertex}");
+            let call = format!("ipu_stack_unpack_amp_to_row_major_f16_{suffix}");
+            plan.compilations.push(KernelCompilation {
+                source: "unpack_amp_f16.cpp",
+                name: format!("unpack_amp_f16_codelet_{suffix}"),
+                flags: vec![
+                    "-O2".into(),
+                    format!("-DUNPACK_SOURCE_ORDER={order_index}"),
+                    format!("-DUNPACK_LOGICAL_ROWS={logical_rows}"),
+                    format!("-DUNPACK_PHYSICAL_ROWS={physical_rows}"),
+                    format!("-DUNPACK_LOGICAL_COLUMNS={logical_columns}"),
+                    format!("-DUNPACK_PHYSICAL_COLUMNS={physical_columns}"),
+                    format!("-DUNPACK_VERTEX_NAME={vertex}"),
+                ],
+                retained_symbols: Vec::new(),
+            });
+            plan.compilations.push(KernelCompilation {
+                source: "rearrange_f16.S",
+                name: format!("unpack_amp_f16_wrapper_{suffix}"),
+                flags: vec![
+                    format!("-DREARRANGE_CALL_SYMBOL={call}"),
+                    format!("-DREARRANGE_CODELET_SYMBOL={codelet}"),
+                ],
+                retained_symbols: vec![call.clone()],
+            });
+            plan.unpack_symbols.insert(
+                (
+                    order,
+                    logical_rows,
+                    physical_rows,
+                    logical_columns,
+                    physical_columns,
+                ),
+                call,
+            );
+        }
         for (order, logical_rows, physical_rows, logical_columns, physical_columns) in
             rearrangements
         {
@@ -367,7 +436,7 @@ impl KernelBuildPlan {
                 call,
             );
         }
-        if has_rearrange_codelets || !attention.is_empty() || !attention_stages.is_empty() {
+        if has_worker_codelets || !attention.is_empty() || !attention_stages.is_empty() {
             plan.compilations.push(KernelCompilation {
                 source: "worker_support.S",
                 name: "worker_support".into(),
@@ -595,6 +664,23 @@ impl KernelBuildPlan {
                 ))
                 .cloned()
                 .ok_or(KernelAbiError::RequirementMismatch)?,
+            (
+                KernelSymbols::UnpackSpecialized,
+                TileKernelSpec::Rearrange {
+                    from: crate::Layout { order, .. },
+                    ..
+                },
+            ) => self
+                .unpack_symbols
+                .get(&(
+                    UnpackSource::from_order(*order).ok_or(KernelAbiError::RequirementMismatch)?,
+                    input_matrix_extent(run, true, false)?,
+                    input_matrix_extent(run, false, false)?,
+                    input_matrix_extent(run, true, true)?,
+                    input_matrix_extent(run, false, true)?,
+                ))
+                .cloned()
+                .ok_or(KernelAbiError::RequirementMismatch)?,
             _ => return Err(KernelAbiError::RequirementMismatch),
         };
         Ok(PlannedKernelCall {
@@ -691,6 +777,7 @@ fn collect_kernels(
     gelu: &mut bool,
     reduction_add: &mut bool,
     rearrangements: &mut BTreeSet<(RearrangeTarget, u32, u32, u32, u32)>,
+    unpacks: &mut BTreeSet<(UnpackSource, u32, u32, u32, u32)>,
     attention: &mut BTreeSet<AttentionKernelShape>,
     attention_stages: &mut Vec<(TileKernelSpec, u32)>,
 ) -> Result<(), KernelAbiError> {
@@ -734,6 +821,23 @@ fn collect_kernels(
                         matrix_extent(run, true, true)?,
                         matrix_extent(run, false, true)?,
                     ));
+                } else if let TileKernelSpec::Rearrange {
+                    from: crate::Layout { order, .. },
+                    to:
+                        crate::Layout {
+                            order: ElementOrder::RowMajor,
+                            ..
+                        },
+                } = kernel
+                    && let Some(source) = UnpackSource::from_order(*order)
+                {
+                    unpacks.insert((
+                        source,
+                        input_matrix_extent(run, true, false)?,
+                        input_matrix_extent(run, false, false)?,
+                        input_matrix_extent(run, true, true)?,
+                        input_matrix_extent(run, false, true)?,
+                    ));
                 } else if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
                     attention.insert(attention_shape(run)?);
                 } else if matches!(
@@ -753,6 +857,7 @@ fn collect_kernels(
                 gelu,
                 reduction_add,
                 rearrangements,
+                unpacks,
                 attention,
                 attention_stages,
             )?,
@@ -827,7 +932,10 @@ fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
     };
     let matrix_column_axis = rank
         .checked_sub(
-            if matches!(output_order, ElementOrder::Amp(AmpOrder::TransposedOutput)) {
+            if matches!(
+                output_order,
+                ElementOrder::Amp(AmpOrder::TransposedOutput | AmpOrder::TransposedLeft)
+            ) {
                 2
             } else {
                 1
@@ -857,6 +965,43 @@ fn matrix_extent(run: &KernelRun, logical: bool, columns: bool) -> Result<u32, K
     } else {
         extent.physical_end - extent.start
     })
+}
+
+fn input_matrix_extent(
+    run: &KernelRun,
+    logical: bool,
+    columns: bool,
+) -> Result<u32, KernelAbiError> {
+    let view = run
+        .inputs
+        .first()
+        .and_then(|operand| operand.views.first())
+        .ok_or(KernelAbiError::RequirementMismatch)?;
+    let rank = view.extents.len();
+    let axis = rank
+        .checked_sub(if columns { 1 } else { 2 })
+        .ok_or(KernelAbiError::RequirementMismatch)?;
+    let extent = &view.extents[axis];
+    Ok(if logical {
+        extent.logical_end - extent.start
+    } else {
+        extent.physical_end - extent.start
+    })
+}
+
+fn matrix_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
+    let view = run
+        .inputs
+        .first()
+        .and_then(|operand| operand.views.first())
+        .ok_or(KernelAbiError::RequirementMismatch)?;
+    view.extents[..view.extents.len().saturating_sub(2)]
+        .iter()
+        .try_fold(1u32, |product, extent| {
+            product
+                .checked_mul(extent.physical_end - extent.start)
+                .ok_or(KernelAbiError::ElementCountOverflow)
+        })
 }
 
 fn rearrangement_specialization(
@@ -918,6 +1063,7 @@ fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbi
             },
             "logical_rows" => matrix_extent(run, true, false),
             "physical_rows" => matrix_extent(run, false, false),
+            "matrices" => matrix_count(run),
             "logical_columns" => matrix_extent(run, true, true),
             "physical_columns" => matrix_extent(run, false, true),
             "target_order" => match &run.kernel {
@@ -1040,6 +1186,27 @@ pub fn tile_kernel_abi(
             1,
             scalar_arguments(1, &["element_count"]),
         ),
+        TileKernelSpec::Rearrange { from, to }
+            if precision == Precision::F16
+                && UnpackSource::from_order(from.order).is_some()
+                && to.order == ElementOrder::RowMajor =>
+        {
+            (
+                KernelSymbols::UnpackSpecialized,
+                KernelAvailability::Implemented,
+                1,
+                scalar_arguments(
+                    1,
+                    &[
+                        "matrices",
+                        "logical_rows",
+                        "physical_rows",
+                        "logical_columns",
+                        "physical_columns",
+                    ],
+                ),
+            )
+        }
         TileKernelSpec::Rearrange { from, to }
             if precision == Precision::F16
                 && from.order == ElementOrder::RowMajor
@@ -1238,9 +1405,76 @@ mod tests {
     use super::*;
     use crate::{
         AccumulationPrecision, ComputeGraph, Ipu21CostModel, Layout, MemoryClass,
-        OperandRequirement, OperatorRequirements, OutputAliasing, PipelineConfig, TensorFormat,
-        TensorTiling, lower, lower_to_tiles,
+        OperandRequirement, OperatorRequirements, OutputAliasing, PipelineConfig, ShardExtent,
+        ShardView, TensorFormat, TensorTiling, WorkProvenance, WorkReason, lower, lower_to_tiles,
     };
+
+    #[test]
+    fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
+        let mut random = fastrand::Rng::with_seed(0x726f_7773_6f72_6465);
+        for case in 0..256 {
+            let outer = random.u32(1..=4);
+            let semantic_rows = random.u32(1..=96);
+            let semantic_columns = random.u32(1..=96);
+            let transposed = random.bool();
+            let order = match (transposed, random.bool()) {
+                (false, false) => AmpOrder::Output,
+                (false, true) => AmpOrder::Left,
+                (true, false) => AmpOrder::TransposedOutput,
+                (true, true) => AmpOrder::TransposedLeft,
+            };
+            let format = TensorFormat {
+                precision: Precision::F16,
+                layout: Layout {
+                    order: ElementOrder::Amp(order),
+                    tiling: TensorTiling::replicated(1),
+                    memory_class: MemoryClass::Ipu21Standard,
+                },
+            };
+            let run = KernelRun::new(
+                WorkProvenance {
+                    operation: None,
+                    value: None,
+                    reason: WorkReason::OperatorKernel,
+                },
+                TileKernel::Planned(TileKernelSpec::Gemm {
+                    multiply: Precision::F16,
+                    accumulate: AccumulationPrecision::F32,
+                    mode: GemmKernelMode::Initialize,
+                    weights: GemmWeightLoad::Standard,
+                    inner_block: 64,
+                    output_columns: 16,
+                }),
+                Vec::new(),
+                ShardView {
+                    shard: LowShardId::from_index(0),
+                    extents: [outer, semantic_rows, semantic_columns]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(axis, physical_end)| ShardExtent {
+                            axis: axis as u16,
+                            start: 0,
+                            logical_end: physical_end,
+                            physical_end,
+                        })
+                        .collect(),
+                },
+                KernelRequirements::Operator(OperatorRequirements {
+                    inputs: Vec::new(),
+                    output: OperandRequirement::new(format, 8),
+                    output_aliasing: OutputAliasing::Fresh,
+                    memory_relations: Vec::new(),
+                }),
+            );
+            let expected = outer
+                * if transposed {
+                    semantic_columns
+                } else {
+                    semantic_rows
+                };
+            assert_eq!(gemm_rows(&run).unwrap(), expected, "random case {case}");
+        }
+    }
 
     #[test]
     fn randomized_gemm_abis_resolve_to_retained_symbols() {
