@@ -475,7 +475,7 @@ struct DeferredValue {
 
 struct PreparedDistributedPanel {
     panel: u32,
-    row_major: LowShardId,
+    row_major: Option<LowShardId>,
     packed: LowShardId,
     tile: u16,
     destinations: Vec<LowShardId>,
@@ -808,6 +808,40 @@ impl LoweringState {
         self.deferred_root(value).is_some()
     }
 
+    fn deferred_supports_physical_exchange(
+        &self,
+        value: MidValueId,
+        destination: LowShardId,
+    ) -> bool {
+        let Some(root) = self.deferred_root(value) else {
+            return false;
+        };
+        let Some(source) = self
+            .deferred_values
+            .get(&root)
+            .and_then(|deferred| deferred.shards.first())
+        else {
+            return false;
+        };
+        self.value_shards(value)
+            .ok()
+            .and_then(|shards| shards.first())
+            .and_then(|shard| {
+                self.shards[shard.index() as usize]
+                    .tensor_type
+                    .shape
+                    .0
+                    .last()
+            })
+            .is_some_and(|width| width.is_multiple_of(2))
+            && self.shards[source.index() as usize]
+                .tensor_type
+                .format
+                .supports_f16_micro_panel_exchange(
+                    &self.shards[destination.index() as usize].tensor_type.format,
+                )
+    }
+
     fn local_shard(&self, value: MidValueId, tile: u16) -> LowLoweringResult<LowShardId> {
         let shards = self.value_shards(value)?;
         if let Some(&shard) = shards.get(usize::from(tile))
@@ -1094,17 +1128,41 @@ impl LoweringState {
         if parts == 0 || !columns.is_multiple_of(parts) {
             return Ok(false);
         }
-        let Some(staging_shards) = self.unpack_amp_to_row_major(
-            *source,
-            WorkProvenance {
-                operation: operation.source,
-                value: Some(*result),
-                reason: WorkReason::OperatorKernel,
-            },
-            tiles,
-        )?
-        else {
-            return Ok(false);
+        let source_shards = self.value_shards(*source)?.to_vec();
+        let source_format = &self.shards[source_shards[0].index() as usize]
+            .tensor_type
+            .format;
+        let result_format = &self.shards[self.value_shards(*result)?[0].index() as usize]
+            .tensor_type
+            .format;
+        let direct_panel_exchange = source_format.supports_f16_micro_panel_exchange(result_format);
+        tracing::debug!(
+            source = ?operation.source.map(OperationId::index),
+            source_order = ?source_format.layout.order,
+            result_order = ?result_format.layout.order,
+            direct_panel_exchange,
+            "selected deferred-output storage"
+        );
+        let staging_shards = if direct_panel_exchange
+            || !matches!(
+                source_format.layout.order,
+                ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedLeft)
+            ) {
+            source_shards
+        } else {
+            let Some(staging) = self.unpack_amp_to_row_major(
+                *source,
+                WorkProvenance {
+                    operation: operation.source,
+                    value: Some(*result),
+                    reason: WorkReason::OperatorKernel,
+                },
+                tiles,
+            )?
+            else {
+                return Ok(false);
+            };
+            staging
         };
         self.deferred_values.insert(
             *result,
@@ -1281,6 +1339,7 @@ impl LoweringState {
         self.lower_mapped_views(
             mappings,
             logical_order,
+            ExchangeOrder::Semantic,
             operation_provenance(operation, kind),
             tiles,
         )
@@ -1290,6 +1349,7 @@ impl LoweringState {
         &mut self,
         mappings: Vec<(ShardView, ShardView)>,
         logical_order: bool,
+        exchange_order: ExchangeOrder,
         provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
@@ -1415,7 +1475,7 @@ impl LoweringState {
         for (tile, copy) in before_exchange {
             self.append_local_copy(tiles, tile, copy)?;
         }
-        self.append_phase(transfers, provenance, tiles)?;
+        self.append_ordered_phase(transfers, provenance, exchange_order, tiles)?;
         for (tile, copy) in after_exchange {
             self.append_local_copy(tiles, tile, copy)?;
         }
@@ -1541,10 +1601,10 @@ impl LoweringState {
         let [result] = operation.results.as_slice() else {
             return Err(LowLoweringError::ResultArity);
         };
-        let input_type = &self
+        let input_type = self
             .value_shards(*input)?
             .first()
-            .map(|shard| &self.shards[shard.index() as usize].tensor_type)
+            .map(|shard| self.shards[shard.index() as usize].tensor_type.clone())
             .ok_or(LowLoweringError::InvalidOperatorPlan)?;
         if input_type.shape.0.len() != 3 || options.heads == 0 {
             return Err(LowLoweringError::InvalidOperatorPlan);
@@ -1553,6 +1613,49 @@ impl LoweringState {
         if head_width == 0 || head_width * options.heads != input_type.shape.0[2] {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
+        let output_shards = self.value_shards(*result)?.to_vec();
+        let output_type = output_shards
+            .first()
+            .map(|shard| self.shards[shard.index() as usize].tensor_type.clone())
+            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+        let original_sources = self.value_shards(*input)?.to_vec();
+        let direct_panel_exchange = input_type
+            .format
+            .supports_f16_micro_panel_exchange(&output_type.format);
+        tracing::debug!(
+            source = ?operation.source.map(OperationId::index),
+            source_order = ?input_type.format.layout.order,
+            destination_order = ?output_type.format.layout.order,
+            direct_panel_exchange,
+            "selected split-head exchange strategy"
+        );
+        if direct_panel_exchange {
+            let mappings = self.split_head_mappings(
+                &original_sources,
+                &output_shards,
+                options.heads,
+                head_width,
+            )?;
+            if let Some(mappings) = self.f16_micro_panel_mappings(mappings)? {
+                tracing::info!(
+                    source = ?operation.source.map(OperationId::index),
+                    mappings = mappings.len(),
+                    "lowering split transform as physical micro-panel exchange"
+                );
+                return self.lower_mapped_views(
+                    mappings,
+                    false,
+                    ExchangeOrder::Physical,
+                    WorkProvenance {
+                        operation: operation.source,
+                        value: Some(*result),
+                        reason: WorkReason::OperatorInputs,
+                    },
+                    tiles,
+                );
+            }
+        }
+
         let source_shards = if matches!(
             input_type.format.layout.order,
             ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedLeft)
@@ -1571,8 +1674,30 @@ impl LoweringState {
             self.value_shards(*input)?.to_vec()
         };
 
+        let mappings =
+            self.split_head_mappings(&source_shards, &output_shards, options.heads, head_width)?;
+        self.lower_mapped_views(
+            mappings,
+            true,
+            ExchangeOrder::Semantic,
+            WorkProvenance {
+                operation: operation.source,
+                value: Some(*result),
+                reason: WorkReason::OperatorInputs,
+            },
+            tiles,
+        )
+    }
+
+    fn split_head_mappings(
+        &self,
+        source_shards: &[LowShardId],
+        output_shards: &[LowShardId],
+        heads: u32,
+        head_width: u32,
+    ) -> LowLoweringResult<Vec<(ShardView, ShardView)>> {
         let mut mappings = Vec::new();
-        for output in self.value_shards(*result)?.to_vec() {
+        for &output in output_shards {
             let output_extents = self.shards[output.index() as usize].extents.clone();
             let tile = self.shards[output.index() as usize].tile;
             if output_extents.len() != 3
@@ -1581,7 +1706,7 @@ impl LoweringState {
                 return Err(LowLoweringError::InvalidOperatorPlan);
             }
             let (target, column_base) =
-                split_head_source_extents(&output_extents, options.heads, head_width)?;
+                split_head_source_extents(&output_extents, heads, head_width)?;
             for (source_extents, source) in
                 self.intersecting_shard_set(&source_shards, &target, tile)
             {
@@ -1606,16 +1731,44 @@ impl LoweringState {
                 mappings.push((source_view, destination_view));
             }
         }
-        self.lower_mapped_views(
-            mappings,
-            true,
-            WorkProvenance {
-                operation: operation.source,
-                value: Some(*result),
-                reason: WorkReason::OperatorInputs,
-            },
-            tiles,
-        )
+        Ok(mappings)
+    }
+
+    /// Splits corresponding views at each allocation's F16 micro-panel
+    /// boundaries. Within every resulting rectangle the source and
+    /// destination have identical physical traversal, even when their outer
+    /// panel sequence and tile ownership differ.
+    fn f16_micro_panel_mappings(
+        &self,
+        mappings: Vec<(ShardView, ShardView)>,
+    ) -> LowLoweringResult<Option<Vec<(ShardView, ShardView)>>> {
+        let mut split = Vec::new();
+        for (source, destination) in mappings {
+            let source_shard = &self.shards[source.shard.index() as usize];
+            let destination_shard = &self.shards[destination.shard.index() as usize];
+            let pieces = split_mapping_at_panel_boundaries(
+                source_shard,
+                source,
+                destination_shard,
+                destination,
+            )?;
+            for (source, destination) in pieces {
+                let source_spans = view_byte_spans(source_shard, &source)?;
+                let destination_spans = view_byte_spans(destination_shard, &destination)?;
+                let valid_spans = source_spans
+                    .iter()
+                    .chain(&destination_spans)
+                    .all(|span| span.offset & 0b11 == 0 && span.bytes & 0b11 == 0);
+                let source_bytes = source_spans.iter().map(|span| span.bytes).sum::<u32>();
+                let destination_bytes =
+                    destination_spans.iter().map(|span| span.bytes).sum::<u32>();
+                if !valid_spans || source_bytes != destination_bytes {
+                    return Ok(None);
+                }
+                split.push((source, destination));
+            }
+        }
+        Ok(Some(split))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1687,7 +1840,7 @@ impl LoweringState {
                 .last()
                 .ok_or(LowLoweringError::InvalidOperatorPlan)?;
             let deferred_query = self.has_deferred_value(*query);
-            let query = if deferred_query {
+            let query_shard = if deferred_query {
                 self.push_attention_buffer(
                     tile,
                     rows,
@@ -1699,7 +1852,9 @@ impl LoweringState {
             } else {
                 canonical_query
             };
-            let query_receive = deferred_query
+            let direct_query =
+                deferred_query && self.deferred_supports_physical_exchange(*query, query_shard);
+            let query_receive = (deferred_query && !direct_query)
                 .then(|| {
                     self.push_attention_buffer(
                         tile,
@@ -1763,7 +1918,7 @@ impl LoweringState {
                 query_rows: rows,
                 query_dimension,
                 value_dimension,
-                query,
+                query: query_shard,
                 query_receive,
                 output,
                 scratch,
@@ -1794,6 +1949,7 @@ impl LoweringState {
         if self.has_deferred_value(*query) {
             let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
             let mut local_copies = Vec::new();
+            let physical = tasks.iter().all(|task| task.query_receive.is_none());
             for task in &tasks {
                 self.gather_deferred_panel(
                     *query,
@@ -1802,8 +1958,12 @@ impl LoweringState {
                     task.query_rows,
                     0,
                     task.query_dimension,
-                    task.query_receive
-                        .ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                    task.query_receive.unwrap_or(task.query),
+                    if physical {
+                        ExchangeOrder::Physical
+                    } else {
+                        ExchangeOrder::Semantic
+                    },
                     &mut transfers,
                     &mut local_copies,
                 )?;
@@ -1811,22 +1971,34 @@ impl LoweringState {
             for (tile, copy) in local_copies {
                 self.append_local_copy(tiles, tile, copy)?;
             }
-            self.append_phase(transfers, exchange_provenance, tiles)?;
-            for task in &tasks {
-                self.append_attention_rearrange(
-                    tiles,
-                    task.tile,
-                    task.query_receive
-                        .ok_or(LowLoweringError::InvalidOperatorPlan)?,
-                    task.query,
-                    kernel_provenance,
-                )?;
+            self.append_ordered_phase(
+                transfers,
+                exchange_provenance,
+                if physical {
+                    ExchangeOrder::Physical
+                } else {
+                    ExchangeOrder::Semantic
+                },
+                tiles,
+            )?;
+            if !physical {
+                for task in &tasks {
+                    self.append_attention_rearrange(
+                        tiles,
+                        task.tile,
+                        task.query_receive
+                            .ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                        task.query,
+                        kernel_provenance,
+                    )?;
+                }
             }
         }
         let deferred_key_value = self.has_deferred_value(*key);
         let mut prepared_blocks = Vec::new();
         if deferred_key_value {
-            let mut gathers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+            let mut semantic_gathers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+            let mut physical_gathers = BTreeMap::<ShardView, Vec<ShardView>>::new();
             for block in 0..blocks {
                 let block_start = u32::try_from(block).map_err(|_| LowLoweringError::IdOverflow)?
                     * key_block_rows;
@@ -1865,7 +2037,8 @@ impl LoweringState {
                     padded_query_dimension,
                     ElementOrder::Amp(AmpOrder::TransposedRight),
                     owner_offset,
-                    &mut gathers,
+                    &mut semantic_gathers,
+                    &mut physical_gathers,
                     tiles,
                 )?;
                 let value_panels = self.prepare_distributed_attention_panels(
@@ -1880,21 +2053,29 @@ impl LoweringState {
                         column_block: AMP_COLUMN_MICRO as u16,
                     }),
                     owner_offset.saturating_add(key_panel_count),
-                    &mut gathers,
+                    &mut semantic_gathers,
+                    &mut physical_gathers,
                     tiles,
                 )?;
                 prepared_blocks.push((key_panels, value_panels, valid_key_rows));
             }
-            self.append_phase(gathers, exchange_provenance, tiles)?;
+            self.append_mixed_phase(
+                semantic_gathers,
+                physical_gathers,
+                exchange_provenance,
+                tiles,
+            )?;
             for (key_panels, value_panels, _) in &prepared_blocks {
                 for panel in key_panels.iter().chain(value_panels) {
-                    self.append_attention_rearrange(
-                        tiles,
-                        panel.tile,
-                        panel.row_major,
-                        panel.packed,
-                        kernel_provenance,
-                    )?;
+                    if let Some(row_major) = panel.row_major {
+                        self.append_attention_rearrange(
+                            tiles,
+                            panel.tile,
+                            row_major,
+                            panel.packed,
+                            kernel_provenance,
+                        )?;
+                    }
                 }
             }
         }
@@ -2049,6 +2230,7 @@ impl LoweringState {
         column_start: u32,
         columns: u32,
         destination: LowShardId,
+        order: ExchangeOrder,
         transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
         local_copies: &mut Vec<(u16, LocalCopy)>,
     ) -> LowLoweringResult<()> {
@@ -2059,6 +2241,7 @@ impl LoweringState {
             .deferred_values
             .get(&deferred_root)
             .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+        let deferred_shards = deferred.shards.clone();
         let logical_type = &self.shards[self.value_shards(value)?[0].index() as usize].tensor_type;
         let source_type = &self.shards[deferred.shards[0].index() as usize].tensor_type;
         let logical_target = [
@@ -2086,12 +2269,9 @@ impl LoweringState {
             .collect::<LowLoweringResult<Vec<_>>>()?;
         let destination_tile = self.shards[destination.index() as usize].tile;
         let mut covered = 0u64;
-        for &source in &deferred.shards {
-            let Some(source_extents) =
-                intersect_extents(&self.shards[source.index() as usize].extents, &target)
-            else {
-                continue;
-            };
+        for (source_extents, source) in
+            self.intersecting_shard_set(&deferred_shards, &target, destination_tile)
+        {
             let destination_extents = mapping
                 .destination_source_axes
                 .iter()
@@ -2125,19 +2305,37 @@ impl LoweringState {
                 shard: destination,
                 extents: destination_extents,
             };
-            if self.shards[source.index() as usize].tile == destination_tile {
-                append_logical_span_copies(
-                    &self.shards,
-                    &source_view,
-                    &destination_view,
-                    destination_tile,
-                    local_copies,
-                )?;
+            let mappings = if order == ExchangeOrder::Physical {
+                self.f16_micro_panel_mappings(vec![(source_view, destination_view)])?
+                    .ok_or(LowLoweringError::InvalidOperatorPlan)?
             } else {
-                transfers
-                    .entry(source_view)
-                    .or_default()
-                    .push(destination_view);
+                vec![(source_view, destination_view)]
+            };
+            for (source_view, destination_view) in mappings {
+                if self.shards[source.index() as usize].tile == destination_tile {
+                    if order == ExchangeOrder::Physical {
+                        append_span_copies(
+                            &self.shards,
+                            &source_view,
+                            &destination_view,
+                            destination_tile,
+                            local_copies,
+                        )?;
+                    } else {
+                        append_logical_span_copies(
+                            &self.shards,
+                            &source_view,
+                            &destination_view,
+                            destination_tile,
+                            local_copies,
+                        )?;
+                    }
+                } else {
+                    transfers
+                        .entry(source_view)
+                        .or_default()
+                        .push(destination_view);
+                }
             }
         }
         if covered != u64::from(rows) * u64::from(columns) {
@@ -2157,7 +2355,8 @@ impl LoweringState {
         physical_columns: u32,
         order: ElementOrder,
         owner_offset: u32,
-        gathers: &mut BTreeMap<ShardView, Vec<ShardView>>,
+        semantic_gathers: &mut BTreeMap<ShardView, Vec<ShardView>>,
+        physical_gathers: &mut BTreeMap<ShardView, Vec<ShardView>>,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<Vec<PreparedDistributedPanel>> {
         let panels = physical_columns.div_ceil(AMP_COLUMN_MICRO);
@@ -2179,29 +2378,6 @@ impl LoweringState {
                     % stream_destinations.len();
                 let tile = stream_destinations[owner];
                 let tile = self.shards[tile.index() as usize].tile;
-                let row_major = self.push_attention_buffer(
-                    tile,
-                    valid_rows,
-                    valid_rows,
-                    panel_columns,
-                    panel_columns,
-                    ElementOrder::RowMajor,
-                )?;
-                let mut local_copies = Vec::new();
-                self.gather_deferred_panel(
-                    value,
-                    stream,
-                    block_start,
-                    valid_rows,
-                    column_start,
-                    panel_columns,
-                    row_major,
-                    gathers,
-                    &mut local_copies,
-                )?;
-                for (tile, copy) in local_copies {
-                    self.append_local_copy(tiles, tile, copy)?;
-                }
                 let packed = self.push_attention_buffer(
                     tile,
                     valid_rows,
@@ -2210,6 +2386,44 @@ impl LoweringState {
                     AMP_COLUMN_MICRO,
                     order,
                 )?;
+                let physical = self.deferred_supports_physical_exchange(value, packed);
+                let row_major = if physical {
+                    None
+                } else {
+                    Some(self.push_attention_buffer(
+                        tile,
+                        valid_rows,
+                        valid_rows,
+                        panel_columns,
+                        panel_columns,
+                        ElementOrder::RowMajor,
+                    )?)
+                };
+                let gather_destination = row_major.unwrap_or(packed);
+                let mut local_copies = Vec::new();
+                self.gather_deferred_panel(
+                    value,
+                    stream,
+                    block_start,
+                    valid_rows,
+                    column_start,
+                    panel_columns,
+                    gather_destination,
+                    if physical {
+                        ExchangeOrder::Physical
+                    } else {
+                        ExchangeOrder::Semantic
+                    },
+                    if physical {
+                        physical_gathers
+                    } else {
+                        semantic_gathers
+                    },
+                    &mut local_copies,
+                )?;
+                for (tile, copy) in local_copies {
+                    self.append_local_copy(tiles, tile, copy)?;
+                }
                 packed_panels.push(PreparedDistributedPanel {
                     panel,
                     row_major,
@@ -4069,10 +4283,7 @@ impl LoweringState {
         order: ExchangeOrder,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        if transfers.is_empty() {
-            return Ok(());
-        }
-        let mut transfers = transfers
+        let transfers = transfers
             .into_iter()
             .map(|(source, mut destinations)| {
                 destinations.sort_unstable();
@@ -4084,6 +4295,43 @@ impl LoweringState {
                 }
             })
             .collect::<Vec<_>>();
+        self.append_exchange_phase(transfers, provenance, tiles)
+    }
+
+    fn append_mixed_phase(
+        &mut self,
+        semantic: BTreeMap<ShardView, Vec<ShardView>>,
+        physical: BTreeMap<ShardView, Vec<ShardView>>,
+        provenance: WorkProvenance,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<()> {
+        let mut transfers = Vec::with_capacity(semantic.len().saturating_add(physical.len()));
+        for (order, mappings) in [
+            (ExchangeOrder::Semantic, semantic),
+            (ExchangeOrder::Physical, physical),
+        ] {
+            transfers.extend(mappings.into_iter().map(|(source, mut destinations)| {
+                destinations.sort_unstable();
+                destinations.dedup();
+                LogicalExchange {
+                    source,
+                    destinations,
+                    order,
+                }
+            }));
+        }
+        self.append_exchange_phase(transfers, provenance, tiles)
+    }
+
+    fn append_exchange_phase(
+        &mut self,
+        mut transfers: Vec<LogicalExchange>,
+        provenance: WorkProvenance,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<()> {
+        if transfers.is_empty() {
+            return Ok(());
+        }
         if let Some(previous) = self.phases.last().map(|phase| phase.id)
             && self.phases[previous.index() as usize]
                 .provenance
@@ -4851,6 +5099,162 @@ fn split_head_source_extents(
         ],
         column_base,
     ))
+}
+
+fn split_mapping_at_panel_boundaries(
+    source_shard: &LowShard,
+    mut source: ShardView,
+    destination_shard: &LowShard,
+    mut destination: ShardView,
+) -> LowLoweringResult<Vec<(ShardView, ShardView)>> {
+    let source_rank = source.extents.len();
+    let destination_rank = destination.extents.len();
+    let outer_elements = |extents: &[ShardExtent]| {
+        extents[..extents.len().saturating_sub(2)]
+            .iter()
+            .try_fold(1_u32, |elements, extent| {
+                elements.checked_mul(extent.logical_end - extent.start)
+            })
+    };
+    if source_rank < 2
+        || destination_rank < 2
+        || source_shard.extents.len() != source_rank
+        || destination_shard.extents.len() != destination_rank
+        || outer_elements(&source.extents) != Some(1)
+        || outer_elements(&destination.extents) != Some(1)
+    {
+        return Err(LowLoweringError::InvalidOperatorPlan);
+    }
+
+    let aligned_ranges = |source: ShardExtent,
+                          source_shard: ShardExtent,
+                          destination: ShardExtent,
+                          destination_shard: ShardExtent|
+     -> LowLoweringResult<Vec<(ShardExtent, ShardExtent)>> {
+        let logical_width = source.logical_end - source.start;
+        if logical_width != destination.logical_end - destination.start {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let width = source.physical_end - source.start;
+        if width != destination.physical_end - destination.start {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let mut ranges = Vec::new();
+        let mut offset = 0;
+        while offset < width {
+            let source_position = source
+                .start
+                .checked_sub(source_shard.start)
+                .and_then(|start| start.checked_add(offset))
+                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            let destination_position = destination
+                .start
+                .checked_sub(destination_shard.start)
+                .and_then(|start| start.checked_add(offset))
+                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            let source_remaining = AMP_COLUMN_MICRO - source_position % AMP_COLUMN_MICRO;
+            let destination_remaining = AMP_COLUMN_MICRO - destination_position % AMP_COLUMN_MICRO;
+            let length = (width - offset)
+                .min(source_remaining)
+                .min(destination_remaining);
+            let source_start = source.start + offset;
+            let destination_start = destination.start + offset;
+            ranges.push((
+                ShardExtent {
+                    axis: source.axis,
+                    start: source_start,
+                    logical_end: source
+                        .logical_end
+                        .min(source_start + length)
+                        .max(source_start),
+                    physical_end: source_start + length,
+                },
+                ShardExtent {
+                    axis: destination.axis,
+                    start: destination_start,
+                    logical_end: destination
+                        .logical_end
+                        .min(destination_start + length)
+                        .max(destination_start),
+                    physical_end: destination_start + length,
+                },
+            ));
+            offset += length;
+        }
+        Ok(ranges)
+    };
+
+    let source_row_axis = source_rank - 2;
+    let source_column_axis = source_rank - 1;
+    let destination_row_axis = destination_rank - 2;
+    let destination_column_axis = destination_rank - 1;
+
+    // The global row tail can finish part-way through a micro-panel while
+    // both allocations contain padding through the same panel boundary.
+    // Carry that padding with the useful values so the direct physical
+    // exchange remains word-aligned. A split head's column tail is not
+    // extended because the following source columns may belong to another
+    // head rather than padding.
+    let source_rows = source.extents[source_row_axis];
+    let destination_rows = destination.extents[destination_row_axis];
+    if source_rows.logical_end == source_shard.tensor_type.shape.0[source_row_axis]
+        && destination_rows.logical_end
+            == destination_shard.tensor_type.shape.0[destination_row_axis]
+    {
+        let source_panel_tail = (AMP_COLUMN_MICRO
+            - (source_rows.logical_end - source_shard.extents[source_row_axis].start)
+                % AMP_COLUMN_MICRO)
+            % AMP_COLUMN_MICRO;
+        let destination_panel_tail = (AMP_COLUMN_MICRO
+            - (destination_rows.logical_end
+                - destination_shard.extents[destination_row_axis].start)
+                % AMP_COLUMN_MICRO)
+            % AMP_COLUMN_MICRO;
+        let padding = source_panel_tail
+            .min(destination_panel_tail)
+            .min(source_shard.extents[source_row_axis].physical_end - source_rows.logical_end)
+            .min(
+                destination_shard.extents[destination_row_axis].physical_end
+                    - destination_rows.logical_end,
+            );
+        source.extents[source_row_axis].physical_end += padding;
+        destination.extents[destination_row_axis].physical_end += padding;
+    }
+
+    let rows = aligned_ranges(
+        source.extents[source_row_axis],
+        source_shard.extents[source_row_axis],
+        destination.extents[destination_row_axis],
+        destination_shard.extents[destination_row_axis],
+    )?;
+    let columns = aligned_ranges(
+        source.extents[source_column_axis],
+        source_shard.extents[source_column_axis],
+        destination.extents[destination_column_axis],
+        destination_shard.extents[destination_column_axis],
+    )?;
+    let mut pieces = Vec::with_capacity(rows.len().saturating_mul(columns.len()));
+    for (source_row, destination_row) in rows {
+        for &(source_column, destination_column) in &columns {
+            let mut source_extents = source.extents.clone();
+            let mut destination_extents = destination.extents.clone();
+            source_extents[source_row_axis] = source_row;
+            source_extents[source_column_axis] = source_column;
+            destination_extents[destination_row_axis] = destination_row;
+            destination_extents[destination_column_axis] = destination_column;
+            pieces.push((
+                ShardView {
+                    shard: source.shard,
+                    extents: source_extents,
+                },
+                ShardView {
+                    shard: destination.shard,
+                    extents: destination_extents,
+                },
+            ));
+        }
+    }
+    Ok(pieces)
 }
 
 #[cfg(test)]
@@ -5636,6 +6040,114 @@ mod tests {
                     .map(|extent| extent.logical_end - extent.start)
                     .product::<u32>()
             );
+        }
+    }
+
+    #[test]
+    fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
+        let mut random = fastrand::Rng::with_seed(0x7061_6464_6564_5f72);
+        for case in 0..CASES * 8 {
+            let rows = random.u32(1..=AMP_INNER_BLOCK);
+            let panel_rows = rows.div_ceil(AMP_COLUMN_MICRO) * AMP_COLUMN_MICRO;
+            let source_rows = if random.bool() {
+                panel_rows
+            } else {
+                AMP_INNER_BLOCK
+            };
+            let source = LowShard {
+                id: LowShardId(0),
+                tile: 0,
+                tensor_type: TensorType::new(
+                    [rows, AMP_COLUMN_MICRO],
+                    Precision::F16,
+                    Layout {
+                        order: ElementOrder::Amp(AmpOrder::TransposedLeft),
+                        tiling: TensorTiling::replicated(1),
+                        memory_class: MemoryClass::Ipu21Standard,
+                    },
+                ),
+                extents: vec![
+                    ShardExtent {
+                        axis: 0,
+                        start: 0,
+                        logical_end: rows,
+                        physical_end: source_rows,
+                    },
+                    ShardExtent {
+                        axis: 1,
+                        start: 0,
+                        logical_end: AMP_COLUMN_MICRO,
+                        physical_end: AMP_COLUMN_MICRO,
+                    },
+                ],
+                definition: ShardDefinition::ExchangeStaging,
+            };
+            let destination = LowShard {
+                id: LowShardId(1),
+                tile: 1,
+                tensor_type: TensorType::new(
+                    [rows, AMP_COLUMN_MICRO],
+                    Precision::F16,
+                    Layout {
+                        order: ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                            row_block: AMP_INNER_BLOCK as u16,
+                            column_block: AMP_COLUMN_MICRO as u16,
+                        }),
+                        tiling: TensorTiling::replicated(1),
+                        memory_class: MemoryClass::Ipu21Standard,
+                    },
+                ),
+                extents: vec![
+                    ShardExtent {
+                        axis: 0,
+                        start: 0,
+                        logical_end: rows,
+                        physical_end: AMP_INNER_BLOCK,
+                    },
+                    ShardExtent {
+                        axis: 1,
+                        start: 0,
+                        logical_end: AMP_COLUMN_MICRO,
+                        physical_end: AMP_COLUMN_MICRO,
+                    },
+                ],
+                definition: ShardDefinition::ExchangeStaging,
+            };
+            let logical_view = |shard: &LowShard| ShardView {
+                shard: shard.id,
+                extents: shard
+                    .extents
+                    .iter()
+                    .copied()
+                    .map(|mut extent| {
+                        extent.physical_end = extent.logical_end;
+                        extent
+                    })
+                    .collect(),
+            };
+            let mappings = split_mapping_at_panel_boundaries(
+                &source,
+                logical_view(&source),
+                &destination,
+                logical_view(&destination),
+            )
+            .unwrap_or_else(|error| panic!("case {case}, rows {rows}: {error}"));
+            let source_bytes = mappings
+                .iter()
+                .flat_map(|(view, _)| view_byte_spans(&source, view).unwrap())
+                .map(|span| {
+                    assert_eq!(span.offset & 0b11, 0, "case {case}, rows {rows}");
+                    assert_eq!(span.bytes & 0b11, 0, "case {case}, rows {rows}");
+                    span.bytes
+                })
+                .sum::<u32>();
+            let destination_bytes = mappings
+                .iter()
+                .flat_map(|(_, view)| view_byte_spans(&destination, view).unwrap())
+                .map(|span| span.bytes)
+                .sum::<u32>();
+            assert_eq!(source_bytes, panel_rows * AMP_COLUMN_MICRO * 2);
+            assert_eq!(destination_bytes, source_bytes, "case {case}, rows {rows}");
         }
     }
 

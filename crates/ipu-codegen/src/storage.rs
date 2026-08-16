@@ -1002,4 +1002,89 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn randomized_compatible_f16_micro_panel_orders_preserve_coordinates() {
+        let mut random = fastrand::Rng::with_seed(0x7061_6e65_6c21);
+        for case in 0..128 {
+            let panels = random.u32(1..=8);
+            let selected = random.u32(0..panels);
+            for (source_order, destination_order) in [
+                (
+                    ElementOrder::Amp(AmpOrder::Left),
+                    ElementOrder::Amp(AmpOrder::TransposedRight),
+                ),
+                (
+                    ElementOrder::Amp(AmpOrder::TransposedLeft),
+                    ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                        row_block: 64,
+                        column_block: AMP_COLUMN_MICRO as u16,
+                    }),
+                ),
+            ] {
+                let layout = |order| Layout {
+                    order,
+                    tiling: crate::TensorTiling::replicated(1),
+                    memory_class: MemoryClass::Ipu21Standard,
+                };
+                let source = shard(
+                    layout(source_order),
+                    &[AMP_INNER_BLOCK, panels * AMP_COLUMN_MICRO],
+                );
+                let destination = shard(
+                    layout(destination_order),
+                    &[AMP_INNER_BLOCK, AMP_COLUMN_MICRO],
+                );
+                let source_view = ShardView {
+                    shard: source.id,
+                    extents: vec![
+                        source.extents[0],
+                        ShardExtent {
+                            axis: 1,
+                            start: selected * AMP_COLUMN_MICRO,
+                            logical_end: (selected + 1) * AMP_COLUMN_MICRO,
+                            physical_end: (selected + 1) * AMP_COLUMN_MICRO,
+                        },
+                    ],
+                };
+                let destination_view = ShardView {
+                    shard: destination.id,
+                    extents: destination.extents.clone(),
+                };
+                let source_offsets = view_byte_spans(&source, &source_view)
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(|span| (span.offset..span.offset + span.bytes).step_by(2));
+                let destination_offsets = view_byte_spans(&destination, &destination_view)
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(|span| (span.offset..span.offset + span.bytes).step_by(2));
+                let pairs = source_offsets.zip(destination_offsets).collect::<Vec<_>>();
+                assert_eq!(
+                    pairs.len(),
+                    (AMP_INNER_BLOCK * AMP_COLUMN_MICRO) as usize,
+                    "case {case}"
+                );
+                for (source_offset, destination_offset) in pairs {
+                    let source_coordinates = physical_coordinates(
+                        &source,
+                        &[AMP_INNER_BLOCK, panels * AMP_COLUMN_MICRO],
+                        u64::from(source_offset / 2),
+                    )
+                    .unwrap();
+                    let destination_coordinates = physical_coordinates(
+                        &destination,
+                        &[AMP_INNER_BLOCK, AMP_COLUMN_MICRO],
+                        u64::from(destination_offset / 2),
+                    )
+                    .unwrap();
+                    assert_eq!(source_coordinates[0], destination_coordinates[0]);
+                    assert_eq!(
+                        source_coordinates[1],
+                        destination_coordinates[1] + selected * AMP_COLUMN_MICRO
+                    );
+                }
+            }
+        }
+    }
 }

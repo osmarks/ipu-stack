@@ -380,6 +380,15 @@ pub enum ElementOrder {
     Amp(AmpOrder),
 }
 
+/// Physical traversal within one 16-by-16 F16 matrix micro-panel. Layouts
+/// with the same order can exchange whole panels while changing their outer
+/// ownership and panel sequence, without an intermediate rearrangement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum F16MicroPanelOrder {
+    RowsThenColumns,
+    ColumnsThenRows,
+}
+
 impl ElementOrder {
     /// This packing is consumed as contiguous K-major panels, while a generic
     /// intersection rearrangement produces rectangular tensor-coordinate
@@ -402,6 +411,20 @@ impl ElementOrder {
                 | Self::BlockMajor(BlockMajorOrder::Matrix { .. })
                 | Self::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
         )
+    }
+
+    pub(crate) const fn f16_micro_panel_order(self) -> Option<F16MicroPanelOrder> {
+        match self {
+            Self::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
+            | Self::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }) => {
+                Some(F16MicroPanelOrder::RowsThenColumns)
+            }
+            Self::Amp(AmpOrder::TransposedLeft)
+            | Self::BlockMajor(BlockMajorOrder::Matrix { .. }) => {
+                Some(F16MicroPanelOrder::ColumnsThenRows)
+            }
+            Self::RowMajor | Self::Amp(AmpOrder::Output | AmpOrder::TransposedOutput) => None,
+        }
     }
 
     /// Smallest column span which remains a self-contained physical fragment
@@ -1349,6 +1372,16 @@ pub enum LayoutError {
 pub struct TensorFormat {
     pub precision: Precision,
     pub layout: Layout,
+}
+
+impl TensorFormat {
+    pub(crate) fn supports_f16_micro_panel_exchange(&self, destination: &Self) -> bool {
+        self.precision == Precision::F16
+            && destination.precision == Precision::F16
+            && self.layout.order.f16_micro_panel_order().is_some()
+            && self.layout.order.f16_micro_panel_order()
+                == destination.layout.order.f16_micro_panel_order()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -7056,7 +7089,12 @@ mod tests {
                     .sum::<u64>(),
                 "random case {case}"
             );
-            let tiled = crate::low::lower_to_tiles(&lowered, &config).unwrap();
+            let tiled = crate::low::lower_to_tiles(&lowered, &config)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "random case {case}, heads {heads}, width {head_width}, tokens {tokens}: {error}"
+                    )
+                });
             crate::KernelBuildPlan::from_program(&tiled)
                 .unwrap_or_else(|error| panic!("random case {case}: {error}"));
             let attention_phases = tiled

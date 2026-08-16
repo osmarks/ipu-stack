@@ -550,6 +550,17 @@ fn amp_unpack_cycles(tensor: &TensorType) -> u64 {
         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
 }
 
+fn split_heads_uses_micro_panel_exchange(source: &TensorType, output: &TensorType) -> bool {
+    source
+        .format
+        .supports_f16_micro_panel_exchange(&output.format)
+        && output
+            .shape
+            .0
+            .last()
+            .is_some_and(|width| width.is_multiple_of(2))
+}
+
 fn amp_kernel_cycles(
     multiply: Precision,
     dispatch: &OperatorDispatch,
@@ -716,7 +727,19 @@ fn deferred_split_input_cycles(
         return None;
     }
     let bytes = consumer_input.format.precision.bytes().max(1);
-    let source_unpack = amp_unpack_cycles(source);
+    let direct_panel_exchange = source
+        .format
+        .supports_f16_micro_panel_exchange(&consumer_input.format)
+        && logical_output
+            .shape
+            .0
+            .last()
+            .is_some_and(|width| width.is_multiple_of(2));
+    let source_unpack = if direct_panel_exchange {
+        0
+    } else {
+        amp_unpack_cycles(source)
+    };
     let rank = consumer_input.shape.0.len();
     let rows = consumer_input
         .shape
@@ -728,6 +751,9 @@ fn deferred_split_input_cycles(
         consumer_input.format.layout.order,
         ElementOrder::Amp(AmpOrder::Left)
     ) {
+        if direct_panel_exchange {
+            return Some((0, 0));
+        }
         let local_elements = maximum_shard_elements(consumer_input);
         let gather = local_elements
             .saturating_mul(bytes)
@@ -764,10 +790,18 @@ fn deferred_split_input_cycles(
     let owners = rows.div_ceil(query_block_rows.max(1)).max(1);
     let panels_per_owner = blocks.saturating_mul(panels_per_block).div_ceil(owners);
     let panel_elements = block_rows.saturating_mul(panel_columns);
-    let gather = panel_elements
-        .saturating_mul(bytes)
-        .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle);
-    let pack = row_major_pack_cycles(consumer_input, panel_elements);
+    let gather = if direct_panel_exchange {
+        0
+    } else {
+        panel_elements
+            .saturating_mul(bytes)
+            .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
+    };
+    let pack = if direct_panel_exchange {
+        0
+    } else {
+        row_major_pack_cycles(consumer_input, panel_elements)
+    };
     // A materialized block is one contiguous source span. Deferral assigns its
     // micro-panels to independent owners, so every source change after the
     // first adds another panel-serialization horizon on the shared exchange
@@ -1107,6 +1141,12 @@ impl CostModel for Ipu21CostModel {
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
             MidOperator::SplitHeads(_) => {
                 let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
+                if inputs
+                    .first()
+                    .is_some_and(|input| split_heads_uses_micro_panel_exchange(input, output))
+                {
+                    return exchange;
+                }
                 let source_unpack = inputs.first().map_or(0, amp_unpack_cycles);
                 let destination_pack =
                     row_major_pack_cycles(output, maximum_shard_elements(output));
