@@ -629,7 +629,7 @@ pub(crate) fn build(
                 MulticastPlan {
                     sender: point.sender,
                     receivers: vec![finalize_point_receiver(
-                        &point.receiver,
+                        &point.receivers[0],
                         topology.physical(source)?,
                     )?],
                 }
@@ -1665,7 +1665,7 @@ fn point_plan(
     Ok(MulticastPlan {
         sender: point.sender,
         receivers: vec![finalize_point_receiver(
-            &point.receiver,
+            &point.receivers[0],
             topology.physical(source)?,
         )?],
     })
@@ -1678,7 +1678,7 @@ fn paired_control_words(
     maximum: u32,
 ) -> Result<Option<u32>> {
     let plan = topology.point_to_point(source, receiver, 1)?;
-    let receiver = finalize_point_receiver(&plan.receiver, topology.physical(source)?)?;
+    let receiver = finalize_point_receiver(&plan.receivers[0], topology.physical(source)?)?;
     let timing = scheduled_receiver_timing(&receiver, 0)?;
     Ok(timing
         .pointer_event

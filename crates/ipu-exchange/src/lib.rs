@@ -272,6 +272,17 @@ pub struct PhaseTransferTiming {
     pub horizon: u32,
 }
 
+impl PhaseTransferTiming {
+    pub fn payload_completion(&self) -> u32 {
+        self.receiver_payload_ends
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.payload_end))
+            .max()
+            .unwrap_or(self.payload_end)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhasePrograms {
     pub programs: Vec<Option<Vec<u32>>>,
@@ -1932,12 +1943,6 @@ enum HostPacketSize {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Plan {
-    pub sender: PlanRow,
-    pub receiver: PlanRow,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MulticastPlan {
     pub sender: PlanRow,
     pub receivers: Vec<PlanRow>,
@@ -2508,7 +2513,7 @@ impl Topology {
         sender_logical: u16,
         receiver_logical: u16,
         count: u32,
-    ) -> Result<Plan, ExchangeError> {
+    ) -> Result<MulticastPlan, ExchangeError> {
         validate_count(count)?;
         if sender_logical == receiver_logical {
             return Err(ExchangeError::DuplicateTile);
@@ -2568,9 +2573,9 @@ impl Topology {
             sender_logical,
             receiver_logical, count, "assembled point-to-point exchange"
         );
-        Ok(Plan {
+        Ok(MulticastPlan {
             sender: sender_row,
-            receiver: receiver_row,
+            receivers: vec![receiver_row],
         })
     }
 
@@ -3437,7 +3442,7 @@ mod tests {
             let plan = topology.point_to_point(sender, receiver, count).unwrap();
             assert_eq!(&plan.sender[..expected_sender.len()], &expected_sender);
             assert_eq!(
-                &plan.receiver[..expected_receiver.len()],
+                &plan.receivers[0][..expected_receiver.len()],
                 &expected_receiver
             );
             assert!(
@@ -3446,7 +3451,7 @@ mod tests {
                     .all(|word| *word == 0)
             );
             assert!(
-                plan.receiver[expected_receiver.len()..]
+                plan.receivers[0][expected_receiver.len()..]
                     .iter()
                     .all(|word| *word == 0)
             );
@@ -4239,7 +4244,8 @@ mod tests {
     fn finalizes_point_receiver_for_direct_execution() {
         let topology = Topology::c600();
         let plan = topology.point_to_point(274, 1286, 64).unwrap();
-        let row = finalize_point_receiver(&plan.receiver, topology.physical(274).unwrap()).unwrap();
+        let row =
+            finalize_point_receiver(&plan.receivers[0], topology.physical(274).unwrap()).unwrap();
         assert_eq!(row[0], SYNC_SUPERVISOR_INSTRUCTION);
         assert_eq!(row[1] & 0x1fff, 9);
         assert_eq!(row[5], RETURN_M10_INSTRUCTION);
