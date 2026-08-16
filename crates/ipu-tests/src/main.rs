@@ -2,10 +2,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
-    AmpOrder, AttentionStrategy, BlockMajorOrder, CompiledPackage, ComputeGraph, DiagnosticTensor,
+    AmpOrder, AttentionStrategy, BlockMajorOrder, CompiledPackage, CompiledTensor, ComputeGraph,
     GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid, GemmOrientation, GemmPlanConstraint,
     GemmResultGrid, Layout, LocalOperandStaging, MemoryClass, OperatorClass, PackageConfig,
-    ParallelReductionPlan, PipelineConfig, PlannerSearchDomain, Precision, ProfilingMode,
+    ParallelReductionPlan, PipelineConfig, PlannerSearchDomain, Precision, ProfilingConfig,
     ReductionStaging, TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates,
     build_diagnostic_package, build_package,
 };
@@ -56,7 +56,7 @@ struct Arguments {
     profile_output: Option<PathBuf>,
     /// Profiling instrumentation: none, overall start/end timing, or full step traces.
     #[arg(long, default_value = "full")]
-    profiling: ProfilingMode,
+    profiling: ProfilingConfig,
     /// Log exchange scheduling lower bounds and critical dependency chains.
     #[arg(long)]
     exchange_diagnostics: bool,
@@ -1201,7 +1201,7 @@ fn run_projected_attention_benchmark(
     clock_hz: u64,
     timeout_seconds: u64,
     profile_output: Option<&Path>,
-    profiling: ProfilingMode,
+    profiling: ProfilingConfig,
 ) -> Result<()> {
     let streams = batch
         .checked_mul(heads)
@@ -1311,7 +1311,7 @@ fn run_attention_smoke(
     clock_hz: u64,
     timeout_seconds: u64,
     profile_output: Option<&Path>,
-    profiling: ProfilingMode,
+    profiling: ProfilingConfig,
 ) -> Result<()> {
     const QUERY_SEED: u64 = 0x6174_746e_5f71;
     const KEY_SEED: u64 = 0x6174_746e_5f6b;
@@ -1568,7 +1568,7 @@ fn run_gemm_benchmark(
     clock_hz: u64,
     timeout_seconds: u64,
     profile_output: Option<&Path>,
-    profiling: ProfilingMode,
+    profiling: ProfilingConfig,
 ) -> Result<()> {
     validate_benchmark_shape(rows, inner, columns)?;
     if clock_hz == 0 {
@@ -1635,7 +1635,7 @@ fn run_siglip_mlp_benchmark(
     clock_hz: u64,
     timeout_seconds: u64,
     profile_output: Option<&Path>,
-    profiling: ProfilingMode,
+    profiling: ProfilingConfig,
 ) -> Result<()> {
     validate_mlp_benchmark_shape(batch, tokens, dimension, hidden_dimension)?;
     if clock_hz == 0 {
@@ -1652,7 +1652,7 @@ fn run_siglip_mlp_benchmark(
         .tensors
         .outputs
         .iter()
-        .find(|tensor| tensor.name.as_deref() == Some("output.0"))
+        .find(|tensor| tensor.storage.name.as_deref() == Some("output.0"))
         .context("MLP benchmark package has no logical output storage map")?;
     let expected = references
         .get(&output_metadata.value)
@@ -1799,13 +1799,13 @@ fn verify_benchmark_output(application: &Application, bytes: &[u8], inner: u32) 
 
 fn verify_logical_f16_output(
     application: &Application,
-    tensor: &DiagnosticTensor,
+    tensor: &CompiledTensor,
     bytes: &[u8],
     expected: &[f32],
 ) -> Result<f32> {
     let (binding, base) = output_binding(application, "output.0")?;
-    if tensor.precision != Precision::F16
-        || expected.len() != usize::try_from(tensor.shape.elements())?
+    if tensor.storage.precision != Precision::F16
+        || expected.len() != usize::try_from(tensor.storage.shape.elements())?
     {
         bail!("MLP benchmark output metadata is inconsistent with its reference");
     }
@@ -1814,7 +1814,7 @@ fn verify_logical_f16_output(
     let mut mismatches = Vec::new();
     let mut mismatch_count = 0usize;
     let mut checked = 0usize;
-    for shard in &tensor.shards {
+    for shard in &tensor.storage.shards {
         let slice = binding
             .slices
             .iter()

@@ -65,13 +65,14 @@ pub use mid::{
     MidValueId, OperandMaterialization, OperandRequirement, OperationMetrics, OperatorClass,
     OperatorDispatch, OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing,
     Padding, ParallelReductionPlan, PipelineConfig, PlanMetrics, PlannerSearchDomain,
-    PointwiseInputMapping, Precision, ProfilingMode, ReductionStaging, RegionMetrics, TensorAxis,
+    PointwiseInputMapping, Precision, ProfilingConfig, ReductionStaging, RegionMetrics, TensorAxis,
     TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{
-    CompiledPackage, DiagnosticCheckpoint, DiagnosticShard, DiagnosticTensor, PackageBuildError,
-    PackageBuildResult, PackageConfig, PackageExchangeArtifacts, PackageTensorMetadata,
-    TileProgramData, build_diagnostic_package, build_package, build_tile_program_package,
+    CompiledPackage, CompiledTensor, CompiledTensorShard, CompiledTensorStorage,
+    DiagnosticCheckpoint, PackageBuildError, PackageBuildResult, PackageConfig,
+    PackageExchangeArtifacts, PackageTensorMetadata, TileProgramData, build_diagnostic_package,
+    build_package, build_tile_program_package,
 };
 pub use place::{Placement, PlacementError, place};
 pub use storage::{

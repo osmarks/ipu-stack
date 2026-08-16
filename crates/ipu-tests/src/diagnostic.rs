@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
 use ipu_codegen::{
-    AttentionScale, CompiledPackage, ComputeGraph, DiagnosticTensor, GemmOptions, Operation,
-    OperationKind, Precision, Region, Repeat, ShardExtent, ShardView, ValueId,
-    logical_view_byte_spans,
+    AttentionScale, CompiledPackage, CompiledTensor, CompiledTensorShard, ComputeGraph,
+    GemmOptions, Operation, OperationKind, Precision, Region, Repeat, ShardExtent, ShardView,
+    ValueId, logical_view_byte_spans,
 };
 use ipu_driver::{Device, DriverError, TileException};
 use ipu_package::{Application, Binding};
@@ -158,7 +158,7 @@ fn service_checkpoint(
                 tensor.value.index()
             )
         })?;
-        if tensor.shards.is_empty() {
+        if tensor.storage.shards.is_empty() {
             tracing::warn!(
                 operation = checkpoint.operation.index(),
                 value = tensor.value.index(),
@@ -201,18 +201,18 @@ fn service_checkpoint(
 
 fn compare_tensor(
     device: &Device,
-    tensor: &DiagnosticTensor,
+    tensor: &CompiledTensor,
     expected: &HostTensor,
     sample_limit: usize,
     atol: f32,
     rtol: f32,
     operation: u32,
 ) -> Result<(usize, f32)> {
-    let total = usize::try_from(tensor.shape.elements())?;
+    let total = usize::try_from(tensor.storage.shape.elements())?;
     let wanted = sample_indices(total, sample_limit);
     let mut actual = BTreeMap::<usize, f32>::new();
     let mut words = HashMap::<(u16, u32), u32>::new();
-    for shard in &tensor.shards {
+    for shard in &tensor.storage.shards {
         for (index, byte_offset) in shard_elements(tensor, shard)? {
             if !wanted.contains(&index) || actual.contains_key(&index) {
                 continue;
@@ -225,7 +225,10 @@ fn compare_tensor(
             let word = *words
                 .entry((shard.physical_tile, word_address))
                 .or_insert(device.read_tile_word(shard.physical_tile, word_address)?);
-            actual.insert(index, decode_word(word, address & 0b11, tensor.precision)?);
+            actual.insert(
+                index,
+                decode_word(word, address & 0b11, tensor.storage.precision)?,
+            );
         }
     }
     let mut mismatches = Vec::new();
@@ -268,8 +271,8 @@ fn sample_indices(total: usize, limit: usize) -> BTreeSet<usize> {
 }
 
 pub(crate) fn shard_elements(
-    tensor: &DiagnosticTensor,
-    shard: &ipu_codegen::DiagnosticShard,
+    tensor: &CompiledTensor,
+    shard: &CompiledTensorShard,
 ) -> Result<Vec<(usize, u32)>> {
     let logical_extents = shard
         .storage
@@ -284,7 +287,7 @@ pub(crate) fn shard_elements(
         shard: shard.storage.id,
         extents: logical_extents.clone().into(),
     };
-    let element_bytes = u32::try_from(tensor.precision.bytes())?;
+    let element_bytes = u32::try_from(tensor.storage.precision.bytes())?;
     let offsets = logical_view_byte_spans(&shard.storage, &view)?
         .into_iter()
         .flat_map(|span| (span.offset..span.offset + span.bytes).step_by(element_bytes as usize))
@@ -300,7 +303,7 @@ pub(crate) fn shard_elements(
         let mut stride = 1u64;
         for (extent, (&width, &dimension)) in logical_extents
             .iter()
-            .zip(widths.iter().zip(&tensor.shape.0))
+            .zip(widths.iter().zip(&tensor.storage.shape.0))
             .rev()
         {
             let coordinate = remainder % u64::from(width);
@@ -325,7 +328,7 @@ fn decode_word(word: u32, byte: u32, precision: Precision) -> Result<f32> {
 pub(crate) fn prepare_inputs(
     graph: &ComputeGraph,
     application: &Application,
-    metadata: &[DiagnosticTensor],
+    metadata: &[CompiledTensor],
 ) -> Result<PreparedInputs> {
     let mut values = BTreeMap::new();
     for input in graph.inputs() {
@@ -339,7 +342,12 @@ pub(crate) fn prepare_inputs(
         };
         let seed = 0x4449_4147_4e4f_5354 ^ u64::from(input.value.index());
         let data = (0..input.shape.elements())
-            .map(|index| quantize(super::gaussian(seed, index) * scale, metadata.precision))
+            .map(|index| {
+                quantize(
+                    super::gaussian(seed, index) * scale,
+                    metadata.storage.precision,
+                )
+            })
             .collect();
         values.insert(
             input.value,
@@ -354,12 +362,12 @@ pub(crate) fn prepare_inputs(
         for binding in bindings {
             let metadata = metadata
                 .iter()
-                .find(|tensor| tensor.name.as_deref() == Some(binding.name.as_str()))
+                .find(|tensor| tensor.storage.name.as_deref() == Some(binding.name.as_str()))
                 .with_context(|| format!("diagnostic metadata for {} is missing", binding.name))?;
             let tensor = &values[&metadata.value];
             let mut bytes = vec![0; usize::try_from(super::binding_size(binding))?];
-            let mut covered = vec![false; usize::try_from(metadata.shape.elements())?];
-            for shard in &metadata.shards {
+            let mut covered = vec![false; usize::try_from(metadata.storage.shape.elements())?];
+            for shard in &metadata.storage.shards {
                 let slice = binding
                     .slices
                     .iter()
@@ -371,14 +379,16 @@ pub(crate) fn prepare_inputs(
                         format!("binding slice for {} shard is missing", binding.name)
                     })?;
                 for (index, offset) in shard_elements(metadata, shard)? {
-                    if u64::from(offset) + u64::try_from(metadata.precision.bytes())? > slice.size {
+                    if u64::from(offset) + u64::try_from(metadata.storage.precision.bytes())?
+                        > slice.size
+                    {
                         bail!("logical element exceeds binding {} shard", binding.name);
                     }
                     encode_value(
                         &mut bytes,
                         usize::try_from(slice.file_offset + u64::from(offset))?,
                         tensor.values[index],
-                        metadata.precision,
+                        metadata.storage.precision,
                     )?;
                     covered[index] = true;
                 }

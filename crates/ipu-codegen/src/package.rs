@@ -106,8 +106,8 @@ pub struct CompiledPackage {
 
 #[derive(Clone, Debug, Default)]
 pub struct PackageTensorMetadata {
-    pub inputs: Vec<DiagnosticTensor>,
-    pub outputs: Vec<DiagnosticTensor>,
+    pub inputs: Vec<CompiledTensor>,
+    pub outputs: Vec<CompiledTensor>,
     pub precisions: BTreeMap<ValueId, Precision>,
 }
 
@@ -126,20 +126,25 @@ pub struct PackageExchangeArtifacts {
 pub struct DiagnosticCheckpoint {
     pub operation: OperationId,
     pub breakpoint: u8,
-    pub tensors: Vec<DiagnosticTensor>,
+    pub tensors: Vec<CompiledTensor>,
 }
 
 #[derive(Clone, Debug)]
-pub struct DiagnosticTensor {
-    pub name: Option<String>,
+pub struct CompiledTensor {
     pub value: ValueId,
+    pub storage: CompiledTensorStorage,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompiledTensorStorage {
+    pub name: Option<String>,
     pub shape: crate::TensorShape,
     pub precision: Precision,
-    pub shards: Vec<DiagnosticShard>,
+    pub shards: Vec<CompiledTensorShard>,
 }
 
 #[derive(Clone, Debug)]
-pub struct DiagnosticShard {
+pub struct CompiledTensorShard {
     pub physical_tile: u16,
     pub address: u32,
     pub storage: crate::LowShard,
@@ -555,19 +560,22 @@ pub fn build_diagnostic_package(
         // A fully deferred view operation has no device work or independently
         // materialized boundary to stop at; its consumer's checkpoint covers
         // the fused mapping instead.
-        if tensors.iter().all(|tensor| tensor.shards.is_empty()) {
+        if tensors
+            .iter()
+            .all(|tensor| tensor.storage.shards.is_empty())
+        {
             continue;
         }
         for tensor in &tensors {
             tracing::debug!(
                 operation = source.index(),
                 value = tensor.value.index(),
-                shape = ?tensor.shape.0,
-                precision = ?tensor.precision,
-                shards = tensor.shards.len(),
-                order = ?tensor.shards.first().map(|shard| &shard.storage.tensor_type.format.layout.order),
-                memory_class = ?tensor.shards.first().map(|shard| shard.storage.tensor_type.format.layout.memory_class),
-                first_extents = ?tensor.shards.first().map(|shard| &shard.storage.extents),
+                shape = ?tensor.storage.shape.0,
+                precision = ?tensor.storage.precision,
+                shards = tensor.storage.shards.len(),
+                order = ?tensor.storage.shards.first().map(|shard| &shard.storage.tensor_type.format.layout.order),
+                memory_class = ?tensor.storage.shards.first().map(|shard| shard.storage.tensor_type.format.layout.memory_class),
+                first_extents = ?tensor.storage.shards.first().map(|shard| &shard.storage.extents),
                 "recorded diagnostic tensor"
             );
         }
@@ -640,7 +648,7 @@ fn build_package_artifacts(
     let mut planning = config.pipeline.clone();
     planning.diagnostic_checkpoints = diagnostic_checkpoints;
     if diagnostic_checkpoints {
-        planning.profiling = crate::ProfilingMode::Disabled;
+        planning.profiling = crate::ProfilingConfig::Disabled;
     }
     let cost_model = planning.target.cost_model();
     let finalists = build_phase("lower_mid", || {
@@ -1315,47 +1323,32 @@ fn diagnostic_tensor(
     topology: &Topology,
     value: crate::MidValueId,
     name: Option<String>,
-) -> PackageBuildResult<DiagnosticTensor> {
+) -> PackageBuildResult<CompiledTensor> {
     let mid_value = mid
         .values
         .get(value.index() as usize)
         .ok_or_else(|| invalid("diagnostic mid-level value is missing"))?;
     let low_value = low.values.iter().find(|candidate| candidate.value == value);
-    let shards = if let Some(low_value) = low_value {
-        low_value
-            .shards
-            .iter()
-            .filter(|id| {
-                low.shards
-                    .get(id.index() as usize)
-                    .is_some_and(|shard| shard.definition != crate::ShardDefinition::Unmaterialized)
-            })
-            .map(|id| {
-                let storage = low
-                    .shards
-                    .get(id.index() as usize)
-                    .ok_or_else(|| invalid("diagnostic low-level shard is missing"))?;
-                let address = placement
-                    .shard_addresses
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| invalid("diagnostic shard placement is missing"))?;
-                Ok(DiagnosticShard {
-                    physical_tile: topology.physical(storage.tile)?,
-                    address,
-                    storage: storage.clone(),
-                })
-            })
-            .collect::<PackageBuildResult<Vec<_>>>()?
+    let storage = if let Some(low_value) = low_value {
+        compiled_tensor_storage(
+            low,
+            placement,
+            topology,
+            name,
+            &mid_value.tensor_type,
+            &low_value.shards,
+        )?
     } else {
-        Vec::new()
+        CompiledTensorStorage {
+            name,
+            shape: mid_value.tensor_type.shape.clone(),
+            precision: mid_value.tensor_type.format.precision,
+            shards: Vec::new(),
+        }
     };
-    Ok(DiagnosticTensor {
-        name,
+    Ok(CompiledTensor {
         value: mid_value.origin,
-        shape: mid_value.tensor_type.shape.clone(),
-        precision: mid_value.tensor_type.format.precision,
-        shards,
+        storage,
     })
 }
 
@@ -2136,38 +2129,94 @@ fn binding(
         .first()
         .and_then(|id| program.shards.get(id.index() as usize))
         .ok_or_else(|| invalid("binding has no shards"))?;
-    let dtype = match first.tensor_type.format.precision {
-        crate::Precision::F8F143 { .. } => "f8f143",
-        crate::Precision::F16 => "f16",
-        crate::Precision::F32 => "f32",
-    };
-    let mut file_offset = 0u64;
-    let slices = shards
+    compiled_tensor_storage(
+        program,
+        placement,
+        topology,
+        Some(name),
+        &first.tensor_type,
+        shards,
+    )?
+    .binding()
+}
+
+fn compiled_tensor_storage(
+    program: &LowProgram,
+    placement: &crate::Placement,
+    topology: &Topology,
+    name: Option<String>,
+    tensor_type: &crate::TensorType,
+    shards: &[crate::LowShardId],
+) -> PackageBuildResult<CompiledTensorStorage> {
+    let shards = shards
         .iter()
+        .filter(|id| {
+            program
+                .shards
+                .get(id.index() as usize)
+                .is_some_and(|shard| shard.definition != crate::ShardDefinition::Unmaterialized)
+        })
         .map(|id| {
-            let shard = &program.shards[id.index() as usize];
-            let size = u64::from(shard_storage_bytes(shard)?);
-            let slice = RegionSlice {
-                tile: u32::from(topology.physical(shard.tile)?),
-                tile_address: *placement
-                    .shard_addresses
-                    .get(id)
-                    .ok_or_else(|| invalid("binding shard is not placed"))?,
-                file_offset,
-                size,
-            };
-            file_offset = file_offset
-                .checked_add(size)
-                .ok_or_else(|| invalid("binding file offset overflow"))?;
-            Ok(slice)
+            let storage = program
+                .shards
+                .get(id.index() as usize)
+                .ok_or_else(|| invalid("compiled tensor shard is missing"))?;
+            let address = placement
+                .shard_addresses
+                .get(id)
+                .copied()
+                .ok_or_else(|| invalid("compiled tensor shard placement is missing"))?;
+            Ok(CompiledTensorShard {
+                physical_tile: topology.physical(storage.tile)?,
+                address,
+                storage: storage.clone(),
+            })
         })
         .collect::<PackageBuildResult<Vec<_>>>()?;
-    Ok(Binding {
+    Ok(CompiledTensorStorage {
         name,
-        dtype: dtype.into(),
-        shape: first.tensor_type.shape.0.clone(),
-        slices,
+        shape: tensor_type.shape.clone(),
+        precision: tensor_type.format.precision,
+        shards,
     })
+}
+
+impl CompiledTensorStorage {
+    pub fn binding(&self) -> PackageBuildResult<Binding> {
+        let name = self
+            .name
+            .clone()
+            .ok_or_else(|| invalid("unnamed compiled tensor cannot be a host binding"))?;
+        let dtype = match self.precision {
+            crate::Precision::F8F143 { .. } => "f8f143",
+            crate::Precision::F16 => "f16",
+            crate::Precision::F32 => "f32",
+        };
+        let mut file_offset = 0u64;
+        let slices = self
+            .shards
+            .iter()
+            .map(|shard| {
+                let size = u64::from(shard_storage_bytes(&shard.storage)?);
+                let slice = RegionSlice {
+                    tile: u32::from(shard.physical_tile),
+                    tile_address: shard.address,
+                    file_offset,
+                    size,
+                };
+                file_offset = file_offset
+                    .checked_add(size)
+                    .ok_or_else(|| invalid("binding file offset overflow"))?;
+                Ok(slice)
+            })
+            .collect::<PackageBuildResult<Vec<_>>>()?;
+        Ok(Binding {
+            name,
+            dtype: dtype.into(),
+            shape: self.shape.0.clone(),
+            slices,
+        })
+    }
 }
 
 fn runtime_symbols(

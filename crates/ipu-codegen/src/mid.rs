@@ -1585,7 +1585,7 @@ pub struct PipelineConfig {
     /// reservation. Lower values emulate a model whose other persistent state
     /// occupies the remainder of SRAM.
     pub tile_memory_budget_bytes: u64,
-    pub profiling: ProfilingMode,
+    pub profiling: ProfilingConfig,
     /// Insert all-tile patched-breakpoint stops after semantic operators.
     pub diagnostic_checkpoints: bool,
     /// Emit exchange-scheduler lower bounds, per-tile role pressure, and
@@ -1811,14 +1811,14 @@ impl HardwareTarget {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ProfilingMode {
+pub enum ProfilingConfig {
     #[default]
     Disabled,
     Overall,
     Full,
 }
 
-impl ProfilingMode {
+impl ProfilingConfig {
     pub const fn records_overall_time(self) -> bool {
         !matches!(self, Self::Disabled)
     }
@@ -1828,7 +1828,7 @@ impl ProfilingMode {
     }
 }
 
-impl std::fmt::Display for ProfilingMode {
+impl std::fmt::Display for ProfilingConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Disabled => "none",
@@ -1838,7 +1838,7 @@ impl std::fmt::Display for ProfilingMode {
     }
 }
 
-impl std::str::FromStr for ProfilingMode {
+impl std::str::FromStr for ProfilingConfig {
     type Err = &'static str;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -1865,7 +1865,7 @@ impl PipelineConfig {
             exchange_schedule_finalists: 1,
             standard_memory_reservation_bytes: memory.default_standard_reservation_bytes,
             tile_memory_budget_bytes: memory.total_bytes,
-            profiling: ProfilingMode::default(),
+            profiling: ProfilingConfig::default(),
             diagnostic_checkpoints: false,
             exchange_diagnostics: false,
             conversion_streaming: ConversionStreamingPolicy::WhenRequired,
