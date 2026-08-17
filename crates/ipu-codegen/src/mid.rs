@@ -12,10 +12,7 @@ use crate::config::{
     PipelineConfig, PlannerSearchDomain,
 };
 use crate::cost::MemoizedCostModel;
-pub use crate::cost::{
-    CostEstimate, CostModel, ExchangeFootprint, IPU21_TARGET_COSTS, Ipu21CostModel,
-    Ipu21TargetCosts,
-};
+pub use crate::cost::{CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts};
 use crate::estimate::{
     conversion_memory_estimate, operator_memory_estimate, region_peak_memory,
     region_peak_memory_with_multiplicity,
@@ -32,6 +29,7 @@ use crate::layout::{
     AMP_WIDE_OUTPUT_COLUMN_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout, MemoryClass,
     Padding, TensorAxis, TensorFormat, TensorType,
 };
+pub use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics, RegionMetrics};
 use crate::operator::*;
 use rayon::prelude::*;
@@ -701,7 +699,7 @@ struct FutureDeferredState {
     source_parameter: bool,
     source_storage_class: u32,
     transform: DeferredTransform,
-    unfused_cycles: u64,
+    unfused_cost: CostEstimate,
     claimed: bool,
 }
 
@@ -1445,7 +1443,7 @@ fn future_beam_state(
             source_parameter: branch.state.parameter_values.contains(&source),
             source_storage_class: storage_class(source),
             transform: offer.transform,
-            unfused_cycles: offer.unfused_cycles,
+            unfused_cost: offer.unfused_cost,
             claimed: claims.contains(&result),
         })
         .collect();
@@ -1495,7 +1493,7 @@ fn deferred_aware_branch_score(
                         && !possible_future_consumers.contains(&branch.state.get(*result).origin)
                 })
             })
-            .map_or(0, |offer| offer.unfused_cycles);
+            .map_or(0, |offer| offer.unfused_cost.cycles);
         cycles
             .saturating_add(operation.metrics.cost.cycles)
             .saturating_add(pending)
@@ -1516,8 +1514,7 @@ fn restore_unclaimed_deferred_costs(operations: &mut [MidOperation]) {
             .first()
             .is_some_and(|result| !claims.contains(result))
         {
-            operation.metrics.cost.cycles = offer.unfused_cycles;
-            operation.metrics.cost.exchange_cycles = offer.unfused_exchange_cycles;
+            operation.metrics.cost = offer.unfused_cost;
         }
     }
 }
@@ -1678,7 +1675,7 @@ fn apply_selected_plan(
         let Some(&source) = operations[producer_index].inputs.get(offered.source_input) else {
             continue;
         };
-        let producer_cycles = offered.unfused_cycles;
+        let producer_cycles = offered.unfused_cost.cycles;
         let fused_cycles = costs.deferred_input_cycles(
             offered.transform,
             &state.get(source).tensor_type,
@@ -1729,8 +1726,11 @@ fn apply_selected_plan(
     );
     let mut deferred_output = plan.deferred_output;
     if let Some(offer) = &mut deferred_output {
-        offer.unfused_cycles = operator_cycles;
-        offer.unfused_exchange_cycles = operator_exchange_cycles;
+        offer.unfused_cost = CostEstimate {
+            cycles: operator_cycles,
+            exchange_cycles: operator_exchange_cycles,
+            exchange_footprint: exchange,
+        };
         operator_cycles = 0;
         operator_exchange_cycles = 0;
     }
@@ -2011,8 +2011,7 @@ fn plans_for_operation(
                     transform: DeferredTransform::SplitLastAxisIntoLeading {
                         parts: options.heads,
                     },
-                    unfused_cycles: 0,
-                    unfused_exchange_cycles: 0,
+                    unfused_cost: CostEstimate::default(),
                 }),
                 deferred_inputs: vec![None],
             };
@@ -4213,8 +4212,8 @@ mod tests {
             _strategy: ConversionStrategy,
             _from: &Layout,
             _to: &Layout,
-        ) -> crate::cost::CostEstimate {
-            crate::cost::CostEstimate::default()
+        ) -> crate::CostEstimate {
+            crate::CostEstimate::default()
         }
     }
 
@@ -4817,7 +4816,7 @@ mod tests {
                 .and_then(|plan| plan.deferred_output)
                 .unwrap();
             assert_eq!(
-                operation.metrics.cost.cycles, offer.unfused_cycles,
+                operation.metrics.cost.cycles, offer.unfused_cost.cycles,
                 "random case {case}"
             );
             assert!(operation.metrics.cost.cycles != 0, "random case {case}");

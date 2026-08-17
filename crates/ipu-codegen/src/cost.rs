@@ -12,6 +12,7 @@ use crate::graph::TensorShape;
 use crate::layout::{
     AmpOrder, BlockMajorOrder, ElementOrder, Layout, MemoryClass, TensorAxis, TensorType,
 };
+use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::operator::{
     ConversionStrategy, DeferredTransform, GemmDistribution, LocalOperandStaging, MidOperator,
     OperatorDispatch, OperatorRequirements, Precision, layout_conversion_strategy,
@@ -151,60 +152,6 @@ pub trait CostModel: Sync {
     ) -> CostEstimate;
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CostEstimate {
-    pub cycles: u64,
-    pub exchange_cycles: u64,
-    pub exchange_footprint: ExchangeFootprint,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ExchangeFootprint {
-    pub phases: u64,
-    pub maximum_transfer_chunks_per_tile: u64,
-}
-
-impl CostEstimate {
-    pub const fn exchange_row_bytes(self) -> u64 {
-        self.exchange_footprint.estimated_row_bytes()
-    }
-
-    pub const fn sequence(self, next: Self) -> Self {
-        Self {
-            cycles: self.cycles.saturating_add(next.cycles),
-            exchange_cycles: self.exchange_cycles.saturating_add(next.exchange_cycles),
-            exchange_footprint: ExchangeFootprint {
-                phases: self
-                    .exchange_footprint
-                    .phases
-                    .saturating_add(next.exchange_footprint.phases),
-                maximum_transfer_chunks_per_tile: if self
-                    .exchange_footprint
-                    .maximum_transfer_chunks_per_tile
-                    > next.exchange_footprint.maximum_transfer_chunks_per_tile
-                {
-                    self.exchange_footprint.maximum_transfer_chunks_per_tile
-                } else {
-                    next.exchange_footprint.maximum_transfer_chunks_per_tile
-                },
-            },
-        }
-    }
-
-    pub const fn repeated(self, count: u32) -> Self {
-        Self {
-            cycles: self.cycles.saturating_mul(count as u64),
-            exchange_cycles: self.exchange_cycles.saturating_mul(count as u64),
-            exchange_footprint: ExchangeFootprint {
-                phases: self.exchange_footprint.phases.saturating_mul(count as u64),
-                maximum_transfer_chunks_per_tile: self
-                    .exchange_footprint
-                    .maximum_transfer_chunks_per_tile,
-            },
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SpatialOccupancy {
     average_work: u64,
@@ -226,27 +173,6 @@ impl SpatialOccupancy {
         // without incorrectly scoring latency as mean work.
         debug_assert!(self.average_work <= self.critical_work);
         self.critical_work
-    }
-}
-
-impl ExchangeFootprint {
-    pub const fn estimated_row_bytes(self) -> u64 {
-        // A primitive plan contributes its synchronization-free body to the
-        // consolidated per-phase row. The entry sync and terminal return are
-        // shared by the caller and consolidated row respectively. Mid-level
-        // byte volume cannot see where independently tiled source and
-        // destination spans meet, or the address tables needed by shared
-        // executable rows. Six encoded chunks per logical chunk tracks the
-        // combined executable, offset, and per-use value storage on IPU21.
-        let words_per_chunk = (ipu_target::exchange::PLAN_WORDS - 2) as u64;
-        let encoded_chunks_per_logical_chunk = 6;
-        self.phases
-            .saturating_add(
-                self.maximum_transfer_chunks_per_tile
-                    .saturating_mul(words_per_chunk)
-                    .saturating_mul(encoded_chunks_per_logical_chunk),
-            )
-            .saturating_mul(4)
     }
 }
 

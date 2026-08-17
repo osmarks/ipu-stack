@@ -70,11 +70,12 @@ pub use memory::{
     IPU21_STANDARD_FIXED_BYTES,
 };
 pub use metrics::{
-    MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics, PlanMetrics, RegionMetrics,
+    CostEstimate, ExchangeFootprint, MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics,
+    PlanMetrics, RegionMetrics,
 };
 pub use mid::{
-    CostEstimate, CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, LoweringError,
-    LoweringResult, lower,
+    CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, LoweringError, LoweringResult,
+    lower,
 };
 pub use operator::{
     AccumulationPrecision, AllocationRequirements, AttentionBlocking, AttentionPadding,

@@ -6,6 +6,7 @@ use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
     MemoryClass, ShardExtent, TensorAxis, TensorFormat, TensorRegion, TensorType,
 };
+use crate::metrics::CostEstimate;
 
 /// In-memory representation of one tensor element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -290,9 +291,7 @@ pub struct DeferredOutputPlan {
     pub source_input: usize,
     pub transform: DeferredTransform,
     /// Cost restored if no later consumer claims this offer.
-    pub unfused_cycles: u64,
-    /// Exchange portion of `unfused_cycles`, restored with the offer.
-    pub unfused_exchange_cycles: u64,
+    pub unfused_cost: CostEstimate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
