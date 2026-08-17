@@ -138,6 +138,9 @@ pub enum ExchangeOrder {
     Semantic,
     /// Preserve allocation order, treating both views as packed byte spans.
     Physical,
+    /// Use copy geometry selected from the resolved layouts by mid-level
+    /// conversion planning.
+    Planned(crate::CopyGeometry),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1368,7 +1371,9 @@ impl LoweringState {
             ConversionStrategy::LocalKernel => {
                 self.lower_local_conversion(operation, kind, plan, tiles)
             }
-            ConversionStrategy::DirectRetile | ConversionStrategy::StageLogicalThenTransform => {
+            ConversionStrategy::DirectRetile
+            | ConversionStrategy::DirectLogical
+            | ConversionStrategy::StageLogicalThenTransform => {
                 self.lower_intersection_conversion(operation, kind, plan, tiles)
             }
         }
@@ -1426,49 +1431,136 @@ impl LoweringState {
         };
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
-        let logical_order = match plan.strategy {
-            ConversionStrategy::DirectRetile => false,
-            ConversionStrategy::StageLogicalThenTransform => true,
-            ConversionStrategy::LocalKernel => {
-                return Err(LowLoweringError::InvalidConversionPlan);
-            }
+        let staged = plan.strategy == ConversionStrategy::StageLogicalThenTransform;
+        let staging = if staged {
+            outputs
+                .iter()
+                .map(|&output| self.push_conversion_staging(output))
+                .collect::<LowLoweringResult<Vec<_>>>()?
+        } else {
+            outputs.clone()
         };
-        let mut mappings = Vec::new();
-        for output in outputs {
-            let tile = self.shards[output.index() as usize].tile;
-            let mut unique_intersections = BTreeMap::<Vec<ShardExtent>, LowShardId>::new();
-            for source in &inputs {
-                let Some(extents) = intersect_extents(
-                    &self.shards[source.index() as usize].extents,
-                    &self.shards[output.index() as usize].extents,
-                ) else {
-                    continue;
-                };
-                let selected = unique_intersections.entry(extents).or_insert(*source);
-                if self.shards[source.index() as usize].tile == tile {
-                    *selected = *source;
+        if plan.strategy == ConversionStrategy::DirectLogical {
+            for &output in &outputs {
+                if self.shard_has_padding(output) {
+                    self.append_fill_zero(tiles, output, operation_provenance(operation, kind))?;
                 }
             }
-            for (extents, source) in unique_intersections {
-                mappings.push((
-                    ShardView {
-                        shard: source,
-                        extents: extents.clone().into(),
-                    },
-                    ShardView {
-                        shard: output,
-                        extents: extents.into(),
-                    },
-                ));
+        }
+        let mut transfers = BTreeMap::<(ShardView, crate::CopyGeometry), Vec<ShardView>>::new();
+        let mut local_copies = Vec::new();
+        for mapping in &plan.mappings {
+            let source = inputs
+                .get(mapping.source_shard as usize)
+                .copied()
+                .ok_or(LowLoweringError::InvalidConversionPlan)?;
+            let destination = staging
+                .get(mapping.destination_shard as usize)
+                .copied()
+                .ok_or(LowLoweringError::InvalidConversionPlan)?;
+            let source_shard = &self.shards[source.index() as usize];
+            let destination_shard = &self.shards[destination.index() as usize];
+            if source_shard.extents != mapping.source_storage
+                || destination_shard.extents != mapping.destination_storage
+            {
+                return Err(LowLoweringError::InvalidConversionPlan);
+            }
+            let source_view = ShardView {
+                shard: source,
+                extents: mapping.region.clone(),
+            };
+            let destination_view = ShardView {
+                shard: destination,
+                extents: mapping.region.clone(),
+            };
+            for geometry in &mapping.copies {
+                if source_shard.tile == destination_shard.tile {
+                    local_copies.push((
+                        destination_shard.tile,
+                        LocalCopy {
+                            source,
+                            source_offset: geometry.source_offset,
+                            destination,
+                            destination_offset: geometry.destination_offset,
+                            bytes: u32::try_from(geometry.bytes())
+                                .map_err(|_| LowLoweringError::IdOverflow)?,
+                            pattern: if geometry.rows == 1 {
+                                LocalCopyPattern::Contiguous
+                            } else {
+                                LocalCopyPattern::Strided {
+                                    rows: geometry.rows,
+                                    row_bytes: geometry.row_bytes,
+                                    source_stride: geometry.source_stride,
+                                    destination_stride: geometry.destination_stride,
+                                }
+                            },
+                        },
+                    ));
+                } else {
+                    transfers
+                        .entry((source_view.clone(), *geometry))
+                        .or_default()
+                        .push(destination_view.clone());
+                }
             }
         }
-        self.lower_mapped_views(
-            mappings,
-            logical_order,
-            ExchangeOrder::Semantic,
-            operation_provenance(operation, kind),
-            tiles,
-        )
+        if staged {
+            for (tile, copy) in local_copies.drain(..) {
+                self.append_local_copy(tiles, tile, copy)?;
+            }
+        }
+        self.append_planned_phase(transfers, operation_provenance(operation, kind), tiles)?;
+        for (tile, copy) in local_copies {
+            self.append_local_copy(tiles, tile, copy)?;
+        }
+        if staged {
+            for (&staging, &destination) in staging.iter().zip(&outputs) {
+                let source_format = self.shards[staging.index() as usize]
+                    .tensor_type
+                    .format
+                    .clone();
+                let destination_format = self.shards[destination.index() as usize]
+                    .tensor_type
+                    .format
+                    .clone();
+                if source_format.precision != crate::Precision::F16
+                    || source_format.layout.order != ElementOrder::RowMajor
+                    || !matches!(
+                        destination_format.layout.order,
+                        ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
+                            | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
+                    )
+                {
+                    return Err(LowLoweringError::InvalidConversionPlan);
+                }
+                let tile = self.shards[destination.index() as usize].tile;
+                self.append_kernel(
+                    tiles,
+                    tile,
+                    KernelRun::new(
+                        operation_provenance(operation, kind),
+                        TileKernelSpec::Rearrange {
+                            from: source_format.layout.clone(),
+                            to: destination_format.layout.clone(),
+                        },
+                        vec![KernelOperand {
+                            views: vec![self.full_view(staging)],
+                        }],
+                        self.full_view(destination),
+                        KernelRequirements::Conversion {
+                            input: OperandRequirement::new(source_format, 2),
+                            output: OperandRequirement::new(destination_format, 2),
+                            memory_space: MemorySpaceRequirements::default()
+                                .with_distinct_elements([
+                                    MemoryOperand::Input(0),
+                                    MemoryOperand::Output,
+                                ]),
+                        },
+                    ),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn lower_mapped_views(
@@ -4944,6 +5036,27 @@ impl LoweringState {
                 }
             })
             .collect::<Vec<_>>();
+        self.append_exchange_phase(transfers, provenance, tiles)
+    }
+
+    fn append_planned_phase(
+        &mut self,
+        transfers: BTreeMap<(ShardView, crate::CopyGeometry), Vec<ShardView>>,
+        provenance: WorkProvenance,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<()> {
+        let transfers = transfers
+            .into_iter()
+            .map(|((source, geometry), mut destinations)| {
+                destinations.sort_unstable();
+                destinations.dedup();
+                LogicalExchange {
+                    source,
+                    destinations,
+                    order: ExchangeOrder::Planned(geometry),
+                }
+            })
+            .collect();
         self.append_exchange_phase(transfers, provenance, tiles)
     }
 

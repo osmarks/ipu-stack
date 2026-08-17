@@ -3,7 +3,7 @@
 #[cfg(test)]
 use crate::MemorySpaceRequirements;
 use crate::estimate::{
-    ExchangeEndpointTraffic, average_shard_bytes, conversion_traffic,
+    ExchangeEndpointTraffic, average_shard_bytes, conversion_mapping_traffic,
     gemm_exchange_endpoint_traffic, gemm_exchange_phase_count, gemm_partial_tensor,
     gemm_requires_panel_repacking, gemm_uses_panel_buffer, maximum_axis_shard_extent,
     maximum_shard_bytes, operator_memory_estimate, physical_elements,
@@ -17,6 +17,8 @@ use crate::operator::{
     ConversionStrategy, DeferredTransform, GemmDistribution, LocalOperandStaging, MidOperator,
     OperatorDispatch, OperatorRequirements, Precision, layout_conversion_strategy,
 };
+use crate::ConversionMapping;
+use crate::conversion::plan_conversion_mappings;
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -62,10 +64,9 @@ pub trait CostModel: Sync {
                 self.operator_cycles(operator, dispatch, requirements, inputs, output),
                 |cycles, ((source, input), _)| {
                     cycles.saturating_add(
-                        self.rearrangement_cost(
+                        self.layout_conversion_cost(
                             &input.shape,
                             input.format.precision,
-                            layout_conversion_strategy(&source.format.layout, &input.format.layout),
                             &source.format.layout,
                             &input.format.layout,
                         )
@@ -95,10 +96,9 @@ pub trait CostModel: Sync {
                 self.operator_exchange_cycles(operator, dispatch, requirements, inputs, output),
                 |cycles, ((source, input), _)| {
                     cycles.saturating_add(
-                        self.rearrangement_cost(
+                        self.layout_conversion_cost(
                             &input.shape,
                             input.format.precision,
-                            layout_conversion_strategy(&source.format.layout, &input.format.layout),
                             &source.format.layout,
                             &input.format.layout,
                         )
@@ -149,7 +149,33 @@ pub trait CostModel: Sync {
         strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
+        mappings: &[ConversionMapping],
     ) -> CostEstimate;
+
+    fn layout_conversion_cost(
+        &self,
+        shape: &TensorShape,
+        precision: Precision,
+        from: &Layout,
+        to: &Layout,
+    ) -> CostEstimate {
+        let strategy = layout_conversion_strategy(precision, from, to);
+        let Ok(mappings) = plan_conversion_mappings(shape, precision, from, to, strategy) else {
+            return impossible_conversion_cost();
+        };
+        self.rearrangement_cost(shape, precision, strategy, from, to, &mappings)
+    }
+}
+
+fn impossible_conversion_cost() -> CostEstimate {
+    CostEstimate {
+        cycles: u64::MAX / 8,
+        exchange_cycles: u64::MAX / 8,
+        exchange_footprint: ExchangeFootprint {
+            phases: u64::MAX / 8,
+            maximum_transfer_chunks_per_tile: u64::MAX / 8,
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,6 +307,7 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
+        mappings: &[ConversionMapping],
     ) -> CostEstimate {
         let key = (shape.clone(), precision, strategy, from.clone(), to.clone());
         let cached = self
@@ -293,7 +320,7 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         *cached.get_or_init(|| {
             let mut cost = self
                 .inner
-                .rearrangement_cost(shape, precision, strategy, from, to);
+                .rearrangement_cost(shape, precision, strategy, from, to, mappings);
             let active_tiles = from.tiling.tile_count.max(to.tiling.tile_count);
             // The inner model reports occupied work. Reduced-grid conversions
             // leave spatial issue slots idle, so convert that work into a phase
@@ -1427,35 +1454,14 @@ impl CostModel for Ipu21CostModel {
         strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
+        mappings: &[ConversionMapping],
     ) -> CostEstimate {
-        if strategy == ConversionStrategy::StageLogicalThenTransform
-            && from.order != ElementOrder::RowMajor
-            && to.order != ElementOrder::RowMajor
-        {
-            // This strategy receives into row-major destination staging. It
-            // does not yet pack a permuted source locally, so a non-row-major
-            // source can expose sub-word logical spans which the exchange
-            // hardware cannot send. Do not price an unmaterializable plan.
-            return CostEstimate {
-                cycles: u64::MAX / 8,
-                exchange_cycles: u64::MAX / 8,
-                exchange_footprint: ExchangeFootprint {
-                    phases: u64::MAX / 8,
-                    maximum_transfer_chunks_per_tile: u64::MAX / 8,
-                },
-            };
-        }
-        let Some(traffic) = conversion_traffic(shape, precision, from, to) else {
-            return CostEstimate {
-                cycles: u64::MAX / 8,
-                exchange_cycles: u64::MAX / 8,
-                exchange_footprint: ExchangeFootprint {
-                    phases: u64::MAX / 8,
-                    maximum_transfer_chunks_per_tile: u64::MAX / 8,
-                },
-            };
-        };
-        let direct_retile = strategy == ConversionStrategy::DirectRetile;
+        let _ = (shape, precision);
+        let traffic = conversion_mapping_traffic(mappings);
+        let direct_retile = matches!(
+            strategy,
+            ConversionStrategy::DirectRetile | ConversionStrategy::DirectLogical
+        );
         let endpoint_traffic = ExchangeEndpointTraffic::from_conversion(&traffic);
         let exchange_cycles = exchange_endpoint_cycles(&endpoint_traffic, 1);
         let (local_bytes, local_calls) = if direct_retile {

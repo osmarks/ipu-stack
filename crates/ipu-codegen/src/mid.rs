@@ -1537,10 +1537,9 @@ fn format_equality_cost(
         let rearrange = (source.format.layout != target.format.layout)
             .then(|| {
                 costs
-                    .rearrangement_cost(
+                    .layout_conversion_cost(
                         &source.shape,
                         target.format.precision,
-                        layout_conversion_strategy(&source.format.layout, &target.format.layout),
                         &source.format.layout,
                         &target.format.layout,
                     )
@@ -3587,6 +3586,7 @@ fn ensure_format(
                 input: OperandRequirement::new(original.tensor_type.format.clone(), 8),
                 output: OperandRequirement::new(tensor_type.format.clone(), 8),
                 strategy: ConversionStrategy::LocalKernel,
+                mappings: Vec::new(),
             }),
             metrics: OperationMetrics {
                 cost: CostEstimate {
@@ -3604,13 +3604,30 @@ fn ensure_format(
         let from = tensor_type.format.layout.clone();
         tensor_type.format.layout = target.layout.clone();
         let result = state.derived_value(value, tensor_type.clone());
-        let strategy = layout_conversion_strategy(&from, &target.layout);
+        let strategy =
+            layout_conversion_strategy(tensor_type.format.precision, &from, &target.layout);
+        let mappings = crate::conversion::plan_conversion_mappings(
+            &tensor_type.shape,
+            tensor_type.format.precision,
+            &from,
+            &target.layout,
+            strategy,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "selected layout conversion must have regular copy geometry: {error}; shape={:?}; precision={:?}; from={from:?}; to={:?}",
+                tensor_type.shape,
+                tensor_type.format.precision,
+                target.layout,
+            )
+        });
         let rearrangement = costs.rearrangement_cost(
             &tensor_type.shape,
             tensor_type.format.precision,
             strategy,
             &from,
             &target.layout,
+            &mappings,
         );
         let memory = conversion_memory_estimate(&current.tensor_type, &tensor_type);
         operations.push(MidOperation {
@@ -3630,6 +3647,7 @@ fn ensure_format(
                 output: OperandRequirement::new(tensor_type.format.clone(), 8)
                     .with_materialization(materialization),
                 strategy,
+                mappings,
             }),
             metrics: OperationMetrics {
                 cost: rearrangement,
@@ -4212,6 +4230,7 @@ mod tests {
             _strategy: ConversionStrategy,
             _from: &Layout,
             _to: &Layout,
+            _mappings: &[crate::ConversionMapping],
         ) -> crate::CostEstimate {
             crate::CostEstimate::default()
         }

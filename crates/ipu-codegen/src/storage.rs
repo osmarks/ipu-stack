@@ -1,6 +1,6 @@
 //! Conversion from logical shard views to physical byte ranges.
 
-use crate::layout::{AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder};
+use crate::layout::{AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, TensorRegion};
 use crate::low::{LowShard, ShardView};
 use crate::operator::Precision;
 
@@ -172,8 +172,51 @@ pub fn logical_view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageRes
 }
 
 fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> StorageResult<u64> {
+    physical_index_for(
+        shard.tensor_type.format.layout.order,
+        shard.tensor_type.format.precision,
+        widths,
+        coordinates,
+    )
+}
+
+/// Resolves one semantic coordinate to a byte offset within an owning tensor
+/// region. Conversion planning uses this only at layout block boundaries;
+/// enumerating individual tensor elements remains a validation facility.
+pub(crate) fn physical_byte_offset(
+    order: ElementOrder,
+    precision: Precision,
+    owner: &TensorRegion,
+    coordinates: &[u32],
+) -> StorageResult<u32> {
+    if coordinates.len() != owner.len() {
+        return Err(StorageError::InvalidView);
+    }
+    let mut local = Vec::with_capacity(coordinates.len());
+    let mut widths = Vec::with_capacity(owner.len());
+    for (coordinate, extent) in coordinates.iter().zip(owner.iter()) {
+        if *coordinate < extent.start || *coordinate >= extent.physical_end {
+            return Err(StorageError::InvalidView);
+        }
+        local.push(*coordinate - extent.start);
+        widths.push(extent.physical_end - extent.start);
+    }
+    let elements = physical_index_for(order, precision, &widths, &local)?;
+    let element_bytes = precision.bytes();
+    u32::try_from(elements)
+        .ok()
+        .and_then(|elements| elements.checked_mul(element_bytes as u32))
+        .ok_or(StorageError::Overflow)
+}
+
+fn physical_index_for(
+    order: ElementOrder,
+    precision: Precision,
+    widths: &[u32],
+    coordinates: &[u32],
+) -> StorageResult<u64> {
     let rank = widths.len();
-    match shard.tensor_type.format.layout.order {
+    match order {
         ElementOrder::RowMajor => encode_row_major(widths, coordinates),
         ElementOrder::BlockMajor(order) => {
             if rank < 2 {
@@ -185,14 +228,7 @@ fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> Stor
             let row = coordinates[rank - 2];
             let column = coordinates[rank - 1];
             let matrix_elements = u64::from(rows) * u64::from(columns);
-            let within = block_major_matrix_index(
-                order,
-                shard.tensor_type.format.precision,
-                rows,
-                columns,
-                row,
-                column,
-            )?;
+            let within = block_major_matrix_index(order, precision, rows, columns, row, column)?;
             outer
                 .checked_mul(matrix_elements)
                 .and_then(|base| base.checked_add(u64::from(within)))
@@ -209,13 +245,7 @@ fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> Stor
             let column = coordinates[rank - 1];
             if role == AmpOrder::TransposedRight {
                 let matrix_elements = u64::from(rows) * u64::from(columns);
-                let within = right_matrix_index(
-                    shard.tensor_type.format.precision,
-                    columns,
-                    rows,
-                    column,
-                    row,
-                )?;
+                let within = right_matrix_index(precision, columns, rows, column, row)?;
                 outer
                     .checked_mul(matrix_elements)
                     .and_then(|base| base.checked_add(u64::from(within)))
@@ -226,7 +256,7 @@ fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> Stor
                 })?;
                 amp_matrix_index(
                     role,
-                    shard.tensor_type.format.precision,
+                    precision,
                     flat_rows,
                     columns,
                     u32::try_from(outer)
@@ -239,14 +269,7 @@ fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> Stor
                 .map(u64::from)
             } else {
                 let matrix_elements = u64::from(rows) * u64::from(columns);
-                let within = amp_matrix_index(
-                    role,
-                    shard.tensor_type.format.precision,
-                    rows,
-                    columns,
-                    row,
-                    column,
-                )?;
+                let within = amp_matrix_index(role, precision, rows, columns, row, column)?;
                 outer
                     .checked_mul(matrix_elements)
                     .and_then(|base| base.checked_add(u64::from(within)))
@@ -753,7 +776,7 @@ pub fn block_major_matrix_coordinates(
     ))
 }
 
-fn amp_micro_dimension(precision: Precision) -> u32 {
+pub(crate) fn amp_micro_dimension(precision: Precision) -> u32 {
     match precision {
         Precision::F8F143 { .. } => 32,
         Precision::F16 => 16,

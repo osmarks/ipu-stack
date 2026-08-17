@@ -1,6 +1,7 @@
 //! Memory, communication, and capacity estimates shared by planning policies.
 
 use crate::graph::TensorShape;
+use crate::ConversionMapping;
 use crate::ir::{MidOperation, MidOperationKind, MidValue, MidValueId};
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, Layout, MemoryClass, TensorAxis, TensorRegion,
@@ -265,6 +266,109 @@ pub(crate) fn conversion_traffic(
         add_endpoint_load(&mut traffic.source_bus_loads, bus, bytes, fragments);
     }
     Some(traffic)
+}
+
+/// Derives communication pressure from the same regular copy nests consumed
+/// by low lowering. A multicast contributes once to its source bus and once to
+/// every receiving tile; local geometries contribute no exchange traffic.
+pub(crate) fn conversion_mapping_traffic(
+    mappings: &[ConversionMapping],
+) -> ConversionTraffic {
+    let maximum_chunk_bytes = u64::from(ipu_target::exchange::MAX_TRANSFER_WORDS) * 4;
+    let geometry_fragments = |mapping: &ConversionMapping| {
+        mapping.copies.iter().fold(0u64, |total, geometry| {
+            total.saturating_add(
+                u64::from(geometry.rows)
+                    .saturating_mul(u64::from(geometry.row_bytes).div_ceil(maximum_chunk_bytes)),
+            )
+        })
+    };
+    let geometry_bytes = |mapping: &ConversionMapping| {
+        mapping
+            .copies
+            .iter()
+            .fold(0u64, |total, geometry| total.saturating_add(geometry.bytes()))
+    };
+
+    let mut traffic = ConversionTraffic::default();
+    let mut destination_loads = HashMap::<u32, (u16, u64, u64, u64, u64)>::new();
+    let mut remote_sources = HashMap::<
+        (u32, TensorRegion, Vec<crate::CopyGeometry>),
+        (u16, u64, u64),
+    >::new();
+    for mapping in mappings {
+        let bytes = geometry_bytes(mapping);
+        let fragments = geometry_fragments(mapping);
+        let destination = destination_loads.entry(mapping.destination_shard).or_insert((
+            mapping.destination_tile,
+            0,
+            0,
+            0,
+            0,
+        ));
+        destination.1 = destination.1.saturating_add(bytes);
+        destination.3 = destination.3.saturating_add(1);
+        if mapping.source_tile == mapping.destination_tile {
+            destination.4 = destination.4.saturating_add(bytes);
+            traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(bytes);
+            traffic.maximum_local_intersections =
+                traffic.maximum_local_intersections.max(mapping.copies.len() as u64);
+        } else {
+            destination.2 = destination.2.saturating_add(bytes);
+            add_endpoint_load(
+                &mut traffic.remote_destination_loads,
+                mapping.destination_tile,
+                bytes,
+                fragments,
+            );
+            remote_sources.entry((
+                mapping.source_shard,
+                mapping.region.clone(),
+                mapping.copies.clone(),
+            ))
+            .or_insert((mapping.source_tile, bytes, fragments));
+        }
+    }
+    for (_, total_bytes, remote_bytes, intersections, local_bytes) in
+        destination_loads.into_values()
+    {
+        traffic.maximum_destination_bytes = traffic.maximum_destination_bytes.max(total_bytes);
+        traffic.maximum_remote_destination_bytes =
+            traffic.maximum_remote_destination_bytes.max(remote_bytes);
+        traffic.maximum_intersections = traffic.maximum_intersections.max(intersections);
+        traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
+    }
+    for load in &traffic.remote_destination_loads {
+        traffic.maximum_remote_destination_fragments = traffic
+            .maximum_remote_destination_fragments
+            .max(load.fragments);
+    }
+    traffic.remote_fragments = remote_sources.len() as u64;
+    let mut source_loads = HashMap::<u16, (u64, u64)>::new();
+    for (_, (tile, bytes, fragments)) in remote_sources {
+        traffic.source_payload_bytes = traffic.source_payload_bytes.saturating_add(bytes);
+        traffic.maximum_routed_fragments = traffic.maximum_routed_fragments.max(fragments);
+        let load = source_loads.entry(tile).or_default();
+        load.0 = load.0.saturating_add(bytes);
+        load.1 = load.1.saturating_add(fragments);
+    }
+    let mut bus_loads = HashMap::<u16, (u64, u64)>::new();
+    for (tile, (bytes, fragments)) in source_loads {
+        traffic.maximum_source_payload_bytes =
+            traffic.maximum_source_payload_bytes.max(bytes);
+        traffic.maximum_source_fragments = traffic.maximum_source_fragments.max(fragments);
+        let bus = bus_loads.entry(tile / 2).or_default();
+        bus.0 = bus.0.saturating_add(bytes);
+        bus.1 = bus.1.saturating_add(fragments);
+    }
+    for (bus, (bytes, fragments)) in bus_loads {
+        traffic.maximum_source_bus_payload_bytes =
+            traffic.maximum_source_bus_payload_bytes.max(bytes);
+        traffic.maximum_source_bus_fragments =
+            traffic.maximum_source_bus_fragments.max(fragments);
+        add_endpoint_load(&mut traffic.source_bus_loads, bus, bytes, fragments);
+    }
+    traffic
 }
 
 fn layout_extents(shape: &TensorShape, layout: &Layout) -> Option<Vec<(u16, TensorRegion)>> {

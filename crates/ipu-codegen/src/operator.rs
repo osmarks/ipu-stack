@@ -1,5 +1,6 @@
 //! Whole-device operator plans and tile-kernel specifications.
 
+use crate::ConversionMapping;
 use crate::graph::{AddOptions, AttentionOptions, GemmOptions, SplitHeadsOptions, TensorShape};
 use crate::ir::MidValueId;
 use crate::layout::{
@@ -591,6 +592,9 @@ pub enum ConversionStrategy {
     LocalKernel,
     /// Exchange logical intersections directly into the destination layout.
     DirectRetile,
+    /// Exchange word-aligned semantic blocks directly between differing
+    /// element orders.
+    DirectLogical,
     /// Exchange logical values into row-major staging, then transform locally
     /// into the destination element order.
     StageLogicalThenTransform,
@@ -598,13 +602,40 @@ pub enum ConversionStrategy {
 
 impl ConversionStrategy {
     pub const fn uses_intersections(self) -> bool {
-        matches!(self, Self::DirectRetile | Self::StageLogicalThenTransform)
+        !matches!(self, Self::LocalKernel)
     }
 }
 
-pub fn layout_conversion_strategy(from: &Layout, to: &Layout) -> ConversionStrategy {
+pub fn layout_conversion_strategy(
+    precision: Precision,
+    from: &Layout,
+    to: &Layout,
+) -> ConversionStrategy {
     if from.order == to.order {
         ConversionStrategy::DirectRetile
+    } else if precision == Precision::F32
+        || matches!(from.order, ElementOrder::RowMajor)
+            && matches!(
+                to.order,
+                ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+            )
+        || matches!(to.order, ElementOrder::RowMajor)
+            && matches!(
+                from.order,
+                ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+            )
+        || matches!(
+            (from.order, to.order),
+            (
+                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }),
+                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
+            ) | (
+                ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }),
+                ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
+            )
+        )
+    {
+        ConversionStrategy::DirectLogical
     } else {
         ConversionStrategy::StageLogicalThenTransform
     }
@@ -616,6 +647,9 @@ pub struct ConversionPlan {
     pub input: OperandRequirement,
     pub output: OperandRequirement,
     pub strategy: ConversionStrategy,
+    /// Resolved ownership intersections and copy nests used by costing,
+    /// exchange generation, and local-copy lowering.
+    pub mappings: Vec<ConversionMapping>,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]

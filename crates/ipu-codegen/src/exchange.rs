@@ -529,6 +529,9 @@ fn prepare_transfer(
     placement: &Placement,
     transfer: &LogicalExchange,
 ) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
+    if let crate::low::ExchangeOrder::Planned(geometry) = transfer.order {
+        return prepare_planned_transfer(program, placement, transfer, geometry);
+    }
     let source = &program.shards[transfer.source.shard.index() as usize];
     let logical_order = transfer.order == crate::low::ExchangeOrder::Semantic
         && transfer.destinations.iter().any(|view| {
@@ -671,6 +674,125 @@ fn prepare_transfer(
         .any(|((index, offset), (_, _, spans))| *index != spans.len() || *offset != 0)
     {
         return Err(ExchangeLoweringError::SizeMismatch);
+    }
+    Ok(pending)
+}
+
+fn prepare_planned_transfer(
+    program: &LowProgram,
+    placement: &Placement,
+    transfer: &LogicalExchange,
+    geometry: crate::CopyGeometry,
+) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
+    let source = &program.shards[transfer.source.shard.index() as usize];
+    let source_base = placement
+        .shard_addresses
+        .get(&source.id)
+        .copied()
+        .ok_or(ExchangeLoweringError::UnplacedShard)?;
+    let destinations = transfer
+        .destinations
+        .iter()
+        .map(|view| {
+            let shard = &program.shards[view.shard.index() as usize];
+            if matches!(shard.definition, ShardDefinition::Alias(_)) {
+                return Err(ExchangeLoweringError::InvalidDestination);
+            }
+            Ok((
+                shard.tile,
+                placement
+                    .shard_addresses
+                    .get(&view.shard)
+                    .copied()
+                    .ok_or(ExchangeLoweringError::UnplacedShard)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
+    if destinations.is_empty()
+        || geometry.rows == 0
+        || geometry.row_bytes == 0
+        || geometry.source_offset & 0b11 != 0
+        || geometry.destination_offset & 0b11 != 0
+        || geometry.row_bytes & 0b11 != 0
+    {
+        return Err(ExchangeLoweringError::UnalignedPayload);
+    }
+    let source_limit = crate::shard_storage_bytes(source)?;
+    let destination_limits = transfer
+        .destinations
+        .iter()
+        .map(|view| crate::shard_storage_bytes(&program.shards[view.shard.index() as usize]))
+        .collect::<Result<Vec<_>, _>>()?;
+    let maximum_chunk_bytes = MAX_TRANSFER_WORDS
+        .checked_mul(4)
+        .ok_or(ExchangeLoweringError::Overflow)?;
+    let mut pending = Vec::new();
+    for row in 0..geometry.rows {
+        let source_offset = geometry
+            .source_offset
+            .checked_add(
+                row.checked_mul(geometry.source_stride)
+                    .ok_or(ExchangeLoweringError::Overflow)?,
+            )
+            .ok_or(ExchangeLoweringError::Overflow)?;
+        let destination_offset = geometry
+            .destination_offset
+            .checked_add(
+                row.checked_mul(geometry.destination_stride)
+                    .ok_or(ExchangeLoweringError::Overflow)?,
+            )
+            .ok_or(ExchangeLoweringError::Overflow)?;
+        let mut copied = 0u32;
+        while copied < geometry.row_bytes {
+            let bytes = (geometry.row_bytes - copied).min(maximum_chunk_bytes);
+            if bytes & 0b11 != 0
+                || source_offset
+                    .checked_add(copied)
+                    .and_then(|offset| offset.checked_add(bytes))
+                    .is_none_or(|end| end > source_limit)
+                || destination_limits.iter().any(|&limit| {
+                    destination_offset
+                        .checked_add(copied)
+                        .and_then(|offset| offset.checked_add(bytes))
+                        .is_none_or(|end| end > limit)
+                })
+            {
+                return Err(ExchangeLoweringError::UnalignedPayload);
+            }
+            let relative_source = source_offset
+                .checked_add(copied)
+                .ok_or(ExchangeLoweringError::Overflow)?;
+            let source_address = source_base
+                .checked_add(relative_source)
+                .ok_or(ExchangeLoweringError::Overflow)?;
+            let destination_entries = destinations
+                .iter()
+                .map(|&(tile, base)| {
+                    Ok(TransferEndpoint(
+                        tile,
+                        base.checked_add(destination_offset)
+                            .and_then(|address| address.checked_add(copied))
+                            .ok_or(ExchangeLoweringError::Overflow)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
+            pending.push(PendingTransfer {
+                physical: PhysicalTransfer {
+                    source: source.tile,
+                    source_addresses: vec![source_address],
+                    destinations: destination_entries,
+                    words: bytes / 4,
+                    width: TransferWidth::Word32,
+                },
+                source_shard: source.id,
+                source_offset: relative_source,
+                source_elements: memory_elements_for_words(source_address, bytes / 4).collect(),
+                reserved_source: None,
+            });
+            copied = copied
+                .checked_add(bytes)
+                .ok_or(ExchangeLoweringError::Overflow)?;
+        }
     }
     Ok(pending)
 }

@@ -25,7 +25,7 @@ mod diagnostic;
 mod exchange_stress;
 
 #[derive(Parser)]
-#[command(version, about = "Build, load, and diagnose the trivial IPU21 package")]
+#[command(version, about = "Build, load, and diagnose IPU21 packages")]
 struct Arguments {
     /// Captured IPUCFG1 device configuration.
     configuration: PathBuf,

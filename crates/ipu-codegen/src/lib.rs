@@ -12,6 +12,7 @@ pub use package::{
 };
 
 mod config;
+mod conversion;
 mod cost;
 mod estimate;
 pub mod exchange;
@@ -32,6 +33,7 @@ pub use config::{
     AttentionStrategy, ConversionStreamingPolicy, HardwareMemoryConstraints, HardwareTarget,
     OperatorClass, PipelineConfig, PlannerSearchDomain, ProfilingConfig,
 };
+pub use conversion::{ConversionGeometryError, ConversionMapping, CopyGeometry};
 pub use exchange::{
     EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityDiagnostic,
     ExchangeLoweringError, ExchangeLoweringOptions, ExchangeScheduleProblem, ExchangeScheduleRun,
