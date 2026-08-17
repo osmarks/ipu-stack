@@ -4,15 +4,14 @@ use crate::layout::MemoryClass;
 use crate::low::{
     KernelRequirements, LowProgram, LowShardId, ShardDefinition, TileWorkList, TileWorkRef,
 };
-use crate::memory::IPU21_DATA_BASE;
 use crate::operator::{
     AllocationRequirements, MemoryElementRequirement, MemoryOperand, OperandRequirement,
 };
 use crate::storage::{StorageError, shard_storage_bytes};
 use ipu_package::AddressRegion;
 use ipu_target::memory::{
-    IPU21_APPLICATION_MEMORY_LIMIT, IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE,
-    TILE_MEMORY_ELEMENT_SIZE,
+    IPU21_APPLICATION_MEMORY_LIMIT, IPU21_DATA_BASE, IPU21_INTERLEAVED_ELEMENT_SIZE,
+    IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
 };
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};

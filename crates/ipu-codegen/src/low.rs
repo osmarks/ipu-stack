@@ -792,7 +792,7 @@ impl LoweringState {
         Ok(used
             .checked_add(bytes)
             .and_then(|total| total.checked_add(access_tail))
-            .is_some_and(|total| total <= crate::memory::IPU21_INTERLEAVED_REGION_BYTES))
+            .is_some_and(|total| total <= ipu_target::memory::IPU21_INTERLEAVED_REGION_BYTES))
     }
 
     fn right_shard_for_block(
@@ -2956,14 +2956,14 @@ impl LoweringState {
         let elements = bytes.div_ceil(shard.tensor_type.format.precision.bytes().max(1));
         let packed_cycles = crate::cost::row_major_pack_cycles(&shard.tensor_type, elements);
         let clear_cycles = if self.shard_has_padding(destination) {
-            crate::cost::IPU21_TARGET_COSTS
+            ipu_target::cost::IPU21_TARGET_COSTS
                 .kernel_launch_cycles
                 .saturating_add(bytes.div_ceil(8 * 6))
         } else {
             0
         };
         let fragment_cycles = fragments
-            .saturating_mul(crate::cost::IPU21_LOGICAL_FRAGMENT_CYCLES)
+            .saturating_mul(ipu_target::cost::IPU21_TARGET_COSTS.logical_fragment_cycles)
             .saturating_add(clear_cycles);
         let direct = fragment_cycles < packed_cycles;
         tracing::trace!(

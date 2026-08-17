@@ -2,10 +2,7 @@ use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
 use crate::ir::{MidGraph, MidOperationKind};
 use crate::low::LowProgram;
-use crate::memory::{
-    MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE,
-    RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
-};
+use crate::memory::{MemoryLayoutError, MemoryRequest, TileMemoryMap};
 use crate::mid::lower_finalists;
 use crate::operator::Precision;
 use crate::{
@@ -27,8 +24,13 @@ use ipu_target::emit::{
     WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit,
 };
 use ipu_target::exchange::ExchangeError;
+use ipu_target::hardware::HardwareTarget;
 use ipu_target::instruction::{encode_br_m, encode_setzi_m};
 use ipu_target::memory::TILE_MEMORY_BASE;
+use ipu_target::memory::{
+    IPU21_DATA_BASE, PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE,
+    RUNTIME_STATE_BYTES, WORKER_STACK_HEADROOM,
+};
 use ipu_target::program::{StepProfile, TileProgram, TileStep};
 use ipu_target::topology::{Topology, c600_logical_to_physical};
 use rayon::prelude::*;
@@ -296,7 +298,7 @@ pub fn build_tile_program_package(
     let mut run_outputs = outputs.to_vec();
     run_outputs.push(finish);
     let host_bounds = AddressRegion::new(
-        crate::IPU21_DATA_BASE,
+        IPU21_DATA_BASE,
         TILE_MEMORY_BASE + ipu_target::memory::TILE_MEMORY_SIZE,
     );
     let sizing_host_base = memory.next_free(
@@ -647,7 +649,9 @@ fn build_package_artifacts(
     if diagnostic_checkpoints {
         planning.profiling = crate::ProfilingConfig::Disabled;
     }
-    let cost_model = planning.target.cost_model();
+    let cost_model = match planning.target {
+        HardwareTarget::Ipu21 => crate::Ipu21CostModel,
+    };
     let finalists = build_phase("lower_mid", || {
         Ok(lower_finalists(
             graph,
@@ -730,7 +734,7 @@ fn select_scheduled_finalist(
             .sum::<u64>()
             .saturating_add(
                 (exchanges.phases.len() as u64)
-                    .saturating_mul(crate::IPU21_TARGET_COSTS.exchange_phase_cycles),
+                    .saturating_mul(ipu_target::cost::IPU21_TARGET_COSTS.exchange_phase_cycles),
             );
         let estimated_non_exchange_cycles = mid
             .metrics
@@ -830,7 +834,7 @@ fn build_package_from_objects(
                 // share a standard-memory element with instruction fetch.
                 alignment: ipu_target::memory::TILE_MEMORY_ELEMENT_SIZE,
                 bounds: AddressRegion::new(
-                    crate::IPU21_DATA_BASE,
+                    IPU21_DATA_BASE,
                     ipu_target::memory::IPU21_INTERLEAVED_MEMORY_BASE,
                 ),
                 end_alignment: ipu_target::memory::TILE_MEMORY_ELEMENT_SIZE,
@@ -849,7 +853,7 @@ fn build_package_from_objects(
                 // row table's first element.
                 alignment: ipu_target::memory::TILE_MEMORY_ELEMENT_SIZE,
                 bounds: AddressRegion::new(
-                    crate::IPU21_DATA_BASE,
+                    IPU21_DATA_BASE,
                     ipu_target::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
                 ),
                 end_alignment: ipu_target::memory::TILE_MEMORY_ELEMENT_SIZE,
@@ -859,7 +863,7 @@ fn build_package_from_objects(
         .transpose()?;
     let exchange_code_base = exchange_rows
         .as_ref()
-        .map_or(crate::IPU21_DATA_BASE, |allocation| allocation.range.start);
+        .map_or(IPU21_DATA_BASE, |allocation| allocation.range.start);
     let execution_topology = Topology::c600();
     let mut physical_to_logical = vec![None; usize::from(execution_tile_count)];
     for logical in 0..execution_tile_count {
@@ -920,7 +924,7 @@ fn build_package_from_objects(
     )?;
     let mut provisional_auxiliary_ranges = vec![
         vec![AddressRegion::new(
-            crate::IPU21_DATA_BASE,
+            IPU21_DATA_BASE,
             TILE_MEMORY_BASE + ipu_target::memory::TILE_MEMORY_SIZE,
         )];
         usize::from(execution_tile_count)
@@ -1055,7 +1059,7 @@ fn build_package_from_objects(
             .start
     };
     let standard_ranges = memory.free_ranges(AddressRegion::new(
-        crate::IPU21_DATA_BASE,
+        IPU21_DATA_BASE,
         ipu_target::memory::IPU21_INTERLEAVED_MEMORY_BASE,
     ));
     tracing::info!(

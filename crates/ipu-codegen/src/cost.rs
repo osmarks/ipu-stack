@@ -1,7 +1,9 @@
 //! Analytical IPU21 cycle estimation used during operator planning.
 
+use crate::ConversionMapping;
 #[cfg(test)]
 use crate::MemorySpaceRequirements;
+use crate::conversion::plan_conversion_mappings;
 use crate::estimate::{
     ExchangeEndpointTraffic, average_shard_bytes, conversion_mapping_traffic,
     gemm_exchange_endpoint_traffic, gemm_exchange_phase_count, gemm_partial_tensor,
@@ -17,9 +19,8 @@ use crate::operator::{
     ConversionStrategy, DeferredTransform, GemmDistribution, LocalOperandStaging, MidOperator,
     OperatorDispatch, OperatorRequirements, Precision, layout_conversion_strategy,
 };
-use crate::ConversionMapping;
-use crate::conversion::plan_conversion_mappings;
 use foldhash::fast::FixedState;
+use ipu_target::cost::IPU21_TARGET_COSTS;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -337,46 +338,6 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Ipu21CostModel;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ipu21TargetCosts {
-    pub exchange_bytes_per_cycle: u64,
-    pub standard_load_bytes_per_cycle: u64,
-    pub interleaved_load_bytes_per_cycle: u64,
-    pub local_copy_bytes_per_cycle: u64,
-    pub reduction_output_bytes_per_cycle: u64,
-    pub local_copy_call_cycles: u64,
-    pub exchange_phase_cycles: u64,
-    pub kernel_launch_cycles: u64,
-}
-
-// Target::getExchangeBytesPerCycle.
-pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
-    exchange_bytes_per_cycle: 4,
-    // Target::getMemcpyBytesPerCycle. Interleaved reads use both memory
-    // elements, while an ordinary read or local copy uses one data path.
-    standard_load_bytes_per_cycle: 8,
-    interleaved_load_bytes_per_cycle: 16,
-    local_copy_bytes_per_cycle: 8,
-    // Reduction-add reads two partials and writes one. Current IPU21 profiles
-    // sustain roughly one output byte per cycle after all three interleaved
-    // streams and worker imbalance are included.
-    reduction_output_bytes_per_cycle: 1,
-    // A finalized six-worker local-copy invocation, including supervisor and
-    // worker rendezvous overhead, takes 288 tile cycles on IPU21.
-    local_copy_call_cycles: 288,
-    // Target::getGlobalSyncCycles.
-    exchange_phase_cycles: 600,
-    // popops::internal::basicOpSupervisorOverhead(false).
-    kernel_launch_cycles: 11,
-};
-
-// Fragmented logical conversions spend most of their critical path changing
-// endpoints and receive pointers rather than moving payload. Current IPU21
-// schedules sustain about 160 event cycles per independent fragment once
-// routing and pointer cutovers are included. This is used to choose between a
-// direct word-fragment exchange and one local packed staging pass.
-pub(crate) const IPU21_LOGICAL_FRAGMENT_CYCLES: u64 = 160;
-
 fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases: u64) -> u64 {
     if traffic.is_empty() || phases == 0 {
         return 0;
@@ -483,39 +444,6 @@ fn attention_endpoint_traffic(
     ))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AmpKernelCosts {
-    call_cycles: u64,
-    column_group_width: u64,
-    interleaved_column_group_cycles: u64,
-    standard_column_group_cycles: u64,
-}
-
-// Cycle counts of the generated IPU21 AMP kernel. A column group processes
-// sixteen output columns and one 64-element K block. The row term represents
-// AMP work; the remaining group cost is dominated by feeding its weights.
-const IPU21_AMP_KERNEL_COSTS: AmpKernelCosts = AmpKernelCosts {
-    call_cycles: 294,
-    column_group_width: 16,
-    interleaved_column_group_cycles: 940,
-    standard_column_group_cycles: 1_063,
-};
-
-// Indexed F16 layout transforms execute scalar address arithmetic as well as
-// their loads and stores. The transposed-right panel is a contiguous copy:
-// its final coefficient permutation is performed by the GEMM's ld*putcs
-// sequence. Keep these costs separate from ideal memcpy bandwidth.
-const IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT: u64 = 10;
-// The unrolled six-worker panel pack measures about 2,364 cycles for the
-// 640-element attention shards, including launch and tail initialization.
-const IPU21_AMP_LEFT_PACK_CYCLES_PER_ELEMENT: u64 = 4;
-const IPU21_CONTIGUOUS_PANEL_PACK_CYCLES_PER_ELEMENT: u64 = 3;
-// The paired-row assembly pack has a roughly four-thousand-cycle fixed worker
-// cost, then sustains about four cycles per F16 element for both 64x16 and
-// 64x80 destinations.
-const IPU21_BLOCK_MAJOR_PACK_STARTUP_CYCLES: u64 = 4_096;
-const IPU21_BLOCK_MAJOR_PACK_CYCLES_PER_ELEMENT: u64 = 4;
-
 fn maximum_shard_elements(tensor: &TensorType) -> u64 {
     maximum_shard_bytes(tensor).div_ceil(tensor.format.precision.bytes().max(1))
 }
@@ -524,9 +452,9 @@ pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
     let cycles_per_element = match tensor.format.layout.order {
         ElementOrder::RowMajor => return 0,
         ElementOrder::Amp(AmpOrder::TransposedRight) => {
-            IPU21_CONTIGUOUS_PANEL_PACK_CYCLES_PER_ELEMENT
+            IPU21_TARGET_COSTS.contiguous_panel_pack_cycles_per_element
         }
-        ElementOrder::Amp(AmpOrder::Left) => IPU21_AMP_LEFT_PACK_CYCLES_PER_ELEMENT,
+        ElementOrder::Amp(AmpOrder::Left) => IPU21_TARGET_COSTS.amp_left_pack_cycles_per_element,
         ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
             row_block,
             column_block,
@@ -534,14 +462,14 @@ pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
             && u32::from(column_block) == crate::layout::AMP_COLUMN_MICRO =>
         {
             return elements
-                .saturating_mul(IPU21_BLOCK_MAJOR_PACK_CYCLES_PER_ELEMENT)
-                .saturating_add(IPU21_BLOCK_MAJOR_PACK_STARTUP_CYCLES);
+                .saturating_mul(IPU21_TARGET_COSTS.block_major_pack_cycles_per_element)
+                .saturating_add(IPU21_TARGET_COSTS.block_major_pack_startup_cycles);
         }
         ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }) | ElementOrder::Amp(_) => {
-            IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT
+            IPU21_TARGET_COSTS.indexed_f16_transform_cycles_per_element
         }
         ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }) => {
-            IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT
+            IPU21_TARGET_COSTS.indexed_f16_transform_cycles_per_element
         }
     };
     elements
@@ -557,7 +485,7 @@ fn amp_unpack_cycles(tensor: &TensorType) -> u64 {
         return 0;
     }
     maximum_shard_elements(tensor)
-        .saturating_mul(IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT)
+        .saturating_mul(IPU21_TARGET_COSTS.indexed_f16_transform_cycles_per_element)
         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
 }
 
@@ -602,7 +530,7 @@ fn split_heads_word_fragment_cycles(output: &TensorType) -> Option<u64> {
     .unwrap_or(0);
     Some(
         fragments
-            .saturating_mul(IPU21_LOGICAL_FRAGMENT_CYCLES)
+            .saturating_mul(IPU21_TARGET_COSTS.logical_fragment_cycles)
             .saturating_add(clear_cycles),
     )
 }
@@ -678,35 +606,35 @@ fn amp_kernel_cycles(
         || output_column_block == 0
         || output_columns_per_tile == 0
         || !inner_block.is_multiple_of(u64::from(crate::layout::AMP_COLUMN_MICRO))
-        || !output_column_block.is_multiple_of(IPU21_AMP_KERNEL_COSTS.column_group_width)
+        || !output_column_block.is_multiple_of(IPU21_TARGET_COSTS.amp_column_group_width)
     {
         return None;
     }
     let rows = output_elements_per_tile.div_ceil(output_columns_per_tile);
-    let column_groups = output_column_block.div_ceil(IPU21_AMP_KERNEL_COSTS.column_group_width);
+    let column_groups = output_column_block.div_ceil(IPU21_TARGET_COSTS.amp_column_group_width);
     let interleaved = staged_local_weights
         || right.is_some_and(|right| right.format.layout.memory_class == MemoryClass::Interleaved);
     let (row_cycles, group_cycles) = match multiply {
         Precision::F16 => (
             rows,
             if interleaved {
-                IPU21_AMP_KERNEL_COSTS.interleaved_column_group_cycles
+                IPU21_TARGET_COSTS.amp_interleaved_column_group_cycles
             } else {
-                IPU21_AMP_KERNEL_COSTS.standard_column_group_cycles
+                IPU21_TARGET_COSTS.amp_standard_column_group_cycles
             },
         ),
         // F32 AMP issues one quarter as many operations per cycle and feeds
         // twice as many weight bytes as F16 for the same matrix block.
         Precision::F32 => (
             rows.saturating_mul(4),
-            IPU21_AMP_KERNEL_COSTS
-                .standard_column_group_cycles
+            IPU21_TARGET_COSTS
+                .amp_standard_column_group_cycles
                 .saturating_mul(2),
         ),
         Precision::F8F143 { .. } => return None,
     };
     let inner_micro_groups_per_call = inner_block / u64::from(crate::layout::AMP_COLUMN_MICRO);
-    let call_cycles = IPU21_AMP_KERNEL_COSTS.call_cycles.saturating_add(
+    let call_cycles = IPU21_TARGET_COSTS.amp_call_cycles.saturating_add(
         inner_micro_groups_per_call.saturating_mul(
             output_column_block
                 .saturating_mul(row_cycles)
@@ -1198,7 +1126,7 @@ impl CostModel for Ipu21CostModel {
                 let memory = operator_memory_estimate(dispatch, requirements, inputs, output);
                 let capacity_penalty = if memory
                     .peak
-                    .fits(crate::HardwareTarget::Ipu21.memory_constraints())
+                    .fits(ipu_target::hardware::HardwareTarget::Ipu21.memory_constraints())
                 {
                     0
                 } else {

@@ -8,11 +8,11 @@
 //! layout rearrangements at format boundaries.
 
 use crate::config::{
-    AttentionStrategy, ConversionStreamingPolicy, HardwareMemoryConstraints, OperatorClass,
-    PipelineConfig, PlannerSearchDomain,
+    AttentionStrategy, ConversionStreamingPolicy, OperatorClass, PipelineConfig,
+    PlannerSearchDomain,
 };
 use crate::cost::MemoizedCostModel;
-pub use crate::cost::{CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts};
+pub use crate::cost::{CostModel, Ipu21CostModel};
 use crate::estimate::{
     conversion_memory_estimate, operator_memory_estimate, region_peak_memory,
     region_peak_memory_with_multiplicity,
@@ -32,6 +32,7 @@ use crate::layout::{
 pub use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics, RegionMetrics};
 use crate::operator::*;
+use ipu_target::hardware::HardwareMemoryConstraints;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -3670,7 +3671,8 @@ fn lookup(values: &BTreeMap<ValueId, MidValueId>, value: ValueId) -> LoweringRes
 mod tests {
     use super::*;
     use crate::graph::{AddOptions, AttentionOptions};
-    use crate::{AxisTiling, HardwareTarget, LayoutError, TensorTiling};
+    use crate::{AxisTiling, LayoutError, TensorTiling};
+    use ipu_target::hardware::HardwareTarget;
 
     const RANDOM_CASES: usize = 128;
 

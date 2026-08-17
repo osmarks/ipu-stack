@@ -30,8 +30,8 @@ pub mod place;
 pub mod storage;
 pub mod tile;
 pub use config::{
-    AttentionStrategy, ConversionStreamingPolicy, HardwareMemoryConstraints, HardwareTarget,
-    OperatorClass, PipelineConfig, PlannerSearchDomain, ProfilingConfig,
+    AttentionStrategy, ConversionStreamingPolicy, OperatorClass, PipelineConfig,
+    PlannerSearchDomain, ProfilingConfig,
 };
 pub use conversion::{ConversionGeometryError, ConversionMapping, CopyGeometry};
 pub use exchange::{
@@ -67,18 +67,11 @@ pub use low::{
     RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, RepeatRunId, ShardDefinition,
     ShardView, TileWork, TileWorkList, TileWorkRef, WorkProvenance, WorkReason, lower_to_tiles,
 };
-pub use memory::{
-    IPU21_DATA_BASE, IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES,
-    IPU21_STANDARD_FIXED_BYTES,
-};
 pub use metrics::{
     CostEstimate, ExchangeFootprint, MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics,
     PlanMetrics, RegionMetrics,
 };
-pub use mid::{
-    CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, LoweringError, LoweringResult,
-    lower,
-};
+pub use mid::{CostModel, Ipu21CostModel, LoweringError, LoweringResult, lower};
 pub use operator::{
     AccumulationPrecision, AllocationRequirements, AttentionBlocking, AttentionPadding,
     AttentionPlan, BlockedGemmPlan, ConversionPlan, ConversionStrategy, GemmBlockShape,

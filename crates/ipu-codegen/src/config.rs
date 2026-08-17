@@ -1,9 +1,9 @@
 //! Compiler target and planner search configuration.
 
-use crate::cost::Ipu21CostModel;
 use crate::graph::{TensorShape, ValueId};
 use crate::layout::{MemoryClass, TensorFormat};
 use crate::operator::{GemmPlanConstraint, Precision};
+use ipu_target::hardware::HardwareTarget;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,20 +64,6 @@ pub struct PlannerSearchDomain {
     pub(crate) weight_memory_classes: Vec<MemoryClass>,
     pub(crate) attention_strategy: AttentionStrategy,
     pub(crate) gemm_plan_constraints: Vec<GemmPlanConstraint>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HardwareTarget {
-    Ipu21,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HardwareMemoryConstraints {
-    pub standard_fixed_bytes: u64,
-    pub interleaved_bytes: u64,
-    pub interleaved_element_bytes: u64,
-    pub total_bytes: u64,
-    pub default_standard_reservation_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -216,28 +202,6 @@ impl PlannerSearchDomain {
             .retain(|existing| existing.source_operation != constraint.source_operation);
         self.gemm_plan_constraints.push(constraint);
         self
-    }
-}
-
-impl HardwareTarget {
-    pub const fn cost_model(self) -> Ipu21CostModel {
-        match self {
-            Self::Ipu21 => Ipu21CostModel,
-        }
-    }
-
-    pub const fn memory_constraints(self) -> HardwareMemoryConstraints {
-        match self {
-            Self::Ipu21 => HardwareMemoryConstraints {
-                standard_fixed_bytes: crate::memory::IPU21_STANDARD_FIXED_BYTES as u64,
-                interleaved_bytes: crate::memory::IPU21_INTERLEAVED_REGION_BYTES as u64,
-                interleaved_element_bytes: ipu_target::memory::IPU21_INTERLEAVED_ELEMENT_SIZE
-                    as u64,
-                total_bytes: crate::memory::IPU21_PLANNED_DATA_BYTES as u64,
-                default_standard_reservation_bytes:
-                    crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES as u64,
-            },
-        }
     }
 }
 

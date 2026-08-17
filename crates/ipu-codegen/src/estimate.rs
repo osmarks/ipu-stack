@@ -951,7 +951,7 @@ pub(crate) fn region_peak_memory(
     operations: &[MidOperation],
     outputs: &[MidValueId],
     values: &[MidValue],
-    constraints: crate::HardwareMemoryConstraints,
+    constraints: ipu_target::hardware::HardwareMemoryConstraints,
 ) -> MemoryPeaks {
     region_peak_memory_with_multiplicity(
         initial,
@@ -969,7 +969,7 @@ pub(crate) fn region_peak_memory_with_multiplicity(
     outputs: &[MidValueId],
     values: &[MidValue],
     allocation_multiplicity: &BTreeMap<MidValueId, u32>,
-    constraints: crate::HardwareMemoryConstraints,
+    constraints: ipu_target::hardware::HardwareMemoryConstraints,
 ) -> MemoryPeaks {
     let requirements = allocation_requirements(operations);
     let streamed_aliases = operations

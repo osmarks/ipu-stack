@@ -1,7 +1,7 @@
 //! Shared cycle and per-tile memory metrics used by operator and region planning.
 
-use crate::config::HardwareMemoryConstraints;
 use crate::layout::MemoryClass;
+use ipu_target::hardware::HardwareMemoryConstraints;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CostEstimate {

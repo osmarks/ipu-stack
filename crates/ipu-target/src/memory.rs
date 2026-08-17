@@ -25,6 +25,29 @@ pub const IPU21_APPLICATION_MEMORY_LIMIT: u32 = 0xe7bb0;
 /// Logical bytes covered by a pair of physical elements in interleaved region 1.
 pub const IPU21_INTERLEAVED_ELEMENT_SIZE: u32 = 2 * TILE_MEMORY_ELEMENT_SIZE;
 
+/// Runtime completion word followed by supervisor and worker stack state.
+pub const RUNTIME_STATE_BASE: u32 =
+    crate::exchange::EXCHANGE_WINDOW_BASE + crate::exchange::EXCHANGE_WINDOW_BYTES;
+pub const WORKER_STACK_HEADROOM: u32 = 0xe0;
+pub const WORKER_SYNC_STRIDE: u32 = 0x100;
+pub const WORKER_CONTEXTS: u32 = 6;
+pub const RUNTIME_STATE_BYTES: u32 = WORKER_STACK_HEADROOM + WORKER_CONTEXTS * WORKER_SYNC_STRIDE;
+pub const PROFILE_START_CYCLE: u32 = RUNTIME_STATE_BASE + 4;
+pub const PROFILE_END_CYCLE: u32 = RUNTIME_STATE_BASE + 8;
+
+/// First byte after permanently reserved runtime state.
+pub const IPU21_DATA_BASE: u32 = RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES;
+/// Loader-populatable region 1 storage available to interleaved data.
+pub const IPU21_INTERLEAVED_REGION_BYTES: u32 =
+    IPU21_APPLICATION_MEMORY_LIMIT - IPU21_INTERLEAVED_MEMORY_BASE;
+/// Standard-addressable storage which is not borrowed from region 1.
+pub const IPU21_STANDARD_FIXED_BYTES: u32 = IPU21_INTERLEAVED_MEMORY_BASE - IPU21_DATA_BASE;
+/// Total tile SRAM available to planned values after permanent runtime state.
+pub const IPU21_PLANNED_DATA_BYTES: u32 =
+    IPU21_STANDARD_FIXED_BYTES + IPU21_INTERLEAVED_REGION_BYTES;
+/// Baseline standard-memory reservation for generated package support data.
+pub const IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES: u32 = 3 * TILE_MEMORY_ELEMENT_SIZE;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MemoryElement {
     pub interleaved: bool,
