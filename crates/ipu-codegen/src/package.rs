@@ -1,3 +1,9 @@
+use crate::emitter::{
+    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenError, CodegenOptions, GeneratedProgram,
+    HOST_RUN_SYMBOL, HOST_STAGING_SYMBOL, PATCH_ROW_SYMBOL, PATCH_WORD_SYMBOL, PRNG_SEED_SYMBOL,
+    PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL,
+    WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit,
+};
 use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
 use crate::ir::{MidGraph, MidOperationKind};
@@ -9,11 +15,8 @@ use crate::memory::{
 use crate::mid::lower_finalists;
 use crate::operator::Precision;
 use crate::{
-    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HOST_RUN_SYMBOL, KernelBuildPlan,
-    PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, PipelineConfig, REPEAT_CALL_SYMBOL,
-    RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL, TileProgram, TileProgramLowering,
-    WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit,
-    lower_exchanges, lower_to_tiles, place, shard_storage_bytes,
+    KernelBuildPlan, PipelineConfig, TileProgram, TileProgramLowering, lower_exchanges,
+    lower_to_tiles, place, shard_storage_bytes,
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
@@ -41,7 +44,7 @@ const RUNTIME_EXECUTABLE_START: u32 =
 #[derive(Debug, thiserror::Error)]
 pub enum PackageBuildError {
     #[error("code generation failed: {0}")]
-    Codegen(#[from] crate::CodegenError),
+    Codegen(#[from] CodegenError),
     #[error("ELF processing failed: {0}")]
     Elf(#[from] ElfError),
     #[error("exchange encoding failed: {0}")]
@@ -1380,7 +1383,7 @@ fn add_generated_debug_map(
     application: &mut Application,
     physical_tile: u32,
     code_address: u32,
-    generated: &crate::GeneratedProgram,
+    generated: &GeneratedProgram,
 ) -> PackageBuildResult<()> {
     if !generated.bytes.is_empty() {
         application.debug_regions.push(DebugRegion {
@@ -1452,7 +1455,7 @@ struct TileBuildContext<'a> {
 fn build_tile(
     physical_tile: u32,
     logical_tile: u32,
-    generated: &crate::GeneratedProgram,
+    generated: &GeneratedProgram,
     host_segments: &[Segment],
     context: &TileBuildContext<'_>,
 ) -> PackageBuildResult<TileImage> {
@@ -1552,17 +1555,17 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
     let mut symbols = vec![COMPLETE_SYMBOL.into()];
     if !program.exchange_phases.is_empty() {
         symbols.push(WORKER_BARRIER_SYMBOL.into());
-        symbols.push(crate::PATCH_ROW_SYMBOL.into());
+        symbols.push(PATCH_ROW_SYMBOL.into());
         if !program.repeat_runs.is_empty() {
-            symbols.push(crate::PATCH_WORD_SYMBOL.into());
+            symbols.push(PATCH_WORD_SYMBOL.into());
         }
     }
     if config.pipeline.profiling.records_overall_time() {
         symbols.push(SAMPLE_CYCLE_SYMBOL.into());
     }
     if !program.inputs.is_empty() || !program.outputs.is_empty() {
-        symbols.push(crate::HOST_RUN_SYMBOL.into());
-        symbols.push(crate::REPEAT_CALL_SYMBOL.into());
+        symbols.push(HOST_RUN_SYMBOL.into());
+        symbols.push(REPEAT_CALL_SYMBOL.into());
     }
     if program
         .tiles
@@ -1574,18 +1577,18 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
             .iter()
             .any(|tile| tile_has_halfword_copy(program, tile))
         {
-            symbols.push(crate::COPY_U16_SYMBOL.into());
+            symbols.push(crate::emitter::COPY_U16_SYMBOL.into());
         }
-        symbols.push(crate::COPY_U32_SYMBOL.into());
-        symbols.push(crate::COPY_U64_SYMBOL.into());
-        symbols.push(crate::COPY_STRIDED_U64_SYMBOL.into());
+        symbols.push(crate::emitter::COPY_U32_SYMBOL.into());
+        symbols.push(crate::emitter::COPY_U64_SYMBOL.into());
+        symbols.push(crate::emitter::COPY_STRIDED_U64_SYMBOL.into());
     }
     if program
         .tiles
         .iter()
         .any(|tile| tile_has_fill_zero(program, tile))
     {
-        symbols.push(crate::FILL_ZERO_U64_SYMBOL.into());
+        symbols.push(crate::emitter::FILL_ZERO_U64_SYMBOL.into());
     }
     symbols
 }
@@ -2137,7 +2140,7 @@ fn runtime_symbols(
         (PRNG_SEED_SYMBOL.into(), prng_seed),
         (PROGRAM_ADDRESS_SYMBOL.into(), program_address),
         (COMPLETION_ADDRESS_SYMBOL.into(), COMPLETION_ADDRESS),
-        (crate::HOST_STAGING_SYMBOL.into(), host_staging_address),
+        (HOST_STAGING_SYMBOL.into(), host_staging_address),
     ]))
 }
 

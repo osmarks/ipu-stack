@@ -304,18 +304,18 @@ fn local_copy_call(copy: &crate::LocalCopy) -> Option<(&'static str, Vec<u32>)> 
             && row_bytes.checked_mul(rows) == Some(bytes))
         .then(|| {
             (
-                crate::COPY_STRIDED_U64_SYMBOL,
+                crate::emitter::COPY_STRIDED_U64_SYMBOL,
                 vec![row_bytes / 8, rows, source_stride, destination_stride],
             )
         });
     }
     if bytes >= 6 * 8 && bytes.is_multiple_of(8) {
         let words = bytes / 8;
-        Some((crate::COPY_U64_SYMBOL, vec![words / 6, words % 6]))
+        Some((crate::emitter::COPY_U64_SYMBOL, vec![words / 6, words % 6]))
     } else if bytes != 0 && bytes.is_multiple_of(4) {
-        Some((crate::COPY_U32_SYMBOL, vec![bytes / 4]))
+        Some((crate::emitter::COPY_U32_SYMBOL, vec![bytes / 4]))
     } else if bytes != 0 && bytes.is_multiple_of(2) {
-        Some((crate::COPY_U16_SYMBOL, vec![bytes / 2]))
+        Some((crate::emitter::COPY_U16_SYMBOL, vec![bytes / 2]))
     } else {
         None
     }
@@ -778,12 +778,12 @@ mod tests {
                 pattern: crate::LocalCopyPattern::Contiguous,
             };
             let (symbol, arguments) = local_copy_call(&copy).unwrap();
-            if symbol == crate::COPY_U64_SYMBOL {
+            if symbol == crate::emitter::COPY_U64_SYMBOL {
                 assert!(arguments[0] != 0);
                 assert_eq!((arguments[0] * 6 + arguments[1]) * 8, bytes);
                 assert!(arguments[1] < 6);
             } else {
-                assert_eq!(symbol, crate::COPY_U32_SYMBOL);
+                assert_eq!(symbol, crate::emitter::COPY_U32_SYMBOL);
                 assert_eq!(arguments, [words]);
             }
         }

@@ -1221,7 +1221,7 @@ pub fn tile_kernel_abi(
     };
     let (symbols, availability, inputs, scalars) = match kernel {
         TileKernelSpec::FillZero => (
-            KernelSymbols::Exact(crate::FILL_ZERO_U64_SYMBOL),
+            KernelSymbols::Exact(crate::emitter::FILL_ZERO_U64_SYMBOL),
             KernelAvailability::Implemented,
             0,
             scalar_arguments(0, &["words_per_worker", "remainder_workers"]),
@@ -1424,7 +1424,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
         let bytes = output_byte_count(run)?;
         if !bytes.is_multiple_of(8) {
             return Err(KernelAbiError::UnsupportedElementCount {
-                symbol: crate::FILL_ZERO_U64_SYMBOL,
+                symbol: crate::emitter::FILL_ZERO_U64_SYMBOL,
                 count: bytes,
                 divisor: 8,
             });
