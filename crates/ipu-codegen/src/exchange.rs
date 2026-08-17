@@ -4,7 +4,7 @@ use crate::{
     ExchangePhaseId, LogicalExchange, LowProgram, LowShardId, Placement, ShardDefinition,
     logical_view_byte_spans, view_byte_spans,
 };
-use ipu_exchange::{
+use ipu_target::{
     MAX_TRANSFER_WORDS, MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming,
     RETURN_M10_INSTRUCTION, Topology, finalize_point_receiver, patch_receiver_address,
     patch_sender_address, patch_sender_instruction, sender_address_instruction_groups,
@@ -18,7 +18,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 #[cfg(test)]
-use ipu_exchange::plan_event_cycles;
+use ipu_target::plan_event_cycles;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalExchangePhase {
@@ -85,7 +85,7 @@ pub struct ExchangeTileDiagnostic {
     pub tile: u16,
     pub row_address: u32,
     pub row_elements: Vec<ExchangeMemoryElement>,
-    pub program: ipu_exchange::diagnostic::PlanProgramDiagnostic,
+    pub program: ipu_target::diagnostic::PlanProgramDiagnostic,
     pub activities: Vec<ExchangeActivityDiagnostic>,
 }
 
@@ -157,7 +157,7 @@ pub fn diagnose_exchange_tile(
         tile,
         row_address,
         row_elements,
-        program: ipu_exchange::diagnostic::diagnose_plan_program(program, Some(row_address))?,
+        program: ipu_target::diagnostic::diagnose_plan_program(program, Some(row_address))?,
         activities,
     })
 }
@@ -295,7 +295,7 @@ struct PhaseDiagnostics {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExchangeLoweringError {
     #[error(transparent)]
-    Exchange(#[from] ipu_exchange::ExchangeError),
+    Exchange(#[from] ipu_target::ExchangeError),
     #[error(transparent)]
     Storage(#[from] crate::StorageError),
     #[error("exchange refers to an unplaced shard")]
@@ -1612,7 +1612,7 @@ pub fn schedule_exchange_problem(
     }
     let topology = Topology::new(
         (0..tile_count)
-            .map(ipu_exchange::c600_logical_to_physical)
+            .map(ipu_target::c600_logical_to_physical)
             .collect(),
     )?;
     let pending = pending_from_problem(tile_count, problem)?;
@@ -1735,7 +1735,7 @@ pub fn validate_exchange_schedule(
         .map(|transfer| Topology::c600().paired_logical(transfer.source))
         .collect::<Result<BTreeSet<_>, _>>()?;
     for tile in 0..size {
-        let decoded = ipu_exchange::diagnostic::diagnose_plan_program(&phase.programs[tile], None)?;
+        let decoded = ipu_target::diagnostic::diagnose_plan_program(&phase.programs[tile], None)?;
         if decoded.event_cycles != phase.tile_event_cycles[tile] {
             return Err(fail(format!(
                 "phase {} tile {tile} decoded horizon {} differs from {}",
@@ -2511,7 +2511,7 @@ fn materialize_schedule_order(
     if schedule_encoding_is_valid(&schedule)? {
         Ok(schedule)
     } else {
-        Err(ipu_exchange::ExchangeError::Schedule("SENDPICP instruction alignment").into())
+        Err(ipu_target::ExchangeError::Schedule("SENDPICP instruction alignment").into())
     }
 }
 
@@ -2520,7 +2520,7 @@ fn schedule_encoding_is_valid(
 ) -> Result<bool, ExchangeLoweringError> {
     match schedule.builder.clone().finish() {
         Ok(_) => Ok(true),
-        Err(ipu_exchange::ExchangeError::Schedule("SENDPICP instruction alignment")) => Ok(false),
+        Err(ipu_target::ExchangeError::Schedule("SENDPICP instruction alignment")) => Ok(false),
         Err(error) => Err(error.into()),
     }
 }
@@ -3664,7 +3664,7 @@ mod tests {
                     assert_eq!(*active, *local_cycles != 0);
                     assert_eq!(plan_event_cycles(program).unwrap(), *local_cycles);
                     assert!(*local_cycles <= phase.event_cycles);
-                    assert!(!program.contains(&ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION));
+                    assert!(!program.contains(&ipu_target::SYNC_SUPERVISOR_INSTRUCTION));
                 }
             }
         }

@@ -3,7 +3,7 @@ use clap::Parser;
 use ipu_codegen::{
     ExchangeScheduleSnapshot, schedule_exchange_problem, validate_exchange_schedule,
 };
-use ipu_exchange::diagnostic::diagnose_plan_program;
+use ipu_target::diagnostic::diagnose_plan_program;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::hint::black_box;

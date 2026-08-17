@@ -7,10 +7,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use super::package::{PackageBuildResult, invalid};
 
-const HOST_DATA_START: u32 = ipu_exchange::HOST_PAGE_BYTES;
-const HOST_PACKET_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE;
-const HOST_CLOSE_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x160;
-const HOST_STAGING_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x180;
+const HOST_DATA_START: u32 = ipu_target::HOST_PAGE_BYTES;
+const HOST_PACKET_ADDRESS: u32 = ipu_target::EXCHANGE_WINDOW_BASE;
+const HOST_CLOSE_ADDRESS: u32 = ipu_target::EXCHANGE_WINDOW_BASE + 0x160;
+const HOST_STAGING_ADDRESS: u32 = ipu_target::EXCHANGE_WINDOW_BASE + 0x180;
 
 #[derive(Clone, Copy)]
 enum Direction {
@@ -101,7 +101,7 @@ pub(crate) fn plan(
     {
         transfer.copy_destination = Some(transfer.tile_address);
         transfer.tile_address = HOST_STAGING_ADDRESS;
-        ipu_exchange::plan_host_to_tile(
+        ipu_target::plan_host_to_tile(
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
@@ -109,7 +109,7 @@ pub(crate) fn plan(
         )?;
     }
     for transfer in output_phases.iter().flat_map(|phase| &phase.transfers) {
-        ipu_exchange::plan_tile_to_host(
+        ipu_target::plan_tile_to_host(
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
@@ -172,7 +172,7 @@ pub(crate) fn plan(
         input_batch_ends: input_ends,
         output_batch_ends: output_ends,
     });
-    let data_bytes = u64::from(ipu_exchange::HOST_PAGE_BYTES)
+    let data_bytes = u64::from(ipu_target::HOST_PAGE_BYTES)
         .checked_mul(u64::try_from(slots.len().max(1))?)
         .ok_or_else(|| invalid("host page arena overflow"))?;
     Ok(HostPackagePlan {
@@ -185,7 +185,7 @@ pub(crate) fn plan(
             pages: vec![
                 HostPage {
                     index: 0,
-                    size: u64::from(ipu_exchange::HOST_PAGE_BYTES),
+                    size: u64::from(ipu_target::HOST_PAGE_BYTES),
                 },
                 HostPage {
                     index: 1,
@@ -230,7 +230,7 @@ fn append_slice(
         .ok_or_else(|| invalid("host file offset overflow"))?;
     let mut remaining = u32::try_from(slice.size)?;
     while remaining != 0 {
-        let bytes = remaining.min(ipu_exchange::HOST_PAGE_BYTES);
+        let bytes = remaining.min(ipu_target::HOST_PAGE_BYTES);
         result.push(PendingTransfer {
             transfer: Transfer {
                 direction,
@@ -284,7 +284,7 @@ fn batch(
                 continue;
             };
             let page_offset = slots[&tile]
-                .checked_mul(ipu_exchange::HOST_PAGE_BYTES)
+                .checked_mul(ipu_target::HOST_PAGE_BYTES)
                 .ok_or_else(|| invalid("host page offset overflow"))?;
             pending.transfer.host_offset = HOST_DATA_START
                 .checked_add(page_offset)
@@ -425,7 +425,7 @@ fn phase_instructions(
     let targets = xreq_targets(physical_tile, phase)?;
     let xreq = (!targets.is_empty())
         .then(|| {
-            ipu_exchange::assemble_host_xreq_program_for_targets(&targets, HOST_PACKET_ADDRESS)
+            ipu_target::assemble_host_xreq_program_for_targets(&targets, HOST_PACKET_ADDRESS)
         })
         .transpose()?;
     Ok(match (target, xreq) {
@@ -433,7 +433,7 @@ fn phase_instructions(
             let mut packets = xreq.packet_words;
             packets.extend_from_slice(&target.packet_words);
             (
-                ipu_exchange::wrap_combined_host_operation(
+                ipu_target::wrap_combined_host_operation(
                     physical_tile,
                     &target.instructions,
                     HOST_PACKET_ADDRESS,
@@ -442,11 +442,11 @@ fn phase_instructions(
             )
         }
         (None, Some(xreq)) => (
-            ipu_exchange::wrap_host_xreq_operation(physical_tile, &xreq.instructions)?,
+            ipu_target::wrap_host_xreq_operation(physical_tile, &xreq.instructions)?,
             xreq.packet_words,
         ),
         (Some(target), None) => (
-            ipu_exchange::wrap_host_target_operation(physical_tile, &target.instructions)?,
+            ipu_target::wrap_host_target_operation(physical_tile, &target.instructions)?,
             target.packet_words,
         ),
         (None, None) => return Err(invalid("active host phase has no work")),
@@ -456,16 +456,16 @@ fn phase_instructions(
 fn target_program(
     transfer: Transfer,
     packet_address: u32,
-) -> PackageBuildResult<ipu_exchange::TileToHostProgram> {
+) -> PackageBuildResult<ipu_target::TileToHostProgram> {
     Ok(match transfer.direction {
-        Direction::ToTile => ipu_exchange::assemble_host_to_tile_target_program(
+        Direction::ToTile => ipu_target::assemble_host_to_tile_target_program(
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
             transfer.bytes,
             packet_address,
         )?,
-        Direction::ToHost => ipu_exchange::assemble_tile_to_host_target_program(
+        Direction::ToHost => ipu_target::assemble_tile_to_host_target_program(
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
@@ -515,7 +515,7 @@ fn xreq_targets(physical_tile: u16, phase: &Phase) -> PackageBuildResult<Vec<u16
         .transfers
         .iter()
         .filter_map(
-            |transfer| match ipu_exchange::host_hierarchy(transfer.physical_tile) {
+            |transfer| match ipu_target::host_hierarchy(transfer.physical_tile) {
                 Ok(hierarchy) if hierarchy.xreq_physical_tile == physical_tile => {
                     Some(Ok(transfer.physical_tile))
                 }
@@ -533,9 +533,9 @@ fn active(physical_tile: u16, phase: &Phase) -> bool {
 
 fn inactive_instructions() -> Vec<u32> {
     vec![
-        ipu_exchange::sans(1),
-        ipu_exchange::SYNC_ANS_INSTRUCTION,
-        ipu_exchange::RETURN_M10_INSTRUCTION,
+        ipu_target::sans(1),
+        ipu_target::SYNC_ANS_INSTRUCTION,
+        ipu_target::RETURN_M10_INSTRUCTION,
     ]
 }
 

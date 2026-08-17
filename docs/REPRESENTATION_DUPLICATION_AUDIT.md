@@ -139,13 +139,13 @@ transfer should wrap the physical transfer with low-IR provenance, memory
 elements, and paired-resource reservations. The schedule snapshot should
 serialize the core record directly.
 
-Timing has a related duplication: `ipu_exchange::PhaseTransferTiming`,
+Timing has a related duplication: `ipu_target::PhaseTransferTiming`,
 codegen's `ScheduledTransferTiming` and `MaterializedTiming`, diagnostics, and
 profile activities hold overlapping event intervals. The encoder's timing
 result should be authoritative; scheduler memory windows and dependency links
 should extend it rather than copying its fields.
 
-`ipu_exchange::Plan` is only the one-receiver form of `MulticastPlan` and is
+`ipu_target::Plan` is only the one-receiver form of `MulticastPlan` and is
 immediately converted by callers. `point_to_point` should return the general
 form and the wrapper should be removed.
 

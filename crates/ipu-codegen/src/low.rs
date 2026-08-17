@@ -2785,7 +2785,7 @@ impl LoweringState {
         &self,
         mappings: &[(ShardView, ShardView)],
     ) -> LowLoweringResult<Option<u64>> {
-        let maximum_bytes = ipu_exchange::MAX_TRANSFER_WORDS
+        let maximum_bytes = ipu_target::MAX_TRANSFER_WORDS
             .checked_mul(4)
             .ok_or(LowLoweringError::IdOverflow)?;
         let mut fragments = 0u64;

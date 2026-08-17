@@ -7,7 +7,7 @@ use ipu_codegen::{
 };
 use ipu_driver::{Device, TileException};
 use ipu_elf::Toolchain;
-use ipu_exchange::{
+use ipu_target::{
     MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming, Topology, encode_exchange_delay,
     finalize_point_receiver, patch_receiver_address, patch_sender_address,
     scheduled_receiver_timing,
@@ -99,7 +99,7 @@ pub(crate) fn build_wide(
     }
     let topology = Topology::c600();
     let execution_tiles = u16::try_from(topology.tile_count())?;
-    if words < 128 || words & 1 != 0 || words / 2 > ipu_exchange::MAX_TRANSFER_WORDS {
+    if words < 128 || words & 1 != 0 || words / 2 > ipu_target::MAX_TRANSFER_WORDS {
         bail!("paired 64-bit exchange payload must contain 128..=8296 even u32 words");
     }
     let items = words / 2;
@@ -124,9 +124,9 @@ pub(crate) fn build_wide(
     let mut validated = BTreeSet::new();
     let mut row_address = WIDE_ROW_BASE;
     let setup_row = vec![
-        ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION,
+        ipu_target::SYNC_SUPERVISOR_INSTRUCTION,
         encode_exchange_delay(0),
-        ipu_exchange::RETURN_M10_INSTRUCTION,
+        ipu_target::RETURN_M10_INSTRUCTION,
     ];
     let setup_end = row_address + u32::try_from(setup_row.len())? * 4;
     diagnostic_rows.push(StressRow {
@@ -237,7 +237,7 @@ pub(crate) fn build_wide(
         let phase = builder.finish()?;
         let mut rows = phase.programs;
         for row in rows.iter_mut().flatten() {
-            row.insert(0, ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
+            row.insert(0, ipu_target::SYNC_SUPERVISOR_INSTRUCTION);
         }
         for (index, &destination) in destinations.iter().enumerate() {
             if receiver_mask & (1 << (index & 1)) == 0 {
@@ -248,9 +248,9 @@ pub(crate) fn build_wide(
             for row in &mut rows {
                 if row.is_none() {
                     *row = Some(vec![
-                        ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION,
+                        ipu_target::SYNC_SUPERVISOR_INSTRUCTION,
                         encode_exchange_delay(0),
-                        ipu_exchange::RETURN_M10_INSTRUCTION,
+                        ipu_target::RETURN_M10_INSTRUCTION,
                     ]);
                 }
             }
@@ -450,10 +450,10 @@ pub(crate) fn build(
     if cases == 0 {
         bail!("--exchange-cases must be nonzero");
     }
-    if maximum_words == 0 || maximum_words > ipu_exchange::MAX_TRANSFER_WORDS {
+    if maximum_words == 0 || maximum_words > ipu_target::MAX_TRANSFER_WORDS {
         bail!(
             "--exchange-max-words must be in 1..={}",
-            ipu_exchange::MAX_TRANSFER_WORDS
+            ipu_target::MAX_TRANSFER_WORDS
         );
     }
     if maximum_transfers == 0 {
@@ -1454,7 +1454,7 @@ impl StressPackage {
             .iter()
             .map(|(&tile, program)| {
                 let decoded =
-                    ipu_exchange::diagnostic::diagnose_plan_program(program, Some(row.address))?;
+                    ipu_target::diagnostic::diagnose_plan_program(program, Some(row.address))?;
                 Ok(format!(
                     "tile={tile} words={} events={}\n{}",
                     program.len(),
@@ -1532,7 +1532,7 @@ impl StressPackage {
                     .map(|(offset, (&expected, &actual))| (offset, expected, actual))
                     .collect::<Vec<_>>();
                 let decode =
-                    ipu_exchange::diagnostic::diagnose_plan_program(expected, Some(row.address))
+                    ipu_target::diagnostic::diagnose_plan_program(expected, Some(row.address))
                         .map(|diagnostic| diagnostic.render_around_address(pc, 16));
                 Some((
                     logical,

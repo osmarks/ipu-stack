@@ -6,7 +6,7 @@ contain the allocator or complete graph-to-device compiler.
 
 ## Components
 
-- `ipu-exchange` generates and encodes device and host exchange programs.
+- `ipu-target` generates and encodes device and host exchange programs.
 - `ipu-codegen` emits straight-line supervisor code from caller-resolved tile
   programs.
 - `ipu-elf` compiles Graphcore tile sources and links Colossus ELF objects.

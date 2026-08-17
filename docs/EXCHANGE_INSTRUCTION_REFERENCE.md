@@ -5,7 +5,7 @@ It separates facts verified against the SDK assembler/disassembler and emitted
 Poplar programs from timing interpretations inferred from those programs.
 
 The executable decoder and consistency checker are in
-`ipu_exchange::diagnostic`. Every row produced by `PhaseProgramBuilder` is
+`ipu_target::diagnostic`. Every row produced by `PhaseProgramBuilder` is
 decoded and checked against its scheduled send intervals and incoming-control
 events before codegen can use it.
 
@@ -177,7 +177,7 @@ The encodings above are checked in three independent ways:
    fields.
 2. Small Poplar copy graphs supply complete SDK-generated rows, including the
    inline payload and scheduling choices.
-3. `ipu_exchange::diagnostic` decodes ipu-stack rows and checks them against the
+3. `ipu_target::diagnostic` decodes ipu-stack rows and checks them against the
    phase builder's declarative send/control schedule.
 
 For an ipu-stack failure, inspect in this order:

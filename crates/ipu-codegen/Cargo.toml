@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 foldhash.workspace = true
-ipu-exchange = { path = "../ipu-exchange" }
+ipu-target = { path = "../ipu-target" }
 ipu-driver = { path = "../ipu-driver" }
 ipu-elf = { path = "../ipu-elf" }
 ipu-package = { path = "../ipu-package" }

@@ -23,7 +23,7 @@ dotenvy.workspace = true
 ipu-codegen = { path = "../ipu-codegen" }
 ipu-driver = { path = "../ipu-driver" }
 ipu-elf = { path = "../ipu-elf" }
-ipu-exchange = { path = "../ipu-exchange" }
+ipu-target = { path = "../ipu-target" }
 ipu-package = { path = "../ipu-package" }
 ipu-runtime = { path = "../ipu-runtime" }
 fastrand.workspace = true

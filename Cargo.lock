@@ -342,8 +342,8 @@ dependencies = [
  "foldhash",
  "ipu-driver",
  "ipu-elf",
- "ipu-exchange",
  "ipu-package",
+ "ipu-target",
  "rayon",
  "serde",
  "thiserror",
@@ -371,16 +371,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "ipu-exchange"
-version = "0.1.0"
-dependencies = [
- "fastrand",
- "serde",
  "thiserror",
  "tracing",
 ]
@@ -416,6 +406,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipu-target"
+version = "0.1.0"
+dependencies = [
+ "fastrand",
+ "serde",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "ipu-tests"
 version = "0.1.0"
 dependencies = [
@@ -427,9 +427,9 @@ dependencies = [
  "ipu-codegen",
  "ipu-driver",
  "ipu-elf",
- "ipu-exchange",
  "ipu-package",
  "ipu-runtime",
+ "ipu-target",
  "rand_distr",
  "rand_xoshiro",
  "serde_json",

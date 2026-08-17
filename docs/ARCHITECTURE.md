@@ -2,7 +2,7 @@
 
 The package path has four explicit components:
 
-1. `ipu-exchange` produces exchange rows.
+1. `ipu-target` produces exchange rows.
 2. `ipu-codegen` lowers a `ComputeGraph`, emits supervisor code, and coordinates
    package construction according to `PackageConfig`.
 3. `ipu-elf` compiles and links the static runtime and selected kernels.

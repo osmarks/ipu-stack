@@ -1,6 +1,6 @@
 [workspace]
 members = [
-  "crates/ipu-exchange",
+    "crates/ipu-target",
   "crates/ipu-codegen",
   "crates/ipu-package",
   "crates/ipu-elf",

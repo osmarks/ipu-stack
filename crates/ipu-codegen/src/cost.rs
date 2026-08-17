@@ -238,7 +238,7 @@ impl ExchangeFootprint {
         // destination spans meet, or the address tables needed by shared
         // executable rows. Six encoded chunks per logical chunk tracks the
         // combined executable, offset, and per-use value storage on IPU21.
-        let words_per_chunk = (ipu_exchange::PLAN_WORDS - 2) as u64;
+        let words_per_chunk = (ipu_target::PLAN_WORDS - 2) as u64;
         let encoded_chunks_per_logical_chunk = 6;
         self.phases
             .saturating_add(
@@ -440,7 +440,7 @@ fn tensor_transition_endpoint_traffic(
     source: &TensorType,
     destination: &TensorType,
 ) -> ExchangeEndpointTraffic {
-    let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
+    let transfer_bytes = u64::from(ipu_target::MAX_TRANSFER_WORDS) * 4;
     let outgoing = maximum_shard_bytes(source)
         .saturating_mul(u64::from(source.format.layout.tiling.tile_count.min(2)));
     let incoming = maximum_shard_bytes(destination);
@@ -459,7 +459,7 @@ fn exchange_endpoint_footprint(
     if traffic.is_empty() || phases == 0 {
         return ExchangeFootprint::default();
     }
-    let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
+    let transfer_bytes = u64::from(ipu_target::MAX_TRANSFER_WORDS) * 4;
     ExchangeFootprint {
         phases,
         maximum_transfer_chunks_per_tile: traffic
@@ -1615,7 +1615,7 @@ mod tests {
             let reversed = exchange_endpoint_cycles(&reversed_traffic, phases);
             assert_eq!(cycles, reversed, "case {case}");
             let footprint = exchange_endpoint_footprint(&traffic, phases);
-            let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
+            let transfer_bytes = u64::from(ipu_target::MAX_TRANSFER_WORDS) * 4;
             assert_eq!(footprint.phases, phases, "case {case}");
             assert!(
                 footprint.maximum_transfer_chunks_per_tile

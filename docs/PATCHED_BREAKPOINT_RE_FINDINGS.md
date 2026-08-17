@@ -30,7 +30,7 @@ put CSR[index], $m1 = 0x43008100 | index
 It is not `index << 4`. Any experiment using `0x43008730` to address CSR
 `0x73` wrote a different register.
 
-The previous `ipu-exchange-re` note calling CSR `0x73` `DBG_ECSR` is not
+The previous `ipu-target-re` note calling CSR `0x73` `DBG_ECSR` is not
 conclusive. Its actual diagnostic names the index `debugExceptionControl`,
 ORs bit zero into it, and enables a separately configured IBRK. That proves the
 IBRK registers at `0x80/0x81`, but does not distinguish `DBG_CTL.CHAN_EN` from
