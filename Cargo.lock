@@ -404,7 +404,6 @@ version = "0.1.0"
 dependencies = [
  "ipu-driver",
  "ipu-package",
- "thiserror",
  "tracing-subscriber",
 ]
 
