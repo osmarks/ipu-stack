@@ -1964,15 +1964,23 @@ impl LoweringState {
             } else {
                 canonical_query
             };
+            let query_region = TensorRegion::logical_bounds([
+                (
+                    self.shards[output.index() as usize].extents[rank - 3].start,
+                    self.shards[output.index() as usize].extents[rank - 3].start + 1,
+                ),
+                (
+                    self.shards[output.index() as usize].extents[rank - 2].start,
+                    self.shards[output.index() as usize].extents[rank - 2].start + rows,
+                ),
+                (0, query_dimension),
+            ])
+            .ok_or(LowLoweringError::IdOverflow)?;
             let direct_query = deferred_query
                 && (self.deferred_supports_physical_exchange(query, query_shard)
                     || self.deferred_panel_benefits_from_word_exchange(
                         query,
-                        self.shards[output.index() as usize].extents[rank - 3].start,
-                        self.shards[output.index() as usize].extents[rank - 2].start,
-                        rows,
-                        0,
-                        query_dimension,
+                        &query_region,
                         query_shard,
                     )?);
             let query_receive = (deferred_query && !direct_query)
@@ -2081,13 +2089,15 @@ impl LoweringState {
             }
         }
         for task in tasks {
+            let region = TensorRegion::logical_bounds([
+                (task.head, task.head + 1),
+                (task.query_row_start, task.query_row_start + task.query_rows),
+                (0, task.query_dimension),
+            ])
+            .ok_or(LowLoweringError::IdOverflow)?;
             self.gather_deferred_panel(
                 query,
-                task.head,
-                task.query_row_start,
-                task.query_rows,
-                0,
-                task.query_dimension,
+                &region,
                 task.query_receive.unwrap_or(task.query),
                 if physical {
                     ExchangeOrder::Physical
@@ -2698,15 +2708,10 @@ impl LoweringState {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn deferred_panel_mappings(
         &self,
         value: MidValueId,
-        stream: u32,
-        row_start: u32,
-        rows: u32,
-        column_start: u32,
-        columns: u32,
+        logical_target: &TensorRegion,
         destination: LowShardId,
     ) -> LowLoweringResult<Vec<(ShardView, ShardView)>> {
         let deferred_root = self
@@ -2719,15 +2724,9 @@ impl LoweringState {
         let deferred_shards = deferred.shards.clone();
         let logical_type = &self.shards[self.value_shards(value)?[0].index() as usize].tensor_type;
         let source_type = &self.shards[deferred.shards[0].index() as usize].tensor_type;
-        let logical_target = TensorRegion::logical_bounds([
-            (stream, stream + 1),
-            (row_start, row_start + rows),
-            (column_start, column_start + columns),
-        ])
-        .ok_or(LowLoweringError::IdOverflow)?;
         let mapping = deferred
             .transform
-            .map_slice(&source_type.shape, &logical_type.shape, &logical_target)
+            .map_slice(&source_type.shape, &logical_type.shape, logical_target)
             .ok_or(LowLoweringError::InvalidOperatorPlan)?;
         let target = mapping.source;
         let destination_tile = self.shards[destination.index() as usize].tile;
@@ -2771,7 +2770,7 @@ impl LoweringState {
             };
             mappings.push((source_view, destination_view));
         }
-        if covered != u64::from(rows) * u64::from(columns) {
+        if covered != logical_target.logical_elements() {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
         Ok(mappings)
@@ -2886,53 +2885,27 @@ impl LoweringState {
         Ok(direct)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn deferred_panel_benefits_from_word_exchange(
         &self,
         value: MidValueId,
-        stream: u32,
-        row_start: u32,
-        rows: u32,
-        column_start: u32,
-        columns: u32,
+        region: &TensorRegion,
         destination: LowShardId,
     ) -> LowLoweringResult<bool> {
-        let mappings = self.deferred_panel_mappings(
-            value,
-            stream,
-            row_start,
-            rows,
-            column_start,
-            columns,
-            destination,
-        )?;
+        let mappings = self.deferred_panel_mappings(value, region, destination)?;
         self.mappings_benefit_from_word_exchange(&mappings, destination)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn gather_deferred_panel(
         &self,
         value: MidValueId,
-        stream: u32,
-        row_start: u32,
-        rows: u32,
-        column_start: u32,
-        columns: u32,
+        region: &TensorRegion,
         destination: LowShardId,
         order: ExchangeOrder,
         transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
         local_copies: &mut Vec<(u16, LocalCopy)>,
     ) -> LowLoweringResult<()> {
         let destination_tile = self.shards[destination.index() as usize].tile;
-        let mappings = self.deferred_panel_mappings(
-            value,
-            stream,
-            row_start,
-            rows,
-            column_start,
-            columns,
-            destination,
-        )?;
+        let mappings = self.deferred_panel_mappings(value, region, destination)?;
         for (source_view, destination_view) in mappings {
             let mappings = if order == ExchangeOrder::Physical {
                 self.f16_micro_panel_mappings(vec![(source_view, destination_view)])?
@@ -3013,17 +2986,15 @@ impl LoweringState {
                     AMP_COLUMN_MICRO,
                     order,
                 )?;
+                let region = TensorRegion::logical_bounds([
+                    (stream, stream + 1),
+                    (block_start, block_start + valid_rows),
+                    (column_start, column_start + panel_columns),
+                ])
+                .ok_or(LowLoweringError::IdOverflow)?;
                 let physical = self.deferred_supports_physical_exchange(value, packed);
                 let word_exchange = !physical
-                    && self.deferred_panel_benefits_from_word_exchange(
-                        value,
-                        stream,
-                        block_start,
-                        valid_rows,
-                        column_start,
-                        panel_columns,
-                        packed,
-                    )?;
+                    && self.deferred_panel_benefits_from_word_exchange(value, &region, packed)?;
                 if word_exchange && self.shard_has_padding(packed) {
                     self.append_fill_zero(tiles, packed, provenance.clone())?;
                 }
@@ -3043,11 +3014,7 @@ impl LoweringState {
                 let mut local_copies = Vec::new();
                 self.gather_deferred_panel(
                     value,
-                    stream,
-                    block_start,
-                    valid_rows,
-                    column_start,
-                    panel_columns,
+                    &region,
                     gather_destination,
                     if physical {
                         ExchangeOrder::Physical
