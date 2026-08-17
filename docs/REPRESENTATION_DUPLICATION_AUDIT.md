@@ -23,6 +23,14 @@ resolution.
 - `AllocationRequirements` is merged and consumed by both estimation and
   placement. Alignment, access tails, and memory-element separation are not
   re-expressed in estimator- or allocator-private schemas.
+- `ConversionPlan` owns the target-selected direct-retile, direct-logical, or
+  staged execution strategy and its `CopyPlan`. The cost model selects it and
+  the mid-level conversion stores it; low lowering binds that plan to shards
+  without selecting a different materialization.
+- `CopyRun` is the shared address-independent local-copy representation.
+  Planning and lowering derive it from the same physical span sequences, so
+  contiguous/strided call selection and its target threshold are not a
+  low-level peephole pass.
 
 ## Cost and memory
 

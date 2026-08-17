@@ -293,7 +293,7 @@ fn lower_work(
 
 fn local_copy_call(copy: &crate::LocalCopy) -> Option<(&'static str, Vec<u32>)> {
     let bytes = copy.bytes;
-    if let crate::LocalCopyPattern::Strided {
+    if let crate::CopyPattern::Strided {
         rows,
         row_bytes,
         source_stride,
@@ -781,7 +781,7 @@ mod tests {
                 destination: crate::LowShardId::from_index(1),
                 destination_offset: 0,
                 bytes,
-                pattern: crate::LocalCopyPattern::Contiguous,
+                pattern: crate::CopyPattern::Contiguous,
             };
             let (symbol, arguments) = local_copy_call(&copy).unwrap();
             if symbol == ipu_target::emit::COPY_U64_SYMBOL {

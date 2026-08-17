@@ -12,6 +12,7 @@ pub use package::{
 };
 
 mod config;
+mod copy;
 mod cost;
 mod estimate;
 pub mod exchange;
@@ -32,6 +33,7 @@ pub use config::{
     AttentionStrategy, ConversionStreamingPolicy, HardwareMemoryConstraints, HardwareTarget,
     OperatorClass, PipelineConfig, PlannerSearchDomain, ProfilingConfig,
 };
+pub use copy::{CopyPattern, CopyPlan};
 pub use exchange::{
     EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityDiagnostic,
     ExchangeLoweringError, ExchangeLoweringOptions, ExchangeScheduleProblem, ExchangeScheduleRun,
@@ -60,10 +62,10 @@ pub use layout::{
 };
 pub use low::{
     ExchangeOrder, ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun,
-    KernelRunId, KernelRunMetadata, LocalCopy, LocalCopyId, LocalCopyPattern, LogicalExchange,
-    LowInput, LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId, LowValue,
-    RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, RepeatRunId, ShardDefinition,
-    ShardView, TileWork, TileWorkList, TileWorkRef, WorkProvenance, WorkReason, lower_to_tiles,
+    KernelRunId, KernelRunMetadata, LocalCopy, LocalCopyId, LogicalExchange, LowInput,
+    LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId, LowValue, RepeatCarried,
+    RepeatInvariant, RepeatIterated, RepeatRun, RepeatRunId, ShardDefinition, ShardView, TileWork,
+    TileWorkList, TileWorkRef, WorkProvenance, WorkReason, lower_to_tiles,
 };
 pub use memory::{
     IPU21_DATA_BASE, IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES,

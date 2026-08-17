@@ -7,6 +7,7 @@
 //! remaining choices.
 
 use crate::PipelineConfig;
+use crate::copy::{CopyPattern, CopyPlan, plan_copy_runs, plan_transfer_runs};
 use crate::graph::{GraphInputKind, OperationId};
 use crate::ir::{MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId};
 use crate::layout::{
@@ -229,19 +230,7 @@ pub struct LocalCopy {
     pub destination: LowShardId,
     pub destination_offset: u32,
     pub bytes: u32,
-    pub pattern: LocalCopyPattern,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LocalCopyPattern {
-    #[default]
-    Contiguous,
-    Strided {
-        rows: u32,
-        row_bytes: u32,
-        source_stride: u32,
-        destination_stride: u32,
-    },
+    pub pattern: CopyPattern,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -455,7 +444,7 @@ pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringR
     if config.tile_count == 0 {
         return Err(LowLoweringError::EmptyTileGroup);
     }
-    let mut state = LoweringState::new(graph, config.tile_count)?;
+    let mut state = LoweringState::new(graph, config.tile_count, config.target.copy_plan())?;
     let tiles = state.lower_region(
         &graph.operations,
         &graph.outputs,
@@ -609,6 +598,7 @@ enum AttentionOperand {
 
 struct LoweringState {
     tile_count: u16,
+    copy_plan: CopyPlan,
     shards: Vec<LowShard>,
     canonical: Vec<Vec<LowShardId>>,
     phases: Vec<ExchangePhase>,
@@ -634,9 +624,10 @@ impl LoweringState {
         shard
     }
 
-    fn new(graph: &MidGraph, tile_count: u16) -> LowLoweringResult<Self> {
+    fn new(graph: &MidGraph, tile_count: u16, copy_plan: CopyPlan) -> LowLoweringResult<Self> {
         let mut state = Self {
             tile_count,
+            copy_plan,
             shards: Vec::new(),
             canonical: vec![Vec::new(); graph.values.len()],
             phases: Vec::new(),
@@ -1368,7 +1359,9 @@ impl LoweringState {
             ConversionStrategy::LocalKernel => {
                 self.lower_local_conversion(operation, kind, plan, tiles)
             }
-            ConversionStrategy::DirectRetile | ConversionStrategy::StageLogicalThenTransform => {
+            ConversionStrategy::DirectRetile
+            | ConversionStrategy::DirectLogical
+            | ConversionStrategy::StageLogicalThenTransform => {
                 self.lower_intersection_conversion(operation, kind, plan, tiles)
             }
         }
@@ -1426,9 +1419,10 @@ impl LoweringState {
         };
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
-        let logical_order = match plan.strategy {
-            ConversionStrategy::DirectRetile => false,
-            ConversionStrategy::StageLogicalThenTransform => true,
+        let strategy = match plan.strategy {
+            strategy @ (ConversionStrategy::DirectRetile
+            | ConversionStrategy::DirectLogical
+            | ConversionStrategy::StageLogicalThenTransform) => strategy,
             ConversionStrategy::LocalKernel => {
                 return Err(LowLoweringError::InvalidConversionPlan);
             }
@@ -1464,7 +1458,8 @@ impl LoweringState {
         }
         self.lower_mapped_views(
             mappings,
-            logical_order,
+            strategy,
+            plan.copies,
             ExchangeOrder::Semantic,
             operation_provenance(operation, kind),
             tiles,
@@ -1474,7 +1469,8 @@ impl LoweringState {
     fn lower_mapped_views(
         &mut self,
         mappings: Vec<(ShardView, ShardView)>,
-        logical_order: bool,
+        strategy: ConversionStrategy,
+        copy_plan: CopyPlan,
         exchange_order: ExchangeOrder,
         provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
@@ -1504,6 +1500,7 @@ impl LoweringState {
                             .any(|span| span.offset & 0b11 != 0 || span.bytes & 0b11 != 0))
                 },
             )?;
+            let logical_order = strategy != ConversionStrategy::DirectRetile;
             let requires_materialization = logical_order
                 && (mappings.iter().any(|(source, _)| {
                     self.shards[source.shard.index() as usize]
@@ -1513,9 +1510,10 @@ impl LoweringState {
                         .order
                         != destination_format.layout.order
                 }) || destination_unaligned);
-            let direct_logical = requires_materialization
-                && self.mappings_benefit_from_word_exchange(&mappings, destination_shard)?;
-            let stage_destination = requires_materialization && !direct_logical;
+            let direct_logical =
+                requires_materialization && strategy == ConversionStrategy::DirectLogical;
+            let stage_destination = requires_materialization
+                && strategy == ConversionStrategy::StageLogicalThenTransform;
             if direct_logical && self.shard_has_padding(destination_shard) {
                 self.append_fill_zero(tiles, destination_shard, provenance.clone())?;
             }
@@ -1549,6 +1547,7 @@ impl LoweringState {
                             &destination,
                             destination_tile,
                             copies,
+                            copy_plan,
                         )?;
                     } else {
                         append_span_copies(
@@ -1557,6 +1556,7 @@ impl LoweringState {
                             &destination,
                             destination_tile,
                             copies,
+                            copy_plan,
                         )?;
                     }
                 } else {
@@ -1613,6 +1613,7 @@ impl LoweringState {
                         &destination,
                         tile,
                         &mut after_exchange,
+                        copy_plan,
                     )?;
                 }
             }
@@ -1766,7 +1767,8 @@ impl LoweringState {
                 );
                 return self.lower_mapped_views(
                     mappings,
-                    false,
+                    ConversionStrategy::DirectRetile,
+                    self.copy_plan,
                     ExchangeOrder::Physical,
                     WorkProvenance {
                         operation: operation.source,
@@ -1800,7 +1802,8 @@ impl LoweringState {
             self.split_head_mappings(&source_shards, &output_shards, options.heads, head_width)?;
         self.lower_mapped_views(
             mappings,
-            true,
+            ConversionStrategy::StageLogicalThenTransform,
+            self.copy_plan,
             ExchangeOrder::Semantic,
             WorkProvenance {
                 operation: operation.source,
@@ -2505,6 +2508,7 @@ impl LoweringState {
                             &destination_view,
                             task.tile,
                             &mut copies,
+                            self.copy_plan,
                         )?;
                         for (tile, copy) in copies {
                             self.append_local_copy(tiles, tile, copy)?;
@@ -2791,13 +2795,9 @@ impl LoweringState {
                 &self.shards[destination.shard.index() as usize],
                 destination,
             )?;
-            let aligned = source_spans
-                .iter()
-                .chain(&destination_spans)
-                .all(|span| span.offset & 0b11 == 0 && span.bytes & 0b11 == 0);
-            let source_bytes = source_spans.iter().map(|span| span.bytes).sum::<u32>();
-            let destination_bytes = destination_spans.iter().map(|span| span.bytes).sum::<u32>();
-            if !aligned || source_bytes != destination_bytes {
+            let Some(runs) =
+                plan_transfer_runs(&source_spans, &destination_spans, maximum_bytes, 4)
+            else {
                 tracing::trace!(
                     source = ?source,
                     destination = ?destination,
@@ -2807,46 +2807,11 @@ impl LoweringState {
                         .tensor_type.format.layout.order,
                     source_spans = ?source_spans,
                     destination_spans = ?destination_spans,
-                    aligned,
-                    source_bytes,
-                    destination_bytes,
                     "deferred logical fragment cannot be exchanged directly"
                 );
                 return Ok(None);
-            }
-            let mut source_index = 0usize;
-            let mut destination_index = 0usize;
-            let mut source_offset = 0u32;
-            let mut destination_offset = 0u32;
-            while source_index < source_spans.len() && destination_index < destination_spans.len() {
-                let source_remaining = source_spans[source_index].bytes - source_offset;
-                let destination_remaining =
-                    destination_spans[destination_index].bytes - destination_offset;
-                let bytes = source_remaining
-                    .min(destination_remaining)
-                    .min(maximum_bytes);
-                if bytes == 0 || bytes & 0b11 != 0 {
-                    return Ok(None);
-                }
-                fragments = fragments.saturating_add(1);
-                source_offset += bytes;
-                destination_offset += bytes;
-                if source_offset == source_spans[source_index].bytes {
-                    source_index += 1;
-                    source_offset = 0;
-                }
-                if destination_offset == destination_spans[destination_index].bytes {
-                    destination_index += 1;
-                    destination_offset = 0;
-                }
-            }
-            if source_index != source_spans.len()
-                || destination_index != destination_spans.len()
-                || source_offset != 0
-                || destination_offset != 0
-            {
-                return Ok(None);
-            }
+            };
+            fragments = fragments.saturating_add(runs.len() as u64);
         }
         Ok(Some(fragments))
     }
@@ -2922,6 +2887,7 @@ impl LoweringState {
                             &destination_view,
                             destination_tile,
                             local_copies,
+                            self.copy_plan,
                         )?;
                     } else {
                         append_logical_span_copies(
@@ -2930,6 +2896,7 @@ impl LoweringState {
                             &destination_view,
                             destination_tile,
                             local_copies,
+                            self.copy_plan,
                         )?;
                     }
                 } else {
@@ -3075,6 +3042,7 @@ impl LoweringState {
                         &destination_view,
                         panel.tile,
                         &mut copies,
+                        self.copy_plan,
                     )?;
                     for (tile, copy) in copies {
                         self.append_local_copy(tiles, tile, copy)?;
@@ -3482,6 +3450,7 @@ impl LoweringState {
                     &destination_view,
                     tile,
                     local_copies,
+                    self.copy_plan,
                 )?;
             } else {
                 transfers
@@ -3693,7 +3662,7 @@ impl LoweringState {
                                             destination: copy,
                                             destination_offset,
                                             bytes: span.bytes,
-                                            pattern: LocalCopyPattern::Contiguous,
+                                            pattern: CopyPattern::Contiguous,
                                         },
                                     ));
                                     destination_offset = destination_offset
@@ -4251,6 +4220,7 @@ impl LoweringState {
                                         &destination_view,
                                         left_shard.tile,
                                         &mut local_copies,
+                                        self.copy_plan,
                                     )?;
                                 } else {
                                     transfers
@@ -4524,6 +4494,7 @@ impl LoweringState {
                             &self.full_view(initial),
                             owner.tile,
                             &mut seed_copies,
+                            self.copy_plan,
                         )?;
                     } else {
                         reduction_transfers[0]
@@ -4608,6 +4579,7 @@ impl LoweringState {
                         },
                         owner.tile,
                         &mut result_copies,
+                        self.copy_plan,
                     )?;
                     reduction_roots += 1;
                 }
@@ -4827,7 +4799,7 @@ impl LoweringState {
                                                 destination: resident,
                                                 destination_offset,
                                                 bytes: span.bytes,
-                                                pattern: LocalCopyPattern::Contiguous,
+                                                pattern: CopyPattern::Contiguous,
                                             },
                                         ));
                                         destination_offset = destination_offset
@@ -5378,6 +5350,7 @@ fn append_span_copies(
     destination: &ShardView,
     tile: u16,
     copies: &mut Vec<(u16, LocalCopy)>,
+    copy_plan: CopyPlan,
 ) -> LowLoweringResult<()> {
     let source_spans = view_byte_spans(&shards[source.shard.index() as usize], source)?;
     let destination_spans =
@@ -5389,6 +5362,7 @@ fn append_span_copies(
         &source_spans,
         &destination_spans,
         copies,
+        copy_plan,
     )
 }
 
@@ -5399,120 +5373,24 @@ fn append_byte_span_copies(
     source_spans: &[ByteSpan],
     destination_spans: &[ByteSpan],
     copies: &mut Vec<(u16, LocalCopy)>,
+    copy_plan: CopyPlan,
 ) -> LowLoweringResult<()> {
-    let mut pending = Vec::new();
-    let mut source_index = 0usize;
-    let mut destination_index = 0usize;
-    let mut source_offset = 0u32;
-    let mut destination_offset = 0u32;
-    while source_index < source_spans.len() && destination_index < destination_spans.len() {
-        let source_span = source_spans[source_index];
-        let destination_span = destination_spans[destination_index];
-        let bytes =
-            (source_span.bytes - source_offset).min(destination_span.bytes - destination_offset);
-        pending.push(LocalCopy {
-            source: source.shard,
-            source_offset: source_span.offset + source_offset,
-            destination: destination.shard,
-            destination_offset: destination_span.offset + destination_offset,
-            bytes,
-            pattern: LocalCopyPattern::Contiguous,
-        });
-        source_offset += bytes;
-        destination_offset += bytes;
-        if source_offset == source_span.bytes {
-            source_index += 1;
-            source_offset = 0;
-        }
-        if destination_offset == destination_span.bytes {
-            destination_index += 1;
-            destination_offset = 0;
-        }
-    }
-    if source_index != source_spans.len() || destination_index != destination_spans.len() {
-        return Err(LowLoweringError::InvalidConversionPlan);
-    }
-    copies.extend(
-        coalesce_local_copies(pending)
-            .into_iter()
-            .map(|copy| (tile, copy)),
-    );
+    let runs = plan_copy_runs(source_spans, destination_spans, copy_plan)
+        .ok_or(LowLoweringError::InvalidConversionPlan)?;
+    copies.extend(runs.into_iter().map(|run| {
+        (
+            tile,
+            LocalCopy {
+                source: source.shard,
+                source_offset: run.source_offset,
+                destination: destination.shard,
+                destination_offset: run.destination_offset,
+                bytes: run.bytes,
+                pattern: run.pattern,
+            },
+        )
+    }));
     Ok(())
-}
-
-const PARALLEL_STRIDED_COPY_MAX_BYTES: u32 = 512;
-
-fn coalesce_local_copies(copies: Vec<LocalCopy>) -> Vec<LocalCopy> {
-    let mut coalesced = Vec::new();
-    let mut index = 0;
-    while index < copies.len() {
-        let first = &copies[index];
-        let Some(second) = copies.get(index + 1) else {
-            coalesced.push(first.clone());
-            break;
-        };
-        if first.source != second.source
-            || first.destination != second.destination
-            || first.bytes != second.bytes
-            || first.bytes == 0
-            || !first.bytes.is_multiple_of(8)
-        {
-            coalesced.push(first.clone());
-            index += 1;
-            continue;
-        }
-        let source_stride = second.source_offset.saturating_sub(first.source_offset);
-        let destination_stride = second
-            .destination_offset
-            .saturating_sub(first.destination_offset);
-        if source_stride == 0 || destination_stride == 0 {
-            coalesced.push(first.clone());
-            index += 1;
-            continue;
-        }
-        let mut end = index + 2;
-        while let Some(copy) = copies.get(end) {
-            let previous = &copies[end - 1];
-            if copy.source != first.source
-                || copy.destination != first.destination
-                || copy.bytes != first.bytes
-                || copy.source_offset.checked_sub(previous.source_offset) != Some(source_stride)
-                || copy
-                    .destination_offset
-                    .checked_sub(previous.destination_offset)
-                    != Some(destination_stride)
-            {
-                break;
-            }
-            end += 1;
-        }
-        let rows = u32::try_from(end - index).unwrap_or(u32::MAX);
-        // Larger strided regions are deliberately left as contiguous rows:
-        // spreading them over workers loses more to bank contention than it
-        // saves in call overhead on IPU21.
-        if first.bytes.saturating_mul(rows) > PARALLEL_STRIDED_COPY_MAX_BYTES {
-            coalesced.extend(copies[index..end].iter().cloned());
-            index = end;
-            continue;
-        }
-        if source_stride == first.bytes && destination_stride == first.bytes {
-            let mut copy = first.clone();
-            copy.bytes = copy.bytes.saturating_mul(rows);
-            coalesced.push(copy);
-        } else {
-            let mut copy = first.clone();
-            copy.bytes = copy.bytes.saturating_mul(rows);
-            copy.pattern = LocalCopyPattern::Strided {
-                rows,
-                row_bytes: first.bytes,
-                source_stride,
-                destination_stride,
-            };
-            coalesced.push(copy);
-        }
-        index = end;
-    }
-    coalesced
 }
 
 fn append_logical_span_copies(
@@ -5521,6 +5399,7 @@ fn append_logical_span_copies(
     destination: &ShardView,
     tile: u16,
     copies: &mut Vec<(u16, LocalCopy)>,
+    copy_plan: CopyPlan,
 ) -> LowLoweringResult<()> {
     let source_spans = logical_view_byte_spans(&shards[source.shard.index() as usize], source)?;
     let destination_spans =
@@ -5532,6 +5411,7 @@ fn append_logical_span_copies(
         &source_spans,
         &destination_spans,
         copies,
+        copy_plan,
     )
 }
 

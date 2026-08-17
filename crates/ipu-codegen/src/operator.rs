@@ -1,5 +1,6 @@
 //! Whole-device operator plans and tile-kernel specifications.
 
+use crate::copy::CopyPlan;
 use crate::graph::{AddOptions, AttentionOptions, GemmOptions, SplitHeadsOptions, TensorShape};
 use crate::ir::MidValueId;
 use crate::layout::{
@@ -591,6 +592,8 @@ pub enum ConversionStrategy {
     LocalKernel,
     /// Exchange logical intersections directly into the destination layout.
     DirectRetile,
+    /// Exchange canonical logical spans directly into the destination order.
+    DirectLogical,
     /// Exchange logical values into row-major staging, then transform locally
     /// into the destination element order.
     StageLogicalThenTransform,
@@ -598,15 +601,7 @@ pub enum ConversionStrategy {
 
 impl ConversionStrategy {
     pub const fn uses_intersections(self) -> bool {
-        matches!(self, Self::DirectRetile | Self::StageLogicalThenTransform)
-    }
-}
-
-pub fn layout_conversion_strategy(from: &Layout, to: &Layout) -> ConversionStrategy {
-    if from.order == to.order {
-        ConversionStrategy::DirectRetile
-    } else {
-        ConversionStrategy::StageLogicalThenTransform
+        !matches!(self, Self::LocalKernel)
     }
 }
 
@@ -615,7 +610,10 @@ pub struct ConversionPlan {
     pub kernel: TileKernelSpec,
     pub input: OperandRequirement,
     pub output: OperandRequirement,
+    /// Target-selected materialization consumed unchanged by costing and
+    /// low-level lowering.
     pub strategy: ConversionStrategy,
+    pub copies: CopyPlan,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]

@@ -1633,8 +1633,8 @@ fn tile_has_fill_zero(program: &LowProgram, tile: &crate::TileWorkList) -> bool 
 fn tile_has_halfword_copy(program: &LowProgram, tile: &crate::TileWorkList) -> bool {
     program.work(tile).any(|work| match work {
         crate::TileWorkRef::LocalCopy(copy) => match copy.pattern {
-            crate::LocalCopyPattern::Contiguous => !copy.bytes.is_multiple_of(4),
-            crate::LocalCopyPattern::Strided { row_bytes, .. } => !row_bytes.is_multiple_of(4),
+            crate::CopyPattern::Contiguous => !copy.bytes.is_multiple_of(4),
+            crate::CopyPattern::Strided { row_bytes, .. } => !row_bytes.is_multiple_of(4),
         },
         crate::TileWorkRef::Repeat(repeat) => tile_has_halfword_copy(program, &repeat.body),
         crate::TileWorkRef::Exchange(_)

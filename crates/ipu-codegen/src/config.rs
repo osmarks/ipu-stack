@@ -1,5 +1,6 @@
 //! Compiler target and planner search configuration.
 
+use crate::copy::CopyPlan;
 use crate::cost::Ipu21CostModel;
 use crate::graph::{TensorShape, ValueId};
 use crate::layout::{MemoryClass, TensorFormat};
@@ -236,6 +237,16 @@ impl HardwareTarget {
                 total_bytes: crate::memory::IPU21_PLANNED_DATA_BYTES as u64,
                 default_standard_reservation_bytes:
                     crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES as u64,
+            },
+        }
+    }
+
+    pub const fn copy_plan(self) -> CopyPlan {
+        match self {
+            Self::Ipu21 => CopyPlan {
+                // Larger strided regions lose more to worker bank contention
+                // than they save in supervisor call overhead on IPU21.
+                parallel_strided_max_bytes: 512,
             },
         }
     }

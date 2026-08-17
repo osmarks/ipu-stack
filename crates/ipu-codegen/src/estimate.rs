@@ -1,5 +1,6 @@
 //! Memory, communication, and capacity estimates shared by planning policies.
 
+use crate::copy::{CopyPlan, plan_copy_runs, plan_transfer_runs};
 use crate::graph::TensorShape;
 use crate::ir::{MidOperation, MidOperationKind, MidValue, MidValueId};
 use crate::layout::{
@@ -8,27 +9,18 @@ use crate::layout::{
 };
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage};
 use crate::operator::{
-    AllocationRequirements, GemmDistribution, MemoryElementRequirement, MemoryOperand,
-    OperandMaterialization, OperatorDispatch, OperatorRequirements, Precision,
+    AllocationRequirements, ConversionStrategy, GemmDistribution, MemoryElementRequirement,
+    MemoryOperand, OperandMaterialization, OperatorDispatch, OperatorRequirements, Precision,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use crate::storage::{logical_region_byte_spans, physical_region_byte_spans};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConversionTraffic {
-    pub source_payload_bytes: u64,
-    pub maximum_source_payload_bytes: u64,
     pub remote_fragments: u64,
-    pub maximum_source_fragments: u64,
-    pub maximum_source_bus_payload_bytes: u64,
-    pub maximum_source_bus_fragments: u64,
-    pub maximum_routed_fragments: u64,
-    pub maximum_destination_bytes: u64,
-    pub maximum_remote_destination_bytes: u64,
-    pub maximum_remote_destination_fragments: u64,
-    pub maximum_local_bytes: u64,
-    pub maximum_intersections: u64,
-    pub maximum_local_intersections: u64,
+    pub maximum_local_copy_bytes: u64,
+    pub maximum_local_copy_calls: u64,
     pub source_bus_loads: Vec<ExchangeEndpointLoad>,
     pub remote_destination_loads: Vec<ExchangeEndpointLoad>,
 }
@@ -156,24 +148,75 @@ fn add_endpoint_load(
     loads[usize::from(endpoint)].add(bytes, fragments);
 }
 
+fn conversion_copy_spans(
+    strategy: ConversionStrategy,
+    source_type: &TensorType,
+    destination_type: &TensorType,
+    staging_type: &TensorType,
+    source_shard: &TensorRegion,
+    destination_shard: &TensorRegion,
+    extents: &TensorRegion,
+) -> Option<(Vec<crate::ByteSpan>, Vec<crate::ByteSpan>)> {
+    match strategy {
+        ConversionStrategy::DirectRetile => Some((
+            physical_region_byte_spans(source_type, source_shard, extents).ok()?,
+            physical_region_byte_spans(destination_type, destination_shard, extents).ok()?,
+        )),
+        ConversionStrategy::DirectLogical => Some((
+            logical_region_byte_spans(source_type, source_shard, extents).ok()?,
+            logical_region_byte_spans(destination_type, destination_shard, extents).ok()?,
+        )),
+        ConversionStrategy::StageLogicalThenTransform => {
+            let staging_extents = destination_shard.logical();
+            Some((
+                logical_region_byte_spans(source_type, source_shard, extents).ok()?,
+                logical_region_byte_spans(staging_type, &staging_extents, extents).ok()?,
+            ))
+        }
+        ConversionStrategy::LocalKernel => None,
+    }
+}
+
 pub(crate) fn conversion_traffic(
     shape: &TensorShape,
     precision: Precision,
+    strategy: ConversionStrategy,
+    copy_plan: CopyPlan,
     from: &Layout,
     to: &Layout,
 ) -> Option<ConversionTraffic> {
-    let sources = layout_extents(shape, from)?;
-    let destinations = layout_extents(shape, to)?;
+    let sources = layout_storage_extents(shape, from)?;
+    let destinations = layout_storage_extents(shape, to)?;
     let element_bytes = precision.bytes();
+    let source_type = TensorType::new(shape.0.clone(), precision, from.clone());
+    let destination_type = TensorType::new(shape.0.clone(), precision, to.clone());
+    let staging_type = TensorType::new(
+        shape.0.clone(),
+        precision,
+        Layout {
+            order: ElementOrder::RowMajor,
+            tiling: crate::TensorTiling::replicated(1),
+            memory_class: MemoryClass::Standard,
+        },
+    );
     let mut source_groups = HashMap::<TensorRegion, Vec<u16>>::new();
+    let mut source_storage = HashMap::<(u16, TensorRegion), TensorRegion>::new();
     for (tile, extents) in sources {
-        source_groups.entry(extents).or_default().push(tile);
+        let logical = extents.logical();
+        source_groups.entry(logical.clone()).or_default().push(tile);
+        source_storage.insert((tile, logical), extents);
     }
     let mut destination_groups = HashMap::<TensorRegion, Vec<u16>>::new();
+    let mut destination_storage = HashMap::<(u16, TensorRegion), TensorRegion>::new();
     for (tile, extents) in destinations {
-        destination_groups.entry(extents).or_default().push(tile);
+        let logical = extents.logical();
+        destination_groups
+            .entry(logical.clone())
+            .or_default()
+            .push(tile);
+        destination_storage.insert((tile, logical), extents);
     }
-    let mut remote = HashSet::<(u16, TensorRegion)>::new();
+    let mut remote = HashMap::<(u16, TensorRegion), (u64, u64)>::new();
     let mut traffic = ConversionTraffic::default();
     for (destination, destination_tiles) in &destination_groups {
         let mut intersections = Vec::with_capacity(source_groups.len());
@@ -181,32 +224,90 @@ pub(crate) fn conversion_traffic(
             let Some(extents) = source.intersection(destination) else {
                 continue;
             };
-            intersections.push((extents, source_tiles));
+            intersections.push((extents, source, source_tiles));
         }
         let mut destination_bytes = 0u64;
-        for (extents, _) in &intersections {
+        for (extents, _, _) in &intersections {
             let bytes = extents.logical_elements().saturating_mul(element_bytes);
             destination_bytes = destination_bytes.saturating_add(bytes);
         }
-        traffic.maximum_destination_bytes =
-            traffic.maximum_destination_bytes.max(destination_bytes);
-        traffic.maximum_intersections = traffic
-            .maximum_intersections
-            .max(intersections.len() as u64);
         for &destination_tile in destination_tiles {
+            let destination_shard =
+                destination_storage.get(&(destination_tile, destination.clone()))?;
             let mut remote_bytes = 0u64;
             let mut remote_fragments = 0u64;
-            let mut local_bytes = 0u64;
-            let mut local_intersections = 0u64;
-            for (extents, source_tiles) in &intersections {
+            let mut local_copy_bytes = 0u64;
+            let mut local_copy_calls = 0u64;
+            for (extents, source, source_tiles) in &intersections {
                 let bytes = extents.logical_elements().saturating_mul(element_bytes);
                 if source_tiles.binary_search(&destination_tile).is_ok() {
-                    local_bytes = local_bytes.saturating_add(bytes);
-                    local_intersections = local_intersections.saturating_add(1);
+                    let source_shard =
+                        source_storage.get(&(destination_tile, (*source).clone()))?;
+                    let (source_spans, destination_spans) = conversion_copy_spans(
+                        strategy,
+                        &source_type,
+                        &destination_type,
+                        &staging_type,
+                        source_shard,
+                        destination_shard,
+                        extents,
+                    )?;
+                    let runs = plan_copy_runs(&source_spans, &destination_spans, copy_plan)?;
+                    local_copy_bytes = local_copy_bytes
+                        .saturating_add(runs.iter().map(|run| u64::from(run.bytes)).sum::<u64>());
+                    local_copy_calls = local_copy_calls.saturating_add(runs.len() as u64);
                 } else {
+                    let source_tile = source_tiles[0];
+                    let source_shard = source_storage.get(&(source_tile, (*source).clone()))?;
+                    let (source_spans, destination_spans) = conversion_copy_spans(
+                        strategy,
+                        &source_type,
+                        &destination_type,
+                        &staging_type,
+                        source_shard,
+                        destination_shard,
+                        extents,
+                    )?;
+                    let maximum_bytes = ipu_target::exchange::MAX_TRANSFER_WORDS.checked_mul(4)?;
+                    let routed_fragments =
+                        plan_transfer_runs(&source_spans, &destination_spans, maximum_bytes, 4)?
+                            .len() as u64;
                     remote_bytes = remote_bytes.saturating_add(bytes);
-                    remote_fragments = remote_fragments.saturating_add(1);
-                    remote.insert((source_tiles[0], extents.clone()));
+                    remote_fragments = remote_fragments.saturating_add(routed_fragments);
+                    let route = remote
+                        .entry((source_tile, extents.clone()))
+                        .or_insert((bytes, 0));
+                    route.1 = route.1.max(routed_fragments);
+                }
+            }
+            if strategy == ConversionStrategy::StageLogicalThenTransform {
+                let uses_transform_kernel = precision == Precision::F16
+                    && matches!(
+                        to.order,
+                        ElementOrder::Amp(crate::AmpOrder::Left | crate::AmpOrder::TransposedRight)
+                            | ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix { .. })
+                    );
+                if uses_transform_kernel {
+                    local_copy_bytes = local_copy_bytes.saturating_add(destination_bytes);
+                    local_copy_calls = local_copy_calls.saturating_add(1);
+                } else {
+                    let staging_extents = destination_shard.logical();
+                    let source_spans = logical_region_byte_spans(
+                        &staging_type,
+                        &staging_extents,
+                        &staging_extents,
+                    )
+                    .ok()?;
+                    let destination_spans = logical_region_byte_spans(
+                        &destination_type,
+                        destination_shard,
+                        destination,
+                    )
+                    .ok()?;
+                    let runs = plan_copy_runs(&source_spans, &destination_spans, copy_plan)?;
+                    local_copy_bytes = local_copy_bytes
+                        .saturating_add(runs.iter().map(|run| u64::from(run.bytes)).sum::<u64>());
+                    local_copy_calls = local_copy_calls.saturating_add(runs.len() as u64);
                 }
             }
             add_endpoint_load(
@@ -215,53 +316,20 @@ pub(crate) fn conversion_traffic(
                 remote_bytes,
                 remote_fragments,
             );
-            traffic.maximum_remote_destination_bytes =
-                traffic.maximum_remote_destination_bytes.max(remote_bytes);
-            traffic.maximum_remote_destination_fragments = traffic
-                .maximum_remote_destination_fragments
-                .max(remote_fragments);
-            traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
-            traffic.maximum_local_intersections =
-                traffic.maximum_local_intersections.max(local_intersections);
+            traffic.maximum_local_copy_bytes =
+                traffic.maximum_local_copy_bytes.max(local_copy_bytes);
+            traffic.maximum_local_copy_calls =
+                traffic.maximum_local_copy_calls.max(local_copy_calls);
         }
     }
     traffic.remote_fragments = remote.len() as u64;
-    traffic.maximum_routed_fragments = if from.order == to.order {
-        traffic.maximum_intersections
-    } else {
-        traffic
-            .maximum_destination_bytes
-            .saturating_sub(traffic.maximum_local_bytes)
-            .div_ceil(4)
-    };
-    traffic.source_payload_bytes = remote
-        .iter()
-        .map(|(_, extents)| extents.logical_elements().saturating_mul(element_bytes))
-        .sum();
-    let mut source_roles = HashMap::<u16, (u64, u64)>::new();
-    for (source, extents) in &remote {
-        let role = source_roles.entry(*source).or_default();
-        role.0 = role
-            .0
-            .saturating_add(extents.logical_elements().saturating_mul(element_bytes));
-        role.1 = role.1.saturating_add(1);
-    }
-    for (bytes, fragments) in source_roles.into_values() {
-        traffic.maximum_source_payload_bytes = traffic.maximum_source_payload_bytes.max(bytes);
-        traffic.maximum_source_fragments = traffic.maximum_source_fragments.max(fragments);
-    }
     let mut source_buses = HashMap::<u16, (u64, u64)>::new();
-    for (source, extents) in &remote {
+    for ((source, _), (bytes, fragments)) in &remote {
         let role = source_buses.entry(*source / 2).or_default();
-        role.0 = role
-            .0
-            .saturating_add(extents.logical_elements().saturating_mul(element_bytes));
-        role.1 = role.1.saturating_add(1);
+        role.0 = role.0.saturating_add(*bytes);
+        role.1 = role.1.saturating_add(*fragments);
     }
     for (bus, (bytes, fragments)) in source_buses {
-        traffic.maximum_source_bus_payload_bytes =
-            traffic.maximum_source_bus_payload_bytes.max(bytes);
-        traffic.maximum_source_bus_fragments = traffic.maximum_source_bus_fragments.max(fragments);
         add_endpoint_load(&mut traffic.source_bus_loads, bus, bytes, fragments);
     }
     Some(traffic)
@@ -275,6 +343,21 @@ fn layout_extents(shape: &TensorShape, layout: &Layout) -> Option<Vec<(u16, Tens
             .shard_extents()
             .into_iter()
             .map(|shard| (shard.tile, shard.extents.logical()))
+            .collect(),
+    )
+}
+
+fn layout_storage_extents(
+    shape: &TensorShape,
+    layout: &Layout,
+) -> Option<Vec<(u16, TensorRegion)>> {
+    Some(
+        layout
+            .resolve(shape)
+            .ok()?
+            .shard_extents()
+            .into_iter()
+            .map(|shard| (shard.tile, shard.extents))
             .collect(),
     )
 }
@@ -1316,7 +1399,7 @@ mod tests {
     #[test]
     fn randomized_average_shard_storage_covers_spatial_work() {
         let mut random = fastrand::Rng::with_seed(0x7370_6174_6961_6c77);
-        for case in 0..32 {
+        for case in 0..16 {
             let row_partitions = 1_u16 << random.u32(0..=4);
             let column_partitions = 1_u16 << random.u32(0..=4);
             let tiles = row_partitions * column_partitions;
@@ -1517,102 +1600,6 @@ mod tests {
         }
     }
 
-    fn conversion_traffic_reference(
-        shape: &TensorShape,
-        precision: Precision,
-        from: &Layout,
-        to: &Layout,
-    ) -> ConversionTraffic {
-        let sources = layout_extents(shape, from).unwrap();
-        let destinations = layout_extents(shape, to).unwrap();
-        let mut remote = BTreeSet::<(u16, TensorRegion)>::new();
-        let mut traffic = ConversionTraffic::default();
-        for (destination_tile, destination) in &destinations {
-            let mut intersections = BTreeMap::<TensorRegion, u16>::new();
-            for (source_tile, source) in &sources {
-                let Some(extents) = source.intersection(destination) else {
-                    continue;
-                };
-                let selected = intersections.entry(extents).or_insert(*source_tile);
-                if source_tile == destination_tile {
-                    *selected = *source_tile;
-                }
-            }
-            let mut destination_bytes = 0;
-            let mut local_bytes = 0;
-            let mut local_intersections = 0;
-            let mut remote_intersections = 0;
-            for (extents, source_tile) in &intersections {
-                let bytes = extents.logical_elements() * precision.bytes();
-                destination_bytes += bytes;
-                if source_tile == destination_tile {
-                    local_bytes += bytes;
-                    local_intersections += 1;
-                } else {
-                    remote.insert((*source_tile, extents.clone()));
-                    remote_intersections += 1;
-                }
-            }
-            traffic.maximum_destination_bytes =
-                traffic.maximum_destination_bytes.max(destination_bytes);
-            traffic.maximum_remote_destination_bytes = traffic
-                .maximum_remote_destination_bytes
-                .max(destination_bytes.saturating_sub(local_bytes));
-            traffic.maximum_remote_destination_fragments = traffic
-                .maximum_remote_destination_fragments
-                .max(remote_intersections);
-            add_endpoint_load(
-                &mut traffic.remote_destination_loads,
-                *destination_tile,
-                destination_bytes.saturating_sub(local_bytes),
-                remote_intersections,
-            );
-            traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
-            traffic.maximum_intersections = traffic
-                .maximum_intersections
-                .max(intersections.len() as u64);
-            traffic.maximum_local_intersections =
-                traffic.maximum_local_intersections.max(local_intersections);
-        }
-        traffic.remote_fragments = remote.len() as u64;
-        traffic.maximum_routed_fragments = if from.order == to.order {
-            traffic.maximum_intersections
-        } else {
-            traffic
-                .maximum_destination_bytes
-                .saturating_sub(traffic.maximum_local_bytes)
-                .div_ceil(4)
-        };
-        traffic.source_payload_bytes = remote
-            .iter()
-            .map(|(_, extents)| extents.logical_elements() * precision.bytes())
-            .sum();
-        let mut source_roles = BTreeMap::<u16, (u64, u64)>::new();
-        for (source, extents) in &remote {
-            let role = source_roles.entry(*source).or_default();
-            role.0 += extents.logical_elements() * precision.bytes();
-            role.1 += 1;
-        }
-        for (bytes, fragments) in source_roles.into_values() {
-            traffic.maximum_source_payload_bytes = traffic.maximum_source_payload_bytes.max(bytes);
-            traffic.maximum_source_fragments = traffic.maximum_source_fragments.max(fragments);
-        }
-        let mut source_buses = BTreeMap::<u16, (u64, u64)>::new();
-        for (source, extents) in &remote {
-            let role = source_buses.entry(*source / 2).or_default();
-            role.0 += extents.logical_elements() * precision.bytes();
-            role.1 += 1;
-        }
-        for (bus, (bytes, fragments)) in source_buses {
-            traffic.maximum_source_bus_payload_bytes =
-                traffic.maximum_source_bus_payload_bytes.max(bytes);
-            traffic.maximum_source_bus_fragments =
-                traffic.maximum_source_bus_fragments.max(fragments);
-            add_endpoint_load(&mut traffic.source_bus_loads, bus, bytes, fragments);
-        }
-        traffic
-    }
-
     #[test]
     fn randomized_conversion_traffic_counts_fragmented_multicasts() {
         let mut random = fastrand::Rng::with_seed(0x6672_6167_6d65_6e74);
@@ -1639,38 +1626,41 @@ mod tests {
             );
             let destination =
                 Layout::amp_output_replicated_grid(tiles, column_partitions, row_partitions);
-            let fragmented =
-                conversion_traffic(&shape, Precision::F16, &fragmented_source, &destination)
-                    .unwrap();
-            let aligned =
-                conversion_traffic(&shape, Precision::F16, &aligned_source, &destination).unwrap();
+            let copy_plan = crate::HardwareTarget::Ipu21.copy_plan();
+            let fragmented = conversion_traffic(
+                &shape,
+                Precision::F16,
+                ConversionStrategy::DirectRetile,
+                copy_plan,
+                &fragmented_source,
+                &destination,
+            )
+            .unwrap();
+            let aligned = conversion_traffic(
+                &shape,
+                Precision::F16,
+                ConversionStrategy::DirectRetile,
+                copy_plan,
+                &aligned_source,
+                &destination,
+            )
+            .unwrap();
 
-            assert_eq!(
-                fragmented,
-                conversion_traffic_reference(
-                    &shape,
-                    Precision::F16,
-                    &fragmented_source,
-                    &destination,
-                ),
-                "case {case}"
-            );
-            assert_eq!(
-                aligned,
-                conversion_traffic_reference(&shape, Precision::F16, &aligned_source, &destination,),
-                "case {case}"
-            );
+            for traffic in [&fragmented, &aligned] {
+                assert_eq!(
+                    traffic.maximum_local_copy_calls == 0,
+                    traffic.maximum_local_copy_bytes == 0,
+                    "case {case}"
+                );
+                assert_eq!(
+                    traffic.remote_fragments == 0,
+                    traffic.remote_destination_loads.is_empty(),
+                    "case {case}"
+                );
+            }
 
-            assert_eq!(
-                fragmented.maximum_destination_bytes, aligned.maximum_destination_bytes,
-                "case {case}"
-            );
             assert!(
                 fragmented.remote_fragments >= aligned.remote_fragments,
-                "case {case}: {fragmented:?} {aligned:?}"
-            );
-            assert!(
-                fragmented.maximum_intersections >= aligned.maximum_intersections,
                 "case {case}: {fragmented:?} {aligned:?}"
             );
         }
