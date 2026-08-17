@@ -1,11 +1,11 @@
 //! Memory, communication, and capacity estimates shared by planning policies.
 
 use crate::graph::TensorShape;
+use crate::ir::{MidOperation, MidOperationKind, MidValue, MidValueId};
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, Layout, MemoryClass, TensorAxis, TensorType,
 };
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage};
-use crate::mid::{MidOperation, MidOperationKind, MidValue, MidValueId};
 use crate::operator::{
     AllocationRequirements, GemmDistribution, MemoryElementRequirement, MemoryOperand,
     OperandMaterialization, OperatorDispatch, OperatorRequirements, Precision,

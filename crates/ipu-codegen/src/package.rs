@@ -1,11 +1,12 @@
 use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
+use crate::ir::{MidGraph, MidOperationKind};
 use crate::low::LowProgram;
 use crate::memory::{
     MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE,
     RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
 };
-use crate::mid::{MidGraph, MidOperationKind, lower_finalists};
+use crate::mid::lower_finalists;
 use crate::operator::Precision;
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HOST_RUN_SYMBOL, KernelBuildPlan,

@@ -11,6 +11,7 @@ mod estimate;
 pub mod exchange;
 pub mod graph;
 mod host;
+mod ir;
 pub mod kernel;
 mod layout;
 pub mod low;
@@ -41,6 +42,9 @@ pub use graph::{
     Region, RegionBuilder, Repeat, RepeatArguments, SplitHeadsOptions, TensorShape, ValueId,
     ValueSequence, ValueSequenceId,
 };
+pub use ir::{
+    MidGraph, MidInput, MidOperation, MidOperationKind, MidRegion, MidRepeat, MidValue, MidValueId,
+};
 pub use kernel::{
     KernelAbi, KernelAbiError, KernelAvailability, KernelBuildPlan, KernelCompilation,
     KernelMaterializationError, KernelSymbols, PlannedKernelCall, ScalarArgument,
@@ -67,8 +71,7 @@ pub use metrics::{
 };
 pub use mid::{
     CostEstimate, CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, LoweringError,
-    LoweringResult, MidGraph, MidInput, MidOperation, MidOperationKind, MidRegion, MidRepeat,
-    MidValue, MidValueId, lower,
+    LoweringResult, lower,
 };
 pub use operator::{
     AccumulationPrecision, AllocationRequirements, AttentionBlocking, AttentionKernelFamily,

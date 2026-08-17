@@ -1,11 +1,11 @@
 //! Whole-device operator plans and tile-kernel specifications.
 
 use crate::graph::{AddOptions, AttentionOptions, GemmOptions, SplitHeadsOptions, TensorShape};
+use crate::ir::MidValueId;
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
     MemoryClass, TensorAxis, TensorFormat, TensorType,
 };
-use crate::mid::MidValueId;
 
 /// In-memory representation of one tensor element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

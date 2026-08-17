@@ -8,11 +8,11 @@
 
 use crate::PipelineConfig;
 use crate::graph::{GraphInputKind, OperationId};
+use crate::ir::{MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId};
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
     LayoutError, MemoryClass, ShardExtent, TensorRegion, TensorTiling, TensorType,
 };
-use crate::mid::{MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId};
 use crate::operator::{
     ConversionStrategy, DeferredTransform, GemmDistribution, MemoryOperand,
     MemorySpaceRequirements, OperandRequirement, OperatorDispatch, OperatorRequirements,
