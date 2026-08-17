@@ -815,17 +815,14 @@ struct RankedBeamBranch {
     order: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct FutureFormatCompatibility(
-    Vec<(
-        ValueId,
-        FutureFormatRole,
-        Precision,
-        ElementOrderCompatibility,
-        MemoryClass,
-        Vec<(TensorAxis, u16, u32)>,
-    )>,
-);
+type FutureFormatCompatibility = Vec<(
+    ValueId,
+    FutureFormatRole,
+    Precision,
+    ElementOrderCompatibility,
+    MemoryClass,
+    Vec<(TensorAxis, u16, u32)>,
+)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum FutureFormatRole {
@@ -900,7 +897,7 @@ fn future_format_compatibility(
             );
         }
     }
-    FutureFormatCompatibility(formats)
+    formats
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

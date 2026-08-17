@@ -54,16 +54,12 @@ pub enum OperatorClass {
     Attention,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ActiveTileDomain {
-    Automatic,
-    Explicit(Vec<u16>),
-}
-
 /// Search axes shared by semantic operator plan generators.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannerSearchDomain {
-    pub(crate) active_tiles: ActiveTileDomain,
+    /// `None` derives useful tile counts from graph shapes; `Some` restricts
+    /// planning to the explicitly supplied counts.
+    pub(crate) active_tiles: Option<Vec<u16>>,
     pub(crate) operator_precisions: BTreeMap<OperatorClass, Vec<Precision>>,
     pub(crate) weight_memory_classes: Vec<MemoryClass>,
     pub(crate) attention_strategy: AttentionStrategy,
@@ -118,7 +114,7 @@ impl std::str::FromStr for AttentionStrategy {
 impl Default for PlannerSearchDomain {
     fn default() -> Self {
         Self {
-            active_tiles: ActiveTileDomain::Automatic,
+            active_tiles: None,
             operator_precisions: BTreeMap::from([
                 (OperatorClass::Gemm, vec![Precision::F16, Precision::F32]),
                 (OperatorClass::Gelu, vec![Precision::F16, Precision::F32]),
@@ -153,7 +149,7 @@ impl PlannerSearchDomain {
         shapes: impl IntoIterator<Item = &'a TensorShape>,
     ) -> Vec<u16> {
         match &self.active_tiles {
-            ActiveTileDomain::Automatic => {
+            None => {
                 let mut counts = candidate_active_tile_counts(capacity);
                 for count in shape_aware_active_tile_counts(capacity, shapes) {
                     if !counts.contains(&count) {
@@ -162,7 +158,7 @@ impl PlannerSearchDomain {
                 }
                 counts
             }
-            ActiveTileDomain::Explicit(counts) => counts
+            Some(counts) => counts
                 .iter()
                 .copied()
                 .filter(|&count| count <= capacity)
@@ -206,7 +202,7 @@ impl PlannerSearchDomain {
                 active_tiles.push(count);
             }
         }
-        self.active_tiles = ActiveTileDomain::Explicit(active_tiles);
+        self.active_tiles = Some(active_tiles);
         self
     }
 
