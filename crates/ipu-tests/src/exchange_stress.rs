@@ -29,27 +29,13 @@ const INTERLEAVED_SOURCE_BASE: u32 = 0x88000;
 const INTERLEAVED_DESTINATION_BASE: u32 = 0x98000;
 
 #[derive(Clone, Debug)]
-struct Transfer {
+struct StressTransfer {
     case: u32,
     physical: PhysicalTransfer,
     expected_words: Vec<u32>,
     requested_schedule_offset: u32,
     schedule_offset: u32,
     timing: PhaseTransferTiming,
-}
-
-impl Transfer {
-    fn source_address(&self) -> u32 {
-        self.physical.source_addresses[0]
-    }
-
-    fn destination_tiles(&self) -> impl Iterator<Item = u16> + '_ {
-        self.physical.destinations.iter().map(|endpoint| endpoint.0)
-    }
-
-    fn destination_addresses(&self) -> impl Iterator<Item = u32> + '_ {
-        self.physical.destinations.iter().map(|endpoint| endpoint.1)
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +49,7 @@ struct TransferSpec {
 pub(crate) struct StressPackage {
     pub application: Application,
     active_tiles: u16,
-    transfers: Vec<Transfer>,
+    transfers: Vec<StressTransfer>,
     rows: Vec<StressRow>,
     readbacks: Vec<ExpectedSpan>,
 }
@@ -364,7 +350,7 @@ pub(crate) fn build_wide(
                 });
             }
         }
-        transfers.push(Transfer {
+        transfers.push(StressTransfer {
             case: u32::try_from(case)?,
             physical: PhysicalTransfer {
                 source,
@@ -427,13 +413,6 @@ struct ExpectedSpan {
     tile: u16,
     address: u32,
     words: Vec<u32>,
-}
-
-#[derive(Clone, Debug)]
-struct ReplayTransfer {
-    physical: PhysicalTransfer,
-    send: ExchangeActivity,
-    receives: Vec<(u16, ExchangeActivity)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -673,7 +652,7 @@ pub(crate) fn build(
                     .or_default()
                     .push((destination, expected, words));
             }
-            transfers.push(Transfer {
+            transfers.push(StressTransfer {
                 case,
                 physical: PhysicalTransfer {
                     source,
@@ -1000,18 +979,19 @@ fn build_physical_phase_replay(
             };
             Ok((
                 id,
-                ReplayTransfer {
-                    physical,
-                    send,
-                    receives,
-                },
+                physical,
+                send,
+                receives
+                    .into_iter()
+                    .map(|(_, activity)| activity)
+                    .collect::<Vec<_>>(),
             ))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut events = Vec::new();
-    for (transfer, (_, replay)) in transfers.iter().enumerate() {
-        events.push((replay.send.start_cycle, 1u8, ReplayEvent::Send { transfer }));
-        for (destination, &(_, receive)) in replay.receives.iter().enumerate() {
+    for (transfer, (_, _, send, receives)) in transfers.iter().enumerate() {
+        events.push((send.start_cycle, 1u8, ReplayEvent::Send { transfer }));
+        for (destination, receive) in receives.iter().enumerate() {
             events.push((
                 receive.memory_end_cycle,
                 0u8,
@@ -1029,11 +1009,11 @@ fn build_physical_phase_replay(
     for (_, _, event) in events {
         match event {
             ReplayEvent::Send { transfer } => {
-                let (id, replay) = &transfers[transfer];
-                let tile = replay.physical.source;
-                let address = replay.physical.source_addresses[0];
+                let (id, physical, _, _) = &transfers[transfer];
+                let tile = physical.source;
+                let address = physical.source_address();
                 let memory = &expected_memory[usize::from(tile)];
-                let payload = (0..replay.physical.words)
+                let payload = (0..physical.words)
                     .map(|word| {
                         let address = address + word * 4;
                         memory.get(&address).copied().with_context(|| {
@@ -1049,8 +1029,8 @@ fn build_physical_phase_replay(
                 transfer,
                 destination,
             } => {
-                let (id, replay) = &transfers[transfer];
-                let TransferEndpoint(tile, address) = replay.physical.destinations[destination];
+                let (id, physical, _, _) = &transfers[transfer];
+                let TransferEndpoint(tile, address) = physical.destinations[destination];
                 let payload = payloads[transfer].as_ref().with_context(|| {
                     format!(
                         "phase {phase_index} transfer {id} completes a receive before its send snapshot"
@@ -1373,7 +1353,7 @@ impl StressPackage {
         let mut relevant = Vec::new();
         for transfer in &self.transfers {
             relevant.push(transfer.physical.source);
-            relevant.extend(transfer.destination_tiles());
+            relevant.extend(transfer.physical.destination_tiles());
             if let Ok(paired) = topology.paired_logical(transfer.physical.source) {
                 relevant.push(paired);
             }
@@ -1455,9 +1435,9 @@ impl StressPackage {
                 format!(
                     "source={} address=0x{:x} destinations={:?} addresses={:?} words={} expectedWords={} requestedOffset={} encodedOffset={} sender={}..{} receivers={:?}..{:?}",
                     transfer.physical.source,
-                    transfer.source_address(),
-                    transfer.destination_tiles().collect::<Vec<_>>(),
-                    transfer.destination_addresses().collect::<Vec<_>>(),
+                    transfer.physical.source_address(),
+                    transfer.physical.destination_tiles().collect::<Vec<_>>(),
+                    transfer.physical.destination_addresses().collect::<Vec<_>>(),
                     transfer.physical.words,
                     transfer.expected_words.len(),
                     transfer.requested_schedule_offset,
@@ -1521,10 +1501,13 @@ impl StressPackage {
                 (
                     transfer.case,
                     transfer.physical.source,
-                    transfer.destination_tiles().collect::<Vec<_>>(),
+                    transfer.physical.destination_tiles().collect::<Vec<_>>(),
                     transfer.physical.words,
-                    transfer.source_address(),
-                    transfer.destination_addresses().collect::<Vec<_>>(),
+                    transfer.physical.source_address(),
+                    transfer
+                        .physical
+                        .destination_addresses()
+                        .collect::<Vec<_>>(),
                 )
             })
             .collect::<Vec<_>>();

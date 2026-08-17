@@ -197,8 +197,16 @@ pub struct PhysicalTransfer {
 }
 
 impl PhysicalTransfer {
-    fn source_address(&self) -> u32 {
+    pub fn source_address(&self) -> u32 {
         self.source_addresses[0]
+    }
+
+    pub fn destination_tiles(&self) -> impl Iterator<Item = u16> + '_ {
+        self.destinations.iter().map(|endpoint| endpoint.0)
+    }
+
+    pub fn destination_addresses(&self) -> impl Iterator<Item = u32> + '_ {
+        self.destinations.iter().map(|endpoint| endpoint.1)
     }
 
     fn item_count(&self) -> Result<u32, ExchangeLoweringError> {
