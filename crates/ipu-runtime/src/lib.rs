@@ -2,13 +2,7 @@ use ipu_driver::{Device, DriverError, HostSession, Loader, block_device_interrup
 use ipu_package::Application;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, thiserror::Error)]
-pub enum RuntimeError {
-    #[error("driver error: {0}")]
-    Driver(#[from] DriverError),
-}
-
-pub type Result<T> = std::result::Result<T, RuntimeError>;
+pub type Result<T> = std::result::Result<T, DriverError>;
 
 /// Thin ownership wrapper around an initialized device.
 ///
