@@ -99,21 +99,9 @@ pub struct TileProgramData {
 #[derive(Clone, Debug)]
 pub struct CompiledPackage {
     pub application: Application,
-    pub tensors: PackageTensorMetadata,
-    pub exchanges: PackageExchangeArtifacts,
-    pub checkpoints: Vec<DiagnosticCheckpoint>,
-    placement: crate::Placement,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct PackageTensorMetadata {
     pub inputs: Vec<CompiledTensor>,
     pub outputs: Vec<CompiledTensor>,
     pub precisions: BTreeMap<ValueId, Precision>,
-}
-
-#[derive(Clone, Debug)]
-pub struct PackageExchangeArtifacts {
     /// Exact physical exchange schedules retained for low-level diagnostics.
     /// This is build metadata and is not serialized into the application.
     pub exchange_phases: Vec<crate::PhysicalExchangePhase>,
@@ -121,6 +109,8 @@ pub struct PackageExchangeArtifacts {
     pub exchange_schedule: crate::ExchangeScheduleSnapshot,
     /// Base address used when laying out the compact per-tile exchange table.
     pub exchange_code_base: u32,
+    pub checkpoints: Vec<DiagnosticCheckpoint>,
+    placement: crate::Placement,
 }
 
 #[derive(Clone, Debug)]
@@ -587,12 +577,12 @@ fn package_precisions(mid: &MidGraph) -> BTreeMap<ValueId, Precision> {
         .collect()
 }
 
-fn package_tensors(
+fn compiled_graph_tensors(
     mid: &MidGraph,
     low: &LowProgram,
     placement: &crate::Placement,
     topology: &Topology,
-) -> PackageBuildResult<PackageTensorMetadata> {
+) -> PackageBuildResult<(Vec<CompiledTensor>, Vec<CompiledTensor>)> {
     let inputs = low
         .inputs
         .iter()
@@ -622,11 +612,7 @@ fn package_tensors(
             )
         })
         .collect::<PackageBuildResult<Vec<_>>>()?;
-    Ok(PackageTensorMetadata {
-        inputs,
-        outputs,
-        precisions: package_precisions(mid),
-    })
+    Ok((inputs, outputs))
 }
 
 fn build_package_artifacts(
@@ -862,23 +848,23 @@ fn build_package_from_objects(
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| invalid("execution topology does not cover every physical tile"))?;
-    let provisional_tensors = package_tensors(mid, program, &provisional_placement, &topology)?;
+    let (provisional_tensors, provisional_output_tensors) =
+        compiled_graph_tensors(mid, program, &provisional_placement, &topology)?;
     let provisional_inputs = program
         .inputs
         .iter()
-        .zip(&provisional_tensors.inputs)
+        .zip(&provisional_tensors)
         .filter(|(input, _)| input.kind == crate::GraphInputKind::Host)
         .map(|(_, tensor)| tensor.binding())
         .collect::<PackageBuildResult<Vec<_>>>()?;
     let provisional_weights = program
         .inputs
         .iter()
-        .zip(&provisional_tensors.inputs)
+        .zip(&provisional_tensors)
         .filter(|(input, _)| input.kind == crate::GraphInputKind::Parameter)
         .map(|(_, tensor)| tensor.binding())
         .collect::<PackageBuildResult<Vec<_>>>()?;
-    let mut provisional_outputs = provisional_tensors
-        .outputs
+    let mut provisional_outputs = provisional_output_tensors
         .iter()
         .map(CompiledTensor::binding)
         .collect::<PackageBuildResult<Vec<_>>>()?;
@@ -1071,23 +1057,22 @@ fn build_package_from_objects(
     })?;
     let exchange_schedule = lowered_exchanges.schedule_snapshot;
     let exchanges = lowered_exchanges.phases;
-    let tensors = package_tensors(mid, program, &placement, &topology)?;
+    let (tensors, output_tensors) = compiled_graph_tensors(mid, program, &placement, &topology)?;
     let inputs = program
         .inputs
         .iter()
-        .zip(&tensors.inputs)
+        .zip(&tensors)
         .filter(|(input, _)| input.kind == crate::GraphInputKind::Host)
         .map(|(_, tensor)| tensor.binding())
         .collect::<PackageBuildResult<Vec<_>>>()?;
     let weights = program
         .inputs
         .iter()
-        .zip(&tensors.inputs)
+        .zip(&tensors)
         .filter(|(input, _)| input.kind == crate::GraphInputKind::Parameter)
         .map(|(_, tensor)| tensor.binding())
         .collect::<PackageBuildResult<Vec<_>>>()?;
-    let mut outputs = tensors
-        .outputs
+    let mut outputs = output_tensors
         .iter()
         .map(CompiledTensor::binding)
         .collect::<PackageBuildResult<Vec<_>>>()?;
@@ -1298,12 +1283,12 @@ fn build_package_from_objects(
     application.validate()?;
     Ok(CompiledPackage {
         application,
-        tensors,
-        exchanges: PackageExchangeArtifacts {
-            exchange_phases: exchanges,
-            exchange_schedule,
-            exchange_code_base,
-        },
+        inputs: tensors,
+        outputs: output_tensors,
+        precisions: package_precisions(mid),
+        exchange_phases: exchanges,
+        exchange_schedule,
+        exchange_code_base,
         checkpoints: Vec::new(),
         placement,
     })

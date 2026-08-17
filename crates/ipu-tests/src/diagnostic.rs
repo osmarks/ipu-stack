@@ -34,9 +34,8 @@ pub fn run(
     rtol: f32,
     timeout: Duration,
 ) -> Result<()> {
-    let (values, weights, inputs) =
-        prepare_inputs(graph, &package.application, &package.tensors.inputs)?;
-    let references = evaluate(graph, values, &package.tensors.precisions)?;
+    let (values, weights, inputs) = prepare_inputs(graph, &package.application, &package.inputs)?;
+    let references = evaluate(graph, values, &package.precisions)?;
     let mut session = runtime.host_session(&package.application)?;
     session.start()?;
     if !package.application.weights.is_empty() {

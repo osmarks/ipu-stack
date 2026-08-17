@@ -82,8 +82,8 @@ pub use operator::{
 };
 pub use package::{
     CompiledPackage, CompiledTensor, CompiledTensorShard, DiagnosticCheckpoint, PackageBuildError,
-    PackageBuildResult, PackageConfig, PackageExchangeArtifacts, PackageTensorMetadata,
-    TileProgramData, build_diagnostic_package, build_package, build_tile_program_package,
+    PackageBuildResult, PackageConfig, TileProgramData, build_diagnostic_package, build_package,
+    build_tile_program_package,
 };
 pub use place::{Placement, PlacementError, place};
 pub use storage::{
