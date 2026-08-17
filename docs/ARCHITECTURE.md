@@ -2,9 +2,10 @@
 
 The package path has four explicit components:
 
-1. `ipu-target` produces exchange rows.
-2. `ipu-codegen` lowers a `ComputeGraph`, emits supervisor code, and coordinates
-   package construction according to `PackageConfig`.
+1. `ipu-target` defines IPU21 topology and SRAM geometry, generates and parses
+   exchange rows, encodes instructions, and emits finalized tile programs.
+2. `ipu-codegen` lowers a `ComputeGraph` and coordinates package construction
+   according to `PackageConfig`.
 3. `ipu-elf` compiles and links the static runtime and selected kernels.
 4. `ipu-package` stores final tile images and host protocol metadata for
    `ipu-driver` and `ipu-runtime`.
@@ -121,9 +122,10 @@ A tile program is an ordered list of:
 - an exchange row and its final address; or
 - a kernel symbol, output address, input addresses, and scalar arguments.
 
-The code generator validates only local encoding constraints. It does not check
+`ipu_target::emit` validates only local encoding constraints. It does not check
 lifetimes, search memory, merge repeated regions, repack executable objects, or
-derive kernel memory requirements.
+derive kernel memory requirements. `ipu-codegen` owns those planning and
+placement decisions and supplies a fully resolved `ipu_target::program`.
 
 Optional cycle samples name explicit destination addresses. This is a narrow
 mechanism rather than a profiling layout policy.

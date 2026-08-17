@@ -18,6 +18,7 @@ ipu-elf = { path = "../ipu-elf" }
 ipu-package = { path = "../ipu-package" }
 ipu-profile = { path = "../ipu-profile" }
 ipu-runtime = { path = "../ipu-runtime" }
+ipu-target = { path = "../ipu-target" }
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

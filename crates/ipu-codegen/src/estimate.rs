@@ -421,8 +421,8 @@ fn allocation_memory(tensor: &TensorType, requirement: AllocationRequirements) -
         maximum_shard_bytes(tensor).saturating_add(u64::from(requirement.access_tail_bytes));
     if requirement.memory_element == MemoryElementRequirement::Distinct {
         let element = match tensor.format.layout.memory_class {
-            MemoryClass::Standard => ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-            MemoryClass::Interleaved => ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE,
+            MemoryClass::Standard => ipu_target::memory::TILE_MEMORY_ELEMENT_SIZE,
+            MemoryClass::Interleaved => ipu_target::memory::IPU21_INTERLEAVED_ELEMENT_SIZE,
         };
         bytes = bytes.div_ceil(u64::from(element)) * u64::from(element);
     }
@@ -560,8 +560,8 @@ pub(crate) fn operator_memory_estimate(
                 });
             if left_must_be_distinct {
                 left_staging = left_staging
-                    .div_ceil(u64::from(ipu_package::TILE_MEMORY_ELEMENT_SIZE))
-                    .saturating_mul(u64::from(ipu_package::TILE_MEMORY_ELEMENT_SIZE));
+                    .div_ceil(u64::from(ipu_target::memory::TILE_MEMORY_ELEMENT_SIZE))
+                    .saturating_mul(u64::from(ipu_target::memory::TILE_MEMORY_ELEMENT_SIZE));
             }
             convolution.add_class(left.format.layout.memory_class, left_staging);
             if left.format.layout.memory_class == MemoryClass::Standard {

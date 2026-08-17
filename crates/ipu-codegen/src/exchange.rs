@@ -4,15 +4,13 @@ use crate::{
     ExchangePhaseId, LogicalExchange, LowProgram, LowShardId, Placement, ShardDefinition,
     logical_view_byte_spans, view_byte_spans,
 };
-use ipu_package::{
-    IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
-};
 use ipu_target::exchange::{
     MAX_TRANSFER_WORDS, MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming,
     finalize_point_receiver, patch_receiver_address, patch_sender_address,
     patch_sender_instruction, sender_address_instruction_groups,
 };
 use ipu_target::instruction::RETURN_M10_INSTRUCTION;
+use ipu_target::memory::{MemoryElement, memory_elements_for_words};
 use ipu_target::topology::{Topology, c600_logical_to_physical};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -68,16 +66,10 @@ pub enum ExchangeActivityKind {
     PartnerBusy,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ExchangeMemoryElement {
-    pub interleaved: bool,
-    pub index: u32,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExchangeActivityDiagnostic {
     pub activity: ExchangeActivity,
-    pub memory_elements: Vec<ExchangeMemoryElement>,
+    pub memory_elements: Vec<MemoryElement>,
     pub conflicts_with_row: bool,
 }
 
@@ -86,7 +78,7 @@ pub struct ExchangeTileDiagnostic {
     pub phase: ExchangePhaseId,
     pub tile: u16,
     pub row_address: u32,
-    pub row_elements: Vec<ExchangeMemoryElement>,
+    pub row_elements: Vec<MemoryElement>,
     pub program: ipu_target::exchange::parse::PlanProgramDiagnostic,
     pub activities: Vec<ExchangeActivityDiagnostic>,
 }
@@ -135,7 +127,7 @@ pub fn diagnose_exchange_tile(
         .get(usize::from(tile))
         .ok_or(ExchangeLoweringError::DiagnosticTile(tile))?;
     let row_words = u32::try_from(program.len()).map_err(|_| ExchangeLoweringError::Overflow)?;
-    let row_elements = effective_memory_elements(row_address, row_words);
+    let row_elements = memory_elements_for_words(row_address, row_words).collect::<Vec<_>>();
     let activities = phase
         .activities
         .get(usize::from(tile))
@@ -143,7 +135,8 @@ pub fn diagnose_exchange_tile(
         .iter()
         .copied()
         .map(|activity| {
-            let memory_elements = effective_memory_elements(activity.address, activity.words);
+            let memory_elements =
+                memory_elements_for_words(activity.address, activity.words).collect::<Vec<_>>();
             let conflicts_with_row = memory_elements
                 .iter()
                 .any(|element| row_elements.contains(element));
@@ -723,7 +716,7 @@ fn prepare_transfer(
                 .offset
                 .checked_add(source_offset)
                 .ok_or(ExchangeLoweringError::Overflow)?,
-            source_elements: effective_memory_elements(source_address, chunk_bytes / 4),
+            source_elements: memory_elements_for_words(source_address, chunk_bytes / 4).collect(),
             reserved_source: None,
         });
         source_offset += chunk_bytes;
@@ -936,7 +929,7 @@ struct PendingTransfer {
     physical: PhysicalTransfer,
     source_shard: LowShardId,
     source_offset: u32,
-    source_elements: Vec<ExchangeMemoryElement>,
+    source_elements: Vec<MemoryElement>,
     reserved_source: Option<u16>,
 }
 
@@ -952,7 +945,7 @@ impl PendingTransfer {
             .physical
             .source_addresses
             .iter()
-            .flat_map(|&address| effective_memory_elements(address, self.physical.words))
+            .flat_map(|&address| memory_elements_for_words(address, self.physical.words))
             .collect();
         self.source_elements.sort_unstable();
         self.source_elements.dedup();
@@ -2186,7 +2179,7 @@ fn memory_dependencies(transfers: &[PendingTransfer], tile_count: u16) -> BTreeS
 struct ScheduledTransfer<'a> {
     physical: &'a PhysicalTransfer,
     source_address: u32,
-    source_elements: &'a [ExchangeMemoryElement],
+    source_elements: &'a [MemoryElement],
     schedule_offset: u32,
 }
 
@@ -2214,7 +2207,7 @@ struct MaterializedTiming {
 struct MemoryAccess {
     start: u32,
     end: u32,
-    elements: Vec<ExchangeMemoryElement>,
+    elements: Vec<MemoryElement>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2333,7 +2326,7 @@ impl MaterializedSchedule {
                 .push(MemoryAccess {
                     start,
                     end: memory_end,
-                    elements: effective_memory_elements(address, physical.words),
+                    elements: memory_elements_for_words(address, physical.words).collect(),
                 });
         }
         self.scheduled_sends[usize::from(physical.source)]
@@ -3121,7 +3114,7 @@ fn memory_safe_transfer_offset(
     memory_accesses: &[TileMemorySchedule],
     source: u16,
     destinations: &[TransferEndpoint],
-    source_elements: &[ExchangeMemoryElement],
+    source_elements: &[MemoryElement],
     words: u32,
     payload_start: u32,
     payload_end: u32,
@@ -3151,9 +3144,8 @@ fn memory_safe_transfer_offset(
                     .iter()
                     .filter(move |access| receive_start < access.end && access.start < receive_end)
                     .filter(move |access| {
-                        effective_memory_elements(address, words)
-                            .iter()
-                            .any(|element| access.elements.contains(element))
+                        memory_elements_for_words(address, words)
+                            .any(|element| access.elements.contains(&element))
                     })
                     .map(move |access| access.end.saturating_sub(receive_start))
             },
@@ -3174,35 +3166,13 @@ fn spans_share_effective_memory_element(
     right_address: u32,
     right_words: u32,
 ) -> bool {
-    effective_memory_elements(left_address, left_words)
+    memory_elements_for_words(left_address, left_words)
         .into_iter()
         .any(|left| {
-            effective_memory_elements(right_address, right_words)
+            memory_elements_for_words(right_address, right_words)
                 .into_iter()
                 .any(|right| left == right)
         })
-}
-
-fn effective_memory_elements(address: u32, words: u32) -> Vec<ExchangeMemoryElement> {
-    let end = address.saturating_add(words.saturating_mul(4));
-    let mut elements = Vec::new();
-    let mut cursor = address;
-    while cursor < end {
-        let interleaved = cursor >= IPU21_INTERLEAVED_MEMORY_BASE;
-        let (base, size) = if interleaved {
-            (
-                IPU21_INTERLEAVED_MEMORY_BASE,
-                IPU21_INTERLEAVED_ELEMENT_SIZE,
-            )
-        } else {
-            (0, TILE_MEMORY_ELEMENT_SIZE)
-        };
-        let index = (cursor - base) / size;
-        elements.push(ExchangeMemoryElement { interleaved, index });
-        let boundary = base.saturating_add((index + 1).saturating_mul(size));
-        cursor = boundary.min(end);
-    }
-    elements
 }
 
 pub fn inactive_exchange_program() -> Vec<u32> {
@@ -3417,7 +3387,7 @@ mod tests {
                 },
                 source_shard: LowShardId::from_index(u32::from(source)),
                 source_offset: random.u32(0..16) * 8,
-                source_elements: effective_memory_elements(source_address, words),
+                source_elements: memory_elements_for_words(source_address, words).collect(),
                 reserved_source: None,
             };
             let paired_tiles = destinations
@@ -3502,7 +3472,7 @@ mod tests {
                         },
                         source_shard: LowShardId::from_index(u32::from(source)),
                         source_offset: 0,
-                        source_elements: effective_memory_elements(0, words),
+                        source_elements: memory_elements_for_words(0, words).collect(),
                         reserved_source: None,
                     }
                 })

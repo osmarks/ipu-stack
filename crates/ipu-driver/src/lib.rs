@@ -1,4 +1,5 @@
-use ipu_package::{Application, HostCall, HostExchange, TILE_MEMORY_BASE};
+use ipu_package::{Application, HostCall, HostExchange};
+use ipu_target::memory::{TILE_MEMORY_BASE, TILE_MEMORY_SIZE};
 use object::{Object, ObjectSegment};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -12,7 +13,6 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, trace};
 
 pub const CONFIG_BAR_SIZE: usize = 0x80000;
-pub const TILE_MEMORY_SIZE: usize = 624 * 1024;
 // The secondary loader installs framed application payload at the SDK image's
 // launch slot. Applications reserve that word and enter at the following word.
 pub const APPLICATION_LOAD_BASE: u32 = TILE_MEMORY_BASE + 0x10;
@@ -34,7 +34,7 @@ pub const SECONDARY_LOADER_MIN_PAYLOAD_SIZE: usize = 0x4134;
 pub const SECONDARY_LOADER_MAX_FRAMES: usize = 0x283;
 /// Exclusive upper address that can be represented by that bootloader when
 /// loading an application from [`APPLICATION_LOAD_BASE`].
-pub const APPLICATION_LOAD_LIMIT: u32 = ipu_package::IPU21_APPLICATION_MEMORY_LIMIT;
+pub const APPLICATION_LOAD_LIMIT: u32 = ipu_target::memory::IPU21_APPLICATION_MEMORY_LIMIT;
 const _: () = assert!(
     APPLICATION_LOAD_LIMIT
         == APPLICATION_LOAD_BASE + (SECONDARY_LOADER_MAX_FRAMES * FRAME_PAYLOAD_SIZE) as u32

@@ -1,14 +1,15 @@
 # ipu-stack
 
-`ipu-stack` is a small collection of runtime, packaging, code-generation, and
-early graph-lowering components for Graphcore IPU21 devices. It does not yet
-contain the allocator or complete graph-to-device compiler.
+`ipu-stack` is a collection of graph lowering, code generation, packaging, and
+runtime components for Graphcore IPU21 devices.
 
 ## Components
 
-- `ipu-target` generates and encodes device and host exchange programs.
-- `ipu-codegen` emits straight-line supervisor code from caller-resolved tile
-  programs.
+- `ipu-target` owns IPU21 topology and memory geometry, exchange generation and
+  parsing, instruction encoding, finalized tile programs, and supervisor-code
+  emission.
+- `ipu-codegen` plans and lowers graphs and builds loadable packages using that
+  target API.
 - `ipu-elf` compiles Graphcore tile sources and links Colossus ELF objects.
 - `ipu-package` reads, writes, and validates `.ipuexe` application packages and
   cycle profiles.
@@ -30,8 +31,8 @@ graph is shaped structured SSA. Its separate mid-level lowering selects
 precision and layout with a toy cost model and inserts explicit casts and
 rearrangements. Mid-to-low lowering then produces logical per-tile shard work,
 kernel runs, synchronized exchanges, and structured repeats. Package
-construction produces completion-only tile programs until SRAM placement,
-exchange encoding, and kernel-symbol selection are implemented. The config
+construction resolves SRAM placement, exchange encoding, and kernel symbols
+before `ipu-target` emits each finalized tile program. The config
 uses one shared `PipelineConfig` for target, tile count, input formats, operator
 catalog, scheduling, and profiling. `PackageConfig` adds the toolchain, static
 runtime source, and build directory.

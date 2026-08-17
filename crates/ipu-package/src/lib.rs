@@ -1,4 +1,5 @@
 use capnp::{message, serialize};
+use ipu_target::memory::{TILE_MEMORY_BASE, TILE_MEMORY_SIZE};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use tracing::{info, trace};
@@ -259,30 +260,6 @@ impl ProfileReport {
 
 pub const SCHEMA_VERSION: u32 = 5;
 pub const TARGET_IPU21: &str = "ipu21";
-pub const TILE_MEMORY_BASE: u32 = 0x4c000;
-pub const TILE_MEMORY_SIZE: u32 = 624 * 1024;
-/// IPU21 `TMEM_ELEMSIZE`. Instruction fetch and data access contend at this
-/// granularity even when placement policy is supplied by another crate.
-pub const TILE_MEMORY_ELEMENT_SIZE: u32 = 0x4000;
-/// Maximum supervisor instruction-fetch lookahead used when checking whether
-/// executable and data ranges share a memory element.
-pub const IPU21_SUPERVISOR_FETCH_LOOKAHEAD: u32 = 8 * 8;
-/// End of IPU21 region 0, the only tile-memory region supporting instruction fetch.
-pub const IPU21_EXECUTABLE_MEMORY_LIMIT: u32 = 0x80000;
-/// First logical address of the commonly used interleaved operand window.
-pub const IPU21_INTERLEAVED_MEMORY_BASE: u32 = TILE_MEMORY_BASE + 0x34000;
-/// End of the commonly used interleaved operand window.
-pub const IPU21_INTERLEAVED_MEMORY_LIMIT: u32 = TILE_MEMORY_BASE + 0x3c000;
-/// End of architectural region 1, whose interleave factor is two on IPU21.
-pub const IPU21_INTERLEAVED_REGION_LIMIT: u32 = TILE_MEMORY_BASE + TILE_MEMORY_SIZE;
-/// Exclusive end of SRAM which the SDK secondary loader can populate.
-///
-/// The final 0x450 bytes are architectural tile memory, but lie beyond the
-/// loader's 643 frames of 992 payload bytes starting at `TILE_MEMORY_BASE +
-/// 0x10`. Packages intended for runtime loading must place no segment there.
-pub const IPU21_APPLICATION_MEMORY_LIMIT: u32 = 0xe7bb0;
-/// Logical bytes covered by a pair of physical elements in interleaved region 1.
-pub const IPU21_INTERLEAVED_ELEMENT_SIZE: u32 = 2 * TILE_MEMORY_ELEMENT_SIZE;
 pub const SEGMENT_READ: u32 = 1;
 pub const SEGMENT_WRITE: u32 = 2;
 pub const SEGMENT_EXECUTE: u32 = 4;

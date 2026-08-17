@@ -13,11 +13,11 @@ pub const PROFILE_END_CYCLE: u32 = RUNTIME_STATE_BASE + 8;
 /// First byte after the permanently reserved runtime state.
 pub const IPU21_DATA_BASE: u32 = RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES;
 /// Loader-populatable region 1 storage available to interleaved data.
-pub const IPU21_INTERLEAVED_REGION_BYTES: u32 =
-    ipu_package::IPU21_APPLICATION_MEMORY_LIMIT - ipu_package::IPU21_INTERLEAVED_MEMORY_BASE;
+pub const IPU21_INTERLEAVED_REGION_BYTES: u32 = ipu_target::memory::IPU21_APPLICATION_MEMORY_LIMIT
+    - ipu_target::memory::IPU21_INTERLEAVED_MEMORY_BASE;
 /// Standard-addressable storage which is not borrowed from region 1.
 pub const IPU21_STANDARD_FIXED_BYTES: u32 =
-    ipu_package::IPU21_INTERLEAVED_MEMORY_BASE - IPU21_DATA_BASE;
+    ipu_target::memory::IPU21_INTERLEAVED_MEMORY_BASE - IPU21_DATA_BASE;
 /// Total tile SRAM available to planned values after permanent runtime state.
 pub const IPU21_PLANNED_DATA_BYTES: u32 =
     IPU21_STANDARD_FIXED_BYTES + IPU21_INTERLEAVED_REGION_BYTES;
@@ -26,7 +26,8 @@ pub const IPU21_PLANNED_DATA_BYTES: u32 =
 /// so three standard memory elements preserve one contiguous allocation once
 /// host-command and generated-program data are placed around the interleaved
 /// region.
-pub const IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES: u32 = 3 * ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+pub const IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES: u32 =
+    3 * ipu_target::memory::TILE_MEMORY_ELEMENT_SIZE;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemoryAllocation {
@@ -70,8 +71,8 @@ pub(crate) enum MemoryLayoutError {
 impl TileMemoryMap {
     pub(crate) fn new() -> Self {
         let free = std::iter::once(AddressRegion::new(
-            ipu_package::TILE_MEMORY_BASE,
-            ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            ipu_target::memory::TILE_MEMORY_BASE,
+            ipu_target::memory::TILE_MEMORY_BASE + ipu_target::memory::TILE_MEMORY_SIZE,
         ))
         .collect();
         Self {
@@ -219,8 +220,8 @@ mod tests {
                     bytes,
                     alignment,
                     bounds: AddressRegion::new(
-                        ipu_package::TILE_MEMORY_BASE,
-                        ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                        ipu_target::memory::TILE_MEMORY_BASE,
+                        ipu_target::memory::TILE_MEMORY_BASE + ipu_target::memory::TILE_MEMORY_SIZE,
                     ),
                     end_alignment: 1 << random.u32(0..=14),
                     guard_after: random.u32(0..=64),

@@ -3682,7 +3682,7 @@ mod tests {
         let constraints = HardwareTarget::Ipu21.memory_constraints();
         let capacity = constraints.total_bytes;
         let interleaved_capacity = constraints.interleaved_bytes;
-        let element = u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE);
+        let element = u64::from(ipu_target::memory::IPU21_INTERLEAVED_ELEMENT_SIZE);
         let mut rejected_noncoincident_peaks = 0;
         for _ in 0..RANDOM_CASES * 16 {
             let standard = random.u64(0..=capacity);

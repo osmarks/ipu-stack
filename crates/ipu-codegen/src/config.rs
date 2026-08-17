@@ -231,7 +231,8 @@ impl HardwareTarget {
             Self::Ipu21 => HardwareMemoryConstraints {
                 standard_fixed_bytes: crate::memory::IPU21_STANDARD_FIXED_BYTES as u64,
                 interleaved_bytes: crate::memory::IPU21_INTERLEAVED_REGION_BYTES as u64,
-                interleaved_element_bytes: ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE as u64,
+                interleaved_element_bytes: ipu_target::memory::IPU21_INTERLEAVED_ELEMENT_SIZE
+                    as u64,
                 total_bytes: crate::memory::IPU21_PLANNED_DATA_BYTES as u64,
                 default_standard_reservation_bytes:
                     crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES as u64,

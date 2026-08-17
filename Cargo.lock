@@ -329,6 +329,7 @@ dependencies = [
  "ipu-package",
  "ipu-profile",
  "ipu-runtime",
+ "ipu-target",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -356,6 +357,7 @@ version = "0.1.0"
 dependencies = [
  "fastrand",
  "ipu-package",
+ "ipu-target",
  "libc",
  "object",
  "thiserror",
@@ -382,6 +384,7 @@ dependencies = [
  "capnp",
  "capnpc",
  "fastrand",
+ "ipu-target",
  "thiserror",
  "tracing",
 ]

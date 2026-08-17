@@ -103,7 +103,7 @@ impl<'a> TileProgramLowering<'a> {
                 program.tile_count,
             )?)
             .ok_or(TileLoweringError::Overflow)?;
-        let executable_memory_end = ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT;
+        let executable_memory_end = ipu_target::memory::IPU21_EXECUTABLE_MEMORY_LIMIT;
         if cursor > executable_memory_end {
             return Err(TileLoweringError::ExchangeCodeMemory {
                 start: exchange_code_base,

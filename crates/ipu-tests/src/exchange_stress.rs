@@ -190,16 +190,17 @@ pub(crate) fn build_wide(
     {
         let destinations = (first_destination..destination_end).collect::<Vec<_>>();
         let bank_case = case & 3;
-        let source_element_size = if source_base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE {
-            ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
-        } else {
-            ipu_package::TILE_MEMORY_ELEMENT_SIZE
-        };
-        let destination_element_size =
-            if destination_base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE {
-                ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
+        let source_element_size =
+            if source_base >= ipu_target::memory::IPU21_INTERLEAVED_MEMORY_BASE {
+                ipu_target::memory::IPU21_INTERLEAVED_ELEMENT_SIZE
             } else {
-                ipu_package::TILE_MEMORY_ELEMENT_SIZE
+                ipu_target::memory::TILE_MEMORY_ELEMENT_SIZE
+            };
+        let destination_element_size =
+            if destination_base >= ipu_target::memory::IPU21_INTERLEAVED_MEMORY_BASE {
+                ipu_target::memory::IPU21_INTERLEAVED_ELEMENT_SIZE
+            } else {
+                ipu_target::memory::TILE_MEMORY_ELEMENT_SIZE
             };
         let source_bank_offset = (u32::try_from(bank_case)? >> 1) * source_element_size;
         let destination_bank_offset = (u32::try_from(bank_case)? & 1) * destination_element_size;
