@@ -5,13 +5,13 @@ use crate::memory::{
     MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE,
     RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
 };
-use crate::mid::{MidGraph, MidOperationKind, PipelineConfig, Precision, lower_finalists};
+use crate::mid::{MidGraph, MidOperationKind, Precision, lower_finalists};
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HOST_RUN_SYMBOL, KernelBuildPlan,
-    PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL,
-    SAMPLE_CYCLE_SYMBOL, TileProgram, TileProgramLowering, WORKER_BARRIER_SYMBOL,
-    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower_exchanges, lower_to_tiles,
-    place, shard_storage_bytes,
+    PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, PipelineConfig, REPEAT_CALL_SYMBOL,
+    RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL, TileProgram, TileProgramLowering,
+    WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit,
+    lower_exchanges, lower_to_tiles, place, shard_storage_bytes,
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};

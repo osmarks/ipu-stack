@@ -6,6 +6,7 @@ use ipu_exchange::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+mod config;
 mod cost;
 mod estimate;
 pub mod exchange;
@@ -20,6 +21,10 @@ mod package;
 pub mod place;
 pub mod storage;
 pub mod tile;
+pub use config::{
+    AttentionStrategy, ConversionStreamingPolicy, HardwareMemoryConstraints, HardwareTarget,
+    OperatorClass, PipelineConfig, PlannerSearchDomain, ProfilingConfig,
+};
 pub use exchange::{
     EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityDiagnostic,
     ExchangeActivityKind, ExchangeLoweringError, ExchangeLoweringOptions, ExchangeMemoryElement,
@@ -53,19 +58,17 @@ pub use memory::{
 };
 pub use mid::{
     AccumulationPrecision, AllocationRequirements, AmpOrder, AttentionBlocking,
-    AttentionKernelFamily, AttentionPadding, AttentionPlan, AttentionStrategy, AxisTiling,
-    BlockMajorOrder, BlockedGemmPlan, ConversionPlan, ConversionStrategy,
-    ConversionStreamingPolicy, CostEstimate, CostModel, ElementOrder, GemmBlockShape,
-    GemmDistribution, GemmGeometry, GemmGrid, GemmKernelFamily, GemmKernelMode, GemmOrientation,
-    GemmPlanConstraint, GemmResultGrid, GemmWeightLoad, GridOrder, HardwareMemoryConstraints,
-    HardwareTarget, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, Layout, LayoutError,
-    LocalOperandStaging, LoweringError, LoweringResult, MemoryClass, MemoryElementRequirement,
-    MemoryEstimate, MemoryOperand, MemoryPeaks, MemorySpaceRequirements, MemoryUsage, MidGraph,
-    MidInput, MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue,
-    MidValueId, OperandMaterialization, OperandRequirement, OperationMetrics, OperatorClass,
-    OperatorDispatch, OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing,
-    Padding, ParallelReductionPlan, PipelineConfig, PlanMetrics, PlannerSearchDomain,
-    PointwiseInputMapping, Precision, ProfilingConfig, ReductionStaging, RegionMetrics, TensorAxis,
+    AttentionKernelFamily, AttentionPadding, AttentionPlan, AxisTiling, BlockMajorOrder,
+    BlockedGemmPlan, ConversionPlan, ConversionStrategy, CostEstimate, CostModel, ElementOrder,
+    GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid, GemmKernelFamily, GemmKernelMode,
+    GemmOrientation, GemmPlanConstraint, GemmResultGrid, GemmWeightLoad, GridOrder,
+    IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, Layout, LayoutError, LocalOperandStaging,
+    LoweringError, LoweringResult, MemoryClass, MemoryElementRequirement, MemoryEstimate,
+    MemoryOperand, MemoryPeaks, MemorySpaceRequirements, MemoryUsage, MidGraph, MidInput,
+    MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId,
+    OperandMaterialization, OperandRequirement, OperationMetrics, OperatorDispatch, OperatorPlan,
+    OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, ParallelReductionPlan,
+    PlanMetrics, PointwiseInputMapping, Precision, ReductionStaging, RegionMetrics, TensorAxis,
     TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{

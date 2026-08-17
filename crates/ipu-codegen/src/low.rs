@@ -6,6 +6,7 @@
 //! than a linked symbol. Placement and final code generation resolve those
 //! remaining choices.
 
+use crate::PipelineConfig;
 use crate::graph::{GraphInputKind, OperationId};
 use crate::layout::{ShardExtent, TensorRegion};
 use crate::mid::{
@@ -13,7 +14,7 @@ use crate::mid::{
     DeferredTransform, ElementOrder, GemmDistribution, Layout, LayoutError, MemoryClass,
     MemoryOperand, MemorySpaceRequirements, MidGraph, MidOperation, MidOperationKind, MidRepeat,
     MidValueId, OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing,
-    PipelineConfig, PointwiseInputMapping, Precision, TensorTiling, TensorType, TileKernelSpec,
+    PointwiseInputMapping, Precision, TensorTiling, TensorType, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use std::collections::{BTreeMap, BTreeSet};
