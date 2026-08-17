@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use ipu_driver::{Device, block_device_interrupt_signals};
 use ipu_elf::{LinkOptions, Toolchain, inspect_object, link, source_tree_digest};
-use ipu_package::{Application, ProfileExchangeActivityKind, ProfileReport, ProfileStepKind};
+use ipu_package::{Application, ExchangeActivityKind, ProfileReport, ProfileStepKind};
 use ipu_profile::{
     GroupBy, Query, SortBy, calibrate_profiles, cycle_origin, exchange_activity_summary, query,
 };
@@ -603,9 +603,9 @@ fn render_profile_html(report: &ProfileReport) -> Result<String> {
                         .map(|activity| {
                             [
                                 match activity.kind {
-                                    ProfileExchangeActivityKind::Send => 0,
-                                    ProfileExchangeActivityKind::Receive => 1,
-                                    ProfileExchangeActivityKind::PartnerBusy => 2,
+                                    ExchangeActivityKind::Send => 0,
+                                    ExchangeActivityKind::Receive => 1,
+                                    ExchangeActivityKind::PartnerBusy => 2,
                                 },
                                 activity.start_cycle,
                                 activity.end_cycle,

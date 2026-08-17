@@ -1,6 +1,5 @@
 use ipu_package::{
-    CycleSample, ProfileExchangeActivity, ProfileExchangeActivityKind, ProfileReport,
-    ProfileStepKind,
+    CycleSample, ExchangeActivityKind, ProfileExchangeActivity, ProfileReport, ProfileStepKind,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -333,13 +332,13 @@ pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySumm
             summary.described_samples += 1;
             for activity in &sample.step.exchange_activities {
                 match activity.kind {
-                    ProfileExchangeActivityKind::Send => {
+                    ExchangeActivityKind::Send => {
                         summary.send_intervals += 1;
                     }
-                    ProfileExchangeActivityKind::Receive => {
+                    ExchangeActivityKind::Receive => {
                         summary.receive_intervals += 1;
                     }
-                    ProfileExchangeActivityKind::PartnerBusy => {
+                    ExchangeActivityKind::PartnerBusy => {
                         summary.partner_busy_intervals += 1;
                     }
                 }
@@ -383,9 +382,9 @@ fn exchange_role_cycles(
             continue;
         }
         let (send, receive, partner_busy) = match activity.kind {
-            ProfileExchangeActivityKind::Send => (1i32, 0i32, 0i32),
-            ProfileExchangeActivityKind::Receive => (0, 1, 0),
-            ProfileExchangeActivityKind::PartnerBusy => (0, 0, 1),
+            ExchangeActivityKind::Send => (1i32, 0i32, 0i32),
+            ExchangeActivityKind::Receive => (0, 1, 0),
+            ExchangeActivityKind::PartnerBusy => (0, 0, 1),
         };
         events.push((start, send, receive, partner_busy));
         events.push((end, -send, -receive, -partner_busy));
@@ -960,9 +959,9 @@ mod tests {
                     let start_cycle = random.u32(0..event_cycles);
                     ProfileExchangeActivity {
                         kind: match random.u8(0..3) {
-                            0 => ProfileExchangeActivityKind::Send,
-                            1 => ProfileExchangeActivityKind::Receive,
-                            _ => ProfileExchangeActivityKind::PartnerBusy,
+                            0 => ExchangeActivityKind::Send,
+                            1 => ExchangeActivityKind::Receive,
+                            _ => ExchangeActivityKind::PartnerBusy,
                         },
                         start_cycle,
                         end_cycle: random.u32(start_cycle + 1..=event_cycles),
@@ -972,15 +971,15 @@ mod tests {
             let expected =
                 (0..event_cycles).fold(ExchangeRoleCycles::default(), |mut totals, cycle| {
                     let send = activities.iter().any(|activity| {
-                        activity.kind == ProfileExchangeActivityKind::Send
+                        activity.kind == ExchangeActivityKind::Send
                             && (activity.start_cycle..activity.end_cycle).contains(&cycle)
                     });
                     let receive = activities.iter().any(|activity| {
-                        activity.kind == ProfileExchangeActivityKind::Receive
+                        activity.kind == ExchangeActivityKind::Receive
                             && (activity.start_cycle..activity.end_cycle).contains(&cycle)
                     });
                     let partner_busy = activities.iter().any(|activity| {
-                        activity.kind == ProfileExchangeActivityKind::PartnerBusy
+                        activity.kind == ExchangeActivityKind::PartnerBusy
                             && (activity.start_cycle..activity.end_cycle).contains(&cycle)
                     });
                     totals.send += u64::from(send);

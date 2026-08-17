@@ -34,10 +34,10 @@ pub use config::{
 };
 pub use exchange::{
     EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityDiagnostic,
-    ExchangeActivityKind, ExchangeLoweringError, ExchangeLoweringOptions, ExchangeScheduleProblem,
-    ExchangeScheduleRun, ExchangeScheduleSnapshot, ExchangeTileDiagnostic, LoweredExchanges,
-    PhysicalExchangePhase, diagnose_exchange_tile, inactive_exchange_program, lower_exchanges,
-    schedule_exchange_problem, validate_exchange_schedule,
+    ExchangeLoweringError, ExchangeLoweringOptions, ExchangeScheduleProblem, ExchangeScheduleRun,
+    ExchangeScheduleSnapshot, ExchangeTileDiagnostic, LoweredExchanges, PhysicalExchangePhase,
+    diagnose_exchange_tile, inactive_exchange_program, lower_exchanges, schedule_exchange_problem,
+    validate_exchange_schedule,
 };
 pub use graph::{
     AddOptions, AttentionOptions, AttentionScale, BroadcastMode, ComputeGraph, GemmOptions,

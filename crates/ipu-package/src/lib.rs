@@ -56,7 +56,7 @@ impl std::str::FromStr for ProfileStepKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProfileExchangeActivityKind {
+pub enum ExchangeActivityKind {
     Send,
     Receive,
     PartnerBusy,
@@ -64,7 +64,7 @@ pub enum ProfileExchangeActivityKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProfileExchangeActivity {
-    pub kind: ProfileExchangeActivityKind,
+    pub kind: ExchangeActivityKind,
     /// Estimated event-cycle offset within the exchange phase.
     pub start_cycle: u32,
     /// Estimated event-cycle offset within the exchange phase.
@@ -82,6 +82,92 @@ pub struct ProfileStep {
     pub metadata: Vec<ProfileMetadata>,
     pub exchange_activities: Vec<ProfileExchangeActivity>,
     pub exchange_event_cycles: u32,
+}
+
+fn write_profile_step(mut output: profile_common_capnp::step::Builder<'_>, step: &ProfileStep) {
+    output.set_local_index(step.local_index);
+    output.set_phase(step.phase);
+    output.set_epoch(step.epoch);
+    output.set_operation(&step.operation);
+    output.set_kind(match step.kind {
+        ProfileStepKind::Exchange => profile_common_capnp::StepKind::Exchange,
+        ProfileStepKind::Compute => profile_common_capnp::StepKind::Compute,
+        ProfileStepKind::Synchronization => profile_common_capnp::StepKind::Synchronization,
+        ProfileStepKind::Idle => profile_common_capnp::StepKind::Idle,
+    });
+    output.set_kernel(&step.kernel);
+    output.set_exchange_event_cycles(step.exchange_event_cycles);
+    let mut metadata = output.reborrow().init_metadata(step.metadata.len() as u32);
+    for (index, entry) in step.metadata.iter().enumerate() {
+        let mut output_entry = metadata.reborrow().get(index as u32);
+        output_entry.set_name(&entry.name);
+        output_entry.set_value(&entry.value);
+    }
+    let mut activities = output
+        .reborrow()
+        .init_exchange_activities(step.exchange_activities.len() as u32);
+    for (index, activity) in step.exchange_activities.iter().enumerate() {
+        let mut output_activity = activities.reborrow().get(index as u32);
+        output_activity.set_kind(match activity.kind {
+            ExchangeActivityKind::Send => profile_common_capnp::ExchangeActivityKind::Send,
+            ExchangeActivityKind::Receive => profile_common_capnp::ExchangeActivityKind::Receive,
+            ExchangeActivityKind::PartnerBusy => {
+                profile_common_capnp::ExchangeActivityKind::PartnerBusy
+            }
+        });
+        output_activity.set_start_cycle(activity.start_cycle);
+        output_activity.set_end_cycle(activity.end_cycle);
+    }
+}
+
+fn read_profile_step(
+    input: profile_common_capnp::step::Reader<'_>,
+) -> Result<ProfileStep, PackageError> {
+    Ok(ProfileStep {
+        local_index: input.get_local_index(),
+        phase: input.get_phase(),
+        epoch: input.get_epoch(),
+        operation: input.get_operation()?.to_str()?.into(),
+        kind: match input.get_kind()? {
+            profile_common_capnp::StepKind::Exchange => ProfileStepKind::Exchange,
+            profile_common_capnp::StepKind::Compute => ProfileStepKind::Compute,
+            profile_common_capnp::StepKind::Synchronization => ProfileStepKind::Synchronization,
+            profile_common_capnp::StepKind::Idle => ProfileStepKind::Idle,
+        },
+        kernel: input.get_kernel()?.to_str()?.into(),
+        metadata: input
+            .get_metadata()?
+            .iter()
+            .map(|entry| {
+                Ok(ProfileMetadata {
+                    name: entry.get_name()?.to_str()?.into(),
+                    value: entry.get_value()?.to_str()?.into(),
+                })
+            })
+            .collect::<Result<_, PackageError>>()?,
+        exchange_activities: input
+            .get_exchange_activities()?
+            .iter()
+            .map(|activity| {
+                Ok(ProfileExchangeActivity {
+                    kind: match activity.get_kind()? {
+                        profile_common_capnp::ExchangeActivityKind::Send => {
+                            ExchangeActivityKind::Send
+                        }
+                        profile_common_capnp::ExchangeActivityKind::Receive => {
+                            ExchangeActivityKind::Receive
+                        }
+                        profile_common_capnp::ExchangeActivityKind::PartnerBusy => {
+                            ExchangeActivityKind::PartnerBusy
+                        }
+                    },
+                    start_cycle: activity.get_start_cycle(),
+                    end_cycle: activity.get_end_cycle(),
+                })
+            })
+            .collect::<Result<_, PackageError>>()?,
+        exchange_event_cycles: input.get_exchange_event_cycles(),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,48 +212,7 @@ impl ProfileReport {
                 let mut output_sample = samples.reborrow().get(sample_index as u32);
                 output_sample.set_start_cycle(sample.start_cycle);
                 output_sample.set_end_cycle(sample.end_cycle);
-                let mut step = output_sample.reborrow().init_step();
-                step.set_local_index(sample.step.local_index);
-                step.set_phase(sample.step.phase);
-                step.set_epoch(sample.step.epoch);
-                step.set_operation(&sample.step.operation);
-                step.set_kind(match sample.step.kind {
-                    ProfileStepKind::Exchange => profile_common_capnp::StepKind::Exchange,
-                    ProfileStepKind::Compute => profile_common_capnp::StepKind::Compute,
-                    ProfileStepKind::Synchronization => {
-                        profile_common_capnp::StepKind::Synchronization
-                    }
-                    ProfileStepKind::Idle => profile_common_capnp::StepKind::Idle,
-                });
-                step.set_kernel(&sample.step.kernel);
-                step.set_exchange_event_cycles(sample.step.exchange_event_cycles);
-                let mut metadata = step
-                    .reborrow()
-                    .init_metadata(sample.step.metadata.len() as u32);
-                for (index, entry) in sample.step.metadata.iter().enumerate() {
-                    let mut output_entry = metadata.reborrow().get(index as u32);
-                    output_entry.set_name(&entry.name);
-                    output_entry.set_value(&entry.value);
-                }
-                let mut activities = step
-                    .reborrow()
-                    .init_exchange_activities(sample.step.exchange_activities.len() as u32);
-                for (index, activity) in sample.step.exchange_activities.iter().enumerate() {
-                    let mut output_activity = activities.reborrow().get(index as u32);
-                    output_activity.set_kind(match activity.kind {
-                        ProfileExchangeActivityKind::Send => {
-                            profile_common_capnp::ExchangeActivityKind::Send
-                        }
-                        ProfileExchangeActivityKind::Receive => {
-                            profile_common_capnp::ExchangeActivityKind::Receive
-                        }
-                        ProfileExchangeActivityKind::PartnerBusy => {
-                            profile_common_capnp::ExchangeActivityKind::PartnerBusy
-                        }
-                    });
-                    output_activity.set_start_cycle(activity.start_cycle);
-                    output_activity.set_end_cycle(activity.end_cycle);
-                }
+                write_profile_step(output_sample.reborrow().init_step(), &sample.step);
             }
         }
         serialize::write_message(&mut output, &message)?;
@@ -191,55 +236,8 @@ impl ProfileReport {
                     .get_samples()?
                     .iter()
                     .map(|sample| {
-                        let step = sample.get_step()?;
                         Ok(CycleSample {
-                            step: ProfileStep {
-                                local_index: step.get_local_index(),
-                                phase: step.get_phase(),
-                                epoch: step.get_epoch(),
-                                operation: step.get_operation()?.to_str()?.into(),
-                                kind: match step.get_kind()? {
-                                    profile_common_capnp::StepKind::Exchange => ProfileStepKind::Exchange,
-                                    profile_common_capnp::StepKind::Compute => ProfileStepKind::Compute,
-                                    profile_common_capnp::StepKind::Synchronization => {
-                                        ProfileStepKind::Synchronization
-                                    }
-                                    profile_common_capnp::StepKind::Idle => ProfileStepKind::Idle,
-                                },
-                                kernel: step.get_kernel()?.to_str()?.into(),
-                                metadata: step
-                                    .get_metadata()?
-                                    .iter()
-                                    .map(|entry| {
-                                        Ok(ProfileMetadata {
-                                            name: entry.get_name()?.to_str()?.into(),
-                                            value: entry.get_value()?.to_str()?.into(),
-                                        })
-                                    })
-                                    .collect::<Result<_, PackageError>>()?,
-                                exchange_activities: step
-                                    .get_exchange_activities()?
-                                    .iter()
-                                    .map(|activity| {
-                                        Ok(ProfileExchangeActivity {
-                                            kind: match activity.get_kind()? {
-                                                profile_common_capnp::ExchangeActivityKind::Send => {
-                                                    ProfileExchangeActivityKind::Send
-                                                }
-                                                profile_common_capnp::ExchangeActivityKind::Receive => {
-                                                    ProfileExchangeActivityKind::Receive
-                                                }
-                                                profile_common_capnp::ExchangeActivityKind::PartnerBusy => {
-                                                    ProfileExchangeActivityKind::PartnerBusy
-                                                }
-                                            },
-                                            start_cycle: activity.get_start_cycle(),
-                                            end_cycle: activity.get_end_cycle(),
-                                        })
-                                    })
-                                    .collect::<Result<_, PackageError>>()?,
-                                exchange_event_cycles: step.get_exchange_event_cycles(),
-                            },
+                            step: read_profile_step(sample.get_step()?)?,
                             start_cycle: sample.get_start_cycle(),
                             end_cycle: sample.get_end_cycle(),
                         })
@@ -1038,46 +1036,7 @@ fn write_profile_tiles(
         output_tile.set_physical_tile(tile.physical_tile);
         let mut steps = output_tile.reborrow().init_steps(tile.steps.len() as u32);
         for (step_index, step) in tile.steps.iter().enumerate() {
-            let mut output_step = steps.reborrow().get(step_index as u32);
-            output_step.set_local_index(step.local_index);
-            output_step.set_phase(step.phase);
-            output_step.set_epoch(step.epoch);
-            output_step.set_operation(&step.operation);
-            output_step.set_kind(match step.kind {
-                ProfileStepKind::Exchange => profile_common_capnp::StepKind::Exchange,
-                ProfileStepKind::Compute => profile_common_capnp::StepKind::Compute,
-                ProfileStepKind::Synchronization => profile_common_capnp::StepKind::Synchronization,
-                ProfileStepKind::Idle => profile_common_capnp::StepKind::Idle,
-            });
-            output_step.set_kernel(&step.kernel);
-            output_step.set_exchange_event_cycles(step.exchange_event_cycles);
-            let mut metadata = output_step
-                .reborrow()
-                .init_metadata(step.metadata.len() as u32);
-            for (metadata_index, entry) in step.metadata.iter().enumerate() {
-                let mut output_entry = metadata.reborrow().get(metadata_index as u32);
-                output_entry.set_name(&entry.name);
-                output_entry.set_value(&entry.value);
-            }
-            let mut activities = output_step
-                .reborrow()
-                .init_exchange_activities(step.exchange_activities.len() as u32);
-            for (activity_index, activity) in step.exchange_activities.iter().enumerate() {
-                let mut output_activity = activities.reborrow().get(activity_index as u32);
-                output_activity.set_kind(match activity.kind {
-                    ProfileExchangeActivityKind::Send => {
-                        profile_common_capnp::ExchangeActivityKind::Send
-                    }
-                    ProfileExchangeActivityKind::Receive => {
-                        profile_common_capnp::ExchangeActivityKind::Receive
-                    }
-                    ProfileExchangeActivityKind::PartnerBusy => {
-                        profile_common_capnp::ExchangeActivityKind::PartnerBusy
-                    }
-                });
-                output_activity.set_start_cycle(activity.start_cycle);
-                output_activity.set_end_cycle(activity.end_cycle);
-            }
+            write_profile_step(steps.reborrow().get(step_index as u32), step);
         }
     }
 }
@@ -1093,59 +1052,7 @@ fn read_profile_tiles(
                 steps: tile
                     .get_steps()?
                     .iter()
-                    .map(|step| {
-                        Ok(ProfileStep {
-                            local_index: step.get_local_index(),
-                            phase: step.get_phase(),
-                            epoch: step.get_epoch(),
-                            operation: step.get_operation()?.to_str()?.into(),
-                            kind: match step.get_kind()? {
-                                profile_common_capnp::StepKind::Exchange => {
-                                    ProfileStepKind::Exchange
-                                }
-                                profile_common_capnp::StepKind::Compute => {
-                                    ProfileStepKind::Compute
-                                }
-                                profile_common_capnp::StepKind::Synchronization => {
-                                    ProfileStepKind::Synchronization
-                                }
-                                profile_common_capnp::StepKind::Idle => ProfileStepKind::Idle,
-                            },
-                            kernel: step.get_kernel()?.to_str()?.into(),
-                            metadata: step
-                                .get_metadata()?
-                                .iter()
-                                .map(|entry| {
-                                    Ok(ProfileMetadata {
-                                        name: entry.get_name()?.to_str()?.into(),
-                                        value: entry.get_value()?.to_str()?.into(),
-                                    })
-                                })
-                                .collect::<Result<_, PackageError>>()?,
-                            exchange_activities: step
-                                .get_exchange_activities()?
-                                .iter()
-                                .map(|activity| {
-                                    Ok(ProfileExchangeActivity {
-                                        kind: match activity.get_kind()? {
-                                            profile_common_capnp::ExchangeActivityKind::Send => {
-                                                ProfileExchangeActivityKind::Send
-                                            }
-                                            profile_common_capnp::ExchangeActivityKind::Receive => {
-                                                ProfileExchangeActivityKind::Receive
-                                            }
-                                            profile_common_capnp::ExchangeActivityKind::PartnerBusy => {
-                                                ProfileExchangeActivityKind::PartnerBusy
-                                            }
-                                        },
-                                        start_cycle: activity.get_start_cycle(),
-                                        end_cycle: activity.get_end_cycle(),
-                                    })
-                                })
-                                .collect::<Result<_, PackageError>>()?,
-                            exchange_event_cycles: step.get_exchange_event_cycles(),
-                        })
-                    })
+                    .map(read_profile_step)
                     .collect::<Result<_, PackageError>>()?,
             })
         })
@@ -1302,12 +1209,12 @@ mod tests {
                 }],
                 exchange_activities: vec![
                     ProfileExchangeActivity {
-                        kind: ProfileExchangeActivityKind::Receive,
+                        kind: ExchangeActivityKind::Receive,
                         start_cycle: 3,
                         end_cycle: 11,
                     },
                     ProfileExchangeActivity {
-                        kind: ProfileExchangeActivityKind::PartnerBusy,
+                        kind: ExchangeActivityKind::PartnerBusy,
                         start_cycle: 1,
                         end_cycle: 3,
                     },
@@ -1540,12 +1447,12 @@ mod tests {
                         exchange_activities: if kind == ProfileStepKind::Exchange {
                             vec![
                                 ProfileExchangeActivity {
-                                    kind: ProfileExchangeActivityKind::Send,
+                                    kind: ExchangeActivityKind::Send,
                                     start_cycle: 2,
                                     end_cycle: 6,
                                 },
                                 ProfileExchangeActivity {
-                                    kind: ProfileExchangeActivityKind::PartnerBusy,
+                                    kind: ExchangeActivityKind::PartnerBusy,
                                     start_cycle: 6,
                                     end_cycle: 8,
                                 },

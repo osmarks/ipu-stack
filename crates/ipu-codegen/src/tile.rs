@@ -56,7 +56,7 @@ pub enum TileLoweringError {
         phase: ExchangePhaseId,
         row_address: u32,
         transfer: u32,
-        kind: crate::ExchangeActivityKind,
+        kind: ipu_package::ExchangeActivityKind,
         data_address: u32,
     },
     #[error(

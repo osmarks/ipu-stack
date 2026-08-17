@@ -16,9 +16,9 @@ use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
 use ipu_package::{
     AddressRegion, Application, Binding, DEBUG_ALL_TILES, DebugRegion, DebugSymbol, EntryPoint,
-    PROFILE_CYCLES_BINDING, PackageError, ProfileExchangeActivity, ProfileExchangeActivityKind,
-    ProfileMetadata, ProfileStep, ProfileStepKind, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ,
-    SEGMENT_WRITE, Segment, TileImage, TileProfilePlan,
+    PROFILE_CYCLES_BINDING, PackageError, ProfileExchangeActivity, ProfileMetadata, ProfileStep,
+    ProfileStepKind, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ, SEGMENT_WRITE, Segment, TileImage,
+    TileProfilePlan,
 };
 use ipu_target::emit::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenError, CodegenOptions, GeneratedProgram,
@@ -1902,15 +1902,7 @@ fn profile_step(
                     .ok_or_else(|| invalid("profile exchange tile is missing"))?
                     .iter()
                     .map(|activity| ProfileExchangeActivity {
-                        kind: match activity.kind {
-                            crate::ExchangeActivityKind::Send => ProfileExchangeActivityKind::Send,
-                            crate::ExchangeActivityKind::Receive => {
-                                ProfileExchangeActivityKind::Receive
-                            }
-                            crate::ExchangeActivityKind::PartnerBusy => {
-                                ProfileExchangeActivityKind::PartnerBusy
-                            }
-                        },
+                        kind: activity.kind,
                         start_cycle: activity.start_cycle,
                         end_cycle: activity.end_cycle,
                     })

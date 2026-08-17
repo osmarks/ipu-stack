@@ -4,6 +4,7 @@ use crate::{
     ExchangePhaseId, LogicalExchange, LowProgram, LowShardId, Placement, ShardDefinition,
     logical_view_byte_spans, view_byte_spans,
 };
+use ipu_package::ExchangeActivityKind;
 use ipu_target::exchange::{
     MAX_TRANSFER_WORDS, PhaseProgramBuilder, PhaseTransferTiming, PhysicalTransfer,
     ResolvedTransfer, TransferEndpoint, TransferWidth, patch_sender_instruction,
@@ -56,14 +57,6 @@ pub struct ExchangeActivity {
     pub memory_end_cycle: u32,
     pub address: u32,
     pub words: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExchangeActivityKind {
-    Send,
-    Receive,
-    /// This tile's paired-width exchange resources are borrowed by its partner.
-    PartnerBusy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

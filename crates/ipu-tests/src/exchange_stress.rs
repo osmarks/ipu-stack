@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, bail};
 use ipu_codegen::{
-    CompiledPackage, ExchangeActivity, ExchangeActivityKind, TileProgramData,
-    build_tile_program_package, inactive_exchange_program,
+    CompiledPackage, ExchangeActivity, TileProgramData, build_tile_program_package,
+    inactive_exchange_program,
 };
 use ipu_driver::{Device, TileException};
 use ipu_elf::Toolchain;
-use ipu_package::{Application, Binding, RegionSlice};
+use ipu_package::{Application, Binding, ExchangeActivityKind, RegionSlice};
 use ipu_runtime::Runtime;
 use ipu_target::exchange::{
     PhaseProgramBuilder, PhaseTransferTiming, PhysicalTransfer, TransferEndpoint, TransferWidth,
