@@ -3845,8 +3845,18 @@ impl LoweringState {
         let row_partitions = reduction.compute.rows;
         let column_partitions = reduction.compute.columns;
         let inner_partitions = reduction.compute.inner;
-        let result_row_partitions = reduction.result.rows;
-        let result_column_partitions = reduction.result.columns;
+        let result_row_partitions = plan
+            .geometry
+            .result
+            .rows
+            .checked_div(reduction.compute.rows)
+            .unwrap_or(0);
+        let result_column_partitions = plan
+            .geometry
+            .result
+            .columns
+            .checked_div(reduction.compute.columns)
+            .unwrap_or(0);
         let reduction_staging = reduction.staging;
         let [semantic_left_value, semantic_right_value] = operation.inputs.as_slice() else {
             return Err(LowLoweringError::InvalidOperatorPlan);
@@ -6051,16 +6061,18 @@ mod tests {
                                     output_columns,
                                 },
                                 orientation: crate::GemmOrientation::Normal,
+                                result: crate::GemmResultGrid {
+                                    rows: row_partitions.saturating_mul(result_row_partitions),
+                                    columns: column_partitions
+                                        .saturating_mul(result_column_partitions),
+                                },
+                                order: crate::GridOrder::ColumnsFast,
                                 distribution: GemmDistribution::ParallelReduction(
                                     crate::ParallelReductionPlan {
                                         compute: crate::GemmGrid {
                                             rows: row_partitions,
                                             columns: column_partitions,
                                             inner: inner_partitions,
-                                        },
-                                        result: crate::GemmResultGrid {
-                                            rows: result_row_partitions,
-                                            columns: result_column_partitions,
                                         },
                                         staging: reduction_staging,
                                     },

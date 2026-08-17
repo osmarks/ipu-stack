@@ -319,6 +319,12 @@ fn parse_gemm_plan_constraint(value: &str) -> Result<GemmPlanConstraint, String>
         "streamed" => ReductionStaging::Streamed,
         _ => return Err("reduction must be complete or streamed".into()),
     };
+    let result_rows = row_partitions
+        .checked_mul(*result_row_partitions)
+        .ok_or("result row grid overflows")?;
+    let result_columns = column_partitions
+        .checked_mul(*result_column_partitions)
+        .ok_or("result column grid overflows")?;
     Ok(GemmPlanConstraint {
         source_operation: operation
             .parse::<u32>()
@@ -329,15 +335,16 @@ fn parse_gemm_plan_constraint(value: &str) -> Result<GemmPlanConstraint, String>
                 output_columns: *output_column_block,
             },
             orientation,
+            result: GemmResultGrid {
+                rows: result_rows,
+                columns: result_columns,
+            },
+            order: ipu_codegen::GridOrder::ColumnsFast,
             distribution: GemmDistribution::ParallelReduction(ParallelReductionPlan {
                 compute: GemmGrid {
                     rows: *row_partitions,
                     columns: *column_partitions,
                     inner: *inner_partitions,
-                },
-                result: GemmResultGrid {
-                    rows: *result_row_partitions,
-                    columns: *result_column_partitions,
                 },
                 staging,
             }),

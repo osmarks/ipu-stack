@@ -545,8 +545,11 @@ pub(crate) fn operator_memory_estimate(
         // later reduction ping-pongs an accumulator and result while its
         // staging policy bounds the simultaneously resident remote partials.
         let partial_bytes = maximum_shard_bytes(&gemm_partial_tensor(dispatch, output));
-        let reduction_partial_bytes = if (reduction.result.rows, reduction.result.columns) != (1, 1)
-        {
+        let reduction_partial_bytes = if plan.geometry.result
+            != (crate::GemmResultGrid {
+                rows: reduction.compute.rows,
+                columns: reduction.compute.columns,
+            }) {
             maximum_shard_bytes(output)
         } else {
             partial_bytes
@@ -1275,6 +1278,11 @@ mod tests {
                     output_columns: crate::layout::AMP_OUTPUT_COLUMN_BLOCK,
                 },
                 orientation: crate::GemmOrientation::Normal,
+                result: crate::GemmResultGrid {
+                    rows: 1,
+                    columns: 1,
+                },
+                order: crate::GridOrder::ColumnsFast,
                 distribution: GemmDistribution::OutputStationary,
             },
         })
@@ -1289,16 +1297,16 @@ mod tests {
         let OperatorDispatch::BlockedGemm(plan) = &mut dispatch else {
             unreachable!();
         };
+        plan.geometry.result = crate::GemmResultGrid {
+            rows: row_partitions,
+            columns: column_partitions,
+        };
         plan.geometry.distribution =
             GemmDistribution::ParallelReduction(crate::ParallelReductionPlan {
                 compute: crate::GemmGrid {
                     rows: row_partitions,
                     columns: column_partitions,
                     inner: inner_partitions,
-                },
-                result: crate::GemmResultGrid {
-                    rows: 1,
-                    columns: 1,
                 },
                 staging: crate::ReductionStaging::Streamed,
             });

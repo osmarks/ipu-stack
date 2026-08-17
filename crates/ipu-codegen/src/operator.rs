@@ -343,11 +343,6 @@ impl GemmResultGrid {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParallelReductionPlan {
     pub compute: GemmGrid,
-    /// Additional spatial partitions of each computed output block. Their
-    /// product cannot exceed the K partition count; reduction roots are
-    /// spread over former K-partition tiles rather than concentrated on one
-    /// root per compute row/column block.
-    pub result: GemmResultGrid,
     pub staging: ReductionStaging,
 }
 
@@ -381,6 +376,10 @@ impl GemmKernelFamily {
 pub struct GemmGeometry {
     pub block: GemmBlockShape,
     pub orientation: GemmOrientation,
+    /// Spatial ownership of the final result. Parallel reductions may spread
+    /// roots over former K-partition tiles.
+    pub result: GemmResultGrid,
+    pub order: GridOrder,
     pub distribution: GemmDistribution,
 }
 
@@ -829,40 +828,49 @@ impl OperatorPlan {
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
                 }
+                let row_axis = match orientation {
+                    GemmOrientation::Normal => TensorAxis::FromEnd(2),
+                    GemmOrientation::Swapped => TensorAxis::FromEnd(1),
+                };
+                let column_axis = match orientation {
+                    GemmOrientation::Normal => TensorAxis::FromEnd(1),
+                    GemmOrientation::Swapped => TensorAxis::FromEnd(2),
+                };
+                let axis_partitions = |axis| {
+                    output
+                        .format
+                        .layout
+                        .tiling
+                        .axes
+                        .iter()
+                        .find(|tiling| tiling.axis == axis)
+                        .map_or(1, |tiling| tiling.partitions)
+                };
+                if output.format.layout.tiling.tile_count != plan.geometry.result.tile_count()
+                    || axis_partitions(row_axis) != plan.geometry.result.rows
+                    || axis_partitions(column_axis) != plan.geometry.result.columns
+                {
+                    return Err(OperatorPlanError::InvalidBlocking);
+                }
                 if let GemmDistribution::ParallelReduction(reduction) = distribution {
-                    let result_rows = reduction.compute.rows.saturating_mul(reduction.result.rows);
-                    let result_columns = reduction
-                        .compute
-                        .columns
-                        .saturating_mul(reduction.result.columns);
-                    let expected_tiles = result_rows.saturating_mul(result_columns);
-                    let row_axis = match orientation {
-                        GemmOrientation::Normal => TensorAxis::FromEnd(2),
-                        GemmOrientation::Swapped => TensorAxis::FromEnd(1),
-                    };
-                    let column_axis = match orientation {
-                        GemmOrientation::Normal => TensorAxis::FromEnd(1),
-                        GemmOrientation::Swapped => TensorAxis::FromEnd(2),
-                    };
-                    let axis_partitions = |axis| {
-                        output
-                            .format
-                            .layout
-                            .tiling
-                            .axes
-                            .iter()
-                            .find(|tiling| tiling.axis == axis)
-                            .map(|tiling| tiling.partitions)
-                    };
+                    let result_rows = plan.geometry.result.rows;
+                    let result_columns = plan.geometry.result.columns;
+                    let result_row_partitions =
+                        result_rows.checked_div(reduction.compute.rows).unwrap_or(0);
+                    let result_column_partitions = result_columns
+                        .checked_div(reduction.compute.columns)
+                        .unwrap_or(0);
                     if reduction.compute.rows == 0
                         || reduction.compute.columns == 0
                         || reduction.compute.inner < 2
-                        || reduction.result.rows == 0
-                        || reduction.result.columns == 0
-                        || reduction.result.tile_count() > reduction.compute.inner
-                        || output.format.layout.tiling.tile_count != expected_tiles
-                        || axis_partitions(row_axis) != Some(result_rows)
-                        || axis_partitions(column_axis) != Some(result_columns)
+                        || result_rows == 0
+                        || result_columns == 0
+                        || !result_rows.is_multiple_of(reduction.compute.rows)
+                        || !result_columns.is_multiple_of(reduction.compute.columns)
+                        || result_row_partitions.saturating_mul(result_column_partitions)
+                            > reduction.compute.inner
+                        || axis_partitions(row_axis) != result_rows
+                        || axis_partitions(column_axis) != result_columns
                     {
                         return Err(OperatorPlanError::InvalidBlocking);
                     }

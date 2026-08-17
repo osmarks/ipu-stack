@@ -786,6 +786,7 @@ fn estimated_operator_exchange_cycles(
         OperatorDispatch::BlockedGemm(crate::BlockedGemmPlan {
             geometry:
                 crate::GemmGeometry {
+                    result,
                     distribution: GemmDistribution::ParallelReduction(reduction),
                     ..
                 },
@@ -810,12 +811,15 @@ fn estimated_operator_exchange_cycles(
                 .inner
                 .saturating_sub(1)
                 .div_ceil(remote_partials_per_stage.max(1));
-            let reduction_partial_bytes =
-                if (reduction.result.rows, reduction.result.columns) != (1, 1) {
-                    maximum_shard_bytes(output)
-                } else {
-                    maximum_shard_bytes(&compute_output)
-                };
+            let reduction_partial_bytes = if *result
+                != (crate::GemmResultGrid {
+                    rows: reduction.compute.rows,
+                    columns: reduction.compute.columns,
+                }) {
+                maximum_shard_bytes(output)
+            } else {
+                maximum_shard_bytes(&compute_output)
+            };
             let reduction = ExchangeEndpointTraffic::from_maxima(
                 reduction_partial_bytes.saturating_mul(2),
                 u64::from(reduction.compute.inner.saturating_sub(1))
@@ -1173,6 +1177,7 @@ impl CostModel for Ipu21CostModel {
                     OperatorDispatch::BlockedGemm(crate::BlockedGemmPlan {
                         geometry:
                             crate::GemmGeometry {
+                                result,
                                 distribution: GemmDistribution::ParallelReduction(reduction),
                                 ..
                             },
@@ -1190,12 +1195,15 @@ impl CostModel for Ipu21CostModel {
                             .saturating_sub(1)
                             .div_ceil(remote_partials_per_stage.max(1));
                         let partial_bytes = maximum_shard_bytes(&compute_output);
-                        let reduction_partial_bytes =
-                            if (reduction.result.rows, reduction.result.columns) != (1, 1) {
-                                maximum_shard_bytes(output)
-                            } else {
-                                partial_bytes
-                            };
+                        let reduction_partial_bytes = if *result
+                            != (crate::GemmResultGrid {
+                                rows: reduction.compute.rows,
+                                columns: reduction.compute.columns,
+                            }) {
+                            maximum_shard_bytes(output)
+                        } else {
+                            partial_bytes
+                        };
                         u64::from(
                             reduction
                                 .compute

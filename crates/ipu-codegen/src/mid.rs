@@ -47,9 +47,17 @@ fn gemm_seed_plans_for_tile_count(
         .filter(|columns| tile_count.is_multiple_of(*columns))
         .flat_map(|columns| {
             let rows = tile_count / columns;
-            let grid_shape = AmpGridShape {
-                result: GemmResultGrid { rows, columns },
-                order: GridOrder::ColumnsFast,
+            let result = GemmResultGrid { rows, columns };
+            let order = GridOrder::ColumnsFast;
+            let geometry = GemmGeometry {
+                block: GemmBlockShape {
+                    inner: AMP_INNER_BLOCK,
+                    output_columns: AMP_OUTPUT_COLUMN_BLOCK,
+                },
+                orientation: GemmOrientation::Normal,
+                result,
+                order,
+                distribution: GemmDistribution::OutputStationary,
             };
             let mut grid = Vec::new();
             let mut placements = Vec::new();
@@ -109,15 +117,10 @@ fn gemm_seed_plans_for_tile_count(
                     {
                         continue;
                     }
-                    let candidate = amp_grid_gemm_plan(
-                        options,
-                        precision,
-                        64,
-                        left_tail,
-                        output_columns,
-                        grid_shape,
-                        weights,
-                    );
+                    let mut geometry = geometry;
+                    geometry.block.output_columns = output_columns;
+                    let candidate =
+                        amp_grid_gemm_plan(options, precision, left_tail, geometry, weights);
                     grid.push(candidate.clone());
                     if precision == Precision::F16 && weights.memory_class == MemoryClass::Standard
                     {
@@ -190,7 +193,22 @@ fn amp_gemm_plan(
     };
     OperatorPlan::candidate(
         operator,
-        blocked_gemm_dispatch(operator, output_columns),
+        blocked_gemm_dispatch(
+            operator,
+            GemmGeometry {
+                block: GemmBlockShape {
+                    inner: u32::from(inner),
+                    output_columns,
+                },
+                orientation: GemmOrientation::Normal,
+                result: GemmResultGrid {
+                    rows: tile_count,
+                    columns: 1,
+                },
+                order: GridOrder::ColumnsFast,
+                distribution: GemmDistribution::OutputStationary,
+            },
+        ),
         OperatorRequirements {
             inputs: vec![
                 OperandRequirement::new(
@@ -239,27 +257,28 @@ fn amp_gemm_plan(
 fn amp_grid_gemm_plan(
     options: GemmOptions,
     precision: Precision,
-    inner: u16,
     left_tail: u32,
-    output_columns: u32,
-    grid: AmpGridShape,
+    geometry: GemmGeometry,
     weights: AmpWeightPlacement,
 ) -> OperatorPlan {
+    let inner = u16::try_from(geometry.block.inner).unwrap_or(0);
+    let output_columns = geometry.block.output_columns;
+    let grid = geometry.result;
     let right_layout = match (weights.inner_partitions, weights.memory_class) {
         (1, MemoryClass::Standard) => Layout::block_major_matrix_grid(
             inner,
             output_columns,
-            grid.result.tile_count(),
-            grid.result.rows,
-            grid.result.columns,
-            grid.order,
+            grid.tile_count(),
+            grid.rows,
+            grid.columns,
+            geometry.order,
         ),
         (inner_partitions, memory_class) => Layout::block_major_matrix_storage(
             inner,
             output_columns,
-            grid.result.columns,
+            grid.columns,
             inner_partitions,
-            grid.result.rows / inner_partitions,
+            grid.rows / inner_partitions,
             memory_class,
         ),
     };
@@ -270,7 +289,7 @@ fn amp_grid_gemm_plan(
     };
     OperatorPlan::candidate(
         operator,
-        blocked_gemm_dispatch(operator, output_columns),
+        blocked_gemm_dispatch(operator, geometry),
         OperatorRequirements {
             inputs: vec![
                 OperandRequirement::new(
@@ -278,10 +297,10 @@ fn amp_grid_gemm_plan(
                         precision,
                         layout: Layout::amp_left_grid(
                             inner,
-                            grid.result.tile_count(),
-                            grid.result.rows,
-                            grid.result.columns,
-                            grid.order,
+                            grid.tile_count(),
+                            grid.rows,
+                            grid.columns,
+                            geometry.order,
                         ),
                     },
                     32,
@@ -302,18 +321,18 @@ fn amp_grid_gemm_plan(
                     layout: if precision == Precision::F16 {
                         Layout::amp_left_result_grid(
                             output_columns,
-                            grid.result.tile_count(),
-                            grid.result.rows,
-                            grid.result.columns,
-                            grid.order,
+                            grid.tile_count(),
+                            grid.rows,
+                            grid.columns,
+                            geometry.order,
                         )
                     } else {
                         Layout::amp_output_grid(
                             output_columns,
-                            grid.result.tile_count(),
-                            grid.result.rows,
-                            grid.result.columns,
-                            grid.order,
+                            grid.tile_count(),
+                            grid.rows,
+                            grid.columns,
+                            geometry.order,
                         )
                     },
                 },
@@ -327,7 +346,7 @@ fn amp_grid_gemm_plan(
     )
 }
 
-fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> OperatorDispatch {
+fn blocked_gemm_dispatch(operator: MidOperator, geometry: GemmGeometry) -> OperatorDispatch {
     let MidOperator::Gemm {
         multiply,
         accumulate,
@@ -342,21 +361,8 @@ fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> Operator
             accumulate,
             weights: GemmWeightLoad::Standard,
         },
-        geometry: GemmGeometry {
-            block: GemmBlockShape {
-                inner: AMP_INNER_BLOCK,
-                output_columns,
-            },
-            orientation: GemmOrientation::Normal,
-            distribution: GemmDistribution::OutputStationary,
-        },
+        geometry,
     })
-}
-
-#[derive(Clone, Copy)]
-struct AmpGridShape {
-    result: GemmResultGrid,
-    order: GridOrder,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2899,15 +2905,16 @@ fn parallel_reduction_plans_for_orientation(
                         output_columns: kernel_output_columns,
                     },
                     orientation,
+                    result: GemmResultGrid {
+                        rows: row_partitions,
+                        columns: column_partitions,
+                    },
+                    order: GridOrder::ColumnsFast,
                     distribution: GemmDistribution::ParallelReduction(ParallelReductionPlan {
                         compute: GemmGrid {
                             rows: row_partitions,
                             columns: column_partitions,
                             inner: inner_partitions,
-                        },
-                        result: GemmResultGrid {
-                            rows: 1,
-                            columns: 1,
                         },
                         staging: ReductionStaging::Complete,
                     }),
@@ -2962,11 +2969,14 @@ fn parallel_reduction_plans_for_orientation(
                     }
                     let mut result_variant = variant.clone();
                     if let OperatorDispatch::BlockedGemm(plan) = &mut result_variant.dispatch
-                        && let GemmDistribution::ParallelReduction(reduction) =
-                            &mut plan.geometry.distribution
+                        && matches!(
+                            plan.geometry.distribution,
+                            GemmDistribution::ParallelReduction(_)
+                        )
                     {
-                        reduction.result.rows = result_row_partitions;
-                        reduction.result.columns = result_column_partitions;
+                        plan.geometry.result.rows = result_rows;
+                        plan.geometry.result.columns = result_columns;
+                        plan.geometry.order = grid_order;
                     }
                     let mut result_layout = match orientation {
                         GemmOrientation::Normal => Layout::amp_left_result_grid(
@@ -3912,15 +3922,19 @@ mod tests {
             let base = amp_grid_gemm_plan(
                 GemmOptions::default(),
                 Precision::F16,
-                64,
                 16,
-                output_columns,
-                AmpGridShape {
+                GemmGeometry {
+                    block: GemmBlockShape {
+                        inner: 64,
+                        output_columns,
+                    },
+                    orientation: GemmOrientation::Normal,
                     result: GemmResultGrid {
                         rows: 1,
                         columns: tiles,
                     },
                     order: GridOrder::ColumnsFast,
+                    distribution: GemmDistribution::OutputStationary,
                 },
                 AmpWeightPlacement::resident(MemoryClass::Standard),
             );
@@ -3951,7 +3965,11 @@ mod tests {
                 else {
                     return false;
                 };
-                (reduction.result.rows, reduction.result.columns) != (1, 1)
+                plan.geometry.result
+                    != GemmResultGrid {
+                        rows: reduction.compute.rows,
+                        columns: reduction.compute.columns,
+                    }
             }));
             for candidate in candidates {
                 assert!(
@@ -3967,6 +3985,7 @@ mod tests {
                                 compute: GemmGrid { rows: actual_rows, columns: actual_columns, inner: actual },
                                 ..
                             }),
+                            ..
                         },
                         ..
                     }) if actual_rows * actual_columns * actual <= tiles
@@ -4024,7 +4043,19 @@ mod tests {
                 multiply: Precision::F16,
                 accumulate: AccumulationPrecision::F32,
             };
-            let dispatch = blocked_gemm_dispatch(operator, AMP_OUTPUT_COLUMN_BLOCK);
+            let dispatch = blocked_gemm_dispatch(
+                operator,
+                GemmGeometry {
+                    block: GemmBlockShape {
+                        inner: AMP_INNER_BLOCK,
+                        output_columns: AMP_OUTPUT_COLUMN_BLOCK,
+                    },
+                    orientation: GemmOrientation::Normal,
+                    result: GemmResultGrid { rows, columns },
+                    order: GridOrder::ColumnsFast,
+                    distribution: GemmDistribution::OutputStationary,
+                },
+            );
             let requirements = OperatorRequirements {
                 inputs: Vec::new(),
                 output: OperandRequirement::new(output.format.clone(), 8),
@@ -4059,20 +4090,24 @@ mod tests {
             let inner_blocks = u32::from(row_partitions) * random.u32(1..=4);
             let inner = inner_blocks * AMP_INNER_BLOCK;
             let columns = u32::from(column_partitions) * AMP_OUTPUT_COLUMN_BLOCK;
-            let grid = AmpGridShape {
+            let geometry = GemmGeometry {
+                block: GemmBlockShape {
+                    inner: 64,
+                    output_columns: AMP_OUTPUT_COLUMN_BLOCK,
+                },
+                orientation: GemmOrientation::Normal,
                 result: GemmResultGrid {
                     rows: row_partitions,
                     columns: column_partitions,
                 },
                 order: GridOrder::ColumnsFast,
+                distribution: GemmDistribution::OutputStationary,
             };
             let candidate = amp_grid_gemm_plan(
                 GemmOptions::default(),
                 Precision::F16,
-                64,
                 16,
-                AMP_OUTPUT_COLUMN_BLOCK,
-                grid,
+                geometry,
                 AmpWeightPlacement::resident(MemoryClass::Interleaved),
             );
             let inputs = [
