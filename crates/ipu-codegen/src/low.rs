@@ -2719,29 +2719,17 @@ impl LoweringState {
         let deferred_shards = deferred.shards.clone();
         let logical_type = &self.shards[self.value_shards(value)?[0].index() as usize].tensor_type;
         let source_type = &self.shards[deferred.shards[0].index() as usize].tensor_type;
-        let logical_target = [
+        let logical_target = TensorRegion::logical_bounds([
             (stream, stream + 1),
             (row_start, row_start + rows),
             (column_start, column_start + columns),
-        ];
+        ])
+        .ok_or(LowLoweringError::IdOverflow)?;
         let mapping = deferred
             .transform
             .map_slice(&source_type.shape, &logical_type.shape, &logical_target)
             .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-        let target = mapping
-            .source_ranges
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(axis, (start, end))| {
-                Ok(ShardExtent {
-                    axis: u16::try_from(axis).map_err(|_| LowLoweringError::IdOverflow)?,
-                    start,
-                    logical_end: end,
-                    physical_end: end,
-                })
-            })
-            .collect::<LowLoweringResult<Vec<_>>>()?;
+        let target = mapping.source;
         let destination_tile = self.shards[destination.index() as usize].tile;
         let mut covered = 0u64;
         let mut mappings = Vec::new();
@@ -4036,13 +4024,9 @@ impl LoweringState {
             }
         }
 
-        let mut replica_groups = BTreeMap::<Vec<(u32, u32)>, Vec<LowShardId>>::new();
+        let mut replica_groups = BTreeMap::<TensorRegion, Vec<LowShardId>>::new();
         for left in left_shards.iter().copied() {
-            let key = self.shards[left.index() as usize]
-                .extents
-                .iter()
-                .map(|extent| (extent.start, extent.physical_end))
-                .collect::<Vec<_>>();
+            let key = self.shards[left.index() as usize].extents.physical();
             replica_groups.entry(key).or_default().push(left);
         }
         let mut replica_columns = BTreeMap::<LowShardId, u16>::new();
@@ -4062,7 +4046,7 @@ impl LoweringState {
             let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
             let mut local_copies = Vec::<(u16, LocalCopy)>::new();
             let mut gemm_runs = Vec::<(u16, KernelRun)>::new();
-            let mut partials = BTreeMap::<Vec<(u32, u32)>, Vec<(u16, ShardView)>>::new();
+            let mut partials = BTreeMap::<TensorRegion, Vec<(u16, ShardView)>>::new();
             let mut resident_lefts = BTreeMap::<LowShardId, ShardView>::new();
             let mut weight_staging = BTreeMap::<(u16, LowShardId), LowShardId>::new();
             for (output_column, &(column_start, logical_column_end, column_end)) in
@@ -4143,10 +4127,7 @@ impl LoweringState {
                         logical_end: logical_column_end,
                         physical_end: column_end,
                     };
-                    let partial_key = extents
-                        .iter()
-                        .map(|extent| (extent.start, extent.physical_end))
-                        .collect::<Vec<_>>();
+                    let partial_key = TensorRegion::new(extents.iter().copied()).physical();
                     let direct_output = output_shards.iter().copied().find(|output| {
                         let shard = &self.shards[output.index() as usize];
                         shard.tile == left_shard.tile

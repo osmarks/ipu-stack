@@ -4,7 +4,7 @@ use crate::graph::{AddOptions, AttentionOptions, GemmOptions, SplitHeadsOptions,
 use crate::ir::MidValueId;
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
-    MemoryClass, TensorAxis, TensorFormat, TensorType,
+    MemoryClass, ShardExtent, TensorAxis, TensorFormat, TensorRegion, TensorType,
 };
 
 /// In-memory representation of one tensor element.
@@ -222,7 +222,7 @@ impl DeferredTransform {
         self,
         source_shape: &TensorShape,
         output_shape: &TensorShape,
-        output: &[(u32, u32)],
+        output: &TensorRegion,
     ) -> Option<DeferredSliceMapping> {
         match self {
             Self::SplitLastAxisIntoLeading { parts } => {
@@ -233,17 +233,21 @@ impl DeferredTransform {
                 else {
                     return None;
                 };
-                let [(stream_start, stream_end), rows, columns] = output else {
+                let [stream, rows, columns] = output.extents.as_slice() else {
                     return None;
                 };
+                let (stream_start, stream_end) = (stream.start, stream.logical_end);
                 if parts == 0
-                    || *stream_end != stream_start.checked_add(1)?
+                    || stream.axis != 0
+                    || rows.axis != 1
+                    || columns.axis != 2
+                    || stream_end != stream_start.checked_add(1)?
                     || *output_streams != source_batch.checked_mul(parts)?
                     || output_rows != source_rows
                     || source_columns != &output_columns.checked_mul(parts)?
-                    || *stream_end > *output_streams
-                    || rows.1 > *output_rows
-                    || columns.1 > *output_columns
+                    || stream_end > *output_streams
+                    || rows.logical_end > *output_rows
+                    || columns.logical_end > *output_columns
                 {
                     return None;
                 }
@@ -251,14 +255,21 @@ impl DeferredTransform {
                 let part = stream_start % parts;
                 let column_base = part.checked_mul(*output_columns)?;
                 Some(DeferredSliceMapping {
-                    source_ranges: vec![
-                        (batch, batch.checked_add(1)?),
+                    source: TensorRegion::new([
+                        ShardExtent {
+                            axis: 0,
+                            start: batch,
+                            logical_end: batch.checked_add(1)?,
+                            physical_end: batch.checked_add(1)?,
+                        },
                         *rows,
-                        (
-                            column_base.checked_add(columns.0)?,
-                            column_base.checked_add(columns.1)?,
-                        ),
-                    ],
+                        ShardExtent {
+                            axis: 2,
+                            start: column_base.checked_add(columns.start)?,
+                            logical_end: column_base.checked_add(columns.logical_end)?,
+                            physical_end: column_base.checked_add(columns.logical_end)?,
+                        },
+                    ]),
                     destination_source_axes: vec![1, 2],
                 })
             }
@@ -268,7 +279,7 @@ impl DeferredTransform {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeferredSliceMapping {
-    pub source_ranges: Vec<(u32, u32)>,
+    pub source: TensorRegion,
     /// Source axes retained, in destination-axis order. Removed axes select a
     /// slice but do not occupy storage in the consumer's dispatch buffer.
     pub destination_source_axes: Vec<usize>,

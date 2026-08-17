@@ -856,6 +856,66 @@ impl TensorRegion {
             extents: extents.into_iter().collect(),
         }
     }
+
+    pub fn logical_bounds(bounds: impl IntoIterator<Item = (u32, u32)>) -> Option<Self> {
+        bounds
+            .into_iter()
+            .enumerate()
+            .map(|(axis, (start, end))| {
+                Some(ShardExtent {
+                    axis: u16::try_from(axis).ok()?,
+                    start,
+                    logical_end: end,
+                    physical_end: end,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Self::new)
+    }
+
+    pub fn logical(&self) -> Self {
+        Self::new(self.extents.iter().map(|extent| ShardExtent {
+            physical_end: extent.logical_end,
+            ..*extent
+        }))
+    }
+
+    pub fn physical(&self) -> Self {
+        Self::new(self.extents.iter().map(|extent| ShardExtent {
+            logical_end: extent.physical_end,
+            ..*extent
+        }))
+    }
+
+    pub fn intersection(&self, other: &Self) -> Option<Self> {
+        if self.extents.len() != other.extents.len() {
+            return None;
+        }
+        self.extents
+            .iter()
+            .zip(&other.extents)
+            .map(|(left, right)| {
+                if left.axis != right.axis {
+                    return None;
+                }
+                let start = left.start.max(right.start);
+                let end = left.logical_end.min(right.logical_end);
+                (start < end).then_some(ShardExtent {
+                    axis: left.axis,
+                    start,
+                    logical_end: end,
+                    physical_end: end,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Self::new)
+    }
+
+    pub fn logical_elements(&self) -> u64 {
+        self.extents.iter().fold(1, |elements, extent| {
+            elements.saturating_mul(u64::from(extent.logical_end.saturating_sub(extent.start)))
+        })
+    }
 }
 
 impl std::ops::Deref for TensorRegion {

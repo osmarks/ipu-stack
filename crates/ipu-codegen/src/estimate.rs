@@ -3,7 +3,8 @@
 use crate::graph::TensorShape;
 use crate::ir::{MidOperation, MidOperationKind, MidValue, MidValueId};
 use crate::layout::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, Layout, MemoryClass, TensorAxis, TensorType,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, Layout, MemoryClass, TensorAxis, TensorRegion,
+    TensorType,
 };
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage};
 use crate::operator::{
@@ -164,27 +165,27 @@ pub(crate) fn conversion_traffic(
     let sources = layout_extents(shape, from)?;
     let destinations = layout_extents(shape, to)?;
     let element_bytes = precision.bytes();
-    let mut source_groups = HashMap::<Vec<(u32, u32)>, Vec<u16>>::new();
+    let mut source_groups = HashMap::<TensorRegion, Vec<u16>>::new();
     for (tile, extents) in sources {
         source_groups.entry(extents).or_default().push(tile);
     }
-    let mut destination_groups = HashMap::<Vec<(u32, u32)>, Vec<u16>>::new();
+    let mut destination_groups = HashMap::<TensorRegion, Vec<u16>>::new();
     for (tile, extents) in destinations {
         destination_groups.entry(extents).or_default().push(tile);
     }
-    let mut remote = HashSet::<(u16, Vec<(u32, u32)>)>::new();
+    let mut remote = HashSet::<(u16, TensorRegion)>::new();
     let mut traffic = ConversionTraffic::default();
     for (destination, destination_tiles) in &destination_groups {
         let mut intersections = Vec::with_capacity(source_groups.len());
         for (source, source_tiles) in &source_groups {
-            let Some(extents) = intersect_ranges(source, destination) else {
+            let Some(extents) = source.intersection(destination) else {
                 continue;
             };
             intersections.push((extents, source_tiles));
         }
         let mut destination_bytes = 0u64;
         for (extents, _) in &intersections {
-            let bytes = range_elements(extents).saturating_mul(element_bytes);
+            let bytes = extents.logical_elements().saturating_mul(element_bytes);
             destination_bytes = destination_bytes.saturating_add(bytes);
         }
         traffic.maximum_destination_bytes =
@@ -198,7 +199,7 @@ pub(crate) fn conversion_traffic(
             let mut local_bytes = 0u64;
             let mut local_intersections = 0u64;
             for (extents, source_tiles) in &intersections {
-                let bytes = range_elements(extents).saturating_mul(element_bytes);
+                let bytes = extents.logical_elements().saturating_mul(element_bytes);
                 if source_tiles.binary_search(&destination_tile).is_ok() {
                     local_bytes = local_bytes.saturating_add(bytes);
                     local_intersections = local_intersections.saturating_add(1);
@@ -235,14 +236,14 @@ pub(crate) fn conversion_traffic(
     };
     traffic.source_payload_bytes = remote
         .iter()
-        .map(|(_, extents)| range_elements(extents).saturating_mul(element_bytes))
+        .map(|(_, extents)| extents.logical_elements().saturating_mul(element_bytes))
         .sum();
     let mut source_roles = HashMap::<u16, (u64, u64)>::new();
     for (source, extents) in &remote {
         let role = source_roles.entry(*source).or_default();
         role.0 = role
             .0
-            .saturating_add(range_elements(extents).saturating_mul(element_bytes));
+            .saturating_add(extents.logical_elements().saturating_mul(element_bytes));
         role.1 = role.1.saturating_add(1);
     }
     for (bytes, fragments) in source_roles.into_values() {
@@ -254,7 +255,7 @@ pub(crate) fn conversion_traffic(
         let role = source_buses.entry(*source / 2).or_default();
         role.0 = role
             .0
-            .saturating_add(range_elements(extents).saturating_mul(element_bytes));
+            .saturating_add(extents.logical_elements().saturating_mul(element_bytes));
         role.1 = role.1.saturating_add(1);
     }
     for (bus, (bytes, fragments)) in source_buses {
@@ -266,45 +267,16 @@ pub(crate) fn conversion_traffic(
     Some(traffic)
 }
 
-fn layout_extents(shape: &TensorShape, layout: &Layout) -> Option<Vec<(u16, Vec<(u32, u32)>)>> {
+fn layout_extents(shape: &TensorShape, layout: &Layout) -> Option<Vec<(u16, TensorRegion)>> {
     Some(
         layout
             .resolve(shape)
             .ok()?
             .shard_extents()
             .into_iter()
-            .map(|shard| {
-                (
-                    shard.tile,
-                    shard
-                        .extents
-                        .into_iter()
-                        .map(|extent| (extent.start, extent.logical_end))
-                        .collect(),
-                )
-            })
+            .map(|shard| (shard.tile, shard.extents.logical()))
             .collect(),
     )
-}
-
-fn intersect_ranges(left: &[(u32, u32)], right: &[(u32, u32)]) -> Option<Vec<(u32, u32)>> {
-    if left.len() != right.len() {
-        return None;
-    }
-    left.iter()
-        .zip(right)
-        .map(|(&(left_start, left_end), &(right_start, right_end))| {
-            let start = left_start.max(right_start);
-            let end = left_end.min(right_end);
-            (start < end).then_some((start, end))
-        })
-        .collect()
-}
-
-fn range_elements(extents: &[(u32, u32)]) -> u64 {
-    extents.iter().fold(1u64, |elements, &(start, end)| {
-        elements.saturating_mul(u64::from(end - start))
-    })
 }
 
 pub(crate) fn physical_elements(shape: &TensorShape, layout: &Layout) -> u64 {
@@ -1138,11 +1110,11 @@ fn replica_shortfall_traffic(
 ) -> Option<ExchangeEndpointTraffic> {
     let sources = layout_extents(&operand.shape, &operand.format.layout)?;
     let destinations = layout_extents(&operand.shape, consumer_layout)?;
-    let mut source_groups = HashMap::<Vec<(u32, u32)>, Vec<u16>>::new();
+    let mut source_groups = HashMap::<TensorRegion, Vec<u16>>::new();
     for (tile, extents) in sources {
         source_groups.entry(extents).or_default().push(tile);
     }
-    let mut destination_groups = HashMap::<Vec<(u32, u32)>, Vec<u16>>::new();
+    let mut destination_groups = HashMap::<TensorRegion, Vec<u16>>::new();
     for (tile, extents) in destinations {
         destination_groups.entry(extents).or_default().push(tile);
     }
@@ -1157,7 +1129,9 @@ fn replica_shortfall_traffic(
         if remote_destinations.is_empty() {
             continue;
         }
-        let bytes = range_elements(&extents).saturating_mul(operand.format.precision.bytes());
+        let bytes = extents
+            .logical_elements()
+            .saturating_mul(operand.format.precision.bytes());
         traffic.add_outgoing(source_tiles[0] / 2, bytes, 1);
         for tile in remote_destinations {
             traffic.add_incoming(tile, bytes, 1);
@@ -1543,12 +1517,12 @@ mod tests {
     ) -> ConversionTraffic {
         let sources = layout_extents(shape, from).unwrap();
         let destinations = layout_extents(shape, to).unwrap();
-        let mut remote = BTreeSet::<(u16, Vec<(u32, u32)>)>::new();
+        let mut remote = BTreeSet::<(u16, TensorRegion)>::new();
         let mut traffic = ConversionTraffic::default();
         for (destination_tile, destination) in &destinations {
-            let mut intersections = BTreeMap::<Vec<(u32, u32)>, u16>::new();
+            let mut intersections = BTreeMap::<TensorRegion, u16>::new();
             for (source_tile, source) in &sources {
-                let Some(extents) = intersect_ranges(source, destination) else {
+                let Some(extents) = source.intersection(destination) else {
                     continue;
                 };
                 let selected = intersections.entry(extents).or_insert(*source_tile);
@@ -1561,7 +1535,7 @@ mod tests {
             let mut local_intersections = 0;
             let mut remote_intersections = 0;
             for (extents, source_tile) in &intersections {
-                let bytes = range_elements(extents) * precision.bytes();
+                let bytes = extents.logical_elements() * precision.bytes();
                 destination_bytes += bytes;
                 if source_tile == destination_tile {
                     local_bytes += bytes;
@@ -1603,12 +1577,12 @@ mod tests {
         };
         traffic.source_payload_bytes = remote
             .iter()
-            .map(|(_, extents)| range_elements(extents) * precision.bytes())
+            .map(|(_, extents)| extents.logical_elements() * precision.bytes())
             .sum();
         let mut source_roles = BTreeMap::<u16, (u64, u64)>::new();
         for (source, extents) in &remote {
             let role = source_roles.entry(*source).or_default();
-            role.0 += range_elements(extents) * precision.bytes();
+            role.0 += extents.logical_elements() * precision.bytes();
             role.1 += 1;
         }
         for (bytes, fragments) in source_roles.into_values() {
@@ -1618,7 +1592,7 @@ mod tests {
         let mut source_buses = BTreeMap::<u16, (u64, u64)>::new();
         for (source, extents) in &remote {
             let role = source_buses.entry(*source / 2).or_default();
-            role.0 += range_elements(extents) * precision.bytes();
+            role.0 += extents.logical_elements() * precision.bytes();
             role.1 += 1;
         }
         for (bus, (bytes, fragments)) in source_buses {
