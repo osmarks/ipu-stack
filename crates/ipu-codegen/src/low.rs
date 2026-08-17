@@ -12,11 +12,11 @@ use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
     LayoutError, MemoryClass, ShardExtent, TensorRegion, TensorTiling, TensorType,
 };
-use crate::mid::{
+use crate::mid::{MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId};
+use crate::operator::{
     ConversionStrategy, DeferredTransform, GemmDistribution, MemoryOperand,
-    MemorySpaceRequirements, MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId,
-    OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing,
-    PointwiseInputMapping, Precision, TileKernelSpec,
+    MemorySpaceRequirements, OperandRequirement, OperatorDispatch, OperatorRequirements,
+    OutputAliasing, PointwiseInputMapping, Precision, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use std::collections::{BTreeMap, BTreeSet};
@@ -3985,7 +3985,7 @@ impl LoweringState {
                     partial_tiles,
                     row_partitions,
                     column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
+                    crate::operator::GridOrder::ColumnsFast,
                 )
             }
             (crate::GemmOrientation::Swapped, ElementOrder::Amp(AmpOrder::TransposedLeft)) => {
@@ -3994,7 +3994,7 @@ impl LoweringState {
                     partial_tiles,
                     row_partitions,
                     column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
+                    crate::operator::GridOrder::ColumnsFast,
                 )
             }
             (crate::GemmOrientation::Normal, _) => Layout::amp_output_grid(
@@ -4002,14 +4002,14 @@ impl LoweringState {
                 partial_tiles,
                 row_partitions,
                 column_partitions,
-                crate::mid::GridOrder::ColumnsFast,
+                crate::operator::GridOrder::ColumnsFast,
             ),
             (crate::GemmOrientation::Swapped, _) => Layout::amp_transposed_output_grid(
                 output_column_block,
                 partial_tiles,
                 row_partitions,
                 column_partitions,
-                crate::mid::GridOrder::ColumnsFast,
+                crate::operator::GridOrder::ColumnsFast,
             ),
         };
         if let Some(axis) = partial_type
@@ -7216,7 +7216,7 @@ mod tests {
                     tiles,
                     row_partitions,
                     column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
+                    crate::operator::GridOrder::ColumnsFast,
                 ),
             };
             let right_format = TensorFormat {

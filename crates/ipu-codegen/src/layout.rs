@@ -1,5 +1,5 @@
 use crate::graph::TensorShape;
-use crate::mid::{GridOrder, Precision};
+use crate::operator::{GridOrder, Precision};
 use std::ops::Range;
 
 /// AMP packing role. Block dimensions are recorded by [`AxisTiling`].

@@ -3,7 +3,7 @@
 use crate::cost::Ipu21CostModel;
 use crate::graph::{TensorShape, ValueId};
 use crate::layout::{MemoryClass, TensorFormat};
-use crate::mid::{GemmPlanConstraint, Precision};
+use crate::operator::{GemmPlanConstraint, Precision};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -5,7 +5,7 @@ use crate::low::{
     KernelRequirements, LowProgram, LowShardId, ShardDefinition, TileWorkList, TileWorkRef,
 };
 use crate::memory::IPU21_DATA_BASE;
-use crate::mid::{
+use crate::operator::{
     AllocationRequirements, MemoryElementRequirement, MemoryOperand, OperandRequirement,
 };
 use crate::storage::{StorageError, shard_storage_bytes};

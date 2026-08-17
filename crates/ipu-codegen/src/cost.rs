@@ -12,7 +12,7 @@ use crate::graph::TensorShape;
 use crate::layout::{
     AmpOrder, BlockMajorOrder, ElementOrder, Layout, MemoryClass, TensorAxis, TensorType,
 };
-use crate::mid::{
+use crate::operator::{
     ConversionStrategy, DeferredTransform, GemmDistribution, LocalOperandStaging, MidOperator,
     OperatorDispatch, OperatorRequirements, Precision, layout_conversion_strategy,
 };

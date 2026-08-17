@@ -5,10 +5,10 @@ use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, Layout, MemoryClass, TensorAxis, TensorType,
 };
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage};
-use crate::mid::{
+use crate::mid::{MidOperation, MidOperationKind, MidValue, MidValueId};
+use crate::operator::{
     AllocationRequirements, GemmDistribution, MemoryElementRequirement, MemoryOperand,
-    MidOperation, MidOperationKind, MidValue, MidValueId, OperandMaterialization, OperatorDispatch,
-    OperatorRequirements, Precision,
+    OperandMaterialization, OperatorDispatch, OperatorRequirements, Precision,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -376,7 +376,7 @@ pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorTy
                     row_partitions.saturating_mul(column_partitions),
                     row_partitions,
                     column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
+                    crate::operator::GridOrder::ColumnsFast,
                 ),
                 (
                     crate::GemmOrientation::Swapped,
@@ -386,21 +386,21 @@ pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorTy
                     row_partitions.saturating_mul(column_partitions),
                     row_partitions,
                     column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
+                    crate::operator::GridOrder::ColumnsFast,
                 ),
                 (crate::GemmOrientation::Normal, _) => Layout::amp_output_grid(
                     output_column_block,
                     row_partitions.saturating_mul(column_partitions),
                     row_partitions,
                     column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
+                    crate::operator::GridOrder::ColumnsFast,
                 ),
                 (crate::GemmOrientation::Swapped, _) => Layout::amp_transposed_output_grid(
                     output_column_block,
                     row_partitions.saturating_mul(column_partitions),
                     row_partitions,
                     column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
+                    crate::operator::GridOrder::ColumnsFast,
                 ),
             },
         },
@@ -1348,7 +1348,7 @@ mod tests {
                     tiles,
                     row_partitions,
                     column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
+                    crate::operator::GridOrder::ColumnsFast,
                 ),
             );
             let total = physical_elements(&tensor.shape, &tensor.format.layout)
@@ -1382,7 +1382,7 @@ mod tests {
                     tiles,
                     row_partitions,
                     column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
+                    crate::operator::GridOrder::ColumnsFast,
                 ),
             );
             let local_left = TensorType::new(
@@ -1393,7 +1393,7 @@ mod tests {
                     tiles,
                     row_partitions,
                     column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
+                    crate::operator::GridOrder::ColumnsFast,
                 ),
             );
             let local_right = TensorType::new(
@@ -1405,7 +1405,7 @@ mod tests {
                     tiles,
                     row_partitions,
                     column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
+                    crate::operator::GridOrder::ColumnsFast,
                 ),
             );
             let dispatch = output_stationary_dispatch();
@@ -1490,7 +1490,7 @@ mod tests {
                     row_partitions * column_partitions,
                     row_partitions,
                     column_partitions,
-                    crate::mid::GridOrder::ColumnsFast,
+                    crate::operator::GridOrder::ColumnsFast,
                 ),
             );
             let dispatch =
@@ -1646,14 +1646,14 @@ mod tests {
                 tiles,
                 row_partitions,
                 column_partitions,
-                crate::mid::GridOrder::ColumnsFast,
+                crate::operator::GridOrder::ColumnsFast,
             );
             let aligned_source = Layout::amp_output_grid(
                 64,
                 tiles,
                 column_partitions,
                 row_partitions,
-                crate::mid::GridOrder::ColumnsFast,
+                crate::operator::GridOrder::ColumnsFast,
             );
             let destination =
                 Layout::amp_output_replicated_grid(tiles, column_partitions, row_partitions);

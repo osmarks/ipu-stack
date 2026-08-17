@@ -2,7 +2,7 @@
 
 use crate::layout::{AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder};
 use crate::low::{LowShard, ShardView};
-use crate::mid::Precision;
+use crate::operator::Precision;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteSpan {
@@ -765,7 +765,7 @@ fn amp_micro_dimension(precision: Precision) -> u32 {
 mod tests {
     use super::*;
     use crate::low::{LowShardId, ShardDefinition};
-    use crate::mid::Precision;
+    use crate::operator::Precision;
     use crate::{
         AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
         MemoryClass, ShardExtent, TensorTiling, TensorType,

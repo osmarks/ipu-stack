@@ -18,6 +18,7 @@ pub mod low;
 pub mod memory;
 mod metrics;
 pub mod mid;
+mod operator;
 mod package;
 pub mod place;
 pub mod storage;
@@ -65,17 +66,19 @@ pub use metrics::{
     MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics, PlanMetrics, RegionMetrics,
 };
 pub use mid::{
+    CostEstimate, CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, LoweringError,
+    LoweringResult, MidGraph, MidInput, MidOperation, MidOperationKind, MidRegion, MidRepeat,
+    MidValue, MidValueId, lower,
+};
+pub use operator::{
     AccumulationPrecision, AllocationRequirements, AttentionBlocking, AttentionKernelFamily,
     AttentionPadding, AttentionPlan, BlockedGemmPlan, ConversionPlan, ConversionStrategy,
-    CostEstimate, CostModel, GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid,
-    GemmKernelFamily, GemmKernelMode, GemmOrientation, GemmPlanConstraint, GemmResultGrid,
-    GemmWeightLoad, GridOrder, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts,
-    LocalOperandStaging, LoweringError, LoweringResult, MemoryElementRequirement, MemoryOperand,
-    MemorySpaceRequirements, MidGraph, MidInput, MidOperation, MidOperationKind, MidOperator,
-    MidRegion, MidRepeat, MidValue, MidValueId, OperandMaterialization, OperandRequirement,
-    OperatorDispatch, OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing,
-    ParallelReductionPlan, PointwiseInputMapping, Precision, ReductionStaging, TileKernelSpec,
-    lower,
+    GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid, GemmKernelFamily, GemmKernelMode,
+    GemmOrientation, GemmPlanConstraint, GemmResultGrid, GemmWeightLoad, GridOrder,
+    LocalOperandStaging, MemoryElementRequirement, MemoryOperand, MemorySpaceRequirements,
+    MidOperator, OperandMaterialization, OperandRequirement, OperatorDispatch, OperatorPlan,
+    OperatorPlanError, OperatorRequirements, OutputAliasing, ParallelReductionPlan,
+    PointwiseInputMapping, Precision, ReductionStaging, TileKernelSpec,
 };
 pub use package::{
     CompiledPackage, CompiledTensor, CompiledTensorShard, DiagnosticCheckpoint, PackageBuildError,
