@@ -199,7 +199,7 @@ fn place_tile(
     // element, then return every remaining byte to standard allocations.
     let mut addresses = BTreeMap::new();
     let mut interleaved = Arena::new(
-        &[(
+        &[AddressRegion::new(
             IPU21_INTERLEAVED_MEMORY_BASE,
             IPU21_APPLICATION_MEMORY_LIMIT,
         )],
@@ -227,11 +227,11 @@ fn place_tile(
             bytes: interleaved_boundary - IPU21_INTERLEAVED_MEMORY_BASE,
         });
     }
-    let mut ranges = standard_ranges
-        .iter()
-        .map(|range| (range.start, range.end))
-        .collect::<Vec<_>>();
-    ranges.push((interleaved_boundary, IPU21_APPLICATION_MEMORY_LIMIT));
+    let mut ranges = standard_ranges.to_vec();
+    ranges.push(AddressRegion::new(
+        interleaved_boundary,
+        IPU21_APPLICATION_MEMORY_LIMIT,
+    ));
     let mut standard = Arena::new(&ranges, false);
     allocate_tile_class(
         program,
@@ -246,15 +246,7 @@ fn place_tile(
         &mut standard,
         &mut addresses,
     )?;
-    Ok((
-        tile,
-        addresses,
-        standard
-            .unused_ranges()
-            .into_iter()
-            .map(|(start, end)| AddressRegion::new(start, end))
-            .collect(),
-    ))
+    Ok((tile, addresses, standard.unused_ranges()))
 }
 
 fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
@@ -702,22 +694,22 @@ struct IteratedGroup {
 }
 
 struct Arena {
-    ranges: Vec<(u32, u32)>,
-    free: Vec<(u32, u32)>,
-    active: Vec<(u32, u32, u32)>,
-    occupied: Vec<(u32, u32)>,
+    ranges: Vec<AddressRegion>,
+    free: Vec<AddressRegion>,
+    active: Vec<(u32, AddressRegion)>,
+    occupied: Vec<AddressRegion>,
     maximum: u32,
     compact_low: bool,
 }
 
 impl Arena {
-    fn new(ranges: &[(u32, u32)], compact_low: bool) -> Self {
+    fn new(ranges: &[AddressRegion], compact_low: bool) -> Self {
         Self {
             ranges: ranges.to_vec(),
             free: ranges.to_vec(),
             active: Vec::new(),
             occupied: Vec::new(),
-            maximum: ranges[0].0,
+            maximum: ranges[0].start,
             compact_low,
         }
     }
@@ -725,11 +717,11 @@ impl Arena {
     fn allocate(&mut self, bytes: u32, alignment: u32, first: u32, last: u32) -> Option<u32> {
         let mut retained = Vec::with_capacity(self.active.len());
         let active = std::mem::take(&mut self.active);
-        for (active_last, address, active_bytes) in active {
+        for (active_last, region) in active {
             if active_last < first {
-                self.release(address, address.checked_add(active_bytes)?);
+                self.release(region);
             } else {
-                retained.push((active_last, address, active_bytes));
+                retained.push((active_last, region));
             }
         }
         self.active = retained;
@@ -737,44 +729,45 @@ impl Arena {
             .free
             .iter()
             .enumerate()
-            .filter_map(|(index, &(base, limit))| {
-                let start = align_up(base, alignment).ok()?;
+            .filter_map(|(index, &free)| {
+                let start = align_up(free.start, alignment).ok()?;
                 let end = start.checked_add(bytes)?;
-                (end <= limit).then(|| {
+                (end <= free.end).then(|| {
                     let key = if self.compact_low {
-                        (start, limit - end)
+                        (start, free.end - end)
                     } else {
-                        (limit - end, start)
+                        (free.end - end, start)
                     };
-                    (key, index, start, end)
+                    (key, index, AddressRegion::new(start, end))
                 })
             })
             .min_by_key(|candidate| (candidate.0, candidate.1));
-        if let Some((_, index, start, end)) = candidate {
-            let (base, limit) = self.free[index];
+        if let Some((_, index, allocated)) = candidate {
+            let free = self.free[index];
             self.free.remove(index);
-            if base < start {
-                self.free.push((base, start));
+            if free.start < allocated.start {
+                self.free
+                    .push(AddressRegion::new(free.start, allocated.start));
             }
-            if end < limit {
-                self.free.push((end, limit));
+            if allocated.end < free.end {
+                self.free.push(AddressRegion::new(allocated.end, free.end));
             }
             self.free.sort_unstable();
-            self.active.push((last, start, bytes));
-            self.occupied.push((start, end));
-            self.maximum = self.maximum.max(end);
-            return Some(start);
+            self.active.push((last, allocated));
+            self.occupied.push(allocated);
+            self.maximum = self.maximum.max(allocated.end);
+            return Some(allocated.start);
         }
         None
     }
 
-    fn release(&mut self, base: u32, limit: u32) {
-        self.free.push((base, limit));
+    fn release(&mut self, region: AddressRegion) {
+        self.free.push(region);
         self.free.sort_unstable();
-        let mut merged = Vec::<(u32, u32)>::with_capacity(self.free.len());
+        let mut merged = Vec::<AddressRegion>::with_capacity(self.free.len());
         for range in self.free.drain(..) {
             match merged.last_mut() {
-                Some(previous) if previous.1 == range.0 => previous.1 = range.1,
+                Some(previous) if previous.end == range.start => previous.end = range.end,
                 _ => merged.push(range),
             }
         }
@@ -785,33 +778,35 @@ impl Arena {
         self.maximum
     }
 
-    fn unused_ranges(&self) -> Vec<(u32, u32)> {
+    fn unused_ranges(&self) -> Vec<AddressRegion> {
         let mut occupied = self.occupied.clone();
         occupied.sort_unstable();
-        let mut merged = Vec::<(u32, u32)>::new();
+        let mut merged = Vec::<AddressRegion>::new();
         for range in occupied {
             match merged.last_mut() {
-                Some(previous) if range.0 <= previous.1 => previous.1 = previous.1.max(range.1),
+                Some(previous) if range.start <= previous.end => {
+                    previous.end = previous.end.max(range.end)
+                }
                 _ => merged.push(range),
             }
         }
         let mut unused = Vec::new();
-        for &(base, limit) in &self.ranges {
-            let mut cursor = base;
-            for &(occupied_base, occupied_limit) in &merged {
-                if occupied_limit <= cursor || occupied_base >= limit {
+        for &range in &self.ranges {
+            let mut cursor = range.start;
+            for &occupied in &merged {
+                if occupied.end <= cursor || occupied.start >= range.end {
                     continue;
                 }
-                if cursor < occupied_base {
-                    unused.push((cursor, occupied_base.min(limit)));
+                if cursor < occupied.start {
+                    unused.push(AddressRegion::new(cursor, occupied.start.min(range.end)));
                 }
-                cursor = cursor.max(occupied_limit);
-                if cursor >= limit {
+                cursor = cursor.max(occupied.end);
+                if cursor >= range.end {
                     break;
                 }
             }
-            if cursor < limit {
-                unused.push((cursor, limit));
+            if cursor < range.end {
+                unused.push(AddressRegion::new(cursor, range.end));
             }
         }
         unused
@@ -1013,7 +1008,7 @@ mod tests {
         for _ in 0..128 {
             let limit = 1 << 20;
             let persistent = random.u32(1..=4096);
-            let mut arena = Arena::new(&[(0, limit)], true);
+            let mut arena = Arena::new(&[AddressRegion::new(0, limit)], true);
             arena.allocate(persistent, 4, 0, u32::MAX).unwrap();
             let mut bound = persistent;
             for phase in 1..=random.u32(2..=16) {
