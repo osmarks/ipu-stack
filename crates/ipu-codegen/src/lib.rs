@@ -16,6 +16,7 @@ pub mod kernel;
 mod layout;
 pub mod low;
 pub mod memory;
+mod metrics;
 pub mod mid;
 mod package;
 pub mod place;
@@ -60,18 +61,21 @@ pub use memory::{
     IPU21_DATA_BASE, IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES,
     IPU21_STANDARD_FIXED_BYTES,
 };
+pub use metrics::{
+    MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics, PlanMetrics, RegionMetrics,
+};
 pub use mid::{
     AccumulationPrecision, AllocationRequirements, AttentionBlocking, AttentionKernelFamily,
     AttentionPadding, AttentionPlan, BlockedGemmPlan, ConversionPlan, ConversionStrategy,
     CostEstimate, CostModel, GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid,
     GemmKernelFamily, GemmKernelMode, GemmOrientation, GemmPlanConstraint, GemmResultGrid,
     GemmWeightLoad, GridOrder, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts,
-    LocalOperandStaging, LoweringError, LoweringResult, MemoryElementRequirement, MemoryEstimate,
-    MemoryOperand, MemoryPeaks, MemorySpaceRequirements, MemoryUsage, MidGraph, MidInput,
-    MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId,
-    OperandMaterialization, OperandRequirement, OperationMetrics, OperatorDispatch, OperatorPlan,
-    OperatorPlanError, OperatorRequirements, OutputAliasing, ParallelReductionPlan, PlanMetrics,
-    PointwiseInputMapping, Precision, ReductionStaging, RegionMetrics, TileKernelSpec, lower,
+    LocalOperandStaging, LoweringError, LoweringResult, MemoryElementRequirement, MemoryOperand,
+    MemorySpaceRequirements, MidGraph, MidInput, MidOperation, MidOperationKind, MidOperator,
+    MidRegion, MidRepeat, MidValue, MidValueId, OperandMaterialization, OperandRequirement,
+    OperatorDispatch, OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing,
+    ParallelReductionPlan, PointwiseInputMapping, Precision, ReductionStaging, TileKernelSpec,
+    lower,
 };
 pub use package::{
     CompiledPackage, CompiledTensor, CompiledTensorShard, DiagnosticCheckpoint, PackageBuildError,

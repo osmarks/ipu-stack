@@ -4,10 +4,11 @@ use crate::graph::TensorShape;
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, Layout, MemoryClass, TensorAxis, TensorType,
 };
+use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage};
 use crate::mid::{
-    AllocationRequirements, GemmDistribution, MemoryElementRequirement, MemoryEstimate,
-    MemoryOperand, MemoryPeaks, MemoryUsage, MidOperation, MidOperationKind, MidValue, MidValueId,
-    OperandMaterialization, OperatorDispatch, OperatorRequirements, Precision,
+    AllocationRequirements, GemmDistribution, MemoryElementRequirement, MemoryOperand,
+    MidOperation, MidOperationKind, MidValue, MidValueId, OperandMaterialization, OperatorDispatch,
+    OperatorRequirements, Precision,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
