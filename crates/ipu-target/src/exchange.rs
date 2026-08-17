@@ -34,6 +34,119 @@ const HOST_COMMAND_ROUTE_CYCLES: u32 = 73;
 
 pub type PlanRow = [u32; PLAN_WORDS];
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalTransfer {
+    pub source: u16,
+    /// Address used by each structured-repeat iteration. Ordinary transfers
+    /// contain exactly one entry.
+    pub source_addresses: Vec<u32>,
+    pub destinations: Vec<TransferEndpoint>,
+    pub words: u32,
+    pub width: TransferWidth,
+}
+
+impl PhysicalTransfer {
+    pub fn source_address(&self) -> u32 {
+        self.source_addresses[0]
+    }
+
+    pub fn destination_tiles(&self) -> impl Iterator<Item = u16> + '_ {
+        self.destinations.iter().map(|endpoint| endpoint.0)
+    }
+
+    pub fn destination_addresses(&self) -> impl Iterator<Item = u32> + '_ {
+        self.destinations.iter().map(|endpoint| endpoint.1)
+    }
+
+    pub fn item_count(&self) -> Option<u32> {
+        let item_words = match self.width {
+            TransferWidth::Word32 => 1,
+            TransferWidth::Paired64 => 2,
+        };
+        (self.words != 0 && self.words.is_multiple_of(item_words))
+            .then_some(self.words / item_words)
+    }
+
+    pub fn resolve(
+        &self,
+        topology: &Topology,
+        incoming_base: Option<u32>,
+    ) -> Result<ResolvedTransfer, ExchangeError> {
+        let source_address = self
+            .source_addresses
+            .first()
+            .copied()
+            .ok_or(ExchangeError::Schedule("missing transfer source address"))?;
+        let words = self
+            .item_count()
+            .ok_or(ExchangeError::Schedule("unaligned transfer payload"))?;
+        let receivers = self.destination_tiles().collect::<Vec<_>>();
+        let point_receiver = self.width == TransferWidth::Word32
+            && self.destinations.len() == 1
+            && incoming_base == Some(self.destinations[0].1);
+        let (reserved_source, mut plan) = match self.width {
+            TransferWidth::Paired64 => (
+                Some(topology.paired_logical(self.source)?),
+                topology.paired_multicast(self.source, &receivers, words)?,
+            ),
+            TransferWidth::Word32 if point_receiver => {
+                let point = topology.point_to_point(self.source, receivers[0], words)?;
+                (
+                    None,
+                    MulticastPlan {
+                        sender: point.sender,
+                        receivers: vec![finalize_point_receiver(
+                            &point.receivers[0],
+                            topology.physical(self.source)?,
+                        )?],
+                    },
+                )
+            }
+            TransferWidth::Word32 => (None, topology.multicast(self.source, &receivers, words, 0)?),
+        };
+        patch_sender_address(&mut plan.sender, source_address)?;
+        if !point_receiver {
+            for (row, TransferEndpoint(_, address)) in
+                plan.receivers.iter_mut().zip(&self.destinations)
+            {
+                patch_receiver_address(row, *address)?;
+            }
+        }
+        Ok(ResolvedTransfer {
+            source: self.source,
+            reserved_source,
+            receivers,
+            words,
+            plan,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferWidth {
+    #[default]
+    Word32,
+    Paired64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TransferEndpoint(pub u16, pub u32);
+
+impl From<(u16, u32)> for TransferEndpoint {
+    fn from((tile, address): (u16, u32)) -> Self {
+        Self(tile, address)
+    }
+}
+
+#[derive(Debug)]
+pub struct ResolvedTransfer {
+    source: u16,
+    reserved_source: Option<u16>,
+    receivers: Vec<u16>,
+    words: u32,
+    plan: MulticastPlan,
+}
+
 /// Returns the plan event horizon measured from the entry synchronization.
 ///
 /// Delay immediates advance to the event `N + 1` cycles later. Send
@@ -151,22 +264,10 @@ impl PhaseProgramBuilder {
     /// tile programs are not encoded until the phase is finished.
     pub fn earliest_transfer_offset(
         &self,
-        source: u16,
-        reserved_tiles: &[u16],
-        receivers: &[u16],
-        plan: &MulticastPlan,
-        words: u32,
+        transfer: &ResolvedTransfer,
         requested: u32,
     ) -> Result<u32, ExchangeError> {
-        self.earliest_transfer_offset_impl(
-            source,
-            reserved_tiles,
-            receivers,
-            plan,
-            words,
-            requested,
-            true,
-        )
+        self.earliest_transfer_offset_impl(transfer, requested, true)
     }
 
     /// Finds an endpoint-compatible offset while deferring whole-row encoding
@@ -175,65 +276,45 @@ impl PhaseProgramBuilder {
     /// if instruction alignment is not representable.
     pub fn earliest_transfer_offset_deferred(
         &self,
-        source: u16,
-        reserved_tiles: &[u16],
-        receivers: &[u16],
-        plan: &MulticastPlan,
-        words: u32,
+        transfer: &ResolvedTransfer,
         requested: u32,
     ) -> Result<u32, ExchangeError> {
-        self.earliest_transfer_offset_impl(
-            source,
-            reserved_tiles,
-            receivers,
-            plan,
-            words,
-            requested,
-            false,
-        )
+        self.earliest_transfer_offset_impl(transfer, requested, false)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn earliest_transfer_offset_impl(
         &self,
-        source: u16,
-        reserved_tiles: &[u16],
-        receivers: &[u16],
-        plan: &MulticastPlan,
-        words: u32,
+        transfer: &ResolvedTransfer,
         requested: u32,
         validate_encoding: bool,
     ) -> Result<u32, ExchangeError> {
-        if receivers.len() != plan.receivers.len() {
-            return Err(ExchangeError::Schedule("receiver row count"));
-        }
         let source_schedule = self
             .tile_states
-            .get(usize::from(source))
-            .ok_or(ExchangeError::Tile(source))?;
+            .get(usize::from(transfer.source))
+            .ok_or(ExchangeError::Tile(transfer.source))?;
         let mut offset = requested;
         loop {
             let previous = offset;
-            offset = source_schedule.earliest_sender_offset(&plan.sender, offset)?;
-            for &tile in reserved_tiles {
+            offset = source_schedule.earliest_sender_offset(&transfer.plan.sender, offset)?;
+            if let Some(tile) = transfer.reserved_source {
                 let schedule = self
                     .tile_states
                     .get(usize::from(tile))
                     .ok_or(ExchangeError::Tile(tile))?;
                 offset = offset.max(schedule.event_cycles);
             }
-            for (&receiver, row) in receivers.iter().zip(&plan.receivers) {
+            for (&receiver, row) in transfer.receivers.iter().zip(&transfer.plan.receivers) {
                 let schedule = self
                     .tile_states
                     .get(usize::from(receiver))
                     .ok_or(ExchangeError::Tile(receiver))?;
-                offset = schedule.earliest_receiver_offset(row, words, offset)?;
+                offset = schedule.earliest_receiver_offset(row, transfer.words, offset)?;
             }
             if offset == previous {
                 if !validate_encoding {
                     return Ok(offset);
                 }
-                match self.transfer_is_encodable_at(source, receivers, plan, offset, words) {
+                match self.transfer_is_encodable_at(transfer, offset) {
                     Ok(()) => return Ok(offset),
                     Err(ExchangeError::Schedule("SENDPICP instruction alignment")) => {
                         offset = offset
@@ -248,26 +329,23 @@ impl PhaseProgramBuilder {
 
     fn transfer_is_encodable_at(
         &self,
-        source: u16,
-        receivers: &[u16],
-        plan: &MulticastPlan,
+        transfer: &ResolvedTransfer,
         schedule_offset: u32,
-        words: u32,
     ) -> Result<(), ExchangeError> {
         let mut source_schedule = self
             .tile_states
-            .get(usize::from(source))
-            .ok_or(ExchangeError::Tile(source))?
+            .get(usize::from(transfer.source))
+            .ok_or(ExchangeError::Tile(transfer.source))?
             .clone();
-        source_schedule.append_sender_at(&plan.sender, schedule_offset)?;
+        source_schedule.append_sender_at(&transfer.plan.sender, schedule_offset)?;
         source_schedule.finish()?;
-        for (&receiver, row) in receivers.iter().zip(&plan.receivers) {
+        for (&receiver, row) in transfer.receivers.iter().zip(&transfer.plan.receivers) {
             let mut receiver_schedule = self
                 .tile_states
                 .get(usize::from(receiver))
                 .ok_or(ExchangeError::Tile(receiver))?
                 .clone();
-            receiver_schedule.append_receiver_at(row, schedule_offset, words)?;
+            receiver_schedule.append_receiver_at(row, schedule_offset, transfer.words)?;
             receiver_schedule.finish()?;
         }
         Ok(())
@@ -278,34 +356,20 @@ impl PhaseProgramBuilder {
     /// [`Self::finish`].
     pub fn append_transfer_at(
         &mut self,
-        source: u16,
-        reserved_tiles: &[u16],
-        receivers: &[u16],
-        plan: &MulticastPlan,
+        transfer: &ResolvedTransfer,
         schedule_offset: u32,
-        words: u32,
     ) -> Result<PhaseTransferTiming, ExchangeError> {
-        let transfer_timing =
-            self.transfer_timing_at(source, receivers, plan, schedule_offset, words)?;
-        if receivers.len() != plan.receivers.len() {
-            return Err(ExchangeError::Schedule("receiver row count"));
-        }
-        let mut updates = Vec::with_capacity(receivers.len() + reserved_tiles.len() + 1);
+        let transfer_timing = self.transfer_timing_at(transfer, schedule_offset)?;
+        let mut updates = Vec::with_capacity(transfer.receivers.len() + 2);
         let mut source_schedule = self
             .tile_states
-            .get(usize::from(source))
-            .ok_or(ExchangeError::Tile(source))?
+            .get(usize::from(transfer.source))
+            .ok_or(ExchangeError::Tile(transfer.source))?
             .clone();
-        source_schedule.append_sender_at(&plan.sender, schedule_offset)?;
-        updates.push((source, source_schedule));
+        source_schedule.append_sender_at(&transfer.plan.sender, schedule_offset)?;
+        updates.push((transfer.source, source_schedule));
 
-        for &tile in reserved_tiles {
-            if tile == source
-                || receivers.contains(&tile)
-                || updates.iter().any(|(updated, _)| *updated == tile)
-            {
-                return Err(ExchangeError::DuplicateTile);
-            }
+        if let Some(tile) = transfer.reserved_source {
             let mut schedule = self
                 .tile_states
                 .get(usize::from(tile))
@@ -315,16 +379,13 @@ impl PhaseProgramBuilder {
             updates.push((tile, schedule));
         }
 
-        for (&receiver, row) in receivers.iter().zip(&plan.receivers) {
-            if receiver == source || updates.iter().any(|(tile, _)| *tile == receiver) {
-                return Err(ExchangeError::DuplicateTile);
-            }
+        for (&receiver, row) in transfer.receivers.iter().zip(&transfer.plan.receivers) {
             let mut receiver_schedule = self
                 .tile_states
                 .get(usize::from(receiver))
                 .ok_or(ExchangeError::Tile(receiver))?
                 .clone();
-            receiver_schedule.append_receiver_at(row, schedule_offset, words)?;
+            receiver_schedule.append_receiver_at(row, schedule_offset, transfer.words)?;
             updates.push((receiver, receiver_schedule));
         }
         for (tile, schedule) in updates {
@@ -335,26 +396,18 @@ impl PhaseProgramBuilder {
 
     pub fn transfer_timing_at(
         &self,
-        source: u16,
-        receivers: &[u16],
-        plan: &MulticastPlan,
+        transfer: &ResolvedTransfer,
         schedule_offset: u32,
-        words: u32,
     ) -> Result<PhaseTransferTiming, ExchangeError> {
-        if receivers.len() != plan.receivers.len() {
-            return Err(ExchangeError::Schedule("receiver row count"));
-        }
         self.tile_states
-            .get(usize::from(source))
-            .ok_or(ExchangeError::Tile(source))?;
-        let sender = scheduled_sender_timing(&plan.sender, schedule_offset)?;
-        let receiver_timings = receivers
+            .get(usize::from(transfer.source))
+            .ok_or(ExchangeError::Tile(transfer.source))?;
+        let sender = scheduled_sender_timing(&transfer.plan.sender, schedule_offset)?;
+        let receiver_timings = transfer
+            .receivers
             .iter()
-            .zip(&plan.receivers)
+            .zip(&transfer.plan.receivers)
             .map(|(&receiver, row)| {
-                if receiver == source {
-                    return Err(ExchangeError::DuplicateTile);
-                }
                 let schedule = self
                     .tile_states
                     .get(usize::from(receiver))
@@ -363,7 +416,7 @@ impl PhaseProgramBuilder {
                 scheduled_receive_window(
                     &base,
                     schedule_offset,
-                    words,
+                    transfer.words,
                     schedule.receive_stream.as_ref(),
                 )
             })
@@ -2821,12 +2874,20 @@ mod tests {
 
             let mut builder = PhaseProgramBuilder::new(1472);
             let source_pair = topology.paired_logical(source).unwrap();
-            let offset = builder
-                .earliest_transfer_offset(source, &[source_pair], &receivers, &plan, 64, 0)
-                .unwrap();
-            builder
-                .append_transfer_at(source, &[source_pair], &receivers, &plan, offset, 64)
-                .unwrap();
+            let transfer = PhysicalTransfer {
+                source,
+                source_addresses: vec![0x50000],
+                destinations: receivers
+                    .into_iter()
+                    .map(|receiver| TransferEndpoint(receiver, 0x60000))
+                    .collect(),
+                words: 128,
+                width: TransferWidth::Paired64,
+            }
+            .resolve(&topology, None)
+            .unwrap();
+            let offset = builder.earliest_transfer_offset(&transfer, 0).unwrap();
+            builder.append_transfer_at(&transfer, offset).unwrap();
             let programs = builder.finish().unwrap();
             assert!(programs.programs[usize::from(source)].is_some());
             assert!(programs.programs[usize::from(source_pair)].is_some());

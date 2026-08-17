@@ -36,9 +36,8 @@ pub use exchange::{
     EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityDiagnostic,
     ExchangeActivityKind, ExchangeLoweringError, ExchangeLoweringOptions, ExchangeScheduleProblem,
     ExchangeScheduleRun, ExchangeScheduleSnapshot, ExchangeTileDiagnostic, LoweredExchanges,
-    PhysicalExchangePhase, PhysicalTransfer, TransferEndpoint, TransferWidth,
-    diagnose_exchange_tile, inactive_exchange_program, lower_exchanges, schedule_exchange_problem,
-    validate_exchange_schedule,
+    PhysicalExchangePhase, diagnose_exchange_tile, inactive_exchange_program, lower_exchanges,
+    schedule_exchange_problem, validate_exchange_schedule,
 };
 pub use graph::{
     AddOptions, AttentionOptions, AttentionScale, BroadcastMode, ComputeGraph, GemmOptions,

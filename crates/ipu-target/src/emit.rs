@@ -274,11 +274,9 @@ fn emit_steps(
                 }
                 if exchange.active && !exchange.sync_in_program {
                     code.instruction(SYNC_SUPERVISOR_INSTRUCTION);
-                } else {
-                    if !exchange.active {
-                        code.instruction(SANS_INACTIVE_INSTRUCTION);
-                        code.instruction(crate::instruction::SYNC_ANS_INSTRUCTION);
-                    }
+                } else if !exchange.active {
+                    code.instruction(SANS_INACTIVE_INSTRUCTION);
+                    code.instruction(crate::instruction::SYNC_ANS_INSTRUCTION);
                 }
                 code.call(exchange.program.address, 10)?;
                 if let Some(address) = exchange.profile.after {

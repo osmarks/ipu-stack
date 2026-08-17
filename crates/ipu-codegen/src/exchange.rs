@@ -5,9 +5,9 @@ use crate::{
     logical_view_byte_spans, view_byte_spans,
 };
 use ipu_target::exchange::{
-    MAX_TRANSFER_WORDS, MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming,
-    finalize_point_receiver, patch_receiver_address, patch_sender_address,
-    patch_sender_instruction, sender_address_instruction_groups,
+    MAX_TRANSFER_WORDS, PhaseProgramBuilder, PhaseTransferTiming, PhysicalTransfer,
+    ResolvedTransfer, TransferEndpoint, TransferWidth, patch_sender_instruction,
+    sender_address_instruction_groups,
 };
 use ipu_target::instruction::RETURN_M10_INSTRUCTION;
 use ipu_target::memory::{MemoryElement, memory_elements_for_words};
@@ -180,68 +180,6 @@ pub struct ExchangeScheduleProblem {
     pub transfers: Vec<PhysicalTransfer>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PhysicalTransfer {
-    pub source: u16,
-    /// Address used by each structured-repeat iteration. Ordinary transfers
-    /// contain exactly one entry.
-    pub source_addresses: Vec<u32>,
-    pub destinations: Vec<TransferEndpoint>,
-    pub words: u32,
-    pub width: TransferWidth,
-}
-
-impl PhysicalTransfer {
-    pub fn source_address(&self) -> u32 {
-        self.source_addresses[0]
-    }
-
-    pub fn destination_tiles(&self) -> impl Iterator<Item = u16> + '_ {
-        self.destinations.iter().map(|endpoint| endpoint.0)
-    }
-
-    pub fn destination_addresses(&self) -> impl Iterator<Item = u32> + '_ {
-        self.destinations.iter().map(|endpoint| endpoint.1)
-    }
-
-    fn item_count(&self) -> Result<u32, ExchangeLoweringError> {
-        self.width.item_count(self.words)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TransferWidth {
-    #[default]
-    Word32,
-    Paired64,
-}
-
-impl TransferWidth {
-    fn item_words(self) -> u32 {
-        match self {
-            Self::Word32 => 1,
-            Self::Paired64 => 2,
-        }
-    }
-
-    fn item_count(self, words: u32) -> Result<u32, ExchangeLoweringError> {
-        let item_words = self.item_words();
-        if words == 0 || words % item_words != 0 {
-            return Err(ExchangeLoweringError::UnalignedPayload);
-        }
-        Ok(words / item_words)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct TransferEndpoint(pub u16, pub u32);
-
-impl From<(u16, u32)> for TransferEndpoint {
-    fn from((tile, address): (u16, u32)) -> Self {
-        Self(tile, address)
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct LoweredExchanges {
     pub phases: Vec<PhysicalExchangePhase>,
@@ -267,10 +205,7 @@ struct TilePressure {
 
 #[derive(Clone, Debug)]
 struct ScheduledTransferDiagnostic {
-    source: u16,
-    source_address: u32,
-    destinations: Vec<TransferEndpoint>,
-    words: u32,
+    transfer: usize,
     start: u32,
     end: u32,
     blocking_tile: u16,
@@ -373,7 +308,6 @@ fn lower_static_exchanges(
             attach_repeat_source_addresses(&mut pending, &repeat_inputs, placement)?;
             let ScheduledPending {
                 pending,
-                receive_counts,
                 incoming_bases,
                 optimized,
             } = select_transfer_widths(phase.id.index(), topology, pending, program.tile_count)?;
@@ -422,7 +356,6 @@ fn lower_static_exchanges(
                         topology,
                         &unsafe_pending,
                         &incoming_bases,
-                        &receive_counts,
                         program.tile_count,
                     )?;
                     tracing::info!(
@@ -471,15 +404,7 @@ fn lower_static_exchanges(
                 for &index in &order {
                     let transfer = &pending[index];
                     let timing = timings[index].ok_or(ExchangeLoweringError::Overflow)?;
-                    diagnostics.record(
-                        transfer.physical.source,
-                        transfer.physical.source_address(),
-                        &transfer.physical.destinations,
-                        transfer.physical.words,
-                        timing.start,
-                        timing.end,
-                        timing.blocking_tile,
-                    );
+                    diagnostics.record(index, &transfer.physical, timing);
                 }
             }
             if let Some(diagnostics) = diagnostics {
@@ -489,6 +414,7 @@ fn lower_static_exchanges(
                     horizon,
                     &tile_availability,
                     &builder,
+                    &pending,
                 );
             }
             let phase_programs = builder.finish()?;
@@ -569,7 +495,10 @@ fn lower_static_exchanges(
                     id: phase.id,
                     active,
                     programs,
-                    incoming_bases,
+                    incoming_bases: incoming_bases
+                        .into_iter()
+                        .map(|base| base.unwrap_or(0))
+                        .collect(),
                     tile_event_cycles,
                     event_cycles: horizon,
                     activities,
@@ -756,40 +685,28 @@ impl PhaseDiagnostics {
         }
     }
 
-    fn record(
-        &mut self,
-        source: u16,
-        source_address: u32,
-        destinations: &[TransferEndpoint],
-        words: u32,
-        start: u32,
-        end: u32,
-        blocking_tile: u16,
-    ) {
+    fn record(&mut self, transfer: usize, physical: &PhysicalTransfer, timing: MaterializedTiming) {
         let id = self.transfers.len();
-        let predecessor = self.tiles[usize::from(blocking_tile)].last_transfer;
-        let source_pressure = &mut self.tiles[usize::from(source)];
+        let predecessor = self.tiles[usize::from(timing.blocking_tile)].last_transfer;
+        let source_pressure = &mut self.tiles[usize::from(physical.source)];
         source_pressure.send_roles += 1;
-        source_pressure.send_words += u64::from(words);
+        source_pressure.send_words += u64::from(physical.words);
         source_pressure.last_transfer = Some(id);
-        for &TransferEndpoint(tile, _) in destinations {
+        for &TransferEndpoint(tile, _) in &physical.destinations {
             let pressure = &mut self.tiles[usize::from(tile)];
             pressure.receive_roles += 1;
-            pressure.receive_words += u64::from(words);
+            pressure.receive_words += u64::from(physical.words);
             pressure.last_transfer = Some(id);
         }
-        self.source_words += u64::from(words);
-        self.destination_words += u64::from(words) * destinations.len() as u64;
-        self.multicast_chunks += usize::from(destinations.len() > 1);
-        self.maximum_fanout = self.maximum_fanout.max(destinations.len());
+        self.source_words += u64::from(physical.words);
+        self.destination_words += u64::from(physical.words) * physical.destinations.len() as u64;
+        self.multicast_chunks += usize::from(physical.destinations.len() > 1);
+        self.maximum_fanout = self.maximum_fanout.max(physical.destinations.len());
         self.transfers.push(ScheduledTransferDiagnostic {
-            source,
-            source_address,
-            destinations: destinations.to_vec(),
-            words,
-            start,
-            end,
-            blocking_tile,
+            transfer,
+            start: timing.start,
+            end: timing.end,
+            blocking_tile: timing.blocking_tile,
             predecessor,
         });
     }
@@ -801,6 +718,7 @@ impl PhaseDiagnostics {
         horizon: u32,
         tile_availability: &[TileAvailability],
         builder: &PhaseProgramBuilder,
+        pending: &[PendingTransfer],
     ) {
         let role_word_lower_bound = self
             .tiles
@@ -884,12 +802,13 @@ impl PhaseDiagnostics {
             .rev()
             .map(|&id| {
                 let transfer = &self.transfers[id];
+                let physical = &pending[transfer.transfer].physical;
                 (
-                    id,
-                    transfer.source,
-                    transfer.source_address,
-                    &transfer.destinations,
-                    transfer.words,
+                    transfer.transfer,
+                    physical.source,
+                    physical.source_address(),
+                    &physical.destinations,
+                    physical.words,
                     transfer.start,
                     transfer.end,
                     transfer.blocking_tile,
@@ -1180,10 +1099,10 @@ fn pending_from_problem(
         .collect()
 }
 
-fn receive_configuration(
+fn incoming_bases(
     pending: &[PendingTransfer],
     tile_count: u16,
-) -> Result<(Vec<usize>, Vec<u32>), ExchangeLoweringError> {
+) -> Result<Vec<Option<u32>>, ExchangeLoweringError> {
     let mut receive_counts = vec![0usize; usize::from(tile_count)];
     for transfer in pending {
         for &TransferEndpoint(tile, _) in &transfer.physical.destinations {
@@ -1195,19 +1114,13 @@ fn receive_configuration(
     }
     let mut incoming_bases = vec![None::<u32>; usize::from(tile_count)];
     for transfer in pending {
-        if let [TransferEndpoint(tile, address)] = transfer.physical.destinations.as_slice() {
-            if receive_counts[usize::from(*tile)] == 1 {
-                incoming_bases[usize::from(*tile)] = Some(*address);
-            }
+        if let [TransferEndpoint(tile, address)] = transfer.physical.destinations.as_slice()
+            && receive_counts[usize::from(*tile)] == 1
+        {
+            incoming_bases[usize::from(*tile)] = Some(*address);
         }
     }
-    Ok((
-        receive_counts,
-        incoming_bases
-            .into_iter()
-            .map(|base| base.unwrap_or(0))
-            .collect(),
-    ))
+    Ok(incoming_bases)
 }
 
 struct OptimizedSchedule {
@@ -1220,8 +1133,7 @@ struct OptimizedSchedule {
 
 struct ScheduledPending {
     pending: Vec<PendingTransfer>,
-    receive_counts: Vec<usize>,
-    incoming_bases: Vec<u32>,
+    incoming_bases: Vec<Option<u32>>,
     optimized: OptimizedSchedule,
 }
 
@@ -1230,17 +1142,10 @@ fn optimize_owned_pending(
     pending: Vec<PendingTransfer>,
     tile_count: u16,
 ) -> Result<ScheduledPending, ExchangeLoweringError> {
-    let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
-    let optimized = optimize_pending_schedule(
-        topology,
-        &pending,
-        &incoming_bases,
-        &receive_counts,
-        tile_count,
-    )?;
+    let incoming_bases = incoming_bases(&pending, tile_count)?;
+    let optimized = optimize_pending_schedule(topology, &pending, &incoming_bases, tile_count)?;
     Ok(ScheduledPending {
         pending,
-        receive_counts,
         incoming_bases,
         optimized,
     })
@@ -1320,7 +1225,6 @@ fn select_transfer_widths(
                 topology,
                 &trial,
                 &ordinary.incoming_bases,
-                &ordinary.receive_counts,
                 tile_count,
                 order,
             )
@@ -1359,7 +1263,6 @@ fn select_transfer_widths(
         &alternatives,
         &selected,
         &ordinary.incoming_bases,
-        &ordinary.receive_counts,
         tile_count,
         order,
     )?;
@@ -1383,7 +1286,6 @@ fn select_transfer_widths(
                     &alternatives,
                     &trial,
                     &ordinary.incoming_bases,
-                    &ordinary.receive_counts,
                     tile_count,
                     order,
                 )
@@ -1404,7 +1306,6 @@ fn select_transfer_widths(
             &alternatives,
             &selected,
             &ordinary.incoming_bases,
-            &ordinary.receive_counts,
             tile_count,
             order,
         )?;
@@ -1412,12 +1313,11 @@ fn select_transfer_widths(
         remaining.retain(|&candidate| candidate != index);
         subset_steps += 1;
     }
-    let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
+    let incoming_bases = incoming_bases(&pending, tile_count)?;
     let optimized = improve_pending_schedule(
         topology,
         &pending,
         &incoming_bases,
-        &receive_counts,
         tile_count,
         schedule,
         "transfer-width",
@@ -1437,7 +1337,6 @@ fn select_transfer_widths(
     );
     Ok(ScheduledPending {
         pending,
-        receive_counts,
         incoming_bases,
         optimized,
     })
@@ -1449,8 +1348,7 @@ fn materialize_width_selection(
     ordinary: &[PendingTransfer],
     alternatives: &[Option<PendingTransfer>],
     selected: &[usize],
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
+    incoming_bases: &[Option<u32>],
     tile_count: u16,
     order: &[usize],
 ) -> Result<(Vec<PendingTransfer>, MaterializedSchedule), ExchangeLoweringError> {
@@ -1468,48 +1366,32 @@ fn materialize_width_selection(
             }
         })
         .collect::<Vec<_>>();
-    let schedule = materialize_schedule_order(
-        topology,
-        &pending,
-        incoming_bases,
-        receive_counts,
-        tile_count,
-        order,
-    )?;
+    let schedule =
+        materialize_schedule_order(topology, &pending, incoming_bases, tile_count, order)?;
     Ok((pending, schedule))
 }
 
 fn optimize_pending_schedule(
     topology: &Topology,
     pending: &[PendingTransfer],
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
+    incoming_bases: &[Option<u32>],
     tile_count: u16,
 ) -> Result<OptimizedSchedule, ExchangeLoweringError> {
-    let schedule = materialize_greedy_schedule(
-        topology,
-        pending,
-        incoming_bases,
-        receive_counts,
-        tile_count,
-    )?;
+    let schedule = materialize_greedy_schedule(topology, pending, incoming_bases, tile_count)?;
     improve_pending_schedule(
         topology,
         pending,
         incoming_bases,
-        receive_counts,
         tile_count,
         schedule,
         "full-duplex",
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn improve_pending_schedule(
     topology: &Topology,
     pending: &[PendingTransfer],
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
+    incoming_bases: &[Option<u32>],
     tile_count: u16,
     mut schedule: MaterializedSchedule,
     initial_kind: &'static str,
@@ -1519,14 +1401,8 @@ fn improve_pending_schedule(
     let mut selected_kind = initial_kind;
     let mut neighborhood_improvements = 0usize;
     if let Some(order) = point_to_point_matching_wave_order(pending, tile_count, &schedule.order) {
-        let matching = materialize_schedule_order(
-            topology,
-            pending,
-            incoming_bases,
-            receive_counts,
-            tile_count,
-            &order,
-        );
+        let matching =
+            materialize_schedule_order(topology, pending, incoming_bases, tile_count, &order);
         if let Ok(matching) = matching
             && schedule_score(&matching) < schedule_score(&schedule)
         {
@@ -1543,7 +1419,6 @@ fn improve_pending_schedule(
             topology,
             pending,
             incoming_bases,
-            receive_counts,
             tile_count,
             &repaired_order,
         );
@@ -1607,20 +1482,14 @@ pub fn schedule_exchange_problem(
     }
     let topology = Topology::new((0..tile_count).map(c600_logical_to_physical).collect())?;
     let pending = pending_from_problem(tile_count, problem)?;
-    let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
+    let incoming_bases = incoming_bases(&pending, tile_count)?;
     let OptimizedSchedule {
         schedule,
         initial_horizon,
         endpoint_lower_bound,
         neighborhood_improvements,
         ..
-    } = optimize_pending_schedule(
-        &topology,
-        &pending,
-        &incoming_bases,
-        &receive_counts,
-        tile_count,
-    )?;
+    } = optimize_pending_schedule(&topology, &pending, &incoming_bases, tile_count)?;
     let MaterializedSchedule {
         builder,
         horizon,
@@ -1649,7 +1518,10 @@ pub fn schedule_exchange_problem(
         id: ExchangePhaseId::from_index(problem.phase),
         active,
         programs,
-        incoming_bases,
+        incoming_bases: incoming_bases
+            .into_iter()
+            .map(|base| base.unwrap_or(0))
+            .collect(),
         tile_event_cycles,
         event_cycles: horizon,
         activities,
@@ -2176,13 +2048,6 @@ fn memory_dependencies(transfers: &[PendingTransfer], tile_count: u16) -> BTreeS
     dependencies
 }
 
-struct ScheduledTransfer<'a> {
-    physical: &'a PhysicalTransfer,
-    source_address: u32,
-    source_elements: &'a [MemoryElement],
-    schedule_offset: u32,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct TileAvailability {
     send: u32,
@@ -2218,6 +2083,7 @@ struct TileMemorySchedule {
 
 struct MaterializedSchedule {
     builder: PhaseProgramBuilder,
+    validate_encoding: bool,
     horizon: u32,
     tile_availability: Vec<TileAvailability>,
     memory_accesses: Vec<TileMemorySchedule>,
@@ -2228,9 +2094,10 @@ struct MaterializedSchedule {
 }
 
 impl MaterializedSchedule {
-    fn new(tile_count: u16, transfer_count: usize) -> Self {
+    fn new(tile_count: u16, transfer_count: usize, validate_encoding: bool) -> Self {
         Self {
             builder: PhaseProgramBuilder::new(tile_count),
+            validate_encoding,
             horizon: 0,
             tile_availability: vec![TileAvailability::default(); usize::from(tile_count)],
             memory_accesses: (0..tile_count)
@@ -2247,11 +2114,9 @@ impl MaterializedSchedule {
         &mut self,
         topology: &Topology,
         pending: &[PendingTransfer],
-        incoming_bases: &[u32],
-        receive_counts: &[usize],
+        incoming_bases: &[Option<u32>],
         index: usize,
         dependency_ready: u32,
-        validate_encoding: bool,
         last_transfer: &mut [TilePredecessor],
     ) -> Result<u32, ExchangeLoweringError> {
         let transfer = &pending[index];
@@ -2293,19 +2158,19 @@ impl MaterializedSchedule {
         } else {
             last_transfer[usize::from(blocking_tile)].receive
         };
+        let incoming_base = physical
+            .destinations
+            .first()
+            .and_then(|endpoint| incoming_bases[usize::from(endpoint.0)]);
+        let resolved = physical.resolve(topology, incoming_base)?;
         let timing = append_transfer(
-            topology,
             &self.memory_accesses,
-            incoming_bases,
-            receive_counts,
-            ScheduledTransfer {
-                physical,
-                source_address: physical.source_address(),
-                source_elements: &transfer.source_elements,
-                schedule_offset: latest_availability,
-            },
+            physical,
+            &resolved,
+            &transfer.source_elements,
+            latest_availability,
             &mut self.builder,
-            validate_encoding,
+            self.validate_encoding,
         )?;
         let payload_end = timing.payload_end;
         self.memory_accesses[usize::from(physical.source)]
@@ -2405,18 +2270,11 @@ impl MaterializedSchedule {
 fn materialize_greedy_schedule(
     topology: &Topology,
     pending: &[PendingTransfer],
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
+    incoming_bases: &[Option<u32>],
     tile_count: u16,
 ) -> Result<MaterializedSchedule, ExchangeLoweringError> {
-    let schedule = materialize_greedy_schedule_impl(
-        topology,
-        pending,
-        incoming_bases,
-        receive_counts,
-        tile_count,
-        false,
-    )?;
+    let schedule =
+        materialize_greedy_schedule_impl(topology, pending, incoming_bases, tile_count, false)?;
     if schedule_encoding_is_valid(&schedule)? {
         return Ok(schedule);
     }
@@ -2424,25 +2282,17 @@ fn materialize_greedy_schedule(
         transfers = pending.len(),
         "retrying exchange schedule with incremental instruction-alignment validation"
     );
-    materialize_greedy_schedule_impl(
-        topology,
-        pending,
-        incoming_bases,
-        receive_counts,
-        tile_count,
-        true,
-    )
+    materialize_greedy_schedule_impl(topology, pending, incoming_bases, tile_count, true)
 }
 
 fn materialize_greedy_schedule_impl(
     topology: &Topology,
     pending: &[PendingTransfer],
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
+    incoming_bases: &[Option<u32>],
     tile_count: u16,
     validate_encoding: bool,
 ) -> Result<MaterializedSchedule, ExchangeLoweringError> {
-    let mut schedule = MaterializedSchedule::new(tile_count, pending.len());
+    let mut schedule = MaterializedSchedule::new(tile_count, pending.len(), validate_encoding);
     let mut scheduler = TransferScheduler::new(pending, tile_count);
     let mut last_transfer = vec![TilePredecessor::default(); usize::from(tile_count)];
     while let Some((index, dependency_ready)) = scheduler.next(&schedule.tile_availability) {
@@ -2450,10 +2300,8 @@ fn materialize_greedy_schedule_impl(
             topology,
             pending,
             incoming_bases,
-            receive_counts,
             index,
             dependency_ready,
-            validate_encoding,
             &mut last_transfer,
         )?;
         scheduler.complete(index, completion);
@@ -2466,15 +2314,14 @@ fn materialize_greedy_schedule_impl(
 fn materialize_schedule_order(
     topology: &Topology,
     pending: &[PendingTransfer],
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
+    incoming_bases: &[Option<u32>],
     tile_count: u16,
     order: &[usize],
 ) -> Result<MaterializedSchedule, ExchangeLoweringError> {
     if order.len() != pending.len() {
         return Err(ExchangeLoweringError::Overflow);
     }
-    let mut schedule = MaterializedSchedule::new(tile_count, pending.len());
+    let mut schedule = MaterializedSchedule::new(tile_count, pending.len(), false);
     let mut last_transfer = vec![TilePredecessor::default(); usize::from(tile_count)];
     let dependencies = memory_dependencies(pending, tile_count);
     let mut predecessors = vec![Vec::new(); pending.len()];
@@ -2492,10 +2339,8 @@ fn materialize_schedule_order(
             topology,
             pending,
             incoming_bases,
-            receive_counts,
             index,
             dependency_ready,
-            false,
             &mut last_transfer,
         )?;
     }
@@ -2608,7 +2453,7 @@ fn point_to_point_matching_wave_order(
     let mut remaining_send_words = vec![0u64; tile_count];
     let mut remaining_receive_words = vec![0u64; tile_count];
     for transfer in pending {
-        let words = u64::from(transfer.physical.item_count().ok()?);
+        let words = u64::from(transfer.physical.item_count()?);
         remaining_send_words[usize::from(transfer.physical.source)] += words;
         remaining_receive_words[usize::from(transfer.physical.destinations[0].0)] += words;
     }
@@ -2674,7 +2519,7 @@ fn point_to_point_matching_wave_order(
         });
         for index in wave {
             let transfer = &pending[index];
-            let words = u64::from(transfer.physical.item_count().ok()?);
+            let words = u64::from(transfer.physical.item_count()?);
             scheduled[index] = true;
             order.push(index);
             let source = usize::from(transfer.physical.source);
@@ -2998,86 +2843,27 @@ fn critical_neighborhood_order(
 }
 
 fn append_transfer(
-    topology: &Topology,
     memory_accesses: &[TileMemorySchedule],
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
-    transfer: ScheduledTransfer<'_>,
+    physical: &PhysicalTransfer,
+    resolved: &ResolvedTransfer,
+    source_elements: &[MemoryElement],
+    requested_offset: u32,
     builder: &mut PhaseProgramBuilder,
     validate_encoding: bool,
 ) -> Result<PhaseTransferTiming, ExchangeLoweringError> {
-    let ScheduledTransfer {
-        physical,
-        source_address,
-        source_elements,
-        schedule_offset: requested_offset,
-    } = transfer;
-    let source = physical.source;
-    let destinations = &physical.destinations;
     let words = physical.words;
-    let width = physical.width;
     if words == 0 || source_elements.is_empty() {
         return Err(ExchangeLoweringError::UnalignedPayload);
-    }
-    let tiles = destinations.iter().map(|entry| entry.0).collect::<Vec<_>>();
-    let item_count = width.item_count(words)?;
-    let reserved_tile = match width {
-        TransferWidth::Word32 => None,
-        TransferWidth::Paired64 => Some(topology.paired_logical(source)?),
-    };
-    let reserved_tiles = reserved_tile.as_slice();
-    let point_receiver = width == TransferWidth::Word32
-        && destinations
-            .first()
-            .is_some_and(|&TransferEndpoint(tile, address)| {
-                destinations.len() == 1
-                    && receive_counts[usize::from(tile)] == 1
-                    && incoming_bases[usize::from(tile)] == address
-            });
-    let mut plan = if width == TransferWidth::Paired64 {
-        topology.paired_multicast(source, &tiles, item_count)?
-    } else if point_receiver {
-        let point = topology.point_to_point(source, tiles[0], words)?;
-        MulticastPlan {
-            sender: point.sender,
-            receivers: vec![finalize_point_receiver(
-                &point.receivers[0],
-                topology.physical(source)?,
-            )?],
-        }
-    } else {
-        topology.multicast(source, &tiles, item_count, 0)?
-    };
-    patch_sender_address(&mut plan.sender, source_address)?;
-    if !point_receiver {
-        for (row, TransferEndpoint(_, address)) in plan.receivers.iter_mut().zip(destinations) {
-            patch_receiver_address(row, *address)?;
-        }
     }
     let mut schedule_offset = requested_offset;
     loop {
         let previous = schedule_offset;
         schedule_offset = if validate_encoding {
-            builder.earliest_transfer_offset(
-                source,
-                reserved_tiles,
-                &tiles,
-                &plan,
-                item_count,
-                schedule_offset,
-            )?
+            builder.earliest_transfer_offset(resolved, schedule_offset)?
         } else {
-            builder.earliest_transfer_offset_deferred(
-                source,
-                reserved_tiles,
-                &tiles,
-                &plan,
-                item_count,
-                schedule_offset,
-            )?
+            builder.earliest_transfer_offset_deferred(resolved, schedule_offset)?
         };
-        let timing =
-            builder.transfer_timing_at(source, &tiles, &plan, schedule_offset, item_count)?;
+        let timing = builder.transfer_timing_at(resolved, schedule_offset)?;
         let receiver_intervals = timing
             .receiver_payload_starts
             .iter()
@@ -3086,12 +2872,9 @@ fn append_transfer(
             .collect::<Vec<_>>();
         schedule_offset = schedule_offset.max(memory_safe_transfer_offset(
             memory_accesses,
-            source,
-            destinations,
+            physical,
             source_elements,
-            words,
-            timing.payload_start,
-            timing.sender_horizon,
+            &timing,
             &receiver_intervals,
             schedule_offset,
         )?);
@@ -3099,33 +2882,22 @@ fn append_transfer(
             break;
         }
     }
-    let timing = builder.append_transfer_at(
-        source,
-        reserved_tiles,
-        &tiles,
-        &plan,
-        schedule_offset,
-        item_count,
-    )?;
-    Ok(timing)
+    Ok(builder.append_transfer_at(resolved, schedule_offset)?)
 }
 
 fn memory_safe_transfer_offset(
     memory_accesses: &[TileMemorySchedule],
-    source: u16,
-    destinations: &[TransferEndpoint],
+    transfer: &PhysicalTransfer,
     source_elements: &[MemoryElement],
-    words: u32,
-    payload_start: u32,
-    payload_end: u32,
+    timing: &PhaseTransferTiming,
     receiver_intervals: &[(u32, u32)],
     schedule_offset: u32,
 ) -> Result<u32, ExchangeLoweringError> {
     let mut safe_offset = schedule_offset;
-    let source_clash = memory_accesses[usize::from(source)]
+    let source_clash = memory_accesses[usize::from(transfer.source)]
         .receives
         .iter()
-        .filter(|access| payload_start < access.end && access.start < payload_end)
+        .filter(|access| timing.payload_start < access.end && access.start < timing.sender_horizon)
         .filter(|access| {
             access
                 .elements
@@ -3134,7 +2906,8 @@ fn memory_safe_transfer_offset(
         })
         .map(|access| access.end)
         .max();
-    let receiver_clash = destinations
+    let receiver_clash = transfer
+        .destinations
         .iter()
         .zip(receiver_intervals)
         .flat_map(
@@ -3144,14 +2917,14 @@ fn memory_safe_transfer_offset(
                     .iter()
                     .filter(move |access| receive_start < access.end && access.start < receive_end)
                     .filter(move |access| {
-                        memory_elements_for_words(address, words)
+                        memory_elements_for_words(address, transfer.words)
                             .any(|element| access.elements.contains(&element))
                     })
                     .map(move |access| access.end.saturating_sub(receive_start))
             },
         )
         .max();
-    let source_delay = source_clash.map(|end| end.saturating_sub(payload_start));
+    let source_delay = source_clash.map(|end| end.saturating_sub(timing.payload_start));
     if let Some(delay) = source_delay.into_iter().chain(receiver_clash).max() {
         safe_offset = safe_offset
             .checked_add(delay)
@@ -3537,7 +3310,7 @@ mod tests {
                 );
             }
 
-            let mut incumbent = MaterializedSchedule::new(tile_count, transfers.len());
+            let mut incumbent = MaterializedSchedule::new(tile_count, transfers.len(), false);
             incumbent.order.extend(0..transfers.len());
             let mut last_transfer = vec![None; usize::from(tile_count)];
             for (index, transfer) in transfers.iter().enumerate() {

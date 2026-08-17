@@ -1,15 +1,15 @@
 use anyhow::{Context, Result, bail};
 use ipu_codegen::{
-    CompiledPackage, ExchangeActivity, ExchangeActivityKind, PhysicalTransfer, TileProgramData,
-    TransferEndpoint, TransferWidth, build_tile_program_package, inactive_exchange_program,
+    CompiledPackage, ExchangeActivity, ExchangeActivityKind, TileProgramData,
+    build_tile_program_package, inactive_exchange_program,
 };
 use ipu_driver::{Device, TileException};
 use ipu_elf::Toolchain;
 use ipu_package::{Application, Binding, RegionSlice};
 use ipu_runtime::Runtime;
 use ipu_target::exchange::{
-    MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming, finalize_point_receiver,
-    patch_receiver_address, patch_sender_address, scheduled_receiver_timing,
+    PhaseProgramBuilder, PhaseTransferTiming, PhysicalTransfer, TransferEndpoint, TransferWidth,
+    finalize_point_receiver, scheduled_receiver_timing,
 };
 use ipu_target::instruction::encode_exchange_delay;
 use ipu_target::program::{
@@ -105,7 +105,6 @@ pub(crate) fn build_wide(
     if words < 128 || words & 1 != 0 || words / 2 > ipu_target::exchange::MAX_TRANSFER_WORDS {
         bail!("paired 64-bit exchange payload must contain 128..=8296 even u32 words");
     }
-    let items = words / 2;
     let payload = (0..words)
         .map(|word| 0x6400_0000 ^ word.wrapping_mul(0x9e37_79b9))
         .collect::<Vec<_>>();
@@ -215,29 +214,20 @@ pub(crate) fn build_wide(
         let source_address = source_base + region_offset + source_bank_offset;
         let destination_address = destination_base + region_offset + destination_bank_offset;
 
-        let mut plan = topology.paired_multicast(source, &destinations, items)?;
-        patch_sender_address(&mut plan.sender, source_address)?;
-        for row in &mut plan.receivers {
-            patch_receiver_address(row, destination_address)?;
-        }
+        let transfer = PhysicalTransfer {
+            source,
+            source_addresses: vec![source_address],
+            destinations: destinations
+                .iter()
+                .map(|&tile| TransferEndpoint(tile, destination_address))
+                .collect(),
+            words,
+            width: TransferWidth::Paired64,
+        };
+        let transfer = transfer.resolve(&topology, None)?;
         let mut builder = PhaseProgramBuilder::new(execution_tiles);
-        let paired_source = topology.paired_logical(source)?;
-        let schedule_offset = builder.earliest_transfer_offset(
-            source,
-            &[paired_source],
-            &destinations,
-            &plan,
-            items,
-            0,
-        )?;
-        let timing = builder.append_transfer_at(
-            source,
-            &[paired_source],
-            &destinations,
-            &plan,
-            schedule_offset,
-            items,
-        )?;
+        let schedule_offset = builder.earliest_transfer_offset(&transfer, 0)?;
+        let timing = builder.append_transfer_at(&transfer, schedule_offset)?;
         let phase = builder.finish()?;
         let mut rows = phase.programs;
         for row in rows.iter_mut().flatten() {
@@ -606,33 +596,25 @@ pub(crate) fn build(
                 .iter()
                 .map(|&tile| allocate(&mut expected_cursors, tile, bytes, DATA_LIMIT, &mut rng))
                 .collect::<Result<Vec<_>>>()?;
-            let mut plan = if destinations.len() == 1 {
-                let point = topology.point_to_point(source, destinations[0], words)?;
-                MulticastPlan {
-                    sender: point.sender,
-                    receivers: vec![finalize_point_receiver(
-                        &point.receivers[0],
-                        topology.physical(source)?,
-                    )?],
-                }
-            } else {
-                topology.multicast(source, &destinations, words, 0)?
-            };
-            patch_sender_address(&mut plan.sender, source_address)?;
-            for (row, &address) in plan.receivers.iter_mut().zip(&destination_addresses) {
-                patch_receiver_address(row, address)?;
-            }
-            let requested_schedule_offset = schedule_offset.unwrap_or(0);
-            let schedule_offset = builder.earliest_transfer_offset(
+            let physical = PhysicalTransfer {
                 source,
-                &[],
-                &destinations,
-                &plan,
+                source_addresses: vec![source_address],
+                destinations: destinations
+                    .iter()
+                    .copied()
+                    .zip(destination_addresses.iter().copied())
+                    .map(TransferEndpoint::from)
+                    .collect(),
                 words,
-                requested_schedule_offset,
-            )?;
+                width: TransferWidth::Word32,
+            };
+            let incoming_base = (destinations.len() == 1).then_some(destination_addresses[0]);
+            let transfer = physical.resolve(&topology, incoming_base)?;
+            let requested_schedule_offset = schedule_offset.unwrap_or(0);
+            let schedule_offset =
+                builder.earliest_transfer_offset(&transfer, requested_schedule_offset)?;
             let timing = builder
-                .append_transfer_at(source, &[], &destinations, &plan, schedule_offset, words)
+                .append_transfer_at(&transfer, schedule_offset)
                 .with_context(|| {
                     format!(
                         "case {case} cannot encode transfer {source} -> {destinations:?} at schedule offset {schedule_offset}"
@@ -658,17 +640,7 @@ pub(crate) fn build(
             }
             transfers.push(StressTransfer {
                 case,
-                physical: PhysicalTransfer {
-                    source,
-                    source_addresses: vec![source_address],
-                    destinations: destinations
-                        .into_iter()
-                        .zip(destination_addresses)
-                        .map(TransferEndpoint::from)
-                        .collect(),
-                    words,
-                    width: TransferWidth::Word32,
-                },
+                physical,
                 expected_words: payload,
                 requested_schedule_offset,
                 schedule_offset,
@@ -1623,12 +1595,11 @@ fn overlap_specs(
         bail!("overlap case requires exactly three tiles");
     };
     let words = random_words(rng, maximum_words);
-    let incoming = point_plan(topology, incoming_source, pivot, words)?;
-    let outgoing = point_plan(topology, pivot, outgoing_destination, words)?;
+    let incoming = point_transfer(topology, incoming_source, pivot, words)?;
+    let outgoing = point_transfer(topology, pivot, outgoing_destination, words)?;
     let empty = PhaseProgramBuilder::new(u16::try_from(topology.tile_count())?);
-    let incoming_base = empty.transfer_timing_at(incoming_source, &[pivot], &incoming, 0, words)?;
-    let outgoing_base =
-        empty.transfer_timing_at(pivot, &[outgoing_destination], &outgoing, 0, words)?;
+    let incoming_base = empty.transfer_timing_at(&incoming, 0)?;
+    let outgoing_base = empty.transfer_timing_at(&outgoing, 0)?;
     let incoming_start = incoming_base.receiver_payload_starts[0];
     let outgoing_start = outgoing_base.payload_start;
     let anchor = incoming_start.max(outgoing_start);
@@ -1664,20 +1635,20 @@ fn overlap_specs(
     })
 }
 
-fn point_plan(
+fn point_transfer(
     topology: &Topology,
     source: u16,
     destination: u16,
     words: u32,
-) -> Result<MulticastPlan> {
-    let point = topology.point_to_point(source, destination, words)?;
-    Ok(MulticastPlan {
-        sender: point.sender,
-        receivers: vec![finalize_point_receiver(
-            &point.receivers[0],
-            topology.physical(source)?,
-        )?],
-    })
+) -> Result<ipu_target::exchange::ResolvedTransfer> {
+    Ok(PhysicalTransfer {
+        source,
+        source_addresses: vec![DATA_BASE],
+        destinations: vec![TransferEndpoint(destination, DATA_BASE)],
+        words,
+        width: TransferWidth::Word32,
+    }
+    .resolve(topology, Some(DATA_BASE))?)
 }
 
 fn paired_control_words(

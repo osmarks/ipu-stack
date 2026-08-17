@@ -778,15 +778,14 @@ impl Application {
             (region.physical_tile == DEBUG_ALL_TILES || region.physical_tile == physical_tile)
                 && (region.address..region.address.saturating_add(region.size)).contains(&pc)
         })?;
-        if region.physical_tile == DEBUG_ALL_TILES {
-            if let Some(symbol) = self
+        if region.physical_tile == DEBUG_ALL_TILES
+            && let Some(symbol) = self
                 .debug_symbols
                 .iter()
                 .filter(|symbol| symbol.address <= pc)
                 .max_by_key(|symbol| symbol.address)
-            {
-                return Some(format!("{}+0x{:x}", symbol.name, pc - symbol.address));
-            }
+        {
+            return Some(format!("{}+0x{:x}", symbol.name, pc - symbol.address));
         }
         Some(format!("{}+0x{:x}", region.name, pc - region.address))
     }
