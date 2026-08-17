@@ -24,7 +24,7 @@ impl Topology {
         })
     }
 
-    pub fn c600() -> Self {
+    pub(crate) fn c600() -> Self {
         Self {
             logical_to_physical: (0..1472).map(c600_logical_to_physical).collect(),
         }
@@ -32,6 +32,16 @@ impl Topology {
 
     pub fn tile_count(&self) -> usize {
         self.logical_to_physical.len()
+    }
+
+    pub fn prefix(&self, tile_count: u16) -> Result<Self, ExchangeError> {
+        Self::new(
+            self.logical_to_physical
+                .iter()
+                .copied()
+                .take(usize::from(tile_count))
+                .collect(),
+        )
     }
 
     pub fn physical(&self, logical: u16) -> Result<u16, ExchangeError> {
@@ -86,7 +96,7 @@ impl Topology {
     }
 }
 
-pub fn c600_logical_to_physical(logical: u16) -> u16 {
+pub(crate) fn c600_logical_to_physical(logical: u16) -> u16 {
     let pair = logical / 2;
     let lane = logical & 1;
     let block = pair / 23;
@@ -175,7 +185,7 @@ mod tests {
 
     #[test]
     fn c600_mapping_is_a_permutation() {
-        let topology = Topology::c600();
+        let topology = crate::hardware::HardwareTarget::Ipu21.topology();
         let mut physical = (0..topology.tile_count())
             .map(|logical| topology.physical(logical as u16).unwrap())
             .collect::<Vec<_>>();

@@ -7,10 +7,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use super::package::{PackageBuildResult, invalid};
 
-const HOST_DATA_START: u32 = ipu_target::exchange::HOST_PAGE_BYTES;
-const HOST_PACKET_ADDRESS: u32 = ipu_target::exchange::EXCHANGE_WINDOW_BASE;
-const HOST_CLOSE_ADDRESS: u32 = ipu_target::exchange::EXCHANGE_WINDOW_BASE + 0x160;
-const HOST_STAGING_ADDRESS: u32 = ipu_target::exchange::EXCHANGE_WINDOW_BASE + 0x180;
+const EXCHANGE: &ipu_target::exchange::ExchangeConstants =
+    ipu_target::hardware::HardwareTarget::Ipu21.exchange();
+const HOST_DATA_START: u32 = EXCHANGE.host_page_bytes;
+const HOST_PACKET_ADDRESS: u32 = EXCHANGE.window_base;
+const HOST_CLOSE_ADDRESS: u32 = EXCHANGE.window_base + 0x160;
+const HOST_STAGING_ADDRESS: u32 = EXCHANGE.window_base + 0x180;
 
 #[derive(Clone, Copy)]
 enum Direction {
@@ -172,7 +174,7 @@ pub(crate) fn plan(
         input_batch_ends: input_ends,
         output_batch_ends: output_ends,
     });
-    let data_bytes = u64::from(ipu_target::exchange::HOST_PAGE_BYTES)
+    let data_bytes = u64::from(EXCHANGE.host_page_bytes)
         .checked_mul(u64::try_from(slots.len().max(1))?)
         .ok_or_else(|| invalid("host page arena overflow"))?;
     Ok(HostPackagePlan {
@@ -185,7 +187,7 @@ pub(crate) fn plan(
             pages: vec![
                 HostPage {
                     index: 0,
-                    size: u64::from(ipu_target::exchange::HOST_PAGE_BYTES),
+                    size: u64::from(EXCHANGE.host_page_bytes),
                 },
                 HostPage {
                     index: 1,
@@ -230,7 +232,7 @@ fn append_slice(
         .ok_or_else(|| invalid("host file offset overflow"))?;
     let mut remaining = u32::try_from(slice.size)?;
     while remaining != 0 {
-        let bytes = remaining.min(ipu_target::exchange::HOST_PAGE_BYTES);
+        let bytes = remaining.min(EXCHANGE.host_page_bytes);
         result.push(PendingTransfer {
             transfer: Transfer {
                 direction,
@@ -284,7 +286,7 @@ fn batch(
                 continue;
             };
             let page_offset = slots[&tile]
-                .checked_mul(ipu_target::exchange::HOST_PAGE_BYTES)
+                .checked_mul(EXCHANGE.host_page_bytes)
                 .ok_or_else(|| invalid("host page offset overflow"))?;
             pending.transfer.host_offset = HOST_DATA_START
                 .checked_add(page_offset)

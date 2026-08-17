@@ -7,18 +7,18 @@ use crate::topology::{Topology, direction, paired_time_to_mux, time_to_mux};
 
 pub mod parse;
 
-pub const PLAN_WORDS: usize = 9;
-pub const MAX_TRANSFER_WORDS: u32 = 4148;
+pub(crate) const PLAN_WORDS: usize = 9;
+pub(crate) const MAX_TRANSFER_WORDS: u32 = 4148;
 /// Largest scheduled delay encodable by one exchange delay instruction.
-pub const EXCHANGE_WINDOW_BASE: u32 = 0x50000;
-pub const EXCHANGE_WINDOW_BYTES: u32 = 0x8000;
-pub const HOST_SHORT_MAX_BYTES: u32 = 60;
-pub const HOST_LONG_MAX_BYTES: u32 = 1024;
-pub const TILE_TO_HOST_MAX_BYTES: u32 = 256;
-pub const HOST_PAGE_BYTES: u32 = 4096;
-pub const HOST_TO_TILE_WINDOW_BYTES: u32 = 0x4000;
-pub const TILE_MUX_HOST: u32 = 0x600;
-pub const TILE_MUX_EXCHANGE: u32 = 0x640;
+pub(crate) const EXCHANGE_WINDOW_BASE: u32 = 0x50000;
+pub(crate) const EXCHANGE_WINDOW_BYTES: u32 = 0x8000;
+pub(crate) const HOST_SHORT_MAX_BYTES: u32 = 60;
+pub(crate) const HOST_LONG_MAX_BYTES: u32 = 1024;
+pub(crate) const TILE_TO_HOST_MAX_BYTES: u32 = 256;
+pub(crate) const HOST_PAGE_BYTES: u32 = 4096;
+pub(crate) const HOST_TO_TILE_WINDOW_BYTES: u32 = 0x4000;
+pub(crate) const TILE_MUX_HOST: u32 = 0x600;
+pub(crate) const TILE_MUX_EXCHANGE: u32 = 0x640;
 const XREQ_BITMAP0_BITS: u32 = 24;
 
 const INCOMING_MUX_REGISTER: u8 = 0xa0;
@@ -31,6 +31,57 @@ const HOST_TO_TILE_STREAM_END_BITS: u32 = 0x0c00_0000;
 // Time reserved by the SDK supervisor schedule between receiving a host
 // command and injecting that command into the device-side dispatch path.
 const HOST_COMMAND_ROUTE_CYCLES: u32 = 73;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExchangeConstants {
+    pub plan_words: usize,
+    pub maximum_transfer_words: u32,
+    pub window_base: u32,
+    pub window_bytes: u32,
+    pub host_short_maximum_bytes: u32,
+    pub host_long_maximum_bytes: u32,
+    pub tile_to_host_maximum_bytes: u32,
+    pub host_page_bytes: u32,
+    pub host_to_tile_window_bytes: u32,
+    pub tile_mux_host: u32,
+    pub tile_mux_exchange: u32,
+    pub xreq_bitmap0_bits: u32,
+    pub incoming_mux: u8,
+    pub incoming_mux_pair: u8,
+    pub incoming_format: u8,
+    pub incoming_base: u8,
+    pub incoming_dcount: u8,
+    pub outgoing_base: u8,
+    pub internal_exchange_dcount: u32,
+    pub tile_to_host_minimum_payload_events: u32,
+    pub host_to_tile_stream_end_bits: u32,
+    pub host_command_route_cycles: u32,
+}
+
+pub(crate) const IPU21_EXCHANGE_CONSTANTS: ExchangeConstants = ExchangeConstants {
+    plan_words: PLAN_WORDS,
+    maximum_transfer_words: MAX_TRANSFER_WORDS,
+    window_base: EXCHANGE_WINDOW_BASE,
+    window_bytes: EXCHANGE_WINDOW_BYTES,
+    host_short_maximum_bytes: HOST_SHORT_MAX_BYTES,
+    host_long_maximum_bytes: HOST_LONG_MAX_BYTES,
+    tile_to_host_maximum_bytes: TILE_TO_HOST_MAX_BYTES,
+    host_page_bytes: HOST_PAGE_BYTES,
+    host_to_tile_window_bytes: HOST_TO_TILE_WINDOW_BYTES,
+    tile_mux_host: TILE_MUX_HOST,
+    tile_mux_exchange: TILE_MUX_EXCHANGE,
+    xreq_bitmap0_bits: XREQ_BITMAP0_BITS,
+    incoming_mux: INCOMING_MUX_REGISTER,
+    incoming_mux_pair: 0xa1,
+    incoming_format: 0xa3,
+    incoming_base: 0xa4,
+    incoming_dcount: INCOMING_DCOUNT_REGISTER,
+    outgoing_base: 0xa7,
+    internal_exchange_dcount: 1,
+    tile_to_host_minimum_payload_events: TILE_TO_HOST_MIN_PAYLOAD_EVENTS,
+    host_to_tile_stream_end_bits: HOST_TO_TILE_STREAM_END_BITS,
+    host_command_route_cycles: HOST_COMMAND_ROUTE_CYCLES,
+};
 
 pub type PlanRow = [u32; PLAN_WORDS];
 

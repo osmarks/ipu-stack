@@ -20,9 +20,12 @@ use crate::operator::{
     OperatorDispatch, OperatorRequirements, Precision, layout_conversion_strategy,
 };
 use foldhash::fast::FixedState;
-use ipu_target::cost::IPU21_TARGET_COSTS;
+use ipu_target::cost::HardwareCosts;
+use ipu_target::hardware::HardwareTarget;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+
+const IPU21_TARGET_COSTS: &HardwareCosts = HardwareTarget::Ipu21.costs();
 
 pub trait CostModel: Sync {
     fn operator_cycles(
@@ -354,7 +357,11 @@ fn tensor_transition_endpoint_traffic(
     source: &TensorType,
     destination: &TensorType,
 ) -> ExchangeEndpointTraffic {
-    let transfer_bytes = u64::from(ipu_target::exchange::MAX_TRANSFER_WORDS) * 4;
+    let transfer_bytes = u64::from(
+        ipu_target::hardware::HardwareTarget::Ipu21
+            .exchange()
+            .maximum_transfer_words,
+    ) * 4;
     let outgoing = maximum_shard_bytes(source)
         .saturating_mul(u64::from(source.format.layout.tiling.tile_count.min(2)));
     let incoming = maximum_shard_bytes(destination);
@@ -373,7 +380,11 @@ fn exchange_endpoint_footprint(
     if traffic.is_empty() || phases == 0 {
         return ExchangeFootprint::default();
     }
-    let transfer_bytes = u64::from(ipu_target::exchange::MAX_TRANSFER_WORDS) * 4;
+    let transfer_bytes = u64::from(
+        ipu_target::hardware::HardwareTarget::Ipu21
+            .exchange()
+            .maximum_transfer_words,
+    ) * 4;
     ExchangeFootprint {
         phases,
         maximum_transfer_chunks_per_tile: traffic
@@ -1483,7 +1494,11 @@ mod tests {
             let reversed = exchange_endpoint_cycles(&reversed_traffic, phases);
             assert_eq!(cycles, reversed, "case {case}");
             let footprint = exchange_endpoint_footprint(&traffic, phases);
-            let transfer_bytes = u64::from(ipu_target::exchange::MAX_TRANSFER_WORDS) * 4;
+            let transfer_bytes = u64::from(
+                ipu_target::hardware::HardwareTarget::Ipu21
+                    .exchange()
+                    .maximum_transfer_words,
+            ) * 4;
             assert_eq!(footprint.phases, phases, "case {case}");
             assert!(
                 footprint.maximum_transfer_chunks_per_tile

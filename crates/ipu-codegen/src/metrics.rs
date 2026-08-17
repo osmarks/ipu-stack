@@ -66,7 +66,10 @@ impl ExchangeFootprint {
         // destination spans meet, or the address tables needed by shared
         // executable rows. Six encoded chunks per logical chunk tracks the
         // combined executable, offset, and per-use value storage on IPU21.
-        let words_per_chunk = (ipu_target::exchange::PLAN_WORDS - 2) as u64;
+        let words_per_chunk = (ipu_target::hardware::HardwareTarget::Ipu21
+            .exchange()
+            .plan_words
+            - 2) as u64;
         let encoded_chunks_per_logical_chunk = 6;
         self.phases
             .saturating_add(

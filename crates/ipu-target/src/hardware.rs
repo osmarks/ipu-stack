@@ -1,13 +1,16 @@
 //! Supported hardware targets and their resource limits.
 
 use crate::cost::{HardwareCosts, IPU21_TARGET_COSTS};
+use crate::exchange::{ExchangeConstants, IPU21_EXCHANGE_CONSTANTS};
 use crate::memory::{
     IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES, IPU21_INTERLEAVED_ELEMENT_SIZE,
     IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES, IPU21_STANDARD_FIXED_BYTES,
 };
+use crate::topology::Topology;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HardwareTarget {
+    #[default]
     Ipu21,
 }
 
@@ -24,6 +27,18 @@ impl HardwareTarget {
     pub const fn costs(self) -> &'static HardwareCosts {
         match self {
             Self::Ipu21 => &IPU21_TARGET_COSTS,
+        }
+    }
+
+    pub const fn exchange(self) -> &'static ExchangeConstants {
+        match self {
+            Self::Ipu21 => &IPU21_EXCHANGE_CONSTANTS,
+        }
+    }
+
+    pub fn topology(self) -> Topology {
+        match self {
+            Self::Ipu21 => Topology::c600(),
         }
     }
 

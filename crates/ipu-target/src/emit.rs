@@ -1,5 +1,6 @@
 //! Encoding of finalized per-tile programs into IPU21 machine code.
 
+use crate::hardware::HardwareTarget;
 use crate::instruction::{
     SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate, encode_br_m,
     encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate, encode_put_special_m,
@@ -13,16 +14,6 @@ use crate::program::{
 use crate::program::{ExchangePatch, RepeatPointer};
 use std::collections::BTreeMap;
 
-const INCOMING_BASE: u8 = 0xa4;
-const INCOMING_DCOUNT: u8 = 0xa6;
-const INCOMING_MUX: u8 = 0xa0;
-const INCOMING_FORMAT: u8 = 0xa3;
-const INCOMING_MUXPAIR: u8 = 0xa1;
-// Recovered primitive PIC/XPIC plans arm A6 with one; their payload length is
-// encoded in the timed instructions rather than this external-stream counter.
-// Consolidated phases currently preserve that primitive-plan setting.
-const INTERNAL_EXCHANGE_DCOUNT: u32 = 1;
-const OUTGOING_BASE: u8 = 0xa7;
 const FIRST_INPUT_REGISTER: u8 = 3;
 const LAST_VALUE_REGISTER: u8 = 9;
 
@@ -59,6 +50,7 @@ pub type Result<T> = std::result::Result<T, CodegenError>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodegenOptions {
+    pub target: HardwareTarget,
     /// Address where the first emitted byte will be placed.
     pub code_address: u32,
     pub invocations: u32,
@@ -69,6 +61,7 @@ pub struct CodegenOptions {
 impl Default for CodegenOptions {
     fn default() -> Self {
         Self {
+            target: HardwareTarget::Ipu21,
             code_address: 0,
             invocations: 1,
             initial_profile_address: None,
@@ -96,7 +89,10 @@ pub fn emit(
     validate(program)?;
 
     let complete = symbol(symbols, COMPLETE_SYMBOL)?;
-    let mut code = TileCode::default();
+    let mut code = TileCode {
+        target: options.target,
+        ..TileCode::default()
+    };
     emit_host_phases(&mut code, symbols, &host.initialize)?;
 
     if options.invocations > 1 {
@@ -226,6 +222,7 @@ fn emit_steps(
         }
         match step {
             TileStep::Exchange(exchange) => {
+                let target = *code.target.exchange();
                 if let Some(address) = exchange.profile.before {
                     emit_cycle_sample(code, symbols, address)?;
                 }
@@ -242,22 +239,22 @@ fn emit_steps(
                 }
                 if !exchange.preserve_base_registers {
                     code.setzi(8, exchange.incoming_base)?;
-                    code.put_special(INCOMING_BASE, 8)?;
+                    code.put_special(target.incoming_base, 8)?;
                 }
                 if let Some(source) = exchange.incoming_mux {
                     code.setzi(8, u32::from(source))?;
-                    code.put_special(INCOMING_MUX, 8)?;
+                    code.put_special(target.incoming_mux, 8)?;
                 }
                 if exchange.incoming_format != 0 {
                     code.setzi(8, u32::from(exchange.incoming_format))?;
-                    code.put_special(INCOMING_FORMAT, 8)?;
+                    code.put_special(target.incoming_format, 8)?;
                 }
                 if let Some(source) = exchange.incoming_mux_pair {
                     code.setzi(8, u32::from(source))?;
-                    code.put_special(INCOMING_MUXPAIR, 8)?;
+                    code.put_special(target.incoming_mux_pair, 8)?;
                 }
                 if !exchange.preserve_base_registers {
-                    code.put_special(OUTGOING_BASE, 15)?;
+                    code.put_special(target.outgoing_base, 15)?;
                 }
                 if exchange.active {
                     code.call(
@@ -267,9 +264,11 @@ fn emit_steps(
                     if exchange.incoming_dcount.is_some() || !exchange.sync_in_program {
                         code.setzi(
                             8,
-                            exchange.incoming_dcount.unwrap_or(INTERNAL_EXCHANGE_DCOUNT),
+                            exchange
+                                .incoming_dcount
+                                .unwrap_or(target.internal_exchange_dcount),
                         )?;
-                        code.put_special(INCOMING_DCOUNT, 8)?;
+                        code.put_special(target.incoming_dcount, 8)?;
                     }
                 }
                 if exchange.active && !exchange.sync_in_program {
@@ -708,6 +707,7 @@ fn invalid(message: impl Into<String>) -> CodegenError {
 
 #[derive(Default)]
 struct TileCode {
+    target: HardwareTarget,
     words: Vec<u32>,
 }
 

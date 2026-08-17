@@ -6,13 +6,13 @@ use crate::{
 };
 use ipu_package::ExchangeActivityKind;
 use ipu_target::exchange::{
-    MAX_TRANSFER_WORDS, PhaseProgramBuilder, PhaseTransferTiming, PhysicalTransfer,
-    ResolvedTransfer, TransferEndpoint, TransferWidth, patch_sender_instruction,
-    sender_address_instruction_groups,
+    PhaseProgramBuilder, PhaseTransferTiming, PhysicalTransfer, ResolvedTransfer, TransferEndpoint,
+    TransferWidth, patch_sender_instruction, sender_address_instruction_groups,
 };
+use ipu_target::hardware::HardwareTarget;
 use ipu_target::instruction::RETURN_M10_INSTRUCTION;
 use ipu_target::memory::{MemoryElement, memory_elements_for_words};
-use ipu_target::topology::{Topology, c600_logical_to_physical};
+use ipu_target::topology::Topology;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -603,7 +603,9 @@ fn prepare_transfer(
             return Err(ExchangeLoweringError::UnalignedPayload);
         }
         let mut chunk_bytes = (source_span.bytes - source_offset).min(
-            MAX_TRANSFER_WORDS
+            HardwareTarget::Ipu21
+                .exchange()
+                .maximum_transfer_words
                 .checked_mul(4)
                 .ok_or(ExchangeLoweringError::Overflow)?,
         );
@@ -723,7 +725,9 @@ fn prepare_planned_transfer(
         .iter()
         .map(|view| crate::shard_storage_bytes(&program.shards[view.shard.index() as usize]))
         .collect::<Result<Vec<_>, _>>()?;
-    let maximum_chunk_bytes = MAX_TRANSFER_WORDS
+    let maximum_chunk_bytes = HardwareTarget::Ipu21
+        .exchange()
+        .maximum_transfer_words
         .checked_mul(4)
         .ok_or(ExchangeLoweringError::Overflow)?;
     let mut pending = Vec::new();
@@ -1056,7 +1060,9 @@ fn pending_from_problem(
                     problem.phase, transfer.source
                 )));
             }
-            if transfer.words == 0 || transfer.words > MAX_TRANSFER_WORDS {
+            if transfer.words == 0
+                || transfer.words > HardwareTarget::Ipu21.exchange().maximum_transfer_words
+            {
                 return Err(ExchangeLoweringError::InvalidSnapshot(format!(
                     "phase {} transfer {index} has invalid word count {}",
                     problem.phase, transfer.words
@@ -1141,9 +1147,11 @@ fn pending_from_problem(
                 source_elements: Vec::new(),
                 reserved_source: match transfer.width {
                     TransferWidth::Word32 => None,
-                    TransferWidth::Paired64 => {
-                        Some(Topology::c600().paired_logical(transfer.source)?)
-                    }
+                    TransferWidth::Paired64 => Some(
+                        HardwareTarget::Ipu21
+                            .topology()
+                            .paired_logical(transfer.source)?,
+                    ),
                 },
             };
             pending.physical.destinations = destinations;
@@ -1283,7 +1291,9 @@ impl ExchangeScheduleSnapshot {
                 self.schema_version, EXCHANGE_SCHEDULE_SNAPSHOT_VERSION
             )));
         }
-        if self.tile_count == 0 || usize::from(self.tile_count) > Topology::c600().tile_count() {
+        if self.tile_count == 0
+            || usize::from(self.tile_count) > HardwareTarget::Ipu21.topology().tile_count()
+        {
             return Err(ExchangeLoweringError::InvalidSnapshot(format!(
                 "tile count {} is outside the C600 topology",
                 self.tile_count
@@ -1309,12 +1319,12 @@ pub fn schedule_exchange_problem(
     tile_count: u16,
     problem: &ExchangeScheduleProblem,
 ) -> Result<ExchangeScheduleRun, ExchangeLoweringError> {
-    if tile_count == 0 || usize::from(tile_count) > Topology::c600().tile_count() {
+    if tile_count == 0 || usize::from(tile_count) > HardwareTarget::Ipu21.topology().tile_count() {
         return Err(ExchangeLoweringError::InvalidSnapshot(format!(
             "tile count {tile_count} is outside the C600 topology"
         )));
     }
-    let topology = Topology::new((0..tile_count).map(c600_logical_to_physical).collect())?;
+    let topology = HardwareTarget::Ipu21.topology().prefix(tile_count)?;
     let pending = pending_from_problem(tile_count, problem)?;
     let incoming_bases = incoming_bases(&pending, tile_count)?;
     let OptimizedSchedule {
@@ -1429,7 +1439,11 @@ pub fn validate_exchange_schedule(
         .transfers
         .iter()
         .filter(|transfer| transfer.width == TransferWidth::Paired64)
-        .map(|transfer| Topology::c600().paired_logical(transfer.source))
+        .map(|transfer| {
+            HardwareTarget::Ipu21
+                .topology()
+                .paired_logical(transfer.source)
+        })
         .collect::<Result<BTreeSet<_>, _>>()?;
     for tile in 0..size {
         let decoded =
@@ -1505,7 +1519,11 @@ pub fn validate_exchange_schedule(
                 }
                 ExchangeActivityKind::PartnerBusy => {
                     let expected = (transfer.width == TransferWidth::Paired64)
-                        .then(|| Topology::c600().paired_logical(transfer.source))
+                        .then(|| {
+                            HardwareTarget::Ipu21
+                                .topology()
+                                .paired_logical(transfer.source)
+                        })
                         .transpose()?;
                     if expected != Some(tile_u16)
                         || activity.address != transfer.source_addresses[0]
@@ -1651,7 +1669,11 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
                                 .is_some_and(|end| end == right_address)
                     },
                 );
-        if contiguous && combined_words.is_some_and(|words| words <= MAX_TRANSFER_WORDS) {
+        if contiguous
+            && combined_words.is_some_and(|words| {
+                words <= HardwareTarget::Ipu21.exchange().maximum_transfer_words
+            })
+        {
             previous.physical.words = combined_words.expect("checked above");
         } else {
             merged.push(transfer);
@@ -2968,7 +2990,8 @@ mod tests {
                             receivers.push(tile);
                         }
                     }
-                    let words = random.u32(1..=MAX_TRANSFER_WORDS);
+                    let words =
+                        random.u32(1..=HardwareTarget::Ipu21.exchange().maximum_transfer_words);
                     PendingTransfer {
                         physical: PhysicalTransfer {
                             source,
@@ -3114,7 +3137,7 @@ mod tests {
             let phases = lower_exchanges(
                 &low,
                 &placement,
-                &Topology::c600(),
+                &HardwareTarget::Ipu21.topology(),
                 ExchangeLoweringOptions::default(),
             )
             .unwrap()

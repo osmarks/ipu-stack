@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ipu_driver::Device;
-use ipu_target::topology::Topology;
 
 #[derive(Parser)]
 #[command(about = "Read live IPU21 exchange state without resetting the device")]
@@ -20,7 +19,7 @@ struct Arguments {
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
     let device = Device::open(&arguments.device)?;
-    let topology = Topology::c600();
+    let topology = ipu_target::hardware::HardwareTarget::Ipu21.topology();
     let requested = (!arguments.tile.is_empty()).then_some(arguments.tile.as_slice());
     for logical in 0..u16::try_from(topology.tile_count())? {
         if requested.is_some_and(|tiles| !tiles.contains(&logical)) {

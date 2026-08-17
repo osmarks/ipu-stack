@@ -8,3 +8,5 @@ pub mod instruction;
 pub mod memory;
 pub mod program;
 pub mod topology;
+
+pub use hardware::{HardwareMemoryConstraints, HardwareTarget};

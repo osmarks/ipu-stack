@@ -689,7 +689,6 @@ mod tests {
         TensorFormat, lower, lower_exchanges, lower_to_tiles, place,
     };
     use ipu_target::instruction::RETURN_M10_INSTRUCTION;
-    use ipu_target::topology::Topology;
 
     #[test]
     fn randomized_gemms_finalize_to_address_resolved_tile_programs() {
@@ -726,7 +725,7 @@ mod tests {
             let exchanges = lower_exchanges(
                 &low,
                 &placement,
-                &Topology::c600(),
+                &ipu_target::hardware::HardwareTarget::Ipu21.topology(),
                 crate::ExchangeLoweringOptions::default(),
             )
             .unwrap()

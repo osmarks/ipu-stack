@@ -92,9 +92,15 @@ pub(crate) fn build_wide(
     {
         bail!("paired 64-bit diagnostic has invalid source or receiver-pair tiles");
     }
-    let topology = Topology::c600();
+    let topology = ipu_target::hardware::HardwareTarget::Ipu21.topology();
     let execution_tiles = u16::try_from(topology.tile_count())?;
-    if words < 128 || words & 1 != 0 || words / 2 > ipu_target::exchange::MAX_TRANSFER_WORDS {
+    if words < 128
+        || words & 1 != 0
+        || words / 2
+            > ipu_target::hardware::HardwareTarget::Ipu21
+                .exchange()
+                .maximum_transfer_words
+    {
         bail!("paired 64-bit exchange payload must contain 128..=8296 even u32 words");
     }
     let payload = (0..words)
@@ -426,7 +432,9 @@ pub(crate) fn build(
     toolchain: &Toolchain,
     runtime_source: &Path,
 ) -> Result<StressPackage> {
-    let maximum_tiles = Topology::c600().tile_count();
+    let maximum_tiles = ipu_target::hardware::HardwareTarget::Ipu21
+        .topology()
+        .tile_count();
     if active_tiles < 2 || usize::from(active_tiles) > maximum_tiles {
         bail!("exchange stress requires 2..={maximum_tiles} active tiles");
     }
@@ -436,10 +444,17 @@ pub(crate) fn build(
     if cases == 0 {
         bail!("--exchange-cases must be nonzero");
     }
-    if maximum_words == 0 || maximum_words > ipu_target::exchange::MAX_TRANSFER_WORDS {
+    if maximum_words == 0
+        || maximum_words
+            > ipu_target::hardware::HardwareTarget::Ipu21
+                .exchange()
+                .maximum_transfer_words
+    {
         bail!(
             "--exchange-max-words must be in 1..={}",
-            ipu_target::exchange::MAX_TRANSFER_WORDS
+            ipu_target::hardware::HardwareTarget::Ipu21
+                .exchange()
+                .maximum_transfer_words
         );
     }
     if maximum_transfers == 0 {
@@ -448,7 +463,7 @@ pub(crate) fn build(
     if maximum_compute_delay == 0 {
         bail!("--exchange-compute-delay must be nonzero");
     }
-    let topology = Topology::c600();
+    let topology = ipu_target::hardware::HardwareTarget::Ipu21.topology();
     let mut rng = fastrand::Rng::with_seed(seed);
     let mut destination_cursors = vec![DATA_BASE; usize::from(active_tiles)];
     let mut source_cursors = vec![SOURCE_BASE; usize::from(active_tiles)];
@@ -802,7 +817,7 @@ fn build_physical_phase_replay(
     toolchain: &Toolchain,
     runtime_source: &Path,
 ) -> Result<PhaseReplayPackage> {
-    let topology = Topology::c600();
+    let topology = ipu_target::hardware::HardwareTarget::Ipu21.topology();
     let execution_tiles = u16::try_from(topology.tile_count())?;
     let scheduled_tiles = u16::try_from(phase.programs.len())?;
     if phase.active.len() != usize::from(scheduled_tiles)
@@ -1091,7 +1106,7 @@ impl PhaseReplayPackage {
         if *serviced {
             return Ok(());
         }
-        let topology = Topology::c600();
+        let topology = ipu_target::hardware::HardwareTarget::Ipu21.topology();
         for tile in &self.application.tiles {
             if device.tile_context_state(u16::try_from(tile.physical_tile)?, 0)? != 2 {
                 return Ok(());
@@ -1335,7 +1350,7 @@ fn replay_word(tile: u16, address: u32) -> u32 {
 
 impl StressPackage {
     pub(crate) fn live_exchange_state(&self, runtime: &Runtime) -> String {
-        let topology = Topology::c600();
+        let topology = ipu_target::hardware::HardwareTarget::Ipu21.topology();
         let mut states = Vec::new();
         let mut relevant = Vec::new();
         for transfer in &self.transfers {
@@ -1459,7 +1474,7 @@ impl StressPackage {
     }
 
     pub(crate) fn failure_context(&self, runtime: &Runtime) -> String {
-        let topology = Topology::c600();
+        let topology = ipu_target::hardware::HardwareTarget::Ipu21.topology();
         let mut stopped = Vec::new();
         for logical in 0..self.active_tiles {
             let Ok(physical) = topology.physical(logical) else {

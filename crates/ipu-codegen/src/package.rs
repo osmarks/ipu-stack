@@ -32,7 +32,7 @@ use ipu_target::memory::{
     RUNTIME_STATE_BYTES, WORKER_STACK_HEADROOM,
 };
 use ipu_target::program::{StepProfile, TileProgram, TileStep};
-use ipu_target::topology::{Topology, c600_logical_to_physical};
+use ipu_target::topology::Topology;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -159,7 +159,8 @@ pub fn build_tile_program_package(
     toolchain: &Toolchain,
     runtime_source: &std::path::Path,
 ) -> PackageBuildResult<Application> {
-    let topology = Topology::c600();
+    let target = HardwareTarget::Ipu21;
+    let topology = target.topology();
     let execution_tiles = u16::try_from(topology.tile_count())?;
     if programs.len() != usize::from(execution_tiles)
         || programs
@@ -199,6 +200,7 @@ pub fn build_tile_program_package(
         runtime_symbols(0, 0, 0)?,
         &kernels,
         &retained_runtime,
+        target,
     )?;
     let symbols = layout
         .symbols
@@ -211,9 +213,8 @@ pub fn build_tile_program_package(
     memory.reserve(
         "host exchange aperture",
         AddressRegion::new(
-            ipu_target::exchange::EXCHANGE_WINDOW_BASE,
-            ipu_target::exchange::EXCHANGE_WINDOW_BASE
-                + ipu_target::exchange::EXCHANGE_WINDOW_BYTES,
+            target.exchange().window_base,
+            target.exchange().window_base + target.exchange().window_bytes,
         ),
     )?;
     memory.reserve(
@@ -443,6 +444,7 @@ pub fn build_tile_program_package(
         retained_runtime: &retained_runtime,
         code_address,
         host_staging_address: host.staging_address,
+        target,
     };
     let mut tiles = Vec::with_capacity(usize::from(execution_tiles));
     for logical in 0..execution_tiles {
@@ -547,7 +549,7 @@ pub fn build_diagnostic_package(
     config: &PackageConfig,
 ) -> PackageBuildResult<CompiledPackage> {
     let (mut built, mid, low) = build_package_artifacts(graph, config, true)?;
-    let topology = active_topology(low.tile_count)?;
+    let topology = active_topology(config.pipeline.target, low.tile_count)?;
     let mut checkpoints = Vec::new();
     for operation in &mid.operations {
         if !matches!(
@@ -643,7 +645,10 @@ fn build_package_artifacts(
     config: &PackageConfig,
     diagnostic_checkpoints: bool,
 ) -> PackageBuildResult<(CompiledPackage, MidGraph, LowProgram)> {
-    validate_tile_count(u32::from(config.pipeline.tile_count))?;
+    validate_tile_count(
+        config.pipeline.target,
+        u32::from(config.pipeline.tile_count),
+    )?;
     let mut planning = config.pipeline.clone();
     planning.diagnostic_checkpoints = diagnostic_checkpoints;
     if diagnostic_checkpoints {
@@ -716,7 +721,7 @@ fn select_scheduled_finalist(
         return Ok((mid, low));
     }
 
-    let topology = active_topology(planning.tile_count)?;
+    let topology = active_topology(planning.target, planning.tile_count)?;
     let mut ranked = Vec::with_capacity(finalists.len());
     for (index, mid) in finalists.into_iter().enumerate() {
         let low = lower_to_tiles(&mid, planning)?;
@@ -734,7 +739,7 @@ fn select_scheduled_finalist(
             .sum::<u64>()
             .saturating_add(
                 (exchanges.phases.len() as u64)
-                    .saturating_mul(ipu_target::cost::IPU21_TARGET_COSTS.exchange_phase_cycles),
+                    .saturating_mul(planning.target.costs().exchange_phase_cycles),
             );
         let estimated_non_exchange_cycles = mid
             .metrics
@@ -769,7 +774,7 @@ fn build_package_from_objects(
     objects: &[Vec<u8>],
     kernel_plan: &KernelBuildPlan,
 ) -> PackageBuildResult<CompiledPackage> {
-    let topology = active_topology(program.tile_count)?;
+    let topology = active_topology(config.pipeline.target, program.tile_count)?;
     let retained_runtime = runtime_retained_symbols(program, config);
     let layout = build_phase("link_runtime", || {
         link_runtime(
@@ -777,6 +782,7 @@ fn build_package_from_objects(
             runtime_symbols(0, 0, 0)?,
             kernel_plan,
             &retained_runtime,
+            config.pipeline.target,
         )
     })?;
     let linked_end = linked_end(&layout)?;
@@ -785,9 +791,9 @@ fn build_package_from_objects(
     memory.reserve(
         "host exchange aperture",
         AddressRegion::new(
-            ipu_target::exchange::EXCHANGE_WINDOW_BASE,
-            ipu_target::exchange::EXCHANGE_WINDOW_BASE
-                + ipu_target::exchange::EXCHANGE_WINDOW_BYTES,
+            config.pipeline.target.exchange().window_base,
+            config.pipeline.target.exchange().window_base
+                + config.pipeline.target.exchange().window_bytes,
         ),
     )?;
     memory.reserve(
@@ -805,7 +811,7 @@ fn build_package_from_objects(
         )?)
     })?
     .phases;
-    let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
+    let execution_tile_count = u16::try_from(config.pipeline.target.topology().tile_count())?;
     let exchange_table_bytes = crate::tile::compact_exchange_table_bytes(
         &provisional_exchanges,
         execution_tile_count,
@@ -864,7 +870,7 @@ fn build_package_from_objects(
     let exchange_code_base = exchange_rows
         .as_ref()
         .map_or(IPU21_DATA_BASE, |allocation| allocation.range.start);
-    let execution_topology = Topology::c600();
+    let execution_topology = config.pipeline.target.topology();
     let mut physical_to_logical = vec![None; usize::from(execution_tile_count)];
     for logical in 0..execution_tile_count {
         let physical = execution_topology.physical(logical)?;
@@ -1016,6 +1022,7 @@ fn build_package_from_objects(
                     &symbols,
                     host,
                     &CodegenOptions {
+                        target: config.pipeline.target,
                         code_address: sizing_code_address,
                         initial_profile_address: config
                             .pipeline
@@ -1216,6 +1223,7 @@ fn build_package_from_objects(
                     &symbols,
                     host,
                     &CodegenOptions {
+                        target: config.pipeline.target,
                         code_address,
                         initial_profile_address: config
                             .pipeline
@@ -1254,6 +1262,7 @@ fn build_package_from_objects(
         retained_runtime: &retained_runtime,
         code_address,
         host_staging_address: host.staging_address,
+        target: config.pipeline.target,
     };
     let tiles = build_phase("build_tile_images", || {
         (0..execution_tile_count)
@@ -1456,8 +1465,8 @@ fn build_phase<T>(
     result
 }
 
-fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
-    let maximum = Topology::c600().tile_count() as u32;
+fn validate_tile_count(target: HardwareTarget, tile_count: u32) -> PackageBuildResult<()> {
+    let maximum = target.topology().tile_count() as u32;
     if tile_count == 0 || !tile_count.is_multiple_of(TILES_PER_BATCH as u32) || tile_count > maximum
     {
         return Err(invalid(format!(
@@ -1467,10 +1476,8 @@ fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
     Ok(())
 }
 
-fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
-    Ok(Topology::new(
-        (0..tile_count).map(c600_logical_to_physical).collect(),
-    )?)
+fn active_topology(target: HardwareTarget, tile_count: u16) -> PackageBuildResult<Topology> {
+    Ok(target.topology().prefix(tile_count)?)
 }
 
 struct TileBuildContext<'a> {
@@ -1479,6 +1486,7 @@ struct TileBuildContext<'a> {
     retained_runtime: &'a [String],
     code_address: u32,
     host_staging_address: u32,
+    target: HardwareTarget,
 }
 
 fn build_tile(
@@ -1497,6 +1505,7 @@ fn build_tile(
         )?,
         context.kernel_plan,
         context.retained_runtime,
+        context.target,
     )?;
     let mut entry = Vec::with_capacity(ENTRY_BYTES as usize);
     entry.extend_from_slice(&encode_setzi_m(0, linked.entry)?.to_le_bytes());
@@ -1559,6 +1568,7 @@ fn link_runtime(
     externals: HashMap<String, u32>,
     kernel_plan: &KernelBuildPlan,
     retained_runtime: &[String],
+    target: HardwareTarget,
 ) -> PackageBuildResult<LinkedImage> {
     let mut retained_symbols = retained_runtime.to_vec();
     retained_symbols.extend(kernel_plan.retained_symbols().map(str::to_owned));
@@ -1567,7 +1577,7 @@ fn link_runtime(
         &LinkOptions {
             image_base: TILE_MEMORY_BASE,
             regions: vec![
-                (SUPPORT_START, ipu_target::exchange::EXCHANGE_WINDOW_BASE),
+                (SUPPORT_START, target.exchange().window_base),
                 (
                     RUNTIME_EXECUTABLE_START,
                     ipu_target::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,

@@ -23,7 +23,7 @@ pub struct HardwareCosts {
 }
 
 /// IPU21 architectural costs and measurements used by analytical planning.
-pub const IPU21_TARGET_COSTS: HardwareCosts = HardwareCosts {
+pub(crate) const IPU21_TARGET_COSTS: HardwareCosts = HardwareCosts {
     // Target::getExchangeBytesPerCycle.
     exchange_bytes_per_cycle: 4,
     // Target::getMemcpyBytesPerCycle. Interleaved reads use both memory

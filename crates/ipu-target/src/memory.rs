@@ -26,8 +26,12 @@ pub const IPU21_APPLICATION_MEMORY_LIMIT: u32 = 0xe7bb0;
 pub const IPU21_INTERLEAVED_ELEMENT_SIZE: u32 = 2 * TILE_MEMORY_ELEMENT_SIZE;
 
 /// Runtime completion word followed by supervisor and worker stack state.
-pub const RUNTIME_STATE_BASE: u32 =
-    crate::exchange::EXCHANGE_WINDOW_BASE + crate::exchange::EXCHANGE_WINDOW_BYTES;
+pub const RUNTIME_STATE_BASE: u32 = crate::hardware::HardwareTarget::Ipu21
+    .exchange()
+    .window_base
+    + crate::hardware::HardwareTarget::Ipu21
+        .exchange()
+        .window_bytes;
 pub const WORKER_STACK_HEADROOM: u32 = 0xe0;
 pub const WORKER_SYNC_STRIDE: u32 = 0x100;
 pub const WORKER_CONTEXTS: u32 = 6;

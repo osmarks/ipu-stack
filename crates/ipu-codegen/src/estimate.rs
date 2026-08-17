@@ -274,7 +274,11 @@ pub(crate) fn conversion_traffic(
 pub(crate) fn conversion_mapping_traffic(
     mappings: &[ConversionMapping],
 ) -> ConversionTraffic {
-    let maximum_chunk_bytes = u64::from(ipu_target::exchange::MAX_TRANSFER_WORDS) * 4;
+    let maximum_chunk_bytes = u64::from(
+        ipu_target::hardware::HardwareTarget::Ipu21
+            .exchange()
+            .maximum_transfer_words,
+    ) * 4;
     let geometry_fragments = |mapping: &ConversionMapping| {
         mapping.copies.iter().fold(0u64, |total, geometry| {
             total.saturating_add(
@@ -1145,7 +1149,11 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
         right_inner_axis,
         output_column_axis,
     )?;
-    let transfer_bytes = u64::from(ipu_target::exchange::MAX_TRANSFER_WORDS) * 4;
+    let transfer_bytes = u64::from(
+        ipu_target::hardware::HardwareTarget::Ipu21
+            .exchange()
+            .maximum_transfer_words,
+    ) * 4;
     let mut traffic = ExchangeEndpointTraffic::default();
     let mut left_is_remote = false;
     let mut right_is_remote = false;
@@ -1331,7 +1339,11 @@ fn add_operand_outgoing_bus_work(
     if !remote {
         return;
     }
-    let transfer_bytes = u64::from(ipu_target::exchange::MAX_TRANSFER_WORDS) * 4;
+    let transfer_bytes = u64::from(
+        ipu_target::hardware::HardwareTarget::Ipu21
+            .exchange()
+            .maximum_transfer_words,
+    ) * 4;
     for tile in 0..operand.format.layout.tiling.tile_count {
         let bytes = maximum_shard_bytes(operand);
         traffic.add_outgoing(tile / 2, bytes, bytes.div_ceil(transfer_bytes));

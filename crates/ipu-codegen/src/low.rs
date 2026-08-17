@@ -2872,7 +2872,9 @@ impl LoweringState {
         &self,
         mappings: &[(ShardView, ShardView)],
     ) -> LowLoweringResult<Option<u64>> {
-        let maximum_bytes = ipu_target::exchange::MAX_TRANSFER_WORDS
+        let maximum_bytes = ipu_target::hardware::HardwareTarget::Ipu21
+            .exchange()
+            .maximum_transfer_words
             .checked_mul(4)
             .ok_or(LowLoweringError::IdOverflow)?;
         let mut fragments = 0u64;
@@ -2956,14 +2958,19 @@ impl LoweringState {
         let elements = bytes.div_ceil(shard.tensor_type.format.precision.bytes().max(1));
         let packed_cycles = crate::cost::row_major_pack_cycles(&shard.tensor_type, elements);
         let clear_cycles = if self.shard_has_padding(destination) {
-            ipu_target::cost::IPU21_TARGET_COSTS
+            ipu_target::hardware::HardwareTarget::Ipu21
+                .costs()
                 .kernel_launch_cycles
                 .saturating_add(bytes.div_ceil(8 * 6))
         } else {
             0
         };
         let fragment_cycles = fragments
-            .saturating_mul(ipu_target::cost::IPU21_TARGET_COSTS.logical_fragment_cycles)
+            .saturating_mul(
+                ipu_target::hardware::HardwareTarget::Ipu21
+                    .costs()
+                    .logical_fragment_cycles,
+            )
             .saturating_add(clear_cycles);
         let direct = fragment_cycles < packed_cycles;
         tracing::trace!(
