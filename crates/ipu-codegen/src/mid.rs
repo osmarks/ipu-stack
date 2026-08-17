@@ -669,6 +669,19 @@ pub struct MemoryEstimate {
     pub maximum_standard_temporary_allocation: u64,
 }
 
+impl MemoryEstimate {
+    fn peaks(self, exchange_rows: u64) -> MemoryPeaks {
+        MemoryPeaks {
+            standard: self.peak.standard,
+            interleaved: self.peak.interleaved,
+            total: self.peak.total(),
+            exchange_rows,
+            maximum_standard_allocation: self.maximum_standard_temporary_allocation,
+            standard_contiguous_overflow: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlanMetrics<M = MemoryEstimate> {
     pub cost: CostEstimate,
@@ -677,6 +690,27 @@ pub struct PlanMetrics<M = MemoryEstimate> {
 
 pub type OperationMetrics = PlanMetrics<MemoryEstimate>;
 pub type RegionMetrics = PlanMetrics<MemoryPeaks>;
+
+impl PlanMetrics<MemoryPeaks> {
+    fn pareto_dimensions(self) -> [u64; 7] {
+        [
+            self.cost.cycles,
+            self.memory.standard,
+            self.memory.interleaved,
+            self.memory.total,
+            self.memory.maximum_standard_allocation,
+            self.memory.standard_contiguous_overflow,
+            self.memory.exchange_rows,
+        ]
+    }
+
+    fn dominates(self, other: Self) -> bool {
+        let left = self.pareto_dimensions();
+        let right = other.pareto_dimensions();
+        left.iter().zip(right).all(|(left, right)| *left <= right)
+            && left.iter().zip(right).any(|(left, right)| *left < right)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TensorAxis {
@@ -3159,46 +3193,9 @@ struct FutureBeamState {
     equal_formats_satisfied: Vec<(ValueId, ValueId, bool)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ParetoMemoryKey {
-    standard: u64,
-    interleaved: u64,
-    total: u64,
-    maximum_standard_allocation: u64,
-    standard_contiguous_overflow: u64,
-    exchange_rows: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ParetoKey {
-    cycles: u64,
-    memory: ParetoMemoryKey,
-}
-
-impl ParetoKey {
-    fn dominates(self, other: Self) -> bool {
-        let no_worse = self.cycles <= other.cycles
-            && self.memory.standard <= other.memory.standard
-            && self.memory.interleaved <= other.memory.interleaved
-            && self.memory.total <= other.memory.total
-            && self.memory.maximum_standard_allocation <= other.memory.maximum_standard_allocation
-            && self.memory.standard_contiguous_overflow
-                <= other.memory.standard_contiguous_overflow
-            && self.memory.exchange_rows <= other.memory.exchange_rows;
-        let strictly_better = self.cycles < other.cycles
-            || self.memory.standard < other.memory.standard
-            || self.memory.interleaved < other.memory.interleaved
-            || self.memory.total < other.memory.total
-            || self.memory.maximum_standard_allocation < other.memory.maximum_standard_allocation
-            || self.memory.standard_contiguous_overflow < other.memory.standard_contiguous_overflow
-            || self.memory.exchange_rows < other.memory.exchange_rows;
-        no_worse && strictly_better
-    }
-}
-
 struct RankedBeamBranch {
     branch: BeamBranch,
-    objective: ParetoKey,
+    objective: RegionMetrics,
     compatibility: FutureFormatCompatibility,
     order: usize,
 }
@@ -3759,18 +3756,14 @@ fn retain_pareto_beam(
     let mut groups = BTreeMap::<FutureBeamState, Vec<RankedBeamBranch>>::new();
     for (order, branch) in branches.into_iter().enumerate() {
         let signature = future_beam_state(&branch, future_origins, constraints);
-        let objective = ParetoKey {
-            cycles: deferred_aware_branch_score(&branch, future_origins).saturating_add(
-                format_equality_cost(&branch, &constraints.required_equal_formats, costs),
-            ),
-            memory: ParetoMemoryKey {
-                standard: branch.peak_memory.standard,
-                interleaved: branch.peak_memory.interleaved,
-                total: branch.peak_memory.total,
-                maximum_standard_allocation: branch.peak_memory.maximum_standard_allocation,
-                standard_contiguous_overflow: branch.peak_memory.standard_contiguous_overflow,
-                exchange_rows: branch.peak_memory.exchange_rows,
+        let objective = RegionMetrics {
+            cost: CostEstimate {
+                cycles: deferred_aware_branch_score(&branch, future_origins).saturating_add(
+                    format_equality_cost(&branch, &constraints.required_equal_formats, costs),
+                ),
+                ..CostEstimate::default()
             },
+            memory: branch.peak_memory,
         };
         groups.entry(signature).or_default().push(RankedBeamBranch {
             compatibility: future_format_compatibility(&branch, future_origins),
@@ -3807,7 +3800,7 @@ fn retain_pareto_beam(
         }
         frontier.extend(group_frontier);
     }
-    frontier.sort_by_key(|candidate| (candidate.objective.cycles, candidate.order));
+    frontier.sort_by_key(|candidate| (candidate.objective.cost.cycles, candidate.order));
 
     let mut selected = BTreeSet::new();
     let mut diversity = 0usize;
@@ -3843,7 +3836,9 @@ fn retain_pareto_beam(
             let index = frontier
                 .iter()
                 .enumerate()
-                .min_by_key(|(index, entry)| (objective(entry), entry.objective.cycles, *index))
+                .min_by_key(|(index, entry)| {
+                    (objective(entry), entry.objective.cost.cycles, *index)
+                })
                 .map(|(index, _)| index)
                 .unwrap();
             if selected.insert(index) {
@@ -5824,28 +5819,25 @@ fn retain_precise_gemm_plans(
                 &planned_inputs,
                 &planned_output,
             );
-            let objective = ParetoKey {
-                cycles: costs.operator_cycles(
-                    operator,
-                    &candidate.dispatch,
-                    &requirements,
-                    &planned_inputs,
-                    &planned_output,
-                ),
-                memory: ParetoMemoryKey {
-                    standard: memory.peak.standard,
-                    interleaved: memory.peak.interleaved,
-                    total: memory.peak.total(),
-                    maximum_standard_allocation: memory.maximum_standard_temporary_allocation,
-                    standard_contiguous_overflow: 0,
-                    exchange_rows: exchange.estimated_row_bytes(),
+            let objective = RegionMetrics {
+                cost: CostEstimate {
+                    cycles: costs.operator_cycles(
+                        operator,
+                        &candidate.dispatch,
+                        &requirements,
+                        &planned_inputs,
+                        &planned_output,
+                    ),
+                    exchange_footprint: exchange,
+                    ..CostEstimate::default()
                 },
+                memory: memory.peaks(exchange.estimated_row_bytes()),
             };
             let compatibility = gemm_plan_compatibility(&candidate);
             (candidate, objective, compatibility)
         })
         .collect::<Vec<_>>();
-    let mut frontier = Vec::<(GemmPlan, ParetoKey, GemmPlanCompatibility)>::new();
+    let mut frontier = Vec::<(GemmPlan, RegionMetrics, GemmPlanCompatibility)>::new();
     for entry in ranked {
         if frontier
             .iter()
@@ -5861,7 +5853,7 @@ fn retain_precise_gemm_plans(
     let mut ranked = frontier;
     ranked.sort_by_key(|(_, objective, _)| {
         (
-            objective.cycles,
+            objective.cost.cycles,
             objective.memory.total,
             objective.memory.interleaved,
             objective.memory.exchange_rows,
