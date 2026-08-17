@@ -143,12 +143,6 @@ pub enum OperatorDispatch {
     SplitHeads,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AttentionKernelFamily {
-    pub query_key: TileKernelSpec,
-    pub probability_value: TileKernelSpec,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AttentionPadding {
     pub query_dimension: u32,
@@ -169,9 +163,43 @@ pub enum AttentionBlocking {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttentionPlan {
-    pub kernels: AttentionKernelFamily,
+    pub kernel: GemmKernelFamily,
     pub blocking: AttentionBlocking,
     pub padding: AttentionPadding,
+}
+
+impl AttentionPlan {
+    pub fn query_key_kernel(&self) -> TileKernelSpec {
+        let output_columns = match self.blocking {
+            AttentionBlocking::Flash { key_rows, .. } => key_rows,
+            AttentionBlocking::Materialized {
+                padded_key_rows, ..
+            } => padded_key_rows,
+        };
+        self.kernel.kernel(
+            GemmKernelMode::Initialize,
+            GemmBlockShape {
+                inner: self.padding.query_dimension,
+                output_columns,
+            },
+        )
+    }
+
+    pub fn probability_value_kernel(&self) -> TileKernelSpec {
+        let inner = match self.blocking {
+            AttentionBlocking::Flash { key_rows, .. } => key_rows,
+            AttentionBlocking::Materialized {
+                padded_key_rows, ..
+            } => padded_key_rows,
+        };
+        self.kernel.kernel(
+            GemmKernelMode::Initialize,
+            GemmBlockShape {
+                inner,
+                output_columns: self.padding.value_dimension,
+            },
+        )
+    }
 }
 
 /// A logical value transformation whose physical materialization may be
@@ -938,7 +966,7 @@ impl OperatorPlan {
                     accumulate,
                 },
                 OperatorDispatch::Attention(AttentionPlan {
-                    kernels,
+                    kernel,
                     blocking:
                         AttentionBlocking::Flash {
                             query_rows,
@@ -969,8 +997,9 @@ impl OperatorPlan {
                     || query.format.layout.tiling.tile_count
                         != output.format.layout.tiling.tile_count
                     || key.format.layout.tiling.tile_count != value.format.layout.tiling.tile_count
-                    || !matches!(kernels.query_key, TileKernelSpec::Gemm { .. })
-                    || !matches!(kernels.probability_value, TileKernelSpec::Gemm { .. })
+                    || kernel.multiply != Precision::F16
+                    || kernel.accumulate != *accumulate
+                    || kernel.weights != GemmWeightLoad::Standard
                 {
                     Err(OperatorPlanError::InvalidBlocking)
                 } else {
@@ -983,7 +1012,7 @@ impl OperatorPlan {
                     accumulate,
                 },
                 OperatorDispatch::Attention(AttentionPlan {
-                    kernels,
+                    kernel,
                     blocking:
                         AttentionBlocking::Materialized {
                             query_rows,
@@ -1015,8 +1044,9 @@ impl OperatorPlan {
                     || query.format.layout.tiling.tile_count
                         != output.format.layout.tiling.tile_count
                     || key.format.layout.tiling.tile_count != value.format.layout.tiling.tile_count
-                    || !matches!(kernels.query_key, TileKernelSpec::Gemm { .. })
-                    || !matches!(kernels.probability_value, TileKernelSpec::Gemm { .. })
+                    || kernel.multiply != Precision::F16
+                    || kernel.accumulate != *accumulate
+                    || kernel.weights != GemmWeightLoad::Standard
                 {
                     Err(OperatorPlanError::InvalidBlocking)
                 } else {

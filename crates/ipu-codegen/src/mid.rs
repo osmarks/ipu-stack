@@ -2070,23 +2070,10 @@ fn plans_for_operation(
                         accumulate: AccumulationPrecision::F32,
                     },
                     dispatch: OperatorDispatch::Attention(AttentionPlan {
-                        kernels: AttentionKernelFamily {
-                            query_key: TileKernelSpec::Gemm {
-                                multiply: Precision::F16,
-                                accumulate: AccumulationPrecision::F32,
-                                mode: GemmKernelMode::Initialize,
-                                weights: GemmWeightLoad::Standard,
-                                inner_block: padded_query_dimension,
-                                output_columns: AMP_INNER_BLOCK,
-                            },
-                            probability_value: TileKernelSpec::Gemm {
-                                multiply: Precision::F16,
-                                accumulate: AccumulationPrecision::F32,
-                                mode: GemmKernelMode::Initialize,
-                                weights: GemmWeightLoad::Standard,
-                                inner_block: AMP_INNER_BLOCK,
-                                output_columns: padded_value_dimension,
-                            },
+                        kernel: GemmKernelFamily {
+                            multiply: Precision::F16,
+                            accumulate: AccumulationPrecision::F32,
+                            weights: GemmWeightLoad::Standard,
                         },
                         blocking: AttentionBlocking::Flash {
                             query_rows: query_rows.div_ceil(u32::from(query_partitions)),
@@ -2121,23 +2108,10 @@ fn plans_for_operation(
                         accumulate: AccumulationPrecision::F32,
                     },
                     dispatch: OperatorDispatch::Attention(AttentionPlan {
-                        kernels: AttentionKernelFamily {
-                            query_key: TileKernelSpec::Gemm {
-                                multiply: Precision::F16,
-                                accumulate: AccumulationPrecision::F32,
-                                mode: GemmKernelMode::Initialize,
-                                weights: GemmWeightLoad::Standard,
-                                inner_block: padded_query_dimension,
-                                output_columns: padded_key_rows,
-                            },
-                            probability_value: TileKernelSpec::Gemm {
-                                multiply: Precision::F16,
-                                accumulate: AccumulationPrecision::F32,
-                                mode: GemmKernelMode::Initialize,
-                                weights: GemmWeightLoad::Standard,
-                                inner_block: padded_key_rows,
-                                output_columns: padded_value_dimension,
-                            },
+                        kernel: GemmKernelFamily {
+                            multiply: Precision::F16,
+                            accumulate: AccumulationPrecision::F32,
+                            weights: GemmWeightLoad::Standard,
                         },
                         blocking: AttentionBlocking::Materialized {
                             query_rows: query_rows.div_ceil(u32::from(query_partitions)),

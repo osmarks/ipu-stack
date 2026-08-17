@@ -77,14 +77,14 @@ pub use mid::{
     LoweringResult, lower,
 };
 pub use operator::{
-    AccumulationPrecision, AllocationRequirements, AttentionBlocking, AttentionKernelFamily,
-    AttentionPadding, AttentionPlan, BlockedGemmPlan, ConversionPlan, ConversionStrategy,
-    GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid, GemmKernelFamily, GemmKernelMode,
-    GemmOrientation, GemmPlanConstraint, GemmResultGrid, GemmWeightLoad, GridOrder,
-    LocalOperandStaging, MemoryElementRequirement, MemoryOperand, MemorySpaceRequirements,
-    MidOperator, OperandMaterialization, OperandRequirement, OperatorDispatch, OperatorPlan,
-    OperatorPlanError, OperatorRequirements, OutputAliasing, ParallelReductionPlan,
-    PointwiseInputMapping, Precision, ReductionStaging, TileKernelSpec,
+    AccumulationPrecision, AllocationRequirements, AttentionBlocking, AttentionPadding,
+    AttentionPlan, BlockedGemmPlan, ConversionPlan, ConversionStrategy, GemmBlockShape,
+    GemmDistribution, GemmGeometry, GemmGrid, GemmKernelFamily, GemmKernelMode, GemmOrientation,
+    GemmPlanConstraint, GemmResultGrid, GemmWeightLoad, GridOrder, LocalOperandStaging,
+    MemoryElementRequirement, MemoryOperand, MemorySpaceRequirements, MidOperator,
+    OperandMaterialization, OperandRequirement, OperatorDispatch, OperatorPlan, OperatorPlanError,
+    OperatorRequirements, OutputAliasing, ParallelReductionPlan, PointwiseInputMapping, Precision,
+    ReductionStaging, TileKernelSpec,
 };
 pub use place::{Placement, PlacementError, place};
 pub use storage::{

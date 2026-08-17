@@ -554,6 +554,7 @@ struct AttentionTask {
 #[derive(Clone, Copy)]
 struct AttentionBufferShape {
     query_block_rows: u32,
+    panel_rows: u32,
     logical_staging_rows: u32,
     physical_staging_rows: u32,
     scratch_columns: u32,
@@ -561,6 +562,43 @@ struct AttentionBufferShape {
     padded_query_dimension: u32,
     padded_value_dimension: u32,
     reuse_key_staging_for_state: bool,
+}
+
+impl AttentionBufferShape {
+    fn from_plan(plan: &crate::AttentionPlan, key_rows: u32) -> Self {
+        let padded_query_dimension = plan.padding.query_dimension;
+        let padded_value_dimension = plan.padding.value_dimension;
+        match plan.blocking {
+            crate::AttentionBlocking::Flash {
+                query_rows,
+                key_rows,
+            } => Self {
+                query_block_rows: query_rows,
+                panel_rows: key_rows,
+                logical_staging_rows: key_rows,
+                physical_staging_rows: key_rows,
+                scratch_columns: padded_value_dimension.max(key_rows),
+                state_columns: key_rows + 16,
+                padded_query_dimension,
+                padded_value_dimension,
+                reuse_key_staging_for_state: false,
+            },
+            crate::AttentionBlocking::Materialized {
+                query_rows,
+                padded_key_rows,
+            } => Self {
+                query_block_rows: query_rows,
+                panel_rows: AMP_INNER_BLOCK,
+                logical_staging_rows: key_rows,
+                physical_staging_rows: padded_key_rows,
+                scratch_columns: padded_key_rows.max(padded_value_dimension),
+                state_columns: padded_key_rows + AMP_COLUMN_MICRO,
+                padded_query_dimension,
+                padded_value_dimension,
+                reuse_key_staging_for_state: true,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2092,19 +2130,19 @@ impl LoweringState {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn prepare_attention_blocks(
         &mut self,
         key: MidValueId,
         value: MidValueId,
         tasks: &[AttentionTask],
         key_rows: u32,
-        block_rows: u32,
-        padded_query_dimension: u32,
-        padded_value_dimension: u32,
+        shape: AttentionBufferShape,
         provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<Vec<PreparedAttentionBlock>> {
+        let block_rows = shape.panel_rows;
+        let padded_query_dimension = shape.padded_query_dimension;
+        let padded_value_dimension = shape.padded_value_dimension;
         let blocks = key_rows.div_ceil(block_rows);
         let key_destinations = tasks.iter().fold(
             BTreeMap::<u32, Vec<LowShardId>>::new(),
@@ -2210,9 +2248,8 @@ impl LoweringState {
         else {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
-        let query_key = plan.kernels.query_key.clone();
-        let probability_value = plan.kernels.probability_value.clone();
-        let padded_query_dimension = plan.padding.query_dimension;
+        let query_key = plan.query_key_kernel();
+        let probability_value = plan.probability_value_kernel();
         let padded_value_dimension = plan.padding.value_dimension;
         let [query, key, value] = operation.inputs.as_slice() else {
             return Err(LowLoweringError::InvalidOperatorPlan);
@@ -2231,24 +2268,12 @@ impl LoweringState {
         if self.has_deferred_value(*key) != self.has_deferred_value(*value) {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let tasks = self.build_attention_tasks(
-            *query,
-            *result,
-            AttentionBufferShape {
-                query_block_rows,
-                logical_staging_rows: key_block_rows,
-                physical_staging_rows: key_block_rows,
-                scratch_columns: padded_value_dimension.max(key_block_rows),
-                state_columns: key_block_rows + 16,
-                padded_query_dimension,
-                padded_value_dimension,
-                reuse_key_staging_for_state: false,
-            },
-        )?;
         let key_rows = self.shards[self.value_shards(*key)?[0].index() as usize]
             .tensor_type
             .shape
             .0[1];
+        let buffer_shape = AttentionBufferShape::from_plan(plan, key_rows);
+        let tasks = self.build_attention_tasks(*query, *result, buffer_shape)?;
         let blocks = usize::try_from(key_rows.div_ceil(key_block_rows))
             .map_err(|_| LowLoweringError::IdOverflow)?;
         if blocks == 0 {
@@ -2272,9 +2297,7 @@ impl LoweringState {
                 *value,
                 &tasks,
                 key_rows,
-                key_block_rows,
-                padded_query_dimension,
-                padded_value_dimension,
+                buffer_shape,
                 exchange_provenance,
                 tiles,
             )?
@@ -2515,9 +2538,8 @@ impl LoweringState {
         else {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
-        let query_key = plan.kernels.query_key.clone();
-        let probability_value = plan.kernels.probability_value.clone();
-        let padded_query_dimension = plan.padding.query_dimension;
+        let query_key = plan.query_key_kernel();
+        let probability_value = plan.probability_value_kernel();
         let padded_value_dimension = plan.padding.value_dimension;
         let [query, key, value] = operation.inputs.as_slice() else {
             return Err(LowLoweringError::InvalidOperatorPlan);
@@ -2544,20 +2566,8 @@ impl LoweringState {
         if key_rows == 0 || key_rows > padded_key_rows {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let tasks = self.build_attention_tasks(
-            *query,
-            *result,
-            AttentionBufferShape {
-                query_block_rows,
-                logical_staging_rows: key_rows,
-                physical_staging_rows: padded_key_rows,
-                scratch_columns: padded_key_rows.max(padded_value_dimension),
-                state_columns: padded_key_rows + AMP_COLUMN_MICRO,
-                padded_query_dimension,
-                padded_value_dimension,
-                reuse_key_staging_for_state: true,
-            },
-        )?;
+        let buffer_shape = AttentionBufferShape::from_plan(plan, key_rows);
+        let tasks = self.build_attention_tasks(*query, *result, buffer_shape)?;
         if tasks.is_empty() {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
@@ -2578,9 +2588,7 @@ impl LoweringState {
                 *value,
                 &tasks,
                 key_rows,
-                AMP_INNER_BLOCK,
-                padded_query_dimension,
-                padded_value_dimension,
+                buffer_shape,
                 exchange_provenance,
                 tiles,
             )?
@@ -3537,14 +3545,11 @@ impl LoweringState {
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        if let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution {
-            return self.lower_parallel_reduction_gemm(
-                operation,
-                plan,
-                reduction,
-                requirements,
-                tiles,
-            );
+        if matches!(
+            plan.geometry.distribution,
+            GemmDistribution::ParallelReduction(_)
+        ) {
+            return self.lower_parallel_reduction_gemm(operation, plan, requirements, tiles);
         }
         let inner_block = plan.geometry.block.inner;
         let output_column_block = plan.geometry.block.output_columns;
@@ -3834,10 +3839,12 @@ impl LoweringState {
         &mut self,
         operation: &MidOperation,
         plan: &crate::BlockedGemmPlan,
-        reduction: crate::ParallelReductionPlan,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
+        let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution else {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        };
         let inner_block = plan.geometry.block.inner;
         let output_column_block = plan.geometry.block.output_columns;
         let orientation = plan.geometry.orientation;
