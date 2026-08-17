@@ -2,7 +2,6 @@
 
 #[cfg(test)]
 use crate::MemorySpaceRequirements;
-use crate::copy::CopyPlan;
 use crate::estimate::{
     ExchangeEndpointTraffic, average_shard_bytes, conversion_traffic,
     gemm_exchange_endpoint_traffic, gemm_exchange_phase_count, gemm_partial_tensor,
@@ -16,14 +15,13 @@ use crate::layout::{
 use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::operator::{
     ConversionStrategy, DeferredTransform, GemmDistribution, LocalOperandStaging, MidOperator,
-    OperatorDispatch, OperatorRequirements, Precision,
+    OperatorDispatch, OperatorRequirements, Precision, layout_conversion_strategy,
 };
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub trait CostModel: Sync {
-    fn copy_plan(&self) -> CopyPlan;
     fn operator_cycles(
         &self,
         operator: MidOperator,
@@ -64,13 +62,13 @@ pub trait CostModel: Sync {
                 self.operator_cycles(operator, dispatch, requirements, inputs, output),
                 |cycles, ((source, input), _)| {
                     cycles.saturating_add(
-                        self.rearrangement_plan(
+                        self.rearrangement_cost(
                             &input.shape,
                             input.format.precision,
+                            layout_conversion_strategy(&source.format.layout, &input.format.layout),
                             &source.format.layout,
                             &input.format.layout,
                         )
-                        .1
                         .cycles,
                     )
                 },
@@ -97,13 +95,13 @@ pub trait CostModel: Sync {
                 self.operator_exchange_cycles(operator, dispatch, requirements, inputs, output),
                 |cycles, ((source, input), _)| {
                     cycles.saturating_add(
-                        self.rearrangement_plan(
+                        self.rearrangement_cost(
                             &input.shape,
                             input.format.precision,
+                            layout_conversion_strategy(&source.format.layout, &input.format.layout),
                             &source.format.layout,
                             &input.format.layout,
                         )
-                        .1
                         .exchange_cycles,
                     )
                 },
@@ -144,13 +142,14 @@ pub trait CostModel: Sync {
     ) -> u64 {
         0
     }
-    fn rearrangement_plan(
+    fn rearrangement_cost(
         &self,
         shape: &TensorShape,
         precision: Precision,
+        strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
-    ) -> (ConversionStrategy, CostEstimate);
+    ) -> CostEstimate;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,9 +182,8 @@ pub(crate) struct MemoizedCostModel<'a, C> {
     rearrangements: Mutex<RearrangementCache>,
 }
 
-type RearrangementKey = (TensorShape, Precision, Layout, Layout);
-type RearrangementCache =
-    HashMap<RearrangementKey, Arc<OnceLock<(ConversionStrategy, CostEstimate)>>, FixedState>;
+type RearrangementKey = (TensorShape, Precision, ConversionStrategy, Layout, Layout);
+type RearrangementCache = HashMap<RearrangementKey, Arc<OnceLock<CostEstimate>>, FixedState>;
 
 impl<'a, C> MemoizedCostModel<'a, C> {
     pub(crate) fn new(inner: &'a C, spatial_capacity: u16) -> Self {
@@ -198,10 +196,6 @@ impl<'a, C> MemoizedCostModel<'a, C> {
 }
 
 impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
-    fn copy_plan(&self) -> CopyPlan {
-        self.inner.copy_plan()
-    }
-
     fn operator_cycles(
         &self,
         operator: MidOperator,
@@ -280,14 +274,15 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         )
     }
 
-    fn rearrangement_plan(
+    fn rearrangement_cost(
         &self,
         shape: &TensorShape,
         precision: Precision,
+        strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
-    ) -> (ConversionStrategy, CostEstimate) {
-        let key = (shape.clone(), precision, from.clone(), to.clone());
+    ) -> CostEstimate {
+        let key = (shape.clone(), precision, strategy, from.clone(), to.clone());
         let cached = self
             .rearrangements
             .lock()
@@ -296,7 +291,9 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
             .or_default()
             .clone();
         *cached.get_or_init(|| {
-            let (strategy, mut cost) = self.inner.rearrangement_plan(shape, precision, from, to);
+            let mut cost = self
+                .inner
+                .rearrangement_cost(shape, precision, strategy, from, to);
             let active_tiles = from.tiling.tile_count.max(to.tiling.tile_count);
             // The inner model reports occupied work. Reduced-grid conversions
             // leave spatial issue slots idle, so convert that work into a phase
@@ -305,7 +302,7 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
                 .cycles
                 .saturating_mul(u64::from(self.spatial_capacity))
                 .div_ceil(u64::from(active_tiles));
-            (strategy, cost)
+            cost
         })
     }
 }
@@ -904,10 +901,6 @@ fn deferred_split_input_cycles(
 }
 
 impl CostModel for Ipu21CostModel {
-    fn copy_plan(&self) -> CopyPlan {
-        crate::HardwareTarget::Ipu21.copy_plan()
-    }
-
     fn operator_cycles(
         &self,
         operator: MidOperator,
@@ -1427,39 +1420,7 @@ impl CostModel for Ipu21CostModel {
             .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
     }
 
-    fn rearrangement_plan(
-        &self,
-        shape: &TensorShape,
-        precision: Precision,
-        from: &Layout,
-        to: &Layout,
-    ) -> (ConversionStrategy, CostEstimate) {
-        let strategies: &[ConversionStrategy] = if from.order == to.order {
-            &[ConversionStrategy::DirectRetile]
-        } else if from.order != ElementOrder::RowMajor && to.order != ElementOrder::RowMajor {
-            &[ConversionStrategy::DirectLogical]
-        } else {
-            &[
-                ConversionStrategy::DirectLogical,
-                ConversionStrategy::StageLogicalThenTransform,
-            ]
-        };
-        strategies
-            .iter()
-            .copied()
-            .map(|strategy| {
-                (
-                    strategy,
-                    self.rearrangement_cost_for_strategy(shape, precision, strategy, from, to),
-                )
-            })
-            .min_by_key(|(_, cost)| (cost.cycles, cost.exchange_cycles))
-            .expect("every layout conversion has an execution strategy")
-    }
-}
-
-impl Ipu21CostModel {
-    fn rearrangement_cost_for_strategy(
+    fn rearrangement_cost(
         &self,
         shape: &TensorShape,
         precision: Precision,
@@ -1484,9 +1445,7 @@ impl Ipu21CostModel {
                 },
             };
         }
-        let Some(traffic) =
-            conversion_traffic(shape, precision, strategy, self.copy_plan(), from, to)
-        else {
+        let Some(traffic) = conversion_traffic(shape, precision, from, to) else {
             return CostEstimate {
                 cycles: u64::MAX / 8,
                 exchange_cycles: u64::MAX / 8,
@@ -1496,30 +1455,30 @@ impl Ipu21CostModel {
                 },
             };
         };
-        let direct_logical = strategy == ConversionStrategy::DirectLogical;
+        let direct_retile = strategy == ConversionStrategy::DirectRetile;
         let endpoint_traffic = ExchangeEndpointTraffic::from_conversion(&traffic);
-        let maximum_routed_fragments = endpoint_traffic.maximum_incoming_fragments();
-        let exchange_cycles =
-            exchange_endpoint_cycles(&endpoint_traffic, 1).saturating_add(if direct_logical {
-                maximum_routed_fragments.saturating_mul(IPU21_LOGICAL_FRAGMENT_CYCLES)
-            } else {
-                0
-            });
-        let local_cycles = traffic
-            .maximum_local_copy_bytes
+        let exchange_cycles = exchange_endpoint_cycles(&endpoint_traffic, 1);
+        let (local_bytes, local_calls) = if direct_retile {
+            (
+                traffic.maximum_local_bytes,
+                traffic.maximum_local_intersections,
+            )
+        } else {
+            (
+                traffic.maximum_destination_bytes.saturating_mul(2),
+                traffic.maximum_intersections,
+            )
+        };
+        let local_cycles = local_bytes
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
-            .saturating_add(
-                traffic
-                    .maximum_local_copy_calls
-                    .saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles),
-            );
+            .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles));
         let mut exchange_footprint = exchange_endpoint_footprint(
             &endpoint_traffic,
             u64::from(traffic.remote_fragments != 0),
         );
         exchange_footprint.maximum_transfer_chunks_per_tile = exchange_footprint
             .maximum_transfer_chunks_per_tile
-            .max(maximum_routed_fragments);
+            .max(traffic.maximum_routed_fragments);
         CostEstimate {
             cycles: exchange_cycles.saturating_add(local_cycles),
             exchange_cycles,

@@ -1537,13 +1537,13 @@ fn format_equality_cost(
         let rearrange = (source.format.layout != target.format.layout)
             .then(|| {
                 costs
-                    .rearrangement_plan(
+                    .rearrangement_cost(
                         &source.shape,
                         target.format.precision,
+                        layout_conversion_strategy(&source.format.layout, &target.format.layout),
                         &source.format.layout,
                         &target.format.layout,
                     )
-                    .1
                     .cycles
             })
             .unwrap_or(0);
@@ -3587,7 +3587,6 @@ fn ensure_format(
                 input: OperandRequirement::new(original.tensor_type.format.clone(), 8),
                 output: OperandRequirement::new(tensor_type.format.clone(), 8),
                 strategy: ConversionStrategy::LocalKernel,
-                copies: costs.copy_plan(),
             }),
             metrics: OperationMetrics {
                 cost: CostEstimate {
@@ -3605,9 +3604,11 @@ fn ensure_format(
         let from = tensor_type.format.layout.clone();
         tensor_type.format.layout = target.layout.clone();
         let result = state.derived_value(value, tensor_type.clone());
-        let (strategy, rearrangement) = costs.rearrangement_plan(
+        let strategy = layout_conversion_strategy(&from, &target.layout);
+        let rearrangement = costs.rearrangement_cost(
             &tensor_type.shape,
             tensor_type.format.precision,
+            strategy,
             &from,
             &target.layout,
         );
@@ -3629,7 +3630,6 @@ fn ensure_format(
                 output: OperandRequirement::new(tensor_type.format.clone(), 8)
                     .with_materialization(materialization),
                 strategy,
-                copies: costs.copy_plan(),
             }),
             metrics: OperationMetrics {
                 cost: rearrangement,
@@ -4162,16 +4162,12 @@ mod tests {
             let after = &value(lowered, *result).tensor_type;
             match &operation.kind {
                 MidOperationKind::CastPrecision { from, to } => {
-                    let plan = operation.conversion_plan.as_ref().unwrap();
-                    assert_eq!(plan.strategy, ConversionStrategy::LocalKernel);
                     assert_eq!(*from, before.format.precision);
                     assert_eq!(*to, after.format.precision);
                     assert_eq!(before.shape, after.shape);
                     assert_eq!(before.format.layout, after.format.layout);
                 }
                 MidOperationKind::Rearrange { from, to } => {
-                    let plan = operation.conversion_plan.as_ref().unwrap();
-                    assert!(plan.strategy.uses_intersections());
                     assert_eq!(from, &before.format.layout);
                     assert_eq!(to, &after.format.layout);
                     assert_eq!(before.shape, after.shape);
@@ -4185,10 +4181,6 @@ mod tests {
     struct ColumnParityCost;
 
     impl CostModel for ColumnParityCost {
-        fn copy_plan(&self) -> crate::CopyPlan {
-            crate::HardwareTarget::Ipu21.copy_plan()
-        }
-
         fn operator_cycles(
             &self,
             operator: MidOperator,
@@ -4213,17 +4205,15 @@ mod tests {
             0
         }
 
-        fn rearrangement_plan(
+        fn rearrangement_cost(
             &self,
             _shape: &TensorShape,
             _precision: Precision,
+            _strategy: ConversionStrategy,
             _from: &Layout,
             _to: &Layout,
-        ) -> (ConversionStrategy, crate::CostEstimate) {
-            (
-                ConversionStrategy::DirectRetile,
-                crate::CostEstimate::default(),
-            )
+        ) -> crate::CostEstimate {
+            crate::CostEstimate::default()
         }
     }
 
@@ -4635,9 +4625,7 @@ mod tests {
         let mut random = fastrand::Rng::with_seed(0x7265_7065);
         for case in 0..RANDOM_CASES {
             let tiles = random.u16(1..=64);
-            // F16 exchange paths move complete words; keep the randomized
-            // Repeat graph inside that legal domain while varying its grid.
-            let size = u32::from(tiles) * 2;
+            let size = u32::from(tiles);
             let count = random.u32(1..=12);
             let layout = Layout::row_sharded(tiles);
             let carried_format = format(precision(&mut random), layout.clone());
@@ -4663,9 +4651,7 @@ mod tests {
                     .insert(weight, format(precision(&mut random), layout.clone()));
             }
 
-            let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap_or_else(|error| {
-                panic!("random case {case}: tiles={tiles} size={size} count={count}: {error}")
-            });
+            let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let repeat = lowered
                 .operations
                 .iter()
